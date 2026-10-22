@@ -27,6 +27,7 @@ impl Qwen3VLTextEncoderFamily {
     pub const FAMILY_ID: &'static str = "family.qwen3_vl.text_encoder";
     pub const REFERENCE_PROFILE_ID: &'static str = "qwen3vl.text.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen3vl.text.cuda.bf16_f32.v1";
+    pub const CUDA_FP8_PROFILE_ID: &'static str = "qwen3vl.text.cuda.fp8_linear.experimental.v1";
     pub const EMBEDDINGS_ID: &'static str = "value.qwen3_vl.text.embeddings";
     pub const COSINE_ID: &'static str = "value.qwen3_vl.text.cosine";
     pub const SINE_ID: &'static str = "value.qwen3_vl.text.sine";
@@ -37,6 +38,28 @@ impl Qwen3VLTextEncoderFamily {
             id: ModelFamilyId::new(Self::FAMILY_ID)?,
             metadata: ExternalModelMetadataId::new("metadata.qwen3_vl.text_encoder")?,
         })
+    }
+    /// The deployed HF adapter replaces each text Linear independently. Q/K/V
+    /// and gate/up remain separate scale groups; embeddings and norms stay BF16.
+    pub fn fp8_weight_groups(config: &Qwen3VLTextConfig) -> Result<Vec<Vec<WeightId>>, VNextError> {
+        config.validate()?;
+        let mut groups = Vec::new();
+        for layer in 0..config.architecture().layers() {
+            for suffix in [
+                "self_attn.q_proj.weight",
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.o_proj.weight",
+                "mlp.gate_proj.weight",
+                "mlp.up_proj.weight",
+                "mlp.down_proj.weight",
+            ] {
+                groups.push(vec![weights::weight_id(&weights::external_name(
+                    layer, suffix,
+                ))?]);
+            }
+        }
+        Ok(groups)
     }
 }
 impl ModelFamilyProvider for Qwen3VLTextEncoderFamily {
@@ -124,7 +147,16 @@ impl ModelFamilyProvider for Qwen3VLTextEncoderFamily {
                 boundaries: boundaries.clone(),
                 states: vec![],
                 kv_storage: vec![],
-                operations: operations.clone(),
+                operations: if name == Self::CUDA_FP8_PROFILE_ID {
+                    operations
+                        .iter()
+                        .filter(|op| op.operation_id.as_str() != DENSE_LINEAR_BF16_OPERATION_ID)
+                        .cloned()
+                        .chain(std::iter::once(crate::fp8_linear::operation()?))
+                        .collect()
+                } else {
+                    operations.clone()
+                },
             })
         };
         FamilyNumericalProfiles::new(
@@ -133,6 +165,7 @@ impl ModelFamilyProvider for Qwen3VLTextEncoderFamily {
             vec![
                 profile(Self::REFERENCE_PROFILE_ID)?,
                 profile(Self::CUDA_PROFILE_ID)?,
+                profile(Self::CUDA_FP8_PROFILE_ID)?,
             ],
             vec![NumericalProfileId::new(Self::REFERENCE_PROFILE_ID)
                 .map_err(|e| invalid("profile", e))?],
@@ -146,10 +179,15 @@ impl ModelFamilyProvider for Qwen3VLTextEncoderFamily {
         if self.numerical_profiles(config)?.resolve(&profile.id)? != profile {
             return Err(invalid(
                 "profile",
-                "text component profile differs from declared BF16 boundaries and FP32 arithmetic",
+                "text component profile differs from its declared boundaries and arithmetic",
             ));
         }
-        program::build(config, &self.id)
+        let program = program::build(config, &self.id)?;
+        if profile.id.as_str() == Self::CUDA_FP8_PROFILE_ID {
+            crate::fp8_linear::select(program, &Self::fp8_weight_groups(config)?)
+        } else {
+            Ok(program)
+        }
     }
     fn semantic_metadata(&self, _: &Self::Config) -> Result<ModelSemanticMetadata, VNextError> {
         Ok(ModelSemanticMetadata::TensorComponent)

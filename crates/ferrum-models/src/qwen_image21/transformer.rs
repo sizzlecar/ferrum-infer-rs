@@ -37,6 +37,10 @@ impl QwenImage21TransformerFamily {
     /// does not select VAE attention or alter the legacy CUDA profile.
     pub const CUDA_FUSED_PROFILE_ID: &'static str =
         "qwen_image21.transformer.t2i.cuda.fused_attention.experimental.v1";
+    pub const CUDA_FP8_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.cuda.fp8_linear.experimental.v1";
+    pub const CUDA_FP8_FUSED_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.cuda.fp8_linear.fused_attention.experimental.v1";
     pub const LATENTS_ID: &'static str = "value.qwen_image21.transformer.latents";
     pub const TEXT_ID: &'static str = "value.qwen_image21.transformer.text";
     pub const TIME_FEATURES_ID: &'static str = "value.qwen_image21.transformer.time_features";
@@ -54,6 +58,37 @@ impl QwenImage21TransformerFamily {
             id: ModelFamilyId::new(Self::FAMILY_ID)?,
             metadata: ExternalModelMetadataId::new("metadata.qwen_image21.transformer.t2i")?,
         })
+    }
+    /// Explicit experimental scope: all block projections, with one shared
+    /// Q/K/V scale per block. Entrance/time/modulation/final projections remain
+    /// BF16. This does not assert the deployment's ignored-layer rule took effect.
+    pub fn fp8_weight_groups(
+        config: &QwenImage21TransformerConfig,
+    ) -> Result<Vec<Vec<WeightId>>, VNextError> {
+        config.validate()?;
+        let mut groups = Vec::new();
+        for layer in 0..config.transformer().layers() {
+            let id = |suffix: &str| {
+                WeightId::new(format!(
+                    "weight.qwen_image21.transformer_blocks.{layer}.{suffix}.weight"
+                ))
+            };
+            groups.push(
+                ["attn.to_q", "attn.to_k", "attn.to_v"]
+                    .into_iter()
+                    .map(id)
+                    .collect::<Result<_, _>>()?,
+            );
+            for suffix in [
+                "attn.to_out.0",
+                "img_mlp.gate_layer",
+                "img_mlp.proj",
+                "img_mlp.out",
+            ] {
+                groups.push(vec![id(suffix)?]);
+            }
+        }
+        Ok(groups)
     }
 }
 
@@ -110,7 +145,8 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
         let source = block.numerical_profiles(&block_config)?;
         let mut profiles = Vec::new();
         for (name, source_name) in profile_sources() {
-            if name == Self::CUDA_FUSED_PROFILE_ID && config.transformer().head_dim() != 128 {
+            if source_name == Block::CUDA_FUSED_PROFILE_ID && config.transformer().head_dim() != 128
+            {
                 continue;
             }
             let mut profile = source.resolve(&profile_id(source_name)?)?.clone();
@@ -154,6 +190,10 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
                     ));
                 }
             }
+            if is_fp8(name) {
+                let op = crate::fp8_linear::operation()?;
+                operations.insert(op.operation_id.clone(), op);
+            }
             profile.operations = operations.into_values().collect();
             profiles.push(profile);
         }
@@ -179,14 +219,26 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
             .into_iter()
             .find(|(name, _)| *name == profile.id.as_str())
             .ok_or_else(|| invalid("profile", "unknown transformer profile"))?;
-        program::build(self, config, source)
+        let program = program::build(self, config, source)?;
+        if is_fp8(profile.id.as_str()) {
+            crate::fp8_linear::select(program, &Self::fp8_weight_groups(config)?)
+        } else {
+            Ok(program)
+        }
     }
     fn semantic_metadata(&self, _: &Self::Config) -> Result<ModelSemanticMetadata, VNextError> {
         Ok(ModelSemanticMetadata::TensorComponent)
     }
 }
 
-fn profile_sources() -> [(&'static str, &'static str); 3] {
+fn is_fp8(name: &str) -> bool {
+    matches!(
+        name,
+        QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
+            | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
+    )
+}
+fn profile_sources() -> [(&'static str, &'static str); 5] {
     [
         (
             QwenImage21TransformerFamily::REFERENCE_PROFILE_ID,
@@ -198,6 +250,14 @@ fn profile_sources() -> [(&'static str, &'static str); 3] {
         ),
         (
             QwenImage21TransformerFamily::CUDA_FUSED_PROFILE_ID,
+            Block::CUDA_FUSED_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID,
+            Block::CUDA_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID,
             Block::CUDA_FUSED_PROFILE_ID,
         ),
     ]

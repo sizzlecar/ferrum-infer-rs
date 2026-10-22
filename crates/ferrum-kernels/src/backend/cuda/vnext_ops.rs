@@ -67,6 +67,13 @@ mod q6_head;
 pub use q6_head::CudaQ6MmqF32LastTokenProvider;
 mod selection;
 mod tensor_dense_bf16;
+mod tensor_dense_fp8_bf16;
+pub use tensor_dense_fp8_bf16::{
+    CudaCutlassFp8Config, CudaCutlassFp8Probe, CudaCutlassFp8ProbeReceipt,
+    CudaCutlassFp8ProbeTicket,
+    NUMERICAL_PROFILE_ID as CUDA_DENSE_LINEAR_FP8_BF16_NUMERICAL_PROFILE_ID,
+    QUANTIZATION_PROBE_PROFILE_ID as CUDA_FP8_QUANTIZATION_PROBE_PROFILE_ID,
+};
 mod tensor_silu;
 mod transformer;
 use ferrum_runtime::{
@@ -406,6 +413,50 @@ pub fn cuda_tensor_runtime_config(
         DynamicStorageView::Contiguous,
     )?]);
     Ok(config)
+}
+
+/// Explicit opt-in to the independently locked SM120 FP8 native artifact.
+/// The ordinary tensor configuration never advertises this capability. The
+/// provider factory separately admits its process-retained native allowance.
+pub fn cuda_tensor_runtime_config_with_cutlass_fp8(
+    ordinal: usize,
+    device_id: DeviceId,
+) -> Result<CudaDeviceRuntimeConfig, VNextError> {
+    let native = tensor_dense_fp8_bf16::source_fingerprint()
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+    let mut config = cuda_tensor_runtime_config(ordinal, device_id)?;
+    config.capabilities.insert(CapabilityId::new(
+        ferrum_runtime::DENSE_LINEAR_FP8_BF16_CAPABILITY_ID,
+    )?);
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        native.as_bytes(),
+    ]);
+    Ok(config)
+}
+
+pub fn cuda_vnext_dense_linear_fp8_bf16_provider(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCutlassFp8Config,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(tensor_dense_fp8_bf16::Provider::new(
+        runtime, config,
+    )?))
+}
+
+/// Diagnostic-only synchronous scratch capture. Caller arms the probe's
+/// accounted Output destinations before each invocation. The ordinary FP8
+/// factory performs no capture or extra synchronization/transfer.
+pub fn cuda_vnext_dense_linear_fp8_bf16_probe_provider(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCutlassFp8Config,
+    probe: Arc<CudaCutlassFp8Probe>,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(tensor_dense_fp8_bf16::Provider::new_with_probe(
+        runtime,
+        config,
+        Some(probe),
+    )?))
 }
 
 /// The fixed-tensor SiLU provider, without token kernels/materializers or

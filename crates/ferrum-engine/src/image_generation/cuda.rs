@@ -7,8 +7,8 @@
 //! Opaque allowances are declarations, not measured memory qualification.
 
 use super::{
-    ImageCudaAttentionPolicy, ImagePipelineConfig, QwenImage21Assets, QwenImage21Pipeline,
-    QwenImage21Profiles,
+    ImageCudaAttentionPolicy, ImageCudaPrecisionPolicy, ImagePipelineConfig, QwenImage21Assets,
+    QwenImage21Pipeline, QwenImage21Profiles,
 };
 use anyhow::{ensure, Context, Result};
 use ferrum_diffusion::Bf16EulerProfile;
@@ -96,6 +96,10 @@ pub struct ImageCudaCompositionReceipt {
     pub cudnn_library: std::path::PathBuf,
     pub cudnn_workspace_limit_bytes: u64,
     pub attention_policy: ImageCudaAttentionPolicy,
+    pub precision_policy: ImageCudaPrecisionPolicy,
+    /// This CUTLASS bridge cannot prove native unload, so its declared module
+    /// claim remains retained until process exit; tensor payloads retire normally.
+    pub fp8_opaque_memory_bytes: u64,
     /// Additional experimental plan-cache allowance, not a measured peak.
     pub attention_opaque_memory_bytes: u64,
     /// These allowances are declared, not measured native memory peaks.
@@ -116,6 +120,7 @@ pub struct QwenImage21CudaConfig {
     pub opaque_memory_profile: String,
     pub cudnn: CudaCudnnConfig,
     pub attention_policy: ImageCudaAttentionPolicy,
+    pub precision_policy: ImageCudaPrecisionPolicy,
     pub host: HostMemoryLimits,
     pub pipeline: ImageCudaPipelineLimits,
 }
@@ -127,6 +132,16 @@ impl QwenImage21CudaConfig {
     /// and ordinary Host/device admission before their execution.
     pub fn validate(&self) -> Result<()> {
         self.pipeline.validate()?;
+        if self.precision_policy == ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 {
+            ensure!(
+                ferrum_kernels::native_ops::cutlass_fp8::compiled(),
+                "FP8 requires cuda-cutlass-fp8 and its locked native artifact"
+            );
+            ensure!(
+                self.host.class_bytes(HostMemoryClass::WeightBacking) > 0,
+                "FP8 requires an explicit Host WeightBacking allowance"
+            );
+        }
         i32::try_from(self.ordinal).context("CUDA ordinal exceeds driver range")?;
         ensure!(
             self.bootstrap_memory_bytes > 0 && self.stream_memory_bytes > 0,
@@ -206,14 +221,20 @@ impl QwenImage21CudaConfig {
         ImageCudaCompositionReceipt,
     )> {
         self.validate()?;
-        let profiles = cuda_profiles(self.attention_policy)?;
-        self.validate_assets(&assets, &profiles)?;
-        let contracts = contracts(self.attention_policy)?;
-        let materializers = WeightMaterializerRegistry::identity_only()?;
-        let device = cuda_tensor_runtime_config(
-            self.ordinal,
-            DeviceId::new(format!("device.cuda.{}", self.ordinal))?,
-        )?;
+        let profiles = cuda_profiles_with_precision(self.attention_policy, self.precision_policy)?;
+        let mut contracts = contracts(self.attention_policy)?;
+        // Exactly one Host ledger, also used by CPU weight conversion.
+        let host = HostMemoryAccount::new(self.host);
+        let (materializers, execution_weight_bytes) =
+            self.prepare_assets(&assets, &profiles, &host)?;
+        let device_id = DeviceId::new(format!("device.cuda.{}", self.ordinal))?;
+        let device = match self.precision_policy {
+            ImageCudaPrecisionPolicy::Bf16 => cuda_tensor_runtime_config(self.ordinal, device_id)?,
+            ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 => {
+                contracts.push(Box::new(dense_linear_fp8_bf16_contract()?));
+                cuda_tensor_runtime_config_with_cutlass_fp8(self.ordinal, device_id)?
+            }
+        };
         let runtime = Arc::new(match self.memory {
             ImageCudaMemoryPolicy::ExplicitTotal(bytes) => {
                 CudaDeviceRuntime::new_tensor_eager(CudaTensorRuntimeConfig {
@@ -253,7 +274,7 @@ impl QwenImage21CudaConfig {
             .context("automatic runtime returned zero capacity")?,
         };
         self.validate_capacity(capacity.get())?;
-        self.validate_weight_capacity(&assets, capacity.get())?;
+        self.validate_weight_capacity(&execution_weight_bytes, capacity.get())?;
         let receipt = ImageCudaCompositionReceipt {
             memory_policy: match self.memory {
                 ImageCudaMemoryPolicy::ExplicitTotal(_) => "explicit_total",
@@ -264,6 +285,8 @@ impl QwenImage21CudaConfig {
             cudnn_library: self.cudnn.library_path.clone(),
             cudnn_workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
             attention_policy: self.attention_policy,
+            precision_policy: self.precision_policy,
+            fp8_opaque_memory_bytes: self.precision_policy.additional_opaque_bytes(),
             attention_opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
             runtime_opaque_profile: self.opaque_memory_profile.clone(),
             cudnn_opaque_profile: self.cudnn.opaque_memory_profile.clone(),
@@ -291,6 +314,16 @@ impl QwenImage21CudaConfig {
             }
         };
         providers.push(cuda_vnext_dense_bf16_provider(&runtime)?);
+        if self.precision_policy == ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 {
+            providers.push(cuda_vnext_dense_linear_fp8_bf16_provider(
+                &runtime,
+                &CudaCutlassFp8Config {
+                    opaque_memory_bytes: self.precision_policy.additional_opaque_bytes(),
+                    maximum_plans: 64,
+                    opaque_memory_profile: "experimental-cutlass-fp8-process-retained-v1".into(),
+                },
+            )?);
+        }
         let registry = OperationRuntimeRegistry::new(contracts, providers)?;
         let descriptor = runtime.descriptor();
         let engine = EngineProviderDescriptor::new(
@@ -302,8 +335,7 @@ impl QwenImage21CudaConfig {
         )?;
         let catalog = materializers
             .augment_catalog(registry.capability_catalog(descriptor.clone(), vec![engine])?)?;
-        // This is the sole Host account. No component receives a fresh ledger.
-        let host = HostMemoryAccount::new(self.host);
+        let device_opaque_allowance = self.opaque_bytes()?;
         let pipeline = QwenImage21Pipeline::new(
             runtime,
             host,
@@ -313,7 +345,8 @@ impl QwenImage21CudaConfig {
             assets,
             profiles,
             self.pipeline.with_device_capacity(capacity),
-        )?;
+        )?
+        .with_device_opaque_allowance(device_opaque_allowance)?;
         Ok((pipeline, receipt))
     }
 
@@ -335,15 +368,13 @@ impl QwenImage21CudaConfig {
         );
         Ok(())
     }
-    fn validate_weight_capacity(&self, assets: &QwenImage21Assets, capacity: u64) -> Result<()> {
-        let largest = assets
-            .receipt()
-            .required_weight_bytes
-            .into_iter()
-            .max()
-            .unwrap_or(0);
+    fn validate_weight_capacity(&self, execution_bytes: &[u64; 3], capacity: u64) -> Result<()> {
+        let largest = execution_bytes.iter().copied().max().unwrap_or(0);
         let opaque = self.opaque_bytes()?;
-        ensure!(largest < capacity - opaque, "largest component weights ({largest} bytes) leave no admitted activation capacity under total ceiling {capacity} with declared opaque allowances {opaque}");
+        let storage = capacity
+            .checked_sub(opaque)
+            .context("opaque allowances exceed capacity")?;
+        ensure!(largest < storage, "largest component execution weights ({largest} bytes) leave no admitted activation capacity under total ceiling {capacity} with declared opaque allowances {opaque}");
         Ok(())
     }
 
@@ -353,17 +384,16 @@ impl QwenImage21CudaConfig {
             .and_then(|n| n.checked_add(self.bootstrap_memory_bytes))
             .and_then(|n| n.checked_add(self.cudnn.opaque_memory_bytes))
             .and_then(|n| n.checked_add(self.attention_policy.additional_opaque_bytes()))
+            .and_then(|n| n.checked_add(self.precision_policy.additional_opaque_bytes()))
             .context("CUDA opaque allowance total overflows")
     }
 
-    fn validate_assets(
+    fn prepare_assets(
         &self,
         assets: &QwenImage21Assets,
         profiles: &QwenImage21Profiles,
-    ) -> Result<()> {
-        if let Some(capacity) = self.declared_maximum() {
-            self.validate_weight_capacity(assets, capacity.get())?;
-        }
+        host: &HostMemoryAccount,
+    ) -> Result<(WeightMaterializerRegistry, [u64; 3])> {
         let minimum_pixels = assets
             .spatial_scale()?
             .checked_mul(2)
@@ -389,15 +419,15 @@ impl QwenImage21CudaConfig {
         let noise = NormalNoiseConfig::new(64, 2, 2)?;
         let families = [
             TypedFamilyRegistration::new(Qwen3VLTextEncoderFamily::new()?)
-                .prepare_with_profile(&serde_json::to_value(text)?, &profiles.text_encoder)?,
+                .prepare_with_profile(&serde_json::to_value(&text)?, &profiles.text_encoder)?,
             TypedFamilyRegistration::new(NormalNoiseFamily::new(profiles.noise.as_str())?)
                 .prepare_with_profile(&serde_json::to_value(noise)?, &profiles.noise)?,
             TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?)
-                .prepare_with_profile(&serde_json::to_value(dit)?, &profiles.denoiser)?,
+                .prepare_with_profile(&serde_json::to_value(&dit)?, &profiles.denoiser)?,
             TypedFamilyRegistration::new(QwenImage21VaeDecoderFamily::new()?)
                 .prepare_with_profile(&serde_json::to_value(decoder)?, &profiles.decoder)?,
         ];
-        for family in families {
+        for family in &families {
             let commands = family
                 .program()
                 .blocks()
@@ -413,7 +443,38 @@ impl QwenImage21CudaConfig {
                 self.maximum_commands_per_submission
             );
         }
-        Ok(())
+        let mut execution_bytes = assets.receipt().required_weight_bytes;
+        let materializers = if self.precision_policy == ImageCudaPrecisionPolicy::Bf16 {
+            WeightMaterializerRegistry::identity_only()?
+        } else {
+            let text_materializer = super::precision::materializer(
+                super::precision::TEXT_MATERIALIZER,
+                host,
+                Qwen3VLTextEncoderFamily::fp8_weight_groups(&text)?,
+            )?;
+            let dit_materializer = super::precision::materializer(
+                super::precision::DIT_MATERIALIZER,
+                host,
+                QwenImage21TransformerFamily::fp8_weight_groups(&dit)?,
+            )?;
+            // Physical execution-schema lower bounds include every required scale
+            // scalar. They are not peak/alignment/activation estimates.
+            for (index, family, materializer) in [
+                (0, &families[0], &text_materializer),
+                (1, &families[2], &dit_materializer),
+            ] {
+                super::precision::validate_backing(family, materializer, host)?;
+                execution_bytes[index] = materializer.execution_weight_bytes(family)?;
+            }
+            WeightMaterializerRegistry::new(vec![
+                Box::new(text_materializer),
+                Box::new(dit_materializer),
+            ])?
+        };
+        if let Some(capacity) = self.declared_maximum() {
+            self.validate_weight_capacity(&execution_bytes, capacity.get())?;
+        }
+        Ok((materializers, execution_bytes))
     }
 }
 
@@ -429,15 +490,36 @@ fn validate_profile(profile: &str, label: &str) -> Result<()> {
 }
 
 fn cuda_profiles(attention: ImageCudaAttentionPolicy) -> Result<QwenImage21Profiles> {
+    cuda_profiles_with_precision(attention, ImageCudaPrecisionPolicy::Bf16)
+}
+fn cuda_profiles_with_precision(
+    attention: ImageCudaAttentionPolicy,
+    precision: ImageCudaPrecisionPolicy,
+) -> Result<QwenImage21Profiles> {
     let id = |value: &str| NumericalProfileId::new(value).map_err(anyhow::Error::msg);
     Ok(QwenImage21Profiles {
-        text_encoder: id(Qwen3VLTextEncoderFamily::CUDA_PROFILE_ID)?,
+        text_encoder: id(match precision {
+            ImageCudaPrecisionPolicy::Bf16 => Qwen3VLTextEncoderFamily::CUDA_PROFILE_ID,
+            ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 => {
+                Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID
+            }
+        })?,
         noise: id(CUDA_PHILOX_NORMAL_BF16_NUMERICAL_PROFILE_ID)?,
-        denoiser: id(match attention {
-            ImageCudaAttentionPolicy::Sequential => QwenImage21TransformerFamily::CUDA_PROFILE_ID,
-            ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
+        denoiser: id(match (attention, precision) {
+            (ImageCudaAttentionPolicy::Sequential, ImageCudaPrecisionPolicy::Bf16) => {
+                QwenImage21TransformerFamily::CUDA_PROFILE_ID
+            }
+            (ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1, ImageCudaPrecisionPolicy::Bf16) => {
                 QwenImage21TransformerFamily::CUDA_FUSED_PROFILE_ID
             }
+            (
+                ImageCudaAttentionPolicy::Sequential,
+                ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1,
+            ) => QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID,
+            (
+                ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
+                ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1,
+            ) => QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID,
         })?,
         decoder: id(QwenImage21VaeDecoderFamily::CUDA_PROFILE_ID)?,
         euler: Bf16EulerProfile::CudaScalarBf16StagedRneV1,
@@ -494,6 +576,7 @@ mod tests {
             maximum_commands_per_submission: 1024,
             opaque_memory_profile: "experimental-unqualified-test-v1".into(),
             attention_policy: ImageCudaAttentionPolicy::Sequential,
+            precision_policy: ImageCudaPrecisionPolicy::Bf16,
             cudnn: CudaCudnnConfig {
                 library_path: "/explicit/libcudnn.so.9".into(),
                 dependency_libraries: Vec::new(),
@@ -655,5 +738,55 @@ mod tests {
         c.memory =
             ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(1024 * 1024 * 1024).unwrap());
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn fp8_profiles_compose_with_attention_without_changing_noise_decoder_or_euler() {
+        for attention in [
+            ImageCudaAttentionPolicy::Sequential,
+            ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
+        ] {
+            let bf16 = cuda_profiles(attention).unwrap();
+            let fp8 = cuda_profiles_with_precision(
+                attention,
+                ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1,
+            )
+            .unwrap();
+            assert_eq!(fp8.noise, bf16.noise);
+            assert_eq!(fp8.decoder, bf16.decoder);
+            assert_eq!(fp8.euler, bf16.euler);
+            assert_eq!(
+                fp8.text_encoder.as_str(),
+                Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID
+            );
+            assert_eq!(
+                fp8.denoiser.as_str(),
+                match attention {
+                    ImageCudaAttentionPolicy::Sequential => {
+                        QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
+                    }
+                    ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
+                        QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
+                    }
+                }
+            );
+            assert_ne!(fp8.text_encoder, bf16.text_encoder);
+            assert_ne!(fp8.denoiser, bf16.denoiser);
+        }
+    }
+
+    #[test]
+    fn execution_weight_lower_bound_reserves_room_and_checks_opaque_underflow() {
+        let config = config();
+        let opaque = config.opaque_bytes().unwrap();
+        assert!(config
+            .validate_weight_capacity(&[12, 24, 8], opaque + 25)
+            .is_ok());
+        assert!(config
+            .validate_weight_capacity(&[12, 24, 8], opaque + 24)
+            .is_err());
+        assert!(config
+            .validate_weight_capacity(&[12, 24, 8], opaque - 1)
+            .is_err());
     }
 }

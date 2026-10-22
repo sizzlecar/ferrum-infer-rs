@@ -10,6 +10,8 @@ pub use crate::backend::cuda_tensor_memory_policy::{
 use ferrum_runtime::{DeviceCapacityOwner, DeviceCapacityRetention, DeviceOpaqueMemoryKind};
 
 use super::*;
+mod cutlass_owner;
+pub(crate) use cutlass_owner::CudaTensorCutlassRetention;
 
 /// Default bound, including uploads, initialization and compute commands.
 /// The actual bound is explicitly configured and enters runtime identity.
@@ -58,6 +60,8 @@ pub(super) struct TensorEagerState {
     maximum_commands: usize,
     streams: AtomicUsize,
     provider_live: AtomicBool,
+    cutlass_module: Mutex<Option<cutlass_owner::ContextModuleQuota>>,
+    cutlass_provider_live: AtomicBool,
 }
 
 pub(crate) struct CudaTensorProviderRetention {
@@ -320,6 +324,7 @@ impl CudaDeviceRuntime {
                     ferrum_runtime::SILU_BF16_CAPABILITY_ID
                         | ferrum_runtime::PHILOX_NORMAL_BF16_CAPABILITY_ID
                         | ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID
+                        | ferrum_runtime::DENSE_LINEAR_FP8_BF16_CAPABILITY_ID
                         | ferrum_runtime::SILU_MUL_BF16_CAPABILITY_ID
                         | ferrum_runtime::TANH_BF16_CAPABILITY_ID
                         | ferrum_runtime::MODULATION_SCALE_BF16_CAPABILITY_ID
@@ -437,6 +442,8 @@ impl CudaDeviceRuntime {
             maximum_commands: config.maximum_commands_per_submission,
             streams: AtomicUsize::new(0),
             provider_live: AtomicBool::new(false),
+            cutlass_module: Mutex::new(None),
+            cutlass_provider_live: AtomicBool::new(false),
         });
         let (runtime, state) = create_native(state, || Self::new(config.device))?;
         let mut guard = RetainedNative::new(runtime, state);
@@ -624,6 +631,8 @@ mod tests {
             maximum_commands: CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION,
             streams: AtomicUsize::new(0),
             provider_live: AtomicBool::new(false),
+            cutlass_module: Mutex::new(None),
+            cutlass_provider_live: AtomicBool::new(false),
         });
         let lane = state.reserve_lane().unwrap();
         let flight = lane.reserve_flight().unwrap();

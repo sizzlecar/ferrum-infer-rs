@@ -20,6 +20,7 @@ pub struct DirectoryOptions {
     pub maximum_batch_size: usize,
     pub ordinal: usize,
     pub cudnn_library: Option<PathBuf>,
+    pub precision: ferrum_engine::image_generation::ImageCudaPrecisionPolicy,
 }
 impl DirectoryOptions {
     pub fn from_cli(
@@ -54,9 +55,25 @@ impl DirectoryOptions {
             maximum_batch_size: batch.unwrap_or(1),
             ordinal,
             cudnn_library,
+            precision: Default::default(),
         };
         result.validate()?;
         Ok(result)
+    }
+    pub fn with_precision(
+        mut self,
+        precision: ferrum_engine::image_generation::ImageCudaPrecisionPolicy,
+    ) -> Self {
+        self.precision = precision;
+        self
+    }
+    pub const fn preset_name(&self) -> &'static str {
+        match self.precision {
+            ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Bf16 => PRESET_NAME,
+            ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 => {
+                "experimental_fp8_linear_cold_v1"
+            }
+        }
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -97,7 +114,10 @@ impl DirectoryOptions {
             input_preprocess_bytes: 768 * MIB as usize,
             transfer_staging_bytes: 16 * MIB as usize,
             output_bytes: 256 * MIB as usize,
-            weight_backing_bytes: 0,
+            weight_backing_bytes: match self.precision {
+                ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Bf16 => 0,
+                ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 => 128 * MIB as usize,
+            },
         }
     }
     pub fn pipeline(&self) -> PipelineConfig {
@@ -135,6 +155,7 @@ impl DirectoryOptions {
             maximum_commands_per_submission: 2048,
             opaque_memory_profile: "experimental-unqualified-runtime-v1".into(),
             attention_policy: ferrum_engine::image_generation::ImageCudaAttentionPolicy::Sequential,
+            precision_policy: self.precision,
             cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
                 library_path: super::library::resolve(self.cudnn_library.as_deref())?,
                 dependency_libraries: Vec::new(),
@@ -227,7 +248,7 @@ impl ImageProductSource {
                 ensure!(!model.is_empty() && model.len() <= 256 && !model.chars().any(char::is_control), "invalid model directory public name; rename it or use explicit image configuration");
                 Ok(PreparedProduct {
                     model,
-                    profile: PRESET_NAME,
+                    profile: options.preset_name(),
                     serving: Some(options.serving()?),
                     cuda,
                     assets,

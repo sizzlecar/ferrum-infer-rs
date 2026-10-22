@@ -128,6 +128,9 @@ pub struct CudaConfig {
     /// Opt-in DiT SDPA. Legacy JSON without this field keeps sequential attention.
     #[serde(default)]
     pub attention_policy: ferrum_engine::image_generation::ImageCudaAttentionPolicy,
+    /// Changes only TE/DiT Linear precision; no implicit lifetime/attention change.
+    #[serde(default)]
+    pub precision_policy: ferrum_engine::image_generation::ImageCudaPrecisionPolicy,
     pub host: HostConfig,
     pub pipeline: PipelineConfig,
 }
@@ -304,6 +307,14 @@ impl ImageProductConfig {
             "cuDNN dependency list exceeds 16 libraries"
         );
         cuda.host.limits()?;
+        if cuda.precision_policy
+            == ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1
+        {
+            ensure!(
+                cuda.host.weight_backing_bytes > 0,
+                "FP8 requires a nonzero backend.host.weight_backing_bytes allowance"
+            );
+        }
         cuda.resolved_pipeline()?;
         if let Some(serving) = &config.serving {
             serving.validate()?;
@@ -320,6 +331,7 @@ impl ImageProductConfig {
                 (
                     ImageExecutionProfile::ExperimentalResidentV1,
                     ImageResidencyPolicy::DenoiserAndDecoder
+                        | ImageResidencyPolicy::AllModelComponents
                 ) | (
                     ImageExecutionProfile::ExperimentalSerialCold
                         | ImageExecutionProfile::ExperimentalBatchedCold,
@@ -404,6 +416,7 @@ impl CudaConfig {
                 maximum_commands_per_submission: self.maximum_commands_per_submission,
                 opaque_memory_profile: self.opaque_memory_profile.clone(),
                 attention_policy: self.attention_policy,
+                precision_policy: self.precision_policy,
                 cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
                     library_path: self.cudnn.library_path.clone(),
                     dependency_libraries: self.cudnn.dependency_libraries.clone(),

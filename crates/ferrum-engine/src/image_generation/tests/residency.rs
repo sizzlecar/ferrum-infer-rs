@@ -3,6 +3,8 @@ use ferrum_kernels::backend::reference::ReferenceDeviceRuntime;
 use ferrum_models::qwen_image21::{IMAGE_PROJECTION_INPUT_ID, IMAGE_PROJECTION_OUTPUT_ID};
 use half::bf16;
 
+mod all_components;
+
 fn numeric_pipeline() -> (
     QwenImage21Pipeline<ReferenceDeviceRuntime>,
     tempfile::TempDir,

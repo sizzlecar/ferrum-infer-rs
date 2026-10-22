@@ -2,8 +2,9 @@
 //!
 //! Cold is the default. Optional DenoiserAndDecoder residency retains two
 //! exact-plan sessions and immutable weight snapshots across compatible plans,
-//! releasing idle dynamic backing between stages. TE and
-//! noise stay cold. A bounded optional cache reuses compiled plans. Compatible
+//! releasing idle dynamic backing between stages. AllModelComponents also
+//! retains TE; noise stays cold under either policy. A bounded optional cache
+//! reuses compiled plans. Compatible
 //! requests share real batched component forwards. These policies are not
 //! throughput qualification or proof that every configured shape fits.
 //!
@@ -23,6 +24,7 @@ mod attention_policy;
 pub mod cuda;
 mod decoder;
 mod plan_cache;
+mod precision;
 mod prepare;
 mod residency;
 pub mod service;
@@ -30,6 +32,7 @@ mod stage;
 pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources};
 pub use attention_policy::ImageCudaAttentionPolicy;
 pub use plan_cache::ImagePlanCachePolicy;
+pub use precision::ImageCudaPrecisionPolicy;
 pub use residency::ImageResidencyPolicy;
 pub use stage::{
     ActiveImageStage, ImageGenerationError, ImageGenerationFailure, ImageStage,
@@ -221,6 +224,9 @@ pub struct QwenImage21Pipeline<R: DeviceRuntime> {
     stopped: bool,
     plan_cache: plan_cache::StagePlanCache<R>,
     resident_stages: residency::ResidentStages<R>,
+    // Composition-supplied planning allowance. Actual native owners still
+    // reserve through the existing device account; this never claims bytes.
+    device_opaque_allowance_bytes: u64,
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
@@ -270,7 +276,20 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             stopped: false,
             plan_cache: plan_cache::StagePlanCache::new(),
             resident_stages: residency::ResidentStages::new(),
+            device_opaque_allowance_bytes: 0,
         })
+    }
+
+    /// Include the composition's one aggregate native allowance in resident
+    /// batch planning. Reference has no native overhead and keeps zero. This
+    /// does not reduce the runtime ceiling or duplicate a capacity reservation.
+    pub(super) fn with_device_opaque_allowance(mut self, bytes: u64) -> anyhow::Result<Self> {
+        ensure!(
+            bytes < self.config.device_capacity_bytes,
+            "device opaque allowance leaves no component storage capacity"
+        );
+        self.device_opaque_allowance_bytes = bytes;
+        Ok(self)
     }
 
     pub fn host_account(&self) -> &HostMemoryAccount {

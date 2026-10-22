@@ -54,6 +54,66 @@ fn metadata_fixture(root: &std::path::Path) {
     .unwrap();
     fs::write(root.join("processor/chat_template.jinja"), "{{ messages }}").unwrap();
 }
+#[test]
+fn explicit_image_precision_routes_both_entrypoints_and_rejects_text_or_config_mixing() {
+    use ferrum_engine::image_generation::ImageCudaPrecisionPolicy;
+    let root = tempfile::tempdir().unwrap();
+    metadata_fixture(root.path());
+    let model = root.path().to_str().unwrap();
+    assert!(validate(&[
+        "ferrum",
+        "run",
+        model,
+        "--prompt",
+        "cat",
+        "--output",
+        "picture.png",
+        "--image-precision",
+        "fp8_linear_experimental_v1"
+    ])
+    .is_ok());
+    assert!(validate(&[
+        "ferrum",
+        "serve",
+        model,
+        "--image-precision",
+        "fp8_linear_experimental_v1"
+    ])
+    .is_ok());
+    assert!(validate(&["ferrum", "serve", model, "--image-precision", "omni"]).is_err());
+    assert!(validate(&["ferrum", "serve", "text-model", "--image-precision", "bf16"]).is_err());
+    assert!(validate(&[
+        "ferrum",
+        "serve",
+        "--image-config",
+        "config.json",
+        "--image-precision",
+        "bf16"
+    ])
+    .is_err());
+    let args = ImageProductArgs {
+        image_config: None,
+        image_cudnn_library: None,
+        image_precision: Some(ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1),
+    };
+    let ImageProductSource::LocalDirectory { options, .. } = args
+        .source(Some(model), 0.9, None, Some(2), "cuda", None)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("directory");
+    };
+    assert_eq!(
+        options.precision,
+        ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1
+    );
+    assert_eq!(options.preset_name(), "experimental_fp8_linear_cold_v1");
+    assert!(options.host().weight_backing_bytes > 0);
+    assert_eq!(
+        options.pipeline().residency,
+        ferrum_engine::image_generation::ImageResidencyPolicy::Cold
+    );
+}
 
 #[test]
 fn local_pipeline_routes_both_commands_without_names_or_weight_payloads() {
@@ -96,6 +156,7 @@ fn local_pipeline_routes_both_commands_without_names_or_weight_payloads() {
     let args = ImageProductArgs {
         image_config: None,
         image_cudnn_library: None,
+        image_precision: None,
     };
     let selected = args
         .source(Some(model), 0.9, None, Some(2), "cuda", Some("1"))

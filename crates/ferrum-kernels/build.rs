@@ -563,6 +563,10 @@ fn native_dynamic_link_name(path: &Path) -> String {
 
 fn required_cuda_native_build_units() -> Vec<CudaNativeBuildUnit> {
     [
+        (
+            "CARGO_FEATURE_CUDA_CUTLASS_FP8",
+            CudaNativeBuildUnit::CutlassFp8ScaledMm,
+        ),
         ("CARGO_FEATURE_MARLIN", CudaNativeBuildUnit::Marlin),
         ("CARGO_FEATURE_VLLM_MARLIN", CudaNativeBuildUnit::VllmMarlin),
         (
@@ -805,6 +809,7 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
 
 fn emit_native_artifact_build_unit(unit: CudaNativeBuildUnit) {
     let summary_artifact = match unit {
+        CudaNativeBuildUnit::CutlassFp8ScaledMm => "cutlass_fp8_scaled_mm",
         CudaNativeBuildUnit::Marlin => "marlin",
         CudaNativeBuildUnit::VllmMarlin => "vllm_marlin",
         CudaNativeBuildUnit::VllmMoeMarlin => "vllm_moe_marlin",

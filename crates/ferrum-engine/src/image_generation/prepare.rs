@@ -70,11 +70,33 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             )?;
         let vae_family = TypedFamilyRegistration::new(QwenImage21VaeDecoderFamily::new()?)
             .prepare_with_profile(&serde_json::to_value(&decoder)?, &self.profiles.decoder)?;
+        let mut text_options = text.compile_options()?;
+        if self.profiles.text_encoder.as_str() == Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID {
+            let conversion = precision::materializer(
+                precision::TEXT_MATERIALIZER,
+                &self.host,
+                Qwen3VLTextEncoderFamily::fp8_weight_groups(&text)?,
+            )?;
+            precision::select(&text_family, &mut text_options, &conversion, &self.host)?;
+        }
+        let mut dit_options = transformer.compile_options()?;
+        if matches!(
+            self.profiles.denoiser.as_str(),
+            QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
+                | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
+        ) {
+            let conversion = precision::materializer(
+                precision::DIT_MATERIALIZER,
+                &self.host,
+                QwenImage21TransformerFamily::fp8_weight_groups(&transformer)?,
+            )?;
+            precision::select(&dit_family, &mut dit_options, &conversion, &self.host)?;
+        }
         let text_stage = PreparedStage::compile(
             ImageStage::TextEncoder,
             batch,
             text_family,
-            &text.compile_options()?,
+            &text_options,
             self,
         )?;
         let noise_stage = PreparedStage::compile(
@@ -84,13 +106,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             &noise.compile_options()?,
             self,
         )?;
-        let denoise_stage = PreparedStage::compile(
-            ImageStage::Denoiser,
-            batch,
-            dit_family,
-            &transformer.compile_options()?,
-            self,
-        )?;
+        let denoise_stage =
+            PreparedStage::compile(ImageStage::Denoiser, batch, dit_family, &dit_options, self)?;
         let decode_stage = PreparedStage::compile(
             ImageStage::Decoder,
             decoder_batch,
@@ -98,6 +115,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             &decoder.compile_options()?,
             self,
         )?;
+        self.validate_resident_capacity(&[
+            &text_stage,
+            &noise_stage,
+            &denoise_stage,
+            &decode_stage,
+        ])?;
         Ok(PreparedRequest {
             prompts,
             transformer,

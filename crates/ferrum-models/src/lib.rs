@@ -14,6 +14,7 @@ pub mod common;
 pub mod definition;
 pub mod deltanet_s1;
 pub mod executor;
+mod fp8_linear;
 pub mod gguf_config;
 pub mod gguf_engine_loader;
 pub mod hf_download;

@@ -26,6 +26,47 @@ fn configuration() -> Value {
                 "maximum_initialization_commands":32,"maximum_backing_maintenance_passes":8}}
     })
 }
+#[test]
+fn fp8_precision_is_shared_by_run_and_serve_without_changing_residency_or_attention() {
+    use ferrum_engine::image_generation::{
+        ImageCudaAttentionPolicy, ImageCudaPrecisionPolicy, ImageResidencyPolicy,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    let mut wire = configuration();
+    let ImageBackendConfig::Cuda(original) = load(&wire).unwrap().backend;
+    assert_eq!(original.precision_policy, ImageCudaPrecisionPolicy::Bf16);
+    wire["backend"]["precision_policy"] = json!("fp8_linear_experimental_v1");
+    assert!(load(&wire).is_err());
+    wire["backend"]["host"]["weight_backing_bytes"] = json!(1024);
+    for serving in [false, true] {
+        wire["serving"] = if serving {
+            json!({"maximum_pending":2,"maximum_prompt_bytes":4096,"max_num_seqs":1,
+                "request_batch_max_wait_ms":0,"default_width":512,"default_height":512,
+                "default_seed":0,"rgba_scratch_bytes":16384,"output":{}})
+        } else {
+            Value::Null
+        };
+        let ImageBackendConfig::Cuda(config) = load(&wire).unwrap().backend;
+        assert_eq!(
+            config.precision_policy,
+            ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1
+        );
+        assert_eq!(
+            config.attention_policy,
+            ImageCudaAttentionPolicy::Sequential
+        );
+        assert_eq!(config.pipeline.residency, ImageResidencyPolicy::Cold);
+    }
+    for invalid in [json!("omni"), json!("fp8"), json!(null), json!({})] {
+        wire["backend"]["precision_policy"] = invalid;
+        assert!(load(&wire).is_err());
+    }
+}
 
 #[test]
 fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
@@ -250,30 +291,37 @@ fn residency_is_explicit_and_shared_by_run_and_serve_configuration() {
         cuda.resolved_pipeline().unwrap().residency,
         ImageResidencyPolicy::Cold
     );
-    wire["backend"]["pipeline"]["residency"] = json!("denoiser_and_decoder");
-    assert!(load(&wire).is_err()); // A cold execution identity must remain truthful.
-    wire["execution_profile"] = json!("experimental_resident_v1");
-    for serving in [false, true] {
-        if serving {
-            wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+    for (name, policy) in [
+        (
+            "denoiser_and_decoder",
+            ImageResidencyPolicy::DenoiserAndDecoder,
+        ),
+        (
+            "all_model_components",
+            ImageResidencyPolicy::AllModelComponents,
+        ),
+    ] {
+        wire["execution_profile"] = json!("experimental_serial_cold");
+        wire["backend"]["pipeline"]["residency"] = json!(name);
+        assert!(load(&wire).is_err()); // A cold execution identity must remain truthful.
+        wire["execution_profile"] = json!("experimental_resident_v1");
+        for serving in [false, true] {
+            wire["serving"] = Value::Null;
+            if serving {
+                wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
                 "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
                 "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+            }
+            let config = load(&wire).unwrap();
+            assert_eq!(
+                config.execution_profile.as_str(),
+                "experimental_resident_v1"
+            );
+            let ImageBackendConfig::Cuda(cuda) = config.backend;
+            assert_eq!(cuda.resolved_pipeline().unwrap().residency, policy);
+            #[cfg(feature = "cuda")]
+            assert_eq!(cuda.resolved().unwrap().pipeline.residency, policy);
         }
-        let config = load(&wire).unwrap();
-        assert_eq!(
-            config.execution_profile.as_str(),
-            "experimental_resident_v1"
-        );
-        let ImageBackendConfig::Cuda(cuda) = config.backend;
-        assert_eq!(
-            cuda.resolved_pipeline().unwrap().residency,
-            ImageResidencyPolicy::DenoiserAndDecoder
-        );
-        #[cfg(feature = "cuda")]
-        assert_eq!(
-            cuda.resolved().unwrap().pipeline.residency,
-            ImageResidencyPolicy::DenoiserAndDecoder
-        );
     }
     wire["backend"]["pipeline"]
         .as_object_mut()

@@ -3,6 +3,65 @@ use serde_json::json;
 type F = QwenImage21TransformerFamily;
 
 #[test]
+fn fp8_transformer_scope_groups_qkv_but_keeps_all_boundary_projections_bf16() {
+    let config = config(true);
+    let family = F::new().unwrap();
+    let profiles = family.numerical_profiles(&config).unwrap();
+    let bf16 = profiles
+        .resolve(&profile_id(F::CUDA_PROFILE_ID).unwrap())
+        .unwrap();
+    let fp8 = profiles
+        .resolve(&profile_id(F::CUDA_FP8_PROFILE_ID).unwrap())
+        .unwrap();
+    let a = family.semantic_program(&config, bf16).unwrap();
+    let b = family.semantic_program(&config, fp8).unwrap();
+    let groups = F::fp8_weight_groups(&config).unwrap();
+    assert_eq!(groups.len(), 10);
+    for (layer, group) in groups.chunks_exact(5).enumerate() {
+        assert_eq!(
+            group[0],
+            ["attn.to_q", "attn.to_k", "attn.to_v"].map(|name| WeightId::new(format!(
+                "weight.qwen_image21.transformer_blocks.{layer}.{name}.weight"
+            ))
+            .unwrap())
+        );
+        assert!(group[1..].iter().all(|g| g.len() == 1));
+    }
+    assert_eq!(a.weights(), b.weights());
+    assert_eq!(a.input_tensor_specs(), b.input_tensor_specs());
+    assert_eq!(bf16.boundaries, fp8.boundaries);
+    assert!(bf16.validate_program(&b).is_err());
+    assert!(fp8.validate_program(&a).is_err());
+    let selected: BTreeSet<_> = groups.iter().flatten().collect();
+    let mut converted = 0;
+    let mut unchanged_dense = 0;
+    for (left, right) in a
+        .blocks()
+        .iter()
+        .flat_map(|b| &b.nodes)
+        .zip(b.blocks().iter().flat_map(|b| &b.nodes))
+    {
+        let mut restored = right.clone();
+        if right.operation_id.as_str() == DENSE_LINEAR_FP8_BF16_OPERATION_ID {
+            let weight = a
+                .weights()
+                .iter()
+                .find(|w| w.value_id == right.inputs[1])
+                .unwrap();
+            assert!(selected.contains(&weight.weight_id));
+            restored.operation_id = left.operation_id.clone();
+            converted += 1;
+        } else if right.operation_id.as_str() == DENSE_LINEAR_BF16_OPERATION_ID {
+            unchanged_dense += 1;
+        }
+        assert_eq!(&restored, left);
+    }
+    assert_eq!(converted, 14);
+    assert!(unchanged_dense > 0);
+    assert_ne!(a.fingerprint().unwrap(), b.fingerprint().unwrap());
+}
+
+#[test]
 fn fused_transformer_profile_selects_every_dit_attention_without_changing_transport() {
     let config = QwenImage21TransformerConfig::new(
         transformer(2, true, true),
@@ -215,7 +274,16 @@ fn full_graph_reuses_two_distinct_layers_and_only_retains_target_velocity() {
                 .iter()
                 .zip(&source.blocks()[0].nodes)
             {
-                assert_eq!(actual.operation_id, original.operation_id);
+                if is_fp8(profile.id.as_str())
+                    && original.operation_id.as_str() == DENSE_LINEAR_BF16_OPERATION_ID
+                {
+                    assert_eq!(
+                        actual.operation_id.as_str(),
+                        DENSE_LINEAR_FP8_BF16_OPERATION_ID
+                    );
+                } else {
+                    assert_eq!(actual.operation_id, original.operation_id);
+                }
                 assert_eq!(actual.attributes, original.attributes);
                 assert_ne!(actual.id, original.id);
                 assert!(actual

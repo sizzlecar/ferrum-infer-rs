@@ -35,6 +35,10 @@ pub struct ImageProductArgs {
     /// Otherwise use LD_LIBRARY_PATH, the system cache and standard library directories.
     #[arg(long, value_name = "LIBRARY")]
     pub image_cudnn_library: Option<PathBuf>,
+    /// Explicit image Linear precision. Default bf16; experimental FP8 changes
+    /// TE/DiT projections only. Residency is configured independently.
+    #[arg(long, value_name = "bf16|fp8_linear_experimental_v1")]
+    pub image_precision: Option<ferrum_engine::image_generation::ImageCudaPrecisionPolicy>,
 }
 
 impl ImageProductArgs {
@@ -49,15 +53,15 @@ impl ImageProductArgs {
     ) -> anyhow::Result<Option<ImageProductSource>> {
         if let Some(path) = &self.image_config {
             anyhow::ensure!(
-                model.is_none() && self.image_cudnn_library.is_none(),
-                "--image-config cannot be combined with MODEL or --image-cudnn-library"
+                model.is_none() && self.image_cudnn_library.is_none() && self.image_precision.is_none(),
+                "--image-config cannot be combined with MODEL, --image-cudnn-library, or --image-precision; set precision_policy in the JSON backend"
             );
             return Ok(Some(ImageProductSource::ExplicitConfig(path.clone())));
         }
         let Some(path) = directory::discover(model)? else {
             anyhow::ensure!(
-                self.image_cudnn_library.is_none(),
-                "--image-cudnn-library requires a registered image pipeline directory"
+                self.image_cudnn_library.is_none() && self.image_precision.is_none(),
+                "--image-cudnn-library and --image-precision require a registered image pipeline directory"
             );
             return Ok(None);
         };
@@ -70,7 +74,8 @@ impl ImageProductArgs {
                 backend,
                 gpu_devices,
                 self.image_cudnn_library.clone(),
-            )?,
+            )?
+            .with_precision(self.image_precision.unwrap_or_default()),
         }))
     }
 }
@@ -115,7 +120,13 @@ pub fn validate_cli_matches(
         .or_else(|| args.try_get_one::<String>("model_option").ok().flatten());
     let automatic = !explicit && directory::discover(model.map(String::as_str))?.is_some();
     if !explicit && !automatic {
-        for id in ["output", "width", "height", "image_cudnn_library"] {
+        for id in [
+            "output",
+            "width",
+            "height",
+            "image_cudnn_library",
+            "image_precision",
+        ] {
             anyhow::ensure!(
                 !(args.try_contains_id(id).unwrap_or(false)
                     && args.value_source(id) == Some(ValueSource::CommandLine)),
@@ -152,6 +163,7 @@ pub fn validate_cli_matches(
         "runtime_memory_budget_bytes",
         "max_num_seqs",
         "image_cudnn_library",
+        "image_precision",
     ];
     let definition = definition
         .find_subcommand(command)

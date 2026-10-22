@@ -1,6 +1,7 @@
-//! Two bounded session/snapshot slots. Compatible plans share the same sealed
+//! Bounded model session/snapshot slots. Compatible plans share the same sealed
 //! physical weights; dynamic storage remains independently admitted.
 use super::*;
+use ferrum_quantization::bf16_whole_tensor_fp8::ExactBf16SafetensorsSource;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -13,11 +14,30 @@ pub enum ImageResidencyPolicy {
     /// plan may explicitly bind the same readonly physical weight snapshot;
     /// incompatible weight contracts fail instead of being silently reused.
     DenoiserAndDecoder,
+    /// Also retain the text encoder's session and readonly weight snapshot.
+    /// All retained weights remain charged to the same device account during
+    /// every other stage. Noise stays cold. This does not imply that all model
+    /// weights and the active stage's dynamic backing fit a given device.
+    AllModelComponents,
+}
+
+impl ImageResidencyPolicy {
+    fn retains(self, stage: ImageStage) -> bool {
+        match self {
+            Self::Cold => false,
+            Self::DenoiserAndDecoder => {
+                matches!(stage, ImageStage::Denoiser | ImageStage::Decoder)
+            }
+            Self::AllModelComponents => !matches!(stage, ImageStage::Noise),
+        }
+    }
 }
 
 pub(super) struct ResidentStages<R: DeviceRuntime> {
+    text_encoder: Option<ActiveImageStage<R>>,
     denoiser: Option<ActiveImageStage<R>>,
     decoder: Option<ActiveImageStage<R>>,
+    text_encoder_weights: Option<ResidentWeights<R>>,
     denoiser_weights: Option<ResidentWeights<R>>,
     decoder_weights: Option<ResidentWeights<R>>,
 }
@@ -28,14 +48,17 @@ struct ResidentWeights<R: DeviceRuntime> {
 impl<R: DeviceRuntime> ResidentStages<R> {
     pub(super) fn new() -> Self {
         Self {
+            text_encoder: None,
             denoiser: None,
             decoder: None,
+            text_encoder_weights: None,
             denoiser_weights: None,
             decoder_weights: None,
         }
     }
     fn weights_slot(&mut self, stage: ImageStage) -> Option<&mut Option<ResidentWeights<R>>> {
         match stage {
+            ImageStage::TextEncoder => Some(&mut self.text_encoder_weights),
             ImageStage::Denoiser => Some(&mut self.denoiser_weights),
             ImageStage::Decoder => Some(&mut self.decoder_weights),
             _ => None,
@@ -43,6 +66,7 @@ impl<R: DeviceRuntime> ResidentStages<R> {
     }
     fn slot(&mut self, stage: ImageStage) -> Option<&mut Option<ActiveImageStage<R>>> {
         match stage {
+            ImageStage::TextEncoder => Some(&mut self.text_encoder),
             ImageStage::Denoiser => Some(&mut self.denoiser),
             ImageStage::Decoder => Some(&mut self.decoder),
             _ => None,
@@ -55,13 +79,57 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         self.config.residency
     }
 
+    /// Batch planning evidence, not an allocation permit. All retained model
+    /// installations coexist; only one stage's dynamic pools execute at once.
+    /// The shared device ledger remains authoritative under outside contention.
+    pub(super) fn validate_resident_capacity(
+        &self,
+        stages: &[&PreparedStage<R>],
+    ) -> anyhow::Result<()> {
+        if self.config.residency == ImageResidencyPolicy::Cold {
+            return Ok(());
+        }
+        let mut retained_static = 0_u64;
+        let mut active_peak = 0_u64;
+        for stage in stages {
+            let payload = stage.component.executable().execution_plan().payload();
+            ensure!(
+                payload.work_limits() == RuntimeWorkLimits::FixedTensor,
+                "image resident capacity requires compiled fixed tensor plans"
+            );
+            let memory = payload.memory();
+            let retained = self.config.residency.retains(stage.plan.stage);
+            if retained {
+                retained_static = retained_static
+                    .checked_add(memory.static_bytes())
+                    .context("resident static bytes overflow")?;
+            }
+            // Fixed demand includes actual compiled provider scratch, per-pool
+            // alignment, and proven activation/invocation lifetime reuse. Do
+            // not add the cuDNN workspace limit again or sum all dynamic plans.
+            let active = memory
+                .minimum_runnable_request_bytes()
+                .checked_add(if retained { 0 } else { memory.static_bytes() })
+                .context("active component bytes overflow")?;
+            active_peak = active_peak.max(active);
+        }
+        let required = retained_static
+            .checked_add(active_peak)
+            .and_then(|n| n.checked_add(self.device_opaque_allowance_bytes))
+            .context("resident batch capacity overflows")?;
+        ensure!(required <= self.config.device_capacity_bytes,
+            "resident image batch needs {required} device bytes (retained static {retained_static}, active stage peak {active_peak}, native allowance {}), exceeding total ceiling {}",
+            self.device_opaque_allowance_bytes, self.config.device_capacity_bytes);
+        Ok(())
+    }
+
     pub(super) fn start_stage(
         &mut self,
         prepared: PreparedStage<R>,
         job: u64,
         stages: &mut Vec<ImageStageReceipt>,
     ) -> Result<ActiveImageStage<R>, ImageGenerationFailure<R>> {
-        if self.config.residency == ImageResidencyPolicy::DenoiserAndDecoder {
+        if self.config.residency.retains(prepared.plan.stage) {
             if let Some(previous) = self
                 .resident_stages
                 .slot(prepared.plan.stage)
@@ -100,20 +168,36 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 return prepared.start_attached(self, job, &weights);
             }
         }
+        // Keep the archive's optional implicit dtype conversion out of the
+        // managed FP8 conversion path. These wrappers borrow the original mmap
+        // and stay alive throughout synchronous static initialization.
+        let text_source = ExactBf16SafetensorsSource::new(&self.assets.sources.text_encoder);
+        let dit_source = ExactBf16SafetensorsSource::new(&self.assets.sources.transformer);
+        let profile = prepared.plan.profile.as_str();
         let source = match prepared.plan.stage {
+            ImageStage::TextEncoder if profile == Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID => {
+                ComponentWeightSource::Stored(&text_source)
+            }
             ImageStage::TextEncoder => {
                 ComponentWeightSource::Stored(self.assets.sources.text_encoder.as_ref())
             }
             ImageStage::Noise => ComponentWeightSource::None,
+            ImageStage::Denoiser
+                if matches!(
+                    profile,
+                    QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
+                        | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
+                ) =>
+            {
+                ComponentWeightSource::Stored(&dit_source)
+            }
             ImageStage::Denoiser => {
                 ComponentWeightSource::Stored(self.assets.sources.transformer.as_ref())
             }
             ImageStage::Decoder => ComponentWeightSource::Stored(self.assets.sources.vae.as_ref()),
         };
         let stage = prepared.plan.stage;
-        if self.config.residency == ImageResidencyPolicy::DenoiserAndDecoder
-            && matches!(stage, ImageStage::Denoiser | ImageStage::Decoder)
-        {
+        if self.config.residency.retains(stage) {
             let (active, weights) = prepared.start_shared(self, job, source)?;
             *self
                 .resident_stages
@@ -133,7 +217,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         mut active: ActiveImageStage<R>,
         stages: &mut Vec<ImageStageReceipt>,
     ) -> Result<(), ImageGenerationFailure<R>> {
-        if self.config.residency == ImageResidencyPolicy::DenoiserAndDecoder {
+        if self.config.residency.retains(active.receipt.plan.stage) {
             if let Some(slot) = self.resident_stages.slot(active.receipt.plan.stage) {
                 if slot.is_some() {
                     return Err(
@@ -170,7 +254,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     pub fn shutdown(&mut self) -> Result<Vec<ImageStageReceipt>, ImageGenerationError<R>> {
         self.stopped = true;
         let mut completed_stages = Vec::new();
-        for stage in [ImageStage::Denoiser, ImageStage::Decoder] {
+        for stage in [
+            ImageStage::TextEncoder,
+            ImageStage::Denoiser,
+            ImageStage::Decoder,
+        ] {
             if let Some(mut active) = self.resident_stages.slot(stage).and_then(Option::take) {
                 active.receipt.completed_executions = 0;
                 active.receipt.execution_wall_durations_us.clear();
@@ -192,7 +280,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         }
         // Every session has retired before any final snapshot release. A live
         // failure/foreign execution owner makes close Referenced, never success.
-        for stage in [ImageStage::Denoiser, ImageStage::Decoder] {
+        for stage in [
+            ImageStage::TextEncoder,
+            ImageStage::Denoiser,
+            ImageStage::Decoder,
+        ] {
             if let Some(ResidentWeights {
                 weights,
                 mut origin,

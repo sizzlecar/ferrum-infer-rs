@@ -28,6 +28,61 @@ fn tiny() -> Qwen3VLTextConfig {
     .unwrap()
 }
 #[test]
+fn explicit_fp8_text_profile_keeps_separate_linear_scales_and_bf16_boundaries() {
+    let config = tiny();
+    let family = Qwen3VLTextEncoderFamily::new().unwrap();
+    let registration = TypedFamilyRegistration::new(family.clone());
+    let prepare = |name| {
+        registration
+            .prepare_with_profile(
+                &serde_json::to_value(&config).unwrap(),
+                &NumericalProfileId::new(name).unwrap(),
+            )
+            .unwrap()
+    };
+    let bf16 = prepare(Qwen3VLTextEncoderFamily::CUDA_PROFILE_ID);
+    let fp8 = prepare(Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID);
+    let groups = Qwen3VLTextEncoderFamily::fp8_weight_groups(&config).unwrap();
+    assert_eq!(groups.len(), 14);
+    assert!(groups.iter().all(|g| g.len() == 1));
+    assert_eq!(bf16.weights(), fp8.weights());
+    assert_eq!(
+        bf16.numerical_profile().boundaries,
+        fp8.numerical_profile().boundaries
+    );
+    assert_ne!(bf16.fingerprint().unwrap(), fp8.fingerprint().unwrap());
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            4096,
+            HostMemoryClassLimits {
+                weight_backing_bytes: 4096,
+                input_preprocess_bytes: 0,
+                transfer_staging_bytes: 0,
+                output_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    let materializer =
+        ferrum_quantization::Bf16WholeTensorFp8Materializer::new(host, groups).unwrap();
+    assert!(materializer.selection(&bf16).is_err());
+    assert!(materializer.selection(&fp8).is_ok());
+    for (a, b) in bf16
+        .program()
+        .blocks()
+        .iter()
+        .flat_map(|b| &b.nodes)
+        .zip(fp8.program().blocks().iter().flat_map(|b| &b.nodes))
+    {
+        let mut restored = b.clone();
+        if b.operation_id.as_str() == DENSE_LINEAR_FP8_BF16_OPERATION_ID {
+            assert_eq!(a.operation_id.as_str(), DENSE_LINEAR_BF16_OPERATION_ID);
+            restored.operation_id = a.operation_id.clone();
+        }
+        assert_eq!(&restored, a);
+    }
+}
+#[test]
 fn real_metadata_schema_has_exactly_required_text_layer_weights_without_unexecuted_components() {
     let mut raw = hf(36, 4096, 12288, 32, 8, 128);
     raw["text_config"]["rope_scaling"]["mrope_section"] = json!([24, 20, 20]);
@@ -98,23 +153,28 @@ fn two_layer_program_has_seventeen_fixed_nodes_per_layer_and_only_pre_final_norm
             [ProgramValueId::new(Qwen3VLTextEncoderFamily::OUTPUT_ID).unwrap()]
         );
         assert_eq!(p.input_tensor_specs(), &c.input_tensor_specs().unwrap());
+        let dense = if profile.id.as_str() == Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID {
+            DENSE_LINEAR_FP8_BF16_OPERATION_ID
+        } else {
+            DENSE_LINEAR_BF16_OPERATION_ID
+        };
         let expected = [
             HEAD_RMS_NORM_BF16_OPERATION_ID,
-            DENSE_LINEAR_BF16_OPERATION_ID,
-            DENSE_LINEAR_BF16_OPERATION_ID,
-            DENSE_LINEAR_BF16_OPERATION_ID,
+            dense,
+            dense,
+            dense,
             HEAD_RMS_NORM_BF16_OPERATION_ID,
             HEAD_RMS_NORM_BF16_OPERATION_ID,
             HALF_SPLIT_ROPE_BF16_OPERATION_ID,
             HALF_SPLIT_ROPE_BF16_OPERATION_ID,
             STRUCTURED_GQA_ATTENTION_BF16_OPERATION_ID,
-            DENSE_LINEAR_BF16_OPERATION_ID,
+            dense,
             PLAIN_RESIDUAL_ADD_BF16_OPERATION_ID,
             HEAD_RMS_NORM_BF16_OPERATION_ID,
-            DENSE_LINEAR_BF16_OPERATION_ID,
-            DENSE_LINEAR_BF16_OPERATION_ID,
+            dense,
+            dense,
             SILU_MUL_BF16_OPERATION_ID,
-            DENSE_LINEAR_BF16_OPERATION_ID,
+            dense,
             PLAIN_RESIDUAL_ADD_BF16_OPERATION_ID,
         ];
         for (i, b) in p.blocks().iter().enumerate() {
