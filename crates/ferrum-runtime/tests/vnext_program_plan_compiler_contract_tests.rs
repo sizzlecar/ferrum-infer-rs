@@ -1,3 +1,5 @@
+#[path = "vnext_program_plan_compiler_contract_tests/bf16_quality.rs"]
+mod bf16_quality;
 mod vnext_core_contract;
 
 use vnext_core_contract::*;

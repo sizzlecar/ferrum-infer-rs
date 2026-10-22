@@ -16,16 +16,23 @@ use super::{
     WeightSchema,
 };
 
+mod quality_case;
+use quality_case::{ActualEncoding, NumericWeightQualityArtifactCase};
+
 pub const IDENTITY_WEIGHT_MATERIALIZER_ID: &str = "weight-materializer.identity";
 const IDENTITY_MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(2, 0);
 pub const MAX_WEIGHT_MATERIALIZERS: usize = 64;
 pub const NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID: &str =
     "quality-approval.weight-materializer.numeric.v1";
+/// BF16 evidence has distinct case fields and authority; F16 v1 is unchanged.
+pub const NUMERIC_WEIGHT_QUALITY_BF16_ARTIFACT_SCHEMA_ID: &str =
+    "quality-approval.weight-materializer.numeric.bf16.v1";
 pub const NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID: &str = "quality-approval-authority.ferrum.numeric";
 pub const MAX_APPROXIMATE_WEIGHT_QUALITY_ARTIFACT_BYTES: usize = 64 * 1024;
 pub const STATIC_WEIGHT_TRANSFORM_SCRATCH_ALIGNMENT_BYTES: u64 = 256;
 
 const NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION: ContractVersion = ContractVersion::new(1, 0);
+const NUMERIC_WEIGHT_QUALITY_BF16_AUTHORITY_VERSION: ContractVersion = ContractVersion::new(2, 0);
 const REQUIRED_NUMERIC_WEIGHT_QUALITY_CASES: usize = 4;
 const MAX_NUMERIC_WEIGHT_QUALITY_VALUES_PER_CASE: usize = 8 * 1024;
 const MAX_NUMERIC_WEIGHT_QUALITY_VALUES: usize = 16 * 1024;
@@ -49,14 +56,46 @@ struct NumericWeightQualityAuthorityFingerprint<'a> {
 /// contract. It changes only when the parser, encodings, metric, or containment
 /// limits change; it is not a digest of a compiler binary or candidate SHA.
 pub fn numeric_weight_quality_authority_implementation_fingerprint() -> Result<String, VNextError> {
+    numeric_quality_authority_fingerprint(ActualEncoding::F16)
+}
+
+/// Identity of the BF16 verifier. Its metric subtracts decoded finite values in
+/// F64, including BF16 extrema; the existing F16 verifier keeps its old metric.
+pub fn numeric_bf16_weight_quality_authority_implementation_fingerprint(
+) -> Result<String, VNextError> {
+    numeric_quality_authority_fingerprint(ActualEncoding::Bf16)
+}
+
+impl ActualEncoding {
+    fn authority_version(self) -> ContractVersion {
+        match self {
+            Self::F16 => NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION,
+            Self::Bf16 => NUMERIC_WEIGHT_QUALITY_BF16_AUTHORITY_VERSION,
+        }
+    }
+    fn artifact_schema_id(self) -> &'static str {
+        match self {
+            Self::F16 => NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID,
+            Self::Bf16 => NUMERIC_WEIGHT_QUALITY_BF16_ARTIFACT_SCHEMA_ID,
+        }
+    }
+}
+
+fn numeric_quality_authority_fingerprint(encoding: ActualEncoding) -> Result<String, VNextError> {
     canonical_fingerprint(
         &NumericWeightQualityAuthorityFingerprint {
             id: NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID,
-            version: NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION,
-            artifact_schema_id: NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID,
-            actual_encoding: "ieee754-binary16-little-endian-bits",
+            version: encoding.authority_version(),
+            artifact_schema_id: encoding.artifact_schema_id(),
+            actual_encoding: match encoding {
+                ActualEncoding::F16 => "ieee754-binary16-little-endian-bits",
+                ActualEncoding::Bf16 => "bfloat16-little-endian-bits",
+            },
             reference_encoding: "ieee754-binary32-little-endian-bits",
-            metric: "norm(actual-reference)_2/max(norm(reference)_2,1e-6)",
+            metric: match encoding {
+                ActualEncoding::F16 => "norm(actual-reference)_2/max(norm(reference)_2,1e-6)",
+                ActualEncoding::Bf16 => "norm(f64(actual)-f64(reference))_2/max(norm(f64(reference))_2,1e-6)",
+            },
             verification_contract: "strict-canonical-json+locked-vector-payload-sha256+case-reference-sha256+raw-vector-sha256+recomputed-nonfinite-and-relative-l2+live-schema-binding",
             artifact_max_bytes: MAX_APPROXIMATE_WEIGHT_QUALITY_ARTIFACT_BYTES,
             required_cases: REQUIRED_NUMERIC_WEIGHT_QUALITY_CASES,
@@ -540,19 +579,6 @@ struct NumericWeightQualityArtifactContract {
     quality_vector_digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NumericWeightQualityArtifactCase {
-    case_id: String,
-    actual_f16le_sha256: String,
-    actual_f16_bits: Vec<u16>,
-    reference_f32le_sha256: String,
-    reference_f32_bits: Vec<u32>,
-    relative_l2_upper_bound: CanonicalRational,
-    nan_count: u64,
-    inf_count: u64,
-}
-
 /// Serializable receipt embedded into an approximate execution-weight plan.
 ///
 /// This record is evidence, not authority: only the non-serializable
@@ -626,10 +652,18 @@ impl ApproximateWeightQualityApprovalRecord {
     }
 
     fn validate_structure(&self) -> Result<(), VNextError> {
+        let encoding = match self.authority_version {
+            NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION => ActualEncoding::F16,
+            NUMERIC_WEIGHT_QUALITY_BF16_AUTHORITY_VERSION => ActualEncoding::Bf16,
+            _ => {
+                return Err(invalid_plan(
+                    "approximate weight quality approval has an unknown authority version",
+                ))
+            }
+        };
         if self.authority_id != NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID
-            || self.authority_version != NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION
             || self.authority_implementation_fingerprint
-                != numeric_weight_quality_authority_implementation_fingerprint()?
+                != numeric_quality_authority_fingerprint(encoding)?
             || !is_canonical_sha256(&self.artifact_sha256)
             || !is_canonical_sha256(&self.source_schema_fingerprint)
             || !is_canonical_sha256(&self.execution_schema_fingerprint)
@@ -701,11 +735,23 @@ fn decode_numeric_weight_quality_artifact(
             "approximate weight quality artifact is not canonical compact JSON",
         ));
     }
-    if artifact.schema_id != NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID
-        || artifact.authority.id != NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID
-        || artifact.authority.version != NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION
+    let encoding = match artifact.schema_id.as_str() {
+        NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID => ActualEncoding::F16,
+        NUMERIC_WEIGHT_QUALITY_BF16_ARTIFACT_SCHEMA_ID => ActualEncoding::Bf16,
+        _ => {
+            return Err(invalid_plan(
+                "approximate weight quality artifact has an unknown schema",
+            ))
+        }
+    };
+    if artifact.authority.id != NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID
+        || artifact.authority.version != encoding.authority_version()
         || artifact.authority.implementation_fingerprint
-            != numeric_weight_quality_authority_implementation_fingerprint()?
+            != numeric_quality_authority_fingerprint(encoding)?
+        || artifact
+            .cases
+            .iter()
+            .any(|case| case.actual_encoding != encoding)
     {
         return Err(invalid_plan(
             "approximate weight quality artifact names a different verification authority",
@@ -749,13 +795,13 @@ fn decode_numeric_weight_quality_artifact(
     let mut case_ids = BTreeSet::new();
     let mut total_values = 0_usize;
     for case in &artifact.cases {
-        let value_count = case.actual_f16_bits.len();
+        let value_count = case.actual_bits.len();
         if !portable_artifact_text(&case.case_id)
             || !case_ids.insert(case.case_id.clone())
             || value_count == 0
             || value_count != case.reference_f32_bits.len()
             || value_count > MAX_NUMERIC_WEIGHT_QUALITY_VALUES_PER_CASE
-            || !is_canonical_sha256(&case.actual_f16le_sha256)
+            || !is_canonical_sha256(&case.actual_le_sha256)
             || !is_canonical_sha256(&case.reference_f32le_sha256)
             || case.relative_l2_upper_bound.numerator() < 0
         {
@@ -852,7 +898,7 @@ fn verify_numeric_weight_quality_artifact(
     let mut total_inf_count = 0_u64;
     let mut maximum_upper_bound = CanonicalRational::new(0, 1)?;
     for case in &artifact.cases {
-        let value_count = case.actual_f16_bits.len();
+        let value_count = case.actual_bits.len();
         if !portable_artifact_text(&case.case_id)
             || !case_ids.insert(case.case_id.clone())
             || value_count == 0
@@ -877,7 +923,7 @@ fn verify_numeric_weight_quality_artifact(
                 "approximate weight quality artifact exceeds {MAX_NUMERIC_WEIGHT_QUALITY_VALUES} total values"
             )));
         }
-        if digest_little_endian_u16(&case.actual_f16_bits) != case.actual_f16le_sha256
+        if digest_little_endian_u16(&case.actual_bits) != case.actual_le_sha256
             || digest_little_endian_u32(&case.reference_f32_bits) != case.reference_f32le_sha256
         {
             return Err(invalid_plan(format!(
@@ -930,9 +976,8 @@ fn verify_numeric_weight_quality_artifact(
 
     let record = ApproximateWeightQualityApprovalRecord {
         authority_id: NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID.to_owned(),
-        authority_version: NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION,
-        authority_implementation_fingerprint:
-            numeric_weight_quality_authority_implementation_fingerprint()?,
+        authority_version: artifact.authority.version,
+        authority_implementation_fingerprint: artifact.authority.implementation_fingerprint.clone(),
         artifact_sha256: format!("{:x}", Sha256::digest(artifact_bytes)),
         source_schema_fingerprint: family.stored_weight_schema()?.fingerprint()?,
         execution_schema_fingerprint: execution_schema.fingerprint()?,
@@ -1080,9 +1125,11 @@ fn recompute_relative_l2(
     let mut reference_squared = 0_f64;
     let mut nan_count = 0_u64;
     let mut inf_count = 0_u64;
-    for (&actual_bits, &reference_bits) in case.actual_f16_bits.iter().zip(&case.reference_f32_bits)
-    {
-        let actual = binary16_as_f32(actual_bits);
+    for (&actual_bits, &reference_bits) in case.actual_bits.iter().zip(&case.reference_f32_bits) {
+        let actual = match case.actual_encoding {
+            ActualEncoding::F16 => binary16_as_f32(actual_bits),
+            ActualEncoding::Bf16 => f32::from_bits(u32::from(actual_bits) << 16),
+        };
         if actual.is_nan() {
             nan_count += 1;
             continue;
@@ -1098,7 +1145,10 @@ fn recompute_relative_l2(
                 case.case_id
             )));
         }
-        let error = f64::from(actual - reference);
+        let error = match case.actual_encoding {
+            ActualEncoding::F16 => f64::from(actual - reference),
+            ActualEncoding::Bf16 => f64::from(actual) - f64::from(reference),
+        };
         error_squared += error * error;
         let reference = f64::from(reference);
         reference_squared += reference * reference;
