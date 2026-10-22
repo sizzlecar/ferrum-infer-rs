@@ -204,9 +204,6 @@ impl PlanBuilder {
         members: &[GroupMember],
         kind: AttemptWorkKind,
     ) -> Result<(), Unsupported> {
-        if members.iter().all(|member| member.work.kind != kind) {
-            return Ok(());
-        }
         self.push_matching(members, Some(kind))
     }
 
@@ -232,8 +229,16 @@ impl PlanBuilder {
         kind: Option<AttemptWorkKind>,
     ) -> Result<(), Unsupported> {
         let matches = |member: &&GroupMember| kind.is_none_or(|kind| member.work.kind == kind);
-        let selected = members.iter().filter(matches);
-        let count = selected.clone().count();
+        let count = match kind {
+            Some(_) => members.iter().filter(matches).count(),
+            None => members.len(),
+        };
+        // An absent split phase was already a no-op in push_group_kind,
+        // including after another accepted group or exhausted limits. Keep
+        // that boundary before all validations, unlike an empty push_group.
+        if kind.is_some() && count == 0 {
+            return Ok(());
+        }
         if count == 0
             || self.group_count >= 2
             || !CostQuery::fits(count, self.query_limits)
@@ -251,10 +256,8 @@ impl PlanBuilder {
             return Err(Unsupported::InvalidPlan);
         }
         if self.execution == CostExecution::SequentialPrefillThenDecode {
-            let first_kind = selected.clone().next().unwrap().work.kind;
-            if selected
-                .clone()
-                .any(|member| member.work.kind != first_kind)
+            let first_kind = kind.unwrap_or(members[0].work.kind);
+            if (kind.is_none() && members.iter().any(|member| member.work.kind != first_kind))
                 || self.groups().first().is_some_and(|group| {
                     group[0].work.kind != AttemptWorkKind::Prefill
                         || first_kind != AttemptWorkKind::Decode
@@ -305,7 +308,11 @@ impl PlanBuilder {
         }
         // Validate before appending: a rejected group cannot affect a later plan.
         self.groups[self.group_count].reserve(count);
-        self.groups[self.group_count].extend(selected.copied());
+        if count == members.len() {
+            self.groups[self.group_count].extend_from_slice(members);
+        } else {
+            self.groups[self.group_count].extend(members.iter().filter(matches).copied());
+        }
         self.group_count += 1;
         Ok(())
     }

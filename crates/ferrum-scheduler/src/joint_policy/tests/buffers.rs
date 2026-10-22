@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod homogeneous;
 mod membership;
 
 fn builder(execution: CostExecution) -> PlanBuilder {
