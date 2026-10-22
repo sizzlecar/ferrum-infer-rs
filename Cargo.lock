@@ -1679,6 +1679,7 @@ dependencies = [
  "metrics",
  "parking_lot",
  "pin-project",
+ "rustc-hash",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

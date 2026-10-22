@@ -3,8 +3,22 @@
 
 use super::*;
 use ferrum_execution::execution_attempt::AttemptPrefixRestore;
-use std::collections::hash_map::DefaultHasher;
+use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
+
+#[cfg(test)]
+mod tests;
+
+/// Private to one ConditionalSnapshot::predict call, for the same cache. The
+/// borrowed query cannot change while the token exists; insertion accepts no
+/// second query that could disagree with this already computed slot. No lock
+/// or owned key allocation is retained across the provider call.
+pub(super) struct InsertionKey<'a> {
+    query: CostQuery<'a>,
+    slot: usize,
+    at: Instant,
+    slots_len: usize,
+}
 
 struct Entry {
     work: Box<[CostWork]>,
@@ -75,34 +89,78 @@ impl ScenarioCache {
         self.hits
     }
 
+    #[cfg(test)]
     pub(super) fn get(
         &mut self,
         query: &CostQuery<'_>,
         at: Instant,
         rank: usize,
     ) -> Option<CostPrediction> {
+        self.get_with_key(query, at, rank).0
+    }
+
+    pub(super) fn get_with_key<'a>(
+        &mut self,
+        query: &CostQuery<'a>,
+        at: Instant,
+        rank: usize,
+    ) -> (Option<CostPrediction>, Option<InsertionKey<'a>>) {
         if self.at != at || self.slots.is_empty() {
-            return None;
+            return (None, None);
         }
-        let slot = self.slots[index(query, self.slots.len())].as_ref()?;
-        if slot.exact != query.work_is_exact
-            || slot.execution != query.execution
-            || slot.work.as_ref() != query.work
-        {
-            return None;
+        let slot = index(query, self.slots.len());
+        let prediction = self.slots[slot].as_ref().and_then(|entry| {
+            (entry.exact == query.work_is_exact
+                && entry.execution == query.execution
+                && entry.work.as_ref() == query.work)
+                .then(|| entry.prediction(rank))
+                .flatten()
+        });
+        if let Some(prediction) = prediction {
+            self.hits = self.hits.saturating_add(1);
+            return (Some(prediction), None);
         }
-        let prediction = slot.prediction(rank)?;
-        self.hits = self.hits.saturating_add(1);
-        Some(prediction)
+        (
+            None,
+            Some(InsertionKey {
+                query: *query,
+                slot,
+                at,
+                slots_len: self.slots.len(),
+            }),
+        )
     }
 
     /// Only complete validated distributions with this comparison's weights and
     /// dependence enter the cache. Insufficient memory merely disables this
     /// insertion; uncached calls retain the normal prediction/time budgets.
     pub(super) fn insert(&mut self, query: &CostQuery<'_>, prediction: CostScenarioPrediction) {
-        if self.slots.is_empty() {
+        if self.slots.is_empty() || !matches!(&prediction, CostScenarioPrediction::Known { .. }) {
             return;
         }
+        // Seed insertion has no preceding lookup. Normal misses use the token.
+        let key = InsertionKey {
+            query: *query,
+            slot: index(query, self.slots.len()),
+            at: self.at,
+            slots_len: self.slots.len(),
+        };
+        self.insert_with_key(Some(key), prediction);
+    }
+
+    pub(super) fn insert_with_key(
+        &mut self,
+        key: Option<InsertionKey<'_>>,
+        prediction: CostScenarioPrediction,
+    ) {
+        let Some(key) = key else {
+            return;
+        };
+        if self.at != key.at || self.slots.len() != key.slots_len || key.slot >= self.slots.len() {
+            return;
+        }
+        let query = key.query;
+        let slot = key.slot;
         let CostScenarioPrediction::Known {
             scenarios,
             dependence,
@@ -115,7 +173,6 @@ impl ScenarioCache {
         else {
             return;
         };
-        let slot = index(query, self.slots.len());
         let previous = self.slots[slot].as_ref().map_or(0, Entry::payload_bytes);
         let Some(bytes) = query
             .work
@@ -152,7 +209,7 @@ impl ScenarioCache {
 }
 
 fn index(query: &CostQuery<'_>, slots: usize) -> usize {
-    let mut hash = DefaultHasher::new();
+    let mut hash = FxHasher::default();
     query.work_is_exact.hash(&mut hash);
     (query.execution as u8).hash(&mut hash);
     query.work.len().hash(&mut hash);

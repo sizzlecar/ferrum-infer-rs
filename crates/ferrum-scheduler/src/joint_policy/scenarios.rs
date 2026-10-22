@@ -352,7 +352,7 @@ impl CostSnapshot for ConditionalSnapshot<'_> {
         }
         // This mutex protects only comparison-local memoization, never the
         // estimator or execution. No lock is held across an original query.
-        let cached = self.cache.lock().get(query, now, self.rank);
+        let (cached, insertion_key) = self.cache.lock().get_with_key(query, now, self.rank);
         if let Some(prediction) = cached {
             self.diagnostics.cache_hit();
             return prediction;
@@ -425,7 +425,7 @@ impl CostSnapshot for ConditionalSnapshot<'_> {
                 drop(valid_until);
                 let bytes = {
                     let mut cache = self.cache.lock();
-                    cache.insert(query, distribution);
+                    cache.insert_with_key(insertion_key, distribution);
                     cache.retained_bytes()
                 };
                 self.diagnostics.cache_bytes(bytes);
