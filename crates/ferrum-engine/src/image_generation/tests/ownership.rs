@@ -36,6 +36,18 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
             .execution_plan()
             .plan_hash()
             .to_string(),
+        static_bytes: component
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory()
+            .static_bytes(),
+        minimum_step_bytes: component
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory()
+            .minimum_step_bytes(),
     };
     let session = component
         .initialize(

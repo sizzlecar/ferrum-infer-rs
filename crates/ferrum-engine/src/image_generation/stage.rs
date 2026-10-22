@@ -29,6 +29,9 @@ pub struct ImageStagePlanReceipt {
     pub profile: NumericalProfileId,
     pub family_fingerprint: String,
     pub plan_hash: String,
+    /// Compiled storage requirements, not an observation of peak device usage.
+    pub static_bytes: u64,
+    pub minimum_step_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,6 +136,9 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             .execution_plan()
             .plan_hash()
             .to_string();
+        let memory = component.executable().execution_plan().payload().memory();
+        let static_bytes = memory.static_bytes();
+        let minimum_step_bytes = memory.minimum_step_bytes();
         Ok(Self {
             component,
             plan: ImageStagePlanReceipt {
@@ -142,6 +148,8 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                 profile,
                 family_fingerprint,
                 plan_hash,
+                static_bytes,
+                minimum_step_bytes,
             },
         })
     }

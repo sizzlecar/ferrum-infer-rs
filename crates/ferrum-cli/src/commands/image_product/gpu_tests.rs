@@ -1,9 +1,9 @@
-//! Explicit, ignored CUDA functional qualification of a real shared B2 forward.
+//! Explicit, ignored CUDA functional qualification of a real shared batch.
 //!
 //! Required test inputs:
 //! - `FERRUM_TEST_IMAGE_PRODUCT_CONFIG`: the ordinary typed product JSON.
 //! - `FERRUM_TEST_IMAGE_ARTIFACT_DIR`: a directory that must not already exist.
-//! - Optional `FERRUM_TEST_IMAGE_REQUESTS_JSON`: JSON array of exactly two normal
+//! - Optional `FERRUM_TEST_IMAGE_REQUESTS_JSON`: JSON array of at least two normal
 //!   ImageGenerationRequests. Otherwise use the product's explicit serving
 //!   default dimensions, two simple prompts, and seeds 42/43.
 //!
@@ -34,15 +34,15 @@ fn required_path(name: &str) -> Result<PathBuf> {
         .with_context(|| format!("set explicit test input {name}"))
 }
 
-fn requests(config: &ImageProductConfig) -> Result<[ImageGenerationRequest; 2]> {
+fn requests(config: &ImageProductConfig) -> Result<Vec<ImageGenerationRequest>> {
     let requests = if let Some(path) = std::env::var_os("FERRUM_TEST_IMAGE_REQUESTS_JSON") {
         let bytes = source::read_bounded(Path::new(&path), 2 * 1024 * 1024 + 4096)?;
-        serde_json::from_slice::<[ImageGenerationRequest; 2]>(&bytes)?
+        serde_json::from_slice::<Vec<ImageGenerationRequest>>(&bytes)?
     } else {
         let serving = config.serving.as_ref().context(
             "provide FERRUM_TEST_IMAGE_REQUESTS_JSON or explicit serving default dimensions",
         )?;
-        [
+        vec![
             ImageGenerationRequest {
                 prompt: "A red kite above the sea".into(),
                 width: serving.default_width,
@@ -59,15 +59,28 @@ fn requests(config: &ImageProductConfig) -> Result<[ImageGenerationRequest; 2]> 
             },
         ]
     };
+    let ImageBackendConfig::Cuda(cuda) = &config.backend;
     ensure!(
-        requests[0].prompt != requests[1].prompt && requests[0].seed != requests[1].seed,
-        "B2 fixture requires distinct prompts and independent seeds"
+        requests.len() >= 2 && requests.len() <= cuda.pipeline.maximum_batch_size,
+        "fixture batch must contain at least two requests within declared pipeline capacity"
     );
+    let prompts = requests
+        .iter()
+        .map(|r| &r.prompt)
+        .collect::<std::collections::BTreeSet<_>>();
+    let seeds = requests
+        .iter()
+        .map(|r| r.seed)
+        .collect::<std::collections::BTreeSet<_>>();
     ensure!(
-        requests[0].width == requests[1].width && requests[0].height == requests[1].height,
-        "B2 fixture requires compatible dimensions"
+        prompts.len() == requests.len() && seeds.len() == requests.len(),
+        "fixture requires distinct prompts and independent seeds"
     );
     for request in &requests {
+        ensure!(
+            request.width == requests[0].width && request.height == requests[0].height,
+            "fixture requires compatible dimensions"
+        );
         ensure!(request.n == 1, "each batch request returns one image");
         PngLimits::default().validate(PngDimensions::new(
             request.width.into(),
@@ -96,12 +109,13 @@ fn write_output(
     host: &HostMemoryAccount,
     directory: &Path,
     index: usize,
+    batch_size: usize,
     request: &ImageGenerationRequest,
     output: &ImageGenerationOutput,
 ) -> Result<Value> {
     ensure!(
-        output.receipt.batch_size == 2 && output.receipt.batch_index == index,
-        "receipt does not describe the actual B2 item"
+        output.receipt.batch_size == batch_size && output.receipt.batch_index == index,
+        "receipt does not describe the actual batch item"
     );
     ensure!(
         output.receipt.seed == request.seed
@@ -154,12 +168,13 @@ fn write_json_new(path: &Path, value: &Value) -> Result<()> {
 
 #[test]
 #[ignore = "requires explicit real assets, CUDA/cuDNN budgets and an exclusive GPU window"]
-fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
-) -> Result<(), ImageProductError> {
+fn cuda_product_one_real_batch_preserves_outputs_and_retires_host() -> Result<(), ImageProductError>
+{
     let config_path = required_path("FERRUM_TEST_IMAGE_PRODUCT_CONFIG")?;
     let artifact_dir = required_path("FERRUM_TEST_IMAGE_ARTIFACT_DIR")?;
     let config = ImageProductConfig::load(&config_path)?;
     let requests = requests(&config)?;
+    let batch_size = requests.len();
     let ImageBackendConfig::Cuda(cuda) = &config.backend;
     let cuda = cuda.resolved()?;
     let decoder_policy = cuda.pipeline.decoder_batch_policy;
@@ -171,12 +186,12 @@ fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
         &artifact_dir.join("request.json"),
         &json!({
             "config":config_path,"requests":requests,"execution":"one cold generate_batch call",
-            "qualification":"functional B2 only; not G3, throughput or Torch parity"
+            "qualification":"functional batch only; not G3, throughput or Torch parity"
         }),
     )?;
     let mut pipeline = Box::new(cuda.create_pipeline(assets)?);
     let host = pipeline.host_account().clone();
-    let outputs = match pipeline.generate_batch(Vec::from(requests.clone())) {
+    let outputs = match pipeline.generate_batch(requests.clone()) {
         Ok(outputs) => outputs,
         Err(source) => return Err(ImageProductError::Generation { source, pipeline }),
     };
@@ -186,7 +201,9 @@ fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
             "batch output count mismatch"
         );
         ensure!(
-            outputs[0].receipt.job == outputs[1].receipt.job,
+            outputs
+                .iter()
+                .all(|output| output.receipt.job == outputs[0].receipt.job),
             "outputs did not originate in one admitted batch"
         );
         for output in &outputs {
@@ -201,8 +218,8 @@ fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
                 .find(|stage| stage.execution.plan.stage == ImageStage::Decoder)
                 .context("missing decoder receipt")?;
             let (batch, executions) = match decoder_policy {
-                ImageDecoderBatchPolicy::SingleImage => (1, 2),
-                ImageDecoderBatchPolicy::FullBatch => (2, 1),
+                ImageDecoderBatchPolicy::SingleImage => (1, batch_size),
+                ImageDecoderBatchPolicy::FullBatch => (batch_size, 1),
             };
             ensure!(
                 decoder.execution.plan.batch_size == batch
@@ -210,17 +227,28 @@ fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
                 "decoder did not execute the configured geometry/count"
             );
         }
-        ensure!(
-            !outputs[0].rgba.bytes().same_region(outputs[1].rgba.bytes()),
-            "independent outputs alias the same batch slice"
-        );
-        let mut records = Vec::with_capacity(2);
+        for (index, output) in outputs.iter().enumerate() {
+            for earlier in &outputs[..index] {
+                ensure!(
+                    !output.rgba.bytes().same_region(earlier.rgba.bytes()),
+                    "independent outputs alias the same batch slice"
+                );
+            }
+        }
+        let mut records = Vec::with_capacity(batch_size);
         let mut bytes = 0usize;
         for (index, (request, output)) in requests.iter().zip(&outputs).enumerate() {
             bytes = bytes
                 .checked_add(output.rgba.bytes().len())
                 .context("output byte sum overflows")?;
-            records.push(write_output(&host, &artifact_dir, index, request, output)?);
+            records.push(write_output(
+                &host,
+                &artifact_dir,
+                index,
+                batch_size,
+                request,
+                output,
+            )?);
         }
         let usage = host.usage()?;
         ensure!(
@@ -232,7 +260,12 @@ fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
         Ok((records, bytes))
     })()?;
     let (records, batch_bytes) = inspect;
-    let final_alias = outputs[1].rgba.bytes().clone();
+    let final_alias = outputs
+        .last()
+        .expect("nonempty validated batch")
+        .rgba
+        .bytes()
+        .clone();
     let retained_bytes = match decoder_policy {
         ImageDecoderBatchPolicy::SingleImage => final_alias.len(),
         ImageDecoderBatchPolicy::FullBatch => batch_bytes,
@@ -261,8 +294,8 @@ fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
         write_json_new(
             &artifact_dir.join("result.json"),
             &json!({
-                "status":"passed", "qualification":"functional cold B2; no G3/performance/Torch parity claim",
-                "batch_size":2,"outputs":records,"decoder_batch_policy":decoder_policy,
+                "status":"passed", "qualification":"functional cold batch; no G3/performance/Torch parity claim",
+                "batch_size":batch_size,"outputs":records,"decoder_batch_policy":decoder_policy,
                 "total_output_bytes":batch_bytes,"retained_execution_bytes":retained_bytes,
                 "host_final_committed_bytes":released.committed_bytes(),
                 "host_final_allocated_bytes":released.allocated_bytes(),
