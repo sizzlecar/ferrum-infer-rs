@@ -45,13 +45,15 @@ pub(super) fn keyed_distribution(
 #[test]
 fn two_slot_collisions_keep_distinct_full_rank_distributions_without_growing_storage() {
     let at = Instant::now();
-    let keys = colliding_work(4, 3);
-    let mut cache = ScenarioCache::new(at, 16 * 1024, 4);
+    // Explicit two-slot table: exercise exhaustion independently of the
+    // maximum probe count used by larger tables.
+    let keys = colliding_work(2, 3);
+    let mut cache = ScenarioCache::new(at, 16 * 1024, 2);
     let slot_bytes = cache.retained_bytes();
     for work in &keys[..2] {
         cache.insert(&cost_query(&[*work]), keyed_distribution(at, *work, 3));
     }
-    assert_eq!(cache.slots.len(), 4);
+    assert_eq!(cache.slots.len(), 2);
     assert_eq!(
         cache.retained_bytes(),
         slot_bytes + 2 * (std::mem::size_of::<CostWork>() + 3 * std::mem::size_of::<u64>())

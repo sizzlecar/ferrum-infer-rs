@@ -1,6 +1,6 @@
 //! Memoization belongs to one immutable snapshot, one query time and one
 //! comparison. One untrusted ordinal hint can avoid hashing; otherwise the
-//! original two-slot lookup applies. Only the private concrete replay path can
+//! bounded neighboring-slot lookup applies. Only the private concrete replay path can
 //! use an owner-bound immutable entry handle instead of repeating work equality.
 
 use super::*;
@@ -17,6 +17,8 @@ mod tests;
 
 mod service_times;
 use service_times::TimeEncoding;
+
+const MAX_PROBES: usize = 8;
 
 static NEXT_HANDLE_OWNER: AtomicU64 = AtomicU64::new(1);
 
@@ -448,8 +450,9 @@ impl ScenarioCache {
         };
         // The provider runs without the cache lock. Search CURRENT entries for
         // this exact key before considering empties, so an interleaved insert
-        // cannot create two copies with different distributions. A third
-        // colliding key deterministically replaces its primary slot.
+        // cannot create two copies with different distributions. Only when
+        // every bounded probe is occupied does a different colliding key
+        // deterministically replace its primary slot.
         let matching_slot = self.probe_slots(key.slot).find(|slot| {
             self.slots[*slot]
                 .as_ref()
@@ -559,16 +562,18 @@ impl ScenarioCache {
 
     fn probe_slots(&self, primary: usize) -> impl Iterator<Item = usize> {
         debug_assert!(primary < self.slots.len());
-        let secondary = if primary == self.slots.len() - 1 {
-            0
-        } else {
-            primary + 1
-        };
-        // Fixed stack storage only. The one-slot case must neither repeat a
-        // lookup nor count a hit twice; zero slots never reach this helper.
-        [primary, secondary]
-            .into_iter()
-            .take(self.slots.len().min(2))
+        let tail = self.slots.len() - primary;
+        // At most eight unique neighboring slots, without allocation. A short
+        // table is visited only once. Avoid primary+offset until it is proven
+        // below len, so even a representable near-usize::MAX table cannot wrap
+        // integer addition. Zero slots never reach this helper.
+        (0..self.slots.len().min(MAX_PROBES)).map(move |offset| {
+            if offset < tail {
+                primary + offset
+            } else {
+                offset - tail
+            }
+        })
     }
 }
 

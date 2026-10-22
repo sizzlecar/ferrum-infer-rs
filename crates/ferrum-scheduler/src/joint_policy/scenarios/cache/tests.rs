@@ -2,6 +2,7 @@ use super::*;
 use ferrum_execution::{execution_attempt::AttemptWorkKind, token_execution::ExecutionRange};
 
 mod accounting;
+mod bounded_probes;
 mod compact_payload;
 mod ordinal_hints;
 mod time_encoding;

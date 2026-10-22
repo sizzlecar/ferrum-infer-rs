@@ -21,11 +21,13 @@ fn insert_handle(
 #[test]
 fn trace_handles_bind_owner_generation_secondary_slot_and_complete_rank_metadata() {
     let at = Instant::now();
-    let keys = colliding_work(4, 3);
+    // A deliberately full two-slot table guarantees the replacement whose
+    // stale handle this test exercises, regardless of the larger-table bound.
+    let keys = colliding_work(2, 3);
     let a = [keys[0]];
     let b = [keys[1]];
     let c = [keys[2]];
-    let mut cache = enabled(at, 16 * 1024, 4);
+    let mut cache = enabled(at, 16 * 1024, 2);
     let first = insert_handle(&mut cache, &cost_query(&a), keyed_distribution(at, a[0], 3));
     let second = insert_handle(&mut cache, &cost_query(&b), keyed_distribution(at, b[0], 3));
     assert_ne!(first.slot, second.slot);
@@ -230,11 +232,13 @@ fn trace_generations_hints_and_payload_share_one_budget_with_atomic_failures() {
 #[test]
 fn trace_handle_fallback_and_interleaved_insertion_keep_one_ordinal_per_query() {
     let at = Instant::now();
-    let keys = colliding_work(4, 3);
+    // A deliberately full two-slot table guarantees the replacement whose
+    // stale handle this test exercises, regardless of the larger-table bound.
+    let keys = colliding_work(2, 3);
     let a = [keys[0]];
     let b = [keys[1]];
     let c = [keys[2]];
-    let mut cache = enabled(at, 16 * 1024, 4);
+    let mut cache = enabled(at, 16 * 1024, 2);
     let a_handle = insert_handle(&mut cache, &cost_query(&a), keyed_distribution(at, a[0], 2));
     let b_handle = insert_handle(&mut cache, &cost_query(&b), keyed_distribution(at, b[0], 2));
     // A pending lookup for C occupies ordinal zero; a different lookup for B
