@@ -22,6 +22,7 @@ const CAP: usize = 64;
 const FILE_BYTES: usize = 8 * 1024 * 1024;
 const CLIENT_ENV: &str = "FERRUM_DIAGNOSTIC_BURST_CLIENT";
 const RECORDS_ENV: &str = "FERRUM_DIAGNOSTIC_SUCCESS_RECORDS";
+const SAMPLING_ITERATIONS: usize = 512;
 
 #[derive(Deserialize)]
 struct Client {
@@ -59,6 +60,12 @@ struct Record {
     usage: Usage,
 }
 
+struct PreparedInputs {
+    client: Client,
+    prompts: Vec<usize>,
+    evidence: Value,
+}
+
 fn read_external(variable: &str) -> Result<(PathBuf, Vec<u8>), String> {
     let path = std::env::var_os(variable)
         .map(PathBuf::from)
@@ -75,7 +82,7 @@ fn read_external(variable: &str) -> Result<(PathBuf, Vec<u8>), String> {
     Ok((path, bytes))
 }
 
-fn inputs() -> Result<(Client, Vec<usize>, Value), String> {
+fn inputs() -> Result<PreparedInputs, String> {
     let (client_path, client_bytes) = read_external(CLIENT_ENV)?;
     let (records_path, records_bytes) = read_external(RECORDS_ENV)?;
     let client: Client = serde_json::from_slice(&client_bytes).map_err(|e| e.to_string())?;
@@ -140,7 +147,11 @@ fn inputs() -> Result<(Client, Vec<usize>, Value), String> {
             "rendered_prompt_tokens": prompt, "output_cap": r.max_tokens,
         })).collect::<Vec<_>>(),
     });
-    Ok((client, prompts, evidence))
+    Ok(PreparedInputs {
+        client,
+        prompts,
+        evidence,
+    })
 }
 
 struct ConditionalCosts {
@@ -211,7 +222,15 @@ impl CacheAccounting {
 }
 
 fn run(accounting: CacheAccounting) -> Result<Value, String> {
-    let (client, prompts, evidence) = inputs()?;
+    let inputs = inputs()?;
+    let mut report = run_prepared(&inputs, accounting)?;
+    report["inputs"] = inputs.evidence;
+    Ok(report)
+}
+
+fn run_prepared(inputs: &PreparedInputs, accounting: CacheAccounting) -> Result<Value, String> {
+    let client = &inputs.client;
+    let prompts = &inputs.prompts;
     let mut slo: SchedulerSloConfig = "ttft:15684.62,tpot:110.56,itl:196.55".parse().unwrap();
     slo.strategy = SloStrategy::Joint;
     slo.planning.max_elapsed_us = 10_000;
@@ -227,7 +246,7 @@ fn run(accounting: CacheAccounting) -> Result<Value, String> {
     });
     let ingress = RequestIngressAnchor::capture(RequestIngressBoundary::SchedulerApi);
     let mut ids = Vec::with_capacity(MEMBERS);
-    for (request, prompt) in client.requests.iter().zip(&prompts) {
+    for (request, prompt) in client.requests.iter().zip(prompts) {
         let mut input = InferenceRequest::new(&request.prompt, "conditional-planning-load")
             .with_ingress(ingress)
             .with_metadata(PROMPT_TOKENS_METADATA_KEY, json!(prompt));
@@ -394,7 +413,7 @@ fn run(accounting: CacheAccounting) -> Result<Value, String> {
     }
     Ok(json!({
         "scope": "one actual admission-gate planning call, original 48 input shapes, conditional all-prefill cohort and cheap Known costs; not historical replay, learned support, GPU capacity or performance",
-        "inputs": evidence, "policy": slo,
+        "policy": slo,
         "premises": {"resident_prefillers": SLOTS, "waiting": MEMBERS-SLOTS, "initial_prefill_progress":0, "initial_generated":0,
             "synthetic_cut_ms":cut, "ages":"last original offset minus each original offset; no sleep, no actual service trace replay",
             "endpoints":"conditional cap64, natural EOS not predicted", "completion":"conditional [1,1], synthetic metadata",
@@ -436,4 +455,61 @@ fn profile_admission_original_burst_with_production_budget() {
 #[ignore = "external-input fixed 48-member CPU cache-accounting diagnostic; set both diagnostic input paths"]
 fn profile_admission_original_burst_with_production_budget_cache_accounting() {
     print_report(CacheAccounting::Enabled);
+}
+
+#[test]
+#[ignore = "CPU sampling diagnostic: 512 fresh original48 gates; set both input paths; no completion-rate or speed assertion"]
+fn profile_admission_original_burst_repeated_for_sampling() {
+    // File reads, full validation, and common input evidence occur once. Each
+    // run_prepared call creates its own scheduler, requests, snapshot, clocks,
+    // capacity premise and planning round with the original per-call limits.
+    let inputs = inputs().unwrap_or_else(|error| panic!("admission profile inputs: {error}"));
+    let pid = std::process::id();
+    println!(
+        "ADMISSION_LOAD_SAMPLING_START {}",
+        json!({
+            "pid": pid,
+            "iterations": SAMPLING_ITERATIONS,
+            "inputs": inputs.evidence,
+            "cache_accounting_enabled": false,
+            "scope": "Repeated original48 diagnostic for CPU sampling, not a clean timing baseline or historical replay. Each gate retains its original planning budget and conditional premises. Setup and report construction are outside each gate timer but remain in the sampled process. All rows, including incomplete evaluations, are retained. No guarantee of a particular sampling-window duration."
+        })
+    );
+    let mut reports = Vec::with_capacity(SAMPLING_ITERATIONS);
+    let loop_started = Instant::now();
+    for iteration in 0..SAMPLING_ITERATIONS {
+        // Do not format JSON text/write stdout during successful iterations or
+        // repeat large input evidence in every row. Building each Value report
+        // remains outside its gate timer. Only invalid fixture construction or
+        // inconsistent accounting stops setup; normal evaluation failures
+        // are part of the unchanged run report and do not stop later calls.
+        match run_prepared(&inputs, CacheAccounting::Disabled) {
+            Ok(report) => reports.push((iteration, report)),
+            Err(error) => {
+                println!(
+                    "ADMISSION_LOAD_SAMPLING_SETUP_FAILURE {}",
+                    json!({"pid": pid, "iteration": iteration, "error": error, "completed_rows": reports.len()})
+                );
+                for (iteration, report) in reports {
+                    println!(
+                        "ADMISSION_LOAD_SAMPLING_COMPARISON {}",
+                        json!({"iteration": iteration, "report": report})
+                    );
+                }
+                panic!("admission sampling setup failed: {error}");
+            }
+        }
+    }
+    let loop_elapsed = loop_started.elapsed();
+    println!(
+        "ADMISSION_LOAD_SAMPLING_END {}",
+        json!({"pid": pid, "iterations": reports.len(), "loop_elapsed": loop_elapsed,
+            "scope": "Loop wall time includes fresh fixture setup and report construction. Per-gate durations and full decision/failure counters are retained independently in each row; neither a test exit nor a short row is a feasibility result."})
+    );
+    for (iteration, report) in reports {
+        println!(
+            "ADMISSION_LOAD_SAMPLING_COMPARISON {}",
+            json!({"iteration": iteration, "report": report})
+        );
+    }
 }
