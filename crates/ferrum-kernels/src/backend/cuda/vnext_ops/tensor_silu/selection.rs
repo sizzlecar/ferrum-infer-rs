@@ -24,10 +24,13 @@ pub enum CudaTensorOperation {
     PlainResidualAdd,
     HalfSplitRope,
     StructuredGqaAttention,
+    ChannelL2Norm,
+    SiluNchw,
+    PlainResidualAddNchw,
 }
 
 impl CudaTensorOperation {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -44,6 +47,9 @@ impl CudaTensorOperation {
         Self::PlainResidualAdd,
         Self::HalfSplitRope,
         Self::StructuredGqaAttention,
+        Self::ChannelL2Norm,
+        Self::SiluNchw,
+        Self::PlainResidualAddNchw,
     ];
 
     fn pointwise(self) -> Option<Kind> {
@@ -79,6 +85,11 @@ impl CudaTensorOperation {
             return norm::descriptor(device, kind);
         }
         match self {
+            Self::ChannelL2Norm => spatial::descriptor(device, spatial::SpatialKind::ChannelL2),
+            Self::SiluNchw => spatial::descriptor(device, spatial::SpatialKind::Silu),
+            Self::PlainResidualAddNchw => {
+                spatial::descriptor(device, spatial::SpatialKind::ResidualAdd)
+            }
             Self::AdjacentRope => rope::descriptor(device),
             Self::StructuredAttention => attention::descriptor(device),
             Self::HalfSplitRope => half_split_rope::descriptor(device),
@@ -109,6 +120,13 @@ impl CudaTensorOperation {
             return norm::provider(kind, descriptor, kernels);
         }
         match self {
+            Self::ChannelL2Norm => {
+                spatial::provider(spatial::SpatialKind::ChannelL2, descriptor, kernels)
+            }
+            Self::SiluNchw => spatial::provider(spatial::SpatialKind::Silu, descriptor, kernels),
+            Self::PlainResidualAddNchw => {
+                spatial::provider(spatial::SpatialKind::ResidualAdd, descriptor, kernels)
+            }
             Self::AdjacentRope => rope::provider(descriptor, kernels),
             Self::StructuredAttention => attention::provider(descriptor, kernels),
             Self::HalfSplitRope => half_split_rope::provider(descriptor, kernels),
@@ -151,10 +169,17 @@ pub(super) fn providers(
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     let descriptors = selected_descriptors(runtime.descriptor(), selected)?;
     let kernels = RetainedFunctions::load(runtime)?;
-    Ok(descriptors
+    Ok(providers_from_descriptors(descriptors, &kernels))
+}
+
+pub(super) fn providers_from_descriptors(
+    descriptors: Vec<(CudaTensorOperation, OperationProviderDescriptor)>,
+    kernels: &Arc<RetainedFunctions>,
+) -> Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> {
+    descriptors
         .into_iter()
-        .map(|(operation, descriptor)| operation.provider(descriptor, &kernels))
-        .collect())
+        .map(|(operation, descriptor)| operation.provider(descriptor, kernels))
+        .collect()
 }
 
 #[cfg(test)]

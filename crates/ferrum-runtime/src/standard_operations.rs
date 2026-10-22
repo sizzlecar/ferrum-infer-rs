@@ -1,3 +1,9 @@
+mod nchw_pointwise_bf16;
+pub use nchw_pointwise_bf16::*;
+mod conv2d_bf16;
+pub use conv2d_bf16::*;
+mod channel_l2_norm_bf16;
+pub use channel_l2_norm_bf16::*;
 mod row_transport_bf16;
 pub use row_transport_bf16::*;
 mod gguf_f16_projections;

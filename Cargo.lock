@@ -1549,6 +1549,8 @@ dependencies = [
  "indicatif",
  "libm",
  "memmap2",
+ "minijinja",
+ "minijinja-contrib",
  "once_cell",
  "parking_lot",
  "pathdiff",

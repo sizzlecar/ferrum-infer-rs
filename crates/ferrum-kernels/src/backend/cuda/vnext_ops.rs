@@ -94,6 +94,8 @@ pub use tensor_silu::{
     ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
     BATCHED_ROW_CONCAT_PROFILE_ID as CUDA_BATCHED_ROW_CONCAT_BF16_NUMERICAL_PROFILE_ID,
     BUNDLE_NUMERICAL_IDENTITY as CUDA_POINTWISE_BF16_NUMERICAL_PROFILE_IDENTITY,
+    CHANNEL_L2_PROFILE_ID as CUDA_CHANNEL_L2_NORM_BF16_NUMERICAL_PROFILE_ID,
+    CONV2D_PROFILE_ID as CUDA_CONV2D_BF16_NUMERICAL_PROFILE_ID,
     GATED_RESIDUAL_NUMERICAL_PROFILE_ID as CUDA_GATED_RESIDUAL_BF16_NUMERICAL_PROFILE_ID,
     GELU_TANH_PROFILE_ID as CUDA_GELU_TANH_BF16_NUMERICAL_PROFILE_ID,
     GQA_NUMERICAL_IDENTITY as CUDA_STRUCTURED_GQA_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
@@ -107,10 +109,12 @@ pub use tensor_silu::{
     NUMERICAL_PROFILE_ID as CUDA_SILU_BF16_NUMERICAL_PROFILE_ID,
     NUMERICAL_PROFILE_IDENTITY as CUDA_SILU_BF16_NUMERICAL_PROFILE_IDENTITY,
     PLAIN_RESIDUAL_ADD_NUMERICAL_PROFILE_ID as CUDA_PLAIN_RESIDUAL_ADD_BF16_NUMERICAL_PROFILE_ID,
+    RESIDUAL_ADD_NCHW_PROFILE_ID as CUDA_PLAIN_RESIDUAL_ADD_NCHW_BF16_NUMERICAL_PROFILE_ID,
     ROPE_NUMERICAL_IDENTITY as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_IDENTITY,
     ROPE_NUMERICAL_PROFILE_ID as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_ID,
     ROW_GATHER_PROFILE_ID as CUDA_ROW_GATHER_BF16_NUMERICAL_PROFILE_ID,
     SILU_MUL_NUMERICAL_PROFILE_ID as CUDA_SILU_MUL_BF16_NUMERICAL_PROFILE_ID,
+    SILU_NCHW_PROFILE_ID as CUDA_SILU_NCHW_BF16_NUMERICAL_PROFILE_ID,
     TANH_NUMERICAL_PROFILE_ID as CUDA_TANH_BF16_NUMERICAL_PROFILE_ID,
     TEXT_PROJECTION_NUMERICAL_IDENTITY as CUDA_TEXT_PROJECTION_BF16_NUMERICAL_PROFILE_IDENTITY,
     TRANSPORT_NUMERICAL_IDENTITY as CUDA_TRANSPORT_BF16_NUMERICAL_PROFILE_IDENTITY,
@@ -356,6 +360,8 @@ pub fn cuda_tensor_runtime_config(
         dense_numerical.as_bytes(),
         include_bytes!("vnext_runtime/tensor_io.rs"),
         include_bytes!("vnext_runtime/tensor_eager.rs"),
+        include_bytes!("vnext_runtime/cudnn.rs"),
+        include_bytes!("vnext_runtime/cudnn/ffi.rs"),
     ]);
     config.capabilities = BTreeSet::from([
         CapabilityId::new(ferrum_runtime::SILU_BF16_CAPABILITY_ID)?,
@@ -375,6 +381,10 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::HALF_SPLIT_ROPE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CONV2D_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CHANNEL_L2_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SILU_NCHW_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID)?,
     ]);
     config.dynamic_storage_profiles = BTreeSet::from([DynamicStorageProfile::new(
         DynamicStorageAllocator::LinearArena,
@@ -404,6 +414,18 @@ pub fn cuda_vnext_tensor_providers(
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     tensor_silu::selected_providers(runtime, selected)
+}
+
+/// Registers one BF16 Conv2D provider and the selected native tensor providers.
+/// All native kernels share one module permit; the cuDNN handle/descriptors
+/// acquire a separate explicit opaque capacity claim. An empty native selection
+/// is valid for a convolution-only plan. No token or capture path is enabled.
+pub fn cuda_vnext_tensor_providers_with_cudnn(
+    runtime: &CudaDeviceRuntime,
+    config: &super::vnext_runtime::CudaCudnnConfig,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::providers_with_cudnn(runtime, config, selected)
 }
 
 /// Builds the five independent BF16 pointwise providers from one native

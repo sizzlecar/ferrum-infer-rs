@@ -28,6 +28,8 @@ pub(crate) use zero_centered_rms_norm::{
     ReferenceZeroCenteredRmsNormLaunch, ReferenceZeroCenteredRmsNormShape,
 };
 mod gelu_tanh;
+mod spatial_bf16;
+pub(crate) use spatial_bf16::{ReferenceChannelL2NormLaunch, ReferenceConv2dLaunch};
 mod head_rms_norm;
 pub(crate) use head_rms_norm::{ReferenceHeadRmsNormLaunch, ReferenceHeadRmsNormShape};
 mod plain_residual_add;
@@ -355,6 +357,12 @@ enum ReferenceCommandKind {
     HeadRmsNorm {
         launch: ReferenceHeadRmsNormLaunch,
     },
+    Conv2d {
+        launch: ReferenceConv2dLaunch,
+    },
+    ChannelL2Norm {
+        launch: ReferenceChannelL2NormLaunch,
+    },
     PlainResidualAdd {
         launch: ReferencePlainResidualAddLaunch,
     },
@@ -406,6 +414,8 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::RowGather { .. } => "row_gather",
             ReferenceCommandKind::BatchedRowConcat { .. } => "batched_row_concat",
             ReferenceCommandKind::HeadRmsNorm { .. } => "head_rms_norm",
+            ReferenceCommandKind::Conv2d { .. } => "conv2d",
+            ReferenceCommandKind::ChannelL2Norm { .. } => "channel_l2_norm",
             ReferenceCommandKind::PlainResidualAdd { .. } => "plain_residual_add",
             ReferenceCommandKind::HalfSplitRope { .. } => "half_split_rope",
             ReferenceCommandKind::StructuredGqaAttention { .. } => "structured_gqa_attention",
@@ -604,6 +614,30 @@ impl ReferenceDeviceCommand {
         })
     }
 
+    pub(crate) fn conv2d_tensor(
+        launch: ReferenceConv2dLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_conv2d_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::Conv2d { launch },
+        })
+    }
+    pub(crate) fn channel_l2_norm_tensor(
+        launch: ReferenceChannelL2NormLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_channel_l2_norm_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::ChannelL2Norm { launch },
+        })
+    }
     pub(crate) fn head_rms_norm_tensor(
         launch: ReferenceHeadRmsNormLaunch,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
@@ -813,6 +847,10 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::HeadRmsNorm { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::Conv2d { launch } => launch.validate_runtime(runtime_instance),
+            ReferenceCommandKind::ChannelL2Norm { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::PlainResidualAdd { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
@@ -907,6 +945,16 @@ impl ReferenceDeviceCommand {
                 head_rms_norm::execute(launch);
                 counters
                     .head_rms_norm_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::Conv2d { launch } => {
+                spatial_bf16::execute_conv2d(launch);
+                counters.conv2d_launches.fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::ChannelL2Norm { launch } => {
+                spatial_bf16::execute_channel_l2_norm(launch);
+                counters
+                    .channel_l2_norm_launches
                     .fetch_add(1, Ordering::Relaxed);
             }
             ReferenceCommandKind::PlainResidualAdd { launch } => {
@@ -1141,6 +1189,8 @@ struct ReferenceRuntimeCounters {
     dense_linear_launches: AtomicU64,
     layer_norm_launches: AtomicU64,
     head_rms_norm_launches: AtomicU64,
+    conv2d_launches: AtomicU64,
+    channel_l2_norm_launches: AtomicU64,
     row_gather_launches: AtomicU64,
     batched_row_concat_launches: AtomicU64,
     zero_centered_rms_norm_launches: AtomicU64,
@@ -1168,6 +1218,8 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub dense_linear_launches: u64,
     pub layer_norm_launches: u64,
     pub head_rms_norm_launches: u64,
+    pub conv2d_launches: u64,
+    pub channel_l2_norm_launches: u64,
     pub row_gather_launches: u64,
     pub batched_row_concat_launches: u64,
     pub zero_centered_rms_norm_launches: u64,
@@ -1305,6 +1357,11 @@ impl ReferenceDeviceRuntime {
             dense_linear_launches: self.counters.dense_linear_launches.load(Ordering::Relaxed),
             layer_norm_launches: self.counters.layer_norm_launches.load(Ordering::Relaxed),
             head_rms_norm_launches: self.counters.head_rms_norm_launches.load(Ordering::Relaxed),
+            conv2d_launches: self.counters.conv2d_launches.load(Ordering::Relaxed),
+            channel_l2_norm_launches: self
+                .counters
+                .channel_l2_norm_launches
+                .load(Ordering::Relaxed),
             row_gather_launches: self.counters.row_gather_launches.load(Ordering::Relaxed),
             batched_row_concat_launches: self
                 .counters

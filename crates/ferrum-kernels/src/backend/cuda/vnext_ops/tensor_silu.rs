@@ -34,12 +34,14 @@ use super::{binding, contract_error, implementation_fingerprint, provider_failur
 
 mod attention;
 mod bundle;
+mod conv2d;
 mod geometry;
 mod gqa;
 mod half_split_rope;
 mod norm;
 mod rope;
 mod selection;
+mod spatial;
 mod text_projection;
 mod transport;
 pub use attention::{
@@ -47,6 +49,8 @@ pub use attention::{
     NUMERICAL_PROFILE_ID as ATTENTION_NUMERICAL_PROFILE_ID,
 };
 use bundle::RetainedFunctions;
+pub(super) use conv2d::providers as providers_with_cudnn;
+pub use conv2d::NUMERICAL_PROFILE_ID as CONV2D_PROFILE_ID;
 use geometry::{geometry, Shape};
 pub use gqa::{
     NUMERICAL_IDENTITY as GQA_NUMERICAL_IDENTITY, NUMERICAL_PROFILE_ID as GQA_NUMERICAL_PROFILE_ID,
@@ -63,6 +67,10 @@ pub use rope::{
     NUMERICAL_PROFILE_ID as ROPE_NUMERICAL_PROFILE_ID,
 };
 pub use selection::CudaTensorOperation;
+pub use spatial::{
+    ADD_PROFILE_ID as RESIDUAL_ADD_NCHW_PROFILE_ID, L2_PROFILE_ID as CHANNEL_L2_PROFILE_ID,
+    SILU_PROFILE_ID as SILU_NCHW_PROFILE_ID,
+};
 pub use text_projection::{
     GELU_TANH_PROFILE_ID, NUMERICAL_IDENTITY as TEXT_PROJECTION_NUMERICAL_IDENTITY,
     ZERO_CENTERED_RMS_NORM_PROFILE_ID,
@@ -233,6 +241,8 @@ pub(super) fn numerical_fingerprint() -> String {
         BUNDLE_NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("tensor_silu.rs"),
         include_bytes!("tensor_silu/bundle.rs"),
+        include_bytes!("tensor_silu/conv2d.rs"),
+        include_bytes!("tensor_silu/spatial.rs"),
         include_bytes!("tensor_silu/geometry.rs"),
         include_bytes!("tensor_silu/norm.rs"),
         include_bytes!("tensor_silu/rope.rs"),

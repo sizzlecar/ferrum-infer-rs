@@ -56,6 +56,7 @@ mod binding_scatter;
 mod binding_transfers;
 #[cfg(test)]
 mod compact_upload_scatter_tests;
+mod cudnn;
 mod execution_facts;
 mod input_upload_packet;
 #[cfg(test)]
@@ -67,6 +68,8 @@ mod sequence_physical;
 mod tensor_eager;
 mod tensor_io;
 mod terminal_readback;
+pub use cudnn::CudaCudnnConfig;
+pub(crate) use cudnn::{CudaCudnnOwner, CudnnConv2dDescriptor};
 pub(crate) use resident_program::{ResidentColdParts, ResidentControlRule};
 use segment_owners::CudaProgramBindingRetention;
 pub(crate) use segment_owners::{CudaSegmentOwnerBuilder, CudaSegmentOwnerTable, CudaSegmentRange};

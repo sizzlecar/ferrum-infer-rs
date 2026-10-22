@@ -36,6 +36,7 @@ use super::row_transport::{ReferenceRowTransportKind, ReferenceRowTransportProvi
 use super::runtime::{
     ReferenceDeviceRuntime, ReferenceDeviceRuntimeConfig, ReferenceDeviceRuntimeError,
 };
+use super::spatial_bf16::{ReferenceSpatialProvider, SpatialKind};
 use super::structured_attention::ReferenceStructuredAttentionProvider;
 use super::structured_gqa_attention::ReferenceStructuredGqaAttentionProvider;
 use super::transcendental::{
@@ -43,6 +44,14 @@ use super::transcendental::{
     ReferenceTranscendentalProvider,
 };
 use super::zero_centered_rms_norm::ReferenceZeroCenteredRmsNormProvider;
+use ferrum_runtime::{
+    channel_l2_norm_bf16_contract, conv2d_bf16_contract, CHANNEL_L2_NORM_BF16_CAPABILITY_ID,
+    CONV2D_BF16_CAPABILITY_ID,
+};
+use ferrum_runtime::{
+    plain_residual_add_nchw_bf16_contract, silu_nchw_bf16_contract,
+    PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID, SILU_NCHW_BF16_CAPABILITY_ID,
+};
 
 const REFERENCE_ENGINE_PROVIDER_ID: &str = "provider.engine.reference.vnext";
 pub const REFERENCE_DENSE_SAFETENSORS_FORMAT_ID: &str = "weight-format.safetensors.dense";
@@ -50,6 +59,10 @@ const REFERENCE_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     Ok(BTreeSet::from([
+        CapabilityId::new(CONV2D_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(CHANNEL_L2_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(SILU_NCHW_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID)?,
         CapabilityId::new(PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID)?,
         CapabilityId::new(HALF_SPLIT_ROPE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID)?,
@@ -95,6 +108,8 @@ fn reference_vnext_runtime_config_with_capacity(
         runtime_implementation_fingerprint: implementation_fingerprint(&[
             &capacity_bytes.to_le_bytes(),
             include_str!("runtime.rs").as_bytes(),
+            include_str!("spatial_bf16.rs").as_bytes(),
+            include_str!("runtime/spatial_bf16.rs").as_bytes(),
             include_str!("plain_residual_add.rs").as_bytes(),
             include_str!("runtime/plain_residual_add.rs").as_bytes(),
             include_str!("half_split_rope.rs").as_bytes(),
@@ -136,6 +151,10 @@ pub fn reference_vnext_operation_registry(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<OperationRuntimeRegistry<ReferenceDeviceRuntime>, ReferenceDeviceRuntimeError> {
     let contracts: Vec<Box<dyn OperationContract>> = vec![
+        Box::new(conv2d_bf16_contract().map_err(contract_error)?),
+        Box::new(channel_l2_norm_bf16_contract().map_err(contract_error)?),
+        Box::new(silu_nchw_bf16_contract().map_err(contract_error)?),
+        Box::new(plain_residual_add_nchw_bf16_contract().map_err(contract_error)?),
         Box::new(plain_residual_add_bf16_contract().map_err(contract_error)?),
         Box::new(half_split_rope_bf16_contract().map_err(contract_error)?),
         Box::new(structured_gqa_attention_bf16_contract().map_err(contract_error)?),
@@ -156,6 +175,10 @@ pub fn reference_vnext_operation_registry(
         Box::new(tanh_bf16_contract().map_err(contract_error)?),
     ];
     let providers = vec![
+        reference_vnext_conv2d_bf16_provider(runtime)?,
+        reference_vnext_channel_l2_norm_bf16_provider(runtime)?,
+        reference_vnext_silu_nchw_bf16_provider(runtime)?,
+        reference_vnext_plain_residual_add_nchw_bf16_provider(runtime)?,
         reference_vnext_plain_residual_add_bf16_provider(runtime)?,
         reference_vnext_half_split_rope_bf16_provider(runtime)?,
         reference_vnext_structured_gqa_attention_bf16_provider(runtime)?,
@@ -203,6 +226,38 @@ pub fn reference_vnext_layer_norm_bf16_provider(
 }
 
 /// Builds head-local BF16 RMSNorm with FP32 pairwise reduction and two BF16 boundaries.
+pub fn reference_vnext_conv2d_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceSpatialProvider::new(
+        runtime,
+        SpatialKind::Conv2d,
+    )?))
+}
+pub fn reference_vnext_silu_nchw_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceSpatialProvider::new(
+        runtime,
+        SpatialKind::SiluNchw,
+    )?))
+}
+pub fn reference_vnext_plain_residual_add_nchw_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceSpatialProvider::new(
+        runtime,
+        SpatialKind::ResidualAddNchw,
+    )?))
+}
+pub fn reference_vnext_channel_l2_norm_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceSpatialProvider::new(
+        runtime,
+        SpatialKind::ChannelL2Norm,
+    )?))
+}
 pub fn reference_vnext_head_rms_norm_bf16_provider(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {

@@ -490,3 +490,68 @@ extern "C" __global__ void ferrum_vnext_half_split_rope_bf16(
         output[right] = ferrum_bf16_rne(__fadd_rn(ferrum_bf16_decode(bc), ferrum_bf16_decode(as)));
     }
 }
+
+// External zero padding preserves the Conv2d call shape used by single-frame
+// causal convolution. All bytes, including the border, are overwritten.
+extern "C" __global__ void ferrum_vnext_nchw_pad_bf16(
+    const uint16_t* input, uint16_t* output, uint64_t elements,
+    uint64_t height, uint64_t width, uint64_t padded_height,
+    uint64_t padded_width, uint64_t top, uint64_t left) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t step = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t i = first; i < elements; i += step) {
+        const uint64_t x = i % padded_width;
+        const uint64_t y = (i / padded_width) % padded_height;
+        const uint64_t plane = i / (padded_height * padded_width);
+        output[i] = (y >= top && y - top < height && x >= left && x - left < width)
+            ? input[(plane * height + y - top) * width + x - left] : 0;
+    }
+}
+
+// PyTorch 2.13 convolution first writes BF16, then performs a separate bias add.
+extern "C" __global__ void ferrum_vnext_nchw_bias_bf16(
+    uint16_t* output, const uint16_t* bias, uint64_t elements,
+    uint64_t channels, uint64_t spatial) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t step = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t i = first; i < elements; i += step) {
+        const uint64_t c = (i / spatial) % channels;
+        output[i] = ferrum_bf16_rne(__fadd_rn(ferrum_bf16_decode(output[i]), ferrum_bf16_decode(bias[c])));
+    }
+}
+
+// One CTA per N/H/W position, a padded adjacent-pair FP32 tree, no full-input
+// conversion or device scratch. shared[] has next_power_of_two(C) floats.
+extern "C" __global__ void ferrum_vnext_channel_l2_norm_bf16(
+    const uint16_t* input, const uint16_t* gamma, uint16_t* output,
+    uint64_t positions, uint64_t channels, uint64_t spatial,
+    uint32_t tree_width, float epsilon, float scale) {
+    extern __shared__ float reduction[];
+    for (uint64_t p = blockIdx.x; p < positions; p += gridDim.x) {
+        const uint64_t n = p / spatial;
+        const uint64_t pixel = p % spatial;
+        for (uint32_t c = threadIdx.x; c < tree_width; c += blockDim.x) {
+            const float x = c < channels ? ferrum_bf16_decode(input[(n * channels + c) * spatial + pixel]) : 0.0f;
+            reduction[c] = __fmul_rn(x,x);
+        }
+        __syncthreads();
+        for (uint32_t span = 1; span < tree_width; span *= 2) {
+            for (uint32_t pair = threadIdx.x; pair < tree_width / (2 * span); pair += blockDim.x) {
+                const uint32_t start = pair * 2 * span;
+                reduction[start] = __fadd_rn(reduction[start], reduction[start + span]);
+            }
+            __syncthreads();
+        }
+        const float norm = __fsqrt_rn(reduction[0]);
+        const float denominator = isnan(norm) ? norm : fmaxf(norm,epsilon);
+        for (uint64_t c = threadIdx.x; c < channels; c += blockDim.x) {
+            const uint64_t i = (n * channels + c) * spatial + pixel;
+            const float x = ferrum_bf16_decode(input[i]);
+            const uint16_t normalized = ferrum_bf16_rne(__fdiv_rn(x,denominator));
+            const uint16_t scaled = ferrum_bf16_rne(__fmul_rn(ferrum_bf16_decode(normalized),scale));
+            const uint16_t weighted = ferrum_bf16_rne(__fmul_rn(ferrum_bf16_decode(scaled),ferrum_bf16_decode(gamma[c])));
+            output[i] = ferrum_bf16_rne(__fadd_rn(ferrum_bf16_decode(weighted),0.0f));
+        }
+        __syncthreads();
+    }
+}

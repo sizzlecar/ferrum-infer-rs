@@ -251,6 +251,10 @@ impl CudaDeviceRuntime {
                         | ferrum_runtime::PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID
                         | ferrum_runtime::HALF_SPLIT_ROPE_BF16_CAPABILITY_ID
                         | ferrum_runtime::STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID
+                        | ferrum_runtime::CONV2D_BF16_CAPABILITY_ID
+                        | ferrum_runtime::CHANNEL_L2_NORM_BF16_CAPABILITY_ID
+                        | ferrum_runtime::SILU_NCHW_BF16_CAPABILITY_ID
+                        | ferrum_runtime::PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID
                 )
             })
         {
@@ -389,6 +393,26 @@ impl CudaDeviceRuntime {
                     "CUDA tensor provider requires a bounded tensor runtime",
                 )
             })
+    }
+
+    /// Charges each additional native-library owner independently. Merely
+    /// cloning the bootstrap retention does not authorize another handle.
+    pub(crate) fn reserve_tensor_opaque(
+        &self,
+        bytes: u64,
+    ) -> Result<DeviceCapacityRetention, CudaDeviceRuntimeError> {
+        if bytes == 0 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "native owner requires a positive opaque allowance",
+            ));
+        }
+        let owner = self.tensor_eager.as_ref().ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("native owner requires bounded tensor runtime")
+        })?;
+        owner
+            .capacity
+            .reserve(DeviceOpaqueMemoryKind::Bootstrap, bytes)
+            .map_err(CudaDeviceRuntimeError::capacity)
     }
 }
 

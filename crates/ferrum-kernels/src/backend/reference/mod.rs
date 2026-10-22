@@ -4,6 +4,17 @@
 //! registered explicitly as [`DeviceClass::Reference`] and advertises only the
 //! operations it really executes.
 
+mod spatial_bf16;
+pub use composition::{
+    reference_vnext_channel_l2_norm_bf16_provider, reference_vnext_conv2d_bf16_provider,
+    reference_vnext_plain_residual_add_nchw_bf16_provider, reference_vnext_silu_nchw_bf16_provider,
+};
+pub use spatial_bf16::{
+    REFERENCE_CHANNEL_L2_NORM_BF16_NUMERICAL_PROFILE_ID,
+    REFERENCE_CONV2D_BF16_NUMERICAL_PROFILE_ID,
+    REFERENCE_PLAIN_RESIDUAL_ADD_NCHW_BF16_NUMERICAL_PROFILE_ID,
+    REFERENCE_SILU_NCHW_BF16_NUMERICAL_PROFILE_ID,
+};
 mod plain_residual_add;
 pub use plain_residual_add::REFERENCE_PLAIN_RESIDUAL_ADD_BF16_NUMERICAL_PROFILE_ID;
 mod half_split_rope;

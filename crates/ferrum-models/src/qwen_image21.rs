@@ -12,7 +12,9 @@ mod config;
 mod headers;
 mod image_projection;
 mod qk_norm;
+pub mod t2i_prompt;
 mod transformer;
+mod vae_stem;
 mod weights;
 
 pub use attention::{
@@ -35,6 +37,7 @@ pub use transformer::{
     QwenImage21ModelTimestep, QwenImage21RotaryFrequencies, QwenImage21T2iLayout,
     QwenImage21Timestep256, QwenImage21TransformerConfig, QwenImage21TransformerFamily,
 };
+pub use vae_stem::{QwenImage21VaeStemConfig, QwenImage21VaeStemFamily, QwenImage21VaeStemWeight};
 pub use weights::{ExpectedTensor, ExpectedWeights};
 
 use ferrum_types::{FerrumError, Result};

@@ -18,6 +18,7 @@ pub(super) struct RetainedFunctions {
     transport_functions: [CudaFunction; 2],
     half_split_rope_function: CudaFunction,
     gqa_attention_function: CudaFunction,
+    spatial_functions: [CudaFunction; 3],
     _provider: CudaTensorProviderRetention,
 }
 
@@ -79,6 +80,22 @@ impl RetainedFunctions {
             let gqa_attention_function = module.load_function(gqa::FUNCTION).map_err(|error| {
                 CudaDeviceRuntimeError::driver("BF16 structured GQA attention function load", error)
             })?;
+            let spatial = [
+                "ferrum_vnext_nchw_pad_bf16",
+                "ferrum_vnext_nchw_bias_bf16",
+                "ferrum_vnext_channel_l2_norm_bf16",
+            ]
+            .map(|name| module.load_function(name));
+            let [pad, bias, channel_norm] = spatial;
+            let spatial_functions = [pad, bias, channel_norm]
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("BF16 spatial function load", error)
+                })?;
+            let spatial_functions: [CudaFunction; 3] = spatial_functions
+                .try_into()
+                .unwrap_or_else(|_| unreachable!());
             Ok::<_, CudaDeviceRuntimeError>((
                 pointwise,
                 normalization,
@@ -87,6 +104,7 @@ impl RetainedFunctions {
                 transport,
                 half_split_rope_function,
                 gqa_attention_function,
+                spatial_functions,
             ))
         }));
         let (
@@ -97,6 +115,7 @@ impl RetainedFunctions {
             transport_functions,
             half_split_rope_function,
             gqa_attention_function,
+            spatial_functions,
         ) = match loaded {
             Ok(Ok(functions)) => functions,
             Ok(Err(error)) => {
@@ -117,12 +136,17 @@ impl RetainedFunctions {
             transport_functions,
             half_split_rope_function,
             gqa_attention_function,
+            spatial_functions,
             _provider: provider,
         }))
     }
 
     pub(super) fn function(&self, kind: Kind) -> &CudaFunction {
         &self.functions[kind.index()]
+    }
+
+    pub(super) fn spatial_function(&self, index: usize) -> &CudaFunction {
+        &self.spatial_functions[index]
     }
 
     pub(super) fn norm_function(&self, kind: norm::Kind) -> &CudaFunction {
