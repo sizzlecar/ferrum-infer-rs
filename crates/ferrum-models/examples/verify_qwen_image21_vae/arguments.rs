@@ -3,7 +3,7 @@ use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
-pub const USAGE: &str = "verify_qwen_image21_vae --model-root MODEL_ROOT --latent-file RAW_LITTLE_ENDIAN_BF16 --latent-layout packed|nchw --latent-domain normalized|denormalized --latent-height H --latent-width W --batch B --artifact-dir NEW_EXTERNAL_DIRECTORY --backend reference|cuda [--config VAE_CONFIG] [--index-file BASENAME] [--maximum-host-bytes N (268435456)] [--reference-memory-bytes N (2147483648)] [CUDA budgets] [--cudnn-library ABSOLUTE_PATH --cudnn-opaque-memory-bytes N --cudnn-workspace-bytes N --cudnn-memory-profile NAME]\nH/W are LATENT spatial dimensions. Packed is [B,H*W,C], not 2x2 patches. Output is raw BF16 NCHW RGBA plus per-sample interleaved RGBA8 and PNG (straight alpha retained; PNG rows limited to 65536 bytes). No denoising, numerical parity or throughput claim. Real 148-node decoder requires a CUDA command budget covering compute and input upload (use 256).";
+pub const USAGE: &str = "verify_qwen_image21_vae --model-root MODEL_ROOT --latent-file RAW_LITTLE_ENDIAN_BF16 --latent-layout packed|nchw --latent-domain normalized|denormalized --latent-height H --latent-width W --batch B --artifact-dir NEW_EXTERNAL_DIRECTORY --backend reference|cuda [--config VAE_CONFIG] [--index-file BASENAME | --weight-file BASENAME.safetensors] [--maximum-host-bytes N (268435456)] [--reference-memory-bytes N (2147483648)] [CUDA budgets] [--cudnn-library ABSOLUTE_PATH --cudnn-opaque-memory-bytes N --cudnn-workspace-bytes N --cudnn-memory-profile NAME]\nH/W are LATENT spatial dimensions. Packed is [B,H*W,C], not 2x2 patches. Output is raw BF16 NCHW RGBA plus per-sample interleaved RGBA8 and PNG (straight alpha retained; PNG rows limited to 65536 bytes). No denoising, numerical parity or throughput claim. Real 148-node decoder requires a CUDA command budget covering compute and input upload (use 256).";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +28,7 @@ pub struct Arguments {
     pub model_root: PathBuf,
     pub config: PathBuf,
     pub index_file: Option<String>,
+    pub weight_file: Option<String>,
     pub latent_file: PathBuf,
     pub layout: LatentLayout,
     pub domain: LatentDomain,
@@ -77,6 +78,26 @@ impl Arguments {
                     && !matches!(name.as_str(), "." | "..")
                     && !name.contains(['/', '\\', ':']),
                 "index must be a basename"
+            );
+        }
+        let weight_file = values
+            .remove("--weight-file")
+            .map(|s| {
+                s.into_string()
+                    .map_err(|_| anyhow::anyhow!("weight filename requires UTF-8"))
+            })
+            .transpose()?;
+        ensure!(
+            index_file.is_none() || weight_file.is_none(),
+            "--index-file and --weight-file are mutually exclusive"
+        );
+        if let Some(name) = &weight_file {
+            ensure!(
+                !name.is_empty()
+                    && name.ends_with(".safetensors")
+                    && !name.contains(['/', '\\', ':'])
+                    && !name.chars().any(char::is_control),
+                "weight file must be a safetensors basename"
             );
         }
         let latent_file = values.remove("--latent-file").context(USAGE)?.into();
@@ -152,6 +173,7 @@ impl Arguments {
             model_root,
             config,
             index_file,
+            weight_file,
             latent_file,
             layout,
             domain,

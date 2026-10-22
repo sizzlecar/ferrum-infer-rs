@@ -92,6 +92,29 @@ impl SafetensorsArchive {
         Self::open_shards(shard_paths)
     }
 
+    /// Opens exactly one explicitly named safetensors file in `model_dir`.
+    ///
+    /// `basename` must be a portable file name ending in `.safetensors`, not
+    /// a relative path, index, or partial download. This never discovers other
+    /// files or falls back to the default archive/index if the selected file
+    /// is missing or invalid. As with [`Self::open`], filesystem symlinks are
+    /// followed and the mapped file must remain immutable while retained.
+    pub fn open_single_file(model_dir: impl AsRef<Path>, basename: &str) -> Result<Self> {
+        if basename.len() <= ".safetensors".len()
+            || !basename.ends_with(".safetensors")
+            || basename.contains(['/', '\\', ':'])
+            || basename.chars().any(char::is_control)
+        {
+            return Err(FerrumError::model(
+                "safetensors single file must be an explicit .safetensors basename within the model directory",
+            ));
+        }
+        Self::open_shards(vec![(
+            basename.to_owned(),
+            model_dir.as_ref().join(basename),
+        )])
+    }
+
     /// Opens an explicitly selected weight-map index in `model_dir`.
     ///
     /// The index name is a portable basename (no drive prefix), and shard paths remain relative to the
@@ -735,6 +758,161 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn explicit_single_file_selects_bf16_and_retains_only_its_payload() {
+        let directory = tempdir().unwrap();
+        let selected = "diffusion_pytorch_model.safetensors";
+        let selected_bytes = [0x80_u8, 0x3f, 0x00, 0xc0]; // BF16 [1, -2].
+        for (file, tensor, bytes) in [
+            (selected, "decoder.weight", selected_bytes),
+            ("model.safetensors", "unrelated", [0_u8, 0, 0, 0]),
+        ] {
+            serialize_to_file(
+                BTreeMap::from([(
+                    tensor,
+                    TensorView::new(Dtype::BF16, vec![1, 2], &bytes).unwrap(),
+                )]),
+                &None,
+                &directory.path().join(file),
+            )
+            .unwrap();
+        }
+        // Neither a partial download nor an unrelated index participates in
+        // explicit single-file selection, even when their contents are bad.
+        std::fs::write(
+            directory.path().join(format!("{selected}.incomplete")),
+            b"partial",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("model.safetensors.index.json"),
+            b"invalid index",
+        )
+        .unwrap();
+        let archive = SafetensorsArchive::open_single_file(directory.path(), selected).unwrap();
+        assert_eq!(archive.tensor_count(), 1);
+        assert!(!archive.contains("unrelated"));
+        let tensor = archive.tensor("decoder.weight").unwrap();
+        assert_eq!(tensor.source_file(), selected);
+        assert_eq!(tensor.element_type(), Some(ElementType::Bf16));
+        assert_eq!(tensor.shape(), [1, 2]);
+        assert_eq!(tensor.bytes(), selected_bytes);
+        let retained = tensor.retained_host_memory().clone();
+        drop(tensor);
+        drop(archive);
+        assert_eq!(retained.bytes(), selected_bytes);
+        assert!(SafetensorsArchive::open(directory.path())
+            .unwrap()
+            .contains("unrelated"));
+    }
+
+    #[test]
+    fn explicit_single_file_rejects_paths_partials_and_invalid_payload_without_fallback() {
+        let directory = tempdir().unwrap();
+        let bytes = [0x80_u8, 0x3f];
+        serialize_to_file(
+            BTreeMap::from([(
+                "default",
+                TensorView::new(Dtype::BF16, vec![1], &bytes).unwrap(),
+            )]),
+            &None,
+            &directory.path().join("model.safetensors"),
+        )
+        .unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            ".safetensors",
+            "../weights.safetensors",
+            "/weights.safetensors",
+            "sub/weights.safetensors",
+            "sub\\weights.safetensors",
+            "C:weights.safetensors",
+            "weights\0.safetensors",
+            "weights\n.safetensors",
+            "weights.safetensors.incomplete",
+            "model.safetensors.index.json",
+        ] {
+            assert!(
+                SafetensorsArchive::open_single_file(directory.path(), name).is_err(),
+                "accepted {name:?}"
+            );
+        }
+        assert!(
+            SafetensorsArchive::open_single_file(directory.path(), "missing.safetensors").is_err()
+        );
+        let invalid = directory.path().join("invalid.safetensors");
+        for payload in [b"".as_slice(), b"not a safetensors header".as_slice()] {
+            std::fs::write(&invalid, payload).unwrap();
+            assert!(
+                SafetensorsArchive::open_single_file(directory.path(), "invalid.safetensors")
+                    .is_err()
+            );
+        }
+        // A real header with a truncated BF16 payload must hit the same
+        // safetensors validation used by the ordinary archive entrypoint.
+        let mut truncated = std::fs::read(directory.path().join("model.safetensors")).unwrap();
+        truncated.pop();
+        std::fs::write(&invalid, truncated).unwrap();
+        assert!(
+            SafetensorsArchive::open_single_file(directory.path(), "invalid.safetensors").is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_single_file_and_index_do_not_interpret_each_others_format() {
+        let directory = tempdir().unwrap();
+        let shard = "weights.safetensors";
+        let index = "weights.safetensors.index.json";
+        let bytes = [0x00_u8, 0x80]; // Preserve BF16 negative zero as raw bytes.
+        serialize_to_file(
+            BTreeMap::from([(
+                "weight",
+                TensorView::new(Dtype::BF16, vec![1], &bytes).unwrap(),
+            )]),
+            &None,
+            &directory.path().join(shard),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join(index),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": { "weight": shard }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            SafetensorsArchive::open_with_index(directory.path(), index)
+                .unwrap()
+                .tensor("weight")
+                .unwrap()
+                .bytes(),
+            bytes
+        );
+        assert_eq!(
+            SafetensorsArchive::open_single_file(directory.path(), shard)
+                .unwrap()
+                .tensor("weight")
+                .unwrap()
+                .bytes(),
+            bytes
+        );
+        assert!(SafetensorsArchive::open_single_file(directory.path(), index).is_err());
+        assert!(SafetensorsArchive::open_with_index(directory.path(), shard).is_err());
+        std::fs::copy(
+            directory.path().join(index),
+            directory.path().join("disguised.safetensors"),
+        )
+        .unwrap();
+        assert!(
+            SafetensorsArchive::open_single_file(directory.path(), "disguised.safetensors")
+                .is_err()
+        );
+        assert!(SafetensorsArchive::open(directory.path()).is_err());
+    }
 
     #[test]
     fn explicit_index_selects_its_shards_even_when_a_default_single_file_exists() {

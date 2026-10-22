@@ -54,9 +54,11 @@ fn run(args: Arguments) -> Result<()> {
         &host,
     )?;
     let vae_dir = args.model_root.join("vae");
-    let source = match &args.index_file {
-        Some(index) => SafetensorsArchive::open_with_index(&vae_dir, index)?,
-        None => SafetensorsArchive::open(&vae_dir)?,
+    let source = match (&args.index_file, &args.weight_file) {
+        (Some(index), None) => SafetensorsArchive::open_with_index(&vae_dir, index)?,
+        (None, Some(file)) => SafetensorsArchive::open_single_file(&vae_dir, file)?,
+        (None, None) => SafetensorsArchive::open(&vae_dir)?,
+        (Some(_), Some(_)) => anyhow::bail!("index and single weight file are mutually exclusive"),
     };
     let mut weights = Vec::new();
     let mut weight_bytes = 0_u64;
@@ -76,7 +78,7 @@ fn run(args: Arguments) -> Result<()> {
     }
     let artifacts = artifacts::Artifacts::create(&args.artifact_dir)?;
     artifacts.json("declaration.json",&json!({
-        "schema":"ferrum.qwen_image21.vae-decoder-execution.v1","model_root":args.model_root.canonicalize()?,"config_path":args.config.canonicalize()?,"config_sha256":artifacts::sha256(&config_bytes),"config":config,"backend":args.backend,"cudnn":args.cudnn,
+        "schema":"ferrum.qwen_image21.vae-decoder-execution.v1","model_root":args.model_root.canonicalize()?,"config_path":args.config.canonicalize()?,"config_sha256":artifacts::sha256(&config_bytes),"config":config,"backend":args.backend,"cudnn":args.cudnn,"index_file":args.index_file,"weight_file":args.weight_file,
         "latent":{"path":args.latent_file.canonicalize()?,"layout":args.layout,"domain":args.domain,"input_shape":loaded.tensor.tensor().dimensions(),"source_sha256":loaded.source_sha256,"prepared_nchw_sha256":loaded.prepared_sha256,"arithmetic":"statistics: JSON->F32->BF16; normalized: B(B(x*B(std))+B(mean)); denormalized: unchanged bits"},
         "weights":weights,"selected_weight_bytes":weight_bytes,"integrity":"observed selected payload SHA-256; not checkpoint authentication or full shard hashes",
         "managed_host_budget":budget,"memory_scope":"input/output/static upload backing uses one Host account; source mmap residency, small metadata/weight digests/control allocations, fixed 8/16 KiB I/O stack buffers and bounded PNG codec state are outside this backing budget; CUDA opaque allowances remain experimental",

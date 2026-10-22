@@ -44,6 +44,31 @@ fn cli() -> Vec<OsString> {
     .to_vec()
 }
 #[test]
+fn explicit_single_weight_file_has_no_index_fallback_or_path_escape() {
+    let mut single = cli();
+    single.extend(["--weight-file", "diffusion_pytorch_model.safetensors"].map(OsString::from));
+    let parsed = Arguments::parse(single.clone()).unwrap().unwrap();
+    assert_eq!(
+        parsed.weight_file.as_deref(),
+        Some("diffusion_pytorch_model.safetensors")
+    );
+    assert!(parsed.index_file.is_none());
+    single.extend(["--index-file", "weights.index.json"].map(OsString::from));
+    assert!(Arguments::parse(single).is_err());
+    for name in [
+        "../weights.safetensors",
+        "/weights.safetensors",
+        r"C:\weights.safetensors",
+        "weights.safetensors.incomplete",
+        "weights.index.json",
+        "",
+    ] {
+        let mut args = cli();
+        args.extend(["--weight-file", name].map(OsString::from));
+        assert!(Arguments::parse(args).is_err(), "{name}");
+    }
+}
+#[test]
 fn explicit_domain_layout_backend_and_cudnn_budgets_are_required() {
     let a = Arguments::parse(cli()).unwrap().unwrap();
     assert_eq!(a.config, std::path::PathBuf::from("model/vae/config.json"));
@@ -253,6 +278,7 @@ fn tiny_real_archive_runs_full_decoder_and_writes_raw_rgba_and_cleanup() {
         model_root: model,
         config: vae.join("config.json"),
         index_file: None,
+        weight_file: None,
         latent_file: latent,
         layout: LatentLayout::Packed,
         domain: LatentDomain::Normalized,
