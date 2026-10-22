@@ -48,6 +48,7 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
             .payload()
             .memory()
             .minimum_step_bytes(),
+        compile_wall_duration_us: 0,
     };
     let session = component
         .initialize(
@@ -68,6 +69,8 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
             plan,
             initialization: session.initialization_receipt().clone(),
             completed_executions: 0,
+            initialization_wall_duration_us: 0,
+            execution_wall_durations_us: Vec::new(),
         },
         session,
     };
@@ -79,6 +82,7 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
     };
     assert!(matches!(source, TensorExecutionError::Runtime(_)));
     assert_eq!(active.receipt.completed_executions, 0);
+    assert_eq!(active.receipt.execution_wall_durations_us.len(), 1);
     let after = composition.runtime().snapshot();
     assert_eq!(after.submissions, before.submissions);
     assert_eq!(after.dense_linear_launches, before.dense_linear_launches);

@@ -1,5 +1,5 @@
 use super::*;
-use std::fmt;
+use std::{fmt, time::Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +32,8 @@ pub struct ImageStagePlanReceipt {
     /// Compiled storage requirements, not an observation of peak device usage.
     pub static_bytes: u64,
     pub minimum_step_bytes: u64,
+    /// Host wall time for family identity and plan compilation; not GPU time.
+    pub compile_wall_duration_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,12 +41,19 @@ pub struct ImageStageExecutionReceipt {
     pub plan: ImageStagePlanReceipt,
     pub initialization: ComponentInitializationReceipt,
     pub completed_executions: usize,
+    /// Host wall time around component initialization, including no-static setup.
+    pub initialization_wall_duration_us: u64,
+    /// Host wall time per execution attempt, including admission, upload,
+    /// submission, completion wait and readback. A failed final attempt is
+    /// retained here; this is not a CUDA event or kernel-only measurement.
+    pub execution_wall_durations_us: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageStageReceipt {
     pub execution: ImageStageExecutionReceipt,
     pub close: PlanRuntimeCloseReceipt,
+    pub close_wall_duration_us: u64,
 }
 
 /// Recovery owns the actual active session rather than a formatted diagnostic.
@@ -119,6 +128,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         options: &ProgramPlanCompileOptions,
         pipeline: &QwenImage21Pipeline<R>,
     ) -> anyhow::Result<Self> {
+        let started = Instant::now();
         ensure!(batch_size > 0, "stage batch size must be positive");
         let family_fingerprint = family.fingerprint()?;
         let family_id = family.family_id().clone();
@@ -150,6 +160,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                 plan_hash,
                 static_bytes,
                 minimum_step_bytes,
+                compile_wall_duration_us: elapsed_us(started),
             },
         })
     }
@@ -172,6 +183,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             })
         })()
         .map_err(ImageGenerationFailure::Preflight)?;
+        let started = Instant::now();
         match component.initialize(
             pipeline.runtime.clone(),
             pipeline.host.clone(),
@@ -183,6 +195,8 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                     plan,
                     initialization: session.initialization_receipt().clone(),
                     completed_executions: 0,
+                    initialization_wall_duration_us: elapsed_us(started),
+                    execution_wall_durations_us: Vec::new(),
                 },
                 session,
             }),
@@ -209,7 +223,12 @@ impl<R: DeviceRuntime> ActiveImageStage<R> {
             Ok(ids) => ids,
             Err(source) => return Err(self.processing(source)),
         };
-        match self.session.execute(run, request, inputs) {
+        let started = Instant::now();
+        let result = self.session.execute(run, request, inputs);
+        self.receipt
+            .execution_wall_durations_us
+            .push(elapsed_us(started));
+        match result {
             Ok(outputs) => {
                 self.receipt.completed_executions += 1;
                 Ok((self, outputs))
@@ -228,10 +247,12 @@ impl<R: DeviceRuntime> ActiveImageStage<R> {
     }
     pub(super) fn close(self) -> Result<ImageStageReceipt, ImageGenerationFailure<R>> {
         let Self { receipt, session } = self;
+        let started = Instant::now();
         match session.close() {
             Ok(PlanRuntimeCloseOutcome::Closed(close)) => Ok(ImageStageReceipt {
                 execution: receipt,
                 close,
+                close_wall_duration_us: elapsed_us(started),
             }),
             Ok(outcome @ PlanRuntimeCloseOutcome::Referenced { .. }) => {
                 Err(ImageGenerationFailure::CloseReferenced { receipt, outcome })
@@ -239,4 +260,8 @@ impl<R: DeviceRuntime> ActiveImageStage<R> {
             Err(source) => Err(ImageGenerationFailure::Close { receipt, source }),
         }
     }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }

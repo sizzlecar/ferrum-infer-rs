@@ -110,7 +110,7 @@ fn decoder_source(
                 }
             }
             if name == "decoder.conv_in.weight" {
-            // Real stored OIHW, with the center of its 3x3 spatial kernel.
+                // Real stored OIHW, with the center of its 3x3 spatial kernel.
                 let area = values.len() / (shape[0] * shape[1]) as usize;
                 for channel in 0..shape[0].min(shape[1]) as usize {
                     values[(channel * shape[1] as usize + channel) * area + area / 2] = 0x3f80;
