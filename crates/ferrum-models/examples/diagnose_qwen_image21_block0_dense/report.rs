@@ -11,11 +11,12 @@ use ferrum_models::qwen_image21::{
 use ferrum_quantization::SafetensorsArchive;
 use serde_json::{json, Value};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     Query,
     Value,
     MlpOutput,
+    MlpUp,
 }
 impl Stage {
     pub fn name(self) -> &'static str {
@@ -23,6 +24,7 @@ impl Stage {
             Self::Query => "query",
             Self::Value => "value",
             Self::MlpOutput => "mlp_output",
+            Self::MlpUp => "mlp_up",
         }
     }
     fn ports(self) -> (&'static str, &'static str, &'static str) {
@@ -38,6 +40,7 @@ impl Stage {
                 Block::WEIGHT_NAMES[4],
             ),
             Self::MlpOutput => (Mlp::ACTIVATION_ID, Mlp::OUTPUT_ID, Block::WEIGHT_NAMES[8]),
+            Self::MlpUp => (Block::MODULATED2_ID, Mlp::UP_ID, Block::WEIGHT_NAMES[7]),
         }
     }
 }
@@ -56,7 +59,7 @@ pub fn analyze(
         input_meta.shape == candidate_meta.shape,
         "local input shapes differ"
     );
-    if !matches!(stage, Stage::MlpOutput) {
+    if matches!(stage, Stage::Query | Stage::Value) {
         ensure!(
             xr == xc,
             "earliest Q/V inputs must be identical to isolate GEMM"

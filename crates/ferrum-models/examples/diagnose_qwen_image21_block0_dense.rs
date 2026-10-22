@@ -14,7 +14,7 @@ use anyhow::{ensure, Context, Result};
 use ferrum_quantization::SafetensorsArchive;
 use serde_json::json;
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
-const USAGE:&str="diagnose_qwen_image21_block0_dense --reference-artifact-dir REF --candidate-artifact-dir CUDA --model-dir TRANSFORMER_DIRECTORY --artifact-dir NEW_EXTERNAL_DIRECTORY [--index-file diffusion_pytorch_model.safetensors.index.json] [--query-channels 953] [--value-channels 126,668,1602] [--mlp-output-channels 2615]\nCPU-only. Reads existing checkpoint tensors; exports only selected OI rows and exact local diagnostics. Default five rows target the previously observed R36 first divergence and largest failing MLP output; they are diagnostic selections, not acceptance gates.";
+const USAGE:&str="diagnose_qwen_image21_block0_dense --reference-artifact-dir REF --candidate-artifact-dir CUDA --model-dir TRANSFORMER_DIRECTORY --artifact-dir NEW_EXTERNAL_DIRECTORY [--index-file diffusion_pytorch_model.safetensors.index.json] [--query-channels 953] [--value-channels 126,668,1602] [--mlp-output-channels 2615] [--mlp-up-channels 342,4878,10182]\nCPU-only. Reads existing checkpoint tensors; exports only selected OI rows and exact local diagnostics. Default five rows target the previously observed R36 first divergence and largest failing MLP output; they are diagnostic selections, not acceptance gates. Optional MLP-up channels add a replay using each backend's own saved MODULATED2 input, for every saved row; no GPU execution or change to the original criterion.";
 
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
@@ -44,9 +44,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "diffusion_pytorch_model.safetensors.index.json".into())
         .into_string()
         .map_err(|_| anyhow::anyhow!("index requires UTF-8"))?;
-    let query = channels(v.remove("--query-channels"), "953")?;
-    let value = channels(v.remove("--value-channels"), "126,668,1602")?;
-    let mlp = channels(v.remove("--mlp-output-channels"), "2615")?;
+    let selected = selected_stages(&mut v)?;
     ensure!(v.is_empty(), "unknown options: {:?}", v.keys());
     let reference = source::Artifact::open(&reference, "reference")?;
     let candidate = source::Artifact::open(&candidate, "cuda")?;
@@ -56,9 +54,13 @@ fn main() -> Result<()> {
     );
     let archive = SafetensorsArchive::open_with_index(model, &index)?;
     let output = artifacts::Artifacts::create(&output)?;
+    let selections = selected
+        .iter()
+        .map(|(stage, channels)| (stage.name().to_owned(), json!(channels)))
+        .collect::<serde_json::Map<_, _>>();
     output.json("declaration.json",&json!({"schema":"ferrum.qwen_image21.block0-dense-diagnosis.v1",
         "reference_manifest_sha256":reference.manifest_sha256,"candidate_manifest_sha256":candidate.manifest_sha256,
-        "identity":reference.manifest.identity,"selections":{"query":query,"value":value,"mlp_output":mlp},
+        "identity":reference.manifest.identity,"selections":selections,
         "exact_domain":"finite BF16 operands; exact products on binary lattice>=2^-126; checked i128 common lattice and absolute sum; gamma(2K,2^-24) absolute-sum expansion<=BF16MAX; insufficient capacity is unresolved/error",
         "bound":"outward exact-dot F64 enclosure +/- [gamma(2K)*S_upper + 2^-8*(maxabs(exact enclosure)+gamma(2K)*S_upper)+2^-134]",
         "replay":"sequential FP32 product/add starting +0, one final integer BF16 RNE; separate from the independent exact dot",
@@ -66,12 +68,8 @@ fn main() -> Result<()> {
         "qualification":"selected-node arithmetic compatibility only; not whole-domain cuBLAS, full model, Torch parity, or performance"}))?;
     let result: Result<_> = (|| {
         let mut records = Vec::new();
-        for (stage, selected) in [
-            (report::Stage::Query, &query),
-            (report::Stage::Value, &value),
-            (report::Stage::MlpOutput, &mlp),
-        ] {
-            let r = report::analyze(stage, selected, &reference, &candidate, &archive, &output)?;
+        for (stage, channels) in &selected {
+            let r = report::analyze(*stage, channels, &reference, &candidate, &archive, &output)?;
             output.json(&format!("{}.json", stage.name()), &r)?;
             records.push(r);
         }
@@ -96,6 +94,28 @@ fn main() -> Result<()> {
         output.json("failure.json",&json!({"completed_successfully":false,"error":format!("{error:#}"),"unresolved_is_not_pass":true}))?;
     }
     result
+}
+fn selected_stages(
+    values: &mut BTreeMap<String, OsString>,
+) -> Result<Vec<(report::Stage, Vec<usize>)>> {
+    let mut selected = vec![
+        (
+            report::Stage::Query,
+            channels(values.remove("--query-channels"), "953")?,
+        ),
+        (
+            report::Stage::Value,
+            channels(values.remove("--value-channels"), "126,668,1602")?,
+        ),
+        (
+            report::Stage::MlpOutput,
+            channels(values.remove("--mlp-output-channels"), "2615")?,
+        ),
+    ];
+    if let Some(value) = values.remove("--mlp-up-channels") {
+        selected.push((report::Stage::MlpUp, channels(Some(value), "")?));
+    }
+    Ok(selected)
 }
 fn path(v: &mut BTreeMap<String, OsString>, key: &str) -> Result<PathBuf> {
     Ok(v.remove(key)
