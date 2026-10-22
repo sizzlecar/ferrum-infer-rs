@@ -9,6 +9,7 @@ use crate::ResolvedNativeOperatorArtifactSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CudaNativeBuildUnit {
+    CutlassFp8ScaledMm,
     Marlin,
     VllmMarlin,
     VllmMoeMarlin,
@@ -20,7 +21,8 @@ pub enum CudaNativeBuildUnit {
 }
 
 impl CudaNativeBuildUnit {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
+        Self::CutlassFp8ScaledMm,
         Self::Marlin,
         Self::VllmMarlin,
         Self::VllmMoeMarlin,
@@ -33,6 +35,7 @@ impl CudaNativeBuildUnit {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::CutlassFp8ScaledMm => "cutlass_fp8_scaled_mm",
             Self::Marlin => "marlin",
             Self::VllmMarlin => "vllm_marlin",
             Self::VllmMoeMarlin => "vllm_moe_marlin",
@@ -46,6 +49,7 @@ impl CudaNativeBuildUnit {
 
     pub const fn artifact_operator(self) -> &'static str {
         match self {
+            Self::CutlassFp8ScaledMm => crate::cutlass_fp8::CUTLASS_FP8_OPERATOR,
             Self::Marlin => "ferrum.cuda.marlin",
             Self::VllmMarlin => "ferrum.cuda.vllm_marlin",
             Self::VllmMoeMarlin => "ferrum.cuda.vllm_moe_marlin",
@@ -70,6 +74,7 @@ impl CudaNativeBuildUnit {
     /// the retained mathematical entrypoint signatures.
     pub const fn required_operator_abi_version(self) -> Option<&'static str> {
         match self {
+            Self::CutlassFp8ScaledMm => Some("1"),
             Self::Marlin => Some("2"),
             Self::VllmMoeMarlin => Some("3"),
             _ => None,
@@ -132,6 +137,7 @@ impl CudaNativeBuildUnit {
 
     pub const fn required_exports(self) -> &'static [&'static str] {
         match self {
+            Self::CutlassFp8ScaledMm => &crate::cutlass_fp8::CUTLASS_FP8_EXPORTS,
             Self::UpstreamQ6F32Linear => &[
                 "ferrum_upstream_q6_f32_check_weights_v1",
                 "ferrum_upstream_q6_f32_dot_v1",

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.cutlass_fp8_scaled_mm",
+  "operator_abi_version": "1",
+  "backend": "cuda",
+  "compute_capabilities": ["sm_120"],
+  "provider_bindings": [
+    {
+      "operation_id": "operation.dense_linear_fp8.bf16",
+      "provider_id": "provider.cuda.dense_linear_fp8.bf16.cutlass.sm120",
+      "entrypoints": [
+        "ferrum_cutlass_fp8_plan_v1",
+        "ferrum_cutlass_fp8_run_v1",
+        "ferrum_cutlass_fp8_validate_v1"
+      ]
+    }
+  ],
+  "required_exports": [
+    "ferrum_cutlass_fp8_plan_v1",
+    "ferrum_cutlass_fp8_run_v1",
+    "ferrum_cutlass_fp8_validate_v1"
+  ],
+  "license_files": [
+    {"source_path": "LICENSE", "output_path": "licenses/Ferrum-MIT.txt"},
+    {"source_path": "native-operators/cuda/cutlass-fp8/CUTLASS-BSD-3-Clause.txt", "output_path": "licenses/CUTLASS-BSD-3-Clause.txt"}
+  ],
+  "cuda_toolkit": "12.8",
+  "cuda_runtime_min": "12.8",
+  "system_libraries": ["cuda_runtime", "std_cxx"]
+}
