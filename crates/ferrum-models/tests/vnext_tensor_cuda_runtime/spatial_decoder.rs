@@ -32,7 +32,7 @@ const SELECTED: [CudaTensorOperation; 3] = [
 ];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "probe", rename_all = "snake_case")]
 enum Probe {
     OddChannels,
     AlternatingRows,
@@ -183,6 +183,19 @@ impl Probe {
     }
 }
 struct DecoderFamily;
+
+#[test]
+fn typed_decoder_probes_prepare_without_device_creation() {
+    for probe in [Probe::OddChannels, Probe::AlternatingRows, Probe::Padding] {
+        TypedFamilyRegistration::new(DecoderFamily)
+            .prepare_with_profile(
+                &serde_json::to_value(probe).unwrap(),
+                &NumericalProfileId::new(PROFILE).unwrap(),
+            )
+            .unwrap();
+    }
+}
+
 impl ModelFamilyProvider for DecoderFamily {
     type Config = Probe;
     fn family_id(&self) -> &ModelFamilyId {
