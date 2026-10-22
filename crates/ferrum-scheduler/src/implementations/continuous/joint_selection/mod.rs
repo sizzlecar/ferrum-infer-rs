@@ -7,6 +7,9 @@ mod trajectory;
 #[cfg(test)]
 mod recoverability_tests;
 
+#[cfg(test)]
+mod planning_profile;
+
 use super::*;
 use crate::{cost_prediction::*, joint_policy::*};
 use ferrum_interfaces::request_observation::{
