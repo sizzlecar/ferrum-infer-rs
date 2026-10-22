@@ -3,13 +3,17 @@ use axum::body::Bytes;
 use base64::{engine::general_purpose::STANDARD, write::EncoderWriter};
 use ferrum_models::qwen_image21::pipeline_adapters::QwenImage21RgbaOutput;
 use ferrum_output::{
-    png::{write_rgba8_png, PngDimensions, PngLimits},
+    png::{encoded_rgba8_png_bytes, write_rgba8_png, PngDimensions, PngLimits},
     OutputBytesLease, OutputSession,
 };
 use ferrum_runtime::{
     HostMemoryAccount, HostMemoryClass, ManagedHostBuffer, ManagedHostBytes, ResolvedTensorSpec,
 };
 use std::io::{self, Cursor, Write};
+
+const JSON_PREFIX: &[u8] = b"{\"created\":";
+const JSON_DATA: &[u8] = b",\"data\":[{\"b64_json\":\"";
+const JSON_SUFFIX: &[u8] = b"\"}]}";
 
 /// The backing charge and output credit outlive the response body if a client
 /// still holds any Bytes clone/slice. No encoded String or PNG Vec is produced.
@@ -53,11 +57,17 @@ impl PreparedEncoding {
             ));
         }
         let dimensions = PngDimensions::new(width as u64, height as u64).map_err(internal)?;
-        limits.validate(dimensions).map_err(internal)?;
+        let png_bytes = encoded_rgba8_png_bytes(dimensions, limits).map_err(internal)?;
+        let created = chrono::Utc::now().timestamp();
+        let count = response_bytes(png_bytes, created)
+            .ok_or_else(|| capacity("encoded image length exceeds the host address space"))?;
+        if count > session.config().max_event_bytes {
+            return Err(capacity("encoded image exceeds configured output limit"));
+        }
         let scratch = host
             .allocate_zeroed(HostMemoryClass::Output, scratch_bytes)
             .map_err(capacity)?;
-        let mut prepared = Self {
+        Ok(Self {
             session,
             host,
             tensor,
@@ -65,35 +75,17 @@ impl PreparedEncoding {
             scratch,
             dimensions,
             limits,
-            created: chrono::Utc::now().timestamp(),
-            count: 0,
-        };
-        let mut counter = CountWriter {
-            count: 0,
-            limit: prepared.session.config().max_event_bytes,
-            exceeded: false,
-        };
-        if let Err(error) = prepared.write(&mut counter) {
-            return Err(if counter.exceeded {
-                ServerError::CapacityExceeded(
-                    "encoded image exceeds configured output limit".into(),
-                )
-            } else {
-                internal(error)
-            });
-        }
-        prepared.count = counter.count;
-        Ok(prepared)
+            created,
+            count,
+        })
     }
 
     fn write(&mut self, sink: &mut dyn Write) -> io::Result<()> {
         let rgba = QwenImage21RgbaOutput::new(&self.host, &self.tensor, &self.raw)
             .map_err(io::Error::other)?;
-        write!(
-            sink,
-            "{{\"created\":{},\"data\":[{{\"b64_json\":\"",
-            self.created
-        )?;
+        sink.write_all(JSON_PREFIX)?;
+        write!(sink, "{}", self.created)?;
+        sink.write_all(JSON_DATA)?;
         {
             let mut base64 = EncoderWriter::new(&mut *sink, &STANDARD);
             write_rgba8_png(&mut base64, self.dimensions, self.limits, |stream| {
@@ -103,7 +95,7 @@ impl PreparedEncoding {
             .map_err(io::Error::other)?;
             base64.finish()?;
         }
-        sink.write_all(b"\"}]}")?;
+        sink.write_all(JSON_SUFFIX)?;
         Ok(())
     }
 
@@ -116,7 +108,7 @@ impl PreparedEncoding {
         self.write(&mut cursor).map_err(internal)?;
         if cursor.position() != self.count as u64 {
             return Err(ServerError::InternalError(
-                "encoded image size changed between passes".into(),
+                "encoded image size differs from the admitted exact length".into(),
             ));
         }
         Ok(Bytes::from_owner(EncodedImage {
@@ -159,27 +151,18 @@ fn capacity(error: impl std::fmt::Display) -> ServerError {
     ServerError::CapacityExceeded(format!("image output capacity: {error}"))
 }
 
-struct CountWriter {
-    count: usize,
-    limit: usize,
-    exceeded: bool,
+fn response_bytes(png_bytes: u64, created: i64) -> Option<usize> {
+    // STANDARD base64 has padding and does not escape any JSON string bytes.
+    let base64_bytes = png_bytes.div_ceil(3).checked_mul(4)?;
+    let timestamp_bytes =
+        created.unsigned_abs().checked_ilog10().unwrap_or(0) as u64 + 1 + u64::from(created < 0);
+    let bytes = base64_bytes
+        .checked_add(timestamp_bytes)?
+        .checked_add((JSON_PREFIX.len() + JSON_DATA.len() + JSON_SUFFIX.len()) as u64)?;
+    usize::try_from(bytes)
+        .ok()
+        .filter(|bytes| *bytes <= isize::MAX as usize)
 }
-impl Write for CountWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let Some(next) = self
-            .count
-            .checked_add(bytes.len())
-            .filter(|next| *next <= self.limit)
-        else {
-            self.exceeded = true;
-            return Err(io::Error::other(
-                "image response size exceeds configured limit",
-            ));
-        };
-        self.count = next;
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
+
+#[cfg(test)]
+mod tests;

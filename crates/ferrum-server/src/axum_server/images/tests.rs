@@ -132,6 +132,26 @@ async fn png_base64_body_retains_host_and_output_credit_until_last_byte_owner() 
     let png = base64::engine::general_purpose::STANDARD
         .decode(json["data"][0]["b64_json"].as_str().unwrap())
         .unwrap();
+    // Compare with the unchanged direct PNG writer, independently of the HTTP
+    // size predictor. The optimized response must preserve the actual PNG and
+    // complete JSON bytes, not merely produce another decodable image.
+    let expected_pixels = [
+        255, 0, 128, 0, 255, 0, 128, 255, 255, 0, 128, 0, 255, 0, 128, 255,
+    ];
+    let mut expected_png = Vec::new();
+    ferrum_output::png::write_rgba8_png(
+        &mut expected_png,
+        ferrum_output::png::PngDimensions::new(2, 2).unwrap(),
+        PngLimits::default(),
+        |writer| writer.write_all(&expected_pixels),
+    )
+    .unwrap();
+    assert_eq!(png, expected_png);
+    let expected_base64 = base64::engine::general_purpose::STANDARD.encode(&expected_png);
+    let created = json["created"].as_i64().unwrap();
+    let expected_json =
+        format!("{{\"created\":{created},\"data\":[{{\"b64_json\":\"{expected_base64}\"}}]}}");
+    assert_eq!(bytes.as_ref(), expected_json.as_bytes());
     let mut reader = png::Decoder::new(Cursor::new(png)).read_info().unwrap();
     let mut pixels = [0; 16];
     let info = reader.next_frame(&mut pixels).unwrap();
@@ -139,10 +159,7 @@ async fn png_base64_body_retains_host_and_output_credit_until_last_byte_owner() 
         (info.width, info.height, info.color_type),
         (2, 2, png::ColorType::Rgba)
     );
-    assert_eq!(
-        pixels,
-        [255, 0, 128, 0, 255, 0, 128, 255, 255, 0, 128, 0, 255, 0, 128, 255]
-    );
+    assert_eq!(pixels, expected_pixels);
     drop(raw);
     let mut body =
         super::super::output::retained_body(session, Body::from(bytes)).into_data_stream();

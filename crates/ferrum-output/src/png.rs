@@ -149,6 +149,7 @@ impl PngReceipt {
 pub enum PngError {
     InvalidDimensions(&'static str),
     InvalidLimits(&'static str),
+    EncodedLengthOverflow,
     RowLimitExceeded { row_bytes: usize, limit: usize },
     Encoding(::png::EncodingError),
     Io(io::Error),
@@ -161,6 +162,7 @@ impl fmt::Display for PngError {
                 write!(formatter, "invalid PNG dimensions: {reason}")
             }
             Self::InvalidLimits(reason) => write!(formatter, "invalid PNG limits: {reason}"),
+            Self::EncodedLengthOverflow => write!(formatter, "PNG encoded length exceeds u64"),
             Self::RowLimitExceeded { row_bytes, limit } => {
                 write!(formatter, "PNG RGBA row {row_bytes} exceeds limit {limit}")
             }
@@ -190,6 +192,54 @@ impl From<io::Error> for PngError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
+}
+
+/// Exact byte length of [`write_rgba8_png`] when the emitter writes the complete
+/// image **without calling `flush`**. This computes metadata only: it neither
+/// reads pixels nor reserves output memory. Arbitrary emitter flushes can add
+/// DEFLATE blocks and IDAT chunks and are outside this length contract.
+///
+/// This describes the current encoding profile: png 0.18.1's streaming
+/// NoCompression path, with the workspace-locked flate2 1.1.5 / miniz_oxide 0.8.9
+/// Rust backend. It is not a generic PNG-size formula. Dependency/backend or
+/// finish-policy changes must revalidate it against the real writer. Callers
+/// admitting a fixed output buffer must also check the actual encoded length;
+/// a size prediction never authorizes publishing a partial output.
+pub fn encoded_rgba8_png_bytes(
+    dimensions: PngDimensions,
+    limits: PngLimits,
+) -> Result<u64, PngError> {
+    limits.validate(dimensions)?;
+    // One filter-type byte precedes each uncompressed RGBA scanline.
+    let filtered_bytes = u64::from(dimensions.width)
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_mul(u64::from(dimensions.height)))
+        .ok_or(PngError::EncodedLengthOverflow)?;
+    stored_png_bytes(filtered_bytes, limits.idat_buffer_bytes as u64)
+}
+
+fn stored_png_bytes(filtered_bytes: u64, idat_bytes: u64) -> Result<u64, PngError> {
+    // miniz_oxide::deflate::stored flushes when bytes_written > 31 * 1024.
+    // Every full 31745-byte block adds five bytes. Sync also writes a tail
+    // block (even when empty) and an empty sync block, after the zlib header.
+    let before_finish = (filtered_bytes / (31 * 1024 + 1))
+        .checked_mul(5)
+        .and_then(|n| n.checked_add(filtered_bytes))
+        .and_then(|n| n.checked_add(2 + 5 + 5))
+        .ok_or(PngError::EncodedLengthOverflow)?;
+    // StreamWriter::finish first Sync-flushes the ChunkWriter, ending the
+    // current IDAT. Finish then emits an empty final block + Adler32 (9 bytes)
+    // into a fresh IDAT buffer. These two chunk counts cannot be combined.
+    let chunks = before_finish
+        .div_ceil(idat_bytes)
+        .checked_add(9_u64.div_ceil(idat_bytes))
+        .ok_or(PngError::EncodedLengthOverflow)?;
+    chunks
+        .checked_mul(12) // IDAT length, type and CRC.
+        .and_then(|n| n.checked_add(before_finish))
+        .and_then(|n| n.checked_add(9 + 8 + 25 + 12)) // Finish, signature, IHDR, IEND.
+        .ok_or(PngError::EncodedLengthOverflow)
 }
 
 struct CountWriter<'a, W: Write + ?Sized> {

@@ -185,3 +185,125 @@ fn sink_flush_failure_cannot_publish_a_success_receipt() {
     assert!(calls.get() > 0);
     assert!(sink.bytes > 0);
 }
+
+fn assert_predicted_length_and_pixels(width: u64, height: u64, idat: usize, chunk: usize) {
+    let dimensions = PngDimensions::new(width, height).unwrap();
+    let limits = PngLimits::new(MAX_RGBA_ROW_BYTES, idat).unwrap();
+    // Different contents have the same stored-stream length. Chunks deliberately
+    // cross both RGBA pixels and scanline boundaries; the emitter never flushes.
+    for patterned in [false, true] {
+        let pixels = (0..dimensions.rgba_bytes())
+            .map(|index| {
+                if patterned {
+                    (index.wrapping_mul(37) >> 3) as u8
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected = encoded_rgba8_png_bytes(dimensions, limits).unwrap();
+        let mut encoded = Vec::new();
+        let receipt = write_rgba8_png(&mut encoded, dimensions, limits, |writer| {
+            for bytes in pixels.chunks(chunk) {
+                writer.write_all(bytes)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            receipt.encoded_bytes(),
+            expected,
+            "{width}x{height}, IDAT {idat}"
+        );
+        assert_eq!(encoded.len() as u64, expected);
+        let mut reader = ::png::Decoder::new(Cursor::new(&encoded))
+            .read_info()
+            .unwrap();
+        let mut decoded = vec![0; dimensions.rgba_bytes()];
+        reader.next_frame(&mut decoded).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(decoded, pixels);
+    }
+}
+
+#[test]
+fn exact_length_matches_stored_block_boundaries_and_row_chunking() {
+    // Filtered lengths include 31743, 31745, 31746, 63489 and 63490. The exact
+    // multiples must account for the empty tail written by Sync, not ceil(L/B).
+    for (width, height) in [
+        (1, 1),
+        (2645, 3),
+        (7936, 1),
+        (3968, 2),
+        (1, 6349),
+        (15872, 1),
+        (1, 12698),
+        ((MAX_RGBA_ROW_BYTES / 4) as u64, 2),
+    ] {
+        for chunk in [13, 8192] {
+            assert_predicted_length_and_pixels(width, height, MAX_IDAT_BUFFER_BYTES, chunk);
+        }
+    }
+}
+
+#[test]
+fn exact_length_keeps_sync_and_finish_idat_chunks_separate() {
+    // 2x2 has 18 filtered bytes: 30 bytes before Finish and a separate 9-byte
+    // tail. Cover exact divisions of either portion and IDAT boundaries ±1.
+    for idat in [1, 3, 8, 9, 10, 15, 16, 29, 30, 31] {
+        assert_predicted_length_and_pixels(2, 2, idat, 3);
+    }
+}
+
+#[test]
+fn exact_length_checks_limits_and_arithmetic_without_allocating_pixels() {
+    let too_wide = PngDimensions::new((MAX_RGBA_ROW_BYTES / 4 + 1) as u64, 1).unwrap();
+    assert!(matches!(
+        encoded_rgba8_png_bytes(too_wide, PngLimits::default()),
+        Err(PngError::RowLimitExceeded { .. })
+    ));
+    assert!(matches!(
+        encoded_rgba8_png_bytes(
+            PngDimensions::new(2, 2).unwrap(),
+            PngLimits::new(7, 1).unwrap()
+        ),
+        Err(PngError::RowLimitExceeded { .. })
+    ));
+    // Exercise both DEFLATE-length and IDAT-overhead overflow in the checked
+    // arithmetic helper; public dimensions reject impossible extents earlier.
+    for filtered_bytes in [u64::MAX, u64::MAX / 2] {
+        assert!(matches!(
+            stored_png_bytes(filtered_bytes, 1),
+            Err(PngError::EncodedLengthOverflow)
+        ));
+    }
+    if usize::BITS == 64 {
+        let dimensions =
+            PngDimensions::new((MAX_RGBA_ROW_BYTES / 4) as u64, u32::MAX as u64).unwrap();
+        assert!(
+            encoded_rgba8_png_bytes(dimensions, PngLimits::default()).unwrap()
+                > dimensions.rgba_bytes() as u64
+        );
+    }
+}
+
+#[test]
+fn explicit_emitter_flush_is_outside_the_exact_length_contract() {
+    let dimensions = PngDimensions::new(2, 2).unwrap();
+    let limits = PngLimits::default();
+    let mut encoded = Vec::new();
+    write_rgba8_png(&mut encoded, dimensions, limits, |writer| {
+        writer.write_all(&PIXELS[..8])?;
+        writer.flush()?;
+        writer.write_all(&PIXELS[8..])
+    })
+    .unwrap();
+    assert!(encoded.len() as u64 > encoded_rgba8_png_bytes(dimensions, limits).unwrap());
+    let mut reader = ::png::Decoder::new(Cursor::new(&encoded))
+        .read_info()
+        .unwrap();
+    let mut decoded = [0; 16];
+    reader.next_frame(&mut decoded).unwrap();
+    reader.finish().unwrap();
+    assert_eq!(decoded, PIXELS);
+}
