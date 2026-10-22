@@ -20,6 +20,7 @@ mod assets;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 mod prepare;
+pub mod service;
 mod stage;
 pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources};
 pub use stage::{
@@ -144,6 +145,8 @@ pub struct ImageDenoiseStepReceipt {
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageGenerationReceipt {
     pub job: u64,
+    pub batch_size: usize,
+    pub batch_index: usize,
     pub width: u32,
     pub height: u32,
     pub seed: u64,
@@ -234,6 +237,19 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         &mut self,
         request: ImageGenerationRequest,
     ) -> Result<ImageGenerationOutput, ImageGenerationError<R>> {
+        let mut outputs = self.generate_batch(vec![request])?;
+        Ok(outputs.remove(0))
+    }
+
+    /// One real shared TE/DiT/VAE forward per stage (and timestep), with each
+    /// request's independent fresh Philox stream. All requests must have the
+    /// same geometry and this pipeline's fixed schedule/profile. Components
+    /// still cold-load per batch; no cross-batch residency is claimed here.
+    /// Output slices retain the entire batch backing until the last one drops.
+    pub fn generate_batch(
+        &mut self,
+        requests: Vec<ImageGenerationRequest>,
+    ) -> Result<Vec<ImageGenerationOutput>, ImageGenerationError<R>> {
         let empty_error = |failure| ImageGenerationError {
             failure,
             completed_stages: Vec::new(),
@@ -243,7 +259,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             return Err(empty_error(ImageGenerationFailure::Unavailable));
         }
         let prepared = self
-            .prepare(&request)
+            .prepare_batch(&requests)
             .map_err(|e| empty_error(ImageGenerationFailure::Preflight(e)))?;
         let job = self.next_job;
         self.next_job = self.next_job.checked_add(1).ok_or_else(|| {
@@ -253,25 +269,43 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         })?;
         let mut stages = Vec::with_capacity(4);
         let mut steps = Vec::with_capacity(self.assets.schedule.evaluation_count());
-        match self.run(prepared, &request, job, &mut stages, &mut steps) {
-            Ok(rgba) => Ok(ImageGenerationOutput {
-                rgba,
-                receipt: ImageGenerationReceipt {
-                    job,
-                    width: request.width,
-                    height: request.height,
-                    seed: request.seed,
-                    stages,
-                    steps,
-                    runtime_fingerprint: self
-                        .runtime
-                        .descriptor()
-                        .runtime_implementation_fingerprint
-                        .clone(),
-                    assets: self.assets.receipt().clone(),
-                    euler_profile: self.profiles.euler.id(),
-                },
-            }),
+        let result = self
+            .run(prepared, &requests, job, &mut stages, &mut steps)
+            .and_then(|rgba| {
+                requests
+                    .iter()
+                    .enumerate()
+                    .map(|(batch_index, request)| {
+                        Ok(ImageGenerationOutput {
+                            rgba: rgba.batch_item(batch_index).map_err(|e| {
+                                ImageGenerationFailure::Processing {
+                                    source: e.into(),
+                                    active: None,
+                                }
+                            })?,
+                            receipt: ImageGenerationReceipt {
+                                job,
+                                batch_size: requests.len(),
+                                batch_index,
+                                width: request.width,
+                                height: request.height,
+                                seed: request.seed,
+                                stages: stages.clone(),
+                                steps: steps.clone(),
+                                runtime_fingerprint: self
+                                    .runtime
+                                    .descriptor()
+                                    .runtime_implementation_fingerprint
+                                    .clone(),
+                                assets: self.assets.receipt().clone(),
+                                euler_profile: self.profiles.euler.id(),
+                            },
+                        })
+                    })
+                    .collect()
+            });
+        match result {
+            Ok(outputs) => Ok(outputs),
             Err(failure) => {
                 self.stopped = true;
                 Err(ImageGenerationError {
@@ -286,7 +320,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     fn run(
         &self,
         prepared: PreparedRequest<R>,
-        request: &ImageGenerationRequest,
+        requests: &[ImageGenerationRequest],
         job: u64,
         stages: &mut Vec<ImageStageReceipt>,
         steps: &mut Vec<ImageDenoiseStepReceipt>,
@@ -334,26 +368,53 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         drop(hidden);
         let text_input = features.into_tensor();
 
-        let mut state = self
+        // A batch has independent seed streams, not one longer draw. The
+        // noise session is reused while per-sample outputs are copied directly
+        // into one admitted NCHW backing. Heavy model stages execute batch B.
+        let [_, _, height, width] = latent_shape.nchw_dimensions();
+        let item_shape = QwenImage21LatentShape::new(1, height, width).map_err(process)?;
+        let mut batch_noise = self
             .host
-            .allocate_zeroed(HostMemoryClass::InputPreprocess, 16)
+            .allocate_zeroed(HostMemoryClass::InputPreprocess, latent_shape.byte_len())
             .map_err(|e| process(e.into()))?;
-        state
-            .as_mut()
-            .copy_from_slice(&PhiloxSeedOffset::fresh(request.seed).little_endian_bytes());
-        let state = ManagedHostTensor::new(
-            id(NormalNoiseFamily::STATE_ID).map_err(process)?,
-            NormalNoiseConfig::state_tensor().map_err(|e| process(e.into()))?,
-            state.freeze(),
+        let mut noise = noise_stage.start(self, job, ComponentWeightSource::None)?;
+        for (index, request) in requests.iter().enumerate() {
+            let state = match noise_state(&self.host, request.seed) {
+                Ok(state) => state,
+                Err(error) => return Err(noise.processing(error)),
+            };
+            let (active, outputs) = noise.execute(job, vec![state])?;
+            noise = active;
+            let copy = (|| -> anyhow::Result<()> {
+                let output = only_output(outputs, NormalNoiseFamily::OUTPUT_ID)?;
+                let checked = QwenImage21ManagedLatents::from_output(
+                    &self.host,
+                    &output,
+                    item_shape,
+                    QwenImage21LatentLayout::Nchw,
+                    QwenImage21LatentDomain::Normalized,
+                )?;
+                let stride = item_shape.byte_len();
+                batch_noise.as_mut()[index * stride..(index + 1) * stride]
+                    .copy_from_slice(checked.bytes().bytes());
+                Ok(())
+            })();
+            if let Err(error) = copy {
+                return Err(noise.processing(error));
+            }
+        }
+        stages.push(noise.close()?);
+        let batch_noise = ManagedHostTensor::new(
+            id(NormalNoiseFamily::OUTPUT_ID).map_err(process)?,
+            latent_shape
+                .tensor(QwenImage21LatentLayout::Nchw)
+                .map_err(process)?,
+            batch_noise.freeze(),
         )
         .map_err(|e| process(e.into()))?;
-        let noise = noise_stage.start(self, job, ComponentWeightSource::None)?;
-        let (noise, outputs) = noise.execute(job, vec![state])?;
-        stages.push(noise.close()?);
-        let noise_output = only_output(outputs, NormalNoiseFamily::OUTPUT_ID).map_err(process)?;
-        let latents = QwenImage21ManagedLatents::from_output(
+        let latents = QwenImage21ManagedLatents::new(
             &self.host,
-            &noise_output,
+            batch_noise,
             latent_shape,
             QwenImage21LatentLayout::Nchw,
             QwenImage21LatentDomain::Normalized,
@@ -368,7 +429,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map_err(process)?
             .into_input_tensor()
             .map_err(process)?;
-        drop((latents, noise_output));
+        drop(latents);
 
         let frequencies = transformer
             .managed_rotary_frequencies(&self.host)
@@ -456,6 +517,18 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
 
 fn id<T: TryFrom<String, Error = VNextError>>(value: impl Into<String>) -> anyhow::Result<T> {
     Ok(T::try_from(value.into())?)
+}
+
+fn noise_state(host: &HostMemoryAccount, seed: u64) -> anyhow::Result<ManagedHostTensor> {
+    let mut state = host.allocate_zeroed(HostMemoryClass::InputPreprocess, 16)?;
+    state
+        .as_mut()
+        .copy_from_slice(&PhiloxSeedOffset::fresh(seed).little_endian_bytes());
+    Ok(ManagedHostTensor::new(
+        id(NormalNoiseFamily::STATE_ID)?,
+        NormalNoiseConfig::state_tensor()?,
+        state.freeze(),
+    )?)
 }
 
 fn only_output(

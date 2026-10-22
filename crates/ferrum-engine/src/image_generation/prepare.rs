@@ -14,16 +14,22 @@ pub(super) struct PreparedRequest<R: DeviceRuntime> {
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// No payload allocation or device submission occurs during preparation.
     /// Missing noise/decoder capabilities are discovered before TE uploads.
-    pub(super) fn prepare(
+    pub(super) fn prepare_batch(
         &self,
-        request: &ImageGenerationRequest,
+        requests: &[ImageGenerationRequest],
     ) -> anyhow::Result<PreparedRequest<R>> {
         let (height, width) =
-            request.latent_dimensions(&self.config, self.assets.spatial_scale()?)?;
+            batch_dimensions(requests, &self.config, self.assets.spatial_scale()?)?;
+        let request = &requests[0];
+        let batch = requests.len();
+        let prompt_text = requests
+            .iter()
+            .map(|r| r.prompt.as_str())
+            .collect::<Vec<_>>();
         let prompts = self
             .assets
             .tokenizer
-            .prepare(&[request.prompt.as_str()], self.config.maximum_user_tokens)?;
+            .prepare(&prompt_text, self.config.maximum_user_tokens)?;
         let text = Qwen3VLTextConfig::new(self.assets.text.clone(), prompts.layout().clone())?;
         let layout = QwenImage21T2iLayout::new(
             u32::try_from(prompts.feature_sequence_length())?,
@@ -37,15 +43,20 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         )?;
         let transformer =
             QwenImage21TransformerConfig::new(self.assets.transformer.clone(), layout)?;
-        let decoder = self.assets.decoder(height, width)?;
+        let decoder = self.assets.decoder_batch(batch, height, width)?;
         ensure!(
             decoder.output_tensor()?.dimensions()
-                == [1, 4, u64::from(request.height), u64::from(request.width)],
+                == [
+                    u64::try_from(batch)?,
+                    4,
+                    u64::from(request.height),
+                    u64::from(request.width)
+                ],
             "decoder output does not reproduce exact requested size"
         );
         let noise = NormalNoiseConfig::new(64, u64::from(height), u64::from(width))?;
         let latent_shape =
-            QwenImage21LatentShape::new(1, usize::try_from(height)?, usize::try_from(width)?)?;
+            QwenImage21LatentShape::new(batch, usize::try_from(height)?, usize::try_from(width)?)?;
         let text_family = TypedFamilyRegistration::new(Qwen3VLTextEncoderFamily::new()?)
             .prepare_with_profile(&serde_json::to_value(&text)?, &self.profiles.text_encoder)?;
         let noise_family =
@@ -93,4 +104,23 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             decode_stage,
         })
     }
+}
+
+pub(super) fn batch_dimensions(
+    requests: &[ImageGenerationRequest],
+    config: &ImagePipelineConfig,
+    scale: u32,
+) -> anyhow::Result<(u32, u32)> {
+    ensure!(
+        (1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&requests.len()),
+        "image request batch exceeds the declared attention layout capacity"
+    );
+    let first = requests[0].latent_dimensions(config, scale)?;
+    for request in &requests[1..] {
+        ensure!(
+            request.latent_dimensions(config, scale)? == first,
+            "request batch requires equal image dimensions"
+        );
+    }
+    Ok(first)
 }

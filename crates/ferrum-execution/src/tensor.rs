@@ -9,6 +9,8 @@ use std::{fmt, sync::Arc};
 use ferrum_runtime::*;
 
 mod admission;
+#[cfg(test)]
+mod output_slices;
 
 /// Bounds physical-backing maintenance, not logical capacity waiting.
 #[derive(Debug, Clone, Copy)]
@@ -100,7 +102,8 @@ impl<R: DeviceRuntime> fmt::Debug for TensorExecutionError<R> {
     }
 }
 
-/// Exact compiled output with an immutable, accounted Host owner.
+/// Compiled output (or an explicitly selected batch item) with an immutable,
+/// accounted Host owner.
 #[derive(Debug, Clone)]
 pub struct TensorExecutionOutput {
     value_id: ProgramValueId,
@@ -117,6 +120,44 @@ impl TensorExecutionOutput {
     }
     pub fn bytes(&self) -> &ManagedHostBytes {
         &self.bytes
+    }
+
+    /// Select one item of a contiguous leading batch axis, retaining that axis
+    /// with extent one. Every slice keeps the entire physical backing charged
+    /// until its last owner drops; this neither copies nor reclassifies bytes.
+    pub fn batch_item(&self, index: usize) -> Result<Self, VNextError> {
+        if self.tensor.layout() != &ResolvedTensorLayout::Contiguous {
+            return Err(invalid("batch slicing requires a contiguous output"));
+        }
+        let mut dimensions = self.tensor.dimensions().to_vec();
+        let batch = dimensions
+            .first_mut()
+            .ok_or_else(|| invalid("output has no batch axis"))?;
+        let count = usize::try_from(*batch).map_err(|_| invalid("batch exceeds address space"))?;
+        if index >= count || self.bytes.len() % count != 0 {
+            return Err(invalid(
+                "batch item is out of bounds or has an invalid byte extent",
+            ));
+        }
+        *batch = 1;
+        let stride = self.bytes.len() / count;
+        let start = index
+            .checked_mul(stride)
+            .ok_or_else(|| invalid("batch offset overflow"))?;
+        let tensor = ResolvedTensorSpec::new(
+            dimensions,
+            self.tensor.element_type(),
+            ResolvedTensorLayout::Contiguous,
+        )?;
+        let bytes = self
+            .bytes
+            .slice(start..start + stride)
+            .map_err(|e| invalid(e.to_string()))?;
+        Ok(Self {
+            value_id: self.value_id.clone(),
+            tensor,
+            bytes,
+        })
     }
 }
 

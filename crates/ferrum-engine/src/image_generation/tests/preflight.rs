@@ -142,3 +142,84 @@ fn reference_missing_real_philox_fails_during_compilation_not_as_fake_noise() {
     assert_eq!(composition.runtime().snapshot().allocations, 0);
     assert_eq!(composition.runtime().snapshot().submissions, 0);
 }
+
+#[test]
+fn batched_heavy_component_graphs_compile_one_forward_with_separate_sample_layouts() {
+    for batch in [2, 8] {
+        let composition = composition("device.image.stage.batched-ports");
+        let mut masks = vec![vec![Qwen3VLTextKeyRun::new(3, true)]; batch];
+        masks[1] = vec![
+            Qwen3VLTextKeyRun::new(2, true),
+            Qwen3VLTextKeyRun::new(1, false),
+        ];
+        let text =
+            Qwen3VLTextConfig::new(text(), Qwen3VLTextLayout::new(3, masks).unwrap()).unwrap();
+        let mut valid = vec![3; batch];
+        valid[1] = 2;
+        let dit = QwenImage21TransformerConfig::new(
+            transformer(),
+            QwenImage21T2iLayout::new(3, 2, 2, valid).unwrap(),
+        )
+        .unwrap();
+        let vae = QwenImage21VaeDecoderConfig::new(
+            64,
+            1,
+            vec![1, 2, 4, 8, 8],
+            2,
+            vec![true, true, true, false],
+            batch as u64,
+            2,
+            2,
+        )
+        .unwrap();
+        let text_family = TypedFamilyRegistration::new(Qwen3VLTextEncoderFamily::new().unwrap())
+            .prepare_with_profile(
+                &serde_json::to_value(&text).unwrap(),
+                &NumericalProfileId::new(Qwen3VLTextEncoderFamily::REFERENCE_PROFILE_ID).unwrap(),
+            )
+            .unwrap();
+        let dit_family = TypedFamilyRegistration::new(QwenImage21TransformerFamily::new().unwrap())
+            .prepare_with_profile(
+                &serde_json::to_value(&dit).unwrap(),
+                &NumericalProfileId::new(QwenImage21TransformerFamily::REFERENCE_PROFILE_ID)
+                    .unwrap(),
+            )
+            .unwrap();
+        let vae_family = TypedFamilyRegistration::new(QwenImage21VaeDecoderFamily::new().unwrap())
+            .prepare_with_profile(
+                &serde_json::to_value(&vae).unwrap(),
+                &NumericalProfileId::new(QwenImage21VaeDecoderFamily::REFERENCE_PROFILE_ID)
+                    .unwrap(),
+            )
+            .unwrap();
+        let cases = [
+            (
+                text_family,
+                text.compile_options().unwrap(),
+                vec![batch as u64 * 3, 8],
+            ),
+            (
+                dit_family,
+                dit.compile_options().unwrap(),
+                vec![batch as u64 * 4, 64],
+            ),
+            (
+                vae_family,
+                vae.compile_options().unwrap(),
+                vec![batch as u64, 4, 32, 32],
+            ),
+        ];
+        for (family, options, expected) in cases {
+            let compiled = compile(&composition, family, &options).unwrap();
+            let ports = compiled
+                .executable()
+                .execution_plan()
+                .payload()
+                .tensor_ports()
+                .unwrap();
+            assert_eq!(ports.outputs()[0].tensor().dimensions(), expected);
+        }
+        assert_eq!(composition.runtime().snapshot().submissions, 0);
+        assert_eq!(composition.runtime().snapshot().allocations, 0);
+    }
+}

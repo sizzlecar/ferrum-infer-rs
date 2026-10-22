@@ -153,13 +153,22 @@ impl QwenImage21Assets {
         height: u32,
         width: u32,
     ) -> anyhow::Result<QwenImage21VaeDecoderConfig> {
+        self.decoder_batch(1, height, width)
+    }
+
+    pub(super) fn decoder_batch(
+        &self,
+        batch: usize,
+        height: u32,
+        width: u32,
+    ) -> anyhow::Result<QwenImage21VaeDecoderConfig> {
         Ok(QwenImage21VaeDecoderConfig::new(
             self.vae.latent_channels(),
             self.vae.base_channels(),
             self.vae.dim_mult().to_vec(),
             self.vae.num_res_blocks(),
             self.vae.temporal_upsample().to_vec(),
-            1,
+            u64::try_from(batch)?,
             u64::from(height),
             u64::from(width),
         )?)

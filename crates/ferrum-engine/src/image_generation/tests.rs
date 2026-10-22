@@ -26,6 +26,30 @@ fn request() -> ImageGenerationRequest {
 }
 
 #[test]
+fn compatible_request_batches_keep_independent_prompts_and_seeds_and_reject_mixed_shapes() {
+    let a = request();
+    let mut b = a.clone();
+    b.prompt = "a different yellow cup".into();
+    b.seed = 42 ^ (1_u64 << 40);
+    assert_eq!(
+        prepare::batch_dimensions(&[a.clone(), b.clone()], &config(), 16).unwrap(),
+        (48, 32)
+    );
+    assert!(prepare::batch_dimensions(&[], &config(), 16).is_err());
+    b.width = 1024;
+    assert!(prepare::batch_dimensions(&[a.clone(), b.clone()], &config(), 16).is_err());
+    b.width = a.width;
+    b.n = 2;
+    assert!(prepare::batch_dimensions(&[a.clone(), b], &config(), 16).is_err());
+    assert!(prepare::batch_dimensions(
+        &vec![a; STRUCTURED_ATTENTION_BF16_MAX_BATCH + 1],
+        &config(),
+        16
+    )
+    .is_err());
+}
+
+#[test]
 fn request_dimensions_are_exact_and_unsupported_controls_fail_before_device_work() {
     let request = request();
     assert_eq!(request.latent_dimensions(&config(), 16).unwrap(), (48, 32));
