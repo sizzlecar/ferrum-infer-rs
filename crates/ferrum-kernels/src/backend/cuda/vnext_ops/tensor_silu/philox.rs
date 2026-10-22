@@ -49,7 +49,7 @@ impl CudaPhiloxDeviceGeometry {
             attr(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?,
         )
     }
-    fn new(multiprocessors: i32, threads: i32) -> Result<Self, CudaDeviceRuntimeError> {
+    pub(super) fn new(multiprocessors: i32, threads: i32) -> Result<Self, CudaDeviceRuntimeError> {
         if multiprocessors <= 0 || threads < THREADS as i32 {
             return Err(CudaDeviceRuntimeError::contract(
                 "Philox requires positive SM count and at least 256 threads per SM",
@@ -109,17 +109,40 @@ impl CudaPhiloxLaunchGeometry {
     }
 }
 
-pub(in crate::backend::cuda::vnext_ops) fn create(
-    runtime: &CudaDeviceRuntime,
-) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
-    let policy = CudaPhiloxDeviceGeometry::query(runtime)?;
-    let descriptor = descriptor(runtime.descriptor(), policy)?;
-    let kernels = RetainedFunctions::load(runtime)?;
-    Ok(Box::new(PhiloxProvider {
-        descriptor,
-        policy,
-        kernels,
-    }))
+/// Keeps the exact fingerprinted geometry attached to its provider descriptor.
+/// Preparation is metadata-only; native module ownership is injected once the
+/// complete selection has been checked and the shared bundle has been loaded.
+pub(super) struct PreparedProvider {
+    descriptor: OperationProviderDescriptor,
+    policy: CudaPhiloxDeviceGeometry,
+}
+
+impl PreparedProvider {
+    pub(super) fn new(
+        device: &DeviceDescriptor,
+        policy: CudaPhiloxDeviceGeometry,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Ok(Self {
+            descriptor: descriptor(device, policy)?,
+            policy,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn descriptor(&self) -> &OperationProviderDescriptor {
+        &self.descriptor
+    }
+
+    pub(super) fn into_provider(
+        self,
+        kernels: &Arc<RetainedFunctions>,
+    ) -> Box<dyn OperationProvider<CudaDeviceRuntime>> {
+        Box::new(PhiloxProvider {
+            descriptor: self.descriptor,
+            policy: self.policy,
+            kernels: Arc::clone(kernels),
+        })
+    }
 }
 fn descriptor(
     device: &DeviceDescriptor,

@@ -416,18 +416,25 @@ pub fn cuda_vnext_silu_bf16_provider(
 
 /// Standalone explicit-state RNG provider. Device SM/thread limits become part
 /// of this provider's fingerprint. It acquires the same single module permit
-/// as other tensor factories, so the previous bundle must retire first.
+/// as other tensor factories. To share that module with other stages, select
+/// `CudaTensorOperation::PhiloxNormal` in the common tensor provider factory
+/// instead of combining standalone factories in one live runtime.
 /// Fresh offset-zero output has NOT been qualified against deployed Torch.
 pub fn cuda_vnext_philox_normal_bf16_provider(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
-    tensor_silu::philox_provider(runtime)
+    let mut providers = cuda_vnext_tensor_providers(runtime, &[CudaTensorOperation::PhiloxNormal])?;
+    providers
+        .pop()
+        .ok_or_else(|| CudaDeviceRuntimeError::contract("Philox selection produced no provider"))
 }
 
 /// Assemble an explicitly selected subset from one shared native module and
 /// capacity permit. Empty/duplicate selections and missing runtime capabilities
 /// are rejected before native loading. Selection order is preserved. Register
 /// each selected operation's standard contract; Dense is supplied separately.
+/// Selecting `PhiloxNormal` queries launch geometry from this existing runtime
+/// and shares the same module owner with all selected component operations.
 /// New normalization/activation profiles require their own target evidence.
 pub fn cuda_vnext_tensor_providers(
     runtime: &CudaDeviceRuntime,
@@ -440,6 +447,8 @@ pub fn cuda_vnext_tensor_providers(
 /// All native kernels share one module permit; the cuDNN handle/descriptors
 /// acquire a separate explicit opaque capacity claim. An empty native selection
 /// is valid for a convolution-only plan. No token or capture path is enabled.
+/// The selection may include `PhiloxNormal`, so noise and later image stages
+/// can retain one combined registry without a second native module load.
 pub fn cuda_vnext_tensor_providers_with_cudnn(
     runtime: &CudaDeviceRuntime,
     config: &super::vnext_runtime::CudaCudnnConfig,

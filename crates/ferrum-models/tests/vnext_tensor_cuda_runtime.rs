@@ -16,6 +16,8 @@ mod spatial;
 mod spatial_decoder;
 #[path = "vnext_tensor_cuda_runtime/text.rs"]
 mod text;
+#[path = "vnext_tensor_cuda_runtime/torch_philox.rs"]
+mod torch_philox;
 #[path = "vnext_tensor_cuda_runtime/transport.rs"]
 mod transport;
 

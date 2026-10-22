@@ -124,6 +124,17 @@ impl Config {
             std::env::join_paths(&self.library_directories)?,
         );
         command.env_remove("LD_PRELOAD").env_remove("LD_AUDIT");
+        // Both the compiler scan/build and oracle execution use this path.
+        // Do not let an inherited SDK search path silently satisfy headers or
+        // libraries absent from the explicit configuration and compiler.
+        for name in [
+            "CPATH",
+            "CPLUS_INCLUDE_PATH",
+            "C_INCLUDE_PATH",
+            "LIBRARY_PATH",
+        ] {
+            command.env_remove(name);
+        }
         command.stdin(Stdio::null());
         Ok(command)
     }
@@ -684,6 +695,44 @@ fn valid_sha(value: &str) -> bool {
 mod tests {
     use super::*;
     use ferrum_runtime::{HostMemoryClassLimits, HostMemoryLimits};
+
+    #[test]
+    fn child_removes_implicit_search_paths_and_keeps_explicit_loader_directories() {
+        let mut config = config();
+        config
+            .library_directories
+            .push("/deployed/nvidia/cu13/lib".into());
+        let command = config.child(Path::new("/test/oracle")).unwrap();
+        for name in [
+            "CPATH",
+            "CPLUS_INCLUDE_PATH",
+            "C_INCLUDE_PATH",
+            "LIBRARY_PATH",
+            "LD_PRELOAD",
+            "LD_AUDIT",
+        ] {
+            let entry = command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name));
+            assert!(
+                matches!(entry, Some((_, None))),
+                "{name} was not explicitly removed"
+            );
+        }
+        let loader = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("LD_LIBRARY_PATH"))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        let expected_loader = std::env::join_paths(&config.library_directories).unwrap();
+        assert_eq!(loader, expected_loader.as_os_str());
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new("PATH")),
+            "the configured compiler may still need ordinary toolchain PATH"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn worker_name() -> String {

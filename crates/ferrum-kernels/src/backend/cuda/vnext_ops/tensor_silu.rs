@@ -40,7 +40,6 @@ mod gqa;
 mod half_split_rope;
 mod norm;
 mod philox;
-pub(super) use philox::create as philox_provider;
 pub use philox::{
     CudaPhiloxDeviceGeometry, CudaPhiloxLaunchGeometry,
     BUILD_IDENTITY_SHA256 as PHILOX_BUILD_IDENTITY_SHA256,

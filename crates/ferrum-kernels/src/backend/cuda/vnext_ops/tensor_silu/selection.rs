@@ -30,10 +30,13 @@ pub enum CudaTensorOperation {
     ChannelL2NormImage,
     SpatialAttention,
     SpatialUpsampleGather,
+    /// Explicit-state normal generation. Its launch geometry is queried from
+    /// the existing runtime only when this operation is selected.
+    PhiloxNormal,
 }
 
 impl CudaTensorOperation {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -56,6 +59,7 @@ impl CudaTensorOperation {
         Self::ChannelL2NormImage,
         Self::SpatialAttention,
         Self::SpatialUpsampleGather,
+        Self::PhiloxNormal,
     ];
 
     fn pointwise(self) -> Option<Kind> {
@@ -164,10 +168,42 @@ impl CudaTensorOperation {
     }
 }
 
-pub(super) fn selected_descriptors(
-    device: &DeviceDescriptor,
-    selected: &[CudaTensorOperation],
-) -> Result<Vec<(CudaTensorOperation, OperationProviderDescriptor)>, CudaDeviceRuntimeError> {
+/// A Philox descriptor cannot lose or substitute its fingerprinted geometry
+/// between metadata validation and sharing the admitted module owner.
+pub(super) enum SelectedDescriptor {
+    Fixed(CudaTensorOperation, OperationProviderDescriptor),
+    Philox(philox::PreparedProvider),
+}
+
+impl SelectedDescriptor {
+    #[cfg(test)]
+    fn operation(&self) -> CudaTensorOperation {
+        match self {
+            Self::Fixed(operation, _) => *operation,
+            Self::Philox(_) => CudaTensorOperation::PhiloxNormal,
+        }
+    }
+
+    #[cfg(test)]
+    fn descriptor(&self) -> &OperationProviderDescriptor {
+        match self {
+            Self::Fixed(_, descriptor) => descriptor,
+            Self::Philox(prepared) => prepared.descriptor(),
+        }
+    }
+
+    fn into_provider(
+        self,
+        kernels: &Arc<RetainedFunctions>,
+    ) -> Box<dyn OperationProvider<CudaDeviceRuntime>> {
+        match self {
+            Self::Fixed(operation, descriptor) => operation.provider(descriptor, kernels),
+            Self::Philox(prepared) => prepared.into_provider(kernels),
+        }
+    }
+}
+
+fn validate_selection(selected: &[CudaTensorOperation]) -> Result<(), CudaDeviceRuntimeError> {
     if selected.is_empty() || selected.len() > CudaTensorOperation::ALL.len() {
         return Err(CudaDeviceRuntimeError::contract(
             "CUDA tensor operation selection must be nonempty and bounded by the module",
@@ -180,29 +216,76 @@ pub(super) fn selected_descriptors(
             ));
         }
     }
+    Ok(())
+}
+
+/// Pure metadata preparation. Philox needs explicitly supplied, checked device
+/// geometry; absence never falls back to creating a context or querying a GPU.
+pub(super) fn selected_descriptors(
+    device: &DeviceDescriptor,
+    selected: &[CudaTensorOperation],
+    philox_geometry: Option<CudaPhiloxDeviceGeometry>,
+) -> Result<Vec<SelectedDescriptor>, CudaDeviceRuntimeError> {
+    validate_selection(selected)?;
     selected
         .iter()
         .copied()
-        .map(|operation| operation.descriptor(device).map(|d| (operation, d)))
+        .map(|operation| {
+            if operation == CudaTensorOperation::PhiloxNormal {
+                let geometry = philox_geometry.ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "Philox selection requires explicit device launch geometry",
+                    )
+                })?;
+                philox::PreparedProvider::new(device, geometry).map(SelectedDescriptor::Philox)
+            } else {
+                operation
+                    .descriptor(device)
+                    .map(|d| SelectedDescriptor::Fixed(operation, d))
+            }
+        })
         .collect()
+}
+
+pub(super) fn runtime_descriptors(
+    runtime: &CudaDeviceRuntime,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<SelectedDescriptor>, CudaDeviceRuntimeError> {
+    runtime_descriptors_with_query(runtime.descriptor(), selected, || {
+        CudaPhiloxDeviceGeometry::query(runtime)
+    })
+}
+
+fn runtime_descriptors_with_query(
+    device: &DeviceDescriptor,
+    selected: &[CudaTensorOperation],
+    query: impl FnOnce() -> Result<CudaPhiloxDeviceGeometry, CudaDeviceRuntimeError>,
+) -> Result<Vec<SelectedDescriptor>, CudaDeviceRuntimeError> {
+    validate_selection(selected)?;
+    let geometry = if selected.contains(&CudaTensorOperation::PhiloxNormal) {
+        Some(query()?)
+    } else {
+        None
+    };
+    selected_descriptors(device, selected, geometry)
 }
 
 pub(super) fn providers(
     runtime: &CudaDeviceRuntime,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    let descriptors = selected_descriptors(runtime.descriptor(), selected)?;
+    let descriptors = runtime_descriptors(runtime, selected)?;
     let kernels = RetainedFunctions::load(runtime)?;
     Ok(providers_from_descriptors(descriptors, &kernels))
 }
 
 pub(super) fn providers_from_descriptors(
-    descriptors: Vec<(CudaTensorOperation, OperationProviderDescriptor)>,
+    descriptors: Vec<SelectedDescriptor>,
     kernels: &Arc<RetainedFunctions>,
 ) -> Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> {
     descriptors
         .into_iter()
-        .map(|(operation, descriptor)| operation.provider(descriptor, kernels))
+        .map(|descriptor| descriptor.into_provider(kernels))
         .collect()
 }
 

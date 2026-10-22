@@ -8,8 +8,8 @@
 mod attention;
 mod block0;
 mod block0_mlp;
-mod config;
 mod conditioning;
+mod config;
 mod headers;
 mod image_projection;
 pub mod pipeline_adapters;

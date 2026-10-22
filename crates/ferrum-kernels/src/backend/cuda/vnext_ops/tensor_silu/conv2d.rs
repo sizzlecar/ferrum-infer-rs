@@ -41,7 +41,7 @@ pub(crate) fn providers(
     let descriptors = if selected.is_empty() {
         Vec::new()
     } else {
-        selection::selected_descriptors(runtime.descriptor(), selected)?
+        selection::runtime_descriptors(runtime, selected)?
     };
     let owner = CudaCudnnOwner::new(runtime, config)?;
     let contract = conv2d_bf16_contract().map_err(contract_error)?;
