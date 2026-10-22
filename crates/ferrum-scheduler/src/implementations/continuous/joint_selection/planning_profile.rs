@@ -8,6 +8,8 @@ use ferrum_types::{RequestId, SchedulerSloConfig, SloStrategy};
 use serde::Serialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod admission_load;
+
 #[derive(Clone, Copy, Serialize)]
 struct ProfilePlan {
     iterations: usize,
