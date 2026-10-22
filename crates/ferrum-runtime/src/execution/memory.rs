@@ -6,10 +6,11 @@ use super::{
     AllocationLifetime, BTreeMap, BTreeSet, BufferRequest, BufferUsage, CanonicalU128, Deserialize,
     Deserializer, DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDemand,
     DynamicResourceDescriptor, DynamicResourceShape, ElementType, InvocationLivenessMode,
-    InvocationResourceLiveness, NodeId, PlanNode, PoolAggregateEvidence, PoolCompatibilityKey,
-    ResolvedReusableExecutionBucket, ResourceAllocation, ResourceId, ReusableExecutionMemoryPlan,
-    ReusableExecutionPolicy, ReusablePoolWorkspaceBudget, Serialize, StepResourceSlot,
-    StepResourceSlotKind, VNextError, MAX_EXECUTION_PLAN_RESOURCE_ROWS,
+    InvocationResourceLiveness, NodeId, NodeWorkContract, PlanNode, PoolAggregateEvidence,
+    PoolCompatibilityKey, ResolvedReusableExecutionBucket, ResolvedValueRole, ResourceAllocation,
+    ResourceId, ReusableExecutionMemoryPlan, ReusableExecutionPolicy, ReusablePoolWorkspaceBudget,
+    Serialize, StepResourceSlot, StepResourceSlotKind, VNextError,
+    MAX_EXECUTION_PLAN_RESOURCE_ROWS,
 };
 
 mod startup;
@@ -730,6 +731,34 @@ impl MemoryPlan {
             .iter()
             .map(|node| (node.id.clone(), node))
             .collect::<BTreeMap<_, _>>();
+        // Fixed tensor inputs are uploaded before the whole submission wave,
+        // even when their first consumer is much later. Only node-produced
+        // values may therefore use the first/last-user liveness intervals.
+        // Semantic plan validation guarantees SSA producer-before-consumer
+        // bindings. Exclude an entire physical resource if any binding on it
+        // is externally supplied, including aliases with an internal output.
+        let produced_values = nodes
+            .iter()
+            .flat_map(|node| &node.values)
+            .filter(|value| value.role() == ResolvedValueRole::Output)
+            .map(|value| value.value_id())
+            .collect::<BTreeSet<_>>();
+        let external_resources = nodes
+            .iter()
+            .flat_map(|node| &node.values)
+            .filter(|value| !produced_values.contains(value.value_id()))
+            .flat_map(|value| value.storage().components())
+            .map(|component| component.resource_id())
+            .collect::<BTreeSet<_>>();
+        let internal_fixed_resources = nodes
+            .iter()
+            .filter(|node| matches!(node.work, NodeWorkContract::Fixed))
+            .flat_map(|node| &node.values)
+            .filter(|value| value.role() == ResolvedValueRole::Output)
+            .flat_map(|value| value.storage().components())
+            .map(|component| component.resource_id())
+            .filter(|resource| !external_resources.contains(resource))
+            .collect::<BTreeSet<_>>();
         let mut intervals = descriptors
             .iter()
             .filter(|descriptor| descriptor.lifetime == AllocationLifetime::Step)
@@ -762,6 +791,8 @@ impl MemoryPlan {
                     // Completion diagnostics read after the terminal fence, so
                     // a retained activation cannot share a liveness slot.
                     reusable: Self::is_reusable_step_activation(descriptor)
+                        && (!matches!(descriptor.demand, DynamicResourceDemand::Fixed { .. })
+                            || internal_fixed_resources.contains(&descriptor.base_resource_id))
                         && !retained_completion_resources.contains(&descriptor.base_resource_id),
                 })
             })
@@ -845,7 +876,10 @@ impl MemoryPlan {
         descriptor.lifetime == AllocationLifetime::Step
             && descriptor.usage == BufferUsage::Activations
             && matches!(descriptor.kind, AllocationKind::Value)
-            && matches!(descriptor.demand, DynamicResourceDemand::Tokens { .. })
+            && matches!(
+                descriptor.demand,
+                DynamicResourceDemand::Tokens { .. } | DynamicResourceDemand::Fixed { .. }
+            )
     }
 
     fn step_slot_bytes(

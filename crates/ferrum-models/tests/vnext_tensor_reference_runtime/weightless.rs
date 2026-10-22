@@ -15,6 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod fault_runtime;
 use fault_runtime::{FaultRuntime, FenceMode};
 
+#[path = "fixed_liveness.rs"]
+mod fixed_liveness;
+
 const PROFILE: &str = "reference.tensor.weightless.silu.bf16";
 const BYTE_LEN: usize = 24;
 const INPUT_BITS: [u16; 12] = [

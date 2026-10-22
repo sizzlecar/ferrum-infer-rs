@@ -5,6 +5,9 @@ use crate::{
     ResourceRequirements, TensorContract,
 };
 
+#[path = "fixed_tensor_liveness_tests.rs"]
+mod fixed_tensor_liveness;
+
 #[test]
 fn execution_plan_wire_limit_is_symmetric() {
     super::validation::validate_execution_plan_wire_size(
