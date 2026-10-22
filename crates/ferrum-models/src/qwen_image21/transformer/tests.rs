@@ -245,22 +245,22 @@ fn full_graph_reuses_two_distinct_layers_and_only_retains_target_velocity() {
         assert!(graph.states().is_empty());
         assert_eq!(graph.weights().len(), 27);
         let nodes = &graph.blocks()[0].nodes;
-        assert_eq!(nodes.len(), 2 * 21 + 22);
         assert_eq!(profile.boundaries.len(), nodes.len());
-        assert_eq!(nodes[15].inputs[0], id(program::JOINT));
-        assert_eq!(nodes[36].inputs[0], nodes[35].outputs[0]);
-        assert_eq!(nodes[57].inputs[0], nodes[56].outputs[0]);
-        assert_eq!(nodes[57].outputs[0], id(program::TARGET_HIDDEN));
+        assert_shared_gates(&graph, config.transformer().layers());
+        let target = nodes
+            .iter()
+            .find(|node| node.outputs == [id(program::TARGET_HIDDEN)])
+            .unwrap();
         assert_eq!(
-            attr(&nodes[57].attributes, "source_starts"),
+            attr(&target.attributes, "source_starts"),
             &SemanticValue::Integers(vec![3])
         );
         assert_eq!(
-            attr(&nodes[57].attributes, "source_batch_strides"),
+            attr(&target.attributes, "source_batch_strides"),
             &SemanticValue::Integers(vec![11])
         );
         assert_eq!(
-            attr(&nodes[57].attributes, "source_row_strides"),
+            attr(&target.attributes, "source_row_strides"),
             &SemanticValue::Integers(vec![1])
         );
         let block = Block::new().unwrap();
@@ -269,11 +269,22 @@ fn full_graph_reuses_two_distinct_layers_and_only_retains_target_velocity() {
         let source = block
             .semantic_program(&block_config, &sources.profiles()[0])
             .unwrap();
-        for layer in 0..2 {
-            for (actual, original) in nodes[15 + layer * 21..15 + (layer + 1) * 21]
+        let mut previous = id(program::JOINT);
+        for layer in 0..config.transformer().layers() {
+            let prefix = format!("node.qwen_image21.transformer.layer{layer}.");
+            let layer_nodes = nodes
                 .iter()
-                .zip(&source.blocks()[0].nodes)
-            {
+                .filter(|node| node.id.as_str().starts_with(&prefix))
+                .collect::<Vec<_>>();
+            assert_eq!(layer_nodes.first().unwrap().inputs[0], previous);
+            previous = layer_nodes.last().unwrap().outputs[0].clone();
+            let unchanged = source.blocks()[0]
+                .nodes
+                .iter()
+                .filter(|node| remap::shared_gate_destination(node).unwrap().is_none())
+                .collect::<Vec<_>>();
+            assert_eq!(layer_nodes.len(), unchanged.len());
+            for (actual, original) in layer_nodes.into_iter().zip(unchanged) {
                 if is_fp8(profile.id.as_str())
                     && original.operation_id.as_str() == DENSE_LINEAR_BF16_OPERATION_ID
                 {
@@ -292,6 +303,7 @@ fn full_graph_reuses_two_distinct_layers_and_only_retains_target_velocity() {
                     .all(|value| !value.as_str().contains("block0")));
             }
         }
+        assert_eq!(target.inputs, [previous]);
         let referenced = nodes
             .iter()
             .flat_map(|node| &node.inputs)
@@ -311,6 +323,73 @@ fn full_graph_reuses_two_distinct_layers_and_only_retains_target_velocity() {
                 assert_eq!(operation.accumulation_type, None);
             }
         }
+    }
+}
+
+fn assert_shared_gates(graph: &ModelProgram, layers: u64) {
+    let nodes = &graph.blocks()[0].nodes;
+    let gates = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.operation_id.as_str() == TANH_BF16_OPERATION_ID)
+        .collect::<Vec<_>>();
+    assert_eq!(gates.len(), program::TANH_GATES.len());
+    for (gate_index, (producer_index, producer)) in gates.into_iter().enumerate() {
+        assert_eq!(
+            producer.inputs,
+            [id(program::CONDITIONING[1 + 2 * gate_index])]
+        );
+        assert_eq!(producer.outputs, [id(program::TANH_GATES[gate_index])]);
+        assert!(producer.attributes.is_empty());
+        let consumers = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.inputs.contains(&producer.outputs[0]))
+            .collect::<Vec<_>>();
+        assert_eq!(consumers.len() as u64, layers);
+        for (consumer_index, consumer) in consumers {
+            assert!(consumer_index > producer_index);
+            assert_eq!(
+                consumer.operation_id.as_str(),
+                GATED_RESIDUAL_BF16_OPERATION_ID
+            );
+            assert_eq!(consumer.inputs[1], producer.outputs[0]);
+        }
+    }
+}
+
+#[test]
+fn shared_gate_remapping_rejects_changed_arithmetic_or_input() {
+    let family = Block::new().unwrap();
+    let config = config(true).block_config().unwrap();
+    let profiles = family.numerical_profiles(&config).unwrap();
+    let source = family
+        .semantic_program(&config, &profiles.profiles()[0])
+        .unwrap();
+    let gate = source.blocks()[0]
+        .nodes
+        .iter()
+        .find(|node| node.outputs == [id(Block::TANH_GATE1_ID)])
+        .unwrap();
+    assert_eq!(
+        remap::shared_gate_destination(gate).unwrap(),
+        Some(program::TANH_GATES[0])
+    );
+    for mutation in 0..5 {
+        let mut changed = gate.clone();
+        match mutation {
+            0 => changed.operation_id = OperationId::new(SILU_BF16_OPERATION_ID).unwrap(),
+            1 => changed.inputs[0] = id(Block::GATE2_ID),
+            2 => changed.required_version = ContractVersion::new(2, 0),
+            3 => changed.outputs.push(id("value.unexpected.gate")),
+            _ => {
+                changed.attributes.insert(
+                    AttributeId::new("unexpected").unwrap(),
+                    SemanticValue::Unsigned(1),
+                );
+            }
+        }
+        assert!(remap::shared_gate_destination(&changed).is_err());
     }
 }
 
@@ -339,7 +418,7 @@ fn real_full_schema_keeps_all_297_tensor_components_without_diagnostic_completio
     let graph = family
         .semantic_program(&config, &profiles.profiles()[0])
         .unwrap();
-    assert_eq!(graph.blocks()[0].nodes.len(), 32 * 21 + 22);
+    assert_shared_gates(&graph, config.transformer().layers());
     assert_eq!(graph.outputs(), &[id(F::VELOCITY_ID)]);
 }
 
@@ -475,7 +554,19 @@ fn typed_compile_options_supply_transport_shapes_and_retain_only_velocity() {
     assert_eq!(ports.outputs().len(), 1);
     assert_eq!(ports.outputs()[0].value_id(), &id(F::VELOCITY_ID));
     assert_eq!(ports.outputs()[0].tensor().dimensions(), [16, 4]);
-    assert_eq!(plan.payload().nodes().len(), 64);
+    let gate_outputs = plan
+        .payload()
+        .nodes()
+        .iter()
+        .filter(|node| node.operation_id().as_str() == TANH_BF16_OPERATION_ID)
+        .flat_map(|node| node.values())
+        .filter(|value| value.role() == ResolvedValueRole::Output)
+        .collect::<Vec<_>>();
+    assert_eq!(gate_outputs.len(), program::TANH_GATES.len());
+    for (gate, name) in gate_outputs.iter().zip(program::TANH_GATES) {
+        assert_eq!(gate.value_id(), &id(name));
+        assert_eq!(gate.tensor().dimensions(), [22, 16]);
+    }
     assert_eq!(composition.runtime().snapshot().live_allocations, 0);
     // A wrong caller override is rechecked against the row-map, not trusted.
     let mut wrong = options.clone();

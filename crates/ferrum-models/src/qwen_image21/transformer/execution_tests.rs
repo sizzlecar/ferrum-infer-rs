@@ -482,6 +482,10 @@ fn execute(
         }
     }
     assert_eq!(runtime.snapshot().live_allocations, 0);
+    // Each standalone block and the complete two-layer candidate execute the
+    // same two unary gates. The candidate shares their values across layers;
+    // the independent expected composition above recomputes them per block.
+    assert_eq!(runtime.snapshot().tanh_launches, 2);
     assert_eq!(host.usage().unwrap().allocated_bytes(), output_bytes);
     let result = outputs
         .iter()

@@ -8,6 +8,10 @@ pub(super) const CONDITIONING: [&str; 4] = [
     "value.qwen_image21.transformer.scale2",
     "value.qwen_image21.transformer.gate2",
 ];
+pub(super) const TANH_GATES: [&str; 2] = [
+    "value.qwen_image21.transformer.tanh_gate1",
+    "value.qwen_image21.transformer.tanh_gate2",
+];
 const TEXT_NORM: &str = "value.qwen_image21.transformer.text_norm";
 const TEXT_IN: &str = "value.qwen_image21.transformer.text_in";
 const TEXT_GELU: &str = "value.qwen_image21.transformer.text_gelu";
@@ -138,6 +142,18 @@ pub(super) fn build(
             vec![id(MODULATION)?],
             output,
             conditioning_attributes(config, index as u64 * h)?,
+        )?);
+    }
+    // Every layer consumes the same raw timestep gates. Preserve the unary
+    // BF16 boundary once and share its immutable result across the layer graph.
+    // Recomputing this independent branch per layer prevents dependency-based
+    // memory reuse even though the arithmetic has identical inputs.
+    for (index, raw) in [CONDITIONING[1], CONDITIONING[3]].into_iter().enumerate() {
+        nodes.push(unary(
+            &format!("tanh_gate{}", index + 1),
+            TANH_BF16_OPERATION_ID,
+            raw,
+            TANH_GATES[index],
         )?);
     }
     let block = Block::new()?;

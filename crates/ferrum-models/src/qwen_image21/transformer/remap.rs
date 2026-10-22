@@ -70,12 +70,23 @@ pub(super) fn append(
             ));
         }
     }
+    let mut shared_gate_nodes = BTreeSet::new();
     for (index, node) in source
         .blocks()
         .iter()
         .flat_map(|block| &block.nodes)
         .enumerate()
     {
+        if let Some(destination) = shared_gate_destination(node)? {
+            if map
+                .insert(node.outputs[0].clone(), ProgramValueId::new(destination)?)
+                .is_some()
+            {
+                return Err(invalid("program", "shared gate has a duplicate producer"));
+            }
+            shared_gate_nodes.insert(index);
+            continue;
+        }
         for (output_index, output) in node.outputs.iter().enumerate() {
             let destination = ProgramValueId::new(format!(
                 "value.qwen_image21.transformer.layer{layer}.node{index}.output{output_index}"
@@ -88,12 +99,21 @@ pub(super) fn append(
             }
         }
     }
+    if shared_gate_nodes.len() != program::TANH_GATES.len() {
+        return Err(invalid(
+            "program",
+            "block template lacks the two shared gate producers",
+        ));
+    }
     for (index, source_node) in source
         .blocks()
         .iter()
         .flat_map(|block| &block.nodes)
         .enumerate()
     {
+        if shared_gate_nodes.contains(&index) {
+            continue;
+        }
         if source_node.work != ProgramNodeWorkSpec::Fixed {
             return Err(invalid("program", "block template introduced token work"));
         }
@@ -124,4 +144,37 @@ pub(super) fn append(
     map.get(&ProgramValueId::new(Block::OUTPUT_ID)?)
         .cloned()
         .ok_or_else(|| invalid("program", "block template lacks final residual"))
+}
+
+/// Sharing is authorized only for the exact two existing unary operations.
+/// A future block with different gate arithmetic must not silently reuse them.
+pub(super) fn shared_gate_destination(
+    node: &ProgramNode,
+) -> Result<Option<&'static str>, VNextError> {
+    for (index, (output, input)) in [
+        (Block::TANH_GATE1_ID, Block::GATE1_ID),
+        (Block::TANH_GATE2_ID, Block::GATE2_ID),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if !node.outputs.iter().any(|value| value.as_str() == output) {
+            continue;
+        }
+        if node.operation_id.as_str() != TANH_BF16_OPERATION_ID
+            || node.required_version != ContractVersion::new(1, 0)
+            || node.work != ProgramNodeWorkSpec::Fixed
+            || node.inputs.len() != 1
+            || node.inputs[0].as_str() != input
+            || node.outputs.len() != 1
+            || !node.attributes.is_empty()
+        {
+            return Err(invalid(
+                "program",
+                "shared gate producer differs from unary BF16 tanh",
+            ));
+        }
+        return Ok(Some(program::TANH_GATES[index]));
+    }
+    Ok(None)
 }
