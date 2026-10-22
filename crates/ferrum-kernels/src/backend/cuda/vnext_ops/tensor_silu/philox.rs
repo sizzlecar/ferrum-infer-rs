@@ -109,7 +109,7 @@ impl CudaPhiloxLaunchGeometry {
     }
 }
 
-pub(super) fn create(
+pub(in crate::backend::cuda::vnext_ops) fn create(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
     let policy = CudaPhiloxDeviceGeometry::query(runtime)?;
