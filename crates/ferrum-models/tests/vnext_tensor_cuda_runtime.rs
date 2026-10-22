@@ -8,6 +8,8 @@ mod attention;
 mod normalization;
 #[path = "vnext_tensor_cuda_runtime/rotary.rs"]
 mod rotary;
+#[path = "vnext_tensor_cuda_runtime/spatial.rs"]
+mod spatial;
 #[path = "vnext_tensor_cuda_runtime/text.rs"]
 mod text;
 #[path = "vnext_tensor_cuda_runtime/transport.rs"]
