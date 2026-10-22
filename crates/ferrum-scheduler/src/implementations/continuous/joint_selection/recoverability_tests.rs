@@ -8,6 +8,8 @@ use ferrum_execution::model_executor::PrefillShapePolicy;
 use ferrum_types::SchedulerSloConfig;
 use std::cell::{Cell, RefCell};
 
+mod future_waiter;
+
 struct ExactCosts(Instant);
 
 impl ExactCosts {
