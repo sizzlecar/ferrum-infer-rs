@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn builder(execution: CostExecution) -> PlanBuilder {
     PlanBuilder {
         groups: [Vec::new(), Vec::new()],
+        members: Vec::new(),
         group_count: 0,
         participant_limit: 4,
         query_limits: CostQueryLimits::default(),
@@ -23,6 +24,52 @@ fn contents(plan: &PlanBuilder) -> Vec<Vec<(usize, CostWork)>> {
         .iter()
         .map(|group| group.iter().map(|m| (m.request, m.work)).collect())
         .collect()
+}
+
+#[test]
+fn reused_members_discard_failed_builds_without_rolling_back_accepted_groups() {
+    let mut plan = builder(CostExecution::SequentialPrefillThenDecode);
+    let prefill = member(0, AttemptWorkKind::Prefill);
+    let decode = member(1, AttemptWorkKind::Decode);
+    assert_eq!(
+        plan.with_members(|members, plan| {
+            members.extend([prefill, member(0, AttemptWorkKind::Decode)]);
+            plan.push_group_kind(members, AttemptWorkKind::Prefill)?;
+            plan.push_group_kind(members, AttemptWorkKind::Decode)
+        }),
+        Err(Unsupported::InvalidPlan)
+    );
+    // As before, rejection of the second split group leaves the accepted
+    // first group intact. Scratch reuse does not make the wave transactional.
+    assert_eq!(contents(&plan), vec![vec![(0, prefill.work)]]);
+    plan.with_members(|members, plan| {
+        assert!(members.is_empty());
+        assert_eq!(plan.active_mask(), Some([true; 4].as_slice()));
+        members.push(decode);
+        plan.push_group(members)
+    })
+    .unwrap();
+    assert_eq!(
+        contents(&plan),
+        vec![vec![(0, prefill.work)], vec![(1, decode.work)]]
+    );
+    plan.clear_groups();
+    assert_eq!(
+        plan.with_members(|members, _| {
+            assert!(members.is_empty());
+            members.push(prefill);
+            Err(Unsupported::NoProgress)
+        }),
+        Err(Unsupported::NoProgress)
+    );
+    assert!(plan.groups().is_empty());
+    plan.with_members(|members, plan| {
+        assert!(members.is_empty());
+        members.push(decode);
+        plan.push_group(members)
+    })
+    .unwrap();
+    assert_eq!(contents(&plan), vec![vec![(1, decode.work)]]);
 }
 
 #[test]

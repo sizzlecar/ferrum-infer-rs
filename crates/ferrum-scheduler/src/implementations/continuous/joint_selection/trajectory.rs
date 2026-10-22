@@ -210,12 +210,12 @@ impl CohortTrajectory {
         })
     }
 
-    fn push(&self, members: Vec<GroupMember>, plan: &mut PlanBuilder) -> Result<(), Unsupported> {
+    fn push(&self, members: &[GroupMember], plan: &mut PlanBuilder) -> Result<(), Unsupported> {
         if self.execution == CostExecution::SingleInvocation {
-            return plan.push_group(&members);
+            return plan.push_group(members);
         }
         for kind in [AttemptWorkKind::Prefill, AttemptWorkKind::Decode] {
-            plan.push_group_kind(&members, kind)?;
+            plan.push_group_kind(members, kind)?;
         }
         Ok(())
     }
@@ -251,10 +251,23 @@ impl CohortTrajectory {
         phase: Option<(NonZeroUsize, &[PrefillTarget], PrefillPackingMode)>,
         active: &[bool],
     ) -> Result<Vec<GroupMember>, Unsupported> {
+        let mut members = Vec::new();
+        self.natural_members_into(requests, phase, active, &mut members)?;
+        Ok(members)
+    }
+
+    fn natural_members_into(
+        &self,
+        requests: &[SimulatedRequest],
+        phase: Option<(NonZeroUsize, &[PrefillTarget], PrefillPackingMode)>,
+        active: &[bool],
+        members: &mut Vec<GroupMember>,
+    ) -> Result<(), Unsupported> {
         if requests.len() != self.shapes.len() || active.len() != requests.len() {
             return Err(Unsupported::ParticipantBudget);
         }
-        let mut members = Vec::with_capacity(requests.len());
+        members.clear();
+        members.reserve_exact(requests.len());
         let mut remaining = self.max_tokens;
         // The supported cohort fits the full decode width, so future cursor
         // rotation cannot change which resident decoders run in a wave.
@@ -365,7 +378,7 @@ impl CohortTrajectory {
         if members.is_empty() {
             return Err(Unsupported::NoProgress);
         }
-        Ok(members)
+        Ok(())
     }
 }
 
@@ -435,20 +448,33 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
         else {
             return Err(Unsupported::InvalidPlan);
         };
-        self.push(
-            self.natural_members_from_active(
+        plan.with_members(|members, plan| {
+            self.natural_members_into(
                 requests,
                 Some((*limit, phase.prefill_targets(), action.packing_mode())),
                 plan.active_mask().ok_or(Unsupported::InvalidState)?,
-            )?,
-            plan,
-        )
+                members,
+            )?;
+            self.push(members, plan)
+        })
     }
 
     fn plan(
         &self,
         first_action: Option<&FirstAction>,
         requests: &[SimulatedRequest],
+        plan: &mut PlanBuilder,
+    ) -> Result<(), Unsupported> {
+        plan.with_members(|members, plan| self.plan_into(first_action, requests, members, plan))
+    }
+}
+
+impl CohortTrajectory {
+    fn plan_into(
+        &self,
+        first_action: Option<&FirstAction>,
+        requests: &[SimulatedRequest],
+        members: &mut Vec<GroupMember>,
         plan: &mut PlanBuilder,
     ) -> Result<(), Unsupported> {
         if let Some(
@@ -461,27 +487,28 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
             if !self.first_wave.is_empty() || self.cap_commit_targets.is_empty() {
                 return Err(Unsupported::InvalidPlan);
             }
-            return self.push(
-                self.natural_members_from_active(
-                    requests,
-                    Some((*limit, &self.cap_commit_targets, action.packing_mode())),
-                    plan.active_mask().ok_or(Unsupported::InvalidState)?,
-                )?,
-                plan,
-            );
+            self.natural_members_into(
+                requests,
+                Some((*limit, &self.cap_commit_targets, action.packing_mode())),
+                plan.active_mask().ok_or(Unsupported::InvalidState)?,
+                members,
+            )?;
+            return self.push(members, plan);
         }
-        let mut members = if first_action.is_some() && !self.first_wave.is_empty() {
-            self.first_wave.clone()
+        if first_action.is_some() && !self.first_wave.is_empty() {
+            members.reserve_exact(self.first_wave.len());
+            members.extend_from_slice(&self.first_wave);
         } else {
-            self.natural_members_from_active(
+            self.natural_members_into(
                 requests,
                 None,
                 plan.active_mask().ok_or(Unsupported::InvalidState)?,
-            )?
-        };
+                members,
+            )?;
+        }
         match first_action {
             Some(FirstAction::DecodeOnly) => {
-                if !self.allows_decode_only(&members) {
+                if !self.allows_decode_only(members) {
                     return Err(Unsupported::InvalidPlan);
                 }
                 members.retain(|member| member.work.kind == AttemptWorkKind::Decode);
@@ -491,7 +518,7 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
                 | FirstAction::PrefillPhaseLimit(limit)
                 | FirstAction::ReservedPrefillPhaseLimit(limit),
             ) => {
-                for member in &mut members {
+                for member in members.iter_mut() {
                     if member.work.kind == AttemptWorkKind::Prefill {
                         let request = requests
                             .get(member.request)

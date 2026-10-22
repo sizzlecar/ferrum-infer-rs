@@ -115,6 +115,7 @@ impl SloPolicy {
         })?;
         let mut plan = PlanBuilder {
             groups: [Vec::new(), Vec::new()],
+            members: Vec::new(),
             group_count: 0,
             participant_limit: input.config.planning.max_participants,
             query_limits: input.config.query.intersect(limits),
@@ -133,6 +134,9 @@ impl SloPolicy {
             validate_member(input.requests, *member)?;
         }
         let work = group.iter().map(|member| member.work).collect::<Vec<_>>();
+        // Only the copied seed work is needed below. Do not retain its member
+        // scratch alongside each rank's separate simulation builder.
+        drop(plan);
         diagnostics.point(
             EvaluationPoint {
                 stage: EvaluationStage::Seed,

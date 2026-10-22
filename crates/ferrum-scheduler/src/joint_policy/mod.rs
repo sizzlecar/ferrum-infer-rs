@@ -170,6 +170,7 @@ pub struct GroupMember {
 /// Split is at most prefill followed by decode; mixed is one invocation.
 pub struct PlanBuilder {
     groups: [Vec<GroupMember>; 2],
+    members: Vec<GroupMember>,
     group_count: usize,
     participant_limit: usize,
     query_limits: CostQueryLimits,
@@ -178,6 +179,21 @@ pub struct PlanBuilder {
 }
 
 impl PlanBuilder {
+    /// Reuse only storage within this simulation; every wave rebuilds its
+    /// members against the core's current, frozen active mask. Taking the
+    /// scratch out permits reading that mask while constructing the members.
+    pub(crate) fn with_members(
+        &mut self,
+        build: impl FnOnce(&mut Vec<GroupMember>, &mut Self) -> Result<(), Unsupported>,
+    ) -> Result<(), Unsupported> {
+        let mut members = std::mem::take(&mut self.members);
+        members.clear();
+        let result = build(&mut members, self);
+        members.clear();
+        self.members = members;
+        result
+    }
+
     pub fn push_group(&mut self, members: &[GroupMember]) -> Result<(), Unsupported> {
         self.push_matching(members, None)
     }
@@ -736,6 +752,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
         .map_err(|_| Unsupported::InvalidState)?;
     let mut plan = PlanBuilder {
         groups: [Vec::new(), Vec::new()],
+        members: Vec::new(),
         group_count: 0,
         participant_limit: input.config.planning.max_participants,
         query_limits: input.config.query,

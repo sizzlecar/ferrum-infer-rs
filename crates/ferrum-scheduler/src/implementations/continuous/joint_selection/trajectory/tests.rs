@@ -1,6 +1,7 @@
 use super::*;
 
 mod cap_repacking;
+mod member_reuse;
 use ferrum_types::RequestId;
 use std::time::Duration;
 
