@@ -15,6 +15,9 @@ pub(super) mod accounting;
 #[cfg(test)]
 mod tests;
 
+mod service_times;
+use service_times::TimeEncoding;
+
 static NEXT_HANDLE_OWNER: AtomicU64 = AtomicU64::new(1);
 
 // Exhaustion is permanent: never reuse an owner identity, including across
@@ -56,7 +59,8 @@ struct Entry {
     execution: CostExecution,
     // Ranks are consecutive and weights/coupling were checked before insert.
     // Keep every rank value; the comparison owns the shared weight vector.
-    service_times: Box<[Duration]>,
+    service_times: Box<[u64]>,
+    time_encoding: TimeEncoding,
     dependence: CostScenarioDependence,
     support: CostSupport,
     samples: usize,
@@ -76,8 +80,12 @@ impl Entry {
             + std::mem::size_of_val(self.service_times.as_ref())
     }
 
+    fn service_time(&self, rank: usize) -> Option<Duration> {
+        self.time_encoding.get(&self.service_times, rank)
+    }
+
     fn prediction(&self, rank: usize) -> Option<CostPrediction> {
-        let service_time = *self.service_times.get(rank)?;
+        let service_time = self.service_time(rank)?;
         Some(CostPrediction::Known {
             central_service_time: service_time,
             upper_service_time: service_time,
@@ -238,10 +246,7 @@ impl ScenarioCache {
                 && entry.samples > 0
                 && entry.observed_at <= at
                 && at < entry.expires_at
-                && entry
-                    .service_times
-                    .get(rank)
-                    .is_some_and(|time| !time.is_zero())
+                && entry.service_time(rank).is_some_and(|time| !time.is_zero())
         })
     }
 
@@ -462,16 +467,13 @@ impl ScenarioCache {
                 accounting.counts.known_insert_attempts.saturating_add(1);
         }
         let previous = self.slots[slot].as_ref().map_or(0, Entry::payload_bytes);
+        let time_encoding = TimeEncoding::select(&scenarios);
+        let time_bytes = time_encoding.payload_bytes(scenarios.len());
         let Some(bytes) = query
             .work
             .len()
             .checked_mul(std::mem::size_of::<CostWork>())
-            .and_then(|work| {
-                scenarios
-                    .len()
-                    .checked_mul(std::mem::size_of::<Duration>())
-                    .and_then(|scenarios| work.checked_add(scenarios))
-            })
+            .and_then(|work| work.checked_add(time_bytes?))
             .and_then(|new| self.retained_bytes.checked_sub(previous)?.checked_add(new))
         else {
             #[cfg(test)]
@@ -522,7 +524,7 @@ impl ScenarioCache {
             accounting.work_payload =
                 accounting.work_payload - old_work + std::mem::size_of_val(query.work);
             accounting.service_time_payload = accounting.service_time_payload - old_times
-                + scenarios.len() * std::mem::size_of::<Duration>();
+                + time_bytes.expect("validated encoded payload bytes");
         }
         // Release a colliding payload before allocating its replacement key.
         self.slots[slot] = None;
@@ -530,10 +532,8 @@ impl ScenarioCache {
             work: query.work.into(),
             exact: query.work_is_exact,
             execution: query.execution,
-            service_times: scenarios
-                .into_iter()
-                .map(|scenario| scenario.service_time)
-                .collect::<Box<[_]>>(),
+            service_times: time_encoding.pack(scenarios),
+            time_encoding,
             dependence,
             support,
             samples,

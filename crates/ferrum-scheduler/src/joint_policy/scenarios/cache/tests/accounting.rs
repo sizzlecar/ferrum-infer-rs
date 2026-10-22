@@ -5,7 +5,7 @@ use super::*;
 fn accounting_separates_replacement_from_refused_bytes_and_preserves_cached_values() {
     let at = Instant::now();
     let keys = two_slot::colliding_work(2, 3);
-    let payload = std::mem::size_of::<CostWork>() + 2 * std::mem::size_of::<Duration>();
+    let payload = std::mem::size_of::<CostWork>() + 2 * std::mem::size_of::<u64>();
     let trace = 64;
     let budget = 2 * std::mem::size_of::<Option<Entry>>()
         + 2 * std::mem::size_of::<Option<NonZeroUsize>>()
@@ -50,7 +50,7 @@ fn accounting_separates_replacement_from_refused_bytes_and_preserves_cached_valu
     assert_eq!(first.victim_payload_bytes, payload);
     assert_eq!(
         first.proposed_retained_bytes,
-        budget + std::mem::size_of::<Duration>()
+        budget + std::mem::size_of::<u64>()
     );
     assert_eq!(
         count.last_byte_rejection.unwrap().proposed_retained_bytes,

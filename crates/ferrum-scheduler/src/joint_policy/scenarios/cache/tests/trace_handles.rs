@@ -170,7 +170,7 @@ fn trace_generations_hints_and_payload_share_one_budget_with_atomic_failures() {
     let at = Instant::now();
     let base = std::mem::size_of::<Option<Entry>>() + std::mem::size_of::<Option<NonZeroUsize>>();
     let generation_bytes = std::mem::size_of::<u64>();
-    let payload = std::mem::size_of::<CostWork>() + 2 * std::mem::size_of::<Duration>();
+    let payload = std::mem::size_of::<CostWork>() + 2 * std::mem::size_of::<u64>();
     let trace_size = 64;
     let budget = base + generation_bytes + payload + trace_size;
     let mut cache = enabled(at, budget, 1);

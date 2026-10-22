@@ -191,7 +191,26 @@ impl CostSnapshot for ConditionalCosts {
     }
 }
 
-fn run() -> Result<Value, String> {
+#[derive(Clone, Copy)]
+enum CacheAccounting {
+    Disabled,
+    Enabled,
+}
+
+impl CacheAccounting {
+    fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    fn scope(self) -> &'static str {
+        match self {
+            Self::Disabled => "Cache-accounting capture disabled: no TLS capture scope or populated accounting counters for this gate. This remains a cfg(test) diagnostic with existing test-only cache hit counters, not a production timing or GPU measurement. A null report means not collected, not zero events.",
+            Self::Enabled => "Test-only TLS opt-in for this one gate; fixed two reports plus explicit overflow. The cache-teardown report is the last retained-allocation ledger (trace may already be freed by local drop order); first/last byte-rejection snapshots are current ledger values. Neither is allocator RSS or a simultaneous peak. Counts add overhead, so this instrumented call is mechanism evidence, not a timing baseline. No extra prediction, comparison, request or cache traversal.",
+        }
+    }
+}
+
+fn run(accounting: CacheAccounting) -> Result<Value, String> {
     let (client, prompts, evidence) = inputs()?;
     let mut slo: SchedulerSloConfig = "ttft:15684.62,tpot:110.56,itl:196.55".parse().unwrap();
     slo.strategy = SloStrategy::Joint;
@@ -354,9 +373,18 @@ fn run() -> Result<Value, String> {
     };
     let mut observed = scheduler.observe_planning_round(Some(round));
     let started = Instant::now();
-    let ((), cache_accounting) = SloPolicy::capture_cache_accounting(|| {
-        scheduler.prepare_joint_admission_gate(&hint, observed.as_mut().unwrap(), started);
-    });
+    let cache_accounting = match accounting {
+        CacheAccounting::Disabled => {
+            scheduler.prepare_joint_admission_gate(&hint, observed.as_mut().unwrap(), started);
+            None
+        }
+        CacheAccounting::Enabled => {
+            let ((), capture) = SloPolicy::capture_cache_accounting(|| {
+                scheduler.prepare_joint_admission_gate(&hint, observed.as_mut().unwrap(), started);
+            });
+            Some(capture)
+        }
+    };
     let gate_elapsed = started.elapsed();
     let round = observed.finish().ok_or("lost planning round")?;
     let with_health_merge = started.elapsed();
@@ -373,8 +401,9 @@ fn run() -> Result<Value, String> {
             "costs":"same CheapKnownCosts as existing 16-member CPU profile; 1ms central, 1000+rank microseconds, shared residual ranks",
             "capacity":"synthetic original-owner complete 48-member envelope, only 16 concurrent slots; no physical allocator or device work",
             "entrypoint":"public submit, original token-admission receipts for first16, public prepare_joint_admission_gate; current automatic actions and same-budget fresh recheck retained"},
+        "cache_accounting_enabled": accounting.enabled(),
         "cache_accounting": cache_accounting,
-        "cache_accounting_scope": "test-only TLS opt-in for this one gate; fixed two reports plus explicit overflow. The cache-teardown report is the last retained-allocation ledger (trace may already be freed by local drop order); first/last byte-rejection snapshots are current ledger values. Neither is allocator RSS or a simultaneous peak. Counts add overhead, so this instrumented call is mechanism evidence, not a timing baseline. No extra prediction, comparison, request or cache traversal.",
+        "cache_accounting_scope": accounting.scope(),
         "gate_elapsed":gate_elapsed, "gate_and_health_merge_elapsed":with_health_merge,
         "original_provider_calls":calls,
         "conditional_stopping_calls":source.stopping.load(Ordering::Relaxed),
@@ -387,14 +416,24 @@ fn run() -> Result<Value, String> {
     }))
 }
 
-#[test]
-#[ignore = "external-input fixed 48-member CPU diagnostic; set both diagnostic input paths"]
-fn profile_admission_original_burst_with_production_budget() {
-    match run() {
+fn print_report(accounting: CacheAccounting) {
+    match run(accounting) {
         Ok(report) => println!(
             "ADMISSION_LOAD_PROFILE {}",
             serde_json::to_string(&report).unwrap()
         ),
         Err(error) => panic!("admission load diagnostic setup failed: {error}"),
     }
+}
+
+#[test]
+#[ignore = "external-input fixed 48-member CPU diagnostic without cache-accounting capture; set both diagnostic input paths"]
+fn profile_admission_original_burst_with_production_budget() {
+    print_report(CacheAccounting::Disabled);
+}
+
+#[test]
+#[ignore = "external-input fixed 48-member CPU cache-accounting diagnostic; set both diagnostic input paths"]
+fn profile_admission_original_burst_with_production_budget_cache_accounting() {
+    print_report(CacheAccounting::Enabled);
 }

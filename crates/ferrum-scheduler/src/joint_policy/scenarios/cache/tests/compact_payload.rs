@@ -113,13 +113,13 @@ fn compact_payload_keeps_all_rank_values_weights_metadata_and_actual_query_quota
         std::mem::size_of::<Option<Entry>>()
             + std::mem::size_of::<Option<NonZeroUsize>>()
             + std::mem::size_of::<CostWork>()
-            + count * std::mem::size_of::<Duration>()
+            + count * std::mem::size_of::<u64>()
     );
     // No ABI-size gate: print the actual compiled target layout for evidence.
     eprintln!(
-        "compact scenario cache layout: scenario={} duration={} entry_slot={} work={} ranks={count}",
+        "compact scenario cache layout: scenario={} encoded_word={} entry_slot={} work={} ranks={count}",
         std::mem::size_of::<CostScenario>(),
-        std::mem::size_of::<Duration>(),
+        std::mem::size_of::<u64>(),
         std::mem::size_of::<Option<Entry>>(),
         std::mem::size_of::<CostWork>(),
     );
@@ -145,7 +145,7 @@ fn compact_payload_exact_byte_boundary_and_rejected_replacement_preserve_old_ent
     let minimum = std::mem::size_of::<Option<Entry>>()
         + std::mem::size_of::<Option<NonZeroUsize>>()
         + std::mem::size_of::<CostWork>()
-        + count * std::mem::size_of::<Duration>();
+        + count * std::mem::size_of::<u64>();
     let mut exact = ScenarioCache::new(at, minimum, 1);
     exact.insert(&query, complete_distribution(at, count));
     assert_eq!(exact.retained_bytes(), minimum);
@@ -180,7 +180,7 @@ fn compact_payload_exact_byte_boundary_and_rejected_replacement_preserve_old_ent
         std::mem::size_of::<Option<Entry>>()
             + std::mem::size_of::<Option<NonZeroUsize>>()
             + 2 * std::mem::size_of::<CostWork>()
-            + 2 * std::mem::size_of::<Duration>()
+            + 2 * std::mem::size_of::<u64>()
     );
     assert!(exact.get(&query, at, 0).is_none());
     assert!(exact.get(&cost_query(&larger), at, 1).is_some());

@@ -215,7 +215,7 @@ fn ordinal_hints_interleaved_misses_remember_original_ordinal_and_actual_seconda
     cache.insert_with_key(a_pending, keyed_distribution(at, keys[0], 2));
     assert_eq!(
         cache.retained_bytes(),
-        fixed_bytes + 2 * std::mem::size_of::<CostWork>() + 5 * std::mem::size_of::<Duration>()
+        fixed_bytes + 2 * std::mem::size_of::<CostWork>() + 5 * std::mem::size_of::<u64>()
     );
     cache.begin_rank();
     assert_eq!(
@@ -234,7 +234,7 @@ fn ordinal_hints_interleaved_misses_remember_original_ordinal_and_actual_seconda
     cache.insert_with_key(pending, keyed_distribution(at, keys[0], 3));
     assert_eq!(
         cache.retained_bytes(),
-        fixed_bytes + 2 * std::mem::size_of::<CostWork>() + 6 * std::mem::size_of::<Duration>()
+        fixed_bytes + 2 * std::mem::size_of::<CostWork>() + 6 * std::mem::size_of::<u64>()
     );
     assert_eq!(
         cache
@@ -258,14 +258,20 @@ fn ordinal_hints_are_bounded_charged_and_do_not_wrap_or_evict_on_capacity_failur
     let keys = colliding_work(2, 3);
     let fixed_bytes =
         2 * (std::mem::size_of::<Option<Entry>>() + std::mem::size_of::<Option<NonZeroUsize>>());
+    // Retain the unchanged conservative slot minimum while exactly filling
+    // the payload budget. One more rank must be refused.
+    let ranks = std::mem::size_of::<CostScenario>()
+        .saturating_sub(std::mem::size_of::<Option<NonZeroUsize>>())
+        .div_ceil(std::mem::size_of::<u64>())
+        .max(2);
     let budget =
-        fixed_bytes + 2 * (std::mem::size_of::<CostWork>() + 2 * std::mem::size_of::<Duration>());
+        fixed_bytes + 2 * (std::mem::size_of::<CostWork>() + ranks * std::mem::size_of::<u64>());
     let mut cache = ScenarioCache::new(at, budget, 2);
     assert_eq!(cache.retained_bytes(), fixed_bytes);
     assert_eq!(cache.slots.len(), 2);
     assert_eq!(cache.hints.len(), 2);
     for key in &keys[..2] {
-        cache.insert(&cost_query(&[*key]), keyed_distribution(at, *key, 2));
+        cache.insert(&cost_query(&[*key]), keyed_distribution(at, *key, ranks));
     }
     assert_eq!(cache.retained_bytes(), budget);
     cache.begin_rank();
@@ -285,7 +291,7 @@ fn ordinal_hints_are_bounded_charged_and_do_not_wrap_or_evict_on_capacity_failur
     cache.begin_rank();
     let third = [keys[2]];
     let (_, pending) = cache.get_with_key(&cost_query(&third), at, 0);
-    cache.insert_with_key(pending, keyed_distribution(at, keys[2], 3));
+    cache.insert_with_key(pending, keyed_distribution(at, keys[2], ranks + 1));
     assert_eq!(cache.retained_bytes(), budget);
     assert_eq!(cache.hints, original_hints);
     for key in &keys[..2] {

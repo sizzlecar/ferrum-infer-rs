@@ -4,6 +4,7 @@ use ferrum_execution::{execution_attempt::AttemptWorkKind, token_execution::Exec
 mod accounting;
 mod compact_payload;
 mod ordinal_hints;
+mod time_encoding;
 mod trace_handles;
 mod two_slot;
 
@@ -182,8 +183,7 @@ fn reused_miss_key_accounts_for_the_entry_present_at_insertion_and_keeps_bounds(
     let b = cost_query(&b);
     let slot_bytes =
         std::mem::size_of::<Option<Entry>>() + std::mem::size_of::<Option<NonZeroUsize>>();
-    let budget =
-        slot_bytes + 2 * std::mem::size_of::<CostWork>() + 4 * std::mem::size_of::<Duration>();
+    let budget = slot_bytes + 2 * std::mem::size_of::<CostWork>() + 4 * std::mem::size_of::<u64>();
     let mut cache = ScenarioCache::new(at, budget, 1);
     let (miss, key) = cache.get_with_key(&a, at, 0);
     assert!(miss.is_none());
@@ -196,7 +196,7 @@ fn reused_miss_key_accounts_for_the_entry_present_at_insertion_and_keeps_bounds(
     cache.insert_with_key(key, distribution(at, 2));
     assert_eq!(
         cache.retained_bytes(),
-        slot_bytes + std::mem::size_of::<CostWork>() + 2 * std::mem::size_of::<Duration>()
+        slot_bytes + std::mem::size_of::<CostWork>() + 2 * std::mem::size_of::<u64>()
     );
     assert!(cache.get(&a, at, 1).is_some());
     assert!(cache.get(&b, at, 0).is_none());
