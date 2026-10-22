@@ -196,6 +196,23 @@ fn assert_only_input_retained(fixture: &FaultFixture) {
     assert_eq!(fixture.runtime.inner.snapshot().dense_linear_launches, 1);
 }
 
+fn assert_idle_trim_busy_without_releasing(fixture: &FaultFixture) {
+    let before = fixture.resources.dynamic_pool_status().unwrap();
+    let native = fixture.runtime.inner.snapshot();
+    assert!(matches!(
+        fixture
+            .resources
+            .try_release_idle_dynamic_backing()
+            .unwrap(),
+        IdleDynamicReleaseOutcome::Busy(_)
+    ));
+    assert_eq!(fixture.resources.dynamic_pool_status().unwrap(), before);
+    assert_eq!(
+        fixture.runtime.inner.snapshot().live_allocations,
+        native.live_allocations
+    );
+}
+
 #[test]
 fn fault_observer_proxy_preserves_the_real_reference_dense_oracle() {
     let mut fixture = FaultFixture::new();
@@ -211,6 +228,7 @@ fn indeterminate_and_pending_observations_retain_authority_until_terminal_recove
     fixture.runtime.set_fence(FenceMode::Indeterminate);
     let mut error = fixture.execute().unwrap_err();
     assert_only_input_retained(&fixture);
+    assert_idle_trim_busy_without_releasing(&fixture);
     let TensorExecutionError::NonTerminal {
         observation,
         completion,
@@ -238,6 +256,8 @@ fn indeterminate_and_pending_observations_retain_authority_until_terminal_recove
     assert_eq!(reaper.retained_count(), 1);
     assert_only_input_retained(&fixture);
 
+    assert_idle_trim_busy_without_releasing(&fixture);
+
     fixture.runtime.set_fence(FenceMode::Real);
     assert!(matches!(
         completion.wait().unwrap(),
@@ -247,6 +267,13 @@ fn indeterminate_and_pending_observations_retain_authority_until_terminal_recove
     retirement.try_abort().unwrap();
     assert_eq!(reaper.retained_count(), 0);
     assert_eq!(fixture.host.usage().unwrap().committed_bytes(), 0);
+    assert!(matches!(
+        fixture
+            .resources
+            .try_release_idle_dynamic_backing()
+            .unwrap(),
+        IdleDynamicReleaseOutcome::Released(_)
+    ));
     // Keep the diagnostic error alive: retirement must release the single
     // execution slot and input owner, not merely promise release on Drop.
     fixture.assert_success();
@@ -279,6 +306,8 @@ fn failed_drain_quarantines_owners_until_a_later_successful_drain() {
     assert_eq!(reaper.quarantined_count(), 1);
     assert!(retirement.try_abort().is_err());
     assert_only_input_retained(&fixture);
+
+    assert_idle_trim_busy_without_releasing(&fixture);
 
     fixture.runtime.set_synchronize_fails(false);
     assert!(matches!(

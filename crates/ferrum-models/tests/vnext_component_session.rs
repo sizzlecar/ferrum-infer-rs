@@ -301,3 +301,77 @@ fn dropping_a_completed_session_releases_owners_for_another_session() {
     assert_eq!(fixture.host.usage().unwrap().committed_bytes(), 0);
     assert_eq!(fixture.host.usage().unwrap().allocated_bytes(), 0);
 }
+
+#[test]
+fn stored_component_trims_dynamic_backing_and_regrows_without_reuploading_weights() {
+    let fixture = Fixture::new("device.component.idle-trim");
+    let mut session = fixture.initialize("trim");
+    let static_bytes = session
+        .executable()
+        .execution_plan()
+        .payload()
+        .memory()
+        .static_bytes();
+    let initialized_uploads = fixture.composition.runtime().snapshot().uploaded_bytes;
+    let first = execute(&mut session, &fixture, "before-trim", 1.);
+    let before = fixture.composition.runtime().snapshot();
+    let IdleDynamicReleaseOutcome::Released(receipt) =
+        session.try_release_idle_dynamic_backing().unwrap()
+    else {
+        panic!("completed execution must be idle");
+    };
+    assert!(receipt.reclaimed_bytes() > 0);
+    assert!(receipt
+        .pools()
+        .iter()
+        .all(|pool| pool.published_capacity_bytes() == 0));
+    let trimmed = fixture.composition.runtime().snapshot();
+    assert_eq!(
+        trimmed.live_allocations, 1,
+        "only the actual matrix remains resident"
+    );
+    assert!(before.live_allocations > trimmed.live_allocations);
+    // Probe the original process account: all non-static capacity is reusable.
+    // This reserves bytes without allocating a second device buffer.
+    drop(
+        fixture
+            .capacity
+            .reserve(
+                DeviceOpaqueMemoryKind::Bootstrap,
+                DEVICE_BYTES - static_bytes,
+            )
+            .unwrap(),
+    );
+    assert_eq!(first[0].bytes().bytes(), bytes(&EXPECTED));
+    assert_eq!(
+        fixture.host.usage().unwrap().committed_bytes(),
+        OUTPUT_BYTES
+    );
+    let IdleDynamicReleaseOutcome::Released(empty) =
+        session.try_release_idle_dynamic_backing().unwrap()
+    else {
+        panic!("already trimmed session remains open and idle");
+    };
+    assert_eq!(empty.reclaimed_bytes(), 0);
+    let second = execute(&mut session, &fixture, "after-trim", 2.);
+    let regrown = fixture.composition.runtime().snapshot();
+    assert!(regrown.allocations > trimmed.allocations);
+    assert_eq!(
+        regrown.uploaded_bytes - initialized_uploads,
+        2 * INPUT_BYTES as u64
+    );
+    assert_eq!(regrown.dense_linear_launches, 2);
+    match session
+        .close()
+        .unwrap_or_else(|failure| panic!("close failed: {:?}", failure.failure()))
+    {
+        PlanRuntimeCloseOutcome::Closed(receipt) => {
+            assert_eq!(receipt.released_static_resources(), 1)
+        }
+        PlanRuntimeCloseOutcome::Referenced { .. } => panic!("trim must not retain a root alias"),
+    }
+    fixture.assert_device_reusable();
+    assert_eq!(second[0].bytes().bytes(), bytes(&EXPECTED.map(|x| x * 2.)));
+    drop((first, second));
+    assert_eq!(fixture.host.usage().unwrap().committed_bytes(), 0);
+}

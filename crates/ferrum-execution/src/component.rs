@@ -397,6 +397,19 @@ impl<R: DeviceRuntime> TensorComponentSession<R> {
             .execute(run_id, request_id, inputs)
     }
 
+    /// Return idle activation/workspace backing while retaining initialized
+    /// static weights and the exact compiled plan. Busy preserves all owners;
+    /// successful release does not close the session. Subsequent execution
+    /// reacquires dynamic capacity through ordinary runtime admission.
+    pub fn try_release_idle_dynamic_backing(
+        &mut self,
+    ) -> Result<IdleDynamicReleaseOutcome, VNextError> {
+        self.resources
+            .as_ref()
+            .expect("live session owns resource root")
+            .try_release_idle_dynamic_backing()
+    }
+
     /// Stops further admission and returns the actual runtime close outcome.
     /// `Referenced` preserves the root for a retry after outstanding execution
     /// errors/completion handles retire. Host outputs may outlive this receipt.

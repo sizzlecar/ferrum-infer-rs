@@ -88,6 +88,8 @@ pub(crate) use segment_permit::{
 mod dynamic_pool_maintenance;
 mod pool_resident_reclaim;
 pub use dynamic_pool_maintenance::*;
+mod idle_trim;
+pub use idle_trim::*;
 mod static_lease;
 pub use static_lease::*;
 mod work;
