@@ -263,6 +263,15 @@ impl PlanBuilder {
                 return Err(Unsupported::InvalidPlan);
             }
         }
+        // This is a local fast path, not a participant/index bound. Large
+        // indices retain the original checks below, including when no active
+        // mask is present and validate_member will reject them only later.
+        let mut seen = 0usize;
+        for prior in self.groups().iter().flatten() {
+            if prior.request < usize::BITS as usize {
+                seen |= 1usize << prior.request;
+            }
+        }
         for (position, member) in members.iter().enumerate() {
             if !matches(&member) {
                 continue;
@@ -274,16 +283,23 @@ impl PlanBuilder {
             {
                 return Err(Unsupported::WaitingResources);
             }
-            if members[..position]
-                .iter()
-                .filter(matches)
-                .any(|prior| prior.request == member.request)
-                || self
-                    .groups()
+            let duplicate = if member.request < usize::BITS as usize {
+                let bit = 1usize << member.request;
+                let duplicate = seen & bit != 0;
+                seen |= bit;
+                duplicate
+            } else {
+                members[..position]
                     .iter()
-                    .flatten()
+                    .filter(matches)
                     .any(|prior| prior.request == member.request)
-            {
+                    || self
+                        .groups()
+                        .iter()
+                        .flatten()
+                        .any(|prior| prior.request == member.request)
+            };
+            if duplicate {
                 return Err(Unsupported::InvalidPlan);
             }
         }

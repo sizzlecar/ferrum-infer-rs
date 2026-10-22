@@ -1,6 +1,8 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod membership;
+
 fn builder(execution: CostExecution) -> PlanBuilder {
     PlanBuilder {
         groups: [Vec::new(), Vec::new()],
