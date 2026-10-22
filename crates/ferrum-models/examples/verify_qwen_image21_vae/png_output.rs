@@ -1,9 +1,8 @@
-//! A bounded, streaming PNG artifact path using the already cached png crate.
-//! PNG 0.18.1's stream writer holds three scanlines and a fixed IDAT buffer.
-//! We cap RGBA rows at 64 KiB, use 16 KiB IDAT chunks, and never materialize an
-//! image or encoded file Vec. The library's row/deflate/decoder state is outside
-//! the managed tensor-backing account; this is not a whole-process RSS claim.
+//! File durability and independent decode checks around the shared PNG writer.
+//! The codec's bounded workspace remains outside the managed tensor-backing
+//! account; see ferrum_output::png for the exact allocation scope.
 use anyhow::{ensure, Context, Result};
+use ferrum_output::png::{write_rgba8_png, PngDimensions, PngLimits};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,23 +11,13 @@ use std::{
     path::Path,
 };
 
-pub const MAX_ROW_BYTES: usize = 64 * 1024;
-const CHUNK_BYTES: usize = 16 * 1024;
+pub use ferrum_output::png::MAX_RGBA_ROW_BYTES as MAX_ROW_BYTES;
 const DECODE_LIMIT: usize = 8 * 1024 * 1024;
 
 pub fn dimensions(width: u64, height: u64) -> Result<(u32, u32)> {
-    let width = u32::try_from(width).context("PNG width exceeds u32")?;
-    let height = u32::try_from(height).context("PNG height exceeds u32")?;
-    let row = usize::try_from(width)?
-        .checked_mul(4)
-        .context("PNG row overflows")?;
-    ensure!(
-        width != 0 && height != 0 && row <= MAX_ROW_BYTES,
-        "PNG requires positive dimensions and an RGBA row <= {MAX_ROW_BYTES} bytes"
-    );
-    row.checked_mul(usize::try_from(height)?)
-        .context("PNG extent exceeds address space")?;
-    Ok((width, height))
+    let dimensions = PngDimensions::new(width, height)?;
+    PngLimits::default().validate(dimensions)?;
+    Ok((dimensions.width(), dimensions.height()))
 }
 
 struct DigestWriter<W> {
@@ -80,21 +69,16 @@ pub fn write(
         hash: Sha256::new(),
         bytes: 0,
     };
-    {
-        let mut encoder = png::Encoder::new(&mut sink, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_compression(png::Compression::NoCompression);
-        encoder.set_filter(png::Filter::NoFilter);
-        let mut writer = encoder.write_header()?;
-        {
-            let mut stream = writer.stream_writer_with_size(CHUNK_BYTES)?;
-            emit(&mut stream)?;
-            stream.finish()?;
-        }
-        writer.finish()?;
-    }
-    sink.flush()?;
+    let receipt = write_rgba8_png(
+        &mut sink,
+        PngDimensions::new(u64::from(width), u64::from(height))?,
+        PngLimits::default(),
+        |stream| emit(stream).map_err(io::Error::other),
+    )?;
+    ensure!(
+        receipt.encoded_bytes() == sink.bytes,
+        "PNG sink byte count differs"
+    );
     sink.inner.sync_all()?;
     let decoded = decode(path, width, height)?;
     Ok(PngArtifact {
@@ -156,7 +140,7 @@ fn decode(path: &Path, width: u32, height: u32) -> Result<(String, u64)> {
 mod tests {
     use super::*;
     #[test]
-    fn streaming_png_roundtrip_keeps_channels_alpha_dimensions_and_digest() {
+    fn file_artifact_is_verified_hashed_and_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rgba.png");
         let pixels = [255, 0, 0, 0, 0, 255, 0, 128, 0, 0, 255, 255, 11, 22, 33, 17];
@@ -177,24 +161,15 @@ mod tests {
         let encoded = std::fs::read(&path).unwrap();
         assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(&encoded)));
         assert_eq!(artifact.bytes, encoded.len() as u64);
-        let mut reader = png::Decoder::new(std::io::Cursor::new(encoded))
-            .read_info()
-            .unwrap();
-        let mut decoded = [0_u8; 16];
-        let info = reader.next_frame(&mut decoded).unwrap();
-        assert_eq!(
-            (info.width, info.height, info.color_type),
-            (2, 2, png::ColorType::Rgba)
-        );
-        assert_eq!(decoded, pixels);
         assert!(write(&path, 2, 2, |_| Ok(())).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), encoded);
     }
     #[test]
-    fn oversized_rows_and_incomplete_stream_are_errors_not_artifacts() {
-        assert!(dimensions(0, 1).is_err());
-        assert!(dimensions((MAX_ROW_BYTES / 4 + 1) as u64, 1).is_err());
-        assert!(dimensions(1, u32::MAX as u64 + 1).is_err());
+    fn oversized_rows_do_not_create_files_and_incomplete_files_have_no_receipt() {
         let dir = tempfile::tempdir().unwrap();
+        let oversized = dir.path().join("oversized.png");
+        assert!(write(&oversized, (MAX_ROW_BYTES / 4 + 1) as u64, 1, |_| Ok(())).is_err());
+        assert!(!oversized.exists());
         assert!(write(&dir.path().join("short.png"), 2, 2, |stream| {
             stream.write_all(&[0; 15])?;
             Ok(())
