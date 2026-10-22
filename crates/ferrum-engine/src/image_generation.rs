@@ -1,5 +1,11 @@
 //! Serial, single-image Qwen-Image 2.1 generation on injected runtime owners.
 //!
+//! This cold BF16 path qualifies G2 functionality. It is not the G3 serving
+//! architecture: it recompiles/reloads stages for every request. Throughput
+//! qualification additionally requires compatible request batching and retained
+//! component sessions with explicit residency/offload policies. Queuing several
+//! calls to this single-image path does not provide parallel image generation.
+//!
 //! Metadata preparation is separate from backend construction. The pipeline
 //! never constructs a runtime or Host account, launches a helper process, or
 //! exchanges tensor payloads through files. All four component plans compile
