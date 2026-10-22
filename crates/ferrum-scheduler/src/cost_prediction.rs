@@ -724,6 +724,9 @@ pub(crate) struct BoundedControlStatistics {
     pub provider_calls: u64,
     pub simulation_queries: u64,
     pub cache_hits: u64,
+    /// Candidate/rank catch-up exhaustion, not unknown whole comparisons or
+    /// global query/time-budget failures; it may coexist with a selected action.
+    pub candidate_horizon_exhaustions: u64,
     pub last_static_score: Option<f64>,
     pub last_selected_score: Option<f64>,
 }
@@ -742,6 +745,9 @@ impl BoundedControlStatistics {
             .simulation_queries
             .saturating_add(other.simulation_queries);
         self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        self.candidate_horizon_exhaustions = self
+            .candidate_horizon_exhaustions
+            .saturating_add(other.candidate_horizon_exhaustions);
         if other.evaluated > 0 {
             self.last_static_score = other.last_static_score;
             self.last_selected_score = other.last_selected_score;

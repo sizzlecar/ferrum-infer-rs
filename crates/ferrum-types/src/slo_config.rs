@@ -48,10 +48,14 @@ pub struct SloPlanningBudget {
     /// Maximum empirical cost ranks retained per query; a resource guard,
     /// never a statistical precision or performance acceptance requirement.
     pub max_scenarios: usize,
-    /// Maximum future execution rounds compared by the bounded strategy.
-    /// Reaching this horizon does not imply request completion or SLO success.
-    /// Query, elapsed-time and byte limits still apply independently.
+    /// Static reference horizon in complete execution waves for the bounded
+    /// strategy. Reaching it does not imply request completion or SLO success.
     pub max_lookahead_rounds: usize,
+    /// Additional complete waves available to a bounded candidate to cover the
+    /// static reference's per-request progress and elapsed-time boundary.
+    /// Zero disables extra catch-up waves. Exhaustion leaves that candidate
+    /// unknown; query, elapsed-time and byte limits still apply independently.
+    pub max_catchup_rounds: usize,
     pub max_candidates: usize,
     pub max_participants: usize,
     /// Cumulative synchronous prediction time; asynchronous admission waits do
@@ -69,6 +73,7 @@ impl Default for SloPlanningBudget {
             max_queries: 4096,
             max_scenarios: 32,
             max_lookahead_rounds: 8,
+            max_catchup_rounds: 8,
             max_candidates: 256,
             max_participants: 256,
             max_elapsed_us: 10_000,
@@ -515,14 +520,17 @@ mod tests {
         .unwrap();
         assert_eq!(original.policy.strategy, SloStrategy::Joint);
         assert_eq!(original.policy.planning.max_lookahead_rounds, 8);
+        assert_eq!(original.policy.planning.max_catchup_rounds, 8);
         assert_eq!(original.policy.planning.max_queries, 17);
 
         let mut bounded = original;
         bounded.policy.strategy = SloStrategy::Bounded;
         bounded.policy.planning.max_lookahead_rounds = 3;
+        bounded.policy.planning.max_catchup_rounds = 0;
         let encoded = serde_json::to_value(bounded).unwrap();
         assert_eq!(encoded["strategy"], "bounded");
         assert_eq!(encoded["planning"]["max_lookahead_rounds"], 3);
+        assert_eq!(encoded["planning"]["max_catchup_rounds"], 0);
         assert_eq!(
             serde_json::from_value::<SloConfig>(encoded).unwrap(),
             bounded
@@ -548,6 +556,27 @@ mod tests {
         assert!(
             serde_json::from_value::<SloConfig>(serde_json::to_value(config).unwrap()).is_err()
         );
+    }
+
+    #[test]
+    fn bounded_catchup_accepts_zero_without_widening_other_planning_limits() {
+        let mut config: SloConfig = "ttft:200,tpot:15,itl:50".parse().unwrap();
+        config.policy.strategy = SloStrategy::Bounded;
+        let defaults = config.policy.planning;
+        // Extra waves are independent of empirical rank count. Overflow of a
+        // particular reference-plus-catchup request is checked by the evaluator,
+        // not replaced with an arbitrary configuration ceiling.
+        for catchup in [0, defaults.max_scenarios + 1, usize::MAX] {
+            config.policy.planning.max_catchup_rounds = catchup;
+            config.policy.validate().unwrap();
+            config.validate().unwrap();
+            let restored: SloConfig =
+                serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+            assert_eq!(restored, config);
+            let mut unchanged = restored.policy.planning;
+            unchanged.max_catchup_rounds = defaults.max_catchup_rounds;
+            assert_eq!(unchanged, defaults);
+        }
     }
 
     #[test]

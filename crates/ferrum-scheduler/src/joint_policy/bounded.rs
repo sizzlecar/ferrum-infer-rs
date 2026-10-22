@@ -70,6 +70,10 @@ pub struct BoundedActionEvidence {
     pub observed_prefix_tpot_undefined_requests: f64,
     /// No throughput projection is invented for a static zero-progress waiter.
     pub waiting_exposure_only_requests: f64,
+    /// Rank-weighted generated tokens beyond the static reference. Actual
+    /// frontiers and service clocks retain them, but TPOT debt earns no extra
+    /// denominator credit for this candidate-only work.
+    pub extra_output_tokens: f64,
     pub prefill_progress_regressions: usize,
     pub overdue_prefill_regressions: usize,
 }
@@ -184,9 +188,9 @@ impl<'a> BoundedAccumulator<'a> {
         {
             return Err(Unsupported::InvalidState);
         }
-        // Complete here means the bounded traversal returned normally. It does
-        // not mean all requests reached their endpoints. targets/window are not
-        // used as a fictitious common wall-clock or common-work certificate.
+        // Complete here means the finite traversal returned normally. The core
+        // checks reference coverage at whole-wave boundaries; this still does
+        // not mean all requests reached their endpoints or visible SLOs hold.
         let baseline = comparison
             .static_result
             .complete()
@@ -198,6 +202,7 @@ impl<'a> BoundedAccumulator<'a> {
             match result {
                 Ok(result) => {
                     validate(self.initial, result)?;
+                    validate_reference_coverage(baseline, result)?;
                     let evidence = score(self.initial, baseline, result, &self.config)?;
                     add_evidence(&mut self.totals[index + 1], evidence, rank.weight)?;
                 }
@@ -293,6 +298,7 @@ fn add_evidence(
     total.observed_prefix_tpot_undefined_requests +=
         weight * value.observed_prefix_tpot_undefined_requests;
     total.waiting_exposure_only_requests += weight * value.waiting_exposure_only_requests;
+    total.extra_output_tokens += weight * value.extra_output_tokens;
     total.future_visible_timing_unknown_requests +=
         weight * value.future_visible_timing_unknown_requests;
     total.unclosed_visible_ttft_exposure += weight * value.unclosed_visible_ttft_exposure;
@@ -377,6 +383,32 @@ fn validate(initial: &[SimulatedRequest], result: &TrajectoryResult) -> Result<(
     Ok(())
 }
 
+fn validate_reference_coverage(
+    baseline: &TrajectoryResult,
+    candidate: &TrajectoryResult,
+) -> Result<(), Unsupported> {
+    let timing = candidate
+        .bounded_timing
+        .as_ref()
+        .ok_or(Unsupported::InvalidState)?;
+    let mut all_finished = true;
+    for ((reference, request), service) in baseline
+        .requests
+        .iter()
+        .zip(&candidate.requests)
+        .zip(&timing.requests)
+    {
+        if !request.progress().covers(reference.progress()) {
+            return Err(Unsupported::InvalidState);
+        }
+        all_finished &= request.finished() && service.central.projection.completed.is_some();
+    }
+    if candidate.central_elapsed < baseline.central_elapsed && !all_finished {
+        return Err(Unsupported::InvalidState);
+    }
+    Ok(())
+}
+
 fn score(
     initial: &[SimulatedRequest],
     baseline: &TrajectoryResult,
@@ -387,6 +419,9 @@ fn score(
     let ttft = config.ttft_ms / 1000.0;
     let tpot = config.tpot_ms / 1000.0;
     let itl = config.itl_ms / 1000.0;
+    // Closed service intervals use this same nanosecond-rounded Duration in
+    // apply_clock. Do not compare open intervals against the unrounded float.
+    let itl_limit = Duration::try_from_secs_f64(itl).map_err(|_| Unsupported::InvalidState)?;
     let baseline_timing = baseline
         .bounded_timing
         .as_ref()
@@ -412,6 +447,9 @@ fn score(
         let clock = service.central.projection;
         let observed = before.central_clock;
         let reference_clock = reference_service.central.projection;
+        let credited_output_tokens = after.output_tokens.min(reference.output_tokens);
+        evidence.extra_output_tokens +=
+            after.output_tokens.saturating_sub(reference.output_tokens) as f64;
         let exposure_at = before
             .age
             .checked_add(baseline.central_elapsed.max(candidate.central_elapsed))
@@ -481,11 +519,12 @@ fn score(
                 now
             };
             let elapsed = end.checked_sub(first).ok_or(Unsupported::InvalidState)?;
-            // Generated-service time debt, not visible or terminal TPOT. The
-            // generated-token denominator does not establish a text clock.
-            // With only one generated token its open wait still matters.
+            // Generated-service time debt, not visible or terminal TPOT. Extra
+            // catch-up work cannot pay down debt with candidate-only token
+            // credit; retain its real elapsed/completion time and service clock.
+            // With only one credited token its open wait still matters.
             evidence.score.tpot_time_debt += (elapsed.as_secs_f64() / tpot
-                - after.output_tokens.saturating_sub(1) as f64)
+                - credited_output_tokens.saturating_sub(1) as f64)
                 .max(0.0);
         }
         evidence.score.itl_pressure +=
@@ -493,7 +532,10 @@ fn score(
         if clock.completed.is_none() {
             if let Some(last) = clock.last_output {
                 let open = now.checked_sub(last).ok_or(Unsupported::InvalidState)?;
-                evidence.score.itl_pressure += (open.as_secs_f64() / itl - 1.0).max(0.0);
+                // Count the pending service interval in the same units as a
+                // closed violating interval. Closing the same stall cannot
+                // reduce its contribution merely by changing its boundary.
+                evidence.score.itl_pressure += if open > itl_limit { 1.0 } else { 0.0 };
             }
         }
         if after.output_tokens < after.scenario_end_tokens || clock.completed.is_none() {
@@ -614,12 +656,17 @@ mod tests {
         request.central_clock.last_output = Some(at);
         request.central_clock.interval_count += 1;
         request.central_clock.violating_interval_count += usize::from(bad);
+        if request.output_tokens == request.scenario_end_tokens {
+            request.central_clock.completed = Some(at);
+        }
         request.risk_clock = request.central_clock;
     }
 
     #[test]
     fn bounded_waiting_tail_stays_in_denominator_without_vetoing_local_improvement() {
         let mut initial = [request(false), request(true)];
+        initial[0].output_cap = 2;
+        initial[0].scenario_end_tokens = 2;
         initial[1].age = Duration::from_millis(110);
         let mut baseline = initial.to_vec();
         emit(&mut baseline[0], 50, true);
@@ -627,14 +674,14 @@ mod tests {
         emit(&mut candidate[0], 25, true);
         let cmp = comparison(
             result(&initial, baseline, 30),
-            vec![Ok(result(&initial, candidate, 5))],
+            vec![Ok(result(&initial, candidate, 30))],
         );
         let mut accumulator = BoundedAccumulator::new(&initial, 1, &config()).unwrap();
         accumulator.observe(rank(0, 1), &cmp).unwrap();
         let decision = accumulator.finish(summary(1)).unwrap();
         assert_eq!(decision.selected, Some(0));
         assert_eq!(decision.request_count, 2);
-        assert_eq!(decision.alternatives[0].unfinished_requests, 2.0);
+        assert_eq!(decision.alternatives[0].unfinished_requests, 1.0);
         assert_eq!(decision.alternatives[0].waiting_exposure_only_requests, 1.0);
         assert_eq!(
             decision.alternatives[0].service_prefix_tpot_undefined_requests,
@@ -644,8 +691,8 @@ mod tests {
             decision.alternatives[0].observed_prefix_tpot_undefined_requests,
             2.0
         );
-        // The overdue, unserved waiter earns no benefit from observing a
-        // shorter prefix. Actual decoder time debt still improves the score.
+        // Both observe the same wall. The decoder's actual earlier endpoint
+        // reduces its debt; the untouched waiter gets no timing credit.
         assert_eq!(
             decision.alternatives[0].score.ttft_pressure,
             decision.static_evidence.score.ttft_pressure
@@ -774,9 +821,9 @@ mod tests {
                 let baseline = comparison.static_result.complete().unwrap();
                 let candidate = comparison.alternatives[0].as_ref().unwrap();
                 assert_eq!(baseline.requests[0].prefill_tokens, 1024);
-                assert_eq!(candidate.requests[0].prefill_tokens, 32 + 7 * 128);
+                assert_eq!(candidate.requests[0].prefill_tokens, 32 + 8 * 128);
                 assert_eq!(baseline.central_elapsed, Duration::from_millis(400));
-                assert_eq!(candidate.central_elapsed, Duration::from_millis(370));
+                assert_eq!(candidate.central_elapsed, Duration::from_millis(420));
                 for result in [baseline, candidate] {
                     assert_eq!(result.requests[1].progress(), initial[1].progress());
                     assert!(result
@@ -796,10 +843,9 @@ mod tests {
         assert_eq!(candidate.waiting_exposure_only_requests, 1.0);
         assert!((decision.static_score - 5.65).abs() < 1e-12);
         assert!(candidate.score.total() > decision.static_score);
-        // Without the reference floor, the unserved waiter's 30 ms shorter
-        // observation would falsely outweigh the slower prefill service rate.
-        let undeserved_waiter_credit = 30.0 / config.ttft_ms / initial.len() as f64;
-        assert!(candidate.score.total() - undeserved_waiter_credit < decision.static_score);
+        // The original shorter eighth-wave prefix cannot be accepted: a ninth
+        // natural wave is required to cover the static prefill target and wall.
+        // No token/frontier is padded or reset to the reference afterwards.
         assert_eq!(decision.selected, None);
     }
 
@@ -819,14 +865,24 @@ mod tests {
                 vec![Ok(result(&initial, candidate, 5))],
             );
             let mut accumulator = BoundedAccumulator::new(&initial, 1, &config()).unwrap();
-            accumulator.observe(rank(0, 1), &cmp).unwrap();
-            let decision = accumulator.finish(summary(1)).unwrap();
-            assert_eq!(decision.selected, None);
-            assert!(
-                decision.alternatives[0].prefill_progress_regressions
-                    + decision.alternatives[0].overdue_prefill_regressions
-                    > 0
+            assert_eq!(
+                accumulator.observe(rank(0, 1), &cmp),
+                Err(Unsupported::InvalidState)
             );
+            let evidence = score(
+                &initial,
+                cmp.static_result.complete().unwrap(),
+                cmp.alternatives[0].as_ref().unwrap(),
+                &config(),
+            )
+            .unwrap();
+            assert!(
+                evidence.prefill_progress_regressions + evidence.overdue_prefill_regressions > 0
+            );
+            assert!(matches!(
+                accumulator.finish(summary(1)),
+                Err(Unsupported::InvalidState)
+            ));
             assert_eq!(initial[1].prefill_tokens, 0);
         }
     }
@@ -836,6 +892,8 @@ mod tests {
         let mut initial = [request(false)];
         initial[0].age = Duration::from_millis(130);
         initial[0].output_tokens = 2;
+        initial[0].output_cap = 3;
+        initial[0].scenario_end_tokens = 3;
         initial[0].central_clock = RequestClock {
             first_output: Some(Duration::from_millis(110)),
             last_output: Some(Duration::from_millis(130)),
@@ -867,14 +925,98 @@ mod tests {
             &config(),
         )
         .unwrap();
-        assert_eq!(open.score.itl_pressure, 2.0);
+        assert_eq!(open.score.itl_pressure, 1.0);
         assert!(open.score.tpot_time_debt > 0.0);
     }
 
     #[test]
-    fn bounded_unknown_rank_budget_and_tie_do_not_become_selected_success() {
+    fn closing_one_service_stall_cannot_reduce_its_count_or_add_token_credit() {
         let initial = [request(false)];
-        let base = || result(&initial, initial.to_vec(), 20);
+        // The same service interval runs from t=10 to t=40. Compare it open
+        // versus closed by one additional opportunity at exactly that boundary.
+        let open = result(&initial, initial.to_vec(), 20);
+        let mut closed_requests = initial.to_vec();
+        emit(&mut closed_requests[0], 40, true);
+        let closed = result(&initial, closed_requests, 20);
+        validate(&initial, &open).unwrap();
+        validate(&initial, &closed).unwrap();
+        let open_score = score(&initial, &open, &open, &config()).unwrap();
+        let closed_score = score(&initial, &open, &closed, &config()).unwrap();
+        assert_eq!(open_score.score.itl_pressure, 1.0);
+        assert_eq!(closed_score.score.itl_pressure, 1.0);
+        assert_eq!(
+            open_score.score.tpot_time_debt,
+            closed_score.score.tpot_time_debt
+        );
+        assert_eq!(closed_score.extra_output_tokens, 1.0);
+        assert_eq!(closed.requests[0].output_tokens, 2);
+        assert_eq!(closed.requests[0].central_clock, initial[0].central_clock);
+        assert_eq!(closed_score.unclosed_visible_itl_exposure, 2.0);
+        assert_eq!(open_score.unclosed_visible_itl_exposure, 2.0);
+
+        for (elapsed, expected) in [(0, 0.0), (1, 1.0)] {
+            let pending = result(&initial, initial.to_vec(), elapsed);
+            let evidence = score(&initial, &pending, &pending, &config()).unwrap();
+            // The initial gap is exactly10ms: equality is not a violation.
+            assert_eq!(evidence.score.itl_pressure, expected);
+        }
+    }
+
+    #[test]
+    fn open_and_closed_service_gaps_share_nanosecond_threshold_rounding() {
+        let mut config = config();
+        config.itl_ms = 0.000_001_6;
+        let limit = Duration::try_from_secs_f64(config.itl_ms / 1000.0).unwrap();
+        assert_eq!(limit, Duration::from_nanos(2));
+        for (nanos, expected) in [(2, 0.0), (3, 1.0)] {
+            let mut initial = [request(false)];
+            initial[0].age = Duration::from_nanos(nanos);
+            initial[0].central_clock.first_output = Some(Duration::ZERO);
+            initial[0].central_clock.last_output = Some(Duration::ZERO);
+            initial[0].risk_clock = initial[0].central_clock;
+            let open = result(&initial, initial.to_vec(), 0);
+            let mut closed = initial.to_vec();
+            closed[0].output_tokens += 1;
+            let age = closed[0].age;
+            super::super::apply_clock(
+                &mut closed[0].central_clock,
+                age,
+                Duration::ZERO,
+                limit,
+                false,
+            )
+            .unwrap();
+            closed[0].risk_clock = closed[0].central_clock;
+            let closed = result(&initial, closed, 0);
+            validate(&initial, &closed).unwrap();
+            assert_eq!(
+                score(&initial, &open, &open, &config)
+                    .unwrap()
+                    .score
+                    .itl_pressure,
+                expected
+            );
+            assert_eq!(
+                score(&initial, &open, &closed, &config)
+                    .unwrap()
+                    .score
+                    .itl_pressure,
+                expected
+            );
+            assert_eq!(closed.requests[0].central_clock, initial[0].central_clock);
+        }
+    }
+
+    #[test]
+    fn bounded_unknown_rank_budget_and_tie_do_not_become_selected_success() {
+        let mut initial = [request(false)];
+        initial[0].output_cap = 2;
+        initial[0].scenario_end_tokens = 2;
+        let base = || {
+            let mut requests = initial.to_vec();
+            emit(&mut requests[0], 50, true);
+            result(&initial, requests, 30)
+        };
         let mut candidate = initial.to_vec();
         emit(&mut candidate[0], 25, true);
         let known = comparison(base(), vec![Ok(result(&initial, candidate, 5))]);
@@ -905,7 +1047,9 @@ mod tests {
 
     #[test]
     fn bounded_cost_tail_rank_changes_choice_without_renormalizing_it_away() {
-        let initial = [request(false)];
+        let mut initial = [request(false)];
+        initial[0].output_cap = 2;
+        initial[0].scenario_end_tokens = 2;
         let baseline = || {
             let mut requests = initial.to_vec();
             emit(&mut requests[0], 40, true);
@@ -982,5 +1126,35 @@ mod tests {
             accumulator.observe(rank(0, 1), &comparison(mismatched, vec![])),
             Err(Unsupported::InvalidState)
         );
+    }
+
+    #[test]
+    fn bounded_accumulator_rejects_unobserved_wall_and_missing_terminal_proof() {
+        for terminal_without_clock in [false, true] {
+            let mut initial = [request(false)];
+            if terminal_without_clock {
+                initial[0].output_cap = 2;
+                initial[0].scenario_end_tokens = 2;
+            }
+            let mut baseline = initial.to_vec();
+            emit(&mut baseline[0], 40, true);
+            let mut candidate = initial.to_vec();
+            emit(&mut candidate[0], 25, true);
+            let baseline = result(&initial, baseline, 20);
+            let mut candidate = result(&initial, candidate, 5);
+            if terminal_without_clock {
+                let timing = candidate.bounded_timing.as_mut().unwrap();
+                timing.requests[0].central.projection.completed = None;
+                timing.requests[0].risk.projection.completed = None;
+            }
+            // Identical target progress is insufficient: a shorter observation
+            // needs real service-endpoint evidence for every cohort member.
+            validate(&initial, &candidate).unwrap();
+            let mut accumulator = BoundedAccumulator::new(&initial, 1, &config()).unwrap();
+            assert_eq!(
+                accumulator.observe(rank(0, 1), &comparison(baseline, vec![Ok(candidate)])),
+                Err(Unsupported::InvalidState)
+            );
+        }
     }
 }

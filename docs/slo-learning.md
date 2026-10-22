@@ -79,19 +79,30 @@ itl_ms = 50
 
 [scheduler.slo.planning]
 max_lookahead_rounds = 8
+max_catchup_rounds = 8
 ```
 
 The values above are illustrative, not a validated workload preset. Each cost
 scenario compares static dispatch and a bounded set of smaller prefill or
-decode-only first waves. Every candidate stops after at most the configured
-number of complete execution waves; it does not replay the remaining output
-to completion or extend a slow candidate until it catches the static plan.
+decode-only first waves. `max_lookahead_rounds` is the static reference horizon
+in complete execution waves. Each candidate must cover that reference's
+per-request prefill and output frontiers and reach its elapsed-time boundary.
+The candidate may use at most `max_lookahead_rounds + max_catchup_rounds`
+complete waves, continuing ordinary scheduling after its proposed first wave.
+It cannot pause after reaching the frontiers to manufacture a common boundary;
+reaching all declared scenario endpoints is the only exception to the elapsed-time
+condition.
+If the extra-wave allowance is exhausted first, that candidate remains Unknown
+and cannot be selected from its partial prefix. Other candidates may still be
+evaluated. The extra allowance defaults to 8 and accepts 0; it is independent of
+the empirical rank limit. It does not require replay to complete every request.
 Only the first wave is applied. Actual execution updates the request facts
 before a later decision; simulated progress never repays a real deferral.
-The query, elapsed-time, participant and memory budgets still apply.
-With a one-wave horizon, decode-only cannot demonstrate later prefill progress
-and is ineligible when static would advance prefill. The strategy never
-silently expands the configured horizon to make an action eligible.
+The original whole-comparison query, elapsed-time, participant and memory
+budgets still apply to all reference and catch-up work. With a one-wave
+reference and zero extra waves, decode-only cannot cover static prefill
+progress. A larger configured allowance can demonstrate later progress but
+does not guarantee support, selection or completion within the CPU budget.
 
 The ranking uses equally weighted, SLO-normalized local delay/debt proxies for
 generated service opportunities, over the same request cohort. A generated
@@ -103,6 +114,13 @@ generated tokens before any text, can participate. The observation boundary is
 the engine output channel, before server protocol projection and transport;
 client-visible SSE timing still requires end-to-end measurement.
 
+Candidate-only output beyond the static reference earns no extra TPOT token
+credit. Its actual elapsed time, output frontier and service clocks remain in
+the comparison. Service ITL pressure counts new bad service intervals plus one
+currently open service gap when it strictly exceeds the ITL target; equality
+does not count as a violation. Both terms use violation counts, not a mixture
+of interval counts and open-gap severity. They do not predict visible SSE gaps.
+
 The comparison retains waiting requests and unfinished work. Observed open
 TTFT/text-gap exposure is reported separately at the larger of the static and
 candidate durations, without inventing future text updates or adding another
@@ -112,7 +130,8 @@ Prefill service-rate extrapolation is a ranking heuristic, not a physical time
 bound. When both plans leave a waiter without service or first text, a shorter
 candidate observation earns no waiting-time improvement: its exposure score
 uses at least the static observation duration. This is a ranking guard, not a
-simulation extended to a common time or a prediction of that waiter's TTFT.
+prediction of that waiter's TTFT. The separate catch-up rule above determines
+whether the candidate has actually reached the reference boundary in simulation.
 A request already past its TTFT target cannot lose predicted prefill
 progress relative to static. Decode-only also retains the actual-progress
 deferral guard. Ties retain static; this initial strategy selects strict local
@@ -133,9 +152,14 @@ configuration errors rather than silently ignored policies. The full-trajectory
 
 Health diagnostics report `bounded` comparisons, completed evaluations,
 selected and applied actions, retained static actions, unknown comparisons and
-invalidated applications separately. The scores are local ranking proxies,
-not violation probabilities or client SLO verdicts. Full-trajectory `joint`
-remains the default during validation of this new strategy.
+invalidated applications separately. `bounded.candidate_horizon_exhaustions`
+counts candidate-by-rank traversals that exhausted their configured catch-up
+allowance. It can be nonzero in a completed comparison that retained static or
+selected another action; it is not a count of unknown whole comparisons and
+does not imply global query or time-budget exhaustion. These counts also
+propagate to the existing per-iteration planning trace. The scores are local
+ranking proxies, not violation probabilities or client SLO verdicts.
+Full-trajectory `joint` remains the default during validation of this new strategy.
 
 The shared engine also writes `scheduler.iteration` events when
 `--scheduler-trace-jsonl` is enabled. These link the iteration and batch IDs to

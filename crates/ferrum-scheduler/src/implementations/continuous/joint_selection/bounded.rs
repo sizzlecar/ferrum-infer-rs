@@ -174,6 +174,11 @@ impl ContinuousBatchScheduler {
             .bounded
             .cache_hits
             .saturating_add(diagnostics.cache_hits);
+        round.statistics.bounded.candidate_horizon_exhaustions = round
+            .statistics
+            .bounded
+            .candidate_horizon_exhaustions
+            .saturating_add(diagnostics.candidate_horizon_exhaustions);
         if !round.charge_scenario_queries(&diagnostics) {
             return Err(Unsupported::QueryBudget);
         }

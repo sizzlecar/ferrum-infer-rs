@@ -31,6 +31,7 @@ enum Reason {
     InvalidState,
     InvalidPlan,
     NoProgress,
+    BoundedHorizonExhausted,
     Arithmetic,
     CostNoCoverage,
     CostStale,
@@ -41,7 +42,7 @@ enum Reason {
 }
 
 impl Reason {
-    const ALL: [Self; 30] = [
+    const ALL: [Self; 31] = [
         Self::EmptyCohort,
         Self::ParticipantBudget,
         Self::CandidateBudget,
@@ -65,6 +66,7 @@ impl Reason {
         Self::InvalidState,
         Self::InvalidPlan,
         Self::NoProgress,
+        Self::BoundedHorizonExhausted,
         Self::Arithmetic,
         Self::CostNoCoverage,
         Self::CostStale,
@@ -99,6 +101,7 @@ impl Reason {
             Unsupported::InvalidState => Self::InvalidState,
             Unsupported::InvalidPlan => Self::InvalidPlan,
             Unsupported::NoProgress => Self::NoProgress,
+            Unsupported::BoundedHorizonExhausted => Self::BoundedHorizonExhausted,
             Unsupported::Arithmetic => Self::Arithmetic,
             Unsupported::Cost(CostUnknownReason::NoCoverage) => Self::CostNoCoverage,
             Unsupported::Cost(CostUnknownReason::Stale) => Self::CostStale,
@@ -184,6 +187,10 @@ mod tests {
             (Unsupported::InvalidState, "invalid_state"),
             (Unsupported::InvalidPlan, "invalid_plan"),
             (Unsupported::NoProgress, "no_progress"),
+            (
+                Unsupported::BoundedHorizonExhausted,
+                "bounded_horizon_exhausted",
+            ),
             (Unsupported::Arithmetic, "arithmetic"),
             (
                 Unsupported::Cost(CostUnknownReason::NoCoverage),
@@ -279,6 +286,7 @@ mod tests {
             Unsupported::HistoricalTextCoalescing,
             Unsupported::FeasibilityUnresolved,
             Unsupported::StoppingCoverage,
+            Unsupported::BoundedHorizonExhausted,
         ] {
             assert!(!reason.is_resource_unknown());
         }

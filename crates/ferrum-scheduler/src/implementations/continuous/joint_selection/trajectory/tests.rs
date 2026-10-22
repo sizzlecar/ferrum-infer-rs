@@ -1,5 +1,6 @@
 use super::*;
 
+mod bounded_terminal_work;
 mod cap_repacking;
 mod member_reuse;
 use ferrum_types::RequestId;

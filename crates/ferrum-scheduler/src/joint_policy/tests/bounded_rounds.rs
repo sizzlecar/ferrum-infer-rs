@@ -1,4 +1,6 @@
 use super::*;
+#[path = "bounded_rounds/catchup.rs"]
+mod catchup;
 #[path = "bounded_rounds/clock_semantics.rs"]
 mod clock_semantics;
 use ferrum_execution::{execution_attempt::AttemptPrefixRestore, token_execution::ExecutionRange};
@@ -332,11 +334,11 @@ fn bounded_rounds_do_not_grow_with_prompt_or_output_endpoint() {
 }
 
 #[test]
-fn bounded_rounds_do_not_chase_static_targets_or_time_with_an_unfinished_phase() {
+fn bounded_rounds_cover_static_targets_with_a_finite_unfinished_phase() {
     let requests = [prefill(100, 64)];
     let alternatives = [Action::SmallPrefillPhase];
     for (horizon, expected_alternative_queries) in [
-        (EvaluationHorizon::BoundedRounds(2), 2),
+        (EvaluationHorizon::BoundedRounds(2), 8),
         // The legacy common-window contract still pursues static progress.
         (EvaluationHorizon::StaticRounds(2), 8),
     ] {
@@ -377,7 +379,7 @@ fn bounded_rounds_do_not_chase_static_targets_or_time_with_an_unfinished_phase()
                 alternative.window_progress,
                 [alternative.requests[0].progress()]
             );
-            assert!(alternative.has_window_debt(&comparison.targets));
+            assert!(!alternative.has_window_debt(&comparison.targets));
         }
     }
 }

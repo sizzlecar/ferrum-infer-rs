@@ -68,6 +68,10 @@ pub struct ScenarioDiagnostics {
     /// unspecified PlanningBudget also stops later queries conservatively; its
     /// internal work is unknown and is never added to provider_calls.
     pub query_budget_exhausted: bool,
+    /// Candidate/rank traversals that exhausted bounded catch-up waves. A
+    /// comparison may still complete or select another action. This does not
+    /// imply exhaustion of the global query or elapsed-time budgets.
+    pub candidate_horizon_exhaustions: u64,
     /// Calls to the simulation snapshot, including cache hits.
     pub simulation_queries: u64,
     pub cache_hits: u64,
@@ -179,6 +183,10 @@ impl Recorder {
     pub(super) fn failure(&self, reason: Unsupported, origin: FailureOrigin) {
         let elapsed_us = self.elapsed_us();
         let mut state = self.state.lock();
+        if reason == Unsupported::BoundedHorizonExhausted {
+            state.report.candidate_horizon_exhaustions =
+                state.report.candidate_horizon_exhaustions.saturating_add(1);
+        }
         state.report.query_budget_exhausted |= matches!(reason, Unsupported::QueryBudget)
             || matches!(
                 origin,
@@ -229,5 +237,67 @@ impl Recorder {
         state.report.elapsed_us = self.elapsed_us();
         state.report.terminal_failure = error.and(state.last_failure);
         state.report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_candidate_horizon_failure_does_not_poison_global_query_budget() {
+        let recorder = Recorder::new(16);
+        recorder.point(
+            EvaluationPoint {
+                stage: EvaluationStage::Simulation,
+                rank: Some(0),
+                candidate: Some(1),
+                round: Some(3),
+                group: Some(0),
+            },
+            4,
+        );
+        let before = recorder.failures();
+        recorder.failure(
+            Unsupported::BoundedHorizonExhausted,
+            FailureOrigin::Simulation,
+        );
+        // The simulator's outer fallback must not count the same failure again.
+        recorder.fallback_failure(
+            before,
+            Unsupported::BoundedHorizonExhausted,
+            FailureOrigin::Simulation,
+        );
+        recorder.rank_finished(false);
+        let completed = recorder.finish(None);
+        assert_eq!(completed.candidate_horizon_exhaustions, 1);
+        assert_eq!(completed.failure_count, 1);
+        assert_eq!(completed.rank_completed, 1);
+        assert!(!completed.query_budget_exhausted);
+        assert_eq!(completed.terminal_failure, None);
+        assert_eq!(
+            completed.first_failure.unwrap().reason,
+            Unsupported::BoundedHorizonExhausted
+        );
+
+        // A later global failure remains its own failure; it neither erases nor
+        // duplicates the already observed candidate/rank boundary.
+        recorder.failure(Unsupported::TimeBudget, FailureOrigin::SimulationTime);
+        let timed_out = recorder.finish(Some(Unsupported::TimeBudget));
+        assert_eq!(timed_out.candidate_horizon_exhaustions, 1);
+        assert!(!timed_out.query_budget_exhausted);
+        assert_eq!(timed_out.failure_count, 2);
+        assert_eq!(
+            timed_out.terminal_failure.unwrap().reason,
+            Unsupported::TimeBudget
+        );
+        recorder.failure(
+            Unsupported::QueryBudget,
+            FailureOrigin::SimulationQueryBudget,
+        );
+        let quota = recorder.finish(Some(Unsupported::QueryBudget));
+        assert!(quota.query_budget_exhausted);
+        assert_eq!(quota.candidate_horizon_exhaustions, 1);
+        assert_eq!(quota.failure_count, 3);
     }
 }

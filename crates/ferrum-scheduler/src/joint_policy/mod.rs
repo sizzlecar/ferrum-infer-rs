@@ -50,6 +50,9 @@ pub enum Unsupported {
     InvalidState,
     InvalidPlan,
     NoProgress,
+    /// This candidate did not cover the finite static reference within its
+    /// additional wave allowance. Other candidates remain independently valid.
+    BoundedHorizonExhausted,
     Cost(CostUnknownReason),
     Arithmetic,
 }
@@ -292,11 +295,12 @@ pub enum EvaluationHorizon {
     /// The static trajectory fixes the common window at this wave's final
     /// invocation boundary, or earlier when the cohort completes.
     StaticRounds(usize),
-    /// Independently evaluate at most this many complete execution waves for
-    /// static and every alternative, or stop sooner at declared scenario endpoints.
-    /// Alternatives do not pursue static progress or its elapsed-time window.
-    /// Unfinished requests and phases remain a short-horizon observation;
-    /// this does not certify endpoint risk or full request completion.
+    /// Static observes at most this many complete waves. Alternatives cover
+    /// its per-request progress and elapsed window using natural continuation,
+    /// with at most `planning.max_catchup_rounds` additional complete waves.
+    /// A cohort that naturally finishes may stop sooner. An exhausted candidate
+    /// remains unknown; a successful finite comparison is not a full-tail or
+    /// client-visible SLO certificate.
     BoundedRounds(usize),
     /// Targets are the full, assigned endpoints of this scenario. This is not
     /// a latency SLO and does not relax the global query or elapsed budgets.
@@ -543,12 +547,9 @@ impl SloPolicy {
             let result = simulate(
                 &input,
                 action,
-                match (input.horizon, window) {
-                    // This is an independent wave budget, not the original
-                    // common-progress/common-wall-window comparison.
-                    (EvaluationHorizon::BoundedRounds(_), _) => None,
-                    (_, StaticWindow::Exact(window)) => Some((window, targets.as_slice())),
-                    (_, StaticWindow::AtLeast(_)) => None,
+                match window {
+                    StaticWindow::Exact(window) => Some((window, targets.as_slice())),
+                    StaticWindow::AtLeast(_) => None,
                 },
                 &mut budget,
                 index + 1,
@@ -706,6 +707,16 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
     candidate: usize,
     mut trace: Option<&mut scenarios::TraceEvaluation<'_, '_>>,
 ) -> Result<StaticTrajectory, Unsupported> {
+    let bounded_wave_limit = match input.horizon {
+        EvaluationHorizon::BoundedRounds(limit) => Some(if probe.is_some() {
+            limit
+                .checked_add(input.config.planning.max_catchup_rounds)
+                .ok_or(Unsupported::Arithmetic)?
+        } else {
+            limit
+        }),
+        _ => None,
+    };
     // All successful alternatives coexist with static until the comparison is
     // visited. Reserve their complete timing payload against the original
     // participant/fact limit, rather than checking each Vec in isolation.
@@ -1008,7 +1019,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 }
             }
             if let Some((window, targets)) = probe {
-                if central <= window {
+                if bounded_wave_limit.is_none() && central <= window {
                     for (progress, request) in window_progress.iter_mut().zip(&requests) {
                         *progress = request.progress();
                     }
@@ -1023,7 +1034,10 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 }
                 // Continue normal scheduling after early target attainment until
                 // the common window has also been observed. No paused winners.
-                if central >= window && reached.is_some() {
+                // Legacy Joint comparisons can stop at an invocation boundary.
+                // Bounded comparisons must apply and validate the entire wave;
+                // otherwise a Split prefill group could omit its decode group.
+                if bounded_wave_limit.is_none() && central >= window && reached.is_some() {
                     if let Some(phase) = &phase {
                         phase.progressed(&requests)?;
                     }
@@ -1073,6 +1087,35 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
             );
         }
         rounds += 1;
+        if let (Some(limit), Some((window, _))) = (bounded_wave_limit, probe) {
+            // Reached targets are never paused while waiting for the common
+            // wall boundary. Natural endpoint completion is the only early
+            // terminal exception; no idle time or future work is invented.
+            if reached.is_some()
+                && (central >= window || requests.iter().all(SimulatedRequest::finished))
+            {
+                for (progress, request) in window_progress.iter_mut().zip(&requests) {
+                    *progress = request.progress();
+                }
+                return Ok(StaticTrajectory::Complete(TrajectoryResult {
+                    requests,
+                    window_progress,
+                    target_reached_at: reached.unwrap(),
+                    central_elapsed: central,
+                    risk_elapsed: risk,
+                    queries: budget.queries - query_start,
+                    cost_risk,
+                    bounded_timing,
+                }));
+            }
+            if rounds >= limit {
+                budget.diagnostics.failure(
+                    Unsupported::BoundedHorizonExhausted,
+                    FailureOrigin::Simulation,
+                );
+                return Err(Unsupported::BoundedHorizonExhausted);
+            }
+        }
         if probe.is_none()
             && (matches!(
                 input.horizon,

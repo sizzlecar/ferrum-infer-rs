@@ -285,4 +285,50 @@ mod tests {
         );
         assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
     }
+
+    #[test]
+    fn bounded_candidate_horizon_counts_survive_round_trace_and_health_aggregation() {
+        let policy = "ttft:1000,tpot:100,itl:100".parse().unwrap();
+        let scheduler = Arc::new(super::super::ContinuousBatchScheduler::new(
+            ferrum_types::SchedulerConfig {
+                slo: Some(policy),
+                ..Default::default()
+            },
+        ));
+        let provider = Arc::new(RevisionProbe {
+            scheduler: scheduler.clone(),
+            calls: AtomicUsize::new(0),
+            panic: false,
+        });
+        for (exhaustions, evaluated) in [(2, true), (3, false)] {
+            let mut round = TimePlanningRound::new(
+                provider.clone(),
+                policy,
+                PrefillShapePolicy::Identity,
+                CostExecution::SingleInvocation,
+            );
+            round.statistics.bounded.comparisons = 1;
+            round.statistics.bounded.candidate_horizon_exhaustions = exhaustions;
+            round.statistics.bounded.evaluated = u64::from(evaluated);
+            round.statistics.bounded.retained = u64::from(evaluated);
+            round.statistics.bounded.unknown = u64::from(!evaluated);
+            let trace = serde_json::to_value(round.diagnostics()).unwrap();
+            assert_eq!(
+                trace["statistics"]["bounded"]["candidate_horizon_exhaustions"],
+                exhaustions
+            );
+            // Both a completed comparison and a turn that ends before batch
+            // selection retain their candidate/rank counts exactly once.
+            drop(scheduler.observe_planning_round(Some(round)).finish());
+        }
+        let health = serde_json::to_value(scheduler.slo_snapshot().unwrap()).unwrap();
+        assert_eq!(health["planning_rounds"], 2);
+        assert_eq!(health["bounded"]["comparisons"], 2);
+        assert_eq!(health["bounded"]["evaluated"], 1);
+        assert_eq!(health["bounded"]["unknown"], 1);
+        assert_eq!(health["bounded"]["candidate_horizon_exhaustions"], 5);
+        assert_eq!(health["joint_unsupported"]["query_budget"], 0);
+        assert_eq!(health["joint_unsupported"]["time_budget"], 0);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+    }
 }
