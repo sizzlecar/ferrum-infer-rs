@@ -98,9 +98,19 @@ fn one_device_budget_drives_plan_resolution_and_obsolete_override_is_rejected() 
             {
                 // Constructing typed settings still performs no CUDA calls.
                 let resolved = cuda.resolved().unwrap();
+                let ferrum_engine::image_generation::cuda::ImageCudaMemoryPolicy::ExplicitTotal(
+                    capacity,
+                ) = resolved.memory
+                else {
+                    panic!("explicit config must keep explicit policy");
+                };
+                assert_eq!(capacity.get(), budget);
                 assert_eq!(
-                    resolved.pipeline.device_capacity_bytes,
-                    resolved.usable_memory_bytes
+                    resolved
+                        .pipeline
+                        .with_device_capacity(capacity)
+                        .device_capacity_bytes,
+                    budget
                 );
             }
         }
@@ -120,6 +130,9 @@ fn one_device_budget_drives_plan_resolution_and_obsolete_override_is_rejected() 
         );
     }
 }
+
+#[path = "directory_tests.rs"]
+mod directory_tests;
 
 #[test]
 fn experimental_batch_profile_connects_service_limit_to_real_pipeline_capacity() {

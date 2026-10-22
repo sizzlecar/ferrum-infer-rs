@@ -4,12 +4,74 @@ The CUDA build exposes the existing in-process image pipeline through both
 entrypoints. It uses one device runtime and one Host account, with the registered
 architecture from `model_index.json`. The public model name is an alias only.
 
+For a complete local pipeline installation, use its directory directly:
+
+```text
+ferrum run /models/image-pipeline --prompt "A red kite above the sea" --seed 42 --output kite.png
+ferrum serve /models/image-pipeline --max-num-seqs 8 --gpu-memory-utilization 0.9 --host 127.0.0.1 --port 8000
+```
+
+Both commands recognize the registered pipeline declaration and validate its
+component metadata before creating CUDA. A directory name does not select an
+architecture. A normal text-model directory without `model_index.json` retains
+the existing text route. An unknown or incomplete pipeline is an error, not a
+text fallback. In particular, a missing `transformer/config.json` must be
+supplied by a complete model installation; Ferrum does not reconstruct it from
+weight shapes or invent it. A successful run using separately supplied metadata
+through `--image-config` does not establish that the ordinary directory route
+works for an incomplete installation.
+
+The directory route selects the named **`experimental_bf16_cold_v1`** preset.
+It uses BF16 components and reloads weights between stages and request batches;
+it does not provide cross-batch residency. Its explicit defaults and bounds are:
+
+| Control | Preset behavior |
+| --- | --- |
+| Dimensions | 512×512 by default, at most 1024 per axis; model divisibility is checked without rounding |
+| `--max-num-seqs` | Defaults to 1; larger values enable real compatible TE/DiT batches up to the supported attention capacity |
+| Batch wait | 0 ms for a ceiling of 1, 200 ms for larger batch ceilings |
+| VAE | One B1 decoder session reused for the images in each batch |
+| User tokens | At most 1024 per prompt |
+| Host tensor account | 1 GiB total, with 768 MiB input, 256 MiB output and 16 MiB transfer-staging class ceilings |
+| CUDA declarations | 1 GiB bootstrap, four streams at 64 MiB each, 64 MiB cuDNN opaque allowance, 16 MiB convolution workspace limit |
+
+These are bounded configuration choices, not measured optimal settings or proof
+that every resolution/batch combination fits. All plans still pass actual
+capacity admission. `run` accepts one prompt and writes one image even when a
+larger batch ceiling is allowed; concurrent compatible HTTP requests use the
+real batching path. Cold execution and these limits do not establish G3
+readiness, latency-SLO compliance or vLLM-Omni throughput parity.
+
+`--gpu-memory-utilization` must be finite and in `(0, 1]` (default 0.9). The
+automatic factory creates the sole managed CUDA context and then selects
+`min(observed_free_bytes, floor(total_bytes * utilization))` as a conservative
+**total** ceiling. Bootstrap, streams, library claims and tensor allocations all
+share it; declared opaque bytes are not added back to observed free memory.
+`--runtime-memory-budget-bytes`, when supplied, only lowers this ceiling.
+It is not an independent plan budget. Free memory may change after observation;
+the selected ceiling is not a promise to reach a particular measured GPU usage.
+The composition receipt separates this observed snapshot from declared profiles.
+
+The directory route supports `--backend auto` or `cuda`, with one optional CUDA
+ordinal in `--gpu-devices`. cuDNN 9 discovery checks `LD_LIBRARY_PATH`, bounded
+system `ldconfig -p` output on Linux, then standard Linux/CUDA library directories.
+To override discovery, pass `--image-cudnn-library /absolute/path/libcudnn.so.9`.
+Discovery only resolves files; the native library loads after its opaque
+reservation. The canonical path is recorded in the composition receipt and
+the existing provider records its library fingerprint. There is no search in a
+model-specific virtual environment. Missing cuDNN produces an installation or
+explicit-path error. The cuDNN deployment and its sibling libraries must remain
+trusted and immutable while running.
+
+For diagnostics or nonstandard metadata/archive locations, the existing explicit
+configuration route remains available:
+
 ```text
 ferrum run --image-config image.json --prompt "A red kite above the sea" --width 512 --height 512 --seed 42 --output kite.png
 ferrum serve --image-config image.json --host 127.0.0.1 --port 8000
 ```
 
-Choose one explicit experimental profile:
+Choose one explicit experimental profile in that JSON:
 
 - `experimental_serial_cold` retains one request per execution. Its pipeline
   `maximum_batch_size` and serving `max_num_seqs` must both be `1`.
@@ -44,7 +106,7 @@ backend convolution algorithms can change with batch geometry. Neither policy
 promises a fixed VRAM peak or fit without actual plan admission and measurement;
 Host input/output storage still grows with request count.
 
-`backend.usable_memory_bytes` is the single product device-memory ceiling.
+In explicit JSON, `backend.usable_memory_bytes` is the single product device-memory ceiling.
 The internal plan admission limit is derived from it automatically for both
 `run` and `serve`; there is no second plan budget to fill in. The compiler still
 calculates each stage's resource requirements and admission checks those
@@ -63,11 +125,12 @@ is no cross-batch component residency in this implementation.
 
 The HTTP path is `POST /v1/images/generations` with `model`, `prompt`, optional
 `size` (`WIDTHxHEIGHT`), `seed`, `n=1` and `response_format="b64_json"`.
-Unknown fields and unsupported controls are rejected. Text flags such as
-`--temperature`, `--max-tokens`, `--backend`, `--model` and compatibility controls
-are rejected when supplied with `--image-config`; without it, text behavior is
-unchanged. Image defaults for `run` are 512×512 pixels and seed zero. HTTP defaults
-come from the explicit `serving` configuration.
+Unknown fields and unsupported controls are rejected. Text generation flags such
+as `--temperature`, `--max-tokens` and text compatibility controls are rejected
+for either image route. `--image-config` also rejects simultaneous MODEL,
+backend/budget flags and `--image-cudnn-library`: change its explicit JSON instead.
+Image defaults for `run` are 512×512 pixels and seed zero. HTTP defaults come from
+the named preset or the explicit `serving` configuration.
 
 `run` creates its PNG destination exclusively, preserving RGBA and alpha. It
 emits a JSON receipt to stdout after the PNG is finished and synced. A failed

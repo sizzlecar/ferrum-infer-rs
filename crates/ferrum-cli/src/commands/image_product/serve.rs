@@ -1,4 +1,4 @@
-use super::ImageProductError;
+use super::{ImageProductError, ImageProductSource};
 use std::path::Path;
 
 pub async fn execute_serve(
@@ -7,16 +7,30 @@ pub async fn execute_serve(
     port: u16,
     aliases: Vec<String>,
 ) -> Result<(), ImageProductError> {
+    execute_serve_source(
+        ImageProductSource::ExplicitConfig(config_path.to_owned()),
+        host,
+        port,
+        aliases,
+    )
+    .await
+}
+
+pub async fn execute_serve_source(
+    source: ImageProductSource,
+    host: String,
+    port: u16,
+    aliases: Vec<String>,
+) -> Result<(), ImageProductError> {
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (config_path, host, port, aliases);
+        let _ = (source, host, port, aliases);
         Err(ImageProductError::Unsupported(
             "image serving currently requires a Ferrum binary built with the cuda feature",
         ))
     }
     #[cfg(feature = "cuda")]
     {
-        use super::{configuration::ImageBackendConfig, ImageProductConfig};
         use ferrum_engine::image_generation::service::{ImageService, ImageServiceConfig};
         use ferrum_output::png::PngLimits;
         use ferrum_server::{
@@ -25,8 +39,8 @@ pub async fn execute_serve(
         };
         use std::sync::Arc;
 
-        let config = ImageProductConfig::load(config_path)?;
-        let serving = config.serving.as_ref().ok_or_else(|| {
+        let product = source.prepare()?;
+        let serving = product.serving.as_ref().ok_or_else(|| {
             anyhow::anyhow!("image serve requires an explicit serving configuration")
         })?;
         serving.validate()?;
@@ -39,7 +53,7 @@ pub async fn execute_serve(
         let model = aliases
             .into_iter()
             .next()
-            .unwrap_or_else(|| config.model.clone());
+            .unwrap_or_else(|| product.model.clone());
         ferrum_server::ServedModelRegistry::try_new(
             model.clone(),
             ferrum_server::ServedModelKind::ImageGeneration,
@@ -47,11 +61,7 @@ pub async fn execute_serve(
             vec![],
         )
         .map_err(anyhow::Error::from)?;
-        let ImageBackendConfig::Cuda(cuda) = &config.backend;
-        let cuda = cuda.resolved()?;
-        cuda.validate()?;
-        let assets = config.prepare_assets()?;
-        let pipeline = cuda.create_pipeline(assets)?;
+        let (pipeline, composition) = product.cuda.create_pipeline_with_receipt(product.assets)?;
         let service = ImageService::new(
             pipeline,
             ImageServiceConfig {
@@ -82,7 +92,8 @@ pub async fn execute_serve(
             port,
             ..Default::default()
         };
-        tracing::warn!(profile=config.execution_profile.as_str(), max_num_seqs=serving.max_num_seqs,
+        tracing::info!(composition=%serde_json::to_string(&composition).map_err(anyhow::Error::from)?, "image CUDA composition and observed conservative memory ceiling");
+        tracing::warn!(profile=product.profile, max_num_seqs=serving.max_num_seqs,
             "image HTTP uses configured cold batches; no cross-batch residency or G3 throughput qualification");
         let mut task = {
             let server = server.clone();

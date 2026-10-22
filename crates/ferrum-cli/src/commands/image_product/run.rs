@@ -1,4 +1,4 @@
-use super::ImageProductError;
+use super::{ImageProductError, ImageProductSource};
 use std::path::Path;
 
 /// One process, one runtime and one Host account. This is a cold serial
@@ -11,26 +11,61 @@ pub fn execute_run(
     seed: u64,
     destination: &Path,
 ) -> Result<(), ImageProductError> {
+    execute_run_source(
+        ImageProductSource::ExplicitConfig(config_path.to_owned()),
+        prompt,
+        width,
+        height,
+        seed,
+        destination,
+    )
+}
+
+pub fn execute_run_source(
+    source: ImageProductSource,
+    prompt: String,
+    width: u32,
+    height: u32,
+    seed: u64,
+    destination: &Path,
+) -> Result<(), ImageProductError> {
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (config_path, prompt, width, height, seed, destination);
+        let _ = (source, prompt, width, height, seed, destination);
         Err(ImageProductError::Unsupported(
             "image generation currently requires a Ferrum binary built with the cuda feature",
         ))
     }
     #[cfg(feature = "cuda")]
     {
-        use super::{configuration::ImageBackendConfig, ImageProductConfig};
         use ferrum_engine::image_generation::ImageGenerationRequest;
         use ferrum_models::qwen_image21::pipeline_adapters::QwenImage21RgbaOutput;
         use ferrum_output::png::{write_rgba8_png, PngDimensions, PngLimits};
         use ferrum_runtime::HostMemoryClass;
         use std::{fs::OpenOptions, io};
 
-        let config = ImageProductConfig::load(config_path)?;
-        let ImageBackendConfig::Cuda(cuda) = &config.backend;
-        let cuda = cuda.resolved()?;
-        cuda.validate()?;
+        let product = source.prepare()?;
+        if width == 0
+            || height == 0
+            || width > product.cuda.pipeline.maximum_width
+            || height > product.cuda.pipeline.maximum_height
+        {
+            return Err(
+                anyhow::anyhow!("requested image dimensions exceed configured bounds").into(),
+            );
+        }
+        let grid_multiple = product
+            .assets
+            .spatial_scale()?
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("image spatial multiple overflows"))?;
+        if grid_multiple == 0
+            || width % grid_multiple != 0
+            || height % grid_multiple != 0
+            || prompt.len() > 1024 * 1024
+        {
+            return Err(anyhow::anyhow!("image dimensions must produce even latent axes and the prompt must fit the 1 MiB bound").into());
+        }
         let dimensions =
             PngDimensions::new(width.into(), height.into()).map_err(anyhow::Error::from)?;
         let png_limits = PngLimits::default();
@@ -38,10 +73,10 @@ pub fn execute_run(
             .validate(dimensions)
             .map_err(anyhow::Error::from)?;
         // Opening archives and validating their actual metadata precedes CUDA.
-        let assets = config.prepare_assets()?;
-        let mut pipeline = Box::new(cuda.create_pipeline(assets)?);
+        let (pipeline, composition) = product.cuda.create_pipeline_with_receipt(product.assets)?;
+        let mut pipeline = Box::new(pipeline);
         tracing::warn!(
-            profile = config.execution_profile.as_str(),
+            profile = product.profile,
             "image run reloads component weights; no throughput qualification"
         );
         let output = match pipeline.generate(ImageGenerationRequest {
@@ -84,8 +119,9 @@ pub fn execute_run(
         println!(
             "{}",
             serde_json::to_string(&serde_json::json!({
-                "model": config.model,
-                "execution_profile": config.execution_profile.as_str(),
+                "model": product.model,
+                "execution_profile": product.profile,
+                "composition": composition,
                 "output": destination,
                 "png": {"width": png.dimensions().width(), "height": png.dimensions().height(),
                     "encoded_bytes": png.encoded_bytes(), "color_type": "rgba8"},

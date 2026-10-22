@@ -666,7 +666,19 @@ pub async fn execute_cli(
     cmd: RunCliCommand,
     config: CliConfig,
 ) -> std::result::Result<(), super::image_product::CommandError> {
-    if let Some(path) = cmd.image.product.image_config {
+    let source = cmd
+        .image
+        .product
+        .source(
+            cmd.command.model.as_deref(),
+            cmd.command.gpu_memory_utilization,
+            cmd.command.runtime_memory_budget_bytes,
+            cmd.command.max_num_seqs,
+            &cmd.command.backend,
+            cmd.command.gpu_devices.as_deref(),
+        )
+        .map_err(super::image_product::ImageProductError::from)?;
+    if let Some(source) = source {
         let prompt = cmd.command.prompt.ok_or_else(|| {
             super::image_product::ImageProductError::from(anyhow::anyhow!(
                 "image run requires --prompt"
@@ -677,8 +689,8 @@ pub async fn execute_cli(
                 "image run requires --output"
             ))
         })?;
-        super::image_product::execute_run(
-            &path,
+        super::image_product::execute_run_source(
+            source,
             prompt,
             cmd.image.width.unwrap_or(512),
             cmd.image.height.unwrap_or(512),
@@ -693,7 +705,7 @@ pub async fn execute_cli(
 
 #[derive(Args)]
 pub struct RunCommand {
-    /// Model name (alias, owner/repository[:QUANT], local directory, or `.gguf` file).
+    /// Model name (alias, owner/repository[:QUANT], local text/image pipeline directory, or `.gguf` file).
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 
@@ -812,12 +824,16 @@ pub struct RunCommand {
     /// Fraction of currently available device memory used by native startup
     /// planning (default: 0.9). Legacy CUDA models use this fraction of total
     /// GPU memory for their KV pool estimate.
+    /// Local image pipelines use min(observed free, total * fraction) as a
+    /// conservative total ceiling including declared native overhead.
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
     /// Exact device-wide memory budget available to runtime weights and
     /// dynamic resources. This is a typed capacity ceiling shared by `run`
     /// and `serve`; omit it to use the normal pressure-threshold policy.
+    /// For an automatically detected image pipeline this only lowers the
+    /// observed utilization ceiling; it is not a second plan allowance.
     #[arg(long, value_name = "BYTES")]
     pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
 
@@ -825,7 +841,7 @@ pub struct RunCommand {
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
 
-    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`.
+    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`; image pipeline batch ceiling.
     #[arg(long, value_name = "N")]
     pub max_num_seqs: Option<usize>,
 

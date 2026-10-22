@@ -1,4 +1,4 @@
-//! Explicit CUDA composition for the serial image pipeline.
+//! One-context CUDA composition for the experimental cold image pipeline.
 //!
 //! Prepare `QwenImage21Assets` before calling this module. Construction validates
 //! caller budgets and architecture-derived command counts before device work,
@@ -12,7 +12,8 @@ use ferrum_diffusion::Bf16EulerProfile;
 use ferrum_kernels::backend::cuda::{
     vnext_ops::*,
     vnext_runtime::{CudaDeviceCommand, CudaDeviceRuntime, CudaTensorRuntimeConfig},
-    CudaCudnnConfig,
+    CudaCudnnConfig, CudaMemoryUtilization, CudaTensorMemoryObservation,
+    CudaTensorRuntimeAutoConfig,
 };
 use ferrum_models::normal_noise::{NormalNoiseConfig, NormalNoiseFamily};
 use ferrum_models::qwen3_vl_text::{
@@ -23,17 +24,80 @@ use ferrum_models::qwen_image21::{
     QwenImage21VaeDecoderFamily,
 };
 use ferrum_runtime::*;
-use std::sync::Arc;
+use std::{num::NonZeroU64, sync::Arc};
 
-/// Every limit is supplied explicitly. Each live plan's
-/// `pipeline.device_capacity_bytes` also caps the shared device account, which
-/// includes runtime/stream and cuDNN opaque claims. Setting it lower than
-/// `usable_memory_bytes` tightens the process ceiling; it is not an independent
-/// allowance for tensor storage. Actual plan and pool admission still apply.
+/// One total device ceiling, including opaque claims. Automatic selection
+/// observes the sole runtime context; the optional maximum only tightens it.
+#[derive(Debug, Clone, Copy)]
+pub enum ImageCudaMemoryPolicy {
+    ExplicitTotal(NonZeroU64),
+    AutoAvailable {
+        utilization: CudaMemoryUtilization,
+        maximum_bytes: Option<NonZeroU64>,
+    },
+}
+
+/// Request limits without an independent device budget. The factory supplies
+/// the actual runtime ceiling to every component plan after context creation.
+#[derive(Debug, Clone)]
+pub struct ImageCudaPipelineLimits {
+    pub maximum_user_tokens: usize,
+    pub maximum_width: u32,
+    pub maximum_height: u32,
+    pub maximum_batch_size: usize,
+    pub decoder_batch_policy: super::ImageDecoderBatchPolicy,
+    pub static_initialization: StaticInitializationPolicy,
+    pub executor: ferrum_execution::TensorExecutorConfig,
+}
+impl ImageCudaPipelineLimits {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.maximum_width > 0 && self.maximum_height > 0,
+            "image dimension limits must be positive"
+        );
+        ensure!(
+            (1..=8192).contains(&self.maximum_user_tokens),
+            "user-token limit must be 1..=8192"
+        );
+        ensure!(
+            (1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&self.maximum_batch_size),
+            "image maximum_batch_size exceeds supported attention capacity"
+        );
+        Ok(())
+    }
+    pub fn with_device_capacity(self, capacity: NonZeroU64) -> ImagePipelineConfig {
+        ImagePipelineConfig {
+            device_capacity_bytes: capacity.get(),
+            maximum_user_tokens: self.maximum_user_tokens,
+            maximum_width: self.maximum_width,
+            maximum_height: self.maximum_height,
+            maximum_batch_size: self.maximum_batch_size,
+            decoder_batch_policy: self.decoder_batch_policy,
+            static_initialization: self.static_initialization,
+            executor: self.executor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImageCudaCompositionReceipt {
+    pub memory_policy: &'static str,
+    pub device_capacity_bytes: u64,
+    pub observed_memory: Option<CudaTensorMemoryObservation>,
+    /// Absolute path passed to the admitted native loader. The generated
+    /// component plans retain the provider's library fingerprint separately.
+    pub cudnn_library: std::path::PathBuf,
+    pub cudnn_workspace_limit_bytes: u64,
+    /// These allowances are declared, not measured native memory peaks.
+    pub runtime_opaque_profile: String,
+    pub cudnn_opaque_profile: String,
+}
+
+/// Explicit limits or a named product preset are resolved before device work.
 #[derive(Debug, Clone)]
 pub struct QwenImage21CudaConfig {
     pub ordinal: usize,
-    pub usable_memory_bytes: u64,
+    pub memory: ImageCudaMemoryPolicy,
     pub bootstrap_memory_bytes: u64,
     pub stream_memory_bytes: u64,
     pub maximum_streams: usize,
@@ -42,7 +106,7 @@ pub struct QwenImage21CudaConfig {
     pub opaque_memory_profile: String,
     pub cudnn: CudaCudnnConfig,
     pub host: HostMemoryLimits,
-    pub pipeline: ImagePipelineConfig,
+    pub pipeline: ImageCudaPipelineLimits,
 }
 
 impl QwenImage21CudaConfig {
@@ -83,19 +147,10 @@ impl QwenImage21CudaConfig {
             })
             .filter(|&n| n <= isize::MAX as usize)
             .context("CUDA command-record capacity exceeds addressable memory")?;
-        let overhead = self.opaque_bytes()?;
-        ensure!(
-            overhead < self.usable_memory_bytes,
-            "CUDA runtime/stream/cuDNN opaque allowances leave no storage capacity"
-        );
-        ensure!(
-            self.pipeline.device_capacity_bytes <= self.usable_memory_bytes,
-            "pipeline device-account ceiling exceeds declared usable device capacity"
-        );
-        ensure!(
-            self.cudnn.workspace_limit_bytes < self.usable_memory_bytes - overhead,
-            "cuDNN workspace ceiling leaves no storage for tensors"
-        );
+        self.opaque_bytes()?;
+        if let Some(capacity) = self.declared_maximum() {
+            self.validate_capacity(capacity.get())?;
+        }
 
         let staging = usize::try_from(self.pipeline.static_initialization.maximum_staging_bytes())
             .context("static staging exceeds Host address range")?;
@@ -128,6 +183,17 @@ impl QwenImage21CudaConfig {
         self,
         assets: QwenImage21Assets,
     ) -> Result<QwenImage21Pipeline<CudaDeviceRuntime>> {
+        self.create_pipeline_with_receipt(assets)
+            .map(|(pipeline, _)| pipeline)
+    }
+
+    pub fn create_pipeline_with_receipt(
+        self,
+        assets: QwenImage21Assets,
+    ) -> Result<(
+        QwenImage21Pipeline<CudaDeviceRuntime>,
+        ImageCudaCompositionReceipt,
+    )> {
         self.validate()?;
         let profiles = cuda_profiles()?;
         self.validate_assets(&assets, &profiles)?;
@@ -137,18 +203,58 @@ impl QwenImage21CudaConfig {
             self.ordinal,
             DeviceId::new(format!("device.cuda.{}", self.ordinal))?,
         )?;
-        let runtime = Arc::new(CudaDeviceRuntime::new_tensor_eager(
-            CudaTensorRuntimeConfig {
+        let runtime = Arc::new(match self.memory {
+            ImageCudaMemoryPolicy::ExplicitTotal(bytes) => {
+                CudaDeviceRuntime::new_tensor_eager(CudaTensorRuntimeConfig {
+                    device,
+                    usable_memory_bytes: bytes.get(),
+                    bootstrap_memory_bytes: self.bootstrap_memory_bytes,
+                    stream_memory_bytes: self.stream_memory_bytes,
+                    maximum_streams: self.maximum_streams,
+                    maximum_in_flight_per_stream: self.maximum_in_flight_per_stream,
+                    maximum_commands_per_submission: self.maximum_commands_per_submission,
+                    opaque_memory_profile: self.opaque_memory_profile.clone(),
+                })?
+            }
+            ImageCudaMemoryPolicy::AutoAvailable {
+                utilization,
+                maximum_bytes,
+            } => CudaDeviceRuntime::new_tensor_eager_auto(CudaTensorRuntimeAutoConfig {
                 device,
-                usable_memory_bytes: self.usable_memory_bytes,
+                utilization,
+                maximum_memory_bytes: maximum_bytes.map(NonZeroU64::get),
                 bootstrap_memory_bytes: self.bootstrap_memory_bytes,
                 stream_memory_bytes: self.stream_memory_bytes,
                 maximum_streams: self.maximum_streams,
                 maximum_in_flight_per_stream: self.maximum_in_flight_per_stream,
                 maximum_commands_per_submission: self.maximum_commands_per_submission,
-                opaque_memory_profile: self.opaque_memory_profile,
+                opaque_memory_profile: self.opaque_memory_profile.clone(),
+            })?,
+        });
+        let observed_memory = runtime.tensor_memory_observation().copied();
+        let capacity = match self.memory {
+            ImageCudaMemoryPolicy::ExplicitTotal(bytes) => bytes,
+            ImageCudaMemoryPolicy::AutoAvailable { .. } => NonZeroU64::new(
+                observed_memory
+                    .context("automatic runtime omitted its memory observation")?
+                    .effective_ceiling_bytes(),
+            )
+            .context("automatic runtime returned zero capacity")?,
+        };
+        self.validate_capacity(capacity.get())?;
+        self.validate_weight_capacity(&assets, capacity.get())?;
+        let receipt = ImageCudaCompositionReceipt {
+            memory_policy: match self.memory {
+                ImageCudaMemoryPolicy::ExplicitTotal(_) => "explicit_total",
+                ImageCudaMemoryPolicy::AutoAvailable { .. } => "auto_available",
             },
-        )?);
+            device_capacity_bytes: capacity.get(),
+            observed_memory,
+            cudnn_library: self.cudnn.library_path.clone(),
+            cudnn_workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
+            runtime_opaque_profile: self.opaque_memory_profile.clone(),
+            cudnn_opaque_profile: self.cudnn.opaque_memory_profile.clone(),
+        };
         // ALL includes Philox. Do not call the standalone Philox factory:
         // it would try to acquire a second live native-module permit.
         let mut providers = cuda_vnext_tensor_providers_with_cudnn(
@@ -170,7 +276,7 @@ impl QwenImage21CudaConfig {
             .augment_catalog(registry.capability_catalog(descriptor.clone(), vec![engine])?)?;
         // This is the sole Host account. No component receives a fresh ledger.
         let host = HostMemoryAccount::new(self.host);
-        QwenImage21Pipeline::new(
+        let pipeline = QwenImage21Pipeline::new(
             runtime,
             host,
             registry,
@@ -178,8 +284,39 @@ impl QwenImage21CudaConfig {
             materializers,
             assets,
             profiles,
-            self.pipeline,
-        )
+            self.pipeline.with_device_capacity(capacity),
+        )?;
+        Ok((pipeline, receipt))
+    }
+
+    fn declared_maximum(&self) -> Option<NonZeroU64> {
+        match self.memory {
+            ImageCudaMemoryPolicy::ExplicitTotal(bytes) => Some(bytes),
+            ImageCudaMemoryPolicy::AutoAvailable { maximum_bytes, .. } => maximum_bytes,
+        }
+    }
+    fn validate_capacity(&self, capacity: u64) -> Result<()> {
+        let overhead = self.opaque_bytes()?;
+        ensure!(
+            overhead < capacity,
+            "CUDA runtime/stream/cuDNN opaque allowances leave no storage capacity"
+        );
+        ensure!(
+            self.cudnn.workspace_limit_bytes < capacity - overhead,
+            "cuDNN workspace ceiling leaves no storage for tensors"
+        );
+        Ok(())
+    }
+    fn validate_weight_capacity(&self, assets: &QwenImage21Assets, capacity: u64) -> Result<()> {
+        let largest = assets
+            .receipt()
+            .required_weight_bytes
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        let opaque = self.opaque_bytes()?;
+        ensure!(largest < capacity - opaque, "largest component weights ({largest} bytes) leave no admitted activation capacity under total ceiling {capacity} with declared opaque allowances {opaque}");
+        Ok(())
     }
 
     fn opaque_bytes(&self) -> Result<u64> {
@@ -195,17 +332,9 @@ impl QwenImage21CudaConfig {
         assets: &QwenImage21Assets,
         profiles: &QwenImage21Profiles,
     ) -> Result<()> {
-        let largest_weights = assets
-            .receipt()
-            .required_weight_bytes
-            .into_iter()
-            .max()
-            .unwrap_or(0);
-        ensure!(
-            largest_weights <= self.pipeline.device_capacity_bytes
-                && largest_weights < self.usable_memory_bytes - self.opaque_bytes()?,
-            "largest component weights leave no admitted device capacity for activations"
-        );
+        if let Some(capacity) = self.declared_maximum() {
+            self.validate_weight_capacity(assets, capacity.get())?;
+        }
         let minimum_pixels = assets
             .spatial_scale()?
             .checked_mul(2)
@@ -319,7 +448,7 @@ mod tests {
     fn config() -> QwenImage21CudaConfig {
         QwenImage21CudaConfig {
             ordinal: 0,
-            usable_memory_bytes: 1024 * 1024,
+            memory: ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(1024 * 1024).unwrap()),
             bootstrap_memory_bytes: 4096,
             stream_memory_bytes: 1024,
             maximum_streams: 1,
@@ -342,8 +471,7 @@ mod tests {
                 },
             )
             .unwrap(),
-            pipeline: ImagePipelineConfig {
-                device_capacity_bytes: 1024 * 1024,
+            pipeline: ImageCudaPipelineLimits {
                 maximum_user_tokens: 1024,
                 maximum_width: 512,
                 maximum_height: 512,
@@ -365,8 +493,9 @@ mod tests {
             |c: &mut QwenImage21CudaConfig| c.maximum_commands_per_submission = 31,
             |c: &mut QwenImage21CudaConfig| c.bootstrap_memory_bytes = 0,
             |c: &mut QwenImage21CudaConfig| c.stream_memory_bytes = u64::MAX,
-            |c: &mut QwenImage21CudaConfig| c.usable_memory_bytes = 9216,
-            |c: &mut QwenImage21CudaConfig| c.pipeline.device_capacity_bytes = 1024 * 1024 + 1,
+            |c: &mut QwenImage21CudaConfig| {
+                c.memory = ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(9216).unwrap())
+            },
             |c: &mut QwenImage21CudaConfig| {
                 c.pipeline.static_initialization =
                     StaticInitializationPolicy::new(1025, 32).unwrap()
@@ -383,6 +512,34 @@ mod tests {
             edit(&mut c);
             assert!(c.validate().is_err());
         }
+    }
+
+    #[test]
+    fn automatic_policy_has_no_placeholder_capacity_or_second_plan_budget() {
+        let mut c = config();
+        c.memory = ImageCudaMemoryPolicy::AutoAvailable {
+            utilization: CudaMemoryUtilization::new(0.9).unwrap(),
+            maximum_bytes: None,
+        };
+        c.validate().unwrap();
+        assert!(c.declared_maximum().is_none());
+        // The sole-context observation is injected here only to test the
+        // pure configuration bridge. This is not a CUDA observation fixture.
+        for observed in [16384, 32768] {
+            let bytes = NonZeroU64::new(observed).unwrap();
+            assert_eq!(
+                c.pipeline
+                    .clone()
+                    .with_device_capacity(bytes)
+                    .device_capacity_bytes,
+                observed
+            );
+        }
+        c.memory = ImageCudaMemoryPolicy::AutoAvailable {
+            utilization: CudaMemoryUtilization::new(0.9).unwrap(),
+            maximum_bytes: NonZeroU64::new(9216),
+        };
+        assert!(c.validate().is_err());
     }
 
     #[test]

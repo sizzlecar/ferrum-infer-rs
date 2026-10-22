@@ -30,7 +30,7 @@ use tokio::signal;
 
 #[derive(Args)]
 pub struct ServeCommand {
-    /// Model alias, owner/repository[:QUANT], or local path (default: from config)
+    /// Model alias, owner/repository[:QUANT], or local text/image pipeline path (default: from config)
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 
@@ -94,11 +94,15 @@ pub struct ServeCommand {
     /// Fraction of currently available device memory used by native startup
     /// planning (default: 0.9). Legacy CUDA models use this fraction of total
     /// GPU memory for their KV pool estimate.
+    /// Local image pipelines use min(observed free, total * fraction) as a
+    /// conservative total ceiling including declared native overhead.
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
     /// Exact device-wide memory budget available to runtime weights and
     /// dynamic resources. This is the same typed ceiling used by `run`.
+    /// For an automatically detected image pipeline this only lowers the
+    /// observed utilization ceiling; it is not a second plan allowance.
     #[arg(long, value_name = "BYTES")]
     pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
 
@@ -106,7 +110,7 @@ pub struct ServeCommand {
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
 
-    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`.
+    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`; maximum real image batch size (default 1).
     #[arg(long, value_name = "N")]
     pub max_num_seqs: Option<usize>,
 
@@ -417,9 +421,23 @@ pub async fn execute_cli(
     config: CliConfig,
     configured_interleaved_system_coalescing: bool,
 ) -> std::result::Result<(), super::image_product::CommandError> {
-    if let Some(path) = cmd.image.image_config {
-        return super::image_product::execute_serve(
-            &path,
+    let source = cmd
+        .image
+        .source(
+            cmd.command
+                .model
+                .as_deref()
+                .or(cmd.command.model_option.as_deref()),
+            cmd.command.gpu_memory_utilization,
+            cmd.command.runtime_memory_budget_bytes,
+            cmd.command.max_num_seqs,
+            &cmd.command.backend,
+            cmd.command.gpu_devices.as_deref(),
+        )
+        .map_err(super::image_product::ImageProductError::from)?;
+    if let Some(source) = source {
+        return super::image_product::execute_serve_source(
+            source,
             cmd.command.host.unwrap_or(config.server.host),
             cmd.command.port.unwrap_or(config.server.port),
             cmd.command.served_model_name,

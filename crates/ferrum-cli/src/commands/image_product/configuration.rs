@@ -310,7 +310,10 @@ impl CudaConfig {
         Ok(
             ferrum_engine::image_generation::cuda::QwenImage21CudaConfig {
                 ordinal: self.ordinal,
-                usable_memory_bytes: self.usable_memory_bytes,
+                memory: ferrum_engine::image_generation::cuda::ImageCudaMemoryPolicy::ExplicitTotal(
+                    std::num::NonZeroU64::new(self.usable_memory_bytes)
+                        .ok_or_else(|| anyhow::anyhow!("usable_memory_bytes must be positive"))?,
+                ),
                 bootstrap_memory_bytes: self.bootstrap_memory_bytes,
                 stream_memory_bytes: self.stream_memory_bytes,
                 maximum_streams: self.maximum_streams,
@@ -324,8 +327,32 @@ impl CudaConfig {
                     opaque_memory_profile: self.cudnn.opaque_memory_profile.clone(),
                 },
                 host: self.host.limits()?,
-                pipeline: self.resolved_pipeline()?,
+                pipeline: self.pipeline.resolved_limits()?,
             },
         )
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PipelineConfig {
+    pub(super) fn resolved_limits(
+        &self,
+    ) -> Result<ferrum_engine::image_generation::cuda::ImageCudaPipelineLimits> {
+        let limits = ferrum_engine::image_generation::cuda::ImageCudaPipelineLimits {
+            maximum_user_tokens: self.maximum_user_tokens,
+            maximum_width: self.maximum_width,
+            maximum_height: self.maximum_height,
+            maximum_batch_size: self.maximum_batch_size,
+            decoder_batch_policy: self.decoder_batch_policy,
+            static_initialization: StaticInitializationPolicy::new(
+                self.maximum_staging_bytes,
+                self.maximum_initialization_commands,
+            )?,
+            executor: ferrum_execution::TensorExecutorConfig::new(
+                self.maximum_backing_maintenance_passes,
+            )?,
+        };
+        limits.validate()?;
+        Ok(limits)
     }
 }
