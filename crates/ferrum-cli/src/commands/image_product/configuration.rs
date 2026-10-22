@@ -193,6 +193,7 @@ impl PipelineConfig {
         &self,
         device_capacity_bytes: u64,
     ) -> Result<ferrum_engine::image_generation::ImagePipelineConfig> {
+        self.plan_cache.validate()?;
         ensure!(
             device_capacity_bytes > 0 && self.maximum_width > 0 && self.maximum_height > 0,
             "backend usable_memory_bytes and image pixel bounds must be positive"

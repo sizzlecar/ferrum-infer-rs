@@ -36,6 +36,9 @@ pub struct ImageStagePlanReceipt {
     pub compile_wall_duration_us: u64,
     /// Reused immutable compilation. Session reuse is reported separately.
     pub plan_cache_hit: bool,
+    /// Compilation metadata retention, separate from device/session residency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_cache: Option<ImagePlanCacheReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,12 +200,14 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         let started = Instant::now();
         ensure!(batch_size > 0, "stage batch size must be positive");
         let family_fingerprint = family.fingerprint()?;
-        if pipeline.config.plan_cache == ImagePlanCachePolicy::LastPerStage {
-            if let Some((component, mut plan)) =
-                pipeline
-                    .plan_cache
-                    .get(stage, batch_size, &family_fingerprint, options)?
-            {
+        if pipeline.config.plan_cache != ImagePlanCachePolicy::Disabled {
+            if let Some((component, mut plan)) = pipeline.plan_cache.get(
+                pipeline.config.plan_cache,
+                stage,
+                batch_size,
+                &family_fingerprint,
+                options,
+            )? {
                 plan.compile_wall_duration_us = elapsed_us(started);
                 plan.plan_cache_hit = true;
                 return Ok(Self { component, plan });
@@ -226,7 +231,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         let memory = component.executable().execution_plan().payload().memory();
         let static_bytes = memory.static_bytes();
         let minimum_step_bytes = memory.minimum_step_bytes();
-        let prepared = Self {
+        let mut prepared = Self {
             component: Arc::new(component),
             plan: ImageStagePlanReceipt {
                 stage,
@@ -239,15 +244,18 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                 minimum_step_bytes,
                 compile_wall_duration_us: elapsed_us(started),
                 plan_cache_hit: false,
+                plan_cache: None,
             },
         };
-        if pipeline.config.plan_cache == ImagePlanCachePolicy::LastPerStage {
-            pipeline.plan_cache.insert(
+        if pipeline.config.plan_cache != ImagePlanCachePolicy::Disabled {
+            prepared.plan.plan_cache = Some(pipeline.plan_cache.insert(
+                pipeline.config.plan_cache,
                 prepared.component.clone(),
                 prepared.plan.clone(),
                 options.clone(),
-            )?;
+            )?);
         }
+        prepared.plan.compile_wall_duration_us = elapsed_us(started);
         Ok(prepared)
     }
 

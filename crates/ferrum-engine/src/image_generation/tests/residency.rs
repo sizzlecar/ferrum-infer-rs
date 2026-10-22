@@ -5,7 +5,7 @@ use half::bf16;
 
 mod all_components;
 
-fn numeric_pipeline() -> (
+pub(super) fn numeric_pipeline() -> (
     QwenImage21Pipeline<ReferenceDeviceRuntime>,
     tempfile::TempDir,
 ) {
@@ -34,7 +34,7 @@ fn numeric_pipeline() -> (
     (pipeline, directory)
 }
 
-fn prepared(
+pub(super) fn prepared(
     pipeline: &QwenImage21Pipeline<ReferenceDeviceRuntime>,
     rows: u64,
 ) -> PreparedStage<ReferenceDeviceRuntime> {
@@ -57,7 +57,7 @@ fn prepared(
     .unwrap()
 }
 
-fn input(host: &HostMemoryAccount, rows: u64, offset: usize) -> ManagedHostTensor {
+pub(super) fn input(host: &HostMemoryAccount, rows: u64, offset: usize) -> ManagedHostTensor {
     let tensor = ResolvedTensorSpec::new(
         vec![rows, 64],
         ElementType::Bf16,

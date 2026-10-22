@@ -15,16 +15,47 @@ between different instances or devices.
 
 For explicit image configuration, set `backend.pipeline.plan_cache` to
 `"disabled"` to compile each batch again. The local-directory preset uses
-`"last_per_stage"`. Each stage receipt reports `plan_cache_hit` and the current
-lookup/compile wall duration. A compilation cache hit alone does not imply
-resident weights.
+`"last_per_stage"`. To retain several exact shapes, both `run` and `serve`
+accept an explicit bounded policy, for example:
+
+```json
+{"multi_shape":{"maximum_entries_per_stage":16,"maximum_encoded_metadata_bytes":134217728}}
+```
+
+This value belongs at `backend.pipeline.plan_cache` in the complete image
+configuration. Both positive bounds are required. The example's 16 entries per
+stage and 128 MiB encoded budget are experimental settings, not defaults or
+measured optimal limits. Least recently acquired entries are evicted first
+within a full stage, then across all stages as needed for the byte limit.
+An entry larger than the byte limit executes normally without being cached;
+it does not evict smaller retained entries.
+
+Each stage receipt reports `plan_cache_hit`, the current lookup/compile wall
+duration, and an optional `plan_cache` snapshot containing the selected policy,
+entry counts, cumulative hits/misses/evictions, oversized skips, and whether
+this acquisition was retained. A compilation cache hit alone does not imply
+resident weights. HTTP currently does not publish per-stage receipts, so an
+HTTP latency improvement by itself is not evidence of a cache hit.
 
 The cache contains graph metadata and immutable provider bindings. It retains
 no tensor payloads, dynamic pool backing or initialized component sessions.
-Metadata memory is bounded by four entries; it is not charged to the Host
-tensor-payload account. Provider/native-library owners follow their existing
-opaque admission and lifetime rules. Cache eviction does not invalidate a
-plan already owned by an in-flight request.
+`last_per_stage` retains at most four entries and does not measure encoded
+bytes (`encoded_metadata_bytes` is null). `multi_shape` counts the compact JSON
+encoding of each prepared family, execution plan, capability catalog, the public
+compile-options projection (tensor specs, retained value IDs, and required
+materializer ID/quality-artifact presence), and normalized plan receipt.
+Private capability/provider preferences and quality-artifact payload bytes are
+outside this size proxy; cache equality still compares the complete options.
+Counting streams to a bounded writer
+once at insertion; cache hits neither serialize the plan nor build an encoded
+buffer. Timing and earlier cache snapshots are excluded from that charge.
+This is an encoded-metadata limit, not measured Rust heap, process RSS, compile
+peak memory, or Host tensor-payload usage. It does not account for private
+provider/native state or other owners retaining an evicted plan. Native-library
+owners follow their existing opaque admission and lifetime rules. Cache
+eviction releases only the cache's Arc; a request or initialized session can
+continue using its independently held authority. This policy does not change
+the separate native FP8 prepared-plan cache limit.
 
 `CompiledTensorComponent::initialize` can create multiple independent sessions
 from one compilation. Each session uses fresh transactions and passes the

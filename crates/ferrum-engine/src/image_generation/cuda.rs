@@ -56,6 +56,7 @@ pub struct ImageCudaPipelineLimits {
 }
 impl ImageCudaPipelineLimits {
     pub fn validate(&self) -> Result<()> {
+        self.plan_cache.validate()?;
         ensure!(
             self.maximum_width > 0 && self.maximum_height > 0,
             "image dimension limits must be positive"

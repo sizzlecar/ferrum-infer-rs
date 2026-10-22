@@ -546,3 +546,55 @@ fn image_serve_rejects_text_controls_and_requires_bounded_capacity() {
         .validate()
         .is_err());
 }
+
+#[test]
+fn bounded_plan_cache_configuration_is_strict_and_shared_by_run_and_serve() {
+    use ferrum_engine::image_generation::ImagePlanCachePolicy;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    let mut wire = configuration();
+    let ImageBackendConfig::Cuda(default) = load(&wire).unwrap().backend;
+    assert_eq!(
+        default.resolved_pipeline().unwrap().plan_cache,
+        ImagePlanCachePolicy::LastPerStage
+    );
+    let policy = ImagePlanCachePolicy::MultiShape {
+        maximum_entries_per_stage: 2,
+        maximum_encoded_metadata_bytes: 65536,
+    };
+    for serving in [false, true] {
+        wire["serving"] = if serving {
+            json!({"maximum_pending":2,"maximum_prompt_bytes":4096,"max_num_seqs":1,
+                "request_batch_max_wait_ms":0,"default_width":512,"default_height":512,
+                "default_seed":0,"rgba_scratch_bytes":16384,"output":{}})
+        } else {
+            Value::Null
+        };
+        for selected in [
+            ImagePlanCachePolicy::Disabled,
+            ImagePlanCachePolicy::LastPerStage,
+            policy,
+        ] {
+            wire["backend"]["pipeline"]["plan_cache"] = serde_json::to_value(selected).unwrap();
+            let ImageBackendConfig::Cuda(config) = load(&wire).unwrap().backend;
+            assert_eq!(config.resolved_pipeline().unwrap().plan_cache, selected);
+        }
+    }
+    for invalid in [
+        json!("multi_shape"),
+        json!({"multi_shape":{"maximum_entries_per_stage":2}}),
+        json!({"multi_shape":{"maximum_encoded_metadata_bytes":65536}}),
+        json!({"multi_shape":{"maximum_entries_per_stage":0,"maximum_encoded_metadata_bytes":65536}}),
+        json!({"multi_shape":{"maximum_entries_per_stage":2,"maximum_encoded_metadata_bytes":0}}),
+        json!({"multi_shape":{"maximum_entries_per_stage":2,"maximum_metadata_bytes":65536}}),
+        json!({"multi_shape":{"maximum_entries_per_stage":2,"maximum_encoded_metadata_bytes":65536,"unused":1}}),
+        json!({"multi_shape":{"maximum_entries_per_stage":usize::MAX,"maximum_encoded_metadata_bytes":65536}}),
+    ] {
+        wire["backend"]["pipeline"]["plan_cache"] = invalid;
+        assert!(load(&wire).is_err());
+    }
+}

@@ -31,7 +31,7 @@ pub mod service;
 mod stage;
 pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources};
 pub use attention_policy::ImageCudaAttentionPolicy;
-pub use plan_cache::ImagePlanCachePolicy;
+pub use plan_cache::{ImagePlanCachePolicy, ImagePlanCacheReceipt};
 pub use precision::ImageCudaPrecisionPolicy;
 pub use residency::ImageResidencyPolicy;
 pub use stage::{
@@ -119,6 +119,7 @@ impl ImagePipelineConfig {
     pub const DEFAULT_MAXIMUM_BATCH_SIZE: usize = 1;
 
     fn validate(&self) -> anyhow::Result<()> {
+        self.plan_cache.validate()?;
         ensure!(
             self.device_capacity_bytes > 0 && self.maximum_width > 0 && self.maximum_height > 0,
             "image capacity and dimension limits must be positive"
