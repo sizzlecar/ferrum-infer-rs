@@ -83,6 +83,7 @@ impl Fixture {
             index_file: "test.index.json".into(),
             artifact_dir: self.directory.path().join(name),
             reference_artifact_dir: reference.map(|name| self.directory.path().join(name)),
+            reference_memory_bytes: 1 << 20,
             backend: backend::Backend::Reference,
         }
     }
@@ -197,4 +198,31 @@ fn cli_rejects_unknown_duplicate_and_unavailable_backend_options() {
     assert!(parse(&["--unknown", "1"]).is_err());
     assert!(parse(&["--artifact-dir", "duplicate"]).is_err());
     assert!(parse(&["--backend", "cuda"]).is_err());
+    assert_eq!(
+        parse(&[]).unwrap().unwrap().reference_memory_bytes,
+        DEFAULT_REFERENCE_MEMORY_BYTES
+    );
+    assert_eq!(
+        parse(&["--reference-memory-bytes", "1048576"])
+            .unwrap()
+            .unwrap()
+            .reference_memory_bytes,
+        1 << 20
+    );
+    for value in ["0", "-1", "18446744073709551615"] {
+        assert!(parse(&["--reference-memory-bytes", value]).is_err());
+    }
+}
+
+#[test]
+fn reference_budget_rejects_weights_that_exceed_declared_capacity() {
+    let fixture = Fixture::new();
+    let mut args = fixture.args("undersized", None);
+    args.reference_memory_bytes = 64;
+    assert!(run(args).is_err());
+    assert!(!fixture
+        .directory
+        .path()
+        .join("undersized/result.json")
+        .exists());
 }

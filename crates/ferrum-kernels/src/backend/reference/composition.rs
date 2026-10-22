@@ -3,22 +3,25 @@ use std::sync::Arc;
 
 use ferrum_runtime::{
     adjacent_rope_bf16_contract, dense_linear_bf16_contract, dense_linear_contract,
-    gated_residual_bf16_contract, head_rms_norm_bf16_contract, layer_norm_bf16_contract,
-    modulation_scale_bf16_contract, silu_bf16_contract, silu_mul_bf16_contract,
-    structured_attention_bf16_contract, tanh_bf16_contract, CapabilityCatalog, CapabilityId,
-    ContractVersion, DeviceClass, DeviceDescriptor, DeviceId, DeviceRuntime,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, EngineProviderDescriptor,
-    OperationContract, OperationProvider, OperationRuntimeRegistry, ProviderId, VNextError,
-    WeightMaterializerId, WeightMaterializerRegistry, ADJACENT_ROPE_BF16_CAPABILITY_ID,
-    DENSE_LINEAR_BF16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
-    GATED_RESIDUAL_BF16_CAPABILITY_ID, HEAD_RMS_NORM_BF16_CAPABILITY_ID,
+    gated_residual_bf16_contract, gelu_tanh_bf16_contract, head_rms_norm_bf16_contract,
+    layer_norm_bf16_contract, modulation_scale_bf16_contract, silu_bf16_contract,
+    silu_mul_bf16_contract, structured_attention_bf16_contract, tanh_bf16_contract,
+    zero_centered_rms_norm_bf16_contract, CapabilityCatalog, CapabilityId, ContractVersion,
+    DeviceClass, DeviceDescriptor, DeviceId, DeviceRuntime, DynamicStorageAllocator,
+    DynamicStorageProfile, DynamicStorageView, EngineProviderDescriptor, OperationContract,
+    OperationProvider, OperationRuntimeRegistry, ProviderId, VNextError, WeightMaterializerId,
+    WeightMaterializerRegistry, ADJACENT_ROPE_BF16_CAPABILITY_ID, DENSE_LINEAR_BF16_CAPABILITY_ID,
+    DENSE_LINEAR_F16_CAPABILITY_ID, GATED_RESIDUAL_BF16_CAPABILITY_ID,
+    GELU_TANH_BF16_CAPABILITY_ID, HEAD_RMS_NORM_BF16_CAPABILITY_ID,
     IDENTITY_WEIGHT_MATERIALIZER_ID, LAYER_NORM_BF16_CAPABILITY_ID,
     MODULATION_SCALE_BF16_CAPABILITY_ID, SILU_BF16_CAPABILITY_ID, SILU_MUL_BF16_CAPABILITY_ID,
     STRUCTURED_ATTENTION_BF16_CAPABILITY_ID, TANH_BF16_CAPABILITY_ID,
+    ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID,
 };
 
 use super::adjacent_rope::ReferenceAdjacentRopeProvider;
 use super::dense_linear::{implementation_fingerprint, ReferenceDenseLinearProvider};
+use super::gelu_tanh::ReferenceGeluTanhProvider;
 use super::head_rms_norm::ReferenceHeadRmsNormProvider;
 use super::layer_norm::ReferenceLayerNormProvider;
 use super::pointwise::{ReferencePointwiseKind, ReferencePointwiseProvider};
@@ -30,6 +33,7 @@ use super::transcendental::{
     numerical_implementation_fingerprint, ReferenceTranscendentalKind,
     ReferenceTranscendentalProvider,
 };
+use super::zero_centered_rms_norm::ReferenceZeroCenteredRmsNormProvider;
 
 const REFERENCE_ENGINE_PROVIDER_ID: &str = "provider.engine.reference.vnext";
 pub const REFERENCE_DENSE_SAFETENSORS_FORMAT_ID: &str = "weight-format.safetensors.dense";
@@ -41,6 +45,8 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
         CapabilityId::new(DENSE_LINEAR_BF16_CAPABILITY_ID)?,
         CapabilityId::new(LAYER_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(GELU_TANH_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ADJACENT_ROPE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(STRUCTURED_ATTENTION_BF16_CAPABILITY_ID)?,
         CapabilityId::new(MODULATION_SCALE_BF16_CAPABILITY_ID)?,
@@ -54,17 +60,34 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
 pub(super) fn reference_vnext_runtime_config(
     device_id: DeviceId,
 ) -> Result<ReferenceDeviceRuntimeConfig, VNextError> {
+    reference_vnext_runtime_config_with_capacity(device_id, REFERENCE_MEMORY_BYTES)
+}
+
+fn reference_vnext_runtime_config_with_capacity(
+    device_id: DeviceId,
+    capacity_bytes: u64,
+) -> Result<ReferenceDeviceRuntimeConfig, VNextError> {
+    if capacity_bytes == 0 || u128::from(capacity_bytes) > isize::MAX as u128 {
+        return Err(VNextError::InvalidExecutionPlan {
+            reason: "reference memory capacity must be positive and fit isize".into(),
+        });
+    }
     let numerical = numerical_implementation_fingerprint();
     let descriptor = DeviceDescriptor {
         id: device_id,
         class: DeviceClass::Reference,
         ordinal: 0,
-        total_memory_bytes: REFERENCE_MEMORY_BYTES,
+        total_memory_bytes: capacity_bytes,
         runtime_implementation_fingerprint: implementation_fingerprint(&[
+            &capacity_bytes.to_le_bytes(),
             include_str!("runtime.rs").as_bytes(),
             include_str!("dense_linear.rs").as_bytes(),
             include_str!("layer_norm.rs").as_bytes(),
             include_str!("runtime/layer_norm.rs").as_bytes(),
+            include_str!("zero_centered_rms_norm.rs").as_bytes(),
+            include_str!("runtime/zero_centered_rms_norm.rs").as_bytes(),
+            include_str!("gelu_tanh.rs").as_bytes(),
+            include_str!("runtime/gelu_tanh.rs").as_bytes(),
             include_str!("head_rms_norm.rs").as_bytes(),
             include_str!("runtime/head_rms_norm.rs").as_bytes(),
             include_str!("adjacent_rope.rs").as_bytes(),
@@ -95,6 +118,8 @@ pub fn reference_vnext_operation_registry(
         Box::new(dense_linear_bf16_contract().map_err(contract_error)?),
         Box::new(layer_norm_bf16_contract().map_err(contract_error)?),
         Box::new(head_rms_norm_bf16_contract().map_err(contract_error)?),
+        Box::new(zero_centered_rms_norm_bf16_contract().map_err(contract_error)?),
+        Box::new(gelu_tanh_bf16_contract().map_err(contract_error)?),
         Box::new(adjacent_rope_bf16_contract().map_err(contract_error)?),
         Box::new(structured_attention_bf16_contract().map_err(contract_error)?),
         Box::new(modulation_scale_bf16_contract().map_err(contract_error)?),
@@ -108,6 +133,8 @@ pub fn reference_vnext_operation_registry(
         reference_vnext_dense_linear_bf16_provider(runtime)?,
         reference_vnext_layer_norm_bf16_provider(runtime)?,
         reference_vnext_head_rms_norm_bf16_provider(runtime)?,
+        reference_vnext_zero_centered_rms_norm_bf16_provider(runtime)?,
+        reference_vnext_gelu_tanh_bf16_provider(runtime)?,
         reference_vnext_adjacent_rope_bf16_provider(runtime)?,
         reference_vnext_structured_attention_bf16_provider(runtime)?,
         reference_vnext_modulation_scale_bf16_provider(runtime)?,
@@ -148,6 +175,22 @@ pub fn reference_vnext_head_rms_norm_bf16_provider(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
     Ok(Box::new(ReferenceHeadRmsNormProvider::new(runtime)?))
+}
+
+/// Builds whole-row RMSNorm with FP32 zero-centered affine and one final BF16 cast.
+pub fn reference_vnext_zero_centered_rms_norm_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceZeroCenteredRmsNormProvider::new(
+        runtime,
+    )?))
+}
+
+/// Builds unary GELU(tanh) with explicit FP32 arithmetic and its own profile.
+pub fn reference_vnext_gelu_tanh_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceGeluTanhProvider::new(runtime)?))
 }
 
 /// Builds nonpaged structured attention with explicit mask and FP32 online softmax.
@@ -229,7 +272,18 @@ pub struct ReferenceVNextComposition {
 
 impl ReferenceVNextComposition {
     pub fn create(device_id: DeviceId) -> Result<Self, ReferenceDeviceRuntimeError> {
-        let config = reference_vnext_runtime_config(device_id).map_err(contract_error)?;
+        Self::create_with_capacity(device_id, REFERENCE_MEMORY_BYTES)
+    }
+
+    /// Creates a Reference device with an explicit managed-memory ceiling.
+    /// This does not allocate that capacity. Subsequent plans use the existing
+    /// shared device ledger; the default constructor remains 64 MiB.
+    pub fn create_with_capacity(
+        device_id: DeviceId,
+        capacity_bytes: u64,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        let config = reference_vnext_runtime_config_with_capacity(device_id, capacity_bytes)
+            .map_err(contract_error)?;
         let runtime = Arc::new(ReferenceDeviceRuntime::new(config)?);
         let registry = reference_vnext_operation_registry(&runtime)?;
         let weight_materializers =
@@ -285,4 +339,72 @@ impl ReferenceVNextComposition {
 
 fn contract_error(error: VNextError) -> ReferenceDeviceRuntimeError {
     ReferenceDeviceRuntimeError::contract(error.to_string())
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use ferrum_runtime::{DeviceCapacityOwner, DeviceOpaqueMemoryKind};
+
+    #[test]
+    fn explicit_capacity_is_checked_and_changes_descriptor_identity_without_allocating() {
+        let id = || DeviceId::new("device.reference.explicit-capacity").unwrap();
+        assert!(ReferenceVNextComposition::create_with_capacity(id(), 0).is_err());
+        assert!(
+            ReferenceVNextComposition::create_with_capacity(id(), isize::MAX as u64 + 1).is_err()
+        );
+        let default = ReferenceVNextComposition::create(id()).unwrap();
+        assert_eq!(
+            default.runtime().descriptor().total_memory_bytes,
+            64 * 1024 * 1024
+        );
+        let large =
+            ReferenceVNextComposition::create_with_capacity(id(), 1024 * 1024 * 1024).unwrap();
+        assert_eq!(
+            large.runtime().descriptor().total_memory_bytes,
+            1024 * 1024 * 1024
+        );
+        assert_ne!(
+            default
+                .runtime()
+                .descriptor()
+                .runtime_implementation_fingerprint,
+            large
+                .runtime()
+                .descriptor()
+                .runtime_implementation_fingerprint
+        );
+        assert_eq!(large.runtime().snapshot().allocations, 0);
+        let maximum = ReferenceVNextComposition::create_with_capacity(
+            DeviceId::new("device.reference.maximum-capacity").unwrap(),
+            isize::MAX as u64,
+        )
+        .unwrap();
+        assert_eq!(maximum.runtime().snapshot().allocations, 0);
+    }
+
+    #[test]
+    fn configured_capacity_uses_shared_account_and_reclaims_only_the_last_owner() {
+        let composition = ReferenceVNextComposition::create_with_capacity(
+            DeviceId::new("device.reference.shared-explicit-capacity").unwrap(),
+            1024,
+        )
+        .unwrap();
+        let descriptor = composition.runtime().descriptor();
+        let first = DeviceCapacityOwner::open(descriptor, 1024).unwrap();
+        let second = DeviceCapacityOwner::open(descriptor, 1024).unwrap();
+        let claim = first
+            .reserve(DeviceOpaqueMemoryKind::Bootstrap, 1000)
+            .unwrap();
+        let retained = claim.clone();
+        drop(claim);
+        assert!(second.reserve(DeviceOpaqueMemoryKind::Stream, 25).is_err());
+        let remainder = second.reserve(DeviceOpaqueMemoryKind::Stream, 24).unwrap();
+        drop(retained);
+        let reclaimed = second
+            .reserve(DeviceOpaqueMemoryKind::Stream, 1000)
+            .unwrap();
+        assert_eq!(reclaimed.bytes() + remainder.bytes(), 1024);
+        assert_eq!(composition.runtime().snapshot().allocations, 0);
+    }
 }

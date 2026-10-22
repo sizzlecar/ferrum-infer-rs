@@ -15,6 +15,7 @@ pub fn execute(
     config: &QwenImage21Block0Config,
     source: &SafetensorsArchive,
     backend: &Backend,
+    reference_memory_bytes: u64,
     payload: &Inputs,
     inspect: impl FnOnce(&[TensorExecutionOutput], &Value) -> Result<Value>,
 ) -> Result<(Value, Value)> {
@@ -46,8 +47,10 @@ pub fn execute(
     )?;
     match backend {
         Backend::Reference => {
-            let composition =
-                ReferenceVNextComposition::create(id("device.reference.qwen_image21.block0")?)?;
+            let composition = ReferenceVNextComposition::create_with_capacity(
+                id("device.reference.qwen_image21.block0")?,
+                reference_memory_bytes,
+            )?;
             execute_stored_component(
                 &family,
                 source,
@@ -58,7 +61,8 @@ pub fn execute(
                     materializers: composition.weight_materializers(),
                     capacity_bytes: composition.runtime().descriptor().total_memory_bytes,
                     staging_bytes: 65536,
-                    provenance: json!({"backend":"Reference","qualification":"execution/finite smoke, or explicitly requested Reference artifact differential; not Torch/vLLM parity"}),
+                    provenance: json!({"backend":"Reference", "capacity_bytes": reference_memory_bytes,
+                        "qualification":"execution/finite smoke, or explicitly requested Reference artifact differential; not Torch/vLLM parity"}),
                 },
                 inputs,
                 inspect,

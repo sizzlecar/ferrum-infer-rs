@@ -134,7 +134,7 @@ fn independent_descriptors_bind_contracts_capabilities_profiles_and_estimators()
 
 #[test]
 fn same_shape_paths_reject_broadcast_dtype_and_equal_numel_reshapes() {
-    for kind in [Kind::Silu, Kind::SiluMul, Kind::Tanh] {
+    for kind in [Kind::Silu, Kind::SiluMul, Kind::Tanh, Kind::GeluTanh] {
         let bindings = values(kind, 2);
         let checked = geometry(kind, &bindings, &BTreeMap::new()).unwrap();
         assert_eq!(

@@ -3,10 +3,12 @@
 //! it does not claim bitwise equivalence to deployment rsqrt implementations.
 
 use ferrum_runtime::{
-    head_rms_norm_bf16_contract, layer_norm_bf16_contract, CanonicalRational,
-    HeadRmsNormBf16Geometry, LayerNormBf16Geometry, PhysicalWeightLayout, ResolvedTensorSpec,
-    WeightFormatId, HEAD_RMS_NORM_BF16_CAPABILITY_ID, HEAD_RMS_NORM_BF16_OPERATION_ID,
+    head_rms_norm_bf16_contract, layer_norm_bf16_contract, zero_centered_rms_norm_bf16_contract,
+    CanonicalRational, HeadRmsNormBf16Geometry, LayerNormBf16Geometry, PhysicalWeightLayout,
+    ResolvedTensorSpec, WeightFormatId, ZeroCenteredRmsNormBf16Geometry,
+    HEAD_RMS_NORM_BF16_CAPABILITY_ID, HEAD_RMS_NORM_BF16_OPERATION_ID,
     LAYER_NORM_BF16_CAPABILITY_ID, LAYER_NORM_BF16_OPERATION_ID,
+    ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID, ZERO_CENTERED_RMS_NORM_BF16_OPERATION_ID,
 };
 
 use super::*;
@@ -30,83 +32,93 @@ const MAX_WIDTH: u64 = 4096;
 pub(super) enum Kind {
     Layer,
     HeadRms,
+    ZeroCenteredRms,
 }
 
 impl Kind {
-    pub(super) const ALL: [Self; 2] = [Self::Layer, Self::HeadRms];
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 3] = [Self::Layer, Self::HeadRms, Self::ZeroCenteredRms];
 
     pub(super) fn index(self) -> usize {
         match self {
             Self::Layer => 0,
             Self::HeadRms => 1,
+            Self::ZeroCenteredRms => 2,
         }
     }
     pub(super) fn function(self) -> &'static str {
         match self {
             Self::Layer => "ferrum_vnext_layer_norm_bf16",
             Self::HeadRms => "ferrum_vnext_head_rms_norm_bf16",
+            Self::ZeroCenteredRms => "ferrum_vnext_zero_centered_rms_norm_bf16",
         }
     }
     fn operation(self) -> &'static str {
         match self {
             Self::Layer => LAYER_NORM_BF16_OPERATION_ID,
             Self::HeadRms => HEAD_RMS_NORM_BF16_OPERATION_ID,
+            Self::ZeroCenteredRms => ZERO_CENTERED_RMS_NORM_BF16_OPERATION_ID,
         }
     }
     fn capability(self) -> &'static str {
         match self {
             Self::Layer => LAYER_NORM_BF16_CAPABILITY_ID,
             Self::HeadRms => HEAD_RMS_NORM_BF16_CAPABILITY_ID,
+            Self::ZeroCenteredRms => ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID,
         }
     }
     fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::Layer => layer_norm_bf16_contract(),
             Self::HeadRms => head_rms_norm_bf16_contract(),
+            Self::ZeroCenteredRms => zero_centered_rms_norm_bf16_contract(),
         }
     }
     fn profile(self) -> &'static str {
         match self {
             Self::Layer => LAYER_NORM_PROFILE_ID,
             Self::HeadRms => HEAD_RMS_NORM_PROFILE_ID,
+            Self::ZeroCenteredRms => ZERO_CENTERED_RMS_NORM_PROFILE_ID,
+        }
+    }
+    fn numerical_identity(self) -> &'static str {
+        match self {
+            Self::ZeroCenteredRms => TEXT_PROJECTION_NUMERICAL_IDENTITY,
+            Self::Layer | Self::HeadRms => NUMERICAL_IDENTITY,
         }
     }
     fn provider(self) -> &'static str {
         match self {
             Self::Layer => "provider.cuda.layer_norm.bf16.pairwise_sqrt_div",
             Self::HeadRms => "provider.cuda.head_rms_norm.bf16.pairwise_sqrt_div",
+            Self::ZeroCenteredRms => "provider.cuda.zero_centered_rms_norm.bf16.pairwise_sqrt_div",
         }
     }
     fn estimator(self) -> &'static str {
         match self {
             Self::Layer => "resource-estimator.cuda.layer_norm.bf16.pairwise_sqrt_div",
             Self::HeadRms => "resource-estimator.cuda.head_rms_norm.bf16.pairwise_sqrt_div",
+            Self::ZeroCenteredRms => {
+                "resource-estimator.cuda.zero_centered_rms_norm.bf16.pairwise_sqrt_div"
+            }
         }
     }
     fn inputs(self) -> u32 {
         match self {
             Self::Layer => 1,
-            Self::HeadRms => 2,
+            Self::HeadRms | Self::ZeroCenteredRms => 2,
         }
     }
-    fn width_attribute(self) -> &'static str {
+    fn width_attribute(self) -> Option<&'static str> {
         match self {
-            Self::Layer => "hidden_size",
-            Self::HeadRms => "head_dim",
+            Self::Layer => Some("hidden_size"),
+            Self::HeadRms => Some("head_dim"),
+            Self::ZeroCenteredRms => None,
         }
     }
 }
 
-pub(super) fn descriptors(
-    device: &DeviceDescriptor,
-) -> Result<Vec<(Kind, OperationProviderDescriptor)>, CudaDeviceRuntimeError> {
-    Kind::ALL
-        .into_iter()
-        .map(|kind| descriptor(device, kind).map(|d| (kind, d)))
-        .collect()
-}
-
-fn descriptor(
+pub(super) fn descriptor(
     device: &DeviceDescriptor,
     kind: Kind,
 ) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
@@ -119,13 +131,13 @@ fn descriptor(
     let contract = kind.contract().map_err(contract_error)?;
     let implementation = implementation_fingerprint(&[
         numerical_fingerprint().as_bytes(),
-        NUMERICAL_IDENTITY.as_bytes(),
+        kind.numerical_identity().as_bytes(),
         kind.profile().as_bytes(),
         kind.provider().as_bytes(),
     ]);
     let estimator =
         implementation_fingerprint(&[kind.estimator().as_bytes(), implementation.as_bytes()]);
-    let weight_formats = if kind == Kind::HeadRms {
+    let weight_formats = if kind != Kind::Layer {
         BTreeSet::from([
             WeightFormatId::new(super::super::DENSE_SAFETENSORS_FORMAT_ID)
                 .map_err(contract_error)?,
@@ -156,20 +168,16 @@ fn descriptor(
     .map(|d| d.with_fixed_tensor_work(true))
 }
 
-pub(super) fn providers(
-    descriptors: Vec<(Kind, OperationProviderDescriptor)>,
+pub(super) fn provider(
+    kind: Kind,
+    descriptor: OperationProviderDescriptor,
     kernels: &Arc<RetainedFunctions>,
-) -> Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> {
-    descriptors
-        .into_iter()
-        .map(|(kind, descriptor)| {
-            Box::new(NormProvider {
-                descriptor,
-                kind,
-                kernels: Arc::clone(kernels),
-            }) as Box<dyn OperationProvider<CudaDeviceRuntime>>
-        })
-        .collect()
+) -> Box<dyn OperationProvider<CudaDeviceRuntime>> {
+    Box::new(NormProvider {
+        descriptor,
+        kind,
+        kernels: Arc::clone(kernels),
+    })
 }
 
 struct NormProvider {
@@ -288,7 +296,7 @@ impl NormProvider {
             let output = regions[kind.inputs() as usize].device_ptr();
             let mut builder = stream.launch_builder(kernels.norm_function(kind));
             builder.arg(&input);
-            if kind == Kind::HeadRms {
+            if kind != Kind::Layer {
                 builder.arg(&gamma);
             }
             builder
@@ -330,7 +338,7 @@ impl Shape {
             || !width.is_power_of_two()
             || width > MAX_WIDTH
             || columns % width != 0
-            || (kind == Kind::Layer && columns != width)
+            || (kind != Kind::HeadRms && columns != width)
             || !epsilon.is_finite()
             || epsilon <= 0.0
         {
@@ -347,7 +355,11 @@ impl Shape {
             .filter(|&b| b <= isize::MAX as u64)
             .ok_or("CUDA norm byte extent exceeds address space")?;
         let groups = elements / width;
-        let operations_per_width = if kind == Kind::Layer { 6_u64 } else { 4_u64 };
+        let operations_per_width = match kind {
+            Kind::Layer => 6_u64,
+            Kind::HeadRms => 4,
+            Kind::ZeroCenteredRms => 5,
+        };
         let arithmetic_operations = width
             .checked_mul(operations_per_width)
             .and_then(|v| v.checked_add(3))
@@ -371,7 +383,8 @@ fn geometry(
     bindings: &[ResolvedValueBinding],
     attributes: &BTreeMap<AttributeId, SemanticValue>,
 ) -> Result<Shape, String> {
-    if bindings.len() != kind.inputs() as usize + 1 || attributes.len() != 2 {
+    let attribute_count = 1 + usize::from(kind.width_attribute().is_some());
+    if bindings.len() != kind.inputs() as usize + 1 || attributes.len() != attribute_count {
         return Err("CUDA normalization has an incorrect port or attribute count".into());
     }
     let get = |name| {
@@ -380,21 +393,29 @@ fn geometry(
             .find(|(key, _)| key.as_str() == name)
             .map(|(_, value)| value)
     };
-    let Some(SemanticValue::Unsigned(width)) = get(kind.width_attribute()) else {
-        return Err("CUDA normalization requires an unsigned width attribute".into());
-    };
     let Some(SemanticValue::Rational(epsilon)) = get("epsilon") else {
         return Err("CUDA normalization requires rational epsilon".into());
     };
     let input = binding(bindings, ResolvedValueRole::Input, 0)?;
     let output = binding(bindings, ResolvedValueRole::Output, 0)?;
-    let gamma = if kind == Kind::HeadRms {
+    let width = if let Some(name) = kind.width_attribute() {
+        let Some(SemanticValue::Unsigned(width)) = get(name) else {
+            return Err("CUDA normalization requires an unsigned width attribute".into());
+        };
+        *width
+    } else {
+        // The common typed helper below independently checks rank and shape.
+        input.tensor().dimensions().get(1).copied().unwrap_or(0)
+    };
+    let gamma = if kind != Kind::Layer {
         let gamma = binding(bindings, ResolvedValueRole::Input, 1)?;
         if gamma
             .weight()
             .is_some_and(|w| !matches!(w.physical_layout(), PhysicalWeightLayout::Dense { .. }))
         {
-            return Err("CUDA HeadRmsNorm cannot consume packed or quantized weights".into());
+            return Err(
+                "CUDA weighted normalization cannot consume packed or quantized weights".into(),
+            );
         }
         Some(gamma.tensor())
     } else {
@@ -405,7 +426,7 @@ fn geometry(
         input.tensor(),
         gamma,
         output.tensor(),
-        *width,
+        width,
         *epsilon,
     )
 }
@@ -442,6 +463,18 @@ fn validate_specs(
                 g.rows(),
                 g.columns(),
                 g.head_dim(),
+                g.effective_epsilon(),
+            )
+        }
+        Kind::ZeroCenteredRms => {
+            let gamma = gamma.ok_or("CUDA zero-centered RMS requires its stored weight")?;
+            let g = ZeroCenteredRmsNormBf16Geometry::new(input, gamma, output, epsilon)
+                .map_err(|e| e.to_string())?;
+            Shape::new(
+                kind,
+                g.rows(),
+                g.columns(),
+                g.columns(),
                 g.effective_epsilon(),
             )
         }

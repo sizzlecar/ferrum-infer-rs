@@ -15,6 +15,7 @@ use super::{
 pub(crate) enum ReferenceUnaryKind {
     Silu,
     Tanh,
+    GeluTanh,
 }
 
 impl ReferenceUnaryKind {
@@ -22,6 +23,7 @@ impl ReferenceUnaryKind {
         match self {
             Self::Silu => 4,
             Self::Tanh => 1,
+            Self::GeluTanh => 9,
         }
     }
 }
@@ -156,6 +158,7 @@ pub(super) fn execute_unary(launch: &ReferenceUnaryLaunch) {
     let scalar = match launch.kind {
         ReferenceUnaryKind::Silu => silu_bf16_bits,
         ReferenceUnaryKind::Tanh => tanh_bf16_bits,
+        ReferenceUnaryKind::GeluTanh => super::gelu_tanh::gelu_tanh_bf16_bits,
     };
     for index in 0..launch.shape.rows * launch.shape.width {
         let output = scalar(storage.read_bits(0, index));

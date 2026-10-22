@@ -184,6 +184,8 @@ impl CudaDeviceRuntime {
                         | ferrum_runtime::HEAD_RMS_NORM_BF16_CAPABILITY_ID
                         | ferrum_runtime::ADJACENT_ROPE_BF16_CAPABILITY_ID
                         | ferrum_runtime::STRUCTURED_ATTENTION_BF16_CAPABILITY_ID
+                        | ferrum_runtime::ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID
+                        | ferrum_runtime::GELU_TANH_BF16_CAPABILITY_ID
                 )
             })
         {

@@ -11,8 +11,8 @@ use crate::backend::cuda::vnext_runtime::CudaTensorProviderRetention;
 pub(super) struct RetainedFunctions {
     // Every CudaFunction retains the same native module/context. Field order
     // releases these owners before returning the one module capacity permit.
-    functions: [CudaFunction; 5],
-    norm_functions: [CudaFunction; 2],
+    functions: [CudaFunction; 6],
+    norm_functions: [CudaFunction; 3],
     rope_function: CudaFunction,
     attention_function: CudaFunction,
     _provider: CudaTensorProviderRetention,
@@ -39,6 +39,7 @@ impl RetainedFunctions {
                 load(Kind::Tanh)?,
                 load(Kind::Modulation)?,
                 load(Kind::GatedResidual)?,
+                load(Kind::GeluTanh)?,
             ];
             let load_norm = |kind: norm::Kind| {
                 module.load_function(kind.function()).map_err(|error| {
@@ -48,6 +49,7 @@ impl RetainedFunctions {
             let normalization = [
                 load_norm(norm::Kind::Layer)?,
                 load_norm(norm::Kind::HeadRms)?,
+                load_norm(norm::Kind::ZeroCenteredRms)?,
             ];
             let rope_function = module.load_function(rope::FUNCTION).map_err(|error| {
                 CudaDeviceRuntimeError::driver("BF16 adjacent RoPE function load", error)

@@ -21,7 +21,9 @@ use ferrum_quantization::SafetensorsArchive;
 use serde_json::json;
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
-const USAGE: &str = "verify_qwen_image21_block0 --config CONFIG --model-dir TRANSFORMER_DIRECTORY --artifact-dir NEW_EXTERNAL_DIRECTORY [--reference-artifact-dir REFERENCE_RUN_DIRECTORY] [--index-file diffusion_pytorch_model.safetensors.index.json] [--backend reference|cuda] [CUDA budget options from verify_qwen_image21_projection]";
+const USAGE: &str = "verify_qwen_image21_block0 --config CONFIG --model-dir TRANSFORMER_DIRECTORY --artifact-dir NEW_EXTERNAL_DIRECTORY [--reference-artifact-dir REFERENCE_RUN_DIRECTORY] [--index-file diffusion_pytorch_model.safetensors.index.json] [--backend reference|cuda] [--reference-memory-bytes BYTES (Reference only; default 1073741824)] [CUDA budget options from verify_qwen_image21_projection]";
+
+const DEFAULT_REFERENCE_MEMORY_BYTES: u64 = 1 << 30;
 
 struct Arguments {
     config: PathBuf,
@@ -29,6 +31,7 @@ struct Arguments {
     index_file: String,
     artifact_dir: PathBuf,
     reference_artifact_dir: Option<PathBuf>,
+    reference_memory_bytes: u64,
     backend: backend::Backend,
 }
 impl Arguments {
@@ -60,7 +63,21 @@ impl Arguments {
             .unwrap_or_else(|| "diffusion_pytorch_model.safetensors.index.json".into())
             .into_string()
             .map_err(|_| anyhow::anyhow!("index name requires UTF-8"))?;
+        let explicit_reference_memory = values.remove("--reference-memory-bytes");
+        let reference_memory_bytes = match explicit_reference_memory.as_ref() {
+            Some(value) => value
+                .to_str()
+                .context("Reference memory budget requires UTF-8")?
+                .parse::<u64>()?,
+            None => DEFAULT_REFERENCE_MEMORY_BYTES,
+        };
+        if reference_memory_bytes == 0 || reference_memory_bytes >= isize::MAX as u64 {
+            bail!("Reference memory budget must be positive and below isize::MAX");
+        }
         let backend = backend::Backend::parse_options(&mut values)?;
+        if explicit_reference_memory.is_some() && !matches!(backend, backend::Backend::Reference) {
+            bail!("--reference-memory-bytes applies only to the Reference backend");
+        }
         backend.ensure_available()?;
         Ok(Some(Self {
             config,
@@ -68,6 +85,7 @@ impl Arguments {
             index_file,
             artifact_dir,
             reference_artifact_dir,
+            reference_memory_bytes,
             backend,
         }))
     }
@@ -107,6 +125,7 @@ fn run(args: Arguments) -> Result<()> {
         &config,
         &source,
         &args.backend,
+        args.reference_memory_bytes,
         &inputs,
         |values, provenance| {
             output.json("execution.json", provenance)?;

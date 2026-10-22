@@ -26,3 +26,11 @@ liveness for intermediates; retaining every block's diagnostic outputs would
 unnecessarily increase memory and readback demand. This component alone does
 not implement image/text input projection, conditioning generation, multiple
 transformer blocks, final output projection, a denoising step or image decoding.
+
+The diagnostic `verify_qwen_image21_block0` accepts
+`--reference-memory-bytes BYTES` with the Reference backend (default 1 GiB).
+This explicit device capacity admits real block weights through the same plan
+ledger and is recorded in execution provenance. The general Reference runtime
+default remains 64 MiB. An undersized capacity fails admission; the example does
+not infer an unlimited host-memory allowance from the checkpoint size. Source
+mapping and diagnostic artifact vectors remain outside that managed capacity.

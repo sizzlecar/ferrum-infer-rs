@@ -40,16 +40,17 @@ fn value(name: &str, role: ResolvedValueRole, ordinal: u32, dims: &[u64]) -> Res
 }
 
 fn attrs(kind: Kind, width: u64) -> BTreeMap<AttributeId, SemanticValue> {
-    BTreeMap::from([
-        (
-            AttributeId::new(kind.width_attribute()).unwrap(),
+    let mut values = BTreeMap::from([(
+        AttributeId::new("epsilon").unwrap(),
+        SemanticValue::Rational(CanonicalRational::new(1, 1_000_000).unwrap()),
+    )]);
+    if let Some(name) = kind.width_attribute() {
+        values.insert(
+            AttributeId::new(name).unwrap(),
             SemanticValue::Unsigned(width),
-        ),
-        (
-            AttributeId::new("epsilon").unwrap(),
-            SemanticValue::Rational(CanonicalRational::new(1, 1_000_000).unwrap()),
-        ),
-    ])
+        );
+    }
+    values
 }
 
 #[test]
@@ -175,11 +176,12 @@ fn dtype_shape_head_grouping_and_epsilon_are_validated_before_encoding() {
 fn port_and_attribute_checks_are_shared_by_estimation_and_encoding() {
     for kind in Kind::ALL {
         let mut values = vec![value("input", ResolvedValueRole::Input, 0, &[2, 256])];
-        if kind == Kind::HeadRms {
-            values.push(value("gamma", ResolvedValueRole::Input, 1, &[128]));
+        if kind != Kind::Layer {
+            let width = if kind == Kind::HeadRms { 128 } else { 256 };
+            values.push(value("gamma", ResolvedValueRole::Input, 1, &[width]));
         }
         values.push(value("output", ResolvedValueRole::Output, 0, &[2, 256]));
-        let width = if kind == Kind::Layer { 256 } else { 128 };
+        let width = if kind == Kind::HeadRms { 128 } else { 256 };
         let attributes = attrs(kind, width);
         assert!(geometry(kind, &values, &attributes).is_ok());
         let mut duplicate = values.clone();
@@ -196,7 +198,7 @@ fn port_and_attribute_checks_are_shared_by_estimation_and_encoding() {
         assert!(geometry(kind, &values, &extra).is_err());
         let mut wrong = attributes;
         wrong.insert(
-            AttributeId::new(kind.width_attribute()).unwrap(),
+            AttributeId::new(kind.width_attribute().unwrap_or("hidden_size")).unwrap(),
             SemanticValue::Unsigned(width / 2),
         );
         assert!(geometry(kind, &values, &wrong).is_err());
@@ -210,10 +212,61 @@ fn metadata_only_byte_and_logical_work_limits_fail_without_allocating_payloads()
         assert!(Shape::new(kind, 1, 128, 0, 1e-6).is_err());
         assert!(Shape::new(kind, u64::MAX, 128, 128, 1e-6).is_err());
         assert!(Shape::new(kind, 1, 128, 128, f32::NAN).is_err());
-        let operations_per_group = if kind == Kind::Layer { 9 } else { 7 };
+        let operations_per_group = match kind {
+            Kind::Layer => 9,
+            Kind::HeadRms => 7,
+            Kind::ZeroCenteredRms => 8,
+        };
         let groups = u64::MAX / operations_per_group + 1;
         if (groups as u128) * 2 <= isize::MAX as u128 {
             assert!(Shape::new(kind, groups, 1, 1, 1e-6).is_err());
         }
+    }
+}
+
+#[test]
+fn zero_centered_rms_is_whole_row_bf16_weight_with_one_epsilon_attribute() {
+    let epsilon = CanonicalRational::new(1, 1_000_000).unwrap();
+    let kind = Kind::ZeroCenteredRms;
+    for width in [1, 128, 4096] {
+        let x = tensor(&[3, width], ElementType::Bf16);
+        let weight = tensor(&[width], ElementType::Bf16);
+        let shape = validate_specs(kind, &x, Some(&weight), &x, width, epsilon).unwrap();
+        assert_eq!(shape.groups, 3);
+        assert_eq!(shape.width as u64, width);
+        assert_eq!(shape.gamma_bytes, width * 2);
+        assert_eq!(shape.bytes, 3 * width * 2);
+        assert_eq!(shape.shared_bytes as u64, width * 4);
+        assert_eq!(shape.arithmetic_operations, 3 * (5 * width + 3));
+    }
+    for width in [3, 8192] {
+        let x = tensor(&[1, width], ElementType::Bf16);
+        let weight = tensor(&[width], ElementType::Bf16);
+        assert!(validate_specs(kind, &x, Some(&weight), &x, width, epsilon).is_err());
+    }
+    let x = tensor(&[2, 256], ElementType::Bf16);
+    let weight = tensor(&[256], ElementType::Bf16);
+    // A head-width gamma cannot implicitly broadcast across a whole row.
+    for wrong in [
+        tensor(&[128], ElementType::Bf16),
+        tensor(&[1, 256], ElementType::Bf16),
+        tensor(&[256], ElementType::F32),
+        tensor(&[256], ElementType::F16),
+    ] {
+        assert!(validate_specs(kind, &x, Some(&wrong), &x, 256, epsilon).is_err());
+    }
+    for wrong in [
+        tensor(&[4, 128], ElementType::Bf16),
+        tensor(&[512], ElementType::Bf16),
+        tensor(&[2, 256], ElementType::F16),
+    ] {
+        assert!(validate_specs(kind, &x, Some(&weight), &wrong, 256, epsilon).is_err());
+    }
+    assert!(validate_specs(kind, &x, None, &x, 256, epsilon).is_err());
+    for bad in [
+        CanonicalRational::new(0, 1).unwrap(),
+        CanonicalRational::new(2, 1).unwrap(),
+    ] {
+        assert!(validate_specs(kind, &x, Some(&weight), &x, 256, bad).is_err());
     }
 }

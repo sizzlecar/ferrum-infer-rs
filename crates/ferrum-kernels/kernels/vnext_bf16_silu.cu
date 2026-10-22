@@ -324,3 +324,57 @@ extern "C" __global__ void ferrum_vnext_structured_attention_bf16(
         __syncthreads();
     }
 }
+
+// Whole-row zero-centered RMS. Weight is stored BF16; weight+1 and x*inverse
+// remain FP32 until the sole final BF16 conversion. This is deliberately not
+// the two-BF16-boundary head RMS implementation.
+extern "C" __global__ void ferrum_vnext_zero_centered_rms_norm_bf16(
+    const uint16_t* input, const uint16_t* weight, uint16_t* output,
+    uint64_t rows, uint32_t width, float epsilon) {
+    extern __shared__ float values[];
+    __shared__ float inverse;
+    for (uint64_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const uint64_t start = row * width;
+        for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+            const float x = ferrum_bf16_decode(input[start + column]);
+            values[column] = __fmul_rn(x, x);
+        }
+        __syncthreads();
+        ferrum_norm_pairwise(values, width);
+        if (threadIdx.x == 0) {
+            const float mean_square = __fdiv_rn(values[0], static_cast<float>(width));
+            const float root = __fsqrt_rn(__fadd_rn(mean_square, epsilon));
+            inverse = __fdiv_rn(1.0f, root);
+        }
+        __syncthreads();
+        for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+            const float normalized = __fmul_rn(
+                ferrum_bf16_decode(input[start + column]), inverse);
+            const float scale = __fadd_rn(ferrum_bf16_decode(weight[column]), 1.0f);
+            output[start + column] = ferrum_bf16_rne(__fmul_rn(normalized, scale));
+        }
+        __syncthreads();
+    }
+}
+
+// GELU(tanh) has one final BF16 boundary. The explicit FP32 evaluation order
+// and constant bits form this profile; libdevice's computed FP32 tanh domain
+// is not covered by earlier BF16-input tanh qualification. Nonfinite data
+// follows IEEE propagation rather than being rejected after submission.
+extern "C" __global__ void ferrum_vnext_gelu_tanh_bf16(
+    const uint16_t* input, uint16_t* output, uint64_t elements) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    const float beta = __uint_as_float(0x3f4c422aU);
+    const float kappa = __uint_as_float(0x3d372713U);
+    for (uint64_t index = first; index < elements; index += stride) {
+        const float x = ferrum_bf16_decode(input[index]);
+        const float xx = __fmul_rn(x, x);
+        const float cube = __fmul_rn(xx, x);
+        const float polynomial = __fadd_rn(x, __fmul_rn(kappa, cube));
+        const float argument = __fmul_rn(beta, polynomial);
+        const float activation = __fadd_rn(1.0f, ferrum_tanh(argument));
+        const float half_x = __fmul_rn(0.5f, x);
+        output[index] = ferrum_bf16_rne(__fmul_rn(half_x, activation));
+    }
+}

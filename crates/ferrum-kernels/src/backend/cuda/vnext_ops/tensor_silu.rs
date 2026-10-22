@@ -9,19 +9,20 @@ use std::sync::Arc;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use ferrum_runtime::{
-    gated_residual_bf16_contract, modulation_scale_bf16_contract, silu_bf16_contract,
-    silu_mul_bf16_contract, tanh_bf16_contract, AttributeId, BatchedOperationInvocation,
-    CapabilityId, ContractVersion, DeviceDescriptor, DeviceRuntime, ElementType,
-    EncodedDeviceOperation, InvocationWorkProjection, NodeWorkContract, OperationContract,
-    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    ProviderExecutionSemantics, ProviderId, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue,
+    gated_residual_bf16_contract, gelu_tanh_bf16_contract, modulation_scale_bf16_contract,
+    silu_bf16_contract, silu_mul_bf16_contract, tanh_bf16_contract, AttributeId,
+    BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceDescriptor, DeviceRuntime,
+    ElementType, EncodedDeviceOperation, InvocationWorkProjection, NodeWorkContract,
+    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProviderExecutionSemantics, ProviderId, ResolvedValueBinding,
+    ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue,
     StandardOperationContract, TensorOperationInvocation, VNextError,
     GATED_RESIDUAL_BF16_CAPABILITY_ID, GATED_RESIDUAL_BF16_OPERATION_ID,
-    MODULATION_SCALE_BF16_CAPABILITY_ID, MODULATION_SCALE_BF16_OPERATION_ID,
-    SILU_BF16_CAPABILITY_ID, SILU_BF16_OPERATION_ID, SILU_MUL_BF16_CAPABILITY_ID,
-    SILU_MUL_BF16_OPERATION_ID, TANH_BF16_CAPABILITY_ID, TANH_BF16_OPERATION_ID,
+    GELU_TANH_BF16_CAPABILITY_ID, GELU_TANH_BF16_OPERATION_ID, MODULATION_SCALE_BF16_CAPABILITY_ID,
+    MODULATION_SCALE_BF16_OPERATION_ID, SILU_BF16_CAPABILITY_ID, SILU_BF16_OPERATION_ID,
+    SILU_MUL_BF16_CAPABILITY_ID, SILU_MUL_BF16_OPERATION_ID, TANH_BF16_CAPABILITY_ID,
+    TANH_BF16_OPERATION_ID,
 };
 
 use super::super::vnext_runtime::{
@@ -35,6 +36,8 @@ mod bundle;
 mod geometry;
 mod norm;
 mod rope;
+mod selection;
+mod text_projection;
 pub use attention::{
     NUMERICAL_IDENTITY as ATTENTION_NUMERICAL_IDENTITY,
     NUMERICAL_PROFILE_ID as ATTENTION_NUMERICAL_PROFILE_ID,
@@ -47,6 +50,11 @@ pub use norm::{
 pub use rope::{
     NUMERICAL_IDENTITY as ROPE_NUMERICAL_IDENTITY,
     NUMERICAL_PROFILE_ID as ROPE_NUMERICAL_PROFILE_ID,
+};
+pub use selection::CudaTensorOperation;
+pub use text_projection::{
+    GELU_TANH_PROFILE_ID, NUMERICAL_IDENTITY as TEXT_PROJECTION_NUMERICAL_IDENTITY,
+    ZERO_CENTERED_RMS_NORM_PROFILE_ID,
 };
 
 pub const NUMERICAL_PROFILE_ID: &str = "cuda.libdevice.precise.silu.bf16.v1";
@@ -77,15 +85,18 @@ pub(super) enum Kind {
     Tanh,
     Modulation,
     GatedResidual,
+    GeluTanh,
 }
 
 impl Kind {
-    pub(super) const ALL: [Self; 5] = [
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 6] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
         Self::Modulation,
         Self::GatedResidual,
+        Self::GeluTanh,
     ];
 
     fn index(self) -> usize {
@@ -95,6 +106,7 @@ impl Kind {
             Self::Tanh => 2,
             Self::Modulation => 3,
             Self::GatedResidual => 4,
+            Self::GeluTanh => 5,
         }
     }
     fn function(self) -> &'static str {
@@ -104,6 +116,7 @@ impl Kind {
             Self::Tanh => "ferrum_vnext_tanh_bf16",
             Self::Modulation => "ferrum_vnext_modulation_scale_bf16",
             Self::GatedResidual => "ferrum_vnext_gated_residual_bf16",
+            Self::GeluTanh => "ferrum_vnext_gelu_tanh_bf16",
         }
     }
     pub(super) fn capability(self) -> &'static str {
@@ -113,6 +126,7 @@ impl Kind {
             Self::Tanh => TANH_BF16_CAPABILITY_ID,
             Self::Modulation => MODULATION_SCALE_BF16_CAPABILITY_ID,
             Self::GatedResidual => GATED_RESIDUAL_BF16_CAPABILITY_ID,
+            Self::GeluTanh => GELU_TANH_BF16_CAPABILITY_ID,
         }
     }
     fn operation(self) -> &'static str {
@@ -122,6 +136,7 @@ impl Kind {
             Self::Tanh => TANH_BF16_OPERATION_ID,
             Self::Modulation => MODULATION_SCALE_BF16_OPERATION_ID,
             Self::GatedResidual => GATED_RESIDUAL_BF16_OPERATION_ID,
+            Self::GeluTanh => GELU_TANH_BF16_OPERATION_ID,
         }
     }
     fn contract(self) -> Result<StandardOperationContract, VNextError> {
@@ -131,6 +146,7 @@ impl Kind {
             Self::Tanh => tanh_bf16_contract(),
             Self::Modulation => modulation_scale_bf16_contract(),
             Self::GatedResidual => gated_residual_bf16_contract(),
+            Self::GeluTanh => gelu_tanh_bf16_contract(),
         }
     }
     fn profile(self) -> &'static str {
@@ -140,6 +156,7 @@ impl Kind {
             Self::Tanh => TANH_NUMERICAL_PROFILE_ID,
             Self::Modulation => MODULATION_NUMERICAL_PROFILE_ID,
             Self::GatedResidual => GATED_RESIDUAL_NUMERICAL_PROFILE_ID,
+            Self::GeluTanh => GELU_TANH_PROFILE_ID,
         }
     }
     fn provider(self) -> &'static str {
@@ -149,6 +166,7 @@ impl Kind {
             Self::Tanh => "provider.cuda.tanh.bf16.libdevice",
             Self::Modulation => "provider.cuda.modulation_scale.bf16.ieee",
             Self::GatedResidual => "provider.cuda.gated_residual.bf16.ieee",
+            Self::GeluTanh => "provider.cuda.gelu_tanh.bf16.libdevice",
         }
     }
     fn estimator(self) -> &'static str {
@@ -158,11 +176,12 @@ impl Kind {
             Self::Tanh => "resource-estimator.cuda.tanh.bf16.libdevice",
             Self::Modulation => "resource-estimator.cuda.modulation_scale.bf16.ieee",
             Self::GatedResidual => "resource-estimator.cuda.gated_residual.bf16.ieee",
+            Self::GeluTanh => "resource-estimator.cuda.gelu_tanh.bf16.libdevice",
         }
     }
     fn inputs(self) -> u32 {
         match self {
-            Self::Silu | Self::Tanh => 1,
+            Self::Silu | Self::Tanh | Self::GeluTanh => 1,
             Self::SiluMul | Self::Modulation => 2,
             Self::GatedResidual => 3,
         }
@@ -173,6 +192,7 @@ impl Kind {
             Self::SiluMul => 5,
             Self::Tanh => 1,
             Self::Modulation | Self::GatedResidual => 2,
+            Self::GeluTanh => 9,
         }
     }
     fn broadcasts(self) -> bool {
@@ -190,6 +210,9 @@ pub(super) fn numerical_fingerprint() -> String {
         include_bytes!("tensor_silu/norm.rs"),
         include_bytes!("tensor_silu/rope.rs"),
         include_bytes!("tensor_silu/attention.rs"),
+        include_bytes!("tensor_silu/selection.rs"),
+        include_bytes!("tensor_silu/text_projection.rs"),
+        TEXT_PROJECTION_NUMERICAL_IDENTITY.as_bytes(),
         norm::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -247,87 +270,37 @@ pub(super) struct CudaTensorPointwiseProvider {
     kernels: Arc<RetainedFunctions>,
 }
 
-impl CudaTensorPointwiseProvider {
-    pub(super) fn single(
-        runtime: &CudaDeviceRuntime,
-        kind: Kind,
-    ) -> Result<Self, CudaDeviceRuntimeError> {
-        let descriptor = descriptor(runtime.descriptor(), kind)?;
-        let kernels = RetainedFunctions::load(runtime)?;
-        Ok(Self {
-            descriptor,
-            kind,
-            kernels,
-        })
-    }
+/// Validate the requested subset before loading one shared native module.
+pub(super) fn selected_providers(
+    runtime: &CudaDeviceRuntime,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    selection::providers(runtime, selected)
 }
 
-/// Validate every descriptor before native side effects, then load one fixed
-/// module. Each provider and every encoded command shares its budget owner.
+/// Compatibility factories keep their original ordered operation subsets.
 pub(super) fn providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    assemble_providers(runtime, false, false, false)
+    selected_providers(runtime, &CudaTensorOperation::ALL[..5])
 }
 
 pub(super) fn component_providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    assemble_providers(runtime, true, false, false)
+    selected_providers(runtime, &CudaTensorOperation::ALL[..7])
 }
 
 pub(super) fn all_component_providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    assemble_providers(runtime, true, true, false)
+    selected_providers(runtime, &CudaTensorOperation::ALL[..8])
 }
 
 pub(super) fn attention_providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    assemble_providers(runtime, true, true, true)
-}
-
-fn assemble_providers(
-    runtime: &CudaDeviceRuntime,
-    with_normalization: bool,
-    with_rope: bool,
-    with_attention: bool,
-) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    let descriptors = Kind::ALL
-        .into_iter()
-        .map(|kind| descriptor(runtime.descriptor(), kind).map(|descriptor| (kind, descriptor)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let norm_descriptors = if with_normalization {
-        norm::descriptors(runtime.descriptor())?
-    } else {
-        Vec::new()
-    };
-    let rope_descriptor = with_rope
-        .then(|| rope::descriptor(runtime.descriptor()))
-        .transpose()?;
-    let attention_descriptor = with_attention
-        .then(|| attention::descriptor(runtime.descriptor()))
-        .transpose()?;
-    let kernels = RetainedFunctions::load(runtime)?;
-    let mut providers = descriptors
-        .into_iter()
-        .map(|(kind, descriptor)| {
-            Box::new(CudaTensorPointwiseProvider {
-                descriptor,
-                kind,
-                kernels: Arc::clone(&kernels),
-            }) as Box<dyn OperationProvider<CudaDeviceRuntime>>
-        })
-        .collect::<Vec<_>>();
-    providers.extend(norm::providers(norm_descriptors, &kernels));
-    if let Some(descriptor) = rope_descriptor {
-        providers.push(rope::provider(descriptor, &kernels));
-    }
-    if let Some(descriptor) = attention_descriptor {
-        providers.push(attention::provider(descriptor, &kernels));
-    }
-    Ok(providers)
+    selected_providers(runtime, &CudaTensorOperation::ALL[..9])
 }
 
 impl OperationResourceEstimator for CudaTensorPointwiseProvider {
@@ -441,7 +414,7 @@ impl CudaTensorPointwiseProvider {
             let output = regions[kind.inputs() as usize].device_ptr();
             let row_broadcast = u32::from(shape.row_broadcast);
             match kind {
-                Kind::Silu | Kind::Tanh => {
+                Kind::Silu | Kind::Tanh | Kind::GeluTanh => {
                     builder.arg(&input).arg(&output).arg(&shape.elements);
                 }
                 Kind::SiluMul => {

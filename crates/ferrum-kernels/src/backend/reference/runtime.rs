@@ -18,6 +18,11 @@ use half::{bf16, f16};
 
 mod layer_norm;
 pub(crate) use layer_norm::ReferenceLayerNormLaunch;
+mod zero_centered_rms_norm;
+pub(crate) use zero_centered_rms_norm::{
+    ReferenceZeroCenteredRmsNormLaunch, ReferenceZeroCenteredRmsNormShape,
+};
+mod gelu_tanh;
 mod head_rms_norm;
 pub(crate) use head_rms_norm::{ReferenceHeadRmsNormLaunch, ReferenceHeadRmsNormShape};
 mod structured_attention;
@@ -327,6 +332,9 @@ enum ReferenceCommandKind {
     LayerNorm {
         launch: ReferenceLayerNormLaunch,
     },
+    ZeroCenteredRmsNorm {
+        launch: ReferenceZeroCenteredRmsNormLaunch,
+    },
     HeadRmsNorm {
         launch: ReferenceHeadRmsNormLaunch,
     },
@@ -368,6 +376,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::Zero { .. } => "zero",
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
             ReferenceCommandKind::LayerNorm { .. } => "layer_norm",
+            ReferenceCommandKind::ZeroCenteredRmsNorm { .. } => "zero_centered_rms_norm",
             ReferenceCommandKind::HeadRmsNorm { .. } => "head_rms_norm",
             ReferenceCommandKind::StructuredAttention { .. } => "structured_attention",
             ReferenceCommandKind::AdjacentRope { .. } => "adjacent_rope",
@@ -376,6 +385,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::UnaryActivation { launch: ref unary } => match unary.kind {
                 ReferenceUnaryKind::Silu => "silu",
                 ReferenceUnaryKind::Tanh => "tanh",
+                ReferenceUnaryKind::GeluTanh => "gelu_tanh",
             },
             ReferenceCommandKind::SiluMul { .. } => "silu_mul",
         };
@@ -486,6 +496,19 @@ impl ReferenceDeviceCommand {
         })
     }
 
+    pub(crate) fn zero_centered_rms_norm_tensor(
+        launch: ReferenceZeroCenteredRmsNormLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_zero_centered_rms_norm_bf16",
+            logical_work: Some(launch.shape.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::ZeroCenteredRmsNorm { launch },
+        })
+    }
+
     pub(crate) fn head_rms_norm_tensor(
         launch: ReferenceHeadRmsNormLaunch,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
@@ -547,6 +570,7 @@ impl ReferenceDeviceCommand {
             operation: match launch.kind {
                 ReferenceUnaryKind::Silu => "vnext_silu_bf16",
                 ReferenceUnaryKind::Tanh => "vnext_tanh_bf16",
+                ReferenceUnaryKind::GeluTanh => "vnext_gelu_tanh_bf16",
             },
             logical_work: Some(launch.logical_work()?),
             compute_dispatch_count: 1,
@@ -684,6 +708,9 @@ impl ReferenceDeviceCommand {
                 }
                 Ok(())
             }
+            ReferenceCommandKind::ZeroCenteredRmsNorm { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::HeadRmsNorm { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
@@ -752,6 +779,12 @@ impl ReferenceDeviceCommand {
                 layer_norm::execute(launch);
                 counters.layer_norm_launches.fetch_add(1, Ordering::Relaxed);
             }
+            ReferenceCommandKind::ZeroCenteredRmsNorm { launch } => {
+                zero_centered_rms_norm::execute(launch);
+                counters
+                    .zero_centered_rms_norm_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             ReferenceCommandKind::HeadRmsNorm { launch } => {
                 head_rms_norm::execute(launch);
                 counters
@@ -787,6 +820,7 @@ impl ReferenceDeviceCommand {
                 let count = match launch.kind {
                     ReferenceUnaryKind::Silu => &counters.silu_launches,
                     ReferenceUnaryKind::Tanh => &counters.tanh_launches,
+                    ReferenceUnaryKind::GeluTanh => &counters.gelu_tanh_launches,
                 };
                 count.fetch_add(1, Ordering::Relaxed);
             }
@@ -971,6 +1005,8 @@ struct ReferenceRuntimeCounters {
     dense_linear_launches: AtomicU64,
     layer_norm_launches: AtomicU64,
     head_rms_norm_launches: AtomicU64,
+    zero_centered_rms_norm_launches: AtomicU64,
+    gelu_tanh_launches: AtomicU64,
     adjacent_rope_launches: AtomicU64,
     structured_attention_launches: AtomicU64,
     modulation_scale_launches: AtomicU64,
@@ -991,6 +1027,8 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub dense_linear_launches: u64,
     pub layer_norm_launches: u64,
     pub head_rms_norm_launches: u64,
+    pub zero_centered_rms_norm_launches: u64,
+    pub gelu_tanh_launches: u64,
     pub adjacent_rope_launches: u64,
     pub structured_attention_launches: u64,
     pub modulation_scale_launches: u64,
@@ -1121,6 +1159,11 @@ impl ReferenceDeviceRuntime {
             dense_linear_launches: self.counters.dense_linear_launches.load(Ordering::Relaxed),
             layer_norm_launches: self.counters.layer_norm_launches.load(Ordering::Relaxed),
             head_rms_norm_launches: self.counters.head_rms_norm_launches.load(Ordering::Relaxed),
+            zero_centered_rms_norm_launches: self
+                .counters
+                .zero_centered_rms_norm_launches
+                .load(Ordering::Relaxed),
+            gelu_tanh_launches: self.counters.gelu_tanh_launches.load(Ordering::Relaxed),
             adjacent_rope_launches: self.counters.adjacent_rope_launches.load(Ordering::Relaxed),
             structured_attention_launches: self
                 .counters

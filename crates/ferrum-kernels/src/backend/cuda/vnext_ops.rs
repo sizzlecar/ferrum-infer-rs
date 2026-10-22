@@ -89,10 +89,12 @@ pub use tensor_dense_bf16::{
     NUMERICAL_PROFILE_IDENTITY as CUDA_DENSE_BF16_NUMERICAL_PROFILE_IDENTITY,
 };
 pub use tensor_silu::{
+    CudaTensorOperation,
     ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
     ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
     BUNDLE_NUMERICAL_IDENTITY as CUDA_POINTWISE_BF16_NUMERICAL_PROFILE_IDENTITY,
     GATED_RESIDUAL_NUMERICAL_PROFILE_ID as CUDA_GATED_RESIDUAL_BF16_NUMERICAL_PROFILE_ID,
+    GELU_TANH_PROFILE_ID as CUDA_GELU_TANH_BF16_NUMERICAL_PROFILE_ID,
     HEAD_RMS_NORM_PROFILE_ID as CUDA_HEAD_RMS_NORM_BF16_NUMERICAL_PROFILE_ID,
     LAYER_NORM_PROFILE_ID as CUDA_LAYER_NORM_BF16_NUMERICAL_PROFILE_ID,
     MODULATION_NUMERICAL_PROFILE_ID as CUDA_MODULATION_SCALE_BF16_NUMERICAL_PROFILE_ID,
@@ -103,6 +105,8 @@ pub use tensor_silu::{
     ROPE_NUMERICAL_PROFILE_ID as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_ID,
     SILU_MUL_NUMERICAL_PROFILE_ID as CUDA_SILU_MUL_BF16_NUMERICAL_PROFILE_ID,
     TANH_NUMERICAL_PROFILE_ID as CUDA_TANH_BF16_NUMERICAL_PROFILE_ID,
+    TEXT_PROJECTION_NUMERICAL_IDENTITY as CUDA_TEXT_PROJECTION_BF16_NUMERICAL_PROFILE_IDENTITY,
+    ZERO_CENTERED_RMS_NORM_PROFILE_ID as CUDA_ZERO_CENTERED_RMS_NORM_BF16_NUMERICAL_PROFILE_ID,
 };
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
@@ -356,6 +360,8 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ADJACENT_ROPE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::STRUCTURED_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GELU_TANH_BF16_CAPABILITY_ID)?,
     ]);
     config.dynamic_storage_profiles = BTreeSet::from([DynamicStorageProfile::new(
         DynamicStorageAllocator::LinearArena,
@@ -369,10 +375,22 @@ pub fn cuda_tensor_runtime_config(
 pub fn cuda_vnext_silu_bf16_provider(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
-    Ok(Box::new(tensor_silu::CudaTensorPointwiseProvider::single(
-        runtime,
-        tensor_silu::Kind::Silu,
-    )?))
+    let mut providers = cuda_vnext_tensor_providers(runtime, &[CudaTensorOperation::Silu])?;
+    providers
+        .pop()
+        .ok_or_else(|| CudaDeviceRuntimeError::contract("SiLU selection produced no provider"))
+}
+
+/// Assemble an explicitly selected subset from one shared native module and
+/// capacity permit. Empty/duplicate selections and missing runtime capabilities
+/// are rejected before native loading. Selection order is preserved. Register
+/// each selected operation's standard contract; Dense is supplied separately.
+/// New normalization/activation profiles require their own target evidence.
+pub fn cuda_vnext_tensor_providers(
+    runtime: &CudaDeviceRuntime,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::selected_providers(runtime, selected)
 }
 
 /// Builds the five independent BF16 pointwise providers from one native
