@@ -295,7 +295,10 @@ impl CudaCudnnOwner {
                 if owner.failed {
                     std::mem::forget((Arc::clone(self), opaque));
                 }
-                return Err(CudaDeviceRuntimeError::contract(error.message));
+                return Err(CudaDeviceRuntimeError::contract(format!(
+                    "SDPA prepare signature={signature:?} workspace_cap={cap} cleanup_known={}: {}",
+                    error.cleanup_known, error.message
+                )));
             }
             Err(payload) => {
                 std::mem::forget((Arc::clone(self), opaque));
@@ -386,7 +389,14 @@ impl CudnnSdpaPlan {
                 if owner.failed {
                     std::mem::forget((Arc::clone(self), ticket));
                 }
-                Err(CudaDeviceRuntimeError::contract(error.message))
+                Err(CudaDeviceRuntimeError::contract(format!(
+                    "SDPA bind plan={} signature={:?} workspace_bytes={} cleanup_known={}: {}",
+                    self.fingerprint,
+                    self.signature,
+                    self.workspace_bytes,
+                    error.cleanup_known,
+                    error.message
+                )))
             }
             Err(payload) => {
                 std::mem::forget((Arc::clone(self), ticket));
@@ -456,7 +466,10 @@ impl CudnnSdpaExecution {
         if result.is_ok() {
             owner.failed = false;
         }
-        result.map_err(CudaDeviceRuntimeError::contract)
+        result.map_err(|error| CudaDeviceRuntimeError::contract(format!(
+            "SDPA execution plan={} signature={:?} workspace_bytes={} descriptor_kind=5 variant_pack_kind=16 attribute=none type=none count=0: {error}",
+            self.plan.fingerprint, self.plan.signature, self.plan.workspace_bytes
+        )))
     }
 }
 

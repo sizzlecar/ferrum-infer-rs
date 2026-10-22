@@ -142,6 +142,8 @@ mod native_abi {
         nondeterministic: false,
         fail_finalize: false,
         fail_destroy: false,
+        fail_set_attribute: None,
+        fail_get_attribute: None,
         execute_calls: 0,
     });
     struct State {
@@ -151,6 +153,8 @@ mod native_abi {
         nondeterministic: bool,
         fail_finalize: bool,
         fail_destroy: bool,
+        fail_set_attribute: Option<c_int>,
+        fail_get_attribute: Option<c_int>,
         execute_calls: usize,
     }
     struct FakeDescriptor {
@@ -175,8 +179,18 @@ mod native_abi {
         state.destroyed += 1;
         0
     }
-    unsafe extern "C" fn set(_: Descriptor, _: c_int, _: c_int, _: i64, _: *const c_void) -> c_int {
-        0
+    unsafe extern "C" fn set(
+        _: Descriptor,
+        name: c_int,
+        _: c_int,
+        _: i64,
+        _: *const c_void,
+    ) -> c_int {
+        if STATE.lock().unwrap().fail_set_attribute == Some(name) {
+            77
+        } else {
+            0
+        }
     }
     unsafe extern "C" fn finalize(d: Descriptor) -> c_int {
         if unsafe { (*d.cast::<FakeDescriptor>()).kind } == 5 && STATE.lock().unwrap().fail_finalize
@@ -195,6 +209,9 @@ mod native_abi {
         out: *mut c_void,
     ) -> c_int {
         let state = STATE.lock().unwrap();
+        if state.fail_get_attribute == Some(name) {
+            return 88;
+        }
         match name {
             202 | 300 => unsafe {
                 *count = 1;
@@ -240,6 +257,8 @@ mod native_abi {
             nondeterministic,
             fail_finalize: false,
             fail_destroy: false,
+            fail_set_attribute: None,
+            fail_get_attribute: None,
             execute_calls: 0,
         };
     }
@@ -277,6 +296,8 @@ mod native_abi {
             Ok(_) => panic!("oversized workspace accepted"),
         };
         assert!(e.cleanup_known);
+        assert!(e.message.contains("workspace=257 exceeds cap=256"));
+        assert_eq!(e.message.matches("mode=").count(), 3);
         no_native_execution_and_all_descriptors_released();
         reset(0, true);
         let e = match native::NativePlan::build(&api(), std::ptr::null_mut(), signature(), 256) {
@@ -284,6 +305,77 @@ mod native_abi {
             Ok(_) => panic!("nondeterministic engine accepted"),
         };
         assert!(e.message.contains("nondeterministic"));
+        assert!(e.cleanup_known);
+        no_native_execution_and_all_descriptors_released();
+    }
+
+    #[test]
+    fn descriptor_failures_identify_tensor_and_attribute_without_addresses() {
+        let _serial = SERIAL.lock().unwrap();
+        reset(256, false);
+        STATE.lock().unwrap().fail_set_attribute = Some(902);
+        let e = match native::NativePlan::build(&api(), std::ptr::null_mut(), signature(), 512) {
+            Err(e) => e,
+            Ok(_) => panic!("failed tensor attribute accepted"),
+        };
+        for context in [
+            "status 77",
+            "descriptor_kind=Some(17)",
+            "attribute=902",
+            "type=3",
+            "count=4",
+            "tensor_uid=1",
+            "dtype=9",
+            "dims=[2, 32, 1024, 128]",
+            "strides=[4280320, 128, 4096, 1]",
+            "alignment=16",
+            "by_value=false",
+        ] {
+            assert!(
+                e.message.contains(context),
+                "missing {context}: {}",
+                e.message
+            );
+        }
+        assert!(e.cleanup_known);
+        no_native_execution_and_all_descriptors_released();
+
+        reset(256, false);
+        STATE.lock().unwrap().fail_set_attribute = Some(1001);
+        let e = match native::VariantPack::build(&api(), bindings(), &0.125) {
+            Err(e) => e,
+            Ok(_) => panic!("failed pointer attribute accepted"),
+        };
+        assert!(e.message.contains("attribute=1001 type=6 count=7"));
+        assert!(e.message.contains("values=<addresses omitted>"));
+        assert!(!e.message.contains("0x"));
+        assert!(!e.message.contains(&bindings().q.to_string()));
+        assert!(e.cleanup_known);
+        no_native_execution_and_all_descriptors_released();
+    }
+
+    #[test]
+    fn heuristic_get_failure_keeps_mode_and_attribute_without_trying_other_modes() {
+        let _serial = SERIAL.lock().unwrap();
+        reset(256, false);
+        STATE.lock().unwrap().fail_get_attribute = Some(202);
+        let e = match native::NativePlan::build(&api(), std::ptr::null_mut(), signature(), 512) {
+            Err(e) => e,
+            Ok(_) => panic!("failed heuristic query accepted"),
+        };
+        for context in [
+            "mode=3",
+            "descriptor_kind=Some(4)",
+            "attribute=202 type=15 count=0",
+            "status 88",
+        ] {
+            assert!(
+                e.message.contains(context),
+                "missing {context}: {}",
+                e.message
+            );
+        }
+        assert_eq!(e.message.matches("mode=").count(), 1);
         assert!(e.cleanup_known);
         no_native_execution_and_all_descriptors_released();
     }
@@ -297,6 +389,15 @@ mod native_abi {
             Ok(_) => panic!("failed finalize accepted"),
         };
         assert!(e.cleanup_known);
+        for mode in [3, 2, 1] {
+            assert!(e
+                .message
+                .contains(&format!("mode={mode}: candidates=1 candidate=0 engine=17")));
+        }
+        assert_eq!(e.message.matches("mode=").count(), 3);
+        assert!(e
+            .message
+            .contains("descriptor_kind=Some(5) attribute=none type=none count=0"));
         no_native_execution_and_all_descriptors_released();
     }
 

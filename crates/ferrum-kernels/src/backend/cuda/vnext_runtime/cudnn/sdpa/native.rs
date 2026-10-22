@@ -46,12 +46,15 @@ pub(super) struct VariantPack {
 struct Builder<'a> {
     api: &'a GraphApi,
     descriptors: Vec<Descriptor>,
+    // Diagnostic metadata only; native ownership remains in `descriptors`.
+    descriptor_kinds: Vec<(Descriptor, c_int)>,
 }
 impl<'a> Builder<'a> {
     fn new(api: &'a GraphApi) -> Self {
         Self {
             api,
             descriptors: Vec::new(),
+            descriptor_kinds: Vec::new(),
         }
     }
     fn create(&mut self, kind: c_int) -> Result<Descriptor, String> {
@@ -60,14 +63,28 @@ impl<'a> Builder<'a> {
         // Even a failed native call may have returned a partially-created owner.
         if !descriptor.is_null() {
             self.descriptors.push(descriptor);
+            self.descriptor_kinds.push((descriptor, kind));
         }
-        check(result, "create graph descriptor")?;
+        check(result, "create graph descriptor").map_err(|error| {
+            format!("{error}; descriptor_kind={kind} attribute=none type=none count=0")
+        })?;
         if descriptor.is_null() {
-            return Err("cuDNN returned a null graph descriptor".into());
+            return Err(format!("cuDNN returned a null graph descriptor; descriptor_kind={kind} attribute=none type=none count=0"));
         }
         Ok(descriptor)
     }
-    fn set<T>(&self, d: Descriptor, name: c_int, kind: c_int, values: &[T]) -> Result<(), String> {
+    fn kind(&self, descriptor: Descriptor) -> Option<c_int> {
+        self.descriptor_kinds
+            .iter()
+            .find_map(|&(d, kind)| (d == descriptor).then_some(kind))
+    }
+    fn set<T: std::fmt::Debug>(
+        &self,
+        d: Descriptor,
+        name: c_int,
+        kind: c_int,
+        values: &[T],
+    ) -> Result<(), String> {
         let count = i64::try_from(values.len()).map_err(|_| "cuDNN attribute count overflows")?;
         unsafe {
             check(
@@ -75,9 +92,22 @@ impl<'a> Builder<'a> {
                 "set graph attribute",
             )
         }
+        .map_err(|error| {
+            let values = if matches!(kind, TYPE_HANDLE | TYPE_POINTER | TYPE_DESCRIPTOR) {
+                "<addresses omitted>".to_owned()
+            } else {
+                format!("{:?}", &values[..values.len().min(8)])
+            };
+            format!("{error}; descriptor_kind={:?} attribute={name} type={kind} count={count} values={values}", self.kind(d))
+        })
     }
     fn finish(&self, d: Descriptor) -> Result<(), String> {
-        unsafe { check((self.api.finalize)(d), "finalize graph descriptor") }
+        unsafe { check((self.api.finalize)(d), "finalize graph descriptor") }.map_err(|error| {
+            format!(
+                "{error}; descriptor_kind={:?} attribute=none type=none count=0",
+                self.kind(d)
+            )
+        })
     }
     fn get<T>(
         &self,
@@ -98,14 +128,21 @@ impl<'a> Builder<'a> {
             check(
                 (self.api.get)(d, name, kind, requested, &mut count, pointer),
                 "get graph attribute",
-            )?;
+            )
+            .map_err(|error| {
+                format!(
+                    "{error}; descriptor_kind={:?} attribute={name} type={kind} count={requested}",
+                    self.kind(d)
+                )
+            })?;
         }
-        usize::try_from(count).map_err(|_| "cuDNN returned a negative attribute count".into())
+        usize::try_from(count).map_err(|_| format!("cuDNN returned negative count={count}; descriptor_kind={:?} attribute={name} type={kind} requested={requested}", self.kind(d)))
     }
     fn i64(&self, d: Descriptor, name: c_int) -> Result<i64, String> {
         let mut value = [0_i64];
-        if self.get(d, name, TYPE_I64, &mut value)? != 1 {
-            return Err("cuDNN scalar attribute count is not one".into());
+        let count = self.get(d, name, TYPE_I64, &mut value)?;
+        if count != 1 {
+            return Err(format!("cuDNN scalar attribute count is not one; descriptor_kind={:?} attribute={name} type={TYPE_I64} count={count} requested=1", self.kind(d)));
         }
         Ok(value[0])
     }
@@ -118,18 +155,21 @@ impl<'a> Builder<'a> {
         alignment: i64,
         by_value: bool,
     ) -> Result<Descriptor, String> {
-        let d = self.create(TENSOR)?;
-        self.set(d, 900, TYPE_I64, &[alignment])?;
-        self.set(d, 901, TYPE_DATA, &[dtype])?;
-        self.set(d, 902, TYPE_I64, &dims)?;
-        self.set(d, 903, TYPE_I64, &strides)?;
-        self.set(d, 906, TYPE_I64, &[uid])?;
-        self.set(d, 907, TYPE_BOOL, &[false])?;
-        if by_value {
-            self.set(d, 908, TYPE_BOOL, &[true])?;
-        }
-        self.finish(d)?;
-        Ok(d)
+        (|| {
+            let d = self.create(TENSOR)?;
+            self.set(d, 900, TYPE_I64, &[alignment])?;
+            self.set(d, 901, TYPE_DATA, &[dtype])?;
+            self.set(d, 902, TYPE_I64, &dims)?;
+            self.set(d, 903, TYPE_I64, &strides)?;
+            self.set(d, 906, TYPE_I64, &[uid])?;
+            self.set(d, 907, TYPE_BOOL, &[false])?;
+            if by_value {
+                self.set(d, 908, TYPE_BOOL, &[true])?;
+            }
+            self.finish(d)?;
+            Ok(d)
+        })()
+        .map_err(|error: String| format!("{error}; tensor_uid={uid} dtype={dtype} dims={dims:?} strides={strides:?} alignment={alignment} by_value={by_value}"))
     }
     fn cleanup(&mut self) -> bool {
         destroy_descriptors(self.api, &mut self.descriptors)
@@ -206,56 +246,87 @@ impl NativePlan {
             b.set(graph, 800, TYPE_HANDLE, &[handle])?;
             b.set(graph, 801, TYPE_DESCRIPTOR, &[op])?;
             b.finish(graph)?;
-            let mut last_failure = "no supported SDPA engine".to_string();
+            let mut mode_failures = Vec::with_capacity(3);
             // Ranked metadata only; no candidate is executed or timed. The
             // bounded result prefix keeps native graph construction finite.
             for mode in [3 as c_int, 2, 1] {
-                let heuristic = b.create(HEURISTICS)?;
-                b.set(heuristic, 201, TYPE_DESCRIPTOR, &[graph])?;
-                b.set(heuristic, 200, TYPE_HEURISTIC, &[mode])?;
-                if let Err(error) = b.finish(heuristic) {
-                    last_failure = error;
-                    continue;
-                }
-                let count = b
-                    .get::<Descriptor>(heuristic, 202, TYPE_DESCRIPTOR, &mut [])?
-                    .min(MAX_CANDIDATES);
-                let mut candidates = Vec::with_capacity(count);
-                for _ in 0..count {
-                    candidates.push(b.create(ENGINE_CONFIG)?);
-                }
-                if count == 0 {
-                    continue;
-                }
-                let found = b.get(heuristic, 202, TYPE_DESCRIPTOR, &mut candidates)?;
-                // cuDNN can report the full available count when the requested
-                // result prefix is shorter. Only initialized requested slots
-                // are examined.
-                for candidate in candidates.into_iter().take(found.min(count)) {
-                    let Some(identity) = engine_identity(&mut b, candidate)? else {
-                        last_failure =
-                            "cuDNN SDPA engine declares nondeterministic execution".into();
-                        continue;
-                    };
-                    let plan = b.create(PLAN)?;
-                    b.set(plan, 400, TYPE_HANDLE, &[handle])?;
-                    b.set(plan, 401, TYPE_DESCRIPTOR, &[candidate])?;
-                    if let Err(error) = b.finish(plan) {
-                        last_failure = error;
-                        continue;
+                let mut summary = "heuristic setup".to_owned();
+                let attempt = (|| -> Result<Option<(Descriptor, u64, String)>, String> {
+                    let heuristic = b.create(HEURISTICS)?;
+                    b.set(heuristic, 201, TYPE_DESCRIPTOR, &[graph])?;
+                    b.set(heuristic, 200, TYPE_HEURISTIC, &[mode])?;
+                    if let Err(error) = b.finish(heuristic) {
+                        summary = error;
+                        return Ok(None);
                     }
-                    let bytes = b.i64(plan, 402)?;
-                    let Ok(workspace) = u64::try_from(bytes) else {
-                        return Err("cuDNN returned negative workspace".into());
-                    };
-                    if workspace > cap || workspace > isize::MAX as u64 {
-                        last_failure = format!("SDPA plan workspace {workspace} exceeds cap {cap}");
-                        continue;
+                    let count = b
+                        .get::<Descriptor>(heuristic, 202, TYPE_DESCRIPTOR, &mut [])?
+                        .min(MAX_CANDIDATES);
+                    let mut candidates = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        candidates.push(b.create(ENGINE_CONFIG)?);
                     }
-                    return Ok((plan, workspace, format!("heuristic={mode};{identity}")));
+                    summary = format!("candidates={count}");
+                    if count == 0 {
+                        return Ok(None);
+                    }
+                    let found = b.get(heuristic, 202, TYPE_DESCRIPTOR, &mut candidates)?;
+                    // cuDNN can report the full available count when the requested
+                    // result prefix is shorter. Only initialized requested slots
+                    // are examined.
+                    for (ordinal, candidate) in
+                        candidates.into_iter().take(found.min(count)).enumerate()
+                    {
+                        summary = format!("candidates={} candidate={ordinal}", found.min(count));
+                        let (identity, engine) = engine_identity(&mut b, candidate)?;
+                        let Some(identity) = identity else {
+                            summary.push_str(&format!(
+                                " engine={engine} declares nondeterministic execution"
+                            ));
+                            continue;
+                        };
+                        summary.push_str(&format!(" engine={engine}"));
+                        let plan = b.create(PLAN)?;
+                        b.set(plan, 400, TYPE_HANDLE, &[handle])?;
+                        b.set(plan, 401, TYPE_DESCRIPTOR, &[candidate])?;
+                        if let Err(error) = b.finish(plan) {
+                            summary.push_str(&format!(" {error}"));
+                            continue;
+                        }
+                        let bytes = b.i64(plan, 402)?;
+                        let Ok(workspace) = u64::try_from(bytes) else {
+                            return Err(format!("cuDNN returned negative workspace={bytes}; descriptor_kind={PLAN} attribute=402 type={TYPE_I64} count=1"));
+                        };
+                        if workspace > cap || workspace > isize::MAX as u64 {
+                            summary.push_str(&format!(" workspace={workspace} exceeds cap={cap}"));
+                            continue;
+                        }
+                        return Ok(Some((
+                            plan,
+                            workspace,
+                            format!("heuristic={mode};{identity}"),
+                        )));
+                    }
+                    Ok(None)
+                })();
+                match attempt {
+                    Ok(Some(plan)) => return Ok(plan),
+                    Ok(None) => mode_failures.push(format!("mode={mode}: {summary}")),
+                    Err(error) => {
+                        mode_failures.push(format!("mode={mode}: {summary}; {error}"));
+                        // Preserve the existing early-failure behavior; only
+                        // diagnostic context changes, not candidate selection.
+                        return Err(format!(
+                            "SDPA preparation failed: {}",
+                            mode_failures.join(" | ")
+                        ));
+                    }
                 }
             }
-            Err(last_failure)
+            Err(format!(
+                "no supported SDPA engine: {}",
+                mode_failures.join(" | ")
+            ))
         })();
         match built {
             Ok((descriptor, workspace_bytes, identity)) => Ok(Self {
@@ -275,50 +346,64 @@ impl NativePlan {
     }
 }
 
-fn engine_identity(b: &mut Builder<'_>, candidate: Descriptor) -> Result<Option<String>, String> {
+fn engine_identity(
+    b: &mut Builder<'_>,
+    candidate: Descriptor,
+) -> Result<(Option<String>, i64), String> {
     let engine = b.create(ENGINE)?;
-    if b.get(candidate, 300, TYPE_DESCRIPTOR, &mut [engine])? != 1 {
-        return Err("cuDNN engine identity missing".into());
+    let engine_count = b.get(candidate, 300, TYPE_DESCRIPTOR, &mut [engine])?;
+    if engine_count != 1 {
+        return Err(format!("cuDNN engine identity missing; descriptor_kind={ENGINE_CONFIG} attribute=300 type={TYPE_DESCRIPTOR} count={engine_count} requested=1"));
     }
     let index = b.i64(engine, 1301)?;
     // The admitted component policy requires BitwiseSameRuntime. Never rely
     // on the heuristic rank to imply determinism: inspect the selected engine.
     let note_count = b.get::<c_int>(engine, 1303, 11, &mut [])?;
     if note_count > 16 {
-        return Err("cuDNN numerical notes exceed the bounded ABI".into());
+        return Err(format!("cuDNN numerical notes exceed the bounded ABI; engine={index} descriptor_kind={ENGINE} attribute=1303 type=11 count={note_count} maximum=16"));
     }
     let mut notes = [0 as c_int; 16];
-    if note_count != 0 && b.get(engine, 1303, 11, &mut notes[..note_count])? != note_count {
-        return Err("cuDNN numerical note count mismatch".into());
+    if note_count != 0 {
+        let actual = b.get(engine, 1303, 11, &mut notes[..note_count])?;
+        if actual != note_count {
+            return Err(format!("cuDNN numerical note count mismatch; engine={index} descriptor_kind={ENGINE} attribute=1303 type=11 count={actual} requested={note_count}"));
+        }
     }
     if notes[..note_count].contains(&4) {
-        return Ok(None);
+        return Ok((None, index));
     }
     notes[..note_count].sort_unstable();
     let count = b.get::<Descriptor>(candidate, 302, TYPE_DESCRIPTOR, &mut [])?;
     if count > MAX_KNOBS {
-        return Err("cuDNN engine has more knob choices than the bounded ABI".into());
+        return Err(format!("cuDNN knob choices exceed the bounded ABI; engine={index} descriptor_kind={ENGINE_CONFIG} attribute=302 type={TYPE_DESCRIPTOR} count={count} maximum={MAX_KNOBS}"));
     }
     let mut knobs = Vec::with_capacity(count);
     for _ in 0..count {
         knobs.push(b.create(KNOB_CHOICE)?);
     }
-    if count != 0 && b.get(candidate, 302, TYPE_DESCRIPTOR, &mut knobs)? != count {
-        return Err("cuDNN knob identity count mismatch".into());
+    if count != 0 {
+        let actual = b.get(candidate, 302, TYPE_DESCRIPTOR, &mut knobs)?;
+        if actual != count {
+            return Err(format!("cuDNN knob identity count mismatch; engine={index} descriptor_kind={ENGINE_CONFIG} attribute=302 type={TYPE_DESCRIPTOR} count={actual} requested={count}"));
+        }
     }
     let mut choices = Vec::with_capacity(count);
     for knob in knobs {
         let mut kind = [0 as c_int];
-        if b.get(knob, 600, TYPE_KNOB, &mut kind)? != 1 {
-            return Err("cuDNN knob identity missing".into());
+        let count = b.get(knob, 600, TYPE_KNOB, &mut kind)?;
+        if count != 1 {
+            return Err(format!("cuDNN knob identity missing; engine={index} descriptor_kind={KNOB_CHOICE} attribute=600 type={TYPE_KNOB} count={count} requested=1"));
         }
         choices.push((kind[0], b.i64(knob, 601)?));
     }
     choices.sort_unstable();
-    Ok(Some(format!(
-        "engine={index};knobs={choices:?};notes={:?}",
-        &notes[..note_count]
-    )))
+    Ok((
+        Some(format!(
+            "engine={index};knobs={choices:?};notes={:?}",
+            &notes[..note_count]
+        )),
+        index,
+    ))
 }
 
 impl VariantPack {

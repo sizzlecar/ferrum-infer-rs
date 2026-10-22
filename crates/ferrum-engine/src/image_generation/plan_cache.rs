@@ -1,5 +1,7 @@
-//! Bounded compilation metadata only. No session, allocation or tensor payload
-//! is retained here. Each cache belongs to one immutable pipeline composition.
+//! Bounded compilation metadata only: no initialized session, stage weight,
+//! activation or output payload. Provider Arcs still retain their shared native
+//! owners and admitted opaque resources. Each cache belongs to one immutable
+//! pipeline composition.
 use super::*;
 use std::sync::Mutex;
 
