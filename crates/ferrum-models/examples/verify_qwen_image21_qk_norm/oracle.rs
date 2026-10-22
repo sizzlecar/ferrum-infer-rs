@@ -297,6 +297,10 @@ impl Prepared {
     pub fn frequencies(&self) -> Option<&[u8]> {
         self.rotary.as_ref().map(|(_, bytes)| bytes.as_slice())
     }
+    /// Candidate-independent allowed sets prepared before execution.
+    pub fn expected_bf16(&self) -> &[Vec<Vec<u16>>] {
+        &self.expected
+    }
     pub fn input(&self) -> &[u8] {
         &self.input
     }

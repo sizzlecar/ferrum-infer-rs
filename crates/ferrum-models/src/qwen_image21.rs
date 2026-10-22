@@ -5,6 +5,7 @@
 //! Transformer, text conditioning and image-generation pipeline remain separate
 //! work. Weight payloads use the existing runtime weight-source interface.
 
+mod attention;
 mod block0_mlp;
 mod config;
 mod headers;
@@ -12,6 +13,10 @@ mod image_projection;
 mod qk_norm;
 mod weights;
 
+pub use attention::{
+    QwenImage21AttentionConfig, QwenImage21AttentionKeyRun, QwenImage21AttentionLayout,
+    QwenImage21AttentionSegment, QwenImage21Block0AttentionFamily,
+};
 pub use block0_mlp::QwenImage21Block0MlpFamily;
 pub use config::QwenImage21Config;
 pub use headers::{

@@ -440,6 +440,13 @@ fn validate_compile_options(
             "every program input requires an explicit canonical tensor capacity",
         ));
     }
+    for (value, required) in program.input_tensor_specs() {
+        if options.tensor_specs.get(value) != Some(required) {
+            return Err(invalid_plan(format!(
+                "program input `{value}` differs from its model-declared tensor constraint"
+            )));
+        }
+    }
     Ok(())
 }
 

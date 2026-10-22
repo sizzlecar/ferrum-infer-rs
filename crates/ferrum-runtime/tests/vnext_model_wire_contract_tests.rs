@@ -8,6 +8,68 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use vnext_numerical_fixture::*;
 
+#[test]
+fn declared_input_tensors_survive_wire_and_reject_unknown_or_invalid_shapes() {
+    let input: ProgramValueId = id("value.input");
+    let program = ModelProgram::new(
+        id("family.input-shapes"),
+        vec![input.clone()],
+        vec![ProgramBlock {
+            id: "block.identity".into(),
+            nodes: vec![ProgramNode {
+                id: id("node.identity"),
+                operation_id: id("operation.identity"),
+                required_version: ContractVersion::new(1, 0),
+                work: ProgramNodeWorkSpec::Fixed,
+                inputs: vec![input.clone()],
+                outputs: vec![id("value.output")],
+                attributes: BTreeMap::new(),
+            }],
+        }],
+        vec![],
+        vec![],
+        vec![id("value.output")],
+    )
+    .unwrap();
+    let legacy = serde_json::to_value(&program).unwrap();
+    assert!(legacy.get("input_tensor_specs").is_none());
+    assert_eq!(
+        serde_json::from_value::<ModelProgram>(legacy).unwrap(),
+        program
+    );
+    let shape = ProgramTensorSpec {
+        dimensions: vec![2, 4],
+        element_type: ElementType::F32,
+        layout: ResolvedTensorLayout::Contiguous,
+    };
+    let constrained = program
+        .clone()
+        .with_input_tensor_specs(BTreeMap::from([(input.clone(), shape.clone())]))
+        .unwrap();
+    assert_ne!(
+        program.fingerprint().unwrap(),
+        constrained.fingerprint().unwrap()
+    );
+    assert_eq!(
+        serde_json::from_value::<ModelProgram>(serde_json::to_value(&constrained).unwrap())
+            .unwrap(),
+        constrained
+    );
+    assert!(program
+        .clone()
+        .with_input_tensor_specs(BTreeMap::from([(id("value.unknown"), shape.clone())]))
+        .is_err());
+    let mut invalid = shape;
+    invalid.dimensions[0] = 0;
+    assert!(program
+        .with_input_tensor_specs(BTreeMap::from([(input, invalid)]))
+        .is_err());
+    let mut forged = serde_json::to_value(&constrained).unwrap();
+    forged["input_tensor_specs"]["value.unknown"] =
+        forged["input_tensor_specs"]["value.input"].clone();
+    assert!(serde_json::from_value::<ModelProgram>(forged).is_err());
+}
+
 #[path = "vnext_model_wire/weights.rs"]
 mod weights;
 

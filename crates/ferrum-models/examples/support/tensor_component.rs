@@ -112,3 +112,197 @@ pub fn initialize_resources<R: DeviceRuntime>(
         .into_plan_runtime()
         .map_err(|error| anyhow::anyhow!("runtime handoff failed: {}", error.failure().message()))
 }
+
+/// Caller-owned source bytes plus their explicit tensor port. This descriptor
+/// grants no runtime authority; bytes enter the executor only after Host charge.
+pub struct ComponentInput<'a> {
+    pub value_id: ProgramValueId,
+    pub tensor: ResolvedTensorSpec,
+    pub bytes: &'a [u8],
+}
+
+pub struct StoredComponentRuntime<'a, R: DeviceRuntime> {
+    pub runtime: Arc<R>,
+    pub registry: &'a OperationRuntimeRegistry<R>,
+    pub catalog: &'a CapabilityCatalog,
+    pub materializers: &'a WeightMaterializerRegistry,
+    pub capacity_bytes: u64,
+    pub staging_bytes: usize,
+    pub provenance: serde_json::Value,
+}
+
+/// Shared managed execution for diagnostic Stored tensor components. Output
+/// capacity comes from compiler-derived ports, never an assumed node count.
+pub fn execute_stored_component<R: DeviceRuntime>(
+    family: &PreparedModelFamily,
+    source: &dyn WeightComponentSource,
+    composition: StoredComponentRuntime<'_, R>,
+    inputs: Vec<ComponentInput<'_>>,
+    inspect: impl FnOnce(
+        &[ferrum_execution::TensorExecutionOutput],
+        &serde_json::Value,
+    ) -> Result<serde_json::Value>,
+) -> Result<(serde_json::Value, serde_json::Value)> {
+    use ferrum_execution::{PreparedTensorExecutor, TensorExecutorConfig};
+    use serde_json::json;
+    let mut specs = std::collections::BTreeMap::new();
+    let mut input_bytes = 0_usize;
+    for input in &inputs {
+        if usize::try_from(input.tensor.minimum_storage_bytes()?)? != input.bytes.len()
+            || input.tensor.layout() != &ResolvedTensorLayout::Contiguous
+        {
+            bail!("component input bytes differ from exact contiguous tensor shape");
+        }
+        if specs
+            .insert(
+                input.value_id.clone(),
+                ProgramTensorSpec {
+                    dimensions: input.tensor.dimensions().to_vec(),
+                    element_type: input.tensor.element_type(),
+                    layout: input.tensor.layout().clone(),
+                },
+            )
+            .is_some()
+        {
+            bail!("duplicate component input port");
+        }
+        input_bytes = input_bytes
+            .checked_add(input.bytes.len())
+            .context("component input bytes overflow")?;
+    }
+    let mut options = ProgramPlanCompileOptions::new(specs)?;
+    for output in family.program().outputs() {
+        options.retain_completion_value(output.clone());
+    }
+    options.require_weight_materializer(id(IDENTITY_WEIGHT_MATERIALIZER_ID)?);
+    let policy = TensorPolicy {
+        capacity_bytes: composition.capacity_bytes,
+        storage_profiles: composition
+            .runtime
+            .descriptor()
+            .dynamic_storage_profiles
+            .iter()
+            .copied()
+            .collect(),
+    };
+    let compiled = ProgramPlanCompiler::compile_with_weight_materializers(
+        family,
+        composition.catalog,
+        &policy,
+        &composition.registry.planning(),
+        composition.materializers,
+        &options,
+    )?;
+    let executable = compiled.executable();
+    let plan = executable.execution_plan();
+    let ports = plan
+        .payload()
+        .tensor_ports()
+        .context("component plan has no tensor ports")?;
+    let mut output_bytes = 0_usize;
+    for output in ports.outputs() {
+        output_bytes = output_bytes
+            .checked_add(usize::try_from(output.tensor().minimum_storage_bytes()?)?)
+            .context("component output bytes overflow")?;
+    }
+    let total = input_bytes
+        .checked_add(output_bytes)
+        .and_then(|n| n.checked_add(composition.staging_bytes))
+        .context("component Host capacity overflow")?;
+    let host = HostMemoryAccount::new(HostMemoryLimits::new(
+        total,
+        HostMemoryClassLimits {
+            input_preprocess_bytes: input_bytes,
+            output_bytes,
+            transfer_staging_bytes: composition.staging_bytes,
+            weight_backing_bytes: 0,
+        },
+    )?);
+    let mut weight_bytes = 0_u64;
+    for component in &family.stored_weight_schema()?.components {
+        weight_bytes = weight_bytes
+            .checked_add(component.physical_bytes()?)
+            .context("component weight bytes overflow")?;
+    }
+    let resources = initialize_resources(
+        composition.runtime.clone(),
+        family,
+        plan,
+        source,
+        weight_bytes,
+        &host,
+        composition.staging_bytes,
+    )?;
+    // All execution owners leave this scope before explicit plan retirement,
+    // including errors during binding, Host input setup or inspection. Drop
+    // remains a safety fallback for nonterminal work, not a cleanup receipt.
+    let execution: Result<serde_json::Value> = (|| {
+        let mut executor = PreparedTensorExecutor::new(
+            executable.clone(),
+            composition.registry.bind_plan(executable)?,
+            resources.clone(),
+            host.clone(),
+            TensorExecutorConfig::default(),
+        )
+        .map_err(|error| anyhow::anyhow!("component executor: {error}"))?;
+        let provenance = json!({"family":family.family_id(),"profile":family.numerical_profile().id,"family_fingerprint":family.fingerprint()?,"canonical_config":family.canonical_config(),"plan_hash":plan.plan_hash(),"runtime_fingerprint":composition.runtime.descriptor().runtime_implementation_fingerprint,"backend":composition.provenance,"initialized_weight_bytes":weight_bytes,"managed_host_bytes":total,"managed_input_bytes":input_bytes,"managed_output_bytes":output_bytes,"managed_staging_bytes":composition.staging_bytes,"nodes":plan.payload().nodes().iter().map(|node|json!({"node":node.id(),"operation":node.operation_id(),"provider":node.provider_resources().provider_id(),"implementation_fingerprint":node.provider_implementation_fingerprint()})).collect::<Vec<_>>()});
+        let mut managed_inputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let mut storage =
+                host.allocate_zeroed(HostMemoryClass::InputPreprocess, input.bytes.len())?;
+            storage.as_mut().copy_from_slice(input.bytes);
+            managed_inputs.push(ManagedHostTensor::new(
+                input.value_id,
+                input.tensor,
+                storage.freeze(),
+            )?);
+        }
+        let outputs = executor
+            .execute(
+                id("run.component.verify")?,
+                id("request.component.verify")?,
+                managed_inputs,
+            )
+            .map_err(|error| anyhow::anyhow!("component execution: {error}"))?;
+        inspect(&outputs, &provenance)
+    })();
+    let closed = match PlanRuntimeResources::close(resources) {
+        Ok(PlanRuntimeCloseOutcome::Closed(receipt)) => Ok(receipt.released_static_resources()),
+        Ok(PlanRuntimeCloseOutcome::Referenced { strong_count, .. }) => Err(anyhow::anyhow!(
+            "component close retains {strong_count} owners"
+        )),
+        Err(error) => Err(anyhow::anyhow!(
+            "component close failed: {:?}",
+            error.failure()
+        )),
+    };
+    // Check Host even when close fails. Retained nonterminal owners are
+    // reported without asserting that releasing them would be safe.
+    let host_cleanup: Result<_> = (|| {
+        let usage = host.usage()?;
+        if usage.committed_bytes() != 0 || usage.allocated_bytes() != 0 {
+            bail!(
+                "component Host owners remain after close: committed={}, allocated={}",
+                usage.committed_bytes(),
+                usage.allocated_bytes()
+            );
+        }
+        Ok(usage)
+    })();
+    let cleanup = match (closed, host_cleanup) {
+        (Ok(released), Ok(usage)) => Ok(
+            json!({"released_static_resources":released,"managed_host_committed_bytes":usage.committed_bytes(),"managed_host_allocated_bytes":usage.allocated_bytes(),"scope":"managed input/output/static staging and plan retirement; not total Host/RSS or CUDA opaque-memory qualification"}),
+        ),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(host_error)) => {
+            Err(error.context(format!("Host cleanup also failed: {host_error:#}")))
+        }
+    };
+    match (execution, cleanup) {
+        (Ok(report), Ok(cleanup)) => Ok((report, cleanup)),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            Err(error.context(format!("component cleanup also failed: {cleanup_error:#}")))
+        }
+    }
+}

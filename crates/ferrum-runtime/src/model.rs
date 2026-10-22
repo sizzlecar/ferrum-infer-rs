@@ -1745,6 +1745,8 @@ pub struct ProgramBlock {
 pub struct ModelProgram {
     family_id: ModelFamilyId,
     inputs: Vec<ProgramValueId>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    input_tensor_specs: BTreeMap<ProgramValueId, ProgramTensorSpec>,
     blocks: Vec<ProgramBlock>,
     states: Vec<StateSpec>,
     weights: Vec<WeightReference>,
@@ -1758,6 +1760,8 @@ pub struct ModelProgram {
 struct ModelProgramWire {
     family_id: ModelFamilyId,
     inputs: Vec<ProgramValueId>,
+    #[serde(default)]
+    input_tensor_specs: BTreeMap<ProgramValueId, ProgramTensorSpec>,
     blocks: Vec<ProgramBlock>,
     states: Vec<StateSpec>,
     weights: Vec<WeightReference>,
@@ -1780,6 +1784,7 @@ impl<'de> Deserialize<'de> for ModelProgram {
             wire.weights,
             wire.outputs,
         )
+        .and_then(|program| program.with_input_tensor_specs(wire.input_tensor_specs))
         .map_err(serde::de::Error::custom)?;
         match wire.checkpoint_inputs {
             Some(inputs) => program
@@ -1949,12 +1954,37 @@ impl ModelProgram {
         Ok(Self {
             family_id,
             inputs,
+            input_tensor_specs: BTreeMap::new(),
             blocks,
             states,
             weights,
             outputs,
             checkpoint_inputs: None,
         })
+    }
+
+    /// Binds selected inputs to exact model-declared tensor shapes. Unbound
+    /// inputs retain the existing caller-selected compilation behavior.
+    pub fn with_input_tensor_specs(
+        mut self,
+        specs: BTreeMap<ProgramValueId, ProgramTensorSpec>,
+    ) -> Result<Self, VNextError> {
+        for (value, spec) in &specs {
+            if !self.inputs.contains(value) {
+                return Err(VNextError::InvalidModelConfig {
+                    family_id: self.family_id.to_string(),
+                    field: "program.input_tensor_specs".to_owned(),
+                    reason: format!("tensor constraint `{value}` is not a program input"),
+                });
+            }
+            spec.validate(&format!("program input constraint `{value}`"))?;
+        }
+        self.input_tensor_specs = specs;
+        Ok(self)
+    }
+
+    pub fn input_tensor_specs(&self) -> &BTreeMap<ProgramValueId, ProgramTensorSpec> {
+        &self.input_tensor_specs
     }
 
     pub fn with_checkpoint_inputs(
