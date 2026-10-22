@@ -24,6 +24,15 @@ pub struct BoundedTiming {
 }
 
 impl BoundedTiming {
+    /// Test-only copy of a generated-service clock, never an observed text
+    /// clock. Production consumers cannot convert this projection back.
+    #[cfg(test)]
+    pub(crate) fn service_clock(&self, index: usize) -> Option<RequestClock> {
+        self.requests
+            .get(index)
+            .map(|timing| timing.central.projection)
+    }
+
     /// Dynamic payload for all simultaneously retained static/alternative
     /// results. Ranks are visited and released sequentially, not retained.
     pub fn retained_bytes_bound(requests: usize, trajectories: usize) -> Option<usize> {
