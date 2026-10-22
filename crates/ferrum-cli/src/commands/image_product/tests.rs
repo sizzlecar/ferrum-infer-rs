@@ -21,7 +21,7 @@ fn configuration() -> Value {
                 "workspace_limit_bytes":64,"opaque_memory_profile":"unqualified-test"},
             "host":{"total_bytes":4096,"input_preprocess_bytes":2048,
                 "transfer_staging_bytes":1024,"output_bytes":2048,"weight_backing_bytes":0},
-            "pipeline":{"device_capacity_bytes":1024,"maximum_user_tokens":128,
+            "pipeline":{"maximum_user_tokens":128,
                 "maximum_width":512,"maximum_height":512,"maximum_staging_bytes":512,
                 "maximum_initialization_commands":32,"maximum_backing_maintenance_passes":8}}
     })
@@ -41,7 +41,7 @@ fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
     let ImageBackendConfig::Cuda(cuda) = config.backend;
     assert_eq!(cuda.pipeline.maximum_batch_size, 1);
     assert_eq!(
-        cuda.pipeline.resolved().unwrap().decoder_batch_policy,
+        cuda.resolved_pipeline().unwrap().decoder_batch_policy,
         ferrum_engine::image_generation::ImageDecoderBatchPolicy::SingleImage
     );
     assert_eq!(cuda.cudnn.library_path, base.join("lib/libcudnn.so.9"));
@@ -69,6 +69,59 @@ fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
 }
 
 #[test]
+fn one_device_budget_drives_plan_resolution_and_obsolete_override_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image.json");
+    let mut wire = configuration();
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    // Both product entrypoints use this source loader. No assets or device
+    // are opened; these nonzero opaque declarations must not be subtracted
+    // from the internal plan's copy of the one account ceiling.
+    for serving in [false, true] {
+        if serving {
+            wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+                "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
+                "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+        }
+        for budget in [1024, 30 * 1024 * 1024 * 1024_u64] {
+            wire["backend"]["usable_memory_bytes"] = json!(budget);
+            let config = load(&wire).unwrap();
+            let ImageBackendConfig::Cuda(cuda) = config.backend;
+            assert_eq!(
+                cuda.resolved_pipeline().unwrap().device_capacity_bytes,
+                budget
+            );
+            #[cfg(feature = "cuda")]
+            {
+                // Constructing typed settings still performs no CUDA calls.
+                let resolved = cuda.resolved().unwrap();
+                assert_eq!(
+                    resolved.pipeline.device_capacity_bytes,
+                    resolved.usable_memory_bytes
+                );
+            }
+        }
+    }
+    wire["backend"]["usable_memory_bytes"] = json!(0);
+    assert!(load(&wire)
+        .unwrap_err()
+        .to_string()
+        .contains("usable_memory_bytes"));
+    wire["backend"]["usable_memory_bytes"] = json!(1024);
+    for obsolete in [json!(1024), json!(512), json!(null)] {
+        wire["backend"]["pipeline"]["device_capacity_bytes"] = obsolete;
+        let error = load(&wire).unwrap_err().to_string();
+        assert!(
+            error.contains("unknown field") && error.contains("device_capacity_bytes"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn experimental_batch_profile_connects_service_limit_to_real_pipeline_capacity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("image.json");
@@ -90,7 +143,7 @@ fn experimental_batch_profile_connects_service_limit_to_real_pipeline_capacity()
         "experimental_batched_cold"
     );
     let ImageBackendConfig::Cuda(cuda) = &config.backend;
-    assert_eq!(cuda.pipeline.resolved().unwrap().maximum_batch_size, 2);
+    assert_eq!(cuda.resolved_pipeline().unwrap().maximum_batch_size, 2);
     assert_eq!(config.serving.as_ref().unwrap().max_num_seqs, 2);
     wire["serving"]["max_num_seqs"] = json!(3);
     assert!(load(&wire).is_err());
@@ -125,7 +178,7 @@ fn decoder_batch_policy_is_explicit_independent_and_strict() {
         fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
         let config = ImageProductConfig::load(&path).unwrap();
         let ImageBackendConfig::Cuda(cuda) = config.backend;
-        let resolved = cuda.pipeline.resolved().unwrap();
+        let resolved = cuda.resolved_pipeline().unwrap();
         assert_eq!(resolved.maximum_batch_size, 8);
         assert_eq!(resolved.decoder_batch_policy, expected);
     }

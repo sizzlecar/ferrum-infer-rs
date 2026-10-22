@@ -44,13 +44,16 @@ backend convolution algorithms can change with batch geometry. Neither policy
 promises a fixed VRAM peak or fit without actual plan admission and measurement;
 Host input/output storage still grows with request count.
 
-Device limits share one capacity account. `backend.usable_memory_bytes` is the
-runtime's declared ceiling; each live plan's `pipeline.device_capacity_bytes`
-can tighten that same ceiling. Bootstrap, stream and cuDNN opaque reservations
-are already charged there alongside tensor storage. For a declared 30 GiB
-process ceiling, setting both fields to 30 GiB does not create 60 GiB of budget;
-subtracting the opaque reservations from the plan field would tighten the total
-again. Keep measured free-device headroom explicit when choosing these limits.
+`backend.usable_memory_bytes` is the single product device-memory ceiling.
+The internal plan admission limit is derived from it automatically for both
+`run` and `serve`; there is no second plan budget to fill in. The compiler still
+calculates each stage's resource requirements and admission checks those
+requirements against the same capacity account. Bootstrap, stream and cuDNN
+opaque reservations are charged there alongside tensor storage, without another
+subtraction during configuration resolution. Choose this one ceiling with
+measured free-device headroom. Older configurations containing
+`pipeline.device_capacity_bytes` are rejected: remove that field and retain the
+intended total ceiling in `backend.usable_memory_bytes`.
 
 Both profiles recompile and reload component weights for each batch. The batched
 profile is experimental and unqualified until actual GPU tests establish its
@@ -122,7 +125,6 @@ Metadata may live separately from the checkpoint directories.
       "weight_backing_bytes": 0
     },
     "pipeline": {
-      "device_capacity_bytes": 25769803776,
       "maximum_user_tokens": 1024,
       "maximum_width": 512,
       "maximum_height": 512,

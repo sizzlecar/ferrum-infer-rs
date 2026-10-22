@@ -159,7 +159,6 @@ impl HostConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
-    pub device_capacity_bytes: u64,
     pub maximum_user_tokens: usize,
     pub maximum_width: u32,
     pub maximum_height: u32,
@@ -175,10 +174,13 @@ fn default_maximum_batch_size() -> usize {
     ferrum_engine::image_generation::ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE
 }
 impl PipelineConfig {
-    pub fn resolved(&self) -> Result<ferrum_engine::image_generation::ImagePipelineConfig> {
+    fn resolved(
+        &self,
+        device_capacity_bytes: u64,
+    ) -> Result<ferrum_engine::image_generation::ImagePipelineConfig> {
         ensure!(
-            self.device_capacity_bytes > 0 && self.maximum_width > 0 && self.maximum_height > 0,
-            "image plan capacity and pixel bounds must be positive"
+            device_capacity_bytes > 0 && self.maximum_width > 0 && self.maximum_height > 0,
+            "backend usable_memory_bytes and image pixel bounds must be positive"
         );
         ensure!(
             (1..=8192).contains(&self.maximum_user_tokens),
@@ -190,7 +192,7 @@ impl PipelineConfig {
             "pipeline maximum_batch_size exceeds supported attention layout capacity"
         );
         Ok(ferrum_engine::image_generation::ImagePipelineConfig {
-            device_capacity_bytes: self.device_capacity_bytes,
+            device_capacity_bytes,
             maximum_user_tokens: self.maximum_user_tokens,
             maximum_width: self.maximum_width,
             maximum_height: self.maximum_height,
@@ -204,6 +206,17 @@ impl PipelineConfig {
                 maximum_backing_maintenance_passes: self.maximum_backing_maintenance_passes,
             },
         })
+    }
+}
+
+impl CudaConfig {
+    /// The product has one device-account ceiling. Internal plan admission
+    /// consumes this same value; opaque claims are not subtracted a second time.
+    /// This is pure configuration resolution and does not initialize a device.
+    pub fn resolved_pipeline(
+        &self,
+    ) -> Result<ferrum_engine::image_generation::ImagePipelineConfig> {
+        self.pipeline.resolved(self.usable_memory_bytes)
     }
 }
 
@@ -228,7 +241,7 @@ impl ImageProductConfig {
         config.resolve_paths(base);
         let ImageBackendConfig::Cuda(cuda) = &config.backend;
         cuda.host.limits()?;
-        cuda.pipeline.resolved()?;
+        cuda.resolved_pipeline()?;
         if let Some(serving) = &config.serving {
             serving.validate()?;
         }
@@ -311,7 +324,7 @@ impl CudaConfig {
                     opaque_memory_profile: self.cudnn.opaque_memory_profile.clone(),
                 },
                 host: self.host.limits()?,
-                pipeline: self.pipeline.resolved()?,
+                pipeline: self.resolved_pipeline()?,
             },
         )
     }
