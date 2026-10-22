@@ -47,8 +47,11 @@ Reference uses libm 0.2.15 expf and a bounded 256-element stack accumulator.
 CUDA uses precise libdevice expf, one CTA per query/head, exactly D threads,
 one Q scalar and one accumulator per thread. Its mask is an initialized
 2,312-byte by-value C ABI structure; together with pointer/scalar parameters,
-the launch remains below 4 KiB. It declares 4*D dynamic shared bytes and 36
-static shared bytes. There is no S*S score tensor or global scratch allocation.
+the launch remains below 4 KiB. It declares 4*D dynamic shared bytes and nine
+static 4-byte scalars. Compiler padding is additional: the pinned sm_120
+offline assembler reports 48 static shared bytes, a zero-byte stack frame
+and no spill loads/stores. This is not a measurement of the driver's JIT
+allocation. There is no S*S score tensor or global scratch allocation.
 Native compiler register spills still require inspecting the compiled result;
 the source structure alone is not a physical VRAM qualification.
 

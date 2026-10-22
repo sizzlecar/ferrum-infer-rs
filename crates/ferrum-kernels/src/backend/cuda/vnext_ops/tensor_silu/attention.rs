@@ -20,7 +20,8 @@ pub const NUMERICAL_IDENTITY: &str = concat!(
     "nonfinite-visible-score=whole-head-NaN;visible-V-IEEE-per-channel;",
     "integer-BF16-RNE;gradual-underflow;fmad=false;no-fast-math;NaN-class-only;",
     "one-CTA-per-query-head;one-scalar-Q-and-acc-per-thread;zero-global-scratch;",
-    "shared=4*D+36-bytes;bounded-by-value-mask;NoAlias;",
+    "dynamic-shared=4*D;static-nine-scalars=36-source-bytes-with-target-padding;",
+    "bounded-by-value-mask;NoAlias;",
     "logical-arithmetic-from-geometry;not-hardware-FLOPs;",
     "general-FP32-expf-unqualified;no-BF16-SiLU-qualification-inheritance;",
     "target-evidence-required;no-Reference-or-Torch-bitwise-or-throughput-claim"
