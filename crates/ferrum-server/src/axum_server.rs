@@ -4826,26 +4826,6 @@ async fn health_handler(
     State(state): State<AppState>,
 ) -> std::result::Result<Response, ServerError> {
     let engine_status = state.status().await;
-    let scheduler_metrics = state.metrics();
-    let runtime_config = RuntimeConfigSnapshot::capture_current();
-    let cache_policy = CachePolicy::current();
-    let engine_cache = state
-        .llm
-        .as_ref()
-        .and_then(|engine| engine.cache_metrics_snapshot());
-    let execution_attribution = state
-        .llm
-        .as_ref()
-        .and_then(|engine| engine.execution_attribution_snapshot());
-    let scheduler_slo = state
-        .llm
-        .as_ref()
-        .and_then(|engine| engine.scheduler_slo_snapshot());
-    let engine_lora = state
-        .llm
-        .as_ref()
-        .and_then(|engine| engine.lora_metrics_snapshot());
-    let auto_config = auto_config_health_value(state.auto_config.as_ref());
     let runtime_admission = match state.llm.as_ref() {
         Some(engine) => engine.admission_snapshot(),
         None => Ok(None),
@@ -4854,14 +4834,6 @@ async fn health_handler(
         Ok(snapshot) => (snapshot.as_ref(), None),
         Err(error) => (None, Some(error.to_string())),
     };
-    let admission = admission_health_json(
-        &engine_status,
-        &scheduler_metrics,
-        &auto_config,
-        runtime_admission_snapshot,
-        runtime_admission_error.as_deref(),
-    );
-
     let profile_report = state
         .profile_delivery
         .as_ref()
@@ -4872,12 +4844,11 @@ async fn health_handler(
     let profile_degraded = profile_report
         .as_ref()
         .is_some_and(HttpProfileDeliveryReport::is_degraded);
-    let health = serde_json::json!({
+    let mut health = serde_json::json!({
         "status": if runtime_admission_error.is_some() || profile_failed
             || state.images.as_ref().is_some_and(|images| !images.service().is_accepting()) { "unhealthy" }
             else if profile_degraded { "degraded" } else { "healthy" },
         "profile_delivery": profile_report.as_ref().map(HttpProfileDeliveryReport::health_json),
-        "reasoning_protocol": state.prompt_template.as_deref().map(ModelChatTemplate::reasoning_capability).unwrap_or_default(),
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "version": env!("CARGO_PKG_VERSION"),
         "engine": {
@@ -4887,37 +4858,62 @@ async fn health_handler(
             "queued_requests": engine_status.queued_requests,
         },
         "images":state.images.as_ref().map(ImageHttpService::health),
-        "scheduler": {
-            "slo": scheduler_slo,
-            "total_requests": scheduler_metrics.total_requests,
-            "successful_requests": scheduler_metrics.successful_requests,
-            "failed_requests": scheduler_metrics.failed_requests,
-            "throughput_rps": scheduler_metrics.throughput_rps,
-            "avg_wait_time_ms": scheduler_metrics.queue_metrics.avg_queue_wait_time_ms,
-            "scheduling_time_ms": scheduler_metrics.performance_breakdown.scheduling_time_ms,
-            "model_execution_time_ms": scheduler_metrics
-                .performance_breakdown
-                .model_execution_time_ms,
-            "iteration_lock_wait_time_ms": scheduler_metrics
-                .performance_breakdown
-                .other_overhead_time_ms,
-        },
-        "config": runtime_config,
-        "auto_config": auto_config,
-        "admission": admission,
-        "numerical_execution": engine_cache.as_ref().and_then(|snapshot| snapshot.get("numerical_execution")),
-        "kv_storage": engine_cache.as_ref().and_then(|snapshot| snapshot.get("kv_storage")),
-        "cache": state.cache.health_json(&cache_policy, engine_cache.as_ref()),
-        "execution_attribution": execution_attribution,
-        "lora": engine_lora.unwrap_or_else(|| serde_json::json!({
-            "enabled": state.served_model_registry.adapter_count() > 0,
-            "adapter_count": state.served_model_registry.adapter_count() as u64,
-            "active_cache_bindings": 0u64,
-            "projection_applications": 0u64,
-            "position": "startup-routing",
-            "source": "server-lora-registry",
-        })),
     });
+
+    // These snapshots describe the text engine. Without one, their fallback
+    // defaults are not evidence of the image runtime, backend, or admission
+    // authority. Keep the existing text-health schema when an LLM is loaded.
+    if let Some(engine) = &state.llm {
+        let scheduler_metrics = state.metrics();
+        let runtime_config = RuntimeConfigSnapshot::capture_current();
+        let cache_policy = CachePolicy::current();
+        let engine_cache = engine.cache_metrics_snapshot();
+        let auto_config = auto_config_health_value(state.auto_config.as_ref());
+        let admission = admission_health_json(
+            &engine_status,
+            &scheduler_metrics,
+            &auto_config,
+            runtime_admission_snapshot,
+            runtime_admission_error.as_deref(),
+        );
+        let text_health = serde_json::json!({
+            "reasoning_protocol": state.prompt_template.as_deref().map(ModelChatTemplate::reasoning_capability).unwrap_or_default(),
+            "scheduler": {
+                "slo": engine.scheduler_slo_snapshot(),
+                "total_requests": scheduler_metrics.total_requests,
+                "successful_requests": scheduler_metrics.successful_requests,
+                "failed_requests": scheduler_metrics.failed_requests,
+                "throughput_rps": scheduler_metrics.throughput_rps,
+                "avg_wait_time_ms": scheduler_metrics.queue_metrics.avg_queue_wait_time_ms,
+                "scheduling_time_ms": scheduler_metrics.performance_breakdown.scheduling_time_ms,
+                "model_execution_time_ms": scheduler_metrics
+                    .performance_breakdown
+                    .model_execution_time_ms,
+                "iteration_lock_wait_time_ms": scheduler_metrics
+                    .performance_breakdown
+                    .other_overhead_time_ms,
+            },
+            "config": runtime_config,
+            "auto_config": auto_config,
+            "admission": admission,
+            "numerical_execution": engine_cache.as_ref().and_then(|snapshot| snapshot.get("numerical_execution")),
+            "kv_storage": engine_cache.as_ref().and_then(|snapshot| snapshot.get("kv_storage")),
+            "cache": state.cache.health_json(&cache_policy, engine_cache.as_ref()),
+            "execution_attribution": engine.execution_attribution_snapshot(),
+            "lora": engine.lora_metrics_snapshot().unwrap_or_else(|| serde_json::json!({
+                "enabled": state.served_model_registry.adapter_count() > 0,
+                "adapter_count": state.served_model_registry.adapter_count() as u64,
+                "active_cache_bindings": 0u64,
+                "projection_applications": 0u64,
+                "position": "startup-routing",
+                "source": "server-lora-registry",
+            })),
+        });
+        if let (Some(health), Some(text_health)) = (health.as_object_mut(), text_health.as_object())
+        {
+            health.extend(text_health.clone());
+        }
+    }
 
     Ok(Json(health).into_response())
 }

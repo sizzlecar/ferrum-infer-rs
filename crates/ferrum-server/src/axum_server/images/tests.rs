@@ -418,6 +418,28 @@ async fn image_only_health_models_and_validation_do_not_claim_a_ready_text_engin
     assert_eq!(health["engine"]["text_ready"], false);
     assert_eq!(health["images"]["ready"], true);
     assert_eq!(health["images"]["scheduler"]["max_num_seqs"], 1);
+    assert_eq!(health["images"]["host"]["allocated_bytes"], 0);
+    assert_eq!(health["images"]["host"]["committed_bytes"], 0);
+    // An image-only service must not present fallback text configuration as
+    // evidence about its actual backend or resource authority. Images retain
+    // their separate observed queue/Host state, without invented CUDA fields.
+    for text_only in [
+        "config",
+        "auto_config",
+        "admission",
+        "scheduler",
+        "numerical_execution",
+        "kv_storage",
+        "cache",
+        "execution_attribution",
+        "lora",
+        "reasoning_protocol",
+    ] {
+        assert!(
+            health.get(text_only).is_none(),
+            "unexpected {text_only}: {health}"
+        );
+    }
     let models = json_get(router.clone(), "/v1/models").await;
     assert_eq!(models["data"][0]["id"], "image");
     assert_eq!(
