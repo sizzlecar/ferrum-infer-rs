@@ -1,5 +1,13 @@
 use super::*;
 
+fn canonical_bytes(value: &Value) -> Vec<u8> {
+    // The workspace enables serde_json/preserve_order. Mutating an artifact
+    // must not turn insertion order into its wire format or vector digest.
+    let mut value = value.clone();
+    value.sort_all_objects();
+    serde_json::to_vec(&value).unwrap()
+}
+
 fn fixture() -> (WeightMaterializerDescriptor, Value) {
     // BF16 1, minimum subnormal, maximum finite, and negative zero. These
     // encodings cannot be substituted with binary16 and retain the same values.
@@ -15,7 +23,7 @@ fn fixture() -> (WeightMaterializerDescriptor, Value) {
     }
     let quality = ApproximateWeightQualityContract::new(
         sha('b'),
-        format!("{:x}", Sha256::digest(serde_json::to_vec(&vector).unwrap())),
+        format!("{:x}", Sha256::digest(canonical_bytes(&vector))),
         4,
         CanonicalRational::new(1, 20).unwrap(),
         0,
@@ -63,7 +71,7 @@ fn select(
         &family,
         &catalog,
         &id,
-        &serde_json::to_vec(artifact).unwrap(),
+        &canonical_bytes(artifact),
     )
 }
 
