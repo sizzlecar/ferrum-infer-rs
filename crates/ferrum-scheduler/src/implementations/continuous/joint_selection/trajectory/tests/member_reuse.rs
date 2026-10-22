@@ -9,6 +9,8 @@ use std::sync::{
 };
 use std::time::Instant;
 
+mod trace_handles;
+
 struct Allocating<'a>(&'a CohortTrajectory);
 
 impl TrajectoryAdapter<FirstAction> for Allocating<'_> {

@@ -216,6 +216,11 @@ impl PlanBuilder {
         &self.groups[..self.group_count]
     }
 
+    #[cfg(test)]
+    pub(crate) fn groups_for_test(&self) -> &[Vec<GroupMember>] {
+        self.groups()
+    }
+
     fn clear_groups(&mut self) {
         for group in &mut self.groups {
             group.clear();
@@ -356,6 +361,18 @@ pub trait TrajectoryAdapter<Action> {
         &self,
         first_action: Option<&Action>,
         requests: &[SimulatedRequest],
+        plan: &mut PlanBuilder,
+    ) -> Result<(), Unsupported>;
+}
+
+/// Crate-private opt-in for the concrete scheduler's token-only topology.
+/// The same immutable adapter, action and complete endpoint vector must produce
+/// the same ordered work independent of rank clocks. Public adapters do not
+/// acquire this authority by implementing TrajectoryAdapter.
+pub(crate) trait ReplayableTrajectory<Action>: TrajectoryAdapter<Action> {
+    fn replay_members(
+        &self,
+        members: &[GroupMember],
         plan: &mut PlanBuilder,
     ) -> Result<(), Unsupported>;
 }
@@ -532,13 +549,14 @@ impl SloPolicy {
         input: EvaluationInput<'_, Action, Adapter>,
     ) -> Result<Comparison, Unsupported> {
         let diagnostics = diagnostics::Recorder::new(input.config.planning.max_queries);
-        Self::evaluate_recorded(input, &diagnostics, None)
+        Self::evaluate_recorded(input, &diagnostics, None, None)
     }
 
     fn evaluate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
         input: EvaluationInput<'_, Action, Adapter>,
         diagnostics: &diagnostics::Recorder,
         rank: Option<usize>,
+        mut trace: Option<&mut scenarios::TraceEvaluation<'_, '_>>,
     ) -> Result<Comparison, Unsupported> {
         if input.requests.is_empty() {
             return Err(Unsupported::EmptyCohort);
@@ -583,7 +601,14 @@ impl SloPolicy {
                     })
                     .collect::<Vec<_>>()
             });
-        let static_result = simulate(&input, input.static_action, None, &mut budget, 0)?;
+        let static_result = simulate(
+            &input,
+            input.static_action,
+            None,
+            &mut budget,
+            0,
+            trace.as_deref_mut(),
+        )?;
         let window = match &static_result {
             StaticTrajectory::Complete(result) => StaticWindow::Exact(result.central_elapsed),
             StaticTrajectory::OutsideSupportPrefix(prefix) => {
@@ -608,6 +633,7 @@ impl SloPolicy {
                 },
                 &mut budget,
                 index + 1,
+                trace.as_deref_mut(),
             )
             .and_then(|result| match result {
                 StaticTrajectory::Complete(result) => Ok(result),
@@ -735,9 +761,10 @@ fn simulate<Action, Adapter: TrajectoryAdapter<Action>>(
     probe: Option<(Duration, &[Progress])>,
     budget: &mut QueryBudget<'_>,
     candidate: usize,
+    trace: Option<&mut scenarios::TraceEvaluation<'_, '_>>,
 ) -> Result<StaticTrajectory, Unsupported> {
     let failures = budget.diagnostics.failures();
-    let result = simulate_recorded(input, action, probe, budget, candidate);
+    let result = simulate_recorded(input, action, probe, budget, candidate, trace);
     if let Err(reason) = &result {
         budget
             .diagnostics
@@ -758,6 +785,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
     probe: Option<(Duration, &[Progress])>,
     budget: &mut QueryBudget<'_>,
     candidate: usize,
+    mut trace: Option<&mut scenarios::TraceEvaluation<'_, '_>>,
 ) -> Result<StaticTrajectory, Unsupported> {
     let mut requests = input.requests.to_vec();
     let mut central = Duration::ZERO;
@@ -844,18 +872,27 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
         if let Some(phase) = &mut phase {
             phase.begin_wave(&requests, plan.active.as_deref())?;
         }
-        if rounds == 0 {
-            input.adapter.plan(Some(action), &requests, &mut plan)?;
-        } else if let Some(phase) = &phase {
-            input
-                .adapter
-                .plan_phase(action, phase.phase(), &requests, &mut plan)?;
+        let phase_kind = scenarios::TracePhase::of(rounds, phase.as_ref().map(|p| p.phase()));
+        let replayed = if let Some(trace) = trace.as_deref_mut() {
+            trace.try_plan(candidate, rounds, phase_kind, &mut plan)?
         } else {
-            input.adapter.plan(None, &requests, &mut plan)?;
+            false
+        };
+        if !replayed {
+            if rounds == 0 {
+                input.adapter.plan(Some(action), &requests, &mut plan)?;
+            } else if let Some(phase) = &phase {
+                input
+                    .adapter
+                    .plan_phase(action, phase.phase(), &requests, &mut plan)?;
+            } else {
+                input.adapter.plan(None, &requests, &mut plan)?;
+            }
         }
         if plan.group_count == 0 {
             return Err(Unsupported::NoProgress);
         }
+        let mut handles = [None; 2];
         for (group_index, group) in plan.groups().iter().enumerate() {
             budget.diagnostics.point(
                 EvaluationPoint {
@@ -882,14 +919,26 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
             budget.queries += 1;
             budget.diagnostics.simulation_query(budget.queries);
             let prediction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                input.snapshot.predict(
-                    &CostQuery {
-                        work: &work,
-                        work_is_exact: true,
-                        execution: CostExecution::SingleInvocation,
-                    },
-                    input.now,
-                )
+                let query = CostQuery {
+                    work: &work,
+                    work_is_exact: true,
+                    execution: CostExecution::SingleInvocation,
+                };
+                if let Some(trace) = trace.as_deref_mut() {
+                    let (prediction, handle) = trace.predict(
+                        candidate,
+                        rounds,
+                        group_index,
+                        phase_kind,
+                        replayed,
+                        &query,
+                        input.now,
+                    );
+                    handles[group_index] = handle;
+                    prediction
+                } else {
+                    input.snapshot.predict(&query, input.now)
+                }
             }))
             .map_err(|_| {
                 let reason = Unsupported::Cost(CostUnknownReason::UnsupportedDomain);
@@ -1016,6 +1065,20 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                     if let Some(phase) = &phase {
                         phase.progressed(&requests)?;
                     }
+                    // A complete wave is publishable only after all its actual
+                    // groups applied and the original phase progress guard ran.
+                    if group_index + 1 == plan.group_count {
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.publish(
+                                candidate,
+                                rounds,
+                                phase_kind,
+                                plan.groups(),
+                                handles,
+                                replayed,
+                            );
+                        }
+                    }
                     return Ok(StaticTrajectory::Complete(TrajectoryResult {
                         requests,
                         window_progress,
@@ -1035,6 +1098,16 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
             .unwrap_or(false)
         {
             phase = None;
+        }
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.publish(
+                candidate,
+                rounds,
+                phase_kind,
+                plan.groups(),
+                handles,
+                replayed,
+            );
         }
         rounds += 1;
         if probe.is_none()

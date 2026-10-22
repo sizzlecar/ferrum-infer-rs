@@ -2,6 +2,9 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 mod cache;
 use cache::ScenarioCache;
+mod trace;
+use trace::{ReplayMembers, TraceStore};
+pub(super) use trace::{TraceEvaluation, TracePhase};
 
 #[cfg(test)]
 mod tests;
@@ -79,8 +82,42 @@ impl SloPolicy {
         visit: impl FnMut(ScenarioRank, &Comparison),
         report: &mut ScenarioDiagnostics,
     ) -> Result<ScenarioEvaluation, Unsupported> {
+        Self::evaluate_scenarios_observed(input, assign, visit, report, None)
+    }
+
+    /// Only the crate's concrete token-topology adapter can enter this route.
+    /// Generic adapters and finite StaticRounds retain the original evaluator.
+    pub(crate) fn evaluate_replayable_scenarios_with_diagnostics<
+        Action,
+        Adapter: ReplayableTrajectory<Action>,
+    >(
+        input: EvaluationInput<'_, Action, Adapter>,
+        assign: impl FnMut(ScenarioRank, &mut [SimulatedRequest]) -> Result<(), Unsupported>,
+        visit: impl FnMut(ScenarioRank, &Comparison),
+        report: &mut ScenarioDiagnostics,
+    ) -> Result<ScenarioEvaluation, Unsupported> {
+        let adapter = input.adapter;
+        let replay =
+            |members: &[GroupMember], plan: &mut PlanBuilder| adapter.replay_members(members, plan);
+        let eligible = input.horizon == EvaluationHorizon::ScenarioCompletion;
+        Self::evaluate_scenarios_observed(
+            input,
+            assign,
+            visit,
+            report,
+            eligible.then_some(&replay as &ReplayMembers<'_>),
+        )
+    }
+
+    fn evaluate_scenarios_observed<Action, Adapter: TrajectoryAdapter<Action>>(
+        input: EvaluationInput<'_, Action, Adapter>,
+        assign: impl FnMut(ScenarioRank, &mut [SimulatedRequest]) -> Result<(), Unsupported>,
+        visit: impl FnMut(ScenarioRank, &Comparison),
+        report: &mut ScenarioDiagnostics,
+        replay: Option<&ReplayMembers<'_>>,
+    ) -> Result<ScenarioEvaluation, Unsupported> {
         let recorder = diagnostics::Recorder::new(input.config.planning.max_queries);
-        let result = Self::evaluate_scenarios_recorded(input, assign, visit, &recorder);
+        let result = Self::evaluate_scenarios_recorded(input, assign, visit, &recorder, replay);
         *report = recorder.finish(result.as_ref().err().copied());
         result
     }
@@ -90,6 +127,7 @@ impl SloPolicy {
         mut assign: impl FnMut(ScenarioRank, &mut [SimulatedRequest]) -> Result<(), Unsupported>,
         mut visit: impl FnMut(ScenarioRank, &Comparison),
         diagnostics: &diagnostics::Recorder,
+        replay: Option<&ReplayMembers<'_>>,
     ) -> Result<ScenarioEvaluation, Unsupported> {
         if input.requests.is_empty() {
             return Err(Unsupported::EmptyCohort);
@@ -198,6 +236,7 @@ impl SloPolicy {
             input.config.planning.max_cost_cache_bytes,
             input.config.planning.max_queries,
         );
+        let replay = replay.filter(|_| cache.enable_handles());
         cache.insert(
             &CostQuery {
                 work: &work,
@@ -208,6 +247,7 @@ impl SloPolicy {
         );
         diagnostics.cache_bytes(cache.retained_bytes());
         let cache = parking_lot::Mutex::new(cache);
+        let mut traces = TraceStore::default();
         let valid_until = parking_lot::Mutex::new(seed_expiry);
         let mut resolved_mass = 0.0;
         let mut unresolved_mass = 0.0;
@@ -276,6 +316,16 @@ impl SloPolicy {
                 diagnostics,
             };
             let failures = diagnostics.failures();
+            let mut trace = replay.and_then(|replay| {
+                let ready = traces.prepare(
+                    &requests,
+                    input.alternatives.len().saturating_add(1),
+                    &cache,
+                    diagnostics,
+                );
+                diagnostics.cache_bytes(cache.lock().retained_bytes());
+                ready.then(|| TraceEvaluation::new(&mut traces, &snapshot, replay, input.now))
+            });
             let comparison = Self::evaluate_recorded(
                 EvaluationInput {
                     snapshot: &snapshot,
@@ -291,6 +341,7 @@ impl SloPolicy {
                 },
                 diagnostics,
                 Some(rank),
+                trace.as_mut(),
             );
             if let Err(reason) = comparison {
                 diagnostics.fallback_failure(failures, reason, FailureOrigin::Evaluation);
@@ -349,19 +400,36 @@ impl CostSnapshot for ConditionalSnapshot<'_> {
         self.query_limits
     }
     fn predict(&self, query: &CostQuery<'_>, now: Instant) -> CostPrediction {
+        self.predict_with_handle(query, now, None).0
+    }
+}
+
+impl ConditionalSnapshot<'_> {
+    fn predict_with_handle(
+        &self,
+        query: &CostQuery<'_>,
+        now: Instant,
+        handle: Option<cache::CacheHandle>,
+    ) -> (CostPrediction, Option<cache::CacheHandle>) {
         if self.started.elapsed() >= Duration::from_micros(self.config.planning.max_elapsed_us) {
             self.diagnostics.failure(
                 Unsupported::Cost(CostUnknownReason::PlanningBudget),
                 FailureOrigin::PreQueryTime,
             );
-            return CostPrediction::Unknown(CostUnknownReason::PlanningBudget);
+            return (
+                CostPrediction::Unknown(CostUnknownReason::PlanningBudget),
+                None,
+            );
         }
         // This mutex protects only comparison-local memoization, never the
         // estimator or execution. No lock is held across an original query.
-        let (cached, insertion_key) = self.cache.lock().get_with_key(query, now, self.rank);
+        let (cached, insertion_key, handle) = self
+            .cache
+            .lock()
+            .get_with_handle(query, now, self.rank, handle);
         if let Some(prediction) = cached {
             self.diagnostics.cache_hit();
-            return prediction;
+            return (prediction, handle);
         }
         if self
             .queries
@@ -374,7 +442,10 @@ impl CostSnapshot for ConditionalSnapshot<'_> {
                 Unsupported::Cost(CostUnknownReason::PlanningBudget),
                 FailureOrigin::ProviderQueryBudget,
             );
-            return CostPrediction::Unknown(CostUnknownReason::PlanningBudget);
+            return (
+                CostPrediction::Unknown(CostUnknownReason::PlanningBudget),
+                None,
+            );
         }
         self.diagnostics.provider_call();
         let distribution =
@@ -392,7 +463,7 @@ impl CostSnapshot for ConditionalSnapshot<'_> {
                         FailureOrigin::Provider
                     },
                 );
-                CostPrediction::Unknown(*reason)
+                (CostPrediction::Unknown(*reason), None)
             }
             CostScenarioPrediction::Known {
                 scenarios,
@@ -412,7 +483,7 @@ impl CostSnapshot for ConditionalSnapshot<'_> {
                     self.weights,
                 ) {
                     self.diagnostics.failure(Unsupported::Cost(reason), origin);
-                    return CostPrediction::Unknown(reason);
+                    return (CostPrediction::Unknown(reason), None);
                 }
                 let service_time = scenarios[self.rank].service_time;
                 let mut valid_until = self.valid_until.lock();
@@ -429,13 +500,13 @@ impl CostSnapshot for ConditionalSnapshot<'_> {
                     expires_at: *expires_at,
                 };
                 drop(valid_until);
-                let bytes = {
+                let (bytes, handle) = {
                     let mut cache = self.cache.lock();
-                    cache.insert_with_key(insertion_key, distribution);
-                    cache.retained_bytes()
+                    let handle = cache.insert_with_handle(insertion_key, distribution);
+                    (cache.retained_bytes(), handle)
                 };
                 self.diagnostics.cache_bytes(bytes);
-                prediction
+                (prediction, handle)
             }
         }
     }

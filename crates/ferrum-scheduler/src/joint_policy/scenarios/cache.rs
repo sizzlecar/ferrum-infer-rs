@@ -1,15 +1,40 @@
 //! Memoization belongs to one immutable snapshot, one query time and one
 //! comparison. One untrusted ordinal hint can avoid hashing; otherwise the
-//! original two-slot lookup applies. Exact work equality is always required.
+//! original two-slot lookup applies. Only the private concrete replay path can
+//! use an owner-bound immutable entry handle instead of repeating work equality.
 
 use super::*;
 use ferrum_execution::execution_attempt::AttemptPrefixRestore;
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 mod tests;
+
+static NEXT_HANDLE_OWNER: AtomicU64 = AtomicU64::new(1);
+
+// Exhaustion is permanent: never reuse an owner identity, including across
+// dropped caches. Relaxed suffices because identity does not publish data.
+fn allocate_handle_owner(counter: &AtomicU64) -> Option<NonZeroU64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .ok()
+        .and_then(NonZeroU64::new)
+}
+
+/// Exact identity of an immutable entry in this comparison's cache. No fields
+/// or factory escape this module; the sealed replay path supplies a handle only
+/// for work previously copied from that same entry after full wave validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::joint_policy) struct CacheHandle {
+    owner: NonZeroU64,
+    slot: usize,
+    generation: NonZeroU64,
+}
 
 /// Private to one ConditionalSnapshot::predict call, for the same cache. The
 /// borrowed query cannot change while the token exists; insertion accepts no
@@ -72,6 +97,14 @@ pub(super) struct ScenarioCache {
     /// rank topology or replacement is harmless because every hit is checked.
     hints: Box<[Option<NonZeroUsize>]>,
     next_hint: usize,
+    // Separate storage preserves the original Entry layout and hash geometry.
+    // Ordinary adapters do not allocate it. Fixed struct metadata, as before,
+    // is distinct from the retained allocation budget (not a process RSS bound).
+    generations: Box<[u64]>,
+    handle_owner: Option<NonZeroU64>,
+    handles_started: bool,
+    last_generation: u64,
+    trace_bytes: usize,
     max_bytes: usize,
     retained_bytes: usize,
     hits: usize,
@@ -79,6 +112,8 @@ pub(super) struct ScenarioCache {
     hint_hits: usize,
     #[cfg(test)]
     hash_lookups: usize,
+    #[cfg(test)]
+    handle_hits: usize,
 }
 
 impl ScenarioCache {
@@ -108,13 +143,121 @@ impl ScenarioCache {
             slots,
             hints,
             next_hint: 0,
+            generations: Box::default(),
+            handle_owner: None,
+            handles_started: false,
+            last_generation: 0,
+            trace_bytes: 0,
             max_bytes,
             hits: 0,
             #[cfg(test)]
             hint_hits: 0,
             #[cfg(test)]
             hash_lookups: 0,
+            #[cfg(test)]
+            handle_hits: 0,
         }
+    }
+
+    /// Enable only before seeding the private concrete replay evaluation. The
+    /// existing slot count and ordinal hints stay unchanged. Failure disables
+    /// this optimization, without evicting entries or granting another budget.
+    pub(super) fn enable_handles(&mut self) -> bool {
+        if self.handles_started {
+            return self.handle_owner.is_some();
+        }
+        self.handles_started = true;
+        if self.slots.is_empty() || self.slots.iter().any(Option::is_some) || self.next_hint != 0 {
+            return false;
+        }
+        let Some(bytes) = self
+            .slots
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
+            .and_then(|extra| self.retained_bytes.checked_add(extra))
+            .filter(|bytes| *bytes <= self.max_bytes)
+        else {
+            return false;
+        };
+        let mut generations = Vec::new();
+        if generations.try_reserve_exact(self.slots.len()).is_err()
+            || !generations
+                .capacity()
+                .checked_mul(std::mem::size_of::<u64>())
+                .and_then(|extra| self.retained_bytes.checked_add(extra))
+                .is_some_and(|bytes| bytes <= self.max_bytes)
+        {
+            return false;
+        }
+        let Some(owner) = allocate_handle_owner(&NEXT_HANDLE_OWNER) else {
+            return false;
+        };
+        generations.resize(self.slots.len(), 0);
+        self.generations = generations.into_boxed_slice();
+        self.handle_owner = Some(owner);
+        self.retained_bytes = bytes;
+        true
+    }
+
+    /// Reserve the trace owner's total *allocated* bytes, sharing the original
+    /// cache budget. The caller frees capacity before lowering this charge;
+    /// rejected growth changes nothing and never evicts a cache entry.
+    pub(super) fn set_trace_bytes(&mut self, total: usize) -> bool {
+        if total > self.trace_bytes && self.handle_owner.is_none() {
+            return false;
+        }
+        let Some(bytes) = self
+            .retained_bytes
+            .checked_sub(self.trace_bytes)
+            .and_then(|bytes| bytes.checked_add(total))
+            .filter(|bytes| *bytes <= self.max_bytes)
+        else {
+            return false;
+        };
+        self.retained_bytes = bytes;
+        self.trace_bytes = total;
+        true
+    }
+
+    fn handle_entry(&self, handle: CacheHandle, at: Instant, rank: usize) -> Option<&Entry> {
+        if self.at != at
+            || self.handle_owner != Some(handle.owner)
+            || self.generations.get(handle.slot).copied() != Some(handle.generation.get())
+        {
+            return None;
+        }
+        self.slots.get(handle.slot)?.as_ref().filter(|entry| {
+            entry.exact
+                && entry.execution == CostExecution::SingleInvocation
+                && entry.samples > 0
+                && entry.observed_at <= at
+                && at < entry.expires_at
+                && entry
+                    .service_times
+                    .get(rank)
+                    .is_some_and(|time| !time.is_zero())
+        })
+    }
+
+    fn handle_at(&self, slot: usize, rank: usize) -> Option<CacheHandle> {
+        let handle = CacheHandle {
+            owner: self.handle_owner?,
+            slot,
+            generation: NonZeroU64::new(*self.generations.get(slot)?)?,
+        };
+        self.handle_entry(handle, self.at, rank).map(|_| handle)
+    }
+
+    /// Borrow only while the caller holds the cache lock. Every group is checked
+    /// before wave copying, and checked again at its original prediction point.
+    pub(super) fn handle_work(
+        &self,
+        handle: CacheHandle,
+        at: Instant,
+        rank: usize,
+    ) -> Option<&[CostWork]> {
+        self.handle_entry(handle, at, rank)
+            .map(|entry| entry.work.as_ref())
     }
 
     /// Retain only untrusted lookup locations from the preceding traversal.
@@ -153,24 +296,66 @@ impl ScenarioCache {
         at: Instant,
         rank: usize,
     ) -> (Option<CostPrediction>, Option<InsertionKey<'a>>) {
+        let (prediction, key, _) = self.get_with_handle(query, at, rank, None);
+        (prediction, key)
+    }
+
+    /// `handle` is trusted only by the sealed replay path: its query work was
+    /// copied from this handle's canonical entry, and the complete wave passed
+    /// the original builder checks. Ordinary lookup always supplies None and
+    /// retains full key equality. A stale handle falls back using the current
+    /// query and the SAME ordinal; no second lookup charge/cursor advance.
+    pub(super) fn get_with_handle<'a>(
+        &mut self,
+        query: &CostQuery<'a>,
+        at: Instant,
+        rank: usize,
+        handle: Option<CacheHandle>,
+    ) -> (
+        Option<CostPrediction>,
+        Option<InsertionKey<'a>>,
+        Option<CacheHandle>,
+    ) {
         if self.at != at || self.slots.is_empty() {
-            return (None, None);
+            return (None, None, None);
         }
         let ordinal = (self.next_hint < self.hints.len()).then_some(self.next_hint);
         self.next_hint = self.next_hint.saturating_add(1);
+        let trusted = handle
+            .filter(|_| query.work_is_exact && query.execution == CostExecution::SingleInvocation)
+            .and_then(|handle| {
+                self.handle_entry(handle, at, rank)
+                    .filter(|entry| entry.work.len() == query.work.len())
+                    .and_then(|entry| entry.prediction(rank))
+                    .map(|prediction| (handle, prediction))
+            });
+        if let Some((handle, prediction)) = trusted {
+            self.remember_hint(ordinal, handle.slot);
+            self.hits = self.hits.saturating_add(1);
+            #[cfg(test)]
+            {
+                self.handle_hits += 1;
+            }
+            return (Some(prediction), None, Some(handle));
+        }
         let hinted = ordinal
             .and_then(|ordinal| self.hints[ordinal])
-            .and_then(|slot| self.slots.get(slot.get() - 1))
-            .and_then(Option::as_ref)
-            .filter(|entry| entry.matches(query))
-            .and_then(|entry| entry.prediction(rank));
-        if let Some(prediction) = hinted {
+            .and_then(|slot| {
+                let slot = slot.get() - 1;
+                self.slots
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .filter(|entry| entry.matches(query))
+                    .and_then(|entry| entry.prediction(rank))
+                    .map(|prediction| (slot, prediction))
+            });
+        if let Some((slot, prediction)) = hinted {
             self.hits = self.hits.saturating_add(1);
             #[cfg(test)]
             {
                 self.hint_hits += 1;
             }
-            return (Some(prediction), None);
+            return (Some(prediction), None, self.handle_at(slot, rank));
         }
         #[cfg(test)]
         {
@@ -187,7 +372,7 @@ impl ScenarioCache {
         if let Some((slot, prediction)) = prediction {
             self.remember_hint(ordinal, slot);
             self.hits = self.hits.saturating_add(1);
-            return (Some(prediction), None);
+            return (Some(prediction), None, self.handle_at(slot, rank));
         }
         (
             None,
@@ -198,6 +383,7 @@ impl ScenarioCache {
                 slots_len: self.slots.len(),
                 hint_ordinal: ordinal,
             }),
+            None,
         )
     }
 
@@ -224,11 +410,17 @@ impl ScenarioCache {
         key: Option<InsertionKey<'_>>,
         prediction: CostScenarioPrediction,
     ) {
-        let Some(key) = key else {
-            return;
-        };
+        let _ = self.insert_with_handle(key, prediction);
+    }
+
+    pub(super) fn insert_with_handle(
+        &mut self,
+        key: Option<InsertionKey<'_>>,
+        prediction: CostScenarioPrediction,
+    ) -> Option<CacheHandle> {
+        let key = key?;
         if self.at != key.at || self.slots.len() != key.slots_len || key.slot >= self.slots.len() {
-            return;
+            return None;
         }
         let query = key.query;
         let CostScenarioPrediction::Known {
@@ -241,7 +433,7 @@ impl ScenarioCache {
             ..
         } = prediction
         else {
-            return;
+            return None;
         };
         // The provider runs without the cache lock. Search CURRENT entries for
         // this exact key before considering empties, so an interleaved insert
@@ -272,10 +464,10 @@ impl ScenarioCache {
             })
             .and_then(|new| self.retained_bytes.checked_sub(previous)?.checked_add(new))
         else {
-            return;
+            return None;
         };
         if bytes > self.max_bytes {
-            return;
+            return None;
         }
         // Release a colliding payload before allocating its replacement key.
         self.slots[slot] = None;
@@ -294,9 +486,20 @@ impl ScenarioCache {
             expires_at,
         });
         self.retained_bytes = bytes;
+        if self.handle_owner.is_some() {
+            if let Some(generation) = self.last_generation.checked_add(1) {
+                self.last_generation = generation;
+                self.generations[slot] = generation;
+            } else {
+                // Never wrap or revive an old handle. Ordinary lookup remains
+                // usable; allocated metadata stays charged until cache drop.
+                self.handle_owner = None;
+            }
+        }
         // The provider ran outside the lock. Associate the actual current slot
         // with the original lookup ordinal, not a later cursor or primary slot.
         self.remember_hint(key.hint_ordinal, slot);
+        self.handle_at(slot, 0)
     }
 
     fn probe_slots(&self, primary: usize) -> impl Iterator<Item = usize> {

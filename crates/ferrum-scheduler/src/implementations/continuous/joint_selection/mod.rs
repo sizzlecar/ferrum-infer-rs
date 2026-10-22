@@ -468,7 +468,7 @@ impl ContinuousBatchScheduler {
             ScenarioRiskAccumulator::new(&cohort.requests, alternatives.len(), &config, &success)?;
         let mut aggregate_error = None;
         let mut diagnostics = ScenarioDiagnostics::default();
-        let summary = SloPolicy::evaluate_scenarios_with_diagnostics(
+        let summary = SloPolicy::evaluate_replayable_scenarios_with_diagnostics(
             EvaluationInput {
                 snapshot: round.snapshot.as_ref(),
                 now,

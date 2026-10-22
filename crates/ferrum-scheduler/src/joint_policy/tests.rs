@@ -341,6 +341,7 @@ fn split_twenty_then_thirty_credits_prefill_at_a_twenty_five_ms_window() {
             rank: None,
         },
         1,
+        None,
     )
     .unwrap();
     let result = result.complete().unwrap();

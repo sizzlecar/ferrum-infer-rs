@@ -515,6 +515,7 @@ fn malformed_simulation(
         },
         &recorder,
         None,
+        None,
     );
     let report = recorder.finish(result.as_ref().err().copied());
     (result, report)

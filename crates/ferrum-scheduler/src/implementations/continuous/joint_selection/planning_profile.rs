@@ -228,7 +228,7 @@ fn compare_once(
     .unwrap();
     let mut diagnostics = ScenarioDiagnostics::default();
     let mut aggregation_error = None;
-    let summary = SloPolicy::evaluate_scenarios_with_diagnostics(
+    let summary = SloPolicy::evaluate_replayable_scenarios_with_diagnostics(
         EvaluationInput {
             snapshot: &snapshot,
             now,

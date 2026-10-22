@@ -3,6 +3,7 @@ use ferrum_execution::{execution_attempt::AttemptWorkKind, token_execution::Exec
 
 mod compact_payload;
 mod ordinal_hints;
+mod trace_handles;
 mod two_slot;
 
 fn work() -> CostWork {
