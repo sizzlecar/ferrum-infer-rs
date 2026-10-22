@@ -100,7 +100,7 @@ fn run(args: &Arguments) -> Result<Value> {
     let provider = cuda_vnext_philox_normal_bf16_provider(&runtime)?;
     let provider_fingerprint = provider
         .descriptor()
-        .implementation_fingerprint()
+        .provider_implementation_fingerprint()
         .to_owned();
     let registry = OperationRuntimeRegistry::new(
         vec![Box::new(philox_normal_bf16_contract()?)],
