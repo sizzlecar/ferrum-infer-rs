@@ -16,7 +16,22 @@ use std::{
 };
 
 const SOURCE: &str = include_str!("../native/torch_philox_oracle.cpp");
-const METADATA_LIMIT: u64 = 64 * 1024;
+pub(crate) const METADATA_LIMIT: u64 = 64 * 1024;
+/// Fixed test sources only; callers do not supply executable source from a
+/// request or environment. Source identity remains in the build receipt.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeSource {
+    pub filename: &'static str,
+    pub text: &'static str,
+    pub required_header: &'static str,
+    pub cache_prefix: &'static str,
+}
+const PHILOX_SOURCE: NativeSource = NativeSource {
+    filename: "torch_philox_oracle.cpp",
+    text: SOURCE,
+    required_header: "ATen/cuda/CUDAGeneratorImpl.h",
+    cache_prefix: "torch-philox",
+};
 const TORCH_LIBRARIES: [&str; 5] = [
     "libtorch.so",
     "libtorch_cpu.so",
@@ -116,7 +131,7 @@ impl Config {
         Ok(())
     }
 
-    fn child(&self, executable: &Path) -> Result<Command> {
+    pub(crate) fn child(&self, executable: &Path) -> Result<Command> {
         let mut command = Command::new(executable);
         // Keep CUDA_VISIBLE_DEVICES: oracle and Ferrum must see the same ordinal.
         command.env(
@@ -163,6 +178,10 @@ impl Oracle {
     /// Build mode is suitable for a build-only ignored Rust test inside the
     /// configured Linux toolchain container. Prebuilt mode needs no compiler.
     pub fn prepare(config: Config) -> Result<Self> {
+        Self::prepare_source(config, PHILOX_SOURCE)
+    }
+
+    pub(crate) fn prepare_source(config: Config, source: NativeSource) -> Result<Self> {
         config.validate()?;
         ensure!(
             cfg!(target_os = "linux"),
@@ -181,7 +200,7 @@ impl Oracle {
                 compiler,
                 cache_directory,
             } => {
-                let (path, receipt) = build(&config, compiler, cache_directory)?;
+                let (path, receipt) = build(&config, compiler, cache_directory, source)?;
                 (path, receipt.executable_sha256.clone(), Some(receipt))
             }
         };
@@ -222,9 +241,20 @@ impl Oracle {
             output_limit,
         )?;
         let mut output = parse_output(&output_path, &self.config, case, host)?;
-        let mapped: BTreeSet<PathBuf> = output
-            .metadata
-            .loaded_libraries
+        output.library_sha256 =
+            self.validate_mapped_libraries(&output.metadata.loaded_libraries)?;
+        Ok(output)
+    }
+
+    pub(crate) fn validate_mapped_libraries(
+        &mut self,
+        libraries: &[PathBuf],
+    ) -> Result<BTreeMap<PathBuf, String>> {
+        ensure!(
+            libraries.len() <= 1024 && libraries.iter().all(|p| p.is_absolute()),
+            "invalid mapped-library metadata"
+        );
+        let mapped: BTreeSet<PathBuf> = libraries
             .iter()
             .map(|path| {
                 path.canonicalize()
@@ -254,15 +284,14 @@ impl Oracle {
         );
         // Hash actual shared objects once per oracle instance; stream their
         // contents, rather than allocating a library-sized payload buffer.
+        let mut hashes = BTreeMap::new();
         for path in mapped {
             if !self.library_hashes.contains_key(&path) {
                 self.library_hashes.insert(path.clone(), file_sha(&path)?);
             }
-            output
-                .library_sha256
-                .insert(path.clone(), self.library_hashes[&path].clone());
+            hashes.insert(path.clone(), self.library_hashes[&path].clone());
         }
-        Ok(output)
+        Ok(hashes)
     }
 }
 
@@ -400,11 +429,16 @@ fn parse_output(
     })
 }
 
-fn build(config: &Config, compiler: &Path, cache: &Path) -> Result<(PathBuf, BuildReceipt)> {
+fn build(
+    config: &Config,
+    compiler: &Path,
+    cache: &Path,
+    program: NativeSource,
+) -> Result<(PathBuf, BuildReceipt)> {
     fs::create_dir_all(cache)?;
     let directory = tempfile::tempdir_in(cache)?;
-    let source = directory.path().join("torch_philox_oracle.cpp");
-    fs::write(&source, SOURCE)?;
+    let source = directory.path().join(program.filename);
+    fs::write(&source, program.text)?;
     let compiler = compiler.canonicalize()?;
     let flags = vec![
         "-std=c++20".into(),
@@ -440,17 +474,15 @@ fn build(config: &Config, compiler: &Path, cache: &Path) -> Result<(PathBuf, Bui
         }
     }
     ensure!(
-        inputs
-            .keys()
-            .any(|p| p.ends_with("ATen/cuda/CUDAGeneratorImpl.h")),
-        "dependency scan omitted generator header"
+        inputs.keys().any(|p| p.ends_with(program.required_header)),
+        "dependency scan omitted required native oracle header"
     );
     inputs.insert(compiler.clone(), file_sha(&compiler)?);
     let libraries = TORCH_LIBRARIES.map(|name| config.torch_root.join("lib").join(name));
     for path in &libraries {
         inputs.insert(path.canonicalize()?, file_sha(path)?);
     }
-    let source_sha256 = bytes_sha(SOURCE.as_bytes());
+    let source_sha256 = bytes_sha(program.text.as_bytes());
     let mut link_flags = vec!["-Xlinker".into(), "--no-as-needed".into()];
     link_flags.extend(libraries.iter().map(|p| p.to_string_lossy().into_owned()));
     link_flags.extend(["-Xlinker".into(), "--as-needed".into(), "-pthread".into()]);
@@ -473,7 +505,7 @@ fn build(config: &Config, compiler: &Path, cache: &Path) -> Result<(PathBuf, Bui
         &inputs,
         &all_flags,
     ))?);
-    let destination = cache.join(format!("torch-philox-{identity}"));
+    let destination = cache.join(format!("{}-{identity}", program.cache_prefix));
     let receipt_path = destination.with_extension("json");
     if destination.is_file() && receipt_path.is_file() {
         let receipt: BuildReceipt =
@@ -514,7 +546,7 @@ fn build(config: &Config, compiler: &Path, cache: &Path) -> Result<(PathBuf, Bui
     Ok((destination, receipt))
 }
 
-fn run(
+pub(crate) fn run(
     command: &mut Command,
     stdout: &Path,
     stderr: &Path,
@@ -656,7 +688,7 @@ fn dependencies(source: &str) -> Result<Vec<PathBuf>> {
     Ok(words)
 }
 
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let file = File::open(path)?;
     ensure!(
         file.metadata()?.len() <= limit,
