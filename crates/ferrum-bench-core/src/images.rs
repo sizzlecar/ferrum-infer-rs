@@ -8,7 +8,9 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fmt};
 
 mod png_response;
-pub use png_response::{validate_image_response, ValidatedImage};
+pub use png_response::{
+    validate_image_response, validate_image_response_with_png, ValidatedImage, ValidatedPngResponse,
+};
 
 #[cfg(test)]
 mod tests;

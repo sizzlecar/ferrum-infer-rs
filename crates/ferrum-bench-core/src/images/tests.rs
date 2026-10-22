@@ -39,6 +39,24 @@ fn decodes_actual_rgb_rgba_pixels_and_hashes_common_rgba8() {
 }
 
 #[test]
+fn retained_png_is_the_validated_original_encoding() {
+    let limits = ImageResponseLimits::default();
+    let original = png(png::ColorType::Rgb, &[0, 127, 255, 1, 2, 3]);
+    let wire = response(&original);
+    let (image, retained) = validate_image_response_with_png(&wire, 2, 1, &limits)
+        .unwrap()
+        .into_parts();
+    assert_eq!(retained, original);
+    assert_eq!(image.png_sha256, sha256(&retained));
+    let summary = validate_image_response(&wire, 2, 1, &limits).unwrap();
+    assert_eq!(image.rgba8_sha256, summary.rgba8_sha256);
+    assert_eq!(image.png_bytes, summary.png_bytes);
+    let mut invalid_png = original;
+    invalid_png.push(0);
+    assert!(validate_image_response_with_png(&response(&invalid_png), 2, 1, &limits).is_err());
+}
+
+#[test]
 fn rejects_corruption_trailing_data_wrong_dimensions_and_capacity() {
     let limits = ImageResponseLimits::default();
     let bytes = png(png::ColorType::Rgba, &[0, 1, 2, 3, 255, 254, 253, 252]);

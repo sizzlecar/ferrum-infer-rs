@@ -15,6 +15,29 @@ pub struct ValidatedImage {
     pub rgba8_sha256: String,
 }
 
+/// A validated response and its original encoded PNG allocation. This payload
+/// deliberately does not implement Serialize or Clone. Consumers may persist
+/// the bytes without decoding base64 again or re-encoding the image.
+pub struct ValidatedPngResponse {
+    image: ValidatedImage,
+    png: Vec<u8>,
+}
+
+impl std::fmt::Debug for ValidatedPngResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatedPngResponse")
+            .field("image", &self.image)
+            .field("png_bytes", &self.png.len())
+            .finish()
+    }
+}
+
+impl ValidatedPngResponse {
+    pub fn into_parts(self) -> (ValidatedImage, Vec<u8>) {
+        (self.image, self.png)
+    }
+}
+
 #[derive(Deserialize)]
 struct Response {
     data: Vec<Datum>,
@@ -35,6 +58,18 @@ pub fn validate_image_response(
     height: u32,
     limits: &ImageResponseLimits,
 ) -> Result<ValidatedImage, ImageBenchError> {
+    validate_image_response_with_png(body, width, height, limits).map(|response| response.image)
+}
+
+/// Apply the same complete validation as `validate_image_response`, retaining
+/// the already bounded PNG bytes for an optional artifact sink. Invalid images
+/// never yield a payload. Decoder pixels and JSON storage are dropped on return.
+pub fn validate_image_response_with_png(
+    body: &[u8],
+    width: u32,
+    height: u32,
+    limits: &ImageResponseLimits,
+) -> Result<ValidatedPngResponse, ImageBenchError> {
     limits.validate()?;
     let rgba_bytes = limits.rgba_bytes(width, height)?;
     if body.len() > limits.maximum_response_bytes {
@@ -107,6 +142,7 @@ pub fn validate_image_response(
     reader
         .finish()
         .map_err(|_| invalid("invalid PNG ending or checksum"))?;
+    drop(reader);
     if decoded.bit_depth != png::BitDepth::Eight
         || decoded.width != width
         || decoded.height != height
@@ -134,13 +170,17 @@ pub fn validate_image_response(
         };
         digest.update(rgba);
     }
-    Ok(ValidatedImage {
+    let image = ValidatedImage {
         width,
         height,
         png_bytes: png_bytes.len(),
         rgba8_bytes: rgba_bytes,
         png_sha256: sha256(&png_bytes),
         rgba8_sha256: format!("{:x}", digest.finalize()),
+    };
+    Ok(ValidatedPngResponse {
+        image,
+        png: png_bytes,
     })
 }
 

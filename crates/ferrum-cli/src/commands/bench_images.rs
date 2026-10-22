@@ -11,10 +11,15 @@ use serde::Serialize;
 use std::{
     fs::OpenOptions,
     io::{BufWriter, Read, Write},
+    num::NonZeroU64,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod capture;
+pub use capture::{
+    PngCaptureConfig, PngCaptureFailureKind, PngCaptureRecord, PngCaptureResult, PngCaptureSummary,
+};
 mod runner;
 pub use runner::run_benchmark;
 #[cfg(test)]
@@ -47,6 +52,14 @@ pub struct BenchImagesCommand {
     /// New JSON report path; an existing file is never overwritten.
     #[arg(long)]
     pub output: PathBuf,
+    /// Save every validated PNG (including warmup) under a wholly new directory.
+    /// Capture IO is excluded from request E2E but affects paced wall throughput.
+    #[arg(long, requires = "maximum_capture_bytes")]
+    pub capture_dir: Option<PathBuf>,
+    /// Aggregate encoded PNG byte limit; required with --capture-dir. Capture
+    /// failures are reported independently and make the final command fail.
+    #[arg(long, requires = "capture_dir")]
+    pub maximum_capture_bytes: Option<NonZeroU64>,
     #[arg(long, default_value_t = 8)]
     pub concurrency: usize,
     /// Each repetition submits the complete dataset in its original order.
@@ -97,11 +110,16 @@ pub struct ImageBenchmarkConfig {
     pub latency_slo_p99_ms: Option<f64>,
     pub limits: ImageResponseLimits,
     pub maximum_total_requests: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<PngCaptureConfig>,
 }
 
 impl ImageBenchmarkConfig {
     pub fn validate(&self, dataset: &ImageDataset) -> anyhow::Result<()> {
         dataset.validate(&self.limits)?;
+        if let Some(capture) = &self.capture {
+            capture.validate()?;
+        }
         ensure!(
             !self.endpoints.is_empty() && self.endpoints.len() <= 16,
             "need 1..=16 endpoints"
@@ -176,6 +194,10 @@ pub struct ImageEndpointReport {
     pub repetitions: Vec<ImageBenchmarkRepetition>,
     pub measured: ImageMetrics,
     pub requests: Vec<ImageRequestRecord>,
+    /// Matched to requests by sample_index, phase and repetition, never by
+    /// response completion order. This endpoint supplies the endpoint index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captures: Option<Vec<PngCaptureRecord>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,6 +211,8 @@ pub struct ImageBenchmarkReport {
     pub dataset: ImageDataset,
     pub endpoints: Vec<ImageEndpointReport>,
     pub evidence: ImageEvidenceScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<PngCaptureSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -260,6 +284,14 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
             server_config_declaration: command.server_config[index].clone(),
         })
         .collect();
+    let capture = match (command.capture_dir, command.maximum_capture_bytes) {
+        (None, None) => None,
+        (Some(directory), Some(maximum_capture_bytes)) => Some(PngCaptureConfig {
+            directory,
+            maximum_capture_bytes,
+        }),
+        _ => anyhow::bail!("--capture-dir and --maximum-capture-bytes must be supplied together"),
+    };
     let config = ImageBenchmarkConfig {
         endpoints,
         concurrency: command.concurrency,
@@ -269,6 +301,7 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
         timeout_seconds: command.timeout_seconds,
         latency_slo_p99_ms: command.latency_slo_p99_ms,
         maximum_total_requests: command.maximum_total_requests,
+        capture,
         limits: ImageResponseLimits {
             maximum_response_bytes: command.maximum_response_bytes,
             maximum_png_bytes: command.maximum_png_bytes,
@@ -313,6 +346,12 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
         report.endpoints.len(),
         errors
     );
+    if let Some(capture) = &report.capture {
+        println!(
+            "PNG capture: {} saved / {} requested, {} write/capacity/task failures, {} without a validated response; local IO affects paced throughput",
+            capture.saved, capture.requested, capture.failed, capture.not_produced
+        );
+    }
     ensure!(
         errors == 0,
         "request errors recorded in {}",
@@ -321,6 +360,14 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
     ensure!(
         !slo_violated,
         "declared latency SLO violated; report saved to {}",
+        command.output.display()
+    );
+    ensure!(
+        report
+            .capture
+            .as_ref()
+            .is_none_or(|capture| capture.complete),
+        "PNG capture incomplete; report saved to {}",
         command.output.display()
     );
     Ok(())

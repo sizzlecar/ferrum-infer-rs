@@ -1,18 +1,24 @@
+use super::capture::{capture_validated_png, CaptureSink};
 use super::*;
 use ferrum_bench_core::images::{
-    validate_image_response, ImageFailureKind, ImageHttpRequest, ImageSample,
+    validate_image_response_with_png, ImageFailureKind, ImageHttpRequest, ImageSample,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 /// Endpoints run sequentially with an identical ordered dataset. Active HTTP
-/// requests AND pending decoder jobs share the same fixed concurrency bound.
+/// requests AND pending decoder/capture jobs share the same fixed concurrency bound.
 /// No requests are retried: retrying would silently change the workload.
 pub async fn run_benchmark(
     config: ImageBenchmarkConfig,
     dataset: ImageDataset,
 ) -> anyhow::Result<ImageBenchmarkReport> {
     config.validate(&dataset)?;
+    let capture = config
+        .capture
+        .as_ref()
+        .map(CaptureSink::create)
+        .transpose()?;
     let started_unix_ms = super::started_unix_ms()?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(config.timeout_seconds))
@@ -24,6 +30,7 @@ pub async fn run_benchmark(
     let mut endpoint_reports = Vec::new();
     for (endpoint_index, endpoint) in config.endpoints.iter().enumerate() {
         let mut records = Vec::new();
+        let mut captures = capture.as_ref().map(|_| Vec::new());
         let mut repetitions = Vec::new();
         let mut measured_seconds = 0.0;
         for phase in [ImageRequestPhase::Warmup, ImageRequestPhase::Measured] {
@@ -33,13 +40,25 @@ pub async fn run_benchmark(
                 config.repetitions
             };
             for repetition in 0..count {
-                let (run, mut requests) =
-                    run_round(&client, endpoint, &config, &dataset, phase, repetition).await;
+                let (run, mut requests, mut artifacts) = run_round(
+                    &client,
+                    endpoint_index,
+                    endpoint,
+                    &config,
+                    &dataset,
+                    phase,
+                    repetition,
+                    capture.as_ref(),
+                )
+                .await;
                 if phase == ImageRequestPhase::Measured {
                     measured_seconds += run.metrics.elapsed_seconds;
                 }
                 repetitions.push(run);
                 records.append(&mut requests);
+                if let Some(captures) = &mut captures {
+                    captures.append(&mut artifacts);
+                }
             }
         }
         let measured: Vec<_> = records
@@ -54,7 +73,13 @@ pub async fn run_benchmark(
             repetitions,
             measured: metrics,
             requests: records,
+            captures,
         });
+    }
+    let capture_summary = capture.as_ref().map(|sink| sink.summary(&endpoint_reports));
+    let mut evidence = ImageEvidenceScope::default();
+    if capture_summary.is_some() {
+        evidence.throughput_scope = "successful validated images divided by measured wall time including errors, local validation and PNG capture IO; warmup excluded; capture retains request slots and changes subsequent dispatch pacing";
     }
     Ok(ImageBenchmarkReport {
         schema_version: 1,
@@ -65,27 +90,36 @@ pub async fn run_benchmark(
         configuration: config,
         dataset,
         endpoints: endpoint_reports,
-        evidence: ImageEvidenceScope::default(),
+        evidence,
+        capture: capture_summary,
     })
 }
 
 async fn run_round(
     client: &reqwest::Client,
+    endpoint_index: usize,
     endpoint: &ImageBenchmarkEndpoint,
     config: &ImageBenchmarkConfig,
     dataset: &ImageDataset,
     phase: ImageRequestPhase,
     repetition: usize,
-) -> (ImageBenchmarkRepetition, Vec<ImageRequestRecord>) {
+    capture: Option<&Arc<CaptureSink>>,
+) -> (
+    ImageBenchmarkRepetition,
+    Vec<ImageRequestRecord>,
+    Vec<PngCaptureRecord>,
+) {
     let start = Instant::now();
     let mut next = 0usize;
     let mut active = FuturesUnordered::new();
     let mut records = Vec::with_capacity(dataset.samples.len());
+    let mut captures = Vec::new();
     let mut http_span = 0.0_f64;
     while next < dataset.samples.len() || !active.is_empty() {
         while next < dataset.samples.len() && active.len() < config.concurrency {
             active.push(run_request(
                 client,
+                endpoint_index,
                 endpoint,
                 config,
                 &dataset.samples[next],
@@ -93,16 +127,21 @@ async fn run_round(
                 phase,
                 repetition,
                 start,
+                capture.cloned(),
             ));
             next += 1;
         }
-        if let Some((record, body_complete_seconds)) = active.next().await {
+        if let Some((record, body_complete_seconds, captured)) = active.next().await {
             http_span = http_span.max(body_complete_seconds);
             records.push(record);
+            if let Some(captured) = captured {
+                captures.push(captured);
+            }
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
     records.sort_by_key(|record| record.sample_index);
+    captures.sort_by_key(|record| record.sample_index);
     let metrics = ImageMetrics::from_records(
         elapsed,
         &records,
@@ -120,11 +159,13 @@ async fn run_round(
             successful_images_per_http_completion_second: rate,
         },
         records,
+        captures,
     )
 }
 
 async fn run_request(
     client: &reqwest::Client,
+    endpoint_index: usize,
     endpoint: &ImageBenchmarkEndpoint,
     config: &ImageBenchmarkConfig,
     sample: &ImageSample,
@@ -132,7 +173,10 @@ async fn run_request(
     phase: ImageRequestPhase,
     repetition: usize,
     round_start: Instant,
-) -> (ImageRequestRecord, f64) {
+    capture: Option<Arc<CaptureSink>>,
+) -> (ImageRequestRecord, f64, Option<PngCaptureRecord>) {
+    let capture_enabled = capture.is_some();
+    let mut capture_result = PngCaptureResult::NotProduced;
     let start = Instant::now();
     let mut record = ImageRequestRecord {
         sample_index,
@@ -168,16 +212,45 @@ async fn run_request(
             let height = sample.height;
             let limits = config.limits.clone();
             let validation_start = Instant::now();
-            // CPU decode cannot stall the async reactor. This job retains its
-            // active-request slot until joined; no unbounded blocking queue.
+            // Decode and optional filesystem IO cannot stall the reactor. This
+            // job retains its slot until joined: no unbounded writer queue.
             let result = tokio::task::spawn_blocking(move || {
-                validate_image_response(&body, width, height, &limits)
+                let validated = validate_image_response_with_png(&body, width, height, &limits);
+                let validation_ms = validation_start.elapsed().as_secs_f64() * 1000.0;
+                // No need to retain JSON/base64 while the original PNG is saved.
+                drop(body);
+                let result = validated.map(|response| match capture.as_ref() {
+                    Some(sink) => {
+                        let (image, captured) = capture_validated_png(response, |image, png| {
+                            sink.save(endpoint_index, phase, repetition, sample_index, image, png)
+                        });
+                        (image, Some(captured))
+                    }
+                    None => {
+                        let (image, _png) = response.into_parts();
+                        (image, None)
+                    }
+                });
+                (result, validation_ms)
             })
             .await;
+            // Preserve the original capture-disabled cutoff after worker join.
+            // It also records elapsed work/queue time if validation panics.
             record.validation_ms = validation_start.elapsed().as_secs_f64() * 1000.0;
             match result {
-                Ok(Ok(image)) => record.image = Some(image),
-                Ok(Err(error)) => {
+                Ok((Ok((image, captured)), validation_ms)) => {
+                    if capture_enabled {
+                        record.validation_ms = validation_ms;
+                    }
+                    record.image = Some(image);
+                    if let Some(captured) = captured {
+                        capture_result = captured;
+                    }
+                }
+                Ok((Err(error), validation_ms)) => {
+                    if capture_enabled {
+                        record.validation_ms = validation_ms;
+                    }
                     record.failure = Some(ImageFailureKind::InvalidResponse);
                     record.error = Some(error.to_string());
                 }
@@ -188,7 +261,14 @@ async fn run_request(
             }
         }
     }
-    (record, body_complete_seconds)
+    let captured = capture_enabled.then(|| PngCaptureRecord {
+        sample_index,
+        sample_id: sample.id.clone(),
+        phase,
+        repetition,
+        result: capture_result,
+    });
+    (record, body_complete_seconds, captured)
 }
 
 async fn receive(

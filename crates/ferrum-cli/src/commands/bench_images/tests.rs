@@ -65,12 +65,13 @@ fn config(url: String) -> ImageBenchmarkConfig {
         latency_slo_p99_ms: None,
         limits: ImageResponseLimits::default(),
         maximum_total_requests: 100,
+        capture: None,
     }
 }
 
 // Exercise the production streaming writer. Encoding does not bypass the client's
 // independent png decoder or its wire checks. No GPU/model substitute is claimed.
-fn valid_body() -> String {
+pub(super) fn valid_body() -> String {
     use ferrum_output::png::{write_rgba8_png, PngDimensions, PngLimits};
     let mut bytes = Vec::new();
     let dimensions = PngDimensions::new(1, 1).unwrap();
@@ -118,9 +119,11 @@ async fn drives_eight_in_flight_without_mutating_requests_across_endpoints_and_r
     let mut cfg = config(url);
     cfg.endpoints.push(cfg.endpoints[0].clone());
     let report = run_benchmark(cfg, dataset(8)).await.unwrap();
+    assert!(report.capture.is_none());
     assert_eq!(state.peak.load(Ordering::SeqCst), 8);
     assert_eq!(state.active.load(Ordering::SeqCst), 0);
     for endpoint in &report.endpoints {
+        assert!(endpoint.captures.is_none());
         assert_eq!(endpoint.measured.succeeded, 16);
         assert_eq!(endpoint.measured.errors, 0);
         assert_eq!(
@@ -172,6 +175,12 @@ async fn protocol_and_streaming_size_errors_are_recorded_without_body_leak_or_su
     cfg.repetitions = 1;
     cfg.limits.maximum_response_bytes = 128;
     cfg.latency_slo_p99_ms = Some(100_000.0);
+    let directory = tempfile::tempdir().unwrap();
+    let capture = directory.path().join("capture");
+    cfg.capture = Some(PngCaptureConfig {
+        directory: capture.clone(),
+        maximum_capture_bytes: NonZeroU64::new(1024).unwrap(),
+    });
     let report = run_benchmark(cfg, dataset(4)).await.unwrap();
     let endpoint = &report.endpoints[0];
     assert_eq!(endpoint.measured.errors, 4);
@@ -196,6 +205,13 @@ async fn protocol_and_streaming_size_errors_are_recorded_without_body_leak_or_su
         ImageSloStatus::Violated
     );
     assert_eq!(endpoint.measured.e2e_p50_ms, None);
+    let captured = report.capture.as_ref().unwrap();
+    assert_eq!(
+        (captured.saved, captured.failed, captured.not_produced),
+        (0, 0, 4)
+    );
+    assert!(!captured.complete);
+    assert_eq!(std::fs::read_dir(&capture).unwrap().count(), 0);
     assert!(!serde_json::to_string(&report)
         .unwrap()
         .contains("secret-base64-payload"));
@@ -315,4 +331,180 @@ fn rejects_invalid_limits_endpoint_and_total_work_before_http() {
     cfg.maximum_total_requests = 100;
     cfg.endpoints[0].url = "http://user:secret@example.test/path".into();
     assert!(cfg.validate(&data).is_err());
+}
+
+#[tokio::test]
+async fn captures_original_pngs_for_every_endpoint_phase_and_repetition_with_numeric_paths() {
+    use ferrum_bench_core::images::validate_image_response_with_png;
+    let body = valid_body();
+    let (expected, original) =
+        validate_image_response_with_png(body.as_bytes(), 1, 1, &ImageResponseLimits::default())
+            .unwrap()
+            .into_parts();
+    let (url, _server) = serve(Router::new().route(
+        "/v1/images/generations",
+        post(move || {
+            let body = body.clone();
+            async move { body }
+        }),
+    ))
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let capture_path = directory.path().join("capture");
+    let mut cfg = config(url);
+    cfg.endpoints.push(cfg.endpoints[0].clone());
+    cfg.concurrency = 2;
+    cfg.warmup_repetitions = 1;
+    cfg.capture = Some(PngCaptureConfig {
+        directory: capture_path.clone(),
+        maximum_capture_bytes: NonZeroU64::new((original.len() * 12) as u64).unwrap(),
+    });
+    let mut data = dataset(2);
+    data.samples[0].id = "../../escape.png".into();
+    data.samples[1].id = "/absolute/path.png".into();
+    data.samples[0].prompt = "../prompt/must/not/be/a/path".into();
+    let report = run_benchmark(cfg, data).await.unwrap();
+    let summary = report.capture.as_ref().unwrap();
+    assert!(summary.complete);
+    assert_eq!(
+        (
+            summary.requested,
+            summary.saved,
+            summary.failed,
+            summary.not_produced
+        ),
+        (12, 12, 0, 0)
+    );
+    assert_eq!(summary.reserved_png_bytes, (original.len() * 12) as u64);
+    let mut names = std::collections::BTreeSet::new();
+    for endpoint in &report.endpoints {
+        let captures = endpoint.captures.as_ref().unwrap();
+        assert_eq!(captures.len(), endpoint.requests.len());
+        for (captured, request) in captures.iter().zip(&endpoint.requests) {
+            assert_eq!(captured.sample_id, request.sample_id);
+            assert_eq!(captured.sample_index, request.sample_index);
+            assert_eq!(captured.phase, request.phase);
+            assert_eq!(captured.repetition, request.repetition);
+            let PngCaptureResult::Saved {
+                relative_path,
+                png_bytes,
+                png_sha256,
+                capture_ms,
+            } = &captured.result
+            else {
+                panic!("validated PNG was not captured");
+            };
+            assert!(names.insert(relative_path.clone()));
+            assert_eq!(std::path::Path::new(relative_path).components().count(), 1);
+            assert!(!relative_path.contains("escape") && !relative_path.contains("absolute"));
+            assert_eq!(
+                std::fs::read(capture_path.join(relative_path)).unwrap(),
+                original
+            );
+            assert_eq!(*png_bytes, original.len());
+            assert_eq!(png_sha256, &expected.png_sha256);
+            assert!(capture_ms.is_finite() && *capture_ms >= 0.0);
+            assert!(request.succeeded());
+        }
+    }
+    assert_eq!(std::fs::read_dir(&capture_path).unwrap().count(), 12);
+    assert!(!directory.path().join("escape.png").exists());
+    assert!(!serde_json::to_string(&report).unwrap().contains("b64_json"));
+}
+
+#[test]
+fn capture_cli_requires_both_options_and_a_nonzero_budget() {
+    use clap::Parser;
+    let base = [
+        "bench-images",
+        "--endpoint",
+        "http://127.0.0.1/v1/images/generations",
+        "--model",
+        "fixture",
+        "--server-config",
+        "CPU fixture",
+        "--dataset",
+        "dataset.json",
+        "--output",
+        "report.json",
+    ];
+    for extra in [
+        vec!["--capture-dir", "new"],
+        vec!["--maximum-capture-bytes", "1"],
+        vec!["--capture-dir", "new", "--maximum-capture-bytes", "0"],
+    ] {
+        assert!(TestCli::try_parse_from(base.into_iter().chain(extra)).is_err());
+    }
+    let plain = TestCli::try_parse_from(base).unwrap().command;
+    assert!(plain.capture_dir.is_none() && plain.maximum_capture_bytes.is_none());
+    let capture = TestCli::try_parse_from(base.into_iter().chain([
+        "--capture-dir",
+        "new",
+        "--maximum-capture-bytes",
+        "1",
+    ]))
+    .unwrap()
+    .command;
+    assert_eq!(capture.maximum_capture_bytes.unwrap().get(), 1);
+}
+
+#[tokio::test]
+async fn capture_capacity_failure_saves_report_without_turning_http_success_into_server_error() {
+    use clap::Parser;
+    let body = valid_body();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let (url, _server) = serve(Router::new().route(
+        "/v1/images/generations",
+        post(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let body = body.clone();
+            async move { body }
+        }),
+    ))
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("dataset.json");
+    let output = directory.path().join("report.json");
+    let capture = directory.path().join("capture");
+    std::fs::write(&data, serde_json::to_vec(&dataset(1)).unwrap()).unwrap();
+    let mut cmd = TestCli::try_parse_from([
+        "bench-images",
+        "--endpoint",
+        &url,
+        "--model",
+        "fixture",
+        "--server-config",
+        "CPU fixture",
+        "--dataset",
+        data.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--repetitions",
+        "1",
+        "--capture-dir",
+        capture.to_str().unwrap(),
+        "--maximum-capture-bytes",
+        "1",
+    ])
+    .unwrap()
+    .command;
+    assert!(execute_inner(cmd.clone()).await.is_err());
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+    assert_eq!(report["endpoints"][0]["measured"]["succeeded"], 1);
+    assert_eq!(report["endpoints"][0]["measured"]["errors"], 0);
+    assert!(report["endpoints"][0]["requests"][0]["failure"].is_null());
+    assert_eq!(report["capture"]["complete"], false);
+    assert_eq!(report["capture"]["failed"], 1);
+    assert_eq!(
+        report["endpoints"][0]["captures"][0]["result"]["kind"],
+        "capacity"
+    );
+    assert_eq!(std::fs::read_dir(&capture).unwrap().count(), 0);
+    // A different report path cannot make reuse of an existing capture directory
+    // permissible. Refusal happens before another request is sent.
+    cmd.output = directory.path().join("second-report.json");
+    assert!(execute_inner(cmd).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
