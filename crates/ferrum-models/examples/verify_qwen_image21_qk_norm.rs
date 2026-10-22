@@ -1,4 +1,5 @@
-//! Real block-0 Q/K projection and head RMS normalization, before RoPE.
+//! Real block-0 Q/K projection and head RMS normalization, optionally followed
+//! by adjacent RoPE with explicit identity/quadrant frequency probes.
 //! One basis input is explicitly already normalized/modulated at the entrance.
 
 #[path = "verify_qwen_image21_projection/artifacts.rs"]
@@ -14,13 +15,14 @@ mod shared;
 
 use anyhow::{bail, Context, Result};
 use ferrum_models::qwen_image21::{
-    QwenImage21Block0QkNormFamily as Family, QwenImage21Config, StructureLimits,
+    QwenImage21Block0QkNormFamily as Family, QwenImage21Config, QwenImage21QkFrontend as Frontend,
+    StructureLimits,
 };
 use ferrum_quantization::SafetensorsArchive;
 use serde_json::json;
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
-const USAGE: &str = "verify_qwen_image21_qk_norm --config CONFIG --model-dir TRANSFORMER_DIRECTORY --artifact-dir NEW_EXTERNAL_DIRECTORY [--index-file diffusion_pytorch_model.safetensors.index.json] [--backend reference|cuda] [CUDA budget options from verify_qwen_image21_projection]";
+const USAGE: &str = "verify_qwen_image21_qk_norm --config CONFIG --model-dir TRANSFORMER_DIRECTORY --artifact-dir NEW_EXTERNAL_DIRECTORY [--index-file diffusion_pytorch_model.safetensors.index.json] [--backend reference|cuda] [--frontend norm|rotary] [--rotary-probe identity|quadrants (required only for rotary)] [CUDA budget options from verify_qwen_image21_projection]";
 
 struct Arguments {
     config: PathBuf,
@@ -28,6 +30,8 @@ struct Arguments {
     index_file: String,
     artifact_dir: PathBuf,
     backend: backend::Backend,
+    frontend: Frontend,
+    rotary_probe: Option<oracle::RotaryProbe>,
 }
 
 impl Arguments {
@@ -61,6 +65,21 @@ impl Arguments {
             .unwrap_or_else(|| "diffusion_pytorch_model.safetensors.index.json".into())
             .into_string()
             .map_err(|_| anyhow::anyhow!("index name requires UTF-8"))?;
+        let frontend = match values.remove("--frontend").as_deref() {
+            None => Frontend::Norm,
+            Some(value) if value == "norm" => Frontend::Norm,
+            Some(value) if value == "rotary" => Frontend::Rotary,
+            _ => bail!("--frontend must be norm or rotary"),
+        };
+        let rotary_probe = match values.remove("--rotary-probe").as_deref() {
+            None => None,
+            Some(value) if value == "identity" => Some(oracle::RotaryProbe::Identity),
+            Some(value) if value == "quadrants" => Some(oracle::RotaryProbe::Quadrants),
+            _ => bail!("--rotary-probe must be identity or quadrants"),
+        };
+        if (frontend == Frontend::Rotary) != rotary_probe.is_some() {
+            bail!("--frontend rotary requires --rotary-probe; norm accepts no rotary probe");
+        }
         let backend = backend::Backend::parse_options(&mut values)?;
         backend.ensure_available()?;
         Ok(Some(Self {
@@ -69,6 +88,8 @@ impl Arguments {
             index_file,
             artifact_dir,
             backend,
+            frontend,
+            rotary_probe,
         }))
     }
 }
@@ -109,21 +130,31 @@ fn run(args: Arguments) -> Result<()> {
         epsilon,
         std::array::from_fn(|i| tensors[i].bytes()),
     )?;
+    let prepared = match (args.frontend, args.rotary_probe) {
+        (Frontend::Norm, None) => prepared,
+        (Frontend::Rotary, Some(probe)) => prepared.with_rotary(probe)?,
+        _ => bail!("frontend and rotary probe disagree"),
+    };
     let output = artifacts::Artifacts::create(&args.artifact_dir)?;
     output.json("declaration.json", &json!({
-        "schema":"ferrum.qwen_image21.block0-qk-norm-verification.v1",
-        "scope":"partial already-normalized/modulated x -> Q/K Dense -> HeadRmsNorm; no RoPE, V, attention, residual, full block or image claim",
+        "schema":"ferrum.qwen_image21.block0-qk-frontend-verification.v2", "frontend":args.frontend,"rotary_probe":args.rotary_probe,
+        "scope":"partial already-normalized/modulated x -> Q/K Dense -> HeadRmsNorm, optionally adjacent RoPE with declared probes; no generated model frequencies, V, attention, residual, full block or image claim",
         "config":{"path":args.config.canonicalize()?,"sha256":artifacts::sha256(&config_bytes)},
         "source":{"directory":args.model_dir.canonicalize()?,"index":args.index_file,"weights":evidence,"integrity":"observed selected payload digests, not original checkpoint authentication or complete shard hashes"},
         "backend":args.backend,"oracle":prepared.declaration(),
         "memory_scope":"managed runtime input/output/static staging; source mmap, hashing, oracle vectors and control allocations excluded from Host/RSS bound"
     }))?;
     output.bytes("input-x.bf16", prepared.input())?;
+    if let Some(frequencies) = prepared.frequencies() {
+        output.bytes("input-frequencies.f32", frequencies)?;
+    }
     let result = execution::execute(
         &config,
         &source,
         &args.backend,
+        args.frontend,
         prepared.input(),
+        prepared.frequencies(),
         |values, provenance| {
             output.json("execution.json", provenance)?;
             for value in values {
@@ -132,6 +163,8 @@ fn run(args: Arguments) -> Result<()> {
                     Family::KEY_ID => "key.bf16",
                     Family::QUERY_NORMALIZED_ID => "query-normalized.bf16",
                     Family::KEY_NORMALIZED_ID => "key-normalized.bf16",
+                    Family::QUERY_ROTATED_ID => "query-rotated.bf16",
+                    Family::KEY_ROTATED_ID => "key-rotated.bf16",
                     _ => bail!("unexpected Q/K norm output port"),
                 };
                 output.bytes(name, value.bytes().bytes())?;
@@ -149,7 +182,7 @@ fn run(args: Arguments) -> Result<()> {
                 bail!("Q/K norm comparison failed; inspect complete outputs and result.json");
             }
             println!(
-                "Q/K norm partial verification passed: {}",
+                "Q/K frontend partial verification passed: {}",
                 output.directory().display()
             );
             Ok(())
@@ -264,23 +297,97 @@ mod tests {
             serde_json::to_vec(&json!({"weight_map":weight_map})).unwrap(),
         )
         .unwrap();
-        let artifacts = directory.path().join("evidence");
-        run(Arguments {
-            config,
-            model_dir: directory.path().into(),
-            index_file: "test.index.json".into(),
-            artifact_dir: artifacts.clone(),
-            backend: backend::Backend::Reference,
-        })
-        .unwrap();
-        let result: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(artifacts.join("result.json")).unwrap()).unwrap();
-        assert_eq!(result["comparison"]["passed"], true);
-        assert_eq!(result["cleanup"]["managed_host_committed_bytes"], 0);
-        let actual = std::fs::read(artifacts.join("query-normalized.bf16")).unwrap();
         let expected = bytes(vec![
             0.5, -1., 1.5, -2., 2.5, -3., 0.5, -1., 1.5, -2., 2.5, -3.,
         ]);
-        assert_eq!(actual, expected);
+        for (name, frontend, rotary_probe) in [
+            ("norm", Frontend::Norm, None),
+            (
+                "identity",
+                Frontend::Rotary,
+                Some(oracle::RotaryProbe::Identity),
+            ),
+            (
+                "quadrants",
+                Frontend::Rotary,
+                Some(oracle::RotaryProbe::Quadrants),
+            ),
+        ] {
+            let artifacts = directory.path().join(name);
+            run(Arguments {
+                config: config.clone(),
+                model_dir: directory.path().into(),
+                index_file: "test.index.json".into(),
+                artifact_dir: artifacts.clone(),
+                backend: backend::Backend::Reference,
+                frontend,
+                rotary_probe,
+            })
+            .unwrap();
+            let result: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(artifacts.join("result.json")).unwrap())
+                    .unwrap();
+            assert_eq!(result["comparison"]["passed"], true);
+            assert_eq!(result["cleanup"]["managed_host_committed_bytes"], 0);
+            assert_eq!(
+                std::fs::read(artifacts.join("query-normalized.bf16")).unwrap(),
+                expected
+            );
+            let execution: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(artifacts.join("execution.json")).unwrap())
+                    .unwrap();
+            assert_eq!(execution["family"], frontend.family_id());
+            assert_eq!(
+                execution["nodes"].as_array().unwrap().len(),
+                frontend.output_ids().len()
+            );
+            assert_eq!(
+                execution["managed_input_bytes"],
+                if frontend == Frontend::Rotary { 48 } else { 24 }
+            );
+            assert_eq!(
+                execution["managed_output_bytes"],
+                frontend.output_ids().len() * 24
+            );
+            match rotary_probe {
+                Some(oracle::RotaryProbe::Identity) => assert_eq!(
+                    std::fs::read(artifacts.join("query-rotated.bf16")).unwrap(),
+                    expected
+                ),
+                Some(oracle::RotaryProbe::Quadrants) => assert_eq!(
+                    std::fs::read(artifacts.join("query-rotated.bf16")).unwrap(),
+                    bytes(vec![
+                        0.5, -1., 2., 1.5, -2.5, 3., 0.5, -1., 2., 1.5, -2.5, 3.
+                    ])
+                ),
+                None => assert!(!artifacts.join("query-rotated.bf16").exists()),
+            }
+        }
+    }
+
+    #[test]
+    fn frontend_defaults_to_norm_and_rotary_requires_explicit_probe() {
+        let base = ["--config", "c", "--model-dir", "m", "--artifact-dir", "a"];
+        let parse = |tail: &[&str]| {
+            Arguments::parse(
+                base.into_iter()
+                    .chain(tail.iter().copied())
+                    .map(OsString::from),
+            )
+        };
+        assert_eq!(parse(&[]).unwrap().unwrap().frontend, Frontend::Norm);
+        let args = parse(&["--frontend", "rotary", "--rotary-probe", "quadrants"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(args.frontend, Frontend::Rotary);
+        assert_eq!(args.rotary_probe, Some(oracle::RotaryProbe::Quadrants));
+        for tail in [
+            vec!["--frontend", "rotary"],
+            vec!["--rotary-probe", "identity"],
+            vec!["--frontend", "unknown"],
+            vec!["--frontend", "rotary", "--rotary-probe", "unknown"],
+        ] {
+            assert!(parse(&tail).is_err());
+        }
     }
 }

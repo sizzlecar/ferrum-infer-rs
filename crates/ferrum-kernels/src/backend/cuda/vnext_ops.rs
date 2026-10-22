@@ -97,6 +97,8 @@ pub use tensor_silu::{
     NORM_NUMERICAL_IDENTITY as CUDA_NORMALIZATION_BF16_NUMERICAL_PROFILE_IDENTITY,
     NUMERICAL_PROFILE_ID as CUDA_SILU_BF16_NUMERICAL_PROFILE_ID,
     NUMERICAL_PROFILE_IDENTITY as CUDA_SILU_BF16_NUMERICAL_PROFILE_IDENTITY,
+    ROPE_NUMERICAL_IDENTITY as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_IDENTITY,
+    ROPE_NUMERICAL_PROFILE_ID as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_ID,
     SILU_MUL_NUMERICAL_PROFILE_ID as CUDA_SILU_MUL_BF16_NUMERICAL_PROFILE_ID,
     TANH_NUMERICAL_PROFILE_ID as CUDA_TANH_BF16_NUMERICAL_PROFILE_ID,
 };
@@ -350,6 +352,7 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::LAYER_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ADJACENT_ROPE_BF16_CAPABILITY_ID)?,
     ]);
     config.dynamic_storage_profiles = BTreeSet::from([DynamicStorageProfile::new(
         DynamicStorageAllocator::LinearArena,
@@ -390,6 +393,17 @@ pub fn cuda_vnext_tensor_bf16_providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     tensor_silu::component_providers(runtime)
+}
+
+/// Builds all eight fixed tensor providers (five pointwise, two normalization,
+/// adjacent RoPE) sharing one module and capacity permit. Dense remains a
+/// separate provider using the existing lane-owned cuBLAS handle. Register
+/// the corresponding contracts or retain the required subset of providers.
+/// The five- and seven-provider factory interfaces retain their former sets.
+pub fn cuda_vnext_tensor_component_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::all_component_providers(runtime)
 }
 
 /// Source, precise build options, and compiled PTX identity. This identifies

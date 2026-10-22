@@ -14,6 +14,8 @@ mod layer_norm_bf16;
 pub use layer_norm_bf16::*;
 mod head_rms_norm_bf16;
 pub use head_rms_norm_bf16::*;
+mod adjacent_rope_bf16;
+pub use adjacent_rope_bf16::*;
 mod pointwise_bf16;
 pub use pointwise_bf16::*;
 mod transcendental_bf16;

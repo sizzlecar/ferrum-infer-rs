@@ -84,3 +84,68 @@ fn changed_arithmetic_cannot_reuse_the_declared_family_profile() {
     profile.operations[1].accumulation_type = Some(ElementType::Bf16);
     assert!(family.semantic_program(&config, &profile).is_err());
 }
+
+#[test]
+fn rotary_is_a_distinct_family_with_explicit_frequencies_and_two_more_nodes() {
+    use QwenImage21Block0QkNormFamily as F;
+    let config = config();
+    let norm = F::new().unwrap();
+    let rotary = F::with_frontend(QwenImage21QkFrontend::Rotary).unwrap();
+    assert_ne!(norm.family_id(), rotary.family_id());
+    assert_ne!(norm.external_metadata_ids(), rotary.external_metadata_ids());
+    assert_eq!(
+        norm.weights(&config).unwrap(),
+        rotary.weights(&config).unwrap()
+    );
+    let norm_profiles = norm.numerical_profiles(&config).unwrap();
+    assert!(rotary
+        .semantic_program(&config, &norm_profiles.profiles()[0])
+        .is_err());
+    let profiles = rotary.numerical_profiles(&config).unwrap();
+    assert_eq!(profiles.profiles().len(), 2);
+    for profile in profiles.profiles() {
+        let program = rotary.semantic_program(&config, profile).unwrap();
+        assert_eq!(
+            program.inputs(),
+            &[
+                ProgramValueId::new(F::INPUT_ID).unwrap(),
+                ProgramValueId::new(F::FREQUENCIES_ID).unwrap()
+            ]
+        );
+        assert_eq!(program.outputs().len(), 6);
+        assert_eq!(program.weights().len(), 4);
+        let nodes = &program.blocks()[0].nodes;
+        assert_eq!(nodes.len(), 6);
+        for branch in 0..2 {
+            let node = &nodes[branch + 4];
+            assert_eq!(node.operation_id.as_str(), ADJACENT_ROPE_BF16_OPERATION_ID);
+            assert_eq!(
+                node.inputs,
+                vec![
+                    nodes[branch + 2].outputs[0].clone(),
+                    ProgramValueId::new(F::FREQUENCIES_ID).unwrap()
+                ]
+            );
+            assert_eq!(node.outputs, vec![program.outputs()[branch + 4].clone()]);
+            assert_eq!(
+                node.attributes,
+                BTreeMap::from([(
+                    AttributeId::new("head_dim").unwrap(),
+                    SemanticValue::Unsigned(6)
+                )])
+            );
+        }
+        assert_eq!(
+            profile.primary_activation,
+            ProgramValueId::new(F::QUERY_ROTATED_ID).unwrap()
+        );
+        assert!(norm.semantic_program(&config, profile).is_err());
+    }
+    let prepared = TypedFamilyRegistration::new(rotary)
+        .prepare_with_profile(
+            &serde_json::to_value(config).unwrap(),
+            &NumericalProfileId::new(QwenImage21QkFrontend::Rotary.cuda_profile_id()).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(prepared.program().blocks()[0].nodes.len(), 6);
+}

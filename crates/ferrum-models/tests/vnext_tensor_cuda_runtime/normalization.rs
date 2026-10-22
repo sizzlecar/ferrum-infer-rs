@@ -190,7 +190,7 @@ impl ModelFamilyProvider for NormalizationFamily {
     }
 }
 
-fn managed_input(
+pub(super) fn managed_input(
     host: &HostMemoryAccount,
     name: &str,
     dimensions: Vec<u64>,

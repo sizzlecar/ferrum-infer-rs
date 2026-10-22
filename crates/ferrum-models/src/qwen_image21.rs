@@ -22,7 +22,7 @@ pub use image_projection::{
     IMAGE_PROJECTION_NODE_ID, IMAGE_PROJECTION_OUTPUT_ID, IMAGE_PROJECTION_PROFILE_ID,
     IMAGE_PROJECTION_WEIGHT_ID,
 };
-pub use qk_norm::QwenImage21Block0QkNormFamily;
+pub use qk_norm::{QwenImage21Block0QkNormFamily, QwenImage21QkFrontend};
 pub use weights::{ExpectedTensor, ExpectedWeights};
 
 use ferrum_types::{FerrumError, Result};

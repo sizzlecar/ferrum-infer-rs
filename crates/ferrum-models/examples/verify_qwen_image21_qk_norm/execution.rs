@@ -5,7 +5,9 @@ use super::{
 use anyhow::{bail, Context, Result};
 use ferrum_execution::{PreparedTensorExecutor, TensorExecutionOutput, TensorExecutorConfig};
 use ferrum_kernels::backend::reference::ReferenceVNextComposition;
-use ferrum_models::qwen_image21::{QwenImage21Block0QkNormFamily as Family, QwenImage21Config};
+use ferrum_models::qwen_image21::{
+    QwenImage21Block0QkNormFamily as Family, QwenImage21Config, QwenImage21QkFrontend as Frontend,
+};
 use ferrum_quantization::SafetensorsArchive;
 use ferrum_runtime::*;
 use serde_json::{json, Value};
@@ -15,9 +17,22 @@ pub fn execute(
     config: &QwenImage21Config,
     source: &SafetensorsArchive,
     backend: &Backend,
+    frontend: Frontend,
     input: &[u8],
+    frequencies: Option<&[u8]>,
     inspect: impl FnOnce(&[TensorExecutionOutput], &Value) -> Result<Value>,
 ) -> Result<(Value, Value)> {
+    match (frontend, frequencies) {
+        (Frontend::Norm, None) => {}
+        (Frontend::Rotary, Some(bytes))
+            if config.head_dim() % 2 == 0
+                && u64::try_from(bytes.len())?
+                    == config
+                        .head_dim()
+                        .checked_mul(4)
+                        .context("frequency size overflows")? => {}
+        _ => bail!("frontend and explicit F32 [1,D/2,2] frequency input disagree"),
+    }
     match backend {
         Backend::Reference => {
             let composition = ReferenceVNextComposition::create(id(
@@ -26,15 +41,17 @@ pub fn execute(
             run(
                 config,
                 source,
+                frontend,
                 input,
+                frequencies,
                 composition.runtime().clone(),
                 composition.registry(),
                 composition.catalog(),
                 composition.weight_materializers(),
-                Family::REFERENCE_PROFILE_ID,
+                frontend.reference_profile_id(),
                 composition.runtime().descriptor().total_memory_bytes,
                 65536,
-                json!({"backend":"Reference", "dense":"FP32 sequential; BF16 boundary", "head_rms_norm":"reference pairwise FP32; sqrt/div; normalize B then scale B"}),
+                json!({"backend":"Reference", "dense":"FP32 sequential; BF16 boundary", "head_rms_norm":"reference pairwise FP32; sqrt/div; normalize B then scale B", "adjacent_rope":(frontend==Frontend::Rotary).then_some("FP32 cross products then explicit FMA; BF16 boundary")}),
                 inspect,
             )
         }
@@ -64,18 +81,24 @@ pub fn execute(
                         opaque_memory_profile: options.opaque_memory_profile.clone(),
                     },
                 )?);
-                let mut providers = cuda_vnext_tensor_bf16_providers(&runtime)?;
+                let mut providers = match frontend {
+                    Frontend::Norm => cuda_vnext_tensor_bf16_providers(&runtime)?,
+                    Frontend::Rotary => cuda_vnext_tensor_component_providers(&runtime)?,
+                };
                 providers.retain(|provider| {
-                    provider.descriptor().operation_id().as_str() == HEAD_RMS_NORM_BF16_OPERATION_ID
+                    let id = provider.descriptor().operation_id().as_str();
+                    id == HEAD_RMS_NORM_BF16_OPERATION_ID
+                        || (frontend == Frontend::Rotary && id == ADJACENT_ROPE_BF16_OPERATION_ID)
                 });
                 providers.push(cuda_vnext_dense_bf16_provider(&runtime)?);
-                let registry = OperationRuntimeRegistry::new(
-                    vec![
-                        Box::new(dense_linear_bf16_contract()?),
-                        Box::new(head_rms_norm_bf16_contract()?),
-                    ],
-                    providers,
-                )?;
+                let mut contracts: Vec<Box<dyn OperationContract>> = vec![
+                    Box::new(dense_linear_bf16_contract()?),
+                    Box::new(head_rms_norm_bf16_contract()?),
+                ];
+                if frontend == Frontend::Rotary {
+                    contracts.push(Box::new(adjacent_rope_bf16_contract()?));
+                }
+                let registry = OperationRuntimeRegistry::new(contracts, providers)?;
                 let materializers = WeightMaterializerRegistry::identity_only()?;
                 let descriptor = runtime.descriptor();
                 let engine = EngineProviderDescriptor::new(
@@ -91,15 +114,17 @@ pub fn execute(
                 run(
                     config,
                     source,
+                    frontend,
                     input,
+                    frequencies,
                     runtime,
                     &registry,
                     &catalog,
                     &materializers,
-                    Family::CUDA_PROFILE_ID,
+                    frontend.cuda_profile_id(),
                     options.usable_memory_bytes,
                     options.transfer_staging_bytes,
-                    json!({"backend":"CUDA", "allowances":options, "dense_profile":CUDA_DENSE_BF16_NUMERICAL_PROFILE_ID, "head_rms_norm_profile":CUDA_HEAD_RMS_NORM_BF16_NUMERICAL_PROFILE_ID, "cublas_version":cuda_dense_bf16_cublas_version()?, "qualification":"sampled mathematical bounds; no Torch/vLLM or Reference bitwise equality"}),
+                    json!({"backend":"CUDA", "allowances":options, "dense_profile":CUDA_DENSE_BF16_NUMERICAL_PROFILE_ID, "head_rms_norm_profile":CUDA_HEAD_RMS_NORM_BF16_NUMERICAL_PROFILE_ID, "adjacent_rope_profile":(frontend==Frontend::Rotary).then_some(CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_ID), "cublas_version":cuda_dense_bf16_cublas_version()?, "qualification":"sampled mathematical bounds and explicit rotary probes; no Torch/vLLM or Reference bitwise equality"}),
                     inspect,
                 )
             }
@@ -110,7 +135,9 @@ pub fn execute(
 fn run<R: DeviceRuntime>(
     config: &QwenImage21Config,
     source: &SafetensorsArchive,
+    frontend: Frontend,
     input: &[u8],
+    frequencies: Option<&[u8]>,
     runtime: Arc<R>,
     registry: &OperationRuntimeRegistry<R>,
     catalog: &CapabilityCatalog,
@@ -121,17 +148,28 @@ fn run<R: DeviceRuntime>(
     backend: Value,
     inspect: impl FnOnce(&[TensorExecutionOutput], &Value) -> Result<Value>,
 ) -> Result<(Value, Value)> {
-    let family = TypedFamilyRegistration::new(Family::new()?).prepare_with_profile(
-        &serde_json::to_value(config)?,
-        &NumericalProfileId::new(profile).map_err(anyhow::Error::msg)?,
-    )?;
+    let family = TypedFamilyRegistration::new(Family::with_frontend(frontend)?)
+        .prepare_with_profile(
+            &serde_json::to_value(config)?,
+            &NumericalProfileId::new(profile).map_err(anyhow::Error::msg)?,
+        )?;
     let spec = ProgramTensorSpec {
         dimensions: vec![1, config.hidden_size()],
         element_type: ElementType::Bf16,
         layout: ResolvedTensorLayout::Contiguous,
     };
-    let mut options =
-        ProgramPlanCompileOptions::new(BTreeMap::from([(id(Family::INPUT_ID)?, spec)]))?;
+    let mut input_specs = BTreeMap::from([(id(Family::INPUT_ID)?, spec)]);
+    if frontend == Frontend::Rotary {
+        input_specs.insert(
+            id(Family::FREQUENCIES_ID)?,
+            ProgramTensorSpec {
+                dimensions: vec![1, config.head_dim() / 2, 2],
+                element_type: ElementType::F32,
+                layout: ResolvedTensorLayout::Contiguous,
+            },
+        );
+    }
+    let mut options = ProgramPlanCompileOptions::new(input_specs)?;
     for output in family.program().outputs() {
         options.retain_completion_value(output.clone());
     }
@@ -158,19 +196,22 @@ fn run<R: DeviceRuntime>(
     let output_bytes = usize::try_from(
         config
             .hidden_size()
-            .checked_mul(4)
+            .checked_mul(u64::try_from(frontend.output_ids().len())?)
             .and_then(|n| n.checked_mul(2))
             .context("output bytes overflow")?,
     )?;
-    let total = input
+    let input_bytes = input
         .len()
+        .checked_add(frequencies.map_or(0, <[u8]>::len))
+        .context("input bytes overflow")?;
+    let total = input_bytes
         .checked_add(output_bytes)
         .and_then(|n| n.checked_add(staging))
         .context("Host total overflows")?;
     let host = HostMemoryAccount::new(HostMemoryLimits::new(
         total,
         HostMemoryClassLimits {
-            input_preprocess_bytes: input.len(),
+            input_preprocess_bytes: input_bytes,
             output_bytes,
             transfer_staging_bytes: staging,
             weight_backing_bytes: 0,
@@ -205,7 +246,7 @@ fn run<R: DeviceRuntime>(
         TensorExecutorConfig::default(),
     )
     .map_err(|error| anyhow::anyhow!("Q/K norm executor: {error}"))?;
-    let provenance = json!({"family":Family::FAMILY_ID, "profile":profile, "plan_hash":plan.plan_hash(), "runtime_fingerprint":runtime.descriptor().runtime_implementation_fingerprint, "backend":backend, "initialized_weight_bytes":weight_bytes, "managed_host_bytes":total, "managed_staging_bytes":staging, "managed_input_bytes":input.len(), "managed_output_bytes":output_bytes, "nodes":plan.payload().nodes().iter().map(|node| json!({"node":node.id(), "operation":node.operation_id(), "provider":node.provider_resources().provider_id(), "implementation_fingerprint":node.provider_implementation_fingerprint()})).collect::<Vec<_>>()});
+    let provenance = json!({"family":frontend.family_id(),"frontend":frontend, "profile":profile, "plan_hash":plan.plan_hash(), "runtime_fingerprint":runtime.descriptor().runtime_implementation_fingerprint, "backend":backend, "initialized_weight_bytes":weight_bytes, "managed_host_bytes":total, "managed_staging_bytes":staging, "managed_input_bytes":input_bytes,"managed_frequency_bytes":frequencies.map_or(0,<[u8]>::len), "managed_output_bytes":output_bytes, "nodes":plan.payload().nodes().iter().map(|node| json!({"node":node.id(), "operation":node.operation_id(), "provider":node.provider_resources().provider_id(), "implementation_fingerprint":node.provider_implementation_fingerprint()})).collect::<Vec<_>>()});
     let mut managed = host.allocate_zeroed(HostMemoryClass::InputPreprocess, input.len())?;
     managed.as_mut().copy_from_slice(input);
     let tensor = ManagedHostTensor::new(
@@ -217,11 +258,25 @@ fn run<R: DeviceRuntime>(
         )?,
         managed.freeze(),
     )?;
+    let mut tensors = vec![tensor];
+    if let Some(bytes) = frequencies {
+        let mut managed = host.allocate_zeroed(HostMemoryClass::InputPreprocess, bytes.len())?;
+        managed.as_mut().copy_from_slice(bytes);
+        tensors.push(ManagedHostTensor::new(
+            id(Family::FREQUENCIES_ID)?,
+            ResolvedTensorSpec::new(
+                vec![1, config.head_dim() / 2, 2],
+                ElementType::F32,
+                ResolvedTensorLayout::Contiguous,
+            )?,
+            managed.freeze(),
+        )?);
+    }
     let outputs = executor
         .execute(
             id("run.qwen-image21.block0-qk-norm.basis0")?,
             id("request.qwen-image21.block0-qk-norm.basis0")?,
-            vec![tensor],
+            tensors,
         )
         .map_err(|error| anyhow::anyhow!("Q/K norm execution: {error}"))?;
     let report = inspect(&outputs, &provenance)?;

@@ -4,6 +4,8 @@
 
 #[path = "vnext_tensor_cuda_runtime/normalization.rs"]
 mod normalization;
+#[path = "vnext_tensor_cuda_runtime/rotary.rs"]
+mod rotary;
 
 use ferrum_execution::{PreparedTensorExecutor, TensorExecutorConfig};
 use ferrum_kernels::backend::cuda::{

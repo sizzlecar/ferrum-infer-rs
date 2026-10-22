@@ -33,10 +33,15 @@ use super::{binding, contract_error, implementation_fingerprint, provider_failur
 mod bundle;
 mod geometry;
 mod norm;
+mod rope;
 use bundle::RetainedFunctions;
 use geometry::{geometry, Shape};
 pub use norm::{
     HEAD_RMS_NORM_PROFILE_ID, LAYER_NORM_PROFILE_ID, NUMERICAL_IDENTITY as NORM_NUMERICAL_IDENTITY,
+};
+pub use rope::{
+    NUMERICAL_IDENTITY as ROPE_NUMERICAL_IDENTITY,
+    NUMERICAL_PROFILE_ID as ROPE_NUMERICAL_PROFILE_ID,
 };
 
 pub const NUMERICAL_PROFILE_ID: &str = "cuda.libdevice.precise.silu.bf16.v1";
@@ -178,6 +183,7 @@ pub(super) fn numerical_fingerprint() -> String {
         include_bytes!("tensor_silu/bundle.rs"),
         include_bytes!("tensor_silu/geometry.rs"),
         include_bytes!("tensor_silu/norm.rs"),
+        include_bytes!("tensor_silu/rope.rs"),
         norm::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -255,18 +261,25 @@ impl CudaTensorPointwiseProvider {
 pub(super) fn providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    assemble_providers(runtime, false)
+    assemble_providers(runtime, false, false)
 }
 
 pub(super) fn component_providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    assemble_providers(runtime, true)
+    assemble_providers(runtime, true, false)
+}
+
+pub(super) fn all_component_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    assemble_providers(runtime, true, true)
 }
 
 fn assemble_providers(
     runtime: &CudaDeviceRuntime,
     with_normalization: bool,
+    with_rope: bool,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     let descriptors = Kind::ALL
         .into_iter()
@@ -277,6 +290,9 @@ fn assemble_providers(
     } else {
         Vec::new()
     };
+    let rope_descriptor = with_rope
+        .then(|| rope::descriptor(runtime.descriptor()))
+        .transpose()?;
     let kernels = RetainedFunctions::load(runtime)?;
     let mut providers = descriptors
         .into_iter()
@@ -289,6 +305,9 @@ fn assemble_providers(
         })
         .collect::<Vec<_>>();
     providers.extend(norm::providers(norm_descriptors, &kernels));
+    if let Some(descriptor) = rope_descriptor {
+        providers.push(rope::provider(descriptor, &kernels));
+    }
     Ok(providers)
 }
 
@@ -456,11 +475,20 @@ fn retained_region<'a, W: InvocationWorkProjection<'a>>(
     binding: &ResolvedValueBinding,
     bytes: u64,
 ) -> Result<CudaBufferRegion, String> {
+    retained_typed_region(participant, binding, bytes, ElementType::Bf16)
+}
+
+fn retained_typed_region<'a, W: InvocationWorkProjection<'a>>(
+    participant: &OperationInvocation<'a, CudaDeviceBuffer, W>,
+    binding: &ResolvedValueBinding,
+    bytes: u64,
+    dtype: ElementType,
+) -> Result<CudaBufferRegion, String> {
     let [component] = binding.storage().components() else {
         return Err("CUDA pointwise requires one physical storage component".into());
     };
-    if component.element_type() != ElementType::Bf16 || component.length_bytes() != bytes {
-        return Err("CUDA pointwise storage differs from its BF16 tensor".into());
+    if component.element_type() != dtype || component.length_bytes() != bytes {
+        return Err("CUDA component storage differs from its typed tensor".into());
     }
     let view = participant
         .views()
@@ -481,11 +509,11 @@ fn retained_region<'a, W: InvocationWorkProjection<'a>>(
     let region = buffer
         .retained_region(range, retention)
         .map_err(|error| error.to_string())?;
-    if region.element_type() != ElementType::Bf16
+    if region.element_type() != dtype
         || region.length_bytes() != bytes
         || region.device_ptr() % ALIGNMENT != 0
     {
-        return Err("CUDA pointwise physical region differs from its aligned BF16 tensor".into());
+        return Err("CUDA component physical region differs from its aligned typed tensor".into());
     }
     Ok(region)
 }

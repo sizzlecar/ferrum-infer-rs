@@ -199,3 +199,29 @@ extern "C" __global__ void ferrum_vnext_head_rms_norm_bf16(
         __syncthreads();
     }
 }
+
+// Explicit FMA is intentional even with --fmad=false: that option prevents
+// unintended contraction, not the declared fused intrinsic. Frequencies are
+// [sequence, head_dim/2, 2] F32, shared across batches and heads. No in-place
+// output is accepted by the provider and no frequency table is synthesized.
+extern "C" __global__ void ferrum_vnext_adjacent_rope_bf16(
+    const uint16_t* input, const float* frequencies, uint16_t* output,
+    uint64_t pairs, uint64_t columns, uint64_t sequence, uint64_t head_dim) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    const uint64_t pairs_per_row = columns / 2;
+    const uint64_t pairs_per_head = head_dim / 2;
+    for (uint64_t pair = first; pair < pairs; pair += stride) {
+        const uint64_t row = pair / pairs_per_row;
+        const uint64_t local_pair = (pair % pairs_per_row) % pairs_per_head;
+        const uint64_t frequency = (row % sequence) * head_dim + 2 * local_pair;
+        const float a = ferrum_bf16_decode(input[2 * pair]);
+        const float b = ferrum_bf16_decode(input[2 * pair + 1]);
+        const float c = frequencies[frequency];
+        const float s = frequencies[frequency + 1];
+        const float negative_product = -__fmul_rn(b, s);
+        const float positive_product = __fmul_rn(a, s);
+        output[2 * pair] = ferrum_bf16_rne(__fmaf_rn(a, c, negative_product));
+        output[2 * pair + 1] = ferrum_bf16_rne(__fmaf_rn(b, c, positive_product));
+    }
+}

@@ -1,12 +1,15 @@
 //! Candidate-independent finite-domain RMS oracle. F64 intervals enclose the
 //! mathematical sum, FP32 reduction error and each sqrt/div rounding boundary.
 //! BF16 sets retain BOTH normalization and learned-scale conversions.
+#[path = "rotary.rs"]
+mod rotary;
 #[path = "../../../ferrum-kernels/src/backend/reference/transcendental/oracle/rounding.rs"]
 mod rounding;
+pub use rotary::RotaryProbe;
 
 use anyhow::{bail, Context, Result};
 use ferrum_execution::TensorExecutionOutput;
-use ferrum_models::qwen_image21::QwenImage21Block0QkNormFamily as Family;
+use ferrum_models::qwen_image21::QwenImage21QkFrontend as Frontend;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -207,9 +210,11 @@ fn rms_choices(input: &[u16], gamma: &[u16], epsilon: f32) -> Result<Vec<Vec<u16
 
 pub struct Prepared {
     input: Vec<u8>,
-    expected: [Vec<Vec<u16>>; 4],
+    expected: Vec<Vec<Vec<u16>>>,
     epsilon: f32,
     head_dim: usize,
+    frontend: Frontend,
+    rotary: Option<(RotaryProbe, Vec<u8>)>,
 }
 
 impl Prepared {
@@ -260,7 +265,7 @@ impl Prepared {
         let gamma_k = (0..head_dim)
             .map(|i| bits(weights[3], i))
             .collect::<Vec<_>>();
-        let expected = [
+        let expected = vec![
             projection_choices(&columns[0]),
             projection_choices(&columns[1]),
             rms_choices(&columns[0], &gamma_q, epsilon)?,
@@ -273,33 +278,47 @@ impl Prepared {
             expected,
             epsilon,
             head_dim,
+            frontend: Frontend::Norm,
+            rotary: None,
         })
+    }
+    pub fn with_rotary(mut self, probe: RotaryProbe) -> Result<Self> {
+        if self.frontend != Frontend::Norm {
+            bail!("rotary oracle can be attached only once");
+        }
+        let frequencies = probe.frequencies(self.head_dim)?;
+        let query = probe.choices(&self.expected[2], self.head_dim)?;
+        let key = probe.choices(&self.expected[3], self.head_dim)?;
+        self.expected.extend([query, key]);
+        self.frontend = Frontend::Rotary;
+        self.rotary = Some((probe, frequencies));
+        Ok(self)
+    }
+    pub fn frequencies(&self) -> Option<&[u8]> {
+        self.rotary.as_ref().map(|(_, bytes)| bytes.as_slice())
     }
     pub fn input(&self) -> &[u8] {
         &self.input
     }
     pub fn declaration(&self) -> Value {
-        json!({"input":"one basis[0] row; already normalized/modulated attention entrance", "head_dim":self.head_dim, "effective_epsilon_f32_bits":self.epsilon.to_bits(),
+        json!({"input":"one basis[0] row; already normalized/modulated attention entrance", "frontend":self.frontend, "head_dim":self.head_dim, "effective_epsilon_f32_bits":self.epsilon.to_bits(),
             "projection":"all channels exact real OI column[0], with both signs allowed for exact zero",
             "norm":"independent outward F64 sum-squares; exact common-lattice reduction where proved, else gamma(D-1,2^-24); monotone RN32 interval propagation through /D,+epsilon,sqrt,1/root; enumerate BF16 normalization choices, then exact BF16-product -> RN32 -> independent integer BF16 RNE",
             "domain":"head width 1..4096; finite normal-or-zero projection matrices; square exact FP32 and nonzero lattice >=2^-126; no possible FP32 sum/denominator or BF16 boundary overflow; finite learned scales; IEEE RN-even gradual underflow, correctly-rounded sqrt/div",
             "expected_bf16_bits":self.expected, "nonunique_counts":self.expected.iter().map(|values| values.iter().filter(|allowed| allowed.len()>1).count()).collect::<Vec<_>>(),
-            "scope":"all four output ports for one basis row; no RoPE, attention, complete block, general-input norm qualification, or Torch/vLLM parity",
+            "rotary":self.rotary.as_ref().map(|(probe,_)| json!({"probe":probe,"frequency_shape":[1,self.head_dim/2,2],"oracle":"Cartesian products of predeclared norm sets; exact quadrant coefficients 0,+/-1; signed-zero multiplication/addition implements adjacent FP32 cross product then FMA and BF16 boundary without candidate values","scope":"explicit probes; no real multi-axis trigonometric frequency generation or general-frequency qualification"})),
+            "output_ports":self.frontend.output_ids(),
+            "scope":"all declared output ports for one basis row; no attention, complete block, general-input norm qualification, or Torch/vLLM parity",
             "candidate_independence":"input, intervals and every allowed set prepared before runtime creation; no candidate intermediate supplies an expectation"})
     }
     pub fn compare(&self, outputs: &[TensorExecutionOutput]) -> Result<Value> {
-        let ids = [
-            Family::QUERY_ID,
-            Family::KEY_ID,
-            Family::QUERY_NORMALIZED_ID,
-            Family::KEY_NORMALIZED_ID,
-        ];
+        let ids = self.frontend.output_ids();
         if outputs.len() != ids.len() {
-            bail!("Q/K norm requires exactly four output ports");
+            bail!("Q/K frontend output count differs from its declared topology");
         }
         let mut reports = Vec::new();
         let mut total_failures = 0;
-        for (id, expected) in ids.into_iter().zip(&self.expected) {
+        for (&id, expected) in ids.iter().zip(&self.expected) {
             let matching = outputs
                 .iter()
                 .filter(|output| output.value_id().as_str() == id)
@@ -313,7 +332,7 @@ impl Prepared {
             reports.push(json!({"port":id, "samples":expected.len(), "failures":failures}));
         }
         Ok(
-            json!({"passed":total_failures==0, "failures":total_failures, "ports":reports, "scope":"all Q/K pre/post norm channels of one independently prepared basis row"}),
+            json!({"passed":total_failures==0, "failures":total_failures, "ports":reports, "frontend":self.frontend,"scope":"all declared Q/K frontend channels of one independently prepared basis row"}),
         )
     }
 }

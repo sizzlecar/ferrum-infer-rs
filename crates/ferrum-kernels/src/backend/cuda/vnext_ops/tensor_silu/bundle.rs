@@ -13,6 +13,7 @@ pub(super) struct RetainedFunctions {
     // releases these owners before returning the one module capacity permit.
     functions: [CudaFunction; 5],
     norm_functions: [CudaFunction; 2],
+    rope_function: CudaFunction,
     _provider: CudaTensorProviderRetention,
 }
 
@@ -47,9 +48,12 @@ impl RetainedFunctions {
                 load_norm(norm::Kind::Layer)?,
                 load_norm(norm::Kind::HeadRms)?,
             ];
-            Ok::<_, CudaDeviceRuntimeError>((pointwise, normalization))
+            let rope_function = module.load_function(rope::FUNCTION).map_err(|error| {
+                CudaDeviceRuntimeError::driver("BF16 adjacent RoPE function load", error)
+            })?;
+            Ok::<_, CudaDeviceRuntimeError>((pointwise, normalization, rope_function))
         }));
-        let (functions, norm_functions) = match loaded {
+        let (functions, norm_functions, rope_function) = match loaded {
             Ok(Ok(functions)) => functions,
             Ok(Err(error)) => {
                 // A partially failed load has not certified native cleanup.
@@ -64,6 +68,7 @@ impl RetainedFunctions {
         Ok(Arc::new(Self {
             functions,
             norm_functions,
+            rope_function,
             _provider: provider,
         }))
     }
@@ -74,5 +79,9 @@ impl RetainedFunctions {
 
     pub(super) fn norm_function(&self, kind: norm::Kind) -> &CudaFunction {
         &self.norm_functions[kind.index()]
+    }
+
+    pub(super) fn rope_function(&self) -> &CudaFunction {
+        &self.rope_function
     }
 }

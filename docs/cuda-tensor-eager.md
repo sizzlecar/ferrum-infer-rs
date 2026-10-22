@@ -35,9 +35,11 @@ The pointwise factory returns five providers sharing one module owner.
 SiLU-mul rounds SiLU to BF16 before multiplication;
 modulation rounds `1 + scale`, and gated residual rounds `gate * update`, before
 their final operation. Each operation has its own CUDA numerical profile.
-The complete `cuda_vnext_tensor_bf16_providers` factory also returns LayerNorm
-and head-wise RMSNorm. All seven functions share that same module and permit;
-the older pointwise factory still returns only its five providers.
+The `cuda_vnext_tensor_bf16_providers` factory also returns LayerNorm
+and head-wise RMSNorm. The `cuda_vnext_tensor_component_providers` factory adds
+[adjacent BF16 RoPE with explicit F32 frequencies](bf16-adjacent-rope.md).
+All eight functions share that same module and permit; the older factories
+still return their original five or seven providers.
 
 CUDA normalization currently accepts power-of-two widths up to 4096. Both
 providers check this during planning and encoding. They use a bounded

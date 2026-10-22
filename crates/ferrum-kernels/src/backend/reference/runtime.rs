@@ -20,6 +20,8 @@ mod layer_norm;
 pub(crate) use layer_norm::ReferenceLayerNormLaunch;
 mod head_rms_norm;
 pub(crate) use head_rms_norm::{ReferenceHeadRmsNormLaunch, ReferenceHeadRmsNormShape};
+mod adjacent_rope;
+pub(crate) use adjacent_rope::{ReferenceAdjacentRopeLaunch, ReferenceAdjacentRopeShape};
 mod pointwise;
 pub(crate) use pointwise::{
     ReferenceGatedResidualLaunch, ReferenceModulationScaleLaunch, ReferencePointwiseShape,
@@ -326,6 +328,9 @@ enum ReferenceCommandKind {
     HeadRmsNorm {
         launch: ReferenceHeadRmsNormLaunch,
     },
+    AdjacentRope {
+        launch: ReferenceAdjacentRopeLaunch,
+    },
     ModulationScale {
         launch: ReferenceModulationScaleLaunch,
     },
@@ -359,6 +364,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
             ReferenceCommandKind::LayerNorm { .. } => "layer_norm",
             ReferenceCommandKind::HeadRmsNorm { .. } => "head_rms_norm",
+            ReferenceCommandKind::AdjacentRope { .. } => "adjacent_rope",
             ReferenceCommandKind::ModulationScale { .. } => "modulation_scale",
             ReferenceCommandKind::GatedResidual { .. } => "gated_residual",
             ReferenceCommandKind::UnaryActivation { launch: ref unary } => match unary.kind {
@@ -445,6 +451,19 @@ impl ReferenceDeviceCommand {
             kind: ReferenceCommandKind::DenseLinear {
                 launches: vec![launch].into_boxed_slice(),
             },
+        })
+    }
+
+    pub(crate) fn adjacent_rope_tensor(
+        launch: ReferenceAdjacentRopeLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_adjacent_rope_bf16",
+            logical_work: Some(launch.shape.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::AdjacentRope { launch },
         })
     }
 
@@ -649,6 +668,9 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::HeadRmsNorm { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::AdjacentRope { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::LayerNorm { launch } => {
                 launch.input.validate_runtime(runtime_instance)?;
                 launch.output.validate_runtime(runtime_instance)?;
@@ -712,6 +734,12 @@ impl ReferenceDeviceCommand {
                 head_rms_norm::execute(launch);
                 counters
                     .head_rms_norm_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::AdjacentRope { launch } => {
+                adjacent_rope::execute(launch);
+                counters
+                    .adjacent_rope_launches
                     .fetch_add(1, Ordering::Relaxed);
             }
             ReferenceCommandKind::ModulationScale { launch } => {
@@ -806,6 +834,17 @@ impl<'a, const N: usize> AllocationLocks<'a, N> {
         let bytes = self.guards[self.slots[role]].as_ref().unwrap();
         let offset = self.offsets[role] + index * 2;
         u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+    }
+
+    fn read_f32(&self, role: usize, index: usize) -> f32 {
+        let bytes = self.guards[self.slots[role]].as_ref().unwrap();
+        let offset = self.offsets[role] + index * 4;
+        f32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
     }
 
     fn write_bits(&mut self, role: usize, index: usize, bits: u16) {
@@ -904,6 +943,7 @@ struct ReferenceRuntimeCounters {
     dense_linear_launches: AtomicU64,
     layer_norm_launches: AtomicU64,
     head_rms_norm_launches: AtomicU64,
+    adjacent_rope_launches: AtomicU64,
     modulation_scale_launches: AtomicU64,
     gated_residual_launches: AtomicU64,
     silu_launches: AtomicU64,
@@ -922,6 +962,7 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub dense_linear_launches: u64,
     pub layer_norm_launches: u64,
     pub head_rms_norm_launches: u64,
+    pub adjacent_rope_launches: u64,
     pub modulation_scale_launches: u64,
     pub gated_residual_launches: u64,
     pub silu_launches: u64,
@@ -1050,6 +1091,7 @@ impl ReferenceDeviceRuntime {
             dense_linear_launches: self.counters.dense_linear_launches.load(Ordering::Relaxed),
             layer_norm_launches: self.counters.layer_norm_launches.load(Ordering::Relaxed),
             head_rms_norm_launches: self.counters.head_rms_norm_launches.load(Ordering::Relaxed),
+            adjacent_rope_launches: self.counters.adjacent_rope_launches.load(Ordering::Relaxed),
             modulation_scale_launches: self
                 .counters
                 .modulation_scale_launches

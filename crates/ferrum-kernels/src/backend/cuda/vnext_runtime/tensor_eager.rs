@@ -182,11 +182,12 @@ impl CudaDeviceRuntime {
                         | ferrum_runtime::GATED_RESIDUAL_BF16_CAPABILITY_ID
                         | ferrum_runtime::LAYER_NORM_BF16_CAPABILITY_ID
                         | ferrum_runtime::HEAD_RMS_NORM_BF16_CAPABILITY_ID
+                        | ferrum_runtime::ADJACENT_ROPE_BF16_CAPABILITY_ID
                 )
             })
         {
             return Err(CudaDeviceRuntimeError::contract(
-                "this CUDA tensor eager profile admits only its fixed BF16 pointwise, normalization and Dense providers",
+                "this CUDA tensor eager profile admits only its fixed BF16 pointwise, normalization, rotary and Dense providers",
             ));
         }
         let streams = u64::try_from(config.maximum_streams)

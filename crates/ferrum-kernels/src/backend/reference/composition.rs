@@ -2,19 +2,21 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ferrum_runtime::{
-    dense_linear_bf16_contract, dense_linear_contract, gated_residual_bf16_contract,
-    head_rms_norm_bf16_contract, layer_norm_bf16_contract, modulation_scale_bf16_contract,
-    silu_bf16_contract, silu_mul_bf16_contract, tanh_bf16_contract, CapabilityCatalog,
-    CapabilityId, ContractVersion, DeviceClass, DeviceDescriptor, DeviceId, DeviceRuntime,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, EngineProviderDescriptor,
-    OperationContract, OperationProvider, OperationRuntimeRegistry, ProviderId, VNextError,
-    WeightMaterializerId, WeightMaterializerRegistry, DENSE_LINEAR_BF16_CAPABILITY_ID,
+    adjacent_rope_bf16_contract, dense_linear_bf16_contract, dense_linear_contract,
+    gated_residual_bf16_contract, head_rms_norm_bf16_contract, layer_norm_bf16_contract,
+    modulation_scale_bf16_contract, silu_bf16_contract, silu_mul_bf16_contract, tanh_bf16_contract,
+    CapabilityCatalog, CapabilityId, ContractVersion, DeviceClass, DeviceDescriptor, DeviceId,
+    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
+    EngineProviderDescriptor, OperationContract, OperationProvider, OperationRuntimeRegistry,
+    ProviderId, VNextError, WeightMaterializerId, WeightMaterializerRegistry,
+    ADJACENT_ROPE_BF16_CAPABILITY_ID, DENSE_LINEAR_BF16_CAPABILITY_ID,
     DENSE_LINEAR_F16_CAPABILITY_ID, GATED_RESIDUAL_BF16_CAPABILITY_ID,
     HEAD_RMS_NORM_BF16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
     LAYER_NORM_BF16_CAPABILITY_ID, MODULATION_SCALE_BF16_CAPABILITY_ID, SILU_BF16_CAPABILITY_ID,
     SILU_MUL_BF16_CAPABILITY_ID, TANH_BF16_CAPABILITY_ID,
 };
 
+use super::adjacent_rope::ReferenceAdjacentRopeProvider;
 use super::dense_linear::{implementation_fingerprint, ReferenceDenseLinearProvider};
 use super::head_rms_norm::ReferenceHeadRmsNormProvider;
 use super::layer_norm::ReferenceLayerNormProvider;
@@ -37,6 +39,7 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
         CapabilityId::new(DENSE_LINEAR_BF16_CAPABILITY_ID)?,
         CapabilityId::new(LAYER_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ADJACENT_ROPE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(MODULATION_SCALE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(GATED_RESIDUAL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(SILU_BF16_CAPABILITY_ID)?,
@@ -61,6 +64,8 @@ pub(super) fn reference_vnext_runtime_config(
             include_str!("runtime/layer_norm.rs").as_bytes(),
             include_str!("head_rms_norm.rs").as_bytes(),
             include_str!("runtime/head_rms_norm.rs").as_bytes(),
+            include_str!("adjacent_rope.rs").as_bytes(),
+            include_str!("runtime/adjacent_rope.rs").as_bytes(),
             include_str!("pointwise.rs").as_bytes(),
             include_str!("runtime/pointwise.rs").as_bytes(),
             numerical.as_bytes(),
@@ -85,6 +90,7 @@ pub fn reference_vnext_operation_registry(
         Box::new(dense_linear_bf16_contract().map_err(contract_error)?),
         Box::new(layer_norm_bf16_contract().map_err(contract_error)?),
         Box::new(head_rms_norm_bf16_contract().map_err(contract_error)?),
+        Box::new(adjacent_rope_bf16_contract().map_err(contract_error)?),
         Box::new(modulation_scale_bf16_contract().map_err(contract_error)?),
         Box::new(gated_residual_bf16_contract().map_err(contract_error)?),
         Box::new(silu_bf16_contract().map_err(contract_error)?),
@@ -96,6 +102,7 @@ pub fn reference_vnext_operation_registry(
         reference_vnext_dense_linear_bf16_provider(runtime)?,
         reference_vnext_layer_norm_bf16_provider(runtime)?,
         reference_vnext_head_rms_norm_bf16_provider(runtime)?,
+        reference_vnext_adjacent_rope_bf16_provider(runtime)?,
         reference_vnext_modulation_scale_bf16_provider(runtime)?,
         reference_vnext_gated_residual_bf16_provider(runtime)?,
         reference_vnext_silu_bf16_provider(runtime)?,
@@ -134,6 +141,13 @@ pub fn reference_vnext_head_rms_norm_bf16_provider(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
     Ok(Box::new(ReferenceHeadRmsNormProvider::new(runtime)?))
+}
+
+/// Builds adjacent-pair BF16 RoPE with explicit FP32 multiplication and FMA.
+pub fn reference_vnext_adjacent_rope_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceAdjacentRopeProvider::new(runtime)?))
 }
 
 /// Builds BF16 scale-only modulation with explicit BF16 rounding of 1 + scale.
