@@ -401,7 +401,65 @@ impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
         &mut self,
         requests: Vec<ImageGenerationRequest>,
     ) -> Result<Vec<Self::Output>, ImageBatchError> {
-        self.0.generate_batch(requests)
+        let batch_size = requests.len();
+        let started = Instant::now();
+        let outcome = self.0.generate_batch(requests);
+        let total_generate_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if tracing::enabled!(target: "ferrum_engine::image_generation::timing", tracing::Level::DEBUG)
+        {
+            match &outcome {
+                Ok(outputs) => {
+                    // Each output carries the same batch stages. Record them
+                    // once, before cancellation or response fanout can discard
+                    // an individual output. These are host wall durations.
+                    tracing::debug!(
+                        target: "ferrum_engine::image_generation::timing",
+                        job = ?outputs.first().map(|output| output.receipt.job),
+                        batch_size,
+                        output_count = outputs.len(),
+                        total_generate_us,
+                        "image batch generation completed"
+                    );
+                    if let Some(output) = outputs.first() {
+                        for (stage_index, stage) in output.receipt.stages.iter().enumerate() {
+                            let execution = &stage.execution;
+                            let plan = &execution.plan;
+                            tracing::debug!(
+                                target: "ferrum_engine::image_generation::timing",
+                                job = output.receipt.job,
+                                batch_size,
+                                stage_index,
+                                stage = ?plan.stage,
+                                stage_batch_size = plan.batch_size,
+                                plan_cache_hit = plan.plan_cache_hit,
+                                session_reused = execution.session_reused,
+                                weights_reused = execution.weights_reused,
+                                completed_executions = execution.completed_executions,
+                                compile_us = plan.compile_wall_duration_us,
+                                init_us = execution.initialization_wall_duration_us,
+                                execute_us = ?execution.execution_wall_durations_us,
+                                close_us = stage.close_wall_duration_us,
+                                "image batch stage timing"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    let outcome = match error {
+                        ImageBatchError::Rejected(_) => "rejected",
+                        ImageBatchError::Fatal(_) => "fatal",
+                    };
+                    tracing::debug!(
+                        target: "ferrum_engine::image_generation::timing",
+                        batch_size,
+                        total_generate_us,
+                        outcome,
+                        "image batch generation failed"
+                    );
+                }
+            }
+        }
+        outcome
     }
 }
 

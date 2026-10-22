@@ -21,7 +21,7 @@ use ferrum_output::{
 };
 use ferrum_types::OutputConfig;
 use serde::Deserialize;
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 mod response;
 
@@ -305,6 +305,7 @@ pub(super) async fn generations_handler(
         .output
         .try_open_session()
         .map_err(|error| ServerError::CapacityExceeded(error.to_string()))?;
+    let wait_started = Instant::now();
     let result = images
         .service
         .try_submit(request)
@@ -312,7 +313,10 @@ pub(super) async fn generations_handler(
         .wait()
         .await
         .map_err(service_error)?;
-    let bytes = response::encode(
+    let queue_and_generation_wait_us =
+        u64::try_from(wait_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let encode_started = Instant::now();
+    let encoded = response::encode(
         session.clone(),
         images.service.host_account().clone(),
         result.rgba.tensor().clone(),
@@ -320,7 +324,22 @@ pub(super) async fn generations_handler(
         images.config.png_limits,
         images.config.rgba_scratch_bytes,
     )
-    .await?;
+    .await;
+    let response_encode_us =
+        u64::try_from(encode_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    // Includes count/encode passes, blocking-pool scheduling and output credit
+    // waits. This stops before the HTTP body is delivered to the client.
+    tracing::debug!(
+        target: "ferrum_server::image_generation::timing",
+        job = result.receipt.job,
+        batch_index = result.receipt.batch_index,
+        batch_size = result.receipt.batch_size,
+        queue_and_generation_wait_us,
+        response_encode_us,
+        encoding_succeeded = encoded.is_ok(),
+        "image HTTP response timing"
+    );
+    let bytes = encoded?;
     drop(result);
     Ok((
         [(header::CONTENT_TYPE, "application/json")],
