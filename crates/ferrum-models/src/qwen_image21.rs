@@ -13,6 +13,7 @@ mod headers;
 mod image_projection;
 pub mod pipeline_adapters;
 mod qk_norm;
+pub mod sampling_schedule;
 pub mod t2i_prompt;
 mod transformer;
 mod vae_decoder;
