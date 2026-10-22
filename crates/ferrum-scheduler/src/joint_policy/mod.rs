@@ -169,7 +169,8 @@ pub struct GroupMember {
 /// The adapter appends actual invocation groups through a bounded builder.
 /// Split is at most prefill followed by decode; mixed is one invocation.
 pub struct PlanBuilder {
-    groups: Vec<Vec<GroupMember>>,
+    groups: [Vec<GroupMember>; 2],
+    group_count: usize,
     participant_limit: usize,
     query_limits: CostQueryLimits,
     execution: CostExecution,
@@ -178,26 +179,67 @@ pub struct PlanBuilder {
 
 impl PlanBuilder {
     pub fn push_group(&mut self, members: &[GroupMember]) -> Result<(), Unsupported> {
-        if members.is_empty()
-            || self.groups.len() >= 2
-            || !CostQuery::fits(members.len(), self.query_limits)
+        self.push_matching(members, None)
+    }
+
+    /// Preserve input order while avoiding an intermediate split-group allocation.
+    pub(crate) fn push_group_kind(
+        &mut self,
+        members: &[GroupMember],
+        kind: AttemptWorkKind,
+    ) -> Result<(), Unsupported> {
+        if members.iter().all(|member| member.work.kind != kind) {
+            return Ok(());
+        }
+        self.push_matching(members, Some(kind))
+    }
+
+    /// The core freezes this mask before any group in the current wave executes.
+    pub(crate) fn active_mask(&self) -> Option<&[bool]> {
+        self.active.as_deref()
+    }
+
+    fn groups(&self) -> &[Vec<GroupMember>] {
+        &self.groups[..self.group_count]
+    }
+
+    fn clear_groups(&mut self) {
+        for group in &mut self.groups {
+            group.clear();
+        }
+        self.group_count = 0;
+    }
+
+    fn push_matching(
+        &mut self,
+        members: &[GroupMember],
+        kind: Option<AttemptWorkKind>,
+    ) -> Result<(), Unsupported> {
+        let matches = |member: &&GroupMember| kind.is_none_or(|kind| member.work.kind == kind);
+        let selected = members.iter().filter(matches);
+        let count = selected.clone().count();
+        if count == 0
+            || self.group_count >= 2
+            || !CostQuery::fits(count, self.query_limits)
             || self
-                .groups
+                .groups()
                 .iter()
                 .map(Vec::len)
                 .sum::<usize>()
-                .checked_add(members.len())
+                .checked_add(count)
                 .is_none_or(|count| count > self.participant_limit)
         {
             return Err(Unsupported::ParticipantBudget);
         }
-        if self.execution == CostExecution::SingleInvocation && !self.groups.is_empty() {
+        if self.execution == CostExecution::SingleInvocation && self.group_count != 0 {
             return Err(Unsupported::InvalidPlan);
         }
         if self.execution == CostExecution::SequentialPrefillThenDecode {
-            let first_kind = members[0].work.kind;
-            if members.iter().any(|member| member.work.kind != first_kind)
-                || self.groups.first().is_some_and(|group| {
+            let first_kind = selected.clone().next().unwrap().work.kind;
+            if selected
+                .clone()
+                .any(|member| member.work.kind != first_kind)
+                || self.groups().first().is_some_and(|group| {
                     group[0].work.kind != AttemptWorkKind::Prefill
                         || first_kind != AttemptWorkKind::Decode
                 })
@@ -206,6 +248,9 @@ impl PlanBuilder {
             }
         }
         for (position, member) in members.iter().enumerate() {
+            if !matches(&member) {
+                continue;
+            }
             if self
                 .active
                 .as_ref()
@@ -215,9 +260,10 @@ impl PlanBuilder {
             }
             if members[..position]
                 .iter()
+                .filter(matches)
                 .any(|prior| prior.request == member.request)
                 || self
-                    .groups
+                    .groups()
                     .iter()
                     .flatten()
                     .any(|prior| prior.request == member.request)
@@ -225,7 +271,10 @@ impl PlanBuilder {
                 return Err(Unsupported::InvalidPlan);
             }
         }
-        self.groups.push(members.to_vec());
+        // Validate before appending: a rejected group cannot affect a later plan.
+        self.groups[self.group_count].reserve(count);
+        self.groups[self.group_count].extend(selected.copied());
+        self.group_count += 1;
         Ok(())
     }
 }
@@ -685,6 +734,15 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
     let mut cost_risk = CostRiskBudget::default();
     let itl_limit = Duration::try_from_secs_f64(input.config.itl_ms / 1000.0)
         .map_err(|_| Unsupported::InvalidState)?;
+    let mut plan = PlanBuilder {
+        groups: [Vec::new(), Vec::new()],
+        group_count: 0,
+        participant_limit: input.config.planning.max_participants,
+        query_limits: input.config.query,
+        execution: input.execution,
+        active: None,
+    };
+    let mut work = Vec::new();
     loop {
         budget.diagnostics.point(
             EvaluationPoint {
@@ -709,28 +767,24 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 .failure(Unsupported::TimeBudget, FailureOrigin::SimulationTime);
             return Err(Unsupported::TimeBudget);
         }
-        let mut plan = PlanBuilder {
-            groups: Vec::new(),
-            participant_limit: input.config.planning.max_participants,
-            query_limits: input.config.query.intersect(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    input.snapshot.query_limits()
-                }))
-                .map_err(|_| {
-                    let reason = Unsupported::Cost(CostUnknownReason::UnsupportedDomain);
-                    budget
-                        .diagnostics
-                        .failure(reason, FailureOrigin::ProviderPanic);
-                    reason
-                })?,
-            ),
-            execution: input.execution,
-            active: input
-                .adapter
-                .admission_slots()
-                .map(|slots| slots.active_mask(&requests))
-                .transpose()?,
-        };
+        plan.clear_groups();
+        plan.query_limits = input.config.query.intersect(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                input.snapshot.query_limits()
+            }))
+            .map_err(|_| {
+                let reason = Unsupported::Cost(CostUnknownReason::UnsupportedDomain);
+                budget
+                    .diagnostics
+                    .failure(reason, FailureOrigin::ProviderPanic);
+                reason
+            })?,
+        );
+        if let Some(slots) = input.adapter.admission_slots() {
+            slots.active_mask_into(&requests, plan.active.get_or_insert_with(Vec::new))?;
+        } else {
+            plan.active = None;
+        }
         if rounds == 0 {
             let mut declaration = PhaseBuilder::new(
                 &requests,
@@ -759,10 +813,10 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
         } else {
             input.adapter.plan(None, &requests, &mut plan)?;
         }
-        if plan.groups.is_empty() {
+        if plan.group_count == 0 {
             return Err(Unsupported::NoProgress);
         }
-        for (group_index, group) in plan.groups.into_iter().enumerate() {
+        for (group_index, group) in plan.groups().iter().enumerate() {
             budget.diagnostics.point(
                 EvaluationPoint {
                     stage: EvaluationStage::Simulation,
@@ -780,10 +834,11 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 );
                 return Err(Unsupported::QueryBudget);
             }
-            for member in &group {
+            for member in group {
                 validate_member(&requests, *member)?;
             }
-            let work = group.iter().map(|member| member.work).collect::<Vec<_>>();
+            work.clear();
+            work.extend(group.iter().map(|member| member.work));
             budget.queries += 1;
             budget.diagnostics.simulation_query(budget.queries);
             let prediction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -903,7 +958,9 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
             }
             if let Some((window, targets)) = probe {
                 if central <= window {
-                    window_progress = requests.iter().map(SimulatedRequest::progress).collect();
+                    for (progress, request) in window_progress.iter_mut().zip(&requests) {
+                        *progress = request.progress();
+                    }
                 }
                 if reached.is_none()
                     && requests
@@ -944,7 +1001,9 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
             && (matches!(input.horizon, EvaluationHorizon::StaticRounds(limit) if rounds >= limit)
                 || requests.iter().all(SimulatedRequest::finished))
         {
-            window_progress = requests.iter().map(SimulatedRequest::progress).collect();
+            for (progress, request) in window_progress.iter_mut().zip(&requests) {
+                *progress = request.progress();
+            }
             return Ok(StaticTrajectory::Complete(TrajectoryResult {
                 requests,
                 window_progress,
@@ -962,7 +1021,9 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                     .zip(targets)
                     .all(|(request, target)| request.progress().covers(*target))
                 {
-                    window_progress = requests.iter().map(SimulatedRequest::progress).collect();
+                    for (progress, request) in window_progress.iter_mut().zip(&requests) {
+                        *progress = request.progress();
+                    }
                     return Ok(StaticTrajectory::Complete(TrajectoryResult {
                         requests,
                         window_progress,

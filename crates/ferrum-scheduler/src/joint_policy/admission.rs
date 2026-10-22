@@ -80,10 +80,21 @@ impl AdmissionSlotPlan {
     /// first unfinished waiters occupy released slots, even when token limits
     /// keep an admitted waiter from doing work in this particular wave.
     pub fn active_mask(&self, requests: &[SimulatedRequest]) -> Result<Vec<bool>, Unsupported> {
+        let mut active = Vec::new();
+        self.active_mask_into(requests, &mut active)?;
+        Ok(active)
+    }
+
+    pub(crate) fn active_mask_into(
+        &self,
+        requests: &[SimulatedRequest],
+        active: &mut Vec<bool>,
+    ) -> Result<(), Unsupported> {
         if requests.len() != self.initial.len() {
             return Err(Unsupported::InvalidState);
         }
-        let mut active = vec![false; requests.len()];
+        active.clear();
+        active.resize(requests.len(), false);
         let mut available = self.max_active;
         for (index, state) in self.initial.iter().enumerate() {
             if *state == InitialAdmission::Resident && !requests[index].finished() {
@@ -108,7 +119,7 @@ impl AdmissionSlotPlan {
         }) {
             return Err(Unsupported::InvalidState);
         }
-        Ok(active)
+        Ok(())
     }
 
     fn validate_initial(

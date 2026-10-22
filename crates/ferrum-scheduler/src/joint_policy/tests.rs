@@ -3,6 +3,8 @@ use ferrum_execution::execution_attempt::AttemptPrefixRestore;
 use ferrum_execution::token_execution::ExecutionRange;
 use ferrum_interfaces::request_observation::{StoppingForecast, StoppingMass};
 
+mod buffers;
+
 struct Snapshot {
     at: Instant,
     split: bool,

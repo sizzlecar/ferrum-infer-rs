@@ -199,14 +199,7 @@ impl CohortTrajectory {
             return plan.push_group(&members);
         }
         for kind in [AttemptWorkKind::Prefill, AttemptWorkKind::Decode] {
-            let group = members
-                .iter()
-                .copied()
-                .filter(|m| m.work.kind == kind)
-                .collect::<Vec<_>>();
-            if !group.is_empty() {
-                plan.push_group(&group)?;
-            }
+            plan.push_group_kind(&members, kind)?;
         }
         Ok(())
     }
@@ -229,6 +222,18 @@ impl CohortTrajectory {
             return Err(Unsupported::ParticipantBudget);
         }
         let active = self.admission.active_mask(requests)?;
+        self.natural_members_from_active(requests, phase, &active)
+    }
+
+    fn natural_members_from_active(
+        &self,
+        requests: &[SimulatedRequest],
+        phase: Option<(NonZeroUsize, &[PrefillTarget])>,
+        active: &[bool],
+    ) -> Result<Vec<GroupMember>, Unsupported> {
+        if requests.len() != self.shapes.len() || active.len() != requests.len() {
+            return Err(Unsupported::ParticipantBudget);
+        }
         let mut members = Vec::with_capacity(requests.len());
         let mut remaining = self.max_tokens;
         // The supported cohort fits the full decode width, so future cursor
@@ -389,7 +394,11 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
             return Err(Unsupported::InvalidPlan);
         };
         self.push(
-            self.natural_members_with_phase(requests, Some((*limit, phase.prefill_targets())))?,
+            self.natural_members_from_active(
+                requests,
+                Some((*limit, phase.prefill_targets())),
+                plan.active_mask().ok_or(Unsupported::InvalidState)?,
+            )?,
             plan,
         )
     }
@@ -408,9 +417,10 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
                 return Err(Unsupported::InvalidPlan);
             }
             return self.push(
-                self.natural_members_with_phase(
+                self.natural_members_from_active(
                     requests,
                     Some((*limit, &self.cap_commit_targets)),
+                    plan.active_mask().ok_or(Unsupported::InvalidState)?,
                 )?,
                 plan,
             );
@@ -418,7 +428,11 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
         let mut members = if first_action.is_some() && !self.first_wave.is_empty() {
             self.first_wave.clone()
         } else {
-            self.natural_members(requests)?
+            self.natural_members_from_active(
+                requests,
+                None,
+                plan.active_mask().ok_or(Unsupported::InvalidState)?,
+            )?
         };
         match first_action {
             Some(FirstAction::DecodeOnly) => {

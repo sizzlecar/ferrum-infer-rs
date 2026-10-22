@@ -114,7 +114,8 @@ impl SloPolicy {
             reason
         })?;
         let mut plan = PlanBuilder {
-            groups: Vec::new(),
+            groups: [Vec::new(), Vec::new()],
+            group_count: 0,
             participant_limit: input.config.planning.max_participants,
             query_limits: input.config.query.intersect(limits),
             execution: input.execution,
@@ -127,7 +128,7 @@ impl SloPolicy {
         input
             .adapter
             .plan(Some(input.static_action), input.requests, &mut plan)?;
-        let group = plan.groups.first().ok_or(Unsupported::NoProgress)?;
+        let group = plan.groups().first().ok_or(Unsupported::NoProgress)?;
         for member in group {
             validate_member(input.requests, *member)?;
         }
