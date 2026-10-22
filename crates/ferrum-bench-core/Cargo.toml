@@ -13,6 +13,8 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 rand = { workspace = true }
 sha2 = "0.10"
+base64 = "0.22"
+png = "=0.18.1"
 
 # Structured release preparation keeps comments and dependency constraints.
 toml_edit = "0.22.27"

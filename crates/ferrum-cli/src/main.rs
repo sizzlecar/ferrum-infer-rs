@@ -44,6 +44,9 @@ enum Commands {
     #[command(hide = true)]
     BenchServe(bench_serve::BenchServeCommand),
 
+    /// Benchmark image HTTP endpoints with a fixed prompt/seed/dimension dataset.
+    BenchImages(bench_images::BenchImagesCommand),
+
     /// Validate and replay a request replay bundle without starting HTTP.
     #[command(hide = true)]
     ReplayBundle(replay_bundle::ReplayBundleCommand),
@@ -132,6 +135,9 @@ fn command_future(
         }
         Commands::BenchServe(cmd) => {
             Box::pin(async move { bench_serve::execute(cmd, config).await.map_err(Into::into) })
+        }
+        Commands::BenchImages(cmd) => {
+            Box::pin(async move { bench_images::execute(cmd).await.map_err(Into::into) })
         }
         Commands::ReplayBundle(cmd) => Box::pin(async move {
             replay_bundle::execute(cmd, config)

@@ -27,6 +27,7 @@ pub mod client_slo;
 pub mod dataset;
 pub mod decode_isolation;
 pub mod env;
+pub mod images;
 // Compatibility for tools; all owners and the path registry live in ferrum-journal.
 pub use ferrum_journal::jsonl_journal;
 pub mod profile;

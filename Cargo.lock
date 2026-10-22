@@ -1266,10 +1266,12 @@ dependencies = [
 name = "ferrum-bench-core"
 version = "0.14.0"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "ferrum-journal",
  "ferrum-types",
  "half",
+ "png",
  "quote",
  "rand 0.9.2",
  "semver",
@@ -1290,6 +1292,7 @@ dependencies = [
  "async-openai",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "candle-core",
  "chrono",
  "clap",
