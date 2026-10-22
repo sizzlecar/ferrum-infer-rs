@@ -243,19 +243,21 @@ static_assert(sizeof(FerrumStructuredAttentionMask) == 2312, "attention mask ABI
 // Finite scores use explicit separate FP32 operations and precise expf.
 // Any visible nonfinite score poisons that query's whole head with NaNs;
 // visible V values otherwise propagate IEEE arithmetic component-wise.
-extern "C" __global__ void ferrum_vnext_structured_attention_bf16(
+__device__ __forceinline__ void ferrum_structured_attention_body(
     const uint16_t* query, const uint16_t* key, const uint16_t* value,
-    uint16_t* output, uint64_t groups, uint64_t heads, uint32_t sequence,
-    uint32_t width, float scale, const FerrumStructuredAttentionMask mask) {
+    uint16_t* output, uint64_t groups, uint64_t query_heads, uint64_t key_value_heads, uint32_t sequence,
+    uint32_t width, float scale, const FerrumStructuredAttentionMask& mask) {
     extern __shared__ float dot_values[];
     __shared__ uint32_t visible_end, seen, poisoned, first_key;
     __shared__ float maximum, denominator, correction, weight, inverse;
     for (uint64_t group = blockIdx.x; group < groups; group += gridDim.x) {
-        const uint64_t head = group % heads;
-        const uint64_t row = group / heads;
+        const uint64_t head = group % query_heads;
+        const uint64_t kv_head = head / (query_heads / key_value_heads);
+        const uint64_t row = group / query_heads;
         const uint32_t batch = static_cast<uint32_t>(row / sequence);
         const uint32_t q = static_cast<uint32_t>(row % sequence);
-        const uint64_t columns = heads * width;
+        const uint64_t columns = query_heads * width;
+        const uint64_t kv_columns = key_value_heads * width;
         const uint64_t query_offset = row * columns + head * width + threadIdx.x;
         float q_scalar = 0.0f;
         float accumulator = 0.0f;
@@ -286,7 +288,7 @@ extern "C" __global__ void ferrum_vnext_structured_attention_bf16(
             // the first visible key and retained in one scalar register.
             if (!seen) q_scalar = ferrum_bf16_decode(query[query_offset]);
             const uint64_t kv_offset = (static_cast<uint64_t>(batch) * sequence + k)
-                * columns + head * width + threadIdx.x;
+                * kv_columns + kv_head * width + threadIdx.x;
             dot_values[threadIdx.x] = __fmul_rn(q_scalar, ferrum_bf16_decode(key[kv_offset]));
             __syncthreads();
             ferrum_norm_pairwise(dot_values, width);
@@ -323,6 +325,24 @@ extern "C" __global__ void ferrum_vnext_structured_attention_bf16(
             (seen ? ferrum_bf16_rne(__fmul_rn(accumulator, inverse)) : 0U);
         __syncthreads();
     }
+}
+
+// The original equal-head entry preserves its ABI and calls the same body.
+extern "C" __global__ void ferrum_vnext_structured_attention_bf16(
+    const uint16_t* query, const uint16_t* key, const uint16_t* value,
+    uint16_t* output, uint64_t groups, uint64_t heads, uint32_t sequence,
+    uint32_t width, float scale, const FerrumStructuredAttentionMask mask) {
+    ferrum_structured_attention_body(query, key, value, output, groups,
+        heads, heads, sequence, width, scale, mask);
+}
+
+// GQA has a separate semantic contract, but does not repeat the KV tensors.
+extern "C" __global__ void ferrum_vnext_structured_gqa_attention_bf16(
+    const uint16_t* query, const uint16_t* key, const uint16_t* value,
+    uint16_t* output, uint64_t groups, uint64_t query_heads, uint64_t key_value_heads,
+    uint32_t sequence, uint32_t width, float scale, const FerrumStructuredAttentionMask mask) {
+    ferrum_structured_attention_body(query, key, value, output, groups,
+        query_heads, key_value_heads, sequence, width, scale, mask);
 }
 
 // Whole-row zero-centered RMS. Weight is stored BF16; weight+1 and x*inverse
@@ -428,5 +448,45 @@ extern "C" __global__ void ferrum_vnext_batched_row_concat_bf16(
         output[index] = local_row < left_rows
             ? left[(batch * left_rows + local_row) * columns + column]
             : right[(batch * right_rows + local_row - left_rows) * columns + column];
+    }
+}
+
+// Plain residual and half-split BF16 text rotary use the same bounded module.
+extern "C" __global__ void ferrum_vnext_plain_residual_add_bf16(
+    const uint16_t* lhs, const uint16_t* rhs, uint16_t* output, uint64_t elements) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t index = first; index < elements; index += stride) {
+        output[index] = ferrum_bf16_rne(__fadd_rn(
+            ferrum_bf16_decode(lhs[index]), ferrum_bf16_decode(rhs[index])));
+    }
+}
+
+// One thread per half-split pair. Cos and sin are BF16 [R,D], independently
+// specified for both halves and shared only across heads of a given row.
+// Each multiplication is explicitly rounded to BF16 before the final sum.
+extern "C" __global__ void ferrum_vnext_half_split_rope_bf16(
+    const uint16_t* input, const uint16_t* cosine, const uint16_t* sine,
+    uint16_t* output, uint64_t pairs, uint64_t columns, uint64_t head_dim) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    const uint64_t half = head_dim / 2;
+    const uint64_t pairs_per_row = columns / 2;
+    for (uint64_t pair = first; pair < pairs; pair += stride) {
+        const uint64_t row = pair / pairs_per_row;
+        const uint64_t row_pair = pair % pairs_per_row;
+        const uint64_t head = row_pair / half;
+        const uint64_t channel = row_pair % half;
+        const uint64_t left = row * columns + head * head_dim + channel;
+        const uint64_t right = left + half;
+        const uint64_t frequency = row * head_dim + channel;
+        const float a = ferrum_bf16_decode(input[left]);
+        const float b = ferrum_bf16_decode(input[right]);
+        const uint16_t ac = ferrum_bf16_rne(__fmul_rn(a, ferrum_bf16_decode(cosine[frequency])));
+        const uint16_t bs = ferrum_bf16_rne(__fmul_rn(-b, ferrum_bf16_decode(sine[frequency])));
+        const uint16_t bc = ferrum_bf16_rne(__fmul_rn(b, ferrum_bf16_decode(cosine[frequency + half])));
+        const uint16_t as = ferrum_bf16_rne(__fmul_rn(a, ferrum_bf16_decode(sine[frequency + half])));
+        output[left] = ferrum_bf16_rne(__fadd_rn(ferrum_bf16_decode(ac), ferrum_bf16_decode(bs)));
+        output[right] = ferrum_bf16_rne(__fadd_rn(ferrum_bf16_decode(bc), ferrum_bf16_decode(as)));
     }
 }

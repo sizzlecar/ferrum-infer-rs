@@ -143,6 +143,38 @@ pub fn execute_stored_component<R: DeviceRuntime>(
         &serde_json::Value,
     ) -> Result<serde_json::Value>,
 ) -> Result<(serde_json::Value, serde_json::Value)> {
+    let specs = inputs
+        .iter()
+        .map(|input| {
+            (
+                input.value_id.clone(),
+                ProgramTensorSpec {
+                    dimensions: input.tensor.dimensions().to_vec(),
+                    element_type: input.tensor.element_type(),
+                    layout: input.tensor.layout().clone(),
+                },
+            )
+        })
+        .collect();
+    let mut options = ProgramPlanCompileOptions::new(specs)?;
+    options.require_weight_materializer(id(IDENTITY_WEIGHT_MATERIALIZER_ID)?);
+    execute_stored_component_with_options(family, source, composition, inputs, options, inspect)
+}
+
+/// Uses the model adapter's complete compile options, including shape-dependent
+/// transport outputs. Supplied input tensors must exactly match those options;
+/// an intermediate spec never grants permission to change an input ABI.
+pub fn execute_stored_component_with_options<R: DeviceRuntime>(
+    family: &PreparedModelFamily,
+    source: &dyn WeightComponentSource,
+    composition: StoredComponentRuntime<'_, R>,
+    inputs: Vec<ComponentInput<'_>>,
+    mut options: ProgramPlanCompileOptions,
+    inspect: impl FnOnce(
+        &[ferrum_execution::TensorExecutionOutput],
+        &serde_json::Value,
+    ) -> Result<serde_json::Value>,
+) -> Result<(serde_json::Value, serde_json::Value)> {
     use ferrum_execution::{PreparedTensorExecutor, TensorExecutorConfig};
     use serde_json::json;
     let mut specs = std::collections::BTreeMap::new();
@@ -170,11 +202,23 @@ pub fn execute_stored_component<R: DeviceRuntime>(
             .checked_add(input.bytes.len())
             .context("component input bytes overflow")?;
     }
-    let mut options = ProgramPlanCompileOptions::new(specs)?;
+    if specs.len() != family.program().inputs().len()
+        || family
+            .program()
+            .inputs()
+            .iter()
+            .any(|value| !specs.contains_key(value))
+    {
+        bail!("component inputs do not cover the exact prepared family input ports");
+    }
+    for (value_id, spec) in &specs {
+        if options.tensor_specs().get(value_id) != Some(spec) {
+            bail!("component input differs from explicit compile options: {value_id}");
+        }
+    }
     for output in family.program().outputs() {
         options.retain_completion_value(output.clone());
     }
-    options.require_weight_materializer(id(IDENTITY_WEIGHT_MATERIALIZER_ID)?);
     let policy = TensorPolicy {
         capacity_bytes: composition.capacity_bytes,
         storage_profiles: composition

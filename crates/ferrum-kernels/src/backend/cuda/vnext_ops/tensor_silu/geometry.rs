@@ -118,9 +118,10 @@ pub(super) fn validate_specs(
         if mode.is_some() {
             return Err("CUDA same-shape pointwise cannot broadcast".into());
         }
-        if kind == Kind::SiluMul && inputs[1] != input {
+        if matches!(kind, Kind::SiluMul | Kind::PlainResidualAdd) && inputs[1] != input {
             return Err(
-                "CUDA SiLU-mul operands must have exactly equal tensor specifications".into(),
+                "CUDA same-shape binary operands must have exactly equal tensor specifications"
+                    .into(),
             );
         }
         let geometry =

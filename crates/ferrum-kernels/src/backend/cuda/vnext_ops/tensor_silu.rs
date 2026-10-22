@@ -10,17 +10,18 @@ use std::sync::Arc;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use ferrum_runtime::{
     gated_residual_bf16_contract, gelu_tanh_bf16_contract, modulation_scale_bf16_contract,
-    silu_bf16_contract, silu_mul_bf16_contract, tanh_bf16_contract, AttributeId,
-    BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceDescriptor, DeviceRuntime,
-    ElementType, EncodedDeviceOperation, InvocationWorkProjection, NodeWorkContract,
-    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    plain_residual_add_bf16_contract, silu_bf16_contract, silu_mul_bf16_contract,
+    tanh_bf16_contract, AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion,
+    DeviceDescriptor, DeviceRuntime, ElementType, EncodedDeviceOperation, InvocationWorkProjection,
+    NodeWorkContract, OperationContract, OperationFailure, OperationInvocation, OperationProvider,
     OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
     OperationResourceEstimator, ProviderExecutionSemantics, ProviderId, ResolvedValueBinding,
     ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue,
     StandardOperationContract, TensorOperationInvocation, VNextError,
     GATED_RESIDUAL_BF16_CAPABILITY_ID, GATED_RESIDUAL_BF16_OPERATION_ID,
     GELU_TANH_BF16_CAPABILITY_ID, GELU_TANH_BF16_OPERATION_ID, MODULATION_SCALE_BF16_CAPABILITY_ID,
-    MODULATION_SCALE_BF16_OPERATION_ID, SILU_BF16_CAPABILITY_ID, SILU_BF16_OPERATION_ID,
+    MODULATION_SCALE_BF16_OPERATION_ID, PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID,
+    PLAIN_RESIDUAL_ADD_BF16_OPERATION_ID, SILU_BF16_CAPABILITY_ID, SILU_BF16_OPERATION_ID,
     SILU_MUL_BF16_CAPABILITY_ID, SILU_MUL_BF16_OPERATION_ID, TANH_BF16_CAPABILITY_ID,
     TANH_BF16_OPERATION_ID,
 };
@@ -34,6 +35,8 @@ use super::{binding, contract_error, implementation_fingerprint, provider_failur
 mod attention;
 mod bundle;
 mod geometry;
+mod gqa;
+mod half_split_rope;
 mod norm;
 mod rope;
 mod selection;
@@ -45,6 +48,13 @@ pub use attention::{
 };
 use bundle::RetainedFunctions;
 use geometry::{geometry, Shape};
+pub use gqa::{
+    NUMERICAL_IDENTITY as GQA_NUMERICAL_IDENTITY, NUMERICAL_PROFILE_ID as GQA_NUMERICAL_PROFILE_ID,
+};
+pub use half_split_rope::{
+    NUMERICAL_IDENTITY as HALF_SPLIT_ROPE_NUMERICAL_IDENTITY,
+    NUMERICAL_PROFILE_ID as HALF_SPLIT_ROPE_NUMERICAL_PROFILE_ID,
+};
 pub use norm::{
     HEAD_RMS_NORM_PROFILE_ID, LAYER_NORM_PROFILE_ID, NUMERICAL_IDENTITY as NORM_NUMERICAL_IDENTITY,
 };
@@ -67,6 +77,7 @@ pub const SILU_MUL_NUMERICAL_PROFILE_ID: &str = "cuda.libdevice.precise.silu_mul
 pub const TANH_NUMERICAL_PROFILE_ID: &str = "cuda.libdevice.precise.tanh.bf16.v1";
 pub const MODULATION_NUMERICAL_PROFILE_ID: &str = "cuda.ieee.modulation_scale.bf16.v1";
 pub const GATED_RESIDUAL_NUMERICAL_PROFILE_ID: &str = "cuda.ieee.gated_residual.bf16.v1";
+pub const PLAIN_RESIDUAL_ADD_NUMERICAL_PROFILE_ID: &str = "cuda.ieee.plain_residual_add.bf16.v1";
 pub const NUMERICAL_PROFILE_IDENTITY: &str =
     "libdevice-expf;fadd-rn;fdiv-rn;integer-bf16-rne;ftz=false;prec-div=true;prec-sqrt=true;fmad=false;no-fast-math;nan-class-only";
 pub const BUNDLE_NUMERICAL_IDENTITY: &str = concat!(
@@ -76,6 +87,7 @@ pub const BUNDLE_NUMERICAL_IDENTITY: &str = concat!(
     "silu_mul=B(RN32(decode(silu(g))*u));tanh=B(libdevice-tanhf(x));",
     "modulation=B(RN32(x*decode(B(RN32(1+s)))));",
     "gated_residual=B(RN32(x+decode(B(RN32(g*u)))));",
+    "plain_residual_add=B(RN32(x+u));logical-work=1-per-element;",
     "broadcast=explicit-elementwise-or-row;logical-work=4,5,1,2,2;",
     "qualification-requires-target-evidence;no-Reference-or-Torch-bitwise-claim"
 );
@@ -91,17 +103,19 @@ pub(super) enum Kind {
     Modulation,
     GatedResidual,
     GeluTanh,
+    PlainResidualAdd,
 }
 
 impl Kind {
     #[cfg(test)]
-    pub(super) const ALL: [Self; 6] = [
+    pub(super) const ALL: [Self; 7] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
         Self::Modulation,
         Self::GatedResidual,
         Self::GeluTanh,
+        Self::PlainResidualAdd,
     ];
 
     fn index(self) -> usize {
@@ -112,6 +126,7 @@ impl Kind {
             Self::Modulation => 3,
             Self::GatedResidual => 4,
             Self::GeluTanh => 5,
+            Self::PlainResidualAdd => 6,
         }
     }
     fn function(self) -> &'static str {
@@ -122,6 +137,7 @@ impl Kind {
             Self::Modulation => "ferrum_vnext_modulation_scale_bf16",
             Self::GatedResidual => "ferrum_vnext_gated_residual_bf16",
             Self::GeluTanh => "ferrum_vnext_gelu_tanh_bf16",
+            Self::PlainResidualAdd => "ferrum_vnext_plain_residual_add_bf16",
         }
     }
     pub(super) fn capability(self) -> &'static str {
@@ -132,6 +148,7 @@ impl Kind {
             Self::Modulation => MODULATION_SCALE_BF16_CAPABILITY_ID,
             Self::GatedResidual => GATED_RESIDUAL_BF16_CAPABILITY_ID,
             Self::GeluTanh => GELU_TANH_BF16_CAPABILITY_ID,
+            Self::PlainResidualAdd => PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID,
         }
     }
     fn operation(self) -> &'static str {
@@ -142,6 +159,7 @@ impl Kind {
             Self::Modulation => MODULATION_SCALE_BF16_OPERATION_ID,
             Self::GatedResidual => GATED_RESIDUAL_BF16_OPERATION_ID,
             Self::GeluTanh => GELU_TANH_BF16_OPERATION_ID,
+            Self::PlainResidualAdd => PLAIN_RESIDUAL_ADD_BF16_OPERATION_ID,
         }
     }
     fn contract(self) -> Result<StandardOperationContract, VNextError> {
@@ -152,6 +170,7 @@ impl Kind {
             Self::Modulation => modulation_scale_bf16_contract(),
             Self::GatedResidual => gated_residual_bf16_contract(),
             Self::GeluTanh => gelu_tanh_bf16_contract(),
+            Self::PlainResidualAdd => plain_residual_add_bf16_contract(),
         }
     }
     fn profile(self) -> &'static str {
@@ -162,6 +181,7 @@ impl Kind {
             Self::Modulation => MODULATION_NUMERICAL_PROFILE_ID,
             Self::GatedResidual => GATED_RESIDUAL_NUMERICAL_PROFILE_ID,
             Self::GeluTanh => GELU_TANH_PROFILE_ID,
+            Self::PlainResidualAdd => PLAIN_RESIDUAL_ADD_NUMERICAL_PROFILE_ID,
         }
     }
     fn provider(self) -> &'static str {
@@ -172,6 +192,7 @@ impl Kind {
             Self::Modulation => "provider.cuda.modulation_scale.bf16.ieee",
             Self::GatedResidual => "provider.cuda.gated_residual.bf16.ieee",
             Self::GeluTanh => "provider.cuda.gelu_tanh.bf16.libdevice",
+            Self::PlainResidualAdd => "provider.cuda.plain_residual_add.bf16.ieee",
         }
     }
     fn estimator(self) -> &'static str {
@@ -182,12 +203,13 @@ impl Kind {
             Self::Modulation => "resource-estimator.cuda.modulation_scale.bf16.ieee",
             Self::GatedResidual => "resource-estimator.cuda.gated_residual.bf16.ieee",
             Self::GeluTanh => "resource-estimator.cuda.gelu_tanh.bf16.libdevice",
+            Self::PlainResidualAdd => "resource-estimator.cuda.plain_residual_add.bf16.ieee",
         }
     }
     fn inputs(self) -> u32 {
         match self {
             Self::Silu | Self::Tanh | Self::GeluTanh => 1,
-            Self::SiluMul | Self::Modulation => 2,
+            Self::SiluMul | Self::Modulation | Self::PlainResidualAdd => 2,
             Self::GatedResidual => 3,
         }
     }
@@ -195,7 +217,7 @@ impl Kind {
         match self {
             Self::Silu => 4,
             Self::SiluMul => 5,
-            Self::Tanh => 1,
+            Self::Tanh | Self::PlainResidualAdd => 1,
             Self::Modulation | Self::GatedResidual => 2,
             Self::GeluTanh => 9,
         }
@@ -218,6 +240,10 @@ pub(super) fn numerical_fingerprint() -> String {
         include_bytes!("tensor_silu/selection.rs"),
         include_bytes!("tensor_silu/text_projection.rs"),
         include_bytes!("tensor_silu/transport.rs"),
+        include_bytes!("tensor_silu/gqa.rs"),
+        include_bytes!("tensor_silu/half_split_rope.rs"),
+        GQA_NUMERICAL_IDENTITY.as_bytes(),
+        HALF_SPLIT_ROPE_NUMERICAL_IDENTITY.as_bytes(),
         TRANSPORT_NUMERICAL_IDENTITY.as_bytes(),
         TEXT_PROJECTION_NUMERICAL_IDENTITY.as_bytes(),
         norm::NUMERICAL_IDENTITY.as_bytes(),
@@ -424,7 +450,7 @@ impl CudaTensorPointwiseProvider {
                 Kind::Silu | Kind::Tanh | Kind::GeluTanh => {
                     builder.arg(&input).arg(&output).arg(&shape.elements);
                 }
-                Kind::SiluMul => {
+                Kind::SiluMul | Kind::PlainResidualAdd => {
                     builder
                         .arg(&input)
                         .arg(&parameter)

@@ -54,7 +54,7 @@ impl ReferenceStructuredAttentionLaunch {
         self.validate()
     }
 }
-fn dot(n: usize, start: usize, read: &impl Fn(usize) -> (f32, f32)) -> f32 {
+pub(super) fn dot(n: usize, start: usize, read: &impl Fn(usize) -> (f32, f32)) -> f32 {
     match n {
         1 => {
             let (a, b) = read(start);

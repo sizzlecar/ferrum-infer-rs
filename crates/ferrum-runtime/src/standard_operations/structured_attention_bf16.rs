@@ -196,7 +196,7 @@ impl StructuredAttentionBf16Geometry {
         self.mask.nonempty_rows()
     }
 }
-fn attribute<'a>(
+pub(super) fn attribute<'a>(
     attrs: &'a BTreeMap<AttributeId, SemanticValue>,
     name: &str,
 ) -> Option<&'a SemanticValue> {
@@ -205,7 +205,10 @@ fn attribute<'a>(
         .find(|(id, _)| id.as_str() == name)
         .map(|(_, value)| value)
 }
-fn unsigned(attrs: &BTreeMap<AttributeId, SemanticValue>, name: &str) -> Result<u64, VNextError> {
+pub(super) fn unsigned(
+    attrs: &BTreeMap<AttributeId, SemanticValue>,
+    name: &str,
+) -> Result<u64, VNextError> {
     match attribute(attrs, name) {
         Some(SemanticValue::Unsigned(value)) => Ok(*value),
         _ => Err(invalid(format!("{name} must be unsigned"))),

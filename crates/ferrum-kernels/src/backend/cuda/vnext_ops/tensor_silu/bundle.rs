@@ -11,11 +11,13 @@ use crate::backend::cuda::vnext_runtime::CudaTensorProviderRetention;
 pub(super) struct RetainedFunctions {
     // Every CudaFunction retains the same native module/context. Field order
     // releases these owners before returning the one module capacity permit.
-    functions: [CudaFunction; 6],
+    functions: [CudaFunction; 7],
     norm_functions: [CudaFunction; 3],
     rope_function: CudaFunction,
     attention_function: CudaFunction,
     transport_functions: [CudaFunction; 2],
+    half_split_rope_function: CudaFunction,
+    gqa_attention_function: CudaFunction,
     _provider: CudaTensorProviderRetention,
 }
 
@@ -41,6 +43,7 @@ impl RetainedFunctions {
                 load(Kind::Modulation)?,
                 load(Kind::GatedResidual)?,
                 load(Kind::GeluTanh)?,
+                load(Kind::PlainResidualAdd)?,
             ];
             let load_norm = |kind: norm::Kind| {
                 module.load_function(kind.function()).map_err(|error| {
@@ -68,33 +71,52 @@ impl RetainedFunctions {
                 load_transport(transport::Kind::RowGather)?,
                 load_transport(transport::Kind::BatchedRowConcat)?,
             ];
+            let half_split_rope_function = module
+                .load_function(half_split_rope::FUNCTION)
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("BF16 half-split RoPE function load", error)
+                })?;
+            let gqa_attention_function = module.load_function(gqa::FUNCTION).map_err(|error| {
+                CudaDeviceRuntimeError::driver("BF16 structured GQA attention function load", error)
+            })?;
             Ok::<_, CudaDeviceRuntimeError>((
                 pointwise,
                 normalization,
                 rope_function,
                 attention_function,
                 transport,
+                half_split_rope_function,
+                gqa_attention_function,
             ))
         }));
-        let (functions, norm_functions, rope_function, attention_function, transport_functions) =
-            match loaded {
-                Ok(Ok(functions)) => functions,
-                Ok(Err(error)) => {
-                    // A partially failed load has not certified native cleanup.
-                    std::mem::forget(provider);
-                    return Err(error);
-                }
-                Err(payload) => {
-                    std::mem::forget(provider);
-                    resume_unwind(payload);
-                }
-            };
+        let (
+            functions,
+            norm_functions,
+            rope_function,
+            attention_function,
+            transport_functions,
+            half_split_rope_function,
+            gqa_attention_function,
+        ) = match loaded {
+            Ok(Ok(functions)) => functions,
+            Ok(Err(error)) => {
+                // A partially failed load has not certified native cleanup.
+                std::mem::forget(provider);
+                return Err(error);
+            }
+            Err(payload) => {
+                std::mem::forget(provider);
+                resume_unwind(payload);
+            }
+        };
         Ok(Arc::new(Self {
             functions,
             norm_functions,
             rope_function,
             attention_function,
             transport_functions,
+            half_split_rope_function,
+            gqa_attention_function,
             _provider: provider,
         }))
     }
@@ -113,6 +135,14 @@ impl RetainedFunctions {
 
     pub(super) fn attention_function(&self) -> &CudaFunction {
         &self.attention_function
+    }
+
+    pub(super) fn half_split_rope_function(&self) -> &CudaFunction {
+        &self.half_split_rope_function
+    }
+
+    pub(super) fn gqa_attention_function(&self) -> &CudaFunction {
+        &self.gqa_attention_function
     }
 
     pub(super) fn transport_function(&self, kind: transport::Kind) -> &CudaFunction {

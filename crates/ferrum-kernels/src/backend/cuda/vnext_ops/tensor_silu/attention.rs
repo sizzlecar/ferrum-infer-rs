@@ -34,7 +34,7 @@ const ESTIMATOR_ID: &str = "resource-estimator.cuda.structured_attention.bf16.on
 // All members are u32, so no padding can contain uninitialized Rust bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-struct NativeMask {
+pub(super) struct NativeMask {
     segment_count: u32,
     segment_ends: [u32; 32],
     bidirectional_mask: u32,
@@ -49,7 +49,7 @@ unsafe impl cudarc::driver::DeviceRepr for NativeMask {}
 const _: [(); 2312] = [(); std::mem::size_of::<NativeMask>()];
 
 impl NativeMask {
-    fn new(mask: &StructuredAttentionBf16Mask) -> Result<Self, String> {
+    pub(super) fn new(mask: &StructuredAttentionBf16Mask) -> Result<Self, String> {
         let segments = mask.segment_ends();
         let bidirectional = mask.segment_bidirectional();
         if segments.is_empty()

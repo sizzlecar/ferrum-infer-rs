@@ -248,6 +248,9 @@ impl CudaDeviceRuntime {
                         | ferrum_runtime::GELU_TANH_BF16_CAPABILITY_ID
                         | ferrum_runtime::ROW_GATHER_BF16_CAPABILITY_ID
                         | ferrum_runtime::BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID
+                        | ferrum_runtime::PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID
+                        | ferrum_runtime::HALF_SPLIT_ROPE_BF16_CAPABILITY_ID
+                        | ferrum_runtime::STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID
                 )
             })
         {

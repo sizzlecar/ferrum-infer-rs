@@ -4,34 +4,40 @@ use std::sync::Arc;
 use ferrum_runtime::{
     adjacent_rope_bf16_contract, batched_row_concat_bf16_contract, dense_linear_bf16_contract,
     dense_linear_contract, gated_residual_bf16_contract, gelu_tanh_bf16_contract,
-    head_rms_norm_bf16_contract, layer_norm_bf16_contract, modulation_scale_bf16_contract,
-    row_gather_bf16_contract, silu_bf16_contract, silu_mul_bf16_contract,
-    structured_attention_bf16_contract, tanh_bf16_contract, zero_centered_rms_norm_bf16_contract,
-    CapabilityCatalog, CapabilityId, ContractVersion, DeviceClass, DeviceDescriptor, DeviceId,
-    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
-    EngineProviderDescriptor, OperationContract, OperationProvider, OperationRuntimeRegistry,
-    ProviderId, VNextError, WeightMaterializerId, WeightMaterializerRegistry,
-    ADJACENT_ROPE_BF16_CAPABILITY_ID, BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID,
-    DENSE_LINEAR_BF16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
-    GATED_RESIDUAL_BF16_CAPABILITY_ID, GELU_TANH_BF16_CAPABILITY_ID,
+    half_split_rope_bf16_contract, head_rms_norm_bf16_contract, layer_norm_bf16_contract,
+    modulation_scale_bf16_contract, plain_residual_add_bf16_contract, row_gather_bf16_contract,
+    silu_bf16_contract, silu_mul_bf16_contract, structured_attention_bf16_contract,
+    structured_gqa_attention_bf16_contract, tanh_bf16_contract,
+    zero_centered_rms_norm_bf16_contract, CapabilityCatalog, CapabilityId, ContractVersion,
+    DeviceClass, DeviceDescriptor, DeviceId, DeviceRuntime, DynamicStorageAllocator,
+    DynamicStorageProfile, DynamicStorageView, EngineProviderDescriptor, OperationContract,
+    OperationProvider, OperationRuntimeRegistry, ProviderId, VNextError, WeightMaterializerId,
+    WeightMaterializerRegistry, ADJACENT_ROPE_BF16_CAPABILITY_ID,
+    BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID, DENSE_LINEAR_BF16_CAPABILITY_ID,
+    DENSE_LINEAR_F16_CAPABILITY_ID, GATED_RESIDUAL_BF16_CAPABILITY_ID,
+    GELU_TANH_BF16_CAPABILITY_ID, HALF_SPLIT_ROPE_BF16_CAPABILITY_ID,
     HEAD_RMS_NORM_BF16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
     LAYER_NORM_BF16_CAPABILITY_ID, MODULATION_SCALE_BF16_CAPABILITY_ID,
-    ROW_GATHER_BF16_CAPABILITY_ID, SILU_BF16_CAPABILITY_ID, SILU_MUL_BF16_CAPABILITY_ID,
-    STRUCTURED_ATTENTION_BF16_CAPABILITY_ID, TANH_BF16_CAPABILITY_ID,
+    PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID, ROW_GATHER_BF16_CAPABILITY_ID, SILU_BF16_CAPABILITY_ID,
+    SILU_MUL_BF16_CAPABILITY_ID, STRUCTURED_ATTENTION_BF16_CAPABILITY_ID,
+    STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID, TANH_BF16_CAPABILITY_ID,
     ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID,
 };
 
 use super::adjacent_rope::ReferenceAdjacentRopeProvider;
 use super::dense_linear::{implementation_fingerprint, ReferenceDenseLinearProvider};
 use super::gelu_tanh::ReferenceGeluTanhProvider;
+use super::half_split_rope::ReferenceHalfSplitRopeProvider;
 use super::head_rms_norm::ReferenceHeadRmsNormProvider;
 use super::layer_norm::ReferenceLayerNormProvider;
+use super::plain_residual_add::ReferencePlainResidualAddProvider;
 use super::pointwise::{ReferencePointwiseKind, ReferencePointwiseProvider};
 use super::row_transport::{ReferenceRowTransportKind, ReferenceRowTransportProvider};
 use super::runtime::{
     ReferenceDeviceRuntime, ReferenceDeviceRuntimeConfig, ReferenceDeviceRuntimeError,
 };
 use super::structured_attention::ReferenceStructuredAttentionProvider;
+use super::structured_gqa_attention::ReferenceStructuredGqaAttentionProvider;
 use super::transcendental::{
     numerical_implementation_fingerprint, ReferenceTranscendentalKind,
     ReferenceTranscendentalProvider,
@@ -44,6 +50,9 @@ const REFERENCE_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     Ok(BTreeSet::from([
+        CapabilityId::new(PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(HALF_SPLIT_ROPE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID)?,
         CapabilityId::new(DENSE_LINEAR_F16_CAPABILITY_ID)?,
         CapabilityId::new(DENSE_LINEAR_BF16_CAPABILITY_ID)?,
         CapabilityId::new(LAYER_NORM_BF16_CAPABILITY_ID)?,
@@ -86,6 +95,12 @@ fn reference_vnext_runtime_config_with_capacity(
         runtime_implementation_fingerprint: implementation_fingerprint(&[
             &capacity_bytes.to_le_bytes(),
             include_str!("runtime.rs").as_bytes(),
+            include_str!("plain_residual_add.rs").as_bytes(),
+            include_str!("runtime/plain_residual_add.rs").as_bytes(),
+            include_str!("half_split_rope.rs").as_bytes(),
+            include_str!("runtime/half_split_rope.rs").as_bytes(),
+            include_str!("structured_gqa_attention.rs").as_bytes(),
+            include_str!("runtime/structured_gqa_attention.rs").as_bytes(),
             include_str!("dense_linear.rs").as_bytes(),
             include_str!("layer_norm.rs").as_bytes(),
             include_str!("runtime/layer_norm.rs").as_bytes(),
@@ -121,6 +136,9 @@ pub fn reference_vnext_operation_registry(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<OperationRuntimeRegistry<ReferenceDeviceRuntime>, ReferenceDeviceRuntimeError> {
     let contracts: Vec<Box<dyn OperationContract>> = vec![
+        Box::new(plain_residual_add_bf16_contract().map_err(contract_error)?),
+        Box::new(half_split_rope_bf16_contract().map_err(contract_error)?),
+        Box::new(structured_gqa_attention_bf16_contract().map_err(contract_error)?),
         Box::new(dense_linear_contract().map_err(contract_error)?),
         Box::new(dense_linear_bf16_contract().map_err(contract_error)?),
         Box::new(layer_norm_bf16_contract().map_err(contract_error)?),
@@ -138,6 +156,9 @@ pub fn reference_vnext_operation_registry(
         Box::new(tanh_bf16_contract().map_err(contract_error)?),
     ];
     let providers = vec![
+        reference_vnext_plain_residual_add_bf16_provider(runtime)?,
+        reference_vnext_half_split_rope_bf16_provider(runtime)?,
+        reference_vnext_structured_gqa_attention_bf16_provider(runtime)?,
         reference_vnext_dense_linear_provider(runtime)?,
         reference_vnext_dense_linear_bf16_provider(runtime)?,
         reference_vnext_layer_norm_bf16_provider(runtime)?,
@@ -220,6 +241,29 @@ pub fn reference_vnext_batched_row_concat_bf16_provider(
     Ok(Box::new(ReferenceRowTransportProvider::new(
         runtime,
         ReferenceRowTransportKind::Concat,
+    )?))
+}
+
+/// Builds the independent fixed-tensor BF16 plain residual add provider.
+pub fn reference_vnext_plain_residual_add_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferencePlainResidualAddProvider::new(runtime)?))
+}
+
+/// Builds the independent fixed-tensor BF16 half split rope provider.
+pub fn reference_vnext_half_split_rope_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceHalfSplitRopeProvider::new(runtime)?))
+}
+
+/// Builds the independent fixed-tensor BF16 structured gqa attention provider.
+pub fn reference_vnext_structured_gqa_attention_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceStructuredGqaAttentionProvider::new(
+        runtime,
     )?))
 }
 

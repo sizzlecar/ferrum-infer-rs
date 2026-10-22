@@ -11,7 +11,7 @@ pub struct StructuredAttentionBf16Mask {
     nonempty: u64,
 }
 impl StructuredAttentionBf16Mask {
-    pub(super) fn parse(
+    pub(in crate::standard_operations) fn parse(
         sequence: u32,
         batch: usize,
         attrs: &BTreeMap<AttributeId, SemanticValue>,

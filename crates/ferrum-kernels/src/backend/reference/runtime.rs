@@ -30,6 +30,12 @@ pub(crate) use zero_centered_rms_norm::{
 mod gelu_tanh;
 mod head_rms_norm;
 pub(crate) use head_rms_norm::{ReferenceHeadRmsNormLaunch, ReferenceHeadRmsNormShape};
+mod plain_residual_add;
+pub(crate) use plain_residual_add::ReferencePlainResidualAddLaunch;
+mod half_split_rope;
+pub(crate) use half_split_rope::{ReferenceHalfSplitRopeLaunch, ReferenceHalfSplitRopeShape};
+mod structured_gqa_attention;
+pub(crate) use structured_gqa_attention::ReferenceStructuredGqaAttentionLaunch;
 mod structured_attention;
 pub(crate) use structured_attention::ReferenceStructuredAttentionLaunch;
 mod adjacent_rope;
@@ -349,6 +355,15 @@ enum ReferenceCommandKind {
     HeadRmsNorm {
         launch: ReferenceHeadRmsNormLaunch,
     },
+    PlainResidualAdd {
+        launch: ReferencePlainResidualAddLaunch,
+    },
+    HalfSplitRope {
+        launch: ReferenceHalfSplitRopeLaunch,
+    },
+    StructuredGqaAttention {
+        launch: ReferenceStructuredGqaAttentionLaunch,
+    },
     StructuredAttention {
         launch: ReferenceStructuredAttentionLaunch,
     },
@@ -391,6 +406,9 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::RowGather { .. } => "row_gather",
             ReferenceCommandKind::BatchedRowConcat { .. } => "batched_row_concat",
             ReferenceCommandKind::HeadRmsNorm { .. } => "head_rms_norm",
+            ReferenceCommandKind::PlainResidualAdd { .. } => "plain_residual_add",
+            ReferenceCommandKind::HalfSplitRope { .. } => "half_split_rope",
+            ReferenceCommandKind::StructuredGqaAttention { .. } => "structured_gqa_attention",
             ReferenceCommandKind::StructuredAttention { .. } => "structured_attention",
             ReferenceCommandKind::AdjacentRope { .. } => "adjacent_rope",
             ReferenceCommandKind::ModulationScale { .. } => "modulation_scale",
@@ -480,6 +498,45 @@ impl ReferenceDeviceCommand {
             kind: ReferenceCommandKind::DenseLinear {
                 launches: vec![launch].into_boxed_slice(),
             },
+        })
+    }
+
+    pub(crate) fn plain_residual_add_tensor(
+        launch: ReferencePlainResidualAddLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_plain_residual_add_bf16",
+            logical_work: Some(launch.shape.logical_work(1)?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::PlainResidualAdd { launch },
+        })
+    }
+
+    pub(crate) fn half_split_rope_tensor(
+        launch: ReferenceHalfSplitRopeLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_half_split_rope_bf16",
+            logical_work: Some(launch.shape.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::HalfSplitRope { launch },
+        })
+    }
+
+    pub(crate) fn structured_gqa_attention_tensor(
+        launch: ReferenceStructuredGqaAttentionLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_structured_gqa_attention_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::StructuredGqaAttention { launch },
         })
     }
 
@@ -756,6 +813,15 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::HeadRmsNorm { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::PlainResidualAdd { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::HalfSplitRope { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::StructuredGqaAttention { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::StructuredAttention { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
@@ -841,6 +907,24 @@ impl ReferenceDeviceCommand {
                 head_rms_norm::execute(launch);
                 counters
                     .head_rms_norm_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::PlainResidualAdd { launch } => {
+                plain_residual_add::execute(launch);
+                counters
+                    .plain_residual_add_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::HalfSplitRope { launch } => {
+                half_split_rope::execute(launch);
+                counters
+                    .half_split_rope_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::StructuredGqaAttention { launch } => {
+                structured_gqa_attention::execute(launch);
+                counters
+                    .structured_gqa_attention_launches
                     .fetch_add(1, Ordering::Relaxed);
             }
             ReferenceCommandKind::StructuredAttention { launch } => {
@@ -1062,6 +1146,9 @@ struct ReferenceRuntimeCounters {
     zero_centered_rms_norm_launches: AtomicU64,
     gelu_tanh_launches: AtomicU64,
     adjacent_rope_launches: AtomicU64,
+    plain_residual_add_launches: AtomicU64,
+    half_split_rope_launches: AtomicU64,
+    structured_gqa_attention_launches: AtomicU64,
     structured_attention_launches: AtomicU64,
     modulation_scale_launches: AtomicU64,
     gated_residual_launches: AtomicU64,
@@ -1086,6 +1173,9 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub zero_centered_rms_norm_launches: u64,
     pub gelu_tanh_launches: u64,
     pub adjacent_rope_launches: u64,
+    pub plain_residual_add_launches: u64,
+    pub half_split_rope_launches: u64,
+    pub structured_gqa_attention_launches: u64,
     pub structured_attention_launches: u64,
     pub modulation_scale_launches: u64,
     pub gated_residual_launches: u64,
@@ -1226,6 +1316,18 @@ impl ReferenceDeviceRuntime {
                 .load(Ordering::Relaxed),
             gelu_tanh_launches: self.counters.gelu_tanh_launches.load(Ordering::Relaxed),
             adjacent_rope_launches: self.counters.adjacent_rope_launches.load(Ordering::Relaxed),
+            plain_residual_add_launches: self
+                .counters
+                .plain_residual_add_launches
+                .load(Ordering::Relaxed),
+            half_split_rope_launches: self
+                .counters
+                .half_split_rope_launches
+                .load(Ordering::Relaxed),
+            structured_gqa_attention_launches: self
+                .counters
+                .structured_gqa_attention_launches
+                .load(Ordering::Relaxed),
             structured_attention_launches: self
                 .counters
                 .structured_attention_launches
