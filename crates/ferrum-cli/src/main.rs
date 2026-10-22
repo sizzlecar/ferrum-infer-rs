@@ -8,7 +8,7 @@
 //! - list: List downloaded models
 //! - doctor: Inspect a binary and model source without downloading weights
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use colored::*;
 use ferrum_cli::{commands::*, config::CliConfig, utils::setup_logging};
 use std::{future::Future, pin::Pin, process};
@@ -33,7 +33,7 @@ struct Cli {
 enum Commands {
     /// Run a model in interactive chat or with a one-shot prompt
     #[command(visible_alias = "r")]
-    Run(run::RunCommand),
+    Run(run::RunCliCommand),
 
     /// Benchmark model throughput and latency
     #[command(hide = true)]
@@ -72,7 +72,13 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     ferrum_cli::terminal::initialize();
-    let cli = Cli::parse();
+    let definition = Cli::command();
+    let matches = definition.clone().get_matches();
+    if let Err(error) = image_product::validate_cli_matches(&definition, &matches) {
+        eprintln!("{} {}", "Error:".red().bold(), error);
+        process::exit(2);
+    }
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
 
     // Setup logging
     let suppress_chat_template_warnings = matches!(cli.command, Commands::Run(_)) && !cli.verbose;
@@ -118,9 +124,9 @@ async fn main() {
 fn command_future(
     command: Commands,
     config: CliConfig,
-) -> Pin<Box<dyn Future<Output = ferrum_execution::ExecutorBuildResult<()>>>> {
+) -> Pin<Box<dyn Future<Output = Result<(), image_product::CommandError>>>> {
     match command {
-        Commands::Run(cmd) => Box::pin(run::execute(cmd, config)),
+        Commands::Run(cmd) => Box::pin(run::execute_cli(cmd, config)),
         Commands::Bench(cmd) => {
             Box::pin(async move { bench::execute(cmd, config).await.map_err(Into::into) })
         }
@@ -139,7 +145,9 @@ fn command_future(
             let compatibility =
                 ferrum_cli::config::load_interleaved_system_coalescing("ferrum.toml").await;
             match compatibility {
-                Ok(configured) => serve::execute_cli(cmd, config, configured).await,
+                Ok(configured) => serve::execute_cli(cmd, config, configured)
+                    .await
+                    .map_err(Into::into),
                 Err(error) => Err(error.into()),
             }
         }),

@@ -1,0 +1,75 @@
+use super::configuration::*;
+use anyhow::{ensure, Context, Result};
+use ferrum_engine::image_generation::{QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources};
+use ferrum_models::pipeline_source::{PipelineArchitecture, PipelineDeclaration};
+use ferrum_quantization::SafetensorsArchive;
+use std::{fs::File, io::Read, path::Path, sync::Arc};
+
+pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let limit = u64::try_from(limit)?;
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    ensure!(
+        file.metadata()?.len() <= limit,
+        "{} exceeds metadata limit",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    file.take(limit.checked_add(1).context("metadata limit overflows")?)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        !bytes.is_empty() && bytes.len() as u64 <= limit,
+        "{} is empty or oversized",
+        path.display()
+    );
+    Ok(bytes)
+}
+
+impl WeightSource {
+    pub fn open(&self) -> Result<Arc<SafetensorsArchive>> {
+        Ok(Arc::new(match self {
+            Self::Single { directory, file } => {
+                SafetensorsArchive::open_single_file(directory, file)?
+            }
+            Self::Index { directory, file } => {
+                SafetensorsArchive::open_with_index(directory, file)?
+            }
+        }))
+    }
+}
+
+impl ImageProductConfig {
+    /// All metadata is retained and validated before the caller creates CUDA.
+    /// Explicit archive filenames never fall back or discover another source.
+    pub fn prepare_assets(&self) -> Result<QwenImage21Assets> {
+        let paths = &self.metadata;
+        let model_index = read_bounded(&paths.model_index, 4 * 1024 * 1024)?;
+        let declaration = PipelineDeclaration::from_json(&model_index)?;
+        match declaration.architecture() {
+            PipelineArchitecture::QwenImage21 => {}
+        }
+        let text = read_bounded(&paths.text_encoder, 4 * 1024 * 1024)?;
+        let transformer = read_bounded(&paths.transformer, 4 * 1024 * 1024)?;
+        let vae = read_bounded(&paths.vae, 4 * 1024 * 1024)?;
+        let scheduler = read_bounded(&paths.scheduler, 4 * 1024 * 1024)?;
+        let tokenizer = read_bounded(&paths.tokenizer, 32 * 1024 * 1024)?;
+        let tokenizer_config = read_bounded(&paths.tokenizer_config, 1024 * 1024)?;
+        let chat_template = read_bounded(&paths.chat_template, 64 * 1024)?;
+        QwenImage21Assets::prepare(
+            QwenImage21Metadata {
+                text_encoder: &text,
+                transformer: &transformer,
+                vae: &vae,
+                model_index: &model_index,
+                scheduler: &scheduler,
+                tokenizer: &tokenizer,
+                tokenizer_config: &tokenizer_config,
+                chat_template: &chat_template,
+            },
+            QwenImage21Sources {
+                text_encoder: self.weights.text_encoder.open()?,
+                transformer: self.weights.transformer.open()?,
+                vae: self.weights.vae.open()?,
+            },
+        )
+    }
+}

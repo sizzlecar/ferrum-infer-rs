@@ -47,6 +47,7 @@ pub use middleware::{
 };
 
 pub use axum_server::{default_chat_sampling_params, init_prometheus_recorder, AxumServer};
+pub use axum_server::{ImageHttpConfig, ImageHttpService};
 pub use model_registry::{
     LoraAdapterModel, ServedModelEntry, ServedModelKind, ServedModelName, ServedModelRegistry,
     ServedModelRegistryError,

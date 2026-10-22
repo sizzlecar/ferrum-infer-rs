@@ -5,12 +5,14 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServedModelKind {
     Llm,
+    ImageGeneration,
 }
 
 impl ServedModelKind {
     pub fn modalities(self) -> &'static [&'static str] {
         match self {
             Self::Llm => &["text"],
+            Self::ImageGeneration => &["image"],
         }
     }
 }
@@ -108,6 +110,11 @@ impl ServedModelRegistry {
     ) -> Result<Self, ServedModelRegistryError> {
         let engine_model_id = engine_model_id.into();
         validate_identifier("engine model id", &engine_model_id.0)?;
+        if kind == ServedModelKind::ImageGeneration && !adapters.is_empty() {
+            return Err(ServedModelRegistryError(
+                "image generation does not support LoRA routing".into(),
+            ));
+        }
         if served_model_names.is_empty() {
             return Err(ServedModelRegistryError(
                 "at least one served model name is required".to_string(),
@@ -216,6 +223,11 @@ impl ServedModelRegistry {
         let primary = base_entries.first().ok_or_else(|| {
             ServedModelRegistryError("cannot attach LoRA adapters to an empty registry".to_string())
         })?;
+        if primary.kind == ServedModelKind::ImageGeneration {
+            return Err(ServedModelRegistryError(
+                "cannot attach LoRA adapters to an image generator".into(),
+            ));
+        }
         require_same_base_model(&base_entries)?;
         let expected_base_matches = primary.engine_model_id.0 == expected_base
             || base_entries

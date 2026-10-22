@@ -653,6 +653,44 @@ async fn collect_run_text_stream(
     Ok(CollectedRunGeneration::Stream { data, semantic })
 }
 
+/// Additive product wrapper; existing text library callers keep RunCommand.
+#[derive(Args)]
+pub struct RunCliCommand {
+    #[command(flatten)]
+    command: RunCommand,
+    #[command(flatten)]
+    image: super::image_product::ImageRunArgs,
+}
+
+pub async fn execute_cli(
+    cmd: RunCliCommand,
+    config: CliConfig,
+) -> std::result::Result<(), super::image_product::CommandError> {
+    if let Some(path) = cmd.image.product.image_config {
+        let prompt = cmd.command.prompt.ok_or_else(|| {
+            super::image_product::ImageProductError::from(anyhow::anyhow!(
+                "image run requires --prompt"
+            ))
+        })?;
+        let output = cmd.image.output.ok_or_else(|| {
+            super::image_product::ImageProductError::from(anyhow::anyhow!(
+                "image run requires --output"
+            ))
+        })?;
+        super::image_product::execute_run(
+            &path,
+            prompt,
+            cmd.image.width.unwrap_or(512),
+            cmd.image.height.unwrap_or(512),
+            cmd.command.seed.unwrap_or(0),
+            &output,
+        )?;
+        Ok(())
+    } else {
+        execute(cmd.command, config).await.map_err(Into::into)
+    }
+}
+
 #[derive(Args)]
 pub struct RunCommand {
     /// Model name (alias, owner/repository[:QUANT], local directory, or `.gguf` file).

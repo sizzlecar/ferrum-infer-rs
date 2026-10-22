@@ -374,6 +374,8 @@ pub struct ServeCommand {
 pub struct ServeCliCommand {
     #[command(flatten)]
     command: ServeCommand,
+    #[command(flatten)]
+    image: super::image_product::ImageProductArgs,
     /// Wait at most this long for another request's exact in-flight prefix.
     #[arg(long, value_name = "MS")]
     prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
@@ -414,7 +416,17 @@ pub async fn execute_cli(
     cmd: ServeCliCommand,
     config: CliConfig,
     configured_interleaved_system_coalescing: bool,
-) -> ferrum_execution::ExecutorBuildResult<()> {
+) -> std::result::Result<(), super::image_product::CommandError> {
+    if let Some(path) = cmd.image.image_config {
+        return super::image_product::execute_serve(
+            &path,
+            cmd.command.host.unwrap_or(config.server.host),
+            cmd.command.port.unwrap_or(config.server.port),
+            cmd.command.served_model_name,
+        )
+        .await
+        .map_err(Into::into);
+    }
     execute_with_compatibility(
         cmd.command,
         config,
@@ -424,6 +436,7 @@ pub async fn execute_cli(
         cmd.prefix_rendezvous_max_wait_ms,
     )
     .await
+    .map_err(Into::into)
 }
 
 async fn execute_with_compatibility(
@@ -1350,7 +1363,7 @@ async fn run_serve_lifecycle(
     shutdown.finish(execution_result.and(cleanup_result).map_err(Into::into))
 }
 
-async fn serve_shutdown_signal() {
+pub(super) async fn serve_shutdown_signal() {
     #[cfg(unix)]
     {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
