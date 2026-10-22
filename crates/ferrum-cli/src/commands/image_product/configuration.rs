@@ -401,9 +401,9 @@ impl PipelineConfig {
                 self.maximum_staging_bytes,
                 self.maximum_initialization_commands,
             )?,
-            executor: ferrum_execution::TensorExecutorConfig::new(
-                self.maximum_backing_maintenance_passes,
-            )?,
+            executor: ferrum_execution::TensorExecutorConfig {
+                maximum_backing_maintenance_passes: self.maximum_backing_maintenance_passes,
+            },
         };
         limits.validate()?;
         Ok(limits)
