@@ -17,6 +17,7 @@ ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-runtime = { workspace = true }
 ferrum-execution = { workspace = true }
+ferrum-diffusion = { workspace = true }
 
 # Optional runtime dependency for loading weights
 
@@ -82,7 +83,6 @@ tempfile = { version = "3.8", optional = true }
 sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
-ferrum-diffusion = { workspace = true }
 png = "=0.18.1"
 ferrum-execution = { workspace = true, features = ["test-support"] }
 tokio-test = "0.4"

@@ -11,6 +11,7 @@ mod block0_mlp;
 mod config;
 mod headers;
 mod image_projection;
+pub mod pipeline_adapters;
 mod qk_norm;
 pub mod t2i_prompt;
 mod transformer;

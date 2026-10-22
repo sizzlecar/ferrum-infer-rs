@@ -6,6 +6,7 @@
 mod build_error;
 pub use build_error::{ExecutorBuildError, ExecutorBuildResult};
 
+pub mod component;
 pub mod driver;
 mod event_sink;
 pub mod execution_attempt;
