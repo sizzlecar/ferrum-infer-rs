@@ -77,6 +77,7 @@ impl SchedulerSloSnapshot {
         // turn creation. Drop/cancellation must not invoke provider callbacks.
         self.last_revision = round.diagnostic_revision;
         let value = &round.statistics;
+        self.selections.bounded.add(&value.bounded);
         self.selections.joint_evaluation.add(value.joint_evaluation);
         self.selections.joint_decision.add(&value.joint_decision);
         self.selections.joint_cost_snapshot_queries = self

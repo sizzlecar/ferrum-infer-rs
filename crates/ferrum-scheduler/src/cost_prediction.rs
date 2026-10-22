@@ -648,6 +648,9 @@ impl TimePlanningRound {
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub(crate) struct PlanningStatistics {
+    /// Local finite-horizon control, separate from complete-trajectory SLO
+    /// feasibility counters. These scores never certify client-visible SLOs.
+    pub bounded: BoundedControlStatistics,
     /// Entered scenario evaluations, separated from pre-evaluation failures
     /// and from each other at the actual admission/dispatch call sites.
     pub joint_evaluation: JointEvaluationDiagnostics,
@@ -686,6 +689,43 @@ pub(crate) struct PlanningStatistics {
     pub shrunk_prefills: u64,
     pub static_fallbacks: u64,
     pub budget_misses: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub(crate) struct BoundedControlStatistics {
+    pub comparisons: u64,
+    pub evaluated: u64,
+    pub selected: u64,
+    pub applied: u64,
+    pub retained: u64,
+    pub unknown: u64,
+    pub invalidated: u64,
+    pub provider_calls: u64,
+    pub simulation_queries: u64,
+    pub cache_hits: u64,
+    pub last_static_score: Option<f64>,
+    pub last_selected_score: Option<f64>,
+}
+
+impl BoundedControlStatistics {
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.comparisons = self.comparisons.saturating_add(other.comparisons);
+        self.evaluated = self.evaluated.saturating_add(other.evaluated);
+        self.selected = self.selected.saturating_add(other.selected);
+        self.applied = self.applied.saturating_add(other.applied);
+        self.retained = self.retained.saturating_add(other.retained);
+        self.unknown = self.unknown.saturating_add(other.unknown);
+        self.invalidated = self.invalidated.saturating_add(other.invalidated);
+        self.provider_calls = self.provider_calls.saturating_add(other.provider_calls);
+        self.simulation_queries = self
+            .simulation_queries
+            .saturating_add(other.simulation_queries);
+        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        if other.evaluated > 0 {
+            self.last_static_score = other.last_static_score;
+            self.last_selected_score = other.last_selected_score;
+        }
+    }
 }
 
 impl PlanningStatistics {

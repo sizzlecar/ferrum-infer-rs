@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod admission_load;
+mod bounded_lengths;
 
 #[derive(Clone, Copy, Serialize)]
 struct ProfilePlan {

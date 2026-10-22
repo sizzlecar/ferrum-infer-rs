@@ -3,6 +3,7 @@
 
 mod admission;
 mod aggregation;
+mod bounded;
 mod decision_observation;
 mod diagnostics;
 mod groups;
@@ -11,6 +12,7 @@ mod risk;
 mod scenarios;
 pub use admission::*;
 pub use aggregation::*;
+pub use bounded::{BoundedAccumulator, BoundedDecision};
 pub use decision_observation::*;
 pub use diagnostics::*;
 use groups::GroupView;
@@ -255,6 +257,12 @@ pub enum EvaluationHorizon {
     /// The static trajectory fixes the common window at this wave's final
     /// invocation boundary, or earlier when the cohort completes.
     StaticRounds(usize),
+    /// Independently evaluate at most this many complete execution waves for
+    /// static and every alternative, or stop sooner at declared scenario endpoints.
+    /// Alternatives do not pursue static progress or its elapsed-time window.
+    /// Unfinished requests and phases remain a short-horizon observation;
+    /// this does not certify endpoint risk or full request completion.
+    BoundedRounds(usize),
     /// Targets are the full, assigned endpoints of this scenario. This is not
     /// a latency SLO and does not relax the global query or elapsed budgets.
     /// Only a scenario evaluation with a known seed distribution may retain a
@@ -265,7 +273,11 @@ pub enum EvaluationHorizon {
 #[derive(Debug, Clone)]
 pub struct TrajectoryResult {
     pub requests: Vec<SimulatedRequest>,
+    /// Progress at the common static window when one is probed, otherwise at
+    /// this trajectory's own final boundary (including BoundedRounds).
     pub window_progress: Vec<Progress>,
+    /// Common-target attainment time when probed; without a probe this is the
+    /// local horizon's elapsed time, not evidence of full endpoint attainment.
     pub target_reached_at: Duration,
     pub central_elapsed: Duration,
     pub risk_elapsed: Duration,
@@ -323,6 +335,8 @@ pub enum StaticWindow {
 
 #[derive(Debug)]
 pub enum StaticTrajectory {
+    /// The requested evaluation horizon completed. Finite horizons can retain
+    /// unfinished requests; inspect their frontiers and completion clocks.
     Complete(TrajectoryResult),
     OutsideSupportPrefix(TrajectoryPrefix),
 }
@@ -431,14 +445,15 @@ impl SloPolicy {
         if !input.resources.kv_reserved_through_scenario_end {
             return Err(Unsupported::UnknownKvCapacity);
         }
-        if input.horizon == EvaluationHorizon::StaticRounds(0)
-            || input.requests.iter().enumerate().any(|(index, request)| {
-                !request.valid()
-                    || input.requests[..index]
-                        .iter()
-                        .any(|prior| prior.id == request.id)
-            })
-        {
+        if matches!(
+            input.horizon,
+            EvaluationHorizon::StaticRounds(0) | EvaluationHorizon::BoundedRounds(0)
+        ) || input.requests.iter().enumerate().any(|(index, request)| {
+            !request.valid()
+                || input.requests[..index]
+                    .iter()
+                    .any(|prior| prior.id == request.id)
+        }) {
             return Err(Unsupported::InvalidState);
         }
         let started = Instant::now();
@@ -487,9 +502,12 @@ impl SloPolicy {
             let result = simulate(
                 &input,
                 action,
-                match window {
-                    StaticWindow::Exact(window) => Some((window, targets.as_slice())),
-                    StaticWindow::AtLeast(_) => None,
+                match (input.horizon, window) {
+                    // This is an independent wave budget, not the original
+                    // common-progress/common-wall-window comparison.
+                    (EvaluationHorizon::BoundedRounds(_), _) => None,
+                    (_, StaticWindow::Exact(window)) => Some((window, targets.as_slice())),
+                    (_, StaticWindow::AtLeast(_)) => None,
                 },
                 &mut budget,
                 index + 1,
@@ -986,8 +1004,11 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
         }
         rounds += 1;
         if probe.is_none()
-            && (matches!(input.horizon, EvaluationHorizon::StaticRounds(limit) if rounds >= limit)
-                || requests.iter().all(SimulatedRequest::finished))
+            && (matches!(
+                input.horizon,
+                EvaluationHorizon::StaticRounds(limit) | EvaluationHorizon::BoundedRounds(limit)
+                    if rounds >= limit
+            ) || requests.iter().all(SimulatedRequest::finished))
         {
             for (progress, request) in window_progress.iter_mut().zip(&requests) {
                 *progress = request.progress();
@@ -1170,3 +1191,7 @@ fn apply_clock(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/bounded_rounds.rs"]
+mod bounded_rounds_tests;

@@ -1,6 +1,7 @@
 //! Compare legal first-wave edits against the actual static wave. Resource
 //! owners retain admission/commit authority; unsupported projections keep it.
 
+mod bounded;
 mod prefill_phase;
 mod trajectory;
 
@@ -89,6 +90,10 @@ impl ContinuousBatchScheduler {
         round: &mut TimePlanningRound,
         now: Instant,
     ) {
+        if round.config.strategy == ferrum_types::SloStrategy::Bounded {
+            self.select_bounded_first_wave(hint, batch, round, now);
+            return;
+        }
         if round.config.strategy != ferrum_types::SloStrategy::Joint {
             return;
         }

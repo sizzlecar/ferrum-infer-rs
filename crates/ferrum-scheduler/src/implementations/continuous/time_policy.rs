@@ -132,7 +132,10 @@ impl TimePlanningRound {
         let admitted = request.logical_work_frontier.work_kind()
             != pressure::LogicalWorkKind::Waiting
             || request.logical_work_frontier.progress_generation() != LogicalWorkGeneration::ZERO;
-        if (self.config.strategy == ferrum_types::SloStrategy::Joint && admitted)
+        if (matches!(
+            self.config.strategy,
+            ferrum_types::SloStrategy::Joint | ferrum_types::SloStrategy::Bounded
+        ) && admitted)
             || request.capacity_deferred_from_decode
             || request.slo_first_token_emitted
         {
@@ -312,6 +315,11 @@ impl ContinuousBatchScheduler {
         planning: &mut TimePlanningRound,
         now: Instant,
     ) -> TimeDecision {
+        if planning.config.strategy == ferrum_types::SloStrategy::Bounded {
+            // A finite control horizon is not an admission feasibility proof.
+            // Keep ordinary resource-owner queueing/probes authoritative.
+            return TimeDecision::Allow(self.remaining_prefill_tokens(request).max(1));
+        }
         if planning.config.strategy == ferrum_types::SloStrategy::Joint {
             return self.joint_admission_time_decision(request, planning, now);
         }
@@ -337,7 +345,10 @@ impl ContinuousBatchScheduler {
         planning: &mut TimePlanningRound,
         now: Instant,
     ) -> TimeDecision {
-        if planning.config.strategy == ferrum_types::SloStrategy::Joint {
+        if matches!(
+            planning.config.strategy,
+            ferrum_types::SloStrategy::Joint | ferrum_types::SloStrategy::Bounded
+        ) {
             // Preserve the static scheduler's nominal token/quota spending.
             // Exact projected device work is recorded separately below.
             return TimeDecision::Allow(maximum);
@@ -431,7 +442,10 @@ impl ContinuousBatchScheduler {
         let Some(planning) = planning else {
             return;
         };
-        if planning.config.strategy == ferrum_types::SloStrategy::Joint {
+        if matches!(
+            planning.config.strategy,
+            ferrum_types::SloStrategy::Joint | ferrum_types::SloStrategy::Bounded
+        ) {
             return;
         }
         let urgency_ms = planning.config.tpot_ms.min(planning.config.itl_ms);

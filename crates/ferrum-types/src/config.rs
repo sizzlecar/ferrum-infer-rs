@@ -1224,6 +1224,18 @@ impl SchedulerSloConfig {
         self.query.validate()?;
         self.planning.validate()?;
         self.joint.validate()?;
+        if self.strategy == crate::SloStrategy::Bounded {
+            for (name, policy) in [
+                ("unknown_cost", self.unknown_cost),
+                ("unknown_stopping", self.unknown_stopping),
+            ] {
+                if policy != crate::UnknownCostPolicy::StaticFallback {
+                    return Err(format!(
+                        "scheduler SLO strategy=bounded requires {name}=static_fallback; bounded control does not implement strict admission"
+                    ));
+                }
+            }
+        }
         self.unknown_cost.validate()?;
         self.unknown_stopping.validate()?;
         for (name, value) in [

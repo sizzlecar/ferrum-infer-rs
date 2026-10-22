@@ -53,6 +53,7 @@ mode = "static_fallback"
 | `predictor = "auto"` | Reuse the family from compatible, fresh bound state; otherwise use a visible conservative Physical fallback. This is not a measured family-winner claim. |
 | `predictor = "reference_diagnostic"` | Exact-work observed window maximum plus an engineering margin; no learned-state persistence or fitted quantile claim. |
 | `strategy = "joint"` | Compare request-level TTFT/TPOT/ITL and completion constraints under explicit bounded forecast assumptions. |
+| `strategy = "bounded"` | Recompare a finite number of future execution waves and apply only the next wave. Local ranking does not certify full-request SLO feasibility. |
 | `strategy = "reference_step_diagnostic"` | Preserve the older step-budget policy as a diagnostic comparison independent of the model family. |
 
 The base families use the same pre-execution work and actual invocation labels.
@@ -60,6 +61,69 @@ Prefill, Decode and one mixed invocation have distinct domains. Sequential
 Prefill-then-Decode is represented by separate invocations. Unknown internal
 reuse is preserved as unknown; restored tokens are not automatically subtracted
 from physical work.
+
+## Finite-horizon control
+
+The opt-in `bounded` strategy uses the same cost models, immutable calibrated
+snapshots, request clocks and resource owners as `joint`. Both `run` and `serve`
+read it from the SLO configuration:
+
+```toml
+[scheduler.slo]
+mode = "learn_and_control"
+predictor = "physical" # or "quantile_gbdt"
+strategy = "bounded"
+ttft_ms = 200
+tpot_ms = 15
+itl_ms = 50
+
+[scheduler.slo.planning]
+max_lookahead_rounds = 8
+```
+
+The values above are illustrative, not a validated workload preset. Each cost
+scenario compares static dispatch and a bounded set of smaller prefill or
+decode-only first waves. Every candidate stops after at most the configured
+number of complete execution waves; it does not replay the remaining output
+to completion or extend a slow candidate until it catches the static plan.
+Only the first wave is applied. Actual execution updates the request facts
+before a later decision; simulated progress never repays a real deferral.
+The query, elapsed-time, participant and memory budgets still apply.
+With a one-wave horizon, decode-only cannot demonstrate later prefill progress
+and is ineligible when static would advance prefill. The strategy never
+silently expands the configured horizon to make an action eligible.
+
+The ranking uses equally weighted, SLO-normalized local delay/debt proxies for
+TTFT, TPOT and ITL, over the same request cohort. It retains waiting requests,
+unfinished work and open text intervals. Historical violations are not erased.
+Prefill service-rate extrapolation is a ranking heuristic, not a physical time
+bound. When both plans leave a waiter without service or first text, a shorter
+candidate observation earns no waiting-time improvement: its exposure score
+uses at least the static observation duration. This is a ranking guard, not a
+simulation extended to a common time or a prediction of that waiter's TTFT.
+A request already past its TTFT target cannot lose predicted prefill
+progress relative to static. Decode-only also retains the actual-progress
+deferral guard. Ties retain static; this initial strategy selects strict local
+delay improvements, not unvalidated throughput-only gains.
+
+Future natural stopping and transport stalls remain unknown. The finite
+survival scenario does not call the full-output stopping/completion forecast,
+and does not turn a finite horizon into an EOS event or a complete-request
+feasibility result. Unknown cost support retains ordinary scheduling. Model
+uncertainty or a poor local score does not reject admission; normal resource
+probes and capacity checks remain authoritative. Full-request TTFT, TPOT,
+client-visible SSE ITL, errors and completion rates must still be measured.
+Because this strategy does not implement predictive admission waits or
+rejections, it requires `unknown_cost` and `unknown_stopping` to be
+`static_fallback` (their defaults). Explicit `reject` or `wait` settings are
+configuration errors rather than silently ignored policies. The full-trajectory
+`joint` admission verdict settings do not apply to a bounded local ranking.
+
+Health diagnostics report `bounded` comparisons, completed evaluations,
+selected and applied actions, retained static actions, unknown comparisons and
+invalidated applications separately. The scores are local ranking proxies,
+not violation probabilities or client SLO verdicts. Full-trajectory `joint`
+remains the default during validation of this new strategy.
 
 Defaults bound resource use. They do not specify the experiment's sample size,
 acceptable regression, or confidence level. Models publish only after disjoint

@@ -48,6 +48,10 @@ pub struct SloPlanningBudget {
     /// Maximum empirical cost ranks retained per query; a resource guard,
     /// never a statistical precision or performance acceptance requirement.
     pub max_scenarios: usize,
+    /// Maximum future execution rounds compared by the bounded strategy.
+    /// Reaching this horizon does not imply request completion or SLO success.
+    /// Query, elapsed-time and byte limits still apply independently.
+    pub max_lookahead_rounds: usize,
     pub max_candidates: usize,
     pub max_participants: usize,
     /// Cumulative synchronous prediction time; asynchronous admission waits do
@@ -64,6 +68,7 @@ impl Default for SloPlanningBudget {
             max_cost_cache_bytes: 2 * 1024 * 1024,
             max_queries: 4096,
             max_scenarios: 32,
+            max_lookahead_rounds: 8,
             max_candidates: 256,
             max_participants: 256,
             max_elapsed_us: 10_000,
@@ -76,6 +81,7 @@ impl SloPlanningBudget {
     pub fn validate(self) -> Result<(), String> {
         if self.max_queries == 0
             || self.max_scenarios == 0
+            || self.max_lookahead_rounds == 0
             || self.max_candidates == 0
             || self.max_participants == 0
             || self.max_elapsed_us == 0
@@ -194,6 +200,9 @@ pub enum PredictorFamily {
 pub enum SloStrategy {
     #[default]
     Joint,
+    /// Recompare a finite future execution horizon after actual progress.
+    /// A bounded decision is not a complete-request feasibility certificate.
+    Bounded,
     ReferenceStepDiagnostic,
 }
 
@@ -498,6 +507,110 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_strategy_round_trips_without_changing_legacy_defaults() {
+        let original: SloConfig = serde_json::from_value(serde_json::json!({
+            "ttft_ms": 200, "tpot_ms": 15, "itl_ms": 50,
+            "planning": { "max_queries": 17 }
+        }))
+        .unwrap();
+        assert_eq!(original.policy.strategy, SloStrategy::Joint);
+        assert_eq!(original.policy.planning.max_lookahead_rounds, 8);
+        assert_eq!(original.policy.planning.max_queries, 17);
+
+        let mut bounded = original;
+        bounded.policy.strategy = SloStrategy::Bounded;
+        bounded.policy.planning.max_lookahead_rounds = 3;
+        let encoded = serde_json::to_value(bounded).unwrap();
+        assert_eq!(encoded["strategy"], "bounded");
+        assert_eq!(encoded["planning"]["max_lookahead_rounds"], 3);
+        assert_eq!(
+            serde_json::from_value::<SloConfig>(encoded).unwrap(),
+            bounded
+        );
+        assert_eq!(SloStrategy::default(), SloStrategy::Joint);
+    }
+
+    #[test]
+    fn bounded_lookahead_is_positive_and_independent_of_cost_rank_limit() {
+        let mut config: SloConfig = "ttft:200,tpot:15,itl:50".parse().unwrap();
+        config.policy.strategy = SloStrategy::Bounded;
+        // A future execution round is not an empirical cost rank. Neither
+        // bound silently replaces the other or widens the query/time guards.
+        config.policy.planning.max_lookahead_rounds = config.policy.planning.max_scenarios + 1;
+        config.validate().unwrap();
+        let original_budget = config.policy.planning;
+        let restored: SloConfig =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(restored.policy.planning, original_budget);
+
+        config.policy.planning.max_lookahead_rounds = 0;
+        assert!(config.validate().is_err());
+        assert!(
+            serde_json::from_value::<SloConfig>(serde_json::to_value(config).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_unknown_policies_require_explicitly_compatible_fallback() {
+        let defaulted: SloConfig = serde_json::from_value(serde_json::json!({
+            "ttft_ms": 200, "tpot_ms": 15, "itl_ms": 50,
+            "strategy": "bounded"
+        }))
+        .unwrap();
+        assert_eq!(
+            defaulted.policy.unknown_cost,
+            UnknownCostPolicy::StaticFallback
+        );
+        assert_eq!(
+            defaulted.policy.unknown_stopping,
+            UnknownCostPolicy::StaticFallback
+        );
+        defaulted.policy.validate().unwrap();
+        defaulted.validate().unwrap();
+        assert_eq!(
+            serde_json::from_value::<SloConfig>(serde_json::to_value(defaulted).unwrap()).unwrap(),
+            defaulted
+        );
+
+        for field in ["unknown_cost", "unknown_stopping"] {
+            for policy in [
+                UnknownCostPolicy::Reject,
+                UnknownCostPolicy::Wait {
+                    max_wait_ms: 25,
+                    on_timeout: CostFallback::Reject,
+                },
+            ] {
+                let mut config = defaulted;
+                match field {
+                    "unknown_cost" => config.policy.unknown_cost = policy,
+                    "unknown_stopping" => config.policy.unknown_stopping = policy,
+                    _ => unreachable!(),
+                }
+                let error = config.policy.validate().unwrap_err();
+                assert!(error.contains("strategy=bounded"));
+                assert!(error.contains(field));
+                assert!(error.contains("static_fallback"));
+                assert_eq!(config.validate().unwrap_err(), error);
+                let encoded = serde_json::to_value(config).unwrap();
+                let wire_error = serde_json::from_value::<SloConfig>(encoded)
+                    .unwrap_err()
+                    .to_string();
+                assert!(wire_error.contains(&error));
+
+                // The existing full-trajectory strategy retains its strict
+                // policies. This restriction belongs to bounded control.
+                config.policy.strategy = SloStrategy::Joint;
+                config.validate().unwrap();
+                assert_eq!(
+                    serde_json::from_value::<SloConfig>(serde_json::to_value(config).unwrap())
+                        .unwrap(),
+                    config
+                );
+            }
+        }
+    }
+
+    #[test]
     fn training_history_policy_is_typed_bounded_and_defaults_to_recent() {
         let mut config: SloConfig = "ttft:200,tpot:15,itl:50".parse().unwrap();
         assert_eq!(config.training_history, TrainingHistoryPolicy::Recent);
@@ -651,6 +764,10 @@ mod tests {
         for invalid in [
             SloPlanningBudget {
                 max_queries: 0,
+                ..Default::default()
+            },
+            SloPlanningBudget {
+                max_lookahead_rounds: 0,
                 ..Default::default()
             },
             SloPlanningBudget {

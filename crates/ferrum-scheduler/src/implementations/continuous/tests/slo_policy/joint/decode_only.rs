@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
+mod bounded;
 mod prefill_phase;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

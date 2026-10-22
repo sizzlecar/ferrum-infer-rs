@@ -357,6 +357,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_product_prepare_preserves_bounded_strategy_and_lookahead() {
+        let slo: SloConfig = toml::from_str(
+            "ttft_ms = 200\ntpot_ms = 15\nitl_ms = 50\n\
+             mode = 'learn_and_control'\npredictor = 'physical'\nstrategy = 'bounded'\n\
+             [planning]\nmax_lookahead_rounds = 3\n",
+        )
+        .unwrap();
+        let mut engine = EngineConfig::default();
+        // run and serve both use prepare_with_state; prepare delegates to that
+        // same assembly without requiring a model or starting an executor.
+        let _feedback = ProductExecutionFeedback::prepare(&mut engine, Some(slo), None).unwrap();
+        let policy = engine.scheduler.slo.expect("enabled scheduler policy");
+        assert_eq!(policy.strategy, ferrum_types::SloStrategy::Bounded);
+        assert_eq!(policy.planning.max_lookahead_rounds, 3);
+    }
+
+    #[test]
     fn shared_product_toml_passes_width_history_to_both_learned_modes() {
         for mode in ["observe", "learn_and_control"] {
             for (history_mode, policy) in [
