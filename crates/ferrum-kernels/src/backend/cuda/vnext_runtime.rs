@@ -5495,16 +5495,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
         }
         let timing_mode = commands.timing_mode();
         let facts_capture = commands.execution_facts_capture();
-        if self.tensor_eager.is_some()
-            && (timing_mode != DeviceTimingMode::Off
-                || facts_capture != ExecutionFactsCapture::Off
-                || commands.len() > CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION)
-        {
-            return Err(DefinitelyNotSubmitted::new(
-                CudaDeviceRuntimeError::contract(
-                    "CUDA tensor eager profile requires timing/facts off and at most 64 commands",
-                ),
-            ));
+        if let Some(state) = &self.tensor_eager {
+            state
+                .validate_submission(commands.len(), timing_mode, facts_capture)
+                .map_err(DefinitelyNotSubmitted::new)?;
         }
         let compute_path_requirement = commands.compute_path_requirement();
         let declared_eager_compute_node_indices = commands

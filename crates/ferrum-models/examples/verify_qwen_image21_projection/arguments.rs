@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
-pub const USAGE: &str = "verify_qwen_image21_projection --config CONFIG --weight-fragment BF16 --weight-sha256 HEX --artifact-dir NEW_DIRECTORY_OUTSIDE_A_GIT_WORKTREE [--backend reference|cuda]\nCUDA requires --cuda-usable-memory-bytes N --cuda-bootstrap-memory-bytes N --cuda-stream-memory-bytes N --cuda-opaque-memory-profile NAME; optional --cuda-device N (0), --cuda-transfer-staging-bytes N (65536), --cuda-maximum-streams N (1), --cuda-maximum-in-flight-per-stream N (1). Budgets are experimental declarations, not measured CUDA memory qualifications.";
+pub const USAGE: &str = "verify_qwen_image21_projection --config CONFIG --weight-fragment BF16 --weight-sha256 HEX --artifact-dir NEW_DIRECTORY_OUTSIDE_A_GIT_WORKTREE [--backend reference|cuda]\nCUDA requires --cuda-usable-memory-bytes N --cuda-bootstrap-memory-bytes N --cuda-stream-memory-bytes N --cuda-opaque-memory-profile NAME; optional --cuda-device N (0), --cuda-transfer-staging-bytes N (65536), --cuda-maximum-streams N (1), --cuda-maximum-in-flight-per-stream N (1), --cuda-maximum-commands-per-submission N (64, including upload/init/compute). Budgets are experimental declarations, not measured CUDA memory qualifications.";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "backend", rename_all = "snake_case")]
@@ -23,6 +23,7 @@ pub struct CudaOptions {
     pub transfer_staging_bytes: usize,
     pub maximum_streams: usize,
     pub maximum_in_flight_per_stream: usize,
+    pub maximum_commands_per_submission: usize,
     pub opaque_memory_profile: String,
 }
 
@@ -75,6 +76,7 @@ impl Arguments {
                     | "--cuda-transfer-staging-bytes"
                     | "--cuda-maximum-streams"
                     | "--cuda-maximum-in-flight-per-stream"
+                    | "--cuda-maximum-commands-per-submission"
                     | "--cuda-opaque-memory-profile"
             ) {
                 bail!("unknown option {flag:?}; {USAGE}");
@@ -122,6 +124,11 @@ impl Backend {
                     optional_number(&mut values, "--cuda-maximum-streams", 1_usize)?;
                 let maximum_in_flight_per_stream =
                     optional_number(&mut values, "--cuda-maximum-in-flight-per-stream", 1_usize)?;
+                let maximum_commands_per_submission = optional_number(
+                    &mut values,
+                    "--cuda-maximum-commands-per-submission",
+                    64_usize,
+                )?;
                 let opaque_memory_profile = take_text(&mut values, "--cuda-opaque-memory-profile")?;
                 let overhead = stream_memory_bytes
                     .checked_mul(u64::try_from(maximum_streams)?)
@@ -131,8 +138,10 @@ impl Backend {
                     || stream_memory_bytes == 0
                     || maximum_streams == 0
                     || maximum_in_flight_per_stream == 0
+                    || maximum_commands_per_submission == 0
                     || maximum_streams
                         .checked_mul(maximum_in_flight_per_stream)
+                        .and_then(|flights| flights.checked_mul(maximum_commands_per_submission))
                         .is_none()
                     || overhead.is_none_or(|bytes| bytes >= usable_memory_bytes)
                     || transfer_staging_bytes < 2
@@ -155,6 +164,7 @@ impl Backend {
                     transfer_staging_bytes,
                     maximum_streams,
                     maximum_in_flight_per_stream,
+                    maximum_commands_per_submission,
                     opaque_memory_profile,
                 })
             }
@@ -246,6 +256,17 @@ mod tests {
         assert_eq!(options.transfer_staging_bytes, 65_536);
         assert_eq!(options.maximum_streams, 1);
         assert_eq!(options.maximum_in_flight_per_stream, 1);
+        assert_eq!(options.maximum_commands_per_submission, 64);
+        let mut larger = cuda();
+        larger.extend(
+            ["--cuda-maximum-commands-per-submission", "1024"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        let Backend::Cuda(larger) = Arguments::parse(larger).unwrap().unwrap().backend else {
+            panic!("expected CUDA")
+        };
+        assert_eq!(larger.maximum_commands_per_submission, 1024);
         let mut wrong_backend = base();
         wrong_backend.extend(["--cuda-device", "0"].into_iter().map(OsString::from));
         assert!(Arguments::parse(wrong_backend).is_err());
@@ -261,6 +282,7 @@ mod tests {
             ("--cuda-maximum-streams", "0"),
             ("--cuda-maximum-streams", "18446744073709551615"),
             ("--cuda-maximum-in-flight-per-stream", "0"),
+            ("--cuda-maximum-commands-per-submission", "0"),
         ] {
             let mut args = cuda();
             args.extend([flag, value].into_iter().map(OsString::from));

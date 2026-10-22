@@ -1,9 +1,9 @@
-//! Qwen-Image 2.1 Transformer metadata and its isolated image-input projection.
+//! Qwen-Image 2.1 Transformer metadata, typed partial families and T2I graph.
 //!
 //! Detached safetensors headers establish declared structure, not payload
-//! authenticity. The image-projection family executes only `img_in`; the full
-//! Transformer, text conditioning and image-generation pipeline remain separate
-//! work. Weight payloads use the existing runtime weight-source interface.
+//! authenticity. The full transformer consumes explicit text/latent inputs;
+//! text encoding, the denoising loop and VAE decoding remain separate stages.
+//! Weight payloads use the existing runtime weight-source interface.
 
 mod attention;
 mod block0;
@@ -12,6 +12,7 @@ mod config;
 mod headers;
 mod image_projection;
 mod qk_norm;
+mod transformer;
 mod weights;
 
 pub use attention::{
@@ -30,6 +31,10 @@ pub use image_projection::{
     IMAGE_PROJECTION_WEIGHT_ID,
 };
 pub use qk_norm::{QwenImage21Block0QkNormFamily, QwenImage21QkFrontend};
+pub use transformer::{
+    QwenImage21ModelTimestep, QwenImage21RotaryFrequencies, QwenImage21T2iLayout,
+    QwenImage21Timestep256, QwenImage21TransformerConfig, QwenImage21TransformerFamily,
+};
 pub use weights::{ExpectedTensor, ExpectedWeights};
 
 use ferrum_types::{FerrumError, Result};

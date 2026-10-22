@@ -8,6 +8,8 @@ mod attention;
 mod normalization;
 #[path = "vnext_tensor_cuda_runtime/rotary.rs"]
 mod rotary;
+#[path = "vnext_tensor_cuda_runtime/transport.rs"]
+mod transport;
 
 use ferrum_execution::{PreparedTensorExecutor, TensorExecutorConfig};
 use ferrum_kernels::backend::cuda::{
@@ -341,6 +343,7 @@ fn managed_cuda_silu_upload_execute_readback_and_retirement() {
             stream_memory_bytes: 64 << 20,
             maximum_streams: 1,
             maximum_in_flight_per_stream: 1,
+            maximum_commands_per_submission: 64,
             opaque_memory_profile: "experimental-unqualified-smoke-v1".into(),
         })
         .unwrap(),

@@ -7,7 +7,8 @@ use ferrum_runtime::{DeviceCapacityOwner, DeviceCapacityRetention, DeviceOpaqueM
 
 use super::*;
 
-/// Bound for this experimental eager profile, including uploads and compute.
+/// Default bound, including uploads, initialization and compute commands.
+/// The actual bound is explicitly configured and enters runtime identity.
 pub const CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION: usize = 64;
 
 pub struct CudaTensorRuntimeConfig {
@@ -17,6 +18,10 @@ pub struct CudaTensorRuntimeConfig {
     pub stream_memory_bytes: u64,
     pub maximum_streams: usize,
     pub maximum_in_flight_per_stream: usize,
+    /// All commands, not just compute nodes. Fixed command record counts are
+    /// checked across all admitted flights. This is not a bound on captured
+    /// closure allocations or total Host RSS, which remain outside this profile.
+    pub maximum_commands_per_submission: usize,
     /// Versioned declaration, e.g. `experimental-unqualified-smoke-v1`.
     /// This identity never certifies that its opaque allowances are sufficient.
     pub opaque_memory_profile: String,
@@ -28,6 +33,7 @@ pub(super) struct TensorEagerState {
     stream_bytes: u64,
     maximum_streams: usize,
     maximum_in_flight: usize,
+    maximum_commands: usize,
     streams: AtomicUsize,
     provider_live: AtomicBool,
 }
@@ -80,6 +86,15 @@ fn claim_count(
 }
 
 impl TensorEagerState {
+    pub(super) fn validate_submission(
+        &self,
+        commands: usize,
+        timing: DeviceTimingMode,
+        facts: ExecutionFactsCapture,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        validate_submission_policy(self.maximum_commands, commands, timing, facts)
+    }
+
     pub(super) fn reserve_lane(
         self: &Arc<Self>,
     ) -> Result<Arc<TensorLaneRetention>, CudaDeviceRuntimeError> {
@@ -100,6 +115,51 @@ impl TensorEagerState {
             flights: AtomicUsize::new(0),
         }))
     }
+}
+
+/// Bounds fixed command records across the configured stream/flight limits.
+/// Heap data retained by individual records is additional and is not claimed
+/// to be charged to a HostMemoryAccount by this experimental runtime.
+fn validate_command_capacity(
+    streams: usize,
+    flights: usize,
+    commands: usize,
+) -> Result<usize, CudaDeviceRuntimeError> {
+    if streams == 0 || flights == 0 || commands == 0 || commands > u32::MAX as usize {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA tensor stream/flight limits must be positive and command limit must be in 1..=u32::MAX",
+        ));
+    }
+    streams
+        .checked_mul(flights)
+        .and_then(|count| count.checked_mul(commands))
+        .and_then(|count| {
+            count.checked_mul(std::mem::size_of::<DeviceCommandEntry<CudaDeviceCommand>>())
+        })
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "CUDA tensor fixed command record capacity exceeds addressable memory",
+            )
+        })
+}
+
+fn validate_submission_policy(
+    maximum_commands: usize,
+    commands: usize,
+    timing: DeviceTimingMode,
+    facts: ExecutionFactsCapture,
+) -> Result<(), CudaDeviceRuntimeError> {
+    if commands == 0
+        || commands > maximum_commands
+        || timing != DeviceTimingMode::Off
+        || facts != ExecutionFactsCapture::Off
+    {
+        return Err(CudaDeviceRuntimeError::contract(format!(
+            "CUDA tensor eager profile requires timing/facts off and 1..={maximum_commands} total commands"
+        )));
+    }
+    Ok(())
 }
 
 impl TensorLaneRetention {
@@ -186,6 +246,8 @@ impl CudaDeviceRuntime {
                         | ferrum_runtime::STRUCTURED_ATTENTION_BF16_CAPABILITY_ID
                         | ferrum_runtime::ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID
                         | ferrum_runtime::GELU_TANH_BF16_CAPABILITY_ID
+                        | ferrum_runtime::ROW_GATHER_BF16_CAPABILITY_ID
+                        | ferrum_runtime::BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID
                 )
             })
         {
@@ -207,12 +269,11 @@ impl CudaDeviceRuntime {
                 "CUDA tensor opaque budget leaves no usable storage",
             ));
         }
-        config
-            .maximum_streams
-            .checked_mul(config.maximum_in_flight_per_stream)
-            .ok_or_else(|| {
-                CudaDeviceRuntimeError::contract("CUDA tensor total flight limit overflows")
-            })?;
+        validate_command_capacity(
+            config.maximum_streams,
+            config.maximum_in_flight_per_stream,
+            config.maximum_commands_per_submission,
+        )?;
         // Driver device queries do not construct a CUDA context. Charge its
         // opaque allowance before the existing constructor can create one.
         let ordinal = i32::try_from(config.device.ordinal)
@@ -242,7 +303,7 @@ impl CudaDeviceRuntime {
             config.stream_memory_bytes.to_string(),
             config.maximum_streams.to_string(),
             config.maximum_in_flight_per_stream.to_string(),
-            CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION.to_string(),
+            config.maximum_commands_per_submission.to_string(),
         ] {
             hash.update((part.len() as u64).to_le_bytes());
             hash.update(part.as_bytes());
@@ -276,6 +337,7 @@ impl CudaDeviceRuntime {
             stream_bytes: config.stream_memory_bytes,
             maximum_streams: config.maximum_streams,
             maximum_in_flight: config.maximum_in_flight_per_stream,
+            maximum_commands: config.maximum_commands_per_submission,
             streams: AtomicUsize::new(0),
             provider_live: AtomicBool::new(false),
         });
@@ -333,6 +395,56 @@ mod tests {
     use ferrum_runtime::{DynamicStorageAllocator, DynamicStorageView};
 
     #[test]
+    fn command_capacity_checks_fixed_records_across_every_stream_and_flight() {
+        let record = std::mem::size_of::<DeviceCommandEntry<CudaDeviceCommand>>();
+        assert_eq!(
+            validate_command_capacity(2, 3, 1024).unwrap(),
+            2 * 3 * 1024 * record
+        );
+        for (streams, flights, commands) in [
+            (0, 1, 1),
+            (1, 0, 1),
+            (1, 1, 0),
+            (usize::MAX, 2, 1),
+            (1, 1, usize::MAX),
+        ] {
+            assert!(validate_command_capacity(streams, flights, commands).is_err());
+        }
+    }
+
+    #[test]
+    fn total_command_limit_applies_before_enqueue_and_preserves_timing_restrictions() {
+        let check = |maximum, count, timing, facts| {
+            validate_submission_policy(maximum, count, timing, facts)
+        };
+        assert!(check(64, 64, DeviceTimingMode::Off, ExecutionFactsCapture::Off).is_ok());
+        assert!(check(64, 65, DeviceTimingMode::Off, ExecutionFactsCapture::Off).is_err());
+        assert!(check(
+            1024,
+            1024,
+            DeviceTimingMode::Off,
+            ExecutionFactsCapture::Off
+        )
+        .is_ok());
+        assert!(check(
+            1024,
+            1025,
+            DeviceTimingMode::Off,
+            ExecutionFactsCapture::Off
+        )
+        .is_err());
+        assert!(check(1024, 0, DeviceTimingMode::Off, ExecutionFactsCapture::Off).is_err());
+        assert!(check(
+            1024,
+            1,
+            DeviceTimingMode::Completion,
+            ExecutionFactsCapture::Off
+        )
+        .is_err());
+        assert!(check(1024, 1, DeviceTimingMode::Off, ExecutionFactsCapture::On).is_err());
+    }
+
+    #[test]
     fn final_flight_owner_holds_lane_limit_and_opaque_capacity() {
         let identity = NEXT_RUNTIME_INSTANCE.fetch_add(1, Ordering::Relaxed);
         let descriptor = DeviceDescriptor {
@@ -357,6 +469,7 @@ mod tests {
             stream_bytes: 32,
             maximum_streams: 1,
             maximum_in_flight: 1,
+            maximum_commands: CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION,
             streams: AtomicUsize::new(0),
             provider_live: AtomicBool::new(false),
         });

@@ -45,6 +45,8 @@ memmap2 = "0.9"
 ferrum-kernels = { workspace = true }
 ferrum-quantization = { workspace = true }
 half = { workspace = true }
+# Deterministic CPU conditioning arithmetic; same small pin as ferrum-kernels.
+libm = "=0.2.15"
 # CUDA ownership tests inspect the same device allocations as ferrum-kernels.
 cudarc = { version = "0.19", default-features = false, features = ["driver"], optional = true }
 

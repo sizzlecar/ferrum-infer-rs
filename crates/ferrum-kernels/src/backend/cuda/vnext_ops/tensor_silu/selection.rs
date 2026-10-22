@@ -19,10 +19,12 @@ pub enum CudaTensorOperation {
     StructuredAttention,
     ZeroCenteredRmsNorm,
     GeluTanh,
+    RowGather,
+    BatchedRowConcat,
 }
 
 impl CudaTensorOperation {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -34,6 +36,8 @@ impl CudaTensorOperation {
         Self::StructuredAttention,
         Self::ZeroCenteredRmsNorm,
         Self::GeluTanh,
+        Self::RowGather,
+        Self::BatchedRowConcat,
     ];
 
     fn pointwise(self) -> Option<Kind> {
@@ -70,6 +74,10 @@ impl CudaTensorOperation {
         match self {
             Self::AdjacentRope => rope::descriptor(device),
             Self::StructuredAttention => attention::descriptor(device),
+            Self::RowGather => transport::descriptor(device, transport::Kind::RowGather),
+            Self::BatchedRowConcat => {
+                transport::descriptor(device, transport::Kind::BatchedRowConcat)
+            }
             _ => Err(CudaDeviceRuntimeError::contract(
                 "unknown CUDA tensor operation",
             )),
@@ -94,6 +102,10 @@ impl CudaTensorOperation {
         match self {
             Self::AdjacentRope => rope::provider(descriptor, kernels),
             Self::StructuredAttention => attention::provider(descriptor, kernels),
+            Self::RowGather => transport::provider(transport::Kind::RowGather, descriptor, kernels),
+            Self::BatchedRowConcat => {
+                transport::provider(transport::Kind::BatchedRowConcat, descriptor, kernels)
+            }
             _ => unreachable!("operation kind was exhaustively classified"),
         }
     }

@@ -16,6 +16,11 @@ use ferrum_runtime::{
 };
 use half::{bf16, f16};
 
+mod row_transport;
+pub(crate) use row_transport::{
+    checked_concat_bytes, checked_gather_bytes, ReferenceBatchedRowConcatLaunch,
+    ReferenceRowGatherLaunch,
+};
 mod layer_norm;
 pub(crate) use layer_norm::ReferenceLayerNormLaunch;
 mod zero_centered_rms_norm;
@@ -335,6 +340,12 @@ enum ReferenceCommandKind {
     ZeroCenteredRmsNorm {
         launch: ReferenceZeroCenteredRmsNormLaunch,
     },
+    RowGather {
+        launch: ReferenceRowGatherLaunch,
+    },
+    BatchedRowConcat {
+        launch: ReferenceBatchedRowConcatLaunch,
+    },
     HeadRmsNorm {
         launch: ReferenceHeadRmsNormLaunch,
     },
@@ -377,6 +388,8 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
             ReferenceCommandKind::LayerNorm { .. } => "layer_norm",
             ReferenceCommandKind::ZeroCenteredRmsNorm { .. } => "zero_centered_rms_norm",
+            ReferenceCommandKind::RowGather { .. } => "row_gather",
+            ReferenceCommandKind::BatchedRowConcat { .. } => "batched_row_concat",
             ReferenceCommandKind::HeadRmsNorm { .. } => "head_rms_norm",
             ReferenceCommandKind::StructuredAttention { .. } => "structured_attention",
             ReferenceCommandKind::AdjacentRope { .. } => "adjacent_rope",
@@ -506,6 +519,31 @@ impl ReferenceDeviceCommand {
             compute_dispatch_count: 1,
             transfer_command_count: 0,
             kind: ReferenceCommandKind::ZeroCenteredRmsNorm { launch },
+        })
+    }
+
+    pub(crate) fn row_gather_tensor(
+        launch: ReferenceRowGatherLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_row_gather_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::RowGather { launch },
+        })
+    }
+    pub(crate) fn batched_row_concat_tensor(
+        launch: ReferenceBatchedRowConcatLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_batched_row_concat_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::BatchedRowConcat { launch },
         })
     }
 
@@ -711,6 +749,10 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::ZeroCenteredRmsNorm { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::RowGather { launch } => launch.validate_runtime(runtime_instance),
+            ReferenceCommandKind::BatchedRowConcat { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::HeadRmsNorm { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
@@ -783,6 +825,16 @@ impl ReferenceDeviceCommand {
                 zero_centered_rms_norm::execute(launch);
                 counters
                     .zero_centered_rms_norm_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::RowGather { launch } => {
+                row_transport::execute_gather(launch);
+                counters.row_gather_launches.fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::BatchedRowConcat { launch } => {
+                row_transport::execute_concat(launch);
+                counters
+                    .batched_row_concat_launches
                     .fetch_add(1, Ordering::Relaxed);
             }
             ReferenceCommandKind::HeadRmsNorm { launch } => {
@@ -1005,6 +1057,8 @@ struct ReferenceRuntimeCounters {
     dense_linear_launches: AtomicU64,
     layer_norm_launches: AtomicU64,
     head_rms_norm_launches: AtomicU64,
+    row_gather_launches: AtomicU64,
+    batched_row_concat_launches: AtomicU64,
     zero_centered_rms_norm_launches: AtomicU64,
     gelu_tanh_launches: AtomicU64,
     adjacent_rope_launches: AtomicU64,
@@ -1027,6 +1081,8 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub dense_linear_launches: u64,
     pub layer_norm_launches: u64,
     pub head_rms_norm_launches: u64,
+    pub row_gather_launches: u64,
+    pub batched_row_concat_launches: u64,
     pub zero_centered_rms_norm_launches: u64,
     pub gelu_tanh_launches: u64,
     pub adjacent_rope_launches: u64,
@@ -1159,6 +1215,11 @@ impl ReferenceDeviceRuntime {
             dense_linear_launches: self.counters.dense_linear_launches.load(Ordering::Relaxed),
             layer_norm_launches: self.counters.layer_norm_launches.load(Ordering::Relaxed),
             head_rms_norm_launches: self.counters.head_rms_norm_launches.load(Ordering::Relaxed),
+            row_gather_launches: self.counters.row_gather_launches.load(Ordering::Relaxed),
+            batched_row_concat_launches: self
+                .counters
+                .batched_row_concat_launches
+                .load(Ordering::Relaxed),
             zero_centered_rms_norm_launches: self
                 .counters
                 .zero_centered_rms_norm_launches

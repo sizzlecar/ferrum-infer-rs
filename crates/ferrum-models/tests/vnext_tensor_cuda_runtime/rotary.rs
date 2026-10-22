@@ -130,6 +130,7 @@ fn managed_cuda_adjacent_rope_batches_heads_fma_and_signed_zero() {
             stream_memory_bytes: 64 << 20,
             maximum_streams: 1,
             maximum_in_flight_per_stream: 1,
+            maximum_commands_per_submission: 64,
             opaque_memory_profile: "experimental-unqualified-rotary-smoke-v1".into(),
         })
         .unwrap(),

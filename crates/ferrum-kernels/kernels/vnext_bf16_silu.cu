@@ -378,3 +378,55 @@ extern "C" __global__ void ferrum_vnext_gelu_tanh_bf16(
         output[index] = ferrum_bf16_rne(__fmul_rn(half_x, activation));
     }
 }
+
+// Pure BF16 bit transport. Metadata is passed by value, not allocated on device.
+struct FerrumRowGatherRuns {
+    uint64_t run_ends[32];
+    uint64_t source_starts[32];
+    uint64_t source_batch_strides[32];
+    uint64_t source_row_strides[32];
+    uint64_t rows_per_batch;
+    uint64_t source_width;
+    uint64_t column_start;
+    uint64_t column_count;
+    uint32_t run_count;
+    uint32_t padding;
+};
+static_assert(sizeof(FerrumRowGatherRuns) == 1064, "gather run ABI");
+
+extern "C" __global__ void ferrum_vnext_row_gather_bf16(
+    const uint16_t* source, uint16_t* output, uint64_t elements,
+    const FerrumRowGatherRuns runs) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t index = first; index < elements; index += stride) {
+        const uint64_t row = index / runs.column_count;
+        const uint64_t batch = row / runs.rows_per_batch;
+        const uint64_t local_row = row % runs.rows_per_batch;
+        uint32_t run = 0;
+        while (run + 1 < runs.run_count && local_row >= runs.run_ends[run]) ++run;
+        const uint64_t run_start = run == 0 ? 0 : runs.run_ends[run - 1];
+        const uint64_t source_row = runs.source_starts[run]
+            + batch * runs.source_batch_strides[run]
+            + (local_row - run_start) * runs.source_row_strides[run];
+        const uint64_t source_column = runs.column_start + index % runs.column_count;
+        output[index] = source[source_row * runs.source_width + source_column];
+    }
+}
+
+extern "C" __global__ void ferrum_vnext_batched_row_concat_bf16(
+    const uint16_t* left, const uint16_t* right, uint16_t* output,
+    uint64_t elements, uint64_t left_rows, uint64_t right_rows, uint64_t columns) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    const uint64_t rows_per_batch = left_rows + right_rows;
+    for (uint64_t index = first; index < elements; index += stride) {
+        const uint64_t row = index / columns;
+        const uint64_t batch = row / rows_per_batch;
+        const uint64_t local_row = row % rows_per_batch;
+        const uint64_t column = index % columns;
+        output[index] = local_row < left_rows
+            ? left[(batch * left_rows + local_row) * columns + column]
+            : right[(batch * right_rows + local_row - left_rows) * columns + column];
+    }
+}

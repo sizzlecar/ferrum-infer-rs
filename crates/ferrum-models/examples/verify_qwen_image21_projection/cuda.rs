@@ -30,6 +30,7 @@ pub(super) fn create(
             stream_memory_bytes: options.stream_memory_bytes,
             maximum_streams: options.maximum_streams,
             maximum_in_flight_per_stream: options.maximum_in_flight_per_stream,
+            maximum_commands_per_submission: options.maximum_commands_per_submission,
             opaque_memory_profile: options.opaque_memory_profile.clone(),
         },
     )?);

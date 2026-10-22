@@ -25,3 +25,12 @@ one native module. It rejects empty, duplicate or unsupported selections before
 module loading and shares one retained module permit across the resulting
 providers. Existing convenience factories retain their previous operation sets.
 Dense remains separate because it uses the already admitted lane BLAS handle.
+
+The eager CUDA runtime accepts a typed `maximum_commands_per_submission`, with
+64 as the existing examples' default. It checks the total upload, initialization
+and compute count before enqueue; timing and execution-fact collection remain
+disabled. Larger finite limits permit a complete transformer plan in one wave.
+The limit enters the runtime fingerprint, and the product of streams, flights,
+commands and fixed command-record size must fit addressable memory. This bounds
+fixed records, not heap allocations captured by their owners or total Host RSS;
+those control allocations remain outside the experimental Host accounting scope.

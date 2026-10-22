@@ -2,19 +2,21 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ferrum_runtime::{
-    adjacent_rope_bf16_contract, dense_linear_bf16_contract, dense_linear_contract,
-    gated_residual_bf16_contract, gelu_tanh_bf16_contract, head_rms_norm_bf16_contract,
-    layer_norm_bf16_contract, modulation_scale_bf16_contract, silu_bf16_contract,
-    silu_mul_bf16_contract, structured_attention_bf16_contract, tanh_bf16_contract,
-    zero_centered_rms_norm_bf16_contract, CapabilityCatalog, CapabilityId, ContractVersion,
-    DeviceClass, DeviceDescriptor, DeviceId, DeviceRuntime, DynamicStorageAllocator,
-    DynamicStorageProfile, DynamicStorageView, EngineProviderDescriptor, OperationContract,
-    OperationProvider, OperationRuntimeRegistry, ProviderId, VNextError, WeightMaterializerId,
-    WeightMaterializerRegistry, ADJACENT_ROPE_BF16_CAPABILITY_ID, DENSE_LINEAR_BF16_CAPABILITY_ID,
-    DENSE_LINEAR_F16_CAPABILITY_ID, GATED_RESIDUAL_BF16_CAPABILITY_ID,
-    GELU_TANH_BF16_CAPABILITY_ID, HEAD_RMS_NORM_BF16_CAPABILITY_ID,
-    IDENTITY_WEIGHT_MATERIALIZER_ID, LAYER_NORM_BF16_CAPABILITY_ID,
-    MODULATION_SCALE_BF16_CAPABILITY_ID, SILU_BF16_CAPABILITY_ID, SILU_MUL_BF16_CAPABILITY_ID,
+    adjacent_rope_bf16_contract, batched_row_concat_bf16_contract, dense_linear_bf16_contract,
+    dense_linear_contract, gated_residual_bf16_contract, gelu_tanh_bf16_contract,
+    head_rms_norm_bf16_contract, layer_norm_bf16_contract, modulation_scale_bf16_contract,
+    row_gather_bf16_contract, silu_bf16_contract, silu_mul_bf16_contract,
+    structured_attention_bf16_contract, tanh_bf16_contract, zero_centered_rms_norm_bf16_contract,
+    CapabilityCatalog, CapabilityId, ContractVersion, DeviceClass, DeviceDescriptor, DeviceId,
+    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
+    EngineProviderDescriptor, OperationContract, OperationProvider, OperationRuntimeRegistry,
+    ProviderId, VNextError, WeightMaterializerId, WeightMaterializerRegistry,
+    ADJACENT_ROPE_BF16_CAPABILITY_ID, BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID,
+    DENSE_LINEAR_BF16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
+    GATED_RESIDUAL_BF16_CAPABILITY_ID, GELU_TANH_BF16_CAPABILITY_ID,
+    HEAD_RMS_NORM_BF16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
+    LAYER_NORM_BF16_CAPABILITY_ID, MODULATION_SCALE_BF16_CAPABILITY_ID,
+    ROW_GATHER_BF16_CAPABILITY_ID, SILU_BF16_CAPABILITY_ID, SILU_MUL_BF16_CAPABILITY_ID,
     STRUCTURED_ATTENTION_BF16_CAPABILITY_ID, TANH_BF16_CAPABILITY_ID,
     ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID,
 };
@@ -25,6 +27,7 @@ use super::gelu_tanh::ReferenceGeluTanhProvider;
 use super::head_rms_norm::ReferenceHeadRmsNormProvider;
 use super::layer_norm::ReferenceLayerNormProvider;
 use super::pointwise::{ReferencePointwiseKind, ReferencePointwiseProvider};
+use super::row_transport::{ReferenceRowTransportKind, ReferenceRowTransportProvider};
 use super::runtime::{
     ReferenceDeviceRuntime, ReferenceDeviceRuntimeConfig, ReferenceDeviceRuntimeError,
 };
@@ -45,6 +48,8 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
         CapabilityId::new(DENSE_LINEAR_BF16_CAPABILITY_ID)?,
         CapabilityId::new(LAYER_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ROW_GATHER_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(GELU_TANH_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ADJACENT_ROPE_BF16_CAPABILITY_ID)?,
@@ -88,6 +93,8 @@ fn reference_vnext_runtime_config_with_capacity(
             include_str!("runtime/zero_centered_rms_norm.rs").as_bytes(),
             include_str!("gelu_tanh.rs").as_bytes(),
             include_str!("runtime/gelu_tanh.rs").as_bytes(),
+            include_str!("row_transport.rs").as_bytes(),
+            include_str!("runtime/row_transport.rs").as_bytes(),
             include_str!("head_rms_norm.rs").as_bytes(),
             include_str!("runtime/head_rms_norm.rs").as_bytes(),
             include_str!("adjacent_rope.rs").as_bytes(),
@@ -118,6 +125,8 @@ pub fn reference_vnext_operation_registry(
         Box::new(dense_linear_bf16_contract().map_err(contract_error)?),
         Box::new(layer_norm_bf16_contract().map_err(contract_error)?),
         Box::new(head_rms_norm_bf16_contract().map_err(contract_error)?),
+        Box::new(row_gather_bf16_contract().map_err(contract_error)?),
+        Box::new(batched_row_concat_bf16_contract().map_err(contract_error)?),
         Box::new(zero_centered_rms_norm_bf16_contract().map_err(contract_error)?),
         Box::new(gelu_tanh_bf16_contract().map_err(contract_error)?),
         Box::new(adjacent_rope_bf16_contract().map_err(contract_error)?),
@@ -133,6 +142,8 @@ pub fn reference_vnext_operation_registry(
         reference_vnext_dense_linear_bf16_provider(runtime)?,
         reference_vnext_layer_norm_bf16_provider(runtime)?,
         reference_vnext_head_rms_norm_bf16_provider(runtime)?,
+        reference_vnext_row_gather_bf16_provider(runtime)?,
+        reference_vnext_batched_row_concat_bf16_provider(runtime)?,
         reference_vnext_zero_centered_rms_norm_bf16_provider(runtime)?,
         reference_vnext_gelu_tanh_bf16_provider(runtime)?,
         reference_vnext_adjacent_rope_bf16_provider(runtime)?,
@@ -191,6 +202,25 @@ pub fn reference_vnext_gelu_tanh_bf16_provider(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
     Ok(Box::new(ReferenceGeluTanhProvider::new(runtime)?))
+}
+
+/// Builds exact BF16 row/window gather with explicitly bounded metadata.
+pub fn reference_vnext_row_gather_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceRowTransportProvider::new(
+        runtime,
+        ReferenceRowTransportKind::Gather,
+    )?))
+}
+/// Builds exact BF16 concatenation of left/right rows separately per sample.
+pub fn reference_vnext_batched_row_concat_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceRowTransportProvider::new(
+        runtime,
+        ReferenceRowTransportKind::Concat,
+    )?))
 }
 
 /// Builds nonpaged structured attention with explicit mask and FP32 online softmax.

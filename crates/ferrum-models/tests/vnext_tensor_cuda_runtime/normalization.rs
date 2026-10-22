@@ -343,6 +343,7 @@ fn managed_cuda_layer_norm_head_rms_modulation_residual_and_tanh() {
             stream_memory_bytes: 64 << 20,
             maximum_streams: 1,
             maximum_in_flight_per_stream: 1,
+            maximum_commands_per_submission: 64,
             opaque_memory_profile: "experimental-unqualified-normalization-activation-smoke-v2"
                 .into(),
         })

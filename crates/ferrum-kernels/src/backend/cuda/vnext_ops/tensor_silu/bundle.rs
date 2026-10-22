@@ -15,6 +15,7 @@ pub(super) struct RetainedFunctions {
     norm_functions: [CudaFunction; 3],
     rope_function: CudaFunction,
     attention_function: CudaFunction,
+    transport_functions: [CudaFunction; 2],
     _provider: CudaTensorProviderRetention,
 }
 
@@ -58,30 +59,42 @@ impl RetainedFunctions {
                 module.load_function(attention::FUNCTION).map_err(|error| {
                     CudaDeviceRuntimeError::driver("BF16 structured attention function load", error)
                 })?;
+            let load_transport = |kind: transport::Kind| {
+                module.load_function(kind.function()).map_err(|error| {
+                    CudaDeviceRuntimeError::driver("BF16 transport function load", error)
+                })
+            };
+            let transport = [
+                load_transport(transport::Kind::RowGather)?,
+                load_transport(transport::Kind::BatchedRowConcat)?,
+            ];
             Ok::<_, CudaDeviceRuntimeError>((
                 pointwise,
                 normalization,
                 rope_function,
                 attention_function,
+                transport,
             ))
         }));
-        let (functions, norm_functions, rope_function, attention_function) = match loaded {
-            Ok(Ok(functions)) => functions,
-            Ok(Err(error)) => {
-                // A partially failed load has not certified native cleanup.
-                std::mem::forget(provider);
-                return Err(error);
-            }
-            Err(payload) => {
-                std::mem::forget(provider);
-                resume_unwind(payload);
-            }
-        };
+        let (functions, norm_functions, rope_function, attention_function, transport_functions) =
+            match loaded {
+                Ok(Ok(functions)) => functions,
+                Ok(Err(error)) => {
+                    // A partially failed load has not certified native cleanup.
+                    std::mem::forget(provider);
+                    return Err(error);
+                }
+                Err(payload) => {
+                    std::mem::forget(provider);
+                    resume_unwind(payload);
+                }
+            };
         Ok(Arc::new(Self {
             functions,
             norm_functions,
             rope_function,
             attention_function,
+            transport_functions,
             _provider: provider,
         }))
     }
@@ -100,5 +113,9 @@ impl RetainedFunctions {
 
     pub(super) fn attention_function(&self) -> &CudaFunction {
         &self.attention_function
+    }
+
+    pub(super) fn transport_function(&self, kind: transport::Kind) -> &CudaFunction {
+        &self.transport_functions[kind.index()]
     }
 }

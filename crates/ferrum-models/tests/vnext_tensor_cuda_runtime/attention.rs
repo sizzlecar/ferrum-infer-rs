@@ -59,6 +59,7 @@ fn run_case(name: &str, config: AttentionConfig, inputs: [Vec<u16>; 3], expected
             stream_memory_bytes: 64 << 20,
             maximum_streams: 1,
             maximum_in_flight_per_stream: 1,
+            maximum_commands_per_submission: 64,
             opaque_memory_profile: "experimental-unqualified-attention-smoke-v1".into(),
         })
         .unwrap(),

@@ -38,6 +38,7 @@ mod norm;
 mod rope;
 mod selection;
 mod text_projection;
+mod transport;
 pub use attention::{
     NUMERICAL_IDENTITY as ATTENTION_NUMERICAL_IDENTITY,
     NUMERICAL_PROFILE_ID as ATTENTION_NUMERICAL_PROFILE_ID,
@@ -55,6 +56,10 @@ pub use selection::CudaTensorOperation;
 pub use text_projection::{
     GELU_TANH_PROFILE_ID, NUMERICAL_IDENTITY as TEXT_PROJECTION_NUMERICAL_IDENTITY,
     ZERO_CENTERED_RMS_NORM_PROFILE_ID,
+};
+pub use transport::{
+    BATCHED_ROW_CONCAT_PROFILE_ID, NUMERICAL_IDENTITY as TRANSPORT_NUMERICAL_IDENTITY,
+    ROW_GATHER_PROFILE_ID,
 };
 
 pub const NUMERICAL_PROFILE_ID: &str = "cuda.libdevice.precise.silu.bf16.v1";
@@ -212,6 +217,8 @@ pub(super) fn numerical_fingerprint() -> String {
         include_bytes!("tensor_silu/attention.rs"),
         include_bytes!("tensor_silu/selection.rs"),
         include_bytes!("tensor_silu/text_projection.rs"),
+        include_bytes!("tensor_silu/transport.rs"),
+        TRANSPORT_NUMERICAL_IDENTITY.as_bytes(),
         TEXT_PROJECTION_NUMERICAL_IDENTITY.as_bytes(),
         norm::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!(concat!(
