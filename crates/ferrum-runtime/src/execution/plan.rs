@@ -2199,11 +2199,18 @@ impl ExecutionPlan {
             .usable_capacity_bytes
             .checked_sub(self.payload.memory.static_bytes)
             .ok_or_else(|| invalid_plan("static memory exceeds usable capacity"))?;
-        let base_pools = MemoryPlan::derive_dynamic_pools_with_completion_retention(
+        let mut base_pools = MemoryPlan::derive_dynamic_pools_with_completion_retention(
             &self.payload.memory.dynamic_descriptors,
             &self.payload.nodes,
             dynamic_capacity_bytes,
             &retained_completion_resources,
+        )
+        .map_err(Self::memory_pool_validation_error)?;
+        MemoryPlan::preserve_legacy_invocation_layouts(
+            &mut base_pools,
+            &self.payload.memory.dynamic_pools,
+            &self.payload.memory.dynamic_descriptors,
+            dynamic_capacity_bytes,
         )
         .map_err(Self::memory_pool_validation_error)?;
         let expected_reusable_execution = self
@@ -2236,13 +2243,20 @@ impl ExecutionPlan {
                 self.payload.sequence_checkpoint_layout.as_ref(),
                 &self.payload.memory.dynamic_descriptors,
             )?;
-        let expected_pools = MemoryPlan::derive_dynamic_pools_with_checkpoint(
+        let mut expected_pools = MemoryPlan::derive_dynamic_pools_with_checkpoint(
             &self.payload.memory.dynamic_descriptors,
             &self.payload.nodes,
             dynamic_capacity_bytes,
             &reusable_workspace_ceilings,
             &retained_completion_resources,
             &checkpoint_growth_ceilings,
+        )
+        .map_err(Self::memory_pool_validation_error)?;
+        MemoryPlan::preserve_legacy_invocation_layouts(
+            &mut expected_pools,
+            &self.payload.memory.dynamic_pools,
+            &self.payload.memory.dynamic_descriptors,
+            dynamic_capacity_bytes,
         )
         .map_err(Self::memory_pool_validation_error)?;
         if self.payload.memory.dynamic_pools != expected_pools {

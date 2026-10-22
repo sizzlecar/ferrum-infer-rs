@@ -2424,14 +2424,28 @@ where
             return Ok(false);
         }
 
-        let mut concurrent_cursor = 0_u64;
-        let mut peak = 0_u64;
-        for row in rows {
-            let row_base = match mode {
-                InvocationLivenessMode::TotalOrderReuse => 0,
-                InvocationLivenessMode::ConservativeConcurrent => concurrent_cursor,
-                InvocationLivenessMode::NoInvocationResources => unreachable!(),
-            };
+        let row_bytes = rows
+            .iter()
+            .map(|row| {
+                row.resource_ids()
+                    .iter()
+                    .try_fold(0_u64, |total, resource_id| {
+                        let projection = projections.get(resource_id).ok_or_else(|| {
+                            invalid_resource("invocation wave projection is absent")
+                        })?;
+                        total
+                            .checked_add(projection.capacity_size_bytes)
+                            .ok_or_else(|| {
+                                invalid_resource("invocation wave row size overflows u64")
+                            })
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let physical_layout = mode.layout(
+            &rows.iter().map(|row| row.chain_slot()).collect::<Vec<_>>(),
+            &row_bytes,
+        )?;
+        for (row, row_base) in rows.iter().zip(physical_layout.row_offsets) {
             let mut row_cursor = 0_u64;
             for resource_id in row.resource_ids() {
                 let Some(projection) = projections.get(resource_id) else {
@@ -2447,19 +2461,8 @@ where
                     .checked_add(projection.capacity_size_bytes)
                     .ok_or_else(|| invalid_resource("invocation wave row size overflows u64"))?;
             }
-            peak = peak.max(row_cursor);
-            if mode == InvocationLivenessMode::ConservativeConcurrent {
-                concurrent_cursor = concurrent_cursor.checked_add(row_cursor).ok_or_else(|| {
-                    invalid_resource("concurrent invocation wave size overflows u64")
-                })?;
-            }
         }
-        Ok(request.capacity_size_bytes
-            == match mode {
-                InvocationLivenessMode::TotalOrderReuse => peak,
-                InvocationLivenessMode::ConservativeConcurrent => concurrent_cursor,
-                InvocationLivenessMode::NoInvocationResources => 0,
-            })
+        Ok(request.capacity_size_bytes == physical_layout.bytes)
     }
 
     pub(in crate::resource) fn view<'lease>(

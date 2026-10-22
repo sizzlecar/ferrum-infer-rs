@@ -307,8 +307,7 @@ pub(super) fn validate_pool_liveness_rows(
         ));
     }
     let mut covered = BTreeSet::new();
-    let mut maximum_row = 0_u64;
-    let mut concurrent_sum = 0_u64;
+    let mut sizes = Vec::with_capacity(rows.len());
     for row in rows {
         if row.resource_ids.is_empty() || row.resource_ids.windows(2).any(|pair| pair[0] >= pair[1])
         {
@@ -325,7 +324,11 @@ pub(super) fn validate_pool_liveness_rows(
                         "pool liveness references a non-member invocation resource",
                     ));
                 }
-                covered.insert(resource_id.clone());
+                if !covered.insert(resource_id.clone())
+                    && mode == InvocationLivenessMode::DependencyChainReuse
+                {
+                    return Err(invalid_plan("pool invocation liveness repeats a resource"));
+                }
                 total
                     .checked_add(
                         descriptors
@@ -335,21 +338,19 @@ pub(super) fn validate_pool_liveness_rows(
                     )
                     .ok_or_else(|| invalid_plan("pool invocation row bytes overflow u64"))
             })?;
-        maximum_row = maximum_row.max(row_bytes);
-        concurrent_sum = concurrent_sum
-            .checked_add(row_bytes)
-            .ok_or_else(|| invalid_plan("pool concurrent invocation bytes overflow u64"))?;
+        sizes.push(row_bytes);
     }
     if covered != *invocation_ids {
         return Err(invalid_plan(
             "pool liveness does not cover every invocation member",
         ));
     }
-    Ok(match mode {
-        InvocationLivenessMode::NoInvocationResources => unreachable!(),
-        InvocationLivenessMode::TotalOrderReuse => maximum_row,
-        InvocationLivenessMode::ConservativeConcurrent => concurrent_sum,
-    })
+    Ok(mode
+        .layout(
+            &rows.iter().map(|row| row.chain_slot).collect::<Vec<_>>(),
+            &sizes,
+        )?
+        .bytes)
 }
 
 pub(super) struct ValueAllocationAccumulator {

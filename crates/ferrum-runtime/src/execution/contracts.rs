@@ -345,6 +345,21 @@ impl PlanNode {
     }
 
     #[cfg(test)]
+    pub(crate) fn resource_test_node_with_scratch(
+        id: NodeId,
+        scratch_resource: ResourceId,
+        scratch: crate::ProviderWorkspaceRequirement,
+        dependencies: Vec<NodeId>,
+    ) -> Self {
+        let mut node = Self::resource_test_node(id);
+        node.dependencies = dependencies;
+        node.scratch_resource = Some(scratch_resource.clone());
+        node.resources = vec![scratch_resource];
+        node.provider_resources.scratch = Some(scratch);
+        node
+    }
+
+    #[cfg(test)]
     pub(crate) fn resource_test_node_with_binding(
         id: NodeId,
         binding_resource: ResourceId,

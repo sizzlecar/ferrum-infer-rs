@@ -10,7 +10,7 @@ use super::{
     DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
     DynamicPoolGrowthBatchReceipt, DynamicPoolMaintenanceController, DynamicPoolMaintenanceStatus,
     DynamicPoolSet, DynamicResourceShape, EvaluatedBackingProjection, EvaluatedBackingRequest,
-    ExecutionLane, ExecutionLaneCreationError, FailureEnvelope, InvocationLivenessMode,
+    ExecutionLane, ExecutionLaneCreationError, FailureEnvelope,
     LaneBackingPrepareDecision, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
     NoStatic, NodeId, Ordering, PhysicalBackingClaimIdentity, PlanHash, PlanId, PlanNode,
     ResourceAbandonSignal, ResourceActionCursor, ResourceDriverFailure,
@@ -1605,20 +1605,17 @@ where
                     "compiled reusable submission-wave projection count differs from its domain layout",
                 ));
             }
-            let mode = domain.pool.invocation_liveness_mode();
-
+            let immediate_layout = layout.physical_layout_for_shape(domain, immediate_shape)?;
+            let fit_pool_bytes = if fit_shape == immediate_shape {
+                immediate_layout.bytes
+            } else {
+                layout.physical_layout_for_shape(domain, fit_shape)?.bytes
+            };
+            let immediate_pool_bytes = immediate_layout.bytes;
+            let capacity_pool_bytes = reusable_capacity_layout
+                .map_or(immediate_layout.bytes, |layout| layout.physical_size_bytes);
             let mut projections = vec![None; layout.projection_count];
-            let mut immediate_pool_bytes = 0_u64;
-            let mut fit_pool_bytes = 0_u64;
-            let mut capacity_pool_bytes = 0_u64;
-            for row in &layout.rows {
-                let row_base = match mode {
-                    InvocationLivenessMode::TotalOrderReuse => 0,
-                    InvocationLivenessMode::ConservativeConcurrent => capacity_pool_bytes,
-                    InvocationLivenessMode::NoInvocationResources => unreachable!(),
-                };
-                let mut immediate_row_bytes = 0_u64;
-                let mut fit_row_bytes = 0_u64;
+            for (row, row_base) in layout.rows.iter().zip(immediate_layout.row_offsets) {
                 let mut capacity_row_bytes = 0_u64;
                 for projection_layout in &row.projections {
                     let descriptor = domain
@@ -1636,11 +1633,6 @@ where
                     }
                     let logical_size_bytes =
                         descriptor.evaluate_request_bytes_for_shape(immediate_shape)?;
-                    let fit_bytes = if fit_shape == immediate_shape {
-                        logical_size_bytes
-                    } else {
-                        descriptor.evaluate_request_bytes_for_shape(fit_shape)?
-                    };
                     let (physical_offset_bytes, capacity_size_bytes) =
                         match reusable_capacity_layout {
                             Some(capacity_layout) => {
@@ -1667,14 +1659,6 @@ where
                                 (physical_offset_bytes, logical_size_bytes)
                             }
                         };
-                    immediate_row_bytes = immediate_row_bytes
-                        .checked_add(logical_size_bytes)
-                        .ok_or_else(|| {
-                            invalid_resource("invocation wave row demand overflows u64")
-                        })?;
-                    fit_row_bytes = fit_row_bytes.checked_add(fit_bytes).ok_or_else(|| {
-                        invalid_resource("invocation wave fit row demand overflows u64")
-                    })?;
                     if reusable_capacity_layout.is_none() {
                         capacity_row_bytes = capacity_row_bytes
                             .checked_add(capacity_size_bytes)
@@ -1696,39 +1680,6 @@ where
                         ));
                     }
                 }
-                match mode {
-                    InvocationLivenessMode::TotalOrderReuse => {
-                        immediate_pool_bytes = immediate_pool_bytes.max(immediate_row_bytes);
-                        fit_pool_bytes = fit_pool_bytes.max(fit_row_bytes);
-                        if reusable_capacity_layout.is_none() {
-                            capacity_pool_bytes = capacity_pool_bytes.max(capacity_row_bytes);
-                        }
-                    }
-                    InvocationLivenessMode::ConservativeConcurrent => {
-                        immediate_pool_bytes = immediate_pool_bytes
-                            .checked_add(immediate_row_bytes)
-                            .ok_or_else(|| {
-                                invalid_resource("invocation wave pool demand overflows u64")
-                            })?;
-                        fit_pool_bytes =
-                            fit_pool_bytes.checked_add(fit_row_bytes).ok_or_else(|| {
-                                invalid_resource("invocation wave pool fit demand overflows u64")
-                            })?;
-                        if reusable_capacity_layout.is_none() {
-                            capacity_pool_bytes = capacity_pool_bytes
-                                .checked_add(capacity_row_bytes)
-                                .ok_or_else(|| {
-                                    invalid_resource(
-                                        "invocation wave capacity pool demand overflows u64",
-                                    )
-                                })?;
-                        }
-                    }
-                    InvocationLivenessMode::NoInvocationResources => unreachable!(),
-                }
-            }
-            if let Some(capacity_layout) = reusable_capacity_layout {
-                capacity_pool_bytes = capacity_layout.physical_size_bytes;
             }
             let projections = projections
                 .into_iter()

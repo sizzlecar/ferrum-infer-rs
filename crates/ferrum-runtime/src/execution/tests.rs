@@ -11,6 +11,9 @@ mod fixed_tensor_liveness;
 #[path = "completion_order_cache_tests.rs"]
 mod completion_order_cache;
 
+#[path = "invocation_chain_tests.rs"]
+mod invocation_chain;
+
 #[test]
 fn execution_plan_wire_limit_is_symmetric() {
     super::validation::validate_execution_plan_wire_size(
