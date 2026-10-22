@@ -5,6 +5,7 @@ mod admission;
 mod aggregation;
 mod decision_observation;
 mod diagnostics;
+mod groups;
 mod phase;
 mod risk;
 mod scenarios;
@@ -12,6 +13,7 @@ pub use admission::*;
 pub use aggregation::*;
 pub use decision_observation::*;
 pub use diagnostics::*;
+use groups::GroupView;
 pub use phase::{ContinuationPhase, PhaseBuilder, PrefillTarget};
 pub use risk::*;
 pub use scenarios::*;
@@ -169,158 +171,15 @@ pub struct GroupMember {
 /// The adapter appends actual invocation groups through a bounded builder.
 /// Split is at most prefill followed by decode; mixed is one invocation.
 pub struct PlanBuilder {
-    groups: [Vec<GroupMember>; 2],
+    work: Vec<CostWork>,
+    requests: Vec<usize>,
+    group_ends: [usize; 2],
     members: Vec<GroupMember>,
     group_count: usize,
     participant_limit: usize,
     query_limits: CostQueryLimits,
     execution: CostExecution,
     active: Option<Vec<bool>>,
-}
-
-impl PlanBuilder {
-    /// Reuse only storage within this simulation; every wave rebuilds its
-    /// members against the core's current, frozen active mask. Taking the
-    /// scratch out permits reading that mask while constructing the members.
-    pub(crate) fn with_members(
-        &mut self,
-        build: impl FnOnce(&mut Vec<GroupMember>, &mut Self) -> Result<(), Unsupported>,
-    ) -> Result<(), Unsupported> {
-        let mut members = std::mem::take(&mut self.members);
-        members.clear();
-        let result = build(&mut members, self);
-        members.clear();
-        self.members = members;
-        result
-    }
-
-    pub fn push_group(&mut self, members: &[GroupMember]) -> Result<(), Unsupported> {
-        self.push_matching(members, None)
-    }
-
-    /// Preserve input order while avoiding an intermediate split-group allocation.
-    pub(crate) fn push_group_kind(
-        &mut self,
-        members: &[GroupMember],
-        kind: AttemptWorkKind,
-    ) -> Result<(), Unsupported> {
-        self.push_matching(members, Some(kind))
-    }
-
-    /// The core freezes this mask before any group in the current wave executes.
-    pub(crate) fn active_mask(&self) -> Option<&[bool]> {
-        self.active.as_deref()
-    }
-
-    fn groups(&self) -> &[Vec<GroupMember>] {
-        &self.groups[..self.group_count]
-    }
-
-    #[cfg(test)]
-    pub(crate) fn groups_for_test(&self) -> &[Vec<GroupMember>] {
-        self.groups()
-    }
-
-    fn clear_groups(&mut self) {
-        for group in &mut self.groups {
-            group.clear();
-        }
-        self.group_count = 0;
-    }
-
-    fn push_matching(
-        &mut self,
-        members: &[GroupMember],
-        kind: Option<AttemptWorkKind>,
-    ) -> Result<(), Unsupported> {
-        let matches = |member: &&GroupMember| kind.is_none_or(|kind| member.work.kind == kind);
-        let count = match kind {
-            Some(_) => members.iter().filter(matches).count(),
-            None => members.len(),
-        };
-        // An absent split phase was already a no-op in push_group_kind,
-        // including after another accepted group or exhausted limits. Keep
-        // that boundary before all validations, unlike an empty push_group.
-        if kind.is_some() && count == 0 {
-            return Ok(());
-        }
-        if count == 0
-            || self.group_count >= 2
-            || !CostQuery::fits(count, self.query_limits)
-            || self
-                .groups()
-                .iter()
-                .map(Vec::len)
-                .sum::<usize>()
-                .checked_add(count)
-                .is_none_or(|count| count > self.participant_limit)
-        {
-            return Err(Unsupported::ParticipantBudget);
-        }
-        if self.execution == CostExecution::SingleInvocation && self.group_count != 0 {
-            return Err(Unsupported::InvalidPlan);
-        }
-        if self.execution == CostExecution::SequentialPrefillThenDecode {
-            let first_kind = kind.unwrap_or(members[0].work.kind);
-            if (kind.is_none() && members.iter().any(|member| member.work.kind != first_kind))
-                || self.groups().first().is_some_and(|group| {
-                    group[0].work.kind != AttemptWorkKind::Prefill
-                        || first_kind != AttemptWorkKind::Decode
-                })
-            {
-                return Err(Unsupported::InvalidPlan);
-            }
-        }
-        // This is a local fast path, not a participant/index bound. Large
-        // indices retain the original checks below, including when no active
-        // mask is present and validate_member will reject them only later.
-        let mut seen = 0usize;
-        for prior in self.groups().iter().flatten() {
-            if prior.request < usize::BITS as usize {
-                seen |= 1usize << prior.request;
-            }
-        }
-        for (position, member) in members.iter().enumerate() {
-            if !matches(&member) {
-                continue;
-            }
-            if self
-                .active
-                .as_ref()
-                .is_some_and(|active| !active.get(member.request).copied().unwrap_or(false))
-            {
-                return Err(Unsupported::WaitingResources);
-            }
-            let duplicate = if member.request < usize::BITS as usize {
-                let bit = 1usize << member.request;
-                let duplicate = seen & bit != 0;
-                seen |= bit;
-                duplicate
-            } else {
-                members[..position]
-                    .iter()
-                    .filter(matches)
-                    .any(|prior| prior.request == member.request)
-                    || self
-                        .groups()
-                        .iter()
-                        .flatten()
-                        .any(|prior| prior.request == member.request)
-            };
-            if duplicate {
-                return Err(Unsupported::InvalidPlan);
-            }
-        }
-        // Validate before appending: a rejected group cannot affect a later plan.
-        self.groups[self.group_count].reserve(count);
-        if count == members.len() {
-            self.groups[self.group_count].extend_from_slice(members);
-        } else {
-            self.groups[self.group_count].extend(members.iter().filter(matches).copied());
-        }
-        self.group_count += 1;
-        Ok(())
-    }
 }
 
 /// By default only the first round receives an action, followed by this same
@@ -372,11 +231,10 @@ pub trait TrajectoryAdapter<Action> {
 /// admission slot plan must also remain immutable: only completion of a request
 /// can change the active membership between waves.
 pub(crate) trait ReplayableTrajectory<Action>: TrajectoryAdapter<Action> {
-    fn replay_members(
-        &self,
-        members: &[GroupMember],
-        plan: &mut PlanBuilder,
-    ) -> Result<(), Unsupported>;
+    /// Read-only observation after canonical groups have passed the same core
+    /// validations and the cache guard has been released. Concrete production
+    /// adapters need no callback; paired tests use this to record exact work.
+    fn record_replay(&self, _plan: &PlanBuilder) {}
 }
 
 pub struct EvaluationInput<'a, Action, Adapter> {
@@ -809,7 +667,9 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
     let itl_limit = Duration::try_from_secs_f64(input.config.itl_ms / 1000.0)
         .map_err(|_| Unsupported::InvalidState)?;
     let mut plan = PlanBuilder {
-        groups: [Vec::new(), Vec::new()],
+        work: Vec::new(),
+        requests: Vec::new(),
+        group_ends: [0; 2],
         members: Vec::new(),
         group_count: 0,
         participant_limit: input.config.planning.max_participants,
@@ -817,7 +677,6 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
         execution: input.execution,
         active: None,
     };
-    let mut work = Vec::new();
     loop {
         budget.diagnostics.point(
             EvaluationPoint {
@@ -904,7 +763,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
             return Err(Unsupported::NoProgress);
         }
         let mut handles = [None; 2];
-        for (group_index, group) in plan.groups().iter().enumerate() {
+        for (group_index, group) in plan.groups().enumerate() {
             budget.diagnostics.point(
                 EvaluationPoint {
                     stage: EvaluationStage::Simulation,
@@ -922,16 +781,14 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 );
                 return Err(Unsupported::QueryBudget);
             }
-            for member in group {
-                validate_member(&requests, *member)?;
+            for member in group.iter() {
+                validate_member(&requests, member)?;
             }
-            work.clear();
-            work.extend(group.iter().map(|member| member.work));
             budget.queries += 1;
             budget.diagnostics.simulation_query(budget.queries);
             let prediction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let query = CostQuery {
-                    work: &work,
+                    work: group.work,
                     work_is_exact: true,
                     execution: CostExecution::SingleInvocation,
                 };
@@ -1048,7 +905,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 .checked_add(upper_service_time)
                 .ok_or(Unsupported::Arithmetic)?;
             clock_coupling.observe_elapsed(central, risk);
-            for member in group {
+            for member in group.iter() {
                 apply_member(
                     &mut requests[member.request],
                     member.work,

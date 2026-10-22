@@ -32,8 +32,8 @@ fn membership_word_accepts_wider_cohorts_without_reordering_work() {
         contents(&plan),
         vec![wave.iter().map(|m| (m.request, m.work)).collect::<Vec<_>>()]
     );
-    for member in &plan.groups()[0] {
-        validate_member(&requests, *member).unwrap();
+    for member in plan.group(0).unwrap().iter() {
+        validate_member(&requests, member).unwrap();
     }
     plan.clear_groups();
     plan.push_group(&wave[..1]).unwrap();
@@ -68,13 +68,13 @@ fn membership_word_preserves_unmasked_out_of_range_validation_boundary() {
             plan.push_group(&[item, item]),
             Err(Unsupported::InvalidPlan)
         );
-        assert!(plan.groups().is_empty());
+        assert!(plan.groups().len() == 0);
         plan.active = Some(vec![true]);
         assert_eq!(
             plan.push_group(&[item, item]),
             Err(Unsupported::WaitingResources)
         );
-        assert!(plan.groups().is_empty());
+        assert!(plan.groups().len() == 0);
     }
 }
 
@@ -123,7 +123,7 @@ fn membership_word_keeps_budget_kind_and_per_member_error_precedence() {
             plan.push_group(&[inactive, inactive]),
             Err(Unsupported::WaitingResources)
         );
-        assert!(plan.groups().is_empty());
+        assert!(plan.groups().len() == 0);
         plan.push_group(&[duplicate]).unwrap();
     }
 }

@@ -10,8 +10,7 @@ use cache::CacheHandle;
 #[cfg(test)]
 mod tests;
 
-pub(super) type ReplayMembers<'a> =
-    dyn Fn(&[GroupMember], &mut PlanBuilder) -> Result<(), Unsupported> + 'a;
+pub(super) type ReplayGroups<'a> = dyn Fn(&PlanBuilder) + 'a;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::joint_policy) enum TracePhase {
@@ -143,18 +142,18 @@ impl TraceStore {
             .filter(|wave| wave.phase == phase)
     }
 
-    fn publish(
+    fn publish<'g>(
         &mut self,
         candidate: usize,
         round: usize,
         phase: TracePhase,
-        groups: &[Vec<GroupMember>],
+        groups: impl ExactSizeIterator<Item = GroupView<'g>> + Clone,
         handles: [Option<CacheHandle>; 2],
         snapshot: &ConditionalSnapshot<'_>,
         now: Instant,
         replayed: bool,
     ) {
-        if groups.is_empty() || groups.len() > 2 || candidate >= self.actions.len() {
+        if groups.len() == 0 || groups.len() > 2 || candidate >= self.actions.len() {
             return;
         }
         if replayed
@@ -170,30 +169,25 @@ impl TraceStore {
         let mut cache = snapshot.cache.lock();
         // Publication never gives authority to an invalid/evicted handle, even
         // if this wave was valid before a later group replaced its cache entry.
-        for (group, handle) in groups.iter().zip(handles) {
+        for (group, handle) in groups.clone().zip(handles) {
             let Some(work) =
                 handle.and_then(|handle| cache.handle_work(handle, now, snapshot.rank))
             else {
                 return;
             };
-            if work.len() != group.len()
-                || work
-                    .iter()
-                    .zip(group)
-                    .any(|(work, member)| *work != member.work)
-            {
+            if work != group.work {
                 return;
             }
         }
-        let lengths = [groups[0].len(), groups.get(1).map_or(0, Vec::len)];
+        let mut lengths = groups.clone().map(GroupView::len);
+        let lengths = [lengths.next().unwrap_or(0), lengths.next().unwrap_or(0)];
         if let Some(old) = self.actions[candidate].waves.get_mut(round) {
             if old.phase == phase
                 && old.lengths == lengths
-                && old
-                    .requests
-                    .iter()
-                    .copied()
-                    .eq(groups.iter().flatten().map(|member| member.request))
+                && old.requests.iter().copied().eq(groups
+                    .clone()
+                    .flat_map(|group| group.iter())
+                    .map(|member| member.request))
             {
                 old.handles = handles;
                 return;
@@ -299,7 +293,12 @@ impl TraceStore {
         }
         // The temporary Vec is converted to a boxed exact-length payload.
         // This byte limit bounds retained memo storage, not allocator RSS.
-        requests.extend(groups.iter().flatten().map(|member| member.request));
+        requests.extend(
+            groups
+                .clone()
+                .flat_map(|group| group.iter())
+                .map(|member| member.request),
+        );
         snapshot.diagnostics.cache_bytes(cache.retained_bytes());
         self.actions[candidate].waves.push(WaveTrace {
             phase,
@@ -315,7 +314,7 @@ impl TraceStore {
 pub(in crate::joint_policy) struct TraceEvaluation<'a, 'snapshot> {
     store: &'a mut TraceStore,
     snapshot: &'a ConditionalSnapshot<'snapshot>,
-    replay: &'a ReplayMembers<'a>,
+    replay: &'a ReplayGroups<'a>,
     now: Instant,
 }
 
@@ -323,7 +322,7 @@ impl<'a, 'snapshot> TraceEvaluation<'a, 'snapshot> {
     pub(super) fn new(
         store: &'a mut TraceStore,
         snapshot: &'a ConditionalSnapshot<'snapshot>,
-        replay: &'a ReplayMembers<'a>,
+        replay: &'a ReplayGroups<'a>,
         now: Instant,
     ) -> Self {
         Self {
@@ -344,50 +343,47 @@ impl<'a, 'snapshot> TraceEvaluation<'a, 'snapshot> {
         let Some(wave) = self.store.wave(candidate, round, phase) else {
             return Ok(false);
         };
-        let mut replayed = false;
-        plan.with_members(|members, plan| {
-            let cache = self.snapshot.cache.lock();
-            for (index, length) in wave.lengths.iter().copied().enumerate() {
-                if length == 0 {
-                    continue;
-                }
-                if !wave.handles[index]
-                    .and_then(|handle| cache.handle_work(handle, self.now, self.snapshot.rank))
-                    .is_some_and(|work| work.len() == length)
-                {
-                    return Ok(());
-                }
+        let cache = self.snapshot.cache.lock();
+        // Validate every canonical handle before changing any logical group.
+        // A miss falls back for the whole wave, never after applying a prefix.
+        for (index, length) in wave.lengths.iter().copied().enumerate() {
+            if length == 0 {
+                continue;
             }
-            if members.try_reserve_exact(wave.requests.len()).is_err() {
-                return Ok(());
+            if !wave.handles[index]
+                .and_then(|handle| cache.handle_work(handle, self.now, self.snapshot.rank))
+                .is_some_and(|work| work.len() == length)
+            {
+                return Ok(false);
             }
-            let mut offset = 0;
-            for (index, length) in wave.lengths.iter().copied().enumerate() {
-                if length == 0 {
-                    continue;
-                }
-                let work = cache
-                    .handle_work(
-                        wave.handles[index].expect("validated trace handle"),
-                        self.now,
-                        self.snapshot.rank,
-                    )
-                    .expect("cache lock preserves validated entry");
-                members.extend(
-                    wave.requests[offset..offset + length]
-                        .iter()
-                        .copied()
-                        .zip(work.iter().copied())
-                        .map(|(request, work)| GroupMember { request, work }),
-                );
-                offset += length;
+        }
+        if !plan.try_reserve_members(wave.requests.len()) {
+            return Ok(false);
+        }
+        let mut offset = 0;
+        for (index, length) in wave.lengths.iter().copied().enumerate() {
+            if length == 0 {
+                continue;
             }
-            drop(cache);
-            (self.replay)(members, plan)?;
-            replayed = true;
-            Ok(())
-        })?;
-        Ok(replayed)
+            let work = cache
+                .handle_work(
+                    wave.handles[index].expect("validated trace handle"),
+                    self.now,
+                    self.snapshot.rank,
+                )
+                .expect("cache lock preserves validated entry");
+            plan.push_group_view(GroupView {
+                requests: &wave.requests[offset..offset + length],
+                work,
+            })?;
+            offset += length;
+        }
+        drop(cache);
+        // No adapter callback, scalar prediction or provider call runs with
+        // the cache guard held. Per-group prediction still occurs below in the
+        // original simulator, with its own query/time/TTL checks.
+        (self.replay)(plan);
+        Ok(true)
     }
 
     pub(in crate::joint_policy) fn predict(
@@ -407,12 +403,12 @@ impl<'a, 'snapshot> TraceEvaluation<'a, 'snapshot> {
         self.snapshot.predict_with_handle(query, now, handle)
     }
 
-    pub(in crate::joint_policy) fn publish(
+    pub(in crate::joint_policy) fn publish<'g>(
         &mut self,
         candidate: usize,
         round: usize,
         phase: TracePhase,
-        groups: &[Vec<GroupMember>],
+        groups: impl ExactSizeIterator<Item = GroupView<'g>> + Clone,
         handles: [Option<CacheHandle>; 2],
         replayed: bool,
     ) {

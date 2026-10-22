@@ -156,6 +156,7 @@ fn trace_handles_account_descriptor_capacity_indexes_reset_and_no_storage() {
     let harness = Harness::new(8, 128 * 1024);
     let snapshot = harness.snapshot();
     let groups = groups();
+    let recorded = recorded_groups(&groups);
     let handles = [
         Some(harness.insert(&[groups[0][0].work])),
         Some(harness.insert(&[groups[1][0].work])),
@@ -169,7 +170,7 @@ fn trace_handles_account_descriptor_capacity_indexes_reset_and_no_storage() {
             0,
             round,
             TracePhase::Continuation,
-            &groups,
+            recorded.groups(),
             handles,
             &snapshot,
             harness.now,
@@ -187,7 +188,7 @@ fn trace_handles_account_descriptor_capacity_indexes_reset_and_no_storage() {
         0,
         0,
         TracePhase::Continuation,
-        &groups,
+        recorded.groups(),
         handles,
         &snapshot,
         harness.now,
@@ -224,6 +225,7 @@ fn trace_handles_require_complete_handles_and_fallback_before_any_replay_append(
     let harness = Harness::new(2, 128 * 1024);
     let snapshot = harness.snapshot();
     let groups = groups();
+    let recorded = recorded_groups(&groups);
     let handles = [
         Some(harness.insert(&[groups[0][0].work])),
         Some(harness.insert(&[groups[1][0].work])),
@@ -235,7 +237,7 @@ fn trace_handles_require_complete_handles_and_fallback_before_any_replay_append(
         0,
         0,
         TracePhase::First,
-        &groups,
+        recorded.groups(),
         [handles[0], None],
         &snapshot,
         harness.now,
@@ -247,7 +249,7 @@ fn trace_handles_require_complete_handles_and_fallback_before_any_replay_append(
         0,
         0,
         TracePhase::First,
-        &groups,
+        recorded.groups(),
         handles,
         &snapshot,
         harness.now,
@@ -262,13 +264,13 @@ fn trace_handles_require_complete_handles_and_fallback_before_any_replay_append(
     replacement.context_tokens = 7;
     harness.insert(&[replacement]);
     let calls = Cell::new(0);
-    let replay = |members: &[GroupMember], plan: &mut PlanBuilder| {
+    let replay = |_plan: &PlanBuilder| {
         calls.set(calls.get() + 1);
-        plan.push_group_kind(members, AttemptWorkKind::Prefill)?;
-        plan.push_group_kind(members, AttemptWorkKind::Decode)
     };
     let mut plan = PlanBuilder {
-        groups: [Vec::new(), Vec::new()],
+        work: Vec::new(),
+        requests: Vec::new(),
+        group_ends: [0; 2],
         members: Vec::new(),
         group_count: 0,
         participant_limit: 2,
@@ -289,4 +291,22 @@ fn trace_handles_require_complete_handles_and_fallback_before_any_replay_append(
     );
     assert_eq!(harness.queries.load(Ordering::Relaxed), 0);
     assert_eq!(trace.store.charged_bytes, actual_bytes(trace.store));
+}
+
+fn recorded_groups(groups: &[Vec<GroupMember>]) -> PlanBuilder {
+    let mut plan = PlanBuilder {
+        work: Vec::new(),
+        requests: Vec::new(),
+        group_ends: [0; 2],
+        members: Vec::new(),
+        group_count: 0,
+        participant_limit: 2,
+        query_limits: CostQueryLimits::default(),
+        execution: CostExecution::SequentialPrefillThenDecode,
+        active: Some(vec![true; 2]),
+    };
+    for group in groups {
+        plan.push_group(group).unwrap();
+    }
+    plan
 }

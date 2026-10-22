@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod cache;
 use cache::ScenarioCache;
 mod trace;
-use trace::{ReplayMembers, TraceStore};
+use trace::{ReplayGroups, TraceStore};
 pub(super) use trace::{TraceEvaluation, TracePhase};
 
 #[cfg(test)]
@@ -106,15 +106,14 @@ impl SloPolicy {
         report: &mut ScenarioDiagnostics,
     ) -> Result<ScenarioEvaluation, Unsupported> {
         let adapter = input.adapter;
-        let replay =
-            |members: &[GroupMember], plan: &mut PlanBuilder| adapter.replay_members(members, plan);
+        let replay = |plan: &PlanBuilder| adapter.record_replay(plan);
         let eligible = input.horizon == EvaluationHorizon::ScenarioCompletion;
         Self::evaluate_scenarios_observed(
             input,
             assign,
             visit,
             report,
-            eligible.then_some(&replay as &ReplayMembers<'_>),
+            eligible.then_some(&replay as &ReplayGroups<'_>),
         )
     }
 
@@ -123,7 +122,7 @@ impl SloPolicy {
         assign: impl FnMut(ScenarioRank, &mut [SimulatedRequest]) -> Result<(), Unsupported>,
         visit: impl FnMut(ScenarioRank, &Comparison),
         report: &mut ScenarioDiagnostics,
-        replay: Option<&ReplayMembers<'_>>,
+        replay: Option<&ReplayGroups<'_>>,
     ) -> Result<ScenarioEvaluation, Unsupported> {
         let recorder = diagnostics::Recorder::new(input.config.planning.max_queries);
         let result = Self::evaluate_scenarios_recorded(input, assign, visit, &recorder, replay);
@@ -136,7 +135,7 @@ impl SloPolicy {
         mut assign: impl FnMut(ScenarioRank, &mut [SimulatedRequest]) -> Result<(), Unsupported>,
         mut visit: impl FnMut(ScenarioRank, &Comparison),
         diagnostics: &diagnostics::Recorder,
-        replay: Option<&ReplayMembers<'_>>,
+        replay: Option<&ReplayGroups<'_>>,
     ) -> Result<ScenarioEvaluation, Unsupported> {
         if input.requests.is_empty() {
             return Err(Unsupported::EmptyCohort);
@@ -161,7 +160,9 @@ impl SloPolicy {
             reason
         })?;
         let mut plan = PlanBuilder {
-            groups: [Vec::new(), Vec::new()],
+            work: Vec::new(),
+            requests: Vec::new(),
+            group_ends: [0; 2],
             members: Vec::new(),
             group_count: 0,
             participant_limit: input.config.planning.max_participants,
@@ -176,11 +177,11 @@ impl SloPolicy {
         input
             .adapter
             .plan(Some(input.static_action), input.requests, &mut plan)?;
-        let group = plan.groups().first().ok_or(Unsupported::NoProgress)?;
-        for member in group {
-            validate_member(input.requests, *member)?;
+        let group = plan.group(0).ok_or(Unsupported::NoProgress)?;
+        for member in group.iter() {
+            validate_member(input.requests, member)?;
         }
-        let work = group.iter().map(|member| member.work).collect::<Vec<_>>();
+        let work = group.work.to_vec();
         // Only the copied seed work is needed below. Do not retain its member
         // scratch alongside each rank's separate simulation builder.
         drop(plan);

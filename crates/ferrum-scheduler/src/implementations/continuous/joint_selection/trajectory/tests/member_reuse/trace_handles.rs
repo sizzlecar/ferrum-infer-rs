@@ -18,7 +18,7 @@ impl Counted<'_> {
         self.planned_groups
             .lock()
             .unwrap()
-            .extend(plan.groups_for_test().iter().map(|group| {
+            .extend(plan.groups_for_test().map(|group| {
                 group
                     .iter()
                     .map(|member| (member.request, member.work))
@@ -69,15 +69,9 @@ impl TrajectoryAdapter<FirstAction> for Counted<'_> {
 
 // Test-only counting wrapper delegates the exact same concrete sealed contract.
 impl ReplayableTrajectory<FirstAction> for Counted<'_> {
-    fn replay_members(
-        &self,
-        members: &[GroupMember],
-        plan: &mut PlanBuilder,
-    ) -> Result<(), Unsupported> {
+    fn record_replay(&self, plan: &PlanBuilder) {
         self.replayed.fetch_add(1, Ordering::Relaxed);
-        self.adapter.replay_members(members, plan)?;
         self.record(plan);
-        Ok(())
     }
 }
 

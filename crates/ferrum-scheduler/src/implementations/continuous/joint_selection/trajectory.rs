@@ -382,18 +382,7 @@ impl CohortTrajectory {
     }
 }
 
-impl ReplayableTrajectory<FirstAction> for CohortTrajectory {
-    fn replay_members(
-        &self,
-        members: &[GroupMember],
-        plan: &mut PlanBuilder,
-    ) -> Result<(), Unsupported> {
-        // Only successful geometry from this same immutable adapter, action,
-        // endpoint vector and wave can reach here. Keep all current builder
-        // limits and frozen active-mask checks at the original push boundary.
-        self.push(members, plan)
-    }
-}
+impl ReplayableTrajectory<FirstAction> for CohortTrajectory {}
 
 impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
     fn admission_slots(&self) -> Option<&AdmissionSlotPlan> {

@@ -1,12 +1,15 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod group_views;
 mod homogeneous;
 mod membership;
 
 fn builder(execution: CostExecution) -> PlanBuilder {
     PlanBuilder {
-        groups: [Vec::new(), Vec::new()],
+        work: Vec::new(),
+        requests: Vec::new(),
+        group_ends: [0; 2],
         members: Vec::new(),
         group_count: 0,
         participant_limit: 4,
@@ -24,7 +27,6 @@ fn member(request: usize, kind: AttemptWorkKind) -> GroupMember {
 
 fn contents(plan: &PlanBuilder) -> Vec<Vec<(usize, CostWork)>> {
     plan.groups()
-        .iter()
         .map(|group| group.iter().map(|m| (m.request, m.work)).collect())
         .collect()
 }
@@ -65,7 +67,7 @@ fn reused_members_discard_failed_builds_without_rolling_back_accepted_groups() {
         }),
         Err(Unsupported::NoProgress)
     );
-    assert!(plan.groups().is_empty());
+    assert!(plan.groups().len() == 0);
     plan.with_members(|members, plan| {
         assert!(members.is_empty());
         members.push(decode);
@@ -107,7 +109,7 @@ fn filtered_groups_preserve_order_and_discard_prior_wave_members() {
     filtered
         .push_group_kind(&members[..1], AttemptWorkKind::Prefill)
         .unwrap();
-    assert!(filtered.groups().is_empty());
+    assert!(filtered.groups().len() == 0);
     filtered
         .push_group_kind(&members[..1], AttemptWorkKind::Decode)
         .unwrap();
