@@ -51,7 +51,7 @@ fn write_archive(
     Arc::new(SafetensorsArchive::open(path).unwrap())
 }
 
-fn tokenizer() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+pub(super) fn tokenizer() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let vocabulary = [
         "[UNK]",
         "system",

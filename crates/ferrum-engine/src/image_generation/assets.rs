@@ -1,4 +1,5 @@
 //! Device-free preparation of explicitly supplied metadata and mapped sources.
+mod directory;
 use super::*;
 use ferrum_models::qwen3_vl_text::{Qwen3VLTextKeyRun, Qwen3VLTextLayout};
 use ferrum_models::qwen_image21::ExpectedWeights;

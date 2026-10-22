@@ -2,6 +2,7 @@ use super::*;
 
 mod adapter;
 mod decoder;
+mod directory;
 mod fixture;
 mod ownership;
 mod preflight;

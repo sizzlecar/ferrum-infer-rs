@@ -16,6 +16,9 @@ use safetensors::{Dtype, SafeTensors};
 const MAX_DENSE_TRANSCODE_WORKERS: usize = 8;
 const PARALLEL_DENSE_TRANSCODE_MIN_ELEMENTS: usize = 256 * 1024;
 
+mod standard;
+pub use standard::SafetensorsNaming;
+
 #[derive(Debug, Clone)]
 struct TensorMeta {
     shard: usize,
@@ -689,7 +692,15 @@ fn discover_shards(model_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
 fn discover_index_shards(model_dir: &Path, index_path: &Path) -> Result<Vec<(String, PathBuf)>> {
     let raw = std::fs::read_to_string(&index_path)
         .map_err(|error| FerrumError::io(format!("read {index_path:?}: {error}")))?;
-    let value: serde_json::Value = serde_json::from_str(&raw)
+    index_shards_from_bytes(model_dir, index_path, raw.as_bytes())
+}
+
+fn index_shards_from_bytes(
+    model_dir: &Path,
+    index_path: &Path,
+    raw: &[u8],
+) -> Result<Vec<(String, PathBuf)>> {
+    let value: serde_json::Value = serde_json::from_slice(raw)
         .map_err(|error| FerrumError::serialization(format!("parse {index_path:?}: {error}")))?;
     let weight_map = value
         .get("weight_map")
