@@ -10,6 +10,8 @@ use ferrum_execution::{
 use ferrum_scheduler::cost_prediction::*;
 use ferrum_types::RequestId;
 
+mod saved_model_planning;
+
 fn config() -> LearningConfig {
     LearningConfig {
         training_samples: 4,
