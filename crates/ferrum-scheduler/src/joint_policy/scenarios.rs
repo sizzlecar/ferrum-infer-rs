@@ -40,6 +40,15 @@ pub struct ScenarioRank {
 }
 
 impl SloPolicy {
+    /// Fixed TLS capture for the existing ignored diagnostic only. Absent from
+    /// normal builds; its accounting overhead is not a performance baseline.
+    #[cfg(test)]
+    pub(crate) fn capture_cache_accounting<T>(
+        body: impl FnOnce() -> T,
+    ) -> (T, cache::accounting::Capture) {
+        cache::accounting::capture(body)
+    }
+
     /// Visit one rank at a time without retaining rank × candidate × cohort
     /// copies. A single global query/time budget covers seed and every rank.
     /// Shared residual rank is a sensitivity assumption, not joint calibration

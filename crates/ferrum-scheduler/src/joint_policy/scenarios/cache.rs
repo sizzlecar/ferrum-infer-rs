@@ -11,6 +11,8 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
+pub(super) mod accounting;
+#[cfg(test)]
 mod tests;
 
 static NEXT_HANDLE_OWNER: AtomicU64 = AtomicU64::new(1);
@@ -114,6 +116,8 @@ pub(super) struct ScenarioCache {
     hash_lookups: usize,
     #[cfg(test)]
     handle_hits: usize,
+    #[cfg(test)]
+    accounting: Option<accounting::Counters>,
 }
 
 impl ScenarioCache {
@@ -156,6 +160,8 @@ impl ScenarioCache {
             hash_lookups: 0,
             #[cfg(test)]
             handle_hits: 0,
+            #[cfg(test)]
+            accounting: accounting::Counters::new(),
         }
     }
 
@@ -439,18 +445,22 @@ impl ScenarioCache {
         // this exact key before considering empties, so an interleaved insert
         // cannot create two copies with different distributions. A third
         // colliding key deterministically replaces its primary slot.
-        let slot = self
-            .probe_slots(key.slot)
-            .find(|slot| {
-                self.slots[*slot]
-                    .as_ref()
-                    .is_some_and(|entry| entry.matches(&query))
-            })
+        let matching_slot = self.probe_slots(key.slot).find(|slot| {
+            self.slots[*slot]
+                .as_ref()
+                .is_some_and(|entry| entry.matches(&query))
+        });
+        let slot = matching_slot
             .or_else(|| {
                 self.probe_slots(key.slot)
                     .find(|slot| self.slots[*slot].is_none())
             })
             .unwrap_or(key.slot);
+        #[cfg(test)]
+        if let Some(accounting) = &mut self.accounting {
+            accounting.counts.known_insert_attempts =
+                accounting.counts.known_insert_attempts.saturating_add(1);
+        }
         let previous = self.slots[slot].as_ref().map_or(0, Entry::payload_bytes);
         let Some(bytes) = query
             .work
@@ -464,10 +474,55 @@ impl ScenarioCache {
             })
             .and_then(|new| self.retained_bytes.checked_sub(previous)?.checked_add(new))
         else {
+            #[cfg(test)]
+            if let Some(accounting) = &mut self.accounting {
+                accounting.counts.arithmetic_rejections =
+                    accounting.counts.arithmetic_rejections.saturating_add(1);
+            }
             return None;
         };
         if bytes > self.max_bytes {
+            #[cfg(test)]
+            {
+                let before = self.accounting_bytes();
+                if let Some(accounting) = &mut self.accounting {
+                    let rejected = accounting::RejectedInsertion {
+                        before,
+                        victim_payload_bytes: previous,
+                        proposed_retained_bytes: bytes,
+                    };
+                    accounting.counts.byte_limit_rejections =
+                        accounting.counts.byte_limit_rejections.saturating_add(1);
+                    accounting
+                        .counts
+                        .first_byte_rejection
+                        .get_or_insert(rejected);
+                    accounting.counts.last_byte_rejection = Some(rejected);
+                }
+            }
             return None;
+        }
+        #[cfg(test)]
+        if let Some(accounting) = &mut self.accounting {
+            let (old_work, old_times) = self.slots[slot].as_ref().map_or((0, 0), |entry| {
+                (
+                    std::mem::size_of_val(entry.work.as_ref()),
+                    std::mem::size_of_val(entry.service_times.as_ref()),
+                )
+            });
+            let count = if self.slots[slot].is_none() {
+                accounting.counts.occupied_slots += 1;
+                &mut accounting.counts.empty_insertions
+            } else if matching_slot.is_some() {
+                &mut accounting.counts.exact_key_replacements
+            } else {
+                &mut accounting.counts.collision_replacements
+            };
+            *count = count.saturating_add(1);
+            accounting.work_payload =
+                accounting.work_payload - old_work + std::mem::size_of_val(query.work);
+            accounting.service_time_payload = accounting.service_time_payload - old_times
+                + scenarios.len() * std::mem::size_of::<Duration>();
         }
         // Release a colliding payload before allocating its replacement key.
         self.slots[slot] = None;

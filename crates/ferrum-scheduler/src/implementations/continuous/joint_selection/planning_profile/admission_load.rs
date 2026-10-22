@@ -354,7 +354,9 @@ fn run() -> Result<Value, String> {
     };
     let mut observed = scheduler.observe_planning_round(Some(round));
     let started = Instant::now();
-    scheduler.prepare_joint_admission_gate(&hint, observed.as_mut().unwrap(), started);
+    let ((), cache_accounting) = SloPolicy::capture_cache_accounting(|| {
+        scheduler.prepare_joint_admission_gate(&hint, observed.as_mut().unwrap(), started);
+    });
     let gate_elapsed = started.elapsed();
     let round = observed.finish().ok_or("lost planning round")?;
     let with_health_merge = started.elapsed();
@@ -371,6 +373,8 @@ fn run() -> Result<Value, String> {
             "costs":"same CheapKnownCosts as existing 16-member CPU profile; 1ms central, 1000+rank microseconds, shared residual ranks",
             "capacity":"synthetic original-owner complete 48-member envelope, only 16 concurrent slots; no physical allocator or device work",
             "entrypoint":"public submit, original token-admission receipts for first16, public prepare_joint_admission_gate; current automatic actions and same-budget fresh recheck retained"},
+        "cache_accounting": cache_accounting,
+        "cache_accounting_scope": "test-only TLS opt-in for this one gate; fixed two reports plus explicit overflow. The cache-teardown report is the last retained-allocation ledger (trace may already be freed by local drop order); first/last byte-rejection snapshots are current ledger values. Neither is allocator RSS or a simultaneous peak. Counts add overhead, so this instrumented call is mechanism evidence, not a timing baseline. No extra prediction, comparison, request or cache traversal.",
         "gate_elapsed":gate_elapsed, "gate_and_health_merge_elapsed":with_health_merge,
         "original_provider_calls":calls,
         "conditional_stopping_calls":source.stopping.load(Ordering::Relaxed),

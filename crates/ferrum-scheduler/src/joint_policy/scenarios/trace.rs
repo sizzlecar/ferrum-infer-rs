@@ -3,6 +3,8 @@
 //! clocks, risks, cached errors or independently retained prediction payloads.
 
 use super::*;
+#[cfg(test)]
+use cache::accounting::TraceClearReason;
 use cache::CacheHandle;
 
 #[cfg(test)]
@@ -38,6 +40,11 @@ struct WaveTrace {
     handles: [Option<CacheHandle>; 2],
     lengths: [usize; 2],
     requests: Box<[usize]>,
+}
+
+#[cfg(test)]
+pub(super) fn wave_trace_size() -> usize {
+    std::mem::size_of::<WaveTrace>()
 }
 
 #[derive(Default)]
@@ -90,6 +97,8 @@ impl TraceStore {
             return true;
         }
         let mut cache = cache.lock();
+        #[cfg(test)]
+        cache.note_trace_clear(TraceClearReason::EndpointOrActionChange);
         self.clear(&mut cache);
         let bytes = requests
             .len()
@@ -113,6 +122,8 @@ impl TraceStore {
                     diagnostics.cache_bytes(cache.retained_bytes());
                 }
             }
+            #[cfg(test)]
+            cache.note_trace_clear(TraceClearReason::PreparationFailure);
             self.clear(&mut cache);
             return false;
         }
@@ -241,22 +252,29 @@ impl TraceStore {
         }
         // Charge actual retained descriptor capacity, including allocator
         // rounding beyond the requested one-slot growth. If it cannot fit,
-        // release this action's trace rather than leave unaccounted storage.
+        // release all trace storage rather than leave unaccounted capacity. This
+        // is a guarded optimization fallback, not an evaluation failure.
         let Some(actual_descriptors) = waves
             .capacity()
             .checked_sub(old_capacity)
             .and_then(|growth| growth.checked_mul(std::mem::size_of::<WaveTrace>()))
             .and_then(|growth| current.checked_add(growth))
         else {
+            #[cfg(test)]
+            cache.note_trace_clear(TraceClearReason::DescriptorArithmetic);
             self.clear(&mut cache);
             return;
         };
         self.charged_bytes = actual_descriptors;
         let Some(actual) = actual_descriptors.checked_add(index_bytes) else {
+            #[cfg(test)]
+            cache.note_trace_clear(TraceClearReason::IndexArithmetic);
             self.clear(&mut cache);
             return;
         };
         if !cache.set_trace_bytes(actual) {
+            #[cfg(test)]
+            cache.note_trace_clear(TraceClearReason::ActualDescriptorCapacityRefused);
             self.clear(&mut cache);
             return;
         }

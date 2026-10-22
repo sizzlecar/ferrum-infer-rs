@@ -1,6 +1,7 @@
 use super::*;
 use ferrum_execution::{execution_attempt::AttemptWorkKind, token_execution::ExecutionRange};
 
+mod accounting;
 mod compact_payload;
 mod ordinal_hints;
 mod trace_handles;
