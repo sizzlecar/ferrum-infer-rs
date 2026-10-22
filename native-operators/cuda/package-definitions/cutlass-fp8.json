@@ -21,8 +21,8 @@
     "ferrum_cutlass_fp8_validate_v1"
   ],
   "license_files": [
-    {"source_path": "LICENSE", "output_path": "licenses/Ferrum-MIT.txt"},
-    {"source_path": "native-operators/cuda/cutlass-fp8/CUTLASS-BSD-3-Clause.txt", "output_path": "licenses/CUTLASS-BSD-3-Clause.txt"}
+    {"source_path": "native-operators/cuda/cutlass-fp8/CUTLASS-BSD-3-Clause.txt", "output_path": "licenses/CUTLASS-BSD-3-Clause.txt"},
+    {"source_path": "LICENSE", "output_path": "licenses/Ferrum-MIT.txt"}
   ],
   "cuda_toolkit": "12.8",
   "cuda_runtime_min": "12.8",
