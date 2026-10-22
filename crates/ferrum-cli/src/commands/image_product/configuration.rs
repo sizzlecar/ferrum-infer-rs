@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 pub struct ImageProductConfig {
     /// Public identity only; it does not select a model implementation.
     pub model: String,
-    /// Explicit acknowledgement of the current cold, serial functional path.
+    /// Explicit selection of a cold functional execution mode, not G3 qualification.
     pub execution_profile: ImageExecutionProfile,
     pub metadata: MetadataPaths,
     pub weights: WeightPaths,
@@ -17,10 +17,19 @@ pub struct ImageProductConfig {
     pub serving: Option<ServingConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageExecutionProfile {
     ExperimentalSerialCold,
+    ExperimentalBatchedCold,
+}
+impl ImageExecutionProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExperimentalSerialCold => "experimental_serial_cold",
+            Self::ExperimentalBatchedCold => "experimental_batched_cold",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,8 +48,8 @@ pub struct ServingConfig {
 impl ServingConfig {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.max_num_seqs == 1,
-            "experimental_serial_cold supports max_num_seqs=1; a queue is not a concurrent batch"
+            (1..=ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&self.max_num_seqs),
+            "max_num_seqs exceeds supported image batch capacity"
         );
         ensure!(
             self.maximum_pending > 0 && (1..=1024 * 1024).contains(&self.maximum_prompt_bytes),
@@ -154,9 +163,14 @@ pub struct PipelineConfig {
     pub maximum_user_tokens: usize,
     pub maximum_width: u32,
     pub maximum_height: u32,
+    #[serde(default = "default_maximum_batch_size")]
+    pub maximum_batch_size: usize,
     pub maximum_staging_bytes: u64,
     pub maximum_initialization_commands: usize,
     pub maximum_backing_maintenance_passes: usize,
+}
+fn default_maximum_batch_size() -> usize {
+    ferrum_engine::image_generation::ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE
 }
 impl PipelineConfig {
     pub fn resolved(&self) -> Result<ferrum_engine::image_generation::ImagePipelineConfig> {
@@ -168,11 +182,17 @@ impl PipelineConfig {
             (1..=8192).contains(&self.maximum_user_tokens),
             "image user-token limit must be 1..=8192"
         );
+        ensure!(
+            (1..=ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH)
+                .contains(&self.maximum_batch_size),
+            "pipeline maximum_batch_size exceeds supported attention layout capacity"
+        );
         Ok(ferrum_engine::image_generation::ImagePipelineConfig {
             device_capacity_bytes: self.device_capacity_bytes,
             maximum_user_tokens: self.maximum_user_tokens,
             maximum_width: self.maximum_width,
             maximum_height: self.maximum_height,
+            maximum_batch_size: self.maximum_batch_size,
             static_initialization: StaticInitializationPolicy::new(
                 self.maximum_staging_bytes,
                 self.maximum_initialization_commands,
@@ -209,7 +229,31 @@ impl ImageProductConfig {
         if let Some(serving) = &config.serving {
             serving.validate()?;
         }
+        config.validate_execution_profile()?;
         Ok(config)
+    }
+    fn validate_execution_profile(&self) -> Result<()> {
+        let ImageBackendConfig::Cuda(cuda) = &self.backend;
+        if self.execution_profile == ImageExecutionProfile::ExperimentalSerialCold {
+            ensure!(
+                cuda.pipeline.maximum_batch_size == 1,
+                "experimental_serial_cold requires pipeline maximum_batch_size=1"
+            );
+        }
+        if let Some(serving) = &self.serving {
+            ensure!(
+                serving.max_num_seqs <= cuda.pipeline.maximum_batch_size,
+                "serving max_num_seqs exceeds configured pipeline maximum_batch_size"
+            );
+            ensure!(
+                serving
+                    .max_num_seqs
+                    .checked_mul(serving.maximum_prompt_bytes)
+                    .is_some_and(|bytes| bytes <= 1024 * 1024),
+                "combined image batch prompt bound exceeds the T2I tokenizer's 1 MiB limit"
+            );
+        }
+        Ok(())
     }
     fn resolve_paths(&mut self, base: &Path) {
         for path in [

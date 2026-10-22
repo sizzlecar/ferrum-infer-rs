@@ -9,12 +9,28 @@ ferrum run --image-config image.json --prompt "A red kite above the sea" --width
 ferrum serve --image-config image.json --host 127.0.0.1 --port 8000
 ```
 
-The current required profile is `experimental_serial_cold`. It recompiles and
-reloads component weights for each request and executes one request at a time.
-It qualifies functional integration only; it is not the final concurrent serving
-architecture or evidence of throughput parity. `max_num_seqs` must be `1`.
-Pending HTTP requests can queue, but the queue does not execute them as a batch.
-The independent request field `n=1` selects one returned image per request.
+Choose one explicit experimental profile:
+
+- `experimental_serial_cold` retains one request per execution. Its pipeline
+  `maximum_batch_size` and serving `max_num_seqs` must both be `1`.
+- `experimental_batched_cold` enables compatible requests to share one real
+  TE/DiT/VAE forward per stage and denoise step. Set pipeline
+  `maximum_batch_size` explicitly and keep serving `max_num_seqs` at or below it.
+  The implementation ceiling is `STRUCTURED_ATTENTION_BF16_MAX_BATCH` (currently
+  16). Larger or mixed-size batches are rejected, not serialized into fake batches.
+
+The pipeline maximum defaults to `1` when omitted. The service collects compatible
+FIFO requests up to `max_num_seqs`, bounded by `request_batch_max_wait_ms`.
+The configured `max_num_seqs * maximum_prompt_bytes` must fit the T2I tokenizer's
+1 MiB combined raw-prompt bound, so individually admitted requests can compose.
+The independent request field `n=1` still selects one returned image per request;
+it does not restrict the number of requests in a batch.
+
+Both profiles recompile and reload component weights for each batch. The batched
+profile is experimental and unqualified until actual GPU tests establish its
+functional scope; neither profile establishes G3 readiness or throughput parity.
+Actual Host/device admission still decides whether a requested batch fits. There
+is no cross-batch component residency in this implementation.
 
 The HTTP path is `POST /v1/images/generations` with `model`, `prompt`, optional
 `size` (`WIDTHxHEIGHT`), `seed`, `n=1` and `response_format="b64_json"`.
@@ -84,6 +100,7 @@ Metadata may live separately from the checkpoint directories.
       "maximum_user_tokens": 1024,
       "maximum_width": 512,
       "maximum_height": 512,
+      "maximum_batch_size": 1,
       "maximum_staging_bytes": 16777216,
       "maximum_initialization_commands": 64,
       "maximum_backing_maintenance_passes": 8
@@ -112,3 +129,12 @@ fields omitted inside `serving.output` use the shared typed `OutputConfig`
 defaults. The account must cover the source RGBA, conversion buffers and encoded
 HTTP body while they coexist. Dimension divisibility and real plan admission
 remain enforced; dimensions are never rounded to fit a model.
+
+For an explicit B2 functional experiment, change `execution_profile` to
+`experimental_batched_cold`, `backend.pipeline.maximum_batch_size` to `2`,
+`serving.max_num_seqs` to `2`, and choose a finite
+`serving.request_batch_max_wait_ms` (for example 25). Keep two simultaneous
+requests at the same dimensions with independently selected seeds. This enables
+the batched path but does not guarantee every arrival is batched, that existing
+memory limits fit it, or that a latency/throughput objective is met. `run` remains
+a one-request invocation even when its configuration permits a larger batch.

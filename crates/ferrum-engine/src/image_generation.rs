@@ -1,17 +1,18 @@
-//! Serial, single-image Qwen-Image 2.1 generation on injected runtime owners.
+//! Cold Qwen-Image 2.1 request batches on injected runtime owners.
 //!
 //! This cold BF16 path qualifies G2 functionality. It is not the G3 serving
-//! architecture: it recompiles/reloads stages for every request. Throughput
-//! qualification additionally requires compatible request batching and retained
-//! component sessions with explicit residency/offload policies. Queuing several
-//! calls to this single-image path does not provide parallel image generation.
+//! architecture: it recompiles/reloads stages for every batch. Compatible
+//! requests share real batched component forwards within that batch. Throughput
+//! qualification additionally requires retained component sessions, explicit
+//! residency/offload policies and measurements; configuring a batch limit is
+//! not evidence that a particular workload fits or meets throughput targets.
 //!
 //! Metadata preparation is separate from backend construction. The pipeline
 //! never constructs a runtime or Host account, launches a helper process, or
 //! exchanges tensor payloads through files. All four component plans compile
 //! before the first upload. Each stage must close successfully before the next
 //! begins; a stage failure returns the original recovery owner and stops this
-//! pipeline instance. This first path has no CFG, image editing, video, batching,
+//! pipeline instance. This first path has no CFG, image editing or video,
 //! device-resident denoise cache, or claim of Torch parity/performance parity.
 //! Host claims cover managed tensor payloads and static transfer staging, not
 //! tokenizer/metadata containers, mapped checkpoints, or total process RSS.
@@ -74,10 +75,15 @@ pub struct ImagePipelineConfig {
     pub maximum_user_tokens: usize,
     pub maximum_width: u32,
     pub maximum_height: u32,
+    /// Admission ceiling for one real request batch. Product configuration
+    /// defaults to one; larger cold batches require explicit opt-in.
+    pub maximum_batch_size: usize,
     pub static_initialization: StaticInitializationPolicy,
     pub executor: TensorExecutorConfig,
 }
 impl ImagePipelineConfig {
+    pub const DEFAULT_MAXIMUM_BATCH_SIZE: usize = 1;
+
     fn validate(&self) -> anyhow::Result<()> {
         ensure!(
             self.device_capacity_bytes > 0 && self.maximum_width > 0 && self.maximum_height > 0,
@@ -86,6 +92,10 @@ impl ImagePipelineConfig {
         ensure!(
             (1..=8192).contains(&self.maximum_user_tokens),
             "user-token limit must be 1..=8192"
+        );
+        ensure!(
+            (1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&self.maximum_batch_size),
+            "image maximum_batch_size exceeds the supported attention layout capacity"
         );
         Ok(())
     }

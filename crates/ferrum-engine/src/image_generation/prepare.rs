@@ -111,9 +111,10 @@ pub(super) fn batch_dimensions(
     config: &ImagePipelineConfig,
     scale: u32,
 ) -> anyhow::Result<(u32, u32)> {
+    config.validate()?;
     ensure!(
-        (1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&requests.len()),
-        "image request batch exceeds the declared attention layout capacity"
+        (1..=config.maximum_batch_size).contains(&requests.len()),
+        "image request batch exceeds configured maximum_batch_size"
     );
     let first = requests[0].latent_dimensions(config, scale)?;
     for request in &requests[1..] {

@@ -345,6 +345,7 @@ mod tests {
                 maximum_user_tokens: 1024,
                 maximum_width: 512,
                 maximum_height: 512,
+                maximum_batch_size: ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE,
                 static_initialization: StaticInitializationPolicy::new(1024, 32).unwrap(),
                 executor: TensorExecutorConfig::default(),
             },

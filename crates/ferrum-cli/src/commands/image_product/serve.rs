@@ -82,8 +82,8 @@ pub async fn execute_serve(
             port,
             ..Default::default()
         };
-        tracing::warn!(profile="experimental_serial_cold", max_num_seqs=1,
-            "image HTTP uses cold serial generation; pending requests are queued, not concurrently generated");
+        tracing::warn!(profile=config.execution_profile.as_str(), max_num_seqs=serving.max_num_seqs,
+            "image HTTP uses configured cold batches; no cross-batch residency or G3 throughput qualification");
         let mut task = {
             let server = server.clone();
             tokio::spawn(async move { server.start(&server_config).await })

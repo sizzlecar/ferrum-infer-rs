@@ -41,8 +41,8 @@ pub fn execute_run(
         let assets = config.prepare_assets()?;
         let mut pipeline = Box::new(cuda.create_pipeline(assets)?);
         tracing::warn!(
-            profile = "experimental_serial_cold",
-            "image path reloads component weights per request; no concurrent throughput claim"
+            profile = config.execution_profile.as_str(),
+            "image run reloads component weights; no throughput qualification"
         );
         let output = match pipeline.generate(ImageGenerationRequest {
             prompt,
@@ -85,7 +85,7 @@ pub fn execute_run(
             "{}",
             serde_json::to_string(&serde_json::json!({
                 "model": config.model,
-                "execution_profile": "experimental_serial_cold",
+                "execution_profile": config.execution_profile.as_str(),
                 "output": destination,
                 "png": {"width": png.dimensions().width(), "height": png.dimensions().height(),
                     "encoded_bytes": png.encoded_bytes(), "color_type": "rgba8"},

@@ -1,5 +1,6 @@
 use super::*;
 
+mod adapter;
 mod fixture;
 mod ownership;
 mod preflight;
@@ -10,6 +11,7 @@ fn config() -> ImagePipelineConfig {
         maximum_user_tokens: 512,
         maximum_width: 1024,
         maximum_height: 1024,
+        maximum_batch_size: ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE,
         static_initialization: StaticInitializationPolicy::new(256, 8).unwrap(),
         executor: TensorExecutorConfig::default(),
     }
@@ -27,23 +29,25 @@ fn request() -> ImageGenerationRequest {
 
 #[test]
 fn compatible_request_batches_keep_independent_prompts_and_seeds_and_reject_mixed_shapes() {
+    let mut config = config();
+    config.maximum_batch_size = 2;
     let a = request();
     let mut b = a.clone();
     b.prompt = "a different yellow cup".into();
     b.seed = 42 ^ (1_u64 << 40);
     assert_eq!(
-        prepare::batch_dimensions(&[a.clone(), b.clone()], &config(), 16).unwrap(),
+        prepare::batch_dimensions(&[a.clone(), b.clone()], &config, 16).unwrap(),
         (48, 32)
     );
-    assert!(prepare::batch_dimensions(&[], &config(), 16).is_err());
+    assert!(prepare::batch_dimensions(&[], &config, 16).is_err());
     b.width = 1024;
-    assert!(prepare::batch_dimensions(&[a.clone(), b.clone()], &config(), 16).is_err());
+    assert!(prepare::batch_dimensions(&[a.clone(), b.clone()], &config, 16).is_err());
     b.width = a.width;
     b.n = 2;
-    assert!(prepare::batch_dimensions(&[a.clone(), b], &config(), 16).is_err());
+    assert!(prepare::batch_dimensions(&[a.clone(), b], &config, 16).is_err());
     assert!(prepare::batch_dimensions(
         &vec![a; STRUCTURED_ATTENTION_BF16_MAX_BATCH + 1],
-        &config(),
+        &config,
         16
     )
     .is_err());
@@ -95,6 +99,16 @@ fn request_dimensions_are_exact_and_unsupported_controls_fail_before_device_work
 #[test]
 fn limits_are_explicit_and_pixel_bounds_do_not_authorize_invalid_latent_geometry() {
     let mut limits = config();
+    for batch in [0, STRUCTURED_ATTENTION_BF16_MAX_BATCH + 1] {
+        limits.maximum_batch_size = batch;
+        assert!(limits.validate().is_err());
+    }
+    limits.maximum_batch_size = 1;
+    assert!(prepare::batch_dimensions(&[request(), request()], &limits, 16).is_err());
+    limits.maximum_batch_size = STRUCTURED_ATTENTION_BF16_MAX_BATCH;
+    assert!(
+        prepare::batch_dimensions(&vec![request(); limits.maximum_batch_size], &limits, 16).is_ok()
+    );
     for tokens in [0, 8193] {
         limits.maximum_user_tokens = tokens;
         assert!(limits.validate().is_err());

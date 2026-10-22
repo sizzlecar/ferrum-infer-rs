@@ -39,6 +39,7 @@ fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
         base.join("transformer/config.json")
     );
     let ImageBackendConfig::Cuda(cuda) = config.backend;
+    assert_eq!(cuda.pipeline.maximum_batch_size, 1);
     assert_eq!(cuda.cudnn.library_path, base.join("lib/libcudnn.so.9"));
     assert!(
         matches!(config.weights.vae, WeightSource::Single{directory,file}
@@ -61,6 +62,47 @@ fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
     assert!(serde_json::from_str::<ImageProductConfig>(&duplicate).is_err());
     fs::write(&path, b"[]").unwrap();
     assert!(ImageProductConfig::load(&path).is_err());
+}
+
+#[test]
+fn experimental_batch_profile_connects_service_limit_to_real_pipeline_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.json");
+    let mut wire = configuration();
+    wire["serving"] = json!({"maximum_pending":4,"maximum_prompt_bytes":4096,"max_num_seqs":2,
+        "request_batch_max_wait_ms":25,"default_width":512,"default_height":512,
+        "default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+    let load = |value: &Value| {
+        fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    assert!(load(&wire).is_err()); // Missing cap remains one, including for serve.
+    wire["backend"]["pipeline"]["maximum_batch_size"] = json!(2);
+    assert!(load(&wire).is_err()); // Serial is not silently upgraded.
+    wire["execution_profile"] = json!("experimental_batched_cold");
+    let config = load(&wire).unwrap();
+    assert_eq!(
+        config.execution_profile.as_str(),
+        "experimental_batched_cold"
+    );
+    let ImageBackendConfig::Cuda(cuda) = &config.backend;
+    assert_eq!(cuda.pipeline.resolved().unwrap().maximum_batch_size, 2);
+    assert_eq!(config.serving.as_ref().unwrap().max_num_seqs, 2);
+    wire["serving"]["max_num_seqs"] = json!(3);
+    assert!(load(&wire).is_err());
+    wire["serving"]["max_num_seqs"] = json!(2);
+    wire["serving"]["maximum_prompt_bytes"] = json!(512 * 1024 + 1);
+    assert!(load(&wire).is_err());
+    wire["serving"]["maximum_prompt_bytes"] = json!(512 * 1024);
+    assert!(load(&wire).is_ok());
+    wire["serving"]["maximum_prompt_bytes"] = json!(4096);
+    for cap in [0, ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH + 1] {
+        wire["backend"]["pipeline"]["maximum_batch_size"] = json!(cap);
+        assert!(load(&wire).is_err());
+    }
+    wire["backend"]["pipeline"]["maximum_batch_size"] =
+        json!(ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH);
+    assert!(load(&wire).is_ok());
 }
 
 #[test]
@@ -225,7 +267,7 @@ fn non_cuda_image_run_rejects_before_file_or_asset_io() {
 }
 
 #[test]
-fn image_serve_rejects_text_controls_and_requires_explicit_serial_capacity() {
+fn image_serve_rejects_text_controls_and_requires_bounded_capacity() {
     assert!(validate(&[
         "ferrum",
         "serve",
@@ -263,7 +305,7 @@ fn image_serve_rejects_text_controls_and_requires_explicit_serial_capacity() {
         .unwrap()
         .validate()
         .unwrap();
-    wire["max_num_seqs"] = json!(8);
+    wire["max_num_seqs"] = json!(ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH + 1);
     assert!(serde_json::from_value::<ServingConfig>(wire.clone())
         .unwrap()
         .validate()

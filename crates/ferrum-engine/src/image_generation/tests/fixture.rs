@@ -9,21 +9,26 @@ pub(super) const DEVICE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) fn transformer() -> QwenImage21Config {
     QwenImage21Config::from_hf_json(
-        &serde_json::to_vec(&json!({
-            "_class_name":"QwenImage21Transformer2DModel",
-            "num_layers":1,"num_attention_heads":1,"attention_head_dim":8,
-            "context_in_dim":8,"in_channels":64,"out_channels":64,
-            "patch_size":1,"mlp_ratio":2,"axes_dims_rope":[2,2,4],
-            "causal_condition":true,"eps":0.000001
-        }))
-        .unwrap(),
+        &serde_json::to_vec(&transformer_metadata()).unwrap(),
         StructureLimits::default(),
     )
     .unwrap()
 }
+pub(super) fn transformer_metadata() -> serde_json::Value {
+    json!({
+        "_class_name":"QwenImage21Transformer2DModel",
+        "num_layers":1,"num_attention_heads":1,"attention_head_dim":8,
+        "context_in_dim":8,"in_channels":64,"out_channels":64,
+        "patch_size":1,"mlp_ratio":2,"axes_dims_rope":[2,2,4],
+        "causal_condition":true,"eps":0.000001
+    })
+}
 
 pub(super) fn text() -> Qwen3VLTextArchitecture {
-    Qwen3VLTextArchitecture::from_hf_value(&json!({
+    Qwen3VLTextArchitecture::from_hf_value(&text_metadata()).unwrap()
+}
+pub(super) fn text_metadata() -> serde_json::Value {
+    json!({
         "model_type":"qwen3_vl","architectures":["Qwen3VLForConditionalGeneration"],
         "text_config":{"model_type":"qwen3_vl_text","dtype":"bfloat16",
             "hidden_act":"silu","attention_bias":false,"attention_dropout":0.0,
@@ -32,8 +37,7 @@ pub(super) fn text() -> Qwen3VLTextArchitecture {
             "vocab_size":32,"max_position_embeddings":1024,"rms_norm_eps":0.000001,
             "rope_theta":100,"rope_scaling":{"rope_type":"default",
                 "mrope_interleaved":true,"mrope_section":[2,1,1]}}
-    }))
-    .unwrap()
+    })
 }
 
 pub(super) fn decoder() -> QwenImage21VaeDecoderConfig {

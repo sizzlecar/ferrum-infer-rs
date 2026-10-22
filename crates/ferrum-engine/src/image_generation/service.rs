@@ -1,10 +1,10 @@
 //! Bounded request batching around one injected image generator.
 //!
 //! The worker calls `generate_batch` once per compatible FIFO batch. The current
-//! Qwen adapter advertises batch one and cold component residency: this is a G2
-//! integration path, not a throughput-qualified serving implementation. A future
-//! resident/batched generator uses the same queue without pretending a loop of
-//! single-image executions is a batch. Pending prompts are bounded separately
+//! Qwen adapter exposes its configured batch ceiling and delegates one batch to
+//! real shared component forwards. It still cold-loads components per batch:
+//! this is an experimental functional path, not G3 throughput qualification.
+//! A future resident generator can use the same queue. Pending prompts are bounded separately
 //! from the generator's shared Host tensor account.
 
 use super::{ImageGenerationOutput, ImageGenerationRequest, QwenImage21Pipeline};
@@ -27,6 +27,30 @@ use tokio::sync::oneshot;
 
 type GeneratorError = Box<dyn Error + Send + 'static>;
 
+/// A batch rejection has no pending device work or recovery owners and leaves
+/// its generator usable. It carries only a diagnostic, not an arbitrary error
+/// whose cleanup obligations could be lost. All other errors are fatal and
+/// retain their original owner until explicit service retirement.
+#[derive(Debug)]
+pub enum ImageBatchError {
+    Rejected(String),
+    Fatal(GeneratorError),
+}
+impl From<GeneratorError> for ImageBatchError {
+    fn from(error: GeneratorError) -> Self {
+        Self::Fatal(error)
+    }
+}
+impl fmt::Display for ImageBatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected(message) => f.write_str(message),
+            Self::Fatal(error) => fmt::Display::fmt(error, f),
+        }
+    }
+}
+impl Error for ImageBatchError {}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ImageServiceConfig {
     pub maximum_pending: usize,
@@ -44,9 +68,10 @@ pub struct ImageGeneratorCapabilities {
 }
 
 /// Implementations own their runtime and use one Host account for all jobs.
-/// Successful outputs correspond exactly to input order. On failure the boxed
-/// error must retain its original cleanup/recovery owners; formatting it is not
-/// a replacement for returning it. Compatibility must be deterministic and may
+/// Successful outputs correspond exactly to input order. Fatal errors must
+/// retain their original cleanup/recovery owners; formatting them is not a
+/// replacement for returning them. `Rejected` is only valid when the generator
+/// remains usable and no recovery obligation exists. Compatibility must be deterministic and may
 /// only restrict the common width/height grouping enforced by this service.
 pub trait ImageGenerator: Send + 'static {
     fn host_account(&self) -> &HostMemoryAccount;
@@ -59,7 +84,7 @@ pub trait ImageGenerator: Send + 'static {
     fn generate_batch(
         &mut self,
         requests: Vec<ImageGenerationRequest>,
-    ) -> Result<Vec<ImageGenerationOutput>, GeneratorError>;
+    ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError>;
 }
 
 impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
@@ -85,7 +110,7 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
             )) as GeneratorError
         })?;
         Ok(ImageGeneratorCapabilities {
-            maximum_batch_size: 1,
+            maximum_batch_size: self.config.maximum_batch_size,
             maximum_width: self.config.maximum_width.min(maximum),
             maximum_height: self.config.maximum_height.min(maximum),
             dimension_multiple: multiple,
@@ -94,16 +119,28 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
 
     fn generate_batch(
         &mut self,
-        mut requests: Vec<ImageGenerationRequest>,
-    ) -> Result<Vec<ImageGenerationOutput>, GeneratorError> {
-        if requests.len() != 1 {
-            return Err(Box::new(service_error(ImageServiceErrorKind::Generation,
-                "current Qwen G2 adapter requires exactly one request; real batched execution is not implemented")));
+        requests: Vec<ImageGenerationRequest>,
+    ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError> {
+        match QwenImage21Pipeline::generate_batch(self, requests) {
+            Ok(outputs) => Ok(outputs),
+            Err(error) => Err(qwen_batch_error(self.is_stopped(), error)),
         }
-        self.generate(requests.remove(0))
-            .map(|output| vec![output])
-            .map_err(|error| Box::new(error) as GeneratorError)
     }
+}
+
+fn qwen_batch_error<R: DeviceRuntime>(
+    stopped: bool,
+    error: super::ImageGenerationError<R>,
+) -> ImageBatchError {
+    // Preflight can also originate inside a stage. The pipeline marks any run
+    // failure stopped, even when its variant happens to be Preflight. Only the
+    // pre-run, empty-receipt path is safe to discard after returning a message.
+    if !stopped && error.completed_stages.is_empty() && error.completed_steps.is_empty() {
+        if let super::ImageGenerationFailure::Preflight(source) = &error.failure {
+            return ImageBatchError::Rejected(format!("image preflight: {source:#}"));
+        }
+    }
+    ImageBatchError::Fatal(Box::new(error))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -335,7 +372,7 @@ trait BatchWorker: Send + 'static {
     fn generate_batch(
         &mut self,
         requests: Vec<ImageGenerationRequest>,
-    ) -> Result<Vec<Self::Output>, GeneratorError>;
+    ) -> Result<Vec<Self::Output>, ImageBatchError>;
 }
 struct GeneratorAdapter<P>(P);
 impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
@@ -346,7 +383,7 @@ impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
     fn generate_batch(
         &mut self,
         requests: Vec<ImageGenerationRequest>,
-    ) -> Result<Vec<Self::Output>, GeneratorError> {
+    ) -> Result<Vec<Self::Output>, ImageBatchError> {
         self.0.generate_batch(requests)
     }
 }
@@ -645,7 +682,29 @@ fn worker_loop<O: Send + 'static>(
                     ImageServiceErrorKind::Generation,
                     "generator returned a different number of outputs than batch requests",
                 )))),
-                Ok(Err(error)) => Err(ImageWorkerFailure::Generation(error)),
+                Ok(Err(ImageBatchError::Rejected(message))) => {
+                    shared.lock().active = 0;
+                    for (cancelled, response) in responses {
+                        let error = if cancelled.load(Ordering::Acquire) {
+                            service_error(
+                                ImageServiceErrorKind::Cancelled,
+                                "image response cancelled; batch preflight rejected",
+                            )
+                        } else {
+                            // A preflight rejection can be a server-side plan
+                            // problem as well as a request problem. Do not turn
+                            // every owner-free rejection into HTTP 400.
+                            service_error(ImageServiceErrorKind::Generation, message.clone())
+                        };
+                        let _ = response.send(Err(error));
+                    }
+                    // Do not reopen admission or clear `closing`: shutdown may
+                    // have been requested while this batch was being prepared.
+                    continue;
+                }
+                Ok(Err(ImageBatchError::Fatal(error))) => {
+                    Err(ImageWorkerFailure::Generation(error))
+                }
                 Err(panic) => Err(ImageWorkerFailure::Panic(panic)),
             };
             match outcome {

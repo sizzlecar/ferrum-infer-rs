@@ -1,7 +1,7 @@
 //! Image-only HTTP admission and a managed PNG/base64 response path.
 //!
-//! The current generator adapter is an experimental serial functional profile.
-//! An HTTP queue is not evidence of batched execution, G3 readiness or throughput.
+//! The generator uses explicit cold functional limits and reports its scheduler.
+//! G3 readiness and throughput require separate runtime measurements.
 
 use super::{json_rejection_detail, AppState, ServerError};
 use crate::model_registry::{ServedModelKind, ServedModelRegistry};
@@ -163,7 +163,7 @@ impl ImageHttpService {
     pub(super) fn health(&self) -> serde_json::Value {
         serde_json::json!({
             "model":self.model_name(), "ready":self.service.is_accepting(),
-            "profile":"experimental_serial_functional",
+            "profile":"experimental_cold_functional",
             "qualification":"functional pipeline only; not G3 or measured throughput",
             "scheduler":self.service.snapshot(),
             "output":{

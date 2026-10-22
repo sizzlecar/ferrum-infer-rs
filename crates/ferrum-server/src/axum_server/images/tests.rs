@@ -341,7 +341,7 @@ impl ferrum_engine::image_generation::service::ImageGenerator for FailingGenerat
         _: Vec<ImageGenerationRequest>,
     ) -> Result<
         Vec<ferrum_engine::image_generation::ImageGenerationOutput>,
-        Box<dyn std::error::Error + Send>,
+        ferrum_engine::image_generation::service::ImageBatchError,
     > {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(gate) = &self.gate {
@@ -351,9 +351,11 @@ impl ferrum_engine::image_generation::service::ImageGenerator for FailingGenerat
                 released = gate.changed.wait(released).unwrap();
             }
         }
-        Err(Box::new(std::io::Error::other(
-            "intentional CPU generator failure",
-        )))
+        Err(
+            ferrum_engine::image_generation::service::ImageBatchError::Fatal(Box::new(
+                std::io::Error::other("intentional CPU generator failure"),
+            )),
+        )
     }
 }
 
