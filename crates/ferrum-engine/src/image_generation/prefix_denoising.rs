@@ -54,10 +54,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             reference,
             frequencies,
         } = work;
+        let started = Instant::now();
         let decode_frequencies = decode
             .config
             .managed_rotary_frequencies(&self.host)
             .map_err(process)?;
+        let decode_rotary_us = elapsed_us(started);
         let mappings = config
             .prefix_cache_ports()
             .map_err(|e| process(e.into()))?
@@ -91,6 +93,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 job,
                 owners.weights.as_ref().unwrap(),
             )?);
+            let started = Instant::now();
             let request_session = owners
                 .decode
                 .as_ref()
@@ -102,6 +105,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     vec![sample.clone(), initial_time, decode_frequencies.clone()],
                 )
                 .map_err(|source| ImageGenerationFailure::RequestExecution { source })?;
+            let request_begin_us = elapsed_us(started);
             owners.request = Some(request_session);
             let initial_inputs = vec![
                 sample.clone(),
@@ -128,7 +132,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let output =
                 output.map_err(|source| ImageGenerationFailure::RequestExecution { source })?;
             prefill.receipt.completed_executions += 1;
+            let started = Instant::now();
             advance(solver, &mut sample, output, steps).map_err(process)?;
+            let mut euler_us = elapsed_us(started);
             // Outputs no longer borrow the prefill arena after the D2D fence.
             // Explicitly retire it before admitting any decode Step backing.
             stages.push(owners.prefill.take().unwrap().close()?);
@@ -151,15 +157,28 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 let output =
                     output.map_err(|source| ImageGenerationFailure::RequestExecution { source })?;
                 active.receipt.completed_executions += 1;
+                let started = Instant::now();
                 advance(solver, &mut sample, output, steps).map_err(process)?;
+                euler_us = euler_us.saturating_add(elapsed_us(started));
             }
             // The cache cannot overlap the VAE decoder's dynamic peak.
+            let started = Instant::now();
             owners
                 .request
                 .take()
                 .unwrap()
                 .close()
                 .map_err(|source| ImageGenerationFailure::RequestClose { source })?;
+            let request_close_us = elapsed_us(started);
+            tracing::debug!(
+                target: "ferrum_engine::image_generation::timing",
+                job,
+                decode_rotary_us,
+                request_begin_us,
+                euler_us,
+                request_close_us,
+                "image prefix denoising host work completed"
+            );
             let origin = owners.decode.as_ref().unwrap().receipt.clone();
             self.finish_stage(owners.decode.take().unwrap(), stages)?;
             let weights = owners.weights.take().unwrap();

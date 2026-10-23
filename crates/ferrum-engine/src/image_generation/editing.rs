@@ -132,9 +132,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .as_ref()
                 .context("editing assets are missing")?;
             let limits = ImageInputLimits::default();
+            let started = std::time::Instant::now();
             let decoded = ManagedRgba8Image::decode_png(&self.host, &request.image, limits)?;
+            let decode_png_us = trace_elapsed_us(started);
+            let started = std::time::Instant::now();
             let inputs = assets.processor.prepare(&self.host, &decoded, limits)?;
+            let reference_preprocess_us = trace_elapsed_us(started);
             drop(decoded);
+            let started = std::time::Instant::now();
             let [temporal, height, width] = inputs.grid_thw();
             let vision = Qwen3VLVisionConfig::new(
                 assets.vision.clone(),
@@ -148,7 +153,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 width,
                 assets.vision.merge_size(),
             )?;
-            self.prepare_batch_with_edit(
+            let edit_layout_and_prompt_us = trace_elapsed_us(started);
+            let prepared = self.prepare_batch_with_edit(
                 std::slice::from_ref(&request.generation),
                 Some(EditInputs {
                     prompt,
@@ -156,7 +162,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     vision,
                     encoder,
                 }),
-            )
+            )?;
+            tracing::debug!(
+                target: "ferrum_engine::image_generation::timing",
+                job = self.next_job,
+                decode_png_us,
+                reference_preprocess_us,
+                edit_layout_and_prompt_us,
+                "image edit inputs prepared"
+            );
+            Ok(prepared)
         })()
         .map_err(preflight)?;
         // Encoded bytes are no longer needed; decoded model inputs own their
@@ -186,6 +201,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             vision_stage,
             encoder_stage,
         } = edit;
+        let started = std::time::Instant::now();
         let positions = self
             .assets
             .sources
@@ -195,12 +211,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let position_inputs = vision
             .managed_position_inputs(&self.host, &positions)
             .map_err(process)?;
+        let vision_position_us = trace_elapsed_us(started);
         let (patches, rgba) = inputs.into_tensors();
         let mut vision_inputs = Vec::from(position_inputs);
         vision_inputs.insert(0, patches);
         let active = self.start_stage(vision_stage, job, stages)?;
         let (active, outputs) = active.execute(job, vision_inputs)?;
         self.finish_stage(active, stages)?;
+        let started = std::time::Instant::now();
         let embedding = self
             .assets
             .sources
@@ -210,9 +228,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let text_inputs = prompt
             .managed_text_inputs(&self.host, &self.assets.text, &embedding, outputs)
             .map_err(process)?;
+        let text_bridge_us = trace_elapsed_us(started);
         let active = self.start_stage(text_stage, job, stages)?;
         let (active, outputs) = active.execute(job, text_inputs)?;
         self.finish_stage(active, stages)?;
+        let started = std::time::Instant::now();
         let hidden = only_output(outputs, Qwen3VLTextEncoderFamily::OUTPUT_ID).map_err(process)?;
         let text = prompt
             .prompts()
@@ -220,10 +240,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map_err(process)?
             .into_tensor();
         drop(hidden);
+        let hidden_crop_us = trace_elapsed_us(started);
 
         let active = self.start_stage(encoder_stage, job, stages)?;
         let (active, outputs) = active.execute(job, vec![rgba])?;
         self.finish_stage(active, stages)?;
+        let started = std::time::Instant::now();
         let encoded =
             only_output(outputs, QwenImage21VaeEncoderFamily::OUTPUT_ID).map_err(process)?;
         let scale = encoder.spatial_scale();
@@ -250,6 +272,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map_err(process)?
             .into_input_tensor()
             .map_err(process)?;
+        tracing::debug!(
+            target: "ferrum_engine::image_generation::timing",
+            job,
+            vision_position_us,
+            text_bridge_us,
+            hidden_crop_us,
+            reference_latent_bridge_us = trace_elapsed_us(started),
+            "image edit conditioning bridges completed"
+        );
         Ok((text, reference))
     }
 }

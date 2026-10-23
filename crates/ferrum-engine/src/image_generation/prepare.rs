@@ -83,6 +83,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         requests: &[ImageGenerationRequest],
         edit: Option<super::editing::EditInputs>,
     ) -> anyhow::Result<PreparedRequest<R>> {
+        let prepare_started = std::time::Instant::now();
         let (height, width) =
             batch_dimensions(requests, &self.config, self.assets.spatial_scale()?)?;
         let request = &requests[0];
@@ -176,7 +177,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             &decoder,
             &self.profiles.decoder,
         )?;
+        let started = std::time::Instant::now();
         let mut text_options = text.compile_options()?;
+        let text_compile_options_us = trace_elapsed_us(started);
+        let started = std::time::Instant::now();
         if self.profiles.text_encoder.as_str() == Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID {
             let conversion = precision::materializer(
                 precision::TEXT_MATERIALIZER,
@@ -185,6 +189,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             )?;
             precision::select(&text_family, &mut text_options, &conversion, &self.host)?;
         }
+        let text_fp8_select_us = trace_elapsed_us(started);
         let text_stage = PreparedStage::compile(
             ImageStage::TextEncoder,
             batch,
@@ -221,12 +226,26 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         if let Some(prefix) = &prefix_decode {
             all_stages.push(&prefix.stage);
         }
+        let started = std::time::Instant::now();
         self.validate_capacity_with_prefix(
             &all_stages,
             prefix_decode
                 .as_ref()
                 .map(|prefix| (&denoise_stage, &prefix.stage)),
         )?;
+        let capacity_us = trace_elapsed_us(started);
+        // This total includes family/plan preparation and the listed subspans.
+        // It must not be added to those subspans or stage compile receipts.
+        tracing::debug!(
+            target: "ferrum_engine::image_generation::timing",
+            job = self.next_job,
+            batch_size = batch,
+            prepare_batch_us = trace_elapsed_us(prepare_started),
+            text_compile_options_us,
+            text_fp8_select_us,
+            capacity_us,
+            "image batch plans prepared"
+        );
         Ok(PreparedRequest {
             prompts,
             request_order,
@@ -260,7 +279,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             transformer,
             &self.profiles.denoiser,
         )?;
+        let started = std::time::Instant::now();
         let mut options = transformer.compile_options()?;
+        let compile_options_us = trace_elapsed_us(started);
+        let started = std::time::Instant::now();
         if matches!(
             self.profiles.denoiser.as_str(),
             QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
@@ -273,6 +295,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             )?;
             precision::select(&family, &mut options, &conversion, &self.host)?;
         }
+        tracing::debug!(
+            target: "ferrum_engine::image_generation::timing",
+            job = self.next_job,
+            ?role,
+            batch_size = batch,
+            compile_options_us,
+            fp8_select_us = trace_elapsed_us(started),
+            "image denoiser options prepared"
+        );
         PreparedStage::compile_with_role(ImageStage::Denoiser, role, batch, family, &options, self)
     }
 }

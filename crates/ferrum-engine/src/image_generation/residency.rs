@@ -352,6 +352,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                         active.processing(anyhow::anyhow!("resident stage slot already occupied"))
                     );
                 }
+                let started = std::time::Instant::now();
                 let idle_release = match active.session.try_release_idle_dynamic_backing() {
                     Ok(IdleDynamicReleaseOutcome::Released(receipt)) => receipt,
                     Ok(IdleDynamicReleaseOutcome::Busy(reason)) => {
@@ -361,11 +362,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     }
                     Err(error) => return Err(active.processing(error.into())),
                 };
+                let close_wall_duration_us = trace_elapsed_us(started);
                 stages.push(ImageStageReceipt {
                     execution: active.receipt.clone(),
                     close: None,
                     retirement: ImageStageRetirement::Resident { idle_release },
-                    close_wall_duration_us: 0,
+                    close_wall_duration_us,
                 });
                 *slot = Some(active);
                 return Ok(());

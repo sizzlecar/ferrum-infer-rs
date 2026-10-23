@@ -543,9 +543,17 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map_err(process)?;
         drop(latents);
 
+        let rotary_started = std::time::Instant::now();
         let frequencies = transformer
             .managed_rotary_frequencies(&self.host)
             .map_err(process)?;
+        tracing::debug!(
+            target: "ferrum_engine::image_generation::timing",
+            job,
+            phase = ?transformer.execution_phase(),
+            rotary_us = trace_elapsed_us(rotary_started),
+            "image denoising rotary inputs prepared"
+        );
         let mut solver = ManagedBf16Euler::new(
             self.assets.schedule.solver().clone(),
             self.host.clone(),
@@ -574,6 +582,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             )?;
         } else {
             let mut denoiser = self.start_stage(denoise_stage, job, stages)?;
+            let mut euler_us = 0_u64;
             while let Some(step) = solver.current_step() {
                 let time =
                     match transformer.managed_time_features(&self.host, step.timestep().as_f32()) {
@@ -596,10 +605,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     Ok(value) => value,
                     Err(error) => return Err(denoiser.processing(error)),
                 };
+                let euler_started = std::time::Instant::now();
                 sample = match solver.advance(&sample, velocity.tensor(), velocity.bytes()) {
                     Ok((_, next)) => next,
                     Err(error) => return Err(denoiser.processing(error.into())),
                 };
+                euler_us = euler_us.saturating_add(trace_elapsed_us(euler_started));
                 steps.push(ImageDenoiseStepReceipt {
                     index: step.index(),
                     sigma: step.sigma(),
@@ -607,6 +618,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     scheduler_timestep: step.timestep().as_f32(),
                 });
             }
+            tracing::debug!(
+                target: "ferrum_engine::image_generation::timing",
+                job,
+                euler_us,
+                "image denoising host solver completed"
+            );
             self.finish_stage(denoiser, stages)?;
         }
         drop((text_input, frequencies, solver, reference));
@@ -629,6 +646,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             self.decode_batch(decode_stage, &decoder, input, requests.len(), job, stages)?;
         request_order.restore_outputs(outputs).map_err(process)
     }
+}
+
+fn trace_elapsed_us(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn id<T: TryFrom<String, Error = VNextError>>(value: impl Into<String>) -> anyhow::Result<T> {
