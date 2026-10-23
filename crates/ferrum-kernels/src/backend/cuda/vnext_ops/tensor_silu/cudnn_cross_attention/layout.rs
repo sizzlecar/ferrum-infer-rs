@@ -3,7 +3,12 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Method {
     Empty,
-    Sdpa { packed_rows: u32 },
+    Sdpa {
+        packed_rows: u32,
+        /// Every original KV row is visible. Its contiguous BSHD storage is
+        /// identical to the packed layout, so only sequence lengths are filled.
+        direct_kv: bool,
+    },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Stage {
@@ -48,6 +53,9 @@ impl Schedule {
             vec![Stage {
                 method: Method::Sdpa {
                     packed_rows: *lengths.iter().max().unwrap(),
+                    direct_kv: lengths
+                        .iter()
+                        .all(|&n| u64::from(n) == geometry.key_value_length()),
                 },
                 ..base
             }]
@@ -63,7 +71,12 @@ impl Schedule {
                     method: if n == 0 {
                         Method::Empty
                     } else {
-                        Method::Sdpa { packed_rows: n }
+                        Method::Sdpa {
+                            packed_rows: n,
+                            // Keep mixed-empty scheduling on its original pack
+                            // path, including nonempty samples with no holes.
+                            direct_kv: false,
+                        }
                     },
                     ..base
                 })
@@ -84,7 +97,7 @@ impl Schedule {
         Ok(result)
     }
     pub fn signature(&self, stage: Stage) -> Result<CudnnSdpaSignature, String> {
-        let Method::Sdpa { packed_rows } = stage.method else {
+        let Method::Sdpa { packed_rows, .. } = stage.method else {
             return Err("empty cross stage has no vendor signature".into());
         };
         let g = &self.geometry;

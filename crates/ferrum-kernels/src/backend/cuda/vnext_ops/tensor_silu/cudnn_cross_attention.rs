@@ -23,6 +23,7 @@ pub const NUMERICAL_IDENTITY: &str = concat!(
     "cuDNN9.20-SDPA-forward-inference;F32-byvalue-scale;vendor-intermediate-rounding;",
     "finite-visible-domain;no-sequential-FP32-or-Torch-bitwise-claim;",
     "stable-KV-pack-without-masked-read;empty-samples-zero-without-QKV-read;",
+    "all-valid-direct-KV-same-SDPA-signature;lengths-only-launch-no-payload-read;",
     "all-nonempty-batches-one-plan;exact-i32-sequence-lengths;NoAlias;",
     "admitted-KV-lengths-workspace-scratch;prepare-estimator-lookup-encode;",
     "shared-native-owner-bounded-plan-binding-cache;target-qualification-required"
@@ -129,7 +130,7 @@ fn prepared_stages_fingerprint<'a>(
     stages: impl IntoIterator<Item = (Stage, Option<&'a str>)>,
 ) -> Result<String, String> {
     let mut digest = Sha256::new();
-    digest.update(b"ferrum.cuda.cross-attention.prepared-stages.v1\0");
+    digest.update(b"ferrum.cuda.cross-attention.prepared-stages.v2\0");
     let mut count = 0u64;
     for (stage, native) in stages {
         count = count
@@ -145,7 +146,13 @@ fn prepared_stages_fingerprint<'a>(
         }
         match (stage.method, native) {
             (Method::Empty, None) => digest.update([1]),
-            (Method::Sdpa { packed_rows }, Some(fingerprint)) => {
+            (
+                Method::Sdpa {
+                    packed_rows,
+                    direct_kv,
+                },
+                Some(fingerprint),
+            ) => {
                 if fingerprint.len() != 64
                     || !fingerprint
                         .bytes()
@@ -155,6 +162,7 @@ fn prepared_stages_fingerprint<'a>(
                 }
                 digest.update([2]);
                 digest.update(packed_rows.to_le_bytes());
+                digest.update([u8::from(direct_kv)]);
                 digest.update(fingerprint.as_bytes());
             }
             _ => return Err("attention prepared stage and native plan identity disagree".into()),
@@ -182,7 +190,7 @@ impl Provider {
         let mut peak = 0;
         let mut stages = Vec::with_capacity(schedule.stages.len());
         for &stage in &schedule.stages {
-            let sdpa = if let Method::Sdpa { packed_rows } = stage.method {
+            let sdpa = if let Method::Sdpa { packed_rows, .. } = stage.method {
                 let signature = schedule.signature(stage)?;
                 let plan = if prepare {
                     self.cache.prepare(signature)
@@ -196,6 +204,8 @@ impl Provider {
                     schedule.geometry.columns(),
                     plan.workspace_bytes(),
                 )?;
+                // Retain the existing conservative scratch policy even when
+                // direct KV bindings leave its payload region unused.
                 peak = peak.max(layout.bytes);
                 Some((plan, layout))
             } else {
@@ -387,10 +397,28 @@ impl Provider {
                     .checked_mul(g.columns())
                     .and_then(|n| n.checked_mul(2))
                     .ok_or("fused attention query offset overflow")?;
+                let direct_kv = matches!(
+                    stage.stage.method,
+                    Method::Sdpa {
+                        direct_kv: true,
+                        ..
+                    }
+                );
+                // Schedule only selects direct KV for a single all-valid
+                // full-batch stage. Its original and packed batch strides are
+                // exactly equal; no tensor view or native plan changes.
                 let bindings = CudnnSdpaBindings {
                     q: address(regions[0].device_ptr(), offset)?,
-                    k: scratch,
-                    v: address(scratch, layout.value_offset)?,
+                    k: if direct_kv {
+                        regions[1].device_ptr()
+                    } else {
+                        scratch
+                    },
+                    v: if direct_kv {
+                        regions[2].device_ptr()
+                    } else {
+                        address(scratch, layout.value_offset)?
+                    },
                     o: address(regions[3].device_ptr(), offset)?,
                     seq_len_q: address(scratch, layout.query_lengths_offset)?,
                     seq_len_kv: address(scratch, layout.key_lengths_offset)?,
@@ -414,7 +442,7 @@ impl Provider {
         let elements = g.element_count();
         let operations = g.logical_arithmetic_operations();
         // Native counts describe our visible launches/calls, not vendor-internal
-        // kernels. Pack + cuDNN is two; fallback/empty is one.
+        // kernels. Pack (or lengths-only) + cuDNN is two; empty is one.
         let calls = bound
             .iter()
             .try_fold(0u64, |n, b| {
@@ -450,13 +478,21 @@ impl Provider {
                                 CudaDeviceRuntimeError::driver("attention empty query range", e)
                             })?;
                         }
-                        Method::Sdpa { packed_rows } => {
+                        Method::Sdpa {
+                            packed_rows,
+                            direct_kv,
+                        } => {
                             let (call, layout) = item.sdpa.as_ref().expect("prepared SDPA stage");
                             let packed_v = scratch + layout.value_offset;
                             let q_lengths = scratch + layout.query_lengths_offset;
                             let k_lengths = scratch + layout.key_lengths_offset;
                             let visible_end = key_sequence;
-                            let n = u64::from(s.batches) * u64::from(packed_rows) * columns;
+                            let copy_payload = u32::from(!direct_kv);
+                            let n = if direct_kv {
+                                u64::from(s.batches)
+                            } else {
+                                u64::from(s.batches) * u64::from(packed_rows) * columns
+                            };
                             let mut launch =
                                 stream.launch_builder(kernels.fused_attention_function(1));
                             launch
@@ -473,6 +509,7 @@ impl Provider {
                                 .arg(&s.query_count)
                                 .arg(&visible_end)
                                 .arg(&packed_rows)
+                                .arg(&copy_payload)
                                 .arg(&schedule.mask);
                             unsafe { launch.launch(flat_launch(n)) }.map_err(|e| {
                                 CudaDeviceRuntimeError::driver("attention stable KV packing", e)

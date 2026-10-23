@@ -444,6 +444,7 @@ impl Provider {
                         .arg(&rows)
                         .arg(&rows)
                         .arg(&rows)
+                        .arg(&one) // copy_payload: preserve stable segment packing
                         .arg(&b.mask);
                     unsafe {
                         launch.launch(LaunchConfig {

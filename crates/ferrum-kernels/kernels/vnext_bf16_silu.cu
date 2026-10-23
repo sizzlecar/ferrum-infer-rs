@@ -501,7 +501,18 @@ extern "C" __global__ void ferrum_vnext_attention_pack_kv_bf16(
     uint16_t* packed_value, int32_t* query_lengths, int32_t* key_lengths,
     uint64_t columns, uint32_t sequence, uint32_t first_batch,
     uint32_t batches, uint32_t query_count, uint32_t visible_end,
-    uint32_t packed_rows, const FerrumStructuredAttentionMask mask) {
+    uint32_t packed_rows, uint32_t copy_payload,
+    const FerrumStructuredAttentionMask mask) {
+    // Explicit direct-KV mode is selected only for an all-valid full-batch
+    // cross-attention stage. Neither original nor scratch K/V is touched.
+    if (copy_payload == 0) {
+        const uint64_t batch = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (batch < batches) {
+            query_lengths[batch] = static_cast<int32_t>(query_count);
+            key_lengths[batch] = static_cast<int32_t>(packed_rows);
+        }
+        return;
+    }
     const uint64_t count = static_cast<uint64_t>(batches) * packed_rows * columns;
     for (uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < count; i += static_cast<uint64_t>(blockDim.x) * gridDim.x) {

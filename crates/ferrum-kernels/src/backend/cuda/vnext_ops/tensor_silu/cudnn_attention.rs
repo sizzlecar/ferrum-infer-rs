@@ -490,6 +490,7 @@ impl Provider {
                             let k_lengths = scratch + layout.key_lengths_offset;
                             let visible_end = s.first_query + s.query_count;
                             let n = u64::from(s.batches) * u64::from(packed_rows) * columns;
+                            let copy_payload = 1_u32;
                             let mut launch =
                                 stream.launch_builder(kernels.fused_attention_function(1));
                             launch
@@ -506,6 +507,7 @@ impl Provider {
                                 .arg(&s.query_count)
                                 .arg(&visible_end)
                                 .arg(&packed_rows)
+                                .arg(&copy_payload)
                                 .arg(&schedule.mask);
                             unsafe { launch.launch(flat_launch(n)) }.map_err(|e| {
                                 CudaDeviceRuntimeError::driver("attention stable KV packing", e)

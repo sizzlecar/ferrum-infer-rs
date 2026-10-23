@@ -48,6 +48,42 @@ fn bits(bytes: &ManagedHostBytes) -> Vec<u16> {
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect()
 }
+
+fn all_valid_probe() -> Probe {
+    let mut probe = Probe::new(false);
+    probe.valid = [[true; KEYS]; BATCH];
+    for (name, values) in [
+        ("key_run_counts", vec![1; BATCH]),
+        ("key_run_lengths", vec![KEYS as i64; BATCH]),
+        ("key_run_valid", vec![1; BATCH]),
+    ] {
+        probe
+            .config
+            .attributes
+            .insert(id(name), SemanticValue::Integers(values));
+    }
+    // Every physical row contributes. Distinct batch/head/key values expose a
+    // mistaken Q-length KV stride or binding both batches to the first batch.
+    // Q already varies across batch, query and head in the shared probe.
+    probe.input[1].fill(0);
+    for b in 0..BATCH {
+        for k in 0..KEYS {
+            for h in 0..oracle::HEADS {
+                let start = (b * KEYS + k) * COLUMNS + h * oracle::DIM;
+                probe.input[1][start] =
+                    bf16::from_f32((k as f32 - 2.) / 4. + b as f32 / 8. + h as f32 / 16.).to_bits();
+                for c in 0..oracle::DIM {
+                    probe.input[2][start + c] = bf16::from_f32(
+                        b as f32 * 2. + k as f32 / 2. - 1. + h as f32 / 4. + (c % 7) as f32 / 16.,
+                    )
+                    .to_bits();
+                }
+            }
+        }
+    }
+    probe
+}
+
 fn run_case(name: &str, probe: Probe, expected: Expected) {
     let (vendor, sdpa) = vendor_config();
     let runtime = Arc::new(
@@ -117,12 +153,14 @@ fn run_case(name: &str, probe: Probe, expected: Expected) {
         node.operation_id().as_str(),
         CROSS_ATTENTION_FUSED_BF16_OPERATION_ID
     );
-    let batches = if probe.valid[1].iter().any(|&v| v) {
-        BATCH
-    } else {
-        1
-    };
-    let packing_minimum = (2 * batches * 4 * COLUMNS * 2) as u64 + 512;
+    let valid_lengths = probe
+        .valid
+        .map(|keys| keys.into_iter().filter(|&v| v).count());
+    let batches = valid_lengths.iter().filter(|&&n| n != 0).count();
+    let packed_rows = valid_lengths.into_iter().max().unwrap();
+    // This fixture's BF16 row size is 256-byte aligned. The direct all-valid
+    // path deliberately retains the same conservative pack-space admission.
+    let packing_minimum = (2 * batches * packed_rows * COLUMNS * 2) as u64 + 512;
     let scratch = node
         .provider_resources()
         .scratch()
@@ -225,16 +263,18 @@ fn run_case(name: &str, probe: Probe, expected: Expected) {
 fn managed_cuda_cross_attention_rectangular_batches_holes_and_empty_retire() {
     let nonempty = Probe::new(false);
     let mixed = Probe::new(true);
+    let all_valid = all_valid_probe();
     let expected_nonempty = Expected::prepare(&nonempty);
     let expected_mixed = Expected::prepare(&mixed);
+    let expected_all_valid = Expected::prepare(&all_valid);
     run_case("both_nonempty", nonempty, expected_nonempty);
     run_case("mixed_empty", mixed, expected_mixed);
+    run_case("all_valid_direct", all_valid, expected_all_valid);
 }
 
 #[test]
 fn cross_fixture_prepares_exact_lengths_masks_and_independent_numeric_comparison() {
-    for mixed in [false, true] {
-        let probe = Probe::new(mixed);
+    for probe in [Probe::new(false), Probe::new(true), all_valid_probe()] {
         let geometry = probe.config.geometry().unwrap();
         assert_eq!(
             (
@@ -269,4 +309,27 @@ fn cross_fixture_prepares_exact_lengths_masks_and_independent_numeric_comparison
         corrupted[0] = bf16::from_f32(8.).to_bits();
         assert!(expected.check(&corrupted).is_err());
     }
+
+    // Counterfactual outputs establish that the all-valid fixture distinguishes
+    // both the batch pointer and the rectangular KV sequence length. They are
+    // independent F64 calculations, never copied from the candidate provider.
+    let expected = Expected::prepare(&all_valid_probe());
+    let mut swapped_batches: Vec<_> = expected
+        .values
+        .iter()
+        .map(|&x| bf16::from_f64(x).to_bits())
+        .collect();
+    swapped_batches.rotate_left(QUERIES * COLUMNS);
+    assert!(expected.check(&swapped_batches).is_err());
+
+    let mut truncated_keys = all_valid_probe();
+    for keys in &mut truncated_keys.valid {
+        keys[QUERIES..].fill(false);
+    }
+    let truncated: Vec<_> = Expected::prepare(&truncated_keys)
+        .values
+        .iter()
+        .map(|&x| bf16::from_f64(x).to_bits())
+        .collect();
+    assert!(expected.check(&truncated).is_err());
 }

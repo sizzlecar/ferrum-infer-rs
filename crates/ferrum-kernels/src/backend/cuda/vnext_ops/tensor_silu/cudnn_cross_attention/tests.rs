@@ -47,7 +47,13 @@ fn rectangular_nonempty_batches_share_one_plan_with_independent_q_and_kv_strides
         ))
         .unwrap();
         assert_eq!(s.stages.len(), 1);
-        assert_eq!(s.stages[0].method, Method::Sdpa { packed_rows: 4 });
+        assert_eq!(
+            s.stages[0].method,
+            Method::Sdpa {
+                packed_rows: 4,
+                direct_kv: false,
+            }
+        );
         let native = s.signature(s.stages[0]).unwrap();
         assert_eq!(
             (
@@ -82,12 +88,112 @@ fn mixed_empty_keys_split_batches_and_all_empty_never_prepare_native_sdpa() {
         (1, 1, 7)
     );
     assert_eq!(s.signature(s.stages[1]).unwrap().query_length, 7);
+    assert_eq!(
+        s.stages[1].method,
+        Method::Sdpa {
+            packed_rows: 3,
+            direct_kv: false,
+        }
+    );
     assert!(s.signature(s.stages[0]).is_err());
     let empty = Schedule::new(geometry(2, 7, 3, 128, &[1, 1], &[3, 3], &[0, 0])).unwrap();
     assert_eq!(empty.stages.len(), 1);
     assert_eq!(empty.stages[0].method, Method::Empty);
     assert_eq!(empty.geometry.logical_arithmetic_operations(), 0);
     assert!(Schedule::new(geometry(1, 2, 3, 8, &[1], &[3], &[1])).is_err());
+}
+
+#[test]
+fn all_valid_direct_kv_preserves_native_signature_and_conservative_scratch() {
+    for (b, q, k, d) in [(1, 3, 5, 128), (2, 7, 3, 72), (16, 1, 9, 128)] {
+        let s = Schedule::new(geometry(
+            b,
+            q,
+            k,
+            d,
+            &vec![1; b as usize],
+            &vec![k as i64; b as usize],
+            &vec![1; b as usize],
+        ))
+        .unwrap();
+        assert_eq!(s.stages.len(), 1);
+        let direct = s.stages[0];
+        assert_eq!(direct.first_batch, 0);
+        assert_eq!(direct.batches, b as u32);
+        assert_eq!(direct.first_query, 0);
+        assert_eq!(
+            direct.method,
+            Method::Sdpa {
+                packed_rows: k as u32,
+                direct_kv: true,
+            }
+        );
+        let packed = Stage {
+            method: Method::Sdpa {
+                packed_rows: k as u32,
+                direct_kv: false,
+            },
+            ..direct
+        };
+        // The vendor key and its engine selection must not change. Only the
+        // binding source and the payload-copy work differ.
+        let signature = s.signature(direct).unwrap();
+        assert_eq!(signature, s.signature(packed).unwrap());
+        assert_eq!(signature.key_value_batch_stride, (k * 2 * d) as i64);
+        let scratch = ScratchLayout::new(b as u32, k as u32, 2 * d, 512).unwrap();
+        let payload_bytes = b * k * 2 * d * 2;
+        assert!(scratch.value_offset >= payload_bytes);
+        assert!(scratch.query_lengths_offset >= scratch.value_offset + payload_bytes);
+        assert_eq!(scratch.workspace_offset + 512, scratch.bytes);
+        // The provider implementation receipt still distinguishes the two
+        // execution paths even though their native SDPA fingerprints agree.
+        let native = "2".repeat(64);
+        assert_ne!(
+            prepared_stages_fingerprint([(direct, Some(native.as_str()))]).unwrap(),
+            prepared_stages_fingerprint([(packed, Some(native.as_str()))]).unwrap()
+        );
+    }
+}
+
+#[test]
+fn any_key_hole_keeps_all_batches_on_the_packed_path() {
+    // Equal valid lengths must not be mistaken for fully visible storage.
+    let equal_holes = Schedule::new(geometry(
+        2,
+        3,
+        5,
+        128,
+        &[3, 3],
+        &[1, 1, 3, 2, 1, 2],
+        &[1, 0, 1, 1, 0, 1],
+    ))
+    .unwrap();
+    assert_eq!(
+        equal_holes.stages[0].method,
+        Method::Sdpa {
+            packed_rows: 4,
+            direct_kv: false,
+        }
+    );
+    // Even when max(valid length) equals the physical KV length, another
+    // sample's hole still needs packing and its shorter seq_len_kv.
+    let one_hole = Schedule::new(geometry(
+        2,
+        3,
+        5,
+        128,
+        &[1, 3],
+        &[5, 1, 1, 3],
+        &[1, 1, 0, 1],
+    ))
+    .unwrap();
+    assert_eq!(
+        one_hole.stages[0].method,
+        Method::Sdpa {
+            packed_rows: 5,
+            direct_kv: false,
+        }
+    );
 }
 #[test]
 fn prepared_identity_distinguishes_empty_vendor_and_batch_range() {
