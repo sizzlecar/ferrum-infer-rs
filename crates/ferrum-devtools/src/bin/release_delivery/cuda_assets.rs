@@ -157,23 +157,29 @@ impl CudaVariant {
             "ferrum-linux-x86_64-cuda-sm120.tar.gz" => Self::Sm120,
             _ => return Err("unrecognized CUDA distribution asset name".into()),
         };
-        let (capability, toolkit, features): (_, _, &[&str]) = match variant {
+        let (capability, toolkit, feature_sets): (_, _, &[&[&str]]) = match variant {
             Self::Sm89 => (
                 "89",
                 "nvidia/cuda:12.4.0-devel-ubuntu22.04",
-                &["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"],
+                &[&["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"]],
             ),
             Self::Sm120 => (
                 "120",
                 "nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66",
-                &["cuda", "cuda-production"],
+                &[
+                    // Keep previously published production packages inspectable.
+                    &["cuda", "cuda-production"],
+                    &["cuda", "cuda-production", "cuda-cutlass-fp8"],
+                ],
             ),
         };
         let actual: BTreeSet<_> = abi.cargo_features.iter().map(String::as_str).collect();
         if abi.target_triple != "x86_64-unknown-linux-gnu"
             || abi.cuda_compute_capability.as_deref() != Some(capability)
             || abi.cuda_toolkit_image.as_deref() != Some(toolkit)
-            || actual != features.iter().copied().collect()
+            || !feature_sets
+                .iter()
+                .any(|features| actual == features.iter().copied().collect())
             || actual.len() != abi.cargo_features.len()
         {
             return Err(
