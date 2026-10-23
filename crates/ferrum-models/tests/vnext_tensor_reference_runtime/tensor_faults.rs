@@ -6,7 +6,7 @@ use ferrum_execution::TensorSerialActor;
 use ferrum_kernels::backend::reference::{
     reference_vnext_dense_linear_provider, ReferenceDeviceBuffer, ReferenceDeviceCommand,
 };
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "fault_runtime.rs"]
 mod runtime;
@@ -57,9 +57,14 @@ struct FaultFixture {
 
 impl FaultFixture {
     fn new() -> Self {
+        static NEXT_DEVICE: AtomicU64 = AtomicU64::new(0);
         let (source_directory, source, family) = source_and_family();
-        let composition =
-            ReferenceVNextComposition::create(id("device.reference.tensor-fault")).unwrap();
+        // Independent fault cases must not share the process-wide device ledger.
+        let composition = ReferenceVNextComposition::create(id(format!(
+            "device.reference.tensor-fault.{}",
+            NEXT_DEVICE.fetch_add(1, Ordering::Relaxed)
+        )))
+        .unwrap();
         let runtime = Arc::new(FaultRuntime::new(composition.runtime().clone()));
         let registry = OperationRuntimeRegistry::new(
             vec![Box::new(dense_linear_contract().unwrap())],
