@@ -462,6 +462,28 @@ impl<R: DeviceRuntime> TensorComponentSession<R> {
             .expect("live session owns executor")
             .execute_initializing_request(run_id, request_id, inputs, destination, mappings)
     }
+
+    pub fn execute_initializing_request_on_actor(
+        &mut self,
+        actor: &mut crate::TensorSerialActor<R>,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        inputs: Vec<ManagedHostTensor>,
+        destination: &mut crate::TensorRequestSession<R>,
+        mappings: &[TensorRequestStateMapping],
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        self.executor
+            .as_mut()
+            .expect("live session owns executor")
+            .execute_initializing_request_on_actor(
+                actor,
+                run_id,
+                request_id,
+                inputs,
+                destination,
+                mappings,
+            )
+    }
     pub fn executable(&self) -> &ExecutablePlan {
         &self.executable
     }
@@ -490,6 +512,19 @@ impl<R: DeviceRuntime> TensorComponentSession<R> {
             .as_mut()
             .expect("live session owns executor")
             .execute(run_id, request_id, inputs)
+    }
+
+    pub fn execute_on_actor(
+        &mut self,
+        actor: &mut crate::TensorSerialActor<R>,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        self.executor
+            .as_mut()
+            .expect("live session owns executor")
+            .execute_on_actor(actor, run_id, request_id, inputs)
     }
 
     /// Return idle activation/workspace backing while retaining initialized

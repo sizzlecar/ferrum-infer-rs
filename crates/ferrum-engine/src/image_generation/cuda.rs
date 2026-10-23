@@ -759,8 +759,8 @@ mod tests {
             automatic.source(),
             super::super::ImageStreamLimitSource::Auto
         );
-        assert_eq!(automatic.required_streams(), 1);
-        assert_eq!(automatic.resolved_streams(), 1);
+        assert_eq!(automatic.required_streams(), 2);
+        assert_eq!(automatic.resolved_streams(), 2);
         let automatic_opaque = c.opaque_bytes().unwrap();
         c.maximum_streams = ImageStreamLimit::Explicit(4);
         c.validate().unwrap();
@@ -769,7 +769,7 @@ mod tests {
         assert_eq!(explicit.resolved_streams(), 4);
         assert_eq!(
             c.opaque_bytes().unwrap(),
-            automatic_opaque + 3 * c.stream_memory_bytes
+            automatic_opaque + 2 * c.stream_memory_bytes
         );
     }
 
@@ -778,6 +778,7 @@ mod tests {
         config().validate().unwrap();
         let edits: &[fn(&mut QwenImage21CudaConfig)] = &[
             |c: &mut QwenImage21CudaConfig| c.maximum_streams = ImageStreamLimit::Explicit(0),
+            |c: &mut QwenImage21CudaConfig| c.maximum_streams = ImageStreamLimit::Explicit(1),
             |c: &mut QwenImage21CudaConfig| c.maximum_in_flight_per_stream = 0,
             |c: &mut QwenImage21CudaConfig| c.maximum_commands_per_submission = 0,
             |c: &mut QwenImage21CudaConfig| c.maximum_commands_per_submission = 31,

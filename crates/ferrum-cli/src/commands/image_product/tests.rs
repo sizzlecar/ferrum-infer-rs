@@ -14,7 +14,7 @@ fn configuration() -> Value {
             "transformer":{"kind":"index","directory":"transformer","file":"diffusion.index.json"},
             "vae":{"kind":"single","directory":"vae","file":"diffusion.safetensors"}},
         "backend":{"kind":"cuda", "ordinal":0, "usable_memory_bytes":1024,
-            "bootstrap_memory_bytes":64,"stream_memory_bytes":64,"maximum_streams":1,
+            "bootstrap_memory_bytes":64,"stream_memory_bytes":64,"maximum_streams":"auto",
             "maximum_in_flight_per_stream":1,"maximum_commands_per_submission":1024,
             "opaque_memory_profile":"unqualified-test",
             "cudnn":{"library_path":"lib/libcudnn.so.9","opaque_memory_bytes":64,
@@ -51,12 +51,12 @@ fn stream_capacity_auto_and_explicit_limits_are_shared_by_run_and_serve() {
         assert_eq!(omitted.maximum_streams, ImageStreamLimit::Auto);
         let automatic = omitted.stream_plan().unwrap();
         assert_eq!(automatic.source(), ImageStreamLimitSource::Auto);
-        assert_eq!(automatic.required_streams(), 1);
-        assert_eq!(automatic.resolved_streams(), 1);
+        assert_eq!(automatic.required_streams(), 2);
+        assert_eq!(automatic.resolved_streams(), 2);
         wire["backend"]["maximum_streams"] = json!("auto");
         let ImageBackendConfig::Cuda(named) = load(&wire).unwrap().backend;
         assert_eq!(named.stream_plan().unwrap(), automatic);
-        for limit in [1, 4] {
+        for limit in [2, 4] {
             wire["backend"]["maximum_streams"] = json!(limit);
             let ImageBackendConfig::Cuda(explicit) = load(&wire).unwrap().backend;
             let plan = explicit.stream_plan().unwrap();
@@ -68,6 +68,7 @@ fn stream_capacity_auto_and_explicit_limits_are_shared_by_run_and_serve() {
         }
         for invalid in [
             json!(0),
+            json!(1),
             json!(-1),
             json!(1.5),
             json!(null),

@@ -617,6 +617,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 });
             }
         }
+        // Successful root retirement precedes the actor's original lane owner.
+        // External failure/completion owners keep their own lane authority;
+        // releasing this owner alone never proves their quiescence.
+        drop(self.serial_actor.take());
         Ok(completed_stages)
     }
 }

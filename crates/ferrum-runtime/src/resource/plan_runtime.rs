@@ -1334,7 +1334,13 @@ where
                         "step slot layout count differs from its immutable pool",
                     ));
                 }
-                for (slot, layout) in domain.pool.step_resource_slots().iter().zip(layouts) {
+                for (slot_index, (slot, layout)) in domain
+                    .pool
+                    .step_resource_slots()
+                    .iter()
+                    .zip(layouts)
+                    .enumerate()
+                {
                     if layout.claim_identity.pool_id() != domain.pool_id()
                         || layout.claim_identity.resource_ids() != slot.resource_ids()
                         || layout.descriptor_indices.len() != slot.resource_ids().len()
@@ -1373,6 +1379,7 @@ where
                         fit_slot_bytes = fit_slot_bytes.max(fit_bytes);
                         capacity_slot_bytes = capacity_slot_bytes.max(capacity_size_bytes);
                         projections.push(EvaluatedBackingProjection {
+                            descriptor_index,
                             descriptor,
                             physical_offset_bytes: 0,
                             logical_size_bytes,
@@ -1389,6 +1396,7 @@ where
                         .ok_or_else(|| invalid_resource("dynamic pool fit demand overflows u64"))?;
                     requested_slices.push(EvaluatedBackingRequest {
                         domain,
+                        step_resource_slot_index: Some(slot_index),
                         claim_identity: layout.claim_identity.clone(),
                         capacity_size_bytes: capacity_slot_bytes,
                         reusable_execution_bucket_id: reusable_execution_bucket
@@ -1398,7 +1406,7 @@ where
                     matched = true;
                 }
             } else {
-                for descriptor in &domain.descriptors {
+                for (descriptor_index, descriptor) in domain.descriptors.iter().enumerate() {
                     if descriptor.lifetime() != lifetime
                         || node_resources.is_some_and(|resources| {
                             !resources.contains(descriptor.base_resource_id())
@@ -1422,6 +1430,7 @@ where
                         .ok_or_else(|| invalid_resource("dynamic pool fit demand overflows u64"))?;
                     requested_slices.push(EvaluatedBackingRequest {
                         domain,
+                        step_resource_slot_index: None,
                         claim_identity: PhysicalBackingClaimIdentity::new(
                             domain.pool_id().clone(),
                             vec![descriptor.base_resource_id().clone()],
@@ -1430,6 +1439,7 @@ where
                         reusable_execution_bucket_id: reusable_execution_bucket
                             .map(|bucket| bucket.bucket_id().clone()),
                         projections: vec![EvaluatedBackingProjection {
+                            descriptor_index,
                             descriptor,
                             physical_offset_bytes: 0,
                             logical_size_bytes,
@@ -1521,7 +1531,7 @@ where
         let mut requested_slices = Vec::new();
         for domain in &self.dynamic_pools().domains {
             let mut pool_delta = 0_u64;
-            for descriptor in &domain.descriptors {
+            for (descriptor_index, descriptor) in domain.descriptors.iter().enumerate() {
                 if descriptor.lifetime() != AllocationLifetime::Sequence {
                     continue;
                 }
@@ -1577,6 +1587,7 @@ where
                 })?;
                 requested_slices.push(EvaluatedBackingRequest {
                     domain,
+                    step_resource_slot_index: None,
                     claim_identity: PhysicalBackingClaimIdentity::new(
                         domain.pool_id().clone(),
                         vec![descriptor.base_resource_id().clone()],
@@ -1584,6 +1595,7 @@ where
                     capacity_size_bytes: delta_bytes,
                     reusable_execution_bucket_id: None,
                     projections: vec![EvaluatedBackingProjection {
+                        descriptor_index,
                         descriptor,
                         physical_offset_bytes: 0,
                         logical_size_bytes: delta_bytes,
@@ -1773,6 +1785,7 @@ where
                     }
                     if projections[projection_layout.projection_index]
                         .replace(EvaluatedBackingProjection {
+                            descriptor_index: projection_layout.descriptor_index,
                             descriptor,
                             physical_offset_bytes,
                             logical_size_bytes,
@@ -1800,6 +1813,7 @@ where
 
             requested_slices.push(EvaluatedBackingRequest {
                 domain,
+                step_resource_slot_index: None,
                 claim_identity: layout.claim_identity.clone(),
                 capacity_size_bytes: capacity_pool_bytes,
                 reusable_execution_bucket_id: reusable_execution_bucket

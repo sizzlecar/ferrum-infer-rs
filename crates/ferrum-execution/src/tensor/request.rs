@@ -65,6 +65,46 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         destination: &mut TensorRequestSession<R>,
         mappings: &[TensorRequestStateMapping],
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        self.execute_initializing_request_with_lane(
+            run_id,
+            request_id,
+            inputs,
+            destination,
+            mappings,
+            None,
+        )
+    }
+
+    pub fn execute_initializing_request_on_actor(
+        &mut self,
+        actor: &mut TensorSerialActor<R>,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        inputs: Vec<ManagedHostTensor>,
+        destination: &mut TensorRequestSession<R>,
+        mappings: &[TensorRequestStateMapping],
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        actor.execute(|lane| {
+            self.execute_initializing_request_with_lane(
+                run_id,
+                request_id,
+                inputs,
+                destination,
+                mappings,
+                Some(lane),
+            )
+        })
+    }
+
+    fn execute_initializing_request_with_lane(
+        &mut self,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        inputs: Vec<ManagedHostTensor>,
+        destination: &mut TensorRequestSession<R>,
+        mappings: &[TensorRequestStateMapping],
+        lane: Option<&Arc<ExecutionLane<R>>>,
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
         if destination.failed || destination.session.is_none() {
             return Err(invalid("cannot initialize a failed or closed tensor request").into());
         }
@@ -75,6 +115,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             work,
             None,
             Some((&destination.target, mappings)),
+            lane,
         );
         if result.is_err() {
             destination.failed = true;
@@ -87,6 +128,22 @@ impl<R: DeviceRuntime> TensorRequestSession<R> {
     pub fn execute(
         &mut self,
         inputs: Vec<ManagedHostTensor>,
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        self.execute_with_lane(inputs, None)
+    }
+
+    pub fn execute_on_actor(
+        &mut self,
+        actor: &mut TensorSerialActor<R>,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        actor.execute(|lane| self.execute_with_lane(inputs, Some(lane)))
+    }
+
+    fn execute_with_lane(
+        &mut self,
+        inputs: Vec<ManagedHostTensor>,
+        lane: Option<&Arc<ExecutionLane<R>>>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
         if self.failed {
             return Err(invalid("failed fixed request cannot execute again").into());
@@ -104,6 +161,7 @@ impl<R: DeviceRuntime> TensorRequestSession<R> {
             work,
             Some(session),
             None,
+            lane,
         );
         if result.is_err() {
             self.failed = true;

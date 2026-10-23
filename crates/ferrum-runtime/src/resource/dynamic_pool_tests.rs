@@ -1420,6 +1420,14 @@ fn evaluated_descriptor_request<'a>(
     let descriptor = &pool.domain.descriptors[descriptor_index];
     EvaluatedBackingRequest {
         domain: &pool.domain,
+        step_resource_slot_index: pool
+            .domain
+            .pool
+            .step_resource_slots()
+            .iter()
+            .position(|slot| {
+                slot.resource_ids() == std::slice::from_ref(descriptor.base_resource_id())
+            }),
         claim_identity: PhysicalBackingClaimIdentity::new(
             pool.domain.pool_id().clone(),
             vec![descriptor.base_resource_id().clone()],
@@ -1428,6 +1436,7 @@ fn evaluated_descriptor_request<'a>(
         capacity_size_bytes: size_bytes,
         reusable_execution_bucket_id: None,
         projections: vec![EvaluatedBackingProjection {
+            descriptor_index,
             descriptor,
             physical_offset_bytes: 0,
             logical_size_bytes: size_bytes,
@@ -2602,6 +2611,44 @@ fn reusable_bucket_reuses_capacity_layout_without_widening_logical_view() {
         128
     );
     assert_eq!(second_requests[0].capacity_size_bytes, 256);
+    // These requests keep the already-cached ID/capacity layout. A warm hit
+    // must still reject invalid immutable index hints without consuming the
+    // idle slot, changing backing occupancy, or allocating a replacement.
+    let reject_warm = |request: EvaluatedBackingRequest<'_>| {
+        assert!(harness
+            .root
+            .dynamic_pools
+            .prepare_lane_stable_claim(&lane, std::slice::from_ref(&request))
+            .is_err());
+        assert_eq!(
+            harness.root.maintenance_controller.status().unwrap(),
+            retained_status
+        );
+        assert_eq!(runtime.allocate_calls(), allocations_before);
+    };
+    let mut bad = second_requests[0].clone();
+    bad.projections[0].descriptor_index = usize::MAX;
+    reject_warm(bad);
+    let mut bad = second_requests[0].clone();
+    bad.step_resource_slot_index = Some(usize::MAX);
+    reject_warm(bad);
+    let mut bad = second_requests[0].clone();
+    bad.step_resource_slot_index = None;
+    reject_warm(bad);
+    let mut wrong_domain = second_requests[0].domain.clone();
+    wrong_domain.domain_id = CapacityDomainId::new(99).unwrap();
+    let mut bad = second_requests[0].clone();
+    bad.domain = &wrong_domain;
+    reject_warm(bad);
+    let mut wrong_descriptor = second_requests[0].domain.clone();
+    let descriptor_index = second_requests[0].projections[0].descriptor_index;
+    let mut wire = serde_json::to_value(&wrong_descriptor.descriptors[descriptor_index]).unwrap();
+    wire["demand"] = serde_json::json!({"tokens": {"bytes_per_token": 128, "maximum_tokens": 4}});
+    wrong_descriptor.descriptors[descriptor_index] = serde_json::from_value(wire).unwrap();
+    let mut bad = second_requests[0].clone();
+    bad.domain = &wrong_descriptor;
+    bad.projections[0].descriptor = &wrong_descriptor.descriptors[descriptor_index];
+    reject_warm(bad);
     let LaneBackingPrepareDecision::Prepared(second_prepared) = harness
         .root
         .dynamic_pools

@@ -32,7 +32,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let mut vae = self.start_stage(stage, job, stages)?;
         let mut images = Vec::with_capacity(request_batch);
         for input in inputs {
-            let (active, outputs) = vae.execute(job, vec![input])?;
+            let (active, outputs) = self.execute_stage(vae, job, vec![input])?;
             vae = active;
             let validation = (|| -> anyhow::Result<()> {
                 let rgba = only_output(outputs, QwenImage21VaeDecoderFamily::OUTPUT_ID)?;

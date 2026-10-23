@@ -100,8 +100,12 @@ fn exact_plan_reuses_static_weights_trims_dynamic_and_preserves_independent_outp
             .unwrap_or_else(|_| panic!("initialize/reuse"));
         assert_eq!(active.receipt.session_reused, job == 1);
         assert_eq!(active.receipt.weights_reused, job == 1);
-        let (active, output) = active
-            .execute(job, vec![input(&pipeline.host, 1, job as usize * 8)])
+        let (active, output) = pipeline
+            .execute_stage(
+                active,
+                job,
+                vec![input(&pipeline.host, 1, job as usize * 8)],
+            )
             .unwrap_or_else(|_| panic!("numeric projection"));
         let output = only_output(output, IMAGE_PROJECTION_OUTPUT_ID).unwrap();
         for (index, part) in output.bytes().bytes().chunks_exact(2).enumerate() {
@@ -133,6 +137,7 @@ fn exact_plan_reuses_static_weights_trims_dynamic_and_preserves_independent_outp
         retained.push(output);
     }
     let shutdown = pipeline.shutdown().unwrap();
+    assert!(pipeline.serial_actor.is_none());
     assert_eq!(shutdown.len(), 2);
     assert!(shutdown[0].close.is_some());
     assert!(serde_json::to_value(&shutdown[0]).unwrap()["close"].is_object());
@@ -153,6 +158,54 @@ fn exact_plan_reuses_static_weights_trims_dynamic_and_preserves_independent_outp
     assert_eq!(&retained[0].bytes().bytes()[..2], &0x3f80_u16.to_le_bytes());
     drop(retained);
     assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn failed_serial_actor_stops_generation_and_edit_admission_before_preparation() {
+    let (mut pipeline, _directory) = numeric_pipeline();
+    let stage = prepared(&pipeline, 1);
+    let active = pipeline
+        .start_stage(stage, 0, &mut Vec::new())
+        .unwrap_or_else(|_| panic!("initialize"));
+    let Err(ImageGenerationFailure::Execution { source, active }) =
+        pipeline.execute_stage(active, 0, Vec::new())
+    else {
+        panic!("missing inputs must fail without losing recovery owners")
+    };
+    assert!(pipeline.is_stopped());
+    let before = pipeline.runtime.snapshot();
+    assert!(matches!(
+        pipeline.generate(request()),
+        Err(ImageGenerationError {
+            failure: ImageGenerationFailure::Unavailable,
+            ..
+        })
+    ));
+    let image = pipeline
+        .host
+        .allocate_zeroed(HostMemoryClass::InputPreprocess, 1)
+        .unwrap()
+        .freeze();
+    assert!(matches!(
+        pipeline.edit(ImageEditRequest {
+            generation: request(),
+            image,
+        }),
+        Err(ImageGenerationError {
+            failure: ImageGenerationFailure::Unavailable,
+            ..
+        })
+    ));
+    assert_eq!(pipeline.runtime.snapshot(), before);
+    assert!(pipeline.serial_actor.is_some());
+    // An input-validation error has no pending device work. Retire the returned
+    // session explicitly, then shutdown may release the pipeline's actor owner.
+    drop(source);
+    active
+        .close()
+        .unwrap_or_else(|_| panic!("recover failed stage"));
+    pipeline.shutdown().unwrap();
+    assert!(pipeline.serial_actor.is_none());
 }
 
 #[test]

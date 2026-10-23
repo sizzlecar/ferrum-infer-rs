@@ -114,7 +114,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             completed_stages: Vec::new(),
             completed_steps: Vec::new(),
         };
-        if self.stopped {
+        if self.is_stopped() {
             return Err(ImageGenerationError {
                 failure: ImageGenerationFailure::Unavailable,
                 completed_stages: Vec::new(),
@@ -216,7 +216,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let mut vision_inputs = Vec::from(position_inputs);
         vision_inputs.insert(0, patches);
         let active = self.start_stage(vision_stage, job, stages)?;
-        let (active, outputs) = active.execute(job, vision_inputs)?;
+        let (active, outputs) = self.execute_stage(active, job, vision_inputs)?;
         self.finish_stage(active, stages)?;
         let started = std::time::Instant::now();
         let embedding = self
@@ -230,7 +230,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map_err(process)?;
         let text_bridge_us = trace_elapsed_us(started);
         let active = self.start_stage(text_stage, job, stages)?;
-        let (active, outputs) = active.execute(job, text_inputs)?;
+        let (active, outputs) = self.execute_stage(active, job, text_inputs)?;
         self.finish_stage(active, stages)?;
         let started = std::time::Instant::now();
         let hidden = only_output(outputs, Qwen3VLTextEncoderFamily::OUTPUT_ID).map_err(process)?;
@@ -243,7 +243,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let hidden_crop_us = trace_elapsed_us(started);
 
         let active = self.start_stage(encoder_stage, job, stages)?;
-        let (active, outputs) = active.execute(job, vec![rgba])?;
+        let (active, outputs) = self.execute_stage(active, job, vec![rgba])?;
         self.finish_stage(active, stages)?;
         let started = std::time::Instant::now();
         let encoded =

@@ -248,7 +248,7 @@ mod attention_policy_tests {
     fn actual_cuda_wire_requires_explicit_sdpa_and_rejects_unknown_policy() {
         let mut wire = serde_json::json!({
             "ordinal":0,"usable_memory_bytes":1024,"bootstrap_memory_bytes":64,
-            "stream_memory_bytes":64,"maximum_streams":1,"maximum_in_flight_per_stream":1,
+            "stream_memory_bytes":64,"maximum_streams":"auto","maximum_in_flight_per_stream":1,
             "maximum_commands_per_submission":2048,"opaque_memory_profile":"test",
             "cudnn":{"library_path":"/explicit/libcudnn.so.9","opaque_memory_bytes":64,
                 "workspace_limit_bytes":0,"opaque_memory_profile":"test"},

@@ -1,5 +1,6 @@
 //! Real Reference producer -> D2D request state -> repeated fixed steps.
 use super::*;
+use ferrum_execution::TensorSerialActor;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -287,6 +288,182 @@ fn request_d2d_initialization_rebinds_inputs_without_host_cache_and_retires() {
     assert_eq!(one[0].bytes().bytes(), bytes(&[12., 16., 36., 48.]));
     drop((one, two));
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn serial_actor_reuses_components_but_initializes_each_request_from_fresh_inputs() {
+    let c =
+        ReferenceVNextComposition::create_with_capacity(id("device.request.serial-actor"), 4096)
+            .unwrap();
+    let host = host();
+    let mut producer = component(&c, &host, true);
+    let consumer = component(&c, &host, false);
+    let mut actor = TensorSerialActor::new(c.runtime().clone()).unwrap();
+    let standalone = producer
+        .execute_on_actor(
+            &mut actor,
+            id("run.actor.standalone"),
+            id("request.actor.standalone"),
+            vec![input(&host, [2., 3., -1., 4.])],
+        )
+        .unwrap();
+    assert_eq!(
+        standalone
+            .iter()
+            .find(|output| output.value_id().as_str() == Y)
+            .unwrap()
+            .bytes()
+            .bytes(),
+        bytes(&[6., 9., -3., 12.]),
+    );
+    drop(standalone);
+    let mut last_output = None;
+    for (ordinal, source, step_input, expected) in [
+        (
+            0,
+            [1., -2., 3., 4.],
+            [10., 20., 30., 40.],
+            [12., 16., 36., 48.],
+        ),
+        (1, [-3., 5., 2., -1.], [8., -4., 6., 2.], [2., 6., 10., 0.]),
+    ] {
+        drop(last_output.take());
+        let mut request = consumer
+            .begin_request(
+                id(format!("run.actor.request.{ordinal}")),
+                id(format!("request.actor.request.{ordinal}")),
+                vec![input(&host, [0.; 4])],
+            )
+            .unwrap();
+        let before = c.runtime().snapshot();
+        assert!(
+            request.execute(vec![input(&host, [1.; 4])]).is_err(),
+            "a new request must not inherit initialized state from the previous request"
+        );
+        assert_eq!(c.runtime().snapshot().submissions, before.submissions);
+        let initial = producer
+            .execute_initializing_request_on_actor(
+                &mut actor,
+                id(format!("run.actor.prefill.{ordinal}")),
+                id(format!("request.actor.prefill.{ordinal}")),
+                vec![input(&host, source)],
+                &mut request,
+                &mappings(),
+            )
+            .unwrap();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].bytes().bytes(), bytes(&source.map(|x| 3. * x)));
+        assert_eq!(
+            c.runtime().snapshot().readback_bytes - before.readback_bytes,
+            8
+        );
+        let output = request
+            .execute_on_actor(&mut actor, vec![input(&host, step_input)])
+            .unwrap();
+        assert_eq!(output[0].bytes().bytes(), bytes(&expected));
+        assert!(!actor.is_failed());
+        request.close().unwrap();
+        drop(initial);
+        last_output = Some(output);
+    }
+    close(producer);
+    close(consumer);
+    drop(actor);
+    assert_eq!(c.runtime().snapshot().live_allocations, 0);
+    let output = last_output.unwrap();
+    assert_eq!(output[0].bytes().bytes(), bytes(&[2., 6., 10., 0.]));
+    assert_eq!(host.usage().unwrap().committed_bytes(), 8);
+    drop(output);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn serial_actor_rejects_foreign_runtime_even_with_identical_device_descriptors() {
+    for route in ["component", "initialization", "request"] {
+        let device = format!("device.request.actor-foreign.{route}");
+        let c = ReferenceVNextComposition::create_with_capacity(id(&device), 4096).unwrap();
+        let other = ReferenceVNextComposition::create_with_capacity(id(&device), 4096).unwrap();
+        assert_eq!(c.runtime().descriptor(), other.runtime().descriptor());
+        assert!(!std::sync::Arc::ptr_eq(c.runtime(), other.runtime()));
+        let host = host();
+        let mut local_producer = component(&c, &host, true);
+        let mut foreign_producer = component(&other, &host, true);
+        let foreign_consumer = component(&other, &host, false);
+        let mut request = foreign_consumer
+            .begin_request(
+                id("run.actor.foreign-request"),
+                id("request.actor.foreign-request"),
+                vec![input(&host, [0.; 4])],
+            )
+            .unwrap();
+        if route == "request" {
+            drop(
+                foreign_producer
+                    .execute_initializing_request(
+                        id("run.actor.foreign-prefill"),
+                        id("request.actor.foreign-prefill"),
+                        vec![input(&host, [1.; 4])],
+                        &mut request,
+                        &mappings(),
+                    )
+                    .unwrap(),
+            );
+        }
+        let mut actor = TensorSerialActor::new(c.runtime().clone()).unwrap();
+        let local_submissions = c.runtime().snapshot().submissions;
+        let foreign_submissions = other.runtime().snapshot().submissions;
+        let result = match route {
+            "component" => foreign_producer.execute_on_actor(
+                &mut actor,
+                id("run.actor.foreign-component"),
+                id("request.actor.foreign-component"),
+                vec![input(&host, [1.; 4])],
+            ),
+            "initialization" => local_producer.execute_initializing_request_on_actor(
+                &mut actor,
+                id("run.actor.foreign-initialization"),
+                id("request.actor.foreign-initialization"),
+                vec![input(&host, [1.; 4])],
+                &mut request,
+                &mappings(),
+            ),
+            "request" => request.execute_on_actor(&mut actor, vec![input(&host, [1.; 4])]),
+            _ => unreachable!(),
+        };
+        assert!(result.is_err(), "foreign runtime accepted on {route}");
+        assert!(actor.is_failed());
+        assert_eq!(c.runtime().snapshot().submissions, local_submissions);
+        assert_eq!(other.runtime().snapshot().submissions, foreign_submissions);
+        drop(result);
+        if route == "request" {
+            // Admission rejected the foreign lane before submission, and the
+            // execution scope already aborted this persistent session. Closing
+            // it again must preserve the runtime's strict terminal transition.
+            assert!(request.execute(vec![input(&host, [2.; 4])]).is_err());
+            assert_eq!(other.runtime().snapshot().submissions, foreign_submissions);
+            let failure = request.close().unwrap_err();
+            assert!(matches!(
+                failure.error(),
+                VNextError::InvalidExecutionPlan { reason }
+                    if reason == "sequence session is already terminal"
+            ));
+            // The failed close still owns the request. Dropping it must release
+            // its remaining claims without manufacturing a successful close.
+            let (_, mut request) = failure.into_parts();
+            assert!(request.execute(vec![input(&host, [3.; 4])]).is_err());
+            assert_eq!(other.runtime().snapshot().submissions, foreign_submissions);
+            drop(request);
+        } else {
+            request.close().unwrap();
+        }
+        close(local_producer);
+        close(foreign_producer);
+        close(foreign_consumer);
+        drop(actor);
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+        assert_eq!(c.runtime().snapshot().live_allocations, 0);
+        assert_eq!(other.runtime().snapshot().live_allocations, 0);
+    }
 }
 
 #[test]

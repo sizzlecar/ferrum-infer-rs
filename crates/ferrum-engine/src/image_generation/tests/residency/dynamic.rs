@@ -64,8 +64,8 @@ fn retain_decoder(
     let active = pipeline
         .start_stage(stage, 0, stages)
         .unwrap_or_else(|_| panic!("decoder start"));
-    let (active, outputs) = active
-        .execute(0, vec![input(&pipeline.host, rows, 0)])
+    let (active, outputs) = pipeline
+        .execute_stage(active, 0, vec![input(&pipeline.host, rows, 0)])
         .unwrap_or_else(|_| panic!("decoder execute"));
     drop(outputs);
     pipeline
@@ -154,8 +154,12 @@ fn decoder_dynamic_reuse_preserves_outputs_and_original_device_capacity_grants()
             .start_stage(stage, job, &mut stages)
             .unwrap_or_else(|_| panic!("decoder start"));
         assert_eq!(active.receipt.session_reused, job == 1);
-        let (active, output) = active
-            .execute(job, vec![input(&pipeline.host, 1, job as usize * 8)])
+        let (active, output) = pipeline
+            .execute_stage(
+                active,
+                job,
+                vec![input(&pipeline.host, 1, job as usize * 8)],
+            )
             .unwrap_or_else(|_| panic!("decoder forward"));
         let output = only_output(output, IMAGE_PROJECTION_OUTPUT_ID).unwrap();
         for (index, bytes) in output.bytes().bytes().chunks_exact(2).enumerate() {
@@ -326,8 +330,12 @@ fn small_stages_reuse_two_independent_pools_and_preserve_numerical_outputs() {
                 .start_stage(stage, job, &mut stages)
                 .unwrap_or_else(|_| panic!("small stage start"));
             assert_eq!(active.receipt.session_reused, job == 1);
-            let (active, output) = active
-                .execute(job, vec![input(&pipeline.host, 1, job as usize * 8)])
+            let (active, output) = pipeline
+                .execute_stage(
+                    active,
+                    job,
+                    vec![input(&pipeline.host, 1, job as usize * 8)],
+                )
                 .unwrap_or_else(|_| panic!("small stage execute"));
             let output = only_output(output, IMAGE_PROJECTION_OUTPUT_ID).unwrap();
             for (index, bytes) in output.bytes().bytes().chunks_exact(2).enumerate() {

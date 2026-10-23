@@ -2,6 +2,7 @@
 //! establish GPU-asynchronous behavior or model precision coverage.
 
 use super::*;
+use ferrum_execution::TensorSerialActor;
 use ferrum_kernels::backend::reference::{
     reference_vnext_dense_linear_provider, ReferenceDeviceBuffer, ReferenceDeviceCommand,
 };
@@ -147,6 +148,19 @@ impl FaultFixture {
         self.executor.execute(
             id("run.tensor.fault"),
             id("request.tensor.fault"),
+            vec![typed_input(managed_input(&self.host))],
+        )
+    }
+
+    fn execute_on_actor(
+        &mut self,
+        actor: &mut TensorSerialActor<FaultRuntime>,
+    ) -> Result<Vec<ferrum_execution::TensorExecutionOutput>, TensorExecutionError<FaultRuntime>>
+    {
+        self.executor.execute_on_actor(
+            actor,
+            id("run.tensor.actor-fault"),
+            id("request.tensor.actor-fault"),
             vec![typed_input(managed_input(&self.host))],
         )
     }
@@ -392,6 +406,129 @@ fn managed_readback_error_or_panic_after_partial_write_never_publishes_the_outpu
         assert_eq!(fixture.host.usage().unwrap().committed_bytes(), 0);
         assert_eq!(fixture.executor.completion_reaper().retained_count(), 0);
         fixture.runtime.set_readback(ReadbackMode::Real);
+        fixture.assert_success();
+        fixture.close();
+        drop(error);
+    }
+}
+
+#[test]
+fn serial_actor_drop_does_not_release_indeterminate_execution_owners() {
+    let mut fixture = FaultFixture::new();
+    let mut actor = TensorSerialActor::new(fixture.runtime.clone()).unwrap();
+    fixture.runtime.set_fence(FenceMode::Indeterminate);
+    let mut error = fixture.execute_on_actor(&mut actor).unwrap_err();
+    assert!(actor.is_failed());
+    assert_only_input_retained(&fixture);
+    assert_idle_trim_busy_without_releasing(&fixture);
+    let before = fixture.runtime.inner.snapshot();
+    assert!(fixture
+        .executor
+        .execute_on_actor(
+            &mut actor,
+            id("run.tensor.actor-stopped"),
+            id("request.tensor.actor-stopped"),
+            Vec::new(),
+        )
+        .is_err());
+    assert_eq!(fixture.runtime.inner.snapshot(), before);
+    drop(actor);
+    assert_only_input_retained(&fixture);
+    assert_idle_trim_busy_without_releasing(&fixture);
+
+    let TensorExecutionError::NonTerminal {
+        completion,
+        retirement,
+        reaper,
+        ..
+    } = &mut error
+    else {
+        panic!("expected indeterminate execution ownership, received {error:?}")
+    };
+    assert_eq!(reaper.retained_count(), 1);
+    assert!(retirement.try_abort().is_err());
+    fixture.runtime.set_fence(FenceMode::Real);
+    assert!(matches!(
+        completion.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+    retirement.try_abort().unwrap();
+    assert_eq!(reaper.retained_count(), 0);
+    assert_eq!(fixture.host.usage().unwrap().committed_bytes(), 0);
+    assert!(matches!(
+        fixture
+            .resources
+            .try_release_idle_dynamic_backing()
+            .unwrap(),
+        IdleDynamicReleaseOutcome::Released(_)
+    ));
+    fixture.assert_success();
+    fixture.close();
+    drop(error);
+}
+
+#[test]
+fn serial_actor_compute_and_readback_failures_keep_retirement_and_stop_reuse() {
+    for (fence, readback) in [
+        (FenceMode::FailedButQuiescent, ReadbackMode::Real),
+        (FenceMode::Real, ReadbackMode::ErrorAfterWrite),
+        (FenceMode::Real, ReadbackMode::PanicAfterWrite),
+    ] {
+        let mut fixture = FaultFixture::new();
+        let mut actor = TensorSerialActor::new(fixture.runtime.clone()).unwrap();
+        fixture.runtime.set_fence(fence);
+        fixture.runtime.set_readback(readback);
+        let mut error = fixture.execute_on_actor(&mut actor).unwrap_err();
+        assert!(actor.is_failed());
+        let usage = fixture.host.usage().unwrap();
+        assert_eq!(
+            usage.class_committed_bytes(HostMemoryClass::InputPreprocess),
+            12
+        );
+        assert_eq!(usage.class_committed_bytes(HostMemoryClass::Output), 0);
+        assert_idle_trim_busy_without_releasing(&fixture);
+        match (&mut error, fence, readback) {
+            (
+                TensorExecutionError::ExecutionFailed {
+                    receipt,
+                    retirement,
+                },
+                FenceMode::FailedButQuiescent,
+                ReadbackMode::Real,
+            ) => {
+                assert!(matches!(
+                    receipt.disposition(),
+                    OperationCompletionDisposition::FailedButQuiescent(_)
+                ));
+                retirement.try_abort().unwrap();
+            }
+            (
+                TensorExecutionError::Readback {
+                    receipt,
+                    retirement,
+                    ..
+                },
+                FenceMode::Real,
+                ReadbackMode::ErrorAfterWrite | ReadbackMode::PanicAfterWrite,
+            ) => {
+                assert!(matches!(
+                    receipt.disposition(),
+                    OperationCompletionDisposition::Succeeded
+                ));
+                retirement.try_abort().unwrap();
+            }
+            _ => panic!("unexpected actor failure: {error:?}"),
+        }
+        assert_eq!(fixture.host.usage().unwrap().committed_bytes(), 0);
+        assert_eq!(fixture.executor.completion_reaper().retained_count(), 0);
+        fixture.runtime.set_fence(FenceMode::Real);
+        fixture.runtime.set_readback(ReadbackMode::Real);
+        let before = fixture.runtime.inner.snapshot();
+        assert!(fixture.execute_on_actor(&mut actor).is_err());
+        assert!(actor.is_failed());
+        assert_eq!(fixture.runtime.inner.snapshot(), before);
+        assert_eq!(fixture.host.usage().unwrap().committed_bytes(), 0);
+        drop(actor);
         fixture.assert_success();
         fixture.close();
         drop(error);

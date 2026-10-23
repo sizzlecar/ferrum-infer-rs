@@ -189,7 +189,7 @@ impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
         let mut logical_bytes = 0_u64;
         let mut extent_bytes = 0_u64;
         for resource in &request.requests {
-            let (domain, descriptor) = self
+            let (domain, descriptor_index, descriptor) = self
                 .dynamic_pools()
                 .domains
                 .iter()
@@ -197,8 +197,11 @@ impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
                     domain
                         .descriptors
                         .iter()
-                        .find(|descriptor| descriptor.base_resource_id() == &resource.resource_id)
-                        .map(|descriptor| (domain, descriptor))
+                        .enumerate()
+                        .find(|(_, descriptor)| {
+                            descriptor.base_resource_id() == &resource.resource_id
+                        })
+                        .map(|(index, descriptor)| (domain, index, descriptor))
                 })
                 .ok_or_else(|| {
                     invalid_resource("checkpoint references an unknown plan resource")
@@ -231,6 +234,7 @@ impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
                 .ok_or_else(|| invalid_resource("checkpoint extent bytes overflow u64"))?;
             requested_slices.push(EvaluatedBackingRequest {
                 domain,
+                step_resource_slot_index: None,
                 claim_identity: PhysicalBackingClaimIdentity::new(
                     domain.pool_id().clone(),
                     vec![resource.resource_id.clone()],
@@ -238,6 +242,7 @@ impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
                 capacity_size_bytes: capacity_bytes,
                 reusable_execution_bucket_id: None,
                 projections: vec![EvaluatedBackingProjection {
+                    descriptor_index,
                     descriptor,
                     physical_offset_bytes: 0,
                     logical_size_bytes: resource.logical_bytes,

@@ -1259,6 +1259,52 @@ where
             .transpose()
     }
 
+    /// Index hints never substitute for immutable membership evidence, even
+    /// when a previously certified lane-stable backing slot can be reused.
+    fn projection_indices_match(
+        pool: &DynamicBackingPool<R>,
+        request: &EvaluatedBackingRequest<'_>,
+    ) -> bool {
+        let step_slot_matches = match request.step_resource_slot_index {
+            Some(index) => pool
+                .domain
+                .pool
+                .step_resource_slots()
+                .get(index)
+                .is_some_and(|slot| {
+                    slot.resource_ids() == request.claim_identity.resource_ids()
+                        && request.projections.iter().all(|projection| {
+                            projection.descriptor.lifetime() == AllocationLifetime::Step
+                        })
+                        && match slot.kind() {
+                            StepResourceSlotKind::Dedicated => request.projections.len() == 1,
+                            StepResourceSlotKind::OrderedSingleFenceStepWave => {
+                                request.projections.len() > 1
+                            }
+                        }
+                }),
+            None => request
+                .projections
+                .iter()
+                .all(|projection| projection.descriptor.lifetime() != AllocationLifetime::Step),
+        };
+        request.domain.pool_id() == pool.domain.pool_id()
+            && request.domain.domain_id() == pool.domain.domain_id()
+            && request.claim_identity.pool_id() == pool.domain.pool_id()
+            && step_slot_matches
+            && !request.projections.is_empty()
+            && request.claim_identity.resource_ids().iter().eq(request
+                .projections
+                .iter()
+                .map(|projection| projection.descriptor.base_resource_id()))
+            && request.projections.iter().all(|projection| {
+                request.domain.descriptors.get(projection.descriptor_index)
+                    == Some(projection.descriptor)
+                    && pool.domain.descriptors.get(projection.descriptor_index)
+                        == Some(projection.descriptor)
+            })
+    }
+
     pub(in crate::resource) fn prepare_lane_stable_claim(
         self: &Arc<Self>,
         lane: &Arc<ExecutionLane<R>>,
@@ -1308,6 +1354,17 @@ where
             return Err(invalid_resource(
                 "lane-stable backing accepts only non-initialized Step or Invocation resources",
             ));
+        }
+
+        for request in requests {
+            let pool = self.pools.get(request.domain.pool_id()).ok_or_else(|| {
+                invalid_resource("lane-stable backing request references an unknown pool")
+            })?;
+            if !Self::projection_indices_match(pool, request) {
+                return Err(invalid_resource(
+                    "lane-stable backing request indices differ from immutable pool membership",
+                ));
+            }
         }
 
         let mut canonical_requests = requests.iter().collect::<Vec<_>>();
@@ -1895,11 +1952,9 @@ where
                 }
                 let quantum = pool.allocation_quantum();
                 for request in pool_requests {
-                    let projection_ids = request
-                        .projections
-                        .iter()
-                        .map(|projection| projection.descriptor.base_resource_id().clone())
-                        .collect::<Vec<_>>();
+                    let step_slot = request
+                        .step_resource_slot_index
+                        .and_then(|index| pool.domain.pool.step_resource_slots().get(index));
                     let single_projection = request.projections.len() == 1
                         && request.projections[0].physical_offset_bytes == 0
                         && request.projections[0].capacity_size_bytes
@@ -1915,16 +1970,13 @@ where
                             .map(|projection| projection.capacity_size_bytes)
                             .max()
                             == Some(request.capacity_size_bytes)
-                        && pool.domain.pool.step_resource_slots().iter().any(|slot| {
+                        && step_slot.is_some_and(|slot| {
                             slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave
                                 && slot.resource_ids() == request.claim_identity.resource_ids()
                         });
                     let invocation_wave =
                         self.validate_invocation_wave_projection(pool, request)?;
-                    if request.domain.pool_id() != pool.domain.pool_id()
-                        || request.claim_identity.pool_id() != pool.domain.pool_id()
-                        || request.claim_identity.resource_ids() != projection_ids
-                        || request.projections.is_empty()
+                    if !Self::projection_indices_match(pool, request)
                         || request.projections.windows(2).any(|pair| {
                             pair[0].descriptor.base_resource_id()
                                 >= pair[1].descriptor.base_resource_id()
@@ -1958,11 +2010,6 @@ where
                                     .physical_offset_bytes
                                     .checked_add(projection.capacity_size_bytes)
                                     .is_none_or(|end| end > request.capacity_size_bytes)
-                                || !request
-                                    .domain
-                                    .descriptors
-                                    .iter()
-                                    .any(|descriptor| descriptor == projection.descriptor)
                         })
                         || request.capacity_size_bytes == 0
                         || request.capacity_size_bytes % quantum != 0

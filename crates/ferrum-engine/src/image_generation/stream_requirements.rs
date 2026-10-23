@@ -1,16 +1,18 @@
 //! Managed stream capacity derived from the serial image execution schedule.
-//! Static initialization completes before execution, and the service worker
-//! finishes a batch before starting another. Failed work stops the pipeline.
+//! The serial actor retains one lane across components; static initialization
+//! needs a separate temporary stream. The service worker finishes a batch
+//! before starting another. Failed work stops the pipeline.
 //! The runtime's bootstrap allocation stream and opaque library internals are
 //! separate owners, not additional execution-lane slots.
 
 use anyhow::{ensure, Result};
-use ferrum_execution::TensorExecutorConfig;
+use ferrum_execution::{TensorExecutorConfig, TensorSerialActorStreamRequirements};
 use ferrum_runtime::{BlockingStreamRequirement, StaticInitializationPolicy};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ImageStreamRequirements {
+    serial_actor: TensorSerialActorStreamRequirements,
     static_initialization: BlockingStreamRequirement,
     tensor_execution: BlockingStreamRequirement,
     request_state: BlockingStreamRequirement,
@@ -24,18 +26,24 @@ impl ImageStreamRequirements {
         initialization: StaticInitializationPolicy,
         executor: TensorExecutorConfig,
     ) -> Self {
+        let serial_actor = executor.serial_actor_stream_requirements();
         Self {
+            serial_actor,
             static_initialization: initialization.stream_requirement(),
-            tensor_execution: executor.execution_stream_requirement(),
+            tensor_execution: BlockingStreamRequirement::new(
+                serial_actor.execution_additional_streams(),
+            ),
             request_state: executor.request_state_stream_requirement(),
         }
     }
 
     pub fn required_streams(self) -> usize {
-        self.static_initialization
-            .maximum_live_streams()
-            .max(self.tensor_execution.maximum_live_streams())
-            .max(self.request_state.maximum_live_streams())
+        self.serial_actor.retained_streams()
+            + self
+                .static_initialization
+                .maximum_live_streams()
+                .max(self.tensor_execution.maximum_live_streams())
+                .max(self.request_state.maximum_live_streams())
     }
 }
 
@@ -127,17 +135,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serial_schedule_uses_executor_declarations_and_does_not_sum_disjoint_phases() {
+    fn serial_schedule_adds_retained_actor_to_peak_additional_phase_requirement() {
         let requirements = ImageStreamRequirements::for_serial_pipeline(
             StaticInitializationPolicy::new(1024, 8).unwrap(),
             TensorExecutorConfig::default(),
         );
         let plan = ImageStreamLimit::Auto.resolve(requirements).unwrap();
-        assert_eq!(plan.required_streams(), 1);
-        assert_eq!(plan.resolved_streams(), 1);
+        assert_eq!(plan.required_streams(), 2);
+        assert_eq!(plan.resolved_streams(), 2);
         assert_eq!(plan.source(), ImageStreamLimitSource::Auto);
+        assert_eq!(requirements.serial_actor.retained_streams(), 1);
+        assert_eq!(requirements.tensor_execution.maximum_live_streams(), 0);
         assert_eq!(requirements.request_state.maximum_live_streams(), 0);
         let wider = ImageStreamRequirements {
+            serial_actor: requirements.serial_actor,
             static_initialization: BlockingStreamRequirement::new(3),
             tensor_execution: BlockingStreamRequirement::new(2),
             request_state: BlockingStreamRequirement::new(0),
@@ -147,18 +158,27 @@ mod tests {
                 .resolve(wider)
                 .unwrap()
                 .resolved_streams(),
-            3
+            4
         );
         assert!(ImageStreamLimit::Explicit(2).resolve(wider).is_err());
         let explicit = ImageStreamLimit::Explicit(5).resolve(wider).unwrap();
-        assert_eq!(explicit.required_streams(), 3);
+        assert_eq!(explicit.required_streams(), 4);
         assert_eq!(explicit.resolved_streams(), 5);
         assert_eq!(explicit.source(), ImageStreamLimitSource::Explicit);
         assert!(ImageStreamLimit::Explicit(0).resolve(requirements).is_err());
+        assert!(ImageStreamLimit::Explicit(1).resolve(requirements).is_err());
         let receipt = serde_json::to_value(plan).unwrap();
         assert_eq!(receipt["source"], "auto");
-        assert_eq!(receipt["required_streams"], 1);
-        assert_eq!(receipt["resolved_streams"], 1);
+        assert_eq!(receipt["required_streams"], 2);
+        assert_eq!(receipt["resolved_streams"], 2);
+        assert_eq!(
+            receipt["requirements"]["serial_actor"]["retained_streams"],
+            1
+        );
+        assert_eq!(
+            receipt["requirements"]["serial_actor"]["execution_additional_streams"],
+            0
+        );
     }
 
     #[test]

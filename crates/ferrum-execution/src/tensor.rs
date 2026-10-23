@@ -10,8 +10,10 @@ use ferrum_runtime::*;
 
 mod admission;
 mod request;
+mod serial_actor;
 pub use ferrum_runtime::TensorRequestStateMapping;
 pub use request::{TensorRequestCloseFailure, TensorRequestSession};
+pub use serial_actor::{TensorSerialActor, TensorSerialActorStreamRequirements};
 #[cfg(test)]
 mod output_slices;
 
@@ -22,6 +24,11 @@ pub struct TensorExecutorConfig {
 }
 
 impl TensorExecutorConfig {
+    /// A serial actor retains its existing lane between blocking executions.
+    pub const fn serial_actor_stream_requirements(self) -> TensorSerialActorStreamRequirements {
+        TensorSerialActorStreamRequirements::new()
+    }
+
     /// One lane spans submission, readback and retirement of a blocking call.
     /// Tensor batch dimensions do not create one lane per sample.
     pub const fn execution_stream_requirement(self) -> BlockingStreamRequirement {
@@ -290,7 +297,22 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         inputs: Vec<ManagedHostTensor>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
         let work = self.binding.bind_inputs(inputs)?;
-        self.execute_bound(run_id, request_id, work, None, None)
+        self.execute_bound(run_id, request_id, work, None, None, None)
+    }
+
+    /// Execute through a scheduler-owned serial lane. Admission and completion
+    /// retain the same exact plan, request, step and resource authorities.
+    pub fn execute_on_actor(
+        &mut self,
+        actor: &mut TensorSerialActor<R>,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        actor.execute(|lane| {
+            let work = self.binding.bind_inputs(inputs)?;
+            self.execute_bound(run_id, request_id, work, None, None, Some(lane))
+        })
     }
 
     fn execute_bound(
@@ -300,6 +322,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         work: ResourceWorkShape,
         request_session: Option<Arc<SequenceSession<R>>>,
         initialize: Option<(&TensorRequestStateTarget<R>, &[TensorRequestStateMapping])>,
+        execution_lane: Option<&Arc<ExecutionLane<R>>>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
         // Host wall observations only: native timing, synchronization and the
         // admission/retirement sequence remain unchanged. The span also binds
@@ -361,10 +384,13 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         let sequence_admission_us = host_wall_us(sequence_started);
         let initial_admission_us = host_wall_us(total_started);
         let lane_started = trace_enabled.then(Instant::now);
-        let lane = self
-            .resources
-            .create_execution_lane()
-            .map_err(TensorExecutionError::Lane)?;
+        let lane = match execution_lane {
+            Some(lane) => Arc::clone(lane),
+            None => self
+                .resources
+                .create_execution_lane()
+                .map_err(TensorExecutionError::Lane)?,
+        };
         let lane_create_us = host_wall_us(lane_started);
         let admission_started = trace_enabled.then(Instant::now);
         let step = self.admit_step(&batch, &lane, &work)?;

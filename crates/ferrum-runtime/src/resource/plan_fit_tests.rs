@@ -117,7 +117,11 @@ fn compiled_step_slots_recompute_work_demand_and_preserve_each_claim_membership(
         );
         assert_eq!(first.len(), expected_members.len());
         assert_eq!(second.len(), expected_members.len());
-        for ((first, second), members) in first.iter().zip(&second).zip(&expected_members) {
+        for (slot_index, ((first, second), members)) in
+            first.iter().zip(&second).zip(&expected_members).enumerate()
+        {
+            assert_eq!(first.step_resource_slot_index, Some(slot_index));
+            assert_eq!(second.step_resource_slot_index, Some(slot_index));
             assert_eq!(first.claim_identity.resource_ids(), members);
             assert_eq!(second.claim_identity.resource_ids(), members);
             assert_eq!(first.claim_identity.pool_id(), &h.pool_ids[0]);
@@ -137,6 +141,11 @@ fn compiled_step_slots_recompute_work_demand_and_preserve_each_claim_membership(
             {
                 assert_eq!(first.descriptor.base_resource_id(), resource_id);
                 assert_eq!(second.descriptor.base_resource_id(), resource_id);
+                assert_eq!(
+                    h.root.dynamic_pools.domains[0].descriptors[first.descriptor_index]
+                        .base_resource_id(),
+                    resource_id
+                );
                 assert_eq!(first.logical_size_bytes, 64);
                 assert_eq!(second.logical_size_bytes, 128);
                 assert_eq!(first.physical_offset_bytes, 0);
@@ -162,6 +171,117 @@ fn compiled_step_slots_recompute_work_demand_and_preserve_each_claim_membership(
                 assert_eq!(reordered.descriptors[index].base_resource_id(), member);
             }
         }
+        drop(binding);
+        close_dynamic_test_root(h.root);
+    }
+}
+
+#[test]
+fn indexed_backing_claims_reject_wrong_descriptors_slots_domains_and_numeric_ranges() {
+    for shared in [false, true] {
+        let catalog = if shared {
+            shared_step_activation_catalog(linear_profile())
+        } else {
+            pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Step,
+                'd',
+                3,
+                1024,
+                TestDemand::Tokens,
+            )
+        };
+        let runtime = new_runtime(&catalog, 1024);
+        let h = harness(Arc::clone(&runtime), catalog, 1024, false);
+        let binding = h.root.trusted_runtime_binding().unwrap();
+        let (_, requests) = binding
+            .scoped_demand(
+                AllocationLifetime::Step,
+                None,
+                shape(1),
+                shape(1),
+                None,
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap();
+        let pools = &h.root.dynamic_pools;
+        assert!(pools.prepare_claim(&requests).is_ok());
+        let before = h.root.maintenance_controller.status().unwrap();
+        let reject = |request: EvaluatedBackingRequest<'_>| {
+            assert!(pools.prepare_claim(std::slice::from_ref(&request)).is_err());
+            assert_eq!(h.root.maintenance_controller.status().unwrap(), before);
+            assert_eq!(runtime.allocate_calls(), 0);
+        };
+        let valid = &requests[0];
+        let mut bad = valid.clone();
+        bad.projections[0].descriptor_index = usize::MAX;
+        reject(bad);
+        let mut bad = valid.clone();
+        bad.projections[0].descriptor_index =
+            (bad.projections[0].descriptor_index + 1) % bad.domain.descriptors.len();
+        reject(bad);
+        let mut bad = valid.clone();
+        bad.step_resource_slot_index = Some(usize::MAX);
+        reject(bad);
+        let mut bad = valid.clone();
+        bad.step_resource_slot_index = None;
+        reject(bad);
+        if shared {
+            let mut bad = valid.clone();
+            bad.projections.pop();
+            bad.claim_identity = PhysicalBackingClaimIdentity::new(
+                bad.domain.pool_id().clone(),
+                bad.projections
+                    .iter()
+                    .map(|p| p.descriptor.base_resource_id().clone())
+                    .collect(),
+            )
+            .unwrap();
+            reject(bad);
+            let mut bad = valid.clone();
+            bad.projections.reverse();
+            reject(bad);
+        } else {
+            let mut bad = valid.clone();
+            bad.step_resource_slot_index = requests[1].step_resource_slot_index;
+            reject(bad);
+        }
+        let mut bad = valid.clone();
+        bad.projections[0].physical_offset_bytes = valid.capacity_size_bytes;
+        reject(bad);
+        let mut bad = valid.clone();
+        bad.projections[0].logical_size_bytes = valid.capacity_size_bytes + 1;
+        reject(bad);
+        let mut bad = valid.clone();
+        bad.projections[0].capacity_size_bytes = 0;
+        reject(bad);
+        let mut wrong_domain = valid.domain.clone();
+        wrong_domain.domain_id = CapacityDomainId::new(99).unwrap();
+        let mut bad = valid.clone();
+        bad.domain = &wrong_domain;
+        reject(bad);
+        // The resource ID stays unchanged: a matching ID alone does not
+        // certify the descriptor's lifetime or demand against the actual pool.
+        let mut wrong_descriptor = valid.domain.clone();
+        let index = valid.projections[0].descriptor_index;
+        let mut wire = serde_json::to_value(&wrong_descriptor.descriptors[index]).unwrap();
+        wire["lifetime"] = serde_json::json!("request");
+        wrong_descriptor.descriptors[index] = serde_json::from_value(wire).unwrap();
+        let mut bad = valid.clone();
+        bad.domain = &wrong_descriptor;
+        bad.projections[0].descriptor = &wrong_descriptor.descriptors[index];
+        reject(bad);
+        let mut wrong_demand = valid.domain.clone();
+        let mut wire = serde_json::to_value(&wrong_demand.descriptors[index]).unwrap();
+        wire["demand"] =
+            serde_json::json!({"tokens": {"bytes_per_token": 128, "maximum_tokens": 4}});
+        wrong_demand.descriptors[index] = serde_json::from_value(wire).unwrap();
+        let mut bad = valid.clone();
+        bad.domain = &wrong_demand;
+        bad.projections[0].descriptor = &wrong_demand.descriptors[index];
+        reject(bad);
+        drop(requests);
         drop(binding);
         close_dynamic_test_root(h.root);
     }

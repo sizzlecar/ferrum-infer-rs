@@ -118,7 +118,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             ];
             let prefill = owners.prefill.as_mut().unwrap();
             let started = Instant::now();
-            let output = prefill.session.execute_initializing_request(
+            let output = prefill.session.execute_initializing_request_on_actor(
+                self.serial_actor
+                    .as_mut()
+                    .ok_or(ImageGenerationFailure::Unavailable)?,
                 id(format!("run.image.{job}.denoise.prefill")).map_err(process)?,
                 id(format!("request.image.{job}.denoise.prefill")).map_err(process)?,
                 initial_inputs,
@@ -144,11 +147,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     .managed_time_features(&self.host, step.timestep().as_f32())
                     .map_err(process)?;
                 let started = Instant::now();
-                let output = owners.request.as_mut().unwrap().execute(vec![
-                    sample.clone(),
-                    time,
-                    decode_frequencies.clone(),
-                ]);
+                let output = owners.request.as_mut().unwrap().execute_on_actor(
+                    self.serial_actor
+                        .as_mut()
+                        .ok_or(ImageGenerationFailure::Unavailable)?,
+                    vec![sample.clone(), time, decode_frequencies.clone()],
+                );
                 let active = owners.decode.as_mut().unwrap();
                 active
                     .receipt

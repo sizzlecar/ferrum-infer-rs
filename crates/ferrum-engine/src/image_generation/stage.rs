@@ -430,10 +430,38 @@ impl<R: DeviceRuntime> PreparedStage<R> {
 }
 
 impl<R: DeviceRuntime> ActiveImageStage<R> {
+    #[cfg(test)]
     pub(super) fn execute(
+        self,
+        job: u64,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<(Self, Vec<TensorExecutionOutput>), ImageGenerationFailure<R>> {
+        self.execute_with(job, inputs, |session, run, request, inputs| {
+            session.execute(run, request, inputs)
+        })
+    }
+
+    pub(super) fn execute_on_actor(
+        self,
+        actor: &mut TensorSerialActor<R>,
+        job: u64,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<(Self, Vec<TensorExecutionOutput>), ImageGenerationFailure<R>> {
+        self.execute_with(job, inputs, |session, run, request, inputs| {
+            session.execute_on_actor(actor, run, request, inputs)
+        })
+    }
+
+    fn execute_with(
         mut self,
         job: u64,
         inputs: Vec<ManagedHostTensor>,
+        execute: impl FnOnce(
+            &mut TensorComponentSession<R>,
+            RunId,
+            RequestIdentity,
+            Vec<ManagedHostTensor>,
+        ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>>,
     ) -> Result<(Self, Vec<TensorExecutionOutput>), ImageGenerationFailure<R>> {
         let stage = self.receipt.plan.stage.name();
         let ordinal = self.receipt.completed_executions;
@@ -448,7 +476,7 @@ impl<R: DeviceRuntime> ActiveImageStage<R> {
             Err(source) => return Err(self.processing(source)),
         };
         let started = Instant::now();
-        let result = self.session.execute(run, request, inputs);
+        let result = execute(&mut self.session, run, request, inputs);
         self.receipt
             .execution_wall_durations_us
             .push(elapsed_us(started));

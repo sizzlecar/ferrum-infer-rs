@@ -54,7 +54,9 @@ use ferrum_execution::component::{
     ComponentInitializationReceipt, ComponentWeightSource, TensorComponentPolicy,
     TensorComponentSession,
 };
-use ferrum_execution::{TensorExecutionError, TensorExecutionOutput, TensorExecutorConfig};
+use ferrum_execution::{
+    TensorExecutionError, TensorExecutionOutput, TensorExecutorConfig, TensorSerialActor,
+};
 use ferrum_models::normal_noise::{NormalNoiseConfig, NormalNoiseFamily};
 use ferrum_models::qwen3_vl_text::{
     Qwen3VLTextArchitecture, Qwen3VLTextConfig, Qwen3VLTextEncoderFamily,
@@ -248,6 +250,9 @@ pub struct QwenImage21Pipeline<R: DeviceRuntime> {
     // Composition-supplied planning allowance. Actual native owners still
     // reserve through the existing device account; this never claims bytes.
     device_opaque_allowance_bytes: u64,
+    // One serial lane spans every component and prefix request. Keep this
+    // field after resident owners so implicit drop also releases them first.
+    serial_actor: Option<TensorSerialActor<R>>,
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
@@ -283,6 +288,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .copied()
                 .collect(),
         )?;
+        let serial_actor = TensorSerialActor::new(runtime.clone())?;
         Ok(Self {
             runtime,
             host,
@@ -299,6 +305,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             plan_cache: plan_cache::StagePlanCache::new(),
             resident_stages: residency::ResidentStages::new(),
             device_opaque_allowance_bytes: 0,
+            serial_actor: Some(serial_actor),
         })
     }
 
@@ -320,6 +327,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     }
     pub fn is_stopped(&self) -> bool {
         self.stopped
+            || self
+                .serial_actor
+                .as_ref()
+                .is_none_or(TensorSerialActor::is_failed)
     }
 
     pub fn generate(
@@ -350,7 +361,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             completed_stages: Vec::new(),
             completed_steps: Vec::new(),
         };
-        if self.stopped {
+        if self.is_stopped() {
             return Err(empty_error(ImageGenerationFailure::Unavailable));
         }
         let prepared = self
@@ -475,7 +486,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .into_parts()
                 .1;
             let text = self.start_stage(text_stage, job, stages)?;
-            let (text, outputs) = text.execute(job, Vec::from(inputs))?;
+            let (text, outputs) = self.execute_stage(text, job, Vec::from(inputs))?;
             self.finish_stage(text, stages)?;
             let hidden =
                 only_output(outputs, Qwen3VLTextEncoderFamily::OUTPUT_ID).map_err(process)?;
@@ -501,7 +512,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 Ok(state) => state,
                 Err(error) => return Err(noise.processing(error)),
             };
-            let (active, outputs) = noise.execute(job, vec![state])?;
+            let (active, outputs) = self.execute_stage(noise, job, vec![state])?;
             noise = active;
             let copy = (|| -> anyhow::Result<()> {
                 let output = only_output(outputs, NormalNoiseFamily::OUTPUT_ID)?;
@@ -604,7 +615,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 if let Some(reference) = &reference {
                     inputs.push(reference.clone());
                 }
-                let (active, outputs) = denoiser.execute(job, inputs)?;
+                let (active, outputs) = self.execute_stage(denoiser, job, inputs)?;
                 denoiser = active;
                 let velocity = match only_output(outputs, QwenImage21TransformerFamily::VELOCITY_ID)
                 {
@@ -651,6 +662,18 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let outputs =
             self.decode_batch(decode_stage, &decoder, input, requests.len(), job, stages)?;
         request_order.restore_outputs(outputs).map_err(process)
+    }
+
+    fn execute_stage(
+        &mut self,
+        active: ActiveImageStage<R>,
+        job: u64,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<(ActiveImageStage<R>, Vec<TensorExecutionOutput>), ImageGenerationFailure<R>> {
+        let Some(actor) = self.serial_actor.as_mut() else {
+            return Err(active.processing(anyhow::anyhow!("image serial actor is closed")));
+        };
+        active.execute_on_actor(actor, job, inputs)
     }
 }
 

@@ -18,7 +18,8 @@ pub mod token_execution;
 pub use tensor::{
     PreparedTensorExecutor, TensorAdmissionFailure, TensorAdmissionStage, TensorExecutionError,
     TensorExecutionOutput, TensorExecutionRetirement, TensorExecutorConfig,
-    TensorRequestCloseFailure, TensorRequestSession, TensorRequestStateMapping,
+    TensorRequestCloseFailure, TensorRequestSession, TensorRequestStateMapping, TensorSerialActor,
+    TensorSerialActorStreamRequirements,
 };
 
 #[cfg(any(test, feature = "test-support"))]

@@ -107,8 +107,8 @@ fn all_components_reuses_real_text_session_then_attaches_changed_sequence_withou
                 before.uploaded_bytes
             );
         }
-        let (active, result) = active
-            .execute(job as u64, inputs)
+        let (active, result) = pipeline
+            .execute_stage(active, job as u64, inputs)
             .unwrap_or_else(|_| panic!("real text forward"));
         // The fixture's learned weights are zero; both residuals preserve the
         // independently constructed nonzero embeddings through the real graph.

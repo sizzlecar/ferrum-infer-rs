@@ -1698,6 +1698,9 @@ mod physical_backing_claim_identity_tests;
 
 #[derive(Clone)]
 pub(super) struct EvaluatedBackingProjection<'a> {
+    /// Index in the immutable pool domain; rechecked against the descriptor
+    /// when physical backing is prepared.
+    pub(super) descriptor_index: usize,
     pub(super) descriptor: &'a DynamicResourceDescriptor,
     pub(super) physical_offset_bytes: u64,
     pub(super) logical_size_bytes: u64,
@@ -1707,6 +1710,7 @@ pub(super) struct EvaluatedBackingProjection<'a> {
 #[derive(Clone)]
 pub(super) struct EvaluatedBackingRequest<'a> {
     pub(super) domain: &'a DynamicPoolDomainSpec,
+    pub(super) step_resource_slot_index: Option<usize>,
     pub(super) claim_identity: PhysicalBackingClaimIdentity,
     pub(super) capacity_size_bytes: u64,
     pub(super) reusable_execution_bucket_id: Option<ReusableExecutionBucketId>,
