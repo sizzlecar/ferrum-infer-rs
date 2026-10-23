@@ -111,8 +111,15 @@ struct WorkspacePackages {
     inherited_dependencies: BTreeSet<String>,
 }
 
+#[derive(Clone, Copy)]
+enum DependencyKind {
+    Development,
+    Other,
+}
+
 fn update_dependency_table(
     table: &mut dyn TableLike,
+    kind: DependencyKind,
     manifest: &str,
     packages: &WorkspacePackages,
     previous: &Version,
@@ -192,6 +199,10 @@ fn update_dependency_table(
                     &format!("{manifest}: {alias}.version"),
                 )?;
             }
+            // Cargo omits unversioned development dependencies from published
+            // manifests. Adding a version can introduce a publication cycle.
+            // Validate their identity/source above even when preserving them.
+            None if matches!(kind, DependencyKind::Development) => {}
             None => {
                 dependency.insert("version", toml_edit::value(target));
             }
@@ -225,7 +236,11 @@ fn update_dependencies(
         let table = item
             .as_table_like_mut()
             .ok_or_else(|| format!("{manifest}: {label} must be a table"))?;
-        update_dependency_table(table, manifest, packages, previous, target)
+        let kind = match label {
+            "dev-dependencies" | "dev_dependencies" => DependencyKind::Development,
+            _ => DependencyKind::Other,
+        };
+        update_dependency_table(table, kind, manifest, packages, previous, target)
     }
     for name in DEPENDENCY_TABLES {
         if let Some(item) = document.get_mut(name) {
