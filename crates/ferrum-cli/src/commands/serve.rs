@@ -97,10 +97,16 @@ pub struct ServeCommand {
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
-    /// Exact device-wide memory budget available to runtime weights and
-    /// dynamic resources. This is the same typed ceiling used by `run`.
+    /// Exact memory budget for weights and dynamic resources of compiled-plan
+    /// executors. Legacy executors reject this option because they cannot
+    /// enforce a total bound; their KV pool has separate capacity/block controls.
     #[arg(long, value_name = "BYTES")]
     pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
+
+    /// Preallocate the configured persistent envelope at startup (native plans only).
+    /// Original maintenance may reclaim idle backing; this is not a hard resident floor.
+    #[arg(long, value_enum)]
+    pub persistent_pool_preparation: Option<crate::commands::PersistentPoolPreparationArg>,
 
     /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
     #[arg(long, value_name = "N")]
@@ -169,7 +175,11 @@ pub struct ServeCommand {
 
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
-    pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
+    pub scheduler_slo: Option<ferrum_types::SloConfig>,
+
+    /// Load and save the instance-bound learned SLO state at this path.
+    #[arg(long, value_name = "PATH")]
+    pub scheduler_slo_state: Option<PathBuf>,
 
     /// Sequence fit gate used before prefill admission.
     #[arg(long, value_enum)]
@@ -477,6 +487,7 @@ async fn run_serve_lifecycle(
         layer_split_pipeline_mode,
         gpu_memory_utilization,
         runtime_memory_budget_bytes,
+        persistent_pool_preparation,
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
@@ -494,6 +505,7 @@ async fn run_serve_lifecycle(
         q5_mmvq_weight_decode,
         q8_projection_weight_preparation,
         scheduler_slo,
+        scheduler_slo_state,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
         scheduler_prefill_step_chunk,
@@ -544,6 +556,9 @@ async fn run_serve_lifecycle(
     } = cmd;
 
     let scheduler_slo = config.resolve_scheduler_slo(scheduler_slo)?;
+    let scheduler_slo_state = scheduler_slo_state
+        .as_deref()
+        .or(config.scheduler.slo_state_path.as_deref());
     let default_enable_thinking = if enable_thinking {
         Some(true)
     } else if disable_thinking {
@@ -668,7 +683,7 @@ async fn run_serve_lifecycle(
     let mut product_engine_config = product_input.engine_config;
     config.apply_output_and_tokenizer_config(&mut product_engine_config)?;
     config.apply_profile_journal_config(&mut product_engine_config)?;
-    product_engine_config.scheduler.slo = scheduler_slo;
+    product_engine_config.scheduler.slo = scheduler_slo.and_then(|slo| slo.scheduler_policy());
     product_engine_config.numerical_execution =
         config.resolve_numerical_execution(numerical_profile.as_ref());
     let config_runtime_entries = config.runtime.runtime_config_entries();
@@ -740,25 +755,6 @@ async fn run_serve_lifecycle(
     let gguf_path = (source.format == ModelFormat::GGUF).then(|| source.local_path.clone());
     println!("{} {}", "Model:".dimmed(), model_id.cyan());
     println!("{} {}", "Path:".dimmed(), source.local_path.display());
-
-    let startup_lora_adapters = if lora_specs.is_empty() {
-        Vec::new()
-    } else {
-        ferrum_models::load_startup_lora_adapters(
-            &primary_served_model_name,
-            Some(&lora_model_id_template),
-            &lora_specs,
-        )?
-    };
-    for adapter in &startup_lora_adapters {
-        println!(
-            "{} {} -> {} ({})",
-            "LoRA:".dimmed(),
-            adapter.name.cyan(),
-            adapter.public_model_id.cyan(),
-            adapter.path.display()
-        );
-    }
 
     let host = host.unwrap_or_else(|| config.server.host.clone());
     let port = port.unwrap_or(config.server.port);
@@ -902,6 +898,10 @@ async fn run_serve_lifecycle(
         &mut startup_cli_runtime_entries,
         sequence_backing_growth,
     );
+    push_persistent_pool_preparation_cli_entry(
+        &mut startup_cli_runtime_entries,
+        persistent_pool_preparation,
+    );
     push_q4_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q4_mmvq_weight_decode);
     push_q5_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q5_mmvq_weight_decode);
     push_q8_projection_weight_preparation_cli_entry(
@@ -982,7 +982,8 @@ async fn run_serve_lifecycle(
         startup_cli_runtime_entries,
     );
     if execution_planning_model == ferrum_types::ExecutionPlanningModel::ExecutorManaged {
-        let entries = crate::gpu_mem_autosize::auto_size_runtime_entries(
+        let entries = crate::gpu_mem_autosize::auto_size_runtime_entries_for_device(
+            &device,
             &source.local_path,
             gpu_memory_utilization,
             crate::gpu_mem_autosize::AutoSizeProfile::Server,
@@ -1022,6 +1023,14 @@ async fn run_serve_lifecycle(
         typed_model_capabilities,
         execution_planning_model,
         selected_kv_cache_layout,
+        crate::startup::selected_kv_cache_storage(
+            execution_planning_model,
+            model_definition.as_ref(),
+            Some(&source.local_path),
+            &device,
+            &product_engine_config,
+            &runtime_config,
+        )?,
         arch_for_dispatch,
         model_definition.as_ref(),
         model_weight_bytes_from_path(&source.local_path),
@@ -1043,6 +1052,25 @@ async fn run_serve_lifecycle(
             )
         })
         .transpose()?;
+    // Validate resource authority before reading adapter tensor payloads too.
+    let startup_lora_adapters = if lora_specs.is_empty() {
+        Vec::new()
+    } else {
+        ferrum_models::load_startup_lora_adapters(
+            &primary_served_model_name,
+            Some(&lora_model_id_template),
+            &lora_specs,
+        )?
+    };
+    for adapter in &startup_lora_adapters {
+        println!(
+            "{} {} -> {} ({})",
+            "LoRA:".dimmed(),
+            adapter.name.cyan(),
+            adapter.public_model_id.cyan(),
+            adapter.path.display()
+        );
+    }
     let lora_server_models: Vec<ferrum_server::LoraAdapterModel> = startup_lora_adapters
         .iter()
         .map(|adapter| {
@@ -1111,7 +1139,12 @@ async fn run_serve_lifecycle(
             metadata.write(&journals, &product_observability)?;
         }
         let scopes = journals.engine_scopes(&engine_config)?;
-        let feedback = crate::slo_product::ProductExecutionFeedback::prepare(&engine_config)?;
+        let feedback = crate::slo_product::ProductExecutionFeedback::prepare_with_state(
+            &mut engine_config,
+            scheduler_slo,
+            model_sources.as_deref(),
+            scheduler_slo_state,
+        )?;
         let mut builder =
             ferrum_engine::EngineBuilder::new(engine_config).with_journal_scopes(scopes);
         builder = feedback.configure(builder);
@@ -1188,7 +1221,7 @@ async fn run_serve_lifecycle(
     write_resolved_execution_config(
         effective_config_json.as_deref(),
         resolved_execution_metrics.as_ref(),
-        scheduler_slo,
+        scheduler_slo.and_then(|slo| slo.scheduler_policy()),
     )?;
     let server = server
         .with_auto_config(startup_auto_config)
@@ -1470,6 +1503,7 @@ fn startup_auto_config(
     typed_model_capabilities: Option<ModelCapabilities>,
     execution_planning_model: ferrum_types::ExecutionPlanningModel,
     selected_kv_cache_layout: ferrum_types::SelectedKvCacheLayout,
+    selected_kv_cache_storage: Option<ferrum_types::KvCacheStorage>,
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
@@ -1510,6 +1544,7 @@ fn startup_auto_config(
         workload,
         execution_planning_model,
         selected_kv_cache_layout,
+        selected_kv_cache_storage,
         crate::startup::StartupUsage::PersistentServing,
     )
 }
@@ -1876,6 +1911,17 @@ fn push_sequence_backing_growth_cli_entry(
     );
 }
 
+fn push_persistent_pool_preparation_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    policy: Option<crate::commands::PersistentPoolPreparationArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY,
+        policy.map(crate::commands::PersistentPoolPreparationArg::as_runtime_value),
+    );
+}
+
 fn push_cli_runtime_usize(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<usize>) {
     if let Some(value) = value {
         entries.push(RuntimeConfigEntry::new(
@@ -2063,15 +2109,22 @@ pub(crate) fn write_resolved_execution_config(
     // from requested runtime options. Keep the source and dtype vocabulary
     // intact: a model-owned cache is not a resolved numerical plan.
     object.remove("model_kv_storage");
+    object.remove("startup_persistent_preparation");
     if let Some(snapshot) = executor_snapshot {
+        if let Some(receipt) = snapshot.get("startup_persistent_preparation") {
+            object.insert("startup_persistent_preparation".into(), receipt.clone());
+        }
         if let (Some(source), Some(dtype)) = (
             snapshot.get("source").and_then(serde_json::Value::as_str),
             snapshot.get("kv_dtype").and_then(serde_json::Value::as_str),
         ) {
-            object.insert(
-                "model_kv_storage".into(),
-                serde_json::json!({"source": source, "kv_dtype": dtype}),
-            );
+            let mut storage = serde_json::json!({"source": source, "kv_dtype": dtype});
+            for field in ["kv_marker", "physical_pool_bytes"] {
+                if let Some(value) = snapshot.get(field) {
+                    storage[field] = value.clone();
+                }
+            }
+            object.insert("model_kv_storage".into(), storage);
         }
     }
     if let Some(snapshot) =
@@ -2332,7 +2385,7 @@ fn infer_sm_count_from_gpu_name(name: &str) -> Option<u32> {
     }
 }
 
-fn compiled_kernel_features() -> CompiledKernelFeatures {
+pub(crate) fn compiled_kernel_features() -> CompiledKernelFeatures {
     let fa2_native = ferrum_kernels::native_ops::compiled_fa2_native_operator_artifact();
     let native_operator_artifacts =
         ferrum_kernels::native_ops::compiled_native_operator_artifacts().to_vec();
@@ -3929,6 +3982,7 @@ mod tests {
             None,
             authority,
             layout,
+            Some(ferrum_types::KvCacheStorage::F32),
             Some(definition.architecture.clone()),
             Some(&definition),
             None,
@@ -3964,6 +4018,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             RuntimeConfigSnapshot::default(),
         )
         .unwrap();
@@ -3972,6 +4027,135 @@ mod tests {
             .apply_runtime_config_snapshot(&resolved.runtime_config)
             .unwrap();
         assert!(engine.runtime.prefix_state_cache_enabled);
+    }
+
+    #[test]
+    fn serve_legacy_capacity_reaches_execution_and_rejects_total_budget() {
+        let mut request = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_MAX_MODEL_LEN", "2048", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "16", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_MAX_BATCHED_TOKENS", "512", RuntimeConfigSource::Cli),
+        ]);
+        let resolve = |request| {
+            startup_auto_config(
+                HardwareCapabilities {
+                    backend: "metal".into(),
+                    ..HardwareCapabilities::unknown()
+                },
+                Some(ModelCapabilities {
+                    max_context_len: Some(40960),
+                    ..ModelCapabilities::unknown()
+                }),
+                ferrum_types::ExecutionPlanningModel::ExecutorManaged,
+                ferrum_types::SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                },
+                Some(ferrum_types::KvCacheStorage::F32),
+                None,
+                None,
+                None,
+                None,
+                request,
+            )
+        };
+        let resolved = resolve(request.clone()).unwrap();
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine.llama_execution_config().kv_capacity, Some(2048));
+        assert_eq!(
+            engine.llama_execution_config().options.kv_max_blocks,
+            Some(2048)
+        );
+        assert_eq!(engine.scheduler.max_running_requests, 16);
+        assert_eq!(engine.batching.max_num_batched_tokens, 512);
+        request.upsert(
+            "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+            "8589934592",
+            RuntimeConfigSource::Cli,
+        );
+        assert!(resolve(request)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot enforce a total memory bound"));
+    }
+
+    #[test]
+    fn serve_legacy_autosizer_batch_fits_the_materialized_pool() {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let device = ferrum_types::Device::Metal;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let device = ferrum_types::Device::CPU;
+        for (context, sequences, expected_capacity, expected_batch, expected_blocks) in [
+            (Some(1024), 1, 1024, 1024, 64),
+            (None, 1, 512, 512, 32),
+            (None, 2, 512, 1024, 64),
+            (Some(40960), 1, 40960, 2048, 2560),
+        ] {
+            let mut request = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                "FERRUM_PAGED_MAX_SEQS",
+                sequences.to_string(),
+                RuntimeConfigSource::Cli,
+            )]);
+            if let Some(context) = context {
+                request.upsert(
+                    "FERRUM_MAX_MODEL_LEN",
+                    context.to_string(),
+                    RuntimeConfigSource::Cli,
+                );
+            }
+            for entry in crate::gpu_mem_autosize::auto_size_runtime_entries_for_device(
+                &device,
+                Path::new("unused-model-source"),
+                0.9,
+                crate::gpu_mem_autosize::AutoSizeProfile::Server,
+                &request,
+            ) {
+                request.upsert_entry(entry);
+            }
+            assert_eq!(
+                request
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == "FERRUM_MAX_BATCHED_TOKENS")
+                    .unwrap()
+                    .source,
+                RuntimeConfigSource::MemoryProfile
+            );
+            let resolved = startup_auto_config(
+                HardwareCapabilities::unknown(),
+                Some(ModelCapabilities {
+                    max_context_len: Some(40960),
+                    ..ModelCapabilities::unknown()
+                }),
+                ferrum_types::ExecutionPlanningModel::ExecutorManaged,
+                ferrum_types::SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                },
+                Some(ferrum_types::KvCacheStorage::F32),
+                None,
+                None,
+                None,
+                None,
+                request,
+            )
+            .unwrap();
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine.llama_execution_config().kv_capacity,
+                Some(expected_capacity)
+            );
+            assert_eq!(
+                engine.llama_execution_config().options.kv_max_blocks,
+                Some(expected_blocks)
+            );
+            assert_eq!(engine.scheduler.max_running_requests, sequences);
+            assert_eq!(engine.batching.max_num_batched_tokens, expected_batch);
+        }
     }
 
     #[test]
@@ -4112,6 +4296,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 effective,
             )
             .unwrap();
@@ -4169,6 +4354,11 @@ mod tests {
             "numerical_execution": {"selected_profile": "fixture.int8"},
             "kv_storage": {"source": "resolved_model_plan", "selected": "int8_per_token_head_f32_scale_v1"},
             "attention_execution_policy": "portable",
+            "startup_persistent_preparation": {
+                "mode": "configured-envelope",
+                "plan": {"context_tokens": 16, "active_sequences": 4, "step_tokens": 8, "checked_peak_bytes": 896},
+                "actual_growth": {"growths": [{"pool_id": "fixture-pool", "chunk_bytes": 256, "published_capacity_bytes": 256}]}
+            },
         });
         let slo = "ttft:200,tpot:15,itl:50".parse().unwrap();
         write_resolved_execution_config(Some(&path), Some(&selected), Some(slo)).unwrap();
@@ -4185,8 +4375,21 @@ mod tests {
         );
         assert_eq!(actual["attention_execution_policy"], "portable");
         assert_eq!(
+            actual["startup_persistent_preparation"],
+            selected["startup_persistent_preparation"]
+        );
+        assert_eq!(
             actual["scheduler"]["slo"],
             serde_json::to_value(slo).unwrap()
+        );
+        write_resolved_execution_config(Some(&path), Some(&serde_json::json!({})), None).unwrap();
+        let without_receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            without_receipt
+                .get("startup_persistent_preparation")
+                .is_none(),
+            "a later snapshot without an owner receipt must clear stale preparation evidence"
         );
     }
     #[test]
@@ -4201,7 +4404,9 @@ mod tests {
         let snapshot = serde_json::json!({
             "source": "llama-family-paged-block-prefix-cache",
             "position": "real-kv-reuse",
-            "kv_dtype": "int8",
+            "kv_dtype": "int8_per_token_head_f16_scales",
+            "kv_marker": "int8",
+            "physical_pool_bytes": 512,
             "hits": 0,
         });
         write_resolved_execution_config(Some(&path), Some(&snapshot), None).unwrap();
@@ -4211,6 +4416,7 @@ mod tests {
             observed["model_kv_storage"],
             serde_json::json!({
                 "source": snapshot["source"], "kv_dtype": snapshot["kv_dtype"],
+                "kv_marker": "int8", "physical_pool_bytes": 512,
             })
         );
         assert_eq!(
@@ -4619,6 +4825,47 @@ mod tests {
                     .unwrap()
                     .source,
                 source
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_pool_preparation_serve_preserves_config_and_cli_precedence() {
+        use ferrum_types::PersistentPoolPreparation as Mode;
+        for (cli, expected) in [
+            (None, Mode::ConfiguredEnvelope),
+            (
+                Some(crate::commands::PersistentPoolPreparationArg::DemandDriven),
+                Mode::DemandDriven,
+            ),
+        ] {
+            let entries = crate::config::RuntimeCliConfig {
+                persistent_pool_preparation: Some(Mode::ConfiguredEnvelope),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut cli_entries = Vec::new();
+            push_persistent_pool_preparation_cli_entry(&mut cli_entries, cli);
+            let snapshot = merge_runtime_config_sources(
+                entries,
+                RuntimeConfigSnapshot::default(),
+                cli_entries,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.memory.persistent_pool_preparation, expected);
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|e| e.key == ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(
+                entry.source,
+                if cli.is_some() {
+                    RuntimeConfigSource::Cli
+                } else {
+                    RuntimeConfigSource::ConfigFile
+                }
             );
         }
     }

@@ -17,7 +17,9 @@ use std::{
     sync::Arc,
 };
 
+mod cohort_capacity;
 mod prefill_shape;
+pub use cohort_capacity::*;
 mod prefix_capture;
 mod prefix_restore;
 pub use prefill_shape::{PrefillShapePlan, PrefillShapePolicy};
@@ -79,6 +81,51 @@ pub struct KvSlotCapacitySnapshot {
     pub block_size: usize,
     pub total_blocks: usize,
     pub free_blocks: usize,
+}
+
+/// Scope of a paged owner's persistent admission proof. Unknown is the default:
+/// a free KV block count does not account for recurrent state, other pools, or
+/// per-sequence device metadata that would require a new allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PagedAdmissionCoverage {
+    #[default]
+    Unknown,
+    /// All persistent request/sequence storage is covered by the observed KV
+    /// pool and already allocated reusable metadata. Existing sequences retain
+    /// their own metadata; only newly admitted sequences consume this bound.
+    /// This does not promise transient workspace, execution success, or reserve
+    /// any storage. Actual admission remains the original owner's authority.
+    AllPersistentState {
+        max_new_sequences: usize,
+        max_sequence_tokens: usize,
+        max_batch_sequences: usize,
+    },
+}
+
+/// KV blocks and persistent-state coverage observed under the same owner lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PagedAdmissionCapacitySnapshot {
+    pub slots: KvSlotCapacitySnapshot,
+    pub coverage: PagedAdmissionCoverage,
+}
+
+/// An exact live incarnation and the context ceiling to be considered. This
+/// query carries no admission or resource authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentSequenceCapacityRequest {
+    pub sequence: crate::token_execution::ExecutorSequence,
+    pub through_tokens: usize,
+}
+
+/// Point-in-time support for the complete supplied resident cohort. The owner
+/// accounts for already held request/recurrent/sequence state and all remaining
+/// persistent growth through each requested ceiling. No new admission, device
+/// growth, transient workspace, reservation, or execution success is promised.
+/// The caller must discard this observation when the cohort changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentCohortCapacitySnapshot {
+    pub participants: usize,
+    pub max_batch_sequences: usize,
 }
 
 /// Token-validity mask for model-side greedy argmax.
@@ -2089,6 +2136,15 @@ pub trait ModelExecutor: Send + Sync + 'static {
     /// Get model information and metadata
     fn info(&self) -> &ModelInfo;
 
+    /// Optional identity of the concrete executor implementation. A product
+    /// may combine this with its executable/operator fingerprints, loaded
+    /// sources, effective configuration and physical device evidence to bind
+    /// persisted performance models. This identifier alone authorizes no reuse.
+    /// Custom executors without that evidence remain instance scoped.
+    fn implementation_identity(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Declares the resource planning model used by this implementation.
     /// Both variants execute and close through the same exact token sequence
     /// protocol. `CompiledPlan` additionally exposes its immutable resolved plan
@@ -2346,6 +2402,36 @@ pub trait ModelExecutor: Send + Sync + 'static {
     /// Executors without model-owned paged KV return `None`.
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
         None
+    }
+
+    /// Read-only cohort admission evidence from the original resource owner.
+    /// Implementations may strengthen coverage only when all persistent pools
+    /// and required per-sequence metadata are accounted for by this snapshot.
+    fn paged_admission_capacity_snapshot(&self) -> Option<PagedAdmissionCapacitySnapshot> {
+        self.kv_slot_capacity_snapshot()
+            .map(|slots| PagedAdmissionCapacitySnapshot {
+                slots,
+                coverage: PagedAdmissionCoverage::Unknown,
+            })
+    }
+
+    /// Observe persistent capacity for these exact resident incarnations. An
+    /// incomplete cohort, unsupported storage, contention, or unknown physical
+    /// ownership returns `None`. This does not authorize future admission.
+    fn resident_cohort_capacity_snapshot(
+        &self,
+        _cohort: &[ResidentSequenceCapacityRequest],
+    ) -> Option<ResidentCohortCapacitySnapshot> {
+        None
+    }
+
+    /// Bounded read-only support for exact resident and waiting members using
+    /// existing persistent backing and the original owner's admission rules.
+    fn persistent_cohort_capacity(
+        &self,
+        _query: &PersistentCapacityQuery<'_>,
+    ) -> std::result::Result<PersistentCohortCapacitySnapshot, PersistentCapacityUnknown> {
+        Err(PersistentCapacityUnknown::Unsupported)
     }
 
     /// Get executor capabilities

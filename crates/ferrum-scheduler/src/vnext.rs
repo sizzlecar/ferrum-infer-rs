@@ -427,6 +427,14 @@ impl<T> DynamicAdmissionQueue<T> {
         self.waiting.is_empty()
     }
 
+    /// A simple closed-cohort projection cannot assume that a previously
+    /// deferred native admission will succeed when a logical slot opens.
+    pub(crate) fn has_capacity_deferrals(&self) -> bool {
+        self.waiting
+            .iter()
+            .any(|entry| entry.deferral.is_some() || entry.release_deferred_at.is_some())
+    }
+
     /// Returns one union predicate only when every queued request is passively
     /// waiting for an exact capacity release. A missing deferral or an active
     /// maintenance action means the caller must run another scheduler tick

@@ -21,7 +21,12 @@ mod capabilities;
 mod device_attributes;
 #[cfg(feature = "cuda")]
 pub use device_attributes::probe_cuda_device_attributes;
+#[cfg(feature = "cuda")]
+pub use device_attributes::probe_cuda_execution_device_identity;
+#[cfg(feature = "metal")]
+pub use device_attributes::probe_metal_execution_device_identity;
 pub use device_attributes::CudaDeviceAttributes;
+pub use device_attributes::{CudaExecutionDeviceIdentity, MetalExecutionDeviceIdentity};
 mod memory;
 pub use memory::probe_device_memory;
 #[cfg(any(feature = "cuda", test))]

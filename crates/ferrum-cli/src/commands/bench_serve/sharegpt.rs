@@ -17,6 +17,7 @@ use std::fs::File;
 use std::path::PathBuf;
 
 mod cache;
+mod exclusions;
 mod export;
 
 #[derive(Args, Clone, Debug)]
@@ -62,6 +63,10 @@ pub struct ShareGptArgs {
     /// Expected SHA256 of the complete parent file; only valid during export.
     #[arg(long, value_name = "SHA256", requires = "export_sharegpt_pool")]
     pub sharegpt_source_sha256: Option<String>,
+    /// Exclude IDs and whitespace-normalized prompts found in a prior ShareGPT
+    /// JSON/JSONL pool. Repeat to exclude several training/development pools.
+    #[arg(long, value_name = "FILE")]
+    pub sharegpt_exclude_path: Vec<PathBuf>,
 }
 
 impl Default for ShareGptArgs {
@@ -78,6 +83,7 @@ impl Default for ShareGptArgs {
             sharegpt_prepared_cache_dir: None,
             export_sharegpt_pool: None,
             sharegpt_source_sha256: None,
+            sharegpt_exclude_path: Vec::new(),
         }
     }
 }
@@ -111,7 +117,15 @@ impl ShareGptArgs {
 
 pub(super) fn validate(cmd: &BenchServeCommand) -> Result<()> {
     export::validate(cmd)?;
+    if cmd.sharegpt.sharegpt_exclude_path.len() > exclusions::MAX_SOURCES {
+        return Err(FerrumError::model("too many ShareGPT exclusion sources"));
+    }
     if cmd.dataset != "sharegpt" {
+        if !cmd.sharegpt.sharegpt_exclude_path.is_empty() {
+            return Err(FerrumError::model(
+                "--sharegpt-exclude-path requires --dataset sharegpt",
+            ));
+        }
         if cmd.sharegpt.sharegpt_selection_pool_size.is_some() {
             return Err(FerrumError::model(
                 "--sharegpt-selection-pool-size requires --dataset sharegpt",
@@ -218,7 +232,9 @@ pub(super) fn load(
         .map_err(|e| FerrumError::model(format!("open ShareGPT {}: {e}", path.display())))?;
     let mut rng = StdRng::seed_from_u64(repeat_seed(seed, repeat));
     let filter = cmd.sharegpt.filter();
+    let exclusions = exclusions::Exclusions::load(&cmd.sharegpt.sharegpt_exclude_path)?;
     let mut selector = Selector {
+        exclusions: &exclusions,
         tok,
         filter: &filter,
         rng: &mut rng,
@@ -281,6 +297,7 @@ pub(super) fn load(
         tokenizer_sha256: sha256_hex(&tokenizer_bytes),
         filter,
         counts,
+        exclusions: exclusions.evidence(),
         prompt_seed: seed,
         sampling: if cmd.sharegpt.sharegpt_selection_pool_size.is_some() {
             "reservoir_without_replacement_then_shuffle_prefix_v1"
@@ -312,6 +329,7 @@ pub(super) fn append_evidence(
             || first.filter != next.filter
             || first.sampling != next.sampling
             || first.selection_pool_size != next.selection_pool_size
+            || first.exclusions != next.exclusions
         {
             return Err(FerrumError::model(
                 "ShareGPT dataset/tokenizer or selection settings changed between repeats",
@@ -325,6 +343,7 @@ pub(super) fn append_evidence(
 }
 
 struct Selector<'a> {
+    exclusions: &'a exclusions::Exclusions,
     tok: &'a tokenizers::Tokenizer,
     filter: &'a ShareGptFilter,
     rng: &'a mut StdRng,
@@ -341,12 +360,20 @@ impl Selector<'_> {
         if original_id.is_none() {
             self.counts.missing_original_id += 1;
         }
+        if self.exclusions.contains_id(original_id.as_deref()) {
+            self.counts.excluded_by_history += 1;
+            return Ok(());
+        }
         let Some(pair) = sharegpt_first_pair(&value) else {
             self.counts.missing_first_pair += 1;
             return Ok(());
         };
         let prompt = pair.prompt;
         let assistant = pair.assistant;
+        if self.exclusions.contains_prompt(prompt) {
+            self.counts.excluded_by_history += 1;
+            return Ok(());
+        }
         if prompt.trim().is_empty() || assistant.trim().is_empty() {
             self.counts.empty_text += 1;
             return Ok(());

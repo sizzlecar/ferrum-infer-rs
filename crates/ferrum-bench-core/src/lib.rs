@@ -29,6 +29,8 @@ pub mod decode_isolation;
 pub mod env;
 // Compatibility for tools; all owners and the path registry live in ferrum-journal.
 pub use ferrum_journal::jsonl_journal;
+pub mod paired_cluster;
+pub mod paired_reader;
 pub mod profile;
 pub mod release_regression;
 pub mod report;

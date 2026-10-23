@@ -11,6 +11,153 @@ use ferrum_types::{
 
 use crate::{Architecture, ModelDefinition};
 
+#[cfg(test)]
+mod physical_storage_tests {
+    use super::*;
+    use ferrum_types::{KvCacheDtype, KvCacheStorage};
+
+    fn tiny_config() -> crate::models::LlamaFamilyConfig {
+        crate::models::LlamaFamilyConfig {
+            hidden_size: 24,
+            intermediate_size: 48,
+            num_heads: 3,
+            num_kv_heads: 1,
+            head_dim: 8,
+            num_layers: 2,
+            vocab_size: 32,
+            max_seq_len: 64,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn physical_kv_storage_cold_selector_uses_actual_backend_and_rejects_unsupported_markers() {
+        let config = tiny_config();
+        for paged in [false, true] {
+            let options = LlamaExecutionOptions {
+                metal_paged_kv: Some(paged),
+                ..Default::default()
+            };
+            assert_eq!(
+                selected_dense_kv_cache_storage(
+                    &config,
+                    &Device::CPU,
+                    KvCacheDtype::Fp16,
+                    &options
+                ),
+                Some(KvCacheStorage::F32)
+            );
+            for unsupported in [KvCacheDtype::Bf16, KvCacheDtype::Int8, KvCacheDtype::Fp8] {
+                assert_eq!(
+                    selected_dense_kv_cache_storage(&config, &Device::CPU, unsupported, &options),
+                    None
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn physical_kv_storage_int8_is_unknown_for_unsupported_contiguous_layout() {
+        let config = tiny_config();
+        let mut options = LlamaExecutionOptions {
+            metal_paged_kv: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            selected_dense_kv_cache_storage(
+                &config,
+                &Device::CUDA(0),
+                KvCacheDtype::Int8,
+                &options
+            ),
+            None
+        );
+        options.metal_paged_kv = Some(true);
+        assert_eq!(
+            selected_dense_kv_cache_storage(
+                &config,
+                &Device::CUDA(0),
+                KvCacheDtype::Int8,
+                &options
+            ),
+            Some(KvCacheStorage::Int8PerTokenHeadF16Scales)
+        );
+    }
+}
+
+/// Cold physical storage declaration from the same backend/KV implementation
+/// selected by the retained dense factory. A requested marker is insufficient.
+pub fn selected_kv_cache_storage(
+    definition: &ModelDefinition,
+    device: &Device,
+    dtype: ferrum_types::KvCacheDtype,
+    options: &LlamaExecutionOptions,
+) -> Option<ferrum_types::KvCacheStorage> {
+    use crate::models::LlamaFamilyConfig;
+    if definition.num_attention_heads == 0 {
+        return None;
+    }
+    let config = match definition.architecture {
+        Architecture::Llama => LlamaFamilyConfig::llama_from_def(definition),
+        Architecture::Qwen2 => LlamaFamilyConfig::qwen2_from_def(definition),
+        Architecture::Qwen3 => LlamaFamilyConfig::qwen3_from_def(definition),
+        Architecture::Mistral => LlamaFamilyConfig::mistral_from_def(definition),
+        Architecture::Gemma3 => LlamaFamilyConfig::gemma3_from_def(definition),
+        _ => return None,
+    };
+    selected_dense_kv_cache_storage(&config, device, dtype, options)
+}
+
+/// Validate the direct GGUF loader's physical model configuration before
+/// declaring storage; no weights or device context are created.
+pub fn selected_gguf_kv_cache_storage(
+    path: &std::path::Path,
+    device: &Device,
+    dtype: ferrum_types::KvCacheDtype,
+    options: &LlamaExecutionOptions,
+) -> ferrum_types::Result<Option<ferrum_types::KvCacheStorage>> {
+    let gguf = ferrum_quantization::gguf::GgufFile::open(path).map_err(|error| {
+        ferrum_types::FerrumError::model(format!("GgufFile::open {}: {error}", path.display()))
+    })?;
+    let config = crate::models::LlamaFamilyConfig::from_gguf(&gguf)?;
+    // The direct GGUF factory has fixed default storage, not INT8 dispatch.
+    Ok((dtype == ferrum_types::KvCacheDtype::Fp16)
+        .then(|| selected_dense_kv_cache_storage(&config, device, dtype, options))
+        .flatten())
+}
+
+fn selected_dense_kv_cache_storage(
+    config: &crate::models::LlamaFamilyConfig,
+    device: &Device,
+    dtype: ferrum_types::KvCacheDtype,
+    options: &LlamaExecutionOptions,
+) -> Option<ferrum_types::KvCacheStorage> {
+    use ferrum_interfaces::kv_dtype::KvFp16;
+    use ferrum_types::KvCacheDtype;
+    match (device, dtype) {
+        (Device::CPU, KvCacheDtype::Fp16) => {
+            config.selected_kv_cache_storage::<ferrum_kernels::backend::cpu::CpuBackend, KvFp16>(options)
+        }
+        #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+        (Device::Metal, KvCacheDtype::Fp16) => {
+            config.selected_kv_cache_storage::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(options)
+        }
+        #[cfg(feature = "cuda")]
+        (Device::CUDA(_), KvCacheDtype::Fp16) => {
+            config.selected_kv_cache_storage::<ferrum_kernels::backend::cuda::CudaBackend, KvFp16>(options)
+        }
+        #[cfg(feature = "cuda")]
+        (Device::CUDA(_), KvCacheDtype::Int8) => {
+            config.selected_kv_cache_storage::<
+                ferrum_kernels::backend::cuda::CudaBackend,
+                ferrum_interfaces::kv_dtype::KvInt8,
+            >(options)
+        }
+        _ => None,
+    }
+}
+
 /// Cold allocation selection for the retained dense factory. The model uses
 /// the same generic selector at cache allocation; device ordinals do not change
 /// its layout. Unsupported/undefined families remain unqualified here.

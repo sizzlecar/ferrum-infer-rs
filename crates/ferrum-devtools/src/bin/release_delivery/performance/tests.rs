@@ -327,7 +327,7 @@ async fn failed_server_start_is_invalid_and_reaped_before_return() {
 }
 
 fn replay_fixture(directory: &Path) -> ExpectedPerformanceRun {
-    replay_fixture_with_path(directory, "legacy-model-executor")
+    replay_fixture_with_path(directory, "production-plan-runtime")
 }
 
 fn replay_fixture_with_path(directory: &Path, execution_path: &str) -> ExpectedPerformanceRun {
@@ -374,7 +374,9 @@ fn replay_fixture_with_path(directory: &Path, execution_path: &str) -> ExpectedP
         source: source.identity().unwrap(),
         obligations: vec![9],
     };
-    expected.validate().unwrap();
+    if runtime::is_plan_runtime(&expected.profile.target) {
+        expected.validate().unwrap();
+    }
     write_json(&directory.join("inputs.json"), &input).unwrap();
     write_json(&directory.join("expected-task.json"), &expected).unwrap();
     write_json(&directory.join("source-manifest.json"), &source).unwrap();
@@ -544,13 +546,40 @@ fn vnext_replay_binds_candidate_plan_after_measurement_and_preserves_unknown_bas
 }
 
 #[test]
-fn earlier_single_request_legacy_evidence_can_replay_with_startup_health_only() {
+fn legacy_evidence_cannot_claim_the_required_total_memory_bound() {
     let root = tempfile::tempdir().unwrap();
-    let expected = replay_fixture(root.path());
+    let expected = replay_fixture_with_path(root.path(), "legacy-model-executor");
     for phase in ["baseline-a", "baseline-b", "candidate"] {
         fs::remove_file(root.path().join(phase).join("health-after.json")).unwrap();
     }
-    verify_evidence(&expected, root.path()).unwrap();
+    assert!(verify_evidence(&expected, root.path())
+        .unwrap_err()
+        .contains("required total runtime memory budget"));
+}
+
+#[tokio::test]
+async fn direct_legacy_performance_execution_rejects_before_opening_model_or_binary() {
+    let root = tempfile::tempdir().unwrap();
+    let expected = replay_fixture_with_path(root.path(), "legacy-model-executor");
+    let mut input = args(root.path());
+    input.expected_task = root.path().join("expected-task.json");
+    input.report_dir = root.path().join("direct-report");
+    // All requested binaries and the source manifest are absent. Authority
+    // validation must precede opening any of them or starting child processes.
+    assert!(!input.baseline_bin.exists());
+    assert!(!input.source_manifest.exists());
+    let report_dir = input.report_dir.clone();
+    assert!(execute(input)
+        .await
+        .unwrap_err()
+        .contains("required total runtime memory budget"));
+    let report: PerformanceReport = read_json(&report_dir.join("performance.json")).unwrap();
+    assert!(matches!(report.status, Status::Invalid));
+    assert!(report.completed_phases.is_empty());
+    assert_eq!(
+        expected.profile.target.execution_path,
+        "legacy-model-executor"
+    );
 }
 
 #[test]
@@ -649,7 +678,7 @@ fn performance_replay_rejects_changed_policy_source_command_and_missing_measurem
             "capacity" => {
                 let path = root.path().join("candidate/health.json");
                 let mut value: serde_json::Value = read_json(&path).unwrap();
-                value["auto_config"]["selected_kv_capacity"] = json!(32);
+                value["cache"]["prefix_cache"]["maximum_model_tokens"] = json!(32);
                 write_json(&path, &value).unwrap();
             }
             "summary" => {
@@ -705,10 +734,13 @@ fn performance_replay_rejects_changed_policy_source_command_and_missing_measurem
 async fn preflight_failure_does_not_leave_weight_links_in_uploaded_reports() {
     let root = tempfile::tempdir().unwrap();
     let input = args(root.path());
-    let source = fixture(root.path());
+    let mut source = fixture(root.path());
+    source.profile.target.execution_path = "production-plan-runtime".into();
+    source.sidecars.push(pin("config.json".into(), b"{}"));
+    fs::write(source.tokenizer_dir.join("config.json"), b"{}").unwrap();
     let expected = ExpectedPerformanceRun {
         schema_version: 1,
-        profile: profile(),
+        profile: source.profile.clone(),
         baseline_version: input.baseline_version.clone(),
         baseline_sha256: input.baseline_sha256.clone(),
         candidate_version: input.candidate_version.clone(),

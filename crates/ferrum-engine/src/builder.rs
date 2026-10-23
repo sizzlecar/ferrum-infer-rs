@@ -12,7 +12,6 @@ use crate::registry::{ComponentConfig, ComponentRegistry};
 use crate::{EngineExecutor, IntoEngineExecutor};
 use ferrum_execution::execution_attempt::ExecutionAttemptObserver;
 use ferrum_execution::executor_lifecycle::{ExecutorOwner, ExecutorScope};
-#[cfg(test)]
 use ferrum_execution::ModelExecutor;
 use ferrum_execution::{ExecutorBuildError, ExecutorBuildResult, ExecutorShutdownObserver};
 use ferrum_interfaces::engine::LlmInferenceEngine;
@@ -25,16 +24,33 @@ use tracing::{debug, info};
 
 #[cfg(test)]
 mod failure_retirement;
+#[cfg(test)]
+mod feedback_factory;
 mod source_binding;
+
+/// Product-owned observers and immutable prediction source bound to the loaded
+/// executor. Construction runs once on the cold assembly path, never inference.
+pub struct ExecutionFeedbackBinding {
+    pub execution_observer: Arc<dyn ExecutionAttemptObserver>,
+    pub cost_source: Option<Arc<dyn CostSnapshotSource>>,
+    pub stopping_observer:
+        Option<Arc<dyn ferrum_interfaces::request_observation::RequestStoppingObserver>>,
+}
+
+type ExecutionFeedbackFactory =
+    Box<dyn FnOnce(&EngineConfig, &dyn ModelExecutor) -> Result<ExecutionFeedbackBinding> + Send>;
 
 // The product composition root captures model-loading options in the typed
 // configuration. The builder does not read process environment variables.
 
 /// Engine builder for creating inference engines with registry-based components
 pub struct EngineBuilder {
+    execution_feedback_factory: Option<ExecutionFeedbackFactory>,
     journal_scopes: Option<crate::EngineJournalScopes>,
     execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
     cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
+    request_stopping_observer:
+        Option<Arc<dyn ferrum_interfaces::request_observation::RequestStoppingObserver>>,
     /// Component registry to use
     registry: Arc<ComponentRegistry>,
     /// Engine configuration
@@ -67,9 +83,11 @@ impl EngineBuilder {
     /// Create a new engine builder with a custom registry
     pub fn with_registry(config: EngineConfig, registry: Arc<ComponentRegistry>) -> Self {
         Self {
+            execution_feedback_factory: None,
             journal_scopes: None,
             execution_attempt_observer: None,
             cost_snapshot_source: None,
+            request_stopping_observer: None,
             registry,
             config,
             model_sources: None,
@@ -115,6 +133,28 @@ impl EngineBuilder {
     ) -> Self {
         self.execution_attempt_observer = Some(observer);
         self.cost_snapshot_source = Some(source);
+        self
+    }
+
+    /// Bind product feedback after the actual executor, source validation and
+    /// authoritative startup memory plan are known, before exposing the engine.
+    /// Direct observer injection and this factory are mutually exclusive.
+    pub fn with_execution_feedback_factory<F>(mut self, factory: F) -> Self
+    where
+        F: FnOnce(&EngineConfig, &dyn ModelExecutor) -> Result<ExecutionFeedbackBinding>
+            + Send
+            + 'static,
+    {
+        self.execution_feedback_factory = Some(Box::new(factory));
+        self
+    }
+
+    /// Collect verified request stopping facts without owning a predictor.
+    pub fn with_request_stopping_observer(
+        mut self,
+        observer: Arc<dyn ferrum_interfaces::request_observation::RequestStoppingObserver>,
+    ) -> Self {
+        self.request_stopping_observer = Some(observer);
         self
     }
 
@@ -245,11 +285,26 @@ impl EngineBuilder {
         self,
         cleanup: &mut Option<ExecutorShutdownObserver>,
     ) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
-        crate::continuous_engine::validate_execution_feedback(
-            &self.config,
-            self.execution_attempt_observer.as_ref(),
-            self.cost_snapshot_source.as_ref(),
-        )?;
+        if self.execution_feedback_factory.is_some() {
+            if let Some(policy) = self.config.scheduler.slo {
+                policy.validate().map_err(FerrumError::config)?;
+            }
+            if self.execution_attempt_observer.is_some()
+                || self.cost_snapshot_source.is_some()
+                || self.request_stopping_observer.is_some()
+            {
+                return Err(FerrumError::config(
+                    "execution feedback factory cannot replace directly injected observers",
+                )
+                .into());
+            }
+        } else {
+            crate::continuous_engine::validate_execution_feedback(
+                &self.config,
+                self.execution_attempt_observer.as_ref(),
+                self.cost_snapshot_source.as_ref(),
+            )?;
+        }
         info!(
             "Building inference engine for model: {}",
             self.config.model.model_id
@@ -288,8 +343,10 @@ impl EngineBuilder {
         let custom_sampler = self.custom_sampler;
         let custom_executor = self.custom_executor;
         let journal_scopes = self.journal_scopes;
-        let execution_attempt_observer = self.execution_attempt_observer;
-        let cost_snapshot_source = self.cost_snapshot_source;
+        let mut execution_attempt_observer = self.execution_attempt_observer;
+        let mut cost_snapshot_source = self.cost_snapshot_source;
+        let mut request_stopping_observer = self.request_stopping_observer;
+        let execution_feedback_factory = self.execution_feedback_factory;
 
         // 2. Create or use provided tokenizer
         let tokenizer = if let Some(tokenizer) = custom_tokenizer {
@@ -393,6 +450,18 @@ impl EngineBuilder {
             .into());
         }
 
+        if let Some(factory) = execution_feedback_factory {
+            let feedback = factory(&config, executor.as_ref())?;
+            execution_attempt_observer = Some(feedback.execution_observer);
+            cost_snapshot_source = feedback.cost_source;
+            request_stopping_observer = feedback.stopping_observer;
+        }
+        crate::continuous_engine::validate_execution_feedback(
+            &config,
+            execution_attempt_observer.as_ref(),
+            cost_snapshot_source.as_ref(),
+        )?;
+
         // 5. Create the engine — always ContinuousBatchEngine.
         info!("All components created, building ContinuousBatchEngine");
 
@@ -404,7 +473,7 @@ impl EngineBuilder {
 
         // Construct the unpublished engine shell first so its typed profile
         // sink is attached before executor startup emits warmup/capture events.
-        let engine = crate::ContinuousBatchEngine::new_observed(
+        let engine = crate::ContinuousBatchEngine::new_observed_with_requests(
             config,
             cb_scheduler,
             tokenizer,
@@ -413,6 +482,7 @@ impl EngineBuilder {
             journal_scopes,
             execution_attempt_observer,
             cost_snapshot_source,
+            request_stopping_observer,
         )?;
 
         // This is the single product readiness boundary shared by `run` and

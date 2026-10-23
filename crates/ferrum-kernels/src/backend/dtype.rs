@@ -17,8 +17,8 @@ pub enum Dtype {
     /// 32-bit IEEE float. Default activation / weight dtype on the
     /// CPU path; fallback for backends without F16 hw support.
     F32,
-    /// 16-bit IEEE half. Hot-path dtype on CUDA + Metal (decode q,
-    /// K/V, GEMM outputs).
+    /// 16-bit IEEE half. CUDA's default allocation dtype and an explicit typed
+    /// Metal buffer option. The retained Metal KV allocator still uses F32.
     F16,
     /// 32-bit unsigned integer. Block tables, context lens, sorted
     /// token ids, args buffers — anything previously tunneled through

@@ -50,6 +50,7 @@ use tokio::sync::Mutex as AsyncMutex;
 mod checkpoint;
 mod completion_worker;
 mod retained_output_capture;
+mod startup_persistent;
 mod timing;
 
 use self::{
@@ -63,10 +64,12 @@ use self::{
 };
 
 mod backing_maintenance;
+mod cohort_capacity;
 mod composition;
 mod determinism;
 mod input_uploads;
 mod invocation_preparation;
+mod resident_capacity;
 mod resident_decode;
 pub use composition::{CompiledProgram, ProgramCompilationError, RuntimeComposition};
 use resident_decode::{
@@ -561,6 +564,7 @@ fn budget_reusable_decode_seed_prefill(
 pub struct ProgramExecutorConfig {
     pub maximum_model_tokens: usize,
     pub startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
+    pub persistent_pool_preparation: ferrum_types::PersistentPoolPreparation,
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
     pub invocation_preparation_strategy: InvocationPreparationStrategy,
@@ -824,6 +828,7 @@ impl ProgramExecutorConfig {
         Ok(Self {
             maximum_model_tokens,
             startup_memory_plan: engine.runtime.startup_memory_plan.clone(),
+            persistent_pool_preparation: engine.memory.persistent_pool_preparation,
             static_initialization,
             runtime_policy,
             invocation_preparation_strategy: engine.runtime.invocation_preparation_strategy,
@@ -4518,6 +4523,7 @@ pub struct ProgramExecutor<R: DeviceRuntime> {
     io: VNextIoBinding,
     maximum_model_tokens: usize,
     startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
+    startup_persistent_preparation: startup_persistent::StartupPersistentPreparation,
     run_id: RunId,
     family_fingerprint: String,
     program_fingerprint: String,
@@ -4857,6 +4863,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             checkpoint_selection,
             repetition_capacity,
             executor_startup,
+            persistent_preallocation,
         } = compiled;
         let runtime = Arc::clone(&composition.runtime);
         let registry = &composition.registry;
@@ -4992,8 +4999,23 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             .provision_static(Arc::clone(&runtime), provision_request)
             .map_err(|error| FerrumError::device(format!("vNext static provision: {error}")))?;
         provision_phase.finish();
+        let mut startup_persistent_preparation =
+            startup_persistent::StartupPersistentPreparation::new(
+                config.persistent_pool_preparation,
+                persistent_preallocation,
+            );
         let (plan_resources, static_provider_attribution) = match provisioned.into_provisioning() {
-            StaticProvisioning::NoStatic(no_static) => (no_static.into_plan_runtime(), None),
+            StaticProvisioning::NoStatic(no_static) => {
+                if let Err(cause) =
+                    startup_persistent_preparation.apply(no_static.maintenance_controller())
+                {
+                    return Err(shutdown::resources_error(
+                        no_static.into_plan_runtime(),
+                        cause,
+                    ));
+                }
+                (no_static.into_plan_runtime(), None)
+            }
             StaticProvisioning::Required(permit) => {
                 let identity = ResourceTransactionIdentity::for_admission(
                     permit.binding(),
@@ -5078,6 +5100,16 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                             return Err(shutdown::initialization_error(original, cause));
                         }
                     };
+                // Static staging has retired. Allocate persistent backing only
+                // now, retaining the initialized owner's cleanup on failure.
+                if let Err(cause) =
+                    startup_persistent_preparation.apply(initialized.maintenance_controller())
+                {
+                    let original = initialized.abort_activation(VNextError::InvalidExecutionPlan {
+                        reason: cause.to_string(),
+                    });
+                    return Err(shutdown::initialization_error(original, cause));
+                }
                 let handoff_phase = StartupPhaseTimer::start("runtime_handoff");
                 match initialized.into_plan_runtime() {
                     Ok(resources) => {
@@ -5119,6 +5151,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             io,
             maximum_model_tokens: config.maximum_model_tokens,
             startup_memory_plan: config.startup_memory_plan,
+            startup_persistent_preparation,
             run_id,
             family_fingerprint,
             program_fingerprint,
@@ -5222,7 +5255,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         }
                     }
                 }
-                TokenAdmissionOutcome::Deferred(_) | TokenAdmissionOutcome::CapacityDeferred(_) => {
+                TokenAdmissionOutcome::Deferred(_)
+                | TokenAdmissionOutcome::CapacityDeferred(_)
+                | TokenAdmissionOutcome::SequenceSlotsDeferred(_) => {
                     resources.cancel_pending();
                     return Ok(None);
                 }
@@ -8956,6 +8991,11 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         let fields = snapshot
             .as_object_mut()
             .expect("vNext executor snapshot is an object");
+        fields.insert(
+            "startup_persistent_preparation".to_owned(),
+            serde_json::to_value(&self.startup_persistent_preparation)
+                .unwrap_or_else(|error| serde_json::json!({"state": "serialization_failed", "message": error.to_string()})),
+        );
         // Cache health consumes these top-level fields. Always publish native
         // values, including disabled/zero, so text-LCP fallback cannot stand in
         // for sequence checkpoint reuse on this executor.
@@ -9118,6 +9158,23 @@ impl<R: DeviceRuntime> ModelExecutor for ProgramExecutor<R> {
                 "resolved vNext admission limits violated their typed contract: {reason}"
             ))
         })
+    }
+
+    fn resident_cohort_capacity_snapshot(
+        &self,
+        cohort: &[crate::model_executor::ResidentSequenceCapacityRequest],
+    ) -> Option<crate::model_executor::ResidentCohortCapacitySnapshot> {
+        self.native_resident_cohort_capacity(cohort)
+    }
+
+    fn persistent_cohort_capacity(
+        &self,
+        query: &crate::model_executor::PersistentCapacityQuery<'_>,
+    ) -> std::result::Result<
+        crate::model_executor::PersistentCohortCapacitySnapshot,
+        crate::model_executor::PersistentCapacityUnknown,
+    > {
+        self.native_persistent_cohort_capacity(query)
     }
 
     fn resolved_model_plan(&self) -> Option<&ResolvedModelPlan> {

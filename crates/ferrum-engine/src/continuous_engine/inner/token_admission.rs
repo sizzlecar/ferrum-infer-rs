@@ -317,6 +317,15 @@ impl EngineInner {
                 outcome: AdmissionProbeOutcome::CapacityDeferred,
                 maintenance: None,
             },
+            Ok(TokenAdmissionOutcome::SequenceSlotsDeferred(deferred)) => {
+                ExecutorPrefillProbeResult {
+                    trace: capture_admission_trace(
+                        ExecutorPrefillAdmissionTraceEvidence::SequenceSlotsDeferred(deferred),
+                    ),
+                    outcome: AdmissionProbeOutcome::CapacityDeferred,
+                    maintenance: None,
+                }
+            }
             Ok(TokenAdmissionOutcome::Deferred(deferred)) => {
                 if deferred.action() == DeferredAction::AwaitBackingGrowth {
                     self.model_executor.cancel_prefill_admission(&request.id);
@@ -409,11 +418,30 @@ impl EngineInner {
         matches!(result.outcome, AdmissionProbeOutcome::Admitted(_)) && pending.publish().is_ok()
     }
 
-    pub(super) async fn prepare_dynamic_admission_round(
+    pub(in crate::continuous_engine) async fn prepare_dynamic_admission_round(
         &self,
         maximum_admissions: usize,
         mut planning: Option<&mut TimePlanningRound>,
     ) -> Result<(usize, Vec<ExecutorPrefillMaintenanceDeferral>)> {
+        if let Some(round) = planning.as_deref_mut() {
+            // This path is shared by ordinary admission and fill-first retries.
+            // Refresh membership, clocks and resource evidence after earlier
+            // asynchronous admissions and their terminal cleanup;
+            // the immutable cost/stopping snapshot remains fixed for the turn.
+            self.capture_planning_request_facts(round, round.max_request_participants());
+            self.scheduler.prepare_joint_admission_gate(
+                &ferrum_interfaces::BatchHint {
+                    max_batch_size: self.config.batching.max_batch_size,
+                    max_tokens: self.config.batching.max_num_batched_tokens,
+                    target_latency_ms: None,
+                    available_memory: None,
+                    resource_constraints:
+                        ferrum_interfaces::scheduler::ResourceConstraints::default(),
+                },
+                round,
+                Instant::now(),
+            );
+        }
         let mut availability = AdmissionAvailability::take(&self.dynamic_admission_availability);
         let epochs = self
             .model_executor

@@ -341,7 +341,9 @@ fn lora_direct_paged_preparation_commits_binding_only_after_reservation() {
     // can now run alongside default constructors without a child process.
     let execution = ferrum_types::LlamaExecutionConfig {
         kv_capacity: Some(64),
-        paged_max_seqs: 2,
+        // Keep the four deliberately retained metadata owners in scope so
+        // this test reaches the independent two-block allocator boundary.
+        paged_max_seqs: 4,
         options: ferrum_types::LlamaExecutionOptions {
             metal_paged_kv: Some(true),
             kv_max_blocks: Some(2),

@@ -568,7 +568,9 @@ async fn reference_native_cpu_mixed_attempt_preserves_order_and_fits_whole_wall_
                 snapshot.predict(
                     &CostQuery {
                         work: &domain,
-                        work_is_exact: true
+                        work_is_exact: true,
+                        execution:
+                            ferrum_scheduler::cost_prediction::CostExecution::SingleInvocation,
                     },
                     Instant::now()
                 ),
@@ -589,6 +591,7 @@ async fn reference_native_cpu_mixed_attempt_preserves_order_and_fits_whole_wall_
         &CostQuery {
             work: &domain,
             work_is_exact: true,
+            execution: ferrum_scheduler::cost_prediction::CostExecution::SingleInvocation,
         },
         Instant::now(),
     )
@@ -606,7 +609,8 @@ async fn reference_native_cpu_mixed_attempt_preserves_order_and_fits_whole_wall_
             snapshot.predict(
                 &CostQuery {
                     work,
-                    work_is_exact: true
+                    work_is_exact: true,
+                    execution: ferrum_scheduler::cost_prediction::CostExecution::SingleInvocation,
                 },
                 Instant::now()
             ),

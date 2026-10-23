@@ -19,8 +19,10 @@ pub(crate) fn resolve_config(
     workload: WorkloadProfile,
     authority: ExecutionPlanningModel,
     selected_kv_cache_layout: SelectedKvCacheLayout,
+    selected_kv_cache_storage: Option<ferrum_types::KvCacheStorage>,
     usage: StartupUsage,
 ) -> Result<ResolvedFerrumConfig> {
+    validate_memory_authority(authority, &requested)?;
     if authority == ExecutionPlanningModel::CompiledPlan
         && crate::runtime_env::runtime_snapshot_value(&requested, "FERRUM_PREFIX_CACHE").is_none()
     {
@@ -59,8 +61,53 @@ pub(crate) fn resolve_config(
         .with_workload_profile(workload)
         .with_execution_planning_model(authority)
         .with_selected_kv_cache_layout(selected_kv_cache_layout)
+        .with_selected_kv_cache_storage(selected_kv_cache_storage)
         .resolve()
         .map_err(|error| FerrumError::config(format!("invalid auto config: {error}")))
+}
+
+/// Use the retained provider's physical storage declaration, not the compatibility
+/// KV dtype option, when reporting cold memory geometry.
+pub(crate) fn selected_kv_cache_storage(
+    authority: ExecutionPlanningModel,
+    definition: Option<&ferrum_models::ModelDefinition>,
+    model_path: Option<&std::path::Path>,
+    device: &ferrum_types::Device,
+    engine_config: &EngineConfig,
+    requested: &RuntimeConfigSnapshot,
+) -> Result<Option<ferrum_types::KvCacheStorage>> {
+    if authority == ExecutionPlanningModel::CompiledPlan {
+        return Ok(None);
+    }
+    let mut selected_config = engine_config.clone();
+    selected_config
+        .apply_runtime_config_snapshot(requested)
+        .map_err(FerrumError::config)?;
+    crate::commands::run::apply_kv_dtype_override(
+        &mut selected_config,
+        crate::runtime_env::runtime_snapshot_value(requested, "FERRUM_KV_DTYPE"),
+    )?;
+    if let Some(definition) = definition {
+        return Ok(
+            ferrum_models::legacy_capabilities::selected_kv_cache_storage(
+                definition,
+                device,
+                selected_config.kv_cache.dtype,
+                &selected_config.runtime.llama,
+            ),
+        );
+    }
+    if let Some(path) = model_path
+        .filter(|path| ferrum_models::gguf_engine_loader::is_gguf_path(&path.to_string_lossy()))
+    {
+        return ferrum_models::legacy_capabilities::selected_gguf_kv_cache_storage(
+            path,
+            device,
+            selected_config.kv_cache.dtype,
+            &selected_config.runtime.llama,
+        );
+    }
+    Ok(None)
 }
 
 /// Select the retained model's KV layout using the same typed options passed to
@@ -110,6 +157,7 @@ pub(crate) fn memory_request(
     utilization: f32,
     requested: &RuntimeConfigSnapshot,
 ) -> Result<Option<StartupMemoryRequest>> {
+    validate_memory_authority(authority, requested)?;
     if authority == ExecutionPlanningModel::CompiledPlan {
         let memory = ferrum_kernels::backend::probe_device_memory(device)?;
         return StartupMemoryRequest::from_snapshot(memory, utilization, requested)
@@ -117,6 +165,37 @@ pub(crate) fn memory_request(
             .map_err(FerrumError::config);
     }
     Ok(None)
+}
+
+fn validate_memory_authority(
+    authority: ExecutionPlanningModel,
+    requested: &RuntimeConfigSnapshot,
+) -> Result<()> {
+    if let Some(entry) = requested
+        .entries
+        .iter()
+        .find(|entry| entry.key == ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY)
+    {
+        let preparation = ferrum_types::PersistentPoolPreparation::parse_config_entry(entry)
+            .map_err(FerrumError::config)?;
+        if preparation == ferrum_types::PersistentPoolPreparation::ConfiguredEnvelope
+            && authority != ExecutionPlanningModel::CompiledPlan
+        {
+            return Err(FerrumError::config("configured-envelope persistent pool preparation requires a compiled-plan executor; the selected executor does not expose this startup allocation authority"));
+        }
+    }
+    if authority == ExecutionPlanningModel::ExecutorManaged
+        && crate::runtime_env::runtime_snapshot_value(
+            requested,
+            "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+        )
+        .is_some()
+    {
+        return Err(FerrumError::config(
+            "runtime_memory_budget_bytes requires a compiled-plan executor with authoritative total resource accounting; the selected legacy executor cannot enforce a total memory bound. Use explicit kv_capacity and kv_max_blocks controls for its KV pool and measure total memory separately; those controls do not bound weights or workspace",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn hardware_for_request(
@@ -270,6 +349,7 @@ mod tests {
                         WorkloadProfile::serving_default(),
                         authority,
                         SelectedKvCacheLayout::Unknown,
+                        None,
                         usage,
                     )
                     .expect_err("removed controls must not disappear at either startup boundary");
@@ -311,6 +391,7 @@ mod tests {
                     WorkloadProfile::serving_default(),
                     ExecutionPlanningModel::CompiledPlan,
                     SelectedKvCacheLayout::Unknown,
+                    None,
                     usage,
                 )
                 .unwrap();
@@ -401,6 +482,7 @@ mod tests {
                 WorkloadProfile::serving_default(),
                 ExecutionPlanningModel::CompiledPlan,
                 SelectedKvCacheLayout::Unknown,
+                None,
                 usage,
             )
             .unwrap();
@@ -433,6 +515,7 @@ mod tests {
                     WorkloadProfile::serving_default(),
                     ExecutionPlanningModel::CompiledPlan,
                     SelectedKvCacheLayout::Unknown,
+                    None,
                     usage,
                 )
                 .unwrap();
@@ -451,6 +534,7 @@ mod tests {
                 WorkloadProfile::serving_default(),
                 ExecutionPlanningModel::ExecutorManaged,
                 SelectedKvCacheLayout::Unknown,
+                None,
                 usage,
             )
             .unwrap();
@@ -481,6 +565,7 @@ mod tests {
                 workload,
                 ExecutionPlanningModel::CompiledPlan,
                 SelectedKvCacheLayout::Unknown,
+                None,
                 StartupUsage::PersistentServing,
             )
             .unwrap();
@@ -510,6 +595,7 @@ mod tests {
             WorkloadProfile::serving_default_for_hardware(&hardware()),
             ExecutionPlanningModel::CompiledPlan,
             SelectedKvCacheLayout::Unknown,
+            None,
             StartupUsage::PersistentServing,
         )
         .unwrap();
@@ -537,6 +623,7 @@ mod tests {
             workload.clone(),
             ExecutionPlanningModel::CompiledPlan,
             SelectedKvCacheLayout::Unknown,
+            None,
             StartupUsage::PersistentServing,
         )
         .unwrap();
@@ -561,6 +648,7 @@ mod tests {
             workload,
             ExecutionPlanningModel::CompiledPlan,
             SelectedKvCacheLayout::Unknown,
+            None,
             StartupUsage::PersistentServing,
         )
         .is_err());
@@ -599,6 +687,7 @@ mod tests {
                 WorkloadProfile::serving_default_for_hardware(&hardware()),
                 ExecutionPlanningModel::CompiledPlan,
                 SelectedKvCacheLayout::Unknown,
+                None,
                 StartupUsage::PersistentServing,
             )
             .unwrap();
@@ -711,6 +800,7 @@ mod tests {
                 SelectedKvCacheLayout::Paged {
                     block_size_tokens: 16,
                 },
+                None,
                 usage,
             )
             .expect_err("one physical page cannot admit a batch of 32 tokens");
@@ -731,5 +821,103 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn legacy_total_budget_is_rejected_before_any_device_probe_for_both_usages() {
+        let requested = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+            "8589934592",
+            RuntimeConfigSource::Cli,
+        )]);
+        let error = memory_request(
+            &ferrum_types::Device::ROCm(0),
+            ExecutionPlanningModel::ExecutorManaged,
+            0.9,
+            &requested,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot enforce a total memory bound"));
+        for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+            let error = resolve_config(
+                requested.clone(),
+                model(),
+                hardware(),
+                WorkloadProfile::serving_default(),
+                ExecutionPlanningModel::ExecutorManaged,
+                SelectedKvCacheLayout::Unknown,
+                None,
+                usage,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("kv_max_blocks"));
+        }
+    }
+
+    #[test]
+    fn persistent_pool_preparation_rejects_legacy_before_probe_for_both_usages() {
+        let requested = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY,
+            "configured-envelope",
+            RuntimeConfigSource::Cli,
+        )]);
+        assert!(memory_request(
+            &ferrum_types::Device::ROCm(0),
+            ExecutionPlanningModel::ExecutorManaged,
+            0.9,
+            &requested
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("compiled-plan executor"));
+        for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+            assert!(resolve_config(
+                requested.clone(),
+                model(),
+                hardware(),
+                WorkloadProfile::serving_default(),
+                ExecutionPlanningModel::ExecutorManaged,
+                SelectedKvCacheLayout::Unknown,
+                None,
+                usage
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("compiled-plan executor"));
+        }
+        assert!(
+            validate_memory_authority(ExecutionPlanningModel::CompiledPlan, &requested).is_ok()
+        );
+        let hardware = HardwareCapabilities::rtx4090_cuda(ferrum_types::CompiledKernelFeatures {
+            cuda: true,
+            cuda_graph: true,
+            vllm_paged_attn: true,
+            cuda_indexed_causal_attention: true,
+            cuda_causal_gqa2: true,
+            ..Default::default()
+        });
+        for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+            let resolved = resolve_config(
+                requested.clone(),
+                model(),
+                hardware.clone(),
+                WorkloadProfile::serving_default(),
+                ExecutionPlanningModel::CompiledPlan,
+                SelectedKvCacheLayout::Unknown,
+                None,
+                usage,
+            )
+            .unwrap();
+            let mut engine = EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine.memory.persistent_pool_preparation,
+                ferrum_types::PersistentPoolPreparation::ConfiguredEnvelope
+            );
+        }
     }
 }

@@ -1,6 +1,17 @@
 use super::*;
 
 #[tokio::test]
+async fn native_resident_capacity_requires_complete_live_incarnations() {
+    let fixture = cpu(SamplingReadbackMode::Uniform);
+    let other = cpu(SamplingReadbackMode::Uniform);
+    token_assertions::native_resident_capacity_requires_complete_live_incarnations(
+        &fixture.executor,
+        &other.executor,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn native_tokens_cpu_partial_final_decode_and_terminal_receipt() {
     let fixture = cpu(SamplingReadbackMode::Uniform);
     token_assertions::native_tokens_cpu_partial_final_decode_and_terminal_receipt(

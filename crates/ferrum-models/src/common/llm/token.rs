@@ -32,6 +32,7 @@ pub struct ModelKvPreparation<'a> {
 pub enum ModelKvReservation {
     Reserved(Option<ferrum_execution::model_executor::KvSlotReservation>),
     CapacityDeferred(ferrum_execution::token_execution::TokenAdmissionCapacityDeferral),
+    SequenceSlotsDeferred(ferrum_execution::token_execution::TokenSequenceSlotDeferral),
 }
 
 #[derive(Debug, Clone, Copy)]

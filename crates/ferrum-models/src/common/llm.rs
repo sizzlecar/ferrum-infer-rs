@@ -7,10 +7,13 @@
 
 use ferrum_execution::model_executor::{
     KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
+    PagedAdmissionCapacitySnapshot, PagedAdmissionCoverage,
 };
 use ferrum_types::Result;
 
+mod capacity;
 mod token;
+pub use capacity::{ModelCapacityResident, ModelPersistentCapacityQuery};
 pub(crate) use token::catch_host_execution;
 pub use token::{
     ModelExecutionRecovery, ModelKvPreparation, ModelKvReservation, ModelRetirementOutcome,
@@ -50,6 +53,15 @@ pub struct LlmRuntimeConfig {
 pub trait DecoderOnlyLLM: Send + Sync {
     /// Runtime-facing configuration.
     fn config(&self) -> &LlmRuntimeConfig;
+
+    /// Prove bounded cohort reuse using actual persistent owners and already
+    /// allocated backing. No reservation, future growth or transient guarantee.
+    fn persistent_capacity_for_cohort(
+        &self,
+        _query: &ModelPersistentCapacityQuery<'_>,
+    ) -> std::result::Result<(), ferrum_execution::model_executor::PersistentCapacityUnknown> {
+        Err(ferrum_execution::model_executor::PersistentCapacityUnknown::Unsupported)
+    }
 
     /// Qualified execution and closure for this configured implementation.
     /// The executor snapshots this immutable declaration at construction.
@@ -267,6 +279,16 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Snapshot model-owned paged-KV capacity without allocating slots.
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
         None
+    }
+
+    /// Observe all persistent admission limits together with the original KV
+    /// block snapshot. Existing models retain Unknown coverage by default.
+    fn paged_admission_capacity_snapshot(&self) -> Option<PagedAdmissionCapacitySnapshot> {
+        self.kv_slot_capacity_snapshot()
+            .map(|slots| PagedAdmissionCapacitySnapshot {
+                slots,
+                coverage: PagedAdmissionCoverage::Unknown,
+            })
     }
 
     /// Observe joint reclaimability in one actual allocator without releasing

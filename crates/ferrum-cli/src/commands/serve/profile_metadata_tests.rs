@@ -13,6 +13,7 @@ fn config() -> ResolvedFerrumConfig {
         None,
         None,
         None,
+        None,
         RuntimeConfigSnapshot::default(),
     )
     .unwrap()

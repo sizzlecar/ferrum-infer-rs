@@ -3,7 +3,7 @@ use super::*;
 use ferrum_runtime::{CheckpointBoundaryConstraint, CheckpointTokenSpanConstraint};
 use std::num::NonZeroU64;
 
-fn tail(reserved: u64) -> PrefillShapePolicy {
+pub(super) fn tail(reserved: u64) -> PrefillShapePolicy {
     PrefillShapePolicy::PromptTail(
         CheckpointBoundaryConstraint::new(
             CheckpointTokenSpanConstraint::any_positive(),
@@ -35,7 +35,12 @@ fn slo_prefill_shape_candidate_ends_and_selected_suffix_use_one_projection() {
         let policy = tail(reserve);
         let boundary = 8 - reserve as usize;
         let source = snapshot(11, Instant::now(), false);
-        let mut planning = TimePlanningRound::new(source.clone(), targets(), policy);
+        let mut planning = TimePlanningRound::new(
+            source.clone(),
+            targets(),
+            policy,
+            CostExecution::SingleInvocation,
+        );
         admit(&sched, Some(&mut planning));
         // Admission already prices the first actually executable range.
         assert!(source
@@ -62,7 +67,12 @@ fn slo_prefill_shape_candidate_ends_and_selected_suffix_use_one_projection() {
             "checkpoint partitioning is not time adaptation"
         );
         assert!(!sched.mark_prefill_chunk_processed(&id, 8, boundary));
-        let mut suffix = TimePlanningRound::new(source.clone(), targets(), policy);
+        let mut suffix = TimePlanningRound::new(
+            source.clone(),
+            targets(),
+            policy,
+            CostExecution::SingleInvocation,
+        );
         let batch = select(&sched, Some(&mut suffix)).batch.unwrap();
         assert_eq!(actual_tokens(&batch, &id), reserve as usize);
         assert_eq!(suffix.selected[0].requested.as_range(), boundary..8);
@@ -87,7 +97,12 @@ fn slo_prefill_shape_time_shrink_starts_from_projected_work() {
     let source = snapshot(1, ingress.instant(), false);
     let mut config = targets();
     config.ttft_ms = 60.0;
-    let mut planning = TimePlanningRound::new(source.clone(), config, tail(20));
+    let mut planning = TimePlanningRound::new(
+        source.clone(),
+        config,
+        tail(20),
+        CostExecution::SingleInvocation,
+    );
     let batch = sched
         .create_iteration_batch_with_time(
             hint(),
@@ -121,6 +136,9 @@ struct ExactDomain {
     calls: Mutex<Vec<CostWork>>,
 }
 impl CostSnapshot for ExactDomain {
+    fn query_limits(&self) -> ferrum_types::CostQueryLimits {
+        ferrum_types::CostQueryLimits::default()
+    }
     fn revision(&self) -> u64 {
         21
     }
@@ -130,7 +148,10 @@ impl CostSnapshot for ExactDomain {
         self.calls.lock().push(query.work[0]);
         if query.work == [self.work] {
             CostPrediction::Known {
+                central_service_time: Duration::from_micros(1),
                 upper_service_time: Duration::from_micros(1),
+                risk: CostRisk::EngineeringMargin,
+                support: CostSupport::ExactObservedWork,
                 samples: 2,
                 observed_at: self.at,
                 expires_at: self.at + Duration::from_secs(10),
@@ -174,6 +195,7 @@ fn slo_prefill_shape_replay_domain_cannot_price_different_prompt_range() {
             ..targets()
         },
         policy,
+        CostExecution::SingleInvocation,
     );
     assert!(select(&sched, Some(&mut planning)).batch.is_none());
     let calls = source.calls.lock();
@@ -198,7 +220,12 @@ fn slo_prefill_shape_restore_and_same_id_replacement_refresh_scope() {
     let id = original.id.clone();
     enqueue_waiting(&sched, original.clone());
     let source = snapshot(9, Instant::now(), false);
-    let mut planning = TimePlanningRound::new(source.clone(), targets(), tail(2));
+    let mut planning = TimePlanningRound::new(
+        source.clone(),
+        targets(),
+        tail(2),
+        CostExecution::SingleInvocation,
+    );
     admit(&sched, Some(&mut planning));
     assert_eq!(
         source.calls.lock().last().unwrap().1[0]
@@ -261,6 +288,7 @@ fn slo_prefill_shape_unknown_preserves_policy_and_existing_decode_progress() {
                 ..targets()
             },
             PrefillShapePolicy::Unknown,
+            CostExecution::SingleInvocation,
         );
         let selection = select(&sched, Some(&mut planning));
         let batch = selection.batch.unwrap();

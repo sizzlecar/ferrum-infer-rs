@@ -12,6 +12,72 @@ pub struct CudaDeviceAttributes {
     pub multiprocessor_count: u32,
 }
 
+/// Stable physical CUDA identity read through the driver-visible ordinal.
+/// UUIDs distinguish devices even when CUDA_VISIBLE_DEVICES remaps ordinals.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CudaExecutionDeviceIdentity {
+    pub uuid: [u8; 16],
+    pub name: String,
+    pub total_memory_bytes: usize,
+    pub compute_capability_major: u32,
+    pub compute_capability_minor: u32,
+    pub multiprocessor_count: u32,
+    pub driver_api_version: i32,
+}
+
+#[cfg(feature = "cuda")]
+pub fn probe_cuda_execution_device_identity(ordinal: usize) -> Result<CudaExecutionDeviceIdentity> {
+    let context = cudarc::driver::CudaContext::new(ordinal)
+        .map_err(|error| FerrumError::device(format!("probe CUDA {ordinal}: {error}")))?;
+    let attributes = cuda_context_device_attributes(&context)?;
+    let error = |error| FerrumError::device(format!("CUDA identity: {error}"));
+    let uuid = context.uuid().map_err(error)?.bytes.map(|byte| byte as u8);
+    let mut driver_api_version = 0;
+    // Driver initialization is owned by the live context above. CUDA writes
+    // one c_int into this valid stack location; no device work is submitted.
+    unsafe {
+        cudarc::driver::sys::cuDriverGetVersion(&mut driver_api_version)
+            .result()
+            .map_err(error)?;
+    }
+    if uuid == [0; 16] || driver_api_version <= 0 {
+        return Err(FerrumError::device(
+            "CUDA returned an incomplete device identity",
+        ));
+    }
+    Ok(CudaExecutionDeviceIdentity {
+        uuid,
+        name: context.name().map_err(error)?,
+        total_memory_bytes: context.total_mem().map_err(error)?,
+        compute_capability_major: attributes.compute_capability_major,
+        compute_capability_minor: attributes.compute_capability_minor,
+        multiprocessor_count: attributes.multiprocessor_count,
+        driver_api_version,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MetalExecutionDeviceIdentity {
+    pub registry_id: u64,
+    pub name: String,
+    pub unified_memory: bool,
+    pub low_power: bool,
+    pub recommended_working_set_bytes: u64,
+}
+
+/// Inspect the same process-owned Metal device used by the production kernels.
+#[cfg(feature = "metal")]
+pub fn probe_metal_execution_device_identity() -> MetalExecutionDeviceIdentity {
+    let device = super::metal::st().pipes.device();
+    MetalExecutionDeviceIdentity {
+        registry_id: device.registry_id(),
+        name: device.name().to_owned(),
+        unified_memory: device.has_unified_memory(),
+        low_power: device.is_low_power(),
+        recommended_working_set_bytes: device.recommended_max_working_set_size(),
+    }
+}
+
 #[cfg(any(feature = "cuda", test))]
 impl CudaDeviceAttributes {
     fn from_raw(major: i32, minor: i32, multiprocessors: i32) -> Result<Self> {

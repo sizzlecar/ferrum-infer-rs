@@ -7,6 +7,8 @@ use ferrum_execution::token_execution::{
 use ferrum_runtime::DynamicBackingPressure;
 
 mod batch;
+mod iteration_trace;
+use iteration_trace::IterationTrace;
 pub(super) mod completion;
 pub(super) mod prefix_rendezvous;
 pub(super) mod prefix_restore;
@@ -77,6 +79,9 @@ pub(super) struct SchedulerTraceRequestStats {
     pub(super) request_id: String,
     pub(super) phase: Option<String>,
     pub(super) scheduled_tokens: usize,
+    /// Final scheduler input range, not a claim of successful backend work.
+    pub(super) scheduled_range: Option<std::ops::Range<usize>>,
+    pub(super) execution_frontier_before: Option<usize>,
     pub(super) tokens_to_process_missing: bool,
     pub(super) prompt_tokens: Option<usize>,
     pub(super) generated_tokens: Option<usize>,
@@ -95,6 +100,7 @@ enum ExecutorPrefillAdmissionTraceEvidence {
     Admitted(ExecutorPrefillAdmissionReceipt),
     Deferred(AdmissionDeferred),
     CapacityDeferred(TokenAdmissionCapacityDeferral),
+    SequenceSlotsDeferred(ferrum_execution::token_execution::TokenSequenceSlotDeferral),
     MaintenanceDeferred(ExecutorPrefillMaintenanceDeferral),
     PermanentRejected(AdmissionRejected),
     Faulted(String),
@@ -247,6 +253,20 @@ impl EngineInner {
                     "free_blocks": deferred.snapshot().free_blocks,
                     "total_blocks": deferred.snapshot().total_blocks,
                     "block_size": deferred.snapshot().block_size,
+                    "retry_after": "confirmed_physical_release",
+                }),
+                1,
+                false,
+                false,
+                None,
+            ),
+            ExecutorPrefillAdmissionTraceEvidence::SequenceSlotsDeferred(deferred) => (
+                "capacity_deferred",
+                serde_json::json!({
+                    "reason": "sequence_slots_capacity",
+                    "occupied_slots": deferred.occupied_slots(),
+                    "capacity_slots": deferred.capacity_slots(),
+                    "required_slots": deferred.required_slots(),
                     "retry_after": "confirmed_physical_release",
                 }),
                 1,
@@ -878,7 +898,7 @@ impl EngineInner {
         );
     }
 
-    fn execute_executor_prefill_maintenance(
+    pub(in crate::continuous_engine) fn execute_executor_prefill_maintenance(
         &self,
         maintenance: Vec<ExecutorPrefillMaintenanceDeferral>,
     ) {
@@ -1115,7 +1135,7 @@ impl EngineInner {
     }
 
     fn scheduler_trace_enabled(&self) -> bool {
-        self.legacy_scheduler_trace_jsonl.is_some()
+        self.legacy_scheduler_trace_jsonl.is_some() || self.scheduler_trace_jsonl.is_some()
     }
 
     pub(super) fn scheduler_trace_plan_stats(
@@ -1146,6 +1166,17 @@ impl EngineInner {
             let prompt_tokens = seq.map(|seq| seq.prefill_context_len());
             let generated_tokens = seq.map(|seq| seq.generated_tokens.len());
             let prefill_tokens_processed = seq.map(|seq| seq.prefill_tokens_processed);
+            let execution_frontier_before = seq
+                .and_then(|seq| seq.execution_frontier.as_ref())
+                .map(|frontier| frontier.consumed_tokens());
+            let scheduled_range = scheduled_req.tokens_to_process.and_then(|tokens| {
+                let start = if matches!(phase, Some(RequestPhase::Decoding)) {
+                    execution_frontier_before?
+                } else {
+                    scheduled_req.tokens_processed
+                };
+                start.checked_add(tokens).map(|end| start..end)
+            });
             let prefill_tokens_remaining_before = prompt_tokens
                 .zip(prefill_tokens_processed)
                 .map(|(prompt, processed)| prompt.saturating_sub(processed));
@@ -1192,6 +1223,8 @@ impl EngineInner {
                 request_id: request_id.to_string(),
                 phase: phase.map(|phase| format!("{phase:?}")),
                 scheduled_tokens,
+                scheduled_range,
+                execution_frontier_before,
                 tokens_to_process_missing: scheduled_req.tokens_to_process.is_none(),
                 prompt_tokens,
                 generated_tokens,
@@ -1257,7 +1290,9 @@ impl EngineInner {
         let prof = self.runtime_config.batch_decode_prof;
         let t_iter_start = if prof { Some(Instant::now()) } else { None };
         let trace_enabled = self.scheduler_trace_enabled();
-        let trace_scheduler_before = trace_enabled.then(|| self.scheduler.trace_snapshot());
+        let legacy_trace_enabled = self.legacy_scheduler_trace_jsonl.is_some();
+        let trace_iteration_started_ns = trace_enabled.then(scheduler_trace_monotonic_nanos);
+        let trace_scheduler_before = legacy_trace_enabled.then(|| self.scheduler.trace_snapshot());
         let trace_prefill_tokens_before = if trace_enabled {
             Some(self.total_prefill_tokens.load(Ordering::Relaxed))
         } else {
@@ -1290,7 +1325,7 @@ impl EngineInner {
         // rounds. Keep one immutable prediction version across all of them;
         // prediction queries still use their current monotonic time.
         let prefill_shape_policy = self.model_executor.prefill_shape_policy();
-        let mut planning = self.config.scheduler.slo.map(|policy| {
+        let mut planning = self.scheduler.observe_planning_round(self.config.scheduler.slo.map(|policy| {
             TimePlanningRound::new(
                 self.cost_snapshot_source
                     .as_ref()
@@ -1298,8 +1333,16 @@ impl EngineInner {
                     .load(),
                 policy,
                 prefill_shape_policy,
+                match self.config.batching.prefill_decode_execution {
+                    ferrum_types::PrefillDecodeExecution::Split => {
+                        ferrum_scheduler::cost_prediction::CostExecution::SequentialPrefillThenDecode
+                    }
+                    ferrum_types::PrefillDecodeExecution::Mixed => {
+                        ferrum_scheduler::cost_prediction::CostExecution::SingleInvocation
+                    }
+                },
             )
-        });
+        }));
         if self
             .prepare_token_prefill_cohort(&hint, planning.as_mut())
             .await?
@@ -1319,6 +1362,12 @@ impl EngineInner {
         if self.model_executor.supports_plan_runtime_prefix_restore() {
             self.restore_admitted_prefixes().await?;
             self.refresh_prefix_rendezvous()?;
+        }
+        if let Some(round) = planning.as_mut() {
+            // Admission can retire a rejected member and prefix restoration
+            // can change its execution frontier. The iteration lock excludes
+            // new product publication, but does not freeze those mutations.
+            self.capture_planning_request_facts(round, round.max_request_participants());
         }
         let (scheduled, observations) = {
             let mut availability = self.dynamic_admission_availability.lock();
@@ -1345,6 +1394,7 @@ impl EngineInner {
             );
             (scheduled, observations)
         };
+        let planning = planning.finish();
         for observation in observations {
             self.trace_executor_admission_queue_observation(observation);
         }
@@ -1359,8 +1409,24 @@ impl EngineInner {
             Some(b) => b,
             None => {
                 self.execute_executor_prefill_maintenance(prefill_maintenance.into_pending());
-                self.complete_typed_admission_failures().await?;
-                if trace_enabled {
+                let post_process = self.complete_typed_admission_failures().await;
+                self.trace_iteration(IterationTrace {
+                    iteration,
+                    started_ns: trace_iteration_started_ns,
+                    batch: None,
+                    plan: None,
+                    planning: planning.as_ref(),
+                    schedule_elapsed: sched_elapsed,
+                    process_started_ns: None,
+                    process_completed_ns: None,
+                    process_elapsed: None,
+                    process_result: None,
+                    post_process_result: &post_process,
+                    prefill_tokens_before: trace_prefill_tokens_before,
+                    decode_tokens_before: trace_decode_tokens_before,
+                });
+                post_process?;
+                if legacy_trace_enabled {
                     let none_streak = self
                         .scheduler_trace_none_streak
                         .fetch_add(1, Ordering::Relaxed)
@@ -1436,12 +1502,13 @@ impl EngineInner {
                 };
             }
         };
-        let trace_none_since_last_some = if trace_enabled {
+        let trace_none_since_last_some = if legacy_trace_enabled {
             Some(self.scheduler_trace_none_streak.swap(0, Ordering::Relaxed))
         } else {
             None
         };
-        let trace_scheduler_after_schedule = trace_enabled.then(|| self.scheduler.trace_snapshot());
+        let trace_scheduler_after_schedule =
+            legacy_trace_enabled.then(|| self.scheduler.trace_snapshot());
         let trace_plan = trace_enabled.then(|| self.scheduler_trace_plan_stats(&batch));
         let t_after_sched = if prof { Some(Instant::now()) } else { None };
 
@@ -1455,6 +1522,7 @@ impl EngineInner {
         // selected batch owns its request authorities, so new ingress may be
         // published while the device executes this wave.
         drop(iteration_guard);
+        let trace_process_started_ns = trace_enabled.then(scheduler_trace_monotonic_nanos);
         let process_t0 = Instant::now();
         let r = self
             .process_batch_with_shape(
@@ -1466,10 +1534,27 @@ impl EngineInner {
             )
             .await;
         let process_elapsed = process_t0.elapsed();
+        let trace_process_completed_ns = trace_enabled.then(scheduler_trace_monotonic_nanos);
         self.record_model_execution_time(process_elapsed);
         self.execute_executor_prefill_maintenance(prefill_maintenance.into_pending());
-        self.complete_typed_admission_failures().await?;
-        if trace_enabled {
+        let post_process = self.complete_typed_admission_failures().await;
+        self.trace_iteration(IterationTrace {
+            iteration,
+            started_ns: trace_iteration_started_ns,
+            batch: Some(&batch),
+            plan: trace_plan.as_ref(),
+            planning: planning.as_ref(),
+            schedule_elapsed: sched_elapsed,
+            process_started_ns: trace_process_started_ns,
+            process_completed_ns: trace_process_completed_ns,
+            process_elapsed: Some(process_elapsed),
+            process_result: Some(&r),
+            post_process_result: &post_process,
+            prefill_tokens_before: trace_prefill_tokens_before,
+            decode_tokens_before: trace_decode_tokens_before,
+        });
+        post_process?;
+        if legacy_trace_enabled {
             let prefill_tokens_after = self.total_prefill_tokens.load(Ordering::Relaxed);
             let decode_tokens_after = self.total_decode_tokens.load(Ordering::Relaxed);
             self.write_scheduler_trace_event(|| serde_json::json!({

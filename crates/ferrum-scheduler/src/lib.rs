@@ -21,6 +21,7 @@
 
 pub mod cost_prediction;
 pub mod implementations;
+pub mod joint_policy;
 pub mod metrics;
 pub mod vnext;
 

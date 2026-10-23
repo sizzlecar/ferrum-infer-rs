@@ -14,10 +14,14 @@ pub use execution_capacity::{ExecutionCapacityDeferral, ExecutionCapacityRelease
 mod prefix_rendezvous;
 mod prefix_restore;
 pub use prefix_rendezvous::{PrefixRendezvousCandidate, PrefixRendezvousHold, PrefixRequestKey};
+pub(crate) mod admission_gate;
+mod joint_selection;
+mod prefill_budget;
+use prefill_budget::{PrefillPacking, PrefillPackingMode, PrefillWorkBudget};
 mod pressure;
 mod slo;
 mod time_policy;
-pub use slo::SchedulerSloSnapshot;
+pub use slo::{PlanningRoundObservation, SchedulerSloSnapshot};
 mod token_admission;
 pub use token_admission::{
     TokenAdmissionAccepted, TokenAdmissionApply, TokenAdmissionCandidate, TokenAdmissionRound,
@@ -65,7 +69,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
@@ -409,6 +413,14 @@ struct ExecutionMaintenanceRetryTicket {
     latest_capacity_epoch: u64,
 }
 
+/// A finite policy commitment, separate from observed execution capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefillPhaseCap {
+    limit: NonZeroUsize,
+    prompt_tokens: usize,
+    packing: PrefillPacking,
+}
+
 /// Extended scheduled request with continuous batching metadata
 #[derive(Debug, Clone)]
 pub struct ContinuousBatchRequest {
@@ -424,6 +436,12 @@ pub struct ContinuousBatchRequest {
     slo_first_token_emitted: bool,
     /// Phase-independent logical progress and resident-work state.
     logical_work_frontier: LogicalWorkFrontier,
+    /// A decode-only first wave may defer this frontier once. Only actual
+    /// logical progress, not replanning or prefix restoration, renews it.
+    joint_decode_only_deferred_generation: Option<LogicalWorkGeneration>,
+    /// A selected positive chunk limit lasts through this original prefill.
+    /// It is not a capacity estimate and survives a later prediction expiry.
+    joint_prefill_phase_cap: Option<PrefillPhaseCap>,
     /// Optional restore state for this admission, separate from compute work.
     prefix_restore: PrefixRestoreState,
     prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState,
@@ -475,6 +493,8 @@ impl ContinuousBatchRequest {
             decode_tokens: 0,
             slo_first_token_emitted: false,
             logical_work_frontier: LogicalWorkFrontier::default(),
+            joint_decode_only_deferred_generation: None,
+            joint_prefill_phase_cap: None,
             prefix_restore: PrefixRestoreState::default(),
             prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState::default(),
             kv_blocks: Vec::new(),
@@ -1957,6 +1977,9 @@ impl ContinuousBatchScheduler {
         observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
         mut planning: Option<&mut TimePlanningRound>,
     ) -> Result<BatchSelection> {
+        if let Some(round) = planning.as_deref_mut() {
+            round.selection_attempted = true;
+        }
         let batch = self.create_iteration_batch_with_time(
             intent.hint,
             WaitingAdmissionMode::Prepared {
@@ -1966,10 +1989,14 @@ impl ContinuousBatchScheduler {
             },
             Instant::now(),
             planning.as_deref_mut(),
-        )?;
-        if let Some(round) = planning.as_ref() {
+        );
+        if let Some(round) = planning
+            .as_ref()
+            .filter(|round| !round.diagnostics_scope_owned)
+        {
             self.slo_diagnostics.lock().record(round);
         }
+        let batch = batch?;
         Ok(BatchSelection {
             batch,
             retry_at: planning.as_ref().and_then(|round| round.retry_at()),
@@ -2031,12 +2058,12 @@ impl ContinuousBatchScheduler {
         let prefill_step_chunk = self.runtime_config.prefill_step_chunk;
         let prefill_queue = self.prefill_queue.read();
         for request in prefill_queue.iter().take(hint.max_batch_size) {
-            let tokens =
+            let budget =
                 self.prefill_budget_tokens(request, None, prefill_step_chunk, remaining_tokens);
-            if tokens == 0 || tokens > remaining_tokens {
+            if budget.execution_tokens == 0 || budget.nominal_charge > remaining_tokens {
                 return 0;
             }
-            remaining_tokens -= tokens;
+            remaining_tokens -= budget.nominal_charge;
         }
         drop(prefill_queue);
 
@@ -2057,11 +2084,11 @@ impl ContinuousBatchScheduler {
                 break;
             }
             let available = remaining_tokens.saturating_sub(admitted_tokens);
-            let tokens = self.prefill_budget_tokens(request, None, prefill_step_chunk, available);
-            if tokens == 0 || tokens > available {
+            let budget = self.prefill_budget_tokens(request, None, prefill_step_chunk, available);
+            if budget.execution_tokens == 0 || budget.nominal_charge > available {
                 break;
             }
-            admitted_tokens += tokens;
+            admitted_tokens += budget.nominal_charge;
             admitted += 1;
         }
         limit = limit.min(admitted);
@@ -3379,6 +3406,7 @@ impl ContinuousBatchScheduler {
         {
             let mut req = prefill_queue.remove(pos).unwrap();
             req.phase = RequestPhase::Decoding;
+            req.joint_prefill_phase_cap = None;
             req.capacity_deferred_until_release_epoch = 0;
             req.capacity_deferred_mixed_attempt_epoch = None;
             req.capacity_deferred_empty_retry_epoch = None;
@@ -3519,13 +3547,48 @@ impl ContinuousBatchScheduler {
         chunk.min(remaining).max(1)
     }
 
-    fn apply_prefill_execution_chunk_ceiling(req: &ContinuousBatchRequest, tokens: usize) -> usize {
+    fn apply_prefill_execution_chunk_ceiling(
+        req: &ContinuousBatchRequest,
+        tokens: usize,
+        policy_quantum: Option<usize>,
+    ) -> PrefillWorkBudget {
         let tokens = req
             .prefill_execution_chunk_ceiling
             .map(|ceiling| tokens.min(ceiling))
             .unwrap_or(tokens)
             .max(1);
-        req.prefix_rendezvous.cap(req.prefill_chunk_offset, tokens)
+        let budget = PrefillWorkBudget::for_cap(
+            tokens,
+            policy_quantum.map(|quantum| {
+                req.prefill_execution_chunk_ceiling
+                    .map_or(quantum, |ceiling| quantum.min(ceiling))
+                    .max(1)
+            }),
+            req.joint_prefill_phase_cap.map(|cap| cap.limit),
+            req.joint_prefill_phase_cap
+                .map_or(PrefillPacking::Refill, |cap| cap.packing),
+        );
+        let execution_tokens = req
+            .prefix_rendezvous
+            .cap(req.prefill_chunk_offset, budget.execution_tokens);
+        // cap() may retire an impossible rendezvous dependency. Keep its one
+        // original call on actual execution, never call it for bookkeeping.
+        // A reservation conservatively retains its pre-rendezvous debit;
+        // modeled joint planning already excludes rendezvous configuration.
+        let nominal_charge = if execution_tokens == 0 {
+            0
+        } else if req
+            .joint_prefill_phase_cap
+            .is_some_and(|cap| cap.packing.reserves_nominal())
+        {
+            budget.nominal_charge
+        } else {
+            execution_tokens
+        };
+        PrefillWorkBudget {
+            execution_tokens,
+            nominal_charge,
+        }
     }
 
     fn prefill_budget_tokens(
@@ -3534,9 +3597,12 @@ impl ContinuousBatchScheduler {
         active_decode_prefill_chunk: Option<usize>,
         prefill_step_chunk: Option<usize>,
         step_tokens_remaining: usize,
-    ) -> usize {
+    ) -> PrefillWorkBudget {
         if step_tokens_remaining == 0 {
-            return 0;
+            return PrefillWorkBudget {
+                execution_tokens: 0,
+                nominal_charge: 0,
+            };
         }
         if let Some(chunk) =
             self.maybe_active_decode_prefill_chunk(req, active_decode_prefill_chunk)
@@ -3548,7 +3614,11 @@ impl ContinuousBatchScheduler {
                 .chunked_prefill_budget_tokens(req, chunk)
                 .min(step_tokens_remaining)
                 .max(1);
-            return Self::apply_prefill_execution_chunk_ceiling(req, tokens);
+            return Self::apply_prefill_execution_chunk_ceiling(
+                req,
+                tokens,
+                Some(chunk.max(1).min(step_tokens_remaining)),
+            );
         }
 
         let remaining = self.remaining_prefill_tokens(req);
@@ -3557,16 +3627,23 @@ impl ContinuousBatchScheduler {
                 .chunked_prefill_budget_tokens(req, chunk)
                 .min(step_tokens_remaining)
                 .max(1);
-            return Self::apply_prefill_execution_chunk_ceiling(req, tokens);
+            return Self::apply_prefill_execution_chunk_ceiling(
+                req,
+                tokens,
+                Some(chunk.max(1).min(step_tokens_remaining)),
+            );
         }
         // An enabled latency policy must be able to enforce its aggregate
         // budget even if a caller disabled the optional static chunk policy.
-        let tokens = if self.cb_config.enable_chunked_prefill || self.config.slo.is_some() {
+        let tokens = if self.cb_config.enable_chunked_prefill
+            || self.config.slo.is_some_and(|slo| {
+                slo.strategy == ferrum_types::SloStrategy::ReferenceStepDiagnostic
+            }) {
             remaining.min(step_tokens_remaining).max(1)
         } else {
             remaining.max(1)
         };
-        Self::apply_prefill_execution_chunk_ceiling(req, tokens)
+        Self::apply_prefill_execution_chunk_ceiling(req, tokens, None)
     }
 
     fn active_decode_prefill_budget_tokens(
@@ -3681,6 +3758,7 @@ impl ContinuousBatchScheduler {
         hint: &BatchHint,
         batch_requests: &mut Vec<ScheduledRequest>,
         total_tokens: &mut usize,
+        policy_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
         active_decode_prefill_tokens_remaining: &mut Option<usize>,
         planning: &mut Option<&mut TimePlanningRound>,
@@ -3692,7 +3770,7 @@ impl ContinuousBatchScheduler {
         _capacity_release_epoch: u64,
         capacity_mixed_recompute_epoch: u64,
     ) -> Result<()> {
-        if batch_requests.len() >= hint.max_batch_size || *total_tokens >= hint.max_tokens {
+        if batch_requests.len() >= hint.max_batch_size || *policy_tokens >= hint.max_tokens {
             return Ok(());
         }
 
@@ -3748,11 +3826,11 @@ impl ContinuousBatchScheduler {
                 break;
             }
 
-            let mut step_tokens_remaining = hint.max_tokens.saturating_sub(*total_tokens);
+            let mut step_tokens_remaining = hint.max_tokens.saturating_sub(*policy_tokens);
             if let Some(remaining) = active_decode_prefill_tokens_remaining.as_ref() {
                 step_tokens_remaining = step_tokens_remaining.min(*remaining);
             }
-            let mut prefill_chunk_tokens = self.prefill_budget_tokens(
+            let mut budget = self.prefill_budget_tokens(
                 req,
                 active_decode_prefill_chunk,
                 prefill_step_chunk,
@@ -3761,7 +3839,7 @@ impl ContinuousBatchScheduler {
             // Skip fully-prefilled requests that are still in the queue
             // (they'll be promoted by mark_prefill_chunk_processed on the
             // next iteration boundary).
-            if prefill_chunk_tokens == 0 {
+            if budget.execution_tokens == 0 {
                 continue;
             }
             if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
@@ -3771,8 +3849,16 @@ impl ContinuousBatchScheduler {
             }
 
             if let Some(round) = planning.as_deref_mut() {
-                match self.prefill_time_decision(req, prefill_chunk_tokens, round, now) {
-                    TimeDecision::Allow(tokens) => prefill_chunk_tokens = tokens,
+                match self.prefill_time_decision(req, budget.execution_tokens, round, now) {
+                    TimeDecision::Allow(tokens) => {
+                        budget.execution_tokens = tokens;
+                        if !req
+                            .joint_prefill_phase_cap
+                            .is_some_and(|cap| cap.packing.reserves_nominal())
+                        {
+                            budget.nominal_charge = tokens;
+                        }
+                    }
                     TimeDecision::Hold => continue,
                     TimeDecision::Reject(error) => {
                         rejected.push((req.inner.request.id.clone(), error));
@@ -3781,14 +3867,23 @@ impl ContinuousBatchScheduler {
                 }
             }
 
-            if *total_tokens + prefill_chunk_tokens <= hint.max_tokens {
+            let prefill_chunk_tokens = budget.execution_tokens;
+            if prefill_chunk_tokens > 0
+                && budget.nominal_charge <= hint.max_tokens.saturating_sub(*policy_tokens)
+            {
                 if let Some(round) = planning.as_deref_mut() {
-                    round.selected_work(self.cost_work(
+                    let projected = self.cost_work(
                         req,
                         prefill_chunk_tokens,
                         false,
                         round.prefill_shape_policy,
-                    ));
+                    );
+                    if projected.is_some_and(|(work, _)| {
+                        work.requested.as_range().len() != prefill_chunk_tokens
+                    }) {
+                        round.execution_already_projected = false;
+                    }
+                    round.selected_work(projected);
                 }
                 let mut scheduled = req.inner.clone();
                 scheduled.tokens_processed = req.prefill_chunk_offset;
@@ -3798,8 +3893,9 @@ impl ContinuousBatchScheduler {
                 scheduled_request_ids.insert(scheduled.request.id.clone());
                 batch_requests.push(scheduled);
                 *total_tokens += prefill_chunk_tokens;
+                *policy_tokens += budget.nominal_charge;
                 if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
-                    *remaining = remaining.saturating_sub(prefill_chunk_tokens);
+                    *remaining = remaining.saturating_sub(budget.nominal_charge);
                 }
                 if let Some(remaining) = active_decode_prefill_chunks_remaining.as_mut() {
                     *remaining = remaining.saturating_sub(1);
@@ -4163,7 +4259,9 @@ impl ContinuousBatchScheduler {
         let fill_first_initial_cohort_armed =
             self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
         fill_first_initial_cohort_armed
-            && !(self.config.slo.is_some() && decoding_count > 0)
+            && !(self.config.slo.is_some_and(|slo| {
+                slo.strategy == ferrum_types::SloStrategy::ReferenceStepDiagnostic
+            }) && decoding_count > 0)
             && !(self
                 .runtime_config
                 .active_decode_prefill_token_budget
@@ -4216,6 +4314,9 @@ impl ContinuousBatchScheduler {
             )?;
         }
         let mut scheduled_decode_count = batch_requests.len();
+        // Shared by both prefill passes, including newly admitted owners.
+        // Never expose this policy debit as actual BatchPlan work/resources.
+        let mut policy_tokens = total_tokens;
         let active_decode_prefill_chunk =
             self.active_decode_prefill_chunk_for_iteration(&hint, scheduled_decode_count);
         let prefill_step_chunk = self.runtime_config.prefill_step_chunk;
@@ -4278,6 +4379,7 @@ impl ContinuousBatchScheduler {
             &hint,
             &mut batch_requests,
             &mut total_tokens,
+            &mut policy_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
             &mut planning,
@@ -4370,6 +4472,7 @@ impl ContinuousBatchScheduler {
             &hint,
             &mut batch_requests,
             &mut total_tokens,
+            &mut policy_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
             &mut planning,
@@ -4410,6 +4513,14 @@ impl ContinuousBatchScheduler {
 
         if batch_requests.is_empty() {
             return Ok(None);
+        }
+
+        if let Some(round) = planning.as_deref_mut() {
+            self.select_joint_first_wave(&hint, &mut batch_requests, round, now);
+            total_tokens = batch_requests
+                .iter()
+                .filter_map(|request| request.tokens_to_process)
+                .sum();
         }
 
         let batch_id = BatchId::new();
@@ -4968,7 +5079,11 @@ mod tests {
                     ttft_ms: 1000.0,
                     tpot_ms: 100.0,
                     itl_ms: 120.0,
-                    reference: Default::default(),
+                    query: Default::default(),
+                    planning: Default::default(),
+                    joint: Default::default(),
+                    strategy: Default::default(),
+                    unknown_stopping: Default::default(),
                     unknown_cost: Default::default(),
                 }),
                 ..SchedulerConfig::default()

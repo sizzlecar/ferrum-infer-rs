@@ -12,7 +12,7 @@ use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use ferrum_execution::{
     model_executor::{
         AttentionType, ExecutorCapabilities, ExecutorStatus, KvSlotCapacitySnapshot, KvSlotRequest,
-        KvSlotReservation, MemoryRequirements,
+        KvSlotReservation, MemoryRequirements, PagedAdmissionCapacitySnapshot,
     },
     ModelExecutor,
 };
@@ -251,6 +251,10 @@ impl ModelExecutor for LlmExecutor {
         &self.info
     }
 
+    fn implementation_identity(&self) -> Option<&'static str> {
+        Some(std::any::type_name::<Self>())
+    }
+
     fn bound_resolved_sources(&self) -> Option<&ferrum_runtime::ResolvedModelSources> {
         self.bound_sources
             .as_deref()
@@ -274,6 +278,20 @@ impl ModelExecutor for LlmExecutor {
 
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
         self.lock_model().ok()?.kv_slot_capacity_snapshot()
+    }
+
+    fn paged_admission_capacity_snapshot(&self) -> Option<PagedAdmissionCapacitySnapshot> {
+        self.lock_model().ok()?.paged_admission_capacity_snapshot()
+    }
+
+    fn persistent_cohort_capacity(
+        &self,
+        query: &ferrum_execution::model_executor::PersistentCapacityQuery<'_>,
+    ) -> std::result::Result<
+        ferrum_execution::model_executor::PersistentCohortCapacitySnapshot,
+        ferrum_execution::model_executor::PersistentCapacityUnknown,
+    > {
+        self.observe_persistent_cohort_capacity(query)
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {

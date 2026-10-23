@@ -89,6 +89,16 @@ pub struct PerformancePolicy {
     pub task_timeout_secs: u64,
 }
 impl PerformancePolicy {
+    /// This policy requires authoritative total accounting. KV capacity alone
+    /// cannot satisfy it, even when a legacy server accepts the same CLI flag.
+    pub fn validate_target(&self, target: &ExecutionTarget) -> Result<(), String> {
+        self.validate()?;
+        if target.execution_path != "production-plan-runtime" {
+            return Err("unsupported performance memory policy: the required total runtime memory budget needs a compiled-plan executor; legacy KV capacity does not enforce a total memory bound".into());
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.workload.validate()?;
         self.limits.validate()?;
@@ -208,7 +218,7 @@ impl ExpectedPerformanceRun {
         {
             return Err("performance task must bind distinct plan obligations".into());
         }
-        self.policy.validate()?;
+        self.policy.validate_target(&self.profile.target)?;
         if self.profile.target.execution_path == "production-plan-runtime"
             && !self.source.sidecars.contains_key("config.json")
         {
@@ -373,7 +383,13 @@ mod tests {
     fn expected() -> ExpectedPerformanceRun {
         ExpectedPerformanceRun {
             schema_version: 1,
-            profile: profile(),
+            profile: ModelProfile {
+                target: ExecutionTarget {
+                    execution_path: "production-plan-runtime".into(),
+                    ..profile().target
+                },
+                ..profile()
+            },
             baseline_version: "1.2.3".into(),
             candidate_version: "1.2.4".into(),
             client_version: "1.2.4".into(),
@@ -408,6 +424,13 @@ mod tests {
                 },
                 sidecars: [
                     (
+                        "config.json".into(),
+                        FileDigest {
+                            bytes: 32,
+                            sha256: "a".repeat(64),
+                        },
+                    ),
+                    (
                         "tokenizer.json".into(),
                         FileDigest {
                             bytes: 32,
@@ -435,6 +458,23 @@ mod tests {
         let replay: ExpectedPerformanceRun = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(replay, expected);
         replay.validate().unwrap();
+    }
+    #[test]
+    fn required_total_memory_policy_rejects_legacy_and_unknown_accounting() {
+        let mut expected = expected();
+        for path in ["legacy-model-executor", "other-executor"] {
+            expected.profile.target.execution_path = path.into();
+            assert!(expected
+                .policy
+                .validate_target(&expected.profile.target)
+                .unwrap_err()
+                .contains("required total runtime memory budget"));
+        }
+        expected.profile.target.execution_path = "legacy-model-executor".into();
+        assert!(expected
+            .validate()
+            .unwrap_err()
+            .contains("required total runtime memory budget"));
     }
     #[test]
     fn descriptor_only_registers_implemented_metal_gguf_text_paths() {

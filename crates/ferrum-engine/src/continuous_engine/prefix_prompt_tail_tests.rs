@@ -91,7 +91,7 @@ async fn prompt_tail_time_planning_matches_submitted_ranges_without_capacity_fee
         config.runtime.profile_detail = ObservabilityProfileDetail::Off;
         config.scheduler.max_running_requests = 1;
         if enabled {
-            config.scheduler.slo = Some("ttft:1000,tpot:100,itl:100".parse().unwrap());
+            config.scheduler.slo = Some(super::cost_feedback_tests::policy());
         }
         let source = Source::new(true);
         let recorder = Arc::new(AttemptRecorder::default());
@@ -295,7 +295,7 @@ async fn prompt_tail_capacity_requeue_distinguishes_before_and_after_first_outpu
     config.runtime.profile_detail = ObservabilityProfileDetail::Off;
     config.scheduler.max_running_requests = 2;
     config.scheduler.prefill_step_chunk = Some(2);
-    config.scheduler.slo = Some("ttft:1000,tpot:100,itl:100".parse().unwrap());
+    config.scheduler.slo = Some(super::cost_feedback_tests::policy());
     let source = Source::new(true);
     let recorder = Arc::new(AttemptRecorder::default());
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =

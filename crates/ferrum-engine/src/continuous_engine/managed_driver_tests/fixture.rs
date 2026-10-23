@@ -11,6 +11,7 @@ use ferrum_models::test_support::{tiny_llama_model, TinyTokenizer};
 use std::sync::atomic::AtomicUsize;
 
 struct ReferenceSequence {
+    request_id: RequestId,
     cache: String,
     prompt: Vec<u32>,
     frontier: usize,
@@ -56,6 +57,7 @@ pub(super) struct NumericalObservation {
     pub(super) checked_outputs: AtomicUsize,
     output_notify: Notify,
     pub(super) dropped: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    work_calls: Mutex<Option<Vec<Vec<(RequestId, TokenWork)>>>>,
 }
 
 struct ExecutorDropSignal(Arc<NumericalObservation>);
@@ -150,6 +152,7 @@ impl ModelExecutor for NumericalExecutor {
                 .insert(
                     frontier.sequence().clone(),
                     ReferenceSequence {
+                        request_id: input.context.request_id.clone(),
                         cache: new_caches[0].clone(),
                         prompt: input
                             .context
@@ -168,6 +171,25 @@ impl ModelExecutor for NumericalExecutor {
     }
 
     async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
+        {
+            let reference = self.reference.lock();
+            if let Some(calls) = self.work_calls.lock().as_mut() {
+                assert!(
+                    calls.len() < 128,
+                    "bounded actual execution witness exhausted"
+                );
+                calls.push(
+                    work.iter()
+                        .map(|input| {
+                            (
+                                reference.sequences[input.sequence()].request_id.clone(),
+                                input.work(),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+        }
         let active = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.maximum_in_flight.fetch_max(active, Ordering::SeqCst);
         let _flight = Flight(&self.in_flight);
@@ -258,6 +280,14 @@ impl ModelExecutor for NumericalExecutor {
 }
 
 impl NumericalObservation {
+    pub(super) fn take_work_calls(&self) -> Vec<Vec<(RequestId, TokenWork)>> {
+        std::mem::take(
+            self.work_calls
+                .lock()
+                .as_mut()
+                .expect("fixture enabled bounded work witness"),
+        )
+    }
     pub(super) fn info(&self) -> &ferrum_types::ModelInfo {
         &self.info
     }
@@ -341,7 +371,7 @@ impl Fixture {
         configure: impl FnOnce(&mut EngineConfig),
         tokenizer: impl FnOnce(usize) -> Arc<dyn Tokenizer>,
     ) -> Self {
-        Self::with_options(configure, tokenizer, |_| None)
+        Self::with_options(configure, tokenizer, |_| None, None, None)
     }
 
     pub(super) fn with_journal_scopes(
@@ -352,13 +382,33 @@ impl Fixture {
             configure,
             |vocab| Arc::new(TinyTokenizer::new(vocab)),
             |config| Some(scopes(config)),
+            None,
+            None,
         )
+    }
+
+    pub(super) fn with_feedback(
+        configure: impl FnOnce(&mut EngineConfig),
+        attempts: Option<Arc<dyn ferrum_execution::execution_attempt::ExecutionAttemptObserver>>,
+        requests: Option<Arc<dyn ferrum_interfaces::request_observation::RequestStoppingObserver>>,
+    ) -> Self {
+        let fixture = Self::with_options(
+            configure,
+            |vocab| Arc::new(TinyTokenizer::new(vocab)),
+            |_| None,
+            attempts,
+            requests,
+        );
+        *fixture.executor.work_calls.lock() = Some(Vec::new());
+        fixture
     }
 
     fn with_options(
         configure: impl FnOnce(&mut EngineConfig),
         tokenizer: impl FnOnce(usize) -> Arc<dyn Tokenizer>,
         scopes: impl FnOnce(&EngineConfig) -> Option<EngineJournalScopes>,
+        attempts: Option<Arc<dyn ferrum_execution::execution_attempt::ExecutionAttemptObserver>>,
+        requests: Option<Arc<dyn ferrum_interfaces::request_observation::RequestStoppingObserver>>,
     ) -> Self {
         let (inner, observed, cfg) = closure::observed_cpu_model_owned();
         let owner = ExecutorOwner::new(inner);
@@ -381,6 +431,7 @@ impl Fixture {
             checked_outputs: AtomicUsize::new(0),
             output_notify: Notify::new(),
             dropped: Mutex::new(None),
+            work_calls: Mutex::new(None),
         });
         let owned_executor = ExecutorOwner::new(Box::new(NumericalExecutor {
             inner,
@@ -399,13 +450,16 @@ impl Fixture {
         config.runtime.scheduler_trace_jsonl = Some(trace.path().join("trace.jsonl"));
         configure(&mut config);
         let journal_scopes = scopes(&config);
-        let engine = ContinuousBatchEngine::new_with_journal_scopes(
+        let engine = ContinuousBatchEngine::new_observed_with_requests(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
             tokenizer(cfg.vocab_size),
             Arc::new(crate::registry::GreedySampler),
             owned_executor,
             journal_scopes,
+            attempts,
+            None,
+            requests,
         )
         .unwrap();
         let original_inner = Arc::downgrade(&engine.active_inner().unwrap());

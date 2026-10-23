@@ -21,6 +21,8 @@ parking_lot = { workspace = true }
 # Data structures
 dashmap = "6.1"
 indexmap = "2.2"
+# Full numeric work-key hashing; equality remains authoritative for cache hits.
+rustc-hash = "2.1.1"
 
 # Serialization
 serde = { workspace = true }

@@ -1,6 +1,53 @@
 use super::*;
 use ferrum_types::ModelOutputProtocol;
 
+#[test]
+fn functional_budget_follows_executor_authority_and_preserves_quick_start() {
+    for (backend, cuda_lane, metal_lane, planned) in [
+        (
+            Backend::Cuda,
+            Some(CudaModelLane::Local),
+            None,
+            DEFAULT_CUDA_FUNCTIONAL_CAPACITY,
+        ),
+        (
+            Backend::Metal,
+            None,
+            Some(MetalModelLane::Local),
+            DEFAULT_METAL_FUNCTIONAL_CAPACITY,
+        ),
+        (
+            Backend::Cuda,
+            Some(CudaModelLane::Cloud),
+            None,
+            DEFAULT_FUNCTIONAL_CAPACITY,
+        ),
+        (Backend::Cpu, None, None, DEFAULT_FUNCTIONAL_CAPACITY),
+    ] {
+        let mut run = ModelRunRequirements {
+            profile: profile("same-model", backend),
+            cuda_lane,
+            metal_lane,
+            checks: vec![ModelCheck::Basic],
+            quick_start: false,
+            obligations: vec![0],
+        };
+        assert_eq!(run.default_runtime_capacity(), Some(planned));
+        for path in ["legacy-model-executor", "unqualified-executor"] {
+            run.profile.target.execution_path = path.into();
+            assert_eq!(
+                run.default_runtime_capacity(),
+                Some(DEFAULT_FUNCTIONAL_CAPACITY)
+            );
+        }
+        for path in ["production-plan-runtime", "legacy-model-executor"] {
+            run.profile.target.execution_path = path.into();
+            run.quick_start = true;
+            assert_eq!(run.default_runtime_capacity(), None);
+        }
+    }
+}
+
 fn profile(id: &str, backend: Backend) -> ModelProfile {
     ModelProfile {
         gguf: None,

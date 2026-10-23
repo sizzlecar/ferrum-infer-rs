@@ -1,65 +1,354 @@
 //! Shared run/serve assembly and ownership of optional execution-cost feedback.
 
-use ferrum_engine::EngineBuilder;
-use ferrum_slo::{ReferenceEstimator, ReferenceEstimatorOwner};
-use ferrum_types::{EngineConfig, FerrumError, Result};
-use std::sync::Arc;
+mod identity;
+mod snapshot;
+
+use ferrum_engine::{builder::ExecutionFeedbackBinding, EngineBuilder};
+use ferrum_execution::execution_attempt::{ExecutionAttemptLimits, ExecutionAttemptSummary};
+use ferrum_models::vnext::ProductionModelSourceBundle;
+use ferrum_scheduler::cost_prediction::CostQuery;
+use ferrum_slo::{
+    learning::{LearningConfig, LearningEstimator, LearningEstimatorOwner},
+    model::ModelFamily,
+    stopping::{StoppingCollectorConfig, StoppingEstimatorOwner},
+    ReferenceEstimator, ReferenceEstimatorOwner,
+};
+use ferrum_types::{EngineConfig, FerrumError, PredictorFamily, Result, SloConfig, SloMode};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+};
+
+enum CostOwner {
+    Reference(ReferenceEstimatorOwner),
+    Learning(LearningEstimatorOwner),
+}
+
+impl CostOwner {
+    fn observer(&self) -> Arc<dyn ferrum_execution::execution_attempt::ExecutionAttemptObserver> {
+        match self {
+            Self::Reference(owner) => owner.observer(),
+            Self::Learning(owner) => owner.observer(),
+        }
+    }
+    fn source(&self) -> Arc<dyn ferrum_scheduler::cost_prediction::CostSnapshotSource> {
+        match self {
+            Self::Reference(owner) => owner.source(),
+            Self::Learning(owner) => owner.source(),
+        }
+    }
+    fn stats(&self) -> ferrum_slo::ReferenceEstimatorStats {
+        match self {
+            Self::Reference(owner) => owner.stats(),
+            Self::Learning(owner) => owner.stats(),
+        }
+    }
+    async fn shutdown(&self, path: Option<&Path>) -> Result<()> {
+        match self {
+            Self::Reference(owner) => owner
+                .shutdown()
+                .await
+                .map(|_| ())
+                .map_err(|error| FerrumError::internal(error.to_string())),
+            Self::Learning(owner) => {
+                if let Some(path) = path {
+                    let (_, report) = owner
+                        .shutdown_and_save(path)
+                        .await
+                        .map_err(|error| FerrumError::internal(error.to_string()))?;
+                    tracing::info!(?report, path = %path.display(), "SLO learned state shutdown");
+                    Ok(())
+                } else {
+                    owner
+                        .shutdown()
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| FerrumError::internal(error.to_string()))
+                }
+            }
+        }
+    }
+}
 
 pub(crate) struct ProductExecutionFeedback {
-    owner: Option<ReferenceEstimatorOwner>,
+    owners: Arc<OnceLock<Owners>>,
+    mode: SloMode,
+    slo: Option<SloConfig>,
+    state_path: Option<PathBuf>,
+}
+
+struct Owners {
+    cost: CostOwner,
+    stopping: StoppingEstimatorOwner,
+    binding: Option<identity::BindingScope>,
+    persistence: PersistenceStatus,
+    state_path: Option<PathBuf>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "status")]
+enum PersistenceStatus {
+    Disabled,
+    Bound,
+    SkippedUnbound { reason: String },
+}
+
+impl Owners {
+    fn feedback(&self, mode: SloMode) -> ExecutionFeedbackBinding {
+        ExecutionFeedbackBinding {
+            execution_observer: self.cost.observer(),
+            cost_source: (mode == SloMode::LearnAndControl).then(|| {
+                Arc::new(snapshot::ProductSnapshotSource {
+                    cost: self.cost.source(),
+                    stopping: self.stopping.source(),
+                }) as Arc<dyn ferrum_scheduler::cost_prediction::CostSnapshotSource>
+            }),
+            stopping_observer: Some(self.stopping.observer()),
+        }
+    }
+}
+
+/// Convert the old observation representation only at the assembly boundary.
+/// The scheduler receives a neutral count/byte limit after this conversion.
+pub(crate) fn resolve_product_slo(mut slo: SloConfig) -> Result<SloConfig> {
+    slo.validate().map_err(FerrumError::config)?;
+    if let Some((max_participants, max_summary_bytes)) = slo.legacy_query_observer_limits() {
+        let limits = ExecutionAttemptLimits {
+            max_participants,
+            max_summary_bytes,
+        };
+        let mut low = 0;
+        let mut high = max_participants;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if limits.accepts(middle) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        if low == 0 {
+            return Err(FerrumError::config(
+                "SLO observation limits cannot fit one query participant",
+            ));
+        }
+        slo.resolve_query_limits(ferrum_types::CostQueryLimits {
+            max_participants: low,
+            max_query_bytes: CostQuery::projected_bytes(low)
+                .ok_or_else(|| FerrumError::config("SLO query size overflows"))?,
+        });
+    }
+    if !CostQuery::fits(1, slo.policy.query) {
+        return Err(FerrumError::config(
+            "SLO query limits cannot fit one participant",
+        ));
+    }
+    Ok(slo)
+}
+
+fn learning_config(slo: &SloConfig) -> LearningConfig {
+    LearningConfig {
+        query: slo.policy.query,
+        training_history: slo.training_history,
+        ..LearningConfig::default()
+    }
 }
 
 impl ProductExecutionFeedback {
-    /// None is a real off path: no estimator, worker, queue or subscription.
-    pub(crate) fn prepare(config: &EngineConfig) -> Result<Self> {
-        let owner = config
-            .scheduler
-            .slo
-            .map(|slo| {
-                slo.validate().map_err(FerrumError::config)?;
-                ReferenceEstimator::spawn(slo.reference)
-                    .map_err(|error| FerrumError::config(error.to_string()))
+    /// Off allocates no learning queue, worker, source, or request observer.
+    pub(crate) fn prepare(
+        config: &mut EngineConfig,
+        slo: Option<SloConfig>,
+        sources: Option<&ProductionModelSourceBundle>,
+    ) -> Result<Self> {
+        Self::prepare_with_state(config, slo, sources, None)
+    }
+
+    pub(crate) fn prepare_with_state(
+        config: &mut EngineConfig,
+        slo: Option<SloConfig>,
+        _sources: Option<&ProductionModelSourceBundle>,
+        state_path: Option<&Path>,
+    ) -> Result<Self> {
+        if state_path.is_some()
+            && slo.is_none_or(|slo| {
+                slo.mode == SloMode::Off || slo.predictor == PredictorFamily::ReferenceDiagnostic
             })
-            .transpose()?;
-        Ok(Self { owner })
+        {
+            return Err(FerrumError::config(
+                "SLO state requires an enabled learned predictor",
+            ));
+        }
+        let Some(slo) = slo.map(resolve_product_slo).transpose()? else {
+            config.scheduler.slo = None;
+            return Ok(Self {
+                owners: Arc::new(OnceLock::new()),
+                mode: SloMode::Off,
+                slo: None,
+                state_path: None,
+            });
+        };
+        config.scheduler.slo = slo.scheduler_policy();
+        if slo.mode == SloMode::Off {
+            return Ok(Self {
+                owners: Arc::new(OnceLock::new()),
+                mode: SloMode::Off,
+                slo: None,
+                state_path: None,
+            });
+        }
+        let owners = Arc::new(OnceLock::new());
+        match slo.predictor {
+            PredictorFamily::ReferenceDiagnostic => {
+                let limits = ExecutionAttemptLimits {
+                    max_participants: slo.reference.max_participants,
+                    max_summary_bytes: slo
+                        .reference
+                        .max_summary_bytes
+                        .min(slo.reference.max_queue_bytes),
+                };
+                if !limits.accepts(slo.policy.query.max_participants) {
+                    return Err(FerrumError::config(
+                        "SLO query exceeds reference observation capacity",
+                    ));
+                }
+                let cost = ReferenceEstimator::spawn(slo.reference)
+                    .map(CostOwner::Reference)
+                    .map_err(|e| FerrumError::config(e.to_string()))?;
+                let stopping = StoppingEstimatorOwner::spawn(StoppingCollectorConfig::default())
+                    .map_err(|e| FerrumError::config(e.to_string()))?;
+                let _ = owners.set(Owners {
+                    cost,
+                    stopping,
+                    binding: None,
+                    persistence: PersistenceStatus::Disabled,
+                    state_path: None,
+                });
+            }
+            _ => {
+                let learning = learning_config(&slo);
+                learning
+                    .validate()
+                    .map_err(|error| FerrumError::config(error.to_string()))?;
+                if slo.policy.query.max_participants > learning.collection.max_participants
+                    || !ExecutionAttemptSummary::projected_bytes(slo.policy.query.max_participants)
+                        .is_some_and(|bytes| bytes <= learning.collection.max_summary_bytes)
+                {
+                    return Err(FerrumError::config(
+                        "SLO query exceeds learning observation capacity",
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            owners,
+            mode: slo.mode,
+            slo: Some(slo),
+            state_path: state_path.map(Path::to_path_buf),
+        })
     }
 
     pub(crate) fn configure(&self, builder: EngineBuilder) -> EngineBuilder {
-        match &self.owner {
-            Some(owner) => builder.with_execution_feedback(owner.observer(), owner.source()),
-            None => builder,
+        let Some(slo) = self.slo else {
+            return builder;
+        };
+        if let Some(owners) = self
+            .owners
+            .get()
+            .filter(|_| slo.predictor == PredictorFamily::ReferenceDiagnostic)
+        {
+            let binding = owners.feedback(self.mode);
+            let builder = builder.with_request_stopping_observer(
+                binding.stopping_observer.expect("stopping observer"),
+            );
+            return match binding.cost_source {
+                Some(source) => builder.with_execution_feedback(binding.execution_observer, source),
+                None => builder.with_execution_attempt_observer(binding.execution_observer),
+            };
         }
+        let owners = Arc::clone(&self.owners);
+        let requested_path = self.state_path.clone();
+        builder.with_execution_feedback_factory(move |config, executor| {
+            if owners.get().is_some() {
+                return Err(FerrumError::config("feedback assembly already bound to an executor"));
+            }
+            let bound = identity::bind(config, executor)?;
+            let (state_path, persistence) = match (&requested_path, &bound.scope) {
+                (None, _) => (None, PersistenceStatus::Disabled),
+                (Some(path), identity::BindingScope::Reusable) => (Some(path.clone()), PersistenceStatus::Bound),
+                (Some(_), identity::BindingScope::InstanceScoped { reason }) => {
+                    tracing::warn!(%reason, "SLO persistent reuse skipped: execution binding is instance scoped");
+                    (None, PersistenceStatus::SkippedUnbound { reason: reason.clone() })
+                }
+            };
+            let learning = learning_config(&slo);
+            let learner = match slo.predictor {
+                PredictorFamily::Auto => LearningEstimator::spawn_auto_with_state(learning, bound.identity, state_path.as_deref()),
+                PredictorFamily::QuantileGbdt => LearningEstimator::spawn_with_state(learning, bound.identity, ModelFamily::Gbdt, state_path.as_deref()),
+                _ => LearningEstimator::spawn_with_state(learning, bound.identity, ModelFamily::Physical, state_path.as_deref()),
+            }.map_err(|e| FerrumError::config(e.to_string()))?;
+            tracing::info!(requested = ?slo.predictor, resolution = ?learner.family_resolution(), state_load = ?learner.load_report(), "SLO predictor selection");
+            let cost = CostOwner::Learning(learner);
+            let stopping = StoppingEstimatorOwner::spawn(StoppingCollectorConfig::default())
+                .map_err(|e| FerrumError::config(e.to_string()))?;
+            owners.set(Owners { cost, stopping, binding: Some(bound.scope), persistence, state_path })
+                .map_err(|_| FerrumError::config("feedback assembly was bound twice"))?;
+            Ok(owners.get().expect("initialized feedback").feedback(slo.mode))
+        })
     }
 
     pub(crate) fn into_owner(self) -> Option<Arc<Self>> {
-        self.owner.is_some().then(|| Arc::new(self))
+        self.slo.is_some().then(|| Arc::new(self))
     }
 
-    /// Health reporting is a cold path; no serialization runs with inference.
+    /// Health serialization is a cold path, separate from inference.
     pub(crate) fn stats(&self) -> Option<serde_json::Value> {
-        self.owner
-            .as_ref()
-            .and_then(|owner| serde_json::to_value(owner.stats()).ok())
+        self.owners.get().and_then(|owners| {
+            serde_json::to_value(owners.cost.stats())
+                .ok()
+                .map(|mut value| {
+                    value["mode"] = serde_json::json!(self.mode);
+                    value["stopping"] = serde_json::json!(owners.stopping.stats());
+                    value["execution_binding"] = serde_json::json!(owners.binding);
+                    value["persistence"] = serde_json::json!(owners.persistence);
+                    if let CostOwner::Learning(owner) = &owners.cost {
+                        value["state_load"] = serde_json::json!(owner.load_report());
+                        value["live_prediction"] = serde_json::json!(owner.prediction_stats());
+                        value["query_rejections"] = serde_json::json!(owner.rejection_stats());
+                        value["predictor_selection"] = serde_json::json!(owner.family_resolution());
+                    }
+                    value
+                })
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn revisions_for_test(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.owner
-            .as_ref()
-            .expect("enabled feedback")
+        self.owners
+            .get()
+            .expect("bound feedback")
+            .cost
             .source()
             .subscribe()
     }
 
-    /// Observe the original worker, including after an earlier wait was
-    /// cancelled. Its owner also stops and retains its join on startup Drop.
+    /// Every cancelled shutdown wait may be retried against the original join.
     pub(crate) async fn shutdown(&self) -> Result<()> {
-        if let Some(owner) = &self.owner {
-            let _exit = owner.shutdown().await.map_err(|error| {
-                FerrumError::internal(format!("execution feedback shutdown: {error}"))
-            })?;
-        }
-        Ok(())
+        let Some(owners) = self.owners.get() else {
+            return Ok(());
+        };
+        let cost = owners.cost.shutdown(owners.state_path.as_deref());
+        let stopping = async {
+            owners
+                .stopping
+                .shutdown()
+                .await
+                .map(|_| ())
+                .map_err(|error| FerrumError::internal(error.to_string()))
+        };
+        let (cost, stopping) = tokio::join!(cost, stopping);
+        cost.and(stopping)
+            .map_err(|error| FerrumError::internal(format!("execution feedback shutdown: {error}")))
     }
 }
 
@@ -68,18 +357,185 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_off_needs_no_runtime_or_worker_owner() {
-        let feedback = ProductExecutionFeedback::prepare(&EngineConfig::default()).unwrap();
-        assert!(feedback.into_owner().is_none());
+    fn shared_product_prepare_preserves_bounded_strategy_and_lookahead() {
+        let slo: SloConfig = toml::from_str(
+            "ttft_ms = 200\ntpot_ms = 15\nitl_ms = 50\n\
+             mode = 'learn_and_control'\npredictor = 'physical'\nstrategy = 'bounded'\n\
+             [planning]\nmax_lookahead_rounds = 3\n",
+        )
+        .unwrap();
+        let mut engine = EngineConfig::default();
+        // run and serve both use prepare_with_state; prepare delegates to that
+        // same assembly without requiring a model or starting an executor.
+        let _feedback = ProductExecutionFeedback::prepare(&mut engine, Some(slo), None).unwrap();
+        let policy = engine.scheduler.slo.expect("enabled scheduler policy");
+        assert_eq!(policy.strategy, ferrum_types::SloStrategy::Bounded);
+        assert_eq!(policy.planning.max_lookahead_rounds, 3);
+    }
+
+    #[test]
+    fn shared_product_toml_passes_width_history_to_both_learned_modes() {
+        for mode in ["observe", "learn_and_control"] {
+            for (history_mode, policy) in [
+                (
+                    "width_stratified",
+                    ferrum_types::TrainingHistoryPolicy::WidthStratified {
+                        samples_per_width: 2,
+                    },
+                ),
+                (
+                    "width_and_extrema",
+                    ferrum_types::TrainingHistoryPolicy::WidthAndExtrema {
+                        samples_per_width: 2,
+                    },
+                ),
+            ] {
+                let raw = format!("ttft_ms = 200\ntpot_ms = 15\nitl_ms = 50\nmode = '{mode}'\npredictor = 'physical'\n[training_history]\nmode = '{history_mode}'\nsamples_per_width = 2\n");
+                let slo: SloConfig = toml::from_str(&raw).unwrap();
+                let learned = learning_config(&slo);
+                assert_eq!(learned.training_history, policy);
+                assert_eq!(
+                    (
+                        learned.training_samples,
+                        learned.validation_samples,
+                        learned.calibration_samples
+                    ),
+                    (128, 32, 32)
+                );
+                learned.validate().unwrap();
+                let mut engine = EngineConfig::default();
+                ProductExecutionFeedback::prepare(&mut engine, Some(slo), None).unwrap();
+                assert_eq!(engine.scheduler.slo.is_some(), mode == "learn_and_control");
+            }
+        }
+    }
+
+    #[test]
+    fn default_and_explicit_off_need_no_runtime_or_worker() {
+        let mut engine = EngineConfig::default();
+        assert!(ProductExecutionFeedback::prepare(&mut engine, None, None)
+            .unwrap()
+            .into_owner()
+            .is_none());
+        let mut slo: SloConfig = "ttft:200,tpot:15,itl:50".parse().unwrap();
+        slo.mode = SloMode::Off;
+        assert!(
+            ProductExecutionFeedback::prepare(&mut engine, Some(slo), None)
+                .unwrap()
+                .into_owner()
+                .is_none()
+        );
+        assert!(engine.scheduler.slo.is_none());
     }
 
     #[tokio::test]
     async fn shared_feedback_owner_stops_the_original_worker() {
+        for mode in [SloMode::Observe, SloMode::LearnAndControl] {
+            let mut engine = EngineConfig::default();
+            let mut slo: SloConfig = "ttft:200,tpot:15,itl:50".parse().unwrap();
+            slo.mode = mode;
+            slo.predictor = PredictorFamily::ReferenceDiagnostic;
+            let feedback = ProductExecutionFeedback::prepare(&mut engine, Some(slo), None).unwrap();
+            assert_eq!(
+                engine.scheduler.slo.is_some(),
+                mode == SloMode::LearnAndControl
+            );
+            feedback.shutdown().await.unwrap();
+            feedback.shutdown().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_bytes_become_neutral_participant_limits() {
+        let bytes = ExecutionAttemptSummary::projected_bytes(3).unwrap();
+        let raw = serde_json::json!({"ttft_ms":200,"tpot_ms":15,"itl_ms":50,
+            "reference":{"max_participants":12,"max_summary_bytes":bytes}});
+        let slo = resolve_product_slo(serde_json::from_value(raw).unwrap()).unwrap();
+        assert_eq!(slo.policy.query.max_participants, 3);
+        assert_eq!(
+            slo.policy.query.max_query_bytes,
+            CostQuery::projected_bytes(3).unwrap()
+        );
+        assert!(slo.legacy_query_observer_limits().is_none());
+    }
+
+    #[tokio::test]
+    async fn actual_engine_assembly_starts_each_learned_predictor_once() {
+        for predictor in [
+            PredictorFamily::Auto,
+            PredictorFamily::Physical,
+            PredictorFamily::QuantileGbdt,
+        ] {
+            for mode in [SloMode::Observe, SloMode::LearnAndControl] {
+                let mut engine = EngineConfig::default();
+                let mut slo: SloConfig = "ttft:200,tpot:15,itl:50".parse().unwrap();
+                slo.predictor = predictor;
+                slo.mode = mode;
+                let feedback =
+                    ProductExecutionFeedback::prepare(&mut engine, Some(slo), None).unwrap();
+                assert_eq!(
+                    engine.scheduler.slo.is_some(),
+                    mode == SloMode::LearnAndControl
+                );
+                assert!(
+                    feedback.stats().is_none(),
+                    "no learner before actual executor binding"
+                );
+                let engine = feedback
+                    .configure(EngineBuilder::new(engine))
+                    .build()
+                    .await
+                    .unwrap();
+                assert!(feedback.stats().is_some());
+                let rejection_stats = &feedback.stats().unwrap()["query_rejections"];
+                assert_eq!(rejection_stats["outside_observed_support"], 0);
+                assert_eq!(rejection_stats["axes"].as_array().unwrap().len(), 9);
+                assert_eq!(rejection_stats["last_witness_read_busy"], false);
+                assert!(rejection_stats["last"].is_null());
+                assert_eq!(
+                    feedback.stats().unwrap()["execution_binding"]["scope"],
+                    "InstanceScoped"
+                );
+                let selected = &feedback.stats().unwrap()["predictor_selection"];
+                assert_eq!(
+                    selected["resolution"],
+                    if predictor == PredictorFamily::Auto {
+                        "AutoPhysicalFallback"
+                    } else {
+                        "Explicit"
+                    }
+                );
+                if predictor == PredictorFamily::Auto {
+                    assert_eq!(selected["reason"], "NoBoundStateProvided");
+                }
+                engine.shutdown().await.unwrap();
+                engine.wait_for_shutdown_completion().await.unwrap();
+                feedback.shutdown().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unbound_state_path_is_visible_and_never_reads_or_overwrites_an_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        std::fs::write(&path, b"invalid previous artifact").unwrap();
         let mut config = EngineConfig::default();
-        config.scheduler.slo = Some("ttft:200,tpot:15,itl:50".parse().unwrap());
-        let feedback = ProductExecutionFeedback::prepare(&config).unwrap();
-        assert!(feedback.owner.is_some());
+        let slo: SloConfig = "ttft:200,tpot:15,itl:50".parse().unwrap();
+        let feedback =
+            ProductExecutionFeedback::prepare_with_state(&mut config, Some(slo), None, Some(&path))
+                .unwrap();
+        let engine = feedback
+            .configure(EngineBuilder::new(config))
+            .build()
+            .await
+            .unwrap();
+        let stats = feedback.stats().unwrap();
+        assert_eq!(stats["persistence"]["status"], "SkippedUnbound");
+        assert!(stats["persistence"]["reason"].as_str().unwrap().len() > 0);
+        engine.shutdown().await.unwrap();
+        engine.wait_for_shutdown_completion().await.unwrap();
         feedback.shutdown().await.unwrap();
-        feedback.shutdown().await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid previous artifact");
     }
 }

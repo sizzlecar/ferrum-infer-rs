@@ -55,6 +55,8 @@ Weights download automatically. API URL: **`http://127.0.0.1:8000/v1`**, model `
 
 Defaults adapt execution and capacity to capabilities, hardware and memory; explicit settings prevail. Qualified SM120 GGUF paths can use 8-bit activation quantization and integer dot products. `--numerical-profile qwen3_5.f32-master` retains the original mixed-precision reference. Batch layouts can change output. [Numerical profiles](docs/numerical-execution.zh.md) · [Caching](docs/cache-product.md).
 
+Optional [SLO learning and scheduling](docs/slo-learning.md) supports observation and control modes in both `run` and `serve`, with explicit model selectors and execution-bound state. See [performance evaluation](docs/performance-evaluation.md) for measurement requirements.
+
 ## Supported scope
 
 | Scope | Supported paths |

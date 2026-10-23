@@ -21,6 +21,7 @@ use std::ops::Range;
 
 use ferrum_execution::model_executor::{
     KvSlotAllocation, KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
+    PagedAdmissionCapacitySnapshot, PagedAdmissionCoverage,
 };
 use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
 use ferrum_kernels::backend::{
@@ -44,6 +45,7 @@ use crate::lora::{
 
 mod allocator_reclaim;
 pub(super) mod device_execution;
+mod persistent_capacity;
 mod prefix_preparation;
 use device_execution::{DeviceFrameResult, FrameLayout, LlamaExecutionFrame};
 
@@ -488,6 +490,19 @@ impl Default for LlamaFamilyConfig {
 }
 
 impl LlamaFamilyConfig {
+    pub(crate) fn selected_kv_cache_storage<B: BackendPagedKv, K: KvLayer<B>>(
+        &self,
+        options: &LlamaExecutionOptions,
+    ) -> Option<ferrum_types::KvCacheStorage> {
+        selected_llama_kv_layout_for_dtype::<B, K>(
+            self,
+            options.metal_paged_kv,
+            0..self.num_layers,
+        )
+        .ok()?;
+        K::physical_storage()
+    }
+
     /// The allocation layout selected by the same policy used at cache creation.
     /// This cold query allocates no device resources and does not infer layout
     /// from a model name or execution resource-authority tag.
@@ -2335,6 +2350,43 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         .into_legacy_result();
     }
 
+    /// Count actual cache owners under the original model lock. A cache that
+    /// is logically complete but awaiting device/graph retirement still lives
+    /// in `kv_caches`; configured batch width is not evidence of its release.
+    fn new_paged_sequence_slots(
+        &self,
+        required_slots: usize,
+    ) -> Result<Option<ferrum_execution::token_execution::TokenSequenceSlotDeferral>> {
+        if required_slots == 0
+            || !matches!(
+                selected_llama_kv_layout_for_dtype::<B, K>(
+                    &self.cfg,
+                    self.runtime_env.metal_paged_kv,
+                    self.source_layer_range(),
+                )?,
+                SelectedKvCacheLayout::Paged { .. }
+            )
+        {
+            return Ok(None);
+        }
+        let capacity = self.runtime_env.paged_max_seqs;
+        let occupied = self.kv_caches.len();
+        if capacity == 0 || occupied > capacity || required_slots > capacity {
+            return Err(ferrum_types::FerrumError::resource_exhausted(
+                "paged sequence metadata demand exceeds the configured physical slot capacity",
+            ));
+        }
+        if required_slots <= capacity - occupied {
+            return Ok(None);
+        }
+        ferrum_execution::token_execution::TokenSequenceSlotDeferral::new(
+            capacity,
+            occupied,
+            required_slots,
+        )
+        .map(Some)
+    }
+
     pub(in crate::models) fn ensure_kv_in_context(
         &mut self,
         ctx: &mut B::Context,
@@ -2343,6 +2395,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     ) {
         if self.kv_caches.contains_key(cache_id) {
             return;
+        }
+        // Keep the invariant at the common construction point, including
+        // legacy and batched callers. Their existing frame boundary translates
+        // capacity errors into the ordinary error path. Typed admission checks
+        // before entering preparation and preserves a retryable slot deferral.
+        match self.new_paged_sequence_slots(1) {
+            Ok(None) => {}
+            Ok(Some(deferred)) => std::panic::panic_any(deferred.capacity_error()),
+            Err(error) => std::panic::panic_any(error),
         }
         let nkv = self.cfg.num_kv_heads;
         let hd = self.cfg.head_dim;
@@ -2644,6 +2705,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     deferred.snapshot().free_blocks,
                 )))
             }
+            crate::common::llm::ModelKvReservation::SequenceSlotsDeferred(deferred) => {
+                Err(deferred.capacity_error())
+            }
         }
     }
 
@@ -2706,6 +2770,13 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             }
         }
 
+        let new_slots = targets
+            .iter()
+            .filter(|(cache_id, _, _)| !self.kv_caches.contains_key(cache_id))
+            .count();
+        if let Some(deferred) = self.new_paged_sequence_slots(new_slots)? {
+            return Ok(ModelKvReservation::SequenceSlotsDeferred(deferred));
+        }
         for (cache_id, _, _) in &targets {
             if !self.kv_caches.contains_key(cache_id) {
                 self.ensure_kv_in_context(
@@ -2859,7 +2930,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     }
 
     fn prefix_cache_snapshot_json(&self) -> serde_json::Value {
-        let (entries, block_size) = self
+        let (entries, block_size, physical_pool_blocks) = self
             .paged_block_alloc
             .as_ref()
             .and_then(|alloc| {
@@ -2868,16 +2939,24 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     .kv_caches
                     .values()
                     .find_map(|layers| layers.first().map(K::block_size))
-                    .unwrap_or(16);
-                Some((alloc.hash_table_size() as u64, block_size))
+                    .unwrap_or(LLAMA_PAGED_BLOCK_SIZE);
+                Some((
+                    alloc.hash_table_size() as u64,
+                    block_size,
+                    Some(alloc.capacity()),
+                ))
             })
-            .unwrap_or((0, 16));
-        let bytes_per_entry = (block_size
-            * self.local_layer_count()
-            * self.cfg.num_kv_heads
-            * self.cfg.head_dim
-            * K::BYTES_PER_ELEM
-            * 2) as u64;
+            .unwrap_or((0, LLAMA_PAGED_BLOCK_SIZE, None));
+        let physical_storage = K::physical_storage();
+        let bytes_per_entry = physical_storage
+            .and_then(|storage| {
+                storage.bytes_per_token(
+                    self.local_layer_count(),
+                    self.cfg.num_kv_heads,
+                    self.cfg.head_dim,
+                )
+            })
+            .and_then(|bytes| bytes.checked_mul(u64::try_from(block_size).ok()?));
         serde_json::json!({
             "position": "real-kv-reuse",
             "source": "llama-family-paged-block-prefix-cache",
@@ -2887,9 +2966,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             "evictions": 0u64,
             "saved_prefill_tokens": self.prefix_cache_saved_prefill_tokens,
             "entries": entries,
-            "bytes": entries.saturating_mul(bytes_per_entry),
+            "bytes": bytes_per_entry.and_then(|bytes| entries.checked_mul(bytes)),
+            "bytes_scope": "cached_block_kv_payload_including_scales",
+            "physical_pool_blocks": physical_pool_blocks,
+            "physical_pool_bytes": physical_pool_blocks.and_then(|blocks| {
+                bytes_per_entry?.checked_mul(u64::from(blocks))
+            }),
             "block_size": block_size,
-            "kv_dtype": K::NAME,
+            "kv_dtype": physical_storage.map(|storage| storage.name()),
+            "kv_marker": K::NAME,
             "decode_batch": self.decode_batch_stats.snapshot_json(),
         })
     }
@@ -4410,6 +4495,42 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
     }
 
+    fn paged_admission_snapshot(&self) -> Option<PagedAdmissionCapacitySnapshot> {
+        let allocator = self.paged_block_alloc.as_ref()?;
+        let allocator = allocator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slots = KvSlotCapacitySnapshot {
+            block_size: LLAMA_PAGED_BLOCK_SIZE,
+            total_blocks: allocator.capacity() as usize,
+            free_blocks: allocator.free_count(),
+        };
+        // This implementation's only persistent semantic sequence state is KV.
+        // Paged payload lives in the shared pool, but a NEW metadata slot still
+        // allocates device block tables/context lengths. Credit only slots
+        // retired by the original close protocol and retained in kv_free_pool.
+        // Do not infer spare metadata from free KV blocks or general memory.
+        let coverage = match self.paged_dims {
+            Some((max_batch_sequences, blocks_per_sequence))
+                if self.pending_device_frame.is_none()
+                    && self.paged_pools.is_some()
+                    && max_batch_sequences > 0
+                    && blocks_per_sequence > 0 =>
+            {
+                match blocks_per_sequence.checked_mul(LLAMA_PAGED_BLOCK_SIZE) {
+                    Some(tokens) => PagedAdmissionCoverage::AllPersistentState {
+                        max_new_sequences: self.kv_free_pool.len(),
+                        max_sequence_tokens: tokens.min(self.kv_capacity_limit()),
+                        max_batch_sequences,
+                    },
+                    None => PagedAdmissionCoverage::Unknown,
+                }
+            }
+            _ => PagedAdmissionCoverage::Unknown,
+        };
+        Some(PagedAdmissionCapacitySnapshot { slots, coverage })
+    }
+
     pub(crate) fn prepare_managed_token_capacity(
         &mut self,
         requests: &[KvSlotRequest],
@@ -4422,6 +4543,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             Ok(ModelKvReservation::Reserved(_)) => ModelTokenOutcome::Terminal(Ok(())),
             Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
                 ModelTokenOutcome::CapacityDeferred(deferred)
+            }
+            Ok(ModelKvReservation::SequenceSlotsDeferred(deferred)) => {
+                ModelTokenOutcome::NotSubmitted(deferred.capacity_error())
             }
             Err(error) if self.pending_device_frame.is_some() => ModelTokenOutcome::Held(error),
             Err(error) => ModelTokenOutcome::NotSubmitted(error),
@@ -5456,6 +5580,13 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
 // FP16 DecoderOnlyLLM impl — full path with batched + unified-forward overrides.
 impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
+    fn persistent_capacity_for_cohort(
+        &self,
+        query: &crate::common::llm::ModelPersistentCapacityQuery<'_>,
+    ) -> std::result::Result<(), ferrum_execution::model_executor::PersistentCapacityUnknown> {
+        self.observe_persistent_capacity(query)
+    }
+
     fn observe_token_allocator_reclaim(
         &self,
         blocked_cache_id: &str,
@@ -5595,6 +5726,10 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
             total_blocks: alloc.capacity() as usize,
             free_blocks: alloc.free_count(),
         })
+    }
+
+    fn paged_admission_capacity_snapshot(&self) -> Option<PagedAdmissionCapacitySnapshot> {
+        self.paged_admission_snapshot()
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
@@ -5843,6 +5978,10 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
             total_blocks: alloc.capacity() as usize,
             free_blocks: alloc.free_count(),
         })
+    }
+
+    fn paged_admission_capacity_snapshot(&self) -> Option<PagedAdmissionCapacitySnapshot> {
+        self.paged_admission_snapshot()
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
@@ -6250,6 +6389,95 @@ mod tests {
         assert!(model.kv_free_pool.is_empty());
         assert_eq!(model.prefill("seq-b", &[3, 4, 5]), other);
         assert_eq!(model.cache_len("seq-b"), 3);
+    }
+
+    #[test]
+    fn physical_kv_storage_diagnostics_count_f32_pool_and_cached_blocks_separately() {
+        let mut cfg = test_llama_config(2, false);
+        cfg.max_seq_len = 64;
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
+        model.runtime_env = runtime_for_entries([
+            ("FERRUM_METAL_PAGED_KV", "1"),
+            ("FERRUM_KV_CAPACITY", "64"),
+            ("FERRUM_KV_MAX_BLOCKS", "4"),
+            ("FERRUM_PAGED_MAX_SEQS", "2"),
+        ]);
+        assert!(model.prefix_cache_snapshot_json()["physical_pool_bytes"].is_null());
+        model.ensure_kv("resident");
+        let actual_payload: usize = model
+            .paged_pools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| std::mem::size_of_val(k.as_slice()) + std::mem::size_of_val(v.as_slice()))
+            .sum();
+        {
+            let mut alloc = model.paged_block_alloc.as_ref().unwrap().lock().unwrap();
+            let block = alloc.allocate().unwrap();
+            alloc.register_block_hash(
+                block,
+                crate::common::paged_pool::block_hash(
+                    0,
+                    &[ferrum_types::TokenId::new(1); super::LLAMA_PAGED_BLOCK_SIZE],
+                ),
+            );
+        }
+        let snapshot = model.prefix_cache_snapshot_json();
+        assert_eq!(snapshot["kv_marker"], "fp16");
+        assert_eq!(snapshot["kv_dtype"], "f32");
+        assert_eq!(snapshot["entries"], 1);
+        assert_eq!(snapshot["physical_pool_blocks"], 4);
+        assert_eq!(snapshot["physical_pool_bytes"], actual_payload as u64);
+        assert_eq!(snapshot["bytes"], (actual_payload / 4) as u64);
+    }
+
+    #[test]
+    fn paged_admission_coverage_counts_only_retired_metadata_slots() {
+        use crate::common::DecoderOnlyLLM;
+        use ferrum_execution::model_executor::PagedAdmissionCoverage;
+
+        let mut cfg = test_llama_config(2, false);
+        cfg.max_seq_len = 63;
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
+        model.runtime_env = runtime_for_entries([
+            ("FERRUM_METAL_PAGED_KV", "1"),
+            ("FERRUM_KV_CAPACITY", "63"),
+            ("FERRUM_KV_MAX_BLOCKS", "4"),
+            ("FERRUM_PAGED_MAX_SEQS", "2"),
+        ]);
+        assert!(model.paged_admission_capacity_snapshot().is_none());
+        model.ensure_kv("resident");
+        let initial = model.paged_admission_capacity_snapshot().unwrap();
+        assert_eq!(initial.slots.free_blocks, 4);
+        assert_eq!(
+            initial.coverage,
+            PagedAdmissionCoverage::AllPersistentState {
+                max_new_sequences: 0,
+                max_sequence_tokens: 63,
+                max_batch_sequences: 2,
+            },
+            "free payload blocks do not prove another device metadata allocation"
+        );
+        assert_eq!(
+            model.paged_admission_capacity_snapshot(),
+            Some(initial.clone())
+        );
+
+        model.release("resident");
+        let reusable = model.paged_admission_capacity_snapshot().unwrap();
+        assert_eq!(reusable.slots, initial.slots);
+        assert_eq!(
+            reusable.coverage,
+            PagedAdmissionCoverage::AllPersistentState {
+                max_new_sequences: 1,
+                max_sequence_tokens: 63,
+                max_batch_sequences: 2,
+            }
+        );
+        model.ensure_kv("new-incarnation");
+        assert_eq!(model.paged_admission_capacity_snapshot(), Some(initial));
     }
 
     #[test]

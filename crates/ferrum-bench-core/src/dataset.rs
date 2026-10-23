@@ -31,9 +31,27 @@ pub struct ShareGptCounts {
     pub output_too_short: u64,
     pub output_too_long: u64,
     pub total_too_long: u64,
+    /// Matches a prior conversation ID or normalized first-human prompt.
+    #[serde(default)]
+    pub excluded_by_history: u64,
     pub eligible: u64,
     /// Informational; missing IDs do not exclude an otherwise valid pair.
     pub missing_original_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareGptExclusionSource {
+    pub source_path: String,
+    pub source_sha256: String,
+    pub records: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareGptExclusionEvidence {
+    pub matching: String,
+    pub sources: Vec<ShareGptExclusionSource>,
+    pub unique_original_ids: usize,
+    pub unique_normalized_prompts: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +88,8 @@ pub struct ShareGptDatasetEvidence {
     pub tokenizer_sha256: String,
     pub filter: ShareGptFilter,
     pub counts: ShareGptCounts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusions: Option<ShareGptExclusionEvidence>,
     pub prompt_seed: u64,
     pub sampling: String,
     /// Explicit reservoir size before shuffling and taking the dispatched prefix.

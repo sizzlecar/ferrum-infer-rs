@@ -25,6 +25,7 @@ use ferrum_execution::{
     },
     ModelExecutor, ProductExecutionEventSink,
 };
+use ferrum_interfaces::request_observation::RequestStoppingObserver;
 use ferrum_interfaces::{
     adapter::AdapterExecutionSupport,
     engine::{InferenceEngine, LlmInferenceEngine},
@@ -1198,6 +1199,7 @@ fn token_id_tail(tokens: &[TokenId], limit: usize) -> Vec<u32> {
     tokens[start..].iter().map(|token| token.get()).collect()
 }
 
+mod request_observation;
 mod sequence;
 mod sequence_registry;
 pub use sequence::SequenceState;
@@ -1417,6 +1419,9 @@ struct EngineInner {
     scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
     host_profile_sink: Option<Arc<VNextProfileExecutionEventSink>>,
     execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+    request_stopping_observer: Option<Arc<dyn RequestStoppingObserver>>,
+    request_stopping_producer: Option<u64>,
+    request_stopping_admission: AtomicU64,
     cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
     legacy_scheduler_trace_jsonl: Option<JsonlJournal<serde_json::Value>>,
     journal_scopes: Arc<Mutex<EngineJournals>>,
@@ -2216,6 +2221,31 @@ impl ContinuousBatchEngine {
         execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
         cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
     ) -> Result<Self> {
+        Self::new_observed_with_requests(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            model_executor,
+            journal_scopes,
+            execution_attempt_observer,
+            cost_snapshot_source,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_observed_with_requests(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        model_executor: impl IntoEngineExecutor,
+        journal_scopes: Option<EngineJournalScopes>,
+        execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+        cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
+        request_stopping_observer: Option<Arc<dyn RequestStoppingObserver>>,
+    ) -> Result<Self> {
         validate_execution_feedback(
             &config,
             execution_attempt_observer.as_ref(),
@@ -2308,6 +2338,9 @@ impl ContinuousBatchEngine {
             scheduler_trace_jsonl,
             host_profile_sink,
             execution_attempt_observer,
+            request_stopping_observer,
+            request_stopping_producer: request_observation::next_producer(),
+            request_stopping_admission: AtomicU64::new(1),
             cost_snapshot_source,
             legacy_scheduler_trace_jsonl,
             journal_scopes,
@@ -2383,11 +2416,14 @@ impl ContinuousBatchEngine {
             inner
                 .sequences
                 .publish(request_id.clone(), || {
+                    inner.attach_request_stopping(&mut sequence);
                     // No cancellable await exists after opening the product slot.
                     // The same gate serializes this publication with shutdown.
                     sequence.request_slot =
                         Some(RequestSlotLease::open(&inner, request_id.clone()));
                     if let Err(error) = inner.scheduler.submit_request(request) {
+                        let _ =
+                            inner.observe_request_terminal(&mut sequence, 0, FinishReason::Error);
                         if let Some(slot) = sequence.request_slot.take() {
                             slot.reject(&inner, error.to_string());
                         }

@@ -204,18 +204,25 @@ fn metal_lane_fixture() -> Plan {
     functional.id = "functional-metal".into();
     functional.model = format!("owner/functional@{}", "d".repeat(40));
     functional.target.precision = "bf16".into();
+    let mut legacy = functional.clone();
+    legacy.id = "legacy-metal".into();
+    legacy.target.execution_path = "legacy-model-executor".into();
     let mut extended = quick.clone();
     extended.id = "extended-metal".into();
     extended.model = format!("owner/extended@{}", "e".repeat(40));
     extended.target.architecture = "mixture".into();
-    profiles.extend([functional, extended]);
+    profiles.extend([functional, legacy, extended]);
     plan(&PlanInput {
         release_cpu: Default::default(),
         stage: Stage::Release,
         release_cuda: None,
         release_metal: Some(ReleaseMetalPolicy {
             model_limitations: Vec::new(),
-            mandatory_local_profile_ids: vec![quick_id.clone(), "functional-metal".into()],
+            mandatory_local_profile_ids: vec![
+                quick_id.clone(),
+                "functional-metal".into(),
+                "legacy-metal".into(),
+            ],
             extended_profile_ids: vec!["extended-metal".into()],
             reason: "Resource-bounded Metal execution with explicit not-run coverage.".into(),
         }),
@@ -249,7 +256,13 @@ fn bounded_metal_preparation_keeps_defaults_and_binds_only_mandatory_functional_
         } else {
             assert_eq!(
                 task.runtime_capacity,
-                Some(DEFAULT_METAL_FUNCTIONAL_CAPACITY)
+                Some(
+                    if task.profile.target.execution_path == "production-plan-runtime" {
+                        DEFAULT_METAL_FUNCTIONAL_CAPACITY
+                    } else {
+                        DEFAULT_FUNCTIONAL_CAPACITY
+                    }
+                )
             );
         }
     }

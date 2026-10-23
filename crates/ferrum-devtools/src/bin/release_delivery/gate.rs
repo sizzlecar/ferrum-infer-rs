@@ -4,6 +4,14 @@ use super::{
     Sm120RuntimeOutcome,
 };
 use clap::Args;
+#[cfg(test)]
+use ferrum_bench_core::release_regression::{
+    model_tasks::{
+        DEFAULT_CUDA_FUNCTIONAL_CAPACITY, DEFAULT_FUNCTIONAL_CAPACITY,
+        DEFAULT_METAL_FUNCTIONAL_CAPACITY,
+    },
+    MetalModelLane,
+};
 use ferrum_bench_core::{
     release_candidate::staging::{self, AbiInput, CandidateInput},
     release_regression::{
@@ -12,12 +20,9 @@ use ferrum_bench_core::{
         },
         distribution::distribution_check_descriptors,
         model_schedule::{model_check_descriptors, model_task_schedule, ModelTaskSchedule},
-        model_tasks::{
-            verify_model_reports, ExpectedModelRun, ModelCheck, DEFAULT_CUDA_FUNCTIONAL_CAPACITY,
-            DEFAULT_FUNCTIONAL_CAPACITY, DEFAULT_METAL_FUNCTIONAL_CAPACITY,
-        },
-        Backend, Behavior, CheckDescriptor, CudaModelLane, EvidenceLayer, Gap, MetalModelLane,
-        Obligation, ObligationScope, Plan, ReleaseCudaPolicy, ReleasePerformancePolicy, Stage,
+        model_tasks::{verify_model_reports, ExpectedModelRun, ModelCheck},
+        Backend, Behavior, CheckDescriptor, CudaModelLane, EvidenceLayer, Gap, Obligation,
+        ObligationScope, Plan, ReleaseCudaPolicy, ReleasePerformancePolicy, Stage,
     },
 };
 use serde::Deserialize;
@@ -704,14 +709,7 @@ fn validate_tasks(
             || expected.binary_sha256 != binary.binary_sha256
             || expected.disable_thinking != run.quick_start
             || expected.use_default_backend != run.quick_start
-            || expected.runtime_capacity
-                != (!run.quick_start).then_some(if run.cuda_lane == Some(CudaModelLane::Local) {
-                    DEFAULT_CUDA_FUNCTIONAL_CAPACITY
-                } else if run.metal_lane == Some(MetalModelLane::Local) {
-                    DEFAULT_METAL_FUNCTIONAL_CAPACITY
-                } else {
-                    DEFAULT_FUNCTIONAL_CAPACITY
-                })
+            || expected.runtime_capacity != run.default_runtime_capacity()
             || expected.checks.iter().copied().collect::<BTreeSet<_>>()
                 != run.checks.iter().copied().collect::<BTreeSet<_>>()
             || expected.checks.len() != run.checks.len()

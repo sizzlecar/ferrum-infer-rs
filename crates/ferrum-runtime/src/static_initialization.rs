@@ -218,6 +218,12 @@ where
         &self.receipt
     }
 
+    /// Borrow the same cold provisioning authority after all static uploads
+    /// became quiescent. This does not create a second maintenance owner.
+    pub fn maintenance_controller(&self) -> &crate::DynamicPoolMaintenanceController<D::Runtime> {
+        self.transaction.maintenance_controller()
+    }
+
     /// Activation is still cold: failed handoff retains the initialized,
     /// quiescent transaction and retires it through its original release ledger.
     pub fn into_plan_runtime(

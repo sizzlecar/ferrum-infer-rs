@@ -179,14 +179,24 @@ async fn product_lifetime_shutdown_panic_joins_feedback_without_proving_model_re
     let config = configuration(&path, ProfileDetailArg::Verify);
     let mut engine_config = ferrum_types::EngineConfig::default();
     engine_config.scheduler.slo = Some("ttft:200,tpot:15,itl:50".parse().unwrap());
-    let feedback = crate::slo_product::ProductExecutionFeedback::prepare(&engine_config)
-        .unwrap()
-        .into_owner()
-        .unwrap();
+    let mut slo = ferrum_types::SloConfig::new(engine_config.scheduler.slo.unwrap());
+    slo.predictor = ferrum_types::PredictorFamily::ReferenceDiagnostic;
+    slo.mode = ferrum_types::SloMode::Observe;
+    let feedback =
+        crate::slo_product::ProductExecutionFeedback::prepare(&mut engine_config, Some(slo), None)
+            .unwrap()
+            .into_owner()
+            .unwrap();
     let mut revisions = feedback.revisions_for_test();
     let session = ProductJournalSession::prepare(&config, &engine_config);
     let (lifetime, state, release, dropped) =
         lifetime_fixture_with_feedback(&session, Some(Arc::clone(&feedback)));
+    assert!(engine_config.scheduler.slo.is_none());
+    assert_eq!(
+        lifetime.engine().scheduler_slo_snapshot().unwrap()["feedback"]["mode"],
+        "observe",
+        "observation feedback remains visible without a scheduler control policy"
+    );
     state.shutdown_panics.store(true, Ordering::SeqCst);
 
     let first = lifetime.shutdown().await.unwrap_err();

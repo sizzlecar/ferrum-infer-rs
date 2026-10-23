@@ -1,5 +1,6 @@
 //! Original context custody, backed by real CPU numerical operations.
 use super::*;
+mod sequence_slots;
 use crate::common::DecoderOnlyLLM;
 use crate::models::llama_family::LlamaFamilyConfig;
 use crate::test_support::SyntheticLlamaLoader;

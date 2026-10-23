@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 mod capacity;
+mod persistent_capacity;
 
 #[cfg(test)]
 use ferrum_execution::model_executor::{ExecutorSamplingOutput, LogitsReturnPolicy};
@@ -249,6 +250,9 @@ impl LlmExecutor {
                     Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
                         Ok(TokenAdmissionOutcome::CapacityDeferred(deferred))
                     }
+                    Ok(ModelKvReservation::SequenceSlotsDeferred(deferred)) => {
+                        Ok(TokenAdmissionOutcome::SequenceSlotsDeferred(deferred))
+                    }
                     Err(error) => Err(error),
                     Ok(ModelKvReservation::Reserved(_)) => unreachable!(),
                 }
@@ -322,6 +326,9 @@ impl LlmExecutor {
                 Err(error) => ModelTokenOutcome::NotSubmitted(error),
                 Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
                     ModelTokenOutcome::CapacityDeferred(deferred)
+                }
+                Ok(ModelKvReservation::SequenceSlotsDeferred(deferred)) => {
+                    ModelTokenOutcome::NotSubmitted(deferred.capacity_error())
                 }
                 Ok(ModelKvReservation::Reserved(_)) => {
                     let work = match input.work() {

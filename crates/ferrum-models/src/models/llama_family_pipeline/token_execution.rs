@@ -108,6 +108,9 @@ where
             Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
                 ModelTokenOutcome::CapacityDeferred(deferred)
             }
+            Ok(ModelKvReservation::SequenceSlotsDeferred(deferred)) => {
+                ModelTokenOutcome::NotSubmitted(deferred.capacity_error())
+            }
             Err(error) => match self.recover_pipeline_stages() {
                 ModelExecutionRecovery::Held { .. } => ModelTokenOutcome::Held(error),
                 // Preparation has not run token work or advanced its frontier.

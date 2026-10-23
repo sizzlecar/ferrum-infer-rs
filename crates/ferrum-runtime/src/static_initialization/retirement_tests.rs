@@ -274,6 +274,48 @@ fn static_retirement_initialized_activation_error_releases_original_without_reup
 }
 
 #[test]
+fn persistent_startup_growth_failure_retires_initialized_static_owner_without_reupload() {
+    let (initialized, trace, allocations) = initialized_for_activation_test();
+    let status = initialized.maintenance_controller().status().unwrap();
+    let pool = status
+        .pools()
+        .first()
+        .expect("real plan declares dynamic workspace");
+    assert_eq!(pool.resident_bytes(), 0);
+    let uploaded = trace.lock().unwrap().upload_calls;
+    let submitted = trace.lock().unwrap().submit_calls;
+    {
+        let mut trace = trace.lock().unwrap();
+        trace.runtime_allocation_failure_at = Some(trace.runtime_allocate_calls + 1);
+    }
+    // The real original allocator is invoked after successful static uploads.
+    let error = initialized
+        .maintenance_controller()
+        .grow_pool(
+            pool.pool_id(),
+            pool.contract().provisioning().minimum_resident_bytes(),
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected runtime allocation failure"));
+    let status = initialized.maintenance_controller().status().unwrap();
+    assert!(status
+        .pools()
+        .iter()
+        .all(|p| p.resident_bytes() == 0 && p.pending_growth_bytes() == 0));
+    let mut failure = initialized.abort_activation(error);
+    assert!(!failure.is_indeterminate());
+    failure.retire_in_place().unwrap();
+    assert!(failure.is_retired());
+    let trace = trace.lock().unwrap();
+    assert_eq!(trace.buffer_drops, allocations as u64);
+    assert_eq!(trace.upload_calls, uploaded);
+    assert_eq!(trace.submit_calls, submitted);
+    assert!(trace.abandon.is_empty());
+}
+
+#[test]
 fn static_retirement_initialized_handoff_error_preserves_real_committed_owner() {
     let (mut initialized, trace, allocations) = initialized_for_activation_test();
     // This is a real lease-policy change: handoff requires every lease Active.

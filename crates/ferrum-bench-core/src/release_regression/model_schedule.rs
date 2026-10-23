@@ -1,6 +1,9 @@
 //! Bind the model runner's implemented cases to selected model obligations.
 //! This schedule neither changes plan gaps nor approves other release evidence.
-use super::model_tasks::ModelCheck;
+use super::model_tasks::{
+    ModelCheck, ModelRunCapacity, DEFAULT_CUDA_FUNCTIONAL_CAPACITY, DEFAULT_FUNCTIONAL_CAPACITY,
+    DEFAULT_METAL_FUNCTIONAL_CAPACITY,
+};
 use super::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,6 +19,28 @@ pub struct ModelRunRequirements {
     pub checks: Vec<ModelCheck>,
     pub quick_start: bool,
     pub obligations: Vec<usize>,
+}
+
+impl ModelRunRequirements {
+    /// Bind functional capacity to the declared executor's accounting authority.
+    /// Legacy execution can constrain its KV pool, but cannot enforce a total
+    /// memory budget. Quick Start continues to use unchanged product defaults.
+    pub fn default_runtime_capacity(&self) -> Option<ModelRunCapacity> {
+        if self.quick_start {
+            return None;
+        }
+        Some(
+            if self.profile.target.execution_path != "production-plan-runtime" {
+                DEFAULT_FUNCTIONAL_CAPACITY
+            } else if self.cuda_lane == Some(CudaModelLane::Local) {
+                DEFAULT_CUDA_FUNCTIONAL_CAPACITY
+            } else if self.metal_lane == Some(MetalModelLane::Local) {
+                DEFAULT_METAL_FUNCTIONAL_CAPACITY
+            } else {
+                DEFAULT_FUNCTIONAL_CAPACITY
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

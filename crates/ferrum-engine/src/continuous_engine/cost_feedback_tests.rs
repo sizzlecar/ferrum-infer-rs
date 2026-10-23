@@ -4,7 +4,7 @@
 use super::*;
 use crate::continuous_engine::attempt_observation_tests::AttemptRecorder;
 use ferrum_scheduler::cost_prediction::{
-    CostPrediction, CostQuery, CostSnapshot, CostUnknownReason, CostWork,
+    CostPrediction, CostQuery, CostRisk, CostSnapshot, CostSupport, CostUnknownReason, CostWork,
 };
 use tokio::sync::watch;
 
@@ -18,6 +18,9 @@ struct Snapshot {
 }
 
 impl CostSnapshot for Snapshot {
+    fn query_limits(&self) -> ferrum_types::CostQueryLimits {
+        ferrum_types::CostQueryLimits::default()
+    }
     fn revision(&self) -> u64 {
         self.revision
     }
@@ -32,7 +35,10 @@ impl CostSnapshot for Snapshot {
         self.queried.notify_one();
         if self.known {
             CostPrediction::Known {
+                central_service_time: Duration::from_micros(10),
                 upper_service_time: Duration::from_micros(10),
+                risk: CostRisk::EngineeringMargin,
+                support: CostSupport::ExactObservedWork,
                 samples: 4,
                 observed_at: self.created,
                 expires_at: self.created + Duration::from_secs(3600),
@@ -124,8 +130,13 @@ impl CostSnapshotSource for Source {
     }
 }
 
-fn policy() -> ferrum_types::SchedulerSloConfig {
-    "ttft:1000,tpot:100,itl:100".parse().unwrap()
+pub(super) fn policy() -> ferrum_types::SchedulerSloConfig {
+    // These fixtures provide per-invocation costs, not joint stopping or
+    // completion evidence. Keep their reference-step consumer contract explicit.
+    let mut policy: ferrum_types::SchedulerSloConfig =
+        "ttft:1000,tpot:100,itl:100".parse().unwrap();
+    policy.strategy = ferrum_types::SloStrategy::ReferenceStepDiagnostic;
+    policy
 }
 
 fn engine(
@@ -232,6 +243,47 @@ async fn cost_feedback_requires_both_inputs_and_keeps_default_off() {
     drop(inner);
     off.shutdown().await.unwrap();
     off.wait_for_shutdown_completion().await.unwrap();
+}
+
+#[tokio::test]
+async fn cost_feedback_counts_admission_only_progress_and_selection_once() {
+    let mut config = EngineConfig::default();
+    config.scheduler.slo = Some(policy());
+    config.scheduler.max_running_requests = 2;
+    config.scheduler.prefill_first_until_active = Some(2);
+    config.batching.max_batch_size = 2;
+    config.batching.max_num_batched_tokens = 16;
+    let source = Source::new(true);
+    let (engine, executor, tokenizer) = engine(config, source.clone(), false);
+    submit(&engine, &tokenizer, "test").await;
+
+    let outcome = engine
+        .active_inner()
+        .unwrap()
+        .run_iteration()
+        .await
+        .unwrap();
+    assert!(matches!(outcome, EngineIterationOutcome::Progressed));
+    assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(executor.batch_prefill_calls.load(Ordering::Relaxed), 0);
+    let admitted = engine.scheduler.slo_snapshot().unwrap();
+    assert_eq!(admitted.planning_rounds, 1);
+    assert_eq!(admitted.planning_rounds_before_selection, 1);
+    assert_eq!(source.load_count(), 1);
+
+    engine
+        .active_inner()
+        .unwrap()
+        .run_iteration()
+        .await
+        .unwrap();
+    assert_eq!(engine.scheduler.decoding_count(), 1);
+    let selected = engine.scheduler.slo_snapshot().unwrap();
+    assert_eq!(selected.planning_rounds, 2);
+    assert_eq!(selected.planning_rounds_before_selection, 1);
+    assert_eq!(source.load_count(), 2);
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
 }
 
 #[tokio::test]

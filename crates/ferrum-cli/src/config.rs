@@ -7,7 +7,7 @@ use ferrum_types::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 
 #[cfg(test)]
@@ -59,7 +59,9 @@ pub struct CliConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulerCliConfig {
     /// Optional latency targets for adaptive scheduling, in milliseconds.
-    pub slo: Option<ferrum_types::SchedulerSloConfig>,
+    pub slo: Option<ferrum_types::SloConfig>,
+    /// Optional model/calibration state loaded at startup and saved on shutdown.
+    pub slo_state_path: Option<PathBuf>,
 }
 
 /// Server CLI configuration
@@ -217,6 +219,9 @@ pub struct DevConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeCliConfig {
+    /// Initial persistent-pool residency for compiled-plan executors only.
+    #[serde(default)]
+    pub persistent_pool_preparation: Option<ferrum_types::PersistentPoolPreparation>,
     /// Named startup/runtime preset. Presets provide product-owned default
     /// bundles and can still be overridden by explicit runtime keys below,
     /// environment variables, or CLI flags.
@@ -518,6 +523,12 @@ impl RuntimeCliConfig {
         );
         push_string_entry(
             &mut entries,
+            ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY,
+            self.persistent_pool_preparation
+                .map(ferrum_types::PersistentPoolPreparation::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
             ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
             self.q4_mmvq_weight_decode
                 .map(ferrum_types::Q4MmvqWeightDecode::as_runtime_value),
@@ -745,8 +756,8 @@ impl CliConfig {
 
     pub fn resolve_scheduler_slo(
         &self,
-        cli: Option<ferrum_types::SchedulerSloConfig>,
-    ) -> Result<Option<ferrum_types::SchedulerSloConfig>> {
+        cli: Option<ferrum_types::SloConfig>,
+    ) -> Result<Option<ferrum_types::SloConfig>> {
         let slo = cli.or(self.scheduler.slo);
         if let Some(slo) = slo {
             slo.validate().map_err(ferrum_types::FerrumError::config)?;
@@ -1044,7 +1055,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.resolve_scheduler_slo(None).unwrap().unwrap().tpot_ms,
+            config
+                .resolve_scheduler_slo(None)
+                .unwrap()
+                .unwrap()
+                .policy
+                .tpot_ms,
             15.0
         );
         assert_eq!(config.runtime.prefix_cache, Some(false));
@@ -1932,5 +1948,32 @@ mod tests {
             "[runtime]\nsequence_backing_growth = \"automatic\"\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn persistent_pool_preparation_toml_values_are_typed() {
+        for mode in [
+            ferrum_types::PersistentPoolPreparation::DemandDriven,
+            ferrum_types::PersistentPoolPreparation::ConfiguredEnvelope,
+        ] {
+            let parsed: CliConfig = toml::from_str(&format!(
+                "[runtime]\npersistent_pool_preparation = {:?}\n",
+                mode.as_runtime_value()
+            ))
+            .unwrap();
+            assert_eq!(parsed.runtime.persistent_pool_preparation, Some(mode));
+            let entry = parsed
+                .runtime
+                .runtime_config_entries()
+                .into_iter()
+                .find(|e| e.key == ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(entry.effective_value, mode.as_runtime_value());
+            assert_eq!(entry.source, ferrum_types::RuntimeConfigSource::ConfigFile);
+        }
+        assert!(
+            toml::from_str::<CliConfig>("[runtime]\npersistent_pool_preparation = \"auto\"\n")
+                .is_err()
+        );
     }
 }

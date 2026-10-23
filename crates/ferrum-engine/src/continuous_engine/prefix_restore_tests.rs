@@ -243,7 +243,7 @@ async fn prefix_restore_time_planning_reprojects_current_frontier_with_original_
     let mut config = EngineConfig::default();
     config.runtime.profile_detail = ObservabilityProfileDetail::Off;
     config.scheduler.max_running_requests = 1;
-    config.scheduler.slo = Some("ttft:1000,tpot:100,itl:100".parse().unwrap());
+    config.scheduler.slo = Some(super::cost_feedback_tests::policy());
     let state = Arc::new(RestoreState {
         behavior: RestoreBehavior::Hit,
         tokens: 2,

@@ -809,6 +809,13 @@ where
         ));
     }
     execution.validate().map_err(FerrumError::config)?;
+    info!(
+        kv_marker = K::NAME,
+        kv_storage = K::physical_storage()
+            .map(|storage| storage.name())
+            .unwrap_or("unknown"),
+        "Selected retained model physical KV storage"
+    );
     let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open_with_options(
         model_path,
         loader_options,
@@ -966,6 +973,14 @@ fn validate_causal_decode_preparation_mode(
     config: &ComponentConfig,
     plan_runtime: bool,
 ) -> Result<()> {
+    if config.engine_config.memory.persistent_pool_preparation
+        == ferrum_types::PersistentPoolPreparation::ConfiguredEnvelope
+        && !plan_runtime
+    {
+        return Err(FerrumError::unsupported(
+            "configured-envelope persistent pool preparation requires a compiled-plan executor",
+        ));
+    }
     validate_q4_mmvq_weight_decode(config, plan_runtime)?;
     validate_q5_mmvq_weight_decode(config, plan_runtime)?;
     validate_q8_projection_weight_preparation(config, plan_runtime)?;
@@ -1621,7 +1636,7 @@ impl ComponentFactory<ExecutorOwner, ExecutorBuildError> for LlmExecutorFactory 
                 let llm: Box<dyn ferrum_models::common::DecoderOnlyLLM> =
                     match (&config.device, kv_dtype) {
                         (Device::CPU, KvCacheDtype::Fp16) => {
-                            info!("  Backend: CPU, KV: fp16");
+                            info!("  Backend: CPU");
                             build_llm::<ferrum_kernels::backend::cpu::CpuBackend, KvFp16>(
                                 qcfg,
                                 &model_path,
@@ -1641,7 +1656,7 @@ impl ComponentFactory<ExecutorOwner, ExecutorBuildError> for LlmExecutorFactory 
                                     } else {
                                         "f32"
                                     };
-                                info!("  Backend: Metal (weights {}), KV: fp16", dtype_hint);
+                                info!("  Backend: Metal (weights {})", dtype_hint);
                                 build_llm::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(
                                     qcfg,
                                     &model_path,
@@ -1662,7 +1677,7 @@ impl ComponentFactory<ExecutorOwner, ExecutorBuildError> for LlmExecutorFactory 
                         (Device::CUDA(_), KvCacheDtype::Fp16) => {
                             #[cfg(feature = "cuda")]
                             {
-                                info!("  Backend: CUDA, KV: fp16");
+                                info!("  Backend: CUDA");
                                 build_llm::<ferrum_kernels::backend::cuda::CudaBackend, KvFp16>(
                                     qcfg,
                                     &model_path,
@@ -1684,7 +1699,7 @@ impl ComponentFactory<ExecutorOwner, ExecutorBuildError> for LlmExecutorFactory 
                             #[cfg(feature = "cuda")]
                             {
                                 // The CUDA backend provides paged INT8 KV for dense models.
-                                info!("  Backend: CUDA, KV: int8 (paged, vLLM-style)");
+                                info!("  Backend: CUDA (paged INT8 KV with F16 scales)");
                                 build_llm::<ferrum_kernels::backend::cuda::CudaBackend, KvInt8>(
                                     qcfg,
                                     &model_path,
@@ -1868,6 +1883,7 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
 
     mod mixed_batch_tests;
+    mod persistent_startup_tests;
 
     #[test]
     fn sequence_backing_growth_direct_factories_reject_unsupported_execution() {

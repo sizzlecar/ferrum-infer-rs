@@ -889,6 +889,14 @@ impl EngineConfig {
                 value,
             )?);
         }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == crate::PERSISTENT_POOL_PREPARATION_CONFIG_KEY)
+        {
+            self.memory.persistent_pool_preparation =
+                crate::PersistentPoolPreparation::parse_config_entry(entry)?;
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_BATCHED_GRAPH") {
             self.backend.enable_cuda_graphs = parse_presence_bool(value)?;
         }
@@ -1196,15 +1204,40 @@ pub struct SchedulerSloConfig {
     #[serde(deserialize_with = "deserialize_slo_milliseconds")]
     pub itl_ms: f64,
     #[serde(default)]
-    pub reference: crate::ReferenceEstimatorConfig,
+    pub query: crate::CostQueryLimits,
+    #[serde(default)]
+    pub planning: crate::SloPlanningBudget,
+    #[serde(default)]
+    pub joint: crate::JointSloTargets,
+    #[serde(default)]
+    pub strategy: crate::SloStrategy,
     #[serde(default)]
     pub unknown_cost: crate::UnknownCostPolicy,
+    /// Stopping-distribution uncertainty is independent of execution cost
+    /// uncertainty; neither fallback declares joint SLO feasibility.
+    #[serde(default)]
+    pub unknown_stopping: crate::UnknownCostPolicy,
 }
 
 impl SchedulerSloConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
-        self.reference.validate()?;
+        self.query.validate()?;
+        self.planning.validate()?;
+        self.joint.validate()?;
+        if self.strategy == crate::SloStrategy::Bounded {
+            for (name, policy) in [
+                ("unknown_cost", self.unknown_cost),
+                ("unknown_stopping", self.unknown_stopping),
+            ] {
+                if policy != crate::UnknownCostPolicy::StaticFallback {
+                    return Err(format!(
+                        "scheduler SLO strategy=bounded requires {name}=static_fallback; bounded control does not implement strict admission"
+                    ));
+                }
+            }
+        }
         self.unknown_cost.validate()?;
+        self.unknown_stopping.validate()?;
         for (name, value) in [
             ("ttft", self.ttft_ms),
             ("tpot", self.tpot_ms),
@@ -1252,8 +1285,12 @@ impl std::str::FromStr for SchedulerSloConfig {
             ttft_ms,
             tpot_ms,
             itl_ms,
-            reference: crate::ReferenceEstimatorConfig::default(),
+            query: crate::CostQueryLimits::default(),
+            planning: crate::SloPlanningBudget::default(),
+            joint: crate::JointSloTargets::default(),
+            strategy: crate::SloStrategy::default(),
             unknown_cost: crate::UnknownCostPolicy::default(),
+            unknown_stopping: crate::UnknownCostPolicy::default(),
         };
         slo.validate()?;
         Ok(slo)
@@ -1514,7 +1551,9 @@ pub enum KvCacheType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KvCacheDtype {
-    /// FP16 K/V — the validated production path on every backend.
+    /// FP16 request and legacy compatibility marker. Retained CPU/Metal
+    /// implementations store F32 values; retained CUDA stores F16. The actual
+    /// executor's selected storage declaration is authoritative for byte counts.
     #[default]
     Fp16,
     /// BF16 K/V — same memory cost as FP16, slightly different precision.
@@ -1555,6 +1594,9 @@ impl KvCacheDtype {
 /// Memory management configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
+    /// Optional startup residency; the original allocator may reclaim it later.
+    #[serde(default)]
+    pub persistent_pool_preparation: crate::PersistentPoolPreparation,
     /// Memory pool size in bytes
     pub pool_size: Option<usize>,
     /// Exact device-wide usable runtime budget in bytes. When present this
@@ -1636,6 +1678,7 @@ impl MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            persistent_pool_preparation: crate::PersistentPoolPreparation::DemandDriven,
             pool_size: None,
             usable_capacity_bytes: None,
             enable_pooling: true,

@@ -9,7 +9,7 @@ use ferrum_types::{ModelOutputProtocol, ModelReasoningProtocol};
 fn profile() -> ModelProfile {
     ModelProfile {
         gguf: None,
-        id: "legacy-metal".into(),
+        id: "planned-metal".into(),
         model: "fixture:gguf".into(),
         reasoning_protocol: ModelReasoningProtocol::None,
         available: true,
@@ -19,7 +19,7 @@ fn profile() -> ModelProfile {
             protocol: ModelOutputProtocol::Text,
             backend: Backend::Metal,
             precision: "gguf-q4_k_m".into(),
-            execution_path: "legacy-model-executor".into(),
+            execution_path: "production-plan-runtime".into(),
         },
     }
 }
@@ -128,7 +128,11 @@ fn cache(root: &Path) {
         root,
         "owner/tokenizer",
         'd',
-        &[("tokenizer.json", b"{}"), ("tokenizer_config.json", b"{}")],
+        &[
+            ("config.json", b"{}"),
+            ("tokenizer.json", b"{}"),
+            ("tokenizer_config.json", b"{}"),
+        ],
     );
 }
 fn write_metadata(root: &Path, role: &str, version: &str, commit: char, binary: char) -> PathBuf {
@@ -196,7 +200,7 @@ async fn prepare_freezes_recomputed_task_and_preserves_ci_origin_without_model_e
     fs::create_dir(&args.output_dir).unwrap();
     fs::write(args.output_dir.join("ci-origin.json"), b"preserved").unwrap();
     prepare(args).await.unwrap();
-    let directory = root.path().join("tasks/legacy-metal");
+    let directory = root.path().join("tasks/planned-metal");
     let expected: ExpectedPerformanceRun =
         read_json(&directory.join("expected-task.json")).unwrap();
     expected.validate().unwrap();
@@ -254,6 +258,33 @@ fn fixture_other_input(root: &Path) -> PerformancePrepareArgs {
 }
 
 #[tokio::test]
+async fn legacy_total_budget_is_rejected_before_source_or_binary_work() {
+    let root = tempfile::tempdir().unwrap();
+    let args = fixture(root.path());
+    let mut plan = plan();
+    let profile = &mut plan.selected[0].profile;
+    profile.target.execution_path = "legacy-model-executor".into();
+    plan.obligations[0].scope = ObligationScope::Profile {
+        profile_id: profile.id.clone(),
+        target: profile.target.clone(),
+    };
+    plan.obligations[0].checkers = performance_check_descriptors(&[profile.target.clone()])
+        .into_iter()
+        .map(|check| check.id)
+        .collect();
+    write_json(&args.plan, &document(plan)).unwrap();
+    // These inputs must not be opened for an executor that cannot satisfy policy.
+    fs::remove_file(&args.candidate_abi).unwrap();
+    fs::remove_dir_all(&args.hf_cache).unwrap();
+    let output = args.output_dir.clone();
+    assert!(prepare(args)
+        .await
+        .unwrap_err()
+        .contains("required total runtime memory budget"));
+    assert!(!output.exists());
+}
+
+#[tokio::test]
 async fn prepare_vnext_binds_semantic_source_and_concurrent_policy() {
     let root = tempfile::tempdir().unwrap();
     let args = fixture(root.path());
@@ -281,7 +312,7 @@ async fn prepare_vnext_binds_semantic_source_and_concurrent_policy() {
     );
     prepare(args).await.unwrap();
     let task: ExpectedPerformanceRun =
-        read_json(&root.path().join("tasks/legacy-metal/expected-task.json")).unwrap();
+        read_json(&root.path().join("tasks/planned-metal/expected-task.json")).unwrap();
     assert_eq!(
         task.profile.target.execution_path,
         "production-plan-runtime"

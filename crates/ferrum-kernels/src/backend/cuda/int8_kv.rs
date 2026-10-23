@@ -100,6 +100,10 @@ impl OptionalCudaScalesF16 {
 // `B::int8_paged_decode_attention(...)` without reaching into
 // cudarc primitives directly.
 impl crate::backend::BackendInt8KvOps for CudaBackend {
+    fn int8_kv_storage() -> Option<ferrum_types::KvCacheStorage> {
+        Some(ferrum_types::KvCacheStorage::Int8PerTokenHeadF16Scales)
+    }
+
     fn alloc_paged_int8_pool(
         ctx: &mut Self::Context,
         num_blocks: usize,

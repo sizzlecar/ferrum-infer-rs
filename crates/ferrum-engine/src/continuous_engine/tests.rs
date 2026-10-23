@@ -129,6 +129,8 @@ mod metrics_only_tests;
 mod mixed_batch_tests;
 #[path = "partial_batch_tests.rs"]
 mod partial_batch_tests;
+#[path = "prefill_phase_feedback_tests.rs"]
+mod prefill_phase_feedback_tests;
 #[path = "prefix_prompt_tail_tests.rs"]
 mod prefix_prompt_tail_tests;
 #[path = "token_capacity_tests.rs"]
@@ -3204,8 +3206,12 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
 
 #[tokio::test]
 async fn plan_runtime_prefill_resource_failure_preserves_terminal_error_and_releases_request() {
+    let trace = tempfile::tempdir().unwrap();
+    let trace_path = trace.path().join("failed-iteration.jsonl");
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
+    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
+    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Run);
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
@@ -3245,6 +3251,50 @@ async fn plan_runtime_prefill_resource_failure_preserves_terminal_error_and_rele
         .expect("retained admission mutex poisoned")
         .is_empty());
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
+    // The output-control owner retains the same terminal failure while
+    // shutdown still joins it and flushes the scheduler journal.
+    let shutdown_error = engine
+        .shutdown()
+        .await
+        .expect_err("shutdown must retain the injected request failure");
+    assert!(
+        matches!(shutdown_error, FerrumError::ResourceExhausted { .. }),
+        "unexpected shutdown error: {shutdown_error:?}"
+    );
+    assert_eq!(shutdown_error.to_string(), error.to_string());
+    let events = read_engine_profile_events(&trace_path);
+    let iteration = events
+        .iter()
+        .find(|event| {
+            event.phase == "scheduler.iteration"
+                && event.attributes["plan"]["requests"]
+                    .as_array()
+                    .is_some_and(|rows| {
+                        rows.iter()
+                            .any(|row| row["request_id"] == request_id.to_string())
+                    })
+        })
+        .expect("the failed real submission retains its selected plan and iteration");
+    assert!(iteration.attributes["batch_id"].is_string());
+    assert!(iteration.attributes["iteration"].is_u64());
+    assert!(iteration.attributes["timing_us"]["process"].is_u64());
+    assert_eq!(
+        iteration.attributes["engine_counters"]["prefill_tokens_delta"],
+        0
+    );
+    assert_eq!(
+        iteration.attributes["engine_counters"]["decode_tokens_delta"],
+        0
+    );
+    // This executor error is handed to detached request completion; registering
+    // that completion succeeds. Process Ok is not request or GPU success.
+    assert_eq!(iteration.attributes["result"], "some_ok");
+    assert!(iteration.attributes["process_error"].is_null());
+    assert!(iteration.attributes["post_process_error"].is_null());
+    let row = &iteration.attributes["plan"]["requests"][0];
+    assert_eq!(row["request_id"], request_id.to_string());
+    assert_eq!(row["scheduled_range"]["start"], 0);
+    assert_eq!(row["scheduled_range"]["end"], row["prompt_tokens"]);
 }
 
 #[tokio::test]

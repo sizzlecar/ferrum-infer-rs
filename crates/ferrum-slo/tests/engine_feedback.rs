@@ -177,7 +177,9 @@ async fn reference_actual_cpu_feedback_changes_next_prefill_and_preserves_output
                     snapshot.predict(
                         &CostQuery {
                             work: &work(sample),
-                            work_is_exact: true
+                            work_is_exact: true,
+                            execution:
+                                ferrum_scheduler::cost_prediction::CostExecution::SingleInvocation,
                         },
                         Instant::now()
                     ),
@@ -215,6 +217,7 @@ async fn reference_actual_cpu_feedback_changes_next_prefill_and_preserves_output
         &CostQuery {
             work: &prefill_work,
             work_is_exact: true,
+            execution: ferrum_scheduler::cost_prediction::CostExecution::SingleInvocation,
         },
         Instant::now(),
     )
@@ -230,7 +233,11 @@ async fn reference_actual_cpu_feedback_changes_next_prefill_and_preserves_output
         ttft_ms: upper_service_time.as_secs_f64() * 1000.0 / 2.0,
         tpot_ms: 10_000.0,
         itl_ms: 10_000.0,
-        reference: ReferenceEstimatorConfig::default(),
+        query: Default::default(),
+        planning: Default::default(),
+        joint: Default::default(),
+        strategy: ferrum_types::SloStrategy::ReferenceStepDiagnostic,
+        unknown_stopping: Default::default(),
         unknown_cost: Default::default(),
     };
     let consumer = Witness::new(estimator.observer());

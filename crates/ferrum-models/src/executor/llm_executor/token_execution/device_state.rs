@@ -22,6 +22,18 @@ pub(super) struct DeviceSequenceState {
     terminal: Option<watch::Sender<Option<TerminalObservation>>>,
 }
 
+impl DeviceSequenceState {
+    pub(super) fn persistent_capacity_ready(&self) -> bool {
+        self.prepared
+            && self.published
+            && self.claim.is_none()
+            && self.adapter.is_none()
+            && self.operation_error.is_none()
+            && self.recovery_error.is_none()
+            && !self.needs_recovery
+    }
+}
+
 #[derive(Clone)]
 struct TerminalObservation {
     ended: ExecutionEnded,
@@ -198,6 +210,10 @@ impl TokenWorkerState {
             Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
                 entry.closing = true;
                 Ok(TokenAdmissionOutcome::CapacityDeferred(deferred))
+            }
+            Ok(ModelKvReservation::SequenceSlotsDeferred(deferred)) => {
+                entry.closing = true;
+                Ok(TokenAdmissionOutcome::SequenceSlotsDeferred(deferred))
             }
             Ok(ModelKvReservation::Reserved(_)) => Err(FerrumError::request_validation(
                 "token admission was cancelled during preparation",

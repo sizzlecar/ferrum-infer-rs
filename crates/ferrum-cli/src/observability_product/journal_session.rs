@@ -521,11 +521,14 @@ impl ferrum_interfaces::InferenceEngine for ProductEngineHandle {
         self.engine.execution_attribution_snapshot()
     }
     fn scheduler_slo_snapshot(&self) -> Option<Value> {
-        let mut snapshot = self.engine.scheduler_slo_snapshot()?;
-        if let (Some(fields), Some(feedback)) = (snapshot.as_object_mut(), &self.feedback) {
-            if let Some(stats) = feedback.stats() {
-                fields.insert("feedback".into(), stats);
-            }
+        let stats = self.feedback.as_ref().and_then(|feedback| feedback.stats());
+        let mut snapshot = match self.engine.scheduler_slo_snapshot() {
+            Some(snapshot) => snapshot,
+            None if stats.is_some() => serde_json::json!({}),
+            None => return None,
+        };
+        if let (Some(fields), Some(stats)) = (snapshot.as_object_mut(), stats) {
+            fields.insert("feedback".into(), stats);
         }
         Some(snapshot)
     }

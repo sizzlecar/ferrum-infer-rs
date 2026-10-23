@@ -15,11 +15,12 @@
 pub trait KvDtypeKind: Send + Sync + 'static {
     /// Stable name for logging / debug (e.g. "fp16", "int8").
     const NAME: &'static str;
-    /// Bytes per element on disk + in cache memory.
+    /// Nominal marker width. Actual backend allocation may differ; physical
+    /// capacity accounting must use the selected KV implementation's storage.
     const BYTES_PER_ELEM: usize;
 }
 
-/// FP16 KV cache (the existing default on CUDA + Metal).
+/// Legacy default KV marker. CUDA stores F16; Metal and CPU store F32.
 pub struct KvFp16;
 impl KvDtypeKind for KvFp16 {
     const NAME: &'static str = "fp16";

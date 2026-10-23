@@ -1,6 +1,64 @@
 use super::*;
 use crate::continuous_engine::token_completion_tests as actual;
 
+#[tokio::test]
+async fn delivery_clock_excludes_empty_failed_and_still_backpressured_text() {
+    let budget = OutputBudget::new(ferrum_types::OutputConfig::default()).unwrap();
+    let id = RequestId::new();
+    let (sender, mut receiver) = OutputSender::new(
+        Weak::new(),
+        id.clone(),
+        budget.try_open_session().unwrap(),
+        1,
+    );
+    let ingress = Instant::now();
+    sender.configure_text_clock(ingress);
+    let chunk = |text: &str| StreamChunk {
+        request_id: id.clone(),
+        text: text.into(),
+        token: None,
+        finish_reason: None,
+        usage: None,
+        created_at: chrono::Utc::now(),
+        metadata: HashMap::new(),
+        api_response: None,
+        execution_evidence: None,
+    };
+    sender.send(Ok(chunk(""))).await.unwrap();
+    assert_eq!(
+        sender.text_clock_snapshot(0).unwrap().nonempty_text_events,
+        0
+    );
+    receiver.recv().await.unwrap().unwrap();
+    sender.send(Ok(chunk("first"))).await.unwrap();
+    let first = sender.text_clock_snapshot(1).unwrap();
+    let mut next = Box::pin(sender.send(Ok(chunk("second"))));
+    assert!(futures::poll!(&mut next).is_pending());
+    assert_eq!(
+        sender.text_clock_snapshot(2).unwrap().nonempty_text_events,
+        1,
+        "publication waiting for channel capacity is not delivered text"
+    );
+    receiver.recv().await.unwrap().unwrap();
+    next.await.unwrap();
+    let second = sender.text_clock_snapshot(2).unwrap();
+    assert_eq!(second.nonempty_text_events, 2);
+    assert_eq!(second.first_text, first.first_text);
+    assert!(second.max_text_interval.is_some());
+    sender.configure_text_clock(Instant::now());
+    assert_eq!(
+        sender.text_clock_snapshot(2).unwrap().first_text,
+        first.first_text,
+        "rebinding must not renew original request ingress"
+    );
+    drop(receiver);
+    assert!(sender.send(Ok(chunk("lost"))).await.is_err());
+    assert_eq!(
+        sender.text_clock_snapshot(3).unwrap().nonempty_text_events,
+        2
+    );
+}
+
 async fn completion_after_delivery_failure(panic: bool) {
     let mut fixture = actual::fixture(false, false).await;
     let sender = fixture

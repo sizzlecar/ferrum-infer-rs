@@ -14,6 +14,7 @@ pub mod adapter;
 pub mod engine;
 pub mod kv_cache;
 pub mod kv_dtype;
+pub mod request_observation;
 pub mod sampler;
 pub mod scheduler;
 pub mod tensor;

@@ -28,6 +28,12 @@ impl<R: DeviceRuntime> Default for SequenceSettlement<R> {
     }
 }
 
+impl<R: DeviceRuntime> SequenceSettlement<R> {
+    pub(super) fn token_frontier_is_open(&self) -> bool {
+        !self.closing && !self.cancel_requested && self.terminal.is_none() && self.held.is_none()
+    }
+}
+
 enum WaveObserver<R: DeviceRuntime> {
     Completion(CompletionHandle<R>),
     Indeterminate(IndeterminateSubmissionHandle<R>),
@@ -782,11 +788,7 @@ impl<R: DeviceRuntime> VNextSequence<R> {
     }
     pub(super) fn token_frontier_is_open(&self) -> bool {
         let settlement = self.settlement.lock();
-        self.active.load(Ordering::Acquire)
-            && !settlement.closing
-            && !settlement.cancel_requested
-            && settlement.terminal.is_none()
-            && settlement.held.is_none()
+        self.active.load(Ordering::Acquire) && settlement.token_frontier_is_open()
     }
 
     pub(super) fn begin_closing(&self) {

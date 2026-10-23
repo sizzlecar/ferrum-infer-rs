@@ -3,6 +3,7 @@ use super::*;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
+mod exclusions;
 mod export;
 mod prepared_cache;
 

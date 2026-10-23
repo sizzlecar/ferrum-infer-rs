@@ -50,12 +50,12 @@ struct Table {
     revision: u64,
 }
 
-enum Excluded {
+pub(super) enum Excluded {
     Ineligible,
     Invalid,
 }
 
-fn sample_work(member: &ExecutionAttemptParticipant) -> CostWork {
+pub(super) fn sample_work(member: &ExecutionAttemptParticipant) -> CostWork {
     CostWork {
         kind: member.kind,
         requested: member.requested,
@@ -65,7 +65,10 @@ fn sample_work(member: &ExecutionAttemptParticipant) -> CostWork {
     }
 }
 
-fn validate_sample(sample: &ExecutionAttemptSummary, now: Instant) -> Result<Duration, Excluded> {
+pub(super) fn validate_sample(
+    sample: &ExecutionAttemptSummary,
+    now: Instant,
+) -> Result<Duration, Excluded> {
     if sample.eligibility != ExecutionAttemptEligibility::Completed {
         return Err(Excluded::Ineligible);
     }
@@ -201,6 +204,11 @@ impl Table {
                 let expires = domain.observed.checked_add(ttl)?;
                 eligible.push(Entry {
                     members: domain.members.clone(),
+                    central: Duration::try_from_secs_f64(
+                        domain.window.iter().map(Duration::as_secs_f64).sum::<f64>()
+                            / domain.window.len() as f64,
+                    )
+                    .ok()?,
                     upper,
                     samples: domain.window.len(),
                     observed: domain.observed,
@@ -257,15 +265,42 @@ pub(super) fn run(
     wake: crossbeam_channel::Receiver<()>,
     hooks: Hooks,
 ) {
-    let _liveness = Liveness {
-        shared: Arc::clone(&shared),
-        receiver: &receiver,
-        wake: &wake,
-    };
     let mut table = Table {
         domains: HashMap::new(),
         count: 0,
         revision: 0,
+    };
+    receive(Arc::clone(&shared), receiver, wake, hooks, |sample| {
+        if table.apply(&config, &shared, sample) {
+            if let Some(snapshot) = table.snapshot(&config) {
+                let revision = snapshot.revision;
+                source.install(snapshot);
+                revisions.send_replace(revision);
+                shared
+                    .counters
+                    .published_snapshots
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                shared
+                    .counters
+                    .training_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+pub(super) fn receive(
+    shared: Arc<Shared>,
+    receiver: crossbeam_channel::Receiver<Envelope>,
+    wake: crossbeam_channel::Receiver<()>,
+    hooks: Hooks,
+    mut apply: impl FnMut(&ExecutionAttemptSummary),
+) {
+    let _liveness = Liveness {
+        shared: Arc::clone(&shared),
+        receiver: &receiver,
+        wake: &wake,
     };
     loop {
         if shared.drained() {
@@ -275,18 +310,7 @@ pub(super) fn run(
             recv(receiver) -> message => {
                 let Ok(envelope) = message else { break; };
                 hooks.before_apply();
-                if table.apply(&config, &shared, &envelope.summary) {
-                    if let Some(snapshot) = table.snapshot(&config) {
-                        let revision = snapshot.revision;
-                        source.install(snapshot);
-                        revisions.send_replace(revision);
-                        shared.counters.published_snapshots.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        // Keep the previous complete snapshot with its original
-                        // expiry. Invalid arithmetic never publishes a partial fit.
-                        shared.counters.training_failures.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                apply(&envelope.summary);
             }
             recv(wake) -> _ => {}
         }
