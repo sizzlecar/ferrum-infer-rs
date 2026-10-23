@@ -183,7 +183,7 @@ fn spelling_passes_through_source(candidate: &Path, root: &Path) -> Result<bool>
 mod tests {
     use super::*;
     fn fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
-        let source = root.join("source");
+        let source = root.join("source with spaces #hash");
         fs::create_dir_all(source.join("kernels")).unwrap();
         fs::write(source.join("kernels/unit.cu"), "#include \"required.h\"\n").unwrap();
         fs::write(source.join("kernels/required.h"), "#pragma once\n").unwrap();
@@ -228,26 +228,38 @@ mod tests {
             .iter()
             .chain(input.headers.iter())
             .map(|p| source.join(p).display().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        fs::write(&depfile, format!("object.o: {dependencies}\n")).unwrap();
+            .collect::<Vec<_>>();
+        // The portable serializer requires an absolute target. Use the real
+        // host spelling: its Windows branch accepts drive/UNC paths and the
+        // parser selects Windows escaping from that target (not from a RHS).
+        let target = root.canonicalize().unwrap().join("object.o");
+        let target = target.to_str().unwrap();
+        let raw = serialize_portable_depfile(target, &dependencies).unwrap();
+        assert_eq!(
+            parse_make_depfile(std::str::from_utf8(&raw).unwrap(), &depfile).unwrap(),
+            (target.to_owned(), dependencies)
+        );
+        fs::write(&depfile, raw).unwrap();
         (source, definition, depfile)
+    }
+    fn append_dependency(depfile: &Path, dependency: &Path) {
+        let raw = fs::read_to_string(depfile).unwrap();
+        let (target, mut dependencies) = parse_make_depfile(&raw, depfile).unwrap();
+        dependencies.push(dependency.display().to_string());
+        // A synthetic make rule must escape separators, spaces and # on every
+        // host. Raw Path::display is not a valid make-word serialization.
+        fs::write(
+            depfile,
+            serialize_portable_depfile(&target, &dependencies).unwrap(),
+        )
+        .unwrap();
     }
     #[test]
     fn import_locks_observed_closure_without_claiming_a_build() {
         let root = tempfile::tempdir().unwrap();
         let (source, definition, depfile) = fixture(root.path());
         fs::write(source.join("kernels/discovered.h"), "#pragma once\n").unwrap();
-        let previous = fs::read_to_string(&depfile).unwrap();
-        fs::write(
-            &depfile,
-            format!(
-                "{} {}\n",
-                previous.trim_end(),
-                source.join("kernels/discovered.h").display()
-            ),
-        )
-        .unwrap();
+        append_dependency(&depfile, &source.join("kernels/discovered.h"));
         let output = root.path().join("observed.json");
         let plan = root.path().join("lock.json");
         let locked = lock_native_operator_source_dependencies(
@@ -293,24 +305,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (source, definition, depfile) = fixture(root.path());
         fs::write(source.join("unlisted.h"), "#pragma once\n").unwrap();
-        let previous = fs::read_to_string(&depfile).unwrap();
-        fs::write(
-            &depfile,
-            format!(
-                "{} {}\n",
-                previous.trim_end(),
-                source.join("unlisted.h").display()
-            ),
-        )
-        .unwrap();
-        assert!(lock_native_operator_source_dependencies(
+        append_dependency(&depfile, &source.join("unlisted.h"));
+        let error = lock_native_operator_source_dependencies(
             &definition,
             &source,
             &[depfile],
             &root.path().join("out.json"),
-            &root.path().join("plan.json")
+            &root.path().join("plan.json"),
         )
-        .is_err());
+        .unwrap_err();
+        assert!(matches!(error, NativeOperatorBuilderError::Invalid(message)
+            if message.contains("outside declared include roots")));
         assert!(!root.path().join("out.json").exists());
     }
     #[cfg(unix)]
@@ -323,16 +328,7 @@ mod tests {
         std::os::unix::fs::symlink(&external, source.join("kernels/link.h")).unwrap();
         let alias = root.path().join("source-alias");
         std::os::unix::fs::symlink(&source, &alias).unwrap();
-        let previous = fs::read_to_string(&depfile).unwrap();
-        fs::write(
-            &depfile,
-            format!(
-                "{} {}\n",
-                previous.trim_end(),
-                alias.join("kernels/link.h").display()
-            ),
-        )
-        .unwrap();
+        append_dependency(&depfile, &alias.join("kernels/link.h"));
         assert!(lock_native_operator_source_dependencies(
             &definition,
             &source,
