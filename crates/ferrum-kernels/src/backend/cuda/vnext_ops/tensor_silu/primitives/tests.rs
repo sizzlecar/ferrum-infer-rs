@@ -143,7 +143,7 @@ fn half_rotary_accepts_actual_f32_phases_and_rejects_bf16_reinterpretation() {
 }
 #[test]
 fn segmented_d72_native_metadata_is_bounded_and_does_not_merge_segments() {
-    let ports = values(&[(&[3, 144], ElementType::Bf16); 3], &[3, 144]);
+    let ports = values(&[(&[3, 144][..], ElementType::Bf16); 3], &[3, 144]);
     let mut a = attrs(&[
         ("head_dim", SemanticValue::Unsigned(72)),
         (
