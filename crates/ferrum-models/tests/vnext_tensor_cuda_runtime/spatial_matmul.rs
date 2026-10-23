@@ -403,6 +403,23 @@ fn managed_cuda_spatial_matmul_full_head_batch_and_query_tails() {
         let expected = oracle::reference(shape, &input);
         run_case(name, shape, input, expected);
     }
+    // Scores [0, 1] nearly cancel these exact BF16 values in F64/F32 PV.
+    // Narrowing P to BF16 instead produces 0.59375, outside the same tolerance.
+    let shape = Shape {
+        batch: 1,
+        channels: 1,
+        spatial: 2,
+    };
+    let input: Vec<u16> = [1.0, 1.0, 0.0, 8.0, 696.0, -256.0]
+        .into_iter()
+        .map(|value| bf16::from_f32(value).to_bits())
+        .collect();
+    let expected = oracle::reference(shape, &input);
+    for &value in &expected {
+        assert!(value > 0.03 && value < 0.04);
+        assert!((0.59375 - value).abs() > ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * value.abs());
+    }
+    run_case("probability_f32_cancellation", shape, input, expected);
 }
 
 #[test]
