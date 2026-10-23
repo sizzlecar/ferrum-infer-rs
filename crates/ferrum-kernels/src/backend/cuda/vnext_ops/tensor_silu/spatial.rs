@@ -22,7 +22,9 @@ pub const NUMERICAL_IDENTITY:&str=concat!(
     "scale-and-epsilon=(rational-as-f64)-as-f32;gamma-actual[C,1,1,1]-or-independent-image-contract[C,1,1];",
     "silu=existing-precise-FP32-expf-div-profile;add=B(RN32(x+u));",
     "logical-work-L2=6/elements;Silu=4/elements;Add=1/elements;",
-    "no-global-scratch;shared=4*nextpow2(C);no-ATen-reduction-or-deployment-bitwise-claim"
+    "spatial>=32:one-thread-per-pixel;coalesced-spatial-lanes;12-named-FP32-carry-slots;same-adjacent-tree;",
+    "spatial<32:original-CTA-per-pixel;shared=4*nextpow2(C);otherwise-shared=0;",
+    "no-global-scratch;no-ATen-reduction-or-deployment-bitwise-claim"
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,15 +273,9 @@ impl SpatialProvider {
                     .arg(&s.tree_width)
                     .arg(&s.epsilon)
                     .arg(&s.scale);
-                unsafe {
-                    launch.launch(LaunchConfig {
-                        grid_dim: (s.positions.min(MAX_BLOCKS) as u32, 1, 1),
-                        block_dim: (THREADS, 1, 1),
-                        shared_mem_bytes: s.tree_width * 4,
-                    })
-                }
-                .map(|_| ())
-                .map_err(|e| CudaDeviceRuntimeError::driver("BF16 channel L2 normalization", e))
+                unsafe { launch.launch(s.channel_norm_launch()) }
+                    .map(|_| ())
+                    .map_err(|e| CudaDeviceRuntimeError::driver("BF16 channel L2 normalization", e))
             } else {
                 let function = if kind == SpatialKind::Silu {
                     kernels.function(Kind::Silu)
@@ -323,6 +319,29 @@ struct Shape {
     tree_width: u32,
     epsilon: f32,
     scale: f32,
+}
+impl Shape {
+    fn channel_norm_launch(&self) -> LaunchConfig {
+        let spatial_lanes = self.spatial >= 32;
+        LaunchConfig {
+            grid_dim: (
+                if spatial_lanes {
+                    self.positions.div_ceil(u64::from(THREADS))
+                } else {
+                    self.positions
+                }
+                .min(MAX_BLOCKS) as u32,
+                1,
+                1,
+            ),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: if spatial_lanes {
+                0
+            } else {
+                self.tree_width * 4
+            },
+        }
+    }
 }
 fn geometry(
     kind: SpatialKind,

@@ -182,3 +182,86 @@ fn pointwise_shapes_and_work_stay_nchw_and_reject_attributes() {
         120
     );
 }
+
+#[test]
+fn channel_norm_spatial_lanes_cover_batch_tail_and_keep_small_spatial_launch() {
+    for spatial in [1, 31, 32, 33, 131, u64::from(THREADS) * MAX_BLOCKS + 1] {
+        let dims = [2, 144, 1, spatial];
+        let s = geometry(
+            SpatialKind::ChannelL2Image,
+            &[
+                input("x", 0, &dims),
+                input("gamma", 1, &[144, 1, 1]),
+                output(&dims),
+            ],
+            &attributes(),
+        )
+        .unwrap();
+        let launch = s.channel_norm_launch();
+        assert_eq!(launch.block_dim, (THREADS, 1, 1));
+        if spatial < 32 {
+            assert_eq!(launch.grid_dim.0, (2 * spatial) as u32);
+            assert_eq!(launch.shared_mem_bytes, 256 * 4);
+        } else {
+            assert_eq!(launch.shared_mem_bytes, 0);
+            assert_eq!(
+                u64::from(launch.grid_dim.0),
+                (2 * spatial).div_ceil(u64::from(THREADS)).min(MAX_BLOCKS)
+            );
+            let stride = u64::from(launch.grid_dim.0) * u64::from(THREADS);
+            // Every pixel has one block/lane/iteration decomposition, including
+            // a partial final block and a capped grid's second iteration.
+            for p in [0, spatial - 1, spatial, 2 * spatial - 1] {
+                let first = p % stride;
+                let iteration = p / stride;
+                assert!(first / u64::from(THREADS) < u64::from(launch.grid_dim.0));
+                assert_eq!(first + iteration * stride, p);
+            }
+        }
+    }
+}
+
+#[test]
+fn channel_norm_carry_preserves_padded_adjacent_tree_not_sequential_sum() {
+    fn adjacent(values: &[f32]) -> f32 {
+        if values.len() == 1 {
+            values[0]
+        } else {
+            let half = values.len() / 2;
+            adjacent(&values[..half]) + adjacent(&values[half..])
+        }
+    }
+    fn carry(values: &[f32]) -> f32 {
+        let mut slots = [0.0_f32; 12];
+        let mut root = 0.0_f32;
+        for (i, &leaf) in values.iter().enumerate() {
+            root = leaf;
+            for (level, slot) in slots.iter_mut().enumerate() {
+                if i & (1 << level) == 0 {
+                    *slot = root;
+                    break;
+                }
+                root = *slot + root;
+            }
+        }
+        root
+    }
+    // These are exact BF16 input squares (4096^2 and 1^2). The old adjacent
+    // tree preserves the pair of unit squares that a sequential sum loses.
+    let rounding = [16_777_216.0_f32, 1.0, 1.0, 1.0];
+    assert_eq!(adjacent(&rounding), 16_777_218.0);
+    assert_eq!(rounding.into_iter().sum::<f32>(), 16_777_216.0);
+    for channels in [1_usize, 3, 4, 96, 144, 288, 4096] {
+        let mut leaves = vec![0.0_f32; channels.next_power_of_two()];
+        for (i, value) in leaves[..channels].iter_mut().enumerate() {
+            *value = rounding[i % rounding.len()];
+        }
+        assert_eq!(carry(&leaves).to_bits(), adjacent(&leaves).to_bits());
+        leaves.fill(0.0);
+        assert_eq!(carry(&leaves).to_bits(), 0);
+        leaves[channels - 1] = f32::INFINITY;
+        assert_eq!(carry(&leaves), f32::INFINITY);
+        leaves[0] = f32::NAN;
+        assert!(carry(&leaves).is_nan());
+    }
+}

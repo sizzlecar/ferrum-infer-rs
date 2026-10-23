@@ -9,6 +9,9 @@ use ferrum_kernels::backend::cuda::{
     CudaCudnnConfig,
 };
 
+#[path = "spatial_decoder/channel_norm.rs"]
+mod channel_norm;
+
 const PROFILE: &str = "fixture.cuda.spatial_decoder.bf16.v1";
 const WORKSPACE_BYTES: u64 = 1 << 20;
 const WIDE: &str = "value.decoder.wide_qkv";
@@ -37,6 +40,11 @@ enum Probe {
     OddChannels,
     AlternatingRows,
     Padding,
+    ChannelNorm {
+        channels: u64,
+        batch: u64,
+        width: u64,
+    },
 }
 fn spec(d: &[u64]) -> ProgramTensorSpec {
     ProgramTensorSpec {
@@ -47,6 +55,17 @@ fn spec(d: &[u64]) -> ProgramTensorSpec {
 }
 impl Probe {
     fn inputs(self) -> BTreeMap<ProgramValueId, ProgramTensorSpec> {
+        if let Self::ChannelNorm {
+            channels,
+            batch,
+            width,
+        } = self
+        {
+            return BTreeMap::from([
+                (id(NORM), spec(&[batch, channels, 1, width])),
+                (id(GAMMA), spec(&[channels, 1, 1])),
+            ]);
+        }
         let entries: Vec<(&str, &[u64])> = if matches!(self, Self::Padding) {
             vec![(X, &[1, 1, 2, 3]), (WEIGHT, &[1, 1, 3, 3]), (BIAS, &[1])]
         } else {
@@ -64,6 +83,14 @@ impl Probe {
             .collect()
     }
     fn outputs(self) -> Vec<(&'static str, ProgramTensorSpec)> {
+        if let Self::ChannelNorm {
+            channels,
+            batch,
+            width,
+        } = self
+        {
+            return vec![(NORM_OUT, spec(&[batch, channels, 1, width]))];
+        }
         if matches!(self, Self::Padding) {
             vec![
                 (IMPLICIT, spec(&[1, 1, 2, 3])),
@@ -79,6 +106,9 @@ impl Probe {
         }
     }
     fn operations(self) -> Vec<&'static str> {
+        if matches!(self, Self::ChannelNorm { .. }) {
+            return vec![CHANNEL_L2_NORM_IMAGE_BF16_OPERATION_ID];
+        }
         if matches!(self, Self::Padding) {
             vec![CONV2D_BF16_OPERATION_ID]
         } else {
@@ -106,6 +136,26 @@ impl Probe {
                 SemanticValue::Rational(CanonicalRational::new(1, 1).unwrap()),
             )])
         };
+        if matches!(self, Self::ChannelNorm { .. }) {
+            return vec![node(
+                "norm",
+                CHANNEL_L2_NORM_IMAGE_BF16_OPERATION_ID,
+                &[NORM, GAMMA],
+                NORM_OUT,
+                BTreeMap::from([
+                    (
+                        id("scale"),
+                        SemanticValue::Rational(CanonicalRational::new(3, 2).unwrap()),
+                    ),
+                    (
+                        id("epsilon"),
+                        SemanticValue::Rational(
+                            CanonicalRational::new(1, 1_000_000_000_000).unwrap(),
+                        ),
+                    ),
+                ]),
+            )];
+        }
         if matches!(self, Self::Padding) {
             return [
                 ("implicit", IMPLICIT, "implicit_zero"),
@@ -302,6 +352,14 @@ fn prepared(
     BTreeMap<&'static str, Vec<u16>>,
     BTreeMap<&'static str, Vec<u16>>,
 ) {
+    if let Probe::ChannelNorm {
+        channels,
+        batch,
+        width,
+    } = c
+    {
+        return channel_norm::prepared(channels as usize, batch as usize, width as usize);
+    }
     if matches!(c, Probe::Padding) {
         // Asymmetric kernel top-left=1, center=2, bottom-right=-1;
         // cross-correlation of [1,2,3;4,5,6] is [-3,-2,6;8,11,14].
@@ -385,6 +443,14 @@ fn check(bytes: &[u8], expected: &[u16]) {
             *expected,
             "element {i}"
         );
+    }
+}
+
+fn check_probe(c: Probe, bytes: &[u8], expected: &[u16]) {
+    if matches!(c, Probe::ChannelNorm { .. }) {
+        channel_norm::check(bytes, expected);
+    } else {
+        check(bytes, expected);
     }
 }
 
@@ -517,7 +583,8 @@ fn execute_probe(c: Probe, cudnn: Option<&CudaCudnnConfig>) {
     assert!(outputs.len() <= 4);
     for output in &outputs {
         assert!(host.owns(output.bytes()));
-        check(
+        check_probe(
+            c,
             output.bytes().bytes(),
             &expected[output.value_id().as_str()],
         );
@@ -532,6 +599,8 @@ fn execute_probe(c: Probe, cudnn: Option<&CudaCudnnConfig>) {
     assert_eq!(host.usage().unwrap().committed_bytes(), output_bytes);
     let name = if matches!(c, Probe::Padding) {
         IMPLICIT
+    } else if matches!(c, Probe::ChannelNorm { .. }) {
+        NORM_OUT
     } else {
         GATHER_OUT
     };
@@ -555,10 +624,25 @@ fn execute_probe(c: Probe, cudnn: Option<&CudaCudnnConfig>) {
     }
     drop(runtime.create_stream().unwrap());
     drop(runtime);
-    check(retained.bytes(), &expected[name]);
+    check_probe(c, retained.bytes(), &expected[name]);
     drop(retained);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     assert_eq!(host.usage().unwrap().allocated_bytes(), 0);
+}
+
+#[test]
+#[ignore = "requires exclusive CUDA; compares actual managed channel normalization with the original FP32 tree"]
+fn managed_cuda_channel_l2_norm_coalesced_tree_tail_and_ieee() {
+    for channels in [96, 144, 288, 4096] {
+        execute_probe(
+            Probe::ChannelNorm {
+                channels,
+                batch: 2,
+                width: if channels == 4096 { 33 } else { 131 },
+            },
+            None,
+        );
+    }
 }
 
 #[test]

@@ -738,12 +738,67 @@ extern "C" __global__ void ferrum_vnext_nchw_bias_bf16(
     }
 }
 
-// One CTA per N/H/W position, a padded adjacent-pair FP32 tree, no full-input
-// conversion or device scratch. shared[] has next_power_of_two(C) floats.
+// Spatial lanes read consecutive NCHW pixels. The carry at level j is the
+// completed left subtree of 2^j adjacent channel leaves. Inserting the next
+// square combines left + right with the same RN32 boundary as the old tree.
+// Named scalar slots avoid a dynamically indexed per-thread channel array.
+__device__ __forceinline__ void ferrum_channel_l2_spatial_lanes_bf16(
+    const uint16_t* input, const uint16_t* gamma, uint16_t* output,
+    uint64_t positions, uint64_t channels, uint64_t spatial,
+    uint32_t tree_width, float epsilon, float scale) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t step = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t p = first; p < positions; p += step) {
+        const uint64_t n = p / spatial;
+        const uint64_t pixel = p % spatial;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        float s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
+        float s8 = 0.0f, s9 = 0.0f, s10 = 0.0f, s11 = 0.0f;
+        float sum = 0.0f;
+        for (uint32_t c = 0; c < tree_width; ++c) {
+            const float x = c < channels
+                ? ferrum_bf16_decode(input[(n * channels + c) * spatial + pixel]) : 0.0f;
+            sum = __fmul_rn(x, x);
+            // A zero bit stores an unfinished left subtree. A one bit closes
+            // that pair, in its original operand order. At the final padded
+            // leaf all lower bits are one, so sum is the complete root.
+#define FERRUM_L2_CARRY(I) \
+            if ((c & (1U << I)) == 0) { s##I = sum; break; } \
+            sum = __fadd_rn(s##I, sum);
+            do {
+                FERRUM_L2_CARRY(0) FERRUM_L2_CARRY(1)
+                FERRUM_L2_CARRY(2) FERRUM_L2_CARRY(3)
+                FERRUM_L2_CARRY(4) FERRUM_L2_CARRY(5)
+                FERRUM_L2_CARRY(6) FERRUM_L2_CARRY(7)
+                FERRUM_L2_CARRY(8) FERRUM_L2_CARRY(9)
+                FERRUM_L2_CARRY(10) FERRUM_L2_CARRY(11)
+            } while (false);
+#undef FERRUM_L2_CARRY
+        }
+        const float norm = __fsqrt_rn(sum);
+        const float denominator = isnan(norm) ? norm : fmaxf(norm, epsilon);
+        for (uint64_t c = 0; c < channels; ++c) {
+            const uint64_t i = (n * channels + c) * spatial + pixel;
+            const float x = ferrum_bf16_decode(input[i]);
+            const uint16_t normalized = ferrum_bf16_rne(__fdiv_rn(x, denominator));
+            const uint16_t scaled = ferrum_bf16_rne(__fmul_rn(ferrum_bf16_decode(normalized), scale));
+            const uint16_t weighted = ferrum_bf16_rne(__fmul_rn(ferrum_bf16_decode(scaled), ferrum_bf16_decode(gamma[c])));
+            output[i] = ferrum_bf16_rne(__fadd_rn(ferrum_bf16_decode(weighted), 0.0f));
+        }
+    }
+}
+
+// Small spatial tensors retain the original CTA-per-pixel implementation.
+// Larger images use spatial lanes and need no shared payload or barriers.
 extern "C" __global__ void ferrum_vnext_channel_l2_norm_bf16(
     const uint16_t* input, const uint16_t* gamma, uint16_t* output,
     uint64_t positions, uint64_t channels, uint64_t spatial,
     uint32_t tree_width, float epsilon, float scale) {
+    if (spatial >= 32) {
+        ferrum_channel_l2_spatial_lanes_bf16(input, gamma, output, positions,
+            channels, spatial, tree_width, epsilon, scale);
+        return;
+    }
     extern __shared__ float reduction[];
     for (uint64_t p = blockIdx.x; p < positions; p += gridDim.x) {
         const uint64_t n = p / spatial;
