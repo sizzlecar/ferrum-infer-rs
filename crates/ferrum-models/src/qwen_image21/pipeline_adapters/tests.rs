@@ -545,3 +545,23 @@ fn writer_io_failure_is_reported_without_claiming_sink_rollback() {
     assert_eq!(bits(&data), [0; 4]);
     assert_eq!(host.usage().unwrap().allocated_bytes(), 8);
 }
+
+#[test]
+fn rgba_rejects_every_nonfinite_bf16_before_exposing_a_writer() {
+    let host = account(0, 8);
+    let tensor = rgba_spec(1, 1, 1);
+    for bits in u16::MIN..=u16::MAX {
+        if bf16::from_bits(bits).is_finite() {
+            continue;
+        }
+        // Put the invalid value last, after three valid channel values. A
+        // table entry must never make NaN or either infinity a valid pixel.
+        let data = backing(&host, HostMemoryClass::Output, &[0xbf80, 0, 0x3f80, bits]);
+        assert!(
+            QwenImage21RgbaOutput::new(&host, &tensor, &data).is_err(),
+            "nonfinite BF16 bits {bits:#06x}"
+        );
+        drop(data);
+        assert_eq!(host.usage().unwrap().allocated_bytes(), 0);
+    }
+}

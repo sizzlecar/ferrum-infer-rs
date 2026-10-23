@@ -23,6 +23,9 @@ use half::bf16;
 use serde_json::Value;
 use std::io::Write;
 
+mod rgba8;
+use rgba8::rgba8_finite;
+
 pub const QWEN_IMAGE21_LATENT_CHANNELS: usize = 64;
 pub const QWEN_IMAGE21_LATENT_DECODE_PROFILE: &str = "qwen_image21.latent.bf16.mul_b.add_b.v1";
 /// Fixed Omni source casts both statistics to BF16, subtracts, then divides;
@@ -514,15 +517,6 @@ fn validate_finite(bytes: &[u8]) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn rgba8_finite(value: bf16) -> u8 {
-    let clamped = value.to_f32().clamp(-1.0, 1.0);
-    let scaled = bf16::from_f32(clamped * 0.5);
-    let shifted = bf16::from_f32(scaled.to_f32() + 0.5)
-        .to_f32()
-        .clamp(0.0, 1.0);
-    (shifted * 255.0).round_ties_even() as u8
 }
 
 #[cfg(test)]
