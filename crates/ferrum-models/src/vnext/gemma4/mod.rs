@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use ferrum_quantization::{CompressedTensorsMarlinSafetensorsSource, SafetensorsArchive};
 use ferrum_runtime::{
-    ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId, ModelFamilyProvider,
-    ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata, NumericalExecutionProfile,
-    PreparedModelFamily, TypedFamilyRegistration, VNextError, WeightComponentSource, WeightSchema,
+    CausalLanguageMetadata, ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId,
+    ModelFamilyProvider, ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata,
+    ModelWeights, NumericalExecutionProfile, PreparedModelFamily, TypedFamilyRegistration,
+    VNextError, WeightComponentSource,
 };
 use ferrum_types::{DataType, ModelOutputProtocol};
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,7 @@ pub const NUMERICAL_PROFILE_ID: &str = "gemma4_unified.f16";
 #[serde(deny_unknown_fields)]
 pub struct Gemma4FamilyConfig {
     semantic: Gemma4SemanticConfig,
-    metadata: ModelSemanticMetadata,
+    metadata: CausalLanguageMetadata,
     weights: Gemma4WeightManifest,
 }
 
@@ -119,8 +120,11 @@ impl ModelFamilyProvider for Gemma4FamilyProvider {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        config.weights.weight_schema(&config.semantic)
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        config
+            .weights
+            .weight_schema(&config.semantic)
+            .map(ModelWeights::Stored)
     }
 
     fn numerical_profiles(
@@ -143,7 +147,7 @@ impl ModelFamilyProvider for Gemma4FamilyProvider {
         &self,
         config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(config.metadata.clone())
+        Ok(config.metadata.clone().into())
     }
 }
 

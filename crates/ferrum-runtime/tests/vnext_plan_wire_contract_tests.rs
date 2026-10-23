@@ -150,16 +150,16 @@ fn execution_weight_materializer_and_schema_cannot_authorize_themselves_from_wir
         let mut value = serde_json::to_value(&fixture.plan).unwrap();
         match mutation {
             "materializer" => {
-                value["payload"]["execution_weights"]["materializer_id"] =
+                value["payload"]["execution_weights"]["plan"]["materializer_id"] =
                     json!("weight-materializer.forged");
             }
             "schema" => {
-                value["payload"]["execution_weights"]["schema"]["layout_id"] =
+                value["payload"]["execution_weights"]["plan"]["schema"]["layout_id"] =
                     json!("weight-layout.forged");
             }
             "component_sources" => {
-                value["payload"]["execution_weights"]["component_sources"]["weight.component"] =
-                    json!(["weight.component.forged"]);
+                value["payload"]["execution_weights"]["plan"]["component_sources"]
+                    ["weight.component"] = json!(["weight.component.forged"]);
             }
             _ => unreachable!(),
         }

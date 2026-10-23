@@ -545,12 +545,23 @@ mod tests {
     use std::fs;
 
     fn fixture(windows: bool, source: &[u8]) -> Snapshot {
-        // Exercise the actual reviewed workflow, without pinning a commit or
-        // inventing success logs. The source inventory itself is deliberately small.
+        // Model the reviewed immutable SM89 artifact route explicitly. Reuse
+        // its actual commands and Windows bridge, but do not silently pull new
+        // source-building Linux jobs into this positive compatibility fixture.
+        // The complete current workflow is checked separately below and must
+        // retain kernel scope when it consumes native source inputs.
         let mut workflow = yaml(include_str!(
             "../../../../.github/workflows/release-cuda.yml"
         ))
         .unwrap();
+        workflow["jobs"]
+            .as_object_mut()
+            .unwrap()
+            .retain(|name, _| matches!(name.as_str(), LINUX | WINDOWS));
+        workflow["on"]["workflow_call"]["outputs"]
+            .as_object_mut()
+            .unwrap()
+            .retain(|name, _| matches!(name.as_str(), "cuda_asset_id" | "windows_asset_id"));
         if !windows {
             workflow["jobs"].as_object_mut().unwrap().remove(WINDOWS);
             for trigger in ["workflow_call", "workflow_dispatch"] {
@@ -715,6 +726,35 @@ mod tests {
             refine(repo.path(), &base, &candidate, &mut impact)["applied"],
             false
         );
+        assert_eq!(impact, original);
+    }
+
+    #[test]
+    fn current_linux_source_build_consumer_retains_kernel_scope() {
+        let repo = tempfile::tempdir().unwrap();
+        super::super::git(repo.path(), &["init", "--quiet"]).unwrap();
+        let mut before = fixture(true, b"old native device arithmetic");
+        let mut after = fixture(true, b"different native device arithmetic");
+        for snapshot in [&mut before, &mut after] {
+            snapshot.files.insert(
+                WORKFLOW.into(),
+                include_str!("../../../../.github/workflows/release-cuda.yml").into(),
+            );
+            snapshot.consumers.insert(WORKFLOW.into());
+        }
+        // Both revisions have the same release topology and immutable SM89
+        // recipe. The additional Linux source consumer itself prevents a
+        // Windows-only refinement; this must not pass merely by comparing the
+        // already-reviewed SM89 job or by ignoring another Linux producer.
+        recipes(&before, &after).unwrap();
+        assert!(consumers(&before, &after).is_err());
+        let base = commit(repo.path(), &before);
+        let candidate = commit(repo.path(), &after);
+        let original = analyze_paths([BUNDLE, NATIVE, BUILDER]);
+        assert!(original.areas.contains(&ChangeArea::Kernel));
+        let mut impact = original.clone();
+        let result = refine(repo.path(), &base, &candidate, &mut impact);
+        assert_eq!(result["applied"], false, "{result}");
         assert_eq!(impact, original);
     }
 

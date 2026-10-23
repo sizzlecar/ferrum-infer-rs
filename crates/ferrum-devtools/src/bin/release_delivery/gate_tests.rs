@@ -493,6 +493,8 @@ fn cuda_asset_identity_binds_architecture_toolkit_and_feature_set() {
          "nvidia/cuda:12.4.0-devel-ubuntu22.04", vec!["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"]),
         (CudaVariant::Sm120, "ferrum-linux-x86_64-cuda-sm120.tar.gz", "120",
          "nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66", vec!["cuda", "cuda-production"]),
+        (CudaVariant::Sm120, "ferrum-linux-x86_64-cuda-sm120.tar.gz", "120",
+         "nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66", vec!["cuda", "cuda-production", "cuda-cutlass-fp8"]),
     ] {
         let mut abi = AbiInput {
             backend: staging::Backend::Cuda,
@@ -502,6 +504,14 @@ fn cuda_asset_identity_binds_architecture_toolkit_and_feature_set() {
             cuda_toolkit_image: Some(image.into()),
         };
         assert_eq!(CudaVariant::from_abi(name, &abi).unwrap(), Some(variant));
+        abi.cargo_features.reverse();
+        assert_eq!(CudaVariant::from_abi(name, &abi).unwrap(), Some(variant));
+        abi.cargo_features.push("unknown-cuda-feature".into());
+        assert!(CudaVariant::from_abi(name, &abi).is_err());
+        abi.cargo_features.pop();
+        abi.cargo_features.push(abi.cargo_features[0].clone());
+        assert!(CudaVariant::from_abi(name, &abi).is_err());
+        abi.cargo_features.pop();
         abi.cuda_compute_capability = Some("80".into());
         assert!(CudaVariant::from_abi(name, &abi).is_err());
         abi.cuda_compute_capability = Some(capability.into());
@@ -510,6 +520,14 @@ fn cuda_asset_identity_binds_architecture_toolkit_and_feature_set() {
         abi.cuda_toolkit_image = Some(image.into());
         abi.cargo_features = vec!["cuda".into()];
         assert!(CudaVariant::from_abi(name, &abi).is_err());
+        // A benchmark-only FP8 build is not a full production distribution.
+        abi.cargo_features = vec!["cuda".into(), "cuda-cutlass-fp8".into()];
+        assert!(CudaVariant::from_abi(name, &abi).is_err());
+        if variant == CudaVariant::Sm89 {
+            abi.cargo_features = features.iter().map(|feature| (*feature).into()).collect();
+            abi.cargo_features.push("cuda-cutlass-fp8".into());
+            assert!(CudaVariant::from_abi(name, &abi).is_err());
+        }
         abi.cargo_features = features.into_iter().map(str::to_owned).collect();
         abi.target_triple = "x86_64-pc-windows-msvc".into();
         assert!(CudaVariant::from_abi(name, &abi).is_err());

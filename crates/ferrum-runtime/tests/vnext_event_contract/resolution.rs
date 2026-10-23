@@ -46,7 +46,7 @@ pub(crate) fn plan_resolutions_with_mode(
                 BufferUsage::Weights,
                 Some(
                     ResolvedWeightBinding::from_schema(
-                        family.weight_schema(),
+                        family.stored_weight_schema().unwrap(),
                         &id("weight.matrix"),
                     )
                     .unwrap(),
@@ -183,18 +183,35 @@ pub(crate) fn resolution_value(inputs: &ResolvedModelPlanInputs, field: Resoluti
             serde_json::to_value(inputs.prepared_family.family_id()).unwrap()
         }
         ResolutionField::WeightSchema => {
-            serde_json::to_value(inputs.prepared_family.weight_schema()).unwrap()
+            serde_json::to_value(inputs.prepared_family.stored_weight_schema().unwrap()).unwrap()
         }
-        ResolutionField::WeightFormat => {
-            serde_json::to_value(&inputs.prepared_family.weight_schema().format_id).unwrap()
-        }
+        ResolutionField::WeightFormat => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .stored_weight_schema()
+                .unwrap()
+                .format_id,
+        )
+        .unwrap(),
         ResolutionField::Tokenizer => serde_json::to_value(&inputs.tokenizer).unwrap(),
-        ResolutionField::Template => {
-            serde_json::to_value(&inputs.prepared_family.metadata().template).unwrap()
-        }
-        ResolutionField::SpecialTokens => {
-            serde_json::to_value(&inputs.prepared_family.metadata().special_tokens).unwrap()
-        }
+        ResolutionField::Template => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .template,
+        )
+        .unwrap(),
+        ResolutionField::SpecialTokens => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .special_tokens,
+        )
+        .unwrap(),
         ResolutionField::Device => serde_json::to_value(&inputs.device).unwrap(),
         ResolutionField::Capabilities => serde_json::to_value(&inputs.capabilities).unwrap(),
         ResolutionField::RuntimePreset => json!({

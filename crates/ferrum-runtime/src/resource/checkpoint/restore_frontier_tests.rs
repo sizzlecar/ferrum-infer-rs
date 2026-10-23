@@ -84,14 +84,14 @@ fn imported_step_rejects_changed_wave_and_individual_work_before_submission() {
     else {
         panic!("unchanged work must retain its admitted evidence")
     };
-    let original = step.work_shape().participant_work()[0]
+    let original = step.work_shape().participant_work().unwrap()[0]
         .token_span()
         .checkpoint_tokens()
         .unwrap();
     for node in wave.nodes() {
         assert!(Arc::ptr_eq(
             original,
-            node.work_shape().participant_work()[0]
+            node.work_shape().participant_work().unwrap()[0]
                 .token_span()
                 .checkpoint_tokens()
                 .unwrap()
@@ -213,11 +213,11 @@ fn imported_individual_completion_without_full_plan_cannot_clear_the_contract() 
         panic!("unchanged individual work must be admitted")
     };
     assert!(Arc::ptr_eq(
-        step.work_shape().participant_work()[0]
+        step.work_shape().participant_work().unwrap()[0]
             .token_span()
             .checkpoint_tokens()
             .unwrap(),
-        invocation.work_shape().participant_work()[0]
+        invocation.work_shape().participant_work().unwrap()[0]
             .token_span()
             .checkpoint_tokens()
             .unwrap(),

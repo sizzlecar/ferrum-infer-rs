@@ -1,0 +1,14 @@
+[package]
+name = "ferrum-diffusion"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Diffusion schedules and numerical contracts for Ferrum"
+readme = "../../README.md"
+
+[dependencies]
+ferrum-runtime = { workspace = true }
+half = { workspace = true }
+thiserror = { workspace = true }

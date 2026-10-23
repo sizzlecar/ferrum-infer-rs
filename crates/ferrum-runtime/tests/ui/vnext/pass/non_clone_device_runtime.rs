@@ -25,8 +25,10 @@ impl RuntimePolicy for Policy {
         4
     }
 
-    fn maximum_scheduled_tokens(&self) -> u64 {
-        4
+    fn work_limits(&self) -> ferrum_runtime::RuntimeWorkLimits {
+        ferrum_runtime::RuntimeWorkLimits::Tokens {
+            maximum_scheduled_tokens: 4,
+        }
     }
 
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
@@ -133,18 +135,14 @@ impl DeviceRuntime for Runtime {
     }
 
     fn query_fence(&self, _fence: &Fence) -> FenceQuery<io::Error> {
-        FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(
-            DeviceTerminal::Succeeded,
-        ))
+        FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
     }
 
     fn wait_fence(
         &self,
         _fence: &Fence,
     ) -> Result<DeviceTerminalReceipt<io::Error>, FenceIndeterminate<io::Error>> {
-        Ok(DeviceTerminalReceipt::unprofiled(
-            DeviceTerminal::Succeeded,
-        ))
+        Ok(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
     }
 
     fn synchronize(&self, _stream: &mut Stream) -> Result<(), io::Error> {

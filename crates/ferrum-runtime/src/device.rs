@@ -17,10 +17,12 @@ pub use immutable_metadata::{
 mod program_binding_upload;
 pub use program_binding_upload::DeviceProgramBindingUploadSnapshot;
 mod resident_program;
+mod tensor_state_copy;
 mod terminal_readback;
 pub use resident_program::{
     DeviceEncodedResidentDecode, DeviceResidentDecodeRefresh, DeviceResidentDecodeRequest,
 };
+pub use tensor_state_copy::DeviceTensorStateCopy;
 pub use terminal_readback::{
     DevicePreparedTerminalReadback, DeviceScalarU32ReadbackBatch, DeviceScalarU32ReadbackSource,
 };
@@ -800,6 +802,28 @@ impl DeviceBatchingForm {
     }
 }
 
+/// Logical work domains are explicit; tensor elements are never token counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeviceLogicalWork {
+    Tokens {
+        token_count: u64,
+    },
+    Tensor {
+        element_count: u64,
+        arithmetic_operations: u64,
+    },
+}
+
+impl DeviceLogicalWork {
+    pub const fn token_count(self) -> Option<u64> {
+        match self {
+            Self::Tokens { token_count } => Some(token_count),
+            Self::Tensor { .. } => None,
+        }
+    }
+}
+
 /// Core-owned logical work bound to a node-scoped device command.
 ///
 /// Providers describe their own command work directly. Core-created commands,
@@ -811,7 +835,7 @@ pub struct DeviceCommandLogicalWork {
     batching_form: DeviceBatchingForm,
     participant_start: u32,
     participant_count: u32,
-    token_count: u64,
+    work: DeviceLogicalWork,
 }
 
 impl DeviceCommandLogicalWork {
@@ -839,7 +863,7 @@ impl DeviceCommandLogicalWork {
             batching_form,
             participant_start,
             participant_count,
-            token_count,
+            work: DeviceLogicalWork::Tokens { token_count },
         })
     }
 
@@ -859,8 +883,34 @@ impl DeviceCommandLogicalWork {
         self.participant_start + self.participant_count
     }
 
-    pub const fn token_count(self) -> u64 {
-        self.token_count
+    pub const fn token_count(self) -> Option<u64> {
+        self.work.token_count()
+    }
+
+    pub const fn work(self) -> DeviceLogicalWork {
+        self.work
+    }
+
+    /// Counts are derived from validated tensor dimensions by core/provider;
+    /// they are observations, never allocation authority.
+    pub fn tensor(
+        element_count: u64,
+        arithmetic_operations: u64,
+    ) -> Result<Self, super::VNextError> {
+        if element_count == 0 {
+            return Err(super::VNextError::InvalidExecutionPlan {
+                reason: "tensor logical work is empty".to_owned(),
+            });
+        }
+        Ok(Self {
+            batching_form: DeviceBatchingForm::Scalar,
+            participant_start: 0,
+            participant_count: 1,
+            work: DeviceLogicalWork::Tensor {
+                element_count,
+                arithmetic_operations,
+            },
+        })
     }
 }
 
@@ -2634,7 +2684,7 @@ pub struct DeviceNativeWorkAttribution {
     batching_form: DeviceBatchingForm,
     participant_start: u32,
     participant_count: u32,
-    token_count: u64,
+    work: DeviceLogicalWork,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
     dependency_wait_count: u64,
@@ -2753,7 +2803,7 @@ impl DeviceNativeWorkAttribution {
             batching_form,
             participant_start,
             participant_count,
-            token_count,
+            work: DeviceLogicalWork::Tokens { token_count },
             compute_dispatch_count,
             transfer_command_count,
             dependency_wait_count,
@@ -2797,8 +2847,46 @@ impl DeviceNativeWorkAttribution {
         self.participant_start + self.participant_count
     }
 
-    pub const fn token_count(&self) -> u64 {
-        self.token_count
+    pub const fn token_count(&self) -> Option<u64> {
+        self.work.token_count()
+    }
+
+    pub const fn logical_work(&self) -> DeviceLogicalWork {
+        self.work
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_logical_work(
+        command_index: u32,
+        node_index: Option<u32>,
+        command_phase: DeviceCommandPhase,
+        native_op_id: DeviceNativeOperationId,
+        execution_path: DeviceExecutionPath,
+        logical: DeviceCommandLogicalWork,
+        compute_dispatch_count: u64,
+        transfer_command_count: u64,
+    ) -> Option<Self> {
+        if compute_dispatch_count == 0 && transfer_command_count == 0 {
+            return None;
+        }
+        if node_index.is_none() && logical.participant_start() != 0 {
+            return None;
+        }
+        Some(Self {
+            command_index,
+            node_index,
+            command_phase,
+            native_op_id,
+            execution_path,
+            batching_form: logical.batching_form(),
+            participant_start: logical.participant_start(),
+            participant_count: logical.participant_count(),
+            work: logical.work(),
+            compute_dispatch_count,
+            transfer_command_count,
+            dependency_wait_count: 0,
+            reusable_graph_node_count: None,
+        })
     }
 
     pub const fn compute_dispatch_count(&self) -> u64 {
@@ -3031,7 +3119,7 @@ impl DeviceSubmissionAttribution {
                 || physical.node_index() != Some(segment.segment().start_node_index())
                 || physical.participant_start() != 0
                 || physical.participant_count() != segment.program_id().immediate_sequences()
-                || physical.token_count() != segment.program_id().immediate_tokens()
+                || physical.token_count() != Some(segment.program_id().immediate_tokens())
                 || segment
                     .logical_commands()
                     .iter()
@@ -3926,6 +4014,16 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         region: CopyRegion,
     ) -> Result<Self::Command, Self::Error>;
 
+    /// Encodes an admitted fixed Request-state initialization in the producer
+    /// wave's ResultBinding phase. The core retains both owners through that
+    /// wave; eager backends may additionally retain them in their typed command.
+    fn encode_tensor_state_copy(
+        &self,
+        request: DeviceTensorStateCopy<'_, Self::Buffer>,
+    ) -> Result<Self::Command, Self::Error> {
+        self.encode_copy(request.source(), request.destination(), request.region())
+    }
+
     fn encode_upload(
         &self,
         source: &[u8],
@@ -3933,6 +4031,24 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         destination: &Self::Buffer,
         destination_offset_bytes: u64,
     ) -> Result<Self::Command, Self::Error>;
+
+    /// Whether this backend implements both owner-retaining managed uploads
+    /// and synchronous managed readback without unaccounted staging copies.
+    fn supports_managed_tensor_io(&self) -> bool {
+        false
+    }
+
+    /// Retains the immutable, accounted backing through the completion fence.
+    /// `None` declines before submission; no unaccounted staging copy is allowed.
+    fn encode_managed_upload(
+        &self,
+        _source: crate::ManagedHostBytes,
+        _source_layout: HostTransferLayout,
+        _destination: &Self::Buffer,
+        _destination_offset_bytes: u64,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        Ok(None)
+    }
 
     fn encode_zero(
         &self,
@@ -4031,6 +4147,24 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         region: CopyRegion,
         output_layout: HostTransferLayout,
     ) -> Result<Vec<u8>, Self::Error>;
+
+    /// Synchronous readback into accounted caller-owned storage. Every return,
+    /// including errors and unwind, must leave no backend access to destination.
+    /// Async DMA implementations must decline until they can satisfy that
+    /// contract; they must never retain a borrowed destination past this call.
+    /// `output_layout` describes this region's piece, not the entire destination.
+    /// `region.destination_offset_bytes` selects its position in that allocation.
+    /// `false` declines without enqueuing or modifying the destination.
+    fn readback_managed_into(
+        &self,
+        _stream: &mut Self::Stream,
+        _source: &Self::Buffer,
+        _region: CopyRegion,
+        _output_layout: HostTransferLayout,
+        _destination: &mut crate::ManagedHostBuffer,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
 
     /// Prepare without enqueuing anything. None declines the entire packet
     /// before submission and preserves ordinary readback. A supporting runtime

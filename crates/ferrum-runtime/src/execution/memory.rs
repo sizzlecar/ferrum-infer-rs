@@ -3,15 +3,18 @@ use super::{
     invalid_plan, minimum_for_lifetime, node_completion_precedes, quantize_storage_bytes,
     static_contiguous_storage_profile, validate_active_sequence_ceiling,
     validate_pool_liveness_rows, workspace_storage_layout_fingerprint, AllocationKind,
-    AllocationLifetime, BTreeMap, BTreeSet, BufferRequest, BufferUsage, CanonicalU128, Deserialize,
-    Deserializer, DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDemand,
-    DynamicResourceDescriptor, DynamicResourceShape, ElementType, InvocationLivenessMode,
-    InvocationResourceLiveness, NodeId, PlanNode, PoolAggregateEvidence, PoolCompatibilityKey,
-    ResolvedReusableExecutionBucket, ResourceAllocation, ResourceId, ReusableExecutionMemoryPlan,
-    ReusableExecutionPolicy, ReusablePoolWorkspaceBudget, Serialize, StepResourceSlot,
-    StepResourceSlotKind, VNextError, MAX_EXECUTION_PLAN_RESOURCE_ROWS,
+    AllocationLifetime, BTreeMap, BTreeSet, BufferRequest, BufferUsage, CanonicalU128,
+    CompletionOrderCache, Deserialize, Deserializer, DynamicBackingPoolId, DynamicBackingPoolSpec,
+    DynamicResourceDemand, DynamicResourceDescriptor, DynamicResourceShape, ElementType,
+    InvocationLivenessMode, InvocationResourceLiveness, NodeId, NodeWorkContract, PlanNode,
+    PoolAggregateEvidence, PoolCompatibilityKey, ProviderWorkspaceReusePolicy,
+    ProviderWorkspaceScope, ResolvedReusableExecutionBucket, ResolvedValueRole, ResourceAllocation,
+    ResourceId, ReusableExecutionMemoryPlan, ReusableExecutionPolicy, ReusablePoolWorkspaceBudget,
+    Serialize, StepResourceSlot, StepResourceSlotKind, VNextError,
+    MAX_EXECUTION_PLAN_RESOURCE_ROWS,
 };
 
+mod legacy_invocation;
 mod startup;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -695,29 +698,46 @@ impl MemoryPlan {
                         .ok_or_else(|| invalid_plan("reusable invocation row budget overflows u64"))
                 })
         };
-        match pool.invocation_liveness_mode {
-            InvocationLivenessMode::NoInvocationResources => Ok(0),
-            InvocationLivenessMode::TotalOrderReuse => pool
-                .invocation_liveness
-                .iter()
-                .try_fold(0_u64, |maximum, row| {
-                    Ok::<u64, VNextError>(maximum.max(row_bytes(row)?))
-                }),
-            InvocationLivenessMode::ConservativeConcurrent => pool
-                .invocation_liveness
-                .iter()
-                .try_fold(0_u64, |total, row| {
-                    total.checked_add(row_bytes(row)?).ok_or_else(|| {
-                        invalid_plan("reusable concurrent invocation budget overflows u64")
-                    })
-                }),
-        }
+        Ok(pool
+            .invocation_liveness_mode
+            .layout(
+                &pool
+                    .invocation_liveness
+                    .iter()
+                    .map(|row| row.chain_slot)
+                    .collect::<Vec<_>>(),
+                &pool
+                    .invocation_liveness
+                    .iter()
+                    .map(row_bytes)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?
+            .bytes)
     }
 
     pub(super) fn derive_pool_step_slots(
         nodes: &[PlanNode],
         descriptors: &[&DynamicResourceDescriptor],
         retained_completion_resources: &BTreeSet<ResourceId>,
+    ) -> Result<Vec<StepResourceSlot>, VNextError> {
+        let nodes_by_id = nodes
+            .iter()
+            .map(|node| (node.id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
+        let mut completion_order = CompletionOrderCache::new(&nodes_by_id);
+        Self::derive_pool_step_slots_with_order(
+            nodes,
+            descriptors,
+            retained_completion_resources,
+            |predecessor, successor| completion_order.precedes(predecessor, successor),
+        )
+    }
+
+    pub(super) fn derive_pool_step_slots_with_order(
+        nodes: &[PlanNode],
+        descriptors: &[&DynamicResourceDescriptor],
+        retained_completion_resources: &BTreeSet<ResourceId>,
+        mut precedes: impl FnMut(&NodeId, &NodeId) -> Result<bool, VNextError>,
     ) -> Result<Vec<StepResourceSlot>, VNextError> {
         struct Interval<'a> {
             resource_id: &'a ResourceId,
@@ -726,10 +746,34 @@ impl MemoryPlan {
             reusable: bool,
         }
 
-        let nodes_by_id = nodes
+        // Fixed tensor inputs are uploaded before the whole submission wave,
+        // even when their first consumer is much later. Only node-produced
+        // values may therefore use the first/last-user liveness intervals.
+        // Semantic plan validation guarantees SSA producer-before-consumer
+        // bindings. Exclude an entire physical resource if any binding on it
+        // is externally supplied, including aliases with an internal output.
+        let produced_values = nodes
             .iter()
-            .map(|node| (node.id.clone(), node))
-            .collect::<BTreeMap<_, _>>();
+            .flat_map(|node| &node.values)
+            .filter(|value| value.role() == ResolvedValueRole::Output)
+            .map(|value| value.value_id())
+            .collect::<BTreeSet<_>>();
+        let external_resources = nodes
+            .iter()
+            .flat_map(|node| &node.values)
+            .filter(|value| !produced_values.contains(value.value_id()))
+            .flat_map(|value| value.storage().components())
+            .map(|component| component.resource_id())
+            .collect::<BTreeSet<_>>();
+        let internal_fixed_resources = nodes
+            .iter()
+            .filter(|node| matches!(node.work, NodeWorkContract::Fixed))
+            .flat_map(|node| &node.values)
+            .filter(|value| value.role() == ResolvedValueRole::Output)
+            .flat_map(|value| value.storage().components())
+            .map(|component| component.resource_id())
+            .filter(|resource| !external_resources.contains(resource))
+            .collect::<BTreeSet<_>>();
         let mut intervals = descriptors
             .iter()
             .filter(|descriptor| descriptor.lifetime == AllocationLifetime::Step)
@@ -762,6 +806,8 @@ impl MemoryPlan {
                     // Completion diagnostics read after the terminal fence, so
                     // a retained activation cannot share a liveness slot.
                     reusable: Self::is_reusable_step_activation(descriptor)
+                        && (!matches!(descriptor.demand, DynamicResourceDemand::Fixed { .. })
+                            || internal_fixed_resources.contains(&descriptor.base_resource_id))
                         && !retained_completion_resources.contains(&descriptor.base_resource_id),
                 })
             })
@@ -774,19 +820,11 @@ impl MemoryPlan {
             ))
         });
 
-        let ordered_without_overlap = |left: &Interval<'_>, right: &Interval<'_>| {
+        let mut ordered_without_overlap = |left: &Interval<'_>, right: &Interval<'_>| {
             let left_before = left.last_user < right.first_user
-                && node_completion_precedes(
-                    &nodes_by_id,
-                    &nodes[left.last_user].id,
-                    &nodes[right.first_user].id,
-                )?;
+                && precedes(&nodes[left.last_user].id, &nodes[right.first_user].id)?;
             let right_before = right.last_user < left.first_user
-                && node_completion_precedes(
-                    &nodes_by_id,
-                    &nodes[right.last_user].id,
-                    &nodes[left.first_user].id,
-                )?;
+                && precedes(&nodes[right.last_user].id, &nodes[left.first_user].id)?;
             Ok::<bool, VNextError>(left_before || right_before)
         };
 
@@ -845,7 +883,10 @@ impl MemoryPlan {
         descriptor.lifetime == AllocationLifetime::Step
             && descriptor.usage == BufferUsage::Activations
             && matches!(descriptor.kind, AllocationKind::Value)
-            && matches!(descriptor.demand, DynamicResourceDemand::Tokens { .. })
+            && matches!(
+                descriptor.demand,
+                DynamicResourceDemand::Tokens { .. } | DynamicResourceDemand::Fixed { .. }
+            )
     }
 
     fn step_slot_bytes(
@@ -896,7 +937,7 @@ impl MemoryPlan {
             .map(|descriptor| (descriptor.base_resource_id.clone(), *descriptor))
             .collect::<BTreeMap<_, _>>();
         let mut covered = BTreeSet::new();
-        let liveness_in_execution_order = nodes
+        let mut liveness_in_execution_order = nodes
             .iter()
             .filter_map(|node| {
                 let resource_ids = node
@@ -909,6 +950,7 @@ impl MemoryPlan {
                 (!resource_ids.is_empty()).then(|| InvocationResourceLiveness {
                     node_id: node.id.clone(),
                     resource_ids,
+                    chain_slot: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -954,32 +996,81 @@ impl MemoryPlan {
                         .ok_or_else(|| invalid_plan("pool invocation row bytes overflow u64"))
                 })
         };
-        let invocation_peak = if total_ordered {
-            liveness_in_execution_order
-                .iter()
-                .try_fold(0_u64, |peak, row| {
-                    Ok::<u64, VNextError>(peak.max(row_bytes(row)?))
-                })?
+        let mut mode = if total_ordered {
+            InvocationLivenessMode::TotalOrderReuse
         } else {
-            liveness_in_execution_order
-                .iter()
-                .try_fold(0_u64, |total, row| {
-                    total.checked_add(row_bytes(row)?).ok_or_else(|| {
-                        invalid_plan("pool concurrent invocation bytes overflow u64")
-                    })
-                })?
+            InvocationLivenessMode::ConservativeConcurrent
         };
+        // New chain reuse requires the provider's explicit overwrite contract.
+        // A zero-before-use workspace cannot share a slot without evidence
+        // that core clears it again between individual invocation commands.
+        // Keep the pre-existing total-order and conservative layouts unchanged.
+        let chain_reusable = liveness_in_execution_order.iter().all(|row| {
+            let node = nodes_by_id[&row.node_id];
+            row.resource_ids.len() == 1
+                && node.scratch_resource.as_ref() == row.resource_ids.first()
+                && node
+                    .provider_resources
+                    .scratch
+                    .as_ref()
+                    .is_some_and(|scratch| {
+                        scratch.scope == ProviderWorkspaceScope::Invocation
+                            && scratch.reuse_policy
+                                == ProviderWorkspaceReusePolicy::OverwriteBeforeRead
+                    })
+                && row.resource_ids.iter().all(|resource_id| {
+                    matches!(&descriptor_by_id[resource_id].kind,
+                        AllocationKind::Scratch { node_id } if node_id == &row.node_id)
+                })
+        });
+        if !contains_binding && !total_ordered && chain_reusable {
+            // A fork only prevents sharing between its siblings. It does not
+            // keep every earlier layer's scratch live until the terminal fence.
+            // Transitivity makes checking a chain's last member sufficient.
+            let mut order = CompletionOrderCache::new(&nodes_by_id);
+            let mut tails = Vec::<NodeId>::new();
+            let mut slots = Vec::with_capacity(liveness_in_execution_order.len());
+            for row in &liveness_in_execution_order {
+                let mut selected = None;
+                for (slot, tail) in tails.iter().enumerate() {
+                    if order.precedes(tail, &row.node_id)? {
+                        selected = Some(slot);
+                        break;
+                    }
+                }
+                let slot = selected.unwrap_or(tails.len());
+                if slot == tails.len() {
+                    tails.push(row.node_id.clone());
+                } else {
+                    tails[slot] = row.node_id.clone();
+                }
+                slots.push(
+                    u32::try_from(slot)
+                        .map_err(|_| invalid_plan("invocation chain count exceeds u32"))?,
+                );
+            }
+            if tails.len() < liveness_in_execution_order.len() {
+                mode = InvocationLivenessMode::DependencyChainReuse;
+                for (row, slot) in liveness_in_execution_order.iter_mut().zip(slots) {
+                    row.chain_slot = Some(slot);
+                }
+            }
+        }
+        let invocation_peak = mode
+            .layout(
+                &liveness_in_execution_order
+                    .iter()
+                    .map(|row| row.chain_slot)
+                    .collect::<Vec<_>>(),
+                &liveness_in_execution_order
+                    .iter()
+                    .map(row_bytes)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?
+            .bytes;
         let mut invocation_liveness = liveness_in_execution_order;
         invocation_liveness.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-        Ok((
-            if total_ordered {
-                InvocationLivenessMode::TotalOrderReuse
-            } else {
-                InvocationLivenessMode::ConservativeConcurrent
-            },
-            invocation_liveness,
-            invocation_peak,
-        ))
+        Ok((mode, invocation_liveness, invocation_peak))
     }
 
     pub(super) fn validate_dynamic_pools_structure(
@@ -1162,7 +1253,8 @@ impl MemoryPlan {
             match pool.invocation_liveness_mode {
                 InvocationLivenessMode::NoInvocationResources => {}
                 InvocationLivenessMode::TotalOrderReuse => has_invocation = true,
-                InvocationLivenessMode::ConservativeConcurrent => {
+                InvocationLivenessMode::ConservativeConcurrent
+                | InvocationLivenessMode::DependencyChainReuse => {
                     has_invocation = true;
                     all_total_ordered = false;
                 }
@@ -1179,6 +1271,9 @@ impl MemoryPlan {
             .map(|(node_id, resource_ids)| InvocationResourceLiveness {
                 node_id,
                 resource_ids: resource_ids.into_iter().collect(),
+                // Slots are pool-local. This aggregate is descriptive only;
+                // capacity and physical projections use each pool's evidence.
+                chain_slot: None,
             })
             .collect::<Vec<_>>();
         let reference_count = liveness.iter().try_fold(0_usize, |total, row| {
@@ -1199,6 +1294,63 @@ impl MemoryPlan {
             },
             liveness,
         ))
+    }
+
+    /// Older plans deliberately reserved every invocation row separately. That
+    /// remains safe even when the current planner can prove a tighter layout.
+    /// Preserve that declared layout during rehydration; never rewrite its
+    /// hash, admission bytes or runtime offsets into the new optimization.
+    pub(super) fn preserve_legacy_invocation_layouts(
+        expected: &mut [DynamicBackingPoolSpec],
+        declared: &[DynamicBackingPoolSpec],
+        descriptors: &[DynamicResourceDescriptor],
+        dynamic_capacity_bytes: u64,
+    ) -> Result<(), VNextError> {
+        let descriptors = descriptors
+            .iter()
+            .map(|d| (d.base_resource_id.clone(), d))
+            .collect::<BTreeMap<_, _>>();
+        for pool in expected {
+            if pool.invocation_liveness_mode != InvocationLivenessMode::DependencyChainReuse
+                || !declared.iter().any(|actual| {
+                    actual.pool_id == pool.pool_id
+                        && actual.invocation_liveness_mode
+                            == InvocationLivenessMode::ConservativeConcurrent
+                })
+            {
+                continue;
+            }
+            let mut rows = pool.invocation_liveness.clone();
+            for row in &mut rows {
+                row.chain_slot = None;
+            }
+            let ids = rows
+                .iter()
+                .flat_map(|row| row.resource_ids.iter().cloned())
+                .collect();
+            let peak = validate_pool_liveness_rows(
+                InvocationLivenessMode::ConservativeConcurrent,
+                &rows,
+                &ids,
+                &descriptors,
+            )?;
+            *pool = DynamicBackingPoolSpec::from_core(
+                pool.compatibility.clone(),
+                pool.resource_ids.clone(),
+                pool.minimum_request_bytes,
+                pool.minimum_sequence_bytes,
+                pool.minimum_step_bytes,
+                peak,
+                pool.step_resource_slots.clone(),
+                pool.theoretical_ceiling_bytes.get(),
+                pool.reusable_workspace_ceiling_bytes,
+                pool.checkpoint_growth_ceiling_bytes,
+                dynamic_capacity_bytes,
+                InvocationLivenessMode::ConservativeConcurrent,
+                rows,
+            )?;
+        }
+        Ok(())
     }
 
     pub const fn device_capacity_bytes(&self) -> u64 {

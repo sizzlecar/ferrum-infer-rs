@@ -11,7 +11,7 @@ fn exact_component(component_id: &str) -> PhysicalWeightComponentBinding {
 #[test]
 fn physical_weight_layout_tree_accepts_dense_fixture() {
     let family = TestRegistry::new().prepare();
-    let schema = family.weight_schema();
+    let schema = family.stored_weight_schema().unwrap();
     schema.validate(family.family_id()).unwrap();
     let components = schema
         .physical_component_refs(&id("weight.matrix"))
@@ -1041,17 +1041,21 @@ fn weight_schema_order_is_normalized_before_fingerprinting() {
     })
     .prepare_fixture(&json!({"width": 4}))
     .unwrap();
-    assert_eq!(canonical.weight_schema(), reversed.weight_schema());
+    assert_eq!(
+        canonical.stored_weight_schema().unwrap(),
+        reversed.stored_weight_schema().unwrap()
+    );
     assert_eq!(
         canonical.fingerprint().unwrap(),
         reversed.fingerprint().unwrap()
     );
     assert_eq!(
-        canonical.weight_schema().components[0].external_names,
+        canonical.stored_weight_schema().unwrap().components[0].external_names,
         ["weight.a", "weight.z"]
     );
     let PhysicalWeightLayout::Composite { parts } = &canonical
-        .weight_schema()
+        .stored_weight_schema()
+        .unwrap()
         .tensor(&id("weight.optional"))
         .unwrap()
         .physical_layout
@@ -1067,13 +1071,16 @@ fn weight_schema_order_is_normalized_before_fingerprinting() {
     })
     .prepare_fixture(&json!({"width": 4}))
     .unwrap();
-    assert_ne!(canonical.weight_schema(), source_reversed.weight_schema());
+    assert_ne!(
+        canonical.stored_weight_schema().unwrap(),
+        source_reversed.stored_weight_schema().unwrap()
+    );
     assert_ne!(
         canonical.fingerprint().unwrap(),
         source_reversed.fingerprint().unwrap()
     );
     assert_eq!(
-        source_reversed.weight_schema().components[0].external_names,
+        source_reversed.stored_weight_schema().unwrap().components[0].external_names,
         ["weight.z", "weight.a"]
     );
 }
@@ -1269,12 +1276,22 @@ fn physical_weight_layout_tree_rejects_invalid_shape_reuse_padding_overflow_and_
         .validate(&id("family.overlapping-stride"))
         .is_err());
 
-    let mut overflowing = TestFamily.weight_schema(&TestConfig { width: 4 }).unwrap();
+    let mut overflowing = TestFamily
+        .weights(&TestConfig { width: 4 })
+        .unwrap()
+        .stored_schema()
+        .unwrap()
+        .clone();
     overflowing.components[0].dimensions = vec![u64::MAX, 2];
     overflowing.tensors[0].dimensions = vec![u64::MAX, 2];
     assert!(overflowing.validate(&id("family.overflowing")).is_err());
 
-    let mut too_deep = TestFamily.weight_schema(&TestConfig { width: 4 }).unwrap();
+    let mut too_deep = TestFamily
+        .weights(&TestConfig { width: 4 })
+        .unwrap()
+        .stored_schema()
+        .unwrap()
+        .clone();
     let mut nested = too_deep.tensors[0].physical_layout.clone();
     for _ in 0..MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH {
         nested = PhysicalWeightLayout::Composite {

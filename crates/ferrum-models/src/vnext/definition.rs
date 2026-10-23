@@ -44,6 +44,10 @@ impl DefinedProductionModel {
         let definition = registration
             .define(raw)
             .map_err(|error| FerrumError::model(error.to_string()))?;
+        definition
+            .metadata()
+            .causal_language()
+            .map_err(|error| FerrumError::model(error.to_string()))?;
         Ok(Self {
             definition,
             registration: Arc::new(registration),
@@ -68,7 +72,12 @@ impl DefinedProductionModel {
         requested_model: impl Into<String>,
         resolved_model: impl Into<String>,
     ) -> Result<ferrum_runtime::ProductModelSourceIdentity> {
-        let template = &self.definition.metadata().template;
+        let template = &self
+            .definition
+            .metadata()
+            .causal_language()
+            .map_err(|error| FerrumError::model(error.to_string()))?
+            .template;
         self.sources.product_source_identity(
             requested_model,
             resolved_model,
@@ -137,7 +146,11 @@ impl DefinedProductionModel {
                     .filter_map(element_type_label),
             );
         }
-        let formats = self.definition.weight_schema().quantization_formats();
+        let formats = self
+            .definition
+            .stored_weight_schema()
+            .map_err(|error| FerrumError::model(error.to_string()))?
+            .quantization_formats();
         let weight_bytes = self.sources.weight_payload_bytes()?;
         Ok(ModelCapabilities {
             architecture: self.descriptor.architecture().to_owned(),

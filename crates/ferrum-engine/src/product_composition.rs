@@ -862,13 +862,13 @@ fn generation_defaults(
     let mut strings = params.stop_sequences.clone();
     strings.sort();
     strings.dedup();
-    let token_ids = prepared
+    let special_tokens = &prepared
         .family()
         .metadata()
-        .special_tokens
-        .eos_token_ids
-        .clone();
-    let special_tokens = &prepared.family().metadata().special_tokens;
+        .causal_language()
+        .map_err(|error| FerrumError::model(error.to_string()))?
+        .special_tokens;
+    let token_ids = special_tokens.eos_token_ids.clone();
     let collision_policy = stop_collision_policy(
         &token_ids,
         special_tokens.bos_token_id,
@@ -1073,6 +1073,15 @@ fn resolution_evidence(
 }
 
 fn resolution_value(inputs: &ResolvedModelPlanInputs, field: ResolutionField) -> Result<Value> {
+    let language = inputs
+        .prepared_family
+        .metadata()
+        .causal_language()
+        .map_err(|error| FerrumError::model(error.to_string()))?;
+    let schema = inputs
+        .prepared_family
+        .stored_weight_schema()
+        .map_err(|error| FerrumError::model(error.to_string()))?;
     let value = match field {
         ResolutionField::OriginalSources => serde_json::to_value(&inputs.original_sources),
         ResolutionField::ResolvedSources => serde_json::to_value(&inputs.resolved_sources),
@@ -1080,19 +1089,11 @@ fn resolution_value(inputs: &ResolvedModelPlanInputs, field: ResolutionField) ->
         ResolutionField::ExternalMetadata => serde_json::to_value(&inputs.external_metadata_id),
         ResolutionField::Family => serde_json::to_value(inputs.prepared_family.family_id()),
         ResolutionField::NumericalExecution => serde_json::to_value(&inputs.numerical_execution),
-        ResolutionField::WeightSchema => {
-            serde_json::to_value(inputs.prepared_family.weight_schema())
-        }
-        ResolutionField::WeightFormat => {
-            serde_json::to_value(&inputs.prepared_family.weight_schema().format_id)
-        }
+        ResolutionField::WeightSchema => serde_json::to_value(schema),
+        ResolutionField::WeightFormat => serde_json::to_value(&schema.format_id),
         ResolutionField::Tokenizer => serde_json::to_value(&inputs.tokenizer),
-        ResolutionField::Template => {
-            serde_json::to_value(&inputs.prepared_family.metadata().template)
-        }
-        ResolutionField::SpecialTokens => {
-            serde_json::to_value(&inputs.prepared_family.metadata().special_tokens)
-        }
+        ResolutionField::Template => serde_json::to_value(&language.template),
+        ResolutionField::SpecialTokens => serde_json::to_value(&language.special_tokens),
         ResolutionField::Device => serde_json::to_value(&inputs.device),
         ResolutionField::Capabilities => serde_json::to_value(&inputs.capabilities),
         ResolutionField::RuntimePreset => Ok(json!({

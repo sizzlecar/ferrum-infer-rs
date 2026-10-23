@@ -1,5 +1,7 @@
 //! Dynamic pool-set orchestration over backing owned by `dynamic_pool`.
 
+use super::dynamic_pool::DynamicPoolDomainIndex;
+use super::plan_runtime::{compile_step_resource_slot_layouts, StepResourceSlotLayout};
 use super::{
     align_up_resource, backing_segment_range, backing_segment_range_matches,
     bind_lane_stable_slot_projections, compile_program_binding_layouts,
@@ -79,6 +81,7 @@ where
     pub(in crate::resource) pools: BTreeMap<DynamicBackingPoolId, Arc<DynamicBackingPool<R>>>,
     pub(in crate::resource) domains: Vec<DynamicPoolDomainSpec>,
     pub(in crate::resource) nodes: Arc<[PlanNode]>,
+    pub(in crate::resource) step_resource_slot_layouts: Vec<Vec<StepResourceSlotLayout>>,
     pub(in crate::resource) submission_wave_layouts: Vec<Option<SubmissionWaveDomainLayout>>,
     pub(in crate::resource) submission_wave_reusable_capacity_layouts:
         BTreeMap<ReusableExecutionBucketId, Vec<Option<SubmissionWaveDomainCapacityLayout>>>,
@@ -163,6 +166,10 @@ where
         reusable_execution: Option<ReusableExecutionMemoryPlan>,
     ) -> Result<Self, VNextError> {
         let request_state_hazards = RequestStateHazardCoordinator::compile(&nodes)?;
+        let step_resource_slot_layouts = domains
+            .iter()
+            .map(compile_step_resource_slot_layouts)
+            .collect::<Result<Vec<_>, _>>()?;
         let submission_wave_layouts = domains
             .iter()
             .map(|domain| compile_submission_wave_domain_layout(domain, &nodes))
@@ -183,7 +190,7 @@ where
         .map(|(bucket_id, layout)| (bucket_id, Arc::new(layout)))
         .collect();
         let mut pools = BTreeMap::new();
-        for domain in &domains {
+        for (domain_index, domain) in domains.iter().enumerate() {
             let instance_id = NEXT_DYNAMIC_POOL_INSTANCE_ID
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     current.checked_add(1)
@@ -191,6 +198,7 @@ where
                 .map_err(|_| invalid_resource("dynamic pool instance id space is exhausted"))?;
             let pool = Arc::new(DynamicBackingPool {
                 instance_id,
+                domain_index: DynamicPoolDomainIndex(domain_index),
                 domain: domain.clone(),
                 logical_admission: logical_admission.clone(),
                 maintenance: Mutex::new(()),
@@ -221,6 +229,7 @@ where
             domains,
             pools,
             nodes,
+            step_resource_slot_layouts,
             submission_wave_layouts,
             submission_wave_reusable_capacity_layouts,
             program_binding_layouts,
@@ -1252,6 +1261,52 @@ where
             .transpose()
     }
 
+    /// Index hints never substitute for immutable membership evidence, even
+    /// when a previously certified lane-stable backing slot can be reused.
+    fn projection_indices_match(
+        pool: &DynamicBackingPool<R>,
+        request: &EvaluatedBackingRequest<'_>,
+    ) -> bool {
+        let step_slot_matches = match request.step_resource_slot_index {
+            Some(index) => pool
+                .domain
+                .pool
+                .step_resource_slots()
+                .get(index)
+                .is_some_and(|slot| {
+                    slot.resource_ids() == request.claim_identity.resource_ids()
+                        && request.projections.iter().all(|projection| {
+                            projection.descriptor.lifetime() == AllocationLifetime::Step
+                        })
+                        && match slot.kind() {
+                            StepResourceSlotKind::Dedicated => request.projections.len() == 1,
+                            StepResourceSlotKind::OrderedSingleFenceStepWave => {
+                                request.projections.len() > 1
+                            }
+                        }
+                }),
+            None => request
+                .projections
+                .iter()
+                .all(|projection| projection.descriptor.lifetime() != AllocationLifetime::Step),
+        };
+        request.domain.pool_id() == pool.domain.pool_id()
+            && request.domain.domain_id() == pool.domain.domain_id()
+            && request.claim_identity.pool_id() == pool.domain.pool_id()
+            && step_slot_matches
+            && !request.projections.is_empty()
+            && request.claim_identity.resource_ids().iter().eq(request
+                .projections
+                .iter()
+                .map(|projection| projection.descriptor.base_resource_id()))
+            && request.projections.iter().all(|projection| {
+                request.domain.descriptors.get(projection.descriptor_index)
+                    == Some(projection.descriptor)
+                    && pool.domain.descriptors.get(projection.descriptor_index)
+                        == Some(projection.descriptor)
+            })
+    }
+
     pub(in crate::resource) fn prepare_lane_stable_claim(
         self: &Arc<Self>,
         lane: &Arc<ExecutionLane<R>>,
@@ -1301,6 +1356,21 @@ where
             return Err(invalid_resource(
                 "lane-stable backing accepts only non-initialized Step or Invocation resources",
             ));
+        }
+
+        for request in requests {
+            let pool = self.pools.get(request.domain.pool_id()).ok_or_else(|| {
+                invalid_resource("lane-stable backing request references an unknown pool")
+            })?;
+            if !Self::projection_indices_match(pool, request)
+                || (lifetime == AllocationLifetime::Invocation
+                    && request.projections.len() > 1
+                    && !self.validate_invocation_wave_projection(pool, request)?)
+            {
+                return Err(invalid_resource(
+                    "lane-stable backing request indices differ from immutable pool membership",
+                ));
+            }
         }
 
         let mut canonical_requests = requests.iter().collect::<Vec<_>>();
@@ -1888,11 +1958,9 @@ where
                 }
                 let quantum = pool.allocation_quantum();
                 for request in pool_requests {
-                    let projection_ids = request
-                        .projections
-                        .iter()
-                        .map(|projection| projection.descriptor.base_resource_id().clone())
-                        .collect::<Vec<_>>();
+                    let step_slot = request
+                        .step_resource_slot_index
+                        .and_then(|index| pool.domain.pool.step_resource_slots().get(index));
                     let single_projection = request.projections.len() == 1
                         && request.projections[0].physical_offset_bytes == 0
                         && request.projections[0].capacity_size_bytes
@@ -1908,16 +1976,13 @@ where
                             .map(|projection| projection.capacity_size_bytes)
                             .max()
                             == Some(request.capacity_size_bytes)
-                        && pool.domain.pool.step_resource_slots().iter().any(|slot| {
+                        && step_slot.is_some_and(|slot| {
                             slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave
                                 && slot.resource_ids() == request.claim_identity.resource_ids()
                         });
                     let invocation_wave =
                         self.validate_invocation_wave_projection(pool, request)?;
-                    if request.domain.pool_id() != pool.domain.pool_id()
-                        || request.claim_identity.pool_id() != pool.domain.pool_id()
-                        || request.claim_identity.resource_ids() != projection_ids
-                        || request.projections.is_empty()
+                    if !Self::projection_indices_match(pool, request)
                         || request.projections.windows(2).any(|pair| {
                             pair[0].descriptor.base_resource_id()
                                 >= pair[1].descriptor.base_resource_id()
@@ -1951,11 +2016,6 @@ where
                                     .physical_offset_bytes
                                     .checked_add(projection.capacity_size_bytes)
                                     .is_none_or(|end| end > request.capacity_size_bytes)
-                                || !request
-                                    .domain
-                                    .descriptors
-                                    .iter()
-                                    .any(|descriptor| descriptor == projection.descriptor)
                         })
                         || request.capacity_size_bytes == 0
                         || request.capacity_size_bytes % quantum != 0
@@ -2387,54 +2447,71 @@ where
         {
             return Ok(false);
         }
-        let mut expected_resources = pool
-            .domain
-            .pool
-            .invocation_liveness()
-            .iter()
-            .flat_map(|row| row.resource_ids().iter().cloned())
-            .collect::<Vec<_>>();
-        expected_resources.sort();
-        if expected_resources.windows(2).any(|pair| pair[0] == pair[1])
-            || expected_resources != request.claim_identity.resource_ids()
+        let domain_index = pool.domain_index.0;
+        let Some(domain) = self.domains.get(domain_index) else {
+            return Ok(false);
+        };
+        let Some(layout) = self
+            .submission_wave_layouts
+            .get(domain_index)
+            .and_then(Option::as_ref)
+        else {
+            return Ok(false);
+        };
+        // The physical pool selects the immutable layout, never an untrusted
+        // request hint. Normal requests borrow this exact domain; equivalent
+        // owned descriptors remain valid only after comparing the whole domain.
+        if domain.pool_id() != pool.domain.pool_id()
+            || domain.domain_id() != pool.domain.domain_id()
+            || (!std::ptr::eq(request.domain, domain) && request.domain != domain)
+            || request.claim_identity != layout.claim_identity
+            || request.projections.len() != layout.projection_count
         {
             return Ok(false);
         }
-        let projections = request
-            .projections
-            .iter()
-            .map(|projection| (projection.descriptor.base_resource_id().clone(), projection))
-            .collect::<BTreeMap<_, _>>();
-        if projections.len() != request.projections.len() {
-            return Ok(false);
-        }
-        let rows_by_node = pool
-            .domain
-            .pool
-            .invocation_liveness()
-            .iter()
-            .map(|row| (row.node_id(), row))
-            .collect::<BTreeMap<_, _>>();
-        let rows = self
-            .nodes
-            .iter()
-            .filter_map(|node| rows_by_node.get(node.id()).copied())
-            .collect::<Vec<_>>();
-        if rows.len() != rows_by_node.len() {
-            return Ok(false);
-        }
 
-        let mut concurrent_cursor = 0_u64;
-        let mut peak = 0_u64;
-        for row in rows {
-            let row_base = match mode {
-                InvocationLivenessMode::TotalOrderReuse => 0,
-                InvocationLivenessMode::ConservativeConcurrent => concurrent_cursor,
-                InvocationLivenessMode::NoInvocationResources => unreachable!(),
-            };
+        let row_bytes = layout
+            .rows
+            .iter()
+            .map(|row| {
+                row.projections
+                    .iter()
+                    .try_fold(0_u64, |total, projection_layout| {
+                        let projection = request
+                            .projections
+                            .get(projection_layout.projection_index)
+                            .ok_or_else(|| {
+                                invalid_resource("invocation wave projection is absent")
+                            })?;
+                        if projection.descriptor_index != projection_layout.descriptor_index
+                            || domain.descriptors.get(projection_layout.descriptor_index)
+                                != Some(projection.descriptor)
+                        {
+                            return Err(invalid_resource(
+                                "invocation wave projection differs from its compiled member",
+                            ));
+                        }
+                        total
+                            .checked_add(projection.capacity_size_bytes)
+                            .ok_or_else(|| {
+                                invalid_resource("invocation wave row size overflows u64")
+                            })
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let physical_layout = mode.layout(
+            &layout
+                .rows
+                .iter()
+                .map(|row| row.chain_slot)
+                .collect::<Vec<_>>(),
+            &row_bytes,
+        )?;
+        for (row, row_base) in layout.rows.iter().zip(physical_layout.row_offsets) {
             let mut row_cursor = 0_u64;
-            for resource_id in row.resource_ids() {
-                let Some(projection) = projections.get(resource_id) else {
+            for projection_layout in &row.projections {
+                let Some(projection) = request.projections.get(projection_layout.projection_index)
+                else {
                     return Ok(false);
                 };
                 let expected_offset = row_base.checked_add(row_cursor).ok_or_else(|| {
@@ -2447,19 +2524,8 @@ where
                     .checked_add(projection.capacity_size_bytes)
                     .ok_or_else(|| invalid_resource("invocation wave row size overflows u64"))?;
             }
-            peak = peak.max(row_cursor);
-            if mode == InvocationLivenessMode::ConservativeConcurrent {
-                concurrent_cursor = concurrent_cursor.checked_add(row_cursor).ok_or_else(|| {
-                    invalid_resource("concurrent invocation wave size overflows u64")
-                })?;
-            }
         }
-        Ok(request.capacity_size_bytes
-            == match mode {
-                InvocationLivenessMode::TotalOrderReuse => peak,
-                InvocationLivenessMode::ConservativeConcurrent => concurrent_cursor,
-                InvocationLivenessMode::NoInvocationResources => 0,
-            })
+        Ok(request.capacity_size_bytes == physical_layout.bytes)
     }
 
     pub(in crate::resource) fn view<'lease>(

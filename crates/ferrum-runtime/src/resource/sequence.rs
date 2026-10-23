@@ -174,6 +174,7 @@ where
         // Request-lifetime values own the complete canonical input/output for
         // every prefill chunk. This is live request state, not a reservation
         // for future Sequence/Step/Invocation capacity.
+        self.validate_work_root(&work_shape)?;
         let request_shape = work_shape.fit_shape();
         let (demand, requested_slices) = self.scoped_demand(
             AllocationLifetime::Request,
@@ -260,7 +261,9 @@ where
             fit_policy: sequence_fit_policy,
             pressure_action: sequence_pressure_action,
         } = sequence;
-        if sequence_work_shape.fit_tokens() > request_work_shape.fit_tokens() {
+        self.validate_work_root(&request_work_shape)?;
+        self.validate_work_root(&sequence_work_shape)?;
+        if !request_work_shape.covers_fit(&sequence_work_shape)? {
             return Err(invalid_resource(
                 "initial sequence token ceiling exceeds its request ceiling",
             ));
@@ -452,6 +455,7 @@ pub struct AdmittedRequestResources<R>
 where
     R: DeviceRuntime,
 {
+    pub(super) tensor_state_initialization_claimed: super::AtomicBool,
     // Unregister Request-state hazard cells before backing and logical
     // capacity are released. A live permit retains this exact request Arc.
     _request_state_hazard_registration: Option<RequestStateHazardRegistration>,
@@ -486,6 +490,7 @@ where
             .register_request(logical_lease.request())?;
         Ok(Self {
             _request_state_hazard_registration: request_state_hazard_registration,
+            tensor_state_initialization_claimed: super::AtomicBool::new(false),
             backing_slices,
             logical_lease,
             plan,
@@ -574,7 +579,7 @@ where
             fit_policy,
             pressure_action,
         } = request;
-        if work_shape.fit_tokens() > self.work_shape.fit_tokens() {
+        if !self.work_shape.covers_fit(&work_shape)? {
             return Err(invalid_resource(
                 "sequence token ceiling exceeds its parent request ceiling",
             ));
@@ -1105,7 +1110,7 @@ where
             .read_lifecycle("extend sequence backing")?;
         let target_fingerprint = request.target_work.fingerprint().to_owned();
         let target = request.target_work.fit_shape();
-        if target.tokens() > self.resources.request.work_shape().fit_tokens() {
+        if target.tokens()? > self.resources.request.work_shape().fit_tokens()? {
             return Err(invalid_resource(
                 "sequence backing extension exceeds its parent request token ceiling",
             ));
@@ -1148,13 +1153,13 @@ where
                     "sequence backing coverage target must contain exactly one sequence",
                 ));
             }
-            if current.committed_tokens() >= target.tokens()
-                && current.committed_pages() >= target.pages()
+            if current.committed_tokens()? >= target.tokens()?
+                && current.committed_pages()? >= target.pages()?
             {
                 return Ok(SequenceResourceExtensionDecision::Current(current));
             }
-            if target.tokens() < current.committed_tokens()
-                || target.pages() < current.committed_pages()
+            if target.tokens()? < current.committed_tokens()?
+                || target.pages()? < current.committed_pages()?
             {
                 return Err(invalid_resource(
                     "sequence backing coverage target is incomparable with committed work",
@@ -1264,8 +1269,8 @@ where
         let mut backing = self.resources.lock_backing_state()?;
         if !Arc::ptr_eq(&backing.current, &expected) {
             let current = Arc::clone(&backing.current);
-            if current.committed_tokens() >= target.tokens()
-                && current.committed_pages() >= target.pages()
+            if current.committed_tokens()? >= target.tokens()?
+                && current.committed_pages()? >= target.pages()?
             {
                 return Ok(SequenceResourceExtensionDecision::Current(current));
             }
@@ -1698,10 +1703,10 @@ where
             .map(SequenceBackingGeneration)
             .ok_or_else(|| invalid_resource("sequence backing generation space is exhausted"))?;
         if committed_shape.sequences() != 1
-            || committed_shape.tokens() < prior.committed_shape.tokens()
-            || committed_shape.pages() < prior.committed_shape.pages()
-            || (committed_shape.tokens() == prior.committed_shape.tokens()
-                && committed_shape.pages() == prior.committed_shape.pages())
+            || committed_shape.tokens()? < prior.committed_shape.tokens()?
+            || committed_shape.pages()? < prior.committed_shape.pages()?
+            || (committed_shape.tokens()? == prior.committed_shape.tokens()?
+                && committed_shape.pages()? == prior.committed_shape.pages()?)
             || extension.backing_slices.is_empty() != extension.capacity.is_none()
         {
             return Err(invalid_resource(
@@ -1772,11 +1777,11 @@ where
         &self.physical.backing_slices
     }
 
-    pub const fn committed_tokens(&self) -> u64 {
+    pub fn committed_tokens(&self) -> Result<u64, VNextError> {
         self.committed_shape.tokens()
     }
 
-    pub const fn committed_pages(&self) -> u64 {
+    pub fn committed_pages(&self) -> Result<u64, VNextError> {
         self.committed_shape.pages()
     }
 
@@ -2215,6 +2220,20 @@ where
 
     pub fn static_provisioning(&self) -> Option<&StaticProvisioningLease<R>> {
         self.request.static_provisioning()
+    }
+
+    /// Resolve immutable storage through this exact consumer root. Shared
+    /// roots translate validated readonly subsets to the original physical
+    /// installation; ordinary roots retain exact slot/allocation validation.
+    pub(crate) fn plan_static_view(
+        &self,
+        slot_index: usize,
+        allocation: &super::ResourceAllocation,
+    ) -> Result<super::LeasedBufferView<'_, R::Buffer>, VNextError> {
+        self.request
+            .plan
+            .resources
+            .plan_static_view(slot_index, allocation)
     }
 
     pub fn plan_evidence(&self) -> TrustedPlanRuntimeEvidence {

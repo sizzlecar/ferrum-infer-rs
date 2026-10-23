@@ -7,7 +7,7 @@ use super::{
 use crate::ProviderExecutionSemantics;
 use std::sync::Arc;
 
-pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(8, 1);
+pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(10, 0);
 pub const MAX_EXECUTION_PLAN_WIRE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of O(graph) static allocations plus dynamic descriptors.
 /// This limit is independent of the concurrency ceiling.
@@ -313,6 +313,7 @@ impl PlanNode {
             binding: None,
             persistent: None,
             projection_numerics: None,
+            prepared_implementation_fingerprint: None,
         };
         let selected_provider = provider_resources.provider_id().clone();
         Self {
@@ -341,6 +342,21 @@ impl PlanNode {
             persistent_resource: None,
             resources: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resource_test_node_with_scratch(
+        id: NodeId,
+        scratch_resource: ResourceId,
+        scratch: crate::ProviderWorkspaceRequirement,
+        dependencies: Vec<NodeId>,
+    ) -> Self {
+        let mut node = Self::resource_test_node(id);
+        node.dependencies = dependencies;
+        node.scratch_resource = Some(scratch_resource.clone());
+        node.resources = vec![scratch_resource];
+        node.provider_resources.scratch = Some(scratch);
+        node
     }
 
     #[cfg(test)]

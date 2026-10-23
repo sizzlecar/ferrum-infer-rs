@@ -142,13 +142,17 @@ where
                     })
             })
             .transpose()?;
-        if reusable_execution_bucket.as_ref().is_some_and(|bucket| {
+        if let Some(bucket) = reusable_execution_bucket.as_ref() {
             let capacity = bucket.capacity();
-            !capacity.covers(fit_shape.sequences(), fit_shape.tokens(), fit_shape.pages())
-        }) {
-            return Err(invalid_resource(
-                "step work shape exceeds its selected reusable execution bucket",
-            ));
+            if !capacity.covers(
+                fit_shape.sequences(),
+                fit_shape.tokens()?,
+                fit_shape.pages()?,
+            ) {
+                return Err(invalid_resource(
+                    "step work shape exceeds its selected reusable execution bucket",
+                ));
+            }
         }
         record_step_admission_profile::<PROFILE, _>(
             &mut observer,

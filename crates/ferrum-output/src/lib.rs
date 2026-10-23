@@ -16,6 +16,8 @@ use std::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
+pub mod png;
+
 mod semantic;
 pub use semantic::{semantic_cost, InferenceOutput, OutputSemanticLease};
 

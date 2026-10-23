@@ -73,7 +73,7 @@ impl ModelFamilyProvider for LanguageFamily {
         Ok(raw.clone())
     }
 
-    fn weight_schema(&self, _: &Value) -> std::result::Result<WeightSchema, VNextError> {
+    fn weights(&self, _: &Value) -> std::result::Result<ModelWeights, VNextError> {
         let dimensions = vec![VOCAB as u64, VOCAB as u64];
         let names = ["embedding", "head"];
         let components = names
@@ -103,13 +103,13 @@ impl ModelFamilyProvider for LanguageFamily {
                 required: true,
             })
             .collect::<Vec<_>>();
-        Ok(WeightSchema {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.safetensors.dense"),
             layout_id: id("weight-layout.fixture.sampling-readback"),
             version: ContractVersion::new(1, 0),
             components: components.into(),
             tensors: tensors.into(),
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -270,7 +270,7 @@ impl ModelFamilyProvider for LanguageFamily {
         &self,
         _: &Value,
     ) -> std::result::Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
+        Ok(CausalLanguageMetadata {
             template: TemplateMetadata {
                 template: "{{ messages }}".into(),
                 source_file: "tokenizer_config.json".into(),
@@ -282,7 +282,8 @@ impl ModelFamilyProvider for LanguageFamily {
                 pad_token_id: None,
                 collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
             },
-        })
+        }
+        .into())
     }
 }
 
@@ -641,12 +642,19 @@ pub(crate) fn resolve_plan(
         ),
         (
             ResolutionField::WeightSchema,
-            serde_json::to_value(inputs.prepared_family.weight_schema()).unwrap(),
+            serde_json::to_value(inputs.prepared_family.stored_weight_schema().unwrap()).unwrap(),
             ResolutionDecisionSource::TypedModelResolution,
         ),
         (
             ResolutionField::WeightFormat,
-            serde_json::to_value(&inputs.prepared_family.weight_schema().format_id).unwrap(),
+            serde_json::to_value(
+                &inputs
+                    .prepared_family
+                    .stored_weight_schema()
+                    .unwrap()
+                    .format_id,
+            )
+            .unwrap(),
             ResolutionDecisionSource::TypedModelResolution,
         ),
         (
@@ -656,12 +664,28 @@ pub(crate) fn resolve_plan(
         ),
         (
             ResolutionField::Template,
-            serde_json::to_value(&inputs.prepared_family.metadata().template).unwrap(),
+            serde_json::to_value(
+                &inputs
+                    .prepared_family
+                    .metadata()
+                    .causal_language()
+                    .unwrap()
+                    .template,
+            )
+            .unwrap(),
             ResolutionDecisionSource::TypedModelResolution,
         ),
         (
             ResolutionField::SpecialTokens,
-            serde_json::to_value(&inputs.prepared_family.metadata().special_tokens).unwrap(),
+            serde_json::to_value(
+                &inputs
+                    .prepared_family
+                    .metadata()
+                    .causal_language()
+                    .unwrap()
+                    .special_tokens,
+            )
+            .unwrap(),
             ResolutionDecisionSource::TypedModelResolution,
         ),
         (

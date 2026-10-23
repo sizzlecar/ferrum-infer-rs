@@ -23,6 +23,8 @@ pub struct ProviderResourcePlan {
     pub(super) persistent: Option<ProviderWorkspaceRequirement>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) projection_numerics: Option<crate::PreparedProjectionNumerics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) prepared_implementation_fingerprint: Option<String>,
 }
 
 impl ProviderResourcePlan {
@@ -56,6 +58,9 @@ impl ProviderResourcePlan {
             binding: estimate.binding().cloned(),
             persistent: estimate.persistent().cloned(),
             projection_numerics: estimate.projection_numerics().cloned(),
+            prepared_implementation_fingerprint: estimate
+                .prepared_implementation_fingerprint()
+                .map(str::to_owned),
         };
         plan.validate_fields()?;
         plan.estimate_fingerprint = plan.compute_estimate_fingerprint()?;
@@ -72,6 +77,10 @@ impl ProviderResourcePlan {
             || self.estimator_version.major == 0
             || !is_canonical_sha256(&self.estimator_implementation_fingerprint)
             || !is_canonical_sha256(&self.estimator_input_fingerprint)
+            || self
+                .prepared_implementation_fingerprint
+                .as_ref()
+                .is_some_and(|fp| !is_canonical_sha256(fp))
             || self.value_alignment_bytes == 0
             || !self.value_alignment_bytes.is_power_of_two()
             || self.scratch.as_ref().is_some_and(|workspace| {
@@ -143,6 +152,7 @@ impl ProviderResourcePlan {
                 binding: &self.binding,
                 persistent: &self.persistent,
                 projection_numerics: &self.projection_numerics,
+                prepared_implementation_fingerprint: &self.prepared_implementation_fingerprint,
             },
             "fingerprint provider resource estimate",
         )
@@ -191,6 +201,12 @@ impl ProviderResourcePlan {
     pub fn projection_numerics(&self) -> Option<&crate::PreparedProjectionNumerics> {
         self.projection_numerics.as_ref()
     }
+
+    /// Exact prepared native implementation selected by the estimator. The
+    /// provider must verify it before encoding a shape-specific native plan.
+    pub fn prepared_implementation_fingerprint(&self) -> Option<&str> {
+        self.prepared_implementation_fingerprint.as_deref()
+    }
 }
 
 #[derive(Serialize)]
@@ -206,4 +222,9 @@ pub(super) struct ProviderEstimateFingerprintMaterial<'a> {
     pub(super) persistent: &'a Option<ProviderWorkspaceRequirement>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) projection_numerics: &'a Option<crate::PreparedProjectionNumerics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) prepared_implementation_fingerprint: &'a Option<String>,
 }
+
+#[cfg(test)]
+mod tests;

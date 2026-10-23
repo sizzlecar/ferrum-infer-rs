@@ -4,8 +4,127 @@ use super::{
 };
 use crate::{
     CapacityAvailabilitySource, DeviceCapacityPressure, DeviceCapacityPressureScope,
-    DynamicAdmissionFaultKind,
+    DeviceDescriptor, DynamicAdmissionFaultKind,
 };
+
+/// Native device memory which has no tensor or buffer descriptor. These tags
+/// classify a reservation; they do not create a separate capacity ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceOpaqueMemoryKind {
+    Bootstrap,
+    Stream,
+}
+
+/// A runtime-owned budget in the same process-wide account used by plan
+/// allocations. Opening it does not initialize a device or allocate memory.
+///
+/// The descriptor must identify the same physical device and implementation as
+/// subsequent plan admission. Its usable ceiling includes opaque reservations;
+/// external memory headroom is separate from these live claims.
+#[derive(Clone)]
+pub struct DeviceCapacityOwner {
+    budget: Arc<DeviceCapacityBudget>,
+}
+
+impl std::fmt::Debug for DeviceCapacityOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceCapacityOwner")
+            .field("device_id", &self.budget.account.device_id)
+            .field(
+                "usable_bytes",
+                &self.budget.device_wide_usable_ceiling_bytes,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeviceCapacityOwner {
+    pub fn open(device: &DeviceDescriptor, usable_bytes: u64) -> Result<Self, VNextError> {
+        device.validate()?;
+        let account = device_capacity_account(
+            &device.id,
+            &device.runtime_implementation_fingerprint,
+            device.total_memory_bytes,
+        )?;
+        Ok(Self {
+            budget: account.register_budget(usable_bytes)?,
+        })
+    }
+
+    /// Reserves before native creation. A zero-byte reservation retains the
+    /// budget identity and ceiling without creating a fictitious device claim.
+    ///
+    /// Backends must retain the returned owner until every corresponding native
+    /// resource is destroyed. Partial creation or cleanup with an unknown
+    /// outcome must retain it with the actual resources, including during panic
+    /// unwinding; this capacity primitive cannot establish device quiescence.
+    pub fn reserve(
+        &self,
+        kind: DeviceOpaqueMemoryKind,
+        bytes: u64,
+    ) -> Result<DeviceCapacityRetention, VNextError> {
+        let claim = if bytes == 0 {
+            // Even zero-byte creation must respect a fail-closed account.
+            self.budget.availability_snapshot()?;
+            None
+        } else {
+            Some(self.budget.account.claim(&self.budget, bytes)?)
+        };
+        Ok(DeviceCapacityRetention {
+            inner: Arc::new(RetainedDeviceCapacity {
+                claim,
+                budget: Arc::clone(&self.budget),
+                kind,
+            }),
+        })
+    }
+
+    /// Exact budget-owner identity, not equality of numeric limits or device
+    /// descriptors. Independently opened budgets share capacity but not ownership.
+    pub fn owns(&self, retention: &DeviceCapacityRetention) -> bool {
+        Arc::ptr_eq(&self.budget, &retention.inner.budget)
+    }
+}
+
+struct RetainedDeviceCapacity {
+    // Return the bytes before allowing the budget record to disappear.
+    claim: Option<DeviceCapacityClaim>,
+    budget: Arc<DeviceCapacityBudget>,
+    kind: DeviceOpaqueMemoryKind,
+}
+
+/// Shared ownership of one opaque reservation. Cloning never claims additional
+/// bytes; the final clone returns them. This must accompany native owners rather
+/// than an outer runtime facade which those native owners can outlive.
+#[derive(Clone)]
+#[must_use = "retain this reservation until all associated native resources are released"]
+pub struct DeviceCapacityRetention {
+    inner: Arc<RetainedDeviceCapacity>,
+}
+
+impl DeviceCapacityRetention {
+    pub fn bytes(&self) -> u64 {
+        self.inner
+            .claim
+            .as_ref()
+            .map_or(0, DeviceCapacityClaim::bytes)
+    }
+
+    pub fn kind(&self) -> DeviceOpaqueMemoryKind {
+        self.inner.kind
+    }
+}
+
+impl std::fmt::Debug for DeviceCapacityRetention {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceCapacityRetention")
+            .field("kind", &self.kind())
+            .field("bytes", &self.bytes())
+            .finish_non_exhaustive()
+    }
+}
 
 static NEXT_ADMISSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_BATCH_STEP_ID: AtomicU64 = AtomicU64::new(1);
@@ -560,6 +679,9 @@ pub(super) fn issue_generation() -> Result<u64, VNextError> {
         })
         .map_err(|_| invalid_resource("resource admission generation space is exhausted"))
 }
+
+#[cfg(test)]
+mod opaque_tests;
 
 #[cfg(test)]
 mod tests {

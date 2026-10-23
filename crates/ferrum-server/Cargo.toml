@@ -13,6 +13,8 @@ ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-output = { workspace = true }
 ferrum-engine = { workspace = true }
+ferrum-models = { workspace = true }
+ferrum-runtime = { workspace = true }
 ferrum-journal = { workspace = true }
 ferrum-scheduler = { workspace = true }
 ferrum-sampler = { workspace = true }
@@ -43,7 +45,7 @@ http-body = "1.0"
 mime = "0.3"
 
 # Web framework for MVP server implementation
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.7", features = ["ws", "multipart"] }
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 hyper = "1.0"
@@ -66,6 +68,7 @@ uuid = { workspace = true }
 config = { workspace = true }
 
 [dev-dependencies]
+png = "=0.18.1"
 ferrum-execution = { workspace = true }
 ferrum-testkit = { workspace = true }
 ferrum-tokenizer = { workspace = true }

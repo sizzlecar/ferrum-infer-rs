@@ -154,7 +154,7 @@ impl DenseAttributionBuilder {
             weight.physical_layout(),
             component,
         )?;
-        let source_fingerprint = family.weight_schema().fingerprint()?;
+        let source_fingerprint = family.stored_weight_schema()?.fingerprint()?;
         let execution_fingerprint = execution.schema().fingerprint()?;
         if execution.source_schema_fingerprint() != source_fingerprint {
             return Err(invalid_attribution(
@@ -184,7 +184,7 @@ impl DenseAttributionBuilder {
         }
         for source_id in source_ids {
             let source = family
-                .weight_schema()
+                .stored_weight_schema()?
                 .components
                 .iter()
                 .find(|c| &c.id == *source_id)
@@ -248,7 +248,7 @@ impl DenseAttributionBuilder {
         weight.validate_logical(value.tensor().dimensions(), value.tensor().element_type())?;
         let plan =
             RnF16FragmentPlanV1::from_dimensions(*source_format, value.tensor().dimensions())?;
-        let source_fingerprint = family.weight_schema().fingerprint()?;
+        let source_fingerprint = family.stored_weight_schema()?.fingerprint()?;
         if execution.source_schema_fingerprint() != source_fingerprint {
             return Err(invalid_attribution("fragment source schema changed"));
         }
@@ -284,7 +284,7 @@ impl DenseAttributionBuilder {
         let mut rows = 0_u64;
         for source_id in source_ids {
             let source = family
-                .weight_schema()
+                .stored_weight_schema()?
                 .components
                 .iter()
                 .find(|c| &c.id == *source_id)

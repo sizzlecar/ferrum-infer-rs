@@ -134,7 +134,7 @@ fn resident_checkpoint_evidence_advances_only_after_successful_retirement() {
         let req = checkpoint_request(&batch, &bucket, tokens);
         let (use_, retirement) = ready(&owner, &batch, &req);
         assert_eq!(
-            use_.work_shape().participant_work()[0]
+            use_.work_shape().participant_work().unwrap()[0]
                 .token_span()
                 .checkpoint_tokens()
                 .unwrap()

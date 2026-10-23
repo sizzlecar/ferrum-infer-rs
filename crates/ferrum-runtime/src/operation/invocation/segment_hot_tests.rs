@@ -135,21 +135,22 @@ pub(super) fn oracle_with_owners(
             )
             .unwrap();
         let node = identity.materialize_node(compiled.node_index).unwrap();
-        let invocation = BatchedOperationInvocation::from_resources(
-            fixture.runtime.as_ref(),
-            &fixture.resolved,
-            provider.dispatch(),
-            identity,
-            node,
-            OperationInvocationResources::Wave {
-                wave,
-                node_index: compiled.node_index,
-            },
-            active.iter(),
-            false,
-            true,
-        )
-        .unwrap();
+        let invocation =
+            BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
+                fixture.runtime.as_ref(),
+                &fixture.resolved,
+                provider.dispatch(),
+                identity,
+                node,
+                OperationInvocationResources::Wave {
+                    wave,
+                    node_index: compiled.node_index,
+                },
+                active.iter(),
+                false,
+                true,
+            )
+            .unwrap();
         for (participant, invocation) in invocation.participants().iter().enumerate() {
             for (region_index, region) in compiled.regions.iter().enumerate() {
                 let resource = &recipe.resources[region.resource_index].resource_id;

@@ -11,6 +11,8 @@ mod host;
 use host::HostTools;
 #[path = "build_support/gguf.rs"]
 mod gguf;
+#[path = "build_support/philox.rs"]
+mod philox;
 
 use ferrum_native_ops::{
     legacy_signature_matches_without_numeric_line, load_manifest,
@@ -49,6 +51,7 @@ static CUDA_BUILD_SUMMARY_ROWS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLo
 const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/fused_add_rms_norm.cu",
     "kernels/fused_silu_mul.cu",
+    "kernels/vnext_bf16_silu.cu",
     "kernels/rms_norm.cu",
     "kernels/sandwich_norm.cu",
     "kernels/rope.cu",
@@ -560,6 +563,10 @@ fn native_dynamic_link_name(path: &Path) -> String {
 
 fn required_cuda_native_build_units() -> Vec<CudaNativeBuildUnit> {
     [
+        (
+            "CARGO_FEATURE_CUDA_CUTLASS_FP8",
+            CudaNativeBuildUnit::CutlassFp8ScaledMm,
+        ),
         ("CARGO_FEATURE_MARLIN", CudaNativeBuildUnit::Marlin),
         ("CARGO_FEATURE_VLLM_MARLIN", CudaNativeBuildUnit::VllmMarlin),
         (
@@ -802,6 +809,7 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
 
 fn emit_native_artifact_build_unit(unit: CudaNativeBuildUnit) {
     let summary_artifact = match unit {
+        CudaNativeBuildUnit::CutlassFp8ScaledMm => "cutlass_fp8_scaled_mm",
         CudaNativeBuildUnit::Marlin => "marlin",
         CudaNativeBuildUnit::VllmMarlin => "vllm_marlin",
         CudaNativeBuildUnit::VllmMoeMarlin => "vllm_moe_marlin",
@@ -1462,17 +1470,38 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
         // the cache identity and the actual compiler invocation.
         let precise_math = matches!(
             *kernel,
-            gguf::KERNEL | "kernels/residual_add.cu" | "kernels/argmax_rows.cu"
+            gguf::KERNEL
+                | "kernels/residual_add.cu"
+                | "kernels/argmax_rows.cu"
+                | "kernels/vnext_bf16_silu.cu"
         );
+        let precise_transcendental = *kernel == "kernels/vnext_bf16_silu.cu";
         if precise_math {
             flags.retain(|flag| flag != "--use_fast_math");
             flags.push("--fmad=false".into());
         }
+        if precise_transcendental {
+            flags.extend(["--ftz=false", "--prec-div=true", "--prec-sqrt=true"].map(str::to_owned));
+        }
         if *kernel == gguf::KERNEL {
             flags.push(format!("-I{}", out_dir.display()));
         }
-        let legacy_signature = core_ptx_signature(kernel, &flags);
-        let content_signature = content_core_ptx_signature(kernel, &flags);
+        let mut legacy_signature = core_ptx_signature(kernel, &flags);
+        let mut content_signature = content_core_ptx_signature(kernel, &flags);
+        if *kernel == "kernels/vnext_bf16_silu.cu" {
+            let identity = philox::identity(
+                &nvcc,
+                cuda_root.as_deref(),
+                kernel,
+                &flags,
+                HostTools::current() == HostTools::Unix,
+            )
+            .unwrap_or_else(|error| panic!("[core-ptx] {error}"));
+            println!("cargo:rustc-env=FERRUM_PHILOX_BUILD_IDENTITY_SHA256={identity}");
+            let extra = format!("\nphilox-transitive-input-sha256={identity}");
+            legacy_signature.push_str(&extra);
+            content_signature.push_str(&extra);
+        }
         let signature = cuda_native_input_signature(&content_signature);
         let stem = Path::new(kernel)
             .file_stem()
@@ -1545,6 +1574,9 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                     command.arg("--fmad=false");
                 } else {
                     command.arg("--use_fast_math");
+                }
+                if precise_transcendental {
+                    command.args(["--ftz=false", "--prec-div=true", "--prec-sqrt=true"]);
                 }
                 if *kernel == gguf::KERNEL {
                     command.arg(format!("-I{}", out_dir.display()));

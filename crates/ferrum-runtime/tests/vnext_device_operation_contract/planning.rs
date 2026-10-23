@@ -84,18 +84,35 @@ pub(crate) fn resolution_value(inputs: &ResolvedModelPlanInputs, field: Resoluti
             serde_json::to_value(inputs.prepared_family.family_id()).unwrap()
         }
         ResolutionField::WeightSchema => {
-            serde_json::to_value(inputs.prepared_family.weight_schema()).unwrap()
+            serde_json::to_value(inputs.prepared_family.stored_weight_schema().unwrap()).unwrap()
         }
-        ResolutionField::WeightFormat => {
-            serde_json::to_value(&inputs.prepared_family.weight_schema().format_id).unwrap()
-        }
+        ResolutionField::WeightFormat => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .stored_weight_schema()
+                .unwrap()
+                .format_id,
+        )
+        .unwrap(),
         ResolutionField::Tokenizer => serde_json::to_value(&inputs.tokenizer).unwrap(),
-        ResolutionField::Template => {
-            serde_json::to_value(&inputs.prepared_family.metadata().template).unwrap()
-        }
-        ResolutionField::SpecialTokens => {
-            serde_json::to_value(&inputs.prepared_family.metadata().special_tokens).unwrap()
-        }
+        ResolutionField::Template => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .template,
+        )
+        .unwrap(),
+        ResolutionField::SpecialTokens => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .special_tokens,
+        )
+        .unwrap(),
         ResolutionField::Device => serde_json::to_value(&inputs.device).unwrap(),
         ResolutionField::Capabilities => serde_json::to_value(&inputs.capabilities).unwrap(),
         ResolutionField::RuntimePreset => json!({
@@ -822,13 +839,13 @@ pub(crate) fn begin_single_participant_step_on_lane_with_bucket_and_work(
                 assert_eq!(step.work_shape().participants().len(), 1);
                 assert_eq!(step.work_shape().immediate_sequences(), 1);
                 assert_eq!(
-                    step.work_shape().immediate_tokens(),
+                    step.work_shape().immediate_tokens().unwrap(),
                     expected_immediate_tokens
                 );
-                assert_eq!(step.work_shape().immediate_pages(), 0);
+                assert_eq!(step.work_shape().immediate_pages().unwrap(), 0);
                 assert_eq!(step.work_shape().fit_sequences(), 1);
-                assert_eq!(step.work_shape().fit_tokens(), expected_fit_tokens);
-                assert_eq!(step.work_shape().fit_pages(), 0);
+                assert_eq!(step.work_shape().fit_tokens().unwrap(), expected_fit_tokens);
+                assert_eq!(step.work_shape().fit_pages().unwrap(), 0);
                 assert_eq!(step.work_shape().fingerprint().len(), 64);
                 assert_eq!(step.claimed_backing().fingerprint().len(), 64);
                 match step.claimed_backing().logical_capacity() {

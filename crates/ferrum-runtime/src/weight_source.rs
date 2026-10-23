@@ -2,7 +2,24 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
-use super::{ElementType, VNextError, WeightComponentSpec, WeightId};
+use super::{
+    ElementType, HostMemoryClass, ManagedHostBytes, VNextError, WeightComponentSpec, WeightId,
+};
+
+enum WeightPayloadBytes<'source> {
+    Ordinary(Cow<'source, [u8]>),
+    Managed(ManagedHostBytes),
+}
+
+impl std::ops::Deref for WeightPayloadBytes<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Ordinary(bytes) => bytes,
+            Self::Managed(bytes) => bytes.bytes(),
+        }
+    }
+}
 
 /// Owner for host bytes whose address, length, and contents remain stable for
 /// the lifetime of the owner.
@@ -89,14 +106,14 @@ impl fmt::Debug for RetainedHostMemoryRegion {
 /// attached [`RetainedHostMemoryRegion`] proves and owns the exact borrowed
 /// range.
 pub struct WeightComponentSegment<'source> {
-    bytes: Cow<'source, [u8]>,
+    bytes: WeightPayloadBytes<'source>,
     retained_host_memory: Option<RetainedHostMemoryRegion>,
 }
 
 impl<'source> WeightComponentSegment<'source> {
     pub fn new(bytes: impl Into<Cow<'source, [u8]>>) -> Self {
         Self {
-            bytes: bytes.into(),
+            bytes: WeightPayloadBytes::Ordinary(bytes.into()),
             retained_host_memory: None,
         }
     }
@@ -255,7 +272,7 @@ pub struct WeightComponentPayload<'source> {
     source_files: Vec<String>,
     dimensions: Vec<u64>,
     element_type: ElementType,
-    bytes: Cow<'source, [u8]>,
+    bytes: WeightPayloadBytes<'source>,
     retained_host_memory: Option<RetainedHostMemoryRegion>,
 }
 
@@ -310,8 +327,45 @@ impl<'source> WeightComponentPayload<'source> {
             source_files,
             dimensions,
             element_type,
-            bytes,
+            bytes: WeightPayloadBytes::Ordinary(bytes),
             retained_host_memory: None,
+        })
+    }
+
+    /// Own a converted component without copying it into an unaccounted Vec.
+    /// The materializer must allocate this backing from the composition's Host
+    /// account. Slices retain the entire original allocation and its one claim;
+    /// the initializer's separate TransferStaging copies remain separately charged.
+    pub fn from_managed_host(
+        component: &WeightComponentSpec,
+        external_names: Vec<String>,
+        source_files: Vec<String>,
+        dimensions: Vec<u64>,
+        element_type: ElementType,
+        bytes: ManagedHostBytes,
+    ) -> Result<Self, VNextError> {
+        if bytes.class() != HostMemoryClass::WeightBacking
+            || !valid_ordered_sources(component, &external_names, &source_files)
+            || dimensions != component.dimensions
+            || element_type != component.physical_element_type()
+            || u64::try_from(bytes.len()).ok() != Some(component.physical_bytes()?)
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: format!(
+                    "weight component `{}` managed payload differs from its WeightBacking class, schema identity, source, shape, type, or byte length",
+                    component.id
+                ),
+            });
+        }
+        let retained = RetainedHostMemoryRegion::new(Arc::new(bytes.clone()), 0, bytes.len())?;
+        Ok(Self {
+            component_id: component.id.clone(),
+            external_names,
+            source_files,
+            dimensions,
+            element_type,
+            bytes: WeightPayloadBytes::Managed(bytes),
+            retained_host_memory: Some(retained),
         })
     }
 
@@ -423,6 +477,97 @@ fn valid_ordered_sources(
 mod tests {
     use super::*;
     use crate::{BlockQuantizationSpec, WeightComponentRole, WeightEncoding};
+
+    fn managed_account(total: usize) -> crate::HostMemoryAccount {
+        crate::HostMemoryAccount::new(
+            crate::HostMemoryLimits::new(
+                total,
+                crate::HostMemoryClassLimits {
+                    input_preprocess_bytes: total,
+                    transfer_staging_bytes: total,
+                    output_bytes: total,
+                    weight_backing_bytes: total,
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn managed_payload_and_segments_retain_one_backing_without_a_copy() {
+        let account = managed_account(32);
+        let mut buffer = account
+            .allocate_zeroed(HostMemoryClass::WeightBacking, 32)
+            .unwrap();
+        buffer.as_mut()[8..24].fill(0x35);
+        let backing = buffer.freeze();
+        let view = backing.slice(8..24).unwrap();
+        let pointer = view.bytes().as_ptr();
+        let component = packed_component();
+        let payload = WeightComponentPayload::from_managed_host(
+            &component,
+            component.external_names.clone(),
+            vec!["model-1.safetensors".into(), "model-2.safetensors".into()],
+            component.dimensions.clone(),
+            ElementType::F16,
+            view,
+        )
+        .unwrap();
+        assert_eq!(payload.bytes().as_ptr(), pointer);
+        assert_eq!(payload.bytes(), &[0x35; 16]);
+        assert_eq!(account.usage().unwrap().committed_bytes(), 32);
+        let segments = WeightComponentSegments::from_payload(payload);
+        let retained = segments.segments()[0]
+            .retained_host_memory()
+            .unwrap()
+            .clone();
+        drop(backing);
+        drop(segments);
+        assert_eq!(retained.bytes().as_ptr(), pointer);
+        assert_eq!(retained.bytes(), &[0x35; 16]);
+        assert_eq!(account.usage().unwrap().committed_bytes(), 32);
+        drop(retained);
+        assert_eq!(account.usage().unwrap().committed_bytes(), 0);
+    }
+
+    #[test]
+    fn managed_payload_rejects_wrong_class_extent_and_metadata_without_leaking_charge() {
+        let account = managed_account(32);
+        let component = packed_component();
+        for (class, bytes, dtype, dimensions) in [
+            (HostMemoryClass::Output, 16, ElementType::F16, vec![2, 2, 2]),
+            (
+                HostMemoryClass::WeightBacking,
+                15,
+                ElementType::F16,
+                vec![2, 2, 2],
+            ),
+            (
+                HostMemoryClass::WeightBacking,
+                16,
+                ElementType::Bf16,
+                vec![2, 2, 2],
+            ),
+            (
+                HostMemoryClass::WeightBacking,
+                16,
+                ElementType::F16,
+                vec![2, 4],
+            ),
+        ] {
+            let backing = account.allocate_zeroed(class, bytes).unwrap().freeze();
+            assert!(WeightComponentPayload::from_managed_host(
+                &component,
+                component.external_names.clone(),
+                vec!["model-1.safetensors".into(), "model-2.safetensors".into()],
+                dimensions,
+                dtype,
+                backing,
+            )
+            .is_err());
+            assert_eq!(account.usage().unwrap().committed_bytes(), 0);
+        }
+    }
 
     struct StableBytes(Vec<u8>);
 

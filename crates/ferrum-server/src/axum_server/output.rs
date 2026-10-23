@@ -53,6 +53,15 @@ struct OutputBody {
     _session: OutputSession,
 }
 
+/// Retain admission even after the inner body yields its final data frame.
+/// Each emitted frame independently retains its own byte/backing owner.
+pub(super) fn retained_body(session: OutputSession, inner: Body) -> Body {
+    Body::new(OutputBody {
+        inner,
+        _session: session,
+    })
+}
+
 impl HttpBody for OutputBody {
     type Data = Bytes;
     type Error = axum::Error;

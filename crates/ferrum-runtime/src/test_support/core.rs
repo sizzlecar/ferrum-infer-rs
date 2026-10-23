@@ -156,8 +156,8 @@ impl ModelFamilyProvider for TestFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.dense"),
             layout_id: id("weight-layout.dense"),
             version: ContractVersion::new(1, 0),
@@ -180,7 +180,7 @@ impl ModelFamilyProvider for TestFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -245,19 +245,21 @@ impl ModelFamilyProvider for TestFamily {
         &self,
         _config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
-            template: TemplateMetadata {
-                template: "{{ messages }}".to_owned(),
-                source_file: "template.json".to_owned(),
-                sha256: sha('c'),
+        Ok(ModelSemanticMetadata::CausalLanguage(
+            crate::CausalLanguageMetadata {
+                template: TemplateMetadata {
+                    template: "{{ messages }}".to_owned(),
+                    source_file: "template.json".to_owned(),
+                    sha256: sha('c'),
+                },
+                special_tokens: SpecialTokenMetadata {
+                    bos_token_id: Some(1),
+                    eos_token_ids: BTreeSet::from([2]),
+                    pad_token_id: Some(0),
+                    collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
+                },
             },
-            special_tokens: SpecialTokenMetadata {
-                bos_token_id: Some(1),
-                eos_token_ids: BTreeSet::from([2]),
-                pad_token_id: Some(0),
-                collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
-            },
-        })
+        ))
     }
 }
 
@@ -297,8 +299,8 @@ impl ModelFamilyProvider for OrderedSchemaFamily {
         TestFamily.parse_config(raw)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        let mut schema = TestFamily.weight_schema(config)?;
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        let mut schema = TestFamily.weights(config)?.stored_schema()?.clone();
         schema.components[0].external_names = if self.reverse_sources {
             vec!["weight.z".to_owned(), "weight.a".to_owned()]
         } else {
@@ -356,7 +358,7 @@ impl ModelFamilyProvider for OrderedSchemaFamily {
             schema.components.reverse();
             schema.tensors.reverse();
         }
-        Ok(schema)
+        Ok(ModelWeights::Stored(schema))
     }
 
     fn numerical_profiles(
@@ -417,8 +419,8 @@ impl ModelFamilyProvider for FixedSchemaFamily {
         TestFamily.parse_config(raw)
     }
 
-    fn weight_schema(&self, _config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(self.schema.clone())
+    fn weights(&self, _config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(self.schema.clone()))
     }
 
     fn numerical_profiles(
@@ -507,8 +509,8 @@ impl ModelFamilyProvider for SequentialScratchFamily {
         TestFamily.parse_config(raw)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        TestFamily.weight_schema(config)
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        TestFamily.weights(config)
     }
 
     fn numerical_profiles(
@@ -1324,8 +1326,10 @@ impl RuntimePolicy for AdversarialRuntimePolicy {
         self.maximum_active_sequences
     }
 
-    fn maximum_scheduled_tokens(&self) -> u64 {
-        self.maximum_scheduled_tokens
+    fn work_limits(&self) -> crate::RuntimeWorkLimits {
+        crate::RuntimeWorkLimits::Tokens {
+            maximum_scheduled_tokens: self.maximum_scheduled_tokens,
+        }
     }
 
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
@@ -1355,7 +1359,8 @@ pub(crate) fn resolved_tensor(element_type: ElementType) -> ResolvedTensorSpec {
 
 pub(crate) fn resolved_test_weight() -> ResolvedWeightBinding {
     let family = TestRegistry::new().prepare();
-    ResolvedWeightBinding::from_schema(family.weight_schema(), &id("weight.matrix")).unwrap()
+    ResolvedWeightBinding::from_schema(family.stored_weight_schema().unwrap(), &id("weight.matrix"))
+        .unwrap()
 }
 
 pub(crate) fn binding(
@@ -1663,8 +1668,8 @@ impl ModelFamilyProvider for GraphFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, _config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, _config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.execution-graph"),
             layout_id: id("weight-layout.execution-graph"),
             version: ContractVersion::new(1, 0),
@@ -1687,7 +1692,7 @@ impl ModelFamilyProvider for GraphFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -1863,19 +1868,21 @@ impl ModelFamilyProvider for GraphFamily {
         &self,
         _config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
-            template: TemplateMetadata {
-                template: "{{ messages }}".to_owned(),
-                source_file: "template.json".to_owned(),
-                sha256: sha('a'),
+        Ok(ModelSemanticMetadata::CausalLanguage(
+            crate::CausalLanguageMetadata {
+                template: TemplateMetadata {
+                    template: "{{ messages }}".to_owned(),
+                    source_file: "template.json".to_owned(),
+                    sha256: sha('a'),
+                },
+                special_tokens: SpecialTokenMetadata {
+                    bos_token_id: Some(1),
+                    eos_token_ids: BTreeSet::from([2]),
+                    pad_token_id: Some(0),
+                    collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
+                },
             },
-            special_tokens: SpecialTokenMetadata {
-                bos_token_id: Some(1),
-                eos_token_ids: BTreeSet::from([2]),
-                pad_token_id: Some(0),
-                collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
-            },
-        })
+        ))
     }
 }
 pub(crate) fn graph_program_tensor() -> ProgramTensorSpec {

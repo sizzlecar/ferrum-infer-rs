@@ -11,9 +11,10 @@ use ferrum_quantization::{
     GgufWeightComponentSource, GptqMarlinSafetensorsSource, SafetensorsArchive,
 };
 use ferrum_runtime::{
-    ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId, ModelFamilyProvider,
-    ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata, NumericalExecutionProfile,
-    PreparedModelFamily, TypedFamilyRegistration, VNextError, WeightComponentSource, WeightSchema,
+    CausalLanguageMetadata, ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId,
+    ModelFamilyProvider, ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata,
+    ModelWeights, NumericalExecutionProfile, PreparedModelFamily, TypedFamilyRegistration,
+    VNextError, WeightComponentSource,
 };
 use ferrum_types::DataType;
 use serde::{Deserialize, Serialize};
@@ -41,7 +42,7 @@ pub const INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_moe.f16.int8-kv";
 #[serde(deny_unknown_fields)]
 pub struct Qwen3MoeFamilyConfig {
     semantic: Qwen3MoeSemanticConfig,
-    metadata: ModelSemanticMetadata,
+    metadata: CausalLanguageMetadata,
     weights: Qwen3MoeWeightManifest,
 }
 
@@ -122,8 +123,11 @@ impl ModelFamilyProvider for Qwen3MoeFamilyProvider {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        config.weights.weight_schema(&config.semantic)
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        config
+            .weights
+            .weight_schema(&config.semantic)
+            .map(ModelWeights::Stored)
     }
 
     fn numerical_profiles(
@@ -146,7 +150,7 @@ impl ModelFamilyProvider for Qwen3MoeFamilyProvider {
         &self,
         config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(config.metadata.clone())
+        Ok(config.metadata.clone().into())
     }
 }
 
@@ -336,7 +340,7 @@ mod tests {
         Qwen3MoeFamilyConfig {
             weights: weights::expected_manifest(&semantic, &quantization).unwrap(),
             semantic,
-            metadata: ModelSemanticMetadata {
+            metadata: CausalLanguageMetadata {
                 template: TemplateMetadata {
                     template: "{{ messages }}".to_owned(),
                     source_file: "tokenizer_config.json".to_owned(),

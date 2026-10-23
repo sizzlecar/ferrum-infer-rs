@@ -77,7 +77,8 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 # HTTP client for testing
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
+bytes = "1"
 tokio-stream = "0.1"
 futures = "0.3"
 
@@ -91,8 +92,9 @@ shellexpand = "3.1"
 libc = "0.2"
 
 [dev-dependencies]
+base64 = "0.22"
 ferrum-execution = { workspace = true, features = ["test-support"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 rstest = "0.23"
 async-openai = { version = "0.27", default-features = false, features = ["rustls"] }
 safetensors = { workspace = true }
@@ -112,6 +114,7 @@ interactive = [] # Enable interactive mode
 accelerate = ["ferrum-engine/accelerate"]  # Use Apple Accelerate BLAS (matches PyTorch precision)
 metal = ["ferrum-engine/metal", "ferrum-kernels/metal", "ferrum-quantization/metal"]  # Apple GPU
 cuda = ["ferrum-engine/cuda", "ferrum-kernels/cuda", "ferrum-quantization/cuda"]    # NVIDIA CUDA
+cuda-cutlass-fp8 = ["cuda", "ferrum-kernels/cuda-cutlass-fp8", "ferrum-models/cuda-cutlass-fp8"]
 # Full production capability set; requires a matching native operator-set lock.
 cuda-production = [
     "cuda-upstream-q6-f32-linear",

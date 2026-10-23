@@ -87,7 +87,10 @@ fn q8act_ffn_require_preserves_auto_state_boundaries_and_non_ffn_operations() {
     );
     let prepared = registration.prepare(&definition, &id).unwrap();
     let baseline = registration.prepare(&definition, &strict_id).unwrap();
-    assert_eq!(prepared.weight_schema(), baseline.weight_schema());
+    assert_eq!(
+        prepared.stored_weight_schema().unwrap(),
+        baseline.stored_weight_schema().unwrap()
+    );
     assert_eq!(prepared.canonical_config(), baseline.canonical_config());
     assert_eq!(prepared.program().states(), baseline.program().states());
     q8.validate_program(prepared.program()).unwrap();
@@ -241,7 +244,10 @@ fn q8act_three_format_require_changes_only_ffn_and_preserves_old_policy() {
     );
     let prepared = registration.prepare(&definition, &new_id).unwrap();
     let old_prepared = registration.prepare(&definition, &old_id).unwrap();
-    assert_eq!(prepared.weight_schema(), old_prepared.weight_schema());
+    assert_eq!(
+        prepared.stored_weight_schema().unwrap(),
+        old_prepared.stored_weight_schema().unwrap()
+    );
     assert_eq!(prepared.program().states(), old_prepared.program().states());
     new.validate_program(prepared.program()).unwrap();
     assert_ne!(new.fingerprint().unwrap(), old.fingerprint().unwrap());

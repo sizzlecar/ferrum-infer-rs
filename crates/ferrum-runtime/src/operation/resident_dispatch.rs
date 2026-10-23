@@ -126,7 +126,7 @@ impl<R: DeviceRuntime> ResidentDecodeProgram<R> {
                 "resident physical table changed after use authorization",
             ));
         }
-        let work = use_.work_shape();
+        let work = use_.work_shape().token_view()?;
         let snapshots = use_.backing_snapshots().collect::<Vec<_>>();
         if snapshots.len() != work.participant_token_ranges().len() {
             return Err(invalid_operation(
@@ -198,7 +198,11 @@ impl<R: DeviceRuntime> ResidentDecodeProgram<R> {
             return Ok(None);
         }
         self.validate_current_windows(use_, tables)?;
-        let refresh = DeviceResidentDecodeRefresh::new(use_.work_shape(), &previous.tables, tables);
+        let refresh = DeviceResidentDecodeRefresh::new(
+            use_.work_shape().token_view()?,
+            &previous.tables,
+            tables,
+        );
         let Some(backend) = self
             .lane
             .runtime()
@@ -667,8 +671,11 @@ impl OperationDispatch {
         let fresh_retention = use_.retention();
         let dependencies = program.dependencies.issue(fresh_retention.clone());
         let scope = Arc::clone(dependencies.scope());
-        let mut request =
-            DeviceResidentDecodeRequest::new(use_.work_shape(), fresh_retention, dependencies);
+        let mut request = DeviceResidentDecodeRequest::new(
+            use_.work_shape().token_view().map_err(invalid)?,
+            fresh_retention,
+            dependencies,
+        );
         drop(contract);
         let mut provider_stage = ResidentProviderTimer::start(timing);
         let encoded = lane
@@ -700,7 +707,7 @@ impl OperationDispatch {
             .map_err(invalid)?;
         let participant_count = u32::try_from(use_.work_shape().participants().len())
             .map_err(|_| invalid(invalid_operation("resident participant count exceeds u32")))?;
-        let immediate_tokens = use_.work_shape().immediate_tokens();
+        let immediate_tokens = use_.work_shape().immediate_tokens().map_err(invalid)?;
         let runtime = lane.runtime();
         provider_stage.pause();
         let backing_stage = SubmissionWaveDispatchStageTimer::start(

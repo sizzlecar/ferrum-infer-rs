@@ -11,6 +11,7 @@ use super::ElementType;
 
 mod hadamard;
 mod rn_f16_fragment;
+mod whole_tensor;
 pub(crate) use hadamard::same_shared_transform_sign_component;
 pub use hadamard::{
     GroupedFeatureTranspose, HadamardApplication, HadamardSigns, HadamardTransformSpec,
@@ -18,6 +19,7 @@ pub use hadamard::{
 pub use rn_f16_fragment::{
     RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1, RN_F16_FRAGMENT_ABI_V1,
 };
+pub use whole_tensor::FP8_E4M3FN_WHOLE_TENSOR_F32_FORMAT_ID;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,11 +36,14 @@ pub enum QuantizationPacking {
 /// matrix dimension part of the otherwise stable quantization-format ABI.
 /// `Block2d` carries the exact rectangular source block shape; the physical
 /// layout separately binds its two dimensions to ordered logical axes.
+/// `WholeTensor` shares one scalar across every logical element, including
+/// all matrix rows. It has no group axis and is not channelwise quantization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QuantizationGrouping {
     Fixed { size: u32 },
     WholeAxis,
+    WholeTensor,
     Block2d { block_shape: [NonZeroU32; 2] },
 }
 
@@ -50,7 +55,7 @@ impl QuantizationGrouping {
     pub const fn fixed_size(self) -> Option<u32> {
         match self {
             Self::Fixed { size } => Some(size),
-            Self::WholeAxis | Self::Block2d { .. } => None,
+            Self::WholeAxis | Self::WholeTensor | Self::Block2d { .. } => None,
         }
     }
 
@@ -61,7 +66,7 @@ impl QuantizationGrouping {
     pub const fn block_shape_2d(self) -> Option<[NonZeroU32; 2]> {
         match self {
             Self::Block2d { block_shape } => Some(block_shape),
-            Self::Fixed { .. } | Self::WholeAxis => None,
+            Self::Fixed { .. } | Self::WholeAxis | Self::WholeTensor => None,
         }
     }
 
@@ -72,14 +77,14 @@ impl QuantizationGrouping {
             // Multidimensional grouping has no meaningful single-axis size.
             // Zero makes accidental use by a legacy single-axis validator
             // fail closed instead of silently choosing one block dimension.
-            Self::Block2d { .. } => 0,
+            Self::WholeTensor | Self::Block2d { .. } => 0,
         }
     }
 
     const fn is_valid(self) -> bool {
         match self {
             Self::Fixed { size } => size != 0 && size.is_power_of_two(),
-            Self::WholeAxis => true,
+            Self::WholeAxis | Self::WholeTensor => true,
             Self::Block2d { block_shape } => {
                 block_shape[0].get().is_power_of_two() && block_shape[1].get().is_power_of_two()
             }
@@ -116,7 +121,7 @@ impl QuantizationSpec {
                 reason: format!("invalid quantization format `{}`", self.format_id),
             });
         }
-        Ok(())
+        self.validate_reserved_whole_tensor_format()
     }
 }
 
@@ -351,6 +356,17 @@ pub enum PhysicalWeightLayout {
         scales: PhysicalWeightComponentBinding,
         block_axes: [u32; 2],
     },
+    /// One scale for the entire logical tensor, without an implicit group
+    /// axis or zero point. The packed component must declare `WholeTensor`
+    /// grouping; a dense U8 component never implies a quantized encoding.
+    QuantizedTensor {
+        packed_values: PhysicalWeightComponentBinding,
+        /// Semantic byte shape before an explicit storage mapping. Its
+        /// product equals the exact packed size of the unpadded tensor.
+        packed_dimensions: Vec<u64>,
+        /// A one-element semantic tensor `[1]`, with the spec's scale dtype.
+        scales: PhysicalWeightComponentBinding,
+    },
     /// One opaque, self-contained quantization block represents a fixed
     /// number of logical values along `block_axis`. The bound component shape
     /// is the padded logical shape with that axis divided by the block width.
@@ -428,6 +444,7 @@ impl PhysicalWeightLayout {
             | Self::Stored { .. }
             | Self::Quantized { .. }
             | Self::QuantizedBlockGrid { .. }
+            | Self::QuantizedTensor { .. }
             | Self::BlockQuantized { .. }
             | Self::RnF16DenseAndFragmentV1 { .. } => {}
         }
@@ -696,6 +713,7 @@ pub(crate) fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> 
                     + usize::from(codebook.is_some())
             }
             PhysicalWeightLayout::QuantizedBlockGrid { .. }
+            | PhysicalWeightLayout::QuantizedTensor { .. }
             | PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. } => 2,
             PhysicalWeightLayout::BlockQuantized { .. } => 1,
             PhysicalWeightLayout::Hadamard { transform, .. } => {
@@ -736,6 +754,7 @@ pub(crate) fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> 
             | PhysicalWeightLayout::Stored { .. }
             | PhysicalWeightLayout::Quantized { .. }
             | PhysicalWeightLayout::QuantizedBlockGrid { .. }
+            | PhysicalWeightLayout::QuantizedTensor { .. }
             | PhysicalWeightLayout::BlockQuantized { .. }
             | PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. } => {}
         }
@@ -786,6 +805,11 @@ pub(crate) fn physical_component_ids(
                 }
             }
             PhysicalWeightLayout::QuantizedBlockGrid {
+                packed_values,
+                scales,
+                ..
+            }
+            | PhysicalWeightLayout::QuantizedTensor {
                 packed_values,
                 scales,
                 ..

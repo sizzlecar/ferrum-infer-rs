@@ -33,6 +33,8 @@ pub use extra_readback::*;
 pub use readback_collection::*;
 mod readback_selection;
 pub use readback_selection::*;
+mod managed_readback;
+pub use managed_readback::*;
 mod segment_binding_publication;
 use segment_binding_publication::SegmentBindingRecipeCache;
 pub use segment_binding_publication::{ReadySegmentBindingPublication, SegmentBindingPublication};
@@ -2649,6 +2651,18 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                                 );
                         }
                     }
+                }
+            }
+            if let CompletionResourceLease::Wave(wave) = &mut resources {
+                if let Err(error) = wave.finish_tensor_state_initialization(matches!(
+                    disposition,
+                    OperationCompletionDisposition::Succeeded
+                )) {
+                    disposition = OperationCompletionDisposition::ContractFailedButQuiescent(
+                        QuiescentCompletionContractFailure::new(format!(
+                            "fixed request state publication failed: {error}"
+                        )),
+                    );
                 }
             }
             drop(guard);

@@ -1,4 +1,5 @@
 use super::*;
+use ferrum_runtime::ModelWeights;
 
 pub(crate) const MAX_EVENT_MAINTENANCE_ATTEMPTS: usize = 8;
 
@@ -110,9 +111,9 @@ impl ModelFamilyProvider for TestFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
         let required = !config.no_static;
-        Ok(WeightSchema {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.event-dense"),
             layout_id: id("weight-layout.event-dense"),
             version: ContractVersion::new(1, 0),
@@ -135,7 +136,7 @@ impl ModelFamilyProvider for TestFamily {
                 },
                 required,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -208,19 +209,21 @@ impl ModelFamilyProvider for TestFamily {
         &self,
         _config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
-            template: TemplateMetadata {
-                template: "{{ messages }}".to_owned(),
-                source_file: "template.json".to_owned(),
-                sha256: sha('a'),
+        Ok(ModelSemanticMetadata::CausalLanguage(
+            ferrum_runtime::CausalLanguageMetadata {
+                template: TemplateMetadata {
+                    template: "{{ messages }}".to_owned(),
+                    source_file: "template.json".to_owned(),
+                    sha256: sha('a'),
+                },
+                special_tokens: SpecialTokenMetadata {
+                    bos_token_id: Some(1),
+                    eos_token_ids: BTreeSet::from([2]),
+                    pad_token_id: Some(0),
+                    collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
+                },
             },
-            special_tokens: SpecialTokenMetadata {
-                bos_token_id: Some(1),
-                eos_token_ids: BTreeSet::from([2]),
-                pad_token_id: Some(0),
-                collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
-            },
-        })
+        ))
     }
 }
 
@@ -440,7 +443,7 @@ pub(crate) fn execution_plan_with_mode(
                 BufferUsage::Weights,
                 Some(
                     ResolvedWeightBinding::from_schema(
-                        family.weight_schema(),
+                        family.stored_weight_schema().unwrap(),
                         &id("weight.matrix"),
                     )
                     .unwrap(),

@@ -76,7 +76,7 @@ fn paged_growth_grow_only_reserves_a_cold_pool_without_advancing_actual_work() {
         SequenceResourceExtensionDecision::Extended(next) => next,
         _ => panic!("budgeted page-group growth must admit from a cold pool"),
     };
-    assert_eq!(next.committed_tokens(), 2);
+    assert_eq!(next.committed_tokens().unwrap(), 2);
     assert_eq!(owned(&next), 256);
     assert_eq!(h.runtime.allocate_calls(), allocations + 1);
     h.runtime
@@ -97,7 +97,7 @@ fn paged_growth_grow_only_reserves_a_cold_pool_without_advancing_actual_work() {
         SequenceResourceExtensionDecision::Extended(next) => next,
         _ => panic!("owned surplus must cover later real work"),
     };
-    assert_eq!(last.committed_tokens(), 4);
+    assert_eq!(last.committed_tokens().unwrap(), 4);
     assert!(next.shares_physical_catalog(&last));
     let last_table = last
         .physical_binding_table(
@@ -153,7 +153,7 @@ fn paged_growth_grow_only_budget_denial_preserves_idle_chunks_and_uses_exact() {
         SequenceResourceExtensionDecision::Extended(next) => next,
         _ => panic!("required work must fit without reclaiming optional capacity"),
     };
-    assert_eq!(next.committed_tokens(), 2);
+    assert_eq!(next.committed_tokens().unwrap(), 2);
     assert_eq!(owned(&next), 128);
     assert_eq!(h.runtime.allocate_calls(), allocations);
     let after = h.root.dynamic_pool_status().unwrap();
@@ -267,7 +267,7 @@ fn paged_growth_keeps_actual_frontier_and_reuses_owned_capacity() {
     let session = sequence.open_session().unwrap();
     let initial = sequence.backing_snapshot().unwrap();
     let reserved = grow(&session, 2, true);
-    assert_eq!(reserved.committed_tokens(), 2);
+    assert_eq!(reserved.committed_tokens().unwrap(), 2);
     assert_eq!(owned(&reserved), 256);
     assert!(!reserved.shares_physical_catalog(&initial));
     h.runtime
@@ -317,8 +317,8 @@ fn paged_growth_keeps_actual_frontier_and_reuses_owned_capacity() {
     // the same bytes a second time after the opt-in reservation has succeeded.
     let third = grow(&session, 3, false);
     let fourth = grow(&session, 4, true);
-    assert_eq!(third.committed_tokens(), 3);
-    assert_eq!(fourth.committed_tokens(), 4);
+    assert_eq!(third.committed_tokens().unwrap(), 3);
+    assert_eq!(fourth.committed_tokens().unwrap(), 4);
     assert_eq!(owned(&fourth), 256);
     assert!(reserved.shares_physical_catalog(&third));
     assert!(reserved.shares_physical_catalog(&fourth));
@@ -373,7 +373,7 @@ fn paged_growth_surplus_shortage_falls_back_without_pool_growth() {
     let session = sequence.open_session().unwrap();
     let allocations = runtime.allocate_calls.load(Ordering::Acquire);
     let next = grow(&session, 2, true);
-    assert_eq!(next.committed_tokens(), 2);
+    assert_eq!(next.committed_tokens().unwrap(), 2);
     assert_eq!(owned(&next), 128);
     assert_eq!(runtime.allocate_calls.load(Ordering::Acquire), allocations);
     assert_eq!(
@@ -406,7 +406,7 @@ fn paged_growth_clamps_to_parent_and_exact_remains_default() {
         let sequence = admitted_sequence_with_ceiling(&h.root, "grouped-ceiling", ceiling);
         let session = sequence.open_session().unwrap();
         let next = grow(&session, 2, grouped);
-        assert_eq!(next.committed_tokens(), 2);
+        assert_eq!(next.committed_tokens().unwrap(), 2);
         assert_eq!(owned(&next), expected_bytes);
         assert!(session
             .try_ensure_backing_covers(

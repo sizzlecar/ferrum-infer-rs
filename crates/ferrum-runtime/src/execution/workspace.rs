@@ -155,6 +155,10 @@ impl ProviderWorkspaceSizeFormula {
 
     fn evaluate_shape_bytes(&self, shape: DynamicResourceShape) -> Result<u64, VNextError> {
         self.validate()?;
+        if let Self::Fixed { bytes } = self {
+            return Ok(*bytes);
+        }
+        let shape = shape.token_dimensions()?;
         let bytes = match self {
             Self::Fixed { bytes } => *bytes,
             Self::ActualSequences { bytes_per_sequence } => bytes_per_sequence
@@ -207,9 +211,19 @@ impl ProviderWorkspaceSizeFormula {
     pub(super) fn bind_runtime_limits(
         &self,
         maximum_sequences: u32,
-        maximum_tokens: u64,
+        work_limits: super::RuntimeWorkLimits,
     ) -> Result<DynamicResourceDemand, VNextError> {
         self.validate()?;
+        work_limits.validate()?;
+        if work_limits.is_tensor() {
+            return match self {
+                Self::Fixed { bytes } => DynamicResourceDemand::fixed(*bytes),
+                _ => Err(invalid_plan(
+                    "fixed tensor work requires a fixed provider workspace",
+                )),
+            };
+        }
+        let maximum_tokens = work_limits.maximum_scheduled_tokens()?;
         match self {
             Self::Fixed { bytes } => DynamicResourceDemand::fixed(*bytes),
             Self::ActualSequences { bytes_per_sequence } => {
@@ -402,6 +416,9 @@ impl ProviderWorkspaceRequirement {
     }
 
     pub fn minimum_bytes(&self) -> Result<u64, VNextError> {
+        if let Some(bytes) = self.fixed_bytes() {
+            return align_up(bytes, self.alignment_bytes);
+        }
         self.evaluate_shape_bytes(DynamicResourceShape::from_validated(1, 1, 1))
     }
 

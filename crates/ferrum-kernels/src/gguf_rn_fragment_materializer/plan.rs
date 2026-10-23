@@ -22,7 +22,7 @@ pub(super) struct Prepared {
 }
 
 pub(super) fn prepare(family: &PreparedModelFamily) -> Result<Prepared, VNextError> {
-    prepare_program(family.weight_schema(), family.program())
+    prepare_program(family.stored_weight_schema()?, family.program())
 }
 
 pub(super) fn prepare_program(

@@ -106,7 +106,10 @@ fn q8act_attention_require_preserves_auto_and_only_overrides_declared_operations
     );
     let prepared = registration.prepare(&definition, &candidate_id).unwrap();
     let baseline = registration.prepare(&definition, &strict_id).unwrap();
-    assert_eq!(prepared.weight_schema(), baseline.weight_schema());
+    assert_eq!(
+        prepared.stored_weight_schema().unwrap(),
+        baseline.stored_weight_schema().unwrap()
+    );
     assert_eq!(prepared.program().states(), baseline.program().states());
     selected.validate_program(prepared.program()).unwrap();
     let mut missing_kv = selected.clone();

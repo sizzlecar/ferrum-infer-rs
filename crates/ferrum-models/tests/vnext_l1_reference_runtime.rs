@@ -92,8 +92,8 @@ impl ModelFamilyProvider for TinyDenseFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id(REFERENCE_DENSE_SAFETENSORS_FORMAT_ID),
             layout_id: id("weight-layout.reference.tiny-dense"),
             version: ContractVersion::new(1, 0),
@@ -116,7 +116,7 @@ impl ModelFamilyProvider for TinyDenseFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -230,7 +230,7 @@ impl ModelFamilyProvider for TinyDenseFamily {
         &self,
         _config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
+        Ok(CausalLanguageMetadata {
             template: TemplateMetadata {
                 template: "{{ messages }}".to_owned(),
                 source_file: "reference-template.json".to_owned(),
@@ -242,7 +242,8 @@ impl ModelFamilyProvider for TinyDenseFamily {
                 pad_token_id: Some(0),
                 collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
             },
-        })
+        }
+        .into())
     }
 }
 
@@ -733,6 +734,7 @@ fn execute_reference_batch(
     let token_ranges = token_wave_node
         .work_shape()
         .participant_token_ranges()
+        .unwrap()
         .to_vec();
     assert_eq!(token_ranges.len(), canonical_cases.len());
     let batch_identity = OperationDispatch::bind_submission_wave_identity(

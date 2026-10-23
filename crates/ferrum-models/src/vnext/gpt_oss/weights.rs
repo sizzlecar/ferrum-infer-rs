@@ -1621,15 +1621,31 @@ mod tests {
             ferrum_types::ModelOutputProtocol::HarmonyGptOss
         );
         assert_eq!(
-            prepared.family().metadata().special_tokens.eos_token_ids,
+            prepared
+                .family()
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .special_tokens
+                .eos_token_ids,
             BTreeSet::from([199_999, 200_002, 200_012])
         );
         assert_eq!(
-            prepared.family().weight_schema().format_id.as_str(),
+            prepared
+                .family()
+                .stored_weight_schema()
+                .unwrap()
+                .format_id
+                .as_str(),
             "weight-format.safetensors.gpt-oss-mxfp4-source"
         );
         assert_eq!(
-            prepared.family().weight_schema().layout_id.as_str(),
+            prepared
+                .family()
+                .stored_weight_schema()
+                .unwrap()
+                .layout_id
+                .as_str(),
             "weight-layout.gpt_oss.mxfp4.e2m1_e8m0.group32.expert_major"
         );
 

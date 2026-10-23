@@ -4,9 +4,11 @@
 //! environment variables or select an accelerator path by itself; product
 //! entrypoints must pass typed manifest/artifact choices into this layer.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+pub mod cutlass_fp8;
 pub mod upstream_linear;
 pub mod upstream_q6_f16_linear;
 pub mod upstream_q6_f32_linear;
@@ -21,6 +23,7 @@ use ferrum_types::{
     NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
 };
 
+pub use ferrum_native_ops::CudaNativeBuildUnit;
 pub use ferrum_types::CompiledNativeOperatorIdentity as CompiledNativeOperatorArtifact;
 
 pub const FA2_NATIVE_OPERATOR: &str = "fa2";
@@ -39,9 +42,90 @@ pub fn compiled_native_operator_artifacts() -> &'static [CompiledNativeOperatorA
         .as_slice()
 }
 
+/// Validate the native artifacts explicitly consumed by one composition.
+///
+/// The caller declares units from its registration policy, never by intersecting
+/// bindings with the live catalog. Every required artifact must exist exactly
+/// once and satisfy its complete ABI/export contract. All bindings of each
+/// selected artifact are then checked, including bindings for shared units.
+/// `native-operators/cuda/package-definitions/marlin.json` explicitly declares
+/// no G03 provider bindings for Marlin ABI 2. A scope containing only that
+/// legacy unit validates its ABI, exports and provenance.
+/// An empty scope explicitly means this composition consumes no packaged native
+/// operators; it does not change the compiled inventory or its build-time proof.
+pub fn validate_compiled_native_operator_provider_catalog_for_units(
+    catalog: &NativeOperatorProviderCatalog,
+    artifacts: &[CompiledNativeOperatorArtifact],
+    required: &[CudaNativeBuildUnit],
+) -> Result<(), String> {
+    let mut selected = Vec::new();
+    let mut selected_operators = BTreeSet::new();
+    for unit in required.iter().copied().collect::<BTreeSet<_>>() {
+        let mut matches = artifacts
+            .iter()
+            .filter(|artifact| artifact.operator == unit.artifact_operator());
+        let artifact = matches.next().ok_or_else(|| {
+            format!(
+                "composition requires missing native build unit {} (operator={})",
+                unit.as_str(),
+                unit.artifact_operator()
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "composition native build unit {} has ambiguous compiled artifacts",
+                unit.as_str()
+            ));
+        }
+        if artifact.backend != NativeOperatorBackend::Cuda {
+            return Err(format!(
+                "composition native build unit {} requires a CUDA artifact",
+                unit.as_str()
+            ));
+        }
+        unit.validate_package_contract(&artifact.operator_abi_version, &artifact.exports)
+            .map_err(|error| error.to_string())?;
+        if unit != CudaNativeBuildUnit::Marlin && artifact.operation_bindings.is_empty() {
+            return Err(format!(
+                "composition native build unit {} requires a live provider binding",
+                unit.as_str()
+            ));
+        }
+        if selected_operators.insert(unit.artifact_operator()) {
+            // Metadata only; the binary inventory and native ownership remain
+            // intact. Shared artifacts retain their entire binding list.
+            selected.push(artifact.clone());
+        }
+    }
+    let binding_requirement = if !required.is_empty()
+        && required
+            .iter()
+            .all(|unit| *unit == CudaNativeBuildUnit::Marlin)
+    {
+        CatalogBindingRequirement::AbiOnlyMarlin
+    } else {
+        CatalogBindingRequirement::AtLeastOne
+    };
+    validate_provider_catalog_artifacts(catalog, &selected, binding_requirement)
+}
+
 pub fn validate_compiled_native_operator_provider_catalog(
     catalog: &NativeOperatorProviderCatalog,
     artifacts: &[CompiledNativeOperatorArtifact],
+) -> Result<(), String> {
+    validate_provider_catalog_artifacts(catalog, artifacts, CatalogBindingRequirement::AtLeastOne)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CatalogBindingRequirement {
+    AtLeastOne,
+    AbiOnlyMarlin,
+}
+
+fn validate_provider_catalog_artifacts(
+    catalog: &NativeOperatorProviderCatalog,
+    artifacts: &[CompiledNativeOperatorArtifact],
+    binding_requirement: CatalogBindingRequirement,
 ) -> Result<(), String> {
     catalog.validate()?;
     if artifacts.is_empty() {
@@ -113,7 +197,7 @@ pub fn validate_compiled_native_operator_provider_catalog(
             }
         }
     }
-    if binding_count == 0 {
+    if binding_count == 0 && binding_requirement == CatalogBindingRequirement::AtLeastOne {
         return Err(
             "compiled native operator set does not bind any live G03 operation/provider"
                 .to_string(),

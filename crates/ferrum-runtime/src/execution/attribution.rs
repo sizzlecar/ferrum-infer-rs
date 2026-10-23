@@ -52,7 +52,9 @@ pub struct QuantizedProviderAttributionDenominator {
 
 impl QuantizedProviderAttributionDenominator {
     pub fn from_prepared_family(family: &PreparedModelFamily) -> Result<Option<Self>, VNextError> {
-        let schema = family.weight_schema();
+        let crate::ModelWeights::Stored(schema) = family.weights() else {
+            return Ok(None);
+        };
         let weights_by_value = family
             .program()
             .weights()
@@ -334,7 +336,12 @@ impl StaticProviderAttributionWitness {
         let family = &resolved.parts().prepared_family;
         let plan = resolved.execution_plan();
         let payload = plan.payload();
-        let execution_weights = payload.execution_weights();
+        let super::ExecutionWeights::Stored(execution_weights) = payload.execution_weights() else {
+            payload
+                .execution_weights()
+                .validate_against_family(family)?;
+            return Ok(None);
+        };
         // The v1 witness assumes one operation owner per source tensor. The
         // identity path can legally reuse a tied quantized embedding for both
         // token embedding and logits, so this optional witness must not block
@@ -350,7 +357,7 @@ impl StaticProviderAttributionWitness {
             return Ok(None);
         };
         let source_components = family
-            .weight_schema()
+            .stored_weight_schema()?
             .components
             .iter()
             .map(|component| (&component.id, component))
@@ -526,7 +533,7 @@ impl StaticProviderAttributionWitness {
             )));
         }
         let family_fingerprint = family.fingerprint()?;
-        let source_schema_fingerprint = family.weight_schema().fingerprint()?;
+        let source_schema_fingerprint = family.stored_weight_schema()?.fingerprint()?;
         if execution_weights.source_schema_fingerprint() != source_schema_fingerprint {
             return Err(invalid_attribution(
                 "execution weight plan source schema differs from the live prepared family",
@@ -553,8 +560,8 @@ impl StaticProviderAttributionWitness {
         let binding = ProviderAttributionBinding {
             prepared_family_fingerprint: family_fingerprint,
             source_schema_fingerprint,
-            source_weight_format_id: family.weight_schema().format_id.to_string(),
-            source_weight_layout_id: family.weight_schema().layout_id.to_string(),
+            source_weight_format_id: family.stored_weight_schema()?.format_id.to_string(),
+            source_weight_layout_id: family.stored_weight_schema()?.layout_id.to_string(),
             source_quantization_format_ids: denominator.source_quantization_format_ids,
             execution_weight_plan_fingerprint: execution_weights.fingerprint()?,
             execution_schema_fingerprint: execution_weights.schema().fingerprint()?,

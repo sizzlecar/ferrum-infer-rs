@@ -535,9 +535,10 @@ impl Fixture {
                 {
                     assert!(
                         G32MmqPrefillPolicy::g32_partition(
-                            step.work_shape().immediate_tokens(),
+                            step.work_shape().immediate_tokens().unwrap(),
                             step.work_shape()
                                 .participant_token_ranges()
+                                .unwrap()
                                 .iter()
                                 .map(|range| range.immediate_token_range()),
                         )

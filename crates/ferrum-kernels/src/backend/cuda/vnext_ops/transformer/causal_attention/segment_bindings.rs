@@ -75,7 +75,10 @@ pub(crate) fn resident_control_rules(
             state_bytes: bytes,
             maximum_state_bytes,
             values: Arc::new(move |work| {
-                let Some(token) = work.participant_token_ranges().get(participant) else {
+                let ranges = work
+                    .participant_token_ranges()
+                    .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+                let Some(token) = ranges.get(participant) else {
                     return Ok(None);
                 };
                 let source = token.source_token_range();

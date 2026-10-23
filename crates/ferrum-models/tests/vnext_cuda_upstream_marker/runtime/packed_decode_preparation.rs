@@ -113,7 +113,7 @@ fn physical_pages(
     else {
         panic!("already extended Sequence must expose its actual committed backing");
     };
-    assert!(backing.committed_tokens() >= end as u64);
+    assert!(backing.committed_tokens().unwrap() >= end as u64);
     let bytes: u64 = backing
         .backing_slices()
         .iter()
@@ -182,7 +182,7 @@ fn attention_work(
     assert_eq!(work.execution_path(), DeviceExecutionPath::Eager);
     assert_eq!(work.batching_form(), DeviceBatchingForm::Packed);
     assert_eq!(work.participant_count(), participants as u32);
-    assert_eq!(work.token_count(), participants as u64);
+    assert_eq!(work.token_count(), Some(participants as u64));
     assert_eq!(
         work.native_op_id(),
         if matches!(
@@ -423,7 +423,8 @@ fn verify_options_with_execution_capacity(
                 .executable()
                 .execution_plan()
                 .payload()
-                .maximum_scheduled_tokens();
+                .maximum_scheduled_tokens()
+                .expect("language policy has token limits");
             let prefill_chunk =
                 32.min(usize::try_from(scheduled_limit / owners.len() as u64).unwrap());
             assert!(prefill_chunk > 0);

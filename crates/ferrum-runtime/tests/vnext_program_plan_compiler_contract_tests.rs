@@ -1,3 +1,5 @@
+#[path = "vnext_program_plan_compiler_contract_tests/bf16_quality.rs"]
+mod bf16_quality;
 mod vnext_core_contract;
 
 use vnext_core_contract::*;
@@ -206,7 +208,7 @@ impl WeightMaterializer for PaddedDenseMaterializer {
         family: &PreparedModelFamily,
         _device: &DeviceDescriptor,
     ) -> Result<WeightSchema, VNextError> {
-        let mut schema = family.weight_schema().clone();
+        let mut schema = family.stored_weight_schema().unwrap().clone();
         schema.layout_id = id("weight-layout.test.padded-dense");
         schema.components[0].dimensions = vec![8];
         schema.tensors[0].physical_layout = PhysicalWeightLayout::Stored {
@@ -282,7 +284,7 @@ impl WeightMaterializer for LogicalMutationMaterializer {
         family: &PreparedModelFamily,
         _device: &DeviceDescriptor,
     ) -> Result<WeightSchema, VNextError> {
-        let mut schema = family.weight_schema().clone();
+        let mut schema = family.stored_weight_schema().unwrap().clone();
         schema.components[0].dimensions = vec![5];
         schema.tensors[0].dimensions = vec![5];
         Ok(schema)
@@ -317,24 +319,37 @@ fn semantic_program_compiles_through_the_registered_provider_authority() {
     )]))
     .unwrap();
 
+    assert_eq!(options.weight_preparation(), &WeightPreparation::Auto);
     let compilation =
         ProgramPlanCompiler::compile(&family, &catalog, &policy, &planning, &options).unwrap();
     let plan = compilation.executable().execution_plan();
     assert_eq!(plan.payload().nodes().len(), 1);
     assert!(plan.payload().retained_completion_values().is_empty());
     assert_eq!(
-        plan.payload().execution_weights().schema(),
-        family.weight_schema()
+        plan.payload()
+            .execution_weights()
+            .stored()
+            .unwrap()
+            .schema(),
+        family.stored_weight_schema().unwrap()
     );
     assert_eq!(
         plan.payload()
             .execution_weights()
+            .stored()
+            .unwrap()
             .source_schema_fingerprint(),
-        family.weight_schema().fingerprint().unwrap()
+        family
+            .stored_weight_schema()
+            .unwrap()
+            .fingerprint()
+            .unwrap()
     );
     assert_eq!(
         plan.payload()
             .execution_weights()
+            .stored()
+            .unwrap()
             .materializer_id()
             .as_str(),
         "weight-materializer.identity"
@@ -342,12 +357,16 @@ fn semantic_program_compiles_through_the_registered_provider_authority() {
     assert!(plan
         .payload()
         .execution_weights()
+        .stored()
+        .unwrap()
         .approximate_quality_approval()
         .is_none());
-    assert!(serde_json::to_value(plan.payload().execution_weights())
-        .unwrap()
-        .get("approximate_quality_approval")
-        .is_none());
+    assert!(
+        serde_json::to_value(plan.payload().execution_weights().stored().unwrap())
+            .unwrap()
+            .get("approximate_quality_approval")
+            .is_none()
+    );
     assert_eq!(compilation.node_resolutions().len(), 1);
     assert_eq!(
         compilation
@@ -479,7 +498,9 @@ fn canonical_numeric_artifact_mints_a_live_schema_bound_approval() {
         .executable()
         .execution_plan()
         .payload()
-        .execution_weights();
+        .execution_weights()
+        .stored()
+        .unwrap();
     assert_eq!(weights.materializer_id(), &materializer_id);
     let approval = weights
         .approximate_quality_approval()
@@ -491,7 +512,11 @@ fn canonical_numeric_artifact_mints_a_live_schema_bound_approval() {
     assert_eq!(approval.inf_count(), 0);
     assert_eq!(
         approval.source_schema_fingerprint(),
-        family.weight_schema().fingerprint().unwrap()
+        family
+            .stored_weight_schema()
+            .unwrap()
+            .fingerprint()
+            .unwrap()
     );
     assert_eq!(
         approval.execution_schema_fingerprint(),
@@ -505,13 +530,16 @@ fn canonical_numeric_artifact_mints_a_live_schema_bound_approval() {
     let selection =
         WeightMaterializerSelection::numeric_quality_artifact(materializer_id, artifact).unwrap();
     assert!(selection.has_numeric_quality_artifact());
-    assert_eq!(options.weight_materializer_selection(), &selection);
+    assert_eq!(
+        options.weight_preparation(),
+        &WeightPreparation::Require(selection)
+    );
 }
 
 #[test]
 fn numeric_artifact_is_reusable_but_each_approval_binds_the_live_schema() {
     let first_family = TestRegistry::new().prepare();
-    let mut second_source_schema = first_family.weight_schema().clone();
+    let mut second_source_schema = first_family.stored_weight_schema().unwrap().clone();
     second_source_schema.components[0].external_names = vec!["alternate-weight.bin".to_owned()];
     let second_family = prepared_with_weight_schema(second_source_schema);
     let descriptor =
@@ -777,11 +805,20 @@ fn trusted_materializer_changes_physical_plan_memory_and_wire_requires_its_witne
     .unwrap();
     let plan = transformed.executable().execution_plan();
     assert_eq!(
-        plan.payload().execution_weights().materializer_id(),
+        plan.payload()
+            .execution_weights()
+            .stored()
+            .unwrap()
+            .materializer_id(),
         &materializer_id
     );
     assert_eq!(
-        plan.payload().execution_weights().schema().layout_id,
+        plan.payload()
+            .execution_weights()
+            .stored()
+            .unwrap()
+            .schema()
+            .layout_id,
         id("weight-layout.test.padded-dense")
     );
     assert_eq!(
@@ -902,7 +939,12 @@ fn materializer_cannot_change_the_prepared_logical_weight_contract() {
 
 #[test]
 fn dense_binding_in_mixed_checkpoint_does_not_require_the_container_format() {
-    let mut schema = TestFamily.weight_schema(&TestConfig { width: 4 }).unwrap();
+    let mut schema = TestFamily
+        .weights(&TestConfig { width: 4 })
+        .unwrap()
+        .stored_schema()
+        .unwrap()
+        .clone();
     schema.format_id = id("weight-format.safetensors.mixed-gptq");
     schema.layout_id = id("weight-layout.synthetic.mixed-gptq");
     let family = prepared_with_weight_schema(schema);

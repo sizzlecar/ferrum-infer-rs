@@ -121,7 +121,6 @@ jobs:
           end
           runtime_required = !!asset && policy == 'required'
           if mode == 'delivery'
-            raise 'This candidate requires real SM120 validation, but no approved SM120 runner is available; historical evidence is not a new verification run' if runtime_required
             raise 'Active release must declare its SM120 asset' if ENV.fetch('VERIFY_PUBLISHED_VERSION', '').empty? && !asset
           end
           puts "sm120_required=#{!!asset}"
@@ -223,6 +222,8 @@ jobs:
             --jq .body > "$RUNNER_TEMP/release-notes.md"
           if [ "$SM120_RUNTIME_POLICY" = not_run_hardware_unavailable ]; then
             printf '\n## SM120 validation scope\n\nThe SM120 package has archive, ABI and build validation. Model execution and public SM120 installation/startup are not run for this candidate: %s Earlier SM120 measurements remain evidence only for their original binaries and configurations.\n' "$SM120_RUNTIME_REASON" >> "$RUNNER_TEMP/release-notes.md"
+          elif [ "$SM120_RUNTIME_POLICY" = required ]; then
+            printf '\n## SM120 validation scope\n\nSM120 model execution and startup must validate the final extracted release archive before publication. Manual execution evidence is recorded separately from CI. Text-model tasks do not establish image generation or image editing validation.\n' >> "$RUNNER_TEMP/release-notes.md"
           fi
           if [ "$version" = 0.13.0 ]; then
             cat >> "$RUNNER_TEMP/release-notes.md" <<'NOTES_013'
@@ -475,7 +476,8 @@ jobs:
               --output "$RUNNER_TEMP/installation/$backend.json" "${extra[@]}"
           done
           # Inspect the exact SM120 bytes without substituting an SM89 run.
-          # The candidate's unavailable-hardware policy keeps this receipt not_run.
+          # This planning-host receipt remains not_run. A runtime-required
+          # candidate must replace it with the actual extracted-archive run.
           release_delivery inspect \
             --abi "$RUNNER_TEMP/staged/ferrum-linux-x86_64-cuda-sm120.tar.gz.abi.json" --version "$VERSION" \
             --candidate-sha "$GITHUB_SHA" --extract-dir "$RUNNER_TEMP/extracted-cuda-sm120" \
@@ -488,6 +490,22 @@ jobs:
             --abi "$RUNNER_TEMP/staged/ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json" \
             --abi "$RUNNER_TEMP/staged/ferrum-macos-aarch64.tar.gz.abi.json" \
             --output-dir "$RUNNER_TEMP/tasks"
+      - name: Prepare required SM120 tasks against the final archive binary
+        if: needs.prepare.outputs.sm120_runtime_required == 'true'
+        run: |
+          model_gate prepare --plan "$RUNNER_TEMP/plan/release-plan.json" \
+            --version "$VERSION" --backend cuda --cuda-lane local \
+            --abi "$RUNNER_TEMP/staged/ferrum-linux-x86_64-cuda-sm120.tar.gz.abi.json" \
+            --output-dir "$RUNNER_TEMP/tasks-sm120"
+          printf 'SM120 text-model tasks are bound to the final staged binary. Image generation and image editing additionally require actual validation of that same extracted binary; text-model reports do not cover those workloads.\n' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always() && needs.prepare.outputs.sm120_runtime_required == 'true'
+        with:
+          name: release-cuda-sm120-tasks
+          overwrite: true
+          path: ${{ runner.temp }}/tasks-sm120/
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -940,6 +958,7 @@ jobs:
     if: >-
       always() && !cancelled() &&
       needs.prepare.outputs.active == 'true' &&
+      needs.prepare.outputs.sm120_runtime_required == 'false' &&
       needs.prepare.result == 'success' && needs.quality.result == 'success' &&
       needs.tools.result == 'success' && needs.stage.result == 'success' &&
       needs.stage-metal.result == 'success' && needs.stage-cuda-linux.result == 'success' &&
@@ -1325,6 +1344,11 @@ jobs:
           WINDOWS_BOOTSTRAP: ${{ needs.install-bootstrap-windows.result }}
         run: |
           test "$PREPARE" = success
+          if [ "$ACTIVE" = true ] && [ "$SM120_RUNTIME_REQUIRED" = true ]; then
+            test "$PUBLISH" = skipped
+            printf 'Publication is blocked pending required SM120 runtime evidence. Validate the final extracted SM120 archive on the approved GPU, including its prepared text-model tasks and image generation/editing workloads, then use release-resume with the original manual evidence asset and its SHA-256. A planning-host extract-only receipt is not runtime validation.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           if [ "$VERIFY_ONLY" = true ]; then
             test "$ACTIVE" = false
             test "$PUBLISH" = skipped
@@ -1336,13 +1360,21 @@ jobs:
           test "$CARGO_INSTALL" = success
           test "$BREW_INSTALL" = success
           test "$UNIX_BOOTSTRAP" = success
-          test "$SM120_RUNTIME_REQUIRED" = false
+          test "$WINDOWS_BOOTSTRAP" = success
           case "$SM120_REQUIRED:$SM120_RUNTIME_POLICY" in
+            true:required)
+              test "$SM120_RUNTIME_REQUIRED" = true
+              test "$VERIFY_ONLY" = true
+              printf 'Public Cargo, Homebrew and approved-fleet installation/startup checks passed. Public SM120 installation/startup still requires separate actual validation; prior manual candidate-archive evidence does not establish public installation success.\n' >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
             true:not_run_hardware_unavailable)
+              test "$SM120_RUNTIME_REQUIRED" = false
               test -n "$SM120_RUNTIME_REASON"
               printf 'SM120 model execution and public installation/startup: not_run (hardware unavailable). %s\n' "$SM120_RUNTIME_REASON" >> "$GITHUB_STEP_SUMMARY"
               ;;
             false:required)
+              test "$SM120_RUNTIME_REQUIRED" = false
               test "$VERIFY_ONLY" = true
               test "$ACTIVE" = false
               test -z "$SM120_RUNTIME_REASON"
@@ -1350,5 +1382,4 @@ jobs:
               ;;
             *) echo 'Missing or unsupported candidate SM120 validation scope' >&2; exit 1 ;;
           esac
-          test "$WINDOWS_BOOTSTRAP" = success
           printf 'Ferrum %s: required Cargo, Homebrew and public Windows/Linux/macOS installation/startup checks passed (verification-only=%s); SM120 runtime scope is recorded separately above.\n' "$VERSION" "$VERIFY_ONLY" >> "$GITHUB_STEP_SUMMARY"

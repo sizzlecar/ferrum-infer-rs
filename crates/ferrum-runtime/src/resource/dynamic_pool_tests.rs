@@ -29,6 +29,12 @@ mod reusable_pressure_tests;
 #[path = "plan_fit_tests.rs"]
 mod plan_fit_tests;
 
+#[path = "submission_wave_projection_tests.rs"]
+mod submission_wave_projection_tests;
+
+#[path = "idle_dynamic_footprint_tests.rs"]
+mod idle_dynamic_footprint_tests;
+
 #[path = "operation_view_coverage_tests.rs"]
 mod operation_view_coverage_tests;
 
@@ -871,6 +877,9 @@ fn harness_with_checkpoint_policy(
         admission_generation: generation,
     };
     let binding = StaticProvisioningBinding {
+        work_limits: crate::RuntimeWorkLimits::Tokens {
+            maximum_scheduled_tokens: 4096,
+        },
         pool_identity,
         plan_id,
         plan_hash,
@@ -1417,6 +1426,14 @@ fn evaluated_descriptor_request<'a>(
     let descriptor = &pool.domain.descriptors[descriptor_index];
     EvaluatedBackingRequest {
         domain: &pool.domain,
+        step_resource_slot_index: pool
+            .domain
+            .pool
+            .step_resource_slots()
+            .iter()
+            .position(|slot| {
+                slot.resource_ids() == std::slice::from_ref(descriptor.base_resource_id())
+            }),
         claim_identity: PhysicalBackingClaimIdentity::new(
             pool.domain.pool_id().clone(),
             vec![descriptor.base_resource_id().clone()],
@@ -1425,6 +1442,7 @@ fn evaluated_descriptor_request<'a>(
         capacity_size_bytes: size_bytes,
         reusable_execution_bucket_id: None,
         projections: vec![EvaluatedBackingProjection {
+            descriptor_index,
             descriptor,
             physical_offset_bytes: 0,
             logical_size_bytes: size_bytes,
@@ -2599,6 +2617,44 @@ fn reusable_bucket_reuses_capacity_layout_without_widening_logical_view() {
         128
     );
     assert_eq!(second_requests[0].capacity_size_bytes, 256);
+    // These requests keep the already-cached ID/capacity layout. A warm hit
+    // must still reject invalid immutable index hints without consuming the
+    // idle slot, changing backing occupancy, or allocating a replacement.
+    let reject_warm = |request: EvaluatedBackingRequest<'_>| {
+        assert!(harness
+            .root
+            .dynamic_pools
+            .prepare_lane_stable_claim(&lane, std::slice::from_ref(&request))
+            .is_err());
+        assert_eq!(
+            harness.root.maintenance_controller.status().unwrap(),
+            retained_status
+        );
+        assert_eq!(runtime.allocate_calls(), allocations_before);
+    };
+    let mut bad = second_requests[0].clone();
+    bad.projections[0].descriptor_index = usize::MAX;
+    reject_warm(bad);
+    let mut bad = second_requests[0].clone();
+    bad.step_resource_slot_index = Some(usize::MAX);
+    reject_warm(bad);
+    let mut bad = second_requests[0].clone();
+    bad.step_resource_slot_index = None;
+    reject_warm(bad);
+    let mut wrong_domain = second_requests[0].domain.clone();
+    wrong_domain.domain_id = CapacityDomainId::new(99).unwrap();
+    let mut bad = second_requests[0].clone();
+    bad.domain = &wrong_domain;
+    reject_warm(bad);
+    let mut wrong_descriptor = second_requests[0].domain.clone();
+    let descriptor_index = second_requests[0].projections[0].descriptor_index;
+    let mut wire = serde_json::to_value(&wrong_descriptor.descriptors[descriptor_index]).unwrap();
+    wire["demand"] = serde_json::json!({"tokens": {"bytes_per_token": 128, "maximum_tokens": 4}});
+    wrong_descriptor.descriptors[descriptor_index] = serde_json::from_value(wire).unwrap();
+    let mut bad = second_requests[0].clone();
+    bad.domain = &wrong_descriptor;
+    bad.projections[0].descriptor = &wrong_descriptor.descriptors[descriptor_index];
+    reject_warm(bad);
     let LaneBackingPrepareDecision::Prepared(second_prepared) = harness
         .root
         .dynamic_pools
@@ -5017,8 +5073,8 @@ fn request_token_backing_covers_nonzero_chunk_source_range() {
         _ => panic!("resident full-input request backing must admit"),
     };
 
-    assert_eq!(admitted.work_shape().immediate_tokens(), 1);
-    assert_eq!(admitted.work_shape().fit_tokens(), 4);
+    assert_eq!(admitted.work_shape().immediate_tokens().unwrap(), 1);
+    assert_eq!(admitted.work_shape().fit_tokens().unwrap(), 4);
     assert_eq!(admitted.backing_slices().len(), 1);
     assert_eq!(admitted.backing_slices()[0].size_bytes(), 256);
     let snapshot = harness
@@ -5232,8 +5288,8 @@ fn sequence_physical_catalog_shares_without_extent_growth_and_retains_logical_ow
         _ => panic!("logical token progress must publish a new snapshot"),
     };
     assert_ne!(initial.generation(), advanced.generation());
-    assert_eq!(initial.committed_tokens(), 1);
-    assert_eq!(advanced.committed_tokens(), 2);
+    assert_eq!(initial.committed_tokens().unwrap(), 1);
+    assert_eq!(advanced.committed_tokens().unwrap(), 2);
     assert!(std::ptr::eq(
         initial.backing_slices(),
         advanced.backing_slices()
@@ -5355,7 +5411,7 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
     assert_eq!(initial.generation().get(), 1);
     assert_eq!(first_captured.generation().get(), 1);
     assert_eq!(extended.generation().get(), 2);
-    assert_eq!(extended.committed_tokens(), 2);
+    assert_eq!(extended.committed_tokens().unwrap(), 2);
     assert_eq!(extended.backing_slices().len(), 2);
     assert_ne!(
         initial.backing_slices().as_ptr(),
@@ -5520,7 +5576,7 @@ fn sequence_backing_extension_waits_for_released_capacity_then_retries() {
         _ => panic!("released backing capacity must admit the pending extension"),
     };
     assert_eq!(extended.generation().get(), 2);
-    assert_eq!(extended.committed_tokens(), 2);
+    assert_eq!(extended.committed_tokens().unwrap(), 2);
     assert_eq!(extended.backing_slices().len(), 2);
 
     session.request_cancel().unwrap();
@@ -5607,7 +5663,7 @@ fn three_initial_sequence_bundles_precede_typed_token_extension_deferral() {
         SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
         _ => panic!("released token-scaled backing must resume the deferred extension"),
     };
-    assert_eq!(extended.committed_tokens(), 2);
+    assert_eq!(extended.committed_tokens().unwrap(), 2);
 
     session.request_cancel().unwrap();
     session.try_abort().unwrap();
@@ -6384,6 +6440,21 @@ fn descriptor_mismatch_is_observable_and_explicit_cleanup_returns_its_grant() {
     assert_eq!(quarantined.pools()[0].quarantined_bytes(), 64);
     assert_eq!(quarantined.pools()[0].descriptor_mismatch_chunks(), 1);
     assert_eq!(quarantined.pools()[0].publication_rejected_chunks(), 0);
+    assert!(matches!(
+        harness.root.try_release_idle_dynamic_backing().unwrap(),
+        IdleDynamicReleaseOutcome::Busy(IdleDynamicReleaseBusy::Pool {
+            quarantined_chunks: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        harness.root.try_retain_idle_dynamic_backing(64).unwrap(),
+        IdleDynamicBackingOutcome::Busy(IdleDynamicReleaseBusy::Pool {
+            quarantined_chunks: 1,
+            ..
+        })
+    ));
+    assert_eq!(&harness.root.dynamic_pool_status().unwrap(), quarantined);
     let before_release = harness
         .root
         .dynamic_pools
@@ -6490,6 +6561,7 @@ fn maintenance_panic_cancels_pending_capacity_and_poison_closes_the_controller()
         .maintenance_controller
         .initialize_pool(&harness.pool_ids[0])
         .is_err());
+    assert!(harness.root.try_release_idle_dynamic_backing().is_err());
 }
 
 #[test]
@@ -6685,4 +6757,443 @@ fn paged_internal_fault_restores_segments_selected_earlier_in_the_same_call() {
     assert_eq!(index.by_offset.len(), 2);
     assert_eq!(index.by_offset[&(1, 0)].length_bytes, 64);
     assert!(index.by_size.contains(&(64, 1, 1, 0)));
+}
+
+mod idle_trim_tests {
+    use super::*;
+
+    #[test]
+    fn partial_idle_retention_keeps_largest_whole_chunks_and_their_original_grants() {
+        for (cap, expected_sizes) in [
+            (384, vec![64, 128, 192]),
+            (256, vec![64, 192]),
+            (192, vec![192]),
+            (191, vec![128]),
+            (63, vec![]),
+            (0, vec![]),
+        ] {
+            let catalog = pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Request,
+                'a',
+                1,
+                384,
+                TestDemand::Fixed,
+            );
+            let runtime = new_runtime(&catalog, 384);
+            let harness = harness(runtime.clone(), catalog, 384, false);
+            for bytes in [64, 128, 192] {
+                harness
+                    .root
+                    .maintenance_controller
+                    .grow_pool(&harness.pool_ids[0], bytes)
+                    .unwrap();
+            }
+            let budget = Arc::clone(&harness.root.dynamic_pools.budget);
+            let originals = {
+                let state = harness.root.dynamic_pools.pools[&harness.pool_ids[0]]
+                    .state
+                    .lock()
+                    .unwrap();
+                state
+                    .chunks
+                    .values()
+                    .map(|chunk| (chunk.backing._grant.bytes(), Arc::downgrade(&chunk.backing)))
+                    .collect::<Vec<_>>()
+            };
+            let retained_bytes: u64 = expected_sizes.iter().sum();
+            let released = match harness
+                .root
+                .try_retain_largest_idle_dynamic_chunks(cap)
+                .unwrap()
+            {
+                IdleDynamicBackingOutcome::Retained(receipt) => {
+                    assert_eq!(receipt.retained_bytes(), retained_bytes);
+                    assert_eq!(receipt.retained_chunks(), expected_sizes.len());
+                    receipt.released().cloned()
+                }
+                IdleDynamicBackingOutcome::Released(receipt) => {
+                    assert!(expected_sizes.is_empty());
+                    Some(receipt)
+                }
+                IdleDynamicBackingOutcome::Busy(reason) => panic!("idle plan is busy: {reason:?}"),
+            };
+            if retained_bytes == 384 {
+                assert!(released.is_none());
+            } else {
+                let receipt = released.unwrap();
+                assert_eq!(receipt.reclaimed_bytes(), 384 - retained_bytes);
+                assert_eq!(receipt.reclaimed_chunks(), 3 - expected_sizes.len());
+                assert_eq!(receipt.pools().len(), 1);
+                assert_eq!(
+                    receipt.pools()[0].published_capacity_bytes(),
+                    retained_bytes
+                );
+            }
+            for (bytes, backing) in &originals {
+                assert_eq!(backing.upgrade().is_some(), expected_sizes.contains(bytes));
+            }
+            let status = harness.root.dynamic_pool_status().unwrap();
+            assert_eq!(status.budget_claimed_bytes(), retained_bytes);
+            assert_eq!(status.process_claimed_bytes(), retained_bytes);
+            assert_eq!(status.pools()[0].resident_bytes(), retained_bytes);
+            // Only released chunks return capacity; a retained chunk's actual
+            // grant continues to exclude competing allocations.
+            assert!(matches!(
+                DeviceCapacityReservation::reserve(&budget, 385 - retained_bytes),
+                Err(VNextError::DeviceCapacityUnavailable(_))
+            ));
+            if retained_bytes < 384 {
+                drop(DeviceCapacityReservation::reserve(&budget, 384 - retained_bytes).unwrap());
+            }
+            let allocation_calls = runtime.allocate_calls();
+            if expected_sizes.is_empty() {
+                // A cold pool can grow again through the normal controller.
+                harness
+                    .root
+                    .maintenance_controller
+                    .initialize_pools(&harness.pool_ids)
+                    .unwrap();
+            } else {
+                assert!(matches!(
+                    harness.root.try_retain_largest_idle_dynamic_chunks(cap).unwrap(),
+                    IdleDynamicBackingOutcome::Retained(receipt)
+                        if receipt.retained_bytes() == retained_bytes && receipt.released().is_none()
+                ));
+            }
+            // Retention itself supplies no authority. A real request still
+            // claims and returns a normal descriptor-backed physical extent.
+            let request = admitted_request(&harness.root, "partial-idle-reuse");
+            assert_eq!(
+                runtime.allocate_calls(),
+                allocation_calls + u64::from(expected_sizes.is_empty())
+            );
+            drop(request);
+            close_dynamic_test_root(harness.root);
+            assert!(originals
+                .iter()
+                .all(|(_, backing)| backing.upgrade().is_none()));
+            drop(DeviceCapacityReservation::reserve(&budget, 384).unwrap());
+        }
+    }
+
+    #[test]
+    fn partial_idle_retention_ties_follow_pool_order_and_cold_pool_regrows() {
+        let catalogs = ['a', 'b'].map(|layout| {
+            pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Request,
+                layout,
+                1,
+                64,
+                TestDemand::Fixed,
+            )
+        });
+        let catalog = combine_catalogs(&catalogs);
+        let runtime = new_runtime(&catalog, 128);
+        let harness = harness(runtime.clone(), catalog, 128, false);
+        harness
+            .root
+            .maintenance_controller
+            .initialize_pools(&harness.pool_ids)
+            .unwrap();
+        let originals = harness
+            .root
+            .dynamic_pools
+            .pools
+            .values()
+            .map(|pool| {
+                let state = pool.state.lock().unwrap();
+                Arc::downgrade(&state.chunks.values().next().unwrap().backing)
+            })
+            .collect::<Vec<_>>();
+        let IdleDynamicBackingOutcome::Retained(receipt) = harness
+            .root
+            .try_retain_largest_idle_dynamic_chunks(64)
+            .unwrap()
+        else {
+            panic!("one of the two equal-sized chunks fits");
+        };
+        assert_eq!(receipt.retained_bytes(), 64);
+        assert_eq!(receipt.retained_chunks(), 1);
+        assert_eq!(receipt.released().unwrap().reclaimed_bytes(), 64);
+        assert!(originals[0].upgrade().is_some());
+        assert!(originals[1].upgrade().is_none());
+        let calls = runtime.allocate_calls();
+        harness
+            .root
+            .maintenance_controller
+            .initialize_pools(&harness.pool_ids)
+            .unwrap();
+        assert_eq!(runtime.allocate_calls(), calls + 1);
+        assert!(originals[0].upgrade().is_some());
+        let request = admitted_request(&harness.root, "partial-idle-mixed-warm-cold");
+        drop(request);
+        let budget = Arc::clone(&harness.root.dynamic_pools.budget);
+        assert_eq!(
+            harness
+                .root
+                .dynamic_pool_status()
+                .unwrap()
+                .budget_claimed_bytes(),
+            128
+        );
+        close_dynamic_test_root(harness.root);
+        assert!(originals[0].upgrade().is_none());
+        drop(DeviceCapacityReservation::reserve(&budget, 128).unwrap());
+    }
+
+    #[test]
+    fn exact_retention_bound_preserves_chunks_and_grants_until_original_root_close() {
+        let catalogs = ['a', 'b'].map(|layout| {
+            pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Request,
+                layout,
+                1,
+                64,
+                TestDemand::Fixed,
+            )
+        });
+        let catalog = combine_catalogs(&catalogs);
+        let runtime = new_runtime(&catalog, 128);
+        let harness = harness(runtime.clone(), catalog, 128, false);
+        harness
+            .root
+            .maintenance_controller
+            .initialize_pools(&harness.pool_ids)
+            .unwrap();
+        let budget = Arc::clone(&harness.root.dynamic_pools.budget);
+        let original_backing = harness
+            .root
+            .dynamic_pools
+            .pools
+            .values()
+            .map(|pool| {
+                let state = pool.state.lock().unwrap();
+                Arc::downgrade(&state.chunks.values().next().unwrap().backing)
+            })
+            .collect::<Vec<_>>();
+        let before = harness.root.dynamic_pool_status().unwrap();
+        let allocation_calls = runtime.allocate_calls();
+        let IdleDynamicBackingOutcome::Retained(receipt) =
+            harness.root.try_retain_idle_dynamic_backing(128).unwrap()
+        else {
+            panic!("the exact total bound retains both idle pools");
+        };
+        assert_eq!(receipt.retained_bytes(), 128);
+        assert_eq!(receipt.retained_chunks(), 2);
+        assert_eq!(harness.root.dynamic_pool_status().unwrap(), before);
+        assert!(original_backing
+            .iter()
+            .all(|backing| backing.upgrade().is_some()));
+        assert!(matches!(
+            DeviceCapacityReservation::reserve(&budget, 1),
+            Err(VNextError::DeviceCapacityUnavailable(_))
+        ));
+
+        // Retention is not an admission permit: the next real request claims
+        // the existing extents through ordinary authority checks.
+        let request = admitted_request(&harness.root, "retained-idle-backing");
+        assert_eq!(runtime.allocate_calls(), allocation_calls);
+        drop(request);
+        assert_eq!(
+            harness
+                .root
+                .dynamic_pool_status()
+                .unwrap()
+                .budget_claimed_bytes(),
+            128
+        );
+
+        close_dynamic_test_root(harness.root);
+        assert!(original_backing
+            .iter()
+            .all(|backing| backing.upgrade().is_none()));
+        // The receipt and independent budget reference survive close, but
+        // neither keeps any native backing or physical capacity grant alive.
+        assert_eq!(receipt.retained_bytes(), 128);
+        let full_capacity = DeviceCapacityReservation::reserve(&budget, 128).unwrap();
+        drop(full_capacity);
+    }
+
+    #[test]
+    fn retention_below_total_or_zero_releases_all_pools_atomically() {
+        for maximum_bytes in [127, 0] {
+            let catalogs = ['a', 'b'].map(|layout| {
+                pool_catalog(
+                    linear_profile(),
+                    AllocationLifetime::Request,
+                    layout,
+                    1,
+                    64,
+                    TestDemand::Fixed,
+                )
+            });
+            let catalog = combine_catalogs(&catalogs);
+            let runtime = new_runtime(&catalog, 128);
+            let harness = harness(runtime, catalog, 128, false);
+            harness
+                .root
+                .maintenance_controller
+                .initialize_pools(&harness.pool_ids)
+                .unwrap();
+            let IdleDynamicBackingOutcome::Released(receipt) = harness
+                .root
+                .try_retain_idle_dynamic_backing(maximum_bytes)
+                .unwrap()
+            else {
+                panic!("an exceeded or zero retention bound releases all idle backing");
+            };
+            assert_eq!(receipt.reclaimed_bytes(), 128);
+            assert_eq!(receipt.reclaimed_chunks(), 2);
+            let after = harness.root.dynamic_pool_status().unwrap();
+            assert_eq!(after.budget_claimed_bytes(), 0);
+            assert_eq!(after.process_claimed_bytes(), 0);
+            assert!(after.pools().iter().all(|pool| pool.resident_bytes() == 0));
+            assert!(matches!(
+                harness.root.try_retain_idle_dynamic_backing(0).unwrap(),
+                IdleDynamicBackingOutcome::Released(receipt) if receipt.reclaimed_bytes() == 0
+            ));
+            close_dynamic_test_root(harness.root);
+        }
+    }
+
+    #[test]
+    fn idle_trim_is_atomic_across_pools_and_rejects_live_authorities_and_backing_aliases() {
+        let catalogs = ['a', 'b'].map(|layout| {
+            pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Request,
+                layout,
+                1,
+                128,
+                TestDemand::Fixed,
+            )
+        });
+        let catalog = combine_catalogs(&catalogs);
+        let runtime = new_runtime(&catalog, 512);
+        let harness = harness(runtime, catalog, 512, false);
+        harness
+            .root
+            .maintenance_controller
+            .initialize_pools(&harness.pool_ids)
+            .unwrap();
+        let request = admitted_request(&harness.root, "idle-trim-live");
+        let before = harness.root.dynamic_pool_status().unwrap();
+        assert!(matches!(
+            harness.root.try_release_idle_dynamic_backing().unwrap(),
+            IdleDynamicReleaseOutcome::Busy(IdleDynamicReleaseBusy::LogicalAuthorities { .. })
+        ));
+        assert!(matches!(
+            harness.root.try_retain_idle_dynamic_backing(512).unwrap(),
+            IdleDynamicBackingOutcome::Busy(IdleDynamicReleaseBusy::LogicalAuthorities { .. })
+        ));
+        assert_eq!(harness.root.dynamic_pool_status().unwrap(), before);
+        drop(request);
+        let pool = &harness.root.dynamic_pools.pools[&harness.pool_ids[1]];
+        let (alias, old_epoch) = {
+            let state = pool.state.lock().unwrap();
+            (
+                state.chunks.values().next().unwrap().backing.clone(),
+                state.chunks.epoch(),
+            )
+        };
+        let before = harness.root.dynamic_pool_status().unwrap();
+        assert!(matches!(
+            harness.root.try_release_idle_dynamic_backing().unwrap(),
+            IdleDynamicReleaseOutcome::Busy(IdleDynamicReleaseBusy::Pool {
+                externally_retained_chunks: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            harness.root.try_retain_idle_dynamic_backing(512).unwrap(),
+            IdleDynamicBackingOutcome::Busy(IdleDynamicReleaseBusy::Pool {
+                externally_retained_chunks: 1,
+                ..
+            })
+        ));
+        assert_eq!(harness.root.dynamic_pool_status().unwrap(), before);
+        drop(alias);
+        let IdleDynamicReleaseOutcome::Released(receipt) =
+            harness.root.try_release_idle_dynamic_backing().unwrap()
+        else {
+            panic!("all actual authorities have been released");
+        };
+        assert_eq!(receipt.reclaimed_bytes(), before.budget_claimed_bytes());
+        assert_eq!(receipt.pools().len(), 2);
+        let after = harness.root.dynamic_pool_status().unwrap();
+        assert_eq!(after.process_claimed_bytes(), 0);
+        assert!(after.pools().iter().all(|pool| pool.resident_bytes() == 0));
+        assert!(pool.state.lock().unwrap().chunks.epoch() > old_epoch);
+        assert!(!harness.root.is_closing());
+        harness
+            .root
+            .maintenance_controller
+            .initialize_pools(&harness.pool_ids)
+            .unwrap();
+        assert!(pool.state.lock().unwrap().chunks.epoch() > old_epoch);
+        let request = admitted_request(&harness.root, "idle-trim-regrown");
+        drop(request);
+        let root = harness.root.clone();
+        drop(harness);
+        close_dynamic_test_root(root);
+    }
+
+    #[test]
+    fn idle_trim_reports_busy_during_real_pending_native_growth_without_waiting_or_freeing() {
+        let catalog = pool_catalog(
+            linear_profile(),
+            AllocationLifetime::Request,
+            'a',
+            1,
+            128,
+            TestDemand::Fixed,
+        );
+        let runtime = new_runtime(&catalog, 512);
+        let harness = harness(runtime.clone(), catalog, 512, false);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        runtime.set_allocation_rendezvous(entered.clone(), resume.clone());
+        let (outcome, retention, before, after) = std::thread::scope(|scope| {
+            let controller = &harness.root.maintenance_controller;
+            let pool = &harness.pool_ids[0];
+            let worker = std::thread::Builder::new()
+                .name("idle-trim-pending-growth".into())
+                .spawn_scoped(scope, move || controller.initialize_pool(pool))
+                .unwrap();
+            entered.wait();
+            let before = harness.root.dynamic_pool_status().unwrap();
+            let outcome = harness.root.try_release_idle_dynamic_backing();
+            let retention = harness.root.try_retain_idle_dynamic_backing(512);
+            let after = harness.root.dynamic_pool_status().unwrap();
+            resume.wait();
+            worker.join().unwrap().unwrap();
+            (outcome, retention, before, after)
+        });
+        assert!(before.pools()[0].pending_growth_bytes() > 0);
+        assert_eq!(before, after);
+        assert!(matches!(
+            outcome.unwrap(),
+            IdleDynamicReleaseOutcome::Busy(IdleDynamicReleaseBusy::PoolMaintenance { .. })
+        ));
+        assert!(matches!(
+            retention.unwrap(),
+            IdleDynamicBackingOutcome::Busy(IdleDynamicReleaseBusy::PoolMaintenance { .. })
+        ));
+        assert!(matches!(
+            harness.root.try_release_idle_dynamic_backing().unwrap(),
+            IdleDynamicReleaseOutcome::Released(_)
+        ));
+        assert_eq!(
+            harness
+                .root
+                .dynamic_pool_status()
+                .unwrap()
+                .process_claimed_bytes(),
+            0
+        );
+        close_dynamic_test_root(harness.root);
+    }
 }

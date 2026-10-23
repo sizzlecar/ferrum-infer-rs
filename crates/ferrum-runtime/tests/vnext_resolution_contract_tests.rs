@@ -1,5 +1,6 @@
 mod vnext_core_contract;
 
+use ferrum_runtime::ModelWeights;
 use vnext_core_contract::*;
 
 fn bytes_sha256(bytes: &[u8]) -> String {
@@ -758,18 +759,35 @@ fn fixture_resolution_value(inputs: &ResolvedModelPlanInputs, field: ResolutionF
             serde_json::to_value(inputs.prepared_family.family_id()).unwrap()
         }
         ResolutionField::WeightSchema => {
-            serde_json::to_value(inputs.prepared_family.weight_schema()).unwrap()
+            serde_json::to_value(inputs.prepared_family.stored_weight_schema().unwrap()).unwrap()
         }
-        ResolutionField::WeightFormat => {
-            serde_json::to_value(&inputs.prepared_family.weight_schema().format_id).unwrap()
-        }
+        ResolutionField::WeightFormat => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .stored_weight_schema()
+                .unwrap()
+                .format_id,
+        )
+        .unwrap(),
         ResolutionField::Tokenizer => serde_json::to_value(&inputs.tokenizer).unwrap(),
-        ResolutionField::Template => {
-            serde_json::to_value(&inputs.prepared_family.metadata().template).unwrap()
-        }
-        ResolutionField::SpecialTokens => {
-            serde_json::to_value(&inputs.prepared_family.metadata().special_tokens).unwrap()
-        }
+        ResolutionField::Template => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .template,
+        )
+        .unwrap(),
+        ResolutionField::SpecialTokens => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .special_tokens,
+        )
+        .unwrap(),
         ResolutionField::Device => serde_json::to_value(&inputs.device).unwrap(),
         ResolutionField::Capabilities => serde_json::to_value(&inputs.capabilities).unwrap(),
         ResolutionField::RuntimePreset => json!({
@@ -838,7 +856,7 @@ impl ModelFamilyProvider for DuplicateMetadataFamily {
         })
     }
 
-    fn weight_schema(&self, _config: &Self::Config) -> Result<WeightSchema, VNextError> {
+    fn weights(&self, _config: &Self::Config) -> Result<ModelWeights, VNextError> {
         unreachable!("identity-only adversarial registration")
     }
 
@@ -1801,7 +1819,10 @@ fn unknown_inputs_fail_closed() {
         }};
     }
 
-    reject!(|value| value["payload"]["schema"]["major"] = json!(9));
+    reject!(|value| {
+        let current_major = value["payload"]["schema"]["major"].as_u64().unwrap();
+        value["payload"]["schema"]["major"] = json!(current_major.checked_add(1).unwrap());
+    });
     reject!(|value| value["payload"]["family_id"] = json!("family.other"));
     reject!(|value| value["payload"]["device_id"] = json!("device.other"));
     reject!(|value| value["payload"]["prepared_family_fingerprint"] = json!(sha('0')));

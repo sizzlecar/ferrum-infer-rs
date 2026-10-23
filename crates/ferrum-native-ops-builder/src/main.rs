@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use ferrum_native_ops_builder::{
     assemble_native_operator_set, lock_native_operator_source_definition,
-    materialize_native_operator_package_spec, materialize_native_operator_source_overlay,
-    package_native_operator, run_native_operator_source_build, NativeOperatorPackageRequest,
+    lock_native_operator_source_dependencies, materialize_native_operator_package_spec,
+    materialize_native_operator_source_overlay, package_native_operator,
+    run_native_operator_source_build, NativeOperatorPackageRequest,
     NativeOperatorPackageSpecRequest, NativeOperatorSetRequest, NativeOperatorSourceBuildRequest,
 };
 
@@ -35,6 +36,20 @@ enum Command {
         source_root: PathBuf,
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Import an observed NVCC source closure, then use the normal locked build.
+    LockSourceDependencies {
+        #[arg(long)]
+        definition: PathBuf,
+        #[arg(long)]
+        source_root: PathBuf,
+        /// One actual NVCC depfile per translation unit, in definition order.
+        #[arg(long, required = true)]
+        depfile: Vec<PathBuf>,
+        #[arg(long)]
+        out_definition: PathBuf,
+        #[arg(long)]
+        out_plan: PathBuf,
     },
     SourceBuild {
         #[arg(long)]
@@ -136,6 +151,25 @@ fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
         } => {
             lock_native_operator_source_definition(&definition, &source_root, &out)?;
             println!("FERRUM NATIVE SOURCE LOCK READY: {}", out.display());
+        }
+        Command::LockSourceDependencies {
+            definition,
+            source_root,
+            depfile,
+            out_definition,
+            out_plan,
+        } => {
+            lock_native_operator_source_dependencies(
+                &definition,
+                &source_root,
+                &depfile,
+                &out_definition,
+                &out_plan,
+            )?;
+            println!(
+                "FERRUM NATIVE OBSERVED SOURCE LOCK READY: {}",
+                out_plan.display()
+            );
         }
         Command::SourceBuild {
             plan,

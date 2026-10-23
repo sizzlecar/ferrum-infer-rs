@@ -14,8 +14,8 @@ fn token_work_separates_current_backing_from_request_fit_ceiling() {
     assert_eq!(span.fit_input_tokens(), 128);
 
     let shape = ResourceWorkShape::single(span).unwrap();
-    assert_eq!(shape.immediate_tokens(), 1);
-    assert_eq!(shape.fit_tokens(), 128);
+    assert_eq!(shape.immediate_tokens().unwrap(), 1);
+    assert_eq!(shape.fit_tokens().unwrap(), 128);
     assert!(TokenSpanWork::from_token_ids_with_fit(&[10, 11, 12], 2..3, 2).is_err());
 }
 
@@ -161,7 +161,7 @@ fn thirty_two_participant_dispatch_is_one_physical_submission() {
     let step = admit_batch_step(&batch, &lane);
     let node = &plan.payload().nodes()[0];
     let invocation = admit_batch_invocation(&plan_resources, &step, node.id());
-    let packed_ranges = invocation.work_shape().participant_token_ranges();
+    let packed_ranges = invocation.work_shape().participant_token_ranges().unwrap();
     assert_eq!(packed_ranges.len(), 32);
     for (index, range) in packed_ranges.iter().enumerate() {
         assert_eq!(

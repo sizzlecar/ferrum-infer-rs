@@ -5,6 +5,15 @@ use crate::{
     ResourceRequirements, TensorContract,
 };
 
+#[path = "fixed_tensor_liveness_tests.rs"]
+mod fixed_tensor_liveness;
+
+#[path = "completion_order_cache_tests.rs"]
+mod completion_order_cache;
+
+#[path = "invocation_chain_tests.rs"]
+mod invocation_chain;
+
 #[test]
 fn execution_plan_wire_limit_is_symmetric() {
     super::validation::validate_execution_plan_wire_size(
@@ -52,6 +61,7 @@ fn provider_resources(provider: &str) -> ProviderResourcePlan {
         binding: None,
         persistent: None,
         projection_numerics: None,
+        prepared_implementation_fingerprint: None,
     }
 }
 
@@ -183,12 +193,25 @@ fn node_work_contract_is_derived_from_one_symbolic_activation_axis() {
 #[test]
 fn request_token_capacity_uses_canonical_extent_while_step_uses_scheduler_ceiling() {
     assert_eq!(
-        ExecutionPlan::activation_token_capacity(AllocationLifetime::Request, 131_072, 4096)
-            .unwrap(),
+        ExecutionPlan::activation_token_capacity(
+            AllocationLifetime::Request,
+            131_072,
+            RuntimeWorkLimits::Tokens {
+                maximum_scheduled_tokens: 4096
+            }
+        )
+        .unwrap(),
         131_072
     );
     assert_eq!(
-        ExecutionPlan::activation_token_capacity(AllocationLifetime::Step, 131_072, 4096).unwrap(),
+        ExecutionPlan::activation_token_capacity(
+            AllocationLifetime::Step,
+            131_072,
+            RuntimeWorkLimits::Tokens {
+                maximum_scheduled_tokens: 4096
+            }
+        )
+        .unwrap(),
         4096
     );
 }
@@ -1285,4 +1308,77 @@ fn storage_fallback_evidence_is_nonempty_canonical_and_matches_conflicts() {
         ..selection
     };
     assert!(ExecutionPlan::validate_provider_selection_evidence(&empty).is_err());
+}
+
+#[test]
+fn fixed_tensor_work_has_no_token_or_page_dimension() {
+    let shape = DynamicResourceShape::FixedTensor;
+    assert!(shape.tokens().is_err());
+    assert!(shape.pages().is_err());
+    assert_eq!(
+        DynamicResourceDemand::fixed(128)
+            .unwrap()
+            .evaluate_shape_bytes(shape)
+            .unwrap(),
+        128
+    );
+    for demand in [
+        DynamicResourceDemand::actual_sequences(8, 2).unwrap(),
+        DynamicResourceDemand::tokens(8, 32).unwrap(),
+        DynamicResourceDemand::pages(8, 32).unwrap(),
+        DynamicResourceDemand::affine(4, 8, 2, 8, 32).unwrap(),
+        DynamicResourceDemand::bounded_shape_buckets(vec![DynamicResourceShapeBucket::new(
+            2, 32, 32, 128,
+        )
+        .unwrap()])
+        .unwrap(),
+    ] {
+        assert!(demand.evaluate_shape_bytes(shape).is_err());
+    }
+}
+
+#[test]
+fn fixed_tensor_workspace_binds_without_token_ceiling() {
+    let limits = RuntimeWorkLimits::FixedTensor;
+    assert!(limits.maximum_scheduled_tokens().is_err());
+    assert_eq!(
+        ProviderWorkspaceSizeFormula::fixed(128)
+            .unwrap()
+            .bind_runtime_limits(1, limits)
+            .unwrap(),
+        DynamicResourceDemand::fixed(128).unwrap()
+    );
+    for formula in [
+        ProviderWorkspaceSizeFormula::actual_sequences(8).unwrap(),
+        ProviderWorkspaceSizeFormula::tokens(8).unwrap(),
+        ProviderWorkspaceSizeFormula::pages(8, 32).unwrap(),
+        ProviderWorkspaceSizeFormula::affine(4, 8, 8).unwrap(),
+    ] {
+        assert!(formula.bind_runtime_limits(1, limits).is_err());
+    }
+}
+
+#[test]
+fn work_domain_is_explicit_on_the_wire() {
+    let tensor = RuntimeWorkLimits::FixedTensor;
+    let token = RuntimeWorkLimits::Tokens {
+        maximum_scheduled_tokens: 64,
+    };
+    assert_ne!(
+        serde_json::to_value(tensor).unwrap(),
+        serde_json::to_value(token).unwrap()
+    );
+    assert_eq!(
+        serde_json::from_slice::<RuntimeWorkLimits>(&serde_json::to_vec(&tensor).unwrap()).unwrap(),
+        tensor
+    );
+    assert!(serde_json::from_str::<RuntimeWorkLimits>(
+        r#"{"kind":"fixed_tensor","maximum_scheduled_tokens":1}"#
+    )
+    .is_err());
+    assert!(RuntimeWorkLimits::Tokens {
+        maximum_scheduled_tokens: 0
+    }
+    .validate()
+    .is_err());
 }

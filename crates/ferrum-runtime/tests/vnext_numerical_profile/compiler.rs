@@ -1,4 +1,5 @@
 use super::*;
+use ferrum_runtime::ModelWeights;
 
 #[path = "../vnext_core_contract/mod.rs"]
 mod core;
@@ -29,8 +30,8 @@ impl ModelFamilyProvider for TwoStageFamily {
     fn parse_config(&self, raw: &Value) -> Result<Config, VNextError> {
         self.0.parse_config(raw)
     }
-    fn weight_schema(&self, config: &Config) -> Result<WeightSchema, VNextError> {
-        self.0.weight_schema(config)
+    fn weights(&self, config: &Config) -> Result<ModelWeights, VNextError> {
+        self.0.weights(config)
     }
     fn specialize_weight_schema(
         &self,
@@ -241,8 +242,8 @@ fn same_gguf_compiles_both_profiles_and_registration_order_preserves_selection_a
     let (f32, f32_plan) = &compiled_profiles[0];
     let (f16, f16_plan) = &compiled_profiles[1];
     assert_eq!(
-        f32.weight_schema().components,
-        f16.weight_schema().components
+        f32.stored_weight_schema().unwrap().components,
+        f16.stored_weight_schema().unwrap().components
     );
     assert_ne!(
         f32_plan.executable().execution_plan().plan_hash(),

@@ -37,10 +37,16 @@ use super::{
     MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
 
+mod tensor;
+pub use tensor::*;
+mod tensor_request;
+pub use tensor_request::{TensorRequestStateMapping, TensorRequestStateTarget};
+
 mod contracts;
 pub use contracts::*;
 mod capacity;
 use capacity::*;
+pub use capacity::{DeviceCapacityOwner, DeviceCapacityRetention, DeviceOpaqueMemoryKind};
 mod provisioning;
 pub use provisioning::*;
 mod allocation;
@@ -84,12 +90,16 @@ pub(crate) use segment_permit::{
 mod dynamic_pool_maintenance;
 mod pool_resident_reclaim;
 pub use dynamic_pool_maintenance::*;
+mod idle_trim;
+pub use idle_trim::*;
 mod static_lease;
 pub use static_lease::*;
 mod work;
 pub use work::*;
 mod plan_runtime;
 pub use plan_runtime::*;
+mod shared_weights;
+pub use shared_weights::*;
 mod checkpoint;
 pub(crate) use checkpoint::*;
 pub use checkpoint::{

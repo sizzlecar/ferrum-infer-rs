@@ -5,13 +5,20 @@ use std::sync::Arc;
 
 pub const MAX_PROVIDER_WORKSPACE_SHAPE_BUCKETS: usize = 64;
 
-/// Internal evaluator dimensions. Public callers supply token/page evidence;
-/// only core lowers that evidence into aggregate formula inputs.
+/// Token dimensions can only be projected from validated token evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DynamicResourceShape {
+pub(crate) struct TokenResourceDimensions {
     pub(super) sequences: u32,
     pub(super) tokens: u64,
     pub(super) pages: u64,
+}
+
+/// Formula inputs retain their work domain. Fixed tensor work has no token or
+/// page values and cannot enter a dimensioned formula by coercion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DynamicResourceShape {
+    Tokens(TokenResourceDimensions),
+    FixedTensor,
 }
 
 impl DynamicResourceShape {
@@ -22,31 +29,42 @@ impl DynamicResourceShape {
                 "dynamic resource shape dimensions must be non-zero",
             ));
         }
-        Ok(Self {
+        Ok(Self::from_validated(sequences, tokens, pages))
+    }
+
+    pub(crate) const fn sequences(self) -> u32 {
+        match self {
+            Self::Tokens(shape) => shape.sequences,
+            Self::FixedTensor => 1,
+        }
+    }
+
+    pub(crate) fn tokens(self) -> Result<u64, VNextError> {
+        Ok(self.token_dimensions()?.tokens)
+    }
+    pub(crate) fn pages(self) -> Result<u64, VNextError> {
+        Ok(self.token_dimensions()?.pages)
+    }
+
+    pub(crate) fn token_dimensions(self) -> Result<TokenResourceDimensions, VNextError> {
+        match self {
+            Self::Tokens(shape) => Ok(shape),
+            Self::FixedTensor => Err(invalid_plan(
+                "tensor work cannot satisfy a token/page formula",
+            )),
+        }
+    }
+
+    pub(crate) const fn is_tensor(self) -> bool {
+        matches!(self, Self::FixedTensor)
+    }
+
+    pub(crate) const fn from_validated(sequences: u32, tokens: u64, pages: u64) -> Self {
+        Self::Tokens(TokenResourceDimensions {
             sequences,
             tokens,
             pages,
         })
-    }
-
-    pub(crate) const fn sequences(self) -> u32 {
-        self.sequences
-    }
-
-    pub(crate) const fn tokens(self) -> u64 {
-        self.tokens
-    }
-
-    pub(crate) const fn pages(self) -> u64 {
-        self.pages
-    }
-
-    pub(crate) const fn from_validated(sequences: u32, tokens: u64, pages: u64) -> Self {
-        Self {
-            sequences,
-            tokens,
-            pages,
-        }
     }
 }
 
@@ -205,10 +223,121 @@ impl CommittedPageWork {
     }
 }
 
+/// Domain-preserving work proof. Tensor evidence can only be minted by a live
+/// root after checking actual managed input owners against compiled ports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "evidence", rename_all = "snake_case")]
+pub enum ResourceWorkShape {
+    Tokens(TokenResourceWorkShape),
+    Tensor(super::TensorWorkEvidence),
+}
+
+impl ResourceWorkShape {
+    pub fn from_token_spans(spans: Vec<TokenSpanWork>) -> Result<Self, VNextError> {
+        Ok(Self::Tokens(TokenResourceWorkShape::from_token_spans(
+            spans,
+        )?))
+    }
+    pub fn single(span: TokenSpanWork) -> Result<Self, VNextError> {
+        Self::from_token_spans(vec![span])
+    }
+    pub(crate) fn from_tensor_evidence(evidence: super::TensorWorkEvidence) -> Self {
+        Self::Tensor(evidence)
+    }
+    pub fn token_view(&self) -> Result<&TokenResourceWorkShape, VNextError> {
+        match self {
+            Self::Tokens(tokens) => Ok(tokens),
+            Self::Tensor(_) => Err(invalid_plan("tensor work has no token view")),
+        }
+    }
+    pub fn tensor_evidence(&self) -> Option<&super::TensorWorkEvidence> {
+        match self {
+            Self::Tokens(_) => None,
+            Self::Tensor(tensor) => Some(tensor),
+        }
+    }
+    pub const fn is_tensor(&self) -> bool {
+        matches!(self, Self::Tensor(_))
+    }
+    pub fn fingerprint(&self) -> &str {
+        match self {
+            Self::Tokens(tokens) => tokens.fingerprint(),
+            Self::Tensor(tensor) => tensor.fingerprint(),
+        }
+    }
+    // This counts actual admitted execution instances, not generated tokens.
+    pub const fn immediate_sequences(&self) -> u32 {
+        match self {
+            Self::Tokens(tokens) => tokens.immediate_sequences(),
+            Self::Tensor(_) => 1,
+        }
+    }
+    pub const fn fit_sequences(&self) -> u32 {
+        match self {
+            Self::Tokens(tokens) => tokens.fit_sequences(),
+            Self::Tensor(_) => 1,
+        }
+    }
+    pub fn immediate_tokens(&self) -> Result<u64, VNextError> {
+        Ok(self.token_view()?.immediate_tokens())
+    }
+    pub fn immediate_pages(&self) -> Result<u64, VNextError> {
+        Ok(self.token_view()?.immediate_pages())
+    }
+    pub fn fit_tokens(&self) -> Result<u64, VNextError> {
+        Ok(self.token_view()?.fit_tokens())
+    }
+    pub fn fit_pages(&self) -> Result<u64, VNextError> {
+        Ok(self.token_view()?.fit_pages())
+    }
+    pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+        match self {
+            Self::Tokens(tokens) => tokens.immediate_shape(),
+            Self::Tensor(_) => DynamicResourceShape::FixedTensor,
+        }
+    }
+    pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+        match self {
+            Self::Tokens(tokens) => tokens.fit_shape(),
+            Self::Tensor(_) => DynamicResourceShape::FixedTensor,
+        }
+    }
+    pub(crate) fn validate_single_checkpoint_input(
+        &self,
+        tokens: Arc<[u32]>,
+    ) -> Result<(), VNextError> {
+        self.token_view()?.validate_single_checkpoint_input(tokens)
+    }
+    pub(crate) fn covers_work(&self, child: &Self) -> Result<bool, VNextError> {
+        match (self, child) {
+            (Self::Tokens(parent), Self::Tokens(child)) => Ok(child.immediate_tokens()
+                <= parent.immediate_tokens()
+                && child.immediate_pages() <= parent.immediate_pages()
+                && child.fit_tokens() <= parent.fit_tokens()
+                && child.fit_pages() <= parent.fit_pages()),
+            (Self::Tensor(parent), Self::Tensor(child)) => Ok(parent.covers_request(child)),
+            (Self::Tokens(_), Self::Tensor(_)) | (Self::Tensor(_), Self::Tokens(_)) => {
+                Err(invalid_plan("parent and child work domains differ"))
+            }
+        }
+    }
+    pub(crate) fn covers_fit(&self, child: &Self) -> Result<bool, VNextError> {
+        match (self, child) {
+            (Self::Tokens(parent), Self::Tokens(child)) => {
+                Ok(child.fit_tokens() <= parent.fit_tokens())
+            }
+            (Self::Tensor(parent), Self::Tensor(child)) => Ok(parent.covers_request(child)),
+            (Self::Tokens(_), Self::Tensor(_)) | (Self::Tensor(_), Self::Tokens(_)) => {
+                Err(invalid_plan("parent and child work domains differ"))
+            }
+        }
+    }
+}
+
 /// Typed shape evidence shared by scoped admission and provider formula
 /// evaluation. The aggregate dimensions and fingerprint are core-derived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ResourceWorkShape {
+pub struct TokenResourceWorkShape {
     pub(super) token_spans: Vec<TokenSpanWork>,
     pub(super) committed_pages: Vec<CommittedPageWork>,
     pub(super) immediate_sequences: u32,
@@ -220,7 +349,7 @@ pub struct ResourceWorkShape {
     pub(super) fingerprint: String,
 }
 
-impl ResourceWorkShape {
+impl TokenResourceWorkShape {
     pub fn from_token_spans(token_spans: Vec<TokenSpanWork>) -> Result<Self, VNextError> {
         Self::from_sources(token_spans, Vec::new())
     }
@@ -372,7 +501,7 @@ impl DynamicResourceShapeBucket {
         })
     }
 
-    pub(super) fn covers(&self, shape: DynamicResourceShape) -> bool {
+    pub(super) fn covers(&self, shape: TokenResourceDimensions) -> bool {
         shape.sequences <= self.maximum_sequences
             && shape.tokens <= self.maximum_tokens
             && shape.pages <= self.maximum_pages
@@ -616,6 +745,10 @@ impl DynamicResourceDemand {
         shape: DynamicResourceShape,
     ) -> Result<u64, VNextError> {
         self.validate()?;
+        if let Self::Fixed { bytes } = self {
+            return Ok(*bytes);
+        }
+        let shape = shape.token_dimensions()?;
         let bytes = match self {
             Self::Fixed { bytes } => *bytes,
             Self::ActualSequences {
@@ -678,11 +811,9 @@ impl DynamicResourceDemand {
     }
 
     pub(crate) fn minimum_shape(&self) -> DynamicResourceShape {
-        DynamicResourceShape {
-            sequences: 1,
-            tokens: 1,
-            pages: 1,
-        }
+        // Legacy token formula lower bound, never admitted work evidence.
+        // Fixed evaluation returns its constant before inspecting dimensions.
+        DynamicResourceShape::from_validated(1, 1, 1)
     }
 
     pub(crate) fn theoretical_maximum_shape(&self) -> DynamicResourceShape {
@@ -690,39 +821,27 @@ impl DynamicResourceDemand {
             Self::Fixed { .. } => self.minimum_shape(),
             Self::ActualSequences {
                 maximum_sequences, ..
-            } => DynamicResourceShape {
-                sequences: *maximum_sequences,
-                tokens: 1,
-                pages: 1,
-            },
-            Self::Tokens { maximum_tokens, .. } => DynamicResourceShape {
-                sequences: 1,
-                tokens: *maximum_tokens,
-                pages: 1,
-            },
+            } => DynamicResourceShape::from_validated(*maximum_sequences, 1, 1),
+            Self::Tokens { maximum_tokens, .. } => {
+                DynamicResourceShape::from_validated(1, *maximum_tokens, 1)
+            }
             Self::Affine {
                 maximum_sequences,
                 maximum_tokens,
                 ..
-            } => DynamicResourceShape {
-                sequences: *maximum_sequences,
-                tokens: *maximum_tokens,
-                pages: 1,
-            },
-            Self::Pages { maximum_pages, .. } => DynamicResourceShape {
-                sequences: 1,
-                tokens: 1,
-                pages: *maximum_pages,
-            },
+            } => DynamicResourceShape::from_validated(*maximum_sequences, *maximum_tokens, 1),
+            Self::Pages { maximum_pages, .. } => {
+                DynamicResourceShape::from_validated(1, 1, *maximum_pages)
+            }
             Self::BoundedShapeBuckets { buckets } => {
                 let bucket = buckets
                     .last()
                     .expect("validated bounded formula has at least one bucket");
-                DynamicResourceShape {
-                    sequences: bucket.maximum_sequences,
-                    tokens: bucket.maximum_tokens,
-                    pages: bucket.maximum_pages,
-                }
+                DynamicResourceShape::from_validated(
+                    bucket.maximum_sequences,
+                    bucket.maximum_tokens,
+                    bucket.maximum_pages,
+                )
             }
         }
     }

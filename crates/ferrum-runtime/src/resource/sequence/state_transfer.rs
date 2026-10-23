@@ -88,6 +88,29 @@ pub(crate) struct PreparedSequenceStateTransfer<R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> PreparedSequenceStateTransfer<R> {
+    /// Fixed initialization is independent of token checkpoint frontiers.
+    /// Only a successful producer completion publishes these state bytes.
+    pub(crate) fn finish_fixed_tensor_initialization(self) -> Result<(), VNextError> {
+        let mut slot = self
+            .session
+            .slot
+            .state
+            .lock()
+            .map_err(|_| invalid_resource("fixed state publication lock poisoned"))?;
+        let SequenceSessionSlotState::Active(active) = &mut *slot else {
+            return Err(invalid_resource(
+                "fixed state publication lost its live session",
+            ));
+        };
+        if active.phase != SequenceSessionPhase::Open
+            || self.kind() != SequenceStateTransferKind::RestoreWrite
+        {
+            return Err(invalid_resource(
+                "fixed state publication target is not open",
+            ));
+        }
+        self.release_active_reservation(active)
+    }
     pub(crate) fn backing(&self) -> &Arc<SequenceBackingSnapshot<R>> {
         &self.backing
     }

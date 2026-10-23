@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use ferrum_quantization::{Mxfp4SafetensorsSource, SafetensorsArchive};
 use ferrum_runtime::{
-    ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId, ModelFamilyProvider,
-    ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata, NumericalExecutionProfile,
-    TypedFamilyRegistration, VNextError, WeightComponentSource, WeightSchema,
+    CausalLanguageMetadata, ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId,
+    ModelFamilyProvider, ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata,
+    ModelWeights, NumericalExecutionProfile, TypedFamilyRegistration, VNextError,
+    WeightComponentSource,
 };
 use ferrum_types::{DataType, ModelOutputProtocol, ReasoningEffort, ReasoningEffortSupport};
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,7 @@ const HARMONY_CALL_TOKEN_ID: u32 = 200_012;
 #[serde(deny_unknown_fields)]
 pub struct GptOssFamilyConfig {
     semantic: GptOssSemanticConfig,
-    metadata: ModelSemanticMetadata,
+    metadata: CausalLanguageMetadata,
     weights: GptOssWeightManifest,
 }
 
@@ -128,8 +129,11 @@ impl ModelFamilyProvider for GptOssFamilyProvider {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        config.weights.weight_schema(&config.semantic)
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        config
+            .weights
+            .weight_schema(&config.semantic)
+            .map(ModelWeights::Stored)
     }
 
     fn numerical_profiles(
@@ -152,7 +156,7 @@ impl ModelFamilyProvider for GptOssFamilyProvider {
         &self,
         config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(config.metadata.clone())
+        Ok(config.metadata.clone().into())
     }
 }
 
@@ -343,7 +347,7 @@ mod tests {
         GptOssFamilyConfig {
             weights: weights::expected_manifest(&semantic, &quantization).unwrap(),
             semantic,
-            metadata: ModelSemanticMetadata {
+            metadata: CausalLanguageMetadata {
                 template: TemplateMetadata {
                     template: "{{ messages }}".to_owned(),
                     source_file: "chat_template.jinja".to_owned(),

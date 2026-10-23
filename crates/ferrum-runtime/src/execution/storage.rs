@@ -475,6 +475,7 @@ impl DynamicBackingPoolSpec {
                 }
             }
             InvocationLivenessMode::TotalOrderReuse
+            | InvocationLivenessMode::DependencyChainReuse
             | InvocationLivenessMode::ConservativeConcurrent => {
                 if self.minimum_invocation_peak_bytes == 0
                     || self.invocation_liveness.is_empty()
@@ -489,6 +490,14 @@ impl DynamicBackingPoolSpec {
                 }
             }
         }
+        self.invocation_liveness_mode.layout(
+            &self
+                .invocation_liveness
+                .iter()
+                .map(|row| row.chain_slot)
+                .collect::<Vec<_>>(),
+            &vec![0; self.invocation_liveness.len()],
+        )?;
         Ok(())
     }
 
@@ -717,6 +726,29 @@ impl DynamicResourceDescriptor {
     }
 
     #[cfg(test)]
+    pub(crate) fn resource_test_scratch(
+        base_resource_id: ResourceId,
+        demand: DynamicResourceDemand,
+        alignment_bytes: u64,
+        node_id: NodeId,
+        storage: DynamicStorageContract,
+        theoretical_maximum_instances: u32,
+    ) -> Result<Self, VNextError> {
+        Self::new(
+            base_resource_id,
+            demand,
+            alignment_bytes,
+            BufferUsage::Scratch,
+            ElementType::U8,
+            AllocationLifetime::Invocation,
+            AllocationKind::Scratch { node_id },
+            storage,
+            StateInitialization::None,
+            theoretical_maximum_instances,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn resource_test_binding(
         base_resource_id: ResourceId,
         demand: DynamicResourceDemand,
@@ -934,6 +966,9 @@ pub enum InvocationLivenessMode {
     /// completion dependency, so one runnable request needs only the maximum
     /// row size rather than their sum.
     TotalOrderReuse,
+    /// Each slot is a completion-ordered chain. Independent rows occupy
+    /// different slots; the runnable extent sums the maximum row per slot.
+    DependencyChainReuse,
     /// The plan cannot prove that every invocation row completes before the
     /// next one starts. The runnable minimum therefore sums member resources.
     ConservativeConcurrent,
@@ -1011,6 +1046,8 @@ pub enum StepResourceSlotKind {
 pub struct InvocationResourceLiveness {
     pub(super) node_id: NodeId,
     pub(super) resource_ids: Vec<ResourceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) chain_slot: Option<u32>,
 }
 
 impl InvocationResourceLiveness {
@@ -1020,5 +1057,87 @@ impl InvocationResourceLiveness {
 
     pub fn resource_ids(&self) -> &[ResourceId] {
         &self.resource_ids
+    }
+
+    pub const fn chain_slot(&self) -> Option<u32> {
+        self.chain_slot
+    }
+}
+
+/// One checked layout calculation is used by planning, admission and physical
+/// projection validation. Row sizes already include the pool's allocation
+/// quantum; rows in one slot overlap only under the sealed dependency proof.
+pub(crate) struct InvocationPhysicalLayout {
+    pub(crate) bytes: u64,
+    pub(crate) row_offsets: Vec<u64>,
+}
+
+impl InvocationLivenessMode {
+    pub(crate) fn layout(
+        self,
+        chain_slots: &[Option<u32>],
+        row_bytes: &[u64],
+    ) -> Result<InvocationPhysicalLayout, VNextError> {
+        if chain_slots.len() != row_bytes.len() {
+            return Err(invalid_plan("invocation layout row count differs"));
+        }
+        if self == Self::NoInvocationResources {
+            if !row_bytes.is_empty() {
+                return Err(invalid_plan("non-invocation layout contains rows"));
+            }
+            return Ok(InvocationPhysicalLayout {
+                bytes: 0,
+                row_offsets: Vec::new(),
+            });
+        }
+        if row_bytes.is_empty() {
+            return Err(invalid_plan("invocation layout has no rows"));
+        }
+        let slots = if self == Self::DependencyChainReuse {
+            chain_slots
+                .iter()
+                .map(|slot| {
+                    let slot = slot
+                        .ok_or_else(|| invalid_plan("invocation chain slot is absent"))?
+                        as usize;
+                    if slot >= row_bytes.len() {
+                        return Err(invalid_plan("invocation chain slot exceeds row count"));
+                    }
+                    Ok(slot)
+                })
+                .collect::<Result<Vec<_>, VNextError>>()?
+        } else {
+            if chain_slots.iter().any(Option::is_some) {
+                return Err(invalid_plan("legacy invocation mode has chain slots"));
+            }
+            (0..row_bytes.len())
+                .map(|index| {
+                    if self == Self::TotalOrderReuse {
+                        0
+                    } else {
+                        index
+                    }
+                })
+                .collect()
+        };
+        let count = slots.iter().copied().max().unwrap() + 1;
+        let mut peaks = vec![None; count];
+        for (&slot, &bytes) in slots.iter().zip(row_bytes) {
+            peaks[slot] = Some(peaks[slot].unwrap_or(0_u64).max(bytes));
+        }
+        let mut bytes = 0_u64;
+        let mut bases = Vec::with_capacity(count);
+        for peak in peaks {
+            bases.push(bytes);
+            bytes = bytes
+                .checked_add(
+                    peak.ok_or_else(|| invalid_plan("invocation chain slots are not dense"))?,
+                )
+                .ok_or_else(|| invalid_plan("invocation layout byte extent overflows u64"))?;
+        }
+        Ok(InvocationPhysicalLayout {
+            bytes,
+            row_offsets: slots.into_iter().map(|slot| bases[slot]).collect(),
+        })
     }
 }

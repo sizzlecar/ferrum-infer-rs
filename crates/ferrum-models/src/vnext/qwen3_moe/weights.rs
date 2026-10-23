@@ -2004,7 +2004,8 @@ mod tests {
         let router_id = layer_component_id(0, ROUTER_ROLE).unwrap();
         let router = prepared
             .family()
-            .weight_schema()
+            .stored_weight_schema()
+            .unwrap()
             .components
             .iter()
             .find(|component| component.id == router_id)
@@ -2021,12 +2022,23 @@ mod tests {
             .bytes()
             .chunks_exact(2)
             .all(|value| value == expected));
-        let metadata = &prepared.family().metadata().template;
+        let metadata = &prepared
+            .family()
+            .metadata()
+            .causal_language()
+            .unwrap()
+            .template;
         assert_eq!(metadata.template.as_bytes(), template);
         assert_eq!(metadata.source_file, "chat_template.jinja");
         assert_eq!(metadata.sha256, format!("{:x}", Sha256::digest(template)));
         assert_eq!(
-            prepared.family().metadata().special_tokens.eos_token_ids,
+            prepared
+                .family()
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .special_tokens
+                .eos_token_ids,
             BTreeSet::from([2])
         );
         let fingerprint = prepared

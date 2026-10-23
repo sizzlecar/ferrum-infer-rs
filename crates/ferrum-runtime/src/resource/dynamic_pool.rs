@@ -15,6 +15,10 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+#[path = "invocation_chain_layout_tests.rs"]
+mod invocation_chain_layout_tests;
+
 pub(super) static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn align_up_resource(value: u64, alignment: u64) -> Result<u64, VNextError> {
@@ -135,6 +139,7 @@ pub(super) struct SubmissionWaveProjectionLayout {
 #[derive(Debug)]
 pub(super) struct SubmissionWaveRowLayout {
     pub(super) projections: Vec<SubmissionWaveProjectionLayout>,
+    pub(super) chain_slot: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -154,6 +159,45 @@ pub(super) struct SubmissionWaveProjectionCapacity {
 pub(super) struct SubmissionWaveDomainCapacityLayout {
     pub(super) physical_size_bytes: u64,
     pub(super) projections: Vec<SubmissionWaveProjectionCapacity>,
+}
+
+impl SubmissionWaveDomainLayout {
+    pub(super) fn physical_layout_for_shape(
+        &self,
+        domain: &DynamicPoolDomainSpec,
+        shape: DynamicResourceShape,
+    ) -> Result<crate::InvocationPhysicalLayout, VNextError> {
+        let row_bytes = self
+            .rows
+            .iter()
+            .map(|row| {
+                row.projections.iter().try_fold(0_u64, |total, projection| {
+                    let descriptor = domain
+                        .descriptors
+                        .get(projection.descriptor_index)
+                        .ok_or_else(|| {
+                            invalid_resource("invocation layout descriptor is absent")
+                        })?;
+                    if descriptor.lifetime() != AllocationLifetime::Invocation {
+                        return Err(invalid_resource(
+                            "invocation layout contains a non-Invocation descriptor",
+                        ));
+                    }
+                    total
+                        .checked_add(descriptor.evaluate_request_bytes_for_shape(shape)?)
+                        .ok_or_else(|| invalid_resource("invocation row extent overflows u64"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        domain.pool.invocation_liveness_mode().layout(
+            &self
+                .rows
+                .iter()
+                .map(|row| row.chain_slot)
+                .collect::<Vec<_>>(),
+            &row_bytes,
+        )
+    }
 }
 
 pub(super) fn compile_submission_wave_domain_layout(
@@ -217,7 +261,10 @@ pub(super) fn compile_submission_wave_domain_layout(
                 })
             })
             .collect::<Result<Vec<_>, VNextError>>()?;
-        rows.push(SubmissionWaveRowLayout { projections });
+        rows.push(SubmissionWaveRowLayout {
+            projections,
+            chain_slot: row.chain_slot(),
+        });
     }
     if rows.len() != liveness.len()
         || covered_projections.len() != canonical_projections.len()
@@ -279,17 +326,12 @@ pub(super) fn compile_submission_wave_reusable_capacity_layouts(
                     let Some(layout) = layout else {
                         return Ok(None);
                     };
-                    let mode = domain.pool.invocation_liveness_mode();
+                    let physical_layout = layout.physical_layout_for_shape(domain, capacity_shape)?;
                     let mut projections = (0..layout.projection_count)
                         .map(|_| None)
                         .collect::<Vec<_>>();
-                    let mut physical_size_bytes = 0_u64;
-                    for row in &layout.rows {
-                        let row_base = match mode {
-                            InvocationLivenessMode::TotalOrderReuse => 0,
-                            InvocationLivenessMode::ConservativeConcurrent => physical_size_bytes,
-                            InvocationLivenessMode::NoInvocationResources => unreachable!(),
-                        };
+                    let physical_size_bytes = physical_layout.bytes;
+                    for (row, row_base) in layout.rows.iter().zip(physical_layout.row_offsets) {
                         let mut row_bytes = 0_u64;
                         for projection_layout in &row.projections {
                             let descriptor = domain
@@ -331,19 +373,6 @@ pub(super) fn compile_submission_wave_reusable_capacity_layouts(
                                 ));
                             }
                         }
-                        physical_size_bytes = match mode {
-                            InvocationLivenessMode::TotalOrderReuse => {
-                                physical_size_bytes.max(row_bytes)
-                            }
-                            InvocationLivenessMode::ConservativeConcurrent => physical_size_bytes
-                                .checked_add(row_bytes)
-                                .ok_or_else(|| {
-                                    invalid_resource(
-                                        "reusable submission pool capacity overflows u64",
-                                    )
-                                })?,
-                            InvocationLivenessMode::NoInvocationResources => unreachable!(),
-                        };
                     }
                     let projections =
                         projections
@@ -434,11 +463,16 @@ pub(super) struct QuarantinedDynamicChunk<B> {
     pub(super) reason: DynamicChunkQuarantineReason,
 }
 
+/// Bound once to the same immutable domain and compiled layout vectors.
+#[derive(Clone, Copy)]
+pub(super) struct DynamicPoolDomainIndex(pub(super) usize);
+
 pub(super) struct DynamicBackingPool<R>
 where
     R: DeviceRuntime,
 {
     pub(super) instance_id: u64,
+    pub(super) domain_index: DynamicPoolDomainIndex,
     pub(super) domain: DynamicPoolDomainSpec,
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) maintenance: Mutex<()>,
@@ -1669,6 +1703,9 @@ mod physical_backing_claim_identity_tests;
 
 #[derive(Clone)]
 pub(super) struct EvaluatedBackingProjection<'a> {
+    /// Index in the immutable pool domain; rechecked against the descriptor
+    /// when physical backing is prepared.
+    pub(super) descriptor_index: usize,
     pub(super) descriptor: &'a DynamicResourceDescriptor,
     pub(super) physical_offset_bytes: u64,
     pub(super) logical_size_bytes: u64,
@@ -1678,6 +1715,7 @@ pub(super) struct EvaluatedBackingProjection<'a> {
 #[derive(Clone)]
 pub(super) struct EvaluatedBackingRequest<'a> {
     pub(super) domain: &'a DynamicPoolDomainSpec,
+    pub(super) step_resource_slot_index: Option<usize>,
     pub(super) claim_identity: PhysicalBackingClaimIdentity,
     pub(super) capacity_size_bytes: u64,
     pub(super) reusable_execution_bucket_id: Option<ReusableExecutionBucketId>,

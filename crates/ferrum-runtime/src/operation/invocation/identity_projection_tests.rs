@@ -128,7 +128,7 @@ fn identity_projection_successful_views_stay_lazy_and_reject_changed_current_inp
             let projection = projected.materialize_node(node_index).unwrap();
             let reference = eager.materialize_node(node_index).unwrap();
             let make = |identity, node, bindings: &[TrustedActiveSequenceBinding]| {
-                BatchedOperationInvocation::from_resources(
+                BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                     fixture.runtime.as_ref(),
                     &fixture.resolved,
                     provider.dispatch(),
@@ -197,7 +197,7 @@ fn identity_projection_rejects_previous_frame_on_the_same_live_sequence() {
         .bind(&fixture.resolved, wave.nodes()[0].node_id())
         .unwrap();
     let make = |node| {
-        BatchedOperationInvocation::from_resources(
+        BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
             fixture.runtime.as_ref(),
             &fixture.resolved,
             provider.dispatch(),
@@ -282,7 +282,7 @@ fn identity_projection_retained_metadata_does_not_authorize_a_new_admission() {
         .bind(&fixture.resolved, wave.nodes()[0].node_id())
         .unwrap();
     let make = |node| {
-        BatchedOperationInvocation::from_resources(
+        BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
             fixture.runtime.as_ref(),
             &fixture.resolved,
             provider.dispatch(),

@@ -36,21 +36,22 @@ fn segment_dependency_matches_live_invocation_and_issues_fresh_scope() {
                 .bind(&fixture.resolved, wave.nodes()[0].node_id())
                 .unwrap();
             let node = identity.materialize_node(0).unwrap();
-            let invocation = BatchedOperationInvocation::from_resources(
-                fixture.runtime.as_ref(),
-                &fixture.resolved,
-                provider.dispatch(),
-                identity,
-                &node,
-                OperationInvocationResources::Wave {
-                    wave,
-                    node_index: 0,
-                },
-                active.iter(),
-                false,
-                true,
-            )
-            .unwrap();
+            let invocation =
+                BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
+                    fixture.runtime.as_ref(),
+                    &fixture.resolved,
+                    provider.dispatch(),
+                    identity,
+                    &node,
+                    OperationInvocationResources::Wave {
+                        wave,
+                        node_index: 0,
+                    },
+                    active.iter(),
+                    false,
+                    true,
+                )
+                .unwrap();
             let component: WeightId = id("weight.component.left");
             let spec = || RetainedPlanDependencySpec {
                 input_ordinal: 1,
@@ -176,21 +177,22 @@ fn segment_dependency_rejects_equal_descriptor_views_from_another_plan_lease() {
                 .bind(&fixture.resolved, wave.nodes()[0].node_id())
                 .unwrap();
             let node = identity.materialize_node(0).unwrap();
-            let invocation = BatchedOperationInvocation::from_resources(
-                fixture.runtime.as_ref(),
-                &fixture.resolved,
-                provider.dispatch(),
-                identity,
-                &node,
-                OperationInvocationResources::Wave {
-                    wave,
-                    node_index: 0,
-                },
-                active.iter(),
-                false,
-                true,
-            )
-            .unwrap();
+            let invocation =
+                BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
+                    fixture.runtime.as_ref(),
+                    &fixture.resolved,
+                    provider.dispatch(),
+                    identity,
+                    &node,
+                    OperationInvocationResources::Wave {
+                        wave,
+                        node_index: 0,
+                    },
+                    active.iter(),
+                    false,
+                    true,
+                )
+                .unwrap();
             let component: WeightId = id("weight.component.left");
             let binding = invocation.participants()[0]
                 .bindings()

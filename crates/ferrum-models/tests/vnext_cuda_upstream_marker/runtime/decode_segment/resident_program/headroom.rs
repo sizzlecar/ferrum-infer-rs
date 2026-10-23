@@ -194,7 +194,7 @@ pub(super) fn has_spare_capacity(
     backing: &SequenceBackingSnapshot<Runtime>,
     actual_tokens: usize,
 ) -> bool {
-    assert_eq!(backing.committed_tokens(), actual_tokens as u64);
+    assert_eq!(backing.committed_tokens().unwrap(), actual_tokens as u64);
     owned_pages(backing, &kv_resource(fixture)) > actual_tokens.div_ceil(16) as u64
 }
 
@@ -405,7 +405,7 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
                 .iter()
                 .map(|snapshot| {
                     assert_eq!(
-                        snapshot.committed_tokens(),
+                        snapshot.committed_tokens().unwrap(),
                         position as u64 + 1,
                         "headroom must not fabricate executed or committed tokens"
                     );

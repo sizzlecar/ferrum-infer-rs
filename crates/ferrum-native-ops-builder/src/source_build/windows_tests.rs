@@ -365,7 +365,7 @@ fn receipt(
         plan_only: false,
     };
     let environment = effective_build_environment(&request, Some(&toolchain)).unwrap();
-    let architecture = architecture_argument(plan.architecture, "sm_89");
+    let architecture = architecture_argument(plan.architecture, "sm_89").unwrap();
     let mut commands = build_commands(
         &request,
         plan,
@@ -549,7 +549,7 @@ fn msvc_cache_identity_rejects_objects_from_nvcc_reinitialized_environments() {
     let mut receipt = receipt(&plan, &path);
     let specs = build_object_cache_specs(
         &plan,
-        &architecture_argument(plan.architecture, "sm_89"),
+        &architecture_argument(plan.architecture, "sm_89").unwrap(),
         &receipt.toolchain.as_ref().unwrap().static_identity,
         &receipt.effective_environment,
     )
@@ -927,7 +927,7 @@ pub(super) fn configured_nvcc_host_compile() {
         &request,
         &plan,
         &request.source_root,
-        &architecture_argument(plan.architecture, &request.compute_capability),
+        &architecture_argument(plan.architecture, &request.compute_capability).unwrap(),
         &request.output_dir.join("objects"),
         &request.output_dir.join("logs"),
         None,

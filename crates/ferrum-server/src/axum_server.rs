@@ -60,9 +60,12 @@ use tracing::{debug, error, info, span, warn, Level};
 use uuid::Uuid;
 
 mod chat_stream;
+mod images;
 mod output;
 mod profile_delivery;
 mod responses;
+
+pub use images::{ImageHttpConfig, ImageHttpService};
 
 use profile_delivery::HttpProfileDelivery;
 pub use profile_delivery::{
@@ -300,11 +303,17 @@ impl AxumServer {
             let mut state = self.lifecycle.engine_shutdown.lock().await;
             if matches!(*state, LoadedEngineShutdown::Idle) {
                 let engine = self.state.llm.clone();
+                let images = self.state.images.clone();
                 *state = LoadedEngineShutdown::Running(tokio::spawn(async move {
-                    match engine {
+                    let text = match engine {
                         Some(engine) => engine.shutdown().await,
                         None => Ok(()),
-                    }
+                    };
+                    let image = match images {
+                        Some(images) => images.shutdown().await,
+                        None => Ok(()),
+                    };
+                    text.and(image)
                 }));
             }
             if let LoadedEngineShutdown::Running(task) = &mut *state {
@@ -432,6 +441,7 @@ impl AxumServer {
     /// Build the router with all routes
     #[allow(dead_code)]
     fn build_router(&self) -> ferrum_types::Result<Router> {
+        self.state.validate_image_configuration()?;
         let state = self.prepare_profile_state(self.state.clone())?;
         Ok(self.build_router_with_state(state))
     }
@@ -442,6 +452,13 @@ impl AxumServer {
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/responses", post(responses::responses_handler))
             .route("/v1/completions", post(completions_handler))
+            .route("/v1/images/generations", post(images::generations_handler))
+            .route(
+                "/v1/images/edits",
+                post(images::edits_handler).layer(axum::extract::DefaultBodyLimit::max(
+                    images::EDIT_BODY_LIMIT,
+                )),
+            )
             .route("/v1/models", get(models_handler))
             // Health & observability
             .route("/health", get(health_handler))
@@ -457,10 +474,11 @@ impl AxumServer {
     }
 }
 
-/// Application state shared across text inference and observability handlers.
+/// Application state for independent text/image services and observability.
 #[derive(Clone, Default)]
 pub struct AppState {
     pub llm: Option<Arc<dyn LlmInferenceEngine + Send + Sync>>,
+    pub images: Option<ImageHttpService>,
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
     pub default_enable_thinking: Option<bool>,
@@ -480,6 +498,44 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Installs the image registry only when no registry was provided. Existing
+    /// aliases are never silently rewritten; startup checks their image binding.
+    pub fn with_images(mut self, images: ImageHttpService) -> Self {
+        if self.served_model_registry.is_empty() {
+            self.served_model_registry = Arc::new(images.registry());
+        }
+        self.images = Some(images);
+        self
+    }
+
+    fn validate_image_configuration(&self) -> ferrum_types::Result<()> {
+        if let Some(images) = &self.images {
+            let entry = self
+                .served_model_registry
+                .resolve(images.model_name(), ServedModelKind::ImageGeneration)
+                .ok_or_else(|| {
+                    Error::config(
+                        "image service requires its explicit ImageGeneration registry entry",
+                    )
+                })?;
+            if entry.adapter().is_some() {
+                return Err(Error::config("image service does not support LoRA routing"));
+            }
+        }
+        if self.served_model_registry.entries().iter().any(|entry| {
+            entry.kind() == ServedModelKind::ImageGeneration
+                && !self
+                    .images
+                    .as_ref()
+                    .is_some_and(|images| entry.public_name().as_str() == images.model_name())
+        }) {
+            return Err(Error::config(
+                "image registry entry has no matching image service",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_lora_execution_support(&self, has_adapters: bool) -> ferrum_types::Result<()> {
         if has_adapters {
             self.llm
@@ -1094,6 +1150,7 @@ impl HttpServer for AxumServer {
         self.state.validate_lora_execution_support(
             self.state.served_model_registry.adapter_count() > 0,
         )?;
+        self.state.validate_image_configuration()?;
         self.lifecycle
             .running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1178,6 +1235,14 @@ impl HttpServer for AxumServer {
     }
 
     async fn health_check(&self) -> HealthStatus {
+        if self
+            .state
+            .images
+            .as_ref()
+            .is_some_and(|images| !images.service().is_accepting())
+        {
+            return HealthStatus::Unhealthy;
+        }
         match self.profile_delivery_report() {
             Some(report) if report.required_error.is_some() => HealthStatus::Unhealthy,
             Some(report) if report.is_degraded() => HealthStatus::Degraded,
@@ -4360,7 +4425,8 @@ fn stream_validation_error_message(error: ServerError) -> String {
         | ServerError::ServiceUnavailable(message)
         | ServerError::ContextLengthExceeded(message)
         | ServerError::InvalidRequest { message, .. }
-        | ServerError::UnsupportedFeature { message, .. } => message,
+        | ServerError::UnsupportedFeature { message, .. }
+        | ServerError::CapacityExceeded(message) => message,
     }
 }
 
@@ -4729,7 +4795,9 @@ async fn models_handler(
             object: "model".to_string(),
             created: now,
             owned_by: "ferrum".to_string(),
-            max_model_len: state.llm.as_ref().and_then(|llm| llm.context_capacity()),
+            max_model_len: (entry.kind() == ServedModelKind::Llm)
+                .then(|| state.llm.as_ref().and_then(|llm| llm.context_capacity()))
+                .flatten(),
             reasoning: if entry.kind() == ServedModelKind::Llm
                 && state
                     .llm
@@ -4764,26 +4832,6 @@ async fn health_handler(
     State(state): State<AppState>,
 ) -> std::result::Result<Response, ServerError> {
     let engine_status = state.status().await;
-    let scheduler_metrics = state.metrics();
-    let runtime_config = RuntimeConfigSnapshot::capture_current();
-    let cache_policy = CachePolicy::current();
-    let engine_cache = state
-        .llm
-        .as_ref()
-        .and_then(|engine| engine.cache_metrics_snapshot());
-    let execution_attribution = state
-        .llm
-        .as_ref()
-        .and_then(|engine| engine.execution_attribution_snapshot());
-    let scheduler_slo = state
-        .llm
-        .as_ref()
-        .and_then(|engine| engine.scheduler_slo_snapshot());
-    let engine_lora = state
-        .llm
-        .as_ref()
-        .and_then(|engine| engine.lora_metrics_snapshot());
-    let auto_config = auto_config_health_value(state.auto_config.as_ref());
     let runtime_admission = match state.llm.as_ref() {
         Some(engine) => engine.admission_snapshot(),
         None => Ok(None),
@@ -4792,14 +4840,6 @@ async fn health_handler(
         Ok(snapshot) => (snapshot.as_ref(), None),
         Err(error) => (None, Some(error.to_string())),
     };
-    let admission = admission_health_json(
-        &engine_status,
-        &scheduler_metrics,
-        &auto_config,
-        runtime_admission_snapshot,
-        runtime_admission_error.as_deref(),
-    );
-
     let profile_report = state
         .profile_delivery
         .as_ref()
@@ -4810,48 +4850,76 @@ async fn health_handler(
     let profile_degraded = profile_report
         .as_ref()
         .is_some_and(HttpProfileDeliveryReport::is_degraded);
-    let health = serde_json::json!({
-        "status": if runtime_admission_error.is_some() || profile_failed { "unhealthy" }
+    let mut health = serde_json::json!({
+        "status": if runtime_admission_error.is_some() || profile_failed
+            || state.images.as_ref().is_some_and(|images| !images.service().is_accepting()) { "unhealthy" }
             else if profile_degraded { "degraded" } else { "healthy" },
         "profile_delivery": profile_report.as_ref().map(HttpProfileDeliveryReport::health_json),
-        "reasoning_protocol": state.prompt_template.as_deref().map(ModelChatTemplate::reasoning_capability).unwrap_or_default(),
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "version": env!("CARGO_PKG_VERSION"),
         "engine": {
+            "text_loaded": state.llm.is_some(),
+            "text_ready": engine_status.is_ready,
             "active_requests": engine_status.active_requests,
             "queued_requests": engine_status.queued_requests,
         },
-        "scheduler": {
-            "slo": scheduler_slo,
-            "total_requests": scheduler_metrics.total_requests,
-            "successful_requests": scheduler_metrics.successful_requests,
-            "failed_requests": scheduler_metrics.failed_requests,
-            "throughput_rps": scheduler_metrics.throughput_rps,
-            "avg_wait_time_ms": scheduler_metrics.queue_metrics.avg_queue_wait_time_ms,
-            "scheduling_time_ms": scheduler_metrics.performance_breakdown.scheduling_time_ms,
-            "model_execution_time_ms": scheduler_metrics
-                .performance_breakdown
-                .model_execution_time_ms,
-            "iteration_lock_wait_time_ms": scheduler_metrics
-                .performance_breakdown
-                .other_overhead_time_ms,
-        },
-        "config": runtime_config,
-        "auto_config": auto_config,
-        "admission": admission,
-        "numerical_execution": engine_cache.as_ref().and_then(|snapshot| snapshot.get("numerical_execution")),
-        "kv_storage": engine_cache.as_ref().and_then(|snapshot| snapshot.get("kv_storage")),
-        "cache": state.cache.health_json(&cache_policy, engine_cache.as_ref()),
-        "execution_attribution": execution_attribution,
-        "lora": engine_lora.unwrap_or_else(|| serde_json::json!({
-            "enabled": state.served_model_registry.adapter_count() > 0,
-            "adapter_count": state.served_model_registry.adapter_count() as u64,
-            "active_cache_bindings": 0u64,
-            "projection_applications": 0u64,
-            "position": "startup-routing",
-            "source": "server-lora-registry",
-        })),
+        "images":state.images.as_ref().map(ImageHttpService::health),
     });
+
+    // These snapshots describe the text engine. Without one, their fallback
+    // defaults are not evidence of the image runtime, backend, or admission
+    // authority. Keep the existing text-health schema when an LLM is loaded.
+    if let Some(engine) = &state.llm {
+        let scheduler_metrics = state.metrics();
+        let runtime_config = RuntimeConfigSnapshot::capture_current();
+        let cache_policy = CachePolicy::current();
+        let engine_cache = engine.cache_metrics_snapshot();
+        let auto_config = auto_config_health_value(state.auto_config.as_ref());
+        let admission = admission_health_json(
+            &engine_status,
+            &scheduler_metrics,
+            &auto_config,
+            runtime_admission_snapshot,
+            runtime_admission_error.as_deref(),
+        );
+        let text_health = serde_json::json!({
+            "reasoning_protocol": state.prompt_template.as_deref().map(ModelChatTemplate::reasoning_capability).unwrap_or_default(),
+            "scheduler": {
+                "slo": engine.scheduler_slo_snapshot(),
+                "total_requests": scheduler_metrics.total_requests,
+                "successful_requests": scheduler_metrics.successful_requests,
+                "failed_requests": scheduler_metrics.failed_requests,
+                "throughput_rps": scheduler_metrics.throughput_rps,
+                "avg_wait_time_ms": scheduler_metrics.queue_metrics.avg_queue_wait_time_ms,
+                "scheduling_time_ms": scheduler_metrics.performance_breakdown.scheduling_time_ms,
+                "model_execution_time_ms": scheduler_metrics
+                    .performance_breakdown
+                    .model_execution_time_ms,
+                "iteration_lock_wait_time_ms": scheduler_metrics
+                    .performance_breakdown
+                    .other_overhead_time_ms,
+            },
+            "config": runtime_config,
+            "auto_config": auto_config,
+            "admission": admission,
+            "numerical_execution": engine_cache.as_ref().and_then(|snapshot| snapshot.get("numerical_execution")),
+            "kv_storage": engine_cache.as_ref().and_then(|snapshot| snapshot.get("kv_storage")),
+            "cache": state.cache.health_json(&cache_policy, engine_cache.as_ref()),
+            "execution_attribution": engine.execution_attribution_snapshot(),
+            "lora": engine.lora_metrics_snapshot().unwrap_or_else(|| serde_json::json!({
+                "enabled": state.served_model_registry.adapter_count() > 0,
+                "adapter_count": state.served_model_registry.adapter_count() as u64,
+                "active_cache_bindings": 0u64,
+                "projection_applications": 0u64,
+                "position": "startup-routing",
+                "source": "server-lora-registry",
+            })),
+        });
+        if let (Some(health), Some(text_health)) = (health.as_object_mut(), text_health.as_object())
+        {
+            health.extend(text_health.clone());
+        }
+    }
 
     Ok(Json(health).into_response())
 }
@@ -4927,6 +4995,7 @@ enum ServerError {
     InternalError(String),
     ContextLengthExceeded(String),
     ServiceUnavailable(String),
+    CapacityExceeded(String),
 }
 
 impl ServerError {
@@ -4978,6 +5047,12 @@ impl IntoResponse for ServerError {
                 AxumStatusCode::SERVICE_UNAVAILABLE,
                 msg,
                 "service_unavailable_error",
+                None,
+            ),
+            ServerError::CapacityExceeded(msg) => (
+                AxumStatusCode::TOO_MANY_REQUESTS,
+                msg,
+                "rate_limit_error",
                 None,
             ),
         };

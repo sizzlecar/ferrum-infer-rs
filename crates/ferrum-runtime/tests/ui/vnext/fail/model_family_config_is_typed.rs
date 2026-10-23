@@ -41,7 +41,7 @@ impl ModelFamilyProvider for Family {
         unimplemented!()
     }
 
-    fn weight_schema(&self, _config: &Config) -> Result<WeightSchema, VNextError> {
+    fn weights(&self, _config: &Config) -> Result<ModelWeights, VNextError> {
         unimplemented!()
     }
 
@@ -62,5 +62,5 @@ fn main() {
     let family = Family {
         id: ModelFamilyId::new("family/typed").unwrap(),
     };
-    let _ = family.weight_schema(&WrongConfig);
+    let _ = family.weights(&WrongConfig);
 }

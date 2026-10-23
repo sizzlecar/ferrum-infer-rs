@@ -99,7 +99,7 @@ pub(super) fn physical_pages(
     else {
         panic!("fixture extension must expose its actual committed backing")
     };
-    assert!(backing.committed_tokens() >= end as u64);
+    assert!(backing.committed_tokens().unwrap() >= end as u64);
     let bytes: u64 = backing
         .backing_slices()
         .iter()

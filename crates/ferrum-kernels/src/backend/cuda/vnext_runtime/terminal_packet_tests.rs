@@ -152,6 +152,7 @@ fn buffer(
             _base: base,
             aligned_ptr: pointer,
             requested_bytes: bytes as u64,
+            _tensor_owner: None,
         }),
     })
 }

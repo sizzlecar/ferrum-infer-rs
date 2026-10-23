@@ -6,8 +6,13 @@ fn upstream_prefill_fixture_preserves_mixed_weights_and_declares_real_context() 
         let old = Family::new(kind);
         let family = Family::prefill(kind, 2052);
         assert_eq!(
-            family.weight_schema(&kind).unwrap(),
-            old.weight_schema(&kind).unwrap()
+            family
+                .weights(&kind)
+                .unwrap()
+                .stored_schema()
+                .unwrap()
+                .clone(),
+            old.weights(&kind).unwrap().stored_schema().unwrap().clone()
         );
         let registration = TypedFamilyRegistration::new(family);
         let definition = registration
@@ -45,10 +50,18 @@ fn upstream_prefill_fixture_preserves_mixed_weights_and_declares_real_context() 
 fn upstream_marker_fixture_odd_leaf_flags_require_padding_without_changing_tensors() {
     for kind in [AttentionKind::GatedDelta, AttentionKind::Causal] {
         let family = Family::new(kind);
-        let schema = family.weight_schema(&kind).unwrap();
+        let schema = family
+            .weights(&kind)
+            .unwrap()
+            .stored_schema()
+            .unwrap()
+            .clone();
         let base = attention_family::Family::new(kind)
-            .weight_schema(&kind)
-            .unwrap();
+            .weights(&kind)
+            .unwrap()
+            .stored_schema()
+            .unwrap()
+            .clone();
         let attention_names: &[&str] = match kind {
             AttentionKind::GatedDelta => &["qkvzba", "o"],
             AttentionKind::Causal => &["q", "k", "v", "o"],
@@ -134,7 +147,12 @@ fn upstream_marker_fixture_prepares_real_attention_norm_ffn_residual_boundaries(
         let base = attention_family::Family::new(kind);
         let old_wire = serde_json::to_vec(&base.numerical_profiles(&kind).unwrap()).unwrap();
         let provider = Family::new(kind);
-        let mut schema = provider.weight_schema(&kind).unwrap();
+        let mut schema = provider
+            .weights(&kind)
+            .unwrap()
+            .stored_schema()
+            .unwrap()
+            .clone();
         // Typed preparation canonicalizes independent declarations, while each
         // composite's physical part offsets remain semantic and unsorted.
         schema.components.sort_by(|a, b| a.id.cmp(&b.id));
@@ -146,7 +164,7 @@ fn upstream_marker_fixture_prepares_real_attention_norm_ffn_residual_boundaries(
             .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(PROFILE))
             .unwrap();
         profile.validate_program(prepared.program()).unwrap();
-        assert_eq!(prepared.weight_schema(), &schema);
+        assert_eq!(prepared.stored_weight_schema().unwrap(), &schema);
         assert_eq!(prepared.program().states(), base.states());
         assert_eq!(
             profile.boundaries[&id::<ProgramValueId>("value.attention")],
@@ -267,8 +285,18 @@ fn hybrid_fixture_keeps_atn_tensor_state_contract_and_distinct_arithmetic_ids() 
         let baseline = Family::g32_baseline(kind);
         let hybrid = Family::hybrid(kind, MAX_TOKENS);
         assert_eq!(
-            baseline.weight_schema(&kind).unwrap(),
-            hybrid.weight_schema(&kind).unwrap()
+            baseline
+                .weights(&kind)
+                .unwrap()
+                .stored_schema()
+                .unwrap()
+                .clone(),
+            hybrid
+                .weights(&kind)
+                .unwrap()
+                .stored_schema()
+                .unwrap()
+                .clone()
         );
         assert_eq!(baseline.states(), hybrid.states());
         let mut prepared = Vec::new();

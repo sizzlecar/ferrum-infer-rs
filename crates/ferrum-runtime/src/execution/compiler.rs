@@ -8,10 +8,19 @@ use super::{
     PreparedModelFamily, ProgramTensorSpec, ProgramValueId, ProviderId, ProviderResourcePlan,
     ResolvedStorageComponent, ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding,
     ResolvedValueRole, ResolvedValueStorage, ResolvedWeightBinding, ResourceId, RuntimePolicy,
-    StrideConstraint, TensorContract, TrustedExecutionWeightPlan, VNextError, WeightId,
+    StrideConstraint, TensorContract, TrustedExecutionWeights, VNextError, WeightId,
     WeightMaterializerId, WeightMaterializerRegistry, WeightMaterializerSelection, WeightSchema,
     IDENTITY_WEIGHT_MATERIALIZER_ID,
 };
+
+/// Automatic presence-aware preparation, or an explicit materializer demand.
+/// An explicit demand is invalid for a component without stored weights.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WeightPreparation {
+    #[default]
+    Auto,
+    Require(WeightMaterializerSelection),
+}
 
 /// Explicit semantic inputs, per-node selection preferences, and optional
 /// completion diagnostics for compiling a model program. Product input
@@ -23,7 +32,7 @@ pub struct ProgramPlanCompileOptions {
     required_capabilities: BTreeMap<NodeId, BTreeSet<CapabilityId>>,
     preferred_providers: BTreeMap<NodeId, ProviderId>,
     completion_retention: CompletionRetentionSpec,
-    weight_materializer_selection: WeightMaterializerSelection,
+    weight_preparation: WeightPreparation,
 }
 
 impl ProgramPlanCompileOptions {
@@ -38,9 +47,7 @@ impl ProgramPlanCompileOptions {
             required_capabilities: BTreeMap::new(),
             preferred_providers: BTreeMap::new(),
             completion_retention: CompletionRetentionSpec::default(),
-            weight_materializer_selection: WeightMaterializerSelection::exact(
-                WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID)?,
-            ),
+            weight_preparation: WeightPreparation::Auto,
         })
     }
 
@@ -92,14 +99,15 @@ impl ProgramPlanCompileOptions {
     }
 
     pub fn require_weight_materializer(&mut self, materializer_id: WeightMaterializerId) {
-        self.weight_materializer_selection = WeightMaterializerSelection::exact(materializer_id);
+        self.weight_preparation =
+            WeightPreparation::Require(WeightMaterializerSelection::exact(materializer_id));
     }
 
     pub fn require_weight_materializer_selection(
         &mut self,
         selection: WeightMaterializerSelection,
     ) {
-        self.weight_materializer_selection = selection;
+        self.weight_preparation = WeightPreparation::Require(selection);
     }
 
     pub fn require_weight_materializer_with_numeric_quality_artifact(
@@ -107,17 +115,14 @@ impl ProgramPlanCompileOptions {
         materializer_id: WeightMaterializerId,
         artifact_bytes: impl Into<Vec<u8>>,
     ) -> Result<(), VNextError> {
-        self.weight_materializer_selection =
-            WeightMaterializerSelection::numeric_quality_artifact(materializer_id, artifact_bytes)?;
+        self.weight_preparation = WeightPreparation::Require(
+            WeightMaterializerSelection::numeric_quality_artifact(materializer_id, artifact_bytes)?,
+        );
         Ok(())
     }
 
-    pub fn weight_materializer_id(&self) -> &WeightMaterializerId {
-        self.weight_materializer_selection.materializer_id()
-    }
-
-    pub fn weight_materializer_selection(&self) -> &WeightMaterializerSelection {
-        &self.weight_materializer_selection
+    pub fn weight_preparation(&self) -> &WeightPreparation {
+        &self.weight_preparation
     }
 }
 
@@ -181,6 +186,21 @@ impl ProgramPlanCompiler {
         planning: &OperationPlanningHandle<'_>,
         options: &ProgramPlanCompileOptions,
     ) -> Result<ProgramPlanCompilation, VNextError> {
+        if matches!(family.weights(), crate::ModelWeights::None) {
+            if !matches!(options.weight_preparation(), WeightPreparation::Auto) {
+                return Err(invalid_plan(
+                    "explicit weight materializer requires stored model weights",
+                ));
+            }
+            return Self::compile_with_execution_weights(
+                family,
+                catalog,
+                policy,
+                planning,
+                options,
+                TrustedExecutionWeights::for_family(family)?,
+            );
+        }
         let materializers = WeightMaterializerRegistry::identity_only()?;
         Self::compile_with_weight_materializers(
             family,
@@ -200,8 +220,26 @@ impl ProgramPlanCompiler {
         materializers: &WeightMaterializerRegistry,
         options: &ProgramPlanCompileOptions,
     ) -> Result<ProgramPlanCompilation, VNextError> {
-        let execution_weights =
-            materializers.select(family, catalog, options.weight_materializer_selection())?;
+        let execution_weights = match (family.weights(), options.weight_preparation()) {
+            (crate::ModelWeights::None, WeightPreparation::Auto) => {
+                TrustedExecutionWeights::for_family(family)?
+            }
+            (crate::ModelWeights::None, WeightPreparation::Require(_)) => {
+                return Err(invalid_plan(
+                    "explicit weight materializer requires stored model weights",
+                ));
+            }
+            (crate::ModelWeights::Stored(_), WeightPreparation::Auto) => materializers
+                .select_exact(
+                    family,
+                    catalog,
+                    &WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID)?,
+                )?
+                .into(),
+            (crate::ModelWeights::Stored(_), WeightPreparation::Require(selection)) => {
+                materializers.select(family, catalog, selection)?.into()
+            }
+        };
         Self::compile_with_execution_weights(
             family,
             catalog,
@@ -218,7 +256,7 @@ impl ProgramPlanCompiler {
         policy: &P,
         planning: &OperationPlanningHandle<'_>,
         options: &ProgramPlanCompileOptions,
-        execution_weights: TrustedExecutionWeightPlan,
+        execution_weights: TrustedExecutionWeights,
     ) -> Result<ProgramPlanCompilation, VNextError> {
         validate_compile_options(family, options)?;
         let value_tensors = infer_value_tensors(family, catalog, options)?;
@@ -226,8 +264,9 @@ impl ProgramPlanCompiler {
             .numerical_profile()
             .validate_inferred_boundaries(&value_tensors)?;
         let family_fingerprint = family.fingerprint()?;
-        let execution_weight_fingerprint = execution_weights.plan().fingerprint()?;
-        let execution_weight_schema = execution_weights.plan().schema();
+        execution_weights.validate_against_catalog(family, catalog)?;
+        let execution_weight_fingerprint = execution_weights.declaration().fingerprint()?;
+        let execution_weight_schema = execution_weights.schema();
 
         let probe_locations = dedicated_weight_locations(
             family,
@@ -400,6 +439,13 @@ fn validate_compile_options(
         return Err(invalid_plan(
             "every program input requires an explicit canonical tensor capacity",
         ));
+    }
+    for (value, required) in program.input_tensor_specs() {
+        if options.tensor_specs.get(value) != Some(required) {
+            return Err(invalid_plan(format!(
+                "program input `{value}` differs from its model-declared tensor constraint"
+            )));
+        }
     }
     Ok(())
 }
@@ -748,7 +794,7 @@ fn layout_matches(
 
 fn dedicated_weight_locations(
     family: &PreparedModelFamily,
-    execution_weight_schema: &WeightSchema,
+    execution_weight_schema: Option<&WeightSchema>,
     execution_weight_fingerprint: &str,
 ) -> Result<BTreeMap<WeightId, WeightComponentLocation>, VNextError> {
     referenced_weight_components(family, execution_weight_schema)?
@@ -774,7 +820,7 @@ fn dedicated_weight_locations(
 
 fn arena_weight_locations(
     family: &PreparedModelFamily,
-    execution_weight_schema: &WeightSchema,
+    execution_weight_schema: Option<&WeightSchema>,
     execution_weight_fingerprint: &str,
     provider_alignment_bytes: u64,
 ) -> Result<BTreeMap<WeightId, WeightComponentLocation>, VNextError> {
@@ -819,8 +865,14 @@ fn arena_weight_locations(
 
 fn referenced_weight_components<'schema>(
     family: &PreparedModelFamily,
-    execution_weight_schema: &'schema WeightSchema,
+    execution_weight_schema: Option<&'schema WeightSchema>,
 ) -> Result<Vec<&'schema super::super::WeightComponentSpec>, VNextError> {
+    let Some(execution_weight_schema) = execution_weight_schema else {
+        if !family.program().weights().is_empty() {
+            return Err(invalid_plan("program weights require an execution schema"));
+        }
+        return Ok(Vec::new());
+    };
     let referenced = family
         .program()
         .weights()
@@ -860,7 +912,7 @@ fn hashed_resource_id(
 
 fn build_value_storages(
     family: &PreparedModelFamily,
-    execution_weight_schema: &WeightSchema,
+    execution_weight_schema: Option<&WeightSchema>,
     catalog: &CapabilityCatalog,
     tensors: &BTreeMap<ProgramValueId, ResolvedTensorSpec>,
     weight_locations: &BTreeMap<WeightId, WeightComponentLocation>,
@@ -876,6 +928,7 @@ fn build_value_storages(
     }
     for weight in program.weights() {
         let components = execution_weight_schema
+            .ok_or_else(|| invalid_plan("program weight has no execution schema"))?
             .physical_component_refs(&weight.weight_id)?
             .into_iter()
             .map(|component| {
@@ -962,7 +1015,7 @@ fn activation_storage(
 #[allow(clippy::too_many_arguments)]
 fn resolve_nodes<P: RuntimePolicy>(
     family: &PreparedModelFamily,
-    execution_weight_schema: &WeightSchema,
+    execution_weight_schema: Option<&WeightSchema>,
     prepared_family_fingerprint: &str,
     catalog: &CapabilityCatalog,
     policy: &P,
@@ -1032,7 +1085,7 @@ fn resolve_nodes<P: RuntimePolicy>(
 
 fn resolved_binding(
     family: &PreparedModelFamily,
-    execution_weight_schema: &WeightSchema,
+    execution_weight_schema: Option<&WeightSchema>,
     value_id: &ProgramValueId,
     role: ResolvedValueRole,
     ordinal: u32,
@@ -1074,7 +1127,11 @@ fn resolved_binding(
         usage,
         program_weight
             .map(|weight| {
-                ResolvedWeightBinding::from_schema(execution_weight_schema, &weight.weight_id)
+                ResolvedWeightBinding::from_schema(
+                    execution_weight_schema
+                        .ok_or_else(|| invalid_plan("program weight has no execution schema"))?,
+                    &weight.weight_id,
+                )
             })
             .transpose()?,
         storages

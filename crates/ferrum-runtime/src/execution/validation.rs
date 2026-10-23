@@ -1,8 +1,9 @@
 use super::{
-    invalid_plan, CapabilityCatalog, CompletionRetentionSpec, Deserialize, ExecutionPlan,
-    PlanBuildRequest, PlanNodeResolution, PlanSchemaVersion, PreparedModelFamily, RuntimePolicy,
-    TrustedExecutionWeightPlan, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError,
-    EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
+    canonical_fingerprint, invalid_plan, CapabilityCatalog, CompletionRetentionSpec, Deserialize,
+    ExecutionPlan, MemoryPlan, PlanBuildRequest, PlanHash, PlanHashMaterial, PlanNodeResolution,
+    PlanSchemaVersion, PreparedModelFamily, RuntimePolicy, TrustedExecutionWeights,
+    UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError, EXECUTION_PLAN_SCHEMA,
+    MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
 
 #[derive(Deserialize)]
@@ -31,6 +32,29 @@ pub(super) fn validate_execution_plan_wire_size(
 }
 
 impl ExecutionPlan {
+    fn with_declared_legacy_invocation_layouts(
+        mut self,
+        declared: &MemoryPlan,
+    ) -> Result<Self, VNextError> {
+        let memory = self
+            .payload
+            .memory
+            .clone()
+            .with_legacy_invocation_layouts(declared.dynamic_pools(), self.payload.nodes.len())
+            .map_err(Self::memory_pool_validation_error)?;
+        if memory == self.payload.memory {
+            return Ok(self);
+        }
+        self.payload.memory = memory;
+        self.plan_hash = PlanHash::new(canonical_fingerprint(
+            &PlanHashMaterial::from(&self.payload),
+            "fingerprint legacy execution plan",
+        )?)?;
+        self.payload.plan_id = Self::plan_id_for_hash(&self.plan_hash)?;
+        self.validate_internal()?;
+        Ok(self)
+    }
+
     pub fn to_json(&self) -> Result<Vec<u8>, VNextError> {
         let bytes = serde_json::to_vec(self).map_err(|error| VNextError::Serialization {
             context: "serialize execution plan",
@@ -100,7 +124,7 @@ impl ExecutionPlan {
         policy: &P,
         node_resolutions: Vec<PlanNodeResolution>,
         completion_retention: CompletionRetentionSpec,
-        execution_weights: TrustedExecutionWeightPlan,
+        execution_weights: impl Into<TrustedExecutionWeights>,
     ) -> Result<Self, VNextError> {
         Self::decode_untrusted(bytes)?.revalidate_with_execution_weights(
             family,
@@ -140,7 +164,8 @@ impl ExecutionPlan {
             PlanBuildRequest::new(family, capabilities, policy, node_resolutions.to_vec())?
                 .with_execution_weights(self.trusted_execution_weights.clone())?
                 .with_completion_retention(completion_retention)?,
-        )?;
+        )?
+        .with_declared_legacy_invocation_layouts(&self.payload.memory)?;
         if rebuilt.operation_registry_authority != self.operation_registry_authority {
             return Err(invalid_plan(
                 "execution plan belongs to a different operation runtime registry",
@@ -184,7 +209,7 @@ impl UnvalidatedExecutionPlan {
         node_resolutions: Vec<PlanNodeResolution>,
         completion_retention: CompletionRetentionSpec,
     ) -> Result<ExecutionPlan, VNextError> {
-        let execution_weights = TrustedExecutionWeightPlan::identity(family)?;
+        let execution_weights = TrustedExecutionWeights::for_family(family)?;
         self.revalidate_with_execution_weights(
             family,
             capabilities,
@@ -202,7 +227,7 @@ impl UnvalidatedExecutionPlan {
         policy: &P,
         node_resolutions: Vec<PlanNodeResolution>,
         completion_retention: CompletionRetentionSpec,
-        execution_weights: TrustedExecutionWeightPlan,
+        execution_weights: impl Into<TrustedExecutionWeights>,
     ) -> Result<ExecutionPlan, VNextError> {
         if self.payload.schema != EXECUTION_PLAN_SCHEMA {
             return Err(VNextError::UnsupportedPlanSchema {
@@ -216,7 +241,8 @@ impl UnvalidatedExecutionPlan {
             PlanBuildRequest::new(family, capabilities, policy, node_resolutions)?
                 .with_execution_weights(execution_weights)?
                 .with_completion_retention(completion_retention)?,
-        )?;
+        )?
+        .with_declared_legacy_invocation_layouts(&self.payload.memory)?;
         let untrusted_payload =
             serde_json::to_value(&self.payload).map_err(|error| VNextError::Serialization {
                 context: "serialize unvalidated execution plan payload",

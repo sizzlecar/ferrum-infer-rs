@@ -255,8 +255,8 @@ impl ModelFamilyProvider for TestFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, _config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, _config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.device-operation-composite"),
             layout_id: id("weight-layout.device-operation-composite"),
             version: ContractVersion::new(1, 0),
@@ -306,7 +306,7 @@ impl ModelFamilyProvider for TestFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -494,19 +494,21 @@ impl ModelFamilyProvider for TestFamily {
         &self,
         _config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
-            template: TemplateMetadata {
-                template: "{{ messages }}".to_owned(),
-                source_file: "template.json".to_owned(),
-                sha256: sha('a'),
+        Ok(ModelSemanticMetadata::CausalLanguage(
+            ferrum_runtime::CausalLanguageMetadata {
+                template: TemplateMetadata {
+                    template: "{{ messages }}".to_owned(),
+                    source_file: "template.json".to_owned(),
+                    sha256: sha('a'),
+                },
+                special_tokens: SpecialTokenMetadata {
+                    bos_token_id: Some(1),
+                    eos_token_ids: BTreeSet::from([2]),
+                    pad_token_id: Some(0),
+                    collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
+                },
             },
-            special_tokens: SpecialTokenMetadata {
-                bos_token_id: Some(1),
-                eos_token_ids: BTreeSet::from([2]),
-                pad_token_id: Some(0),
-                collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
-            },
-        })
+        ))
     }
 }
 
@@ -1238,7 +1240,8 @@ fn resolved_weight() -> ResolvedWeightBinding {
     let family = TypedFamilyRegistration::new(TestFamily)
         .prepare_fixture(&json!({"width": 4}))
         .unwrap();
-    ResolvedWeightBinding::from_schema(family.weight_schema(), &id("weight.matrix")).unwrap()
+    ResolvedWeightBinding::from_schema(family.stored_weight_schema().unwrap(), &id("weight.matrix"))
+        .unwrap()
 }
 
 pub(crate) fn single_binding(
@@ -1743,7 +1746,10 @@ fn test_submission_attribution(
             || {
                 logical_work.map_or_else(
                     || encoded_work.map_or(u64::from(entry.node_index().is_some()), |work| work.1),
-                    |work| work.token_count(),
+                    |work| {
+                        work.token_count()
+                            .expect("test backend supports token work only")
+                    },
                 )
             },
             DeviceReusableExecutionInvocation::token_count,

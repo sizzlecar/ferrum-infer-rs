@@ -1,3 +1,27 @@
+mod philox_normal_bf16;
+pub use philox_normal_bf16::*;
+mod dense_linear_fp8_bf16;
+pub use dense_linear_fp8_bf16::*;
+mod channel_l2_norm_image_bf16;
+#[cfg(test)]
+mod spatial_decoder_tests;
+pub use channel_l2_norm_image_bf16::*;
+mod spatial_attention_bf16;
+pub use spatial_attention_bf16::*;
+mod spatial_upsample_gather_bf16;
+pub use spatial_upsample_gather_bf16::*;
+mod spatial_group_mean_bf16;
+pub use spatial_group_mean_bf16::*;
+mod tensor_primitives_bf16;
+pub use tensor_primitives_bf16::*;
+mod nchw_pointwise_bf16;
+pub use nchw_pointwise_bf16::*;
+mod conv2d_bf16;
+pub use conv2d_bf16::*;
+mod channel_l2_norm_bf16;
+pub use channel_l2_norm_bf16::*;
+mod row_transport_bf16;
+pub use row_transport_bf16::*;
 mod gguf_f16_projections;
 pub use gguf_f16_projections::*;
 mod rn_f16_fragment;
@@ -10,6 +34,30 @@ mod upstream_marker_v2;
 pub use upstream_marker_v2::*;
 mod q6_mmq_f32;
 pub use q6_mmq_f32::*;
+mod layer_norm_bf16;
+pub use layer_norm_bf16::*;
+mod zero_centered_rms_norm_bf16;
+pub use zero_centered_rms_norm_bf16::*;
+mod gelu_tanh_bf16;
+pub use gelu_tanh_bf16::*;
+mod head_rms_norm_bf16;
+pub use head_rms_norm_bf16::*;
+mod adjacent_rope_bf16;
+pub use adjacent_rope_bf16::*;
+mod plain_residual_add_bf16;
+pub use plain_residual_add_bf16::*;
+mod half_split_rope_bf16;
+pub use half_split_rope_bf16::*;
+mod structured_gqa_attention_bf16;
+pub use structured_gqa_attention_bf16::*;
+mod structured_attention_bf16;
+pub use structured_attention_bf16::*;
+mod cross_attention_bf16;
+pub use cross_attention_bf16::*;
+mod pointwise_bf16;
+pub use pointwise_bf16::*;
+mod transcendental_bf16;
+pub use transcendental_bf16::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -48,6 +96,8 @@ pub const RMS_NORM_F32_OPERATION_ID: &str = "operation.rms_norm.f32";
 pub const RMS_NORM_F32_CAPABILITY_ID: &str = "capability.operation.rms_norm.f32";
 pub const DENSE_LINEAR_OPERATION_ID: &str = "operation.dense_linear";
 pub const DENSE_LINEAR_F16_CAPABILITY_ID: &str = "capability.operation.dense_linear.f16";
+pub const DENSE_LINEAR_BF16_OPERATION_ID: &str = "operation.dense_linear.bf16";
+pub const DENSE_LINEAR_BF16_CAPABILITY_ID: &str = "capability.operation.dense_linear.bf16";
 pub const DENSE_SWIGLU_OPERATION_ID: &str = "operation.dense_swiglu";
 pub const DENSE_SWIGLU_F16_CAPABILITY_ID: &str = "capability.operation.dense_swiglu.f16";
 pub const DENSE_GEGLU_TANH_OPERATION_ID: &str = "operation.dense_geglu_tanh";
@@ -611,16 +661,56 @@ fn rms_norm_contract_with_types(
 }
 
 pub fn dense_linear_contract() -> Result<StandardOperationContract, VNextError> {
+    dense_linear_contract_with_type(
+        DENSE_LINEAR_OPERATION_ID,
+        ContractVersion::new(1, 1),
+        DENSE_LINEAR_F16_CAPABILITY_ID,
+        ElementType::F16,
+        f16_reference_tolerance()?,
+    )
+}
+
+/// Row-wise `Y[r,o] = sum_i X[r,i] * W[o,i]` with BF16 boundaries and
+/// FP32 multiplication/accumulation. This is a separate numerical contract;
+/// accepting BF16 must not widen the established F16 provider signature.
+///
+/// Version 1.0 uses an input-dependent error bound, not the F16 relative
+/// tolerance. For finite inputs without FP32 product/sum overflow or underflow
+/// or final BF16 overflow, and with `2K * 2^-24 < 1`,
+/// let `S = sum_i |X_i W_i|`, `E = gamma(2K, 2^-24) S`, and let `y` be the
+/// exact real dot product. The BF16 result's absolute error is bounded by
+/// `E + 2^-8 (|y| + E) + 2^-134`, allowing final BF16 round-to-nearest-even,
+/// including its subnormal rounding term. An approximate high-precision
+/// oracle must add its own error bound. Nonfinite/overflow/underflow cases
+/// require separate evidence; an output-only relative tolerance cannot prove
+/// this operation's contract.
+pub fn dense_linear_bf16_contract() -> Result<StandardOperationContract, VNextError> {
+    dense_linear_contract_with_type(
+        DENSE_LINEAR_BF16_OPERATION_ID,
+        ContractVersion::new(1, 0),
+        DENSE_LINEAR_BF16_CAPABILITY_ID,
+        ElementType::Bf16,
+        OracleSpec::OperationDefined,
+    )
+}
+
+fn dense_linear_contract_with_type(
+    operation_id: &str,
+    version: ContractVersion,
+    capability_id: &str,
+    element_type: ElementType,
+    oracle: OracleSpec,
+) -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
-        id: OperationId::new(DENSE_LINEAR_OPERATION_ID)?,
-        version: ContractVersion::new(1, 1),
+        id: OperationId::new(operation_id)?,
+        version,
         inputs: vec![
             contiguous_tensor(
                 vec![
                     DimensionConstraint::Symbol("rows".to_owned()),
                     DimensionConstraint::Symbol("in_features".to_owned()),
                 ],
-                [ElementType::F16],
+                [element_type],
                 TensorAccess::Read,
             )?,
             contiguous_tensor(
@@ -628,7 +718,7 @@ pub fn dense_linear_contract() -> Result<StandardOperationContract, VNextError> 
                     DimensionConstraint::Symbol("out_features".to_owned()),
                     DimensionConstraint::Symbol("in_features".to_owned()),
                 ],
-                [ElementType::F16],
+                [element_type],
                 TensorAccess::Read,
             )?,
         ],
@@ -637,7 +727,7 @@ pub fn dense_linear_contract() -> Result<StandardOperationContract, VNextError> 
                 DimensionConstraint::Symbol("rows".to_owned()),
                 DimensionConstraint::Symbol("out_features".to_owned()),
             ],
-            [ElementType::F16],
+            [element_type],
             TensorAccess::Write,
         )?],
         attributes: AttributeSchema::new(BTreeMap::from([
@@ -650,8 +740,8 @@ pub fn dense_linear_contract() -> Result<StandardOperationContract, VNextError> 
             scratch: ResourcePresenceRequirement::Optional,
             ..no_auxiliary_resources()
         },
-        oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(DENSE_LINEAR_F16_CAPABILITY_ID, ContractVersion::new(1, 0))?,
+        oracle,
+        provider: provider_requirement(capability_id, ContractVersion::new(1, 0))?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -2166,6 +2256,35 @@ mod tests {
             contracts[3].descriptor().outputs[0].alias(),
             &AliasPolicy::MayAlias { tensor_index: 0 }
         );
+    }
+
+    #[test]
+    fn bf16_dense_linear_keeps_dtype_and_numerics_separate_from_f16() {
+        let f16 = dense_linear_contract().unwrap();
+        let bf16 = dense_linear_bf16_contract().unwrap();
+        let old = f16.descriptor();
+        let new = bf16.descriptor();
+        assert_eq!(old.id.as_str(), DENSE_LINEAR_OPERATION_ID);
+        assert_eq!(old.version, ContractVersion::new(1, 1));
+        assert_eq!(old.oracle, f16_reference_tolerance().unwrap());
+        assert_eq!(new.id.as_str(), DENSE_LINEAR_BF16_OPERATION_ID);
+        assert_eq!(new.version, ContractVersion::new(1, 0));
+        assert_eq!(new.oracle, OracleSpec::OperationDefined);
+        assert_ne!(old.provider, new.provider);
+        for (descriptor, element_type) in [(old, ElementType::F16), (new, ElementType::Bf16)] {
+            for tensor in descriptor.inputs.iter().chain(&descriptor.outputs) {
+                assert_eq!(tensor.element_types(), &BTreeSet::from([element_type]));
+            }
+            assert_eq!(descriptor.inputs[0].dimensions()[0], symbol("rows"));
+            assert_eq!(descriptor.outputs[0].dimensions()[0], symbol("rows"));
+        }
+        bf16.validate_signature(&new.inputs, &new.outputs).unwrap();
+        assert!(bf16.validate_signature(&old.inputs, &new.outputs).is_err());
+        assert!(bf16.validate_signature(&new.inputs, &old.outputs).is_err());
+        assert!(f16.validate_signature(&new.inputs, &old.outputs).is_err());
+        let mut mixed = new.inputs.clone();
+        mixed[1] = old.inputs[1].clone();
+        assert!(bf16.validate_signature(&mixed, &new.outputs).is_err());
     }
 
     #[test]

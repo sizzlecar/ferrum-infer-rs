@@ -177,7 +177,6 @@ jobs:
           end
           runtime_required = !!asset && policy == 'required'
           if mode == 'delivery'
-            raise 'This candidate requires real SM120 validation, but no approved SM120 runner is available; historical evidence is not a new verification run' if runtime_required
             raise 'Active release must declare its SM120 asset' if ENV.fetch('VERIFY_PUBLISHED_VERSION', '').empty? && !asset
           end
           puts "sm120_required=#{!!asset}"
@@ -332,7 +331,11 @@ jobs:
             --windows-staged "$RUNNER_TEMP/staged-windows" --repo "$GITHUB_REPOSITORY" --ci-run-id "$SOURCE_RUN")
           for abi in "$RUNNER_TEMP/staged/"*.abi.json; do gate_args+=(--abi "$abi"); done
           for install in "$RUNNER_TEMP/installation/"*.json; do
-            if [ "$install" != "$RUNNER_TEMP/installation/cuda.json" ]; then gate_args+=(--installation "$install"); fi
+            # Required CUDA receipts come from execution of the extracted archive.
+            # Retain SM120 extract-only only for an explicit historical not_run policy.
+            if [ "$install" = "$RUNNER_TEMP/installation/cuda.json" ]; then continue; fi
+            if [ "$SM120_RUNTIME_REQUIRED" = true ] && [ "$install" = "$RUNNER_TEMP/installation/cuda-sm120.json" ]; then continue; fi
+            gate_args+=(--installation "$install")
           done
           gate_args+=(--installation "$RUNNER_TEMP/evidence/release-cuda-evidence/installation-cuda.json"
             --installation "$RUNNER_TEMP/evidence/release-metal-evidence/installation-metal.json")

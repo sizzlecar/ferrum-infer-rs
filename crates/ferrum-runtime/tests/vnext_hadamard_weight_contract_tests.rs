@@ -1,5 +1,6 @@
 mod vnext_core_contract;
 
+use ferrum_runtime::ModelWeights;
 use std::num::NonZeroU32;
 
 use vnext_core_contract::*;
@@ -314,8 +315,8 @@ impl ModelFamilyProvider for SharedSignsFamily {
     fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
         TestFamily.parse_config(raw)
     }
-    fn weight_schema(&self, _config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(schema())
+    fn weights(&self, _config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(schema()))
     }
     fn numerical_profiles(
         &self,

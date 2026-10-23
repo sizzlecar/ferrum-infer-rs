@@ -593,7 +593,46 @@ impl PreparedOperationDispatchBinding {
 
 /// One participant projection inside a plan-selected physical batch. It has
 /// no public constructor and does not own submission authority.
-pub struct OperationInvocation<'a, B> {
+mod work_projection_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed projection chosen by core dispatch; providers cannot manufacture it.
+#[doc(hidden)]
+pub trait InvocationWorkProjection<'a>: work_projection_sealed::Sealed + Copy {
+    fn bind(work: &'a BatchWorkShape) -> Result<Self, VNextError>;
+}
+#[derive(Clone, Copy)]
+pub struct TokenInvocationWork<'a>(crate::TokenBatchWorkView<'a>);
+#[derive(Clone, Copy)]
+pub struct TensorInvocationWork<'a>(&'a BatchWorkShape);
+impl<'a> TensorInvocationWork<'a> {
+    pub fn work_shape(self) -> &'a BatchWorkShape {
+        self.0
+    }
+}
+impl work_projection_sealed::Sealed for TokenInvocationWork<'_> {}
+impl work_projection_sealed::Sealed for TensorInvocationWork<'_> {}
+impl<'a> InvocationWorkProjection<'a> for TokenInvocationWork<'a> {
+    fn bind(work: &'a BatchWorkShape) -> Result<Self, VNextError> {
+        Ok(Self(work.token_view()?))
+    }
+}
+impl<'a> InvocationWorkProjection<'a> for TensorInvocationWork<'a> {
+    fn bind(work: &'a BatchWorkShape) -> Result<Self, VNextError> {
+        if !work.resource_work().is_tensor() || work.participants().len() != 1 {
+            return Err(invalid_operation(
+                "tensor invocation requires one root-bound tensor participant",
+            ));
+        }
+        Ok(Self(work))
+    }
+}
+
+pub type TensorOperationInvocation<'a, B> =
+    BatchedOperationInvocation<'a, B, TensorInvocationWork<'a>>;
+
+pub struct OperationInvocation<'a, B, W = TokenInvocationWork<'a>> {
     identity: &'a ExecutionIdentityEnvelope,
     operation: &'a OperationDescriptor,
     node_id: &'a NodeId,
@@ -606,8 +645,10 @@ pub struct OperationInvocation<'a, B> {
     binding_view: Option<usize>,
     persistent_view: Option<usize>,
     work_shape: &'a BatchWorkShape,
+    work_projection: W,
     claimed_backing_fingerprint: &'a str,
     projection_numerics: Option<&'a crate::PreparedProjectionNumerics>,
+    prepared_implementation_fingerprint: Option<&'a str>,
 }
 
 /// Checks this fresh wave's common participant authority once. The private
@@ -765,6 +806,15 @@ fn validate_prepared_participant_authority<'runtime, 'a, R: DeviceRuntime>(
     let admission = active_binding.plan().static_provisioning_binding();
     let pool_fingerprint = active_binding.static_pool_identity_fingerprint_ref();
     let memory = plan.payload().memory();
+    // A shared installation retains its original complete physical claim.
+    // Its consumer may bind a smaller readonly subset only after bind_plan's
+    // exact weight-plan/placement/arena validation. This sealed root evidence
+    // is matched below together with the consumer plan hash; it is not a
+    // caller-provided allowance to accept an arbitrary larger allocation.
+    let expected_static_bytes = active_binding
+        .plan()
+        .shared_component_weights()
+        .map_or(memory.static_bytes(), |shared| shared.physical_bytes());
     if resources.participant_count()? != resources.prepared_participant_count()?
         || resources.node_id()? != node_id
         || participant_frame.sequence_authority() != participant.sequence_authority()
@@ -814,7 +864,7 @@ fn validate_prepared_participant_authority<'runtime, 'a, R: DeviceRuntime>(
         || admission.is_some_and(|admission| {
             admission.device_capacity_bytes() != memory.device_capacity_bytes()
                 || admission.usable_capacity_bytes() != memory.usable_capacity_bytes()
-                || admission.plan_static_bytes() != memory.static_bytes()
+                || admission.plan_static_bytes() != expected_static_bytes
                 || admission.maximum_active_sequences() != memory.maximum_active_sequences()
         })
         || parts.resource_id.is_some()
@@ -828,7 +878,7 @@ fn validate_prepared_participant_authority<'runtime, 'a, R: DeviceRuntime>(
     Ok((participant, participant_backing))
 }
 
-impl<'a, B> OperationInvocation<'a, B> {
+impl<'a, B, W: InvocationWorkProjection<'a>> OperationInvocation<'a, B, W> {
     #[allow(clippy::too_many_arguments)]
     fn from_prepared<'runtime, R>(
         runtime: &'runtime R,
@@ -898,12 +948,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                                 "prepared static resource index differs from the memory plan",
                             )
                         })?;
-                    let lease = static_lease.ok_or_else(|| {
-                        invalid_operation(format!(
-                            "plan-static resource `{resource_id}` lacks static provisioning"
-                        ))
-                    })?;
-                    let leased = lease.plan_static_view(slot_index, allocation)?;
+                    let leased = participant.plan_static_view(slot_index, allocation)?;
                     views.push(OperationBufferView::from_static(
                         leased,
                         participant.device_buffer_retention(),
@@ -967,19 +1012,23 @@ impl<'a, B> OperationInvocation<'a, B> {
                             resources.step_resources().work_shape().immediate_shape(),
                         )?,
                         AllocationLifetime::Sequence => {
-                            let participant_token_range = resources
-                                .work_shape()?
-                                .participant_token_ranges()
-                                .get(participant_index)
-                                .ok_or_else(|| {
-                                    invalid_operation(
-                                        "operation participant token range is missing",
-                                    )
-                                })?;
-                            let execution_shape = sequence_execution_shape(
-                                participant_backing.committed_shape(),
-                                participant_token_range.source_token_range().end,
-                            )?;
+                            let participant_work = resources.work_shape()?;
+                            let execution_shape = if participant_work.resource_work().is_tensor() {
+                                crate::DynamicResourceShape::FixedTensor
+                            } else {
+                                let participant_token_range = participant_work
+                                    .participant_token_ranges()?
+                                    .get(participant_index)
+                                    .ok_or_else(|| {
+                                        invalid_operation(
+                                            "operation participant token range is missing",
+                                        )
+                                    })?;
+                                sequence_execution_shape(
+                                    participant_backing.committed_shape(),
+                                    participant_token_range.source_token_range().end,
+                                )?
+                            };
                             descriptor.evaluate_request_bytes_for_shape(execution_shape)?
                         }
                         AllocationLifetime::Request => descriptor.evaluate_fit_request_bytes(
@@ -1194,8 +1243,11 @@ impl<'a, B> OperationInvocation<'a, B> {
             binding_view,
             persistent_view,
             work_shape: resources.work_shape()?,
+            work_projection: W::bind(resources.work_shape()?)?,
             claimed_backing_fingerprint: resources.backing_fingerprint(),
             projection_numerics: provider_resources.projection_numerics(),
+            prepared_implementation_fingerprint: provider_resources
+                .prepared_implementation_fingerprint(),
         })
     }
 
@@ -1217,6 +1269,10 @@ impl<'a, B> OperationInvocation<'a, B> {
 
     pub fn projection_numerics(&self) -> Option<&crate::PreparedProjectionNumerics> {
         self.projection_numerics
+    }
+
+    pub fn prepared_implementation_fingerprint(&self) -> Option<&str> {
+        self.prepared_implementation_fingerprint
     }
 
     pub fn views(&self) -> &[OperationBufferView<'a, B>] {
@@ -1247,7 +1303,7 @@ impl<'a, B> OperationInvocation<'a, B> {
         self.persistent_view.map(|index| &self.views[index])
     }
 
-    pub fn work_shape(&self) -> &BatchWorkShape {
+    pub fn resource_work_shape(&self) -> &BatchWorkShape {
         self.work_shape
     }
 
@@ -1259,17 +1315,17 @@ impl<'a, B> OperationInvocation<'a, B> {
 /// Borrowed provider view for exactly one physical command. Participant-local
 /// resources remain separate projections while invocation/step/plan resources
 /// may be shared by every projection.
-pub struct BatchedOperationInvocation<'a, B> {
+pub struct BatchedOperationInvocation<'a, B, W = TokenInvocationWork<'a>> {
     execution_facts_capture: crate::ExecutionFactsCapture,
     batch_identity: &'a BatchOperationIdentity,
     node_identity: &'a BatchOperationNodeIdentity,
-    participants: Vec<OperationInvocation<'a, B>>,
+    participants: Vec<OperationInvocation<'a, B, W>>,
     program_binding: Option<ProgramBindingNodeBinding>,
     pub(super) retained_dependency_scope: Arc<()>,
     pub(super) retained_persistent_preserve: bool,
 }
 
-impl<'a, B> BatchedOperationInvocation<'a, B> {
+impl<'a, B, W: InvocationWorkProjection<'a>> BatchedOperationInvocation<'a, B, W> {
     pub(super) fn from_resolved<R>(
         runtime: &R,
         resolved: &'a dyn ExecutablePlanView,
@@ -1476,8 +1532,14 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         self.execution_facts_capture
     }
 
-    pub fn participants(&self) -> &[OperationInvocation<'a, B>] {
+    pub fn participants(&self) -> &[OperationInvocation<'a, B, W>] {
         &self.participants
+    }
+
+    /// Every participant is bound to this same compiled node's provider
+    /// resource plan. Available to fixed tensor and token providers alike.
+    pub fn prepared_implementation_fingerprint(&self) -> Option<&str> {
+        self.participants[0].prepared_implementation_fingerprint()
     }
 
     pub fn operation(&self) -> &OperationDescriptor {
@@ -1492,8 +1554,8 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         self.node_identity.provider_id()
     }
 
-    pub fn work_shape(&self) -> &BatchWorkShape {
-        self.participants[0].work_shape()
+    pub fn resource_work_shape(&self) -> &BatchWorkShape {
+        self.participants[0].resource_work_shape()
     }
 
     pub fn work_contract(&self) -> &NodeWorkContract {
@@ -1518,10 +1580,6 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         } else {
             operation.with_dynamic_binding(command)
         }
-    }
-
-    pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {
-        self.work_shape().participant_token_ranges()
     }
 
     /// Returns whether one exact resolved binding uses the packed token
@@ -1567,6 +1625,20 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             }
         }
         Ok(packed_batch_coordinates.expect("batched operation invocations are non-empty"))
+    }
+}
+
+impl<'a, B> OperationInvocation<'a, B, TokenInvocationWork<'a>> {
+    pub fn work_shape(&self) -> &crate::TokenBatchWorkView<'a> {
+        &self.work_projection.0
+    }
+}
+impl<'a, B> BatchedOperationInvocation<'a, B, TokenInvocationWork<'a>> {
+    pub fn work_shape(&self) -> &crate::TokenBatchWorkView<'a> {
+        self.participants[0].work_shape()
+    }
+    pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {
+        self.work_shape().participant_token_ranges()
     }
 }
 

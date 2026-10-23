@@ -23,7 +23,9 @@ use super::{
     write_json, NativeOperatorBuilderError, NativeOperatorEvidenceFile, Result,
 };
 
+mod dependency_import;
 mod depfile;
+pub use dependency_import::lock_native_operator_source_dependencies;
 pub(crate) mod platform;
 #[cfg(test)]
 mod windows_tests;
@@ -123,6 +125,9 @@ pub enum NativeOperatorCudaArchitecture {
     /// SM120 native compilation path. This is not a minimum-architecture rule:
     /// an unqualified future target retains the original compute_80 policy.
     Compute80PtxWithSm120Native,
+    /// Architecture-specific tensor instructions. Only physical SM120 is
+    /// accepted; the locked NVCC target is sm_120a (CUDA 12.8 or later).
+    Sm120ArchitectureSpecific,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -652,7 +657,7 @@ pub fn run_native_operator_source_build(
             })?;
     validate_locked_source_tree(&canonical_root, &plan)?;
     let architecture_argument =
-        architecture_argument(plan.architecture, &request.compute_capability);
+        architecture_argument(plan.architecture, &request.compute_capability)?;
     let started_unix_ms = unix_ms();
     let started = Instant::now();
     fs::create_dir_all(&request.output_dir).map_err(|source| NativeOperatorBuilderError::Io {
@@ -1652,7 +1657,7 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
     }
 
     let expected_architecture =
-        architecture_argument(plan.architecture, &receipt.compute_capability);
+        architecture_argument(plan.architecture, &receipt.compute_capability)?;
     if receipt.architecture_argument != expected_architecture {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "{} source-build architecture argument differs from its plan: expected={expected_architecture} actual={}",
@@ -5725,8 +5730,8 @@ fn reject_source_build<T>(
 fn architecture_argument(
     architecture: NativeOperatorCudaArchitecture,
     compute_capability: &str,
-) -> String {
-    match architecture {
+) -> Result<String> {
+    Ok(match architecture {
         NativeOperatorCudaArchitecture::DeviceComputeCapability => {
             format!("-arch={compute_capability}")
         }
@@ -5738,7 +5743,15 @@ fn architecture_argument(
                 "-arch=compute_80".to_string()
             }
         }
-    }
+        NativeOperatorCudaArchitecture::Sm120ArchitectureSpecific => {
+            if compute_capability != "sm_120" {
+                return Err(NativeOperatorBuilderError::Invalid(
+                    "sm120_architecture_specific requires physical sm_120".to_string(),
+                ));
+            }
+            "-arch=sm_120a".to_string()
+        }
+    })
 }
 
 fn validate_compute_capability(value: &str) -> Result<()> {
@@ -6340,15 +6353,50 @@ mod tests {
                 .all(|command| command.argv.iter().any(|value| value == argument)));
         }
         assert_eq!(
-            architecture_argument(NativeOperatorCudaArchitecture::Compute80Ptx, "sm_120"),
+            architecture_argument(NativeOperatorCudaArchitecture::Compute80Ptx, "sm_120").unwrap(),
             "-arch=compute_80"
         );
         assert_eq!(
             architecture_argument(
                 NativeOperatorCudaArchitecture::DeviceComputeCapability,
                 "sm_89"
-            ),
+            )
+            .unwrap(),
             "-arch=sm_89"
+        );
+    }
+
+    #[test]
+    fn architecture_specific_sm120_is_explicit_and_rejects_other_physical_devices() {
+        let policy = NativeOperatorCudaArchitecture::Sm120ArchitectureSpecific;
+        assert_eq!(
+            architecture_argument(policy, "sm_120").unwrap(),
+            "-arch=sm_120a"
+        );
+        for unsupported in ["sm_89", "sm_100", "sm_121", "sm_120a", "sm_120f"] {
+            assert!(architecture_argument(policy, unsupported).is_err());
+        }
+        let wire = serde_json::to_string(&policy).unwrap();
+        assert_eq!(wire, "\"sm120_architecture_specific\"");
+        assert_eq!(
+            serde_json::from_str::<NativeOperatorCudaArchitecture>(&wire).unwrap(),
+            policy
+        );
+        assert_eq!(
+            architecture_argument(
+                NativeOperatorCudaArchitecture::DeviceComputeCapability,
+                "sm_120"
+            )
+            .unwrap(),
+            "-arch=sm_120"
+        );
+        assert_eq!(
+            architecture_argument(
+                NativeOperatorCudaArchitecture::Compute80PtxWithSm120Native,
+                "sm_89"
+            )
+            .unwrap(),
+            "-arch=compute_80"
         );
     }
 

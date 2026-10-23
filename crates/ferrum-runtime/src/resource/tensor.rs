@@ -1,0 +1,194 @@
+use std::{any::Any, sync::Arc};
+
+use super::{invalid_resource, PlanRuntimeResources, TrustedPlanRuntimeBinding};
+use crate::{
+    CompiledTensorPorts, DeviceRuntime, ExecutionPlan, HostMemoryAccount, ManagedHostTensor,
+    ResourceWorkShape, TensorWorkEvidence, VNextError,
+};
+
+/// Product composition injects the host parent once. Work submissions cannot
+/// substitute a different account or pass arbitrary compiled port descriptors.
+pub struct TensorExecutionBinding<R: DeviceRuntime> {
+    runtime: TrustedPlanRuntimeBinding<R>,
+    ports: CompiledTensorPorts,
+    host: HostMemoryAccount,
+}
+
+/// One non-forgeable input scope for an admitted fixed tensor request. Each
+/// binding still receives a fresh invocation fingerprint and retains its own
+/// immutable Host inputs; only the capacity/shape parent is shared.
+pub struct TensorRequestInputBinding<R: DeviceRuntime> {
+    binding: TensorExecutionBinding<R>,
+    scope: Arc<()>,
+}
+
+impl<R: DeviceRuntime> TensorRequestInputBinding<R> {
+    /// Admission keeps shape/root authority, not the first step's Host payload.
+    /// This anchor cannot encode uploads; fresh full inputs are mandatory for
+    /// every actual execution.
+    pub fn admission_work(
+        &self,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<ResourceWorkShape, VNextError> {
+        let bound = self.bind_inputs(inputs)?;
+        Ok(ResourceWorkShape::from_tensor_evidence(
+            bound
+                .tensor_evidence()
+                .expect("fixed binding creates tensor evidence")
+                .capacity_anchor(),
+        ))
+    }
+    pub fn bind_inputs(
+        &self,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<ResourceWorkShape, VNextError> {
+        let _lifecycle = self
+            .binding
+            .runtime
+            .resources
+            .read_lifecycle("bind fixed request inputs")?;
+        if inputs
+            .iter()
+            .any(|input| !self.binding.host.owns(input.bytes()))
+        {
+            return Err(invalid_resource(
+                "request input belongs to a different Host parent",
+            ));
+        }
+        let root: Arc<dyn Any + Send + Sync> = self.binding.runtime.resources.clone();
+        Ok(ResourceWorkShape::from_tensor_evidence(
+            TensorWorkEvidence::bind_in_request(
+                root,
+                self.binding.runtime.evidence(),
+                &self.binding.ports,
+                inputs,
+                Some(self.scope.clone()),
+            )?,
+        ))
+    }
+}
+
+impl<R: DeviceRuntime> PlanRuntimeResources<R> {
+    pub fn bind_tensor_execution(
+        self: &Arc<Self>,
+        plan: &ExecutionPlan,
+        host: HostMemoryAccount,
+    ) -> Result<TensorExecutionBinding<R>, VNextError> {
+        let runtime = self.trusted_runtime_binding()?;
+        if runtime.plan_hash() != plan.plan_hash() || !runtime.work_limits().is_tensor() {
+            return Err(invalid_resource(
+                "tensor execution plan differs from its live resource root",
+            ));
+        }
+        let ports =
+            plan.payload().tensor_ports().cloned().ok_or_else(|| {
+                invalid_resource("tensor execution requires compiled tensor ports")
+            })?;
+        Ok(TensorExecutionBinding {
+            runtime,
+            ports,
+            host,
+        })
+    }
+}
+
+impl<R: DeviceRuntime> TensorExecutionBinding<R> {
+    pub fn request_input_binding(&self) -> Result<TensorRequestInputBinding<R>, VNextError> {
+        Ok(TensorRequestInputBinding {
+            binding: TensorExecutionBinding {
+                runtime: self.runtime.resources.trusted_runtime_binding()?,
+                ports: self.ports.clone(),
+                host: self.host.clone(),
+            },
+            scope: Arc::new(()),
+        })
+    }
+    pub fn ports(&self) -> &CompiledTensorPorts {
+        &self.ports
+    }
+    pub fn host_account(&self) -> &HostMemoryAccount {
+        &self.host
+    }
+    pub fn runtime_binding(&self) -> &TrustedPlanRuntimeBinding<R> {
+        &self.runtime
+    }
+
+    pub fn supports_managed_io(&self) -> bool {
+        self.runtime.runtime().supports_managed_tensor_io()
+    }
+
+    /// Builds upload descriptors from the exact immutable owners sealed into
+    /// this root's work. Dispatch repeats the identity/range check before encode.
+    pub fn input_uploads(
+        &self,
+        work: &ResourceWorkShape,
+    ) -> Result<Vec<crate::SubmissionWaveInputUpload>, VNextError> {
+        let _lifecycle = self
+            .runtime
+            .resources
+            .read_lifecycle("prepare tensor uploads")?;
+        self.runtime.validate_work_root(work)?;
+        let evidence = work
+            .tensor_evidence()
+            .ok_or_else(|| invalid_resource("tensor upload requires tensor evidence"))?;
+        self.ports
+            .inputs()
+            .iter()
+            .map(|port| {
+                let input = evidence
+                    .inputs()
+                    .iter()
+                    .find(|input| input.value_id() == port.value_id())
+                    .ok_or_else(|| invalid_resource("bound tensor input port is missing"))?;
+                let layout = crate::HostTransferLayout::new(
+                    port.tensor().element_type(),
+                    port.tensor().minimum_storage_bytes()?
+                        / port.tensor().element_type().size_bytes(),
+                )?;
+                crate::SubmissionWaveInputUpload::managed(
+                    port.node_id().clone(),
+                    port.ordinal(),
+                    layout,
+                    input.bytes().clone(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn bind_inputs(
+        &self,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<ResourceWorkShape, VNextError> {
+        let _lifecycle = self
+            .runtime
+            .resources
+            .read_lifecycle("bind tensor inputs")?;
+        if inputs.iter().any(|input| !self.host.owns(input.bytes())) {
+            return Err(invalid_resource(
+                "tensor input belongs to a different host memory parent",
+            ));
+        }
+        let root: Arc<dyn Any + Send + Sync> = self.runtime.resources.clone();
+        let evidence =
+            TensorWorkEvidence::bind(root, self.runtime.evidence(), &self.ports, inputs)?;
+        Ok(ResourceWorkShape::from_tensor_evidence(evidence))
+    }
+}
+
+impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
+    pub(super) fn validate_work_root(&self, work: &ResourceWorkShape) -> Result<(), VNextError> {
+        if let Some(tensor) = work.tensor_evidence() {
+            let root: Arc<dyn Any + Send + Sync> = self.resources.clone();
+            if !self.work_limits().is_tensor() || !tensor.belongs_to(&root) {
+                return Err(invalid_resource(
+                    "tensor work belongs to another plan runtime root",
+                ));
+            }
+        } else if self.work_limits().is_tensor() {
+            return Err(invalid_resource(
+                "token work cannot enter a fixed tensor plan",
+            ));
+        }
+        Ok(())
+    }
+}

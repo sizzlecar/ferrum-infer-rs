@@ -751,6 +751,7 @@ pub struct UnvalidatedResourceTransactionIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnvalidatedStaticProvisioningBinding {
+    pub(super) work_limits: crate::RuntimeWorkLimits,
     pub pool_identity: UnvalidatedResourcePoolIdentity,
     pub plan_id: PlanId,
     pub plan_hash: PlanHash,
@@ -865,6 +866,7 @@ impl UnvalidatedResourceTransitionReceipt {
             || self.admission.usable_capacity_bytes != expected.admission.usable_capacity_bytes
             || self.admission.plan_static_bytes != expected.admission.plan_static_bytes
             || self.admission.admitted_bytes != expected.admission.admitted_bytes
+            || self.admission.work_limits != expected.admission.work_limits
             || self.admission.maximum_active_sequences
                 != expected.admission.maximum_active_sequences
             || self.admission.admission_generation != expected.admission.admission_generation
@@ -893,6 +895,7 @@ impl From<&ResourceTransitionReceipt> for UnvalidatedResourceTransitionReceipt {
                 request_id: receipt.identity.request_id.clone(),
             },
             admission: UnvalidatedStaticProvisioningBinding {
+                work_limits: receipt.admission.work_limits,
                 pool_identity: UnvalidatedResourcePoolIdentity {
                     pool_id: receipt.admission.pool_identity.pool_id,
                     plan_id: receipt.admission.pool_identity.plan_id.clone(),
@@ -1128,6 +1131,7 @@ impl UnvalidatedResourceLeaseTransitionReceipt {
             || self.admission.usable_capacity_bytes != expected.admission.usable_capacity_bytes
             || self.admission.plan_static_bytes != expected.admission.plan_static_bytes
             || self.admission.admitted_bytes != expected.admission.admitted_bytes
+            || self.admission.work_limits != expected.admission.work_limits
             || self.admission.maximum_active_sequences
                 != expected.admission.maximum_active_sequences
             || self.admission.admission_generation != expected.admission.admission_generation
@@ -1154,6 +1158,7 @@ impl From<&ResourceLeaseTransitionReceipt> for UnvalidatedResourceLeaseTransitio
             transaction_id: receipt.transaction_id.clone(),
             request_id: receipt.request_id.clone(),
             admission: UnvalidatedStaticProvisioningBinding {
+                work_limits: receipt.admission.work_limits,
                 pool_identity: UnvalidatedResourcePoolIdentity {
                     pool_id: receipt.admission.pool_identity.pool_id,
                     plan_id: receipt.admission.pool_identity.plan_id.clone(),
@@ -1511,6 +1516,7 @@ fn validate_context_envelope(
             != admission.device_runtime_implementation_fingerprint
         || admission.pool_identity.admission_generation != admission.admission_generation
         || admission.admission_generation == 0
+        || admission.work_limits.validate().is_err()
         || admission.maximum_active_sequences == 0
         || admission.device_capacity_bytes == 0
         || admission.usable_capacity_bytes == 0

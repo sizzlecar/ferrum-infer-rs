@@ -1,4 +1,5 @@
 use super::*;
+use ferrum_runtime::ModelWeights;
 #[path = "family/extra.rs"]
 pub mod extra;
 #[path = "family/extra_all_rows.rs"]
@@ -246,8 +247,8 @@ impl ModelFamilyProvider for Family {
         self.base.semantic_metadata(config)
     }
 
-    fn weight_schema(&self, config: &AttentionKind) -> Result<WeightSchema, VNextError> {
-        let mut schema = self.base.weight_schema(config)?;
+    fn weights(&self, config: &AttentionKind) -> Result<ModelWeights, VNextError> {
+        let mut schema = self.base.weights(config)?.stored_schema()?.clone();
         if self.causal_sixteen_token_pages {
             for (name, axis, factor) in [("q", 0, 2), ("k", 0, 4), ("v", 0, 4), ("o", 1, 2)] {
                 let tensor = schema
@@ -425,7 +426,7 @@ impl ModelFamilyProvider for Family {
             }
             assert_eq!(offset, HIDDEN);
         }
-        Ok(schema)
+        Ok(ModelWeights::Stored(schema))
     }
 
     fn numerical_profiles(

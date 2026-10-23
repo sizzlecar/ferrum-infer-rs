@@ -1,7 +1,7 @@
 use super::sequence_checkpoint::{SequenceCheckpointLayout, SequenceCheckpointLayoutData};
 use super::{
     AttributeId, BTreeMap, BTreeSet, CapabilityId, ContractVersion, Deserialize, Deserializer,
-    ExecutionWeightPlan, MemoryPlan, ModelFamilyId, NodeId, NodeWorkContract, OperationId,
+    ExecutionWeights, MemoryPlan, ModelFamilyId, NodeId, NodeWorkContract, OperationId,
     OperationRegistryAuthority, PlanExactAlias, PlanHash, PlanId, PlanNode,
     PlanProviderRejectReason, PlanSchemaVersion, PlanStateEffect, ProviderId, ProviderResourcePlan,
     ProviderSelection, ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedValueBinding,
@@ -36,9 +36,10 @@ pub struct ExecutionPlanPayload {
     pub(super) capability_catalog_fingerprint: String,
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: String,
-    pub(super) maximum_scheduled_tokens: u64,
-    pub(super) execution_weights: ExecutionWeightPlan,
-    pub(super) weight_format: WeightFormatId,
+    pub(super) work_limits: super::RuntimeWorkLimits,
+    pub(super) tensor_ports: Option<super::CompiledTensorPorts>,
+    pub(super) execution_weights: ExecutionWeights,
+    pub(super) weight_format: Option<WeightFormatId>,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: Vec<RetainedCompletionValue>,
     pub(super) terminal_output_resources: Vec<ResourceId>,
@@ -89,16 +90,24 @@ impl ExecutionPlanPayload {
         &self.policy_fingerprint
     }
 
-    pub const fn maximum_scheduled_tokens(&self) -> u64 {
-        self.maximum_scheduled_tokens
+    pub const fn work_limits(&self) -> super::RuntimeWorkLimits {
+        self.work_limits
     }
 
-    pub fn execution_weights(&self) -> &ExecutionWeightPlan {
+    pub fn tensor_ports(&self) -> Option<&super::CompiledTensorPorts> {
+        self.tensor_ports.as_ref()
+    }
+
+    pub fn maximum_scheduled_tokens(&self) -> Result<u64, super::VNextError> {
+        self.work_limits.maximum_scheduled_tokens()
+    }
+
+    pub fn execution_weights(&self) -> &ExecutionWeights {
         &self.execution_weights
     }
 
-    pub fn weight_format(&self) -> &WeightFormatId {
-        &self.weight_format
+    pub fn weight_format(&self) -> Option<&WeightFormatId> {
+        self.weight_format.as_ref()
     }
 
     pub fn quantization_formats(&self) -> &BTreeSet<QuantizationFormatId> {
@@ -133,9 +142,10 @@ pub(super) struct PlanHashMaterial<'a> {
     pub(super) capability_catalog_fingerprint: &'a str,
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: &'a str,
-    pub(super) maximum_scheduled_tokens: u64,
-    pub(super) execution_weights: &'a ExecutionWeightPlan,
-    pub(super) weight_format: &'a WeightFormatId,
+    pub(super) work_limits: super::RuntimeWorkLimits,
+    pub(super) tensor_ports: &'a Option<super::CompiledTensorPorts>,
+    pub(super) execution_weights: &'a ExecutionWeights,
+    pub(super) weight_format: &'a Option<WeightFormatId>,
     pub(super) quantization_formats: &'a BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: &'a [RetainedCompletionValue],
     pub(super) terminal_output_resources: &'a [ResourceId],
@@ -158,7 +168,8 @@ impl<'a> From<&'a ExecutionPlanPayload> for PlanHashMaterial<'a> {
             capability_catalog_fingerprint: &payload.capability_catalog_fingerprint,
             policy_version: payload.policy_version,
             policy_fingerprint: &payload.policy_fingerprint,
-            maximum_scheduled_tokens: payload.maximum_scheduled_tokens,
+            work_limits: payload.work_limits,
+            tensor_ports: &payload.tensor_ports,
             execution_weights: &payload.execution_weights,
             weight_format: &payload.weight_format,
             quantization_formats: &payload.quantization_formats,
@@ -188,6 +199,8 @@ pub struct UnvalidatedProviderResourcePlan {
     pub(super) persistent: Option<ProviderWorkspaceRequirement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) projection_numerics: Option<crate::PreparedProjectionNumerics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) prepared_implementation_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,9 +240,10 @@ pub(super) struct UnvalidatedExecutionPlanPayload {
     pub(super) capability_catalog_fingerprint: String,
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: String,
-    pub(super) maximum_scheduled_tokens: u64,
-    pub(super) execution_weights: ExecutionWeightPlan,
-    pub(super) weight_format: WeightFormatId,
+    pub(super) work_limits: super::RuntimeWorkLimits,
+    pub(super) tensor_ports: Option<super::CompiledTensorPorts>,
+    pub(super) execution_weights: ExecutionWeights,
+    pub(super) weight_format: Option<WeightFormatId>,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: Vec<RetainedCompletionValue>,
     pub(super) terminal_output_resources: Vec<ResourceId>,

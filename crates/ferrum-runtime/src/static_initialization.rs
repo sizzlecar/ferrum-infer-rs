@@ -10,9 +10,10 @@ use super::{
     new_deferred_device_cleanup_domain, BufferUsage, DeferredDeviceCleanupDisposition,
     DeferredDeviceCleanupDomainId, DeferredDeviceCleanupMaintenanceReceipt,
     DeferredDeviceCleanupStatus, DeferredDeviceCleanupTask, DeviceRuntime, ElementType,
-    ExecutionPlan, FailureDomain, FailureEnvelope, PlanRuntimeResources, ResourceId,
-    ResourceTransaction, ResourceTransactionDriver, TransactionCommitted, VNextError,
-    MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
+    ExecutionPlan, ExecutionWeights, FailureDomain, FailureEnvelope, HostMemoryAccount,
+    HostMemoryClass, HostMemoryError, HostMemoryReservation, ManagedHostBytes, ModelWeights,
+    PlanRuntimeResources, ResourceId, ResourceTransaction, ResourceTransactionDriver,
+    TransactionCommitted, VNextError, MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
 use super::{
     DeviceCommandBatch, DeviceTerminal, HostTransferLayout, PreparedModelFamily,
@@ -61,7 +62,33 @@ pub struct StaticInitializationPolicy {
     maximum_commands_per_batch: usize,
 }
 
+/// Scheduling metadata for one blocking operation. Its streams have retired
+/// on success; an error may retain recovery owners and must stop normal work.
+/// This declaration is not a capacity grant or permission to create a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BlockingStreamRequirement {
+    maximum_live_streams: usize,
+}
+
+impl BlockingStreamRequirement {
+    pub const fn new(maximum_live_streams: usize) -> Self {
+        Self {
+            maximum_live_streams,
+        }
+    }
+
+    pub const fn maximum_live_streams(self) -> usize {
+        self.maximum_live_streams
+    }
+}
+
 impl StaticInitializationPolicy {
+    /// Initialization owns one upload stream, waits every submission batch,
+    /// and drops that stream before returning initialized resources.
+    pub const fn stream_requirement(self) -> BlockingStreamRequirement {
+        BlockingStreamRequirement::new(1)
+    }
+
     pub fn new(
         maximum_staging_bytes: u64,
         maximum_commands_per_batch: usize,
@@ -230,6 +257,37 @@ where
             let failure = contract_failure(error.error().clone());
             StaticInitializationFailure::new(error.into_transaction(), failure)
         })
+    }
+
+    /// Publish exactly this successfully initialized installation for immutable
+    /// reuse by compatible fixed-tensor plans. Original allocation, transaction,
+    /// generation and capacity ownership remain intact.
+    pub fn into_shared_plan_runtime(
+        self,
+        plan: &ExecutionPlan,
+    ) -> Result<
+        (
+            Arc<PlanRuntimeResources<D::Runtime>>,
+            super::SharedComponentWeights<D::Runtime>,
+        ),
+        StaticInitializationFailure<D>,
+    >
+    where
+        D: 'static,
+    {
+        let contract = match super::resource::SharedWeightContract::from_plan(plan) {
+            Ok(contract) => contract,
+            Err(error) => return Err(self.abort_activation(error)),
+        };
+        if self.transaction.admission().plan_id() != plan.payload().plan_id()
+            || self.transaction.admission().plan_hash() != plan.plan_hash()
+        {
+            return Err(self.abort_activation(VNextError::InvalidExecutionPlan {
+                reason: "shared weight publication differs from the initialized plan".to_owned(),
+            }));
+        }
+        self.into_plan_runtime()
+            .map(|resources| PlanRuntimeResources::publish_initialized_weights(resources, contract))
     }
 
     /// Stop after successful initialization when a cold activation check fails.
@@ -547,7 +605,63 @@ where
         source: &dyn WeightComponentSource,
         policy: StaticInitializationPolicy,
     ) -> Result<InitializedResourceTransaction<D>, StaticInitializationFailure<D>> {
-        match initialize_static_inner(&self, family, plan, source, policy) {
+        self.initialize_static_with_input(
+            family,
+            plan,
+            StaticInitializationInput::Stored(source, None),
+            policy,
+        )
+    }
+
+    /// Uploads stored weights through account-owned, bounded staging chunks.
+    ///
+    /// Each chunk is admitted as [`HostMemoryClass::TransferStaging`] before
+    /// allocating or copying bytes. The backend must retain that exact owner
+    /// until its upload is quiescent; unsupported managed uploads never fall
+    /// back to a raw-byte upload. Device transforms and native weight imports
+    /// are not used by this entrypoint. Existing source/materializer backing,
+    /// including mmap pages or format conversion allocations, is outside this
+    /// staging budget; this is not a bound on total host RSS.
+    pub fn initialize_static_managed(
+        self,
+        family: &PreparedModelFamily,
+        plan: &ExecutionPlan,
+        source: &dyn WeightComponentSource,
+        host: &HostMemoryAccount,
+        policy: StaticInitializationPolicy,
+    ) -> Result<InitializedResourceTransaction<D>, StaticInitializationFailure<D>> {
+        self.initialize_static_with_input(
+            family,
+            plan,
+            StaticInitializationInput::Stored(source, Some(host)),
+            policy,
+        )
+    }
+
+    /// Initializes a committed transaction for a family with no stored weights.
+    ///
+    /// This still zeroes every admitted static allocation and waits for its
+    /// initialization fence. In particular, a plan-scoped persistent workspace
+    /// is not exempt from allocation, capacity, or failed-fence retirement.
+    /// Plans without any static allocations use the provisioning `NoStatic`
+    /// handoff instead and cannot produce this committed transaction.
+    pub fn initialize_static_without_weights(
+        self,
+        family: &PreparedModelFamily,
+        plan: &ExecutionPlan,
+        policy: StaticInitializationPolicy,
+    ) -> Result<InitializedResourceTransaction<D>, StaticInitializationFailure<D>> {
+        self.initialize_static_with_input(family, plan, StaticInitializationInput::None, policy)
+    }
+
+    fn initialize_static_with_input(
+        self,
+        family: &PreparedModelFamily,
+        plan: &ExecutionPlan,
+        input: StaticInitializationInput<'_>,
+        policy: StaticInitializationPolicy,
+    ) -> Result<InitializedResourceTransaction<D>, StaticInitializationFailure<D>> {
+        match initialize_static_inner(&self, family, plan, input, policy) {
             Ok(receipt) => Ok(InitializedResourceTransaction {
                 transaction: self,
                 receipt,
@@ -557,11 +671,19 @@ where
     }
 }
 
+enum StaticInitializationInput<'source> {
+    None,
+    Stored(
+        &'source dyn WeightComponentSource,
+        Option<&'source HostMemoryAccount>,
+    ),
+}
+
 fn initialize_static_inner<D>(
     transaction: &ResourceTransaction<D, TransactionCommitted>,
     family: &PreparedModelFamily,
     plan: &ExecutionPlan,
-    source: &dyn WeightComponentSource,
+    input: StaticInitializationInput<'_>,
     policy: StaticInitializationPolicy,
 ) -> Result<StaticInitializationReceipt, InitializationStepFailure<D::Runtime>>
 where
@@ -570,29 +692,97 @@ where
     let initialization_started = Instant::now();
     let setup_started = Instant::now();
     preflight_transaction(transaction, family, plan).map_err(contract_failure)?;
-    let placements = weight_placements(family, plan).map_err(contract_failure)?;
-    let execution_weight_schema = plan.payload().execution_weights().schema();
+    let (stored, managed_host) = match (input, family.weights(), plan.payload().execution_weights())
+    {
+        (StaticInitializationInput::None, ModelWeights::None, ExecutionWeights::None) => {
+            validate_without_weights(plan).map_err(contract_failure)?;
+            (None, None)
+        }
+        (
+            StaticInitializationInput::Stored(source, host),
+            ModelWeights::Stored(_),
+            ExecutionWeights::Stored(weights),
+        ) => (Some((source, weights)), host),
+        _ => {
+            return Err(contract_failure(VNextError::InvalidExecutionPlan {
+                reason: "static initialization source mode differs from family or plan weights"
+                    .to_owned(),
+            }))
+        }
+    };
+    let placements = if stored.is_some() {
+        weight_placements(family, plan).map_err(contract_failure)?
+    } else {
+        BTreeMap::new()
+    };
     let runtime = Arc::clone(transaction.lease().runtime());
     let has_required_weight_transforms = !plan
         .payload()
         .execution_weights()
         .static_weight_transforms()
         .is_empty();
-    let mut weight_import = if placements.is_empty() || has_required_weight_transforms {
-        None
-    } else {
-        match runtime.begin_static_weight_import() {
-            None => None,
-            Some(Ok(import)) => Some(import),
-            Some(Err(error)) => {
-                return Err(InitializationStepFailure::Quiescent(device_failure(
-                    &runtime,
-                    &error,
-                    "static_weight_import_begin",
-                )))
+    if managed_host.is_some()
+        && (has_required_weight_transforms || !runtime.supports_managed_tensor_io())
+    {
+        return Err(contract_failure(VNextError::InvalidExecutionPlan {
+            reason: "managed static initialization requires managed host upload support and no device weight transforms".to_owned(),
+        }));
+    }
+    // Admit the first real chunk before even a zero batch can be submitted.
+    // Holding this reservation (rather than merely observing free capacity)
+    // prevents a concurrent host user from taking its admission in between.
+    let mut first_staging = match (managed_host, stored) {
+        (Some(host), Some((_, weights))) => {
+            let first = weights
+                .schema()
+                .components
+                .iter()
+                .find(|component| placements.contains_key(&component.id));
+            match first {
+                Some(component) => {
+                    let element_bytes = component.physical_element_type().size_bytes();
+                    let maximum = policy.maximum_staging_bytes()
+                        - policy.maximum_staging_bytes() % element_bytes;
+                    let bytes = component
+                        .physical_bytes()
+                        .map_err(contract_failure)?
+                        .min(maximum);
+                    let bytes = usize::try_from(bytes).map_err(|_| {
+                        contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: "managed static staging exceeds host address space".to_owned(),
+                        })
+                    })?;
+                    Some(
+                        host.reserve(HostMemoryClass::TransferStaging, bytes)
+                            .map_err(|error| {
+                                InitializationStepFailure::Quiescent(resource_failure(
+                                    "static_host_staging",
+                                    error,
+                                ))
+                            })?,
+                    )
+                }
+                None => None,
             }
         }
+        _ => None,
     };
+    let mut weight_import =
+        if placements.is_empty() || has_required_weight_transforms || managed_host.is_some() {
+            None
+        } else {
+            match runtime.begin_static_weight_import() {
+                None => None,
+                Some(Ok(import)) => Some(import),
+                Some(Err(error)) => {
+                    return Err(InitializationStepFailure::Quiescent(device_failure(
+                        &runtime,
+                        &error,
+                        "static_weight_import_begin",
+                    )))
+                }
+            }
+        };
     let created_stream = runtime.create_stream().map_err(|error| {
         InitializationStepFailure::Quiescent(device_failure(
             &runtime,
@@ -645,182 +835,97 @@ where
         }
     }
 
-    let mut materialization_groups = Vec::<Vec<&WeightComponentSpec>>::new();
-    let mut materialization_group_indices = BTreeMap::<Vec<WeightId>, usize>::new();
-    for component in &execution_weight_schema.components {
-        if !placements.contains_key(&component.id) {
-            continue;
-        }
-        let source_ids = plan
-            .payload()
-            .execution_weights()
-            .component_sources()
-            .get(&component.id)
-            .ok_or_else(|| {
-                contract_failure(VNextError::InvalidExecutionPlan {
-                    reason: format!(
-                        "execution weight component `{}` has no source mapping",
-                        component.id
-                    ),
-                })
-            })?;
-        if let Some(group_index) = materialization_group_indices.get(source_ids) {
-            materialization_groups[*group_index].push(component);
-        } else {
-            let group_index = materialization_groups.len();
-            materialization_group_indices.insert(source_ids.clone(), group_index);
-            materialization_groups.push(vec![component]);
-        }
-    }
-
-    for components in materialization_groups {
-        if let Some(transform) = plan
-            .static_weight_transform_for_components(&components)
-            .map_err(contract_failure)?
-        {
-            let materialization_started = Instant::now();
-            let sources =
-                prepare_transform_sources(family, source, transform).map_err(contract_failure)?;
-            let materialization_duration = materialization_started.elapsed();
-            source_materialization_duration += materialization_duration;
-            if slowest_component_id.is_none()
-                || materialization_duration > slowest_component_materialization_duration
-            {
-                slowest_component_materialization_duration = materialization_duration;
-                slowest_component_id = Some(components[0].id.clone());
+    if let Some((source, execution_weights)) = stored {
+        let execution_weight_schema = execution_weights.schema();
+        let mut materialization_groups = Vec::<Vec<&WeightComponentSpec>>::new();
+        let mut materialization_group_indices = BTreeMap::<Vec<WeightId>, usize>::new();
+        for component in &execution_weight_schema.components {
+            if !placements.contains_key(&component.id) {
+                continue;
             }
-            for source_segments in &sources {
-                source_files.extend(source_segments.source_files().iter().cloned());
-            }
-            let scratch_resource_id = plan
-                .payload()
-                .execution_weights()
-                .static_weight_transform_scratch_resource_id()
-                .map_err(contract_failure)?
+            let source_ids = execution_weights
+                .component_sources()
+                .get(&component.id)
                 .ok_or_else(|| {
                     contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: format!(
+                            "execution weight component `{}` has no source mapping",
+                            component.id
+                        ),
+                    })
+                })?;
+            if let Some(group_index) = materialization_group_indices.get(source_ids) {
+                materialization_groups[*group_index].push(component);
+            } else {
+                let group_index = materialization_groups.len();
+                materialization_group_indices.insert(source_ids.clone(), group_index);
+                materialization_groups.push(vec![component]);
+            }
+        }
+
+        for components in materialization_groups {
+            if let Some(transform) = plan
+                .static_weight_transform_for_components(&components)
+                .map_err(contract_failure)?
+            {
+                let materialization_started = Instant::now();
+                let sources = prepare_transform_sources(family, source, transform)
+                    .map_err(contract_failure)?;
+                let materialization_duration = materialization_started.elapsed();
+                source_materialization_duration += materialization_duration;
+                if slowest_component_id.is_none()
+                    || materialization_duration > slowest_component_materialization_duration
+                {
+                    slowest_component_materialization_duration = materialization_duration;
+                    slowest_component_id = Some(components[0].id.clone());
+                }
+                for source_segments in &sources {
+                    source_files.extend(source_segments.source_files().iter().cloned());
+                }
+                let scratch_resource_id =
+                    plan.payload()
+                        .execution_weights()
+                        .static_weight_transform_scratch_resource_id()
+                        .map_err(contract_failure)?
+                        .ok_or_else(|| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
                         reason: "required static weight transform has no admitted scratch resource"
                             .to_owned(),
                     })
-                })?;
-            let encode_started = Instant::now();
-            let command = encode_required_weight_transform(
-                transaction,
-                &runtime,
-                transform,
-                &sources,
-                &components,
-                &placements,
-                &scratch_resource_id,
-            )
-            .map_err(|error| {
-                runtime_or_contract_failure(&runtime, error, "static_weight_transform_encode")
-            })?;
-            device_transform_encode_duration += encode_started.elapsed();
-            pending.push(command);
-            transform_command_count += 1;
-            transformed_component_count += components.len();
-            transformed_bytes = components
-                .iter()
-                .try_fold(transformed_bytes, |total, component| {
-                    total.checked_add(
-                        placements
-                            .get(&component.id)
-                            .expect("transform components have selected placements")
-                            .length_bytes,
-                    )
-                })
-                .ok_or_else(|| {
-                    contract_failure(VNextError::InvalidExecutionPlan {
-                        reason: "static transformed bytes overflow u64".to_owned(),
-                    })
-                })?;
-            if pending.len() == policy.maximum_commands_per_batch() {
-                submission_wait_duration += submit_pending(
+                        })?;
+                let encode_started = Instant::now();
+                let command = encode_required_weight_transform(
+                    transaction,
                     &runtime,
-                    &mut stream,
-                    &mut pending,
-                    &mut pending_staging_bytes,
-                )?;
-                submission_batch_count += 1;
-            }
-            continue;
-        }
-        // Retain only outputs derived from one exact source set. This permits
-        // multi-output transforms to read and convert a large source matrix
-        // once without retaining converted payloads for the whole model.
-        let materialization_started = Instant::now();
-        let uploads = prepare_uploads(family, plan, source, &components, &placements)
-            .map_err(contract_failure)?;
-        let materialization_duration = materialization_started.elapsed();
-        source_materialization_duration += materialization_duration;
-        if slowest_component_id.is_none()
-            || materialization_duration > slowest_component_materialization_duration
-        {
-            slowest_component_materialization_duration = materialization_duration;
-            slowest_component_id = Some(components[0].id.clone());
-        }
-        for (component, upload) in components.into_iter().zip(uploads) {
-            let placement = placements
-                .get(&component.id)
-                .expect("materialization groups contain only placed components");
-            source_files.extend(upload.source_files().iter().cloned());
-            if let Some(import) = weight_import.as_mut() {
-                let import_started = Instant::now();
-                with_static_buffer(transaction, &placement.resource_id, |buffer| {
-                    import.import_component(&upload, buffer, placement.offset_bytes)
-                })
+                    transform,
+                    &sources,
+                    &components,
+                    &placements,
+                    &scratch_resource_id,
+                )
                 .map_err(|error| {
-                    runtime_or_contract_failure(&runtime, error, "static_weight_component_import")
+                    runtime_or_contract_failure(&runtime, error, "static_weight_transform_encode")
                 })?;
-                device_import_duration += import_started.elapsed();
-                imported_component_count += 1;
-                imported_bytes = imported_bytes
-                    .checked_add(placement.length_bytes)
+                device_transform_encode_duration += encode_started.elapsed();
+                pending.push(command);
+                transform_command_count += 1;
+                transformed_component_count += components.len();
+                transformed_bytes = components
+                    .iter()
+                    .try_fold(transformed_bytes, |total, component| {
+                        total.checked_add(
+                            placements
+                                .get(&component.id)
+                                .expect("transform components have selected placements")
+                                .length_bytes,
+                        )
+                    })
                     .ok_or_else(|| {
                         contract_failure(VNextError::InvalidExecutionPlan {
-                            reason: "static initialization imported bytes overflow u64".to_owned(),
+                            reason: "static transformed bytes overflow u64".to_owned(),
                         })
                     })?;
-                continue;
-            }
-            let element_bytes = upload.element_type().size_bytes();
-            let maximum_chunk_bytes =
-                policy.maximum_staging_bytes() - policy.maximum_staging_bytes() % element_bytes;
-            if maximum_chunk_bytes == 0 {
-                return Err(contract_failure(VNextError::InvalidExecutionPlan {
-                    reason: format!(
-                        "static staging budget cannot hold one {:?} element",
-                        upload.element_type()
-                    ),
-                }));
-            }
-            let bytes = upload.bytes();
-            let mut source_offset = 0_usize;
-            while source_offset < bytes.len() {
-                let remaining = bytes.len() - source_offset;
-                let chunk_bytes =
-                    remaining.min(usize::try_from(maximum_chunk_bytes).map_err(|_| {
-                        contract_failure(VNextError::InvalidExecutionPlan {
-                            reason: "static staging budget exceeds host address space".to_owned(),
-                        })
-                    })?);
-                let chunk_bytes = chunk_bytes - chunk_bytes % element_bytes as usize;
-                if chunk_bytes == 0 {
-                    return Err(contract_failure(VNextError::InvalidExecutionPlan {
-                        reason: format!(
-                            "component `{}` has a partial trailing element",
-                            placement.component_id
-                        ),
-                    }));
-                }
-                let chunk_bytes_u64 = chunk_bytes as u64;
-                if !pending.is_empty()
-                    && (pending.len() == policy.maximum_commands_per_batch()
-                        || pending_staging_bytes
-                            .checked_add(chunk_bytes_u64)
-                            .is_none_or(|bytes| bytes > policy.maximum_staging_bytes()))
-                {
+                if pending.len() == policy.maximum_commands_per_batch() {
                     submission_wait_duration += submit_pending(
                         &runtime,
                         &mut stream,
@@ -829,44 +934,186 @@ where
                     )?;
                     submission_batch_count += 1;
                 }
-                let source_end = source_offset + chunk_bytes;
-                let destination_offset = placement
-                    .offset_bytes
-                    .checked_add(source_offset as u64)
-                    .ok_or_else(|| {
-                    contract_failure(VNextError::InvalidExecutionPlan {
-                        reason: "static upload destination offset overflows".to_owned(),
-                    })
-                })?;
-                let layout =
-                    HostTransferLayout::new(upload.element_type(), chunk_bytes_u64 / element_bytes)
-                        .map_err(contract_failure)?;
-                let encode_started = Instant::now();
-                let command = with_static_buffer(transaction, &placement.resource_id, |buffer| {
-                    runtime.encode_upload(
-                        &bytes[source_offset..source_end],
-                        layout,
-                        buffer,
-                        destination_offset,
-                    )
-                })
-                .map_err(|error| {
-                    runtime_or_contract_failure(&runtime, error, "static_upload_encode")
-                })?;
-                device_encode_duration += encode_started.elapsed();
-                pending.push(command);
-                pending_staging_bytes += chunk_bytes_u64;
-                upload_command_count += 1;
-                source_offset = source_end;
+                continue;
             }
-            uploaded_component_count += 1;
-            uploaded_bytes = uploaded_bytes
-                .checked_add(placement.length_bytes)
-                .ok_or_else(|| {
-                    contract_failure(VNextError::InvalidExecutionPlan {
-                        reason: "static initialization uploaded bytes overflow u64".to_owned(),
+            // Retain only outputs derived from one exact source set. This permits
+            // multi-output transforms to read and convert a large source matrix
+            // once without retaining converted payloads for the whole model.
+            let materialization_started = Instant::now();
+            let uploads = prepare_uploads(family, plan, source, &components, &placements)
+                .map_err(contract_failure)?;
+            let materialization_duration = materialization_started.elapsed();
+            source_materialization_duration += materialization_duration;
+            if slowest_component_id.is_none()
+                || materialization_duration > slowest_component_materialization_duration
+            {
+                slowest_component_materialization_duration = materialization_duration;
+                slowest_component_id = Some(components[0].id.clone());
+            }
+            for (component, upload) in components.into_iter().zip(uploads) {
+                let placement = placements
+                    .get(&component.id)
+                    .expect("materialization groups contain only placed components");
+                source_files.extend(upload.source_files().iter().cloned());
+                if let Some(import) = weight_import.as_mut() {
+                    let import_started = Instant::now();
+                    with_static_buffer(transaction, &placement.resource_id, |buffer| {
+                        import.import_component(&upload, buffer, placement.offset_bytes)
                     })
-                })?;
+                    .map_err(|error| {
+                        runtime_or_contract_failure(
+                            &runtime,
+                            error,
+                            "static_weight_component_import",
+                        )
+                    })?;
+                    device_import_duration += import_started.elapsed();
+                    imported_component_count += 1;
+                    imported_bytes = imported_bytes
+                        .checked_add(placement.length_bytes)
+                        .ok_or_else(|| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
+                                reason: "static initialization imported bytes overflow u64"
+                                    .to_owned(),
+                            })
+                        })?;
+                    continue;
+                }
+                let element_bytes = upload.element_type().size_bytes();
+                let maximum_chunk_bytes =
+                    policy.maximum_staging_bytes() - policy.maximum_staging_bytes() % element_bytes;
+                if maximum_chunk_bytes == 0 {
+                    return Err(contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: format!(
+                            "static staging budget cannot hold one {:?} element",
+                            upload.element_type()
+                        ),
+                    }));
+                }
+                let bytes = upload.bytes();
+                let mut source_offset = 0_usize;
+                while source_offset < bytes.len() {
+                    let remaining = bytes.len() - source_offset;
+                    let chunk_bytes =
+                        remaining.min(usize::try_from(maximum_chunk_bytes).map_err(|_| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
+                                reason: "static staging budget exceeds host address space"
+                                    .to_owned(),
+                            })
+                        })?);
+                    let chunk_bytes = chunk_bytes - chunk_bytes % element_bytes as usize;
+                    if chunk_bytes == 0 {
+                        return Err(contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: format!(
+                                "component `{}` has a partial trailing element",
+                                placement.component_id
+                            ),
+                        }));
+                    }
+                    let chunk_bytes_u64 = chunk_bytes as u64;
+                    if !pending.is_empty()
+                        && (pending.len() == policy.maximum_commands_per_batch()
+                            || pending_staging_bytes
+                                .checked_add(chunk_bytes_u64)
+                                .is_none_or(|bytes| bytes > policy.maximum_staging_bytes()))
+                    {
+                        submission_wait_duration += submit_pending(
+                            &runtime,
+                            &mut stream,
+                            &mut pending,
+                            &mut pending_staging_bytes,
+                        )?;
+                        submission_batch_count += 1;
+                    }
+                    let source_end = source_offset + chunk_bytes;
+                    let destination_offset = placement
+                        .offset_bytes
+                        .checked_add(source_offset as u64)
+                        .ok_or_else(|| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
+                                reason: "static upload destination offset overflows".to_owned(),
+                            })
+                        })?;
+                    let layout = HostTransferLayout::new(
+                        upload.element_type(),
+                        chunk_bytes_u64 / element_bytes,
+                    )
+                    .map_err(contract_failure)?;
+                    // If prior chunks own the remaining host quota, retire
+                    // that bounded batch once before retrying admission. Never
+                    // wait while retaining the very staging capacity needed
+                    // by this chunk, and never bypass a genuine capacity error.
+                    let managed_bytes = if let Some(host) = managed_host {
+                        let source_bytes = &bytes[source_offset..source_end];
+                        let mut staged = match first_staging.take() {
+                            Some(reservation) => copy_staged_upload(reservation, source_bytes),
+                            None => stage_upload(host, source_bytes),
+                        };
+                        if matches!(staged, Err(HostMemoryError::Capacity { .. }))
+                            && pending_staging_bytes != 0
+                        {
+                            submission_wait_duration += submit_pending(
+                                &runtime,
+                                &mut stream,
+                                &mut pending,
+                                &mut pending_staging_bytes,
+                            )?;
+                            submission_batch_count += 1;
+                            staged = stage_upload(host, source_bytes);
+                        }
+                        Some(staged.map_err(|error| {
+                            InitializationStepFailure::Quiescent(resource_failure(
+                                "static_host_staging",
+                                error,
+                            ))
+                        })?)
+                    } else {
+                        None
+                    };
+                    let encode_started = Instant::now();
+                    let command = if let Some(managed_bytes) = managed_bytes {
+                        with_static_buffer(transaction, &placement.resource_id, |buffer| {
+                            runtime.encode_managed_upload(
+                                managed_bytes,
+                                layout,
+                                buffer,
+                                destination_offset,
+                            )
+                        })
+                        .map_err(|error| {
+                            runtime_or_contract_failure(&runtime, error, "static_managed_upload_encode")
+                        })?
+                        .ok_or_else(|| contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: "runtime declined managed static upload; raw upload fallback is forbidden".to_owned(),
+                        }))?
+                    } else {
+                        with_static_buffer(transaction, &placement.resource_id, |buffer| {
+                            runtime.encode_upload(
+                                &bytes[source_offset..source_end],
+                                layout,
+                                buffer,
+                                destination_offset,
+                            )
+                        })
+                        .map_err(|error| {
+                            runtime_or_contract_failure(&runtime, error, "static_upload_encode")
+                        })?
+                    };
+                    device_encode_duration += encode_started.elapsed();
+                    pending.push(command);
+                    pending_staging_bytes += chunk_bytes_u64;
+                    upload_command_count += 1;
+                    source_offset = source_end;
+                }
+                uploaded_component_count += 1;
+                uploaded_bytes = uploaded_bytes
+                    .checked_add(placement.length_bytes)
+                    .ok_or_else(|| {
+                        contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: "static initialization uploaded bytes overflow u64".to_owned(),
+                        })
+                    })?;
+            }
         }
     }
 
@@ -915,6 +1162,27 @@ where
         ),
         source_files,
     })
+}
+
+fn stage_upload(
+    host: &HostMemoryAccount,
+    bytes: &[u8],
+) -> Result<ManagedHostBytes, HostMemoryError> {
+    copy_staged_upload(
+        host.reserve(HostMemoryClass::TransferStaging, bytes.len())?,
+        bytes,
+    )
+}
+
+fn copy_staged_upload(
+    reservation: HostMemoryReservation,
+    bytes: &[u8],
+) -> Result<ManagedHostBytes, HostMemoryError> {
+    if reservation.bytes() != bytes.len() || reservation.class() != HostMemoryClass::TransferStaging
+    {
+        return Err(HostMemoryError::InvalidReservation);
+    }
+    Ok(reservation.allocate_copy(bytes)?.freeze())
 }
 
 fn submit_pending<R>(
@@ -1037,6 +1305,37 @@ where
     Ok(())
 }
 
+fn validate_without_weights(plan: &ExecutionPlan) -> Result<(), VNextError> {
+    if plan
+        .payload()
+        .memory()
+        .static_allocations()
+        .iter()
+        .any(|allocation| allocation.usage() == BufferUsage::Weights)
+        || plan
+            .payload()
+            .memory()
+            .dynamic_descriptors()
+            .iter()
+            .any(|allocation| allocation.usage() == BufferUsage::Weights)
+        || plan.payload().nodes().iter().any(|node| {
+            node.values()
+                .iter()
+                .any(|binding| binding.usage() == BufferUsage::Weights)
+        })
+        || !plan
+            .payload()
+            .execution_weights()
+            .static_weight_transforms()
+            .is_empty()
+    {
+        return Err(VNextError::InvalidExecutionPlan {
+            reason: "weightless static initialization cannot contain weight resources, bindings, or transforms".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn weight_placements(
     family: &PreparedModelFamily,
     plan: &ExecutionPlan,
@@ -1044,7 +1343,7 @@ fn weight_placements(
     plan.payload()
         .execution_weights()
         .validate_against_family(family)?;
-    let execution_weight_schema = plan.payload().execution_weights().schema();
+    let execution_weight_schema = plan.payload().execution_weights().stored()?.schema();
     let schema = execution_weight_schema
         .components
         .iter()
@@ -1217,7 +1516,7 @@ fn prepare_transform_sources<'source>(
         .into_iter()
         .map(|source_id| {
             let component_index = family
-                .weight_schema()
+                .stored_weight_schema()?
                 .components
                 .binary_search_by(|component| component.id.cmp(source_id))
                 .map_err(|_| VNextError::InvalidExecutionPlan {
@@ -1225,7 +1524,7 @@ fn prepare_transform_sources<'source>(
                         "static weight transform references unknown source component `{source_id}`"
                     ),
                 })?;
-            let component = &family.weight_schema().components[component_index];
+            let component = &family.stored_weight_schema()?.components[component_index];
             let segments = source.component_segments(component)?;
             if segments.component_id() != &component.id
                 || segments.external_names() != component.external_names.as_slice()
@@ -1487,3 +1786,7 @@ pub(crate) static STATIC_PROVISION_CLEANUP_TEST: std::sync::Mutex<()> = std::syn
 #[cfg(test)]
 #[path = "static_initialization/retirement_tests.rs"]
 mod retirement_tests;
+
+#[cfg(test)]
+#[path = "static_initialization/managed_staging_tests.rs"]
+mod managed_staging_tests;

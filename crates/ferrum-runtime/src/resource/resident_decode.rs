@@ -116,8 +116,7 @@ fn supported_request(request: &StepResourceAdmissionRequest) -> bool {
         && request
             .work_shape()
             .participant_token_ranges()
-            .iter()
-            .all(|range| range.immediate_tokens() == 1)
+            .is_ok_and(|ranges| ranges.iter().all(|range| range.immediate_tokens() == 1))
 }
 
 impl<R: DeviceRuntime> ExecutionBatchParticipants<R> {

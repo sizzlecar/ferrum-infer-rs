@@ -66,6 +66,15 @@ mod native_io;
 mod q6_head;
 pub use q6_head::CudaQ6MmqF32LastTokenProvider;
 mod selection;
+mod tensor_dense_bf16;
+mod tensor_dense_fp8_bf16;
+pub use tensor_dense_fp8_bf16::{
+    CudaCutlassFp8Config, CudaCutlassFp8Probe, CudaCutlassFp8ProbeReceipt,
+    CudaCutlassFp8ProbeTicket,
+    NUMERICAL_PROFILE_ID as CUDA_DENSE_LINEAR_FP8_BF16_NUMERICAL_PROFILE_ID,
+    QUANTIZATION_PROBE_PROFILE_ID as CUDA_FP8_QUANTIZATION_PROBE_PROFILE_ID,
+};
+mod tensor_silu;
 mod transformer;
 use ferrum_runtime::{
     causal_paged_attention_f32_master_contract, causal_paged_attention_f32_master_int8_kv_contract,
@@ -81,6 +90,54 @@ use native_io::TokenPrecision;
 use selection::{
     argmax_dispatches, ArgmaxArguments, ArgmaxBatchArguments, ArgmaxFunctions, ArgmaxPrecision,
     ARGMAX_BATCH_ROWS,
+};
+pub use tensor_dense_bf16::{
+    NUMERICAL_PROFILE_ID as CUDA_DENSE_BF16_NUMERICAL_PROFILE_ID,
+    NUMERICAL_PROFILE_IDENTITY as CUDA_DENSE_BF16_NUMERICAL_PROFILE_IDENTITY,
+};
+pub use tensor_silu::{
+    tensor_primitive_profile as cuda_tensor_primitive_bf16_profile, CudaPhiloxDeviceGeometry,
+    CudaPhiloxLaunchGeometry, CudaTensorOperation,
+    ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
+    ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
+    BATCHED_ROW_CONCAT_PROFILE_ID as CUDA_BATCHED_ROW_CONCAT_BF16_NUMERICAL_PROFILE_ID,
+    BUNDLE_NUMERICAL_IDENTITY as CUDA_POINTWISE_BF16_NUMERICAL_PROFILE_IDENTITY,
+    CHANNEL_L2_IMAGE_PROFILE_ID as CUDA_CHANNEL_L2_NORM_IMAGE_BF16_NUMERICAL_PROFILE_ID,
+    CHANNEL_L2_PROFILE_ID as CUDA_CHANNEL_L2_NORM_BF16_NUMERICAL_PROFILE_ID,
+    CONV2D_PROFILE_ID as CUDA_CONV2D_BF16_NUMERICAL_PROFILE_ID,
+    CROSS_ATTENTION_FUSED_PROFILE_ID as CUDA_CROSS_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_ID,
+    CUDNN_SEGMENTED_ATTENTION_PROFILE_ID as CUDA_CUDNN_SEGMENTED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
+    FUSED_ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_IDENTITY,
+    FUSED_ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_ID,
+    GATED_RESIDUAL_NUMERICAL_PROFILE_ID as CUDA_GATED_RESIDUAL_BF16_NUMERICAL_PROFILE_ID,
+    GELU_TANH_PROFILE_ID as CUDA_GELU_TANH_BF16_NUMERICAL_PROFILE_ID,
+    GQA_NUMERICAL_IDENTITY as CUDA_STRUCTURED_GQA_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
+    GQA_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_GQA_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
+    HALF_SPLIT_ROPE_NUMERICAL_IDENTITY as CUDA_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_IDENTITY,
+    HALF_SPLIT_ROPE_NUMERICAL_PROFILE_ID as CUDA_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_ID,
+    HEAD_RMS_NORM_PROFILE_ID as CUDA_HEAD_RMS_NORM_BF16_NUMERICAL_PROFILE_ID,
+    LAYER_NORM_PROFILE_ID as CUDA_LAYER_NORM_BF16_NUMERICAL_PROFILE_ID,
+    MODULATION_NUMERICAL_PROFILE_ID as CUDA_MODULATION_SCALE_BF16_NUMERICAL_PROFILE_ID,
+    NORM_NUMERICAL_IDENTITY as CUDA_NORMALIZATION_BF16_NUMERICAL_PROFILE_IDENTITY,
+    NUMERICAL_PROFILE_ID as CUDA_SILU_BF16_NUMERICAL_PROFILE_ID,
+    NUMERICAL_PROFILE_IDENTITY as CUDA_SILU_BF16_NUMERICAL_PROFILE_IDENTITY,
+    PHILOX_BUILD_IDENTITY_SHA256 as CUDA_PHILOX_BUILD_IDENTITY_SHA256,
+    PHILOX_NORMAL_IDENTITY as CUDA_PHILOX_NORMAL_BF16_NUMERICAL_PROFILE_IDENTITY,
+    PHILOX_NORMAL_PROFILE_ID as CUDA_PHILOX_NORMAL_BF16_NUMERICAL_PROFILE_ID,
+    PLAIN_RESIDUAL_ADD_NUMERICAL_PROFILE_ID as CUDA_PLAIN_RESIDUAL_ADD_BF16_NUMERICAL_PROFILE_ID,
+    RESIDUAL_ADD_NCHW_PROFILE_ID as CUDA_PLAIN_RESIDUAL_ADD_NCHW_BF16_NUMERICAL_PROFILE_ID,
+    ROPE_NUMERICAL_IDENTITY as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_IDENTITY,
+    ROPE_NUMERICAL_PROFILE_ID as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_ID,
+    ROW_GATHER_PROFILE_ID as CUDA_ROW_GATHER_BF16_NUMERICAL_PROFILE_ID,
+    SILU_MUL_NUMERICAL_PROFILE_ID as CUDA_SILU_MUL_BF16_NUMERICAL_PROFILE_ID,
+    SILU_NCHW_PROFILE_ID as CUDA_SILU_NCHW_BF16_NUMERICAL_PROFILE_ID,
+    SPATIAL_ATTENTION_PROFILE_ID as CUDA_SPATIAL_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
+    SPATIAL_GATHER_PROFILE_ID as CUDA_SPATIAL_UPSAMPLE_GATHER_BF16_NUMERICAL_PROFILE_ID,
+    SPATIAL_GROUP_MEAN_PROFILE_ID as CUDA_SPATIAL_GROUP_MEAN_BF16_NUMERICAL_PROFILE_ID,
+    TANH_NUMERICAL_PROFILE_ID as CUDA_TANH_BF16_NUMERICAL_PROFILE_ID,
+    TEXT_PROJECTION_NUMERICAL_IDENTITY as CUDA_TEXT_PROJECTION_BF16_NUMERICAL_PROFILE_IDENTITY,
+    TRANSPORT_NUMERICAL_IDENTITY as CUDA_TRANSPORT_BF16_NUMERICAL_PROFILE_IDENTITY,
+    ZERO_CENTERED_RMS_NORM_PROFILE_ID as CUDA_ZERO_CENTERED_RMS_NORM_BF16_NUMERICAL_PROFILE_ID,
 };
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
@@ -303,6 +360,271 @@ pub fn cuda_vnext_runtime_config(
             )?,
         ]),
     })
+}
+
+/// Minimal capability/configuration for the bounded, eager tensor constructor.
+/// This does not construct a device or choose opaque memory allowances; pass
+/// it as `CudaTensorRuntimeConfig::device` to `new_tensor_eager`.
+pub fn cuda_tensor_runtime_config(
+    ordinal: usize,
+    device_id: DeviceId,
+) -> Result<CudaDeviceRuntimeConfig, VNextError> {
+    let mut config =
+        cuda_vnext_runtime_config(ordinal, device_id, AttentionExecutionPolicy::Portable)?;
+    let numerical = tensor_silu::numerical_fingerprint();
+    let dense_numerical = tensor_dense_bf16::source_fingerprint();
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        numerical.as_bytes(),
+        dense_numerical.as_bytes(),
+        include_bytes!("vnext_runtime/tensor_io.rs"),
+        include_bytes!("vnext_runtime/tensor_eager.rs"),
+        include_bytes!("vnext_runtime/cudnn.rs"),
+        include_bytes!("vnext_runtime/cudnn/ffi.rs"),
+        include_bytes!("vnext_runtime/cudnn/sdpa.rs"),
+        include_bytes!("vnext_runtime/cudnn/sdpa/native.rs"),
+    ]);
+    config.capabilities = BTreeSet::from([
+        CapabilityId::new(ferrum_runtime::SILU_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PHILOX_NORMAL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SILU_MUL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::TANH_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::MODULATION_SCALE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GATED_RESIDUAL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::LAYER_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ADJACENT_ROPE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::STRUCTURED_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::STRUCTURED_ATTENTION_FUSED_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CROSS_ATTENTION_FUSED_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GELU_TANH_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_GATHER_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::HALF_SPLIT_ROPE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CONV2D_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CHANNEL_L2_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CHANNEL_L2_NORM_IMAGE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SPATIAL_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SPATIAL_GROUP_MEAN_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::AFFINE_LINEAR_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PATCH_PROJECTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::AFFINE_LAYER_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GELU_ERF_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::HALF_ROTARY_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SCATTER_ADD_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::RESHAPE_COPY_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SEGMENTED_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SILU_NCHW_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID)?,
+    ]);
+    config.dynamic_storage_profiles = BTreeSet::from([DynamicStorageProfile::new(
+        DynamicStorageAllocator::LinearArena,
+        DynamicStorageView::Contiguous,
+    )?]);
+    Ok(config)
+}
+
+/// Explicit opt-in to the independently locked SM120 FP8 native artifact.
+/// The ordinary tensor configuration never advertises this capability. The
+/// provider factory separately admits its process-retained native allowance.
+pub fn cuda_tensor_runtime_config_with_cutlass_fp8(
+    ordinal: usize,
+    device_id: DeviceId,
+) -> Result<CudaDeviceRuntimeConfig, VNextError> {
+    let native = tensor_dense_fp8_bf16::source_fingerprint()
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+    let mut config = cuda_tensor_runtime_config(ordinal, device_id)?;
+    config.capabilities.insert(CapabilityId::new(
+        ferrum_runtime::DENSE_LINEAR_FP8_BF16_CAPABILITY_ID,
+    )?);
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        native.as_bytes(),
+    ]);
+    Ok(config)
+}
+
+pub fn cuda_vnext_dense_linear_fp8_bf16_provider(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCutlassFp8Config,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(tensor_dense_fp8_bf16::Provider::new(
+        runtime, config,
+    )?))
+}
+
+/// Diagnostic-only synchronous scratch capture. Caller arms the probe's
+/// accounted Output destinations before each invocation. The ordinary FP8
+/// factory performs no capture or extra synchronization/transfer.
+pub fn cuda_vnext_dense_linear_fp8_bf16_probe_provider(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCutlassFp8Config,
+    probe: Arc<CudaCutlassFp8Probe>,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(tensor_dense_fp8_bf16::Provider::new_with_probe(
+        runtime,
+        config,
+        Some(probe),
+    )?))
+}
+
+/// The fixed-tensor SiLU provider, without token kernels/materializers or
+/// graph registration. Build one registry from this and `silu_bf16_contract`.
+pub fn cuda_vnext_silu_bf16_provider(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    let mut providers = cuda_vnext_tensor_providers(runtime, &[CudaTensorOperation::Silu])?;
+    providers
+        .pop()
+        .ok_or_else(|| CudaDeviceRuntimeError::contract("SiLU selection produced no provider"))
+}
+
+/// Standalone explicit-state RNG provider. Device SM/thread limits become part
+/// of this provider's fingerprint. It acquires the same single module permit
+/// as other tensor factories. To share that module with other stages, select
+/// `CudaTensorOperation::PhiloxNormal` in the common tensor provider factory
+/// instead of combining standalone factories in one live runtime.
+/// Fresh offset-zero output has NOT been qualified against deployed Torch.
+pub fn cuda_vnext_philox_normal_bf16_provider(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    let mut providers = cuda_vnext_tensor_providers(runtime, &[CudaTensorOperation::PhiloxNormal])?;
+    providers
+        .pop()
+        .ok_or_else(|| CudaDeviceRuntimeError::contract("Philox selection produced no provider"))
+}
+
+/// Assemble an explicitly selected subset from one shared native module and
+/// capacity permit. Empty/duplicate selections and missing runtime capabilities
+/// are rejected before native loading. Selection order is preserved. Register
+/// each selected operation's standard contract; Dense is supplied separately.
+/// Selecting `PhiloxNormal` queries launch geometry from this existing runtime
+/// and shares the same module owner with all selected component operations.
+/// New normalization/activation profiles require their own target evidence.
+pub fn cuda_vnext_tensor_providers(
+    runtime: &CudaDeviceRuntime,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::selected_providers(runtime, selected)
+}
+
+/// Registers one BF16 Conv2D provider and the selected native tensor providers.
+/// All native kernels share one module permit; the cuDNN handle/descriptors
+/// acquire a separate explicit opaque capacity claim. An empty native selection
+/// is valid for a convolution-only plan. No token or capture path is enabled.
+/// The selection may include `PhiloxNormal`, so noise and later image stages
+/// can retain one combined registry without a second native module load.
+pub fn cuda_vnext_tensor_providers_with_cudnn(
+    runtime: &CudaDeviceRuntime,
+    config: &super::vnext_runtime::CudaCudnnConfig,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::providers_with_cudnn(runtime, config, selected)
+}
+
+/// Opt-in segmented cuDNN SDPA alongside the selected native operations and
+/// Conv2D, sharing one module permit and one separately charged cuDNN owner.
+/// The explicit finite cache quota is additional to the cuDNN owner's opaque
+/// allowance. Register `structured_attention_fused_bf16_contract` as well as
+/// the selected contracts; legacy attention remains available independently.
+pub fn cuda_vnext_tensor_providers_with_cudnn_sdpa(
+    runtime: &CudaDeviceRuntime,
+    config: &super::vnext_runtime::CudaCudnnConfig,
+    policy: super::vnext_runtime::CudnnSdpaPlanPolicy,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::providers_with_cudnn_sdpa(runtime, config, policy, selected)
+}
+
+/// Adds rectangular noncausal cross-attention to the existing cuDNN SDPA bundle.
+/// All providers share the same module, cuDNN owner and bounded plan cache.
+/// Register `cross_attention_fused_bf16_contract` in addition to the contracts
+/// required by `cuda_vnext_tensor_providers_with_cudnn_sdpa`. The old factory's
+/// provider set is unchanged; this explicit factory opts into the new operation.
+pub fn cuda_vnext_tensor_providers_with_cudnn_cross_attention(
+    runtime: &CudaDeviceRuntime,
+    config: &super::vnext_runtime::CudaCudnnConfig,
+    policy: super::vnext_runtime::CudnnSdpaPlanPolicy,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::providers_with_cudnn_cross_attention(runtime, config, policy, selected)
+}
+
+/// Builds the five independent BF16 pointwise providers from one native
+/// module load and one shared capacity permit. Register their corresponding
+/// standard contracts alongside them. Do not combine this bundle with the
+/// standalone SiLU factory in the same runtime: only one bundle may be live.
+/// An encoded command retains the bundle after its provider is dropped.
+pub fn cuda_vnext_tensor_pointwise_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::providers(runtime)
+}
+
+/// Builds five BF16 pointwise and two normalization providers sharing one
+/// native module/capacity permit. Register all seven corresponding contracts.
+/// LayerNorm and HeadRmsNorm support power-of-two reduction widths <=4096;
+/// their estimators reject unsupported geometry before execution. No global
+/// normalization workspace is allocated. Do not combine this factory with
+/// another module-bundle factory on the same runtime.
+pub fn cuda_vnext_tensor_bf16_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::component_providers(runtime)
+}
+
+/// Builds all eight fixed tensor providers (five pointwise, two normalization,
+/// adjacent RoPE) sharing one module and capacity permit. Dense remains a
+/// separate provider using the existing lane-owned cuBLAS handle. Register
+/// the corresponding contracts or retain the required subset of providers.
+/// The five- and seven-provider factory interfaces retain their former sets.
+pub fn cuda_vnext_tensor_component_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::all_component_providers(runtime)
+}
+
+/// Builds nine providers: the existing eight tensor component providers plus
+/// bounded, nonpaged structured BF16 attention, sharing one native module and
+/// capacity permit. Attention passes its mask by value (2312 bytes; the entire
+/// pointer/scalar/mask parameter list is below 4 KiB). Its declared shared
+/// storage is 4*D dynamic bytes plus 36 static bytes, with no global score or
+/// workspace buffer. This is not a measurement of total native device usage.
+/// Register the corresponding contracts or retain only the required providers.
+/// Dense remains separate; the five/seven/eight-provider factory sets persist.
+/// This baseline implementation makes no optimized-throughput claim.
+pub fn cuda_vnext_tensor_attention_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::attention_providers(runtime)
+}
+
+/// Source, precise build options, and compiled PTX identity. This identifies
+/// an implementation; qualification still requires running on the target GPU.
+pub fn cuda_silu_bf16_implementation_fingerprint() -> String {
+    tensor_silu::numerical_fingerprint()
+}
+
+/// Fixed-tensor BF16 Dense with an explicit FP32 cuBLAS profile and zero
+/// user workspace. A zero-workspace library failure is returned without an
+/// implicit-workspace fallback. The existing token provider is unchanged.
+pub fn cuda_vnext_dense_bf16_provider(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(
+        tensor_dense_bf16::CudaTensorDenseBf16Provider::new(runtime)?,
+    ))
+}
+
+/// Loaded cuBLAS version for validation provenance. NVIDIA supports this
+/// query with a null handle; it creates no extra cuBLAS handle or workspace.
+pub fn cuda_dense_bf16_cublas_version() -> Result<i32, CudaDeviceRuntimeError> {
+    tensor_dense_bf16::cublas_version()
 }
 
 pub(crate) fn rn_fragment_mma_compiled() -> bool {
@@ -873,9 +1195,10 @@ pub fn cuda_weight_materializer_selection(
     let block_fp8_weight_format = WeightFormatId::new(BLOCK_FP8_SAFETENSORS_FORMAT_ID)?;
     let block_fp8_quantization =
         QuantizationFormatId::new(BLOCK_FP8_SOURCE_QUANTIZATION_FORMAT_ID)?;
-    let quantization_formats = family.weight_schema().quantization_formats();
+    let source_schema = family.stored_weight_schema()?;
+    let quantization_formats = source_schema.quantization_formats();
     let has_block_fp8_quantization = quantization_formats.contains(&block_fp8_quantization);
-    let has_block_fp8_weight_format = family.weight_schema().format_id == block_fp8_weight_format;
+    let has_block_fp8_weight_format = source_schema.format_id == block_fp8_weight_format;
     let mxfp4_weight_format = WeightFormatId::new(
         crate::mxfp4_marlin_materializer::GPT_OSS_MXFP4_SOURCE_WEIGHT_FORMAT_ID,
     )?;
@@ -883,7 +1206,7 @@ pub fn cuda_weight_materializer_selection(
         crate::mxfp4_marlin_materializer::GPT_OSS_MXFP4_SOURCE_QUANTIZATION_FORMAT_ID,
     )?;
     let has_mxfp4_quantization = quantization_formats.contains(&mxfp4_quantization);
-    let has_mxfp4_weight_format = family.weight_schema().format_id == mxfp4_weight_format;
+    let has_mxfp4_weight_format = source_schema.format_id == mxfp4_weight_format;
 
     if has_block_fp8_weight_format != has_block_fp8_quantization
         || (has_block_fp8_weight_format
@@ -1305,6 +1628,48 @@ pub struct CudaVNextComposition {
 enum CudaCompositionPurpose {
     Execution,
     NativeCatalogDeclaration,
+}
+
+fn cuda_text_native_build_units() -> Vec<crate::native_ops::CudaNativeBuildUnit> {
+    use crate::native_ops::CudaNativeBuildUnit;
+    // Match the text units in build.rs::required_cuda_native_build_units.
+    // CUDA itself enables Marlin; vllm-moe-marlin also enables vllm-marlin.
+    // CUTLASS BF16-output FP8 belongs to the separately admitted tensor
+    // composition even when the same executable links both kinds of artifact.
+    [
+        (cfg!(feature = "marlin"), CudaNativeBuildUnit::Marlin),
+        (
+            cfg!(feature = "vllm-marlin"),
+            CudaNativeBuildUnit::VllmMarlin,
+        ),
+        (
+            cfg!(feature = "cuda-upstream-linear"),
+            CudaNativeBuildUnit::UpstreamLinear,
+        ),
+        (
+            cfg!(feature = "cuda-upstream-q6-f32-linear"),
+            CudaNativeBuildUnit::UpstreamQ6F32Linear,
+        ),
+        (
+            cfg!(feature = "cuda-upstream-extra-linear"),
+            CudaNativeBuildUnit::UpstreamExtraLinear,
+        ),
+        (
+            cfg!(feature = "vllm-moe-marlin"),
+            CudaNativeBuildUnit::VllmMoeMarlin,
+        ),
+        (
+            cfg!(feature = "vllm-paged-attn-v2"),
+            CudaNativeBuildUnit::VllmPagedAttentionV2,
+        ),
+        (
+            cfg!(feature = "cuda-indexed-causal-attention"),
+            CudaNativeBuildUnit::VllmIndexedPagedAttentionV2,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, unit)| enabled.then_some(unit))
+    .collect()
 }
 
 impl CudaVNextComposition {
@@ -1785,9 +2150,10 @@ impl CudaVNextComposition {
         let native_provider_catalog = catalog
             .native_operator_provider_catalog(NativeOperatorBackend::Cuda)
             .map_err(contract_error)?;
-        crate::native_ops::validate_compiled_native_operator_provider_catalog(
+        crate::native_ops::validate_compiled_native_operator_provider_catalog_for_units(
             &native_provider_catalog,
             crate::native_ops::compiled_native_operator_artifacts(),
+            &cuda_text_native_build_units(),
         )
         .map_err(CudaDeviceRuntimeError::contract)
     }

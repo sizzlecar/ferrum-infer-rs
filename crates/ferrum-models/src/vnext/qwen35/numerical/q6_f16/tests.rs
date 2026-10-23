@@ -117,7 +117,10 @@ fn q6_f16_auto_prefers_qualified_source_and_require_preserves_program_structure(
     );
     let prepared = registration.prepare(&definition, &id()).unwrap();
     let baseline = registration.prepare(&definition, &old_id).unwrap();
-    assert_eq!(prepared.weight_schema(), baseline.weight_schema());
+    assert_eq!(
+        prepared.stored_weight_schema().unwrap(),
+        baseline.stored_weight_schema().unwrap()
+    );
     assert_eq!(prepared.program().states(), baseline.program().states());
     new.validate_program(prepared.program()).unwrap();
     let nodes: Vec<_> = prepared

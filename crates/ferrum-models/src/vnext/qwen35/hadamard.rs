@@ -216,7 +216,12 @@ mod tests {
         let config = config();
         let provider = Qwen35FamilyProvider::new().unwrap();
         provider.validate_typed_config(&config).unwrap();
-        let schema = provider.weight_schema(&config).unwrap();
+        let schema = provider
+            .weights(&config)
+            .unwrap()
+            .stored_schema()
+            .unwrap()
+            .clone();
         schema.validate(provider.family_id()).unwrap();
         let packed = schema
             .tensors

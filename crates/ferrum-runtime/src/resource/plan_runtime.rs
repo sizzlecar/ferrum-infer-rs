@@ -10,19 +10,86 @@ use super::{
     DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
     DynamicPoolGrowthBatchReceipt, DynamicPoolMaintenanceController, DynamicPoolMaintenanceStatus,
     DynamicPoolSet, DynamicResourceShape, EvaluatedBackingProjection, EvaluatedBackingRequest,
-    ExecutionLane, ExecutionLaneCreationError, FailureEnvelope, InvocationLivenessMode,
-    LaneBackingPrepareDecision, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
-    NoStatic, NodeId, Ordering, PhysicalBackingClaimIdentity, PlanHash, PlanId, PlanNode,
-    ResourceAbandonSignal, ResourceActionCursor, ResourceDriverFailure,
-    ResourceLedgerEntrySnapshot, ResourceOwnershipReason, ResourceOwnershipTransferFailure,
-    ResourcePoolIdentity, ResourcePoolOwnership, ResourceReservation, ResourceReservationBatch,
+    ExecutionLane, ExecutionLaneCreationError, FailureEnvelope, LaneBackingPrepareDecision,
+    LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex, NoStatic, NodeId, Ordering,
+    PhysicalBackingClaimIdentity, PlanHash, PlanId, PlanNode, ResourceAbandonSignal,
+    ResourceActionCursor, ResourceDriverFailure, ResourceLedgerEntrySnapshot,
+    ResourceOwnershipReason, ResourceOwnershipTransferFailure, ResourcePoolIdentity,
+    ResourcePoolOwnership, ResourceReservation, ResourceReservationBatch,
     ResourceTransactionAction, ResourceTransactionContext, ResourceTransactionDriver,
     ResourceTransactionIdentity, ResourceTransactionState, RwLock, RwLockReadGuard, Serialize,
-    StaticProvisioningBinding, StaticProvisioningLease, VNextError,
+    SharedComponentWeights, SharedComponentWeightsEvidence, StaticProvisioningBinding,
+    StaticProvisioningLease, VNextError,
 };
 use crate::{
     ResolvedReusableExecutionBucket, ReusableExecutionBucketId, ReusableExecutionBucketSpec,
 };
+
+/// Immutable membership only. Work-shape demand and physical backing authority
+/// are evaluated again for every Step admission.
+pub(super) struct StepResourceSlotLayout {
+    pub(super) descriptor_indices: Vec<usize>,
+    pub(super) claim_identity: PhysicalBackingClaimIdentity,
+}
+
+pub(super) fn compile_step_resource_slot_layouts(
+    domain: &super::DynamicPoolDomainSpec,
+) -> Result<Vec<StepResourceSlotLayout>, VNextError> {
+    let mut descriptor_indices = super::BTreeMap::new();
+    for (index, descriptor) in domain.descriptors.iter().enumerate() {
+        if descriptor_indices
+            .insert(descriptor.base_resource_id(), index)
+            .is_some()
+        {
+            return Err(invalid_resource(
+                "step slot layout requires unique pool descriptors",
+            ));
+        }
+    }
+    let mut covered = super::BTreeSet::new();
+    let mut layouts = Vec::with_capacity(domain.pool.step_resource_slots().len());
+    for slot in domain.pool.step_resource_slots() {
+        let indices = slot
+            .resource_ids()
+            .iter()
+            .map(|resource_id| {
+                let &index = descriptor_indices.get(resource_id).ok_or_else(|| {
+                    invalid_resource("step physical slot references a descriptor outside its pool")
+                })?;
+                if domain.descriptors[index].lifetime() != AllocationLifetime::Step {
+                    return Err(invalid_resource(
+                        "step physical slot references a non-Step descriptor",
+                    ));
+                }
+                if !covered.insert(index) {
+                    return Err(invalid_resource(
+                        "step physical slots repeat a logical resource",
+                    ));
+                }
+                Ok(index)
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        layouts.push(StepResourceSlotLayout {
+            descriptor_indices: indices,
+            claim_identity: PhysicalBackingClaimIdentity::new(
+                domain.pool_id().clone(),
+                slot.resource_ids().to_vec(),
+            )?,
+        });
+    }
+    if covered.len()
+        != domain
+            .descriptors
+            .iter()
+            .filter(|descriptor| descriptor.lifetime() == AllocationLifetime::Step)
+            .count()
+    {
+        return Err(invalid_resource(
+            "step physical slots do not cover immutable Step descriptors exactly",
+        ));
+    }
+    Ok(layouts)
+}
 
 pub(super) const PLAN_RUNTIME_OPEN: u8 = 0;
 const PLAN_RUNTIME_CLOSING: u8 = 1;
@@ -109,7 +176,7 @@ where
             .collect()
     }
 
-    fn release_all(&mut self) -> Result<usize, ResourceDriverFailure> {
+    pub(super) fn release_all(&mut self) -> Result<usize, ResourceDriverFailure> {
         let mut released = 0;
         for order in 0..self.states.len() {
             if self.states[order] == ResourceTransactionState::Released {
@@ -328,8 +395,30 @@ pub(super) enum PlanRuntimeStatic<R>
 where
     R: DeviceRuntime,
 {
-    NoStatic { binding: StaticProvisioningBinding },
+    NoStatic {
+        binding: StaticProvisioningBinding,
+    },
     Static(PlanStaticResources<R>),
+    Shared {
+        binding: StaticProvisioningBinding,
+        weights: SharedComponentWeights<R>,
+    },
+}
+
+impl<R: DeviceRuntime> PlanRuntimeStatic<R> {
+    fn binding(&self) -> &StaticProvisioningBinding {
+        match self {
+            Self::NoStatic { binding } | Self::Shared { binding, .. } => binding,
+            Self::Static(source) => &source.admission,
+        }
+    }
+    fn lease(&self) -> Option<&StaticProvisioningLease<R>> {
+        match self {
+            Self::NoStatic { .. } => None,
+            Self::Static(source) => source.lease.as_ref(),
+            Self::Shared { weights, .. } => Some(weights.lease()),
+        }
+    }
 }
 
 /// Unique plan-lifetime owner of the runtime, dynamic pools, maintenance
@@ -677,6 +766,8 @@ pub struct TrustedPlanRuntimeEvidence {
     static_provisioning_binding: Option<StaticProvisioningBinding>,
     static_pool_identity: Option<ResourcePoolIdentity>,
     static_provisioning_identity: Option<ResourceTransactionIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared_component_weights: Option<SharedComponentWeightsEvidence>,
 }
 
 impl TrustedPlanRuntimeEvidence {
@@ -711,6 +802,10 @@ impl TrustedPlanRuntimeEvidence {
     pub fn static_provisioning_identity(&self) -> Option<&ResourceTransactionIdentity> {
         self.static_provisioning_identity.as_ref()
     }
+
+    pub fn shared_component_weights(&self) -> Option<&SharedComponentWeightsEvidence> {
+        self.shared_component_weights.as_ref()
+    }
 }
 
 impl<R> NoStatic<R>
@@ -742,12 +837,27 @@ impl<R> PlanRuntimeResources<R>
 where
     R: DeviceRuntime,
 {
+    pub(super) fn plan_static_view(
+        &self,
+        slot_index: usize,
+        allocation: &super::ResourceAllocation,
+    ) -> Result<super::LeasedBufferView<'_, R::Buffer>, VNextError> {
+        match &self.static_resources {
+            PlanRuntimeStatic::Shared { weights, .. } => weights.plan_static_view(allocation),
+            PlanRuntimeStatic::Static(resources) => resources
+                .lease
+                .as_ref()
+                .ok_or_else(|| invalid_resource("plan-static lease is retired"))?
+                .plan_static_view(slot_index, allocation),
+            PlanRuntimeStatic::NoStatic { .. } => {
+                Err(invalid_resource("plan has no static installation"))
+            }
+        }
+    }
+
     fn evidence(&self) -> TrustedPlanRuntimeEvidence {
-        let (binding, identity) = match &self.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => (binding, None),
-            PlanRuntimeStatic::Static(source) => (&source.admission, Some(&source.identity)),
-        };
-        let has_static = matches!(&self.static_resources, PlanRuntimeStatic::Static(_));
+        let binding = self.static_resources.binding();
+        let lease = self.static_resources.lease();
         TrustedPlanRuntimeEvidence {
             plan_id: binding.plan_id().clone(),
             plan_hash: binding.plan_hash().clone(),
@@ -756,9 +866,13 @@ where
                 .device_runtime_implementation_fingerprint()
                 .to_owned(),
             coordinator_id: self.dynamic_pools.logical_admission.id(),
-            static_provisioning_binding: has_static.then(|| binding.clone()),
-            static_pool_identity: has_static.then(|| binding.pool_identity().clone()),
-            static_provisioning_identity: identity.cloned(),
+            static_provisioning_binding: lease.map(|lease| lease.admission().clone()),
+            static_pool_identity: lease.map(|lease| lease.admission().pool_identity().clone()),
+            static_provisioning_identity: lease.map(|lease| lease.identity().clone()),
+            shared_component_weights: match &self.static_resources {
+                PlanRuntimeStatic::Shared { weights, .. } => Some(weights.evidence().clone()),
+                _ => None,
+            },
         }
     }
 
@@ -858,6 +972,50 @@ where
     pub fn dynamic_pool_status(&self) -> Result<DynamicPoolMaintenanceStatus, VNextError> {
         let _lifecycle = self.read_lifecycle("observe dynamic pool status")?;
         self.maintenance_controller.status()
+    }
+
+    /// Planning evidence for this exact plan: each pool contributes the larger
+    /// of its canonical runnable minimum and its existing/pending residency.
+    /// A large retained chunk in one pool cannot satisfy a different cold pool.
+    /// This snapshot reserves no bytes and grants no execution authority. It
+    /// does not prove fragmentation fit; physical admission remains decisive.
+    pub fn minimum_runnable_dynamic_bytes_with_residency(&self) -> Result<u64, VNextError> {
+        let _lifecycle = self.read_lifecycle("observe runnable dynamic residency")?;
+        let states = self
+            .dynamic_pools
+            .pools
+            .values()
+            .map(|pool| {
+                pool.state
+                    .lock()
+                    .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.dynamic_pools
+            .pools
+            .values()
+            .zip(&states)
+            .try_fold(0_u64, |total, (pool, state)| {
+                if state.poisoned || !state.quarantined.is_empty() {
+                    return Err(invalid_resource(
+                        "runnable residency cannot use a poisoned or quarantined pool",
+                    ));
+                }
+                let contract = &pool.domain.pool;
+                let minimum = contract
+                    .minimum_request_bytes()
+                    .checked_add(contract.minimum_sequence_bytes())
+                    .and_then(|bytes| bytes.checked_add(contract.minimum_step_bytes()))
+                    .and_then(|bytes| bytes.checked_add(contract.minimum_invocation_peak_bytes()))
+                    .ok_or_else(|| invalid_resource("pool runnable minimum overflows u64"))?;
+                let resident = state
+                    .resident_bytes
+                    .checked_add(state.pending_growth_bytes)
+                    .ok_or_else(|| invalid_resource("pool residency overflows u64"))?;
+                total
+                    .checked_add(minimum.max(resident))
+                    .ok_or_else(|| invalid_resource("runnable dynamic residency overflows u64"))
+            })
     }
 
     pub fn write_dynamic_capacity_availability(
@@ -993,6 +1151,22 @@ where
                     }),
                 }
             }
+            PlanRuntimeStatic::Shared { weights, .. } => {
+                drop(runtime);
+                match weights.release_attachment() {
+                    Ok(released_static_resources) => {
+                        Ok(PlanRuntimeCloseOutcome::Closed(PlanRuntimeCloseReceipt {
+                            evidence,
+                            released_static_resources,
+                        }))
+                    }
+                    Err(failure) => Err(PlanRuntimeCloseFailure {
+                        failure: failure.failure,
+                        evidence,
+                        static_resources: Some(failure.resources),
+                    }),
+                }
+            }
         }
     }
 }
@@ -1028,35 +1202,22 @@ where
     }
 
     pub fn plan_id(&self) -> &PlanId {
-        match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => binding.plan_id(),
-            PlanRuntimeStatic::Static(source) => source.admission.plan_id(),
-        }
+        self.resources.static_resources.binding().plan_id()
     }
 
     pub fn plan_hash(&self) -> &PlanHash {
-        match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => binding.plan_hash(),
-            PlanRuntimeStatic::Static(source) => source.admission.plan_hash(),
-        }
+        self.resources.static_resources.binding().plan_hash()
     }
 
     pub fn device_id(&self) -> &DeviceId {
-        match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => binding.device_id(),
-            PlanRuntimeStatic::Static(source) => source.admission.device_id(),
-        }
+        self.resources.static_resources.binding().device_id()
     }
 
     pub fn runtime_implementation_fingerprint(&self) -> &str {
-        match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => {
-                binding.device_runtime_implementation_fingerprint()
-            }
-            PlanRuntimeStatic::Static(source) => {
-                source.admission.device_runtime_implementation_fingerprint()
-            }
-        }
+        self.resources
+            .static_resources
+            .binding()
+            .device_runtime_implementation_fingerprint()
     }
 
     pub fn coordinator_id(&self) -> LogicalAdmissionCoordinatorId {
@@ -1064,10 +1225,7 @@ where
     }
 
     pub fn static_provisioning(&self) -> Option<&StaticProvisioningLease<R>> {
-        match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { .. } => None,
-            PlanRuntimeStatic::Static(source) => source.lease.as_ref(),
-        }
+        self.resources.static_resources.lease()
     }
 
     pub fn evidence(&self) -> TrustedPlanRuntimeEvidence {
@@ -1097,10 +1255,7 @@ where
                 return Ok(None);
             }
         }
-        let binding = match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => binding,
-            PlanRuntimeStatic::Static(source) => &source.admission,
-        };
+        let binding = self.resources.static_resources.binding();
         let minimum_required =
             pools
                 .domains
@@ -1127,6 +1282,25 @@ where
         )
     }
 
+    pub(super) fn work_limits(&self) -> crate::RuntimeWorkLimits {
+        self.resources.static_resources.binding().work_limits()
+    }
+
+    fn validate_work_shapes(
+        &self,
+        immediate: DynamicResourceShape,
+        fit: DynamicResourceShape,
+    ) -> Result<(), VNextError> {
+        if self.work_limits().is_tensor() != immediate.is_tensor()
+            || immediate.is_tensor() != fit.is_tensor()
+        {
+            return Err(invalid_resource(
+                "work evidence domain differs from its compiled plan",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn scoped_demand(
         &self,
         lifetime: AllocationLifetime,
@@ -1137,6 +1311,7 @@ where
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
+        self.validate_work_shapes(immediate_shape, fit_shape)?;
         if (lifetime == AllocationLifetime::Invocation) != node_id.is_some() {
             return Err(invalid_resource(
                 "invocation resource demand requires one exact node identity",
@@ -1149,12 +1324,12 @@ where
                     AllocationLifetime::Step | AllocationLifetime::Invocation
                 ) && bucket.capacity().covers(
                     immediate_shape.sequences(),
-                    immediate_shape.tokens(),
-                    immediate_shape.pages(),
+                    immediate_shape.tokens()?,
+                    immediate_shape.pages()?,
                 ) && bucket.capacity().covers(
                     fit_shape.sequences(),
-                    fit_shape.tokens(),
-                    fit_shape.pages(),
+                    fit_shape.tokens()?,
+                    fit_shape.pages()?,
                 ) =>
             {
                 DynamicResourceShape::from_validated(
@@ -1184,21 +1359,51 @@ where
         let mut immediate_entries = Vec::new();
         let mut fit_entries = Vec::new();
         let mut requested_slices = Vec::new();
-        for domain in &self.dynamic_pools().domains {
+        let pools = self.dynamic_pools();
+        if lifetime == AllocationLifetime::Step
+            && pools.domains.len() != pools.step_resource_slot_layouts.len()
+        {
+            return Err(invalid_resource(
+                "step slot layout count differs from immutable plan domains",
+            ));
+        }
+        for (domain_index, domain) in pools.domains.iter().enumerate() {
             let mut immediate_pool_bytes = 0_u64;
             let mut fit_pool_bytes = 0_u64;
             let mut matched = false;
             if lifetime == AllocationLifetime::Step {
-                for slot in domain.pool.step_resource_slots() {
+                let layouts = &pools.step_resource_slot_layouts[domain_index];
+                if layouts.len() != domain.pool.step_resource_slots().len() {
+                    return Err(invalid_resource(
+                        "step slot layout count differs from its immutable pool",
+                    ));
+                }
+                for (slot_index, (slot, layout)) in domain
+                    .pool
+                    .step_resource_slots()
+                    .iter()
+                    .zip(layouts)
+                    .enumerate()
+                {
+                    if layout.claim_identity.pool_id() != domain.pool_id()
+                        || layout.claim_identity.resource_ids() != slot.resource_ids()
+                        || layout.descriptor_indices.len() != slot.resource_ids().len()
+                    {
+                        return Err(invalid_resource(
+                            "step slot layout differs from its immutable pool membership",
+                        ));
+                    }
                     let mut projections = Vec::with_capacity(slot.resource_ids().len());
                     let mut immediate_slot_bytes = 0_u64;
                     let mut fit_slot_bytes = 0_u64;
                     let mut capacity_slot_bytes = 0_u64;
-                    for resource_id in slot.resource_ids() {
+                    for (resource_id, &descriptor_index) in
+                        slot.resource_ids().iter().zip(&layout.descriptor_indices)
+                    {
                         let descriptor = domain
                             .descriptors
-                            .iter()
-                            .find(|descriptor| descriptor.base_resource_id() == resource_id)
+                            .get(descriptor_index)
+                            .filter(|descriptor| descriptor.base_resource_id() == resource_id)
                             .ok_or_else(|| {
                                 invalid_resource(
                                     "step physical slot references a descriptor outside its pool",
@@ -1218,6 +1423,7 @@ where
                         fit_slot_bytes = fit_slot_bytes.max(fit_bytes);
                         capacity_slot_bytes = capacity_slot_bytes.max(capacity_size_bytes);
                         projections.push(EvaluatedBackingProjection {
+                            descriptor_index,
                             descriptor,
                             physical_offset_bytes: 0,
                             logical_size_bytes,
@@ -1234,10 +1440,8 @@ where
                         .ok_or_else(|| invalid_resource("dynamic pool fit demand overflows u64"))?;
                     requested_slices.push(EvaluatedBackingRequest {
                         domain,
-                        claim_identity: PhysicalBackingClaimIdentity::new(
-                            domain.pool_id().clone(),
-                            slot.resource_ids().to_vec(),
-                        )?,
+                        step_resource_slot_index: Some(slot_index),
+                        claim_identity: layout.claim_identity.clone(),
                         capacity_size_bytes: capacity_slot_bytes,
                         reusable_execution_bucket_id: reusable_execution_bucket
                             .map(|bucket| bucket.bucket_id().clone()),
@@ -1246,7 +1450,7 @@ where
                     matched = true;
                 }
             } else {
-                for descriptor in &domain.descriptors {
+                for (descriptor_index, descriptor) in domain.descriptors.iter().enumerate() {
                     if descriptor.lifetime() != lifetime
                         || node_resources.is_some_and(|resources| {
                             !resources.contains(descriptor.base_resource_id())
@@ -1270,6 +1474,7 @@ where
                         .ok_or_else(|| invalid_resource("dynamic pool fit demand overflows u64"))?;
                     requested_slices.push(EvaluatedBackingRequest {
                         domain,
+                        step_resource_slot_index: None,
                         claim_identity: PhysicalBackingClaimIdentity::new(
                             domain.pool_id().clone(),
                             vec![descriptor.base_resource_id().clone()],
@@ -1278,6 +1483,7 @@ where
                         reusable_execution_bucket_id: reusable_execution_bucket
                             .map(|bucket| bucket.bucket_id().clone()),
                         projections: vec![EvaluatedBackingProjection {
+                            descriptor_index,
                             descriptor,
                             physical_offset_bytes: 0,
                             logical_size_bytes,
@@ -1357,8 +1563,8 @@ where
     ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
         if committed.sequences() != 1
             || target.sequences() != 1
-            || target.tokens() < committed.tokens()
-            || target.pages() < committed.pages()
+            || target.tokens()? < committed.tokens()?
+            || target.pages()? < committed.pages()?
         {
             return Err(invalid_resource(
                 "sequence extension target must monotonically advance one committed sequence",
@@ -1369,7 +1575,7 @@ where
         let mut requested_slices = Vec::new();
         for domain in &self.dynamic_pools().domains {
             let mut pool_delta = 0_u64;
-            for descriptor in &domain.descriptors {
+            for (descriptor_index, descriptor) in domain.descriptors.iter().enumerate() {
                 if descriptor.lifetime() != AllocationLifetime::Sequence {
                     continue;
                 }
@@ -1425,6 +1631,7 @@ where
                 })?;
                 requested_slices.push(EvaluatedBackingRequest {
                     domain,
+                    step_resource_slot_index: None,
                     claim_identity: PhysicalBackingClaimIdentity::new(
                         domain.pool_id().clone(),
                         vec![descriptor.base_resource_id().clone()],
@@ -1432,6 +1639,7 @@ where
                     capacity_size_bytes: delta_bytes,
                     reusable_execution_bucket_id: None,
                     projections: vec![EvaluatedBackingProjection {
+                        descriptor_index,
                         descriptor,
                         physical_offset_bytes: 0,
                         logical_size_bytes: delta_bytes,
@@ -1477,12 +1685,12 @@ where
             Some(bucket)
                 if bucket.capacity().covers(
                     immediate_shape.sequences(),
-                    immediate_shape.tokens(),
-                    immediate_shape.pages(),
+                    immediate_shape.tokens()?,
+                    immediate_shape.pages()?,
                 ) && bucket.capacity().covers(
                     fit_shape.sequences(),
-                    fit_shape.tokens(),
-                    fit_shape.pages(),
+                    fit_shape.tokens()?,
+                    fit_shape.pages()?,
                 ) =>
             {
                 // Physical reusable capacity is compiled once with the immutable
@@ -1558,20 +1766,17 @@ where
                     "compiled reusable submission-wave projection count differs from its domain layout",
                 ));
             }
-            let mode = domain.pool.invocation_liveness_mode();
-
+            let immediate_layout = layout.physical_layout_for_shape(domain, immediate_shape)?;
+            let fit_pool_bytes = if fit_shape == immediate_shape {
+                immediate_layout.bytes
+            } else {
+                layout.physical_layout_for_shape(domain, fit_shape)?.bytes
+            };
+            let immediate_pool_bytes = immediate_layout.bytes;
+            let capacity_pool_bytes = reusable_capacity_layout
+                .map_or(immediate_layout.bytes, |layout| layout.physical_size_bytes);
             let mut projections = vec![None; layout.projection_count];
-            let mut immediate_pool_bytes = 0_u64;
-            let mut fit_pool_bytes = 0_u64;
-            let mut capacity_pool_bytes = 0_u64;
-            for row in &layout.rows {
-                let row_base = match mode {
-                    InvocationLivenessMode::TotalOrderReuse => 0,
-                    InvocationLivenessMode::ConservativeConcurrent => capacity_pool_bytes,
-                    InvocationLivenessMode::NoInvocationResources => unreachable!(),
-                };
-                let mut immediate_row_bytes = 0_u64;
-                let mut fit_row_bytes = 0_u64;
+            for (row, row_base) in layout.rows.iter().zip(immediate_layout.row_offsets) {
                 let mut capacity_row_bytes = 0_u64;
                 for projection_layout in &row.projections {
                     let descriptor = domain
@@ -1589,11 +1794,6 @@ where
                     }
                     let logical_size_bytes =
                         descriptor.evaluate_request_bytes_for_shape(immediate_shape)?;
-                    let fit_bytes = if fit_shape == immediate_shape {
-                        logical_size_bytes
-                    } else {
-                        descriptor.evaluate_request_bytes_for_shape(fit_shape)?
-                    };
                     let (physical_offset_bytes, capacity_size_bytes) =
                         match reusable_capacity_layout {
                             Some(capacity_layout) => {
@@ -1620,14 +1820,6 @@ where
                                 (physical_offset_bytes, logical_size_bytes)
                             }
                         };
-                    immediate_row_bytes = immediate_row_bytes
-                        .checked_add(logical_size_bytes)
-                        .ok_or_else(|| {
-                            invalid_resource("invocation wave row demand overflows u64")
-                        })?;
-                    fit_row_bytes = fit_row_bytes.checked_add(fit_bytes).ok_or_else(|| {
-                        invalid_resource("invocation wave fit row demand overflows u64")
-                    })?;
                     if reusable_capacity_layout.is_none() {
                         capacity_row_bytes = capacity_row_bytes
                             .checked_add(capacity_size_bytes)
@@ -1637,6 +1829,7 @@ where
                     }
                     if projections[projection_layout.projection_index]
                         .replace(EvaluatedBackingProjection {
+                            descriptor_index: projection_layout.descriptor_index,
                             descriptor,
                             physical_offset_bytes,
                             logical_size_bytes,
@@ -1649,39 +1842,6 @@ where
                         ));
                     }
                 }
-                match mode {
-                    InvocationLivenessMode::TotalOrderReuse => {
-                        immediate_pool_bytes = immediate_pool_bytes.max(immediate_row_bytes);
-                        fit_pool_bytes = fit_pool_bytes.max(fit_row_bytes);
-                        if reusable_capacity_layout.is_none() {
-                            capacity_pool_bytes = capacity_pool_bytes.max(capacity_row_bytes);
-                        }
-                    }
-                    InvocationLivenessMode::ConservativeConcurrent => {
-                        immediate_pool_bytes = immediate_pool_bytes
-                            .checked_add(immediate_row_bytes)
-                            .ok_or_else(|| {
-                                invalid_resource("invocation wave pool demand overflows u64")
-                            })?;
-                        fit_pool_bytes =
-                            fit_pool_bytes.checked_add(fit_row_bytes).ok_or_else(|| {
-                                invalid_resource("invocation wave pool fit demand overflows u64")
-                            })?;
-                        if reusable_capacity_layout.is_none() {
-                            capacity_pool_bytes = capacity_pool_bytes
-                                .checked_add(capacity_row_bytes)
-                                .ok_or_else(|| {
-                                    invalid_resource(
-                                        "invocation wave capacity pool demand overflows u64",
-                                    )
-                                })?;
-                        }
-                    }
-                    InvocationLivenessMode::NoInvocationResources => unreachable!(),
-                }
-            }
-            if let Some(capacity_layout) = reusable_capacity_layout {
-                capacity_pool_bytes = capacity_layout.physical_size_bytes;
             }
             let projections = projections
                 .into_iter()
@@ -1697,6 +1857,7 @@ where
 
             requested_slices.push(EvaluatedBackingRequest {
                 domain,
+                step_resource_slot_index: None,
                 claim_identity: layout.claim_identity.clone(),
                 capacity_size_bytes: capacity_pool_bytes,
                 reusable_execution_bucket_id: reusable_execution_bucket

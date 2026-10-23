@@ -1,5 +1,6 @@
 mod vnext_core_contract;
 
+use ferrum_runtime::ModelWeights;
 use vnext_core_contract::*;
 
 const NOVEL_OPERATION_ID: &str = "operation.extension.scale_bias";
@@ -85,8 +86,8 @@ impl ModelFamilyProvider for SyntheticExtensionFamily {
         TestFamily.parse_config(raw)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        let mut schema = TestFamily.weight_schema(config)?;
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        let mut schema = TestFamily.weights(config)?.stored_schema()?.clone();
         if !self.recurrent {
             schema.components.push(WeightComponentSpec {
                 id: id("weight.component.mask"),
@@ -108,7 +109,7 @@ impl ModelFamilyProvider for SyntheticExtensionFamily {
                 required: true,
             });
         }
-        Ok(schema)
+        Ok(ModelWeights::Stored(schema))
     }
 
     fn numerical_profiles(

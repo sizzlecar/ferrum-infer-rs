@@ -233,7 +233,9 @@ impl SubmissionWaveDeterminismEvidence {
                     execution_path: command.execution_path().as_str().to_owned(),
                     batching_form: command.batching_form().as_str().to_owned(),
                     participant_count: command.participant_count(),
-                    token_count: command.token_count(),
+                    token_count: command.token_count().ok_or_else(|| {
+                        invalid_operation("token determinism artifact rejects tensor work")
+                    })?,
                     compute_dispatch_count: command.compute_dispatch_count(),
                     transfer_command_count: command.transfer_command_count(),
                     dependency_wait_count: command.dependency_wait_count(),

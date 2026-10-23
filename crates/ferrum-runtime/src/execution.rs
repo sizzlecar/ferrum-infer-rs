@@ -31,8 +31,14 @@ pub(crate) use binding::*;
 mod weight;
 pub use weight::*;
 
+mod weight_presence;
+pub use weight_presence::*;
+
 mod work;
 pub use work::*;
+
+mod tensor;
+pub use tensor::*;
 
 mod reusable;
 pub use reusable::*;
@@ -54,6 +60,9 @@ pub use allocation::*;
 
 mod solver;
 use solver::*;
+
+mod completion_order;
+use completion_order::CompletionOrderCache;
 
 mod memory;
 pub use memory::*;

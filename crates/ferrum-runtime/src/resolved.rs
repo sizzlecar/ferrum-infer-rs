@@ -1365,8 +1365,10 @@ impl RuntimePolicy for ResolvedRuntimePolicy {
         self.memory.maximum_active_sequences
     }
 
-    fn maximum_scheduled_tokens(&self) -> u64 {
-        self.admission.maximum_scheduled_tokens
+    fn work_limits(&self) -> crate::RuntimeWorkLimits {
+        crate::RuntimeWorkLimits::Tokens {
+            maximum_scheduled_tokens: self.admission.maximum_scheduled_tokens,
+        }
     }
 
     fn attention_execution_policy(&self) -> AttentionExecutionPolicy {
@@ -3386,6 +3388,7 @@ impl ResolvedModelPlan {
         node_resolutions: &[PlanNodeResolution],
         completion_retention: &CompletionRetentionSpec,
     ) -> Result<(), VNextError> {
+        let language = parts.prepared_family.metadata().causal_language()?;
         let mut source_artifacts = BTreeMap::new();
         for artifact in &parts.source_artifacts {
             if source_artifacts
@@ -3483,8 +3486,8 @@ impl ResolvedModelPlan {
         let program_fingerprint = family.program().fingerprint()?;
         let family_fingerprint = family.fingerprint()?;
         if parts.tokenizer.vocabulary_size == 0
-            || family.metadata().template.template.trim().is_empty()
-            || family.metadata().special_tokens.eos_token_ids.is_empty()
+            || language.template.template.trim().is_empty()
+            || language.special_tokens.eos_token_ids.is_empty()
         {
             return Err(invalid_plan(
                 "model_metadata",
@@ -3514,8 +3517,8 @@ impl ResolvedModelPlan {
         Self::validate_source_file_binding(
             ModelArtifactSourceRole::Tokenizer,
             &parts.resolved_sources.tokenizer,
-            &family.metadata().template.source_file,
-            &family.metadata().template.sha256,
+            &language.template.source_file,
+            &language.template.sha256,
             "template",
         )?;
         Self::validate_token_contract(parts)?;
@@ -3537,18 +3540,16 @@ impl ResolvedModelPlan {
             || family_fingerprint != parts.execution_plan.payload().prepared_family_fingerprint()
             || runtime_fingerprint != parts.execution_plan.payload().policy_fingerprint()
             || program_fingerprint != parts.execution_plan.payload().program_fingerprint()
-            || &parts
+            || parts
                 .execution_plan
                 .payload()
                 .execution_weights()
-                .schema()
-                .format_id
+                .weight_format()
                 != parts.execution_plan.payload().weight_format()
             || parts
                 .execution_plan
                 .payload()
                 .execution_weights()
-                .schema()
                 .quantization_formats()
                 != *parts.execution_plan.payload().quantization_formats()
             || capability_fingerprint
@@ -3832,7 +3833,11 @@ impl ResolvedModelPlan {
 
     fn validate_token_contract(parts: &ResolvedModelPlanParts) -> Result<(), VNextError> {
         let vocabulary_size = parts.tokenizer.vocabulary_size;
-        let special = &parts.prepared_family.metadata().special_tokens;
+        let special = &parts
+            .prepared_family
+            .metadata()
+            .causal_language()?
+            .special_tokens;
         if special.collision_policy.allowed().iter().any(|collision| {
             collision.first() == SpecialTokenRole::Stop
                 || collision.second() == SpecialTokenRole::Stop
@@ -3965,12 +3970,12 @@ impl ResolvedModelPlan {
         );
         insert_value!(
             ResolutionField::WeightSchema,
-            parts.prepared_family.weight_schema(),
+            parts.prepared_family.stored_weight_schema()?,
             "serialize weight schema decision"
         );
         insert_value!(
             ResolutionField::WeightFormat,
-            &parts.prepared_family.weight_schema().format_id,
+            &parts.prepared_family.stored_weight_schema()?.format_id,
             "serialize weight format decision"
         );
         insert_value!(
@@ -3980,12 +3985,16 @@ impl ResolvedModelPlan {
         );
         insert_value!(
             ResolutionField::Template,
-            &parts.prepared_family.metadata().template,
+            &parts.prepared_family.metadata().causal_language()?.template,
             "serialize template decision"
         );
         insert_value!(
             ResolutionField::SpecialTokens,
-            &parts.prepared_family.metadata().special_tokens,
+            &parts
+                .prepared_family
+                .metadata()
+                .causal_language()?
+                .special_tokens,
             "serialize special-token decision"
         );
         insert_value!(

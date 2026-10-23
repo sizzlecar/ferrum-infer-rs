@@ -1557,7 +1557,9 @@ impl MetalDeviceCommand {
         self.batching_form = logical_work.batching_form();
         self.participant_start = logical_work.participant_start();
         self.participant_count = logical_work.participant_count();
-        self.token_count = logical_work.token_count();
+        self.token_count = logical_work.token_count().ok_or_else(|| {
+            MetalDeviceRuntimeError::contract("backend does not support tensor logical attribution")
+        })?;
         Ok(self)
     }
 
@@ -3357,7 +3359,7 @@ mod tests {
             assert_eq!(command.execution_path(), DeviceExecutionPath::Eager);
             assert_eq!(command.batching_form(), DeviceBatchingForm::Packed);
             assert_eq!(command.participant_count(), 2);
-            assert_eq!(command.token_count(), 8);
+            assert_eq!(command.token_count(), Some(8));
             assert_eq!(command.compute_dispatch_count(), 0);
             assert_eq!(command.transfer_command_count(), 1);
 

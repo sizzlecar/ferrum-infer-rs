@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod bf16_whole_tensor_fp8;
 pub mod block_fp8_safetensors_source;
 pub mod compressed_tensors_marlin_source;
 pub mod dense;
@@ -30,6 +31,7 @@ pub mod quant_linear;
 pub mod safetensors_archive;
 pub mod traits;
 
+pub use bf16_whole_tensor_fp8::Bf16WholeTensorFp8Materializer;
 pub use block_fp8_safetensors_source::{
     BlockFp8SafetensorsSource, BLOCK_FP8_E4M3_SOURCE_FORMAT_ID,
 };

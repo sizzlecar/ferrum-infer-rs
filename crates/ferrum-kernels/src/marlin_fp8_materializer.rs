@@ -179,10 +179,10 @@ impl WeightMaterializer for MarlinFp8WeightMaterializer {
     ) -> Result<WeightSchema, VNextError> {
         let candidates = Self::candidates(family)?;
         if candidates.is_empty() {
-            return Ok(family.weight_schema().clone());
+            return Ok(family.stored_weight_schema()?.clone());
         }
 
-        let mut schema = family.weight_schema().clone();
+        let mut schema = family.stored_weight_schema()?.clone();
         schema.format_id = WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID)?;
         schema.layout_id = WeightLayoutId::new(MARLIN_FP8_WEIGHT_LAYOUT_ID)?;
         let candidate_by_weight = candidates
@@ -282,7 +282,7 @@ struct MarlinFp8Candidate {
 fn marlin_fp8_candidates(
     family: &PreparedModelFamily,
 ) -> Result<Vec<MarlinFp8Candidate>, VNextError> {
-    let schema = family.weight_schema();
+    let schema = family.stored_weight_schema()?;
     let mut component_references = BTreeMap::<WeightId, usize>::new();
     for tensor in &schema.tensors {
         for component in schema.physical_component_refs(&tensor.id)? {
@@ -820,10 +820,10 @@ impl WeightMaterializer for BlockFp8ToMarlinFp8WeightMaterializer {
     ) -> Result<WeightSchema, VNextError> {
         let candidates = Self::candidates(family)?;
         if candidates.is_empty() {
-            return Ok(family.weight_schema().clone());
+            return Ok(family.stored_weight_schema()?.clone());
         }
 
-        let mut schema = family.weight_schema().clone();
+        let mut schema = family.stored_weight_schema()?.clone();
         schema.format_id = WeightFormatId::new(MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID)?;
         schema.layout_id = WeightLayoutId::new(MARLIN_FP8_GROUP128_WEIGHT_LAYOUT_ID)?;
         let candidate_by_source = candidates
@@ -979,7 +979,7 @@ impl BlockFp8Candidate {
 fn block_fp8_candidates(
     family: &PreparedModelFamily,
 ) -> Result<Vec<BlockFp8Candidate>, VNextError> {
-    let schema = family.weight_schema();
+    let schema = family.stored_weight_schema()?;
     let mut component_references = BTreeMap::<WeightId, usize>::new();
     for tensor in &schema.tensors {
         for component in schema.physical_component_refs(&tensor.id)? {

@@ -140,8 +140,8 @@ impl ModelFamilyProvider for LanguageFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &LanguageConfig) -> Result<WeightSchema, VNextError> {
-        let mut schema = self.0.weight_schema(&config.attention)?;
+    fn weights(&self, config: &LanguageConfig) -> Result<ModelWeights, VNextError> {
+        let mut schema = self.0.weights(&config.attention)?.stored_schema()?.clone();
         schema.components.push(WeightComponentSpec {
             id: id("component.head"),
             role: WeightComponentRole::Values,
@@ -161,7 +161,7 @@ impl ModelFamilyProvider for LanguageFamily {
             },
             required: true,
         });
-        Ok(schema)
+        Ok(ModelWeights::Stored(schema))
     }
 
     fn numerical_profiles(
@@ -284,10 +284,14 @@ impl ModelFamilyProvider for LanguageFamily {
         &self,
         config: &LanguageConfig,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        let mut metadata = self.0.semantic_metadata(&config.attention)?;
+        let mut metadata = self
+            .0
+            .semantic_metadata(&config.attention)?
+            .causal_language()?
+            .clone();
         metadata.template.source_file = "tokenizer_config.json".to_owned();
         metadata.template.sha256 = format!("{:x}", Sha256::digest(TOKENIZER_CONFIG));
-        Ok(metadata)
+        Ok(metadata.into())
     }
 }
 
@@ -403,9 +407,13 @@ fn build_executor<R: DeviceRuntime>(
         .prepare(&definition, &id(Family::new(kind).profile_id()))
         .unwrap();
     let path = directory.join("startup.gguf");
-    write_weights(&path, family.weight_schema(), kind);
-    let source =
-        GgufWeightComponentSource::open_with_schema(&path, family.weight_schema(), None).unwrap();
+    write_weights(&path, family.stored_weight_schema().unwrap(), kind);
+    let source = GgufWeightComponentSource::open_with_schema(
+        &path,
+        family.stored_weight_schema().unwrap(),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         source.file().architecture().unwrap(),
         family_config.model_type
@@ -435,7 +443,8 @@ fn build_executor<R: DeviceRuntime>(
         family.external_metadata_id(),
     );
     let parameter_count = family
-        .weight_schema()
+        .stored_weight_schema()
+        .unwrap()
         .tensors
         .iter()
         .map(|tensor| tensor.dimensions.iter().product::<u64>())
@@ -464,7 +473,12 @@ fn build_executor<R: DeviceRuntime>(
     let info = prepared.model_info(name.into(), device);
     // Product stop tokens retain the actual family's EOS declaration. Declare
     // only the roles that these exact IDs alias; model metadata stays intact.
-    let special = &prepared.family().metadata().special_tokens;
+    let special = &prepared
+        .family()
+        .metadata()
+        .causal_language()
+        .unwrap()
+        .special_tokens;
     let token_ids = special.eos_token_ids.clone();
     let mut allowed_roles = BTreeSet::new();
     if !token_ids.is_empty() {

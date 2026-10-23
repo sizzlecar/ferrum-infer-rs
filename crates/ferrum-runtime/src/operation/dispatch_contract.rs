@@ -135,7 +135,7 @@ impl BoundDeviceSubmissionAttribution {
                         .is_none_or(|physical| {
                             physical.participant_start() != 0
                                 || program_id.immediate_sequences() != physical.participant_count()
-                                || program_id.immediate_tokens() != physical.token_count()
+                                || Some(program_id.immediate_tokens()) != physical.token_count()
                         })
                 })
             {
@@ -649,6 +649,23 @@ impl Default for SubmissionExecutionPolicy {
 /// One typed host input written into an exact participant's resolved plan
 /// input before any provider command executes. The request names semantic
 /// plan coordinates rather than exposing backend buffers or allocation ids.
+#[derive(Debug, Clone)]
+enum SubmissionInputBytes {
+    Legacy(Vec<u8>),
+    Managed(crate::ManagedHostBytes),
+}
+
+impl PartialEq for SubmissionInputBytes {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Legacy(a), Self::Legacy(b)) => a == b,
+            (Self::Managed(a), Self::Managed(b)) => a.same_region(b),
+            _ => false,
+        }
+    }
+}
+impl Eq for SubmissionInputBytes {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionWaveInputUpload {
     node_id: NodeId,
@@ -656,7 +673,7 @@ pub struct SubmissionWaveInputUpload {
     input_ordinal: u32,
     logical_offset_bytes: u64,
     source_layout: HostTransferLayout,
-    bytes: Vec<u8>,
+    bytes: SubmissionInputBytes,
 }
 
 impl SubmissionWaveInputUpload {
@@ -683,7 +700,7 @@ impl SubmissionWaveInputUpload {
             input_ordinal,
             logical_offset_bytes,
             source_layout,
-            bytes,
+            bytes: SubmissionInputBytes::Legacy(bytes),
         })
     }
 
@@ -708,7 +725,34 @@ impl SubmissionWaveInputUpload {
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        match &self.bytes {
+            SubmissionInputBytes::Legacy(bytes) => bytes,
+            SubmissionInputBytes::Managed(bytes) => bytes.bytes(),
+        }
+    }
+
+    pub fn managed_bytes(&self) -> Option<&crate::ManagedHostBytes> {
+        match &self.bytes {
+            SubmissionInputBytes::Managed(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    pub fn managed(
+        node_id: NodeId,
+        input_ordinal: u32,
+        source_layout: HostTransferLayout,
+        bytes: crate::ManagedHostBytes,
+    ) -> Result<Self, VNextError> {
+        source_layout.validate_bytes(bytes.len())?;
+        Ok(Self {
+            node_id,
+            participant_index: 0,
+            input_ordinal,
+            logical_offset_bytes: 0,
+            source_layout,
+            bytes: SubmissionInputBytes::Managed(bytes),
+        })
     }
 }
 
