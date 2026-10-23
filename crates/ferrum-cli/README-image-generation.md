@@ -84,8 +84,7 @@ Choose one explicit experimental profile in that JSON:
   `backend.pipeline.residency` set to `denoiser_and_decoder` or
   `all_model_components`. The latter also retains text-encoder weights.
   Residency is independent of precision and decoder batching; it does not
-  change the default cold preset. See the [runtime and retirement contract](../../docs/image-generation-runtime.md)
-  for exact-plan reuse, compatible weight snapshots, admission and shutdown.
+  change the default cold preset.
 
 The pipeline maximum defaults to `1` when omitted. The service collects compatible
 FIFO requests up to `max_num_seqs`, bounded by `request_batch_max_wait_ms`.
