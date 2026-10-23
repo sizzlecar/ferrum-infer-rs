@@ -20,7 +20,7 @@ crossbeam-channel = "0.5"
 
 [dev-dependencies]
 # Repository integration tests must not add a versioned publication cycle.
-ferrum-engine = { path = "../ferrum-engine" , version = "0.15.0" }
+ferrum-engine = { path = "../ferrum-engine" }
 ferrum-interfaces = { workspace = true }
 ferrum-kernels = { workspace = true }
 ferrum-models = { workspace = true, features = ["test-support"] }

@@ -187,6 +187,118 @@ fn updates_actual_dependency_locations_and_preserves_unrelated_source() {
 }
 
 #[test]
+fn path_only_development_edges_remain_unpublished_during_version_updates() {
+    // A already has a versioned dependency on B. B's repository-only reverse
+    // development edge must not become a registry requirement on the new A.
+    for (section, target, alias, declaration) in [
+        ("dev-dependencies", None, "a", "a = { path = \"../a\" }"),
+        (
+            "dev-dependencies",
+            Some("cfg(unix)"),
+            "local_a",
+            "local_a = { package = \"a\", path = \"../a\", default-features = false }",
+        ),
+        (
+            "dev_dependencies",
+            None,
+            "local_a",
+            "local_a = { package = \"a\", path = \"../a\" }",
+        ),
+        (
+            "dev_dependencies",
+            Some("cfg(windows)"),
+            "a",
+            "a = { path = \"../a\" }",
+        ),
+    ] {
+        let mut manifests = members();
+        manifests[0].text = A
+            .replace(
+                "renamed_b = { workspace = true }",
+                "renamed_b = { workspace = true }\nb_path = { package = \"b\", path = \"../b\" }",
+            )
+            .replace(", version = \"=0.8.7\"", "");
+        let header = target.map_or_else(
+            || format!("[{section}]"),
+            |target| format!("[target.'{target}'.{section}]"),
+        );
+        manifests[1].text = format!("{B}\n{header}\n{declaration}\n");
+        let result = plan_version_update(ROOT, &manifests, LOCK, "0.9.0").unwrap();
+        let b = doc(&result.members[1].text);
+        let table = match target {
+            Some(target) => &b["target"][target][section],
+            None => &b[section],
+        };
+        let dependency = table[alias].as_table_like().unwrap();
+        assert!(!dependency.contains_key("version"));
+        assert_eq!(dependency.get("path").and_then(Item::as_str), Some("../a"));
+        if alias != "a" {
+            assert_eq!(dependency.get("package").and_then(Item::as_str), Some("a"));
+        }
+        let a = doc(&result.members[0].text);
+        assert_eq!(
+            a["dependencies"]["b_path"]["version"].as_str(),
+            Some("0.9.0")
+        );
+        assert_eq!(
+            a["build-dependencies"]["b_build"]["version"].as_str(),
+            Some("0.9.0")
+        );
+        assert_eq!(
+            a["dev-dependencies"]["b_dev"]["version"].as_str(),
+            Some("~0.9.0")
+        );
+        assert_eq!(
+            a["target"]["cfg(unix)"]["dev-dependencies"]["b_dev_unix"]["version"].as_str(),
+            Some("^0.9.0")
+        );
+        assert_eq!(
+            a["dependencies"]["renamed_b"]["workspace"].as_bool(),
+            Some(true)
+        );
+        assert!(a["dependencies"]["renamed_b"]
+            .as_table_like()
+            .unwrap()
+            .get("version")
+            .is_none());
+        assert_eq!(
+            doc(&result.workspace_manifest)["workspace"]["dependencies"]["renamed_b"]["version"]
+                .as_str(),
+            Some("^0.9.0")
+        );
+    }
+}
+
+#[test]
+fn unversioned_development_dependencies_still_validate_identity_and_source() {
+    for section in ["dev-dependencies", "target.'cfg(unix)'.dev-dependencies"] {
+        for (declaration, error) in [
+            (
+                "a = { path = \"../a\", git = \"https://example.invalid/a\" }",
+                "Git source",
+            ),
+            ("a = { path = \"../a\", rev = \"abc\" }", "Git source"),
+            ("a = { path = \"../a\", branch = \"main\" }", "Git source"),
+            ("a = { path = \"../a\", tag = \"v1\" }", "Git source"),
+            (
+                "wrong_alias = { path = \"../a\" }",
+                "use package for renames",
+            ),
+            ("a = { path = \"../elsewhere\" }", "does not resolve"),
+            (
+                "a = { workspace = true, path = \"../a\" }",
+                "overrides path/version/package",
+            ),
+        ] {
+            let mut manifests = members();
+            manifests[1].text = format!("{B}\n[{section}]\n{declaration}\n");
+            let actual = plan_version_update(ROOT, &manifests, LOCK, "0.9.0").unwrap_err();
+            assert!(actual.contains(error), "{declaration}: {actual}");
+        }
+    }
+}
+
+#[test]
 fn lock_updates_only_local_package_and_local_disambiguated_references() {
     let result = plan_version_update(ROOT, &members(), LOCK, "0.8.8").unwrap();
     let lock = doc(&result.lockfile);
