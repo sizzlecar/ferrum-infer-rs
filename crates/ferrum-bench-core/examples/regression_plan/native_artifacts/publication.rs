@@ -1,7 +1,7 @@
 //! Prove the finite publication condition without weakening mandatory producers.
 //! This accepts only positive required-job success predicates. Monotonicity then
 //! makes all-success plus every single-failure state a complete job-state proof;
-//! active/cloud/cancellation states are enumerated independently.
+//! active/cloud/SM120/cancellation states are enumerated independently.
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +17,7 @@ enum Predicate {
     NotCancelled,
     Active(bool),
     Cloud(bool),
+    Sm120RuntimeRequired(bool),
     Result(usize, Conclusion),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
@@ -25,6 +26,7 @@ enum Predicate {
 struct State {
     active: Option<bool>,
     cloud: Option<bool>,
+    sm120_runtime_required: Option<bool>,
     cloud_job: usize,
     cloud_result: Conclusion,
     cancelled: bool,
@@ -38,6 +40,7 @@ impl Predicate {
             Self::NotCancelled => !state.cancelled,
             Self::Active(expected) => state.active == Some(*expected),
             Self::Cloud(expected) => state.cloud == Some(*expected),
+            Self::Sm120RuntimeRequired(expected) => state.sm120_runtime_required == Some(*expected),
             Self::Result(job, expected) if *job == state.cloud_job => {
                 state.cloud_result == *expected
             }
@@ -127,6 +130,9 @@ impl Parser<'_> {
         match name {
             "needs.prepare.outputs.active" => return Ok(Predicate::Active(boolean()?)),
             "needs.prepare.outputs.cloud_cuda" => return Ok(Predicate::Cloud(boolean()?)),
+            "needs.prepare.outputs.sm120_runtime_required" => {
+                return Ok(Predicate::Sm120RuntimeRequired(boolean()?));
+            }
             _ => {}
         }
         let name = name
@@ -178,29 +184,35 @@ pub(super) fn verify(job: &Value) -> Result<(), String> {
     let (expression, jobs, cloud_job) = parse(job)?;
     for active in [None, Some(false), Some(true)] {
         for cloud in [None, Some(false), Some(true)] {
-            for cancelled in [false, true] {
-                for cloud_result in [Conclusion::Success, Conclusion::Skipped, Conclusion::Other] {
-                    for failed_job in std::iter::once(None)
-                        .chain((0..jobs.len()).filter(|job| *job != cloud_job).map(Some))
+            for sm120_runtime_required in [None, Some(false), Some(true)] {
+                for cancelled in [false, true] {
+                    for cloud_result in
+                        [Conclusion::Success, Conclusion::Skipped, Conclusion::Other]
                     {
-                        let state = State {
-                            active,
-                            cloud,
-                            cloud_job,
-                            cloud_result,
-                            cancelled,
-                            failed_job,
-                        };
-                        let expected = active == Some(true)
-                            && !cancelled
-                            && failed_job.is_none()
-                            && matches!(
-                                (cloud, cloud_result),
-                                (Some(false), Conclusion::Skipped)
-                                    | (Some(true), Conclusion::Success)
-                            );
-                        if expression.evaluate(&state) != expected {
-                            return Err("publication condition does not preserve mandatory success and explicit cloud mode".into());
+                        for failed_job in std::iter::once(None)
+                            .chain((0..jobs.len()).filter(|job| *job != cloud_job).map(Some))
+                        {
+                            let state = State {
+                                active,
+                                cloud,
+                                sm120_runtime_required,
+                                cloud_job,
+                                cloud_result,
+                                cancelled,
+                                failed_job,
+                            };
+                            let expected = active == Some(true)
+                                && sm120_runtime_required == Some(false)
+                                && !cancelled
+                                && failed_job.is_none()
+                                && matches!(
+                                    (cloud, cloud_result),
+                                    (Some(false), Conclusion::Skipped)
+                                        | (Some(true), Conclusion::Success)
+                                );
+                            if expression.evaluate(&state) != expected {
+                                return Err("publication condition does not preserve mandatory success, explicit cloud mode and required SM120 manual validation".into());
+                            }
                         }
                     }
                 }
@@ -238,6 +250,7 @@ mod tests {
                     !expression.evaluate(&State {
                         active: Some(true),
                         cloud: Some(cloud),
+                        sm120_runtime_required: Some(false),
                         cloud_job,
                         cloud_result: if cloud {
                             Conclusion::Success
@@ -259,6 +272,32 @@ mod tests {
     }
 
     #[test]
+    fn required_or_unknown_sm120_runtime_scope_blocks_automatic_publication() {
+        let job = actual();
+        let (expression, _, cloud_job) = parse(&job).unwrap();
+        for cloud in [false, true] {
+            for sm120_runtime_required in [None, Some(false), Some(true)] {
+                assert_eq!(
+                    expression.evaluate(&State {
+                        active: Some(true),
+                        cloud: Some(cloud),
+                        sm120_runtime_required,
+                        cloud_job,
+                        cloud_result: if cloud {
+                            Conclusion::Success
+                        } else {
+                            Conclusion::Skipped
+                        },
+                        cancelled: false,
+                        failed_job: None,
+                    }),
+                    sm120_runtime_required == Some(false),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn weakened_or_unknown_publication_conditions_never_narrow_source_scope() {
         let job = actual();
         let source = job["if"].as_str().unwrap();
@@ -277,6 +316,22 @@ mod tests {
             format!("({source}) && needs.unreviewed.result == 'success'"),
             source.replace("!cancelled()", "always()"),
             source.replace("needs.prepare.outputs.active == 'true'", "always()"),
+            source.replace(
+                "needs.prepare.outputs.sm120_runtime_required == 'false'",
+                "always()",
+            ),
+            source.replace(
+                "needs.prepare.outputs.sm120_runtime_required == 'false'",
+                "needs.prepare.outputs.sm120_runtime_required == 'true'",
+            ),
+            source.replace(
+                "needs.prepare.outputs.sm120_runtime_required",
+                "needs.prepare.outputs.unreviewed_runtime_required",
+            ),
+            source.replace(
+                "needs.prepare.outputs.sm120_runtime_required == 'false'",
+                "needs.prepare.outputs.sm120_runtime_required == 'unknown'",
+            ),
             source.replace("needs.cuda-models-cloud.result == 'skipped'", "always()"),
             source.replace("needs.cuda-models-cloud.result == 'success'", "always()"),
         ] {
