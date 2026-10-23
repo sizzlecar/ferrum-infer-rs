@@ -23,6 +23,70 @@ pub enum BoundedSelectionReason {
     ParetoTargetRepair,
 }
 
+/// Conservative time representation bounds, not model-error or SLO bounds.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct BoundedReferenceTimeBounds {
+    pub lower_seconds: f64,
+    pub upper_seconds: f64,
+}
+
+impl BoundedReferenceTimeBounds {
+    fn from_duration(elapsed: Duration, simulated_groups: usize) -> Result<Self, Unsupported> {
+        // The physical provider rounds floating seconds to Duration and floors
+        // positive progress at 1 ns. One ns per invocation covers both steps;
+        // this is a conservative representation rule for other providers too.
+        // Count simulated groups, including cache hits, not provider calls.
+        // Queries after first reference coverage only widen this bound.
+        let quantum_ns = simulated_groups as u128;
+        let lower_ns = elapsed.as_nanos().saturating_sub(quantum_ns);
+        let upper_ns = elapsed
+            .as_nanos()
+            .checked_add(quantum_ns)
+            .ok_or(Unsupported::Arithmetic)?;
+        let lower_seconds = if lower_ns == 0 {
+            0.0
+        } else {
+            ((lower_ns as f64).next_down() / 1_000_000_000.0)
+                .next_down()
+                .max(0.0)
+        };
+        let upper_seconds = if upper_ns == 0 {
+            0.0
+        } else {
+            ((upper_ns as f64).next_up() / 1_000_000_000.0).next_up()
+        };
+        Ok(Self {
+            lower_seconds,
+            upper_seconds,
+        })
+    }
+
+    pub(super) fn add_weighted(&mut self, value: Self, weight: f64) -> Result<(), Unsupported> {
+        // Outward rounding covers each multiplication and addition, including
+        // nonuniform rank weights. Unsupported ranks are never renormalized.
+        self.lower_seconds = (self.lower_seconds
+            + (value.lower_seconds * weight).next_down().max(0.0))
+        .next_down()
+        .max(0.0);
+        self.upper_seconds = if self.upper_seconds == 0.0 && value.upper_seconds == 0.0 {
+            0.0
+        } else {
+            (self.upper_seconds + (value.upper_seconds * weight).next_up()).next_up()
+        };
+        if !self.lower_seconds.is_finite()
+            || !self.upper_seconds.is_finite()
+            || self.lower_seconds > self.upper_seconds
+        {
+            return Err(Unsupported::Arithmetic);
+        }
+        Ok(())
+    }
+
+    fn strictly_faster_than(self, other: Self) -> bool {
+        self.upper_seconds < other.lower_seconds
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct BoundedMetricTarget {
     pub classification: LocalTargetClass,
@@ -137,7 +201,16 @@ pub(super) fn evaluate(
     baseline: &TrajectoryResult,
     candidate: &TrajectoryResult,
     config: &SchedulerSloConfig,
-) -> Result<(BoundedLocalTargets, f64, BoundedScore, f64), Unsupported> {
+) -> Result<
+    (
+        BoundedLocalTargets,
+        f64,
+        BoundedReferenceTimeBounds,
+        BoundedScore,
+        f64,
+    ),
+    Unsupported,
+> {
     let baseline_timing = baseline
         .bounded_timing
         .as_ref()
@@ -350,6 +423,7 @@ pub(super) fn evaluate(
             )?,
         },
         wave.as_secs_f64(),
+        BoundedReferenceTimeBounds::from_duration(wave, candidate.queries)?,
         guard,
         unfinished_tpot_debt,
     ))
@@ -409,18 +483,22 @@ pub(super) fn select(
     alternatives: &[BoundedActionEvidence],
 ) -> (Option<usize>, BoundedSelectionReason) {
     let static_within = baseline.local_targets.all_within();
-    let mut best_time = static_within.then_some(baseline.reference_time_seconds);
+    let mut best = static_within.then_some(baseline);
     let mut selected = None;
     for (index, candidate) in alternatives.iter().enumerate() {
         if !eligible(candidate, baseline) || !candidate.local_targets.all_within() {
             continue;
         }
-        if best_time.is_none_or(|time| candidate.reference_time_seconds < time) {
+        if best.is_none_or(|reference| {
+            candidate
+                .reference_time_bounds
+                .strictly_faster_than(reference.reference_time_bounds)
+        }) {
             selected = Some(index);
-            best_time = Some(candidate.reference_time_seconds);
+            best = Some(candidate);
         }
     }
-    if best_time.is_some() {
+    if best.is_some() {
         return (
             selected,
             match selected {
@@ -457,6 +535,10 @@ pub(super) fn select(
         },
     )
 }
+
+#[cfg(test)]
+#[path = "local_targets/time_resolution_tests.rs"]
+mod time_resolution_tests;
 
 #[cfg(test)]
 mod tests {

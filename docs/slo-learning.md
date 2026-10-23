@@ -147,6 +147,16 @@ It includes every group in a Split wave. The earlier invocation-group target
 time and the final common observation time are separate diagnostics. A faster
 candidate can win within the local targets; equal times retain static when
 static also satisfies all local targets.
+Time ordering also retains ties within representation resolution: each
+simulated invocation contributes a conservative 1 ns allowance for converting
+floating service seconds to `Duration`, including the provider's 1 ns positive
+floor. Cache hits still count as invocations; groups after first reference
+coverage only make this allowance more conservative. Conversion, rank weighting
+and accumulation round the interval outwards. A candidate is faster only when
+its upper time bound is below the current best's lower bound. The original
+weighted time remains diagnostic. These are numerical representation bounds,
+not prediction-accuracy or SLO confidence intervals; recovery into the local
+targets does not require beating an outside-target static time.
 
 If no candidate is within all local targets, selection permits a conservative
 Pareto improvement of the target-excess vector: at least one component must

@@ -9,7 +9,9 @@
 use super::*;
 mod local_targets;
 mod timing;
-pub use local_targets::{BoundedLocalTargets, BoundedSelectionReason, LocalTargetClass};
+pub use local_targets::{
+    BoundedLocalTargets, BoundedReferenceTimeBounds, BoundedSelectionReason, LocalTargetClass,
+};
 pub use timing::{BoundedTiming, ServiceOpportunityClock};
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
@@ -51,6 +53,9 @@ pub struct BoundedActionEvidence {
     /// Rank-weighted first COMPLETE-wave coverage of the identical reference
     /// progress. Extra observation work until the common wall is not a gain.
     pub reference_time_seconds: f64,
+    /// Representation/rounding bounds for time ordering only, not prediction
+    /// accuracy or an SLO confidence interval. The raw weighted time is retained.
+    pub reference_time_bounds: BoundedReferenceTimeBounds,
     /// Conservative degradation guards at the fixed reference frontier and
     /// ordinal, retaining common-wall time debt when that reference is not
     /// finished. Unlike `score`, catchup-only extra work earns no credit here.
@@ -217,6 +222,7 @@ impl<'a> BoundedAccumulator<'a> {
         (
             reference.local_targets,
             reference.reference_time_seconds,
+            reference.reference_time_bounds,
             reference.reference_pressure,
             reference.unfinished_reference_tpot_debt,
         ) = local_targets::evaluate(self.initial, baseline, baseline, &self.config)?;
@@ -230,6 +236,7 @@ impl<'a> BoundedAccumulator<'a> {
                     (
                         evidence.local_targets,
                         evidence.reference_time_seconds,
+                        evidence.reference_time_bounds,
                         evidence.reference_pressure,
                         evidence.unfinished_reference_tpot_debt,
                     ) = local_targets::evaluate(self.initial, baseline, result, &self.config)?;
@@ -312,6 +319,9 @@ fn add_evidence(
         .add(value.reference_pressure, weight)?;
     total.local_targets.add(value.local_targets, weight);
     total.reference_time_seconds += weight * value.reference_time_seconds;
+    total
+        .reference_time_bounds
+        .add_weighted(value.reference_time_bounds, weight)?;
     total.unfinished_reference_tpot_debt += weight * value.unfinished_reference_tpot_debt;
     if !total.reference_time_seconds.is_finite()
         || !total.unfinished_reference_tpot_debt.is_finite()
@@ -833,9 +843,9 @@ mod tests {
         timing.reference_reached_at = Some(Duration::from_millis(120));
         validate(&initial, &candidate).unwrap();
         validate_reference_coverage(&baseline, &candidate).unwrap();
-        let (_, _, static_pressure, _) =
+        let (_, _, _, static_pressure, _) =
             local_targets::evaluate(&initial, &baseline, &baseline, &config()).unwrap();
-        let (_, _, candidate_pressure, _) =
+        let (_, _, _, candidate_pressure, _) =
             local_targets::evaluate(&initial, &baseline, &candidate, &config()).unwrap();
         assert_eq!(static_pressure.ttft_pressure, 1.0);
         assert!((candidate_pressure.ttft_pressure - 1.4).abs() < 1e-12);
