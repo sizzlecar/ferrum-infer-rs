@@ -5,7 +5,7 @@
 //! build_deployed_torch_linear_oracle -- --ignored --nocapture --test-threads=1
 //! Exclusive GPU: use executable.mode=prebuilt, then select
 //! deployed_torch_linear_replays_real_block0_qv with the same Cargo arguments.
-//! A successful diagnostic is NOT block parity: the original R36 verdict and
+//! A successful Q/V diagnostic is NOT block parity: the original R36 verdict and
 //! abs <= .02 + .02*abs(reference) criterion remain unchanged. This calls BF16
 //! ATen in the deployed libraries, not Omni's FP8 quantized Q/V path.
 
@@ -17,6 +17,9 @@ mod artifacts;
 mod dyadic;
 #[path = "support/torch_linear_oracle.rs"]
 mod linear;
+// Full-block propagation has its own input protocol and numerical verdict.
+#[path = "support/torch_block_oracle.rs"]
+mod block;
 // Share native process/library ownership, not the Philox generation entrypoint.
 #[allow(dead_code)]
 #[path = "support/torch_native_oracle.rs"]
