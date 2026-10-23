@@ -14,7 +14,7 @@ use ferrum_runtime::{
 };
 use sha2::{Digest, Sha256};
 
-mod layout;
+pub(super) mod layout;
 use layout::{Method, Schedule, ScratchLayout, Stage, SCRATCH_ALIGNMENT};
 #[cfg(test)]
 mod tests;

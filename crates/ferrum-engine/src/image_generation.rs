@@ -23,6 +23,8 @@ mod attention_policy;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 mod decoder;
+mod editing;
+pub use editing::QwenImage21EditProfiles;
 mod plan_cache;
 mod precision;
 mod prepare;
@@ -147,6 +149,14 @@ pub struct ImageGenerationRequest {
     pub seed: u64,
     pub n: u32,
 }
+
+/// One encoded PNG reference; its admitted backing belongs to this pipeline's
+/// Host account throughout queueing, preprocessing and execution.
+#[derive(Debug, Clone)]
+pub struct ImageEditRequest {
+    pub generation: ImageGenerationRequest,
+    pub image: ManagedHostBytes,
+}
 impl ImageGenerationRequest {
     fn latent_dimensions(
         &self,
@@ -219,6 +229,7 @@ pub struct QwenImage21Pipeline<R: DeviceRuntime> {
     materializers: WeightMaterializerRegistry,
     assets: QwenImage21Assets,
     profiles: QwenImage21Profiles,
+    editing_profiles: Option<QwenImage21EditProfiles>,
     config: ImagePipelineConfig,
     policy: TensorComponentPolicy,
     next_job: u64,
@@ -271,6 +282,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             materializers,
             assets,
             profiles,
+            editing_profiles: None,
             config,
             policy,
             next_job: 0,
@@ -335,6 +347,19 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let prepared = self
             .prepare_batch(&requests)
             .map_err(|e| empty_error(ImageGenerationFailure::Preflight(e)))?;
+        self.execute_prepared(prepared, &requests)
+    }
+
+    fn execute_prepared(
+        &mut self,
+        prepared: PreparedRequest<R>,
+        requests: &[ImageGenerationRequest],
+    ) -> Result<Vec<ImageGenerationOutput>, ImageGenerationError<R>> {
+        let empty_error = |failure| ImageGenerationError {
+            failure,
+            completed_stages: Vec::new(),
+            completed_steps: Vec::new(),
+        };
         let job = self.next_job;
         self.next_job = self.next_job.checked_add(1).ok_or_else(|| {
             empty_error(ImageGenerationFailure::Preflight(anyhow::anyhow!(
@@ -413,6 +438,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             noise_stage,
             denoise_stage,
             decode_stage,
+            edit,
         } = prepared;
         let process = |source| ImageGenerationFailure::Processing {
             source,
@@ -420,29 +446,35 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         };
         let ordered_requests = request_order.requests(requests).map_err(process)?;
 
-        let inputs = prompts
-            .managed_inputs(
-                &self.host,
-                &self.assets.text,
-                &self
-                    .assets
-                    .sources
-                    .text_encoder
-                    .tensor(Qwen3VLTextEncoderFamily::EMBEDDING_EXTERNAL_NAME)
-                    .map_err(|e| process(e.into()))?,
-            )
-            .map_err(process)?
-            .into_parts()
-            .1;
-        let text = self.start_stage(text_stage, job, stages)?;
-        let (text, outputs) = text.execute(job, Vec::from(inputs))?;
-        self.finish_stage(text, stages)?;
-        let hidden = only_output(outputs, Qwen3VLTextEncoderFamily::OUTPUT_ID).map_err(process)?;
-        let features = prompts
-            .crop_hidden(&self.host, &self.assets.text, &hidden)
-            .map_err(process)?;
-        drop(hidden);
-        let text_input = features.into_tensor();
+        let (text_input, reference) = if let Some(edit) = edit {
+            let (text, reference) = self.run_edit_conditioning(edit, text_stage, job, stages)?;
+            (text, Some(reference))
+        } else {
+            let inputs = prompts
+                .managed_inputs(
+                    &self.host,
+                    &self.assets.text,
+                    &self
+                        .assets
+                        .sources
+                        .text_encoder
+                        .tensor(Qwen3VLTextEncoderFamily::EMBEDDING_EXTERNAL_NAME)
+                        .map_err(|e| process(e.into()))?,
+                )
+                .map_err(process)?
+                .into_parts()
+                .1;
+            let text = self.start_stage(text_stage, job, stages)?;
+            let (text, outputs) = text.execute(job, Vec::from(inputs))?;
+            self.finish_stage(text, stages)?;
+            let hidden =
+                only_output(outputs, Qwen3VLTextEncoderFamily::OUTPUT_ID).map_err(process)?;
+            let features = prompts
+                .crop_hidden(&self.host, &self.assets.text, &hidden)
+                .map_err(process)?;
+            drop(hidden);
+            (features.into_tensor(), None)
+        };
 
         // A batch has independent seed streams, not one longer draw. The
         // noise session is reused while per-sample outputs are copied directly
@@ -524,15 +556,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 Ok(value) => value,
                 Err(error) => return Err(denoiser.processing(error)),
             };
-            let (active, outputs) = denoiser.execute(
-                job,
-                vec![
-                    sample.clone(),
-                    text_input.clone(),
-                    time,
-                    frequencies.clone(),
-                ],
-            )?;
+            let mut inputs = vec![
+                sample.clone(),
+                text_input.clone(),
+                time,
+                frequencies.clone(),
+            ];
+            if let Some(reference) = &reference {
+                inputs.push(reference.clone());
+            }
+            let (active, outputs) = denoiser.execute(job, inputs)?;
             denoiser = active;
             let velocity = match only_output(outputs, QwenImage21TransformerFamily::VELOCITY_ID) {
                 Ok(value) => value,
@@ -550,7 +583,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             });
         }
         self.finish_stage(denoiser, stages)?;
-        drop((text_input, frequencies, solver));
+        drop((text_input, frequencies, solver, reference));
 
         let normalized = QwenImage21ManagedLatents::new(
             &self.host,

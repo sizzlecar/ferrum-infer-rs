@@ -92,6 +92,10 @@ pub struct MetadataPaths {
     pub tokenizer: PathBuf,
     pub tokenizer_config: PathBuf,
     pub chat_template: PathBuf,
+    /// Explicitly enable editing asset validation using the existing text/VAE
+    /// configurations and archives. Omission preserves generation-only setup.
+    #[serde(default)]
+    pub processor: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,6 +297,14 @@ impl ImageProductConfig {
         );
         let mut config: Self = serde_json::from_slice(&bytes)?;
         ensure!(
+            config
+                .metadata
+                .processor
+                .as_ref()
+                .is_none_or(|path| !path.as_os_str().is_empty()),
+            "metadata.processor must be a nonempty path when supplied"
+        );
+        ensure!(
             !config.model.is_empty()
                 && config.model.len() <= 160
                 && !config.model.chars().any(char::is_control),
@@ -373,6 +385,11 @@ impl ImageProductConfig {
             &mut self.metadata.tokenizer_config,
             &mut self.metadata.chat_template,
         ] {
+            if path.is_relative() {
+                *path = base.join(&*path);
+            }
+        }
+        if let Some(path) = &mut self.metadata.processor {
             if path.is_relative() {
                 *path = base.join(&*path);
             }

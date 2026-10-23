@@ -225,7 +225,8 @@ pub(super) fn build(
             m,
             h,
         )?);
-        let output = if layer + 1 == a.layers() {
+        let inject = config.deepstack().is_some() && layer < Family::DEEPSTACK_IDS.len() as u64;
+        let output = if layer + 1 == a.layers() && !inject {
             ProgramValueId::new(Family::OUTPUT_ID)?
         } else {
             value(layer, "output")?
@@ -239,14 +240,45 @@ pub(super) fn build(
             BTreeMap::new(),
         )?);
         input = output;
+        if inject {
+            let injected = if layer + 1 == a.layers() {
+                ProgramValueId::new(Family::OUTPUT_ID)?
+            } else {
+                value(layer, "deepstack")?
+            };
+            nodes.push(node(
+                layer,
+                "deepstack",
+                super::edit::SCATTER_ADD_OPERATION_ID,
+                vec![
+                    input,
+                    ProgramValueId::new(Family::DEEPSTACK_IDS[layer as usize])?,
+                ],
+                injected.clone(),
+                config
+                    .deepstack()
+                    .expect("checked optional DeepStack")
+                    .attributes()?,
+            )?);
+            input = injected;
+        }
         blocks.push(ProgramBlock {
             id: format!("block.qwen3_vl.text.layer{layer}"),
             nodes,
         });
     }
+    let mut inputs = vec![embeddings, cosine, sine];
+    if config.deepstack().is_some() {
+        inputs.extend(
+            Family::DEEPSTACK_IDS
+                .into_iter()
+                .map(ProgramValueId::new)
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
     ModelProgram::new(
         family.clone(),
-        vec![embeddings, cosine, sine],
+        inputs,
         blocks,
         vec![],
         weights,

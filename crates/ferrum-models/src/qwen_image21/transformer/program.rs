@@ -1,6 +1,8 @@
 use super::*;
 
 pub(super) const JOINT: &str = "value.qwen_image21.transformer.joint";
+pub(super) const COMBINED_LATENTS: &str = "value.qwen_image21.transformer.combined_latents";
+pub(super) const UNORDERED_JOINT: &str = "value.qwen_image21.transformer.unordered_joint";
 pub(super) const MODULATION: &str = "value.qwen_image21.transformer.modulation_table";
 pub(super) const CONDITIONING: [&str; 4] = [
     "value.qwen_image21.transformer.scale1",
@@ -65,7 +67,20 @@ pub(super) fn build(
         AttributeId::new("epsilon")?,
         SemanticValue::Rational(t.epsilon()),
     )]);
-    let mut nodes = vec![
+    let mut nodes = Vec::new();
+    if l.reference_image().is_some() {
+        nodes.push(node(
+            "combined_latents",
+            BATCHED_ROW_CONCAT_BF16_OPERATION_ID,
+            vec![id(F::REFERENCE_LATENTS_ID)?, id(F::LATENTS_ID)?],
+            COMBINED_LATENTS,
+            BTreeMap::from([(
+                AttributeId::new("batch")?,
+                SemanticValue::Unsigned(l.batch()),
+            )]),
+        )?);
+    }
+    nodes.extend([
         node(
             "text_norm",
             ZERO_CENTERED_RMS_NORM_BF16_OPERATION_ID,
@@ -92,7 +107,11 @@ pub(super) fn build(
         )?,
         dense(
             "image_in",
-            F::LATENTS_ID,
+            if l.reference_image().is_some() {
+                COMBINED_LATENTS
+            } else {
+                F::LATENTS_ID
+            },
             "img_in.weight",
             IMAGE_OUT,
             t.in_channels(),
@@ -102,7 +121,11 @@ pub(super) fn build(
             "joint",
             BATCHED_ROW_CONCAT_BF16_OPERATION_ID,
             vec![id(TEXT_OUT)?, id(IMAGE_OUT)?],
-            JOINT,
+            if l.reference_image().is_some() {
+                UNORDERED_JOINT
+            } else {
+                JOINT
+            },
             BTreeMap::from([(
                 AttributeId::new("batch")?,
                 SemanticValue::Unsigned(l.batch()),
@@ -134,7 +157,31 @@ pub(super) fn build(
             h,
             4 * h,
         )?,
-    ];
+    ]);
+    if let Some(reference) = l.reference_image() {
+        let text = u64::from(l.text_tokens());
+        let start = u64::from(reference.image_slot_start());
+        let slots = u64::from(reference.image_slots());
+        let refs = reference.latent_tokens();
+        let stride = text + refs + l.target_tokens();
+        nodes.push(node(
+            "interleaved_joint",
+            ROW_GATHER_BF16_OPERATION_ID,
+            vec![id(UNORDERED_JOINT)?],
+            JOINT,
+            gather_attributes(
+                l.batch(),
+                0,
+                h,
+                &[
+                    (start, 0, stride, 1),
+                    (refs, text, stride, 1),
+                    (text - start - slots, start + slots, stride, 1),
+                    (l.target_tokens(), text + refs, stride, 1),
+                ],
+            )?,
+        )?);
+    }
     for (index, output) in CONDITIONING.into_iter().enumerate() {
         nodes.push(node(
             &format!("conditioning{index}"),
@@ -179,12 +226,7 @@ pub(super) fn build(
                 l.batch(),
                 0,
                 h,
-                &[(
-                    l.target_tokens(),
-                    u64::from(l.text_tokens()),
-                    l.sequence_length(),
-                    1,
-                )],
+                &[(l.target_tokens(), l.target_start(), l.sequence_length(), 1)],
             )?,
         )?,
         unary("final_silu", SILU_BF16_OPERATION_ID, TEMB, FINAL_SILU)?,
@@ -233,11 +275,23 @@ pub(super) fn build(
             t.out_channels(),
         )?,
     ]);
+    let mut inputs = F::INPUT_IDS
+        .into_iter()
+        .map(id)
+        .collect::<Result<Vec<_>, _>>()?;
+    if l.reference_image().is_some() {
+        inputs.push(id(F::REFERENCE_LATENTS_ID)?);
+    }
     ModelProgram::new(
         family.id.clone(),
-        F::INPUT_IDS.into_iter().map(id).collect::<Result<_, _>>()?,
+        inputs,
         vec![ProgramBlock {
-            id: "block.qwen_image21.transformer.t2i".into(),
+            id: if l.reference_image().is_some() {
+                "block.qwen_image21.transformer.edit"
+            } else {
+                "block.qwen_image21.transformer.t2i"
+            }
+            .into(),
             nodes,
         }],
         vec![],
@@ -254,7 +308,7 @@ pub(super) fn conditioning_attributes(
     let l = config.layout();
     let runs = if config.transformer().causal_condition() {
         vec![
-            (u64::from(l.text_tokens()), l.batch(), 0, 0),
+            (l.target_start(), l.batch(), 0, 0),
             (l.target_tokens(), 0, 1, 0),
         ]
     } else {

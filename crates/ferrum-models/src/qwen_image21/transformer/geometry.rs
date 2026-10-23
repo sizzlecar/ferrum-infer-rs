@@ -1,14 +1,21 @@
 use super::*;
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// Homogeneous single-frame text-to-image geometry. Valid text lengths may
-/// vary, but padded text length and target grid are shared by every sample.
+#[path = "edit.rs"]
+mod edit;
+pub use edit::QwenImage21ReferenceImage;
+
+/// Homogeneous single-frame geometry. `text_tokens` is the cropped VLM length,
+/// including visual slots when a reference image is configured. All samples
+/// share slot positions and grids; right-padding validity may differ.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QwenImage21T2iLayout {
     text_tokens: u32,
     latent_height: u32,
     latent_width: u32,
     valid_text_lengths: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference_image: Option<QwenImage21ReferenceImage>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,17 +24,25 @@ struct LayoutWire {
     latent_height: u32,
     latent_width: u32,
     valid_text_lengths: Vec<u32>,
+    #[serde(default)]
+    reference_image: Option<QwenImage21ReferenceImage>,
 }
 impl<'de> Deserialize<'de> for QwenImage21T2iLayout {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let wire = LayoutWire::deserialize(d)?;
-        Self::new(
+        let mut layout = Self::new(
             wire.text_tokens,
             wire.latent_height,
             wire.latent_width,
             wire.valid_text_lengths,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(serde::de::Error::custom)?;
+        if let Some(reference) = wire.reference_image {
+            layout = layout
+                .with_reference(reference)
+                .map_err(serde::de::Error::custom)?;
+        }
+        Ok(layout)
     }
 }
 impl QwenImage21T2iLayout {
@@ -60,6 +75,7 @@ impl QwenImage21T2iLayout {
             latent_height,
             latent_width,
             valid_text_lengths,
+            reference_image: None,
         };
         layout
             .target_tokens()
@@ -88,7 +104,12 @@ impl QwenImage21T2iLayout {
         u64::from(self.latent_height) * u64::from(self.latent_width)
     }
     pub fn sequence_length(&self) -> u64 {
-        u64::from(self.text_tokens) + self.target_tokens()
+        u64::from(self.text_tokens)
+            + self.target_tokens()
+            + self
+                .reference_image
+                .as_ref()
+                .map_or(0, |r| r.latent_tokens() - u64::from(r.image_slots()))
     }
     pub fn rows(&self) -> u64 {
         self.batch() * self.sequence_length()
@@ -96,6 +117,9 @@ impl QwenImage21T2iLayout {
     /// Axis order matches adjacent complex pairs: frame, height, width. Padding
     /// still occupies text positions; target frame uses padded T for all samples.
     pub fn rotary_position(&self, row: u64) -> Option<[i32; 3]> {
+        if self.reference_image.is_some() {
+            return self.edit_rotary_position(row);
+        }
         if row >= self.sequence_length() {
             return None;
         }
@@ -112,6 +136,9 @@ impl QwenImage21T2iLayout {
         ])
     }
     pub fn attention_layout(&self) -> Result<QwenImage21AttentionLayout, VNextError> {
+        if self.reference_image.is_some() {
+            return self.edit_attention_layout();
+        }
         let image = u32::try_from(self.target_tokens())
             .map_err(|_| invalid("layout", "target length exceeds u32"))?;
         let runs = self
@@ -219,7 +246,7 @@ impl QwenImage21TransformerConfig {
                 ElementType::F32,
             ),
         ];
-        specs
+        let mut specs = specs
             .into_iter()
             .map(|(id, dimensions, element_type)| {
                 let spec = ProgramTensorSpec {
@@ -230,7 +257,20 @@ impl QwenImage21TransformerConfig {
                 spec.validate(id)?;
                 Ok((ProgramValueId::new(id)?, spec))
             })
-            .collect()
+            .collect::<Result<BTreeMap<_, _>, VNextError>>()?;
+        if let Some(reference) = l.reference_image() {
+            let reference_spec = ProgramTensorSpec {
+                dimensions: vec![l.batch() * reference.latent_tokens(), t.in_channels()],
+                element_type: ElementType::Bf16,
+                layout: ResolvedTensorLayout::Contiguous,
+            };
+            reference_spec.validate(F::REFERENCE_LATENTS_ID)?;
+            specs.insert(
+                ProgramValueId::new(F::REFERENCE_LATENTS_ID)?,
+                reference_spec,
+            );
+        }
+        Ok(specs)
     }
     /// Compile every layer as one fixed-tensor program. Transport output
     /// dimensions depend on typed run-map attributes, so they are supplied
@@ -240,6 +280,32 @@ impl QwenImage21TransformerConfig {
         let mut options = ProgramPlanCompileOptions::new(self.input_tensor_specs()?)?;
         let l = &self.layout;
         let h = self.transformer.hidden_size();
+        if let Some(reference) = l.reference_image() {
+            for (name, rows, columns) in [
+                (
+                    program::COMBINED_LATENTS,
+                    l.batch() * (reference.latent_tokens() + l.target_tokens()),
+                    self.transformer.in_channels(),
+                ),
+                (
+                    program::UNORDERED_JOINT,
+                    l.batch()
+                        * (u64::from(l.text_tokens())
+                            + reference.latent_tokens()
+                            + l.target_tokens()),
+                    h,
+                ),
+            ] {
+                options.insert_tensor_spec(
+                    ProgramValueId::new(name)?,
+                    ProgramTensorSpec {
+                        dimensions: vec![rows, columns],
+                        element_type: ElementType::Bf16,
+                        layout: ResolvedTensorLayout::Contiguous,
+                    },
+                )?;
+            }
+        }
         for (name, rows) in std::iter::once((program::JOINT, l.rows()))
             .chain(
                 program::CONDITIONING

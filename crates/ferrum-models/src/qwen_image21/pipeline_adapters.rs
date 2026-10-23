@@ -25,6 +25,9 @@ use std::io::Write;
 
 pub const QWEN_IMAGE21_LATENT_CHANNELS: usize = 64;
 pub const QWEN_IMAGE21_LATENT_DECODE_PROFILE: &str = "qwen_image21.latent.bf16.mul_b.add_b.v1";
+/// Fixed Omni source casts both statistics to BF16, subtracts, then divides;
+/// it does not materialize a BF16 reciprocal or substitute reciprocal multiply.
+pub const QWEN_IMAGE21_LATENT_ENCODE_PROFILE: &str = "qwen_image21.latent.bf16.sub_b.div_b.v1";
 pub const QWEN_IMAGE21_RGBA8_PROFILE: &str =
     "qwen_image21.rgba8.clamp.bf16_half.bf16_shift.f32_scale.rne.v1";
 
@@ -341,6 +344,60 @@ impl QwenImage21ManagedLatents {
             shape: self.shape,
             layout: QwenImage21LatentLayout::Nchw,
             domain: QwenImage21LatentDomain::Denormalized,
+        })
+    }
+
+    /// Convert a finite VAE posterior-mode NCHW tensor to the normalized packed
+    /// reference-image port. The exact staged arithmetic is
+    /// `B(RN32(B(z - mean[channel]) / std[channel]))`, matching the BF16 tensor
+    /// subtraction and division in pinned `_encode_vae_image` (lines 817–830).
+    /// No reciprocal tensor or intermediate payload is created. The old backing
+    /// remains live while the complete destination is admitted and populated.
+    pub fn normalize_from_vae(
+        &self,
+        host: &HostMemoryAccount,
+        statistics: &QwenImage21LatentStatistics,
+        output_id: ProgramValueId,
+    ) -> Result<Self> {
+        ensure!(
+            host.owns(&self.bytes),
+            "latent belongs to a different Host account"
+        );
+        ensure!(
+            self.domain == QwenImage21LatentDomain::Denormalized
+                && self.layout == QwenImage21LatentLayout::Nchw,
+            "VAE normalization requires Denormalized NCHW latents"
+        );
+        let tensor = self.shape.tensor(QwenImage21LatentLayout::Packed)?;
+        let mut output =
+            host.allocate_zeroed(HostMemoryClass::InputPreprocess, self.shape.byte_len())?;
+        let [_, positions, _] = self.shape.0.sequence_dims();
+        for (index, bytes) in self.bytes.bytes().chunks_exact(2).enumerate() {
+            let channel = (index / positions) % 64;
+            let position = index % positions;
+            let batch = index / (64 * positions);
+            let difference =
+                bf16::from_f32(decode(bytes).to_f32() - statistics.mean[channel].to_f32());
+            ensure!(
+                difference.is_finite(),
+                "latent BF16 difference overflow at source element {index}"
+            );
+            let normalized = bf16::from_f32(difference.to_f32() / statistics.std[channel].to_f32());
+            ensure!(
+                normalized.is_finite(),
+                "latent BF16 quotient overflow at source element {index}"
+            );
+            let destination = ((batch * positions + position) * 64 + channel) * 2;
+            output.as_mut()[destination..destination + 2]
+                .copy_from_slice(&normalized.to_bits().to_le_bytes());
+        }
+        Ok(Self {
+            value_id: output_id,
+            tensor,
+            bytes: output.freeze(),
+            shape: self.shape,
+            layout: QwenImage21LatentLayout::Packed,
+            domain: QwenImage21LatentDomain::Normalized,
         })
     }
 }

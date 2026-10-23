@@ -77,7 +77,8 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 # HTTP client for testing
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
+bytes = "1"
 tokio-stream = "0.1"
 futures = "0.3"
 
@@ -93,7 +94,7 @@ libc = "0.2"
 [dev-dependencies]
 base64 = "0.22"
 ferrum-execution = { workspace = true, features = ["test-support"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 rstest = "0.23"
 async-openai = { version = "0.27", default-features = false, features = ["rustls"] }
 safetensors = { workspace = true }

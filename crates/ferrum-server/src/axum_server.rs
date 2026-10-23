@@ -453,6 +453,12 @@ impl AxumServer {
             .route("/v1/responses", post(responses::responses_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/images/generations", post(images::generations_handler))
+            .route(
+                "/v1/images/edits",
+                post(images::edits_handler).layer(axum::extract::DefaultBodyLimit::max(
+                    images::EDIT_BODY_LIMIT,
+                )),
+            )
             .route("/v1/models", get(models_handler))
             // Health & observability
             .route("/health", get(health_handler))

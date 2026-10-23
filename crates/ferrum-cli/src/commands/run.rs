@@ -689,13 +689,14 @@ pub async fn execute_cli(
                 "image run requires --output"
             ))
         })?;
-        super::image_product::execute_run_source(
+        super::image_product::execute_run_source_with_image(
             source,
             prompt,
             cmd.image.width.unwrap_or(512),
             cmd.image.height.unwrap_or(512),
             cmd.command.seed.unwrap_or(0),
             &output,
+            cmd.image.image.as_deref(),
         )?;
         Ok(())
     } else {

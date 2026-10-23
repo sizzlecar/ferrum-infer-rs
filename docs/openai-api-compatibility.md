@@ -5,7 +5,8 @@ describes the current product contract for the always-on server path.
 
 Ferrum serves text language models through chat completions, Responses, text
 completions, and model discovery. An independently configured experimental
-text-to-image service exposes image generations through the same server.
+image service exposes image generations through the same server and, when its
+loaded pipeline declares editing support, single-image edits.
 It is selected by a registered local pipeline directory or explicit
 `--image-config`; see the [image CLI and HTTP contract](../crates/ferrum-cli/README-image-generation.md).
 Experimental standalone embedding, ASR, and
@@ -25,11 +26,36 @@ will define their own contracts at the model registration and assembly boundary.
 | `POST /v1/responses` | Supported, stateless | Ordered text/reasoning/tool history, non-streaming and streaming output, usage, and caller-owned function/namespace-tool loops. |
 | `POST /v1/completions` | Supported | Non-streaming and streaming text completions with a single string `prompt`; prompt arrays/objects are rejected with `param=prompt`. |
 | `POST /v1/images/generations` | Experimental, requires configured image service | Text-to-image only; `n=1`, `b64_json`, explicit model/prompt and optional size/seed. Unknown fields and unsupported controls are rejected. Without an image service, valid requests return HTTP 503. |
-| `POST /v1/images/edits` | Not supported | Returns HTTP 404; no image-to-image input path is exposed. |
+| `POST /v1/images/edits` | Experimental, requires editing capability | Multipart input with one static RGB8/RGBA8 PNG, `model`, `prompt`, optional size/seed, `n=1` and `b64_json`. No image service returns 503; a loaded service without editing support or an invalid/unsupported input returns 400. |
 | `GET /v1/models` | Supported | Lists public model names and optional effective serving capacity. |
 | `POST /v1/embeddings` | Removed | Returns HTTP 404; requests are not routed to a text model. |
 | `POST /v1/audio/transcriptions` | Removed | Returns HTTP 404. |
 | `POST /v1/audio/speech` | Removed | Returns HTTP 404. |
+
+## Image Editing Boundary
+
+The ordinary local pipeline directory enables editing only after its visual
+encoder, processor and VAE encoder assets validate. Check
+`GET /health` → `images.capabilities.edits`. An explicit `--image-config` opts in
+with the optional `metadata.processor` path, using the same complete text/VAE
+configurations and archives; omission preserves generation-only setup. CLI editing uses
+`ferrum run MODEL_DIR --image reference.png --prompt ... --output edited.png`.
+Omitting `--image` leaves generation behavior unchanged.
+
+The multipart endpoint accepts `image` or its single-file alias `image[]`.
+Masks, multiple images, JPEG/WebP, animated/palette/grayscale/16-bit PNG and
+unsupported controls are rejected. The encoded file is limited to 16 MiB and
+the complete multipart body to 18 MiB; decoded input is limited to 24,000,000
+pixels and 8192 pixels per axis. Retained image buffers share the service's Host
+account. Its capacity can reject uploads below those size limits; parser and
+codec storage are separately bounded and are not a total-RSS guarantee.
+
+Each edit executes as one request in the bounded image worker queue, separately
+from compatible generation batches. `n` must remain `1`; edit batching is not
+exposed. Queue, upload-Host or output-session capacity exhaustion returns 429.
+See the [CLI/HTTP image contract](../crates/ferrum-cli/README-image-generation.md#single-image-editing)
+for examples, precise format/field restrictions and ownership limits. GPU
+end-to-end editing validation and editing throughput measurements remain pending.
 
 ## Output Limits
 

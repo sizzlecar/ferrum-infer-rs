@@ -45,6 +45,8 @@ fn tokenizer_sources() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
             "<|im_start|>",
             "<|im_end|>",
             "<|image_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
         ]
         .map(|t| tokenizers::AddedToken::from(t, true)),
     );
@@ -62,11 +64,133 @@ fn tokenizer() -> QwenImage21T2iTokenizer {
     QwenImage21T2iTokenizer::from_source_bytes(&t, &c, &j).unwrap()
 }
 fn architecture() -> Qwen3VLTextArchitecture {
+    architecture_with_layers(1)
+}
+fn architecture_with_layers(layers: u64) -> Qwen3VLTextArchitecture {
     Qwen3VLTextArchitecture::from_hf_value(&json!({"model_type":"qwen3_vl","architectures":["Qwen3VLForConditionalGeneration"],
         "text_config":{"model_type":"qwen3_vl_text","dtype":"bfloat16","hidden_act":"silu","attention_bias":false,"attention_dropout":0.0,
-            "num_hidden_layers":1,"hidden_size":4,"intermediate_size":8,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,
+            "num_hidden_layers":layers,"hidden_size":4,"intermediate_size":8,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,
             "vocab_size":32,"max_position_embeddings":1024,"rms_norm_eps":0.000001,"rope_theta":100,
             "rope_scaling":{"rope_type":"default","mrope_interleaved":true,"mrope_section":[1,1,0]}}})).unwrap()
+}
+
+#[test]
+fn edit_prompt_expands_only_the_single_image_run_and_reports_cropped_slots() {
+    let tokenizer = tokenizer();
+    let small = tokenizer.prepare_edit("cat", 64, 4, 4, 2).unwrap();
+    let large = tokenizer.prepare_edit("cat", 64, 8, 8, 2).unwrap();
+    assert_eq!(small.image_slots(), 4);
+    assert_eq!(large.image_slots(), 16);
+    assert_eq!(small.image_slot_start(), large.image_slot_start());
+    let start = small.prompts().drop_prefix_tokens() + small.image_slot_start() as usize;
+    let small_ids = small.prompts().input_ids();
+    let large_ids = large.prompts().input_ids();
+    assert_eq!(&small_ids[..start], &large_ids[..start]);
+    assert!(small_ids[start..start + 4]
+        .iter()
+        .all(|&v| v == small_ids[start]));
+    assert!(large_ids[start..start + 16]
+        .iter()
+        .all(|&v| v == small_ids[start]));
+    assert_eq!(&small_ids[start + 4..], &large_ids[start + 16..]);
+    let config = small.text_config(&architecture_with_layers(3)).unwrap();
+    assert_eq!(config.deepstack().unwrap().runs()[0].start(), start as u64);
+    assert_eq!(
+        small.prompts().feature_sequence_length() + 12,
+        large.prompts().feature_sequence_length()
+    );
+    assert!(tokenizer
+        .prepare_edit("cat <|image_pad|>", 64, 4, 4, 2)
+        .is_err());
+    assert!(tokenizer.prepare_edit("cat", 1, 4, 4, 2).is_err());
+    assert!(tokenizer.prepare_edit("cat", 64, 3, 4, 2).is_err());
+    assert!(tokenizer.prepare_edit("cat", 64, u64::MAX, 4, 2).is_err());
+}
+
+#[test]
+fn edit_inputs_copy_output_backings_under_one_host_and_preserve_visual_rows() {
+    use crate::qwen3_vl_text::Qwen3VLTextEncoderFamily as Text;
+    use crate::qwen3_vl_vision::Qwen3VLVisionFamily as Vision;
+    let prompt = tokenizer().prepare_edit("cat", 64, 4, 4, 2).unwrap();
+    let a = architecture_with_layers(3);
+    let rows = prompt.prompts().sequence_length();
+    let visual_bytes = 4 * 4 * 2;
+    let input_bytes = rows * 4 * 2 * 3 + visual_bytes * 3;
+    let host = account(input_bytes + visual_bytes * 4);
+    let spec = ResolvedTensorSpec::new(
+        vec![4, 4],
+        ElementType::Bf16,
+        ResolvedTensorLayout::Contiguous,
+    )
+    .unwrap();
+    let mut outputs = Vec::new();
+    for (index, name) in std::iter::once(Vision::OUTPUT_ID)
+        .chain(Vision::DEEPSTACK_IDS)
+        .enumerate()
+    {
+        let mut bytes = host
+            .allocate_zeroed(HostMemoryClass::Output, visual_bytes)
+            .unwrap();
+        for (j, b) in bytes.as_mut().chunks_exact_mut(2).enumerate() {
+            b.copy_from_slice(&(0x3f00_u16 + index as u16 * 32 + j as u16).to_le_bytes());
+        }
+        outputs.push((
+            ProgramValueId::new(name).unwrap(),
+            spec.clone(),
+            bytes.freeze(),
+        ));
+    }
+    let table = (0..32 * 4)
+        .flat_map(|_| 0x3e80_u16.to_le_bytes())
+        .collect::<Vec<_>>();
+    let parts = outputs
+        .iter()
+        .map(|(id, t, b)| (id, t, b))
+        .collect::<Vec<_>>();
+    let occupied = host
+        .allocate_zeroed(HostMemoryClass::InputPreprocess, 1)
+        .unwrap();
+    assert!(prompt
+        .managed_text_parts(&host, &a, &table, &parts)
+        .is_err());
+    assert_eq!(
+        host.usage().unwrap().committed_bytes(),
+        visual_bytes * 4 + 1
+    );
+    drop(occupied);
+    let inputs = prompt
+        .managed_text_parts(&host, &a, &table, &parts)
+        .unwrap();
+    assert_eq!(inputs.len(), 6);
+    let start = prompt.prompts().drop_prefix_tokens() + prompt.image_slot_start() as usize;
+    let embedding = inputs
+        .iter()
+        .find(|t| t.value_id().as_str() == Text::EMBEDDINGS_ID)
+        .unwrap();
+    assert_eq!(
+        &embedding.bytes().bytes()[start * 8..(start + 4) * 8],
+        outputs[0].2.bytes()
+    );
+    assert_eq!(&embedding.bytes().bytes()[..2], &0x3e80_u16.to_le_bytes());
+    for (input, source) in inputs[3..].iter().zip(&outputs[1..]) {
+        assert_eq!(input.bytes().bytes(), source.2.bytes());
+        assert_eq!(input.bytes().class(), HostMemoryClass::InputPreprocess);
+        assert!(!input.bytes().same_region(&source.2));
+    }
+    assert_eq!(
+        host.usage().unwrap().allocated_bytes(),
+        input_bytes + visual_bytes * 4
+    );
+    let foreign = account(input_bytes + visual_bytes * 4);
+    assert!(prompt
+        .managed_text_parts(&foreign, &a, &table, &parts)
+        .is_err());
+    assert_eq!(foreign.usage().unwrap().committed_bytes(), 0);
+    drop(parts);
+    drop(outputs);
+    assert_eq!(host.usage().unwrap().allocated_bytes(), input_bytes);
+    drop(inputs);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }
 fn account(bytes: usize) -> HostMemoryAccount {
     HostMemoryAccount::new(

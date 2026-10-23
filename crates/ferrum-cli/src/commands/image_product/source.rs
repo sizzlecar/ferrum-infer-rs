@@ -40,6 +40,8 @@ impl WeightSource {
 impl ImageProductConfig {
     /// All metadata is retained and validated before the caller creates CUDA.
     /// Explicit archive filenames never fall back or discover another source.
+    /// An explicit processor path enables editing validation; missing or
+    /// incompatible editing assets never silently fall back to generation.
     pub fn prepare_assets(&self) -> Result<QwenImage21Assets> {
         let paths = &self.metadata;
         let model_index = read_bounded(&paths.model_index, 4 * 1024 * 1024)?;
@@ -47,6 +49,11 @@ impl ImageProductConfig {
         match declaration.architecture() {
             PipelineArchitecture::QwenImage21 => {}
         }
+        let processor = paths
+            .processor
+            .as_ref()
+            .map(|path| read_bounded(path, 4 * 1024 * 1024))
+            .transpose()?;
         let text = read_bounded(&paths.text_encoder, 4 * 1024 * 1024)?;
         let transformer = read_bounded(&paths.transformer, 4 * 1024 * 1024)?;
         let vae = read_bounded(&paths.vae, 4 * 1024 * 1024)?;
@@ -54,7 +61,7 @@ impl ImageProductConfig {
         let tokenizer = read_bounded(&paths.tokenizer, 32 * 1024 * 1024)?;
         let tokenizer_config = read_bounded(&paths.tokenizer_config, 1024 * 1024)?;
         let chat_template = read_bounded(&paths.chat_template, 64 * 1024)?;
-        QwenImage21Assets::prepare(
+        let assets = QwenImage21Assets::prepare(
             QwenImage21Metadata {
                 text_encoder: &text,
                 transformer: &transformer,
@@ -70,6 +77,10 @@ impl ImageProductConfig {
                 transformer: self.weights.transformer.open()?,
                 vae: self.weights.vae.open()?,
             },
-        )
+        )?;
+        match processor {
+            Some(processor) => assets.with_image_editing(&text, &vae, &processor),
+            None => Ok(assets),
+        }
     }
 }

@@ -7,7 +7,8 @@
 //! A future resident generator can use the same queue. Pending prompts are bounded separately
 //! from the generator's shared Host tensor account.
 
-use super::{ImageGenerationOutput, ImageGenerationRequest, QwenImage21Pipeline};
+use super::{ImageEditRequest, ImageGenerationOutput, ImageGenerationRequest, QwenImage21Pipeline};
+use ferrum_models::qwen_image21::image_input::ImageInputLimits;
 use ferrum_runtime::{DeviceRuntime, HostMemoryAccount};
 use serde::Serialize;
 use std::{
@@ -33,6 +34,8 @@ type GeneratorError = Box<dyn Error + Send + 'static>;
 /// retain their original owner until explicit service retirement.
 #[derive(Debug)]
 pub enum ImageBatchError {
+    /// Typed request input rejection, with no native work/recovery obligation.
+    InvalidInput(String),
     Rejected(String),
     Fatal(GeneratorError),
 }
@@ -44,6 +47,7 @@ impl From<GeneratorError> for ImageBatchError {
 impl fmt::Display for ImageBatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidInput(message) => f.write_str(message),
             Self::Rejected(message) => f.write_str(message),
             Self::Fatal(error) => fmt::Display::fmt(error, f),
         }
@@ -78,6 +82,17 @@ pub trait ImageGenerator: Send + 'static {
     /// Metadata-only validation: this method must not initialize work or create
     /// recovery obligations. Execution failures belong to `generate_batch`.
     fn capabilities(&self) -> Result<ImageGeneratorCapabilities, GeneratorError>;
+    fn supports_edits(&self) -> bool {
+        false
+    }
+    fn edit(
+        &mut self,
+        _request: ImageEditRequest,
+    ) -> Result<ImageGenerationOutput, ImageBatchError> {
+        Err(ImageBatchError::Rejected(
+            "image editing is not supported by this generator".into(),
+        ))
+    }
     fn compatible(&self, _a: &ImageGenerationRequest, _b: &ImageGenerationRequest) -> bool {
         true
     }
@@ -94,6 +109,18 @@ pub trait ImageGenerator: Send + 'static {
 }
 
 impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
+    fn supports_edits(&self) -> bool {
+        QwenImage21Pipeline::supports_edits(self)
+    }
+    fn edit(
+        &mut self,
+        request: ImageEditRequest,
+    ) -> Result<ImageGenerationOutput, ImageBatchError> {
+        match QwenImage21Pipeline::edit(self, request) {
+            Ok(output) => Ok(output),
+            Err(error) => Err(qwen_batch_error(self.is_stopped(), error)),
+        }
+    }
     fn shutdown(&mut self) -> Result<(), GeneratorError> {
         QwenImage21Pipeline::shutdown(self)
             .map(|_| ())
@@ -148,6 +175,18 @@ fn qwen_batch_error<R: DeviceRuntime>(
     // pre-run, empty-receipt path is safe to discard after returning a message.
     if !stopped && error.completed_stages.is_empty() && error.completed_steps.is_empty() {
         if let super::ImageGenerationFailure::Preflight(source) = &error.failure {
+            use ferrum_models::qwen_image21::image_input::ImageInputError;
+            if matches!(
+                source.downcast_ref::<ImageInputError>(),
+                Some(
+                    ImageInputError::Invalid(_)
+                        | ImageInputError::Unsupported(_)
+                        | ImageInputError::Limit(_)
+                        | ImageInputError::Png(_)
+                )
+            ) {
+                return ImageBatchError::InvalidInput(format!("image input: {source:#}"));
+            }
             return ImageBatchError::Rejected(format!("image preflight: {source:#}"));
         }
     }
@@ -205,6 +244,7 @@ pub struct ImageService {
     core: ServiceCore<ImageGenerationOutput>,
     host: HostMemoryAccount,
     capabilities: ImageGeneratorCapabilities,
+    supports_edits: bool,
 }
 
 impl ImageService {
@@ -217,10 +257,12 @@ impl ImageService {
         })?;
         validate_config(config, capabilities)?;
         let host = generator.host_account().clone();
+        let supports_edits = generator.supports_edits();
         Ok(Self {
             core: ServiceCore::start(Box::new(GeneratorAdapter(generator)), config)?,
             host,
             capabilities,
+            supports_edits,
         })
     }
 
@@ -229,6 +271,9 @@ impl ImageService {
     }
     pub fn capabilities(&self) -> ImageGeneratorCapabilities {
         self.capabilities
+    }
+    pub fn supports_edits(&self) -> bool {
+        self.supports_edits
     }
     pub fn snapshot(&self) -> ImageServiceSnapshot {
         self.core.snapshot()
@@ -264,6 +309,35 @@ impl ImageService {
         self.validate_request(&request)?;
         self.core
             .try_submit(request)
+            .map(|inner| ImageJob { inner })
+    }
+
+    pub fn validate_edit_request(
+        &self,
+        request: &ImageEditRequest,
+    ) -> Result<(), ImageServiceError> {
+        self.validate_request(&request.generation)?;
+        if !self.supports_edits
+            || !self.host.owns(&request.image)
+            || request.image.class() != ferrum_runtime::HostMemoryClass::InputPreprocess
+            || request.image.is_empty()
+            || request.image.len() > ImageInputLimits::default().maximum_encoded_bytes()
+        {
+            return Err(service_error(ImageServiceErrorKind::InvalidRequest,
+                "editing requires supported single-image capability and a bounded PNG backing from this service Host account"));
+        }
+        Ok(())
+    }
+
+    /// Edits share the generator worker and retirement authority. The initial
+    /// single-image edit path never batches edits or mixes them with generation.
+    pub fn try_submit_edit(
+        &self,
+        request: ImageEditRequest,
+    ) -> Result<ImageJob, ImageServiceError> {
+        self.validate_edit_request(&request)?;
+        self.core
+            .try_submit_request(QueuedRequest::Edit(request))
             .map(|inner| ImageJob { inner })
     }
 
@@ -384,6 +458,11 @@ trait BatchWorker: Send + 'static {
         &mut self,
         requests: Vec<ImageGenerationRequest>,
     ) -> Result<Vec<Self::Output>, ImageBatchError>;
+    fn edit(&mut self, _request: ImageEditRequest) -> Result<Self::Output, ImageBatchError> {
+        Err(ImageBatchError::Rejected(
+            "image editing is not supported by this worker".into(),
+        ))
+    }
     fn shutdown(&mut self) -> Result<(), GeneratorError> {
         Ok(())
     }
@@ -391,6 +470,9 @@ trait BatchWorker: Send + 'static {
 struct GeneratorAdapter<P>(P);
 impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
     type Output = ImageGenerationOutput;
+    fn edit(&mut self, request: ImageEditRequest) -> Result<Self::Output, ImageBatchError> {
+        self.0.edit(request)
+    }
     fn shutdown(&mut self) -> Result<(), GeneratorError> {
         self.0.shutdown()
     }
@@ -446,6 +528,7 @@ impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
                 }
                 Err(error) => {
                     let outcome = match error {
+                        ImageBatchError::InvalidInput(_) => "invalid_input",
                         ImageBatchError::Rejected(_) => "rejected",
                         ImageBatchError::Fatal(_) => "fatal",
                     };
@@ -463,8 +546,22 @@ impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
     }
 }
 
+enum QueuedRequest {
+    Generate(ImageGenerationRequest),
+    Edit(ImageEditRequest),
+}
+
+impl QueuedRequest {
+    fn generation(&self) -> &ImageGenerationRequest {
+        match self {
+            Self::Generate(request) => request,
+            Self::Edit(request) => &request.generation,
+        }
+    }
+}
+
 struct Queued<O> {
-    request: ImageGenerationRequest,
+    request: QueuedRequest,
     submitted: Instant,
     cancelled: Arc<AtomicBool>,
     response: oneshot::Sender<Result<O, ImageServiceError>>,
@@ -578,6 +675,9 @@ impl<O: Send + 'static> ServiceCore<O> {
         }
     }
     fn try_submit(&self, request: ImageGenerationRequest) -> Result<Job<O>, ImageServiceError> {
+        self.try_submit_request(QueuedRequest::Generate(request))
+    }
+    fn try_submit_request(&self, request: QueuedRequest) -> Result<Job<O>, ImageServiceError> {
         let mut state = self.shared.lock();
         prune_cancelled(&mut state.queue);
         if !state.accepting {
@@ -700,6 +800,10 @@ fn take_batch<O: Send + 'static>(
                 .unwrap_or_else(|e| e.into_inner());
             continue;
         };
+        if matches!(first.request, QueuedRequest::Edit(_)) {
+            state.active = 1;
+            return Some(state.queue.drain(..1).collect());
+        }
         let mut count = 1;
         let mut incompatible = false;
         for job in state
@@ -708,9 +812,10 @@ fn take_batch<O: Send + 'static>(
             .skip(1)
             .take(shared.config.max_num_seqs.saturating_sub(1))
         {
-            if job.request.width != first.request.width
-                || job.request.height != first.request.height
-                || !worker.compatible(&first.request, &job.request)
+            if matches!(job.request, QueuedRequest::Edit(_))
+                || job.request.generation().width != first.request.generation().width
+                || job.request.generation().height != first.request.generation().height
+                || !worker.compatible(first.request.generation(), job.request.generation())
             {
                 incompatible = true;
                 break;
@@ -750,14 +855,45 @@ fn worker_loop<O: Send + 'static>(
                 requests.push(job.request);
                 responses.push((job.cancelled, job.response));
             }
-            let outcome = catch_unwind(AssertUnwindSafe(|| worker.generate_batch(requests)));
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                if requests.len() == 1 && matches!(requests.first(), Some(QueuedRequest::Edit(_))) {
+                    match requests.pop().unwrap() {
+                        QueuedRequest::Edit(request) => {
+                            worker.edit(request).map(|output| vec![output])
+                        }
+                        QueuedRequest::Generate(_) => unreachable!(),
+                    }
+                } else {
+                    let generated = requests
+                        .into_iter()
+                        .map(|request| match request {
+                            QueuedRequest::Generate(request) => Ok(request),
+                            QueuedRequest::Edit(_) => Err(ImageBatchError::Rejected(
+                                "mixed editing batch is unsupported".into(),
+                            )),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    worker.generate_batch(generated)
+                }
+            }));
             let outcome = match outcome {
                 Ok(Ok(outputs)) if outputs.len() == responses.len() => Ok(outputs),
                 Ok(Ok(_)) => Err(ImageWorkerFailure::Generation(Box::new(service_error(
                     ImageServiceErrorKind::Generation,
                     "generator returned a different number of outputs than batch requests",
                 )))),
-                Ok(Err(ImageBatchError::Rejected(message))) => {
+                Ok(Err(
+                    error @ (ImageBatchError::Rejected(_) | ImageBatchError::InvalidInput(_)),
+                )) => {
+                    let (message, kind) = match error {
+                        ImageBatchError::InvalidInput(message) => {
+                            (message, ImageServiceErrorKind::InvalidRequest)
+                        }
+                        ImageBatchError::Rejected(message) => {
+                            (message, ImageServiceErrorKind::Generation)
+                        }
+                        ImageBatchError::Fatal(_) => unreachable!(),
+                    };
                     shared.lock().active = 0;
                     for (cancelled, response) in responses {
                         let error = if cancelled.load(Ordering::Acquire) {
@@ -769,7 +905,7 @@ fn worker_loop<O: Send + 'static>(
                             // A preflight rejection can be a server-side plan
                             // problem as well as a request problem. Do not turn
                             // every owner-free rejection into HTTP 400.
-                            service_error(ImageServiceErrorKind::Generation, message.clone())
+                            service_error(kind, message.clone())
                         };
                         let _ = response.send(Err(error));
                     }
@@ -842,5 +978,7 @@ fn worker_loop<O: Send + 'static>(
     }
 }
 
+#[cfg(test)]
+mod edit_tests;
 #[cfg(test)]
 mod tests;

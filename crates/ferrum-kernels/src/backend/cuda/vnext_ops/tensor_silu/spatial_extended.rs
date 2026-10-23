@@ -2,15 +2,20 @@
 //! admitted buffers and one shared native-module owner as the other providers.
 
 use super::*;
+mod group_mean;
 use ferrum_runtime::{
-    spatial_attention_bf16_contract, spatial_upsample_gather_bf16_contract, PhysicalWeightLayout,
-    SpatialAttentionBf16Geometry, SpatialUpsampleGatherBf16Geometry, WeightFormatId,
+    spatial_attention_bf16_contract, spatial_group_mean_bf16_contract,
+    spatial_upsample_gather_bf16_contract, PhysicalWeightLayout, SpatialAttentionBf16Geometry,
+    SpatialGroupMeanBf16Geometry, SpatialUpsampleGatherBf16Geometry, WeightFormatId,
     SPATIAL_ATTENTION_BF16_CAPABILITY_ID, SPATIAL_ATTENTION_BF16_OPERATION_ID,
+    SPATIAL_GROUP_MEAN_BF16_CAPABILITY_ID, SPATIAL_GROUP_MEAN_BF16_OPERATION_ID,
     SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID, SPATIAL_UPSAMPLE_GATHER_BF16_OPERATION_ID,
 };
+use group_mean::NativeGroupMean;
 
 pub const ATTENTION_PROFILE_ID: &str = "cuda.ieee.spatial_attention.bf16.online_padded_pairwise.v1";
 pub const GATHER_PROFILE_ID: &str = "cuda.bitcopy.spatial_upsample_gather.bf16.v1";
+pub const GROUP_MEAN_PROFILE_ID: &str = "cuda.ieee.spatial_group_mean.bf16.ascending_f32.v1";
 pub const NUMERICAL_IDENTITY: &str = concat!(
     "attention=single-head-full-spatial;QKV[N,3C,H,W];Y[N,C,H,W];C=1..2048;",
     "256-threads;8-Q-and-accumulator-scalar-slots-per-thread;",
@@ -30,54 +35,63 @@ pub const NUMERICAL_IDENTITY: &str = concat!(
 pub(super) enum Kind {
     Attention,
     Gather,
+    GroupMean,
 }
 impl Kind {
     pub(super) fn index(self) -> usize {
         match self {
             Self::Attention => 0,
             Self::Gather => 1,
+            Self::GroupMean => 2,
         }
     }
     pub(super) fn function(self) -> &'static str {
         match self {
             Self::Attention => "ferrum_vnext_spatial_attention_bf16",
             Self::Gather => "ferrum_vnext_spatial_upsample_gather_bf16",
+            Self::GroupMean => "ferrum_vnext_spatial_group_mean_bf16",
         }
     }
     fn operation(self) -> &'static str {
         match self {
             Self::Attention => SPATIAL_ATTENTION_BF16_OPERATION_ID,
             Self::Gather => SPATIAL_UPSAMPLE_GATHER_BF16_OPERATION_ID,
+            Self::GroupMean => SPATIAL_GROUP_MEAN_BF16_OPERATION_ID,
         }
     }
     fn capability(self) -> &'static str {
         match self {
             Self::Attention => SPATIAL_ATTENTION_BF16_CAPABILITY_ID,
             Self::Gather => SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID,
+            Self::GroupMean => SPATIAL_GROUP_MEAN_BF16_CAPABILITY_ID,
         }
     }
     fn profile(self) -> &'static str {
         match self {
             Self::Attention => ATTENTION_PROFILE_ID,
             Self::Gather => GATHER_PROFILE_ID,
+            Self::GroupMean => GROUP_MEAN_PROFILE_ID,
         }
     }
     fn provider(self) -> &'static str {
         match self {
             Self::Attention => "provider.cuda.spatial_attention.bf16",
             Self::Gather => "provider.cuda.spatial_upsample_gather.bf16",
+            Self::GroupMean => "provider.cuda.spatial_group_mean.bf16",
         }
     }
     fn estimator(self) -> &'static str {
         match self {
             Self::Attention => "resource-estimator.cuda.spatial_attention.bf16",
             Self::Gather => "resource-estimator.cuda.spatial_upsample_gather.bf16",
+            Self::GroupMean => "resource-estimator.cuda.spatial_group_mean.bf16",
         }
     }
     fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::Attention => spatial_attention_bf16_contract(),
             Self::Gather => spatial_upsample_gather_bf16_contract(),
+            Self::GroupMean => spatial_group_mean_bf16_contract(),
         }
     }
 }
@@ -270,6 +284,18 @@ impl SpatialProvider {
                             shared_mem_bytes: 0,
                         }
                     }
+                    NativeShape::GroupMean(metadata) => {
+                        launch.arg(&shape.elements).arg(metadata);
+                        LaunchConfig {
+                            grid_dim: (
+                                shape.elements.div_ceil(THREADS as u64).min(MAX_BLOCKS) as u32,
+                                1,
+                                1,
+                            ),
+                            block_dim: (THREADS, 1, 1),
+                            shared_mem_bytes: 0,
+                        }
+                    }
                 };
                 unsafe { launch.launch(config) }
                     .map(|_| ())
@@ -299,6 +325,7 @@ enum NativeShape {
         scale: f32,
     },
     Gather(NativeGather),
+    GroupMean(NativeGroupMean),
 }
 /// Exact initialized by-value ABI; 584 bytes plus pointers and element count.
 #[repr(C)]
@@ -386,6 +413,14 @@ fn geometry(
                 NativeShape::Gather(NativeGather::new(&g)),
                 g.element_count(),
                 0,
+            )
+        }
+        Kind::GroupMean => {
+            let g = SpatialGroupMeanBf16Geometry::new(x, y, attrs).map_err(|e| e.to_string())?;
+            (
+                NativeShape::GroupMean(NativeGroupMean::new(&g)),
+                g.element_count(),
+                g.logical_arithmetic_operations(),
             )
         }
     };

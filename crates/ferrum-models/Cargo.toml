@@ -50,6 +50,8 @@ ferrum-quantization = { workspace = true }
 half = { workspace = true }
 # Deterministic CPU conditioning arithmetic; same small pin as ferrum-kernels.
 libm = "=0.2.15"
+# Bounded managed input-image decoding shared by CLI and HTTP editing.
+png = "=0.18.1"
 # CUDA ownership tests inspect the same device allocations as ferrum-kernels.
 cudarc = { version = "0.19", default-features = false, features = ["driver"], optional = true }
 
@@ -83,7 +85,6 @@ tempfile = { version = "3.8", optional = true }
 sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
-png = "=0.18.1"
 ferrum-output = { workspace = true }
 ferrum-execution = { workspace = true, features = ["test-support"] }
 tokio-test = "0.4"

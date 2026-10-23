@@ -84,6 +84,92 @@ fn statistics_are_fixed_64_channels_and_validate_after_both_casts() {
 }
 
 #[test]
+fn vae_mode_normalization_preserves_subtraction_boundary_and_tensor_division() {
+    let shape = QwenImage21LatentShape::new(1, 1, 2).unwrap();
+    let host = account(shape.byte_len() * 2, 0);
+    let source_bits = (0..64).flat_map(|_| [0x3fa0, 0x3fc0]).collect::<Vec<_>>();
+    let source = input(
+        &host,
+        shape,
+        QwenImage21LatentLayout::Nchw,
+        QwenImage21LatentDomain::Denormalized,
+        &source_bits,
+    );
+    let stats = statistics(-1.0 / 256.0, 3.0);
+    let output = source
+        .normalize_from_vae(&host, &stats, id("value.reference.latents"))
+        .unwrap();
+    // B(1.25 + 1/256)=1.25, then B(1.25/3)=0x3ed5. Omitting the
+    // subtraction B or multiplying a BF16 reciprocal gives 0x3ed6 instead.
+    let observed = bits(output.bytes());
+    assert_eq!(&observed[..64], &[0x3ed5; 64]);
+    assert_eq!(&observed[64..], &[0x3f00; 64]);
+    assert_eq!(
+        bf16::from_f32((1.25_f32 + 1.0 / 256.0) / 3.0).to_bits(),
+        0x3ed6
+    );
+    assert_eq!(
+        bf16::from_f32(1.25 * bf16::from_f32(1.0 / 3.0).to_f32()).to_bits(),
+        0x3ed6
+    );
+    assert_eq!(output.layout(), QwenImage21LatentLayout::Packed);
+    assert_eq!(output.domain(), QwenImage21LatentDomain::Normalized);
+    assert_eq!(output.value_id(), &id("value.reference.latents"));
+    assert_eq!(bits(source.bytes()), source_bits);
+    assert!(output
+        .normalize_from_vae(&host, &stats, id("value.double"))
+        .is_err());
+    let held = output.bytes().clone();
+    drop(output);
+    drop(source);
+    assert_eq!(host.usage().unwrap().allocated_bytes(), shape.byte_len());
+    drop(held);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn vae_normalization_admission_and_late_failure_do_not_publish_or_leak() {
+    let shape = QwenImage21LatentShape::new(1, 1, 1).unwrap();
+    let host = account(shape.byte_len() * 2 - 1, 0);
+    let source = input(
+        &host,
+        shape,
+        QwenImage21LatentLayout::Nchw,
+        QwenImage21LatentDomain::Denormalized,
+        &[0x3f80; 64],
+    );
+    assert!(source
+        .normalize_from_vae(&host, &statistics(0., 1.), id("value.next"))
+        .is_err());
+    let foreign = account(shape.byte_len() * 2, 0);
+    assert!(source
+        .normalize_from_vae(&foreign, &statistics(0., 1.), id("value.foreign"))
+        .is_err());
+    assert_eq!(host.usage().unwrap().allocated_bytes(), shape.byte_len());
+    assert_eq!(foreign.usage().unwrap().committed_bytes(), 0);
+    drop(source);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    let host = account(shape.byte_len() * 2, 0);
+    let mut values = [0x3f80; 64];
+    values[63] = 0x7f7f;
+    let source = input(
+        &host,
+        shape,
+        QwenImage21LatentLayout::Nchw,
+        QwenImage21LatentDomain::Denormalized,
+        &values,
+    );
+    let mut stats = statistics(0., 1.);
+    stats.mean[63] = bf16::from_bits(0xff7f);
+    assert!(source
+        .normalize_from_vae(&host, &stats, id("value.nonfinite"))
+        .is_err());
+    assert_eq!(host.usage().unwrap().allocated_bytes(), shape.byte_len());
+    drop(source);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
 fn checked_shape_rejects_zero_overflow_and_equal_numel_wrong_rank() {
     for dims in [
         (0, 1, 1),

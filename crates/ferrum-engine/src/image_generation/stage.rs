@@ -5,6 +5,8 @@ use std::{fmt, time::Instant};
 #[serde(rename_all = "snake_case")]
 pub enum ImageStage {
     TextEncoder,
+    VisionEncoder,
+    VaeEncoder,
     Noise,
     Denoiser,
     Decoder,
@@ -13,6 +15,8 @@ impl ImageStage {
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::TextEncoder => "text",
+            Self::VisionEncoder => "vision",
+            Self::VaeEncoder => "encode",
             Self::Noise => "noise",
             Self::Denoiser => "denoise",
             Self::Decoder => "decode",

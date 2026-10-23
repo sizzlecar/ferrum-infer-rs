@@ -36,16 +36,19 @@ mod attention;
 mod bundle;
 mod conv2d;
 mod cudnn_attention;
+mod cudnn_segmented;
 mod geometry;
 mod gqa;
 mod half_split_rope;
 mod norm;
 mod philox;
+mod primitives;
 pub use philox::{
     CudaPhiloxDeviceGeometry, CudaPhiloxLaunchGeometry,
     BUILD_IDENTITY_SHA256 as PHILOX_BUILD_IDENTITY_SHA256,
     NUMERICAL_IDENTITY as PHILOX_NORMAL_IDENTITY, NUMERICAL_PROFILE_ID as PHILOX_NORMAL_PROFILE_ID,
 };
+pub use primitives::profile as tensor_primitive_profile;
 mod rope;
 mod selection;
 mod spatial;
@@ -64,6 +67,7 @@ pub use cudnn_attention::{
     NUMERICAL_IDENTITY as FUSED_ATTENTION_NUMERICAL_IDENTITY,
     NUMERICAL_PROFILE_ID as FUSED_ATTENTION_NUMERICAL_PROFILE_ID,
 };
+pub use cudnn_segmented::NUMERICAL_PROFILE_ID as CUDNN_SEGMENTED_ATTENTION_PROFILE_ID;
 use geometry::{geometry, Shape};
 pub use gqa::{
     NUMERICAL_IDENTITY as GQA_NUMERICAL_IDENTITY, NUMERICAL_PROFILE_ID as GQA_NUMERICAL_PROFILE_ID,
@@ -88,6 +92,7 @@ pub use spatial::{
 pub use spatial_extended::{
     ATTENTION_PROFILE_ID as SPATIAL_ATTENTION_PROFILE_ID,
     GATHER_PROFILE_ID as SPATIAL_GATHER_PROFILE_ID,
+    GROUP_MEAN_PROFILE_ID as SPATIAL_GROUP_MEAN_PROFILE_ID,
 };
 pub use text_projection::{
     GELU_TANH_PROFILE_ID, NUMERICAL_IDENTITY as TEXT_PROJECTION_NUMERICAL_IDENTITY,
@@ -259,12 +264,18 @@ pub(super) fn numerical_fingerprint() -> String {
         BUNDLE_NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("tensor_silu.rs"),
         include_bytes!("tensor_silu/bundle.rs"),
+        include_bytes!("tensor_silu/primitives.rs"),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_tensor_primitives.cuh"
+        )),
         include_bytes!("tensor_silu/conv2d.rs"),
         include_bytes!("tensor_silu/cudnn_attention.rs"),
         include_bytes!("tensor_silu/cudnn_attention/layout.rs"),
         cudnn_attention::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("tensor_silu/spatial.rs"),
         include_bytes!("tensor_silu/spatial_extended.rs"),
+        include_bytes!("tensor_silu/spatial_extended/group_mean.rs"),
         spatial_extended::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("tensor_silu/geometry.rs"),
         include_bytes!("tensor_silu/norm.rs"),

@@ -109,6 +109,78 @@ impl QwenImage21T2iTokenizer {
     pub fn drop_prefix_tokens(&self) -> usize {
         self.prefix.len()
     }
+    /// Encode the raw image-conditioned template, checking the user contribution
+    /// before expanding the single image placeholder to the merged visual grid.
+    pub fn prepare_edit(
+        &self,
+        prompt: &str,
+        maximum_user_tokens: usize,
+        grid_height: u64,
+        grid_width: u64,
+        merge: u64,
+    ) -> Result<QwenImage21EditPrompt> {
+        use crate::qwen3_vl_text::Qwen3VLTextImageSpan;
+        ensure!(
+            (1..=8192).contains(&maximum_user_tokens) && prompt.len() <= MAX_TOTAL_PROMPT_BYTES,
+            "edit prompt exceeds declared input limits"
+        );
+        let user = encode(&self.engine, prompt, true)?;
+        ensure!(
+            !user.iter().any(|id| self.forbidden_vision.contains(id)),
+            "edit prompt cannot supply additional visual placeholders"
+        );
+        for marker in ["<|vision_start|>", "<|image_pad|>", "<|vision_end|>"] {
+            let id = self
+                .engine
+                .token_to_id(marker)
+                .ok_or_else(|| anyhow::anyhow!("processor has no edit marker {marker}"))?;
+            ensure!(
+                encode(&self.engine, marker, true)? == [id],
+                "edit marker must encode to exactly its declared token"
+            );
+        }
+        let image_id = self
+            .engine
+            .token_to_id("<|image_pad|>")
+            .ok_or_else(|| anyhow::anyhow!("processor has no image placeholder"))?;
+        let rendered = render(&format!(
+            "<image1><|vision_start|><|image_pad|><|vision_end|>{}",
+            if prompt.is_empty() { " " } else { prompt }
+        ));
+        let mut ids = encode(&self.engine, &rendered, true)?;
+        ensure!(
+            ids.starts_with(&self.prefix)
+                && ids.len().saturating_sub(self.baseline) <= maximum_user_tokens,
+            "edit prompt changes the system prefix or exceeds user-token budget"
+        );
+        let mut positions = ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &id)| (id == image_id).then_some(i));
+        let start = positions
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("edit template has no image slot"))?;
+        ensure!(
+            positions.next().is_none() && start >= self.prefix.len(),
+            "edit template must have exactly one image slot after system prefix"
+        );
+        let span = Qwen3VLTextImageSpan::new(start as u64, grid_height, grid_width, merge)?;
+        let slots = usize::try_from(span.visual_run().length())?;
+        let expanded = ids
+            .len()
+            .checked_add(slots - 1)
+            .ok_or_else(|| anyhow::anyhow!("expanded edit prompt overflows"))?;
+        ensure!(
+            expanded < 8192 + self.prefix.len(),
+            "expanded edit prompt exceeds the declared DiT text capacity"
+        );
+        ids.try_reserve_exact(slots - 1)?;
+        ids.splice(start..start + 1, std::iter::repeat_n(image_id, slots));
+        Ok(QwenImage21EditPrompt {
+            batch: QwenImage21T2iPromptBatch::from_encoded(vec![ids], self.prefix.len(), self.pad)?,
+            span,
+        })
+    }
     /// Mirrors Omni's user-token budget: max(full_tokens - empty_template, 0).
     /// Empty strings become one space. No truncation occurs. Raw prompt bytes
     /// across the batch are independently bounded to 1 MiB for tokenizer work.

@@ -111,6 +111,108 @@ fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
 }
 
 #[test]
+fn optional_edit_processor_is_shared_by_run_and_serve_and_resolves_exactly() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image.json");
+    let base = fs::canonicalize(directory.path()).unwrap();
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    let mut wire = configuration();
+    assert!(load(&wire).unwrap().metadata.processor.is_none());
+    wire["metadata"]["processor"] = Value::Null;
+    assert!(load(&wire).unwrap().metadata.processor.is_none());
+    for serving in [false, true] {
+        wire["serving"] = if serving {
+            json!({"maximum_pending":2,"maximum_prompt_bytes":4096,"max_num_seqs":1,
+                "request_batch_max_wait_ms":0,"default_width":512,"default_height":512,
+                "default_seed":0,"rgba_scratch_bytes":16384,"output":{}})
+        } else {
+            Value::Null
+        };
+        wire["metadata"]["processor"] = json!("processor/processor_config.json");
+        let config = load(&wire).unwrap();
+        assert_eq!(
+            config.metadata.processor.as_deref(),
+            Some(base.join("processor/processor_config.json").as_path())
+        );
+        assert_eq!(
+            config.execution_profile,
+            ImageExecutionProfile::ExperimentalSerialCold
+        );
+        let absolute = base.join("explicit-processor.json");
+        wire["metadata"]["processor"] = json!(absolute);
+        assert_eq!(load(&wire).unwrap().metadata.processor, Some(absolute));
+    }
+    for invalid in [json!(""), json!(true), json!([]), json!({"path":"p.json"})] {
+        wire["metadata"]["processor"] = invalid;
+        assert!(load(&wire).is_err());
+    }
+    let mut metadata = configuration()["metadata"].clone();
+    metadata["processor_config"] = json!("p.json");
+    assert!(serde_json::from_value::<MetadataPaths>(metadata).is_err());
+    let original = serde_json::to_string(&configuration()["metadata"]).unwrap();
+    let duplicate = format!(
+        "{{\"processor\":null,\"processor\":\"p.json\",{}",
+        &original[1..]
+    );
+    assert!(serde_json::from_str::<MetadataPaths>(&duplicate).is_err());
+}
+
+#[test]
+fn requested_edit_processor_is_bounded_and_cannot_fall_back_before_weights() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image.json");
+    let mut wire = configuration();
+    wire["metadata"]["processor"] = json!("processor.json");
+    fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+    fs::write(
+        directory.path().join("model_index.json"),
+        serde_json::to_vec(&json!({"_class_name":"QwenImage21Pipeline",
+            "processor":["transformers","Qwen3VLProcessor"],
+            "text_encoder":["transformers","Qwen3VLForConditionalGeneration"],
+            "transformer":["diffusers","QwenImage21Transformer2DModel"],
+            "vae":["diffusers","AutoencoderKLQwenImage21"],
+            "scheduler":["diffusers","FlowMatchEulerDiscreteScheduler"]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let config = ImageProductConfig::load(&path).unwrap();
+    let error = config.prepare_assets().err().unwrap();
+    assert!(error.to_string().contains("processor.json"), "{error:#}");
+    let processor = directory.path().join("processor.json");
+    let file = fs::File::create(&processor).unwrap();
+    file.set_len(4 * 1024 * 1024 + 1).unwrap();
+    drop(file);
+    let error = config.prepare_assets().err().unwrap();
+    assert!(
+        error.to_string().contains("exceeds metadata limit"),
+        "{error:#}"
+    );
+    fs::write(processor, []).unwrap();
+    let error = config.prepare_assets().err().unwrap();
+    assert!(
+        error.to_string().contains("empty or oversized"),
+        "{error:#}"
+    );
+    // Omission keeps the old path: the next missing required generation
+    // metadata is now observed instead of probing a processor or any weights.
+    wire["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("processor");
+    fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+    let error = ImageProductConfig::load(&path)
+        .unwrap()
+        .prepare_assets()
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("config.json"), "{error:#}");
+    assert!(!error.to_string().contains("processor.json"), "{error:#}");
+}
+
+#[test]
 fn explicit_cudnn_dependencies_keep_declared_order_without_loading_native_code() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("image.json");
@@ -416,6 +518,38 @@ fn validate(arguments: &[&str]) -> anyhow::Result<()> {
 
 #[test]
 fn run_image_controls_reject_explicit_text_defaults_and_keep_text_commands() {
+    assert!(validate(&[
+        "ferrum",
+        "run",
+        "--image-config",
+        "image.json",
+        "--image",
+        "input.png",
+        "--prompt",
+        "edit",
+        "--output",
+        "out.png"
+    ])
+    .is_ok());
+    assert!(validate(&[
+        "ferrum",
+        "run",
+        "text-model",
+        "--image",
+        "input.png",
+        "--prompt",
+        "edit"
+    ])
+    .is_err());
+    assert!(validate(&[
+        "ferrum",
+        "serve",
+        "--image-config",
+        "image.json",
+        "--image",
+        "input.png"
+    ])
+    .is_err());
     assert!(validate(&[
         "ferrum",
         "run",

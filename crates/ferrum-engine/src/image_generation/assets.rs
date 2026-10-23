@@ -1,6 +1,8 @@
 //! Device-free preparation of explicitly supplied metadata and mapped sources.
 mod directory;
+mod edit;
 use super::*;
+pub(super) use edit::EditAssets;
 use ferrum_models::qwen3_vl_text::{Qwen3VLTextKeyRun, Qwen3VLTextLayout};
 use ferrum_models::qwen_image21::ExpectedWeights;
 use sha2::{Digest, Sha256};
@@ -44,6 +46,7 @@ pub struct QwenImage21Assets {
     pub(super) tokenizer: QwenImage21T2iTokenizer,
     pub(super) statistics: QwenImage21LatentStatistics,
     pub(super) schedule: QwenImage21SamplingSchedule,
+    pub(super) editing: Option<EditAssets>,
     receipt: ImageAssetReceipt,
 }
 
@@ -133,6 +136,7 @@ impl QwenImage21Assets {
             tokenizer,
             statistics,
             schedule,
+            editing: None,
             receipt: ImageAssetReceipt {
                 metadata_sha256,
                 required_weight_bytes,

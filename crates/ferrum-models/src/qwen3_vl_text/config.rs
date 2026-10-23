@@ -322,17 +322,27 @@ impl Qwen3VLTextArchitecture {
 pub struct Qwen3VLTextConfig {
     architecture: Qwen3VLTextArchitecture,
     layout: Qwen3VLTextLayout,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deepstack: Option<super::Qwen3VLTextDeepStack>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigWire {
     architecture: Qwen3VLTextArchitecture,
     layout: Qwen3VLTextLayout,
+    #[serde(default)]
+    deepstack: Option<super::Qwen3VLTextDeepStack>,
 }
 impl<'de> Deserialize<'de> for Qwen3VLTextConfig {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let w = ConfigWire::deserialize(d)?;
-        Self::new(w.architecture, w.layout).map_err(serde::de::Error::custom)
+        let mut config = Self::new(w.architecture, w.layout).map_err(serde::de::Error::custom)?;
+        if let Some(deepstack) = w.deepstack {
+            config = config
+                .with_deepstack(deepstack)
+                .map_err(serde::de::Error::custom)?;
+        }
+        Ok(config)
     }
 }
 impl Qwen3VLTextConfig {
@@ -343,6 +353,7 @@ impl Qwen3VLTextConfig {
         let c = Self {
             architecture,
             layout,
+            deepstack: None,
         };
         c.validate()?;
         Ok(c)
@@ -362,6 +373,17 @@ impl Qwen3VLTextConfig {
     }
     pub fn layout(&self) -> &Qwen3VLTextLayout {
         &self.layout
+    }
+    pub fn with_deepstack(
+        mut self,
+        deepstack: super::Qwen3VLTextDeepStack,
+    ) -> Result<Self, VNextError> {
+        self.deepstack = Some(deepstack);
+        self.validate()?;
+        Ok(self)
+    }
+    pub fn deepstack(&self) -> Option<&super::Qwen3VLTextDeepStack> {
+        self.deepstack.as_ref()
     }
     pub fn scale(&self) -> Result<CanonicalRational, VNextError> {
         let effective = (1.0 / (self.architecture.head_dim() as f64).sqrt()) as f32;
@@ -383,7 +405,7 @@ impl Qwen3VLTextConfig {
     pub fn input_tensor_specs(
         &self,
     ) -> Result<BTreeMap<ProgramValueId, ProgramTensorSpec>, VNextError> {
-        [
+        let mut specs = [
             (Family::EMBEDDINGS_ID, self.architecture.hidden_size()),
             (Family::COSINE_ID, self.architecture.head_dim()),
             (Family::SINE_ID, self.architecture.head_dim()),
@@ -399,7 +421,20 @@ impl Qwen3VLTextConfig {
                 },
             ))
         })
-        .collect()
+        .collect::<Result<BTreeMap<_, _>, VNextError>>()?;
+        if let Some(deepstack) = &self.deepstack {
+            for id in Family::DEEPSTACK_IDS {
+                specs.insert(
+                    ProgramValueId::new(id)?,
+                    ProgramTensorSpec {
+                        dimensions: vec![deepstack.rows()?, self.architecture.hidden_size()],
+                        element_type: ElementType::Bf16,
+                        layout: ResolvedTensorLayout::Contiguous,
+                    },
+                );
+            }
+        }
+        Ok(specs)
     }
     pub fn compile_options(&self) -> Result<ProgramPlanCompileOptions, VNextError> {
         ProgramPlanCompileOptions::new(self.input_tensor_specs()?)
@@ -408,6 +443,15 @@ impl Qwen3VLTextConfig {
         super::weights::expected(self)
     }
     pub(super) fn validate(&self) -> Result<(), VNextError> {
+        if let Some(deepstack) = &self.deepstack {
+            if self.architecture.layers() < Family::DEEPSTACK_IDS.len() as u64 {
+                return Err(invalid(
+                    "deepstack",
+                    "three injected stages require at least three text layers",
+                ));
+            }
+            deepstack.validate(&self.layout, self.architecture.hidden_size())?;
+        }
         if u64::from(self.layout.sequence_length()) > self.architecture.maximum_positions() {
             return Err(invalid(
                 "layout",

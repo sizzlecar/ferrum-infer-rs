@@ -12,8 +12,10 @@
 //! backing-byte ledger. Gathered embeddings, rotary tables, and cropped hidden
 //! payloads are admitted before allocation. No full embedding-table copy is made.
 
+mod edit;
 mod managed;
 mod tokenizer;
+pub use edit::QwenImage21EditPrompt;
 pub use managed::{QwenImage21T2iManagedInputs, QwenImage21T2iTextFeatures};
 pub use tokenizer::QwenImage21T2iTokenizer;
 

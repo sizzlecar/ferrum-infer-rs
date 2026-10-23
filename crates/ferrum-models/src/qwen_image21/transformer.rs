@@ -1,9 +1,11 @@
-//! Text-to-image transformer step over a homogeneous padded joint sequence.
+//! Transformer step over a homogeneous padded text/image joint sequence.
 //!
 //! Timestep sinusoidal features and joint rotary frequencies are explicit
 //! inputs. The adapter must compute them from the actual timestep/grid; this
 //! family does not claim a completed conditioning or image-generation pipeline.
-//! All layers run in one tensor program, with only target velocity retained.
+//! Optional single-reference editing replaces VLM image slots by VAE rows,
+//! retaining the interleaved text/image attention and rotary geometry. All
+//! layers run in one tensor program, with only target velocity retained.
 
 mod conditioning;
 mod geometry;
@@ -12,7 +14,7 @@ mod remap;
 pub use conditioning::{
     QwenImage21ModelTimestep, QwenImage21RotaryFrequencies, QwenImage21Timestep256,
 };
-pub use geometry::{QwenImage21T2iLayout, QwenImage21TransformerConfig};
+pub use geometry::{QwenImage21ReferenceImage, QwenImage21T2iLayout, QwenImage21TransformerConfig};
 
 use super::{
     ExpectedWeights, QwenImage21AttentionConfig, QwenImage21AttentionKeyRun,
@@ -42,6 +44,8 @@ impl QwenImage21TransformerFamily {
     pub const CUDA_FP8_FUSED_PROFILE_ID: &'static str =
         "qwen_image21.transformer.t2i.cuda.fp8_linear.fused_attention.experimental.v1";
     pub const LATENTS_ID: &'static str = "value.qwen_image21.transformer.latents";
+    pub const REFERENCE_LATENTS_ID: &'static str =
+        "value.qwen_image21.transformer.reference_latents";
     pub const TEXT_ID: &'static str = "value.qwen_image21.transformer.text";
     pub const TIME_FEATURES_ID: &'static str = "value.qwen_image21.transformer.time_features";
     pub const FREQUENCIES_ID: &'static str = "value.qwen_image21.transformer.frequencies";

@@ -5,6 +5,10 @@
 //! operations it really executes.
 
 mod spatial_decoder;
+mod spatial_group_mean;
+mod tensor_primitives;
+pub use composition::reference_vnext_spatial_group_mean_bf16_provider;
+pub use composition::reference_vnext_tensor_primitive_bf16_provider;
 pub use composition::{
     reference_vnext_channel_l2_norm_image_bf16_provider,
     reference_vnext_spatial_attention_bf16_provider,
@@ -15,6 +19,8 @@ pub use spatial_decoder::{
     REFERENCE_SPATIAL_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
     REFERENCE_SPATIAL_UPSAMPLE_GATHER_BF16_NUMERICAL_PROFILE_ID,
 };
+pub use spatial_group_mean::REFERENCE_SPATIAL_GROUP_MEAN_BF16_NUMERICAL_PROFILE_ID;
+pub use tensor_primitives::reference_tensor_primitive_bf16_profile;
 mod spatial_bf16;
 pub use composition::{
     reference_vnext_channel_l2_norm_bf16_provider, reference_vnext_conv2d_bf16_provider,

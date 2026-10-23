@@ -30,6 +30,7 @@ pub mod qwen35_config;
 pub mod qwen35_s1;
 pub mod qwen35_weights;
 pub mod qwen3_vl_text;
+pub mod qwen3_vl_vision;
 pub mod qwen_image21;
 pub mod registry;
 pub mod source;

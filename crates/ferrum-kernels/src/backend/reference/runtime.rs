@@ -31,7 +31,11 @@ mod gelu_tanh;
 mod spatial_bf16;
 pub(crate) use spatial_bf16::{ReferenceChannelL2NormLaunch, ReferenceConv2dLaunch};
 mod spatial_decoder;
+mod spatial_group_mean;
+pub(super) mod tensor_primitives;
 pub(crate) use spatial_decoder::{ReferenceSpatialDecoderGeometry, ReferenceSpatialDecoderLaunch};
+pub(crate) use spatial_group_mean::ReferenceSpatialGroupMeanLaunch;
+pub(crate) use tensor_primitives::ReferenceTensorPrimitiveLaunch;
 mod head_rms_norm;
 pub(crate) use head_rms_norm::{ReferenceHeadRmsNormLaunch, ReferenceHeadRmsNormShape};
 mod plain_residual_add;
@@ -329,6 +333,12 @@ enum ReferenceCommandKind {
     SpatialDecoder {
         launch: ReferenceSpatialDecoderLaunch,
     },
+    SpatialGroupMean {
+        launch: ReferenceSpatialGroupMeanLaunch,
+    },
+    TensorPrimitive {
+        launch: ReferenceTensorPrimitiveLaunch,
+    },
     Copy {
         source: ReferenceBufferRegion,
         destination: ReferenceBufferRegion,
@@ -410,6 +420,8 @@ impl fmt::Debug for ReferenceDeviceCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self.kind {
             ReferenceCommandKind::SpatialDecoder { .. } => "spatial_decoder",
+            ReferenceCommandKind::SpatialGroupMean { .. } => "spatial_group_mean",
+            ReferenceCommandKind::TensorPrimitive { .. } => "tensor_primitive",
             ReferenceCommandKind::Copy { .. } => "copy",
             ReferenceCommandKind::Upload { .. } => "upload",
             ReferenceCommandKind::ManagedUpload { .. } => "managed_upload",
@@ -868,6 +880,12 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::SpatialDecoder { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::SpatialGroupMean { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::TensorPrimitive { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::Conv2d { launch } => launch.validate_runtime(runtime_instance),
             ReferenceCommandKind::ChannelL2Norm { launch } => {
                 launch.validate_runtime(runtime_instance)
@@ -980,6 +998,10 @@ impl ReferenceDeviceCommand {
                 }
                 .fetch_add(1, Ordering::Relaxed);
             }
+            ReferenceCommandKind::SpatialGroupMean { launch } => {
+                spatial_group_mean::execute(launch);
+            }
+            ReferenceCommandKind::TensorPrimitive { launch } => tensor_primitives::execute(launch),
             ReferenceCommandKind::Conv2d { launch } => {
                 spatial_bf16::execute_conv2d(launch);
                 counters.conv2d_launches.fetch_add(1, Ordering::Relaxed);

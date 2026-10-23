@@ -346,6 +346,15 @@ impl CudaDeviceRuntime {
                         | ferrum_runtime::CHANNEL_L2_NORM_IMAGE_BF16_CAPABILITY_ID
                         | ferrum_runtime::SPATIAL_ATTENTION_BF16_CAPABILITY_ID
                         | ferrum_runtime::SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID
+                        | ferrum_runtime::SPATIAL_GROUP_MEAN_BF16_CAPABILITY_ID
+                        | ferrum_runtime::AFFINE_LINEAR_BF16_CAPABILITY_ID
+                        | ferrum_runtime::PATCH_PROJECTION_BF16_CAPABILITY_ID
+                        | ferrum_runtime::AFFINE_LAYER_NORM_BF16_CAPABILITY_ID
+                        | ferrum_runtime::GELU_ERF_BF16_CAPABILITY_ID
+                        | ferrum_runtime::HALF_ROTARY_BF16_CAPABILITY_ID
+                        | ferrum_runtime::ROW_SCATTER_ADD_BF16_CAPABILITY_ID
+                        | ferrum_runtime::RESHAPE_COPY_BF16_CAPABILITY_ID
+                        | ferrum_runtime::SEGMENTED_ATTENTION_BF16_CAPABILITY_ID
                         | ferrum_runtime::SILU_NCHW_BF16_CAPABILITY_ID
                         | ferrum_runtime::PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID
                 )

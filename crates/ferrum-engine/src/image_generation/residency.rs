@@ -35,9 +35,13 @@ impl ImageResidencyPolicy {
 
 pub(super) struct ResidentStages<R: DeviceRuntime> {
     text_encoder: Option<ActiveImageStage<R>>,
+    vision_encoder: Option<ActiveImageStage<R>>,
+    vae_encoder: Option<ActiveImageStage<R>>,
     denoiser: Option<ActiveImageStage<R>>,
     decoder: Option<ActiveImageStage<R>>,
     text_encoder_weights: Option<ResidentWeights<R>>,
+    vision_encoder_weights: Option<ResidentWeights<R>>,
+    vae_encoder_weights: Option<ResidentWeights<R>>,
     denoiser_weights: Option<ResidentWeights<R>>,
     decoder_weights: Option<ResidentWeights<R>>,
 }
@@ -49,9 +53,13 @@ impl<R: DeviceRuntime> ResidentStages<R> {
     pub(super) fn new() -> Self {
         Self {
             text_encoder: None,
+            vision_encoder: None,
+            vae_encoder: None,
             denoiser: None,
             decoder: None,
             text_encoder_weights: None,
+            vision_encoder_weights: None,
+            vae_encoder_weights: None,
             denoiser_weights: None,
             decoder_weights: None,
         }
@@ -59,6 +67,8 @@ impl<R: DeviceRuntime> ResidentStages<R> {
     fn weights_slot(&mut self, stage: ImageStage) -> Option<&mut Option<ResidentWeights<R>>> {
         match stage {
             ImageStage::TextEncoder => Some(&mut self.text_encoder_weights),
+            ImageStage::VisionEncoder => Some(&mut self.vision_encoder_weights),
+            ImageStage::VaeEncoder => Some(&mut self.vae_encoder_weights),
             ImageStage::Denoiser => Some(&mut self.denoiser_weights),
             ImageStage::Decoder => Some(&mut self.decoder_weights),
             _ => None,
@@ -67,6 +77,8 @@ impl<R: DeviceRuntime> ResidentStages<R> {
     fn slot(&mut self, stage: ImageStage) -> Option<&mut Option<ActiveImageStage<R>>> {
         match stage {
             ImageStage::TextEncoder => Some(&mut self.text_encoder),
+            ImageStage::VisionEncoder => Some(&mut self.vision_encoder),
+            ImageStage::VaeEncoder => Some(&mut self.vae_encoder),
             ImageStage::Denoiser => Some(&mut self.denoiser),
             ImageStage::Decoder => Some(&mut self.decoder),
             _ => None,
@@ -112,6 +124,24 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .checked_add(if retained { 0 } else { memory.static_bytes() })
                 .context("active component bytes overflow")?;
             active_peak = active_peak.max(active);
+        }
+        for (kind, weights) in [
+            (
+                ImageStage::VisionEncoder,
+                &self.resident_stages.vision_encoder_weights,
+            ),
+            (
+                ImageStage::VaeEncoder,
+                &self.resident_stages.vae_encoder_weights,
+            ),
+        ] {
+            if !stages.iter().any(|s| s.plan.stage == kind) {
+                if let Some(weights) = weights {
+                    retained_static = retained_static
+                        .checked_add(weights.origin.plan.static_bytes)
+                        .context("retained editing weights overflow")?;
+                }
+            }
         }
         let required = retained_static
             .checked_add(active_peak)
@@ -182,6 +212,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 ComponentWeightSource::Stored(self.assets.sources.text_encoder.as_ref())
             }
             ImageStage::Noise => ComponentWeightSource::None,
+            ImageStage::VisionEncoder => {
+                ComponentWeightSource::Stored(self.assets.sources.text_encoder.as_ref())
+            }
+            ImageStage::VaeEncoder => {
+                ComponentWeightSource::Stored(self.assets.sources.vae.as_ref())
+            }
             ImageStage::Denoiser
                 if matches!(
                     profile,
@@ -256,6 +292,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let mut completed_stages = Vec::new();
         for stage in [
             ImageStage::TextEncoder,
+            ImageStage::VisionEncoder,
+            ImageStage::VaeEncoder,
             ImageStage::Denoiser,
             ImageStage::Decoder,
         ] {
@@ -282,6 +320,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         // failure/foreign execution owner makes close Referenced, never success.
         for stage in [
             ImageStage::TextEncoder,
+            ImageStage::VisionEncoder,
+            ImageStage::VaeEncoder,
             ImageStage::Denoiser,
             ImageStage::Decoder,
         ] {

@@ -71,7 +71,7 @@ pub fn validate_image_response_with_png(
     limits: &ImageResponseLimits,
 ) -> Result<ValidatedPngResponse, ImageBenchError> {
     limits.validate()?;
-    let rgba_bytes = limits.rgba_bytes(width, height)?;
+    limits.rgba_bytes(width, height)?;
     if body.len() > limits.maximum_response_bytes {
         return Err(invalid("JSON response exceeds byte limit"));
     }
@@ -102,14 +102,40 @@ pub fn validate_image_response_with_png(
     if png_bytes.len() > limits.maximum_png_bytes {
         return Err(invalid("PNG exceeds byte limit"));
     }
-    validate_container(&png_bytes)?;
+    let image = validate_png(&png_bytes, Some((width, height)), limits)?;
+    Ok(ValidatedPngResponse {
+        image,
+        png: png_bytes,
+    })
+}
+
+/// Validate a reference image once before any timed HTTP requests, without
+/// base64 conversion or a second encoded payload allocation. Its original PNG
+/// bytes, not a re-encoding or the local path, define the upload identity.
+pub fn validate_reference_png(
+    bytes: &[u8],
+    limits: &ImageResponseLimits,
+) -> Result<ValidatedImage, ImageBenchError> {
+    validate_png(bytes, None, limits)
+}
+
+fn validate_png(
+    png_bytes: &[u8],
+    expected_dimensions: Option<(u32, u32)>,
+    limits: &ImageResponseLimits,
+) -> Result<ValidatedImage, ImageBenchError> {
+    limits.validate()?;
+    if png_bytes.len() > limits.maximum_png_bytes {
+        return Err(invalid("PNG exceeds byte limit"));
+    }
+    validate_container(png_bytes)?;
     let mut options = png::DecodeOptions::default();
     options.set_ignore_checksums(false);
     options.set_skip_ancillary_crc_failures(false);
     // Metadata decompression is unnecessary for pixel verification.
     options.set_ignore_text_chunk(true);
     options.set_ignore_iccp_chunk(true);
-    let mut decoder = png::Decoder::new_with_options(Cursor::new(&png_bytes), options);
+    let mut decoder = png::Decoder::new_with_options(Cursor::new(png_bytes), options);
     decoder.set_limits(png::Limits {
         bytes: limits.decoder_workspace_bytes,
     });
@@ -118,7 +144,9 @@ pub fn validate_image_response_with_png(
         .read_info()
         .map_err(|_| invalid("invalid PNG header or checksum"))?;
     let info = reader.info();
-    if info.width != width || info.height != height {
+    let (width, height) = (info.width, info.height);
+    let rgba_bytes = limits.rgba_bytes(width, height)?;
+    if expected_dimensions.is_some_and(|expected| expected != (width, height)) {
         return Err(invalid("PNG dimensions differ from request"));
     }
     if info.animation_control.is_some() || info.frame_control.is_some() {
@@ -170,17 +198,13 @@ pub fn validate_image_response_with_png(
         };
         digest.update(rgba);
     }
-    let image = ValidatedImage {
+    Ok(ValidatedImage {
         width,
         height,
         png_bytes: png_bytes.len(),
         rgba8_bytes: rgba_bytes,
-        png_sha256: sha256(&png_bytes),
+        png_sha256: sha256(png_bytes),
         rgba8_sha256: format!("{:x}", digest.finalize()),
-    };
-    Ok(ValidatedPngResponse {
-        image,
-        png: png_bytes,
     })
 }
 

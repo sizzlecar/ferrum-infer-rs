@@ -1,4 +1,5 @@
 use super::capture::{capture_validated_png, CaptureSink};
+use super::edit::PreparedReference;
 use super::*;
 use ferrum_bench_core::images::{
     validate_image_response_with_png, ImageFailureKind, ImageHttpRequest, ImageSample,
@@ -11,9 +12,15 @@ use std::{sync::Arc, time::Instant};
 /// No requests are retried: retrying would silently change the workload.
 pub async fn run_benchmark(
     config: ImageBenchmarkConfig,
-    dataset: ImageDataset,
+    mut dataset: ImageDataset,
 ) -> anyhow::Result<ImageBenchmarkReport> {
     config.validate(&dataset)?;
+    let reference = PreparedReference::load(&dataset.mode, &config)?;
+    if let (ImageRequestMode::Edit { image }, Some(reference)) = (&mut dataset.mode, &reference) {
+        // The report's dataset fingerprint binds the bytes actually sent, even
+        // when the caller did not predeclare an encoded SHA-256.
+        image.encoded_sha256 = Some(reference.identity.png_sha256.clone());
+    }
     let capture = config
         .capture
         .as_ref()
@@ -49,6 +56,7 @@ pub async fn run_benchmark(
                     phase,
                     repetition,
                     capture.as_ref(),
+                    reference.as_ref(),
                 )
                 .await;
                 if phase == ImageRequestPhase::Measured {
@@ -82,13 +90,14 @@ pub async fn run_benchmark(
         evidence.throughput_scope = "successful validated images divided by measured wall time including errors, local validation and PNG capture IO; warmup excluded; capture retains request slots and changes subsequent dispatch pacing";
     }
     Ok(ImageBenchmarkReport {
-        schema_version: 1,
+        schema_version: if dataset.mode.is_generate() { 1 } else { 2 },
         client_version: env!("CARGO_PKG_VERSION").into(),
         started_unix_ms,
         dataset_sha256: dataset.fingerprint()?,
         dataset_file_sha256: None,
         configuration: config,
         dataset,
+        reference_image: reference.map(|reference| reference.identity),
         endpoints: endpoint_reports,
         evidence,
         capture: capture_summary,
@@ -104,6 +113,7 @@ async fn run_round(
     phase: ImageRequestPhase,
     repetition: usize,
     capture: Option<&Arc<CaptureSink>>,
+    reference: Option<&PreparedReference>,
 ) -> (
     ImageBenchmarkRepetition,
     Vec<ImageRequestRecord>,
@@ -128,6 +138,7 @@ async fn run_round(
                 repetition,
                 start,
                 capture.cloned(),
+                reference,
             ));
             next += 1;
         }
@@ -174,6 +185,7 @@ async fn run_request(
     repetition: usize,
     round_start: Instant,
     capture: Option<Arc<CaptureSink>>,
+    reference: Option<&PreparedReference>,
 ) -> (ImageRequestRecord, f64, Option<PngCaptureRecord>) {
     let capture_enabled = capture.is_some();
     let mut capture_result = PngCaptureResult::NotProduced;
@@ -198,6 +210,7 @@ async fn run_request(
         sample,
         config.limits.maximum_response_bytes,
         &mut record,
+        reference,
     )
     .await;
     record.e2e_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -277,13 +290,19 @@ async fn receive(
     sample: &ImageSample,
     maximum_bytes: usize,
     record: &mut ImageRequestRecord,
+    reference: Option<&PreparedReference>,
 ) -> Result<Vec<u8>, (ImageFailureKind, &'static str)> {
-    let mut response = client
-        .post(&endpoint.url)
-        .json(&ImageHttpRequest::new(&endpoint.model, sample))
-        .send()
-        .await
-        .map_err(transport_error)?;
+    let request = client.post(&endpoint.url);
+    let request = match reference {
+        Some(reference) => request.multipart(reference.form(endpoint, sample).map_err(|_| {
+            (
+                ImageFailureKind::ClientTask,
+                "cannot build PNG multipart request",
+            )
+        })?),
+        None => request.json(&ImageHttpRequest::new(&endpoint.model, sample)),
+    };
+    let mut response = request.send().await.map_err(transport_error)?;
     record.http_status = Some(response.status().as_u16());
     if !response.status().is_success() {
         return Err((

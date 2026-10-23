@@ -140,8 +140,82 @@ for either image route. `--image-config` also rejects simultaneous MODEL,
 backend/budget flags and `--image-cudnn-library`: change its explicit JSON instead.
 Image defaults for `run` are 512×512 pixels and seed zero. HTTP defaults come from
 the named preset or the explicit `serving` configuration.
-Only text-to-image generation is exposed. Image editing, image-to-image inputs
-and `/v1/images/edits` are not supported by this product path.
+Omitting `--image` preserves text-to-image generation. The experimental editing
+entrypoints below require a loaded pipeline that declares editing support.
+
+## Single-image editing
+
+Use a complete local pipeline directory with its visual encoder, image processor
+metadata and VAE encoder weights. Directory loading validates these components
+before enabling editing; the model alias does not confer the capability.
+`GET /health` reports it as `images.capabilities.edits`. For an explicit
+`--image-config`, add `"processor": "metadata/processor/processor_config.json"`
+inside `metadata`. This opts into editing validation using the same
+`text_encoder` and `vae` configurations and weight archives: they must include
+the complete visual tower and VAE encoder. The processor file is bounded to
+4 MiB and its path resolves relative to the JSON configuration. Missing or
+incompatible editing assets are an error, not a generation-only fallback.
+Omitting `metadata.processor` (or setting it to `null`) preserves older
+generation-only configurations. Both `run` and `serve` use this asset loader.
+
+```text
+ferrum run /models/image-pipeline --image reference.png --prompt "Change the teapot to blue" --width 1024 --height 1024 --seed 42 --output edited.png
+ferrum serve /models/image-pipeline --served-model-name local-image --host 127.0.0.1 --port 8000
+ferrum run --image-config image-with-processor.json --image reference.png --prompt "Change the teapot to blue" --seed 42 --output edited.png
+```
+
+For HTTP, send `multipart/form-data` to `POST /v1/images/edits`:
+
+```sh
+curl http://127.0.0.1:8000/v1/images/edits \
+  -F model=local-image \
+  -F 'prompt=Change the teapot to blue' \
+  -F 'image=@reference.png;type=image/png' \
+  -F n=1 \
+  -F size=1024x1024 \
+  -F response_format=b64_json \
+  -F seed=42
+```
+
+Exactly one static, 8-bit RGB or RGBA PNG is accepted. `image[]` is an alias for
+the single `image` field, not a multiple-image interface. Masks, multiple images,
+JPEG, WebP, animated PNG, palette/grayscale PNG and 16-bit PNG are unsupported.
+PNG `tRNS` and EXIF metadata are rejected because no conversion/orientation
+policy is exposed. RGB input receives opaque alpha; RGBA retains its alpha for
+the VAE and is composited over white for the visual encoder. The reference image
+is preprocessed independently of the requested output dimensions.
+
+Only `model`, `prompt`, `image` (or `image[]`), `n=1`, `size`, `seed` and
+`response_format=b64_json` are accepted as multipart fields. Duplicate and unknown
+fields, including `mask`, strength and inference-step overrides, are rejected.
+`--image` is a `run` option; `serve` receives each reference image through HTTP.
+
+| Input boundary | Current limit |
+| --- | --- |
+| Encoded PNG | 16 MiB |
+| Complete multipart HTTP body | 18 MiB |
+| Decoded image | 24,000,000 pixels, at most 8192 per axis |
+| Multipart prompt | 1 MiB, also subject to configured prompt-byte and token limits |
+| PNG decoder workspace | 64 MiB codec limit; not a process-memory or Host-account guarantee |
+
+Encoded input, decoded pixels and model input tensors use the same managed Host
+account. HTTP reserves a 16 MiB upload backing before retaining file chunks; a
+shorter file still holds that allocation while queued or executing. CLI loading
+reserves the checked file length. These buffers must fit alongside other active
+inputs and outputs. Transport/parser buffers, codec internals and metadata remain
+outside tensor accounting, so these limits do not bound total RSS.
+
+Edits enter the same bounded worker queue as generations but execute one request
+at a time. They are neither combined with generation batches nor batched with
+other edits; `max_num_seqs` continues to control compatible generation requests.
+Cancellation removes pending work, while active work completes safe retirement
+before its resources are released.
+
+Without an image service the endpoint returns 503. A loaded service without
+editing support, unsupported fields/formats and invalid PNG inputs return 400.
+Queue, upload-Host or output-session admission failures return 429; device or
+model failures are not reclassified as malformed input. GPU end-to-end editing
+validation and editing throughput measurements are still pending.
 
 `run` creates its PNG destination exclusively, preserving RGBA and alpha. It
 emits a JSON receipt to stdout after the PNG is finished and synced. A failed
@@ -231,7 +305,7 @@ Metadata may live separately from the checkpoint directories.
 fields omitted inside `serving.output` use the shared typed `OutputConfig`
 defaults. The account must cover the source RGBA, conversion buffers and encoded
 HTTP body while they coexist. Dimension divisibility and real plan admission
-remain enforced; dimensions are never rounded to fit a model.
+remain enforced; requested output dimensions are never rounded to fit a model.
 
 For an explicit B2 functional experiment, change `execution_profile` to
 `experimental_batched_cold`, `backend.pipeline.maximum_batch_size` to `2`,

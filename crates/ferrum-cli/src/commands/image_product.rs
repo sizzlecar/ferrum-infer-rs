@@ -19,6 +19,7 @@ pub use configuration::ImageProductConfig;
 pub use directory::{DirectoryOptions, ImageProductSource};
 pub use run::execute_run;
 pub use run::execute_run_source;
+pub use run::execute_run_source_with_image;
 pub use serve::execute_serve;
 pub use serve::execute_serve_source;
 
@@ -88,6 +89,9 @@ pub struct ImageRunArgs {
     /// PNG destination, created exclusively. Required for image generation.
     #[arg(long, value_name = "PNG")]
     pub output: Option<PathBuf>,
+    /// Edit one static 8-bit RGB/RGBA PNG. No masks or multiple input images.
+    #[arg(long, value_name = "PNG")]
+    pub image: Option<PathBuf>,
     /// Image width in pixels (image default: 512; never rounded).
     #[arg(long)]
     pub width: Option<u32>,
@@ -123,6 +127,7 @@ pub fn validate_cli_matches(
     if !explicit && !automatic {
         for id in [
             "output",
+            "image",
             "width",
             "height",
             "image_cudnn_library",
@@ -141,6 +146,7 @@ pub fn validate_cli_matches(
             "image_config",
             "prompt",
             "output",
+            "image",
             "width",
             "height",
             "seed",

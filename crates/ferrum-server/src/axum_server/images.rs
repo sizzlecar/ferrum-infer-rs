@@ -23,7 +23,9 @@ use ferrum_types::OutputConfig;
 use serde::Deserialize;
 use std::{sync::Arc, time::Instant};
 
+mod edits;
 mod response;
+pub(super) use edits::{edits_handler, EDIT_BODY_LIMIT};
 
 /// Explicit image response limits, independent of the text engine's output
 /// budget. `max_event_bytes` bounds the complete JSON/base64 response here.
@@ -165,6 +167,11 @@ impl ImageHttpService {
             "model":self.model_name(), "ready":self.service.is_accepting(),
             "profile":"experimental_functional",
             "qualification":"functional pipeline only; not G3 or measured throughput",
+            "capabilities":{
+                "generations":true,
+                "edits":self.service.supports_edits(),
+                "edit_input":if self.service.supports_edits() { Some("one static RGB/RGBA8 PNG; no mask") } else { None },
+            },
             "scheduler":self.service.snapshot(),
             "output":{
                 "sessions":self.output.usage().sessions,
@@ -315,6 +322,15 @@ pub(super) async fn generations_handler(
         .map_err(service_error)?;
     let queue_and_generation_wait_us =
         u64::try_from(wait_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    encode_result(images, session, result, queue_and_generation_wait_us).await
+}
+
+async fn encode_result(
+    images: &ImageHttpService,
+    session: ferrum_output::OutputSession,
+    result: ferrum_engine::image_generation::ImageGenerationOutput,
+    queue_and_generation_wait_us: u64,
+) -> Result<Response, ServerError> {
     let encode_started = Instant::now();
     let encoded = response::encode(
         session.clone(),

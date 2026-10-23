@@ -15,14 +15,14 @@ use std::sync::{
 };
 use tokio::sync::Barrier;
 
-struct Server(tokio::task::JoinHandle<()>);
+pub(super) struct Server(tokio::task::JoinHandle<()>);
 impl Drop for Server {
     fn drop(&mut self) {
         self.0.abort();
     }
 }
 
-async fn serve(router: Router) -> (String, Server) {
+pub(super) async fn serve(router: Router) -> (String, Server) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
         "http://{}/v1/images/generations",
@@ -34,9 +34,10 @@ async fn serve(router: Router) -> (String, Server) {
     (url, Server(task))
 }
 
-fn dataset(count: usize) -> ImageDataset {
+pub(super) fn dataset(count: usize) -> ImageDataset {
     ImageDataset {
         schema_version: 1,
+        mode: ImageRequestMode::Generate,
         samples: (0..count)
             .map(|i| ImageSample {
                 id: format!("image-{i}"),
@@ -50,7 +51,7 @@ fn dataset(count: usize) -> ImageDataset {
     }
 }
 
-fn config(url: String) -> ImageBenchmarkConfig {
+pub(super) fn config(url: String) -> ImageBenchmarkConfig {
     ImageBenchmarkConfig {
         endpoints: vec![ImageBenchmarkEndpoint {
             url,
@@ -65,6 +66,7 @@ fn config(url: String) -> ImageBenchmarkConfig {
         latency_slo_p99_ms: None,
         limits: ImageResponseLimits::default(),
         maximum_total_requests: 100,
+        maximum_reference_image_bytes: 16 * 1024 * 1024,
         capture: None,
     }
 }
@@ -259,9 +261,9 @@ async fn records_timeout_and_keeps_warmup_out_of_measured_counts() {
 }
 
 #[derive(clap::Parser)]
-struct TestCli {
+pub(super) struct TestCli {
     #[command(flatten)]
-    command: BenchImagesCommand,
+    pub(super) command: BenchImagesCommand,
 }
 
 #[tokio::test]

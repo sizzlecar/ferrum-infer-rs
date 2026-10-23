@@ -9,8 +9,11 @@ use std::{collections::BTreeSet, fmt};
 
 mod png_response;
 pub use png_response::{
-    validate_image_response, validate_image_response_with_png, ValidatedImage, ValidatedPngResponse,
+    validate_image_response, validate_image_response_with_png, validate_reference_png,
+    ValidatedImage, ValidatedPngResponse,
 };
+mod request_mode;
+pub use request_mode::{ImageReference, ImageRequestMode};
 
 #[cfg(test)]
 mod tests;
@@ -34,6 +37,10 @@ pub(crate) fn invalid(message: &str) -> ImageBenchError {
 #[serde(deny_unknown_fields)]
 pub struct ImageDataset {
     pub schema_version: u32,
+    /// Version 1 retains its original generation JSON. Version 2 may select a
+    /// single shared reference image for every ordered edit request.
+    #[serde(default, skip_serializing_if = "ImageRequestMode::is_generate")]
+    pub mode: ImageRequestMode,
     pub samples: Vec<ImageSample>,
 }
 
@@ -54,11 +61,16 @@ pub struct ImageSample {
 impl ImageDataset {
     pub fn validate(&self, limits: &ImageResponseLimits) -> Result<(), ImageBenchError> {
         limits.validate()?;
-        if self.schema_version != 1 || self.samples.is_empty() || self.samples.len() > 100_000 {
+        if !matches!(self.schema_version, 1 | 2)
+            || (self.schema_version == 1 && !self.mode.is_generate())
+            || self.samples.is_empty()
+            || self.samples.len() > 100_000
+        {
             return Err(invalid(
-                "dataset requires schema_version 1 and 1..=100000 samples",
+                "dataset requires version 1 (generate) or 2 and 1..=100000 samples",
             ));
         }
+        self.mode.validate()?;
         let mut ids = BTreeSet::new();
         for sample in &self.samples {
             if sample.id.is_empty() || sample.id.len() > 256 || !ids.insert(&sample.id) {

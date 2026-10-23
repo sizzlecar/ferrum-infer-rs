@@ -68,7 +68,7 @@ fn providers_impl(
             "CUDA runtime lacks fused attention capability",
         ));
     }
-    let descriptors = if selected.is_empty() {
+    let mut descriptors = if selected.is_empty() {
         Vec::new()
     } else {
         selection::runtime_descriptors(runtime, selected)?
@@ -77,6 +77,18 @@ fn providers_impl(
     let sdpa = sdpa_policy
         .map(|policy| CudaCudnnSdpaCache::new(runtime, Arc::clone(&owner), policy).map(Arc::new))
         .transpose()?;
+    let segmented_sdpa =
+        sdpa.is_some() && selected.contains(&CudaTensorOperation::SegmentedAttention);
+    if segmented_sdpa {
+        // Replace the selected implementation only in this explicit vendor
+        // composition; never register two providers for implicit selection.
+        descriptors.retain(|d| {
+            !matches!(
+                d,
+                selection::SelectedDescriptor::Fixed(CudaTensorOperation::SegmentedAttention, _)
+            )
+        });
+    }
     let contract = conv2d_bf16_contract().map_err(contract_error)?;
     let implementation = implementation_fingerprint(&[
         numerical_fingerprint().as_bytes(),
@@ -112,6 +124,13 @@ fn providers_impl(
     let kernels = RetainedFunctions::load(runtime)?;
     let mut providers = selection::providers_from_descriptors(descriptors, &kernels);
     if let Some(cache) = sdpa {
+        if segmented_sdpa {
+            providers.push(cudnn_segmented::provider(
+                runtime.descriptor(),
+                &kernels,
+                Arc::clone(&cache),
+            )?);
+        }
         providers.push(cudnn_attention::provider(
             runtime.descriptor(),
             &kernels,

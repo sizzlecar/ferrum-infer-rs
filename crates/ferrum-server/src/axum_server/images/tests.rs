@@ -10,7 +10,7 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tower::ServiceExt;
 
-fn config() -> ImageHttpConfig {
+pub(super) fn config() -> ImageHttpConfig {
     ImageHttpConfig {
         output: OutputConfig {
             max_sessions: 1,

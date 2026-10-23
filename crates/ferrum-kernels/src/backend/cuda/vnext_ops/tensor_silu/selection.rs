@@ -2,6 +2,7 @@
 //! capability absent from the runtime descriptor and is checked before load.
 
 use super::*;
+use ferrum_runtime::TensorPrimitiveBf16;
 
 /// BF16 fixed-tensor operations implemented by the shared CUDA native module.
 /// Dense remains a separate provider because it uses the admitted lane BLAS.
@@ -30,13 +31,22 @@ pub enum CudaTensorOperation {
     ChannelL2NormImage,
     SpatialAttention,
     SpatialUpsampleGather,
+    SpatialGroupMean,
+    AffineLinear,
+    PatchProjection,
+    AffineLayerNorm,
+    GeluErf,
+    HalfRotary,
+    RowScatterAdd,
+    ReshapeCopy,
+    SegmentedAttention,
     /// Explicit-state normal generation. Its launch geometry is queried from
     /// the existing runtime only when this operation is selected.
     PhiloxNormal,
 }
 
 impl CudaTensorOperation {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 32] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -59,8 +69,31 @@ impl CudaTensorOperation {
         Self::ChannelL2NormImage,
         Self::SpatialAttention,
         Self::SpatialUpsampleGather,
+        Self::SpatialGroupMean,
+        Self::AffineLinear,
+        Self::PatchProjection,
+        Self::AffineLayerNorm,
+        Self::GeluErf,
+        Self::HalfRotary,
+        Self::RowScatterAdd,
+        Self::ReshapeCopy,
+        Self::SegmentedAttention,
         Self::PhiloxNormal,
     ];
+
+    fn primitive(self) -> Option<TensorPrimitiveBf16> {
+        match self {
+            Self::AffineLinear => Some(TensorPrimitiveBf16::AffineLinear),
+            Self::PatchProjection => Some(TensorPrimitiveBf16::PatchProjection),
+            Self::AffineLayerNorm => Some(TensorPrimitiveBf16::AffineLayerNorm),
+            Self::GeluErf => Some(TensorPrimitiveBf16::GeluErf),
+            Self::HalfRotary => Some(TensorPrimitiveBf16::HalfRotary),
+            Self::RowScatterAdd => Some(TensorPrimitiveBf16::RowScatterAdd),
+            Self::ReshapeCopy => Some(TensorPrimitiveBf16::ReshapeCopy),
+            Self::SegmentedAttention => Some(TensorPrimitiveBf16::SegmentedAttention),
+            _ => None,
+        }
+    }
 
     fn pointwise(self) -> Option<Kind> {
         match self {
@@ -88,6 +121,9 @@ impl CudaTensorOperation {
         self,
         device: &DeviceDescriptor,
     ) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
+        if let Some(kind) = self.primitive() {
+            return primitives::descriptor(device, kind);
+        }
         if let Some(kind) = self.pointwise() {
             return descriptor(device, kind);
         }
@@ -103,6 +139,9 @@ impl CudaTensorOperation {
             }
             Self::SpatialUpsampleGather => {
                 spatial_extended::descriptor(device, spatial_extended::Kind::Gather)
+            }
+            Self::SpatialGroupMean => {
+                spatial_extended::descriptor(device, spatial_extended::Kind::GroupMean)
             }
             Self::ChannelL2Norm => spatial::descriptor(device, spatial::SpatialKind::ChannelL2),
             Self::SiluNchw => spatial::descriptor(device, spatial::SpatialKind::Silu),
@@ -128,6 +167,9 @@ impl CudaTensorOperation {
         descriptor: OperationProviderDescriptor,
         kernels: &Arc<RetainedFunctions>,
     ) -> Box<dyn OperationProvider<CudaDeviceRuntime>> {
+        if let Some(kind) = self.primitive() {
+            return primitives::provider(kind, descriptor, kernels);
+        }
         if let Some(kind) = self.pointwise() {
             return Box::new(CudaTensorPointwiseProvider {
                 descriptor,
@@ -147,6 +189,9 @@ impl CudaTensorOperation {
             }
             Self::SpatialUpsampleGather => {
                 spatial_extended::provider(spatial_extended::Kind::Gather, descriptor, kernels)
+            }
+            Self::SpatialGroupMean => {
+                spatial_extended::provider(spatial_extended::Kind::GroupMean, descriptor, kernels)
             }
             Self::ChannelL2Norm => {
                 spatial::provider(spatial::SpatialKind::ChannelL2, descriptor, kernels)

@@ -20,11 +20,15 @@ use ferrum_kernels::backend::cuda::{
 };
 use ferrum_models::normal_noise::{NormalNoiseConfig, NormalNoiseFamily};
 use ferrum_models::qwen3_vl_text::{
-    Qwen3VLTextConfig, Qwen3VLTextEncoderFamily, Qwen3VLTextKeyRun, Qwen3VLTextLayout,
+    Qwen3VLTextConfig, Qwen3VLTextEncoderFamily, Qwen3VLTextImageSpan, Qwen3VLTextKeyRun,
+    Qwen3VLTextLayout,
+};
+use ferrum_models::qwen3_vl_vision::{
+    Qwen3VLVisionArchitecture, Qwen3VLVisionConfig, Qwen3VLVisionFamily, Qwen3VLVisionGrid,
 };
 use ferrum_models::qwen_image21::{
     QwenImage21T2iLayout, QwenImage21TransformerConfig, QwenImage21TransformerFamily,
-    QwenImage21VaeDecoderFamily,
+    QwenImage21VaeDecoderFamily, QwenImage21VaeEncoderConfig, QwenImage21VaeEncoderFamily,
 };
 use ferrum_runtime::*;
 use std::{num::NonZeroU64, sync::Arc};
@@ -223,6 +227,7 @@ impl QwenImage21CudaConfig {
     )> {
         self.validate()?;
         let profiles = cuda_profiles_with_precision(self.attention_policy, self.precision_policy)?;
+        let editing = assets.editing.is_some();
         let mut contracts = contracts(self.attention_policy)?;
         // Exactly one Host ledger, also used by CPU weight conversion.
         let host = HostMemoryAccount::new(self.host);
@@ -348,6 +353,18 @@ impl QwenImage21CudaConfig {
             self.pipeline.with_device_capacity(capacity),
         )?
         .with_device_opaque_allowance(device_opaque_allowance)?;
+        let pipeline = if editing {
+            pipeline.with_editing_profiles(super::QwenImage21EditProfiles {
+                vision: NumericalProfileId::new(
+                    ferrum_models::qwen3_vl_vision::Qwen3VLVisionFamily::CUDA_PROFILE_ID,
+                )?,
+                encoder: NumericalProfileId::new(
+                    ferrum_models::qwen_image21::QwenImage21VaeEncoderFamily::CUDA_PROFILE_ID,
+                )?,
+            })?
+        } else {
+            pipeline
+        };
         Ok((pipeline, receipt))
     }
 
@@ -418,7 +435,7 @@ impl QwenImage21CudaConfig {
         )?;
         let decoder = assets.decoder(2, 2)?;
         let noise = NormalNoiseConfig::new(64, 2, 2)?;
-        let families = [
+        let mut families = vec![
             TypedFamilyRegistration::new(Qwen3VLTextEncoderFamily::new()?)
                 .prepare_with_profile(&serde_json::to_value(&text)?, &profiles.text_encoder)?,
             TypedFamilyRegistration::new(NormalNoiseFamily::new(profiles.noise.as_str())?)
@@ -428,22 +445,18 @@ impl QwenImage21CudaConfig {
             TypedFamilyRegistration::new(QwenImage21VaeDecoderFamily::new()?)
                 .prepare_with_profile(&serde_json::to_value(decoder)?, &profiles.decoder)?,
         ];
-        for family in &families {
-            let commands = family
-                .program()
-                .blocks()
-                .iter()
-                .try_fold(family.program().inputs().len(), |n, block| {
-                    n.checked_add(block.nodes.len())
-                })
-                .context("component command count overflows")?;
-            ensure!(
-                commands <= self.maximum_commands_per_submission,
-                "{} requires at least {commands} compute/upload commands, exceeding configured {}",
-                family.family_id(),
-                self.maximum_commands_per_submission
-            );
+        // Keep the original four indices stable for materializer selection.
+        // Editing adds two stages and different TE/DiT programs/input counts.
+        if let Some(edit) = &assets.editing {
+            families.extend(editing_command_families(
+                &text,
+                &dit,
+                &edit.vision,
+                &edit.encoder,
+                profiles,
+            )?);
         }
+        validate_family_command_limits(&families, self.maximum_commands_per_submission)?;
         let mut execution_bytes = assets.receipt().required_weight_bytes;
         let materializers = if self.precision_policy == ImageCudaPrecisionPolicy::Bf16 {
             WeightMaterializerRegistry::identity_only()?
@@ -479,6 +492,65 @@ impl QwenImage21CudaConfig {
     }
 }
 
+fn component_command_count(family: &PreparedModelFamily) -> Result<usize> {
+    family
+        .program()
+        .blocks()
+        .iter()
+        .try_fold(family.program().inputs().len(), |n, block| {
+            n.checked_add(block.nodes.len())
+        })
+        .context("component command count overflows")
+}
+
+fn validate_family_command_limits(families: &[PreparedModelFamily], maximum: usize) -> Result<()> {
+    for family in families {
+        let commands = component_command_count(family)?;
+        ensure!(commands <= maximum,
+            "{} requires at least {commands} compute/upload commands, exceeding configured {maximum}",
+            family.family_id());
+    }
+    Ok(())
+}
+
+/// Small metadata-only representatives of every additional editing topology.
+/// Tensor contents and request dimensions cannot reduce these command counts.
+fn editing_command_families(
+    text: &Qwen3VLTextConfig,
+    dit: &QwenImage21TransformerConfig,
+    vision: &Qwen3VLVisionArchitecture,
+    encoder: &QwenImage21VaeEncoderConfig,
+    profiles: &QwenImage21Profiles,
+) -> Result<[PreparedModelFamily; 4]> {
+    let merge = vision.merge_size();
+    let visual = Qwen3VLVisionConfig::new(
+        vision.clone(),
+        vec![Qwen3VLVisionGrid::new(1, merge, merge)?],
+    )?;
+    let text = text
+        .clone()
+        .with_image_spans(&[Qwen3VLTextImageSpan::new(0, merge, merge, merge)?])?;
+    let dit = QwenImage21TransformerConfig::new(
+        dit.transformer().clone(),
+        QwenImage21T2iLayout::new(3, 2, 2, vec![3])?,
+    )?
+    .with_reference_image(1, 1, 2, 2)?;
+    Ok([
+        TypedFamilyRegistration::new(Qwen3VLVisionFamily::new()?).prepare_with_profile(
+            &serde_json::to_value(visual)?,
+            &NumericalProfileId::new(Qwen3VLVisionFamily::CUDA_PROFILE_ID)?,
+        )?,
+        TypedFamilyRegistration::new(QwenImage21VaeEncoderFamily::new()?).prepare_with_profile(
+            &serde_json::to_value(encoder)?,
+            &NumericalProfileId::new(QwenImage21VaeEncoderFamily::CUDA_PROFILE_ID)?,
+        )?,
+        TypedFamilyRegistration::new(Qwen3VLTextEncoderFamily::new()?)
+            .prepare_with_profile(&serde_json::to_value(text)?, &profiles.text_encoder)?,
+        TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?)
+            .prepare_with_profile(&serde_json::to_value(dit)?, &profiles.denoiser)?,
+    ])
+}
+
 fn validate_profile(profile: &str, label: &str) -> Result<()> {
     ensure!(
         !profile.trim().is_empty()
@@ -490,6 +562,7 @@ fn validate_profile(profile: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cuda_profiles(attention: ImageCudaAttentionPolicy) -> Result<QwenImage21Profiles> {
     cuda_profiles_with_precision(attention, ImageCudaPrecisionPolicy::Bf16)
 }
@@ -551,10 +624,14 @@ fn contracts(attention: ImageCudaAttentionPolicy) -> Result<Vec<Box<dyn Operatio
         Box::new(channel_l2_norm_image_bf16_contract()?),
         Box::new(spatial_attention_bf16_contract()?),
         Box::new(spatial_upsample_gather_bf16_contract()?),
+        Box::new(spatial_group_mean_bf16_contract()?),
         Box::new(philox_normal_bf16_contract()?),
         Box::new(conv2d_bf16_contract()?),
         Box::new(dense_linear_bf16_contract()?),
     ];
+    for kind in TensorPrimitiveBf16::ALL {
+        contracts.push(Box::new(kind.contract()?));
+    }
     if attention == ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 {
         contracts.push(Box::new(structured_attention_fused_bf16_contract()?));
     }
@@ -789,5 +866,95 @@ mod tests {
         assert!(config
             .validate_weight_capacity(&[12, 24, 8], opaque - 1)
             .is_err());
+    }
+
+    #[test]
+    fn editing_command_admission_counts_new_stages_and_augmented_text_and_dit() {
+        // Real family programs, metadata only: no CUDA context, native query,
+        // payload allocation, checkpoint or invented successful provider.
+        let raw = serde_json::json!({
+            "model_type":"qwen3_vl","architectures":["Qwen3VLForConditionalGeneration"],
+            "text_config":{"model_type":"qwen3_vl_text","dtype":"bfloat16",
+                "hidden_act":"silu","attention_bias":false,"attention_dropout":0.0,
+                "num_hidden_layers":3,"hidden_size":8,"intermediate_size":16,
+                "num_attention_heads":1,"num_key_value_heads":1,"head_dim":8,
+                "vocab_size":32,"max_position_embeddings":1024,"rms_norm_eps":0.000001,
+                "rope_theta":100,"rope_scaling":{"rope_type":"default",
+                    "mrope_interleaved":true,"mrope_section":[2,1,1]}},
+            "vision_config":{"model_type":"qwen3_vl","dtype":"bfloat16",
+                "hidden_act":"gelu_pytorch_tanh","depth":3,"hidden_size":8,
+                "intermediate_size":12,"num_heads":2,"num_position_embeddings":16,
+                "out_hidden_size":8,"deepstack_visual_indexes":[0,1,2],"in_channels":3,
+                "patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2}
+        });
+        let text = Qwen3VLTextConfig::new(
+            ferrum_models::qwen3_vl_text::Qwen3VLTextArchitecture::from_hf_value(&raw).unwrap(),
+            Qwen3VLTextLayout::new(1, vec![vec![Qwen3VLTextKeyRun::new(1, true)]]).unwrap(),
+        )
+        .unwrap();
+        let dit = QwenImage21TransformerConfig::new(
+            ferrum_models::qwen_image21::QwenImage21Config::from_hf_json(
+                &serde_json::to_vec(&serde_json::json!({
+                    "_class_name":"QwenImage21Transformer2DModel", "num_layers":1,
+                    "num_attention_heads":1,"attention_head_dim":8,"context_in_dim":8,
+                    "in_channels":64,"out_channels":64,"patch_size":1,"mlp_ratio":2,
+                    "axes_dims_rope":[2,2,4],"causal_condition":true,"eps":0.000001
+                }))
+                .unwrap(),
+                ferrum_models::qwen_image21::StructureLimits::default(),
+            )
+            .unwrap(),
+            QwenImage21T2iLayout::new(1, 2, 2, vec![1]).unwrap(),
+        )
+        .unwrap();
+        let vision = Qwen3VLVisionArchitecture::from_hf_value(&raw).unwrap();
+        let encoder = QwenImage21VaeEncoderConfig::new(
+            64,
+            1,
+            vec![1, 2, 4, 8, 8],
+            2,
+            vec![false, true, true, true],
+            1,
+            16,
+            16,
+        )
+        .unwrap();
+        let profiles = cuda_profiles(ImageCudaAttentionPolicy::Sequential).unwrap();
+        let ordinary = [
+            TypedFamilyRegistration::new(Qwen3VLTextEncoderFamily::new().unwrap())
+                .prepare_with_profile(
+                    &serde_json::to_value(&text).unwrap(),
+                    &profiles.text_encoder,
+                )
+                .unwrap(),
+            TypedFamilyRegistration::new(QwenImage21TransformerFamily::new().unwrap())
+                .prepare_with_profile(&serde_json::to_value(&dit).unwrap(), &profiles.denoiser)
+                .unwrap(),
+        ];
+        let editing = editing_command_families(&text, &dit, &vision, &encoder, &profiles).unwrap();
+        assert_eq!(
+            editing[0].family_id().as_str(),
+            Qwen3VLVisionFamily::FAMILY_ID
+        );
+        assert_eq!(
+            editing[1].family_id().as_str(),
+            QwenImage21VaeEncoderFamily::FAMILY_ID
+        );
+        for (base, edit, added) in [
+            (&ordinary[0], &editing[2], 6),
+            (&ordinary[1], &editing[3], 3),
+        ] {
+            let limit = component_command_count(base).unwrap();
+            validate_family_command_limits(std::slice::from_ref(base), limit).unwrap();
+            assert_eq!(component_command_count(edit).unwrap(), limit + added);
+            assert!(validate_family_command_limits(std::slice::from_ref(edit), limit).is_err());
+        }
+        let required = editing
+            .iter()
+            .map(|f| component_command_count(f).unwrap())
+            .max()
+            .unwrap();
+        validate_family_command_limits(&editing, required).unwrap();
+        assert!(validate_family_command_limits(&editing, required - 1).is_err());
     }
 }

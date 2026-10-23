@@ -49,6 +49,27 @@ unsafe impl cudarc::driver::DeviceRepr for NativeMask {}
 const _: [(); 2312] = [(); std::mem::size_of::<NativeMask>()];
 
 impl NativeMask {
+    /// Local contiguous segment, used after rebasing Q/K/V to its first row.
+    /// The pack kernel cannot address any preceding or following segment.
+    pub(super) fn isolated_sequence(rows: u32) -> Result<Self, String> {
+        if rows == 0 || rows > i32::MAX as u32 {
+            return Err("isolated attention sequence must fit positive i32".into());
+        }
+        let mut native = Self {
+            segment_count: 1,
+            segment_ends: [0; 32],
+            bidirectional_mask: 1,
+            key_run_counts: [0; 16],
+            key_run_ends: [0; 16 * 32],
+            key_valid_masks: [0; 16],
+        };
+        native.segment_ends[0] = rows;
+        native.key_run_counts[0] = 1;
+        native.key_run_ends[0] = rows;
+        native.key_valid_masks[0] = 1;
+        Ok(native)
+    }
+
     pub(super) fn new(mask: &StructuredAttentionBf16Mask) -> Result<Self, String> {
         let segments = mask.segment_ends();
         let bidirectional = mask.segment_bidirectional();

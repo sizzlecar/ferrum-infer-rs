@@ -20,8 +20,9 @@ pub(super) struct RetainedFunctions {
     half_split_rope_function: CudaFunction,
     gqa_attention_function: CudaFunction,
     spatial_functions: [CudaFunction; 3],
-    extended_spatial_functions: [CudaFunction; 2],
+    extended_spatial_functions: [CudaFunction; 3],
     philox_function: CudaFunction,
+    primitive_function: CudaFunction,
     _provider: CudaTensorProviderRetention,
 }
 
@@ -119,8 +120,9 @@ impl RetainedFunctions {
             let extended_spatial_functions = [
                 module.load_function(spatial_extended::Kind::Attention.function()),
                 module.load_function(spatial_extended::Kind::Gather.function()),
+                module.load_function(spatial_extended::Kind::GroupMean.function()),
             ];
-            let [attention, gather] = extended_spatial_functions;
+            let [attention, gather, group_mean] = extended_spatial_functions;
             let extended_spatial_functions = [
                 attention.map_err(|e| {
                     CudaDeviceRuntimeError::driver("BF16 spatial attention function load", e)
@@ -128,10 +130,16 @@ impl RetainedFunctions {
                 gather.map_err(|e| {
                     CudaDeviceRuntimeError::driver("BF16 spatial gather function load", e)
                 })?,
+                group_mean.map_err(|e| {
+                    CudaDeviceRuntimeError::driver("BF16 spatial group mean function load", e)
+                })?,
             ];
             let philox_function = module.load_function(philox::FUNCTION).map_err(|e| {
                 CudaDeviceRuntimeError::driver("BF16 Philox normal function load", e)
             })?;
+            let primitive_function = module
+                .load_function(primitives::FUNCTION)
+                .map_err(|e| CudaDeviceRuntimeError::driver("tensor primitive function load", e))?;
             Ok::<_, CudaDeviceRuntimeError>((
                 pointwise,
                 normalization,
@@ -144,6 +152,7 @@ impl RetainedFunctions {
                 spatial_functions,
                 extended_spatial_functions,
                 philox_function,
+                primitive_function,
             ))
         }));
         let (
@@ -158,6 +167,7 @@ impl RetainedFunctions {
             spatial_functions,
             extended_spatial_functions,
             philox_function,
+            primitive_function,
         ) = match loaded {
             Ok(Ok(functions)) => functions,
             Ok(Err(error)) => {
@@ -182,12 +192,17 @@ impl RetainedFunctions {
             spatial_functions,
             extended_spatial_functions,
             philox_function,
+            primitive_function,
             _provider: provider,
         }))
     }
 
     pub(super) fn function(&self, kind: Kind) -> &CudaFunction {
         &self.functions[kind.index()]
+    }
+
+    pub(super) fn primitive_function(&self) -> &CudaFunction {
+        &self.primitive_function
     }
 
     pub(super) fn philox_function(&self) -> &CudaFunction {

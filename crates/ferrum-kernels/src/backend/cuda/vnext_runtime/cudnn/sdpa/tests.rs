@@ -52,6 +52,30 @@ fn sliced_bshd_geometry_preserves_original_batch_stride_without_payload_allocati
 }
 
 #[test]
+fn d72_bf16_sdpa_has_exact_bshd_extents_and_preserves_alignment() {
+    let s = CudnnSdpaSignature {
+        batch: 1,
+        heads: 16,
+        query_length: 4096,
+        key_value_length: 4096,
+        head_dim: 72,
+        query_batch_stride: 4096 * 1152,
+        key_value_batch_stride: 4096 * 1152,
+        output_batch_stride: 4096 * 1152,
+        scale_bits: (1.0_f32 / 72.0_f32.sqrt()).to_bits(),
+    };
+    s.validate().unwrap();
+    assert_eq!(
+        s.extent(4096, s.query_batch_stride).unwrap(),
+        4096 * 1152 * 2
+    );
+    validate_bindings(s, 256, bindings()).unwrap();
+    for d in [0, 70, 73, 256] {
+        assert!(CudnnSdpaSignature { head_dim: d, ..s }.validate().is_err());
+    }
+}
+
+#[test]
 fn bindings_reject_alias_misalignment_overflow_and_a_different_workspace_quote() {
     let s = signature();
     let b = bindings();

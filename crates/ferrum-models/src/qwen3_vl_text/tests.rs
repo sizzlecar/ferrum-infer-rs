@@ -267,3 +267,154 @@ fn unsupported_text_semantics_and_invalid_head_ratio_fail_closed() {
     .is_err());
     assert!(Qwen3VLTextLayout::new(3, vec![vec![Qwen3VLTextKeyRun::new(2, true)]]).is_err());
 }
+
+#[test]
+fn deepstack_updates_follow_each_complete_layer_and_are_typed_inputs() {
+    let base = Qwen3VLTextConfig::new(
+        Qwen3VLTextArchitecture::from_hf_value(&hf(4, 8, 12, 4, 2, 2)).unwrap(),
+        layout(true),
+    )
+    .unwrap();
+    let runs = Qwen3VLTextDeepStack::new(vec![
+        Qwen3VLTextVisualRun::new(1, 2).unwrap(),
+        Qwen3VLTextVisualRun::new(4, 1).unwrap(),
+    ])
+    .unwrap();
+    let edit = base.clone().with_deepstack(runs).unwrap();
+    let family = Qwen3VLTextEncoderFamily::new().unwrap();
+    assert_eq!(
+        family.weights(&base).unwrap(),
+        family.weights(&edit).unwrap()
+    );
+    let profiles = family.numerical_profiles(&edit).unwrap();
+    let p = family
+        .semantic_program(&edit, &profiles.profiles()[0])
+        .unwrap();
+    for layer in 0..3 {
+        let block = &p.blocks()[layer];
+        let inject = block.nodes.last().unwrap();
+        assert_eq!(inject.operation_id.as_str(), edit::SCATTER_ADD_OPERATION_ID);
+        assert_eq!(
+            inject.inputs[0],
+            block.nodes[block.nodes.len() - 2].outputs[0]
+        );
+        assert_eq!(
+            inject.inputs[1],
+            ProgramValueId::new(Qwen3VLTextEncoderFamily::DEEPSTACK_IDS[layer]).unwrap()
+        );
+        assert_eq!(p.blocks()[layer + 1].nodes[0].inputs[0], inject.outputs[0]);
+        assert_eq!(p.input_tensor_specs()[&inject.inputs[1]].dimensions, [3, 8]);
+    }
+    assert!(!serde_json::to_value(&base)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .contains_key("deepstack"));
+    let wire = serde_json::to_value(&edit).unwrap();
+    assert_eq!(
+        serde_json::from_value::<Qwen3VLTextConfig>(wire).unwrap(),
+        edit
+    );
+    let reg = TypedFamilyRegistration::new(family);
+    let id = NumericalProfileId::new(Qwen3VLTextEncoderFamily::REFERENCE_PROFILE_ID).unwrap();
+    assert_ne!(
+        reg.prepare_with_profile(&serde_json::to_value(&base).unwrap(), &id)
+            .unwrap()
+            .fingerprint()
+            .unwrap(),
+        reg.prepare_with_profile(&serde_json::to_value(&edit).unwrap(), &id)
+            .unwrap()
+            .fingerprint()
+            .unwrap()
+    );
+}
+
+#[test]
+fn deepstack_rejects_overlap_padding_cross_sample_and_unchecked_wire() {
+    let base = Qwen3VLTextConfig::new(
+        Qwen3VLTextArchitecture::from_hf_value(&hf(3, 8, 12, 4, 2, 2)).unwrap(),
+        layout(true),
+    )
+    .unwrap();
+    assert!(Qwen3VLTextDeepStack::new(vec![
+        Qwen3VLTextVisualRun::new(1, 2).unwrap(),
+        Qwen3VLTextVisualRun::new(2, 1).unwrap()
+    ])
+    .is_err());
+    for (start, len) in [(0, 1), (2, 2), (6, 1)] {
+        let runs = Qwen3VLTextDeepStack::new(vec![Qwen3VLTextVisualRun::new(start, len).unwrap()])
+            .unwrap();
+        assert!(base.clone().with_deepstack(runs).is_err());
+    }
+    let mut wire = serde_json::to_value(&base).unwrap();
+    wire["deepstack"] = json!({"runs":[{"start":1,"length":0}]});
+    assert!(serde_json::from_value::<Qwen3VLTextConfig>(wire).is_err());
+    assert!(Qwen3VLTextVisualRun::new(u64::MAX, 2).is_err());
+}
+
+#[test]
+fn edit_mrope_uses_image_axes_and_resumes_text_after_maximum_axis() {
+    let mut raw = hf(3, 8, 12, 2, 1, 8);
+    raw["text_config"]["rope_theta"] = json!(1);
+    raw["text_config"]["rope_scaling"]["mrope_section"] = json!([2, 1, 1]);
+    let architecture = Qwen3VLTextArchitecture::from_hf_value(&raw).unwrap();
+    let layout = Qwen3VLTextLayout::new(
+        7,
+        vec![vec![
+            Qwen3VLTextKeyRun::new(1, false),
+            Qwen3VLTextKeyRun::new(6, true),
+        ]],
+    )
+    .unwrap();
+    let spans = [Qwen3VLTextImageSpan::new(2, 4, 4, 2).unwrap()];
+    let c = Qwen3VLTextConfig::new(architecture, layout)
+        .unwrap()
+        .with_image_spans(&spans)
+        .unwrap();
+    let bytes = 7 * 8 * 2 * 2;
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            bytes,
+            HostMemoryClassLimits {
+                weight_backing_bytes: 0,
+                input_preprocess_bytes: bytes,
+                transfer_staging_bytes: 0,
+                output_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    let output = c.managed_edit_mrope(&host, &spans).unwrap();
+    // Padding and one text row precede the 2x2 image. Pair lanes select T,H,W,T.
+    let expected = [
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+        [1, 1, 1, 1],
+        [1, 1, 2, 1],
+        [1, 2, 1, 1],
+        [1, 2, 2, 1],
+        [3, 3, 3, 3],
+    ];
+    for (row, phases) in expected.into_iter().enumerate() {
+        for (column, p) in phases.into_iter().enumerate() {
+            let c = half::bf16::from_f32(libm::cosf(p as f32))
+                .to_bits()
+                .to_le_bytes();
+            let s = half::bf16::from_f32(libm::sinf(p as f32))
+                .to_bits()
+                .to_le_bytes();
+            for col in [column, column + 4] {
+                let offset = (row * 8 + col) * 2;
+                assert_eq!(&output[0].bytes().as_ref()[offset..offset + 2], &c);
+                assert_eq!(&output[1].bytes().as_ref()[offset..offset + 2], &s);
+            }
+        }
+    }
+    assert_eq!(host.usage().unwrap().allocated_bytes(), bytes);
+    drop(output);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    assert!(c
+        .managed_edit_mrope(&host, &[Qwen3VLTextImageSpan::new(1, 4, 4, 2).unwrap()])
+        .is_err());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}

@@ -3,6 +3,156 @@ use serde_json::json;
 type F = QwenImage21TransformerFamily;
 
 #[test]
+fn reference_image_layout_preserves_four_segments_padding_and_rotary_progression() {
+    let base = QwenImage21TransformerConfig::new(
+        transformer(2, true, false),
+        QwenImage21T2iLayout::new(7, 2, 2, vec![7, 5]).unwrap(),
+    )
+    .unwrap();
+    let edit = base.clone().with_reference_image(2, 2, 2, 4).unwrap();
+    let l = edit.layout();
+    assert_eq!(l.sequence_length(), 17);
+    assert_eq!(l.target_start(), 13);
+    // T0=[0,2), reference=[2,10), T1=[10,13), target=[13,17).
+    for (row, p) in [
+        (0, [0, 0, 0]),
+        (1, [1, 1, 1]),
+        (2, [2, -1, -2]),
+        (9, [2, 0, 1]),
+        (10, [6, 6, 6]),
+        (12, [8, 8, 8]),
+        (13, [9, -1, -1]),
+        (16, [9, 0, 0]),
+    ] {
+        assert_eq!(l.rotary_position(row), Some(p));
+    }
+    let attention =
+        QwenImage21AttentionConfig::new(edit.transformer().clone(), l.attention_layout().unwrap())
+            .unwrap();
+    let attrs = attention.attributes().unwrap();
+    assert_eq!(
+        attrs[&AttributeId::new("segment_lengths").unwrap()],
+        SemanticValue::Integers(vec![2, 8, 3, 4])
+    );
+    assert_eq!(
+        attrs[&AttributeId::new("segment_bidirectional").unwrap()],
+        SemanticValue::Integers(vec![0, 1, 0, 1])
+    );
+    let q = ResolvedTensorSpec::new(
+        vec![34, 16],
+        ElementType::Bf16,
+        ResolvedTensorLayout::Contiguous,
+    )
+    .unwrap();
+    let geometry = StructuredAttentionBf16Geometry::new(&q, &q, &q, &q, &attrs).unwrap();
+    assert_eq!(geometry.mask().visible_end(2), Some(10));
+    assert_eq!(geometry.mask().visible_end(10), Some(11));
+    assert_eq!(geometry.mask().visible_end(13), Some(17));
+    assert_eq!(geometry.mask().key_is_valid(1, 10), Some(true));
+    assert_eq!(geometry.mask().key_is_valid(1, 11), Some(false));
+    assert_eq!(geometry.mask().key_is_valid(1, 12), Some(false));
+    assert_eq!(geometry.mask().key_is_valid(1, 13), Some(true));
+    assert!(!serde_json::to_value(&base).unwrap()["layout"]
+        .as_object()
+        .unwrap()
+        .contains_key("reference_image"));
+    assert_eq!(
+        serde_json::from_value::<QwenImage21TransformerConfig>(
+            serde_json::to_value(&edit).unwrap()
+        )
+        .unwrap(),
+        edit
+    );
+    assert!(base.clone().with_reference_image(2, 1, 2, 4).is_err());
+    assert!(base.clone().with_reference_image(4, 2, 2, 4).is_err());
+    assert!(base.with_reference_image(2, 2, 3, 4).is_err());
+}
+
+#[test]
+fn reference_image_program_interleaves_per_sample_without_changing_target_domain() {
+    let c = QwenImage21TransformerConfig::new(
+        transformer(2, true, false),
+        QwenImage21T2iLayout::new(7, 2, 2, vec![7, 5]).unwrap(),
+    )
+    .unwrap()
+    .with_reference_image(2, 2, 2, 4)
+    .unwrap();
+    let f = F::new().unwrap();
+    let profiles = f.numerical_profiles(&c).unwrap();
+    let p = f
+        .semantic_program(
+            &c,
+            profiles
+                .resolve(&profile_id(F::REFERENCE_PROFILE_ID).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    let nodes = &p.blocks()[0].nodes;
+    let node = |name: &str| {
+        nodes
+            .iter()
+            .find(|n| n.id.as_str() == format!("node.qwen_image21.transformer.{name}"))
+            .unwrap()
+    };
+    assert_eq!(
+        node("combined_latents").inputs,
+        [id(F::REFERENCE_LATENTS_ID), id(F::LATENTS_ID)]
+    );
+    assert_eq!(node("image_in").inputs[0], id(program::COMBINED_LATENTS));
+    assert_eq!(
+        node("interleaved_joint").inputs,
+        [id(program::UNORDERED_JOINT)]
+    );
+    let attrs = &node("interleaved_joint").attributes;
+    let list = |name: &str| match &attrs[&AttributeId::new(name).unwrap()] {
+        SemanticValue::Integers(v) => v.clone(),
+        _ => panic!("integer row map"),
+    };
+    let (lengths, starts, strides) = (
+        list("run_lengths"),
+        list("source_starts"),
+        list("source_batch_strides"),
+    );
+    for batch in 0..2 {
+        let selected = lengths
+            .iter()
+            .zip(&starts)
+            .zip(&strides)
+            .flat_map(|((&len, &start), &stride)| (0..len).map(move |i| batch * stride + start + i))
+            .collect::<Vec<_>>();
+        let expected =
+            [0, 1, 7, 8, 9, 10, 11, 12, 13, 14, 4, 5, 6, 15, 16, 17, 18].map(|n| n + batch * 19);
+        assert_eq!(selected, expected);
+    }
+    let conditioning = &node("conditioning0").attributes;
+    assert_eq!(
+        conditioning[&AttributeId::new("run_lengths").unwrap()],
+        SemanticValue::Integers(vec![13, 4])
+    );
+    assert_eq!(
+        conditioning[&AttributeId::new("source_starts").unwrap()],
+        SemanticValue::Integers(vec![2, 0])
+    );
+    assert_eq!(
+        node("target_hidden").attributes[&AttributeId::new("source_starts").unwrap()],
+        SemanticValue::Integers(vec![13])
+    );
+    assert_eq!(
+        p.input_tensor_specs()[&id(F::LATENTS_ID)].dimensions,
+        [8, 3]
+    );
+    assert_eq!(
+        p.input_tensor_specs()[&id(F::REFERENCE_LATENTS_ID)].dimensions,
+        [16, 3]
+    );
+    assert_eq!(p.outputs(), [id(F::VELOCITY_ID)]);
+    assert_eq!(
+        c.compile_options().unwrap().tensor_specs()[&id(program::JOINT)].dimensions,
+        [34, 16]
+    );
+}
+
+#[test]
 fn fp8_transformer_scope_groups_qkv_but_keeps_all_boundary_projections_bf16() {
     let config = config(true);
     let family = F::new().unwrap();

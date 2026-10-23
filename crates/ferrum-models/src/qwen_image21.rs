@@ -11,6 +11,7 @@ mod block0_mlp;
 mod conditioning;
 mod config;
 mod headers;
+pub mod image_input;
 mod image_projection;
 pub mod pipeline_adapters;
 mod qk_norm;
@@ -18,6 +19,7 @@ pub mod sampling_schedule;
 pub mod t2i_prompt;
 mod transformer;
 mod vae_decoder;
+mod vae_encoder;
 mod vae_stem;
 mod weights;
 
@@ -38,11 +40,15 @@ pub use image_projection::{
 };
 pub use qk_norm::{QwenImage21Block0QkNormFamily, QwenImage21QkFrontend};
 pub use transformer::{
-    QwenImage21ModelTimestep, QwenImage21RotaryFrequencies, QwenImage21T2iLayout,
-    QwenImage21Timestep256, QwenImage21TransformerConfig, QwenImage21TransformerFamily,
+    QwenImage21ModelTimestep, QwenImage21ReferenceImage, QwenImage21RotaryFrequencies,
+    QwenImage21T2iLayout, QwenImage21Timestep256, QwenImage21TransformerConfig,
+    QwenImage21TransformerFamily,
 };
 pub use vae_decoder::{
     QwenImage21VaeDecoderConfig, QwenImage21VaeDecoderFamily, QwenImage21VaeDecoderWeight,
+};
+pub use vae_encoder::{
+    QwenImage21VaeEncoderConfig, QwenImage21VaeEncoderFamily, QwenImage21VaeEncoderWeight,
 };
 pub use vae_stem::{QwenImage21VaeStemConfig, QwenImage21VaeStemFamily, QwenImage21VaeStemWeight};
 pub use weights::{ExpectedTensor, ExpectedWeights};

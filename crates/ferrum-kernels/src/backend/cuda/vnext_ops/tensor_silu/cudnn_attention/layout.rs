@@ -2,7 +2,7 @@
 
 use super::*;
 
-pub(super) const SCRATCH_ALIGNMENT: u64 = 256;
+pub(in crate::backend::cuda::vnext_ops::tensor_silu) const SCRATCH_ALIGNMENT: u64 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Method {
@@ -163,7 +163,7 @@ pub(super) fn valid_prefix(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ScratchLayout {
+pub(in crate::backend::cuda::vnext_ops::tensor_silu) struct ScratchLayout {
     pub value_offset: u64,
     pub query_lengths_offset: u64,
     pub key_lengths_offset: u64,

@@ -278,3 +278,41 @@ fn independent_capabilities_and_no_alias_are_checked_before_native_launch() {
     assert!(nonoverlapping_ranges(256, 64, 288, 64).is_err());
     assert!(nonoverlapping_ranges(256, 64, 320, 64).is_ok());
 }
+
+#[test]
+fn spatial_group_mean_metadata_preserves_expanded_channel_geometry_and_checked_extent() {
+    let attrs = ["scale_h", "scale_w", "frame_factor"]
+        .into_iter()
+        .map(|name| (AttributeId::new(name).unwrap(), SemanticValue::Unsigned(2)))
+        .collect();
+    let shape = geometry(Kind::GroupMean, &pair(&[2, 3, 4, 6], &[2, 6, 2, 3]), &attrs).unwrap();
+    assert!(matches!(shape.native, NativeShape::GroupMean(_)));
+    assert_eq!(
+        (
+            shape.input_bytes,
+            shape.output_bytes,
+            shape.elements,
+            shape.operations
+        ),
+        (288, 144, 72, 288)
+    );
+    assert!(geometry(Kind::GroupMean, &pair(&[2, 3, 4, 6], &[2, 5, 2, 3]), &attrs).is_err());
+    assert!(geometry(Kind::GroupMean, &pair(&[2, 3, 5, 6], &[2, 6, 2, 3]), &attrs).is_err());
+    let config = super::super::super::cuda_tensor_runtime_config(
+        0,
+        DeviceId::new("device.cuda.group_mean").unwrap(),
+    )
+    .unwrap();
+    let device = DeviceDescriptor {
+        id: config.device_id,
+        class: DeviceClass::Accelerator,
+        ordinal: 0,
+        total_memory_bytes: 4096,
+        runtime_implementation_fingerprint: config.runtime_implementation_fingerprint,
+        capabilities: config.capabilities,
+        dynamic_storage_profiles: config.dynamic_storage_profiles,
+    };
+    assert!(descriptor(&device, Kind::GroupMean)
+        .unwrap()
+        .supports_fixed_tensor_work());
+}

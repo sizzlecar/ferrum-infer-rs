@@ -10,6 +10,7 @@ pub(super) struct PreparedRequest<R: DeviceRuntime> {
     pub noise_stage: PreparedStage<R>,
     pub denoise_stage: PreparedStage<R>,
     pub decode_stage: PreparedStage<R>,
+    pub edit: Option<super::editing::PreparedEdit<R>>,
 }
 
 /// Execution-to-request mapping. This only moves bounded owners/metadata, never
@@ -67,6 +68,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         &self,
         requests: &[ImageGenerationRequest],
     ) -> anyhow::Result<PreparedRequest<R>> {
+        self.prepare_batch_with_edit(requests, None)
+    }
+
+    pub(super) fn prepare_batch_with_edit(
+        &self,
+        requests: &[ImageGenerationRequest],
+        edit: Option<super::editing::EditInputs>,
+    ) -> anyhow::Result<PreparedRequest<R>> {
         let (height, width) =
             batch_dimensions(requests, &self.config, self.assets.spatial_scale()?)?;
         let request = &requests[0];
@@ -75,12 +84,20 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .iter()
             .map(|r| r.prompt.as_str())
             .collect::<Vec<_>>();
-        let (prompts, order) = self
-            .assets
-            .tokenizer
-            .prepare_canonical(&prompt_text, self.config.maximum_user_tokens)?;
+        let (prompts, order) = if let Some(edit) = &edit {
+            ensure!(batch == 1, "single-reference editing requires one request");
+            (edit.prompt.prompts().clone(), vec![0])
+        } else {
+            self.assets
+                .tokenizer
+                .prepare_canonical(&prompt_text, self.config.maximum_user_tokens)?
+        };
         let request_order = BatchOrder::new(order, batch)?;
-        let text = Qwen3VLTextConfig::new(self.assets.text.clone(), prompts.layout().clone())?;
+        let text = if let Some(edit) = &edit {
+            edit.prompt.text_config(&self.assets.text)?
+        } else {
+            Qwen3VLTextConfig::new(self.assets.text.clone(), prompts.layout().clone())?
+        };
         let layout = QwenImage21T2iLayout::new(
             u32::try_from(prompts.feature_sequence_length())?,
             height,
@@ -91,8 +108,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .map(u32::try_from)
                 .collect::<Result<_, _>>()?,
         )?;
-        let transformer =
+        let mut transformer =
             QwenImage21TransformerConfig::new(self.assets.transformer.clone(), layout)?;
+        if let Some(edit) = &edit {
+            transformer = transformer.with_reference_image(
+                edit.prompt.image_slot_start(),
+                edit.prompt.image_slots(),
+                edit.inputs.height() / 16,
+                edit.inputs.width() / 16,
+            )?;
+        }
         let decoder_batch = self.config.decoder_batch_policy.batch_size(batch);
         let decoder = self.assets.decoder_batch(decoder_batch, height, width)?;
         ensure!(
@@ -165,12 +190,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             &decoder.compile_options()?,
             self,
         )?;
-        self.validate_resident_capacity(&[
-            &text_stage,
-            &noise_stage,
-            &denoise_stage,
-            &decode_stage,
-        ])?;
+        let edit = edit.map(|edit| edit.compile(self)).transpose()?;
+        let mut all_stages = vec![&text_stage, &noise_stage, &denoise_stage, &decode_stage];
+        if let Some(edit) = &edit {
+            all_stages.extend([&edit.vision_stage, &edit.encoder_stage]);
+        }
+        self.validate_resident_capacity(&all_stages)?;
         Ok(PreparedRequest {
             prompts,
             request_order,
@@ -181,6 +206,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             noise_stage,
             denoise_stage,
             decode_stage,
+            edit,
         })
     }
 }

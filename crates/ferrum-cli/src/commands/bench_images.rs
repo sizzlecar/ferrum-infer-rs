@@ -4,8 +4,8 @@
 use anyhow::{ensure, Context};
 use clap::{Args, ValueEnum};
 use ferrum_bench_core::images::{
-    sha256, ImageDataset, ImageMetrics, ImageRequestPhase, ImageRequestRecord, ImageResponseLimits,
-    ImageSloStatus,
+    sha256, ImageDataset, ImageMetrics, ImageRequestMode, ImageRequestPhase, ImageRequestRecord,
+    ImageResponseLimits, ImageSloStatus, ValidatedImage,
 };
 use serde::Serialize;
 use std::{
@@ -20,6 +20,7 @@ mod capture;
 pub use capture::{
     PngCaptureConfig, PngCaptureFailureKind, PngCaptureRecord, PngCaptureResult, PngCaptureSummary,
 };
+mod edit;
 mod runner;
 pub use runner::run_benchmark;
 #[cfg(test)]
@@ -35,7 +36,8 @@ pub enum InitialServerState {
 
 #[derive(Debug, Clone, Args)]
 pub struct BenchImagesCommand {
-    /// Full /v1/images/generations URL. Repeat for sequential endpoint comparison.
+    /// Full /v1/images/generations or /v1/images/edits URL, matching dataset mode.
+    /// Repeat for sequential endpoint comparison; the client never rewrites URLs.
     #[arg(long, required = true)]
     pub endpoint: Vec<String>,
     /// One model alias shared by endpoints, or one per endpoint in the same order.
@@ -47,6 +49,8 @@ pub struct BenchImagesCommand {
     pub server_config: Vec<String>,
     /// JSON {"schema_version":1,"samples":[{"id":"...","prompt":"...",
     /// "seed":1,"width":512,"height":512}]} in fixed request order.
+    /// For edits use schema_version 2 and mode={"kind":"edit","image":
+    /// {"path":"reference.png"}}. Image paths are relative to this JSON file.
     #[arg(long)]
     pub dataset: PathBuf,
     /// New JSON report path; an existing file is never overwritten.
@@ -88,6 +92,10 @@ pub struct BenchImagesCommand {
     pub decoder_workspace_bytes: usize,
     #[arg(long, default_value_t = 16 * 1024 * 1024)]
     pub maximum_dataset_bytes: usize,
+    /// One shared reference PNG allocation, loaded/validated before timing.
+    /// Decoder dimensions/workspace use the same explicit limits as responses.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    pub maximum_reference_image_bytes: usize,
     #[arg(long, default_value_t = 100_000)]
     pub maximum_total_requests: usize,
 }
@@ -110,6 +118,7 @@ pub struct ImageBenchmarkConfig {
     pub latency_slo_p99_ms: Option<f64>,
     pub limits: ImageResponseLimits,
     pub maximum_total_requests: usize,
+    pub maximum_reference_image_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture: Option<PngCaptureConfig>,
 }
@@ -117,6 +126,11 @@ pub struct ImageBenchmarkConfig {
 impl ImageBenchmarkConfig {
     pub fn validate(&self, dataset: &ImageDataset) -> anyhow::Result<()> {
         dataset.validate(&self.limits)?;
+        ensure!(
+            self.maximum_reference_image_bytes > 0
+                && self.maximum_reference_image_bytes < isize::MAX as usize,
+            "reference image byte limit must fit the host address space"
+        );
         if let Some(capture) = &self.capture {
             capture.validate()?;
         }
@@ -163,6 +177,12 @@ impl ImageBenchmarkConfig {
                     && url.fragment().is_none(),
                 "endpoint requires HTTP(S), host and no credentials/query/fragment"
             );
+            if !dataset.mode.is_generate() {
+                ensure!(
+                    url.path().ends_with("/v1/images/edits"),
+                    "edit mode requires an explicit /v1/images/edits endpoint"
+                );
+            }
             ensure!(
                 !endpoint.model.is_empty() && endpoint.model.len() <= 512,
                 "model alias must contain 1..=512 bytes"
@@ -209,6 +229,10 @@ pub struct ImageBenchmarkReport {
     pub dataset_sha256: String,
     pub dataset_file_sha256: Option<String>,
     pub dataset: ImageDataset,
+    /// Complete validation of the actual shared upload. Not the local path or
+    /// an assumed equality of noise/model behavior between implementations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_image: Option<ValidatedImage>,
     pub endpoints: Vec<ImageEndpointReport>,
     pub evidence: ImageEvidenceScope,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,8 +288,17 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
         bytes.len() <= command.maximum_dataset_bytes,
         "dataset exceeds byte limit"
     );
-    let dataset: ImageDataset =
+    let mut dataset: ImageDataset =
         serde_json::from_slice(&bytes).context("invalid image dataset JSON")?;
+    if let ImageRequestMode::Edit { image } = &mut dataset.mode {
+        if image.path.is_relative() {
+            image.path = command
+                .dataset
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(&image.path);
+        }
+    }
     ensure!(
         command.model.len() == 1 || command.model.len() == command.endpoint.len(),
         "provide one model or one model per endpoint"
@@ -301,6 +334,7 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
         timeout_seconds: command.timeout_seconds,
         latency_slo_p99_ms: command.latency_slo_p99_ms,
         maximum_total_requests: command.maximum_total_requests,
+        maximum_reference_image_bytes: command.maximum_reference_image_bytes,
         capture,
         limits: ImageResponseLimits {
             maximum_response_bytes: command.maximum_response_bytes,

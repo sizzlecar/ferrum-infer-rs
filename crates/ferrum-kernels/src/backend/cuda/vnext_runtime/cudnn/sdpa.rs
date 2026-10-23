@@ -29,7 +29,7 @@ impl CudnnSdpaSignature {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if !(1..=16).contains(&self.batch)
             || self.heads <= 0
-            || self.head_dim != 128
+            || !matches!(self.head_dim, 72 | 128)
             || self.query_length <= 0
             || self.key_value_length <= 0
             || self.query_length > i32::MAX as i64
@@ -37,7 +37,7 @@ impl CudnnSdpaSignature {
             || !f32::from_bits(self.scale_bits).is_finite()
             || f32::from_bits(self.scale_bits) <= 0.0
         {
-            return Err("cuDNN SDPA requires B=1..16, positive bounded lengths/heads, D128 and finite positive scale".into());
+            return Err("cuDNN SDPA requires B=1..16, positive bounded lengths/heads, D72 or D128 and finite positive scale".into());
         }
         self.extent(self.query_length, self.query_batch_stride)?;
         self.extent(self.key_value_length, self.key_value_batch_stride)?;

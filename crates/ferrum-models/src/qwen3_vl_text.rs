@@ -1,17 +1,22 @@
-//! Qwen3-VL text-only conditioning component, ending before the final RMSNorm.
+//! Qwen3-VL conditioning component, ending before the final RMSNorm.
 //!
 //! Embedding lookup, tokenization and position generation are caller adapters.
 //! This family consumes their actual BF16 tensors through ordinary managed
-//! execution. It contains no vision branch, logits head, paged cache or tokens
+//! execution. Optional DeepStack inputs are supplied by the separate vision
+//! family. It contains no vision branch, logits head, paged cache or tokens
 //! masquerading as tensor work. Numerical profiles distinguish our FP32 online
 //! attention from Transformers' eager BF16-probability implementation.
 
 mod config;
+mod edit;
+mod mrope;
 mod program;
 mod weights;
 pub use config::{
     Qwen3VLTextArchitecture, Qwen3VLTextConfig, Qwen3VLTextKeyRun, Qwen3VLTextLayout,
 };
+pub use edit::{Qwen3VLTextDeepStack, Qwen3VLTextVisualRun};
+pub use mrope::{Qwen3VLTextImageSpan, QWEN3_VL_EDIT_MROPE_PROFILE};
 pub use weights::Qwen3VLTextExpectedWeight;
 
 use ferrum_runtime::*;
@@ -31,6 +36,11 @@ impl Qwen3VLTextEncoderFamily {
     pub const EMBEDDINGS_ID: &'static str = "value.qwen3_vl.text.embeddings";
     pub const COSINE_ID: &'static str = "value.qwen3_vl.text.cosine";
     pub const SINE_ID: &'static str = "value.qwen3_vl.text.sine";
+    pub const DEEPSTACK_IDS: [&'static str; 3] = [
+        "value.qwen3_vl.text.deepstack.0",
+        "value.qwen3_vl.text.deepstack.1",
+        "value.qwen3_vl.text.deepstack.2",
+    ];
     pub const OUTPUT_ID: &'static str = "value.qwen3_vl.text.pre_final_norm";
     pub const EMBEDDING_EXTERNAL_NAME: &'static str = "model.language_model.embed_tokens.weight";
     pub fn new() -> Result<Self, VNextError> {
@@ -114,7 +124,7 @@ impl ModelFamilyProvider for Qwen3VLTextEncoderFamily {
             .cloned()
             .map(|id| (id, ElementType::Bf16))
             .collect::<BTreeMap<_, _>>();
-        let operations = [
+        let mut operations = [
             DENSE_LINEAR_BF16_OPERATION_ID,
             HEAD_RMS_NORM_BF16_OPERATION_ID,
             HALF_SPLIT_ROPE_BF16_OPERATION_ID,
@@ -138,6 +148,16 @@ impl ModelFamilyProvider for Qwen3VLTextEncoderFamily {
             })
         })
         .collect::<Result<Vec<_>, VNextError>>()?;
+        if config.deepstack().is_some() {
+            operations.push(NumericalOperationContract {
+                operation_id: OperationId::new(edit::SCATTER_ADD_OPERATION_ID)?,
+                version: ContractVersion::new(1, 0),
+                multiplication_type: None,
+                accumulation_type: Some(ElementType::F32),
+                staged_arithmetic: None,
+                composite_arithmetic: None,
+            });
+        }
         let profile = |name: &str| -> Result<NumericalExecutionProfile, VNextError> {
             Ok(NumericalExecutionProfile {
                 id: NumericalProfileId::new(name).map_err(|e| invalid("profile", e))?,

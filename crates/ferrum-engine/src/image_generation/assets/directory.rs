@@ -63,6 +63,16 @@ impl QwenImage21Assets {
                 vae: open(vae)?,
             },
         )?;
+        // A declared visual tower enables the editing capability only after
+        // every required visual/encoder weight and processor field is checked.
+        let text_metadata: serde_json::Value = serde_json::from_slice(text.config().bytes())?;
+        if text_metadata.get("vision_config").is_some() {
+            assets = assets.with_image_editing(
+                text.config().bytes(),
+                vae.config().bytes(),
+                processor.config().bytes(),
+            )?;
+        }
         // Preserve the identity of every consumed package metadata file,
         // including processor declarations and optional generation metadata.
         for digest in bundle.manifest().files() {

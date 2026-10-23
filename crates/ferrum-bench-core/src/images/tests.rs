@@ -119,6 +119,7 @@ fn workload_identity_is_order_seed_and_geometry_sensitive() {
     };
     let mut dataset = ImageDataset {
         schema_version: 1,
+        mode: ImageRequestMode::Generate,
         samples: vec![sample.clone()],
     };
     dataset.validate(&ImageResponseLimits::default()).unwrap();
@@ -174,4 +175,66 @@ fn metrics_do_not_hide_errors_or_invent_missing_slo() {
     assert_eq!(failed.errors, 1);
     assert_eq!(failed.e2e_p99_ms, None);
     assert_eq!(failed.latency_slo_status, ImageSloStatus::Violated);
+}
+
+#[test]
+fn generation_v1_wire_is_unchanged_and_edit_requires_explicit_v2() {
+    let old = serde_json::json!({
+        "schema_version":1,
+        "samples":[{"id":"one","prompt":"blue teapot","seed":9,"width":2,"height":1}]
+    });
+    let mut data: ImageDataset = serde_json::from_value(old.clone()).unwrap();
+    assert!(data.mode.is_generate());
+    assert_eq!(serde_json::to_value(&data).unwrap(), old);
+    let generation_identity = data.fingerprint().unwrap();
+    data.mode = ImageRequestMode::Edit {
+        image: ImageReference {
+            path: "reference.png".into(),
+            encoded_sha256: None,
+        },
+    };
+    assert!(data.validate(&ImageResponseLimits::default()).is_err());
+    data.schema_version = 2;
+    data.validate(&ImageResponseLimits::default()).unwrap();
+    assert_ne!(generation_identity, data.fingerprint().unwrap());
+    let before = data.fingerprint().unwrap();
+    let ImageRequestMode::Edit { image } = &mut data.mode else {
+        unreachable!()
+    };
+    image.encoded_sha256 = Some("a".repeat(64));
+    assert_ne!(before, data.fingerprint().unwrap());
+    let ImageRequestMode::Edit { image } = &mut data.mode else {
+        unreachable!()
+    };
+    image.encoded_sha256 = Some("A".repeat(64));
+    assert!(data.validate(&ImageResponseLimits::default()).is_err());
+    assert!(
+        serde_json::from_value::<ImageRequestMode>(serde_json::json!({
+            "kind":"edit", "image":{"path":"ref.png"}, "mask":"mask.png"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn reference_png_validation_reuses_full_decoder_without_base64_or_assumed_output_size() {
+    let bytes = png(png::ColorType::Rgba, &[10, 20, 30, 0, 40, 50, 60, 255]);
+    let limits = ImageResponseLimits::default();
+    let actual = validate_reference_png(&bytes, &limits).unwrap();
+    let response = validate_image_response(&response(&bytes), 2, 1, &limits).unwrap();
+    assert_eq!((actual.width, actual.height), (2, 1));
+    assert_eq!(actual.png_sha256, sha256(&bytes));
+    assert_eq!(actual.rgba8_sha256, response.rgba8_sha256);
+    let mut short = limits.clone();
+    short.maximum_png_bytes = bytes.len() - 1;
+    assert!(validate_reference_png(&bytes, &short).is_err());
+    short = limits.clone();
+    short.maximum_pixels = 1;
+    assert!(validate_reference_png(&bytes, &short).is_err());
+    let mut bad = bytes.clone();
+    bad[29] ^= 1;
+    assert!(validate_reference_png(&bad, &limits).is_err());
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(validate_reference_png(&trailing, &limits).is_err());
 }

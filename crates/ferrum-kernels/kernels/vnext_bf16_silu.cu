@@ -749,3 +749,7 @@ extern "C" __global__ void ferrum_vnext_spatial_upsample_gather_bf16(
             + y / shape.scale_h) * shape.input_width + x / shape.scale_w];
     }
 }
+
+#include "vnext_bf16_spatial_group_mean.cuh"
+
+#include "vnext_tensor_primitives.cuh"

@@ -27,8 +27,8 @@ impl ImagePlanCachePolicy {
         {
             ensure!(
                 maximum_entries_per_stage > 0
-                    && maximum_entries_per_stage <= isize::MAX as usize / 4,
-                "image multi_shape cache entry limit must be positive and addressable across four stages"
+                    && maximum_entries_per_stage <= isize::MAX as usize / 6,
+                "image multi_shape cache entry limit must be positive and addressable across six stages"
             );
             ensure!(
                 maximum_encoded_metadata_bytes > 0
