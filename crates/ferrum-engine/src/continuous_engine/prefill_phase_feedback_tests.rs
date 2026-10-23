@@ -457,8 +457,40 @@ async fn bounded_decision_trace_uses_actual_queries_and_clears_after_stale_snaps
         assert!(!actions.is_empty());
         assert_eq!(actions.len(), alternatives.len());
         assert_eq!(decision["static_action"]["kind"], "static");
+        let baseline = &decision["static_evidence"];
+        assert!(baseline["reference_time_seconds"].as_f64().unwrap() > 0.0);
+        for candidate in alternatives {
+            if candidate["supported_mass"].as_f64().unwrap() == 1.0 {
+                for metric in ["ttft", "tpot", "itl"] {
+                    assert_eq!(
+                        candidate["local_targets"][metric]["samples"],
+                        baseline["local_targets"][metric]["samples"],
+                        "candidate-only output must not expand the reference population"
+                    );
+                }
+            }
+        }
         if let Some(selected) = decision["selected_index"].as_u64() {
             assert!((selected as usize) < alternatives.len());
+            let candidate = &alternatives[selected as usize];
+            match decision["selection_reason"].as_str().unwrap() {
+                "within_targets_faster" | "within_targets_recovery" => {
+                    for metric in ["ttft", "tpot", "itl"] {
+                        assert_eq!(
+                            candidate["local_targets"][metric]["classification"],
+                            "within"
+                        );
+                    }
+                    if decision["selection_reason"] == "within_targets_faster" {
+                        assert!(
+                            candidate["reference_time_seconds"].as_f64().unwrap()
+                                < baseline["reference_time_seconds"].as_f64().unwrap()
+                        );
+                    }
+                }
+                "pareto_target_repair" => {}
+                other => panic!("selected action has invalid reason: {other}"),
+            }
             assert_eq!(decision["outcome"]["status"], "applied");
             assert_eq!(stats["selected"], 1);
             assert_eq!(stats["applied"], 1);
@@ -471,6 +503,7 @@ async fn bounded_decision_trace_uses_actual_queries_and_clears_after_stale_snaps
                 other => panic!("unexpected bounded action: {other}"),
             }
         } else {
+            assert_eq!(decision["selection_reason"], "static_retained");
             assert_eq!(decision["outcome"]["status"], "retained");
             assert_eq!(stats["selected"], 0);
             assert_eq!(stats["applied"], 0);

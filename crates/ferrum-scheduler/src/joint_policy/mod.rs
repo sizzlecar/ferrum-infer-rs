@@ -13,7 +13,10 @@ mod scenarios;
 pub use admission::*;
 pub use aggregation::*;
 pub(crate) use bounded::BoundedActionEvidence;
-pub use bounded::{BoundedAccumulator, BoundedDecision, BoundedTiming, ServiceOpportunityClock};
+pub use bounded::{
+    BoundedAccumulator, BoundedDecision, BoundedSelectionReason, BoundedTiming, LocalTargetClass,
+    ServiceOpportunityClock,
+};
 pub use decision_observation::*;
 pub use diagnostics::*;
 use groups::GroupView;
@@ -730,7 +733,11 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
         if bytes > input.config.planning.max_request_fact_bytes {
             return Err(Unsupported::ParticipantBudget);
         }
-        Some(BoundedTiming::new(input.requests)?)
+        let mut timing = BoundedTiming::new(input.requests)?;
+        if let Some((_, targets)) = probe {
+            timing.bind_reference(input.requests, targets)?;
+        }
+        Some(timing)
     } else {
         None
     };
@@ -1077,6 +1084,9 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
         {
             phase = None;
         }
+        if let Some(timing) = bounded_timing.as_mut() {
+            timing.finish_wave(central);
+        }
         if let Some(trace) = trace.as_deref_mut() {
             trace.publish(
                 candidate,
@@ -1126,6 +1136,9 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
         {
             for (progress, request) in window_progress.iter_mut().zip(&requests) {
                 *progress = request.progress();
+            }
+            if let Some(timing) = bounded_timing.as_mut() {
+                timing.freeze_static_reference(input.requests, &requests, central)?;
             }
             return Ok(StaticTrajectory::Complete(TrajectoryResult {
                 requests,

@@ -2,7 +2,9 @@
 //! proxies are neither measured counterfactual benefits nor SLO certificates.
 
 use super::*;
-use crate::joint_policy::{BoundedActionEvidence, BoundedDecision, Unsupported};
+use crate::joint_policy::{
+    BoundedActionEvidence, BoundedDecision, BoundedSelectionReason, Unsupported,
+};
 use std::num::NonZeroUsize;
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -40,6 +42,8 @@ pub(crate) struct BoundedDecisionDiagnostic {
     /// Index into both candidate_actions and alternatives. A computed choice
     /// is not evidence of application; consult outcome.
     pub selected_index: Option<usize>,
+    /// Local quantile/paired-work selection rule, distinct from application.
+    pub selection_reason: BoundedSelectionReason,
     pub static_score: f64,
     pub selected_score: Option<f64>,
     pub request_count: usize,
@@ -75,6 +79,7 @@ impl BoundedDecisionDiagnostic {
             max_catchup_rounds: config.planning.max_catchup_rounds,
             cost_valid_for: decision.valid_until.saturating_duration_since(now),
             selected_index: decision.selected,
+            selection_reason: decision.selection_reason,
             static_score: decision.static_score,
             selected_score: decision.selected_score,
             request_count: decision.request_count,

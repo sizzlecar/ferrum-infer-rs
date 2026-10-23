@@ -5,6 +5,7 @@
 //! and action; the complete tail below is a separate small correctness oracle.
 
 use super::*;
+use crate::joint_policy::{BoundedSelectionReason, LocalTargetClass};
 use ferrum_types::{CostQueryLimits, SchedulerSloConfig};
 use std::time::Instant;
 
@@ -453,6 +454,55 @@ fn bounded_common_targets_reject_window_shift_and_extra_token_tpot_credit() {
         ),
         Err(Unsupported::Cost(CostUnknownReason::NoCoverage))
     ));
+}
+
+#[test]
+fn bounded_target_recovery_cannot_borrow_unfinished_reference_tpot_credit() {
+    let (requests, adapter) = fixture(1);
+    let domain = ServiceDomain {
+        at: Instant::now(),
+        unknown_prefill: false,
+    };
+    let mut config = policy(20.0);
+    // Only the ITL threshold differs from the original window-shift case.
+    // This makes DO appear to recover every local target through its earlier
+    // fixed output ordinal, exercising the recovery branch rather than Pareto.
+    config.itl_ms = 500.0;
+    let bounded = prefix(&requests, &adapter, &domain, &config);
+    let baseline = &bounded.decision.static_evidence;
+    let deferred = &bounded.decision.alternatives[2];
+    assert_eq!(
+        baseline.local_targets.ttft.classification,
+        LocalTargetClass::Within
+    );
+    assert_eq!(
+        baseline.local_targets.itl.classification,
+        LocalTargetClass::Within
+    );
+    assert_eq!(
+        baseline.local_targets.tpot.classification,
+        LocalTargetClass::Outside
+    );
+    assert_eq!(
+        deferred.local_targets.tpot.classification,
+        LocalTargetClass::Within
+    );
+    assert!(deferred.local_targets.all_within());
+
+    // The actual catch-up wave still reaches the common work later. Its
+    // extra decoder output cannot pay the unfinished reference's time debt.
+    let (static_result, alternatives) = &bounded.ranks[0];
+    let candidate_result = alternatives[2].as_ref().unwrap();
+    assert_eq!(static_result.central_elapsed, Duration::from_millis(168));
+    assert_eq!(candidate_result.central_elapsed, Duration::from_millis(169));
+    assert_eq!(deferred.extra_output_tokens, 1.0);
+    assert!(baseline.unfinished_reference_tpot_debt > 0.0);
+    assert!(deferred.unfinished_reference_tpot_debt > baseline.unfinished_reference_tpot_debt);
+    assert_eq!(bounded.decision.selected, None);
+    assert_eq!(
+        bounded.decision.selection_reason,
+        BoundedSelectionReason::StaticRetained
+    );
 }
 
 #[test]

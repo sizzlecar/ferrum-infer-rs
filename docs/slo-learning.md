@@ -77,6 +77,11 @@ ttft_ms = 200
 tpot_ms = 15
 itl_ms = 50
 
+[scheduler.slo.joint]
+ttft_quantile = 0.95
+tpot_quantile = 0.95
+itl_quantile = 0.95
+
 [scheduler.slo.planning]
 max_lookahead_rounds = 8
 max_catchup_rounds = 8
@@ -104,9 +109,19 @@ reference and zero extra waves, decode-only cannot cover static prefill
 progress. A larger configured allowance can demonstrate later progress but
 does not guarantee support, selection or completion within the CPU budget.
 
-The ranking uses equally weighted, SLO-normalized local delay/debt proxies for
-generated service opportunities, over the same request cohort. A generated
-token may produce no text. Bounded trajectories therefore keep the observed
+The ranking uses the configured quantile targets over a fixed local reference
+population. It uses nearest-rank threshold checks: for a known population of
+`N > 0`, at most `N - ceil(quantile * N)` samples may strictly exceed the target.
+Equality with the time target is not a violation. Zero eligible samples and
+unresolved timing remain undefined, rather than passing automatically. Cost
+scenario ranks describe cost uncertainty; they are separate from these service
+quantiles and keep their original weights and unsupported mass.
+
+This is a generated-service proxy for the captured live cohort, including its
+waiting requests and immutable observed history. Retired requests are outside
+this declared population; it is not the full arrival population used by an
+end-to-end benchmark. A generated token may produce no text. Bounded
+trajectories therefore keep the observed
 text clock unchanged and advance a separate service-opportunity clock; a
 forecast token never increments the observed event count or clears a text
 stall. Legal histories with different token and text-event counts, including
@@ -114,12 +129,34 @@ generated tokens before any text, can participate. The observation boundary is
 the engine output channel, before server protocol projection and transport;
 client-visible SSE timing still requires end-to-end measurement.
 
-Candidate-only output beyond the static reference earns no extra TPOT token
-credit. Its actual elapsed time, output frontier and service clocks remain in
-the comparison. Service ITL pressure counts new bad service intervals plus one
-currently open service gap when it strictly exceeds the ITL target; equality
-does not count as a violation. Both terms use violation counts, not a mixture
-of interval counts and open-gap severity. They do not predict visible SSE gaps.
+Each candidate captures its service clock at the static reference's output
+ordinal. Extra catch-up output cannot rewrite that endpoint or add good intervals
+to the comparison's denominator. Pending service intervals retain their identity
+when closed; they are not predicted visible SSE gaps. The full trajectory still
+executes its remaining groups and observes the common time boundary.
+For requests unfinished at the static reference, every selection branch also
+requires that time debt at the common observation boundary does not increase,
+using the same reference-token credit. Reaching an output ordinal earlier does
+not erase the subsequent wait or earn credit for additional catch-up output.
+
+When any action is within all three defined local targets, selection considers
+only those actions and compares the first complete execution-wave time covering
+the same reference progress. A recovery into all targets can therefore take
+longer than static, when static is outside a target.
+It includes every group in a Split wave. The earlier invocation-group target
+time and the final common observation time are separate diagnostics. A faster
+candidate can win within the local targets; equal times retain static when
+static also satisfies all local targets.
+
+If no candidate is within all local targets, selection permits a conservative
+Pareto improvement of the target-excess vector: at least one component must
+improve without worsening another or breaking a target already satisfied by
+static. Undefined components stay explicit. Incomparable exchanges retain static.
+Fixed-reference TTFT excess, TPOT debt and ITL violation counts additionally
+must not worsen in this repair mode; they are compared separately, never summed.
+The previous pressure components remain diagnostics, not an equally weighted
+objective that can exchange a satisfied target for unnecessary improvement in
+another. Counts alone do not establish a reduction in latency severity.
 
 The comparison retains waiting requests and unfinished work. Observed open
 TTFT/text-gap exposure is reported separately at the larger of the static and
@@ -134,8 +171,8 @@ prediction of that waiter's TTFT. The separate catch-up rule above determines
 whether the candidate has actually reached the reference boundary in simulation.
 A request already past its TTFT target cannot lose predicted prefill
 progress relative to static. Decode-only also retains the actual-progress
-deferral guard. Ties retain static; this initial strategy selects strict local
-delay improvements, not unvalidated throughput-only gains.
+deferral guard. These local comparisons are not full-request SLO certificates
+or measured throughput gains.
 
 Future natural stopping and transport stalls remain unknown. The finite
 survival scenario does not call the full-output stopping/completion forecast,
@@ -157,8 +194,8 @@ counts candidate-by-rank traversals that exhausted their configured catch-up
 allowance. It can be nonzero in a completed comparison that retained static or
 selected another action; it is not a count of unknown whole comparisons and
 does not imply global query or time-budget exhaustion. These counts also
-propagate to the existing per-iteration planning trace. The scores are local
-ranking proxies, not violation probabilities or client SLO verdicts.
+propagate to the existing per-iteration planning trace. The pressure scores are
+local diagnostics, not violation probabilities or client SLO verdicts.
 Full-trajectory `joint` remains the default during validation of this new strategy.
 
 The shared engine also writes `scheduler.iteration` events when
@@ -170,8 +207,12 @@ and committed-token deltas must be checked separately. These records support
 execution diagnosis; client timestamps remain the latency measurement.
 
 For a completed bounded comparison, `slo_planning.bounded_decision` retains
-the already computed static and candidate score components, action labels,
-selected index, snapshot revision and finite horizon. The `outcome` distinguishes
+the already computed static and candidate pressure components, local target
+classifications and eligible/unknown/violating counts, reference-wave times,
+action labels, selection reason, selected index, snapshot revision and finite
+horizon. `static_score` and `selected_score` retain the old pressure sum for
+diagnosis; a selected candidate need not have a smaller pressure sum.
+The `outcome` distinguishes
 a computed choice from retaining static, applying an edit, invalidating it at
 the batch frontier, or rejecting it after evaluation. A post-evaluation rejection
 also reports CPU-budget exhaustion and cost expiry separately. `cost_valid_for`

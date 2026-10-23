@@ -322,3 +322,63 @@ fn bounded_timing_charges_all_retained_actions_and_restores_history_on_error() {
     assert_eq!(request.central_clock, observed);
     assert_eq!(request.risk_clock, observed);
 }
+
+#[test]
+fn initial_reference_ordinal_without_text_has_no_fabricated_clock_anchor() {
+    let mut request = decode(64);
+    request.output_tokens = 3;
+    request.central_clock = RequestClock::default();
+    request.risk_clock = RequestClock::default();
+    assert!(request.valid_bounded());
+    let initial = request.clone();
+    let mut timing = BoundedTiming::new(std::slice::from_ref(&request)).unwrap();
+    timing
+        .bind_reference(std::slice::from_ref(&request), &[request.progress()])
+        .unwrap();
+    for elapsed in [1, 2] {
+        let context = request.prompt_tokens + request.output_tokens;
+        timing
+            .apply_member(
+                0,
+                &mut request,
+                CostWork {
+                    kind: AttemptWorkKind::Decode,
+                    requested: ExecutionRange::new(context - 1, 1).unwrap(),
+                    context_tokens: context,
+                    prefix_restore: AttemptPrefixRestore::NoneObserved,
+                    internally_reused_tokens: None,
+                },
+                Duration::from_millis(elapsed),
+                Duration::from_millis(elapsed),
+                Duration::from_millis(100),
+                ClockCoupling::Equal,
+            )
+            .unwrap();
+        timing.finish_wave(Duration::from_millis(elapsed));
+    }
+    let reference = timing.requests[0].reference.unwrap();
+    assert!(reference.output_initially_satisfied);
+    assert_eq!(reference.progress_reached_at, Some(Duration::ZERO));
+    assert_eq!(reference.progress_at_reach, Some(initial.progress()));
+    assert_eq!(
+        reference.central.unwrap().projection,
+        RequestClock::default()
+    );
+    assert_eq!(reference.risk.unwrap().projection, RequestClock::default());
+    assert_eq!(
+        reference.following_central_output_at,
+        Some(Duration::from_millis(6))
+    );
+    assert_eq!(
+        reference.following_risk_output_at,
+        Some(Duration::from_millis(6))
+    );
+    assert_eq!(timing.reference_reached_at, Some(Duration::from_millis(1)));
+    assert_eq!(
+        timing.requests[0].central.projection.last_output,
+        Some(Duration::from_millis(7))
+    );
+    assert_eq!(request.output_tokens, 5);
+    assert_eq!(request.central_clock, initial.central_clock);
+    assert_eq!(request.risk_clock, initial.risk_clock);
+}

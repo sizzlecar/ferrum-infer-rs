@@ -73,6 +73,39 @@ fn bounded_catchup_applies_the_entire_split_wave_before_returning() {
     assert_eq!(candidate.requests[1].output_tokens, 5);
     assert_eq!(candidate.target_reached_at, Duration::from_millis(7));
     assert_eq!(candidate.central_elapsed, Duration::from_millis(8));
+    let timing = candidate.bounded_timing.as_ref().unwrap();
+    assert_eq!(timing.reference_reached_at, Some(Duration::from_millis(8)));
+    let prefill_reference = timing.requests[0].reference.unwrap();
+    assert_eq!(
+        prefill_reference.progress_reached_at,
+        Some(Duration::from_millis(7))
+    );
+    assert_eq!(
+        prefill_reference.progress_at_reach,
+        Some(comparison.targets[0])
+    );
+    assert!(prefill_reference.output_initially_satisfied);
+    assert_eq!(
+        prefill_reference.central.unwrap().projection.first_output,
+        None
+    );
+    let decode_reference = timing.requests[1].reference.unwrap();
+    assert!(!decode_reference.output_initially_satisfied);
+    assert_eq!(decode_reference.target.output_tokens, 2);
+    // The reference ordinal arrived in wave one. The final decode group and
+    // later catch-up waves retain their actual work without rewriting it.
+    assert_eq!(
+        decode_reference.central.unwrap().projection.last_output,
+        Some(Duration::from_millis(7))
+    );
+    assert_eq!(
+        decode_reference.following_central_output_at,
+        Some(Duration::from_millis(9))
+    );
+    assert_eq!(
+        timing.requests[1].central.projection.last_output,
+        Some(Duration::from_millis(13))
+    );
     assert_eq!(candidate.queries, 8);
     assert_eq!(snapshot.call_count(), 10);
     assert_eq!(adapter.phase_waves.load(Ordering::Relaxed), 3);
@@ -250,6 +283,18 @@ fn each_rank_checks_its_own_wall_and_natural_completion_without_pausing() {
                     assert_eq!(candidate.queries, 3);
                     assert_eq!(candidate.central_elapsed, Duration::from_millis(5));
                     assert_eq!(candidate.target_reached_at, Duration::from_millis(1));
+                    let timing = candidate.bounded_timing.as_ref().unwrap();
+                    assert_eq!(timing.reference_reached_at, Some(Duration::from_millis(1)));
+                    let reference = timing.requests[0].reference.unwrap();
+                    assert_eq!(reference.target.prefill_tokens, 16);
+                    assert_eq!(
+                        reference.progress_reached_at,
+                        Some(Duration::from_millis(1))
+                    );
+                    assert_eq!(reference.progress_at_reach.unwrap().prefill_tokens, 16);
+                    assert!(reference.output_initially_satisfied);
+                    assert_eq!(reference.central.unwrap().projection.first_output, None);
+                    assert_eq!(reference.following_central_output_at, None);
                 } else {
                     assert_eq!(candidate.requests[0].prefill_tokens, 16);
                     assert_eq!(candidate.queries, 1);

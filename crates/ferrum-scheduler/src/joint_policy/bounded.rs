@@ -1,12 +1,15 @@
-//! Finite-prefix action scoring. These dimensionless, equally weighted proxies
-//! are neither probabilities nor certificates of complete-request feasibility.
+//! Finite-prefix local target selection. Legacy pressure components remain
+//! diagnostic; they are not summed to choose an action. No prefix is a
+//! certificate of complete-request or future visible-text SLO feasibility.
 //! Unknown future tails stay in the cohort and never acquire an EOS endpoint.
 //! ConditionalSnapshot assigns each rank's service time to both simulation
 //! clocks, including cache hits. Thus central is already rank-specific, not a
 //! repeated central estimate. This accumulator requires that paired contract.
 
 use super::*;
+mod local_targets;
 mod timing;
+pub use local_targets::{BoundedLocalTargets, BoundedSelectionReason, LocalTargetClass};
 pub use timing::{BoundedTiming, ServiceOpportunityClock};
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
@@ -43,6 +46,19 @@ impl BoundedScore {
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct BoundedActionEvidence {
+    /// Quantile targets on this captured live cohort's fixed service prefix.
+    pub local_targets: BoundedLocalTargets,
+    /// Rank-weighted first COMPLETE-wave coverage of the identical reference
+    /// progress. Extra observation work until the common wall is not a gain.
+    pub reference_time_seconds: f64,
+    /// Conservative degradation guards at the fixed reference frontier and
+    /// ordinal, retaining common-wall time debt when that reference is not
+    /// finished. Unlike `score`, catchup-only extra work earns no credit here.
+    pub reference_pressure: BoundedScore,
+    /// Fixed-token time debt through the actual common wall, for unfinished
+    /// static-reference requests with a known first timing anchor only. This
+    /// guard applies to every selection branch, not to TPOT classification.
+    pub unfinished_reference_tpot_debt: f64,
     /// Rank-weighted score, normalized by the original request count. Never
     /// normalize away an unsupported rank or divide by newly predicted events.
     pub score: BoundedScore,
@@ -81,6 +97,7 @@ pub struct BoundedActionEvidence {
 #[derive(Debug)]
 pub struct BoundedDecision {
     pub selected: Option<usize>,
+    pub selection_reason: BoundedSelectionReason,
     pub static_score: f64,
     pub selected_score: Option<f64>,
     pub valid_until: Instant,
@@ -196,14 +213,26 @@ impl<'a> BoundedAccumulator<'a> {
             .complete()
             .ok_or(Unsupported::InvalidState)?;
         validate(self.initial, baseline)?;
-        let reference = score(self.initial, baseline, baseline, &self.config)?;
+        let mut reference = score(self.initial, baseline, baseline, &self.config)?;
+        (
+            reference.local_targets,
+            reference.reference_time_seconds,
+            reference.reference_pressure,
+            reference.unfinished_reference_tpot_debt,
+        ) = local_targets::evaluate(self.initial, baseline, baseline, &self.config)?;
         add_evidence(&mut self.totals[0], reference, rank.weight)?;
         for (index, result) in comparison.alternatives.iter().enumerate() {
             match result {
                 Ok(result) => {
                     validate(self.initial, result)?;
                     validate_reference_coverage(baseline, result)?;
-                    let evidence = score(self.initial, baseline, result, &self.config)?;
+                    let mut evidence = score(self.initial, baseline, result, &self.config)?;
+                    (
+                        evidence.local_targets,
+                        evidence.reference_time_seconds,
+                        evidence.reference_pressure,
+                        evidence.unfinished_reference_tpot_debt,
+                    ) = local_targets::evaluate(self.initial, baseline, result, &self.config)?;
                     add_evidence(&mut self.totals[index + 1], evidence, rank.weight)?;
                 }
                 Err(reason) if reason.is_hard_budget_failure() => return Err(*reason),
@@ -237,22 +266,8 @@ impl<'a> BoundedAccumulator<'a> {
         }
         let baseline = self.totals.remove(0);
         let static_score = baseline.score.total();
-        let mut best = static_score;
-        let mut selected = None;
-        for (index, candidate) in self.totals.iter().enumerate() {
-            if candidate.unsupported_mass != 0.0
-                || (candidate.supported_mass - 1.0).abs() > 1e-9
-                || candidate.prefill_progress_regressions != 0
-                || candidate.overdue_prefill_regressions != 0
-            {
-                continue;
-            }
-            let value = candidate.score.total();
-            if value < best {
-                best = value;
-                selected = Some(index);
-            }
-        }
+        let (selected, selection_reason) = local_targets::select(&baseline, &self.totals);
+        let selected_score = selected.map(|index| self.totals[index].score.total());
         let ttft = Duration::try_from_secs_f64(self.config.ttft_ms / 1000.0)
             .map_err(|_| Unsupported::InvalidState)?;
         let intervals = |bad: bool| {
@@ -267,8 +282,9 @@ impl<'a> BoundedAccumulator<'a> {
         };
         Ok(BoundedDecision {
             selected,
+            selection_reason,
             static_score,
-            selected_score: selected.map(|_| best),
+            selected_score,
             valid_until: summary.valid_until,
             request_count: self.initial.len(),
             observed_ranks: self.observed_ranks,
@@ -291,6 +307,17 @@ fn add_evidence(
     weight: f64,
 ) -> Result<(), Unsupported> {
     total.score.add(value.score, weight)?;
+    total
+        .reference_pressure
+        .add(value.reference_pressure, weight)?;
+    total.local_targets.add(value.local_targets, weight);
+    total.reference_time_seconds += weight * value.reference_time_seconds;
+    total.unfinished_reference_tpot_debt += weight * value.unfinished_reference_tpot_debt;
+    if !total.reference_time_seconds.is_finite()
+        || !total.unfinished_reference_tpot_debt.is_finite()
+    {
+        return Err(Unsupported::Arithmetic);
+    }
     total.supported_mass += weight;
     total.unfinished_requests += weight * value.unfinished_requests;
     total.service_prefix_tpot_undefined_requests +=
@@ -590,7 +617,20 @@ mod tests {
         mut requests: Vec<SimulatedRequest>,
         ms: u64,
     ) -> TrajectoryResult {
-        let timing = BoundedTiming::new(&requests).unwrap();
+        let mut timing = BoundedTiming::new(&requests).unwrap();
+        timing
+            .freeze_static_reference(initial, &requests, Duration::from_millis(ms))
+            .unwrap();
+        // These hand-built prefixes declare their changed frontier at the
+        // supplied final boundary; real trajectories capture invocation times.
+        for ((service, before), after) in timing.requests.iter_mut().zip(initial).zip(&requests) {
+            service.reference.as_mut().unwrap().progress_reached_at =
+                Some(if before.progress() == after.progress() {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(ms)
+                });
+        }
         for (request, original) in requests.iter_mut().zip(initial) {
             request.central_clock = original.central_clock;
             request.risk_clock = original.risk_clock;
@@ -671,7 +711,7 @@ mod tests {
         let mut baseline = initial.to_vec();
         emit(&mut baseline[0], 50, true);
         let mut candidate = initial.to_vec();
-        emit(&mut candidate[0], 25, true);
+        emit(&mut candidate[0], 20, false);
         let cmp = comparison(
             result(&initial, baseline, 30),
             vec![Ok(result(&initial, candidate, 30))],
@@ -698,6 +738,110 @@ mod tests {
             decision.static_evidence.score.ttft_pressure
         );
         assert!(decision.selected_score.unwrap() < decision.static_score);
+    }
+
+    #[test]
+    fn bounded_undefined_tpot_does_not_erase_a_defined_interval_repair() {
+        let mut initial = [request(false), request(false)];
+        initial[0].output_cap = 2;
+        initial[0].scenario_end_tokens = 2;
+        // Generated history without any observed text anchor remains unknown.
+        initial[1].output_tokens = 2;
+        initial[1].central_clock = RequestClock::default();
+        initial[1].risk_clock = RequestClock::default();
+        let mut baseline = initial.to_vec();
+        emit(&mut baseline[0], 50, true);
+        let mut candidate = initial.to_vec();
+        emit(&mut candidate[0], 20, false);
+        let cmp = comparison(
+            result(&initial, baseline, 30),
+            vec![Ok(result(&initial, candidate, 30))],
+        );
+        let mut accumulator = BoundedAccumulator::new(&initial, 1, &config()).unwrap();
+        accumulator.observe(rank(0, 1), &cmp).unwrap();
+        let decision = accumulator.finish(summary(1)).unwrap();
+        assert_eq!(decision.selected, Some(0));
+        assert_eq!(
+            decision.selection_reason,
+            BoundedSelectionReason::ParetoTargetRepair
+        );
+        for evidence in [decision.static_evidence, decision.alternatives[0]] {
+            assert_eq!(
+                evidence.local_targets.tpot.classification,
+                LocalTargetClass::Undefined
+            );
+            assert_eq!(evidence.local_targets.tpot.samples, 2.0);
+            assert_eq!(evidence.local_targets.tpot.unknown_samples, 1.0);
+            assert_eq!(evidence.local_targets.itl.samples, 1.0);
+        }
+        assert_eq!(decision.static_evidence.local_targets.itl.violations, 1.0);
+        assert_eq!(decision.alternatives[0].local_targets.itl.violations, 0.0);
+    }
+
+    #[test]
+    fn bounded_completed_endpoint_has_no_fabricated_pending_interval() {
+        let mut initial = [request(false)];
+        initial[0].output_cap = 1;
+        initial[0].scenario_end_tokens = 1;
+        initial[0].central_clock.first_output = Some(Duration::from_millis(5));
+        initial[0].central_clock.interval_count = 1;
+        initial[0].central_clock.maximum_output_interval = Duration::from_millis(5);
+        initial[0].risk_clock = initial[0].central_clock;
+        assert!(initial[0].finished());
+        assert_eq!(initial[0].central_clock.completed, None);
+        let baseline = result(&initial, initial.to_vec(), 0);
+        let mut accumulator = BoundedAccumulator::new(&initial, 0, &config()).unwrap();
+        accumulator
+            .observe(rank(0, 1), &comparison(baseline, vec![]))
+            .unwrap();
+        let evidence = accumulator.finish(summary(1)).unwrap().static_evidence;
+        assert_eq!(evidence.local_targets.itl.samples, 1.0);
+        assert_eq!(evidence.local_targets.itl.violations, 0.0);
+        assert_eq!(
+            evidence.local_targets.tpot.classification,
+            LocalTargetClass::Undefined
+        );
+    }
+
+    #[test]
+    fn bounded_reference_pressure_cannot_borrow_later_prefill_credit() {
+        let mut initial = [request(true)];
+        initial[0].age = Duration::ZERO;
+        initial[0].prompt_tokens = 100;
+        let mut baseline_requests = initial.to_vec();
+        baseline_requests[0].prefill_tokens = 50;
+        let baseline = result(&initial, baseline_requests, 100);
+        let mut later = initial.to_vec();
+        later[0].prefill_tokens = 100;
+        later[0].output_tokens = 1;
+        later[0].central_clock.first_output = Some(Duration::from_millis(150));
+        later[0].central_clock.last_output = Some(Duration::from_millis(150));
+        later[0].risk_clock = later[0].central_clock;
+        let mut candidate = result(&initial, later, 150);
+        let timing = candidate.bounded_timing.as_mut().unwrap();
+        // The same P50 frontier was first attained at120ms. Subsequent work
+        // reached P100 and generated an opportunity at150ms; it is not the
+        // reference's ordinal-zero clock. These are explicitly typed facts,
+        // exercising the scorer independently of the capture implementation.
+        let mut fixed = baseline.bounded_timing.as_ref().unwrap().requests[0]
+            .reference
+            .unwrap();
+        fixed.progress_reached_at = Some(Duration::from_millis(120));
+        fixed.following_central_output_at = Some(Duration::from_millis(150));
+        fixed.following_risk_output_at = fixed.following_central_output_at;
+        timing.requests[0].reference = Some(fixed);
+        timing.reference_reached_at = Some(Duration::from_millis(120));
+        validate(&initial, &candidate).unwrap();
+        validate_reference_coverage(&baseline, &candidate).unwrap();
+        let (_, _, static_pressure, _) =
+            local_targets::evaluate(&initial, &baseline, &baseline, &config()).unwrap();
+        let (_, _, candidate_pressure, _) =
+            local_targets::evaluate(&initial, &baseline, &candidate, &config()).unwrap();
+        assert_eq!(static_pressure.ttft_pressure, 1.0);
+        assert!((candidate_pressure.ttft_pressure - 1.4).abs() < 1e-12);
+        let legacy = score(&initial, &baseline, &candidate, &config()).unwrap();
+        assert!((legacy.score.ttft_pressure - 0.5).abs() < 1e-12);
+        assert!(candidate_pressure.ttft_pressure > static_pressure.ttft_pressure);
     }
 
     #[test]
@@ -1056,7 +1200,7 @@ mod tests {
             result(&initial, requests, 20)
         };
         let mut fast = initial.to_vec();
-        emit(&mut fast[0], 25, true);
+        emit(&mut fast[0], 20, false);
         let fast = comparison(baseline(), vec![Ok(result(&initial, fast, 5))]);
         let mut slow = initial.to_vec();
         emit(&mut slow[0], 120, true);
@@ -1075,7 +1219,7 @@ mod tests {
         assert_eq!(decision.selected, None);
         assert_eq!(decision.observed_ranks, 2);
         assert!((decision.static_score - 3.0).abs() < 1e-12);
-        assert!((decision.alternatives[0].score.total() - 6.25).abs() < 1e-12);
+        assert!((decision.alternatives[0].score.total() - 5.5).abs() < 1e-12);
         assert_eq!(decision.alternatives[0].supported_mass, 1.0);
         assert_eq!(decision.alternatives[0].unsupported_mass, 0.0);
     }
