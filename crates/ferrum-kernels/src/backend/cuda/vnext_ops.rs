@@ -1630,6 +1630,48 @@ enum CudaCompositionPurpose {
     NativeCatalogDeclaration,
 }
 
+fn cuda_text_native_build_units() -> Vec<crate::native_ops::CudaNativeBuildUnit> {
+    use crate::native_ops::CudaNativeBuildUnit;
+    // Match the text units in build.rs::required_cuda_native_build_units.
+    // CUDA itself enables Marlin; vllm-moe-marlin also enables vllm-marlin.
+    // CUTLASS BF16-output FP8 belongs to the separately admitted tensor
+    // composition even when the same executable links both kinds of artifact.
+    [
+        (cfg!(feature = "marlin"), CudaNativeBuildUnit::Marlin),
+        (
+            cfg!(feature = "vllm-marlin"),
+            CudaNativeBuildUnit::VllmMarlin,
+        ),
+        (
+            cfg!(feature = "cuda-upstream-linear"),
+            CudaNativeBuildUnit::UpstreamLinear,
+        ),
+        (
+            cfg!(feature = "cuda-upstream-q6-f32-linear"),
+            CudaNativeBuildUnit::UpstreamQ6F32Linear,
+        ),
+        (
+            cfg!(feature = "cuda-upstream-extra-linear"),
+            CudaNativeBuildUnit::UpstreamExtraLinear,
+        ),
+        (
+            cfg!(feature = "vllm-moe-marlin"),
+            CudaNativeBuildUnit::VllmMoeMarlin,
+        ),
+        (
+            cfg!(feature = "vllm-paged-attn-v2"),
+            CudaNativeBuildUnit::VllmPagedAttentionV2,
+        ),
+        (
+            cfg!(feature = "cuda-indexed-causal-attention"),
+            CudaNativeBuildUnit::VllmIndexedPagedAttentionV2,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, unit)| enabled.then_some(unit))
+    .collect()
+}
+
 impl CudaVNextComposition {
     fn prepare(
         ordinal: usize,
@@ -2108,9 +2150,10 @@ impl CudaVNextComposition {
         let native_provider_catalog = catalog
             .native_operator_provider_catalog(NativeOperatorBackend::Cuda)
             .map_err(contract_error)?;
-        crate::native_ops::validate_compiled_native_operator_provider_catalog(
+        crate::native_ops::validate_compiled_native_operator_provider_catalog_for_units(
             &native_provider_catalog,
             crate::native_ops::compiled_native_operator_artifacts(),
+            &cuda_text_native_build_units(),
         )
         .map_err(CudaDeviceRuntimeError::contract)
     }

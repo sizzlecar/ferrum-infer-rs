@@ -369,6 +369,19 @@ impl QwenImage21CudaConfig {
         )?;
         let catalog = materializers
             .augment_catalog(registry.capability_catalog(descriptor.clone(), vec![engine])?)?;
+        let native_units: &[ferrum_kernels::native_ops::CudaNativeBuildUnit] =
+            match self.precision_policy {
+                ImageCudaPrecisionPolicy::Bf16 => &[],
+                ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 => {
+                    &[ferrum_kernels::native_ops::CudaNativeBuildUnit::CutlassFp8ScaledMm]
+                }
+            };
+        ferrum_kernels::native_ops::validate_compiled_native_operator_provider_catalog_for_units(
+            &catalog.native_operator_provider_catalog(ferrum_types::NativeOperatorBackend::Cuda)?,
+            ferrum_kernels::native_ops::compiled_native_operator_artifacts(),
+            native_units,
+        )
+        .map_err(anyhow::Error::msg)?;
         let device_opaque_allowance = self.opaque_bytes()?;
         let pipeline = QwenImage21Pipeline::new(
             runtime,

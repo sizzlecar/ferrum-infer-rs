@@ -57,13 +57,11 @@ pub fn source_declaration_fingerprint() -> String {
         include_bytes!("../../backend/cuda/vnext_ops/tensor_dense_fp8_bf16.rs"),
         include_bytes!("../../backend/cuda/vnext_ops/tensor_dense_fp8_bf16/weights.rs"),
         include_bytes!("../../backend/cuda/vnext_runtime/tensor_eager/cutlass_owner.rs"),
-        include_bytes!("../../../../../native-operators/cuda/cutlass-fp8/abi.h"),
-        include_bytes!("../../../../../native-operators/cuda/cutlass-fp8/gemm.cuh"),
-        include_bytes!("../../../../../native-operators/cuda/cutlass-fp8/quantize.cuh"),
-        include_bytes!("../../../../../native-operators/cuda/cutlass-fp8/boundary.cu"),
-        include_bytes!(
-            "../../../../../native-operators/cuda/source-definitions/cutlass-fp8.seed.json"
-        ),
+        include_bytes!("../../../native/cutlass-fp8/abi.h"),
+        include_bytes!("../../../native/cutlass-fp8/gemm.cuh"),
+        include_bytes!("../../../native/cutlass-fp8/quantize.cuh"),
+        include_bytes!("../../../native/cutlass-fp8/boundary.cu"),
+        include_bytes!("../../../native/cutlass-fp8/cutlass-fp8.seed.json"),
     ])
 }
 

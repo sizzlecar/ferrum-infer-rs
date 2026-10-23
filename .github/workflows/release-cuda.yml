@@ -419,7 +419,7 @@ jobs:
           mkdir "$work/fp8-source/cutlass" "$work/fp8-source/kernels"
           tar -xzf "$work/cutlass.tar.gz" --strip-components=1 -C "$work/fp8-source/cutlass"
           for source in abi.h boundary.cu gemm.cuh quantize.cuh; do
-            cp "native-operators/cuda/cutlass-fp8/$source" "$work/fp8-source/kernels/$source"
+            cp "crates/ferrum-kernels/native/cutlass-fp8/$source" "$work/fp8-source/kernels/$source"
           done
           /usr/local/cuda/bin/nvcc -M -MT boundary.o -MF "$work/fp8.d" \
             -std=c++17 -O3 --expt-relaxed-constexpr --expt-extended-lambda \
@@ -427,7 +427,7 @@ jobs:
             -I"$work/fp8-source/cutlass/include" -I"$work/fp8-source/cutlass/tools/util/include" \
             -I"$work/fp8-source/kernels" "$work/fp8-source/kernels/boundary.cu"
           ./target/release-tools/ferrum-native-ops-builder lock-source-dependencies \
-            --definition native-operators/cuda/source-definitions/cutlass-fp8.seed.json \
+            --definition crates/ferrum-kernels/native/cutlass-fp8/cutlass-fp8.seed.json \
             --source-root "$work/fp8-source" --depfile "$work/fp8.d" \
             --out-definition "$work/fp8-observed.json" --out-plan "$work/fp8-plan.json"
 

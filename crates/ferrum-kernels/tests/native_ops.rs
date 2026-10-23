@@ -25,6 +25,9 @@ const CUDA_SOURCE_BUNDLE_MANIFEST: &str =
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[path = "native_ops/scoped_catalog.rs"]
+mod scoped_catalog;
+
 #[test]
 fn compiled_cuda_source_bundle_identity_matches_the_distribution_manifest() {
     let manifest: serde_json::Value =
