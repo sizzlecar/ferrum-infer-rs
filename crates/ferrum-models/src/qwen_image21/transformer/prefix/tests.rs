@@ -97,6 +97,78 @@ fn prefix_phases_preserve_default_wire_and_share_exact_weight_schema() {
 }
 
 #[test]
+fn text_entrance_is_logically_phase_optional_but_physically_required_and_fully_counted() {
+    let full = config();
+    let family = F::new().unwrap();
+    let expected =
+        ExpectedWeights::from_config(full.transformer(), StructureLimits::default()).unwrap();
+    let original = expected.weight_schema().unwrap();
+    let mut identity = None;
+    for phase in [
+        QwenImage21TransformerPhase::Full,
+        QwenImage21TransformerPhase::PrefixPrefill,
+        QwenImage21TransformerPhase::PrefixDecode,
+    ] {
+        let config = full.clone().with_execution_phase(phase).unwrap();
+        let prepared = TypedFamilyRegistration::new(F::new().unwrap())
+            .prepare_with_profile(
+                &serde_json::to_value(&config).unwrap(),
+                &profile_id(F::REFERENCE_PROFILE_ID).unwrap(),
+            )
+            .unwrap();
+        let schema = prepared.stored_weight_schema().unwrap();
+        assert_eq!(schema.components, original.components);
+        assert!(schema.components.iter().all(|component| component.required));
+        let bytes: u64 = schema
+            .components
+            .iter()
+            .filter(|component| component.required)
+            .map(|component| component.physical_bytes().unwrap())
+            .sum();
+        assert_eq!(bytes, expected.payload_bytes());
+        let optional = schema
+            .tensors
+            .iter()
+            .filter(|tensor| !tensor.required)
+            .map(|tensor| tensor.id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            optional,
+            BTreeSet::from([
+                "weight.qwen_image21.txt_in.text_norm.weight",
+                "weight.qwen_image21.txt_in.in_layer.weight",
+                "weight.qwen_image21.txt_in.out_layer.weight",
+            ])
+        );
+        for name in optional {
+            let reference = prepared
+                .program()
+                .weights()
+                .iter()
+                .find(|weight| weight.weight_id.as_str() == name);
+            if phase == QwenImage21TransformerPhase::PrefixDecode {
+                assert!(reference.is_none());
+            } else {
+                let reference = reference.expect("full/prefill must bind the text weight");
+                assert!(prepared
+                    .program()
+                    .blocks()
+                    .iter()
+                    .flat_map(|block| &block.nodes)
+                    .any(|node| node.inputs.contains(&reference.value_id)));
+            }
+        }
+        let weights = ExecutionWeightPlan::identity(&prepared).unwrap();
+        if let Some(original) = &identity {
+            assert_eq!(&weights, original);
+        } else {
+            identity = Some(weights);
+        }
+        assert_eq!(family.weights(&config).unwrap(), prepared.weights().clone());
+    }
+}
+
+#[test]
 fn prefill_captures_rotated_keys_and_unmodified_values_into_compact_per_sample_ports() {
     let c = config()
         .with_execution_phase(QwenImage21TransformerPhase::PrefixPrefill)

@@ -135,9 +135,28 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
     }
     fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
         config.validate()?;
-        let schema = ExpectedWeights::from_config(config.transformer(), StructureLimits::default())
-            .and_then(|weights| weights.weight_schema())
-            .map_err(|e| invalid("weights", e.to_string()))?;
+        let mut schema =
+            ExpectedWeights::from_config(config.transformer(), StructureLimits::default())
+                .and_then(|weights| weights.weight_schema())
+                .map_err(|e| invalid("weights", e.to_string()))?;
+        // Prefix decode starts from projected target rows and consumes no text
+        // entrance weights. Logical references are therefore phase-optional in
+        // this family. Keep every physical component required: the complete
+        // checkpoint installation, capacity accounting and materializer/source
+        // identity remain identical in Full, Prefill and Decode. Full/Prefill
+        // still bind these values through their actual text entrance nodes.
+        for name in [
+            "weight.qwen_image21.txt_in.text_norm.weight",
+            "weight.qwen_image21.txt_in.in_layer.weight",
+            "weight.qwen_image21.txt_in.out_layer.weight",
+        ] {
+            schema
+                .tensors
+                .iter_mut()
+                .find(|tensor| tensor.id.as_str() == name)
+                .ok_or_else(|| invalid("weights", "text entrance weight is absent"))?
+                .required = false;
+        }
         schema.validate(&self.id)?;
         Ok(ModelWeights::Stored(schema))
     }

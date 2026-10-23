@@ -4,12 +4,16 @@ use ferrum_models::qwen_image21::QwenImage21TransformerPhase;
 #[test]
 fn prefix_handoff_counts_two_caches_and_one_weight_installation_before_execution() {
     let (mut pipeline, _directory) = super::adapter::pipeline(1);
+    // Two text rows, 64 VLM image slots, then two suffix rows. Each
+    // image slot expands to four latent rows: 64 * 4 == 16 * 16.
+    // Keep the large reference prefix and small target to expose the
+    // simultaneous producer-output and decoder-state capacity boundary.
     let config = QwenImage21TransformerConfig::new(
         transformer(),
-        QwenImage21T2iLayout::new(6, 2, 2, vec![6]).unwrap(),
+        QwenImage21T2iLayout::new(68, 2, 2, vec![68]).unwrap(),
     )
     .unwrap()
-    .with_reference_image(2, 2, 16, 16)
+    .with_reference_image(2, 64, 16, 16)
     .unwrap();
     let prefill = pipeline
         .prepare_denoiser(

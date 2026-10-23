@@ -2222,6 +2222,20 @@ where
         self.request.static_provisioning()
     }
 
+    /// Resolve immutable storage through this exact consumer root. Shared
+    /// roots translate validated readonly subsets to the original physical
+    /// installation; ordinary roots retain exact slot/allocation validation.
+    pub(crate) fn plan_static_view(
+        &self,
+        slot_index: usize,
+        allocation: &super::ResourceAllocation,
+    ) -> Result<super::LeasedBufferView<'_, R::Buffer>, VNextError> {
+        self.request
+            .plan
+            .resources
+            .plan_static_view(slot_index, allocation)
+    }
+
     pub fn plan_evidence(&self) -> TrustedPlanRuntimeEvidence {
         self.request.plan_evidence()
     }

@@ -72,6 +72,12 @@ impl ModelFamilyProvider for Family {
     }
     fn numerical_profiles(&self, config: &Config) -> Result<FamilyNumericalProfiles, VNextError> {
         let profile = NumericalProfileId::new(PROFILE).unwrap();
+        let mut boundaries = BTreeMap::from([(id(Y), ElementType::Bf16)]);
+        if config.producer {
+            // CACHE is a node output only in the producer. The consumer's
+            // identical tensor is described by its readonly StateSpec instead.
+            boundaries.insert(id(CACHE), ElementType::Bf16);
+        }
         FamilyNumericalProfiles::new(
             self.family_id(),
             ContractVersion::new(1, 0),
@@ -81,10 +87,7 @@ impl ModelFamilyProvider for Family {
                 version: ContractVersion::new(1, 0),
                 kv_storage: vec![],
                 primary_activation: id(Y),
-                boundaries: BTreeMap::from([
-                    (id(Y), ElementType::Bf16),
-                    (id(CACHE), ElementType::Bf16),
-                ]),
+                boundaries,
                 states: states(config),
                 operations: vec![NumericalOperationContract {
                     operation_id: id(PLAIN_RESIDUAL_ADD_BF16_OPERATION_ID),

@@ -806,6 +806,15 @@ fn validate_prepared_participant_authority<'runtime, 'a, R: DeviceRuntime>(
     let admission = active_binding.plan().static_provisioning_binding();
     let pool_fingerprint = active_binding.static_pool_identity_fingerprint_ref();
     let memory = plan.payload().memory();
+    // A shared installation retains its original complete physical claim.
+    // Its consumer may bind a smaller readonly subset only after bind_plan's
+    // exact weight-plan/placement/arena validation. This sealed root evidence
+    // is matched below together with the consumer plan hash; it is not a
+    // caller-provided allowance to accept an arbitrary larger allocation.
+    let expected_static_bytes = active_binding
+        .plan()
+        .shared_component_weights()
+        .map_or(memory.static_bytes(), |shared| shared.physical_bytes());
     if resources.participant_count()? != resources.prepared_participant_count()?
         || resources.node_id()? != node_id
         || participant_frame.sequence_authority() != participant.sequence_authority()
@@ -855,7 +864,7 @@ fn validate_prepared_participant_authority<'runtime, 'a, R: DeviceRuntime>(
         || admission.is_some_and(|admission| {
             admission.device_capacity_bytes() != memory.device_capacity_bytes()
                 || admission.usable_capacity_bytes() != memory.usable_capacity_bytes()
-                || admission.plan_static_bytes() != memory.static_bytes()
+                || admission.plan_static_bytes() != expected_static_bytes
                 || admission.maximum_active_sequences() != memory.maximum_active_sequences()
         })
         || parts.resource_id.is_some()
@@ -939,12 +948,7 @@ impl<'a, B, W: InvocationWorkProjection<'a>> OperationInvocation<'a, B, W> {
                                 "prepared static resource index differs from the memory plan",
                             )
                         })?;
-                    let lease = static_lease.ok_or_else(|| {
-                        invalid_operation(format!(
-                            "plan-static resource `{resource_id}` lacks static provisioning"
-                        ))
-                    })?;
-                    let leased = lease.plan_static_view(slot_index, allocation)?;
+                    let leased = participant.plan_static_view(slot_index, allocation)?;
                     views.push(OperationBufferView::from_static(
                         leased,
                         participant.device_buffer_retention(),
