@@ -307,7 +307,18 @@ impl NormProvider {
             unsafe {
                 builder.launch(LaunchConfig {
                     grid_dim: (shape.groups.min(MAX_BLOCKS) as u32, 1, 1),
-                    block_dim: (THREADS, 1, 1),
+                    // HeadRMS keeps the same adjacent-pair tree and shared
+                    // storage. Narrow heads need fewer participating warps;
+                    // all threads still execute every block-wide barrier.
+                    block_dim: (
+                        if kind == Kind::HeadRms {
+                            shape.width.clamp(32, THREADS)
+                        } else {
+                            THREADS
+                        },
+                        1,
+                        1,
+                    ),
                     shared_mem_bytes: shape.shared_bytes,
                 })
             }

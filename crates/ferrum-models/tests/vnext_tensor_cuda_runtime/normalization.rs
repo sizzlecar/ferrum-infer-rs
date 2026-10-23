@@ -2,6 +2,9 @@
 use super::*;
 use ferrum_kernels::backend::cuda::vnext_ops::{cuda_vnext_tensor_providers, CudaTensorOperation};
 
+#[path = "normalization/head_rms.rs"]
+mod head_rms;
+
 const SCALE: &str = "value.tensor.scale";
 const GATE: &str = "value.tensor.gate";
 const NORMALIZED: &str = "value.tensor.normalized";
