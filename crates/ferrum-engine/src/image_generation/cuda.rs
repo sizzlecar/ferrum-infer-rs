@@ -657,7 +657,6 @@ fn contracts(attention: ImageCudaAttentionPolicy) -> Result<Vec<Box<dyn Operatio
         Box::new(head_rms_norm_bf16_contract()?),
         Box::new(adjacent_rope_bf16_contract()?),
         Box::new(structured_attention_bf16_contract()?),
-        Box::new(cross_attention_bf16_contract()?),
         Box::new(zero_centered_rms_norm_bf16_contract()?),
         Box::new(gelu_tanh_bf16_contract()?),
         Box::new(row_gather_bf16_contract()?),
@@ -845,7 +844,10 @@ mod tests {
         );
         let legacy = contracts(ImageCudaAttentionPolicy::Sequential).unwrap();
         let fused = contracts(ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1).unwrap();
-        assert!(legacy
+        assert!(!legacy
+            .iter()
+            .any(|c| c.descriptor().id.as_str() == CROSS_ATTENTION_BF16_OPERATION_ID));
+        assert!(!fused
             .iter()
             .any(|c| c.descriptor().id.as_str() == CROSS_ATTENTION_BF16_OPERATION_ID));
         assert!(!legacy
@@ -878,6 +880,39 @@ mod tests {
         c.memory =
             ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(1024 * 1024 * 1024).unwrap());
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn every_product_contract_requires_only_declared_cuda_capabilities() {
+        // Metadata-only: this does not construct a device, load cuDNN or create
+        // a native provider. CapabilityCatalog checks every registered contract,
+        // including contracts that no current model plan happens to consume.
+        let runtime =
+            cuda_tensor_runtime_config(0, DeviceId::new("device.cuda.0").unwrap()).unwrap();
+        for policy in [
+            ImageCudaAttentionPolicy::Sequential,
+            ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
+        ] {
+            for contract in contracts(policy).unwrap() {
+                let descriptor = contract.descriptor();
+                assert!(
+                    descriptor
+                        .provider
+                        .required_capabilities
+                        .is_subset(&runtime.capabilities),
+                    "CUDA product contract {} requires unavailable capabilities",
+                    descriptor.id,
+                );
+            }
+        }
+        // The ordinary online cross provider is Reference-only. Advertising its
+        // capability would hide the catalog mismatch without adding a backend.
+        assert!(!runtime
+            .capabilities
+            .contains(&CapabilityId::new(CROSS_ATTENTION_BF16_CAPABILITY_ID).unwrap()));
+        assert!(runtime
+            .capabilities
+            .contains(&CapabilityId::new(CROSS_ATTENTION_FUSED_BF16_CAPABILITY_ID).unwrap()));
     }
 
     #[test]
