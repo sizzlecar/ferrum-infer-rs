@@ -47,10 +47,22 @@ impl EditInputs {
             .editing_profiles
             .as_ref()
             .context("editing numerical profiles are not configured")?;
-        let vision_family = TypedFamilyRegistration::new(Qwen3VLVisionFamily::new()?)
-            .prepare_with_profile(&serde_json::to_value(&self.vision)?, &profiles.vision)?;
-        let encoder_family = TypedFamilyRegistration::new(QwenImage21VaeEncoderFamily::new()?)
-            .prepare_with_profile(&serde_json::to_value(&self.encoder)?, &profiles.encoder)?;
+        let vision_family = pipeline.prepare_family(
+            ImageStage::VisionEncoder,
+            ImageStagePlanRole::WholeStage,
+            1,
+            Qwen3VLVisionFamily::new()?,
+            &self.vision,
+            &profiles.vision,
+        )?;
+        let encoder_family = pipeline.prepare_family(
+            ImageStage::VaeEncoder,
+            ImageStagePlanRole::WholeStage,
+            1,
+            QwenImage21VaeEncoderFamily::new()?,
+            &self.encoder,
+            &profiles.encoder,
+        )?;
         let vision_stage = PreparedStage::compile(
             ImageStage::VisionEncoder,
             1,

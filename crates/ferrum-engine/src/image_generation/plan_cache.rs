@@ -2,7 +2,7 @@
 //! initialized session or another request's compiled component. Encoded size
 //! is a serialization budget, not measured heap usage or Host payload bytes.
 use super::*;
-use std::{collections::VecDeque, io, sync::Mutex};
+use std::{collections::VecDeque, io, sync::Mutex, time::Instant};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,6 +93,69 @@ struct CachedStage<R: DeviceRuntime> {
     receipt: ImageStagePlanReceipt,
     encoded_bytes: usize,
 }
+
+#[derive(Clone, Copy)]
+pub(super) struct PreparedFamilyKey<'a> {
+    pub stage: ImageStage,
+    pub role: ImageStagePlanRole,
+    pub batch_size: usize,
+    pub family: &'a ModelFamilyId,
+    pub metadata: &'a ExternalModelMetadataId,
+    pub config: &'a serde_json::Value,
+    pub profile: &'a NumericalProfileId,
+}
+
+impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
+    /// Reuse only a family already validated by this pipeline's fixed built-in
+    /// provider. Config identity is checked even on hits; compile options,
+    /// materializer selection, full fingerprints and capacity checks follow.
+    pub(super) fn prepare_family<P: ModelFamilyProvider>(
+        &self,
+        stage: ImageStage,
+        role: ImageStagePlanRole,
+        batch_size: usize,
+        provider: P,
+        config: &P::Config,
+        profile: &NumericalProfileId,
+    ) -> anyhow::Result<PreparedModelFamily> {
+        let started = Instant::now();
+        ensure!(batch_size > 0, "stage batch size must be positive");
+        let raw_config = serde_json::to_value(config)?;
+        let metadata = provider.validated_external_metadata_id(&raw_config, config)?;
+        ensure!(
+            provider.external_metadata_ids().contains(&metadata),
+            "provider selected an undeclared external metadata identity"
+        );
+        let cached = self.plan_cache.prepared_family(
+            self.config.plan_cache,
+            PreparedFamilyKey {
+                stage,
+                role,
+                batch_size,
+                family: provider.family_id(),
+                metadata: &metadata,
+                config: &raw_config,
+                profile,
+            },
+        )?;
+        let reused = cached.is_some();
+        let family = match cached {
+            Some(family) => family,
+            None => {
+                TypedFamilyRegistration::new(provider).prepare_with_profile(&raw_config, profile)?
+            }
+        };
+        tracing::debug!(
+            ?stage,
+            ?role,
+            batch_size,
+            prepared_family_reused = reused,
+            prepare_family_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "image family metadata preparation"
+        );
+        Ok(family)
+    }
+}
 impl<R: DeviceRuntime> CachedStage<R> {
     fn matches(
         &self,
@@ -177,6 +240,40 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
         Self {
             state: Mutex::new(CacheState::new(ImagePlanCachePolicy::default())),
         }
+    }
+    /// This metadata lookup neither adds an entry nor changes LRU/counters.
+    /// Only the later exact plan/options acquisition counts as a cache hit.
+    pub(super) fn prepared_family(
+        &self,
+        policy: ImagePlanCachePolicy,
+        key: PreparedFamilyKey<'_>,
+    ) -> anyhow::Result<Option<PreparedModelFamily>> {
+        policy.validate()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image plan cache poisoned"))?;
+        let removed = state.configure(policy);
+        let component = (policy != ImagePlanCachePolicy::Disabled)
+            .then(|| {
+                state.entries.iter().rev().find(|entry| {
+                    let family = entry.component.family();
+                    entry.receipt.stage == key.stage
+                        && entry.receipt.role == key.role
+                        && entry.receipt.batch_size == key.batch_size
+                        && family.family_id() == key.family
+                        && family.external_metadata_id() == key.metadata
+                        && family.canonical_config() == key.config
+                        && &family.numerical_profile().id == key.profile
+                })
+            })
+            .flatten()
+            .map(|entry| entry.component.clone());
+        drop(state);
+        drop(removed);
+        // Deep-clone only the selected prepared graph, outside the cache lock.
+        // The existing metadata budget/Host payload distinction is unchanged.
+        Ok(component.map(|component| component.family().clone()))
     }
     pub(super) fn get(
         &self,

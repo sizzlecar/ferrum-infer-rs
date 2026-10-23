@@ -1,5 +1,168 @@
 use super::fixture::*;
 use super::*;
+use crate::image_generation::plan_cache::PreparedFamilyKey;
+
+#[test]
+fn prepared_family_reuse_requires_exact_geometry_identity_and_stage_role() {
+    let (pipeline, _directory) = super::adapter::pipeline(2);
+    let config = QwenImage21TransformerConfig::new(
+        transformer(),
+        QwenImage21T2iLayout::new(3, 2, 2, vec![3]).unwrap(),
+    )
+    .unwrap();
+    let first = pipeline.prepare_denoiser(&config, 1).unwrap();
+    let family = first.component.family();
+    let key = PreparedFamilyKey {
+        stage: ImageStage::Denoiser,
+        role: ImageStagePlanRole::WholeStage,
+        batch_size: 1,
+        family: family.family_id(),
+        metadata: family.external_metadata_id(),
+        config: family.canonical_config(),
+        profile: &family.numerical_profile().id,
+    };
+    let lookup = |key| {
+        pipeline
+            .plan_cache
+            .prepared_family(pipeline.config.plan_cache, key)
+            .unwrap()
+    };
+    assert_eq!(lookup(key).as_ref(), Some(family));
+    let other_family = ModelFamilyId::new("family.different").unwrap();
+    let other_metadata = ExternalModelMetadataId::new("metadata.different").unwrap();
+    let other_profile =
+        NumericalProfileId::new(QwenImage21TransformerFamily::CUDA_PROFILE_ID).unwrap();
+    let different_mask = serde_json::to_value(
+        QwenImage21TransformerConfig::new(
+            transformer(),
+            QwenImage21T2iLayout::new(3, 2, 2, vec![2]).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for changed in [
+        PreparedFamilyKey {
+            stage: ImageStage::Decoder,
+            ..key
+        },
+        PreparedFamilyKey {
+            role: ImageStagePlanRole::PrefixDecode,
+            ..key
+        },
+        PreparedFamilyKey {
+            batch_size: 2,
+            ..key
+        },
+        PreparedFamilyKey {
+            family: &other_family,
+            ..key
+        },
+        PreparedFamilyKey {
+            metadata: &other_metadata,
+            ..key
+        },
+        PreparedFamilyKey {
+            profile: &other_profile,
+            ..key
+        },
+        PreparedFamilyKey {
+            config: &different_mask,
+            ..key
+        },
+    ] {
+        assert!(lookup(changed).is_none());
+    }
+    let repeated = pipeline.prepare_denoiser(&config, 1).unwrap();
+    assert!(repeated.plan.plan_cache_hit);
+    assert!(Arc::ptr_eq(&first.component, &repeated.component));
+    let receipt = repeated.plan.plan_cache.as_ref().unwrap();
+    assert_eq!((receipt.entries, receipt.hits, receipt.misses), (1, 1, 1));
+    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+}
+
+#[test]
+fn prepared_family_reuse_still_checks_new_compile_options() {
+    use ferrum_models::qwen_image21::{
+        QwenImage21ImageProjectionFamily, IMAGE_PROJECTION_PROFILE_ID,
+    };
+    let (pipeline, _directory) = super::adapter::pipeline(1);
+    let original = cached_projection(&pipeline, ImageStage::Denoiser, 1);
+    let family = pipeline
+        .prepare_family(
+            ImageStage::Denoiser,
+            ImageStagePlanRole::WholeStage,
+            1,
+            QwenImage21ImageProjectionFamily::new().unwrap(),
+            &transformer(),
+            &NumericalProfileId::new(IMAGE_PROJECTION_PROFILE_ID).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(&family, original.component.family());
+    let mut options = projection_options();
+    options.retain_completion_value(family.program().outputs()[0].clone());
+    let changed =
+        PreparedStage::compile(ImageStage::Denoiser, 1, family, &options, &pipeline).unwrap();
+    assert!(!changed.plan.plan_cache_hit);
+    assert!(!Arc::ptr_eq(&original.component, &changed.component));
+}
+
+#[test]
+fn prepared_family_lookup_does_not_extend_lru_or_disabled_retention() {
+    let (mut pipeline, _directory) = super::adapter::pipeline(2);
+    pipeline.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
+    let first = cached_projection(&pipeline, ImageStage::Denoiser, 1);
+    let family = first.component.family().clone();
+    let weak = Arc::downgrade(&first.component);
+    drop(first);
+    let key = PreparedFamilyKey {
+        stage: ImageStage::Denoiser,
+        role: ImageStagePlanRole::WholeStage,
+        batch_size: 1,
+        family: family.family_id(),
+        metadata: family.external_metadata_id(),
+        config: family.canonical_config(),
+        profile: &family.numerical_profile().id,
+    };
+    let second = cached_projection(&pipeline, ImageStage::Denoiser, 2);
+    let second_weak = Arc::downgrade(&second.component);
+    drop(second);
+    assert!(pipeline
+        .plan_cache
+        .prepared_family(pipeline.config.plan_cache, key)
+        .unwrap()
+        .is_some());
+    // A metadata-only lookup does not acquire a plan or refresh its LRU slot.
+    drop(cached_projection_with_role(
+        &pipeline,
+        ImageStage::Denoiser,
+        ImageStagePlanRole::PrefixDecode,
+        1,
+    ));
+    assert!(weak.upgrade().is_none());
+    assert!(pipeline
+        .plan_cache
+        .prepared_family(pipeline.config.plan_cache, key)
+        .unwrap()
+        .is_none());
+    let second_key = PreparedFamilyKey {
+        batch_size: 2,
+        ..key
+    };
+    assert!(pipeline
+        .plan_cache
+        .prepared_family(pipeline.config.plan_cache, second_key)
+        .unwrap()
+        .is_some());
+    assert!(pipeline
+        .plan_cache
+        .prepared_family(ImagePlanCachePolicy::Disabled, second_key)
+        .unwrap()
+        .is_none());
+    assert!(second_weak.upgrade().is_none());
+    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+}
 
 #[test]
 fn stage_cache_reuses_compilation_and_misses_changed_geometry_or_options() {

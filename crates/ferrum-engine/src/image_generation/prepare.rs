@@ -152,13 +152,30 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let noise = NormalNoiseConfig::new(64, u64::from(height), u64::from(width))?;
         let latent_shape =
             QwenImage21LatentShape::new(batch, usize::try_from(height)?, usize::try_from(width)?)?;
-        let text_family = TypedFamilyRegistration::new(Qwen3VLTextEncoderFamily::new()?)
-            .prepare_with_profile(&serde_json::to_value(&text)?, &self.profiles.text_encoder)?;
-        let noise_family =
-            TypedFamilyRegistration::new(NormalNoiseFamily::new(self.profiles.noise.as_str())?)
-                .prepare_with_profile(&serde_json::to_value(&noise)?, &self.profiles.noise)?;
-        let vae_family = TypedFamilyRegistration::new(QwenImage21VaeDecoderFamily::new()?)
-            .prepare_with_profile(&serde_json::to_value(&decoder)?, &self.profiles.decoder)?;
+        let text_family = self.prepare_family(
+            ImageStage::TextEncoder,
+            ImageStagePlanRole::WholeStage,
+            batch,
+            Qwen3VLTextEncoderFamily::new()?,
+            &text,
+            &self.profiles.text_encoder,
+        )?;
+        let noise_family = self.prepare_family(
+            ImageStage::Noise,
+            ImageStagePlanRole::WholeStage,
+            1,
+            NormalNoiseFamily::new(self.profiles.noise.as_str())?,
+            &noise,
+            &self.profiles.noise,
+        )?;
+        let vae_family = self.prepare_family(
+            ImageStage::Decoder,
+            ImageStagePlanRole::WholeStage,
+            decoder_batch,
+            QwenImage21VaeDecoderFamily::new()?,
+            &decoder,
+            &self.profiles.decoder,
+        )?;
         let mut text_options = text.compile_options()?;
         if self.profiles.text_encoder.as_str() == Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID {
             let conversion = precision::materializer(
@@ -230,8 +247,19 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         transformer: &QwenImage21TransformerConfig,
         batch: usize,
     ) -> anyhow::Result<PreparedStage<R>> {
-        let family = TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?)
-            .prepare_with_profile(&serde_json::to_value(transformer)?, &self.profiles.denoiser)?;
+        let role = match transformer.execution_phase() {
+            QwenImage21TransformerPhase::Full => ImageStagePlanRole::WholeStage,
+            QwenImage21TransformerPhase::PrefixPrefill => ImageStagePlanRole::PrefixPrefill,
+            QwenImage21TransformerPhase::PrefixDecode => ImageStagePlanRole::PrefixDecode,
+        };
+        let family = self.prepare_family(
+            ImageStage::Denoiser,
+            role,
+            batch,
+            QwenImage21TransformerFamily::new()?,
+            transformer,
+            &self.profiles.denoiser,
+        )?;
         let mut options = transformer.compile_options()?;
         if matches!(
             self.profiles.denoiser.as_str(),
@@ -245,11 +273,6 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             )?;
             precision::select(&family, &mut options, &conversion, &self.host)?;
         }
-        let role = match transformer.execution_phase() {
-            QwenImage21TransformerPhase::Full => ImageStagePlanRole::WholeStage,
-            QwenImage21TransformerPhase::PrefixPrefill => ImageStagePlanRole::PrefixPrefill,
-            QwenImage21TransformerPhase::PrefixDecode => ImageStagePlanRole::PrefixDecode,
-        };
         PreparedStage::compile_with_role(ImageStage::Denoiser, role, batch, family, &options, self)
     }
 }
