@@ -2,6 +2,8 @@ use super::*;
 use ferrum_kernels::backend::reference::reference_vnext_operation_registry;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod stage_budgets;
+
 fn pipeline() -> (
     QwenImage21Pipeline<ReferenceDeviceRuntime>,
     tempfile::TempDir,
@@ -222,7 +224,8 @@ fn decoder_dynamic_budget_counts_other_stages_and_actual_old_shape_without_doubl
             .memory()
             .minimum_runnable_request_bytes()
     };
-    let own_peak = memory(&decoder).max(retention.retained_bytes());
+    // The changed shape closes its old pool before allocating new backing.
+    let own_peak = memory(&decoder);
     pipeline.config.device_capacity_bytes = decoder.plan.static_bytes + own_peak;
     pipeline.validate_resident_capacity(&[&decoder]).unwrap();
     let required = decoder.plan.static_bytes
@@ -425,9 +428,7 @@ fn small_stage_capacity_reserves_every_eligible_slot_and_keeps_actual_old_shape_
     pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainSmallStages {
         maximum_bytes_per_stage: 1,
     };
-    let required = static_sum
-        + (demands[0].max(actual[0]) + actual[1]).max(demands[1].max(actual[1]) + actual[0])
-        + 3;
+    let required = static_sum + (demands[0] + actual[1]).max(demands[1] + actual[0]) + 3;
     pipeline.config.device_capacity_bytes = required - 1;
     assert!(pipeline
         .validate_resident_capacity(&planned.iter().collect::<Vec<_>>())

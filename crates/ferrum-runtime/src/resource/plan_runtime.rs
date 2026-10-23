@@ -974,6 +974,50 @@ where
         self.maintenance_controller.status()
     }
 
+    /// Planning evidence for this exact plan: each pool contributes the larger
+    /// of its canonical runnable minimum and its existing/pending residency.
+    /// A large retained chunk in one pool cannot satisfy a different cold pool.
+    /// This snapshot reserves no bytes and grants no execution authority. It
+    /// does not prove fragmentation fit; physical admission remains decisive.
+    pub fn minimum_runnable_dynamic_bytes_with_residency(&self) -> Result<u64, VNextError> {
+        let _lifecycle = self.read_lifecycle("observe runnable dynamic residency")?;
+        let states = self
+            .dynamic_pools
+            .pools
+            .values()
+            .map(|pool| {
+                pool.state
+                    .lock()
+                    .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.dynamic_pools
+            .pools
+            .values()
+            .zip(&states)
+            .try_fold(0_u64, |total, (pool, state)| {
+                if state.poisoned || !state.quarantined.is_empty() {
+                    return Err(invalid_resource(
+                        "runnable residency cannot use a poisoned or quarantined pool",
+                    ));
+                }
+                let contract = &pool.domain.pool;
+                let minimum = contract
+                    .minimum_request_bytes()
+                    .checked_add(contract.minimum_sequence_bytes())
+                    .and_then(|bytes| bytes.checked_add(contract.minimum_step_bytes()))
+                    .and_then(|bytes| bytes.checked_add(contract.minimum_invocation_peak_bytes()))
+                    .ok_or_else(|| invalid_resource("pool runnable minimum overflows u64"))?;
+                let resident = state
+                    .resident_bytes
+                    .checked_add(state.pending_growth_bytes)
+                    .ok_or_else(|| invalid_resource("pool residency overflows u64"))?;
+                total
+                    .checked_add(minimum.max(resident))
+                    .ok_or_else(|| invalid_resource("runnable dynamic residency overflows u64"))
+            })
+    }
+
     pub fn write_dynamic_capacity_availability(
         &self,
         out: &mut Vec<CapacityAvailabilityEpoch>,

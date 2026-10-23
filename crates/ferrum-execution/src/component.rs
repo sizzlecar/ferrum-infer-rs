@@ -540,6 +540,16 @@ impl<R: DeviceRuntime> TensorComponentSession<R> {
             .try_release_idle_dynamic_backing()
     }
 
+    /// Pool-aware planning evidence for this session's exact compiled plan.
+    /// Includes the runnable minima of cold pools alongside actual retained
+    /// pools; it does not reserve capacity or grant another execution.
+    pub fn minimum_runnable_dynamic_bytes_with_residency(&self) -> Result<u64, VNextError> {
+        self.resources
+            .as_ref()
+            .expect("live session owns resource root")
+            .minimum_runnable_dynamic_bytes_with_residency()
+    }
+
     /// Keep fully idle dynamic backing within the explicit byte bound, with
     /// its original device capacity grants. Zero or an exceeded bound releases
     /// all idle backing. Busy preserves the session and every resource owner.
@@ -551,6 +561,18 @@ impl<R: DeviceRuntime> TensorComponentSession<R> {
             .as_ref()
             .expect("live session owns resource root")
             .try_retain_idle_dynamic_backing(maximum_bytes)
+    }
+
+    /// Retain largest fully idle chunks within the cap, with their original
+    /// capacity grants. The receipt also describes any released chunks.
+    pub fn try_retain_largest_idle_dynamic_chunks(
+        &mut self,
+        maximum_bytes: u64,
+    ) -> Result<IdleDynamicBackingOutcome, VNextError> {
+        self.resources
+            .as_ref()
+            .expect("live session owns resource root")
+            .try_retain_largest_idle_dynamic_chunks(maximum_bytes)
     }
 
     /// Stops further admission and returns the actual runtime close outcome.

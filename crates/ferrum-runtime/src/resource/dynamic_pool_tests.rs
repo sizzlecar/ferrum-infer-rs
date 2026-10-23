@@ -29,6 +29,12 @@ mod reusable_pressure_tests;
 #[path = "plan_fit_tests.rs"]
 mod plan_fit_tests;
 
+#[path = "submission_wave_projection_tests.rs"]
+mod submission_wave_projection_tests;
+
+#[path = "idle_dynamic_footprint_tests.rs"]
+mod idle_dynamic_footprint_tests;
+
 #[path = "operation_view_coverage_tests.rs"]
 mod operation_view_coverage_tests;
 
@@ -6755,6 +6761,187 @@ fn paged_internal_fault_restores_segments_selected_earlier_in_the_same_call() {
 
 mod idle_trim_tests {
     use super::*;
+
+    #[test]
+    fn partial_idle_retention_keeps_largest_whole_chunks_and_their_original_grants() {
+        for (cap, expected_sizes) in [
+            (384, vec![64, 128, 192]),
+            (256, vec![64, 192]),
+            (192, vec![192]),
+            (191, vec![128]),
+            (63, vec![]),
+            (0, vec![]),
+        ] {
+            let catalog = pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Request,
+                'a',
+                1,
+                384,
+                TestDemand::Fixed,
+            );
+            let runtime = new_runtime(&catalog, 384);
+            let harness = harness(runtime.clone(), catalog, 384, false);
+            for bytes in [64, 128, 192] {
+                harness
+                    .root
+                    .maintenance_controller
+                    .grow_pool(&harness.pool_ids[0], bytes)
+                    .unwrap();
+            }
+            let budget = Arc::clone(&harness.root.dynamic_pools.budget);
+            let originals = {
+                let state = harness.root.dynamic_pools.pools[&harness.pool_ids[0]]
+                    .state
+                    .lock()
+                    .unwrap();
+                state
+                    .chunks
+                    .values()
+                    .map(|chunk| (chunk.backing._grant.bytes(), Arc::downgrade(&chunk.backing)))
+                    .collect::<Vec<_>>()
+            };
+            let retained_bytes: u64 = expected_sizes.iter().sum();
+            let released = match harness
+                .root
+                .try_retain_largest_idle_dynamic_chunks(cap)
+                .unwrap()
+            {
+                IdleDynamicBackingOutcome::Retained(receipt) => {
+                    assert_eq!(receipt.retained_bytes(), retained_bytes);
+                    assert_eq!(receipt.retained_chunks(), expected_sizes.len());
+                    receipt.released().cloned()
+                }
+                IdleDynamicBackingOutcome::Released(receipt) => {
+                    assert!(expected_sizes.is_empty());
+                    Some(receipt)
+                }
+                IdleDynamicBackingOutcome::Busy(reason) => panic!("idle plan is busy: {reason:?}"),
+            };
+            if retained_bytes == 384 {
+                assert!(released.is_none());
+            } else {
+                let receipt = released.unwrap();
+                assert_eq!(receipt.reclaimed_bytes(), 384 - retained_bytes);
+                assert_eq!(receipt.reclaimed_chunks(), 3 - expected_sizes.len());
+                assert_eq!(receipt.pools().len(), 1);
+                assert_eq!(
+                    receipt.pools()[0].published_capacity_bytes(),
+                    retained_bytes
+                );
+            }
+            for (bytes, backing) in &originals {
+                assert_eq!(backing.upgrade().is_some(), expected_sizes.contains(bytes));
+            }
+            let status = harness.root.dynamic_pool_status().unwrap();
+            assert_eq!(status.budget_claimed_bytes(), retained_bytes);
+            assert_eq!(status.process_claimed_bytes(), retained_bytes);
+            assert_eq!(status.pools()[0].resident_bytes(), retained_bytes);
+            // Only released chunks return capacity; a retained chunk's actual
+            // grant continues to exclude competing allocations.
+            assert!(matches!(
+                DeviceCapacityReservation::reserve(&budget, 385 - retained_bytes),
+                Err(VNextError::DeviceCapacityUnavailable(_))
+            ));
+            if retained_bytes < 384 {
+                drop(DeviceCapacityReservation::reserve(&budget, 384 - retained_bytes).unwrap());
+            }
+            let allocation_calls = runtime.allocate_calls();
+            if expected_sizes.is_empty() {
+                // A cold pool can grow again through the normal controller.
+                harness
+                    .root
+                    .maintenance_controller
+                    .initialize_pools(&harness.pool_ids)
+                    .unwrap();
+            } else {
+                assert!(matches!(
+                    harness.root.try_retain_largest_idle_dynamic_chunks(cap).unwrap(),
+                    IdleDynamicBackingOutcome::Retained(receipt)
+                        if receipt.retained_bytes() == retained_bytes && receipt.released().is_none()
+                ));
+            }
+            // Retention itself supplies no authority. A real request still
+            // claims and returns a normal descriptor-backed physical extent.
+            let request = admitted_request(&harness.root, "partial-idle-reuse");
+            assert_eq!(
+                runtime.allocate_calls(),
+                allocation_calls + u64::from(expected_sizes.is_empty())
+            );
+            drop(request);
+            close_dynamic_test_root(harness.root);
+            assert!(originals
+                .iter()
+                .all(|(_, backing)| backing.upgrade().is_none()));
+            drop(DeviceCapacityReservation::reserve(&budget, 384).unwrap());
+        }
+    }
+
+    #[test]
+    fn partial_idle_retention_ties_follow_pool_order_and_cold_pool_regrows() {
+        let catalogs = ['a', 'b'].map(|layout| {
+            pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Request,
+                layout,
+                1,
+                64,
+                TestDemand::Fixed,
+            )
+        });
+        let catalog = combine_catalogs(&catalogs);
+        let runtime = new_runtime(&catalog, 128);
+        let harness = harness(runtime.clone(), catalog, 128, false);
+        harness
+            .root
+            .maintenance_controller
+            .initialize_pools(&harness.pool_ids)
+            .unwrap();
+        let originals = harness
+            .root
+            .dynamic_pools
+            .pools
+            .values()
+            .map(|pool| {
+                let state = pool.state.lock().unwrap();
+                Arc::downgrade(&state.chunks.values().next().unwrap().backing)
+            })
+            .collect::<Vec<_>>();
+        let IdleDynamicBackingOutcome::Retained(receipt) = harness
+            .root
+            .try_retain_largest_idle_dynamic_chunks(64)
+            .unwrap()
+        else {
+            panic!("one of the two equal-sized chunks fits");
+        };
+        assert_eq!(receipt.retained_bytes(), 64);
+        assert_eq!(receipt.retained_chunks(), 1);
+        assert_eq!(receipt.released().unwrap().reclaimed_bytes(), 64);
+        assert!(originals[0].upgrade().is_some());
+        assert!(originals[1].upgrade().is_none());
+        let calls = runtime.allocate_calls();
+        harness
+            .root
+            .maintenance_controller
+            .initialize_pools(&harness.pool_ids)
+            .unwrap();
+        assert_eq!(runtime.allocate_calls(), calls + 1);
+        assert!(originals[0].upgrade().is_some());
+        let request = admitted_request(&harness.root, "partial-idle-mixed-warm-cold");
+        drop(request);
+        let budget = Arc::clone(&harness.root.dynamic_pools.budget);
+        assert_eq!(
+            harness
+                .root
+                .dynamic_pool_status()
+                .unwrap()
+                .budget_claimed_bytes(),
+            128
+        );
+        close_dynamic_test_root(harness.root);
+        assert!(originals[0].upgrade().is_none());
+        drop(DeviceCapacityReservation::reserve(&budget, 128).unwrap());
+    }
 
     #[test]
     fn exact_retention_bound_preserves_chunks_and_grants_until_original_root_close() {

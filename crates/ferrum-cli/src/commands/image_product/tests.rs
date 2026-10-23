@@ -514,6 +514,69 @@ fn decoder_backing_retention_is_bounded_and_shared_by_run_and_serve() {
 }
 
 #[test]
+fn per_stage_dynamic_budgets_are_shared_by_run_and_serve_and_reject_ineligible_stages() {
+    use ferrum_engine::image_generation::{
+        ImageDynamicResidencyPolicy, ImageStageRetentionBudgets,
+    };
+    use std::num::NonZeroU64;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    let mut wire = configuration();
+    let selected = json!({"retain_stage_budgets":{"maximum_bytes_by_stage":{
+        "text_encoder":2048,"vision_encoder":3072,"decoder":4096
+    }}});
+    wire["backend"]["pipeline"]["dynamic_residency"] = selected.clone();
+    assert!(load(&wire).is_err());
+    wire["execution_profile"] = json!("experimental_resident_v1");
+    wire["backend"]["pipeline"]["residency"] = json!("denoiser_and_decoder");
+    assert!(load(&wire).is_err());
+    wire["backend"]["pipeline"]["residency"] = json!("all_model_components");
+    let expected = ImageDynamicResidencyPolicy::RetainStageBudgets {
+        maximum_bytes_by_stage: ImageStageRetentionBudgets {
+            text_encoder: NonZeroU64::new(2048),
+            vision_encoder: NonZeroU64::new(3072),
+            decoder: NonZeroU64::new(4096),
+            ..ImageStageRetentionBudgets::default()
+        },
+    };
+    for serving in [false, true] {
+        wire["serving"] = Value::Null;
+        if serving {
+            wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+                "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
+                "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+        }
+        wire["backend"]["pipeline"]["dynamic_residency"] = selected.clone();
+        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+        assert_eq!(
+            cuda.resolved_pipeline().unwrap().dynamic_residency,
+            expected
+        );
+        #[cfg(feature = "cuda")]
+        assert_eq!(
+            cuda.resolved().unwrap().pipeline.dynamic_residency,
+            expected
+        );
+        for invalid in [
+            json!({}),
+            json!({"decoder":0}),
+            json!({"decoder":-1}),
+            json!({"noise":1024}),
+            json!({"decoder":1024,"unknown_stage":1}),
+        ] {
+            wire["backend"]["pipeline"]["dynamic_residency"] = json!({
+                "retain_stage_budgets":{"maximum_bytes_by_stage":invalid}
+            });
+            assert!(load(&wire).is_err());
+        }
+    }
+}
+
+#[test]
 fn residency_is_explicit_and_shared_by_run_and_serve_configuration() {
     use ferrum_engine::image_generation::ImageResidencyPolicy;
     let dir = tempfile::tempdir().unwrap();

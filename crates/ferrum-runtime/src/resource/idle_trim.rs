@@ -41,6 +41,8 @@ pub enum IdleDynamicReleaseOutcome {
 pub struct IdleDynamicRetentionReceipt {
     retained_bytes: u64,
     retained_chunks: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    released: Option<DynamicPoolRebalanceReceipt>,
 }
 
 impl IdleDynamicRetentionReceipt {
@@ -51,9 +53,14 @@ impl IdleDynamicRetentionReceipt {
     pub const fn retained_chunks(&self) -> usize {
         self.retained_chunks
     }
+
+    pub fn released(&self) -> Option<&DynamicPoolRebalanceReceipt> {
+        self.released.as_ref()
+    }
 }
 
-/// An atomic idle observation followed by bounded retention or full release.
+/// An atomic idle observation followed by bounded retention or release.
+/// Retention may include a receipt for other chunks released in the same call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "receipt", rename_all = "snake_case")]
 pub enum IdleDynamicBackingOutcome {
@@ -78,7 +85,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
     pub fn try_release_idle_dynamic_backing(
         &self,
     ) -> Result<IdleDynamicReleaseOutcome, VNextError> {
-        match self.try_manage_idle_dynamic_backing(0)? {
+        match self.try_manage_idle_dynamic_backing(0, false)? {
             IdleDynamicBackingOutcome::Released(receipt) => {
                 Ok(IdleDynamicReleaseOutcome::Released(receipt))
             }
@@ -99,12 +106,25 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         &self,
         maximum_bytes: u64,
     ) -> Result<IdleDynamicBackingOutcome, VNextError> {
-        self.try_manage_idle_dynamic_backing(maximum_bytes)
+        self.try_manage_idle_dynamic_backing(maximum_bytes, false)
+    }
+
+    /// Retain whole idle chunks within a byte cap, largest first. Equal sizes
+    /// are ordered by pool ID and chunk ordinal; each chunk is kept if it fits
+    /// the remaining cap. This is deterministic greedy selection, not packing
+    /// or physical storage splitting. Original buffers and grants stay paired.
+    /// Every pool must pass the same complete idle checks before any release.
+    pub fn try_retain_largest_idle_dynamic_chunks(
+        &self,
+        maximum_bytes: u64,
+    ) -> Result<IdleDynamicBackingOutcome, VNextError> {
+        self.try_manage_idle_dynamic_backing(maximum_bytes, true)
     }
 
     fn try_manage_idle_dynamic_backing(
         &self,
         maximum_retained_bytes: u64,
+        retain_partial: bool,
     ) -> Result<IdleDynamicBackingOutcome, VNextError> {
         let lifecycle = match self.lifecycle.try_write() {
             Ok(gate) => gate,
@@ -178,11 +198,9 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             ));
         }
 
-        let mut receipts = Vec::with_capacity(pools.len());
-        let mut updates = Vec::with_capacity(pools.len());
-        let mut released_bytes = 0_u64;
-        let mut released_chunks = 0_usize;
-        for (pool, state) in pools.iter().zip(&states) {
+        let mut candidates = Vec::new();
+        let mut total_bytes = 0_u64;
+        for (pool_index, (pool, state)) in pools.iter().zip(&states).enumerate() {
             let live_segments = state.chunks.values().try_fold(0_u64, |sum, chunk| {
                 sum.checked_add(chunk.live_segments)
                     .ok_or_else(|| invalid_resource("idle backing segment count overflow"))
@@ -217,13 +235,13 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                 || state.live_occupancy.total().physical_bytes() != 0
                 || state.live_occupancy.total().segment_count() != 0
                 || state.allocator.by_offset.len() != state.chunks.len()
+                || state.allocator.by_size.len() != state.chunks.len()
             {
                 return Err(invalid_resource(
                     "idle pool capacity/ownership disagrees with its allocator",
                 ));
             }
             let mut bytes = 0_u64;
-            let mut chunks = Vec::with_capacity(state.chunks.len());
             for (&ordinal, chunk) in &state.chunks {
                 let extent = state
                     .allocator
@@ -235,6 +253,12 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     || chunk.backing.identity.ordinal() != ordinal
                     || extent.chunk_generation != chunk.backing.identity.generation()
                     || extent.length_bytes != size
+                    || !state.allocator.by_size.contains(&(
+                        size,
+                        ordinal,
+                        extent.chunk_generation,
+                        0,
+                    ))
                 {
                     return Err(invalid_resource(
                         "idle chunk extent differs from its owned backing",
@@ -243,37 +267,72 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                 bytes = bytes
                     .checked_add(size)
                     .ok_or_else(|| invalid_resource("idle pool byte count overflow"))?;
-                chunks.push(chunk.backing.identity.clone());
+                candidates.push((pool_index, ordinal, size));
             }
             if bytes != state.resident_bytes {
                 return Err(invalid_resource(
                     "idle pool byte count differs from residency",
                 ));
             }
-            released_bytes = released_bytes
+            total_bytes = total_bytes
                 .checked_add(bytes)
                 .ok_or_else(|| invalid_resource("idle release byte count overflow"))?;
-            released_chunks = released_chunks
-                .checked_add(chunks.len())
-                .ok_or_else(|| invalid_resource("idle release chunk count overflow"))?;
-            updates.push((pool.domain.domain_id, CapacityUnits::ZERO));
+        }
+
+        if maximum_retained_bytes != 0 && total_bytes <= maximum_retained_bytes {
+            return Ok(IdleDynamicBackingOutcome::Retained(
+                IdleDynamicRetentionReceipt {
+                    retained_bytes: total_bytes,
+                    retained_chunks: candidates.len(),
+                    released: None,
+                },
+            ));
+        }
+
+        let mut retained = BTreeSet::new();
+        let mut retained_bytes = 0_u64;
+        if retain_partial && maximum_retained_bytes != 0 {
+            candidates.sort_unstable_by(|left, right| {
+                right
+                    .2
+                    .cmp(&left.2)
+                    .then(left.0.cmp(&right.0))
+                    .then(left.1.cmp(&right.1))
+            });
+            for &(pool_index, ordinal, bytes) in &candidates {
+                if bytes <= maximum_retained_bytes - retained_bytes {
+                    retained.insert((pool_index, ordinal));
+                    retained_bytes += bytes;
+                }
+            }
+        }
+        let released_bytes = total_bytes - retained_bytes;
+        let released_chunks = candidates.len() - retained.len();
+        let mut receipts = Vec::with_capacity(pools.len());
+        let mut updates = Vec::with_capacity(pools.len());
+        let mut release_ordinals = Vec::with_capacity(pools.len());
+        for (pool_index, (pool, state)) in pools.iter().zip(&states).enumerate() {
+            let mut chunks = Vec::new();
+            let mut ordinals = Vec::new();
+            let mut bytes = 0_u64;
+            for (&ordinal, chunk) in &state.chunks {
+                if !retained.contains(&(pool_index, ordinal)) {
+                    bytes += chunk.backing._grant.bytes();
+                    chunks.push(chunk.backing.identity.clone());
+                    ordinals.push(ordinal);
+                }
+            }
+            let remaining = state.resident_bytes - bytes;
+            updates.push((pool.domain.domain_id, CapacityUnits::new(remaining)));
+            release_ordinals.push(ordinals);
             if !chunks.is_empty() {
                 receipts.push(DynamicPoolIdleReclaim {
                     pool_id: pool.domain.pool_id().clone(),
                     chunks,
                     reclaimed_bytes: bytes,
-                    published_capacity_bytes: 0,
+                    published_capacity_bytes: remaining,
                 });
             }
-        }
-
-        if maximum_retained_bytes != 0 && released_bytes <= maximum_retained_bytes {
-            return Ok(IdleDynamicBackingOutcome::Retained(
-                IdleDynamicRetentionReceipt {
-                    retained_bytes: released_bytes,
-                    retained_chunks: released_chunks,
-                },
-            ));
         }
 
         // All validation/allocation precedes publication. A publication error
@@ -284,10 +343,16 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             .dynamic_pools
             .logical_admission
             .set_domain_totals(&updates)?;
-        for state in &mut states {
+        for ((state, ordinals), (_, remaining)) in
+            states.iter_mut().zip(release_ordinals).zip(&updates)
+        {
             // Use directory mutation so its monotonic proof epoch survives;
             // replacing it with an empty directory would reset that identity.
-            while let Some((&ordinal, _)) = state.chunks.first_key_value() {
+            for ordinal in ordinals {
+                state
+                    .allocator
+                    .remove_extent(ordinal, 0)
+                    .expect("validated idle chunk retains its entire free extent");
                 removed.push(
                     state
                         .chunks
@@ -295,8 +360,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                         .expect("validated idle chunk remains under the exclusive state lock"),
                 );
             }
-            state.allocator = FreeExtentIndex::default();
-            state.resident_bytes = 0;
+            state.resident_bytes = remaining.get();
             // Directory epoch and ordinal/generation counters survive trim.
         }
         drop(states);
@@ -306,15 +370,22 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         // original DeviceCapacityGrant; no new accounting authority is made.
         drop(removed);
         let availability = self.dynamic_pools.budget.availability_snapshot()?;
-        Ok(IdleDynamicBackingOutcome::Released(
-            DynamicPoolRebalanceReceipt {
-                pools: receipts,
-                reclaimed_chunks: released_chunks,
-                reclaimed_bytes: released_bytes,
-                logical_capacity_epoch: epochs.capacity_epoch(),
-                plan_device_capacity_epoch: availability.plan_epoch(),
-                process_device_capacity_epoch: availability.process_epoch(),
-            },
-        ))
+        let released = DynamicPoolRebalanceReceipt {
+            pools: receipts,
+            reclaimed_chunks: released_chunks,
+            reclaimed_bytes: released_bytes,
+            logical_capacity_epoch: epochs.capacity_epoch(),
+            plan_device_capacity_epoch: availability.plan_epoch(),
+            process_device_capacity_epoch: availability.process_epoch(),
+        };
+        Ok(if retained.is_empty() {
+            IdleDynamicBackingOutcome::Released(released)
+        } else {
+            IdleDynamicBackingOutcome::Retained(IdleDynamicRetentionReceipt {
+                retained_bytes,
+                retained_chunks: retained.len(),
+                released: Some(released),
+            })
+        })
     }
 }

@@ -221,6 +221,53 @@ struct CudaAllocation {
     _tensor_owner: Option<Arc<tensor_eager::TensorEagerState>>,
 }
 
+/// Read-only observations of the device's current allocator pool. This does
+/// not identify a Ferrum capacity owner or certify physical reclamation.
+struct CudaAllocationPoolSnapshot {
+    pool_identity: usize,
+    release_threshold_bytes: u64,
+    reserved_bytes: u64,
+    used_bytes: u64,
+}
+
+impl fmt::Debug for CudaAllocationPoolSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CudaAllocationPoolSnapshot")
+            .field("pool_identity", &self.pool_identity)
+            .field("release_threshold_bytes", &self.release_threshold_bytes)
+            .field("reserved_bytes", &self.reserved_bytes)
+            .field("used_bytes", &self.used_bytes)
+            .finish()
+    }
+}
+
+fn allocation_pool_snapshot(
+    context: &CudaContext,
+) -> Result<Option<CudaAllocationPoolSnapshot>, DriverError> {
+    use cudarc::driver::{result, sys::CUmemPool_attribute as Attr};
+    if !context.has_async_alloc() {
+        return Ok(None);
+    }
+    // SAFETY: the live context supplies its valid device; each supported
+    // attribute writes one u64. No pool configuration or synchronization is
+    // performed, and a diagnostic error never changes allocation behavior.
+    unsafe {
+        let pool = result::device::get_mem_pool(context.cu_device())?;
+        let read = |attribute| {
+            let mut value = 0_u64;
+            result::mem_pool::get_attribute(pool, attribute, (&mut value as *mut u64).cast())?;
+            Ok::<_, DriverError>(value)
+        };
+        Ok(Some(CudaAllocationPoolSnapshot {
+            pool_identity: pool as usize,
+            release_threshold_bytes: read(Attr::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)?,
+            reserved_bytes: read(Attr::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
+            used_bytes: read(Attr::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+        }))
+    }
+}
+
 unsafe impl Send for CudaAllocation {}
 unsafe impl Sync for CudaAllocation {}
 
@@ -4761,6 +4808,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA allocation size overflows"))?;
         let allocation_bytes = checked_usize(allocation_bytes, "CUDA allocation size")?;
         let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        let pool_before = trace_enabled.then(|| allocation_pool_snapshot(&self.context));
         let allocation_started = trace_enabled.then(Instant::now);
         let base = unsafe { self.allocation_stream.alloc::<u8>(allocation_bytes) }
             .map_err(|error| CudaDeviceRuntimeError::driver("allocation", error))?;
@@ -4779,19 +4827,26 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .checked_add(alignment - 1)
             .map(|pointer| pointer & !(alignment - 1))
             .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA aligned pointer overflows"))?;
+        let pool_before_sync = trace_enabled.then(|| allocation_pool_snapshot(&self.context));
         let synchronization_started = trace_enabled.then(Instant::now);
         self.allocation_stream
             .synchronize()
             .map_err(|error| CudaDeviceRuntimeError::driver("allocation synchronization", error))?;
         if trace_enabled {
+            let sync_us = synchronization_started.map_or(0, |started| {
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+            });
+            let pool_after_sync = allocation_pool_snapshot(&self.context);
             tracing::debug!(
                 runtime_instance = self.runtime_instance,
                 resource_id = %request.resource_id(),
                 allocation_bytes,
                 alloc_us,
-                sync_us = synchronization_started.map_or(0, |started| {
-                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
-                }),
+                sync_us,
+                async_allocator = self.context.has_async_alloc(),
+                ?pool_before,
+                ?pool_before_sync,
+                ?pool_after_sync,
                 "CUDA allocation host timing"
             );
         }

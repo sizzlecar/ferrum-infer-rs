@@ -463,11 +463,16 @@ pub(super) struct QuarantinedDynamicChunk<B> {
     pub(super) reason: DynamicChunkQuarantineReason,
 }
 
+/// Bound once to the same immutable domain and compiled layout vectors.
+#[derive(Clone, Copy)]
+pub(super) struct DynamicPoolDomainIndex(pub(super) usize);
+
 pub(super) struct DynamicBackingPool<R>
 where
     R: DeviceRuntime,
 {
     pub(super) instance_id: u64,
+    pub(super) domain_index: DynamicPoolDomainIndex,
     pub(super) domain: DynamicPoolDomainSpec,
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) maintenance: Mutex<()>,

@@ -1,5 +1,6 @@
 //! Dynamic pool-set orchestration over backing owned by `dynamic_pool`.
 
+use super::dynamic_pool::DynamicPoolDomainIndex;
 use super::plan_runtime::{compile_step_resource_slot_layouts, StepResourceSlotLayout};
 use super::{
     align_up_resource, backing_segment_range, backing_segment_range_matches,
@@ -189,7 +190,7 @@ where
         .map(|(bucket_id, layout)| (bucket_id, Arc::new(layout)))
         .collect();
         let mut pools = BTreeMap::new();
-        for domain in &domains {
+        for (domain_index, domain) in domains.iter().enumerate() {
             let instance_id = NEXT_DYNAMIC_POOL_INSTANCE_ID
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     current.checked_add(1)
@@ -197,6 +198,7 @@ where
                 .map_err(|_| invalid_resource("dynamic pool instance id space is exhausted"))?;
             let pool = Arc::new(DynamicBackingPool {
                 instance_id,
+                domain_index: DynamicPoolDomainIndex(domain_index),
                 domain: domain.clone(),
                 logical_admission: logical_admission.clone(),
                 maintenance: Mutex::new(()),
@@ -1360,7 +1362,11 @@ where
             let pool = self.pools.get(request.domain.pool_id()).ok_or_else(|| {
                 invalid_resource("lane-stable backing request references an unknown pool")
             })?;
-            if !Self::projection_indices_match(pool, request) {
+            if !Self::projection_indices_match(pool, request)
+                || (lifetime == AllocationLifetime::Invocation
+                    && request.projections.len() > 1
+                    && !self.validate_invocation_wave_projection(pool, request)?)
+            {
                 return Err(invalid_resource(
                     "lane-stable backing request indices differ from immutable pool membership",
                 ));
@@ -2441,52 +2447,50 @@ where
         {
             return Ok(false);
         }
-        let mut expected_resources = pool
-            .domain
-            .pool
-            .invocation_liveness()
-            .iter()
-            .flat_map(|row| row.resource_ids().iter().cloned())
-            .collect::<Vec<_>>();
-        expected_resources.sort();
-        if expected_resources.windows(2).any(|pair| pair[0] == pair[1])
-            || expected_resources != request.claim_identity.resource_ids()
+        let domain_index = pool.domain_index.0;
+        let Some(domain) = self.domains.get(domain_index) else {
+            return Ok(false);
+        };
+        let Some(layout) = self
+            .submission_wave_layouts
+            .get(domain_index)
+            .and_then(Option::as_ref)
+        else {
+            return Ok(false);
+        };
+        // The physical pool selects the immutable layout, never an untrusted
+        // request hint. Normal requests borrow this exact domain; equivalent
+        // owned descriptors remain valid only after comparing the whole domain.
+        if domain.pool_id() != pool.domain.pool_id()
+            || domain.domain_id() != pool.domain.domain_id()
+            || (!std::ptr::eq(request.domain, domain) && request.domain != domain)
+            || request.claim_identity != layout.claim_identity
+            || request.projections.len() != layout.projection_count
         {
             return Ok(false);
         }
-        let projections = request
-            .projections
-            .iter()
-            .map(|projection| (projection.descriptor.base_resource_id().clone(), projection))
-            .collect::<BTreeMap<_, _>>();
-        if projections.len() != request.projections.len() {
-            return Ok(false);
-        }
-        let rows_by_node = pool
-            .domain
-            .pool
-            .invocation_liveness()
-            .iter()
-            .map(|row| (row.node_id(), row))
-            .collect::<BTreeMap<_, _>>();
-        let rows = self
-            .nodes
-            .iter()
-            .filter_map(|node| rows_by_node.get(node.id()).copied())
-            .collect::<Vec<_>>();
-        if rows.len() != rows_by_node.len() {
-            return Ok(false);
-        }
 
-        let row_bytes = rows
+        let row_bytes = layout
+            .rows
             .iter()
             .map(|row| {
-                row.resource_ids()
+                row.projections
                     .iter()
-                    .try_fold(0_u64, |total, resource_id| {
-                        let projection = projections.get(resource_id).ok_or_else(|| {
-                            invalid_resource("invocation wave projection is absent")
-                        })?;
+                    .try_fold(0_u64, |total, projection_layout| {
+                        let projection = request
+                            .projections
+                            .get(projection_layout.projection_index)
+                            .ok_or_else(|| {
+                                invalid_resource("invocation wave projection is absent")
+                            })?;
+                        if projection.descriptor_index != projection_layout.descriptor_index
+                            || domain.descriptors.get(projection_layout.descriptor_index)
+                                != Some(projection.descriptor)
+                        {
+                            return Err(invalid_resource(
+                                "invocation wave projection differs from its compiled member",
+                            ));
+                        }
                         total
                             .checked_add(projection.capacity_size_bytes)
                             .ok_or_else(|| {
@@ -2496,13 +2500,18 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let physical_layout = mode.layout(
-            &rows.iter().map(|row| row.chain_slot()).collect::<Vec<_>>(),
+            &layout
+                .rows
+                .iter()
+                .map(|row| row.chain_slot)
+                .collect::<Vec<_>>(),
             &row_bytes,
         )?;
-        for (row, row_base) in rows.iter().zip(physical_layout.row_offsets) {
+        for (row, row_base) in layout.rows.iter().zip(physical_layout.row_offsets) {
             let mut row_cursor = 0_u64;
-            for resource_id in row.resource_ids() {
-                let Some(projection) = projections.get(resource_id) else {
+            for projection_layout in &row.projections {
+                let Some(projection) = request.projections.get(projection_layout.projection_index)
+                else {
                     return Ok(false);
                 };
                 let expected_offset = row_base.checked_add(row_cursor).ok_or_else(|| {

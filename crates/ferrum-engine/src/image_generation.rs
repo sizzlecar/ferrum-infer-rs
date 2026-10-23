@@ -37,7 +37,9 @@ pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, Qwen
 pub use attention_policy::ImageCudaAttentionPolicy;
 pub use plan_cache::{ImagePlanCachePolicy, ImagePlanCacheReceipt};
 pub use precision::ImageCudaPrecisionPolicy;
-pub use residency::{ImageDynamicResidencyPolicy, ImageResidencyPolicy};
+pub use residency::{
+    ImageDynamicResidencyPolicy, ImageResidencyPolicy, ImageStageRetentionBudgets,
+};
 pub use stage::{
     ActiveImageStage, ImageGenerationError, ImageGenerationFailure, ImageStage,
     ImageStageExecutionReceipt, ImageStagePlanReceipt, ImageStagePlanRole, ImageStageReceipt,
