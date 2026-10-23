@@ -2707,6 +2707,101 @@ fn protocol_bindings_cannot_substitute_for_state_integration() {
 }
 
 #[test]
+fn image_tooling_and_cuda_distribution_do_not_hide_shared_diffusion_obligations() {
+    let targets = vec![
+        text_target("f32", Backend::Cpu),
+        text_target("bf16", Backend::Cuda),
+    ];
+    let mut request = input(
+        Stage::PullRequest,
+        targets.clone(),
+        vec![
+            profile("cpu", targets[0].clone()),
+            profile("cuda", targets[1].clone()),
+        ],
+    );
+    let tools = [
+        "crates/ferrum-bench-core/src/images/png_response.rs",
+        "crates/ferrum-bench-core/examples/compare_png_pixels.rs",
+        "crates/ferrum-bench-core/examples/image_run_comparison/fieller.rs",
+        "native-operators/cuda/cutlass-fp8/CUTLASS-BSD-3-Clause.txt",
+    ];
+    request.impact = super::super::analyze_paths(tools);
+    let distribution = plan(&request).unwrap();
+    assert!(distribution.impact.unknown_paths.is_empty());
+    for (behavior, layer) in [
+        (Behavior::Installation, EvidenceLayer::Installation),
+        (Behavior::ModelLoad, EvidenceLayer::ModelRuntime),
+    ] {
+        assert!(distribution.obligations.iter().any(|obligation| {
+            obligation.behavior == behavior
+                && obligation.layer == layer
+                && obligation.scope
+                    == ObligationScope::Backend {
+                        backend: Backend::Cuda,
+                    }
+        }));
+    }
+    assert!(!distribution.obligations.iter().any(|obligation| matches!(
+        obligation.layer,
+        EvidenceLayer::BackendNumerics | EvidenceLayer::Performance
+    )));
+
+    // Shared integration arithmetic must retain every declared backend even
+    // when the same diff also contains CUDA-only distribution inputs.
+    let diffusion = [
+        "crates/ferrum-diffusion/src/flow_match_euler/bf16.rs",
+        "crates/ferrum-diffusion/src/spatial_latent.rs",
+    ];
+    request.impact = super::super::analyze_paths(tools.into_iter().chain(diffusion));
+    let shared = plan(&request).unwrap();
+    assert!(shared.impact.unknown_paths.is_empty());
+    for target in &targets {
+        for (behavior, layer) in [
+            (Behavior::ModelForward, EvidenceLayer::ModelRuntime),
+            (Behavior::KernelNumerics, EvidenceLayer::BackendNumerics),
+            (Behavior::KernelBoundaries, EvidenceLayer::BackendNumerics),
+            (Behavior::Performance, EvidenceLayer::Performance),
+        ] {
+            let (index, obligation) = shared
+                .obligations
+                .iter()
+                .enumerate()
+                .find(|(_, obligation)| {
+                    obligation.behavior == behavior
+                        && obligation.layer == layer
+                        && obligation.scope
+                            == ObligationScope::Target {
+                                target: target.clone(),
+                            }
+                })
+                .expect("shared diffusion obligation must remain assigned to each declared target");
+            assert!(obligation.checkers.is_empty());
+            assert!(shared
+                .gaps
+                .contains(&Gap::UnassignedCheck { obligation: index }));
+        }
+    }
+
+    // Reviewed tool/source mappings must not turn arbitrary adjacent files
+    // into validation-only changes or silently discard their review gaps.
+    for unknown in [
+        "crates/ferrum-bench-core/examples/image_run_comparison/unreviewed.rs",
+        "crates/ferrum-diffusion/assets/schedule.json",
+    ] {
+        request.impact =
+            super::super::analyze_paths(tools.into_iter().chain(diffusion).chain([unknown]));
+        let result = plan(&request).unwrap();
+        assert!(result.gaps.contains(&Gap::UnmappedChange {
+            path: unknown.into()
+        }));
+        assert!(result.obligations.iter().any(|obligation| {
+            obligation.behavior == Behavior::UserStop && obligation.layer == EvidenceLayer::Contract
+        }));
+    }
+}
+
+#[test]
 fn isolated_backend_change_keeps_its_forward_numerics_and_performance_unbound() {
     let targets = vec![
         text_target("f32", Backend::Cpu),
