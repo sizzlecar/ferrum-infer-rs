@@ -45,7 +45,10 @@ fn prefix_handoff_counts_two_caches_and_one_weight_installation_before_execution
         .payload()
         .memory();
     assert!(dm.minimum_request_bytes() > 0);
-    assert!(pm.static_bytes() >= dm.static_bytes());
+    assert!(
+        pm.static_bytes() > dm.static_bytes(),
+        "decode consumes a strict subset but still retains the full snapshot"
+    );
     let ordinary = pm.static_bytes()
         + pm.minimum_runnable_request_bytes()
             .max(dm.minimum_runnable_request_bytes());
@@ -60,6 +63,15 @@ fn prefix_handoff_counts_two_caches_and_one_weight_installation_before_execution
     for policy in [
         ImageResidencyPolicy::Cold,
         ImageResidencyPolicy::AllModelComponents,
+        ImageResidencyPolicy::SelectedStages {
+            stages: ImageResidentStageSet {
+                vision_encoder: true,
+                vae_encoder: true,
+                denoiser: true,
+                decoder: true,
+                ..ImageResidentStageSet::default()
+            },
+        },
     ] {
         pipeline.config.residency = policy;
         pipeline.config.device_capacity_bytes = transition - 1;
@@ -71,6 +83,9 @@ fn prefix_handoff_counts_two_caches_and_one_weight_installation_before_execution
             .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
             .unwrap();
     }
+    // The remaining tests exercise the original all-component idle allowances;
+    // do not let the selected subset above silently change those contracts.
+    pipeline.config.residency = ImageResidencyPolicy::AllModelComponents;
     let decoder_retention = 4096;
     pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainDecoder {
         maximum_bytes: decoder_retention,

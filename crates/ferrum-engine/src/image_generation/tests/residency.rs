@@ -6,6 +6,7 @@ use half::bf16;
 mod all_components;
 mod dynamic;
 mod noise;
+mod selected_stages;
 
 pub(super) fn numeric_pipeline() -> (
     QwenImage21Pipeline<ReferenceDeviceRuntime>,
@@ -211,7 +212,11 @@ fn failed_serial_actor_stops_generation_and_edit_admission_before_preparation() 
 
 #[test]
 fn changed_plan_closes_previous_session_and_attaches_without_weight_upload() {
-    let (mut pipeline, _directory) = numeric_pipeline();
+    let (pipeline, _directory) = numeric_pipeline();
+    check_shape_replacement(pipeline);
+}
+
+fn check_shape_replacement(mut pipeline: QwenImage21Pipeline<ReferenceDeviceRuntime>) {
     let mut stages = Vec::new();
     let mut first = prepared(&pipeline, 1);
     first.plan.compile_wall_duration_us = 123;
@@ -279,7 +284,11 @@ fn changed_plan_closes_previous_session_and_attaches_without_weight_upload() {
 
 #[test]
 fn reused_session_failure_keeps_original_owner_outside_resident_slot() {
-    let (mut pipeline, _directory) = numeric_pipeline();
+    let (pipeline, _directory) = numeric_pipeline();
+    check_failed_reused_session_owner(pipeline);
+}
+
+fn check_failed_reused_session_owner(mut pipeline: QwenImage21Pipeline<ReferenceDeviceRuntime>) {
     let mut stages = Vec::new();
     let first = prepared(&pipeline, 1);
     let active = pipeline
@@ -328,7 +337,11 @@ fn reused_session_failure_keeps_original_owner_outside_resident_slot() {
 
 #[test]
 fn incompatible_weight_plan_is_rejected_without_replacement_upload() {
-    let (mut pipeline, _directory) = numeric_pipeline();
+    let (pipeline, _directory) = numeric_pipeline();
+    check_incompatible_weight_plan_owner(pipeline);
+}
+
+fn check_incompatible_weight_plan_owner(mut pipeline: QwenImage21Pipeline<ReferenceDeviceRuntime>) {
     let mut stages = Vec::new();
     let first = prepared(&pipeline, 1);
     let active = pipeline

@@ -5,7 +5,7 @@ use ferrum_quantization::bf16_whole_tensor_fp8::ExactBf16SafetensorsSource;
 use std::num::NonZeroU64;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImageResidencyPolicy {
     #[default]
     Cold,
@@ -23,9 +23,24 @@ pub enum ImageResidencyPolicy {
     /// Also retain weightless stage sessions. Each invocation still consumes
     /// fresh request inputs; dynamic backing follows its separate policy.
     AllStages,
+    /// Retain only the explicitly selected stage sessions and their readonly
+    /// weights. All original capacity and retirement checks still apply.
+    SelectedStages { stages: ImageResidentStageSet },
 }
 
 impl ImageResidencyPolicy {
+    pub fn validate(self) -> anyhow::Result<()> {
+        if let Self::SelectedStages { stages } = self {
+            ensure!(
+                RETAINABLE_STAGES
+                    .into_iter()
+                    .any(|stage| stages.contains(stage)),
+                "selected stage residency requires at least one stage"
+            );
+        }
+        Ok(())
+    }
+
     fn retains(self, stage: ImageStage) -> bool {
         match self {
             Self::Cold => false,
@@ -34,8 +49,45 @@ impl ImageResidencyPolicy {
             }
             Self::AllModelComponents => !matches!(stage, ImageStage::Noise),
             Self::AllStages => true,
+            Self::SelectedStages { stages } => stages.contains(stage),
         }
     }
+}
+
+/// Bounded stage selection. Omitted stages remain cold; selecting a stage does
+/// not change its dynamic retention policy or grant any additional capacity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImageResidentStageSet {
+    #[serde(skip_serializing_if = "is_false")]
+    pub text_encoder: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub vision_encoder: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub vae_encoder: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub denoiser: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub decoder: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub noise: bool,
+}
+
+impl ImageResidentStageSet {
+    fn contains(self, stage: ImageStage) -> bool {
+        match stage {
+            ImageStage::TextEncoder => self.text_encoder,
+            ImageStage::VisionEncoder => self.vision_encoder,
+            ImageStage::VaeEncoder => self.vae_encoder,
+            ImageStage::Denoiser => self.denoiser,
+            ImageStage::Decoder => self.decoder,
+            ImageStage::Noise => self.noise,
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Explicit ceilings for stages that may retain existing idle chunks. Omitted
@@ -93,6 +145,7 @@ pub enum ImageDynamicResidencyPolicy {
 }
 impl ImageDynamicResidencyPolicy {
     pub fn validate(self, residency: ImageResidencyPolicy) -> anyhow::Result<()> {
+        residency.validate()?;
         if let Self::RetainDecoder { maximum_bytes } = self {
             ensure!(
                 maximum_bytes > 0,
@@ -404,7 +457,13 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .context("prefix decode capacity overflows")?;
             active_peak = active_peak.max(decode_peak);
         }
+        // A planning subset does not retire installations owned by other slots.
+        // Count every live snapshot whose stage was not already accounted for.
         for (kind, weights) in [
+            (
+                ImageStage::TextEncoder,
+                &self.resident_stages.text_encoder_weights,
+            ),
             (
                 ImageStage::VisionEncoder,
                 &self.resident_stages.vision_encoder_weights,
@@ -413,12 +472,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 ImageStage::VaeEncoder,
                 &self.resident_stages.vae_encoder_weights,
             ),
+            (ImageStage::Denoiser, &self.resident_stages.denoiser_weights),
+            (ImageStage::Decoder, &self.resident_stages.decoder_weights),
         ] {
-            if !stages.iter().any(|s| s.plan.stage == kind) {
+            if !counted_static.contains(&kind) {
                 if let Some(weights) = weights {
                     retained_static = retained_static
                         .checked_add(weights.origin.plan.static_bytes)
-                        .context("retained editing weights overflow")?;
+                        .context("retained stage weights overflow")?;
                 }
             }
         }

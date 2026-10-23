@@ -41,7 +41,8 @@ pub use host_cache::{ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy};
 pub use plan_cache::{ImagePlanCachePolicy, ImagePlanCacheReceipt};
 pub use precision::ImageCudaPrecisionPolicy;
 pub use residency::{
-    ImageDynamicResidencyPolicy, ImageResidencyPolicy, ImageStageRetentionBudgets,
+    ImageDynamicResidencyPolicy, ImageResidencyPolicy, ImageResidentStageSet,
+    ImageStageRetentionBudgets,
 };
 pub use stage::{
     ActiveImageStage, ImageGenerationError, ImageGenerationFailure, ImageStage,

@@ -675,6 +675,7 @@ fn residency_is_explicit_and_shared_by_run_and_serve_configuration() {
         ),
         ("all_stages", ImageResidencyPolicy::AllStages),
     ] {
+        assert_eq!(serde_json::to_value(policy).unwrap(), json!(name));
         wire["execution_profile"] = json!("experimental_serial_cold");
         wire["backend"]["pipeline"]["residency"] = json!(name);
         assert!(load(&wire).is_err()); // A cold execution identity must remain truthful.
@@ -705,6 +706,85 @@ fn residency_is_explicit_and_shared_by_run_and_serve_configuration() {
     for bad in [json!(null), json!(true), json!("all"), json!({"cold":{}})] {
         wire["backend"]["pipeline"]["residency"] = bad;
         assert!(load(&wire).is_err());
+    }
+}
+
+#[test]
+fn selected_stage_residency_is_bounded_and_shared_by_run_and_serve() {
+    use ferrum_engine::image_generation::{
+        ImageDynamicResidencyPolicy, ImageResidencyPolicy, ImageResidentStageSet,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("selected.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    let selected = json!({"selected_stages":{"stages":{
+        "vision_encoder":true,"vae_encoder":true,"denoiser":true,"decoder":true
+    }}});
+    let policy = ImageResidencyPolicy::SelectedStages {
+        stages: ImageResidentStageSet {
+            vision_encoder: true,
+            vae_encoder: true,
+            denoiser: true,
+            decoder: true,
+            ..ImageResidentStageSet::default()
+        },
+    };
+    policy.validate().unwrap();
+    assert_eq!(serde_json::to_value(policy).unwrap(), selected);
+    let mut wire = configuration();
+    wire["backend"]["pipeline"]["residency"] = selected.clone();
+    assert!(load(&wire).is_err()); // Explicit cold profile cannot retain stages.
+    wire["execution_profile"] = json!("experimental_resident_v1");
+    for serving in [false, true] {
+        wire["serving"] = if serving {
+            json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+                "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
+                "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}})
+        } else {
+            Value::Null
+        };
+        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+        let pipeline = cuda.resolved_pipeline().unwrap();
+        assert_eq!(pipeline.residency, policy);
+        assert_eq!(
+            pipeline.dynamic_residency,
+            ImageDynamicResidencyPolicy::Release
+        );
+        assert_eq!(pipeline.device_capacity_bytes, 1024);
+        assert_eq!(pipeline.maximum_batch_size, 1);
+        #[cfg(feature = "cuda")]
+        assert_eq!(cuda.resolved().unwrap().pipeline.residency, policy);
+    }
+    for invalid in [
+        json!({"selected_stages":{"stages":{}}}),
+        json!({"selected_stages":{"stages":{"decoder":false}}}),
+        json!({"selected_stages":{}}),
+        json!({"selected_stages":{"stages":{"unknown_stage":true}}}),
+        json!({"selected_stages":{"stages":{"decoder":true,"unknown_stage":false}}}),
+        json!({"selected_stages":{"stages":{"decoder":1}}}),
+        json!({"selected_stages":{"stages":{"decoder":null}}}),
+        json!({"selected_stages":{"stages":{"decoder":true},"unknown":true}}),
+        json!("selected_stages"),
+    ] {
+        wire["backend"]["pipeline"]["residency"] = invalid;
+        assert!(load(&wire).is_err(), "invalid selection: {wire}");
+    }
+    wire["backend"]["pipeline"]["residency"] = selected;
+    for (stage, accepted) in [
+        ("vision_encoder", true),
+        ("vae_encoder", true),
+        ("denoiser", true),
+        ("decoder", true),
+        ("text_encoder", false),
+        ("noise", false),
+    ] {
+        wire["backend"]["pipeline"]["dynamic_residency"] = json!({
+            "retain_stage_budgets":{"maximum_bytes_by_stage":{stage:1}}
+        });
+        assert_eq!(load(&wire).is_ok(), accepted, "stage {stage}");
     }
 }
 

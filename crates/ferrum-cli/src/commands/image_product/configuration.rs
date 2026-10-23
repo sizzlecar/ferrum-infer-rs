@@ -375,6 +375,7 @@ impl ImageProductConfig {
                     ImageResidencyPolicy::DenoiserAndDecoder
                         | ImageResidencyPolicy::AllModelComponents
                         | ImageResidencyPolicy::AllStages
+                        | ImageResidencyPolicy::SelectedStages { .. }
                 ) | (
                     ImageExecutionProfile::ExperimentalSerialCold
                         | ImageExecutionProfile::ExperimentalBatchedCold,
