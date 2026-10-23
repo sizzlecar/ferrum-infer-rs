@@ -348,6 +348,34 @@ fn experimental_batch_profile_connects_service_limit_to_real_pipeline_capacity()
 }
 
 #[test]
+fn edit_prefix_policy_is_explicit_and_shared_by_run_and_serve_configuration() {
+    use ferrum_engine::image_generation::ImageEditPrefixPolicy;
+    let mut wire = configuration();
+    let config: ImageProductConfig = serde_json::from_value(wire.clone()).unwrap();
+    let ImageBackendConfig::Cuda(cuda) = config.backend;
+    assert_eq!(
+        cuda.resolved_pipeline().unwrap().edit_prefix_policy,
+        ImageEditPrefixPolicy::Recompute
+    );
+    for (name, expected) in [
+        ("recompute", ImageEditPrefixPolicy::Recompute),
+        ("request_cache", ImageEditPrefixPolicy::RequestCache),
+    ] {
+        wire["backend"]["pipeline"]["edit_prefix_policy"] = json!(name);
+        let config: ImageProductConfig = serde_json::from_value(wire.clone()).unwrap();
+        let ImageBackendConfig::Cuda(cuda) = config.backend;
+        assert_eq!(
+            cuda.resolved_pipeline().unwrap().edit_prefix_policy,
+            expected
+        );
+    }
+    for invalid in [json!(null), json!(true), json!("automatic")] {
+        wire["backend"]["pipeline"]["edit_prefix_policy"] = invalid;
+        assert!(serde_json::from_value::<ImageProductConfig>(wire.clone()).is_err());
+    }
+}
+
+#[test]
 fn decoder_batch_policy_is_explicit_independent_and_strict() {
     use ferrum_engine::image_generation::ImageDecoderBatchPolicy;
     let directory = tempfile::tempdir().unwrap();

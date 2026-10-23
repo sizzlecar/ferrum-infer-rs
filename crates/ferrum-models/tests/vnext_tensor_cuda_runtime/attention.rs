@@ -4,6 +4,8 @@ use ferrum_kernels::backend::cuda::vnext_ops::{
     cuda_vnext_tensor_attention_providers, CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
 };
 use half::bf16;
+#[path = "attention/cross.rs"]
+mod cross;
 #[path = "attention/family.rs"]
 mod family;
 #[path = "attention/newfused.rs"]

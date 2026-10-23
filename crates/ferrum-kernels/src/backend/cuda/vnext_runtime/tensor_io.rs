@@ -147,12 +147,31 @@ impl ManagedUpload {
 pub(super) enum TensorTransfer {
     Upload(ManagedUpload),
     StaticZero(CudaBufferRegion),
+    StateCopy {
+        source: CudaBufferRegion,
+        destination: CudaBufferRegion,
+    },
 }
 
 impl TensorTransfer {
     pub(super) fn enqueue(&self, stream: &CudaStream) -> Result<(), CudaDeviceRuntimeError> {
         match self {
             Self::Upload(upload) => upload.enqueue(stream),
+            Self::StateCopy {
+                source,
+                destination,
+            } => {
+                let bytes = checked_usize(source.length_bytes, "CUDA state copy length")?;
+                unsafe {
+                    cudarc::driver::result::memcpy_dtod_async(
+                        destination.device_ptr,
+                        source.device_ptr,
+                        bytes,
+                        stream.cu_stream(),
+                    )
+                }
+                .map_err(|error| CudaDeviceRuntimeError::driver("fixed tensor state copy", error))
+            }
             Self::StaticZero(destination) => {
                 let bytes = checked_usize(destination.length_bytes, "CUDA static zero length")?;
                 unsafe {
@@ -171,6 +190,31 @@ impl TensorTransfer {
     fn validate(&self, runtime_instance: u64) -> Result<(), CudaDeviceRuntimeError> {
         match self {
             Self::Upload(upload) => upload.validate(runtime_instance),
+            Self::StateCopy {
+                source,
+                destination,
+            } => {
+                let source_end = source.device_ptr.checked_add(source.length_bytes);
+                let destination_end = destination.device_ptr.checked_add(destination.length_bytes);
+                if source.runtime_instance != runtime_instance
+                    || destination.runtime_instance != runtime_instance
+                    || source.length_bytes == 0
+                    || source.length_bytes != destination.length_bytes
+                    || source.element_type != destination.element_type
+                    || source._core_retention.is_none()
+                    || destination._core_retention.is_none()
+                    || source_end.is_none()
+                    || destination_end.is_none()
+                    || (source.device_ptr < destination_end.unwrap_or(0)
+                        && destination.device_ptr < source_end.unwrap_or(0))
+                {
+                    return Err(CudaDeviceRuntimeError::contract(
+                        "invalid retained CUDA state copy",
+                    ));
+                }
+                checked_usize(source.length_bytes, "CUDA state copy length")?;
+                Ok(())
+            }
             Self::StaticZero(destination) => {
                 if destination.runtime_instance != runtime_instance || destination.length_bytes == 0
                 {
@@ -188,6 +232,7 @@ impl TensorTransfer {
         match self {
             Self::Upload(upload) => upload.purpose.phase(),
             Self::StaticZero(_) => DeviceCommandPhase::Initialization,
+            Self::StateCopy { .. } => DeviceCommandPhase::ResultBinding,
         }
     }
 
@@ -195,6 +240,7 @@ impl TensorTransfer {
         match self {
             Self::Upload(_) => HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(),
             Self::StaticZero(_) => DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(),
+            Self::StateCopy { .. } => DEVICE_COPY_NATIVE_OPERATION_ID.as_str(),
         }
     }
 }
@@ -351,6 +397,20 @@ impl CudaDeviceCommand {
         destination: CudaBufferRegion,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         Self::tensor_transfer_command(runtime_instance, TensorTransfer::StaticZero(destination))
+    }
+
+    pub(super) fn tensor_state_copy(
+        runtime_instance: u64,
+        source: CudaBufferRegion,
+        destination: CudaBufferRegion,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::tensor_transfer_command(
+            runtime_instance,
+            TensorTransfer::StateCopy {
+                source,
+                destination,
+            },
+        )
     }
 
     fn tensor_transfer_command(

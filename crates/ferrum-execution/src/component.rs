@@ -437,6 +437,31 @@ pub struct TensorComponentSession<R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> TensorComponentSession<R> {
+    pub fn begin_request(
+        &self,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        initial_inputs: Vec<ManagedHostTensor>,
+    ) -> Result<crate::TensorRequestSession<R>, TensorExecutionError<R>> {
+        self.executor
+            .as_ref()
+            .expect("live session owns executor")
+            .begin_request(run_id, request_id, initial_inputs)
+    }
+
+    pub fn execute_initializing_request(
+        &mut self,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        inputs: Vec<ManagedHostTensor>,
+        destination: &mut crate::TensorRequestSession<R>,
+        mappings: &[TensorRequestStateMapping],
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        self.executor
+            .as_mut()
+            .expect("live session owns executor")
+            .execute_initializing_request(run_id, request_id, inputs, destination, mappings)
+    }
     pub fn executable(&self) -> &ExecutablePlan {
         &self.executable
     }

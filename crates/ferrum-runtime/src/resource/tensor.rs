@@ -14,6 +14,60 @@ pub struct TensorExecutionBinding<R: DeviceRuntime> {
     host: HostMemoryAccount,
 }
 
+/// One non-forgeable input scope for an admitted fixed tensor request. Each
+/// binding still receives a fresh invocation fingerprint and retains its own
+/// immutable Host inputs; only the capacity/shape parent is shared.
+pub struct TensorRequestInputBinding<R: DeviceRuntime> {
+    binding: TensorExecutionBinding<R>,
+    scope: Arc<()>,
+}
+
+impl<R: DeviceRuntime> TensorRequestInputBinding<R> {
+    /// Admission keeps shape/root authority, not the first step's Host payload.
+    /// This anchor cannot encode uploads; fresh full inputs are mandatory for
+    /// every actual execution.
+    pub fn admission_work(
+        &self,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<ResourceWorkShape, VNextError> {
+        let bound = self.bind_inputs(inputs)?;
+        Ok(ResourceWorkShape::from_tensor_evidence(
+            bound
+                .tensor_evidence()
+                .expect("fixed binding creates tensor evidence")
+                .capacity_anchor(),
+        ))
+    }
+    pub fn bind_inputs(
+        &self,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<ResourceWorkShape, VNextError> {
+        let _lifecycle = self
+            .binding
+            .runtime
+            .resources
+            .read_lifecycle("bind fixed request inputs")?;
+        if inputs
+            .iter()
+            .any(|input| !self.binding.host.owns(input.bytes()))
+        {
+            return Err(invalid_resource(
+                "request input belongs to a different Host parent",
+            ));
+        }
+        let root: Arc<dyn Any + Send + Sync> = self.binding.runtime.resources.clone();
+        Ok(ResourceWorkShape::from_tensor_evidence(
+            TensorWorkEvidence::bind_in_request(
+                root,
+                self.binding.runtime.evidence(),
+                &self.binding.ports,
+                inputs,
+                Some(self.scope.clone()),
+            )?,
+        ))
+    }
+}
+
 impl<R: DeviceRuntime> PlanRuntimeResources<R> {
     pub fn bind_tensor_execution(
         self: &Arc<Self>,
@@ -39,6 +93,16 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
 }
 
 impl<R: DeviceRuntime> TensorExecutionBinding<R> {
+    pub fn request_input_binding(&self) -> Result<TensorRequestInputBinding<R>, VNextError> {
+        Ok(TensorRequestInputBinding {
+            binding: TensorExecutionBinding {
+                runtime: self.runtime.resources.trusted_runtime_binding()?,
+                ports: self.ports.clone(),
+                host: self.host.clone(),
+            },
+            scope: Arc::new(()),
+        })
+    }
     pub fn ports(&self) -> &CompiledTensorPorts {
         &self.ports
     }

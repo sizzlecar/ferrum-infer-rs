@@ -179,17 +179,23 @@ impl QwenImage21T2iLayout {
 pub struct QwenImage21TransformerConfig {
     transformer: QwenImage21Config,
     layout: QwenImage21T2iLayout,
+    #[serde(default, skip_serializing_if = "QwenImage21TransformerPhase::is_full")]
+    pub(super) phase: QwenImage21TransformerPhase,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigWire {
     transformer: QwenImage21Config,
     layout: QwenImage21T2iLayout,
+    #[serde(default)]
+    phase: QwenImage21TransformerPhase,
 }
 impl<'de> Deserialize<'de> for QwenImage21TransformerConfig {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let wire = ConfigWire::deserialize(d)?;
-        Self::new(wire.transformer, wire.layout).map_err(serde::de::Error::custom)
+        Self::new(wire.transformer, wire.layout)
+            .and_then(|config| config.with_execution_phase(wire.phase))
+            .map_err(serde::de::Error::custom)
     }
 }
 impl QwenImage21TransformerConfig {
@@ -200,6 +206,7 @@ impl QwenImage21TransformerConfig {
         let config = Self {
             transformer,
             layout,
+            phase: QwenImage21TransformerPhase::Full,
         };
         config.validate()?;
         Ok(config)
@@ -242,7 +249,15 @@ impl QwenImage21TransformerConfig {
             ),
             (
                 F::FREQUENCIES_ID,
-                vec![l.sequence_length(), t.head_dim() / 2, 2],
+                vec![
+                    if self.is_decode() {
+                        l.target_tokens()
+                    } else {
+                        l.sequence_length()
+                    },
+                    t.head_dim() / 2,
+                    2,
+                ],
                 ElementType::F32,
             ),
         ];
@@ -258,7 +273,9 @@ impl QwenImage21TransformerConfig {
                 Ok((ProgramValueId::new(id)?, spec))
             })
             .collect::<Result<BTreeMap<_, _>, VNextError>>()?;
-        if let Some(reference) = l.reference_image() {
+        if self.is_decode() {
+            specs.remove(&ProgramValueId::new(F::TEXT_ID)?);
+        } else if let Some(reference) = l.reference_image() {
             let reference_spec = ProgramTensorSpec {
                 dimensions: vec![l.batch() * reference.latent_tokens(), t.in_channels()],
                 element_type: ElementType::Bf16,
@@ -280,7 +297,7 @@ impl QwenImage21TransformerConfig {
         let mut options = ProgramPlanCompileOptions::new(self.input_tensor_specs()?)?;
         let l = &self.layout;
         let h = self.transformer.hidden_size();
-        if let Some(reference) = l.reference_image() {
+        if let Some(reference) = l.reference_image().filter(|_| !self.is_decode()) {
             for (name, rows, columns) in [
                 (
                     program::COMBINED_LATENTS,
@@ -306,11 +323,11 @@ impl QwenImage21TransformerConfig {
                 )?;
             }
         }
-        for (name, rows) in std::iter::once((program::JOINT, l.rows()))
+        for (name, rows) in std::iter::once((program::JOINT, self.execution_rows()))
             .chain(
                 program::CONDITIONING
                     .into_iter()
-                    .map(|name| (name, l.rows())),
+                    .map(|name| (name, self.execution_rows())),
             )
             .chain([
                 (program::TARGET_HIDDEN, l.batch() * l.target_tokens()),
@@ -326,6 +343,22 @@ impl QwenImage21TransformerConfig {
                 },
             )?;
         }
+        if !self.phase.is_full() {
+            for port in self.prefix_cache_ports()? {
+                if self.phase == QwenImage21TransformerPhase::PrefixPrefill {
+                    options.insert_tensor_spec(port.value_id().clone(), port.tensor().clone())?;
+                } else {
+                    options.insert_tensor_spec(
+                        prefix::joined_value(port.layer(), port.part())?,
+                        ProgramTensorSpec {
+                            dimensions: vec![l.rows(), h],
+                            element_type: ElementType::Bf16,
+                            layout: ResolvedTensorLayout::Contiguous,
+                        },
+                    )?;
+                }
+            }
+        }
         Ok(options)
     }
     pub(super) fn block_config(&self) -> Result<QwenImage21Block0Config, VNextError> {
@@ -338,9 +371,24 @@ impl QwenImage21TransformerConfig {
         )
     }
     pub(super) fn validate(&self) -> Result<(), VNextError> {
+        if !self.phase.is_full() && !self.transformer.causal_condition() {
+            return Err(invalid(
+                "phase",
+                "prefix phases require causal_condition=true",
+            ));
+        }
         self.block_config()?;
-        let inputs = self.input_tensor_specs()?;
-        let text = &inputs[&ProgramValueId::new(QwenImage21TransformerFamily::TEXT_ID)?];
+        self.input_tensor_specs()?;
+        // The text entrance is absent in decode, but the shared architecture
+        // still has to satisfy its original weight/normalization contract.
+        let text = ProgramTensorSpec {
+            dimensions: vec![
+                self.layout.batch() * u64::from(self.layout.text_tokens()),
+                self.transformer.context_dim(),
+            ],
+            element_type: ElementType::Bf16,
+            layout: ResolvedTensorLayout::Contiguous,
+        };
         let text = ResolvedTensorSpec::new(
             text.dimensions.clone(),
             text.element_type,

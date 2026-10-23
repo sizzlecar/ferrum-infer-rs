@@ -17,10 +17,12 @@ pub use immutable_metadata::{
 mod program_binding_upload;
 pub use program_binding_upload::DeviceProgramBindingUploadSnapshot;
 mod resident_program;
+mod tensor_state_copy;
 mod terminal_readback;
 pub use resident_program::{
     DeviceEncodedResidentDecode, DeviceResidentDecodeRefresh, DeviceResidentDecodeRequest,
 };
+pub use tensor_state_copy::DeviceTensorStateCopy;
 pub use terminal_readback::{
     DevicePreparedTerminalReadback, DeviceScalarU32ReadbackBatch, DeviceScalarU32ReadbackSource,
 };
@@ -4011,6 +4013,16 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         destination: &Self::Buffer,
         region: CopyRegion,
     ) -> Result<Self::Command, Self::Error>;
+
+    /// Encodes an admitted fixed Request-state initialization in the producer
+    /// wave's ResultBinding phase. The core retains both owners through that
+    /// wave; eager backends may additionally retain them in their typed command.
+    fn encode_tensor_state_copy(
+        &self,
+        request: DeviceTensorStateCopy<'_, Self::Buffer>,
+    ) -> Result<Self::Command, Self::Error> {
+        self.encode_copy(request.source(), request.destination(), request.region())
+    }
 
     fn encode_upload(
         &self,

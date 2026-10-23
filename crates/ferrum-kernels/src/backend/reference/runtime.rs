@@ -46,6 +46,8 @@ mod structured_gqa_attention;
 pub(crate) use structured_gqa_attention::ReferenceStructuredGqaAttentionLaunch;
 mod structured_attention;
 pub(crate) use structured_attention::ReferenceStructuredAttentionLaunch;
+mod cross_attention;
+pub(crate) use cross_attention::ReferenceCrossAttentionLaunch;
 mod adjacent_rope;
 pub(crate) use adjacent_rope::{ReferenceAdjacentRopeLaunch, ReferenceAdjacentRopeShape};
 mod pointwise;
@@ -390,6 +392,9 @@ enum ReferenceCommandKind {
     StructuredAttention {
         launch: ReferenceStructuredAttentionLaunch,
     },
+    CrossAttention {
+        launch: ReferenceCrossAttentionLaunch,
+    },
     AdjacentRope {
         launch: ReferenceAdjacentRopeLaunch,
     },
@@ -438,6 +443,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::HalfSplitRope { .. } => "half_split_rope",
             ReferenceCommandKind::StructuredGqaAttention { .. } => "structured_gqa_attention",
             ReferenceCommandKind::StructuredAttention { .. } => "structured_attention",
+            ReferenceCommandKind::CrossAttention { .. } => "cross_attention",
             ReferenceCommandKind::AdjacentRope { .. } => "adjacent_rope",
             ReferenceCommandKind::ModulationScale { .. } => "modulation_scale",
             ReferenceCommandKind::GatedResidual { .. } => "gated_residual",
@@ -578,6 +584,18 @@ impl ReferenceDeviceCommand {
             compute_dispatch_count: 1,
             transfer_command_count: 0,
             kind: ReferenceCommandKind::StructuredAttention { launch },
+        })
+    }
+    pub(crate) fn cross_attention_tensor(
+        launch: ReferenceCrossAttentionLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_cross_attention_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::CrossAttention { launch },
         })
     }
 
@@ -902,6 +920,9 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::StructuredAttention { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::CrossAttention { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::AdjacentRope { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
@@ -1034,6 +1055,12 @@ impl ReferenceDeviceCommand {
                 structured_attention::execute(launch);
                 counters
                     .structured_attention_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::CrossAttention { launch } => {
+                cross_attention::execute(launch);
+                counters
+                    .cross_attention_launches
                     .fetch_add(1, Ordering::Relaxed);
             }
             ReferenceCommandKind::AdjacentRope { launch } => {
@@ -1257,6 +1284,7 @@ struct ReferenceRuntimeCounters {
     half_split_rope_launches: AtomicU64,
     structured_gqa_attention_launches: AtomicU64,
     structured_attention_launches: AtomicU64,
+    cross_attention_launches: AtomicU64,
     modulation_scale_launches: AtomicU64,
     gated_residual_launches: AtomicU64,
     silu_launches: AtomicU64,
@@ -1288,6 +1316,7 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub half_split_rope_launches: u64,
     pub structured_gqa_attention_launches: u64,
     pub structured_attention_launches: u64,
+    pub cross_attention_launches: u64,
     pub modulation_scale_launches: u64,
     pub gated_residual_launches: u64,
     pub silu_launches: u64,
@@ -1455,6 +1484,10 @@ impl ReferenceDeviceRuntime {
             structured_attention_launches: self
                 .counters
                 .structured_attention_launches
+                .load(Ordering::Relaxed),
+            cross_attention_launches: self
+                .counters
+                .cross_attention_launches
                 .load(Ordering::Relaxed),
             modulation_scale_launches: self
                 .counters

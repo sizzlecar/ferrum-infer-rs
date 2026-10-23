@@ -315,7 +315,7 @@ impl ResourceWorkShape {
                 && child.immediate_pages() <= parent.immediate_pages()
                 && child.fit_tokens() <= parent.fit_tokens()
                 && child.fit_pages() <= parent.fit_pages()),
-            (Self::Tensor(parent), Self::Tensor(child)) => Ok(parent == child),
+            (Self::Tensor(parent), Self::Tensor(child)) => Ok(parent.covers_request(child)),
             (Self::Tokens(_), Self::Tensor(_)) | (Self::Tensor(_), Self::Tokens(_)) => {
                 Err(invalid_plan("parent and child work domains differ"))
             }
@@ -326,7 +326,7 @@ impl ResourceWorkShape {
             (Self::Tokens(parent), Self::Tokens(child)) => {
                 Ok(child.fit_tokens() <= parent.fit_tokens())
             }
-            (Self::Tensor(parent), Self::Tensor(child)) => Ok(parent == child),
+            (Self::Tensor(parent), Self::Tensor(child)) => Ok(parent.covers_request(child)),
             (Self::Tokens(_), Self::Tensor(_)) | (Self::Tensor(_), Self::Tokens(_)) => {
                 Err(invalid_plan("parent and child work domains differ"))
             }

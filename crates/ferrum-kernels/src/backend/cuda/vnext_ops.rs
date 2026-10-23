@@ -105,6 +105,7 @@ pub use tensor_silu::{
     CHANNEL_L2_IMAGE_PROFILE_ID as CUDA_CHANNEL_L2_NORM_IMAGE_BF16_NUMERICAL_PROFILE_ID,
     CHANNEL_L2_PROFILE_ID as CUDA_CHANNEL_L2_NORM_BF16_NUMERICAL_PROFILE_ID,
     CONV2D_PROFILE_ID as CUDA_CONV2D_BF16_NUMERICAL_PROFILE_ID,
+    CROSS_ATTENTION_FUSED_PROFILE_ID as CUDA_CROSS_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_ID,
     CUDNN_SEGMENTED_ATTENTION_PROFILE_ID as CUDA_CUDNN_SEGMENTED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
     FUSED_ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_IDENTITY,
     FUSED_ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_ID,
@@ -396,6 +397,7 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::ADJACENT_ROPE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::STRUCTURED_ATTENTION_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::STRUCTURED_ATTENTION_FUSED_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CROSS_ATTENTION_FUSED_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::GELU_TANH_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ROW_GATHER_BF16_CAPABILITY_ID)?,
@@ -537,6 +539,20 @@ pub fn cuda_vnext_tensor_providers_with_cudnn_sdpa(
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     tensor_silu::providers_with_cudnn_sdpa(runtime, config, policy, selected)
+}
+
+/// Adds rectangular noncausal cross-attention to the existing cuDNN SDPA bundle.
+/// All providers share the same module, cuDNN owner and bounded plan cache.
+/// Register `cross_attention_fused_bf16_contract` in addition to the contracts
+/// required by `cuda_vnext_tensor_providers_with_cudnn_sdpa`. The old factory's
+/// provider set is unchanged; this explicit factory opts into the new operation.
+pub fn cuda_vnext_tensor_providers_with_cudnn_cross_attention(
+    runtime: &CudaDeviceRuntime,
+    config: &super::vnext_runtime::CudaCudnnConfig,
+    policy: super::vnext_runtime::CudnnSdpaPlanPolicy,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::providers_with_cudnn_cross_attention(runtime, config, policy, selected)
 }
 
 /// Builds the five independent BF16 pointwise providers from one native

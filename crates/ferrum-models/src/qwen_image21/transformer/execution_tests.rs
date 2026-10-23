@@ -13,6 +13,8 @@ use serde_json::json;
 
 #[path = "../../../tests/vnext_tensor_reference_runtime/layer_norm_oracle.rs"]
 mod layer_norm_oracle;
+#[path = "execution_tests/prefix_cache.rs"]
+mod prefix_cache;
 #[path = "../../../examples/support/tensor_component.rs"]
 mod shared;
 

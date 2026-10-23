@@ -771,6 +771,24 @@ impl<R> PlanRuntimeResources<R>
 where
     R: DeviceRuntime,
 {
+    pub(super) fn plan_static_view(
+        &self,
+        slot_index: usize,
+        allocation: &super::ResourceAllocation,
+    ) -> Result<super::LeasedBufferView<'_, R::Buffer>, VNextError> {
+        match &self.static_resources {
+            PlanRuntimeStatic::Shared { weights, .. } => weights.plan_static_view(allocation),
+            PlanRuntimeStatic::Static(resources) => resources
+                .lease
+                .as_ref()
+                .ok_or_else(|| invalid_resource("plan-static lease is retired"))?
+                .plan_static_view(slot_index, allocation),
+            PlanRuntimeStatic::NoStatic { .. } => {
+                Err(invalid_resource("plan has no static installation"))
+            }
+        }
+    }
+
     fn evidence(&self) -> TrustedPlanRuntimeEvidence {
         let binding = self.static_resources.binding();
         let lease = self.static_resources.lease();

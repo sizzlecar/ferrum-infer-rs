@@ -5,6 +5,9 @@ use super::plan_runtime::{PlanRuntimeStatic, PlanStaticResources, PLAN_RUNTIME_O
 use super::*;
 use crate::{ExecutionWeightPlan, ResolvedStorageComponent, RuntimeWorkLimits, WeightId};
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SharedWeightContract {
     weights: ExecutionWeightPlan,
@@ -51,6 +54,21 @@ impl SharedWeightContract {
                     let id = component.component_id().ok_or_else(|| {
                         invalid_resource("shared weight placement has no component identity")
                     })?;
+                    let schema = weights
+                        .schema()
+                        .components
+                        .iter()
+                        .find(|candidate| candidate.id == *id)
+                        .ok_or_else(|| {
+                            invalid_resource("shared weight component is absent from its schema")
+                        })?;
+                    if component.length_bytes() != schema.physical_bytes()?
+                        || component.element_type() != schema.physical_element_type()
+                    {
+                        return Err(invalid_resource(
+                            "shared weight placement differs from its physical schema",
+                        ));
+                    }
                     if let Some(previous) = placements.insert(id.clone(), component.clone()) {
                         if previous != *component {
                             return Err(invalid_resource(
@@ -78,6 +96,39 @@ impl SharedWeightContract {
             placements,
         })
     }
+
+    /// Consumer plans may omit readonly components, but may neither repack
+    /// their arena nor reinterpret the original installation. In particular,
+    /// equal names/shapes alone cannot replace the full materializer/schema/
+    /// source-map/quality identity or exact component offsets.
+    fn supports(&self, consumer: &Self) -> bool {
+        self.weights == consumer.weights
+            && consumer
+                .placements
+                .iter()
+                .all(|(id, placement)| self.placements.get(id) == Some(placement))
+            && consumer.allocations.iter().all(|allocation| {
+                self.allocations
+                    .iter()
+                    .any(|source| allocation_prefix(source, allocation))
+            })
+    }
+}
+
+fn allocation_prefix(source: &ResourceAllocation, consumer: &ResourceAllocation) -> bool {
+    source.resource_id() == consumer.resource_id()
+        && source.alignment_bytes() == consumer.alignment_bytes()
+        && source.usage() == BufferUsage::Weights
+        && consumer.usage() == BufferUsage::Weights
+        && source.element_type() == consumer.element_type()
+        && source.lifetime() == consumer.lifetime()
+        && source.kind() == consumer.kind()
+        && source.storage() == consumer.storage()
+        && source.instance_count() == 1
+        && consumer.instance_count() == 1
+        && consumer.per_instance_bytes() <= source.per_instance_bytes()
+        && consumer.instance_stride_bytes() <= source.instance_stride_bytes()
+        && consumer.size_bytes() <= source.size_bytes()
 }
 
 /// Original physical installation identity, distinct from an attaching plan.
@@ -165,11 +216,34 @@ impl<R: DeviceRuntime> SharedComponentWeights<R> {
             || original.admission.device_capacity_bytes() != memory.device_capacity_bytes()
             || original.admission.usable_capacity_bytes() != memory.usable_capacity_bytes()
             || original.admission.maximum_active_sequences() != memory.maximum_active_sequences()
-            || self.inner.contract != SharedWeightContract::from_plan(plan)?
+            || !self
+                .inner
+                .contract
+                .supports(&SharedWeightContract::from_plan(plan)?)
         {
             return Err(invalid_resource("shared weights differ in runtime instance, physical weight contract/layout, or admission ceiling"));
         }
         Ok(())
+    }
+
+    /// Resolve the consumer's already-validated prefix extent to the original
+    /// physical slot. The lease still checks the complete source descriptor;
+    /// its allocation and capacity claim are never truncated on attachment.
+    pub(super) fn plan_static_view(
+        &self,
+        allocation: &ResourceAllocation,
+    ) -> Result<super::LeasedBufferView<'_, R::Buffer>, VNextError> {
+        let (slot, source) = self
+            .inner
+            .contract
+            .allocations
+            .iter()
+            .enumerate()
+            .find(|(_, source)| allocation_prefix(source, allocation))
+            .ok_or_else(|| {
+                invalid_resource("shared consumer allocation differs from its source extent")
+            })?;
+        self.lease().plan_static_view(slot, source)
     }
 
     /// Creates only this plan's logical/dynamic authority. No weight allocation,

@@ -25,6 +25,7 @@ use ferrum_runtime::{
 };
 
 use super::adjacent_rope::ReferenceAdjacentRopeProvider;
+use super::cross_attention::ReferenceCrossAttentionProvider;
 use super::dense_linear::{implementation_fingerprint, ReferenceDenseLinearProvider};
 use super::gelu_tanh::ReferenceGeluTanhProvider;
 use super::half_split_rope::ReferenceHalfSplitRopeProvider;
@@ -57,6 +58,7 @@ use ferrum_runtime::{
     spatial_upsample_gather_bf16_contract, CHANNEL_L2_NORM_IMAGE_BF16_CAPABILITY_ID,
     SPATIAL_ATTENTION_BF16_CAPABILITY_ID, SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID,
 };
+use ferrum_runtime::{cross_attention_bf16_contract, CROSS_ATTENTION_BF16_CAPABILITY_ID};
 use ferrum_runtime::{
     plain_residual_add_nchw_bf16_contract, silu_nchw_bf16_contract,
     PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID, SILU_NCHW_BF16_CAPABILITY_ID,
@@ -90,6 +92,7 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
         CapabilityId::new(GELU_TANH_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ADJACENT_ROPE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(STRUCTURED_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(CROSS_ATTENTION_BF16_CAPABILITY_ID)?,
         CapabilityId::new(MODULATION_SCALE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(GATED_RESIDUAL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(SILU_BF16_CAPABILITY_ID)?,
@@ -155,6 +158,8 @@ fn reference_vnext_runtime_config_with_capacity(
             include_str!("adjacent_rope.rs").as_bytes(),
             include_str!("runtime/adjacent_rope.rs").as_bytes(),
             include_str!("structured_attention.rs").as_bytes(),
+            include_str!("cross_attention.rs").as_bytes(),
+            include_str!("runtime/cross_attention.rs").as_bytes(),
             include_str!("runtime/structured_attention.rs").as_bytes(),
             include_str!("pointwise.rs").as_bytes(),
             include_str!("runtime/pointwise.rs").as_bytes(),
@@ -197,6 +202,7 @@ pub fn reference_vnext_operation_registry(
         Box::new(gelu_tanh_bf16_contract().map_err(contract_error)?),
         Box::new(adjacent_rope_bf16_contract().map_err(contract_error)?),
         Box::new(structured_attention_bf16_contract().map_err(contract_error)?),
+        Box::new(cross_attention_bf16_contract().map_err(contract_error)?),
         Box::new(modulation_scale_bf16_contract().map_err(contract_error)?),
         Box::new(gated_residual_bf16_contract().map_err(contract_error)?),
         Box::new(silu_bf16_contract().map_err(contract_error)?),
@@ -228,6 +234,7 @@ pub fn reference_vnext_operation_registry(
         reference_vnext_gelu_tanh_bf16_provider(runtime)?,
         reference_vnext_adjacent_rope_bf16_provider(runtime)?,
         reference_vnext_structured_attention_bf16_provider(runtime)?,
+        reference_vnext_cross_attention_bf16_provider(runtime)?,
         reference_vnext_modulation_scale_bf16_provider(runtime)?,
         reference_vnext_gated_residual_bf16_provider(runtime)?,
         reference_vnext_silu_bf16_provider(runtime)?,
@@ -385,6 +392,13 @@ pub fn reference_vnext_structured_gqa_attention_bf16_provider(
     Ok(Box::new(ReferenceStructuredGqaAttentionProvider::new(
         runtime,
     )?))
+}
+
+/// Builds rectangular noncausal attention with explicit key validity and FP32 online softmax.
+pub fn reference_vnext_cross_attention_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceCrossAttentionProvider::new(runtime)?))
 }
 
 /// Builds nonpaged structured attention with explicit mask and FP32 online softmax.

@@ -7,6 +7,7 @@ mod directory;
 mod fixture;
 mod ownership;
 mod plan_cache;
+mod prefix;
 mod preflight;
 mod residency;
 
@@ -18,6 +19,7 @@ fn config() -> ImagePipelineConfig {
         maximum_height: 1024,
         maximum_batch_size: ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE,
         decoder_batch_policy: ImageDecoderBatchPolicy::default(),
+        edit_prefix_policy: ImageEditPrefixPolicy::default(),
         plan_cache: ImagePlanCachePolicy::default(),
         residency: ImageResidencyPolicy::default(),
         static_initialization: StaticInitializationPolicy::new(256, 8).unwrap(),

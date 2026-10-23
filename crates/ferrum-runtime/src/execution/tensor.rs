@@ -137,6 +137,10 @@ pub struct TensorWorkEvidence {
     root: Arc<dyn Any + Send + Sync>,
     #[serde(skip)]
     inputs: Vec<ManagedHostTensor>,
+    /// A core-issued fixed request scope. It permits fresh input owners for
+    /// successive steps without equating their individual invocation identities.
+    #[serde(skip)]
+    request_scope: Option<Arc<()>>,
 }
 
 impl std::fmt::Debug for TensorWorkEvidence {
@@ -159,7 +163,17 @@ impl TensorWorkEvidence {
         root: Arc<dyn Any + Send + Sync>,
         plan: TrustedPlanRuntimeEvidence,
         ports: &CompiledTensorPorts,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<Self, VNextError> {
+        Self::bind_in_request(root, plan, ports, inputs, None)
+    }
+
+    pub(crate) fn bind_in_request(
+        root: Arc<dyn Any + Send + Sync>,
+        plan: TrustedPlanRuntimeEvidence,
+        ports: &CompiledTensorPorts,
         mut inputs: Vec<ManagedHostTensor>,
+        request_scope: Option<Arc<()>>,
     ) -> Result<Self, VNextError> {
         inputs.sort_by(|a, b| a.value_id.cmp(&b.value_id));
         if inputs.len() != ports.inputs.len()
@@ -194,6 +208,7 @@ impl TensorWorkEvidence {
             plan,
             root,
             inputs,
+            request_scope,
         })
     }
     pub fn fingerprint(&self) -> &str {
@@ -204,5 +219,20 @@ impl TensorWorkEvidence {
     }
     pub(crate) fn belongs_to(&self, root: &Arc<dyn Any + Send + Sync>) -> bool {
         Arc::ptr_eq(&self.root, root)
+    }
+
+    pub(crate) fn covers_request(&self, other: &Self) -> bool {
+        self == other
+            || (Arc::ptr_eq(&self.root, &other.root)
+                && match (&self.request_scope, &other.request_scope) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    _ => false,
+                })
+    }
+
+    pub(crate) fn capacity_anchor(&self) -> Self {
+        let mut anchor = self.clone();
+        anchor.inputs.clear();
+        anchor
     }
 }

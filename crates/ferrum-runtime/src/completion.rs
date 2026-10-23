@@ -2653,6 +2653,18 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                     }
                 }
             }
+            if let CompletionResourceLease::Wave(wave) = &mut resources {
+                if let Err(error) = wave.finish_tensor_state_initialization(matches!(
+                    disposition,
+                    OperationCompletionDisposition::Succeeded
+                )) {
+                    disposition = OperationCompletionDisposition::ContractFailedButQuiescent(
+                        QuiescentCompletionContractFailure::new(format!(
+                            "fixed request state publication failed: {error}"
+                        )),
+                    );
+                }
+            }
             drop(guard);
             self.remove_exact(slot_id, &record);
             return OperationCompletionReceipt::new(

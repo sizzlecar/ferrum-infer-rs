@@ -2477,6 +2477,13 @@ impl OperationDispatch {
             drop(provider_stage);
         }
 
+        // Copies into an explicitly admitted fixed request follow every
+        // producer node and share its fence/retention owner.
+        completion
+            .wave()
+            .encode_tensor_state_initialization(runtime, &mut commands)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
+
         let lane_stage = SubmissionWaveDispatchStageTimer::start(
             timing_sink,
             SubmissionWaveDispatchStage::LaneReserveSubmitAndArm,

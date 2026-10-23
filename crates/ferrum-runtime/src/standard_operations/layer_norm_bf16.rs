@@ -16,7 +16,6 @@ pub const LAYER_NORM_BF16_MAX_HIDDEN_SIZE: u64 = 1 << 24;
 /// and outputs have BF16 storage; providers declare and validate their FP32
 /// arithmetic and final BF16 round-to-nearest-even behavior. Version 1.0 uses
 /// an operation-defined numerical oracle, not RMSNorm's relative tolerance.
-/// See `docs/bf16-layer-norm.md` for the Reference order and evidence limits.
 pub fn layer_norm_bf16_contract() -> Result<StandardOperationContract, VNextError> {
     let dimensions = vec![symbol("rows"), symbol("hidden_size")];
     let descriptor = OperationDescriptor {

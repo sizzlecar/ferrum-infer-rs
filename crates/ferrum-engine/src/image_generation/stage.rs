@@ -24,9 +24,21 @@ impl ImageStage {
     }
 }
 
+/// A bounded semantic plan slot within a component stage. This distinguishes
+/// cooperating plans without deriving topology from a model or profile name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageStagePlanRole {
+    #[default]
+    WholeStage,
+    PrefixPrefill,
+    PrefixDecode,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageStagePlanReceipt {
     pub stage: ImageStage,
+    pub role: ImageStagePlanRole,
     /// Actual fixed batch geometry compiled for each execution of this stage.
     pub batch_size: usize,
     pub family: ModelFamilyId,
@@ -97,6 +109,20 @@ pub struct ActiveImageStage<R: DeviceRuntime> {
 pub enum ImageGenerationFailure<R: DeviceRuntime> {
     Preflight(anyhow::Error),
     Unavailable,
+    /// Retains every owner from a two-plan prefix handoff on failure. The inner
+    /// failure owns the failed operation; these are the still-live peers.
+    Prefix {
+        source: Box<ImageGenerationFailure<R>>,
+        request: Option<ferrum_execution::TensorRequestSession<R>>,
+        stages: Vec<ActiveImageStage<R>>,
+        weights: Option<SharedComponentWeights<R>>,
+    },
+    RequestExecution {
+        source: TensorExecutionError<R>,
+    },
+    RequestClose {
+        source: ferrum_execution::TensorRequestCloseFailure<R>,
+    },
     Initialization {
         plan: ImageStagePlanReceipt,
         source: ComponentInitializationError<R>,
@@ -134,13 +160,22 @@ pub struct ImageGenerationError<R: DeviceRuntime> {
     pub completed_steps: Vec<ImageDenoiseStepReceipt>,
 }
 
-impl<R: DeviceRuntime> fmt::Display for ImageGenerationError<R> {
+impl<R: DeviceRuntime> fmt::Display for ImageGenerationFailure<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.failure {
+        match self {
             ImageGenerationFailure::Preflight(e) => write!(f, "image preflight: {e}"),
             ImageGenerationFailure::Unavailable => f.write_str(
                 "image pipeline stopped; recover any retained failure owners before replacing it",
             ),
+            ImageGenerationFailure::Prefix { source, .. } => {
+                write!(f, "image prefix: {source}")
+            }
+            ImageGenerationFailure::RequestExecution { source } => {
+                write!(f, "image prefix request execution: {source}")
+            }
+            ImageGenerationFailure::RequestClose { source } => {
+                write!(f, "image prefix request retirement: {source}")
+            }
             ImageGenerationFailure::Initialization { plan, source } => {
                 write!(f, "image {:?} initialization: {source}", plan.stage)
             }
@@ -176,6 +211,11 @@ impl<R: DeviceRuntime> fmt::Display for ImageGenerationError<R> {
         }
     }
 }
+impl<R: DeviceRuntime> fmt::Display for ImageGenerationError<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.failure, f)
+    }
+}
 impl<R: DeviceRuntime> fmt::Debug for ImageGenerationError<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
@@ -201,6 +241,24 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         options: &ProgramPlanCompileOptions,
         pipeline: &QwenImage21Pipeline<R>,
     ) -> anyhow::Result<Self> {
+        Self::compile_with_role(
+            stage,
+            ImageStagePlanRole::WholeStage,
+            batch_size,
+            family,
+            options,
+            pipeline,
+        )
+    }
+
+    pub(super) fn compile_with_role(
+        stage: ImageStage,
+        role: ImageStagePlanRole,
+        batch_size: usize,
+        family: PreparedModelFamily,
+        options: &ProgramPlanCompileOptions,
+        pipeline: &QwenImage21Pipeline<R>,
+    ) -> anyhow::Result<Self> {
         let started = Instant::now();
         ensure!(batch_size > 0, "stage batch size must be positive");
         let family_fingerprint = family.fingerprint()?;
@@ -208,6 +266,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             if let Some((component, mut plan)) = pipeline.plan_cache.get(
                 pipeline.config.plan_cache,
                 stage,
+                role,
                 batch_size,
                 &family_fingerprint,
                 options,
@@ -239,6 +298,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             component: Arc::new(component),
             plan: ImageStagePlanReceipt {
                 stage,
+                role,
                 batch_size,
                 family: family_id,
                 profile,

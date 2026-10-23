@@ -49,6 +49,33 @@ unsafe impl cudarc::driver::DeviceRepr for NativeMask {}
 const _: [(); 2312] = [(); std::mem::size_of::<NativeMask>()];
 
 impl NativeMask {
+    /// Cross-attention packing only consumes the key runs. Query geometry is
+    /// passed independently to the pack/zero kernels and cuDNN signature.
+    pub(super) fn cross(mask: &ferrum_runtime::CrossAttentionBf16Geometry) -> Result<Self, String> {
+        let mut native = Self::isolated_sequence(
+            u32::try_from(mask.key_value_length()).map_err(|_| "cross KV length exceeds u32")?,
+        )?;
+        if mask.batch() > 16 {
+            return Err("cross batch exceeds native mask ABI".into());
+        }
+        for batch in 0..mask.batch() as usize {
+            let ends = mask.key_run_ends(batch).ok_or("cross key runs missing")?;
+            let valid = mask
+                .key_run_valid(batch)
+                .ok_or("cross key validity missing")?;
+            if ends.is_empty() || ends.len() > 32 || ends.len() != valid.len() {
+                return Err("cross key runs exceed native mask ABI".into());
+            }
+            native.key_run_counts[batch] = ends.len() as u32;
+            native.key_run_ends[batch * 32..batch * 32 + ends.len()].copy_from_slice(ends);
+            native.key_valid_masks[batch] = 0;
+            for (run, &enabled) in valid.iter().enumerate() {
+                native.key_valid_masks[batch] |= u32::from(enabled) << run;
+            }
+        }
+        Ok(native)
+    }
+
     /// Local contiguous segment, used after rebasing Q/K/V to its first row.
     /// The pack kernel cannot address any preceding or following segment.
     pub(super) fn isolated_sequence(rows: u32) -> Result<Self, String> {

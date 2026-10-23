@@ -182,6 +182,8 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub decoder_batch_policy: ferrum_engine::image_generation::ImageDecoderBatchPolicy,
     #[serde(default)]
+    pub edit_prefix_policy: ferrum_engine::image_generation::ImageEditPrefixPolicy,
+    #[serde(default)]
     pub plan_cache: ferrum_engine::image_generation::ImagePlanCachePolicy,
     #[serde(default)]
     pub residency: ferrum_engine::image_generation::ImageResidencyPolicy,
@@ -218,6 +220,7 @@ impl PipelineConfig {
             maximum_height: self.maximum_height,
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy: self.decoder_batch_policy,
+            edit_prefix_policy: self.edit_prefix_policy,
             plan_cache: self.plan_cache,
             residency: self.residency,
             static_initialization: StaticInitializationPolicy::new(
@@ -460,6 +463,7 @@ impl PipelineConfig {
             maximum_height: self.maximum_height,
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy: self.decoder_batch_policy,
+            edit_prefix_policy: self.edit_prefix_policy,
             plan_cache: self.plan_cache,
             residency: self.residency,
             static_initialization: StaticInitializationPolicy::new(

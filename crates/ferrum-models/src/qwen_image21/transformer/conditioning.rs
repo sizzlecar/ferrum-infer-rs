@@ -164,7 +164,58 @@ impl QwenImage21RotaryFrequencies {
         layout: &QwenImage21T2iLayout,
         output: &mut [f32],
     ) -> Result<(), VNextError> {
-        let expected = self.output_elements(layout)?;
+        self.write_range(layout, 0, layout.sequence_length(), output)
+    }
+
+    /// Decode retains the original joint position of every target row. It
+    /// never regenerates target RoPE at a zero-based sequence position.
+    pub fn phase_output_elements(
+        self,
+        config: &QwenImage21TransformerConfig,
+    ) -> Result<usize, VNextError> {
+        checked_elements::<f32>(
+            if config.is_decode() {
+                config.layout().target_tokens()
+            } else {
+                config.layout().sequence_length()
+            },
+            u64::from(self.width),
+        )
+    }
+    pub fn write_phase_into(
+        self,
+        config: &QwenImage21TransformerConfig,
+        output: &mut [f32],
+    ) -> Result<(), VNextError> {
+        let layout = config.layout();
+        if config.is_decode() {
+            self.write_range(
+                layout,
+                layout.target_start(),
+                layout.target_tokens(),
+                output,
+            )
+        } else {
+            self.write_into(layout, output)
+        }
+    }
+    fn write_range(
+        self,
+        layout: &QwenImage21T2iLayout,
+        start: u64,
+        rows: u64,
+        output: &mut [f32],
+    ) -> Result<(), VNextError> {
+        let expected = checked_elements::<f32>(rows, u64::from(self.width))?;
+        if start
+            .checked_add(rows)
+            .is_none_or(|end| end > layout.sequence_length())
+        {
+            return Err(invalid(
+                "conditioning",
+                "rotary subrange exceeds joint layout",
+            ));
+        }
         if output.len() != expected {
             return Err(invalid(
                 "conditioning",
@@ -189,7 +240,7 @@ impl QwenImage21RotaryFrequencies {
                 let frequency = angular_frequency(pair, dimension);
                 for (row, destination) in output.chunks_exact_mut(stride).enumerate() {
                     let position = layout
-                        .rotary_position(row as u64)
+                        .rotary_position(start + row as u64)
                         .expect("exact output length is the checked layout sequence length")[axis];
                     let angle = position as f32 * frequency;
                     let offset = axis_start + 2 * pair as usize;

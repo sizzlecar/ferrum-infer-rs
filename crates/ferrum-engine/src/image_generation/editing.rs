@@ -8,6 +8,16 @@ use ferrum_models::qwen_image21::image_input::{
 use ferrum_models::qwen_image21::t2i_prompt::QwenImage21EditPrompt;
 use ferrum_models::qwen_image21::{QwenImage21VaeEncoderConfig, QwenImage21VaeEncoderFamily};
 
+/// Reuse only the causally isolated, timestep-zero prefix within one edit.
+/// Cache storage is admitted as fixed Request state and retired before VAE decode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageEditPrefixPolicy {
+    #[default]
+    Recompute,
+    RequestCache,
+}
+
 #[derive(Debug, Clone)]
 pub struct QwenImage21EditProfiles {
     pub vision: NumericalProfileId,

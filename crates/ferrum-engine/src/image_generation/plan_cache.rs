@@ -8,7 +8,7 @@ use std::{collections::VecDeque, io, sync::Mutex};
 #[serde(rename_all = "snake_case")]
 pub enum ImagePlanCachePolicy {
     Disabled,
-    /// One compiled plan per stage, without serialized-size accounting.
+    /// One compiled plan per (stage, role), without serialized-size accounting.
     #[default]
     LastPerStage,
     /// LRU within each stage and across all stages for the encoded-byte limit.
@@ -97,11 +97,13 @@ impl<R: DeviceRuntime> CachedStage<R> {
     fn matches(
         &self,
         stage: ImageStage,
+        role: ImageStagePlanRole,
         batch_size: usize,
         fingerprint: &str,
         options: &ProgramPlanCompileOptions,
     ) -> bool {
         self.receipt.stage == stage
+            && self.receipt.role == role
             && self.receipt.batch_size == batch_size
             && self.receipt.family_fingerprint == fingerprint
             && &self.options == options
@@ -180,6 +182,7 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
         &self,
         policy: ImagePlanCachePolicy,
         stage: ImageStage,
+        role: ImageStagePlanRole,
         batch_size: usize,
         family_fingerprint: &str,
         options: &ProgramPlanCompileOptions,
@@ -193,7 +196,7 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
         let found = state
             .entries
             .iter()
-            .position(|entry| entry.matches(stage, batch_size, family_fingerprint, options));
+            .position(|entry| entry.matches(stage, role, batch_size, family_fingerprint, options));
         let result = if let Some(index) = found {
             let entry = state.entries.remove(index).expect("located cache entry");
             let component = entry.component.clone();
@@ -236,6 +239,7 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
             _ => Some(0),
         };
         let stage = receipt.stage;
+        let role = receipt.role;
         let mut state = self
             .state
             .lock()
@@ -249,6 +253,7 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
             if let Some(index) = state.entries.iter().position(|e| {
                 e.matches(
                     stage,
+                    role,
                     receipt.batch_size,
                     &receipt.family_fingerprint,
                     &options,
@@ -263,17 +268,23 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
                 } => (maximum_entries_per_stage, maximum_encoded_metadata_bytes),
                 _ => (1, usize::MAX),
             };
+            // LastPerStage is one slot per typed role. MultiShape retains its
+            // original aggregate per-stage bound across all roles.
+            let same_slot = |entry: &CachedStage<R>| {
+                entry.receipt.stage == stage
+                    && (policy != ImagePlanCachePolicy::LastPerStage || entry.receipt.role == role)
+            };
             while state
                 .entries
                 .iter()
-                .filter(|e| e.receipt.stage == stage)
+                .filter(|entry| same_slot(entry))
                 .count()
                 >= stage_limit
             {
                 let index = state
                     .entries
                     .iter()
-                    .position(|e| e.receipt.stage == stage)
+                    .position(same_slot)
                     .expect("stage at capacity");
                 state.evict(index, &mut removed);
             }

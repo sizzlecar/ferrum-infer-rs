@@ -94,15 +94,25 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// Batch planning evidence, not an allocation permit. All retained model
     /// installations coexist; only one stage's dynamic pools execute at once.
     /// The shared device ledger remains authoritative under outside contention.
+    #[cfg(test)]
     pub(super) fn validate_resident_capacity(
         &self,
         stages: &[&PreparedStage<R>],
     ) -> anyhow::Result<()> {
-        if self.config.residency == ImageResidencyPolicy::Cold {
+        self.validate_capacity_with_prefix(stages, None)
+    }
+
+    pub(super) fn validate_capacity_with_prefix(
+        &self,
+        stages: &[&PreparedStage<R>],
+        prefix: Option<(&PreparedStage<R>, &PreparedStage<R>)>,
+    ) -> anyhow::Result<()> {
+        if self.config.residency == ImageResidencyPolicy::Cold && prefix.is_none() {
             return Ok(());
         }
         let mut retained_static = 0_u64;
         let mut active_peak = 0_u64;
+        let mut counted_static = Vec::new();
         for stage in stages {
             let payload = stage.component.executable().execution_plan().payload();
             ensure!(
@@ -111,10 +121,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             );
             let memory = payload.memory();
             let retained = self.config.residency.retains(stage.plan.stage);
-            if retained {
+            if retained && !counted_static.contains(&stage.plan.stage) {
                 retained_static = retained_static
                     .checked_add(memory.static_bytes())
                     .context("resident static bytes overflow")?;
+                counted_static.push(stage.plan.stage);
             }
             // Fixed demand includes actual compiled provider scratch, per-pool
             // alignment, and proven activation/invocation lifetime reuse. Do
@@ -124,6 +135,51 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .checked_add(if retained { 0 } else { memory.static_bytes() })
                 .context("active component bytes overflow")?;
             active_peak = active_peak.max(active);
+        }
+        if let Some((prefill, decode)) = prefix {
+            let prefill = prefill
+                .component
+                .executable()
+                .execution_plan()
+                .payload()
+                .memory();
+            let decode = decode
+                .component
+                .executable()
+                .execution_plan()
+                .payload()
+                .memory();
+            ensure!(
+                prefill.static_bytes() >= decode.static_bytes(),
+                "prefix decode must use a readonly subset of the prefill installation"
+            );
+            // Prefill output buffers and the compact decode Request state coexist
+            // through the D2D fence. Counting only the larger plan misses one
+            // whole cache. Decode Step backing is not admitted until prefill retires.
+            let transition = prefill
+                .minimum_runnable_request_bytes()
+                .checked_add(decode.minimum_request_bytes())
+                .and_then(|n| n.checked_add(decode.minimum_sequence_bytes()))
+                .and_then(|n| {
+                    n.checked_add(if self.config.residency.retains(ImageStage::Denoiser) {
+                        0
+                    } else {
+                        prefill.static_bytes()
+                    })
+                })
+                .context("prefix handoff capacity overflows")?;
+            active_peak = active_peak.max(transition);
+            // A subset attachment still retains and charges the original full
+            // snapshot, including weights no longer consumed by decode.
+            let decode_peak = decode
+                .minimum_runnable_request_bytes()
+                .checked_add(if self.config.residency.retains(ImageStage::Denoiser) {
+                    0
+                } else {
+                    prefill.static_bytes()
+                })
+                .context("prefix decode capacity overflows")?;
+            active_peak = active_peak.max(decode_peak);
         }
         for (kind, weights) in [
             (
@@ -151,6 +207,42 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             "resident image batch needs {required} device bytes (retained static {retained_static}, active stage peak {active_peak}, native allowance {}), exceeding total ceiling {}",
             self.device_opaque_allowance_bytes, self.config.device_capacity_bytes);
         Ok(())
+    }
+
+    /// The second phase binds this immutable installation while the first
+    /// phase is still live. Cold residency uses a request-local shared owner.
+    pub(super) fn start_prefix_prefill(
+        &mut self,
+        prepared: PreparedStage<R>,
+        job: u64,
+        stages: &mut Vec<ImageStageReceipt>,
+    ) -> Result<(ActiveImageStage<R>, SharedComponentWeights<R>, bool), ImageGenerationFailure<R>>
+    {
+        if self.config.residency.retains(ImageStage::Denoiser) {
+            let active = self.start_stage(prepared, job, stages)?;
+            let weights = self
+                .resident_stages
+                .denoiser_weights
+                .as_ref()
+                .expect("resident denoiser installation")
+                .weights
+                .clone();
+            Ok((active, weights, false))
+        } else {
+            let dit_source = ExactBf16SafetensorsSource::new(&self.assets.sources.transformer);
+            let source = if matches!(
+                prepared.plan.profile.as_str(),
+                QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
+                    | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
+            ) {
+                ComponentWeightSource::Stored(&dit_source)
+            } else {
+                ComponentWeightSource::Stored(self.assets.sources.transformer.as_ref())
+            };
+            prepared
+                .start_shared(self, job, source)
+                .map(|(active, weights)| (active, weights, true))
+        }
     }
 
     pub(super) fn start_stage(

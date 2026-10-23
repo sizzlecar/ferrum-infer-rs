@@ -1,4 +1,10 @@
 use super::*;
+use ferrum_models::qwen_image21::QwenImage21TransformerPhase;
+
+pub(super) struct PreparedPrefixDecode<R: DeviceRuntime> {
+    pub config: QwenImage21TransformerConfig,
+    pub stage: PreparedStage<R>,
+}
 
 pub(super) struct PreparedRequest<R: DeviceRuntime> {
     pub prompts: QwenImage21T2iPromptBatch,
@@ -9,6 +15,7 @@ pub(super) struct PreparedRequest<R: DeviceRuntime> {
     pub text_stage: PreparedStage<R>,
     pub noise_stage: PreparedStage<R>,
     pub denoise_stage: PreparedStage<R>,
+    pub prefix_decode: Option<PreparedPrefixDecode<R>>,
     pub decode_stage: PreparedStage<R>,
     pub edit: Option<super::editing::PreparedEdit<R>>,
 }
@@ -118,6 +125,18 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 edit.inputs.width() / 16,
             )?;
         }
+        let prefix_decode_config = if edit.is_some()
+            && self.config.edit_prefix_policy == ImageEditPrefixPolicy::RequestCache
+        {
+            let decode = transformer
+                .clone()
+                .with_execution_phase(QwenImage21TransformerPhase::PrefixDecode)?;
+            transformer =
+                transformer.with_execution_phase(QwenImage21TransformerPhase::PrefixPrefill)?;
+            Some(decode)
+        } else {
+            None
+        };
         let decoder_batch = self.config.decoder_batch_policy.batch_size(batch);
         let decoder = self.assets.decoder_batch(decoder_batch, height, width)?;
         ensure!(
@@ -138,11 +157,6 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let noise_family =
             TypedFamilyRegistration::new(NormalNoiseFamily::new(self.profiles.noise.as_str())?)
                 .prepare_with_profile(&serde_json::to_value(&noise)?, &self.profiles.noise)?;
-        let dit_family = TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?)
-            .prepare_with_profile(
-                &serde_json::to_value(&transformer)?,
-                &self.profiles.denoiser,
-            )?;
         let vae_family = TypedFamilyRegistration::new(QwenImage21VaeDecoderFamily::new()?)
             .prepare_with_profile(&serde_json::to_value(&decoder)?, &self.profiles.decoder)?;
         let mut text_options = text.compile_options()?;
@@ -153,19 +167,6 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 Qwen3VLTextEncoderFamily::fp8_weight_groups(&text)?,
             )?;
             precision::select(&text_family, &mut text_options, &conversion, &self.host)?;
-        }
-        let mut dit_options = transformer.compile_options()?;
-        if matches!(
-            self.profiles.denoiser.as_str(),
-            QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
-                | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
-        ) {
-            let conversion = precision::materializer(
-                precision::DIT_MATERIALIZER,
-                &self.host,
-                QwenImage21TransformerFamily::fp8_weight_groups(&transformer)?,
-            )?;
-            precision::select(&dit_family, &mut dit_options, &conversion, &self.host)?;
         }
         let text_stage = PreparedStage::compile(
             ImageStage::TextEncoder,
@@ -181,8 +182,13 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             &noise.compile_options()?,
             self,
         )?;
-        let denoise_stage =
-            PreparedStage::compile(ImageStage::Denoiser, batch, dit_family, &dit_options, self)?;
+        let denoise_stage = self.prepare_denoiser(&transformer, batch)?;
+        let prefix_decode = prefix_decode_config
+            .map(|config| {
+                let stage = self.prepare_denoiser(&config, batch)?;
+                Ok::<_, anyhow::Error>(PreparedPrefixDecode { config, stage })
+            })
+            .transpose()?;
         let decode_stage = PreparedStage::compile(
             ImageStage::Decoder,
             decoder_batch,
@@ -195,7 +201,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         if let Some(edit) = &edit {
             all_stages.extend([&edit.vision_stage, &edit.encoder_stage]);
         }
-        self.validate_resident_capacity(&all_stages)?;
+        if let Some(prefix) = &prefix_decode {
+            all_stages.push(&prefix.stage);
+        }
+        self.validate_capacity_with_prefix(
+            &all_stages,
+            prefix_decode
+                .as_ref()
+                .map(|prefix| (&denoise_stage, &prefix.stage)),
+        )?;
         Ok(PreparedRequest {
             prompts,
             request_order,
@@ -205,9 +219,38 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             text_stage,
             noise_stage,
             denoise_stage,
+            prefix_decode,
             decode_stage,
             edit,
         })
+    }
+
+    pub(super) fn prepare_denoiser(
+        &self,
+        transformer: &QwenImage21TransformerConfig,
+        batch: usize,
+    ) -> anyhow::Result<PreparedStage<R>> {
+        let family = TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?)
+            .prepare_with_profile(&serde_json::to_value(transformer)?, &self.profiles.denoiser)?;
+        let mut options = transformer.compile_options()?;
+        if matches!(
+            self.profiles.denoiser.as_str(),
+            QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
+                | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
+        ) {
+            let conversion = precision::materializer(
+                precision::DIT_MATERIALIZER,
+                &self.host,
+                QwenImage21TransformerFamily::fp8_weight_groups(transformer)?,
+            )?;
+            precision::select(&family, &mut options, &conversion, &self.host)?;
+        }
+        let role = match transformer.execution_phase() {
+            QwenImage21TransformerPhase::Full => ImageStagePlanRole::WholeStage,
+            QwenImage21TransformerPhase::PrefixPrefill => ImageStagePlanRole::PrefixPrefill,
+            QwenImage21TransformerPhase::PrefixDecode => ImageStagePlanRole::PrefixDecode,
+        };
+        PreparedStage::compile_with_role(ImageStage::Denoiser, role, batch, family, &options, self)
     }
 }
 

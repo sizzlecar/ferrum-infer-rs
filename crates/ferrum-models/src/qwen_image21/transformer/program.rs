@@ -45,7 +45,7 @@ pub(super) fn build(
     let h = t.hidden_size();
     let full = ExpectedWeights::from_config(t, StructureLimits::default())
         .map_err(|e| invalid("weights", e.to_string()))?;
-    let weights = full
+    let mut weights = full
         .tensors()
         .values()
         .map(|tensor| {
@@ -68,7 +68,7 @@ pub(super) fn build(
         SemanticValue::Rational(t.epsilon()),
     )]);
     let mut nodes = Vec::new();
-    if l.reference_image().is_some() {
+    if l.reference_image().is_some() && !config.is_decode() {
         nodes.push(node(
             "combined_latents",
             BATCHED_ROW_CONCAT_BF16_OPERATION_ID,
@@ -107,7 +107,7 @@ pub(super) fn build(
         )?,
         dense(
             "image_in",
-            if l.reference_image().is_some() {
+            if l.reference_image().is_some() && !config.is_decode() {
                 COMBINED_LATENTS
             } else {
                 F::LATENTS_ID
@@ -158,7 +158,25 @@ pub(super) fn build(
             4 * h,
         )?,
     ]);
-    if let Some(reference) = l.reference_image() {
+    if config.is_decode() {
+        nodes.retain(|node| {
+            ![
+                TEXT_NORM,
+                TEXT_IN,
+                TEXT_GELU,
+                TEXT_OUT,
+                JOINT,
+                UNORDERED_JOINT,
+            ]
+            .contains(&node.outputs[0].as_str())
+        });
+        let image = nodes
+            .iter_mut()
+            .find(|node| node.outputs[0].as_str() == IMAGE_OUT)
+            .ok_or_else(|| invalid("program", "decode lacks image projection"))?;
+        image.outputs[0] = id(JOINT)?;
+    }
+    if let Some(reference) = l.reference_image().filter(|_| !config.is_decode()) {
         let text = u64::from(l.text_tokens());
         let start = u64::from(reference.image_slot_start());
         let slots = u64::from(reference.image_slots());
@@ -212,7 +230,7 @@ pub(super) fn build(
     )?;
     let mut previous = id(JOINT)?;
     for layer in 0..t.layers() {
-        previous = remap::append(&mut nodes, &source, &weights, layer, previous)?;
+        previous = remap::append(&mut nodes, &source, &weights, layer, previous, config)?;
     }
     // Final normalization/projection are row-local. Select target rows first,
     // as the upstream SP target-output path does, and retain no prefix output.
@@ -226,7 +244,20 @@ pub(super) fn build(
                 l.batch(),
                 0,
                 h,
-                &[(l.target_tokens(), l.target_start(), l.sequence_length(), 1)],
+                &[(
+                    l.target_tokens(),
+                    if config.is_decode() {
+                        0
+                    } else {
+                        l.target_start()
+                    },
+                    if config.is_decode() {
+                        l.target_tokens()
+                    } else {
+                        l.sequence_length()
+                    },
+                    1,
+                )],
             )?,
         )?,
         unary("final_silu", SILU_BF16_OPERATION_ID, TEMB, FINAL_SILU)?,
@@ -279,24 +310,52 @@ pub(super) fn build(
         .into_iter()
         .map(id)
         .collect::<Result<Vec<_>, _>>()?;
-    if l.reference_image().is_some() {
+    if config.is_decode() {
+        inputs.retain(|input| input.as_str() != F::TEXT_ID);
+    } else if l.reference_image().is_some() {
         inputs.push(id(F::REFERENCE_LATENTS_ID)?);
+    }
+    let mut outputs = vec![id(F::VELOCITY_ID)?];
+    if config.execution_phase() == QwenImage21TransformerPhase::PrefixPrefill {
+        outputs.extend(
+            config
+                .prefix_cache_ports()?
+                .into_iter()
+                .map(|port| port.value_id().clone()),
+        );
+    }
+    if config.is_decode() {
+        // The checkpoint/schema stays complete, while this phase declares only
+        // values it actually consumes. Shared installation admission verifies
+        // their unchanged physical placements against the complete snapshot.
+        let consumed = nodes
+            .iter()
+            .flat_map(|node| &node.inputs)
+            .collect::<BTreeSet<_>>();
+        weights.retain(|weight| consumed.contains(&weight.value_id));
     }
     ModelProgram::new(
         family.id.clone(),
         inputs,
         vec![ProgramBlock {
-            id: if l.reference_image().is_some() {
-                "block.qwen_image21.transformer.edit"
-            } else {
-                "block.qwen_image21.transformer.t2i"
+            id: match config.execution_phase() {
+                QwenImage21TransformerPhase::PrefixPrefill => {
+                    "block.qwen_image21.transformer.prefix_prefill"
+                }
+                QwenImage21TransformerPhase::PrefixDecode => {
+                    "block.qwen_image21.transformer.prefix_decode"
+                }
+                QwenImage21TransformerPhase::Full if l.reference_image().is_some() => {
+                    "block.qwen_image21.transformer.edit"
+                }
+                QwenImage21TransformerPhase::Full => "block.qwen_image21.transformer.t2i",
             }
             .into(),
             nodes,
         }],
-        vec![],
+        config.prefix_states()?,
         weights,
-        vec![id(F::VELOCITY_ID)?],
+        outputs,
     )?
     .with_input_tensor_specs(config.input_tensor_specs()?)
 }
@@ -306,7 +365,9 @@ pub(super) fn conditioning_attributes(
     column_start: u64,
 ) -> Result<BTreeMap<AttributeId, SemanticValue>, VNextError> {
     let l = config.layout();
-    let runs = if config.transformer().causal_condition() {
+    let runs = if config.is_decode() {
+        vec![(l.target_tokens(), 0, 1, 0)]
+    } else if config.transformer().causal_condition() {
         vec![
             (l.target_start(), l.batch(), 0, 0),
             (l.target_tokens(), 0, 1, 0),
@@ -323,7 +384,7 @@ pub(super) fn conditioning_attributes(
 }
 
 /// Tuple fields are (output length, source start, batch stride, row stride).
-fn gather_attributes(
+pub(super) fn gather_attributes(
     batch: u64,
     column_start: u64,
     column_count: u64,

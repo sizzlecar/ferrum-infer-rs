@@ -53,6 +53,7 @@ pub struct ImageCudaPipelineLimits {
     pub maximum_height: u32,
     pub maximum_batch_size: usize,
     pub decoder_batch_policy: super::ImageDecoderBatchPolicy,
+    pub edit_prefix_policy: super::ImageEditPrefixPolicy,
     pub plan_cache: super::ImagePlanCachePolicy,
     pub residency: super::ImageResidencyPolicy,
     pub static_initialization: StaticInitializationPolicy,
@@ -83,6 +84,7 @@ impl ImageCudaPipelineLimits {
             maximum_height: self.maximum_height,
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy: self.decoder_batch_policy,
+            edit_prefix_policy: self.edit_prefix_policy,
             plan_cache: self.plan_cache,
             residency: self.residency,
             static_initialization: self.static_initialization,
@@ -137,6 +139,11 @@ impl QwenImage21CudaConfig {
     /// and ordinary Host/device admission before their execution.
     pub fn validate(&self) -> Result<()> {
         self.pipeline.validate()?;
+        ensure!(
+            self.pipeline.edit_prefix_policy != super::ImageEditPrefixPolicy::RequestCache
+                || self.attention_policy == ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
+            "CUDA request-cache editing requires the explicit cuDNN SDPA attention policy"
+        );
         if self.precision_policy == ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 {
             ensure!(
                 ferrum_kernels::native_ops::cutlass_fp8::compiled(),
@@ -306,7 +313,7 @@ impl QwenImage21CudaConfig {
                 &CudaTensorOperation::ALL,
             )?,
             ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
-                cuda_vnext_tensor_providers_with_cudnn_sdpa(
+                cuda_vnext_tensor_providers_with_cudnn_cross_attention(
                     &runtime,
                     &self.cudnn,
                     CudnnSdpaPlanPolicy {
@@ -457,6 +464,16 @@ impl QwenImage21CudaConfig {
                 &edit.encoder,
                 profiles,
             )?);
+            if self.pipeline.edit_prefix_policy == super::ImageEditPrefixPolicy::RequestCache {
+                let (prefix, copies) = prefix_command_families(&dit, profiles)?;
+                let prefill_commands = component_command_count(&prefix[0])?
+                    .checked_add(copies)
+                    .context("prefix D2D command count overflows")?;
+                ensure!(prefill_commands <= self.maximum_commands_per_submission,
+                    "prefix prefill requires {prefill_commands} compute/upload/state-copy commands, exceeding configured {}",
+                    self.maximum_commands_per_submission);
+                families.extend(prefix);
+            }
         }
         validate_family_command_limits(&families, self.maximum_commands_per_submission)?;
         let mut execution_bytes = assets.receipt().required_weight_bytes;
@@ -503,6 +520,31 @@ fn component_command_count(family: &PreparedModelFamily) -> Result<usize> {
             n.checked_add(block.nodes.len())
         })
         .context("component command count overflows")
+}
+
+fn prefix_command_families(
+    dit: &QwenImage21TransformerConfig,
+    profiles: &QwenImage21Profiles,
+) -> Result<([PreparedModelFamily; 2], usize)> {
+    use ferrum_models::qwen_image21::QwenImage21TransformerPhase;
+    let config = QwenImage21TransformerConfig::new(
+        dit.transformer().clone(),
+        QwenImage21T2iLayout::new(3, 2, 2, vec![3])?,
+    )?
+    .with_reference_image(1, 1, 2, 2)?;
+    let copies = config.prefix_cache_ports()?.len();
+    let family = TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?);
+    let prefill = config
+        .clone()
+        .with_execution_phase(QwenImage21TransformerPhase::PrefixPrefill)?;
+    let decode = config.with_execution_phase(QwenImage21TransformerPhase::PrefixDecode)?;
+    Ok((
+        [
+            family.prepare_with_profile(&serde_json::to_value(prefill)?, &profiles.denoiser)?,
+            family.prepare_with_profile(&serde_json::to_value(decode)?, &profiles.denoiser)?,
+        ],
+        copies,
+    ))
 }
 
 fn validate_family_command_limits(families: &[PreparedModelFamily], maximum: usize) -> Result<()> {
@@ -615,6 +657,7 @@ fn contracts(attention: ImageCudaAttentionPolicy) -> Result<Vec<Box<dyn Operatio
         Box::new(head_rms_norm_bf16_contract()?),
         Box::new(adjacent_rope_bf16_contract()?),
         Box::new(structured_attention_bf16_contract()?),
+        Box::new(cross_attention_bf16_contract()?),
         Box::new(zero_centered_rms_norm_bf16_contract()?),
         Box::new(gelu_tanh_bf16_contract()?),
         Box::new(row_gather_bf16_contract()?),
@@ -638,6 +681,7 @@ fn contracts(attention: ImageCudaAttentionPolicy) -> Result<Vec<Box<dyn Operatio
     }
     if attention == ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 {
         contracts.push(Box::new(structured_attention_fused_bf16_contract()?));
+        contracts.push(Box::new(cross_attention_fused_bf16_contract()?));
     }
     Ok(contracts)
 }
@@ -682,6 +726,7 @@ mod tests {
                 maximum_height: 512,
                 maximum_batch_size: ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE,
                 decoder_batch_policy: crate::image_generation::ImageDecoderBatchPolicy::default(),
+                edit_prefix_policy: crate::image_generation::ImageEditPrefixPolicy::default(),
                 plan_cache: crate::image_generation::ImagePlanCachePolicy::default(),
                 residency: crate::image_generation::ImageResidencyPolicy::default(),
                 static_initialization: StaticInitializationPolicy::new(1024, 32).unwrap(),
@@ -800,6 +845,19 @@ mod tests {
         );
         let legacy = contracts(ImageCudaAttentionPolicy::Sequential).unwrap();
         let fused = contracts(ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1).unwrap();
+        assert!(legacy
+            .iter()
+            .any(|c| c.descriptor().id.as_str() == CROSS_ATTENTION_BF16_OPERATION_ID));
+        assert!(!legacy
+            .iter()
+            .any(|c| c.descriptor().id.as_str() == CROSS_ATTENTION_FUSED_BF16_OPERATION_ID));
+        assert_eq!(
+            fused
+                .iter()
+                .filter(|c| c.descriptor().id.as_str() == CROSS_ATTENTION_FUSED_BF16_OPERATION_ID)
+                .count(),
+            1
+        );
         assert!(!legacy
             .iter()
             .any(|c| c.descriptor().id.as_str() == STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID));
@@ -819,6 +877,22 @@ mod tests {
         assert!(c.validate().is_err());
         c.memory =
             ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(1024 * 1024 * 1024).unwrap());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn cuda_request_cache_requires_an_explicit_vendor_attention_profile() {
+        let mut c = config();
+        c.memory =
+            ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(1024 * 1024 * 1024).unwrap());
+        c.validate().unwrap();
+        c.pipeline.edit_prefix_policy = super::super::ImageEditPrefixPolicy::RequestCache;
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("request-cache editing"));
+        c.attention_policy = ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1;
         c.validate().unwrap();
     }
 

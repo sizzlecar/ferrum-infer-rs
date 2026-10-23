@@ -1069,6 +1069,7 @@ where
                 purpose,
                 terminal_readback_request: None,
                 terminal_readback_payload: None,
+                tensor_state_initialization: None,
             },
         ))
     }
@@ -1767,6 +1768,8 @@ pub struct PreparedStepSubmissionWave<R>
 where
     R: DeviceRuntime,
 {
+    pub(super) tensor_state_initialization:
+        Option<super::tensor_request::PreparedTensorRequestStateInitialization<R>>,
     // Drop packet-owned fresh retentions before releasing any wave backing.
     terminal_readback_payload: Option<Arc<dyn std::any::Any + Send + Sync>>,
     // Drop wave backing and participant flights before releasing the Step.
@@ -2107,7 +2110,11 @@ where
                     "segment Plan slot requirements are not unique",
                 ));
             }
-            let leased = lease.plan_static_view(request.slot_index, request.allocation)?;
+            let leased = first
+                .request
+                .plan
+                .resources
+                .plan_static_view(request.slot_index, request.allocation)?;
             result.push(super::SegmentPlanResourceView {
                 leased,
                 retention: first.device_buffer_retention(),

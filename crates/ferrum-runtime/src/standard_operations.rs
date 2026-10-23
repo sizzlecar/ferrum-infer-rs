@@ -52,6 +52,8 @@ mod structured_gqa_attention_bf16;
 pub use structured_gqa_attention_bf16::*;
 mod structured_attention_bf16;
 pub use structured_attention_bf16::*;
+mod cross_attention_bf16;
+pub use cross_attention_bf16::*;
 mod pointwise_bf16;
 pub use pointwise_bf16::*;
 mod transcendental_bf16;
@@ -681,7 +683,7 @@ pub fn dense_linear_contract() -> Result<StandardOperationContract, VNextError> 
 /// including its subnormal rounding term. An approximate high-precision
 /// oracle must add its own error bound. Nonfinite/overflow/underflow cases
 /// require separate evidence; an output-only relative tolerance cannot prove
-/// this operation's contract. See `docs/bf16-dense-linear.md`.
+/// this operation's contract.
 pub fn dense_linear_bf16_contract() -> Result<StandardOperationContract, VNextError> {
     dense_linear_contract_with_type(
         DENSE_LINEAR_BF16_OPERATION_ID,

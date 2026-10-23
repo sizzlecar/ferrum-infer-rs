@@ -123,6 +123,37 @@ fn managed_frequencies_preserve_padded_text_axes_and_are_not_repeated_over_batch
 }
 
 #[test]
+fn managed_decode_frequencies_keep_joint_target_positions_and_exact_host_extent() {
+    use crate::qwen_image21::QwenImage21TransformerPhase;
+    let full = config(true, vec![3, 1]);
+    let decode = full
+        .clone()
+        .with_execution_phase(QwenImage21TransformerPhase::PrefixDecode)
+        .unwrap();
+    let full_host = account(11 * 8 * 4);
+    let original = full.managed_rotary_frequencies(&full_host).unwrap();
+    let bytes = 8 * 8 * 4;
+    let host = account(bytes);
+    let target = decode.managed_rotary_frequencies(&host).unwrap();
+    assert_eq!(target.tensor().dimensions(), &[8, 4, 2]);
+    assert_eq!(target.value_id(), original.value_id());
+    assert_eq!(
+        target.bytes().bytes(),
+        &original.bytes().bytes()[3 * 8 * 4..]
+    );
+    assert!(host.owns(target.bytes()));
+    assert_eq!(host.usage().unwrap().allocated_bytes(), bytes);
+    assert!(decode
+        .managed_rotary_frequencies(&account(bytes - 1))
+        .is_err());
+    let retained = target.clone();
+    drop(target);
+    assert_eq!(host.usage().unwrap().committed_bytes(), bytes);
+    drop(retained);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
 fn invalid_time_and_capacity_failures_publish_no_input_and_preserve_existing_owners() {
     let config = config(true, vec![3, 1]);
     let host = account(1536);

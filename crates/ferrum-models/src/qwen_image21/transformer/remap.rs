@@ -8,6 +8,7 @@ pub(super) fn append(
     weights: &[WeightReference],
     layer: u64,
     input: ProgramValueId,
+    config: &QwenImage21TransformerConfig,
 ) -> Result<ProgramValueId, VNextError> {
     type F = QwenImage21TransformerFamily;
     if !source.states().is_empty() {
@@ -139,7 +140,93 @@ pub(super) fn append(
                     .ok_or_else(|| invalid("program", "unmapped block output"))
             })
             .collect::<Result<_, _>>()?;
+        use super::super::QwenImage21Block0AttentionFamily as Attention;
+        if config.is_decode()
+            && source_node
+                .outputs
+                .iter()
+                .any(|v| v.as_str() == Attention::ATTENTION_ID)
+        {
+            if node.inputs.len() != 3 || node.outputs.len() != 1 {
+                return Err(invalid(
+                    "program",
+                    "attention template changed its port contract",
+                ));
+            }
+            for (input_index, part) in [
+                (1, QwenImage21PrefixPart::Key),
+                (2, QwenImage21PrefixPart::Value),
+            ] {
+                let joined = prefix::joined_value(layer, part)?;
+                nodes.push(ProgramNode {
+                    id: NodeId::new(format!(
+                        "node.qwen_image21.transformer.layer{layer}.join_prefix_{input_index}"
+                    ))?,
+                    operation_id: OperationId::new(BATCHED_ROW_CONCAT_BF16_OPERATION_ID)?,
+                    required_version: ContractVersion::new(1, 0),
+                    work: ProgramNodeWorkSpec::Fixed,
+                    inputs: vec![
+                        prefix::cache_value(layer, part)?,
+                        node.inputs[input_index].clone(),
+                    ],
+                    outputs: vec![joined.clone()],
+                    attributes: BTreeMap::from([(
+                        AttributeId::new("batch")?,
+                        SemanticValue::Unsigned(config.layout().batch()),
+                    )]),
+                });
+                node.inputs[input_index] = joined;
+            }
+            node.operation_id = OperationId::new(
+                if source_node.operation_id.as_str() == STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID
+                {
+                    CROSS_ATTENTION_FUSED_BF16_OPERATION_ID
+                } else {
+                    CROSS_ATTENTION_BF16_OPERATION_ID
+                },
+            )?;
+            node.attributes = config.cross_attention_attributes()?;
+        }
+        let capture = if config.execution_phase() == QwenImage21TransformerPhase::PrefixPrefill {
+            source_node.outputs.iter().find_map(|v| match v.as_str() {
+                Attention::KEY_ROTATED_ID => Some(QwenImage21PrefixPart::Key),
+                Attention::VALUE_ID => Some(QwenImage21PrefixPart::Value),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let produced = node.outputs[0].clone();
         nodes.push(node);
+        if let Some(part) = capture {
+            let output = prefix::cache_value(layer, part)?;
+            nodes.push(ProgramNode {
+                id: NodeId::new(format!(
+                    "node.qwen_image21.transformer.layer{layer}.capture_{}",
+                    if part == QwenImage21PrefixPart::Key {
+                        "key"
+                    } else {
+                        "value"
+                    }
+                ))?,
+                operation_id: OperationId::new(ROW_GATHER_BF16_OPERATION_ID)?,
+                required_version: ContractVersion::new(1, 0),
+                work: ProgramNodeWorkSpec::Fixed,
+                inputs: vec![produced],
+                outputs: vec![output],
+                attributes: program::gather_attributes(
+                    config.layout().batch(),
+                    0,
+                    config.transformer().hidden_size(),
+                    &[(
+                        config.layout().target_start(),
+                        0,
+                        config.layout().sequence_length(),
+                        1,
+                    )],
+                )?,
+            });
+        }
     }
     map.get(&ProgramValueId::new(Block::OUTPUT_ID)?)
         .cloned()

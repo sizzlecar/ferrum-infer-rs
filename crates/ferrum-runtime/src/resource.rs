@@ -39,6 +39,8 @@ use super::{
 
 mod tensor;
 pub use tensor::*;
+mod tensor_request;
+pub use tensor_request::{TensorRequestStateMapping, TensorRequestStateTarget};
 
 mod contracts;
 pub use contracts::*;

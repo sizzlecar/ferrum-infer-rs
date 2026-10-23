@@ -5288,6 +5288,42 @@ impl DeviceRuntime for CudaDeviceRuntime {
         ))
     }
 
+    fn encode_tensor_state_copy(
+        &self,
+        request: ferrum_runtime::DeviceTensorStateCopy<'_, Self::Buffer>,
+    ) -> Result<Self::Command, Self::Error> {
+        let source = request.source();
+        let destination = request.destination();
+        self.validate_buffer(source)?;
+        self.validate_buffer(destination)?;
+        let region = request.region();
+        region
+            .validate_bounds(&source.descriptor, &destination.descriptor)
+            .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?;
+        let element_bytes = source.descriptor.element_type.size_bytes();
+        if source.descriptor.usage != ferrum_runtime::BufferUsage::Activations
+            || destination.descriptor.usage != ferrum_runtime::BufferUsage::State
+            || source.descriptor.element_type != destination.descriptor.element_type
+            || region.source_offset_bytes() % element_bytes != 0
+            || region.destination_offset_bytes() % element_bytes != 0
+            || region.length_bytes() % element_bytes != 0
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "fixed tensor state copy requires matching complete activation/state elements",
+            ));
+        }
+        let source = source.retained_region(
+            region.source_offset_bytes()..region.source_offset_bytes() + region.length_bytes(),
+            request.source_retention().clone(),
+        )?;
+        let destination = destination.retained_region(
+            region.destination_offset_bytes()
+                ..region.destination_offset_bytes() + region.length_bytes(),
+            request.destination_retention().clone(),
+        )?;
+        CudaDeviceCommand::tensor_state_copy(self.runtime_instance, source, destination)
+    }
+
     fn encode_upload(
         &self,
         source: &[u8],

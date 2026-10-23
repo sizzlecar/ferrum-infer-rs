@@ -128,6 +128,7 @@ fn equal_tensor_shape_different_key_mask_or_profile_never_reuses_a_plan() {
         .get(
             pipeline.config.plan_cache,
             ImageStage::Denoiser,
+            ImageStagePlanRole::WholeStage,
             1,
             &cuda_family.fingerprint().unwrap(),
             &cuda_options
@@ -140,6 +141,7 @@ fn equal_tensor_shape_different_key_mask_or_profile_never_reuses_a_plan() {
         .get(
             other_pipeline.config.plan_cache,
             ImageStage::Denoiser,
+            ImageStagePlanRole::WholeStage,
             1,
             &masked.plan.family_fingerprint,
             &other_options
@@ -160,6 +162,15 @@ fn cached_projection(
     stage: ImageStage,
     batch: usize,
 ) -> PreparedStage<ferrum_kernels::backend::reference::ReferenceDeviceRuntime> {
+    cached_projection_with_role(pipeline, stage, ImageStagePlanRole::WholeStage, batch)
+}
+
+fn cached_projection_with_role(
+    pipeline: &QwenImage21Pipeline<ferrum_kernels::backend::reference::ReferenceDeviceRuntime>,
+    stage: ImageStage,
+    role: ImageStagePlanRole,
+    batch: usize,
+) -> PreparedStage<ferrum_kernels::backend::reference::ReferenceDeviceRuntime> {
     let options = ProgramPlanCompileOptions::new(BTreeMap::from([(
         id(ferrum_models::qwen_image21::IMAGE_PROJECTION_INPUT_ID).unwrap(),
         ProgramTensorSpec {
@@ -169,7 +180,100 @@ fn cached_projection(
         },
     )]))
     .unwrap();
-    PreparedStage::compile(stage, batch, projection(), &options, pipeline).unwrap()
+    PreparedStage::compile_with_role(stage, role, batch, projection(), &options, pipeline).unwrap()
+}
+
+#[test]
+fn cooperating_roles_hit_on_later_rounds_and_replace_only_their_own_last_shape() {
+    let (pipeline, _directory) = super::adapter::pipeline(2);
+    let compile =
+        |role, batch| cached_projection_with_role(&pipeline, ImageStage::Denoiser, role, batch);
+    let prefill = compile(ImageStagePlanRole::PrefixPrefill, 1);
+    let decode = compile(ImageStagePlanRole::PrefixDecode, 1);
+    let whole = compile(ImageStagePlanRole::WholeStage, 1);
+    assert!(!prefill.plan.plan_cache_hit && !decode.plan.plan_cache_hit);
+    // Roles separate cooperative slots even if this injected component has the
+    // same family/shape. Real plans still match their full family and options.
+    assert!(!Arc::ptr_eq(&prefill.component, &decode.component));
+    for _ in 0..2 {
+        let p = compile(ImageStagePlanRole::PrefixPrefill, 1);
+        let d = compile(ImageStagePlanRole::PrefixDecode, 1);
+        assert!(p.plan.plan_cache_hit && d.plan.plan_cache_hit);
+        assert!(Arc::ptr_eq(&prefill.component, &p.component));
+        assert!(Arc::ptr_eq(&decode.component, &d.component));
+    }
+    let prefill_weak = Arc::downgrade(&prefill.component);
+    drop(prefill);
+    assert!(
+        !compile(ImageStagePlanRole::PrefixPrefill, 2)
+            .plan
+            .plan_cache_hit
+    );
+    assert!(prefill_weak.upgrade().is_none());
+    assert!(
+        compile(ImageStagePlanRole::PrefixDecode, 1)
+            .plan
+            .plan_cache_hit
+    );
+    assert!(
+        compile(ImageStagePlanRole::WholeStage, 1)
+            .plan
+            .plan_cache_hit
+    );
+    let decode_weak = Arc::downgrade(&decode.component);
+    drop(decode);
+    assert!(
+        !compile(ImageStagePlanRole::PrefixDecode, 2)
+            .plan
+            .plan_cache_hit
+    );
+    assert!(decode_weak.upgrade().is_none());
+    assert!(
+        compile(ImageStagePlanRole::PrefixPrefill, 2)
+            .plan
+            .plan_cache_hit
+    );
+    assert!(
+        compile(ImageStagePlanRole::WholeStage, 1)
+            .plan
+            .plan_cache_hit
+    );
+    assert_eq!(whole.plan.role, ImageStagePlanRole::WholeStage);
+    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+}
+
+#[test]
+fn multi_shape_stage_limit_counts_all_roles_together() {
+    let (mut pipeline, _directory) = super::adapter::pipeline(2);
+    pipeline.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
+    let compile =
+        |role, batch| cached_projection_with_role(&pipeline, ImageStage::Denoiser, role, batch);
+    let old = compile(ImageStagePlanRole::PrefixPrefill, 1);
+    let weak = Arc::downgrade(&old.component);
+    drop(old);
+    assert!(
+        !compile(ImageStagePlanRole::PrefixDecode, 1)
+            .plan
+            .plan_cache_hit
+    );
+    let newest = compile(ImageStagePlanRole::WholeStage, 1);
+    assert_eq!(newest.plan.plan_cache.as_ref().unwrap().stage_entries, 2);
+    assert!(weak.upgrade().is_none());
+    assert!(
+        compile(ImageStagePlanRole::PrefixDecode, 1)
+            .plan
+            .plan_cache_hit
+    );
+    assert!(
+        compile(ImageStagePlanRole::WholeStage, 1)
+            .plan
+            .plan_cache_hit
+    );
+    assert_eq!(
+        serde_json::to_value(ImageStagePlanRole::PrefixDecode).unwrap(),
+        "prefix_decode"
+    );
+    assert!(serde_json::from_str::<ImageStagePlanRole>("\"unknown_phase\"").is_err());
 }
 
 #[test]

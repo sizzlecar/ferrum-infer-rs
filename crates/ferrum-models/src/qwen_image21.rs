@@ -40,9 +40,10 @@ pub use image_projection::{
 };
 pub use qk_norm::{QwenImage21Block0QkNormFamily, QwenImage21QkFrontend};
 pub use transformer::{
-    QwenImage21ModelTimestep, QwenImage21ReferenceImage, QwenImage21RotaryFrequencies,
-    QwenImage21T2iLayout, QwenImage21Timestep256, QwenImage21TransformerConfig,
-    QwenImage21TransformerFamily,
+    QwenImage21ModelTimestep, QwenImage21PrefixCachePort, QwenImage21PrefixPart,
+    QwenImage21ReferenceImage, QwenImage21RotaryFrequencies, QwenImage21T2iLayout,
+    QwenImage21Timestep256, QwenImage21TransformerConfig, QwenImage21TransformerFamily,
+    QwenImage21TransformerPhase,
 };
 pub use vae_decoder::{
     QwenImage21VaeDecoderConfig, QwenImage21VaeDecoderFamily, QwenImage21VaeDecoderWeight,

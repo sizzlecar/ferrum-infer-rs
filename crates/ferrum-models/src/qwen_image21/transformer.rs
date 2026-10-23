@@ -9,12 +9,14 @@
 
 mod conditioning;
 mod geometry;
+mod prefix;
 mod program;
 mod remap;
 pub use conditioning::{
     QwenImage21ModelTimestep, QwenImage21RotaryFrequencies, QwenImage21Timestep256,
 };
 pub use geometry::{QwenImage21ReferenceImage, QwenImage21T2iLayout, QwenImage21TransformerConfig};
+pub use prefix::{QwenImage21PrefixCachePort, QwenImage21PrefixPart, QwenImage21TransformerPhase};
 
 use super::{
     ExpectedWeights, QwenImage21AttentionConfig, QwenImage21AttentionKeyRun,
@@ -158,6 +160,7 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
             profile.id = profile_id(name)?;
             profile.family_id = self.id.clone();
             profile.primary_activation = ProgramValueId::new(Self::VELOCITY_ID)?;
+            profile.states = graph.states().to_vec();
             // All arithmetic/copy outputs remain BF16 ABI boundaries even when
             // the execution plan reclaims them before completion.
             profile.boundaries = graph
@@ -196,6 +199,33 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
             }
             if is_fp8(name) {
                 let op = crate::fp8_linear::operation()?;
+                operations.insert(op.operation_id.clone(), op);
+            }
+            if config.is_decode() {
+                for unused in [
+                    ZERO_CENTERED_RMS_NORM_BF16_OPERATION_ID,
+                    GELU_TANH_BF16_OPERATION_ID,
+                ] {
+                    operations.remove(&OperationId::new(unused)?);
+                }
+                let fused = source_name == Block::CUDA_FUSED_PROFILE_ID;
+                operations.remove(&OperationId::new(if fused {
+                    STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID
+                } else {
+                    STRUCTURED_ATTENTION_BF16_OPERATION_ID
+                })?);
+                let op = NumericalOperationContract {
+                    operation_id: OperationId::new(if fused {
+                        CROSS_ATTENTION_FUSED_BF16_OPERATION_ID
+                    } else {
+                        CROSS_ATTENTION_BF16_OPERATION_ID
+                    })?,
+                    version: ContractVersion::new(1, 0),
+                    multiplication_type: (!fused).then_some(ElementType::F32),
+                    accumulation_type: (!fused).then_some(ElementType::F32),
+                    staged_arithmetic: None,
+                    composite_arithmetic: None,
+                };
                 operations.insert(op.operation_id.clone(), op);
             }
             profile.operations = operations.into_values().collect();

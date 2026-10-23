@@ -34,7 +34,7 @@ pub(crate) fn providers(
     config: &CudaCudnnConfig,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, None)
+    providers_impl(runtime, config, selected, None, false)
 }
 
 pub(crate) fn providers_with_sdpa(
@@ -43,7 +43,16 @@ pub(crate) fn providers_with_sdpa(
     policy: CudnnSdpaPlanPolicy,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, Some(policy))
+    providers_impl(runtime, config, selected, Some(policy), false)
+}
+
+pub(crate) fn providers_with_cross_attention(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCudnnConfig,
+    policy: CudnnSdpaPlanPolicy,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    providers_impl(runtime, config, selected, Some(policy), true)
 }
 
 fn providers_impl(
@@ -51,7 +60,18 @@ fn providers_impl(
     config: &CudaCudnnConfig,
     selected: &[CudaTensorOperation],
     sdpa_policy: Option<CudnnSdpaPlanPolicy>,
+    cross_attention: bool,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    if cross_attention
+        && !runtime.descriptor().capabilities.contains(
+            &CapabilityId::new(ferrum_runtime::CROSS_ATTENTION_FUSED_BF16_CAPABILITY_ID)
+                .map_err(contract_error)?,
+        )
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA runtime lacks fused cross attention capability",
+        ));
+    }
     let capability = CapabilityId::new(CONV2D_BF16_CAPABILITY_ID).map_err(contract_error)?;
     if !runtime.descriptor().capabilities.contains(&capability) {
         return Err(CudaDeviceRuntimeError::contract(
@@ -124,6 +144,13 @@ fn providers_impl(
     let kernels = RetainedFunctions::load(runtime)?;
     let mut providers = selection::providers_from_descriptors(descriptors, &kernels);
     if let Some(cache) = sdpa {
+        if cross_attention {
+            providers.push(cudnn_cross_attention::provider(
+                runtime.descriptor(),
+                &kernels,
+                Arc::clone(&cache),
+            )?);
+        }
         if segmented_sdpa {
             providers.push(cudnn_segmented::provider(
                 runtime.descriptor(),

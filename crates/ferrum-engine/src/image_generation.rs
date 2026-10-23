@@ -10,11 +10,11 @@
 //!
 //! Metadata preparation is separate from backend construction. The pipeline
 //! never constructs a runtime or Host account, launches a helper process, or
-//! exchanges tensor payloads through files. All four component plans compile
-//! before the first upload. Each stage must close or release idle dynamic
-//! backing before the next begins; a failure retains recovery owners and stops this
-//! pipeline instance. This first path has no CFG, image editing or video,
-//! device-resident denoise cache, or claim of Torch parity/performance parity.
+//! exchanges tensor payloads through files. All component plans compile before
+//! the first upload. A single-reference edit may reuse the timestep-zero prefix
+//! through admitted fixed Request state. Its D2D handoff accounts for both cache
+//! copies; the request retires before decoding. Failures retain recovery owners
+//! and stop this pipeline instance. CFG and video are not implemented.
 //! Host claims cover managed tensor payloads and static transfer staging, not
 //! tokenizer/metadata containers, mapped checkpoints, or total process RSS.
 
@@ -24,7 +24,8 @@ mod attention_policy;
 pub mod cuda;
 mod decoder;
 mod editing;
-pub use editing::QwenImage21EditProfiles;
+mod prefix_denoising;
+pub use editing::{ImageEditPrefixPolicy, QwenImage21EditProfiles};
 mod plan_cache;
 mod precision;
 mod prepare;
@@ -38,7 +39,8 @@ pub use precision::ImageCudaPrecisionPolicy;
 pub use residency::ImageResidencyPolicy;
 pub use stage::{
     ActiveImageStage, ImageGenerationError, ImageGenerationFailure, ImageStage,
-    ImageStageExecutionReceipt, ImageStagePlanReceipt, ImageStageReceipt, ImageStageRetirement,
+    ImageStageExecutionReceipt, ImageStagePlanReceipt, ImageStagePlanRole, ImageStageReceipt,
+    ImageStageRetirement,
 };
 
 use anyhow::{ensure, Context};
@@ -112,6 +114,7 @@ pub struct ImagePipelineConfig {
     /// defaults to one; larger cold batches require explicit opt-in.
     pub maximum_batch_size: usize,
     pub decoder_batch_policy: ImageDecoderBatchPolicy,
+    pub edit_prefix_policy: ImageEditPrefixPolicy,
     pub plan_cache: ImagePlanCachePolicy,
     pub residency: ImageResidencyPolicy,
     pub static_initialization: StaticInitializationPolicy,
@@ -437,6 +440,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             text_stage,
             noise_stage,
             denoise_stage,
+            prefix_decode,
             decode_stage,
             edit,
         } = prepared;
@@ -549,40 +553,62 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             self.profiles.euler,
         )
         .map_err(|e| process(e.into()))?;
-        let mut denoiser = self.start_stage(denoise_stage, job, stages)?;
-        while let Some(step) = solver.current_step() {
-            let time = match transformer.managed_time_features(&self.host, step.timestep().as_f32())
-            {
-                Ok(value) => value,
-                Err(error) => return Err(denoiser.processing(error)),
-            };
-            let mut inputs = vec![
-                sample.clone(),
-                text_input.clone(),
-                time,
-                frequencies.clone(),
-            ];
-            if let Some(reference) = &reference {
-                inputs.push(reference.clone());
+        if let Some(decode) = prefix_decode {
+            sample = self.run_prefix_denoising(
+                prefix_denoising::PrefixDenoise {
+                    prefill: denoise_stage,
+                    decode,
+                    config: transformer,
+                    sample,
+                    text: text_input.clone(),
+                    reference: reference
+                        .clone()
+                        .context("prefix cache requires a reference image")
+                        .map_err(process)?,
+                    frequencies: frequencies.clone(),
+                },
+                &mut solver,
+                job,
+                stages,
+                steps,
+            )?;
+        } else {
+            let mut denoiser = self.start_stage(denoise_stage, job, stages)?;
+            while let Some(step) = solver.current_step() {
+                let time =
+                    match transformer.managed_time_features(&self.host, step.timestep().as_f32()) {
+                        Ok(value) => value,
+                        Err(error) => return Err(denoiser.processing(error)),
+                    };
+                let mut inputs = vec![
+                    sample.clone(),
+                    text_input.clone(),
+                    time,
+                    frequencies.clone(),
+                ];
+                if let Some(reference) = &reference {
+                    inputs.push(reference.clone());
+                }
+                let (active, outputs) = denoiser.execute(job, inputs)?;
+                denoiser = active;
+                let velocity = match only_output(outputs, QwenImage21TransformerFamily::VELOCITY_ID)
+                {
+                    Ok(value) => value,
+                    Err(error) => return Err(denoiser.processing(error)),
+                };
+                sample = match solver.advance(&sample, velocity.tensor(), velocity.bytes()) {
+                    Ok((_, next)) => next,
+                    Err(error) => return Err(denoiser.processing(error.into())),
+                };
+                steps.push(ImageDenoiseStepReceipt {
+                    index: step.index(),
+                    sigma: step.sigma(),
+                    next_sigma: step.next_sigma(),
+                    scheduler_timestep: step.timestep().as_f32(),
+                });
             }
-            let (active, outputs) = denoiser.execute(job, inputs)?;
-            denoiser = active;
-            let velocity = match only_output(outputs, QwenImage21TransformerFamily::VELOCITY_ID) {
-                Ok(value) => value,
-                Err(error) => return Err(denoiser.processing(error)),
-            };
-            sample = match solver.advance(&sample, velocity.tensor(), velocity.bytes()) {
-                Ok((_, next)) => next,
-                Err(error) => return Err(denoiser.processing(error.into())),
-            };
-            steps.push(ImageDenoiseStepReceipt {
-                index: step.index(),
-                sigma: step.sigma(),
-                next_sigma: step.next_sigma(),
-                scheduler_timestep: step.timestep().as_f32(),
-            });
+            self.finish_stage(denoiser, stages)?;
         }
-        self.finish_stage(denoiser, stages)?;
         drop((text_input, frequencies, solver, reference));
 
         let normalized = QwenImage21ManagedLatents::new(

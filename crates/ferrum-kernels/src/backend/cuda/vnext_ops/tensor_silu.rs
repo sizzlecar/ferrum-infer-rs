@@ -36,6 +36,7 @@ mod attention;
 mod bundle;
 mod conv2d;
 mod cudnn_attention;
+mod cudnn_cross_attention;
 mod cudnn_segmented;
 mod geometry;
 mod gqa;
@@ -61,12 +62,14 @@ pub use attention::{
 };
 use bundle::RetainedFunctions;
 pub(super) use conv2d::providers as providers_with_cudnn;
+pub(super) use conv2d::providers_with_cross_attention as providers_with_cudnn_cross_attention;
 pub(super) use conv2d::providers_with_sdpa as providers_with_cudnn_sdpa;
 pub use conv2d::NUMERICAL_PROFILE_ID as CONV2D_PROFILE_ID;
 pub use cudnn_attention::{
     NUMERICAL_IDENTITY as FUSED_ATTENTION_NUMERICAL_IDENTITY,
     NUMERICAL_PROFILE_ID as FUSED_ATTENTION_NUMERICAL_PROFILE_ID,
 };
+pub use cudnn_cross_attention::NUMERICAL_PROFILE_ID as CROSS_ATTENTION_FUSED_PROFILE_ID;
 pub use cudnn_segmented::NUMERICAL_PROFILE_ID as CUDNN_SEGMENTED_ATTENTION_PROFILE_ID;
 use geometry::{geometry, Shape};
 pub use gqa::{

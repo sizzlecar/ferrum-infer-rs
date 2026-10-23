@@ -17,7 +17,9 @@ use ferrum_runtime::{
 };
 
 impl QwenImage21TransformerConfig {
-    /// One F32 `[S,D/2,2]` frequency table shared across batches and heads.
+    /// One F32 `[S,D/2,2]` frequency table shared across batches and heads,
+    /// or `[target_tokens,D/2,2]` for prefix decode. Decode preserves the
+    /// original joint-sequence positions rather than restarting at zero.
     /// Padded text positions and centered image coordinates are taken directly
     /// from this config's checked layout. The numerical profile is unchanged:
     /// `QwenImage21RotaryFrequencies::NUMERICAL_PROFILE_ID`.
@@ -25,7 +27,7 @@ impl QwenImage21TransformerConfig {
         &self,
         host: &HostMemoryAccount,
     ) -> Result<ManagedHostTensor> {
-        let elements = self.rotary_frequencies()?.output_elements(self.layout())?;
+        let elements = self.rotary_frequencies()?.phase_output_elements(self)?;
         let (id, spec, bytes) =
             input_spec(self, Family::FREQUENCIES_ID, ElementType::F32, elements)?;
         let mut output = host.allocate_zeroed(HostMemoryClass::InputPreprocess, bytes)?;
@@ -100,7 +102,7 @@ fn write_rotary_bytes(config: &QwenImage21TransformerConfig, output: &mut [u8]) 
         .map_err(|e| anyhow::anyhow!("managed rotary buffer alignment/extent: {e}"))?;
     config
         .rotary_frequencies()?
-        .write_into(config.layout(), values)?;
+        .write_phase_into(config, values)?;
     for value in values {
         *value = f32::from_bits(value.to_bits().to_le());
     }

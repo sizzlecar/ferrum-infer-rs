@@ -128,6 +128,7 @@ impl DirectoryOptions {
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy:
                 ferrum_engine::image_generation::ImageDecoderBatchPolicy::SingleImage,
+            edit_prefix_policy: ferrum_engine::image_generation::ImageEditPrefixPolicy::default(),
             plan_cache: ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage,
             residency: ferrum_engine::image_generation::ImageResidencyPolicy::Cold,
             maximum_staging_bytes: 16 * MIB,

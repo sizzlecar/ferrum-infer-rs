@@ -9,6 +9,9 @@ use std::{fmt, sync::Arc};
 use ferrum_runtime::*;
 
 mod admission;
+mod request;
+pub use ferrum_runtime::TensorRequestStateMapping;
+pub use request::{TensorRequestCloseFailure, TensorRequestSession};
 #[cfg(test)]
 mod output_slices;
 
@@ -272,10 +275,36 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         inputs: Vec<ManagedHostTensor>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
         let work = self.binding.bind_inputs(inputs)?;
+        self.execute_bound(run_id, request_id, work, None, None)
+    }
+
+    fn execute_bound(
+        &mut self,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        work: ResourceWorkShape,
+        request_session: Option<Arc<SequenceSession<R>>>,
+        initialize: Option<(&TensorRequestStateTarget<R>, &[TensorRequestStateMapping])>,
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        let persistent_request = request_session.is_some();
+        let outputs = self
+            .outputs
+            .iter()
+            .filter(|(port, _)| {
+                !initialize.is_some_and(|(_, mappings)| {
+                    mappings.iter().any(|m| &m.source_output == port.value_id())
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if outputs.is_empty() {
+            return Err(
+                invalid("tensor execution requires at least one Host completion output").into(),
+            );
+        }
         // Reserve every output atomically, before device admission or transfer
         // slots. Real buffers remain charged through returned clones/slices.
-        let demand = self
-            .outputs
+        let demand = outputs
             .iter()
             .map(|(_, request)| {
                 let bytes = usize::try_from(request.output_layout().byte_len()?)
@@ -284,15 +313,18 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             })
             .collect::<Result<Vec<_>, VNextError>>()?;
         let claims = self.host_account().reserve_many(&demand)?;
-        let readbacks = self
-            .outputs
+        let readbacks = outputs
             .iter()
             .zip(claims)
             .map(|((_, request), claim)| Ok((request.clone(), claim.allocate_zeroed()?)))
             .collect::<Result<Vec<_>, HostMemoryError>>()?;
 
-        let sequence = self.admit_sequence(&work, run_id, request_id)?;
-        let session = sequence.open_session()?;
+        let session = match request_session {
+            Some(session) => session,
+            None => self
+                .admit_sequence(&work, run_id, request_id)?
+                .open_session()?,
+        };
         let mut scope = TensorExecutionRetirement {
             step: None,
             session: Some(session),
@@ -304,7 +336,14 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             .map_err(TensorExecutionError::Lane)?;
         let step = self.admit_step(&batch, &lane, &work)?;
         scope.step = Some(step.clone());
-        let wave = self.prepare_wave(&step)?;
+        let mut wave = self.prepare_wave(&step)?;
+        if let Some((target, mappings)) = initialize {
+            wave.initialize_tensor_request_state(
+                self.executable.execution_plan(),
+                target,
+                mappings,
+            )?;
+        }
         drop(step);
         let active = TrustedActiveSequenceBinding::from_session(scope.session()?)?;
         let identity = OperationDispatch::bind_submission_wave_identity(
@@ -379,21 +418,21 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                 })
             }
         };
-        if bytes.len() != self.outputs.len() {
+        if bytes.len() != outputs.len() {
             return Err(TensorExecutionError::Readback {
                 source: invalid("tensor output count differs from compiled ports"),
                 receipt,
                 retirement: scope,
             });
         }
-        drop((handle, active, identity, uploads, batch, lane, sequence));
-        if let Err(source) = scope.finish() {
+        drop((handle, active, identity, uploads, batch, lane));
+        if let Err(source) = scope.finish_with_request(persistent_request) {
             return Err(TensorExecutionError::Retirement {
                 source,
                 retirement: scope,
             });
         }
-        self.outputs
+        outputs
             .iter()
             .zip(bytes)
             .map(|((port, _), bytes)| {
@@ -463,7 +502,7 @@ impl<R: DeviceRuntime> TensorExecutionRetirement<R> {
             .ok_or_else(|| invalid("tensor execution session has already retired"))
     }
 
-    fn finish(&mut self) -> Result<(), VNextError> {
+    fn finish_with_request(&mut self, keep_request: bool) -> Result<(), VNextError> {
         let step = self
             .step
             .take()
@@ -476,7 +515,9 @@ impl<R: DeviceRuntime> TensorExecutionRetirement<R> {
             self.step = Some(failure.into_step());
             return Err(error);
         }
-        self.session()?.try_complete()?;
+        if !keep_request {
+            self.session()?.try_complete()?;
+        }
         self.session.take();
         Ok(())
     }

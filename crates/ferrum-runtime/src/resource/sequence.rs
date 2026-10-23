@@ -455,6 +455,7 @@ pub struct AdmittedRequestResources<R>
 where
     R: DeviceRuntime,
 {
+    pub(super) tensor_state_initialization_claimed: super::AtomicBool,
     // Unregister Request-state hazard cells before backing and logical
     // capacity are released. A live permit retains this exact request Arc.
     _request_state_hazard_registration: Option<RequestStateHazardRegistration>,
@@ -489,6 +490,7 @@ where
             .register_request(logical_lease.request())?;
         Ok(Self {
             _request_state_hazard_registration: request_state_hazard_registration,
+            tensor_state_initialization_claimed: super::AtomicBool::new(false),
             backing_slices,
             logical_lease,
             plan,
