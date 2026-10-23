@@ -4,7 +4,7 @@
 //! outputs, and ordinary submission. It is not a token-generation driver or a
 //! diffusion scheduler. Capacity deferrals return to the caller without waiting.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Instant};
 
 use ferrum_runtime::*;
 
@@ -286,6 +286,17 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         request_session: Option<Arc<SequenceSession<R>>>,
         initialize: Option<(&TensorRequestStateTarget<R>, &[TensorRequestStateMapping])>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        // Host wall observations only: native timing, synchronization and the
+        // admission/retirement sequence remain unchanged. The span also binds
+        // nested backend construction observations to this exact execution.
+        let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        let trace = tracing::debug_span!(
+            "tensor_execution",
+            run_id = %run_id,
+            request_id = %request_id,
+        );
+        let _entered = trace.enter();
+        let total_started = trace_enabled.then(Instant::now);
         let persistent_request = request_session.is_some();
         let outputs = self
             .outputs
@@ -330,10 +341,14 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             session: Some(session),
         };
         let batch = ExecutionBatchParticipants::new(vec![scope.session()?.clone()])?;
+        let initial_admission_us = host_wall_us(total_started);
+        let lane_started = trace_enabled.then(Instant::now);
         let lane = self
             .resources
             .create_execution_lane()
             .map_err(TensorExecutionError::Lane)?;
+        let lane_create_us = host_wall_us(lane_started);
+        let admission_started = trace_enabled.then(Instant::now);
         let step = self.admit_step(&batch, &lane, &work)?;
         scope.step = Some(step.clone());
         let mut wave = self.prepare_wave(&step)?;
@@ -353,6 +368,9 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             &lane,
         )?;
         let uploads = self.binding.input_uploads(&work)?;
+        let admission_wave_us =
+            initial_admission_us.saturating_add(host_wall_us(admission_started));
+        let encode_started = trace_enabled.then(Instant::now);
         let dispatch = OperationDispatch::encode_and_submit_wave_with_inputs(
             self.providers.providers(),
             &self.executable,
@@ -374,6 +392,8 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                 })
             }
         };
+        let encode_submit_us = host_wall_us(encode_started);
+        let wait_started = trace_enabled.then(Instant::now);
         let observed = match handle.wait_with_managed_readbacks(readbacks) {
             Ok(observed) => observed,
             Err(source) => {
@@ -425,12 +445,31 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                 retirement: scope,
             });
         }
+        let wait_readback_us = host_wall_us(wait_started);
+        let drop_started = trace_enabled.then(Instant::now);
         drop((handle, active, identity, uploads, batch, lane));
+        // This drops execution owners, not a promise that all native owners
+        // disappear here: the step may retain them until normal retirement.
+        let drop_lane_us = host_wall_us(drop_started);
+        let retire_started = trace_enabled.then(Instant::now);
         if let Err(source) = scope.finish_with_request(persistent_request) {
             return Err(TensorExecutionError::Retirement {
                 source,
                 retirement: scope,
             });
+        }
+        let retire_us = host_wall_us(retire_started);
+        if trace_enabled {
+            tracing::debug!(
+                admission_wave_us,
+                lane_create_us,
+                encode_submit_us,
+                wait_readback_us,
+                drop_lane_us,
+                retire_us,
+                total_host_us = host_wall_us(total_started),
+                "tensor execution host timing through retirement"
+            );
         }
         outputs
             .iter()
@@ -452,6 +491,12 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             })
             .collect()
     }
+}
+
+fn host_wall_us(started: Option<Instant>) -> u64 {
+    started.map_or(0, |started| {
+        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+    })
 }
 
 /// The exact step/session ownership of a failed or nonterminal job. After

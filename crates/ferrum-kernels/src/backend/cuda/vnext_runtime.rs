@@ -4859,14 +4859,31 @@ impl DeviceRuntime for CudaDeviceRuntime {
             })
             .map_err(|_| CudaDeviceRuntimeError::contract("CUDA stream identity exhausted"))?;
         let create = || {
+            let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
+            let stream_started = trace_enabled.then(Instant::now);
             let stream = self
                 .context
                 .new_stream()
                 .map_err(|error| CudaDeviceRuntimeError::driver("stream creation", error))?;
+            let stream_create_us = stream_started.map_or(0, |started| {
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+            });
+            let blas_started = trace_enabled.then(Instant::now);
             let blas =
                 Arc::new(CudaBlas::new(Arc::clone(&stream)).map_err(|error| {
                     CudaDeviceRuntimeError::blas("cuBLAS handle creation", error)
                 })?);
+            if trace_enabled {
+                tracing::debug!(
+                    stream_id = id,
+                    runtime_instance = self.runtime_instance,
+                    stream_create_us,
+                    blas_create_us = blas_started.map_or(0, |started| {
+                        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+                    }),
+                    "CUDA stream native creation host timing"
+                );
+            }
             Ok((stream, blas))
         };
         let ((stream, blas), tensor_lane) = if let Some(owner) = &self.tensor_eager {
