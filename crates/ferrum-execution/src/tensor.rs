@@ -329,7 +329,9 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             .zip(claims)
             .map(|((_, request), claim)| Ok((request.clone(), claim.allocate_zeroed()?)))
             .collect::<Result<Vec<_>, HostMemoryError>>()?;
+        let readback_prepare_us = host_wall_us(total_started);
 
+        let sequence_started = trace_enabled.then(Instant::now);
         let session = match request_session {
             Some(session) => session,
             None => self
@@ -341,6 +343,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             session: Some(session),
         };
         let batch = ExecutionBatchParticipants::new(vec![scope.session()?.clone()])?;
+        let sequence_admission_us = host_wall_us(sequence_started);
         let initial_admission_us = host_wall_us(total_started);
         let lane_started = trace_enabled.then(Instant::now);
         let lane = self
@@ -351,6 +354,8 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         let admission_started = trace_enabled.then(Instant::now);
         let step = self.admit_step(&batch, &lane, &work)?;
         scope.step = Some(step.clone());
+        let step_admission_us = host_wall_us(admission_started);
+        let wave_started = trace_enabled.then(Instant::now);
         let mut wave = self.prepare_wave(&step)?;
         if let Some((target, mappings)) = initialize {
             wave.initialize_tensor_request_state(
@@ -360,6 +365,8 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             )?;
         }
         drop(step);
+        let wave_prepare_us = host_wall_us(wave_started);
+        let identity_started = trace_enabled.then(Instant::now);
         let active = TrustedActiveSequenceBinding::from_session(scope.session()?)?;
         let identity = OperationDispatch::bind_submission_wave_identity(
             &self.executable,
@@ -367,7 +374,10 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             &wave,
             &lane,
         )?;
+        let identity_bind_us = host_wall_us(identity_started);
+        let uploads_started = trace_enabled.then(Instant::now);
         let uploads = self.binding.input_uploads(&work)?;
+        let uploads_prepare_us = host_wall_us(uploads_started);
         let admission_wave_us =
             initial_admission_us.saturating_add(host_wall_us(admission_started));
         let encode_started = trace_enabled.then(Instant::now);
@@ -462,6 +472,12 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         if trace_enabled {
             tracing::debug!(
                 admission_wave_us,
+                readback_prepare_us,
+                sequence_admission_us,
+                step_admission_us,
+                wave_prepare_us,
+                identity_bind_us,
+                uploads_prepare_us,
                 lane_create_us,
                 encode_submit_us,
                 wait_readback_us,

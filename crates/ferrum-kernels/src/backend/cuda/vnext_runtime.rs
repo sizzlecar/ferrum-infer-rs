@@ -4760,8 +4760,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .checked_add(extra_alignment)
             .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA allocation size overflows"))?;
         let allocation_bytes = checked_usize(allocation_bytes, "CUDA allocation size")?;
+        let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        let allocation_started = trace_enabled.then(Instant::now);
         let base = unsafe { self.allocation_stream.alloc::<u8>(allocation_bytes) }
             .map_err(|error| CudaDeviceRuntimeError::driver("allocation", error))?;
+        let alloc_us = allocation_started.map_or(0, |started| {
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
         let (base_ptr, base_use) = base.device_ptr(&self.allocation_stream);
         drop(base_use);
         let alignment = request.alignment_bytes();
@@ -4774,9 +4779,22 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .checked_add(alignment - 1)
             .map(|pointer| pointer & !(alignment - 1))
             .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA aligned pointer overflows"))?;
+        let synchronization_started = trace_enabled.then(Instant::now);
         self.allocation_stream
             .synchronize()
             .map_err(|error| CudaDeviceRuntimeError::driver("allocation synchronization", error))?;
+        if trace_enabled {
+            tracing::debug!(
+                runtime_instance = self.runtime_instance,
+                resource_id = %request.resource_id(),
+                allocation_bytes,
+                alloc_us,
+                sync_us = synchronization_started.map_or(0, |started| {
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+                }),
+                "CUDA allocation host timing"
+            );
+        }
         let descriptor = BufferDescriptor {
             resource_id: request.resource_id().clone(),
             size_bytes: request.size_bytes(),
