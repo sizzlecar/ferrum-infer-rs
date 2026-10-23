@@ -175,7 +175,7 @@ fn sm120_rebuilds_verified_production_sources_with_fp8_before_linking() {
 }
 
 #[test]
-fn publishing_keeps_sm120_archive_identity_without_claiming_runtime_validation() {
+fn staging_preserves_sm120_identity_and_requires_manual_runtime_before_publication() {
     let delivery = workflow("release-delivery.yml");
     let tasks = &delivery["jobs"]["tasks"];
     let publish = &delivery["jobs"]["publish"];
@@ -192,6 +192,28 @@ fn publishing_keeps_sm120_archive_identity_without_claiming_runtime_validation()
     assert!(
         inspect.contains("--output \"$RUNNER_TEMP/installation/cuda-sm120.json\" --extract-only")
     );
+    let prepare_sm120 = steps(tasks)
+        .iter()
+        .find(|step| {
+            step["name"] == "Prepare required SM120 tasks against the final archive binary"
+        })
+        .unwrap();
+    assert_eq!(
+        prepare_sm120["if"],
+        "needs.prepare.outputs.sm120_runtime_required == 'true'"
+    );
+    let command = prepare_sm120["run"].as_str().unwrap();
+    assert!(command.contains("--backend cuda --cuda-lane local"));
+    assert!(command
+        .contains("--abi \"$RUNNER_TEMP/staged/ferrum-linux-x86_64-cuda-sm120.tar.gz.abi.json\""));
+    assert!(steps(tasks).iter().any(|step| {
+        step["with"]["name"] == "release-cuda-sm120-tasks"
+            && step["with"]["path"] == "${{ runner.temp }}/tasks-sm120/"
+    }));
+    assert!(publish["if"]
+        .as_str()
+        .unwrap()
+        .contains("needs.prepare.outputs.sm120_runtime_required == 'false'"));
     let accept = script(publish, "gate_args=(");
     assert!(accept.contains("--tasks \"$RUNNER_TEMP/tasks/tasks.json\""));
     assert!(!accept.contains("release-cuda-sm120-evidence"));
@@ -231,6 +253,9 @@ fn publishing_keeps_sm120_archive_identity_without_claiming_runtime_validation()
     assert!(accept.contains("--notes \"$RUNNER_TEMP/plan/release-notes.md\""));
     let notes = preparation[notes_step]["run"].as_str().unwrap();
     assert!(notes.contains("Model execution and public SM120 installation/startup are not run"));
+    assert!(notes.contains(
+        "Text-model tasks do not establish image generation or image editing validation"
+    ));
     assert!(script(&delivery["jobs"]["complete"], "test \"$PREPARE\"")
         .contains("SM120 model execution and public installation/startup: not_run"));
 }
@@ -305,7 +330,7 @@ fn read_capability(
 
 #[cfg(unix)]
 #[test]
-fn candidate_policy_preserves_legacy_requirements_and_fails_before_runner_queue() {
+fn candidate_policy_preserves_legacy_scope_and_allows_required_archive_staging() {
     let staging = workflow("release-cuda.yml");
     let current = serde_yaml::to_string(&staging).unwrap();
     let mut required = staging.clone();
@@ -321,18 +346,20 @@ fn candidate_policy_preserves_legacy_requirements_and_fails_before_runner_queue(
         .remove(key("cuda_sm120_asset_id"));
     let required = serde_yaml::to_string(&required).unwrap();
     let legacy = serde_yaml::to_string(&legacy).unwrap();
+    let unavailable = "'on': {workflow_call: {outputs: {cuda_sm120_asset_id: {value: asset}, cuda_sm120_runtime_policy: {value: not_run_hardware_unavailable}, cuda_sm120_runtime_reason: {value: 'No approved device.'}}}}\n";
     for verify in [false, true] {
-        let (result, output) = read_capability(Some(&current), None, false, verify);
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        assert!(output.contains("sm120_required=true\nsm120_runtime_required=false\nsm120_runtime_policy=not_run_hardware_unavailable\n"));
-        assert!(output.contains("sm120_runtime_reason=SM120 hardware is unavailable"));
-        let (result, _) = read_capability(Some(&required), None, false, verify);
-        assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).contains("no approved SM120 runner"));
+        for source in [&current, &required] {
+            let (result, output) = read_capability(Some(source), None, false, verify);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(output, "sm120_required=true\nsm120_runtime_required=true\nsm120_runtime_policy=required\nsm120_runtime_reason=\n");
+        }
+        let (result, output) = read_capability(Some(unavailable), None, false, verify);
+        assert!(result.status.success());
+        assert_eq!(output, "sm120_required=true\nsm120_runtime_required=false\nsm120_runtime_policy=not_run_hardware_unavailable\nsm120_runtime_reason=No approved device.\n");
     }
     for source in [Some(legacy.as_str()), None] {
         let (result, output) = read_capability(source, None, false, true);
@@ -345,14 +372,14 @@ fn candidate_policy_preserves_legacy_requirements_and_fails_before_runner_queue(
     }
     // The source under candidate/, not the executing workflow checkout, owns
     // historical requirements. Missing policy on 0.13 remains Required.
-    let (result, output) = read_capability(Some(&required), Some(&current), true, false);
+    let (result, output) = read_capability(Some(&required), Some(unavailable), true, false);
     assert!(
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(output, "sm120_required=true\nsm120_runtime_required=true\nsm120_runtime_policy=required\nsm120_runtime_reason=\n");
-    let (result, output) = read_capability(Some(&current), Some(&required), true, false);
+    let (result, output) = read_capability(Some(unavailable), Some(&required), true, false);
     assert!(result.status.success());
     assert!(output.contains("sm120_required=true\nsm120_runtime_required=false\n"));
     let (result, output) = read_capability(Some(&legacy), Some(&required), true, false);
@@ -445,6 +472,105 @@ fn resume_keeps_required_sm120_task_and_installation_evidence() {
     assert!(!run("false", "123").status.success());
     assert!(!run("", "").status.success());
     assert!(!run("unknown", "").status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_replaces_extract_only_sm120_receipt_only_when_runtime_is_required() {
+    use std::process::Command;
+    let resume = workflow("release-resume.yml");
+    let accept = script(&resume["jobs"]["publish"], "gate_args=(");
+    let start = accept.find("for install in ").unwrap();
+    let end = start + accept[start..].find("\ndone").unwrap() + "\ndone".len();
+    let command = format!(
+        "gate_args=()\n{}\nprintf '%s\\n' \"${{gate_args[@]}}\"",
+        &accept[start..end]
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let installation = dir.path().join("installation");
+    fs::create_dir(&installation).unwrap();
+    for name in ["cpu.json", "cuda.json", "cuda-sm120.json"] {
+        fs::write(installation.join(name), "{}").unwrap();
+    }
+    for required in ["true", "false"] {
+        let output = Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                &command,
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("SM120_RUNTIME_REQUIRED", required)
+            .env("RUNNER_TEMP", dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        let receipts: Vec<_> = output
+            .lines()
+            .filter(|arg| *arg != "--installation")
+            .map(|arg| Path::new(arg).file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(receipts.contains(&"cpu.json"));
+        assert!(!receipts.contains(&"cuda.json"));
+        assert_eq!(receipts.contains(&"cuda-sm120.json"), required == "false");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn required_sm120_cannot_complete_without_runtime_or_public_installation_evidence() {
+    use std::process::Command;
+    let delivery = workflow("release-delivery.yml");
+    let command = script(&delivery["jobs"]["complete"], "test \"$PREPARE\"");
+    let dir = tempfile::tempdir().unwrap();
+    let summary = dir.path().join("summary.md");
+    for verify_only in [false, true] {
+        fs::write(&summary, "").unwrap();
+        let output = Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                command,
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("PREPARE", "success")
+            .env("ACTIVE", if verify_only { "false" } else { "true" })
+            .env("VERIFY_ONLY", if verify_only { "true" } else { "false" })
+            .env("PUBLISH", "skipped")
+            .env("VERSION", "2.3.4")
+            .env("SM120_REQUIRED", "true")
+            .env("SM120_RUNTIME_REQUIRED", "true")
+            .env("SM120_RUNTIME_POLICY", "required")
+            .env("SM120_RUNTIME_REASON", "")
+            .env("CARGO_INSTALL", "success")
+            .env("BREW_INSTALL", "success")
+            .env("UNIX_BOOTSTRAP", "success")
+            .env("WINDOWS_BOOTSTRAP", "success")
+            .env("GITHUB_STEP_SUMMARY", &summary)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let summary = fs::read_to_string(&summary).unwrap();
+        if verify_only {
+            assert!(summary.contains("Public SM120 installation/startup still requires"));
+        } else {
+            assert!(
+                summary.contains("Publication is blocked pending required SM120 runtime evidence")
+            );
+            assert!(summary.contains("image generation/editing"));
+        }
+    }
 }
 
 #[cfg(unix)]

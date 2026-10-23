@@ -46,10 +46,7 @@ on:
         value: ${{ jobs.linux-x86_64-cuda-sm120.outputs.asset_id }}
       cuda_sm120_runtime_policy:
         description: Candidate-bound SM120 runtime validation scope
-        value: not_run_hardware_unavailable
-      cuda_sm120_runtime_reason:
-        description: Why this candidate has no SM120 runtime validation
-        value: 'SM120 hardware is unavailable in the approved fleet (local host, RTX 4060 and Mac mini 2); this candidate is not runtime validated on SM120.'
+        value: required
       windows_asset_id:
         description: Windows ZIP, installer, stable launcher and staging byte receipts
         value: ${{ jobs.windows-x86_64-cuda-sm89.outputs.asset_id }}
