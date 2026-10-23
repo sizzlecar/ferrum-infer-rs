@@ -10,8 +10,10 @@
 use ferrum_runtime::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 
 mod conversion;
+mod host_cache;
 mod plan;
 mod quality;
 mod source;
@@ -40,6 +42,7 @@ pub struct Bf16WholeTensorFp8Materializer {
     descriptor: WeightMaterializerDescriptor,
     host: HostMemoryAccount,
     groups: Vec<Vec<WeightId>>,
+    host_cache: Option<host_cache::HostCache>,
 }
 
 impl Bf16WholeTensorFp8Materializer {
@@ -83,6 +86,7 @@ impl Bf16WholeTensorFp8Materializer {
                 include_bytes!("bf16_whole_tensor_fp8.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/plan.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/conversion.rs"),
+                include_bytes!("bf16_whole_tensor_fp8/host_cache.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/quality.rs"),
             ]),
             WeightMaterializationFidelity::Approximate,
@@ -93,7 +97,42 @@ impl Bf16WholeTensorFp8Materializer {
             descriptor,
             host,
             groups,
+            host_cache: None,
         })
+    }
+
+    /// Retain successful converted groups in this materializer's bounded LRU.
+    /// Clones supplied to uploads keep the original WeightBacking charge after
+    /// eviction. A group larger than this cap converts normally without caching.
+    /// Source mappings remain independently retained, immutable mmap owners.
+    pub fn with_host_cache(mut self, maximum_bytes: NonZeroU64) -> Result<Self, VNextError> {
+        if maximum_bytes.get()
+            > self
+                .host
+                .limits()
+                .class_bytes(HostMemoryClass::WeightBacking) as u64
+            || maximum_bytes.get() > self.host.limits().total_bytes() as u64
+        {
+            return Err(invalid(
+                "Host conversion cache exceeds its WeightBacking or total allowance",
+            ));
+        }
+        self.host_cache = Some(host_cache::HostCache::new(
+            maximum_bytes,
+            format!(
+                "{}:{}",
+                self.descriptor.id(),
+                self.descriptor.implementation_fingerprint()
+            ),
+        ));
+        Ok(self)
+    }
+
+    /// Metadata-only bytes for all complete converted groups. Original borrowed
+    /// components, mmap RSS and concurrent transfer/temporary allocations are
+    /// excluded; the composition must separately budget those live owners.
+    pub fn converted_cache_bytes(&self, family: &PreparedModelFamily) -> Result<u64, VNextError> {
+        Ok(plan::prepare(family, &self.groups)?.converted_bytes)
     }
 
     /// Small fixed conversion evidence bound to this implementation and the
@@ -176,7 +215,16 @@ impl WeightMaterializer for Bf16WholeTensorFp8Materializer {
         sources: &[&WeightComponentSpec],
         outputs: &[&WeightComponentSpec],
     ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
-        conversion::materialize(&self.host, source, sources, outputs)
+        match &self.host_cache {
+            Some(cache) => conversion::materialize_with_cache(
+                &self.host,
+                source,
+                sources,
+                outputs,
+                Some(cache),
+            ),
+            None => conversion::materialize(&self.host, source, sources, outputs),
+        }
     }
 }
 

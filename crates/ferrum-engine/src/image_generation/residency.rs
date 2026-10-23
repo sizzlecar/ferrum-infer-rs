@@ -20,6 +20,9 @@ pub enum ImageResidencyPolicy {
     /// every other stage. Noise stays cold. This does not imply that all model
     /// weights and the active stage's dynamic backing fit a given device.
     AllModelComponents,
+    /// Also retain weightless stage sessions. Each invocation still consumes
+    /// fresh request inputs; dynamic backing follows its separate policy.
+    AllStages,
 }
 
 impl ImageResidencyPolicy {
@@ -30,6 +33,7 @@ impl ImageResidencyPolicy {
                 matches!(stage, ImageStage::Denoiser | ImageStage::Decoder)
             }
             Self::AllModelComponents => !matches!(stage, ImageStage::Noise),
+            Self::AllStages => true,
         }
     }
 }
@@ -50,6 +54,8 @@ pub struct ImageStageRetentionBudgets {
     pub denoiser: Option<NonZeroU64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decoder: Option<NonZeroU64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise: Option<NonZeroU64>,
 }
 impl ImageStageRetentionBudgets {
     pub fn maximum_bytes(self, stage: ImageStage) -> u64 {
@@ -59,7 +65,7 @@ impl ImageStageRetentionBudgets {
             ImageStage::VaeEncoder => self.vae_encoder,
             ImageStage::Denoiser => self.denoiser,
             ImageStage::Decoder => self.decoder,
-            ImageStage::Noise => None,
+            ImageStage::Noise => self.noise,
         }
         .map_or(0, NonZeroU64::get)
     }
@@ -138,7 +144,7 @@ impl ImageDynamicResidencyPolicy {
             Self::RetainDecoder { maximum_bytes } if stage == ImageStage::Decoder => maximum_bytes,
             Self::RetainSmallStages {
                 maximum_bytes_per_stage,
-            } if stage != ImageStage::Noise => maximum_bytes_per_stage,
+            } => maximum_bytes_per_stage,
             Self::RetainStageBudgets {
                 maximum_bytes_by_stage,
             } => maximum_bytes_by_stage.maximum_bytes(stage),
@@ -147,12 +153,13 @@ impl ImageDynamicResidencyPolicy {
     }
 }
 
-const RETAINABLE_STAGES: [ImageStage; 5] = [
+const RETAINABLE_STAGES: [ImageStage; 6] = [
     ImageStage::TextEncoder,
     ImageStage::VisionEncoder,
     ImageStage::VaeEncoder,
     ImageStage::Denoiser,
     ImageStage::Decoder,
+    ImageStage::Noise,
 ];
 
 fn resident_stage_index(stage: ImageStage) -> Option<usize> {
@@ -172,8 +179,9 @@ pub(super) struct ResidentStages<R: DeviceRuntime> {
     vae_encoder: Option<ActiveImageStage<R>>,
     denoiser: Option<ActiveImageStage<R>>,
     decoder: Option<ActiveImageStage<R>>,
+    noise: Option<ActiveImageStage<R>>,
     /// Last successful idle-retention receipts, including older shapes' pools.
-    dynamic_bytes: [u64; 5],
+    dynamic_bytes: [u64; 6],
     text_encoder_weights: Option<ResidentWeights<R>>,
     vision_encoder_weights: Option<ResidentWeights<R>>,
     vae_encoder_weights: Option<ResidentWeights<R>>,
@@ -192,7 +200,8 @@ impl<R: DeviceRuntime> ResidentStages<R> {
             vae_encoder: None,
             denoiser: None,
             decoder: None,
-            dynamic_bytes: [0; 5],
+            noise: None,
+            dynamic_bytes: [0; 6],
             text_encoder_weights: None,
             vision_encoder_weights: None,
             vae_encoder_weights: None,
@@ -217,7 +226,7 @@ impl<R: DeviceRuntime> ResidentStages<R> {
             ImageStage::VaeEncoder => Some(&mut self.vae_encoder),
             ImageStage::Denoiser => Some(&mut self.denoiser),
             ImageStage::Decoder => Some(&mut self.decoder),
-            _ => None,
+            ImageStage::Noise => Some(&mut self.noise),
         }
     }
     fn dynamic_bytes(&self, stage: ImageStage) -> u64 {
@@ -243,7 +252,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 ImageStage::VaeEncoder => &self.resident_stages.vae_encoder,
                 ImageStage::Denoiser => &self.resident_stages.denoiser,
                 ImageStage::Decoder => &self.resident_stages.decoder,
-                ImageStage::Noise => unreachable!("noise is never resident"),
+                ImageStage::Noise => &self.resident_stages.noise,
             };
             if let Some(previous) = previous {
                 if same_resident_plan(&previous.receipt.plan, &prepared.plan) {
@@ -465,6 +474,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         job: u64,
         stages: &mut Vec<ImageStageReceipt>,
     ) -> Result<ActiveImageStage<R>, ImageGenerationFailure<R>> {
+        let weightless = matches!(prepared.component.family().weights(), ModelWeights::None);
         if self.config.residency.retains(prepared.plan.stage) {
             if let Some(previous) = self
                 .resident_stages
@@ -477,7 +487,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 previous.receipt.execution_wall_durations_us.clear();
                 previous.receipt.initialization_wall_duration_us = 0;
                 previous.receipt.session_reused = true;
-                previous.receipt.weights_reused = true;
+                previous.receipt.weights_reused = !matches!(
+                    previous
+                        .session
+                        .executable()
+                        .execution_plan()
+                        .payload()
+                        .execution_weights(),
+                    ExecutionWeights::None
+                );
                 if same_resident_plan(&previous.receipt.plan, &prepared.plan) {
                     previous.receipt.plan = prepared.plan;
                     return Ok(previous);
@@ -501,6 +519,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 // cold fallback can silently replace the selected installation.
                 return prepared.start_attached(self, job, &weights);
             }
+        }
+        if weightless {
+            // A weightless contract has no Stored snapshot to share. Its normal
+            // managed session may still retain idle dynamic pools between runs.
+            return prepared.start(self, job, ComponentWeightSource::None);
         }
         // Keep the archive's optional implicit dtype conversion out of the
         // managed FP8 conversion path. These wrappers borrow the original mmap
@@ -634,6 +657,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// returned error retains the original failed owner; the pipeline retains
     /// any other session not yet closed. Keeping only an error string loses
     /// that recovery authority. Already returned Host outputs remain valid.
+    /// Converted-weight Host caches belong to the materializer/compiled-plan
+    /// owners and remain charged until those owners, including this pipeline,
+    /// are dropped; closing device sessions does not imply Host cache release.
     pub fn shutdown(&mut self) -> Result<Vec<ImageStageReceipt>, ImageGenerationError<R>> {
         self.stopped = true;
         let mut completed_stages = Vec::new();
@@ -643,6 +669,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             ImageStage::VaeEncoder,
             ImageStage::Denoiser,
             ImageStage::Decoder,
+            ImageStage::Noise,
         ] {
             if let Some(mut active) = self.resident_stages.slot(stage).and_then(Option::take) {
                 active.receipt.completed_executions = 0;
@@ -650,7 +677,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 active.receipt.initialization_wall_duration_us = 0;
                 active.receipt.plan.compile_wall_duration_us = 0;
                 active.receipt.session_reused = true;
-                active.receipt.weights_reused = true;
+                active.receipt.weights_reused = !matches!(
+                    active
+                        .session
+                        .executable()
+                        .execution_plan()
+                        .payload()
+                        .execution_weights(),
+                    ExecutionWeights::None
+                );
                 match active.close() {
                     Ok(receipt) => {
                         completed_stages.push(receipt);

@@ -4,6 +4,9 @@ use half::bf16;
 use safetensors::tensor::{serialize_to_file, TensorView};
 use safetensors::Dtype;
 
+#[path = "host_cache_tests.rs"]
+mod host_cache_tests;
+
 fn id<T: TryFrom<String>>(value: impl Into<String>) -> T
 where
     T::Error: std::fmt::Debug,
@@ -335,6 +338,7 @@ fn schema_preserves_three_dense_nodes_with_distinct_scales_and_untouched_bf16() 
     }
     assert_eq!(scales.len(), 3);
     assert_eq!(prepared.maximum_group_bytes, 24);
+    assert_eq!(prepared.converted_bytes, 24);
     assert_eq!(prepared.execution_weight_bytes().unwrap(), 32);
     assert_eq!(program.blocks()[0].nodes.len(), 4);
     assert!(prepared

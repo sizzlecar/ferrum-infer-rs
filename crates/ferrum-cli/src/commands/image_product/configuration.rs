@@ -136,6 +136,9 @@ pub struct CudaConfig {
     /// Changes only TE/DiT Linear precision; no implicit lifetime/attention change.
     #[serde(default)]
     pub precision_policy: ferrum_engine::image_generation::ImageCudaPrecisionPolicy,
+    /// Converted weights remain in the managed Host WeightBacking account.
+    #[serde(default)]
+    pub fp8_host_cache: ferrum_engine::image_generation::ImageFp8HostCachePolicy,
     pub host: HostConfig,
     pub pipeline: PipelineConfig,
 }
@@ -344,7 +347,8 @@ impl ImageProductConfig {
             cuda.cudnn.dependency_libraries.len() <= 16,
             "cuDNN dependency list exceeds 16 libraries"
         );
-        cuda.host.limits()?;
+        cuda.fp8_host_cache
+            .validate(cuda.precision_policy, cuda.host.limits()?)?;
         if cuda.precision_policy
             == ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1
         {
@@ -370,6 +374,7 @@ impl ImageProductConfig {
                     ImageExecutionProfile::ExperimentalResidentV1,
                     ImageResidencyPolicy::DenoiserAndDecoder
                         | ImageResidencyPolicy::AllModelComponents
+                        | ImageResidencyPolicy::AllStages
                 ) | (
                     ImageExecutionProfile::ExperimentalSerialCold
                         | ImageExecutionProfile::ExperimentalBatchedCold,
@@ -460,6 +465,7 @@ impl CudaConfig {
                 opaque_memory_profile: self.opaque_memory_profile.clone(),
                 attention_policy: self.attention_policy,
                 precision_policy: self.precision_policy,
+                fp8_host_cache: self.fp8_host_cache,
                 cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
                     library_path: self.cudnn.library_path.clone(),
                     dependency_libraries: self.cudnn.dependency_libraries.clone(),

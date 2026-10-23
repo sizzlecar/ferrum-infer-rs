@@ -11,6 +11,7 @@ use ferrum_runtime::*;
 mod admission;
 mod request;
 mod serial_actor;
+mod wave_identity;
 pub use ferrum_runtime::TensorRequestStateMapping;
 pub use request::{TensorRequestCloseFailure, TensorRequestSession};
 pub use serial_actor::{TensorSerialActor, TensorSerialActorStreamRequirements};
@@ -194,6 +195,7 @@ pub struct PreparedTensorExecutor<R: DeviceRuntime> {
     outputs: Vec<(CompiledTensorPort, CompletionReadbackRequest)>,
     reaper: Arc<CompletionReaper<R>>,
     config: TensorExecutorConfig,
+    wave_identity: wave_identity::TensorWaveIdentityCache<R>,
 }
 
 impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
@@ -278,6 +280,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             outputs,
             reaper: CompletionReaper::new(),
             config,
+            wave_identity: wave_identity::TensorWaveIdentityCache::default(),
         })
     }
 
@@ -409,8 +412,12 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         let wave_prepare_us = host_wall_us(wave_started);
         let identity_started = trace_enabled.then(Instant::now);
         let active = TrustedActiveSequenceBinding::from_session(scope.session()?)?;
-        let identity = OperationDispatch::bind_submission_wave_identity(
-            &self.executable,
+        // Admission above still proves the lane's exact runtime and physical
+        // owners. Only the immutable node/provider identity is reused here;
+        // each bind checks this wave's live request, work and frame authority.
+        let topology = self.wave_identity.get_or_compile(&self.executable, &lane)?;
+        let identity = OperationDispatch::bind_compiled_submission_wave_identity(
+            topology,
             std::iter::once(&active),
             &wave,
             &lane,

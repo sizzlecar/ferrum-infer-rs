@@ -7,9 +7,9 @@
 //! Opaque allowances are declarations, not measured memory qualification.
 
 use super::{
-    ImageCudaAttentionPolicy, ImageCudaPrecisionPolicy, ImagePipelineConfig, ImageStreamLimit,
-    ImageStreamPlan, ImageStreamRequirements, QwenImage21Assets, QwenImage21Pipeline,
-    QwenImage21Profiles,
+    ImageCudaAttentionPolicy, ImageCudaPrecisionPolicy, ImageFp8HostCachePolicy,
+    ImagePipelineConfig, ImageStreamLimit, ImageStreamPlan, ImageStreamRequirements,
+    QwenImage21Assets, QwenImage21Pipeline, QwenImage21Profiles,
 };
 use anyhow::{ensure, Context, Result};
 use ferrum_diffusion::Bf16EulerProfile;
@@ -109,6 +109,7 @@ pub struct ImageCudaCompositionReceipt {
     pub cudnn_workspace_limit_bytes: u64,
     pub attention_policy: ImageCudaAttentionPolicy,
     pub precision_policy: ImageCudaPrecisionPolicy,
+    pub fp8_host_cache: ImageFp8HostCachePolicy,
     /// This CUTLASS bridge cannot prove native unload, so its declared module
     /// claim remains retained until process exit; tensor payloads retire normally.
     pub fp8_opaque_memory_bytes: u64,
@@ -133,6 +134,7 @@ pub struct QwenImage21CudaConfig {
     pub cudnn: CudaCudnnConfig,
     pub attention_policy: ImageCudaAttentionPolicy,
     pub precision_policy: ImageCudaPrecisionPolicy,
+    pub fp8_host_cache: ImageFp8HostCachePolicy,
     pub host: HostMemoryLimits,
     pub pipeline: ImageCudaPipelineLimits,
 }
@@ -153,6 +155,8 @@ impl QwenImage21CudaConfig {
     /// and ordinary Host/device admission before their execution.
     pub fn validate(&self) -> Result<()> {
         self.pipeline.validate()?;
+        self.fp8_host_cache
+            .validate(self.precision_policy, self.host)?;
         let maximum_streams = self.stream_plan()?.resolved_streams();
         ensure!(
             self.pipeline.edit_prefix_policy != super::ImageEditPrefixPolicy::RequestCache
@@ -315,6 +319,7 @@ impl QwenImage21CudaConfig {
             cudnn_workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
             attention_policy: self.attention_policy,
             precision_policy: self.precision_policy,
+            fp8_host_cache: self.fp8_host_cache,
             fp8_opaque_memory_bytes: self.precision_policy.additional_opaque_bytes(),
             attention_opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
             runtime_opaque_profile: self.opaque_memory_profile.clone(),
@@ -496,24 +501,55 @@ impl QwenImage21CudaConfig {
         let materializers = if self.precision_policy == ImageCudaPrecisionPolicy::Bf16 {
             WeightMaterializerRegistry::identity_only()?
         } else {
-            let text_materializer = super::precision::materializer(
+            let mut text_materializer = super::precision::materializer(
                 super::precision::TEXT_MATERIALIZER,
                 host,
                 Qwen3VLTextEncoderFamily::fp8_weight_groups(&text)?,
             )?;
-            let dit_materializer = super::precision::materializer(
+            let mut dit_materializer = super::precision::materializer(
                 super::precision::DIT_MATERIALIZER,
                 host,
                 QwenImage21TransformerFamily::fp8_weight_groups(&dit)?,
             )?;
             // Physical execution-schema lower bounds include every required scale
             // scalar. They are not peak/alignment/activation estimates.
-            for (index, family, materializer) in [
-                (0, &families[0], &text_materializer),
-                (1, &families[2], &dit_materializer),
+            let mut maximum_group_bytes = 0;
+            for (index, stage, family, materializer) in [
+                (
+                    0,
+                    super::ImageStage::TextEncoder,
+                    &families[0],
+                    &text_materializer,
+                ),
+                (
+                    1,
+                    super::ImageStage::Denoiser,
+                    &families[2],
+                    &dit_materializer,
+                ),
             ] {
                 super::precision::validate_backing(family, materializer, host)?;
+                maximum_group_bytes =
+                    maximum_group_bytes.max(materializer.maximum_group_backing_bytes(family)?);
+                if self.fp8_host_cache.maximum_bytes(stage).is_some() {
+                    self.fp8_host_cache
+                        .validate_stage(stage, materializer.converted_cache_bytes(family)?)?;
+                }
                 execution_bytes[index] = materializer.execution_weight_bytes(family)?;
+            }
+            self.fp8_host_cache
+                .validate_peak(self.host, maximum_group_bytes)?;
+            if let Some(capacity) = self
+                .fp8_host_cache
+                .maximum_bytes(super::ImageStage::TextEncoder)
+            {
+                text_materializer = text_materializer.with_host_cache(capacity)?;
+            }
+            if let Some(capacity) = self
+                .fp8_host_cache
+                .maximum_bytes(super::ImageStage::Denoiser)
+            {
+                dit_materializer = dit_materializer.with_host_cache(capacity)?;
             }
             WeightMaterializerRegistry::new(vec![
                 Box::new(text_materializer),
@@ -718,6 +754,7 @@ mod tests {
             opaque_memory_profile: "experimental-unqualified-test-v1".into(),
             attention_policy: ImageCudaAttentionPolicy::Sequential,
             precision_policy: ImageCudaPrecisionPolicy::Bf16,
+            fp8_host_cache: ImageFp8HostCachePolicy::Off,
             cudnn: CudaCudnnConfig {
                 library_path: "/explicit/libcudnn.so.9".into(),
                 dependency_libraries: Vec::new(),

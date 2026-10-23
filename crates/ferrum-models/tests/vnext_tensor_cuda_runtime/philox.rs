@@ -281,6 +281,17 @@ fn exercise_shape(
         }
         drop(outputs);
         assert_eq!(host.usage().unwrap().allocated_bytes(), output_bytes + 16);
+        // Retain the idle managed pools, including the uploaded state buffer.
+        // Next execution must overwrite state from its explicit seed input.
+        let retained = resources
+            .try_retain_idle_dynamic_backing(
+                plan.payload().memory().minimum_runnable_request_bytes(),
+            )
+            .unwrap();
+        assert!(
+            matches!(retained, IdleDynamicBackingOutcome::Retained(receipt)
+            if receipt.retained_bytes() > 0)
+        );
     }
     drop(seed);
     let baseline = first.unwrap();
@@ -299,6 +310,30 @@ fn exercise_shape(
         "changing only the seed high word had no effect"
     );
     drop(changed);
+    // A -> B -> A must match the original A, and releasing backing must not
+    // change the next cold draw. No prompt/seed/output result is cached.
+    for (suffix, release) in [("restored", false), ("cold_again", true)] {
+        if release {
+            let released = resources.try_release_idle_dynamic_backing().unwrap();
+            assert!(
+                matches!(released, IdleDynamicReleaseOutcome::Released(receipt)
+                if receipt.reclaimed_bytes() > 0)
+            );
+        }
+        let restored = executor
+            .execute(
+                id(format!("run.cuda.philox.{label}.{suffix}")),
+                id(format!("request.cuda.philox.{label}.{suffix}")),
+                vec![state_input(&host, SEED)],
+            )
+            .unwrap();
+        assert_eq!(
+            restored[0].bytes().bytes(),
+            baseline.bytes(),
+            "fresh seed changed after a different seed or idle backing release"
+        );
+        drop(restored);
+    }
     managed_layout_check(&host, geometry.shape(), &baseline);
     assert_eq!(host.usage().unwrap().allocated_bytes(), output_bytes);
     let launch = CudaPhiloxDeviceGeometry::query(runtime)

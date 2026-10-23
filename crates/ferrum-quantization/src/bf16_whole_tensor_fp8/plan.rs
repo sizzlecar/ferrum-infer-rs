@@ -4,6 +4,7 @@ pub(super) struct Prepared {
     pub schema: WeightSchema,
     pub sources: BTreeMap<WeightId, Vec<WeightId>>,
     pub maximum_group_bytes: u64,
+    pub converted_bytes: u64,
 }
 
 impl Prepared {
@@ -78,6 +79,7 @@ pub(super) fn prepare_program(
         .collect();
     let mut used_sources = BTreeSet::new();
     let mut maximum_group_bytes = 0;
+    let mut converted_bytes = 0_u64;
     for group in groups {
         let mut source_specs = Vec::with_capacity(group.len());
         for weight in group {
@@ -116,6 +118,9 @@ pub(super) fn prepare_program(
             return Err(invalid("group backing exceeds address space"));
         }
         maximum_group_bytes = maximum_group_bytes.max(group_bytes);
+        converted_bytes = converted_bytes
+            .checked_add(group_bytes)
+            .ok_or_else(|| invalid("converted cache bytes overflow"))?;
         for (index, weight) in group.iter().enumerate() {
             let tensor = schema
                 .tensors
@@ -166,6 +171,7 @@ pub(super) fn prepare_program(
         schema,
         sources: source_map,
         maximum_group_bytes,
+        converted_bytes,
     })
 }
 

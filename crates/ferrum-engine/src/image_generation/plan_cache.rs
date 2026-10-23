@@ -1,6 +1,7 @@
-//! Compilation metadata only. Eviction releases the cache's Arc, never an
-//! initialized session or another request's compiled component. Encoded size
-//! is a serialization budget, not measured heap usage or Host payload bytes.
+//! Compilation metadata cache. Entries also retain their materializer owners;
+//! any converted-weight Host backing remains separately charged to that owner.
+//! Eviction releases this cache's Arc, never another request's compiled component.
+//! Encoded size measures serialization, not heap usage or Host payload bytes.
 use super::*;
 use std::{collections::VecDeque, io, sync::Mutex, time::Instant};
 

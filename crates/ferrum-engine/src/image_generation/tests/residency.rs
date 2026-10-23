@@ -5,6 +5,7 @@ use half::bf16;
 
 mod all_components;
 mod dynamic;
+mod noise;
 
 pub(super) fn numeric_pipeline() -> (
     QwenImage21Pipeline<ReferenceDeviceRuntime>,

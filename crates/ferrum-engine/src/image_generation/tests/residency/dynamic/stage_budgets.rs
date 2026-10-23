@@ -46,7 +46,7 @@ fn stage_budgets_require_known_positive_selected_resident_stages() {
     for fields in [
         serde_json::json!({"decoder":0}),
         serde_json::json!({"decoder":-1}),
-        serde_json::json!({"noise":1024}),
+        serde_json::json!({"noise":0}),
         serde_json::json!({"unknown_stage":1024}),
         serde_json::json!({"decoder":1024,"unknown_stage":1}),
     ] {

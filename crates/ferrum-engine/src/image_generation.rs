@@ -3,7 +3,8 @@
 //! Cold is the default. Optional DenoiserAndDecoder residency retains two
 //! exact-plan sessions and immutable weight snapshots across compatible plans,
 //! releasing idle dynamic backing between stages. AllModelComponents also
-//! retains TE; noise stays cold under either policy. A bounded optional cache
+//! retains TE; both keep noise cold. AllStages explicitly retains weightless
+//! sessions too, while each invocation still consumes fresh inputs. A bounded optional cache
 //! reuses compiled plans. Compatible
 //! requests share real batched component forwards. These policies are not
 //! throughput qualification or proof that every configured shape fits.
@@ -24,6 +25,7 @@ mod attention_policy;
 pub mod cuda;
 mod decoder;
 mod editing;
+mod host_cache;
 mod prefix_denoising;
 pub use editing::{ImageEditPrefixPolicy, QwenImage21EditProfiles};
 mod plan_cache;
@@ -35,6 +37,7 @@ mod stage;
 mod stream_requirements;
 pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources};
 pub use attention_policy::ImageCudaAttentionPolicy;
+pub use host_cache::{ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy};
 pub use plan_cache::{ImagePlanCachePolicy, ImagePlanCacheReceipt};
 pub use precision::ImageCudaPrecisionPolicy;
 pub use residency::{

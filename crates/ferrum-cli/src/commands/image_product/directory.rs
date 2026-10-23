@@ -159,6 +159,7 @@ impl DirectoryOptions {
             opaque_memory_profile: "experimental-unqualified-runtime-v1".into(),
             attention_policy: ferrum_engine::image_generation::ImageCudaAttentionPolicy::Sequential,
             precision_policy: self.precision,
+            fp8_host_cache: ferrum_engine::image_generation::ImageFp8HostCachePolicy::Off,
             cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
                 library_path: super::library::resolve(self.cudnn_library.as_deref())?,
                 dependency_libraries: Vec::new(),

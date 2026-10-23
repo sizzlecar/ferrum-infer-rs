@@ -70,6 +70,16 @@ pub(super) fn materialize<'source>(
     sources: &[&WeightComponentSpec],
     outputs: &[&WeightComponentSpec],
 ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+    materialize_with_cache(host, source, sources, outputs, None)
+}
+
+pub(super) fn materialize_with_cache<'source>(
+    host: &HostMemoryAccount,
+    source: &'source dyn WeightComponentSource,
+    sources: &[&WeightComponentSpec],
+    outputs: &[&WeightComponentSpec],
+    cache: Option<&host_cache::HostCache>,
+) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
     if outputs.is_empty() {
         return Err(invalid("empty requested component group"));
     }
@@ -119,6 +129,23 @@ pub(super) fn materialize<'source>(
             Ok(payload)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let files = payloads
+        .iter()
+        .map(|payload| payload.source_file().to_owned())
+        .collect::<Vec<_>>();
+    let cache = cache.filter(|cache| cache.fits(total));
+    let mut key = cache
+        .map(|cache| cache.key(sources, outputs, &payloads))
+        .transpose()?;
+    // One materializer serializes cache misses. No partially initialized entry
+    // is visible, duplicate misses cannot exceed its retained-byte allowance,
+    // and an unwind poisons this owner rather than publishing partial results.
+    let mut state = cache.map(host_cache::HostCache::lock).transpose()?;
+    if let (Some(state), Some(key)) = (state.as_mut(), key.as_ref()) {
+        if let Some((backing, ranges)) = state.get(key) {
+            return payloads_from_backing(outputs, &files, &backing, ranges);
+        }
+    }
     let mut maximum = 0_f32;
     for payload in &payloads {
         for bytes in payload.bytes().chunks_exact(2) {
@@ -132,6 +159,9 @@ pub(super) fn materialize<'source>(
         }
     }
     let (scale, inverse) = scale(maximum)?;
+    if let (Some(cache), Some(state)) = (cache, state.as_mut()) {
+        cache.make_room(state, total);
+    }
     let mut backing = host
         .allocate_zeroed(HostMemoryClass::WeightBacking, total)
         .map_err(|e| invalid(format!("WeightBacking admission: {e}")))?;
@@ -151,18 +181,31 @@ pub(super) fn materialize<'source>(
         }
     }
     let backing = backing.freeze();
-    let files: Vec<_> = payloads
-        .iter()
-        .map(|payload| payload.source_file().to_owned())
-        .collect();
+    let ranges = indices
+        .into_iter()
+        .map(|(_, range)| range)
+        .collect::<Vec<_>>();
+    let result = payloads_from_backing(outputs, &files, &backing, ranges.clone())?;
+    if let (Some(state), Some(key)) = (state.as_mut(), key.take()) {
+        state.publish(key, backing, ranges);
+    }
+    Ok(result)
+}
+
+fn payloads_from_backing<'source>(
+    outputs: &[&WeightComponentSpec],
+    files: &[String],
+    backing: &ManagedHostBytes,
+    ranges: Vec<std::ops::Range<usize>>,
+) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
     outputs
         .iter()
-        .zip(indices)
-        .map(|(component, (_, range))| {
+        .zip(ranges)
+        .map(|(component, range)| {
             WeightComponentPayload::from_managed_host(
                 component,
                 component.external_names.clone(),
-                files.clone(),
+                files.to_vec(),
                 component.dimensions.clone(),
                 component.physical_element_type(),
                 backing.slice(range).map_err(|e| invalid(e.to_string()))?,

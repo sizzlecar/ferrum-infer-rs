@@ -116,6 +116,21 @@ fn prefix_handoff_counts_two_caches_and_one_weight_installation_before_execution
     pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .unwrap();
+    pipeline.config.residency = ImageResidencyPolicy::AllStages;
+    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
+        maximum_bytes_by_stage: ImageStageRetentionBudgets {
+            noise: std::num::NonZeroU64::new(1024),
+            ..stage_budgets
+        },
+    };
+    pipeline.config.device_capacity_bytes = transition + retained_other + 1024 - 1;
+    assert!(pipeline
+        .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
+        .is_err());
+    pipeline.config.device_capacity_bytes = transition + retained_other + 1024;
+    pipeline
+        .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
+        .unwrap();
     assert_eq!(pipeline.runtime.snapshot().uploaded_bytes, 0);
     assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
 }

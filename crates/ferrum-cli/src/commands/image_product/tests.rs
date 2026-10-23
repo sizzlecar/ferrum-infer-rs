@@ -123,6 +123,64 @@ fn fp8_precision_is_shared_by_run_and_serve_without_changing_residency_or_attent
 }
 
 #[test]
+fn fp8_host_cache_is_explicit_budgeted_and_shared_by_run_and_serve() {
+    use ferrum_engine::image_generation::{ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy};
+    use std::num::NonZeroU64;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    let mut wire = configuration();
+    let ImageBackendConfig::Cuda(defaults) = load(&wire).unwrap().backend;
+    assert_eq!(defaults.fp8_host_cache, ImageFp8HostCachePolicy::Off);
+    let cache = json!({"stage_budgets":{"maximum_bytes_by_stage":{"text_encoder":1024}}});
+    wire["backend"]["fp8_host_cache"] = cache.clone();
+    assert!(load(&wire).is_err()); // BF16 has no converted FP8 payload.
+    wire["backend"]["precision_policy"] = json!("fp8_linear_experimental_v1");
+    wire["backend"]["host"] = json!({"total_bytes":5120,"input_preprocess_bytes":1024,
+        "transfer_staging_bytes":1024,"output_bytes":2048,"weight_backing_bytes":1024});
+    let expected = ImageFp8HostCachePolicy::StageBudgets {
+        maximum_bytes_by_stage: ImageFp8HostCacheBudgets {
+            text_encoder: NonZeroU64::new(1024),
+            ..ImageFp8HostCacheBudgets::default()
+        },
+    };
+    for serving in [false, true] {
+        wire["serving"] = if serving {
+            json!({"maximum_pending":2,"maximum_prompt_bytes":4096,"max_num_seqs":1,
+                "request_batch_max_wait_ms":0,"default_width":512,"default_height":512,
+                "default_seed":0,"rgba_scratch_bytes":16384,"output":{}})
+        } else {
+            Value::Null
+        };
+        wire["backend"]["fp8_host_cache"] = cache.clone();
+        let ImageBackendConfig::Cuda(config) = load(&wire).unwrap().backend;
+        assert_eq!(config.fp8_host_cache, expected);
+        #[cfg(feature = "cuda")]
+        assert_eq!(config.resolved().unwrap().fp8_host_cache, expected);
+        wire["backend"]["host"]["total_bytes"] = json!(5119);
+        assert!(load(&wire).is_err());
+        wire["backend"]["host"]["total_bytes"] = json!(5120);
+        wire["backend"]["host"]["weight_backing_bytes"] = json!(1023);
+        assert!(load(&wire).is_err());
+        wire["backend"]["host"]["weight_backing_bytes"] = json!(1024);
+        for stages in [
+            json!({}),
+            json!({"text_encoder":0}),
+            json!({"decoder":1024}),
+            json!({"vision_encoder":1024}),
+            json!({"text_encoder":1024,"unknown":1}),
+        ] {
+            wire["backend"]["fp8_host_cache"] =
+                json!({"stage_budgets":{"maximum_bytes_by_stage":stages}});
+            assert!(load(&wire).is_err());
+        }
+    }
+}
+
+#[test]
 fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("image.json");
@@ -551,6 +609,7 @@ fn per_stage_dynamic_budgets_are_shared_by_run_and_serve_and_reject_ineligible_s
                 "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
         }
         wire["backend"]["pipeline"]["dynamic_residency"] = selected.clone();
+        wire["backend"]["pipeline"]["residency"] = json!("all_model_components");
         let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
         assert_eq!(
             cuda.resolved_pipeline().unwrap().dynamic_residency,
@@ -573,6 +632,20 @@ fn per_stage_dynamic_budgets_are_shared_by_run_and_serve_and_reject_ineligible_s
             });
             assert!(load(&wire).is_err());
         }
+        // Noise is an explicit AllStages opt-in; old AllModelComponents rejects it.
+        wire["backend"]["pipeline"]["residency"] = json!("all_stages");
+        wire["backend"]["pipeline"]["dynamic_residency"] = json!({
+            "retain_stage_budgets":{"maximum_bytes_by_stage":{"noise":1024}}
+        });
+        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+        assert_eq!(
+            cuda.resolved_pipeline().unwrap().residency,
+            ferrum_engine::image_generation::ImageResidencyPolicy::AllStages
+        );
+        assert_eq!(
+            serde_json::to_value(cuda.resolved_pipeline().unwrap().dynamic_residency).unwrap(),
+            wire["backend"]["pipeline"]["dynamic_residency"]
+        );
     }
 }
 
@@ -600,6 +673,7 @@ fn residency_is_explicit_and_shared_by_run_and_serve_configuration() {
             "all_model_components",
             ImageResidencyPolicy::AllModelComponents,
         ),
+        ("all_stages", ImageResidencyPolicy::AllStages),
     ] {
         wire["execution_profile"] = json!("experimental_serial_cold");
         wire["backend"]["pipeline"]["residency"] = json!(name);
