@@ -72,7 +72,7 @@ impl ModelFamilyProvider for HeadRmsFamily {
         Ok(ModelWeights::None)
     }
     fn numerical_profiles(&self, _: &Config) -> Result<FamilyNumericalProfiles, VNextError> {
-        let profile = NumericalProfileId::new(PROFILE)?;
+        let profile = NumericalProfileId::new(PROFILE).expect("valid fixture profile ID");
         FamilyNumericalProfiles::new(
             self.family_id(),
             ContractVersion::new(1, 0),
