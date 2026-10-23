@@ -90,11 +90,12 @@ struct Build {
     ar: PathBuf,
 }
 
-// The Linux production feature closure, including indexed text attention.
-// VllmMarlin is retained when present in the reference set but is not required
-// by cuda-production itself. The ordinary build.rs verifies feature coverage too.
+// The Linux production feature closure, including indexed text attention and
+// vllm-moe-marlin's dense vllm-marlin repacking dependency. The addressed and
+// indexed attention units share one artifact; units are not artifact counts.
 const PRODUCTION: &[CudaNativeBuildUnit] = &[
     CudaNativeBuildUnit::Marlin,
+    CudaNativeBuildUnit::VllmMarlin,
     CudaNativeBuildUnit::VllmMoeMarlin,
     CudaNativeBuildUnit::VllmPagedAttentionV2,
     CudaNativeBuildUnit::VllmIndexedPagedAttentionV2,

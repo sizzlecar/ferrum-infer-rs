@@ -4,6 +4,30 @@ use ferrum_types::{
     NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
 };
 
+#[test]
+fn production_moe_closure_rejects_missing_dense_repacking_artifact() {
+    // Exercise the resolver's actual missing-artifact boundary for the MoE
+    // feature closure, independently of unrelated production units.
+    let set = ResolvedNativeOperatorArtifactSet {
+        lock_path: PathBuf::from("fixture.lock.json"),
+        g03_catalog_sha256: "a".repeat(64),
+        artifacts: Vec::new(),
+    };
+    let required = PRODUCTION.iter().copied().filter(|unit| {
+        matches!(
+            unit,
+            CudaNativeBuildUnit::VllmMarlin | CudaNativeBuildUnit::VllmMoeMarlin
+        )
+    });
+    assert_eq!(
+        ResolvedCudaNativeBuildCoverage::resolve(&set, required).unwrap_err(),
+        ferrum_native_ops::CudaNativeBuildCoverageError::MissingArtifact {
+            unit: "vllm_marlin",
+            operator: "ferrum.cuda.vllm_marlin",
+        }
+    );
+}
+
 fn row(operation: &str, provider: &str) -> NativeOperatorProviderCatalogRow {
     NativeOperatorProviderCatalogRow {
         operation_id: operation.into(),
