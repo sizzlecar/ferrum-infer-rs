@@ -357,10 +357,12 @@ impl QwenImage21CudaConfig {
             pipeline.with_editing_profiles(super::QwenImage21EditProfiles {
                 vision: NumericalProfileId::new(
                     ferrum_models::qwen3_vl_vision::Qwen3VLVisionFamily::CUDA_PROFILE_ID,
-                )?,
+                )
+                .map_err(anyhow::Error::msg)?,
                 encoder: NumericalProfileId::new(
                     ferrum_models::qwen_image21::QwenImage21VaeEncoderFamily::CUDA_PROFILE_ID,
-                )?,
+                )
+                .map_err(anyhow::Error::msg)?,
             })?
         } else {
             pipeline
@@ -538,11 +540,13 @@ fn editing_command_families(
     Ok([
         TypedFamilyRegistration::new(Qwen3VLVisionFamily::new()?).prepare_with_profile(
             &serde_json::to_value(visual)?,
-            &NumericalProfileId::new(Qwen3VLVisionFamily::CUDA_PROFILE_ID)?,
+            &NumericalProfileId::new(Qwen3VLVisionFamily::CUDA_PROFILE_ID)
+                .map_err(anyhow::Error::msg)?,
         )?,
         TypedFamilyRegistration::new(QwenImage21VaeEncoderFamily::new()?).prepare_with_profile(
             &serde_json::to_value(encoder)?,
-            &NumericalProfileId::new(QwenImage21VaeEncoderFamily::CUDA_PROFILE_ID)?,
+            &NumericalProfileId::new(QwenImage21VaeEncoderFamily::CUDA_PROFILE_ID)
+                .map_err(anyhow::Error::msg)?,
         )?,
         TypedFamilyRegistration::new(Qwen3VLTextEncoderFamily::new()?)
             .prepare_with_profile(&serde_json::to_value(text)?, &profiles.text_encoder)?,
