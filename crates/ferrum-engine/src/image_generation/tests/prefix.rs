@@ -71,6 +71,31 @@ fn prefix_handoff_counts_two_caches_and_one_weight_installation_before_execution
             .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
             .unwrap();
     }
+    let decoder_retention = 4096;
+    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainDecoder {
+        maximum_bytes: decoder_retention,
+    };
+    pipeline.config.device_capacity_bytes = transition + decoder_retention - 1;
+    assert!(pipeline
+        .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
+        .is_err());
+    pipeline.config.device_capacity_bytes = transition + decoder_retention;
+    pipeline
+        .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
+        .unwrap();
+    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainSmallStages {
+        maximum_bytes_per_stage: decoder_retention,
+    };
+    // Five retained-stage allowances, with the one shared Denoiser slot excluded
+    // for both cooperating plans throughout the two-cache handoff.
+    pipeline.config.device_capacity_bytes = transition + 4 * decoder_retention - 1;
+    assert!(pipeline
+        .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
+        .is_err());
+    pipeline.config.device_capacity_bytes = transition + 4 * decoder_retention;
+    pipeline
+        .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
+        .unwrap();
     assert_eq!(pipeline.runtime.snapshot().uploaded_bytes, 0);
     assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
 }

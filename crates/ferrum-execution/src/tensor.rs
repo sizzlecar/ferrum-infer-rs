@@ -21,6 +21,21 @@ pub struct TensorExecutorConfig {
     pub maximum_backing_maintenance_passes: usize,
 }
 
+impl TensorExecutorConfig {
+    /// One lane spans submission, readback and retirement of a blocking call.
+    /// Tensor batch dimensions do not create one lane per sample.
+    pub const fn execution_stream_requirement(self) -> BlockingStreamRequirement {
+        BlockingStreamRequirement::new(1)
+    }
+
+    /// Fixed request admission holds state backing, not a lane. Initialization
+    /// copies run on the producing execution's lane; later steps each use the
+    /// ordinary blocking execution requirement above.
+    pub const fn request_state_stream_requirement(self) -> BlockingStreamRequirement {
+        BlockingStreamRequirement::new(0)
+    }
+}
+
 impl Default for TensorExecutorConfig {
     fn default() -> Self {
         Self {

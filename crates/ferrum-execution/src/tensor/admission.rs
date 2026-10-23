@@ -92,23 +92,15 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         step: &Arc<StepResourceLease<R>>,
     ) -> Result<PreparedStepSubmissionWave<R>, TensorExecutionError<R>> {
         let work = step.shared_tensor_invocation_work_shape()?;
-        let requests = self
-            .executable
-            .execution_plan()
-            .payload()
-            .nodes()
-            .iter()
-            .map(|node| {
-                InvocationResourceAdmissionRequest::for_all_step_participants(
-                    node.id().clone(),
-                    work.clone(),
-                    AdmissionFitPolicy::ImmediateOnly,
-                    AdmissionPressureAction::WaitForRelease,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         for pass in 0..=self.config.maximum_backing_maintenance_passes {
-            match step.try_prepare_submission_wave(requests.clone())? {
+            // The executor always submits the complete immutable plan. Keep
+            // the shared work authority and ordinary per-step admission while
+            // avoiding a cloned request vector for already committed topology.
+            match step.try_prepare_full_plan_submission_wave(
+                work.clone(),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )? {
                 StepSubmissionWaveAdmissionDecision::Prepared(wave) => return Ok(wave),
                 StepSubmissionWaveAdmissionDecision::BackingDeferred(deferred) => {
                     self.check_maintenance_limit(TensorAdmissionStage::Wave, pass)?;

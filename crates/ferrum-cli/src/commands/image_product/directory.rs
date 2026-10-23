@@ -131,6 +131,8 @@ impl DirectoryOptions {
             edit_prefix_policy: ferrum_engine::image_generation::ImageEditPrefixPolicy::default(),
             plan_cache: ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage,
             residency: ferrum_engine::image_generation::ImageResidencyPolicy::Cold,
+            dynamic_residency:
+                ferrum_engine::image_generation::ImageDynamicResidencyPolicy::Release,
             maximum_staging_bytes: 16 * MIB,
             maximum_initialization_commands: 64,
             maximum_backing_maintenance_passes: 8,
@@ -151,7 +153,7 @@ impl DirectoryOptions {
             },
             bootstrap_memory_bytes: 1024 * MIB,
             stream_memory_bytes: 64 * MIB,
-            maximum_streams: 4,
+            maximum_streams: ferrum_engine::image_generation::ImageStreamLimit::Auto,
             maximum_in_flight_per_stream: 1,
             maximum_commands_per_submission: 2048,
             opaque_memory_profile: "experimental-unqualified-runtime-v1".into(),

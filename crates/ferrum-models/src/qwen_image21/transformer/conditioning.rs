@@ -234,21 +234,36 @@ impl QwenImage21RotaryFrequencies {
             }
         }
         let stride = self.width as usize;
-        let mut axis_start = 0_usize;
-        for (axis, dimension) in self.axes.into_iter().enumerate() {
-            for pair in 0..dimension / 2 {
-                let frequency = angular_frequency(pair, dimension);
-                for (row, destination) in output.chunks_exact_mut(stride).enumerate() {
-                    let position = layout
-                        .rotary_position(start + row as u64)
-                        .expect("exact output length is the checked layout sequence length")[axis];
-                    let angle = position as f32 * frequency;
-                    let offset = axis_start + 2 * pair as usize;
-                    destination[offset] = libm::cosf(angle);
-                    destination[offset + 1] = libm::sinf(angle);
+        // Bound scratch independently of the accepted axis widths. Common
+        // head geometries fit one block, computing positions once per row and
+        // writing adjacent pairs in order. Wider descriptors use more blocks.
+        let mut rotary_pairs = [(0_usize, 0.0_f32); 128];
+        let mut frequencies = self
+            .axes
+            .into_iter()
+            .enumerate()
+            .flat_map(|(axis, dimension)| {
+                (0..dimension / 2).map(move |pair| (axis, angular_frequency(pair, dimension)))
+            });
+        for pair_start in (0..stride / 2).step_by(rotary_pairs.len()) {
+            let count = (stride / 2 - pair_start).min(rotary_pairs.len());
+            for (parameters, frequency) in rotary_pairs[..count].iter_mut().zip(&mut frequencies) {
+                *parameters = frequency;
+            }
+            for (row, destination) in output.chunks_exact_mut(stride).enumerate() {
+                let positions = layout
+                    .rotary_position(start + row as u64)
+                    .expect("exact output length is the checked layout sequence length");
+                for (destination, &(axis, frequency)) in destination
+                    [2 * pair_start..2 * (pair_start + count)]
+                    .chunks_exact_mut(2)
+                    .zip(&rotary_pairs[..count])
+                {
+                    let angle = positions[axis] as f32 * frequency;
+                    destination[0] = libm::cosf(angle);
+                    destination[1] = libm::sinf(angle);
                 }
             }
-            axis_start += dimension as usize;
         }
         Ok(())
     }

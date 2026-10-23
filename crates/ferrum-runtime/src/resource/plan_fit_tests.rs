@@ -63,6 +63,138 @@ fn assert_plan_budget(rejected: &AdmissionRejected, required: u64, maximum: u64)
 }
 
 #[test]
+fn compiled_step_slots_recompute_work_demand_and_preserve_each_claim_membership() {
+    for shared in [false, true] {
+        let catalog = if shared {
+            shared_step_activation_catalog(linear_profile())
+        } else {
+            pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Step,
+                'd',
+                3,
+                1024,
+                TestDemand::Tokens,
+            )
+        };
+        let expected_members: Vec<_> = catalog.pools[0]
+            .step_resource_slots()
+            .iter()
+            .map(|slot| slot.resource_ids().to_vec())
+            .collect();
+        let runtime = new_runtime(&catalog, 1024);
+        let h = harness(Arc::clone(&runtime), catalog, 1024, false);
+        let binding = h.root.trusted_runtime_binding().unwrap();
+        let demand = |tokens, fit_tokens| {
+            binding.scoped_demand(
+                AllocationLifetime::Step,
+                None,
+                shape(tokens),
+                shape(fit_tokens),
+                None,
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+        };
+        let (first_demand, first) = demand(1, 3).unwrap();
+        let (second_demand, second) = demand(2, 3).unwrap();
+        let slots = u64::try_from(expected_members.len()).unwrap();
+        assert_eq!(
+            first_demand.immediate_claim().entries()[0].units().get(),
+            64 * slots
+        );
+        assert_eq!(
+            second_demand.immediate_claim().entries()[0].units().get(),
+            128 * slots
+        );
+        assert_eq!(
+            first_demand.fit_requirement().entries()[0].units().get(),
+            192 * slots
+        );
+        assert_eq!(
+            second_demand.fit_requirement().entries()[0].units().get(),
+            192 * slots
+        );
+        assert_eq!(first.len(), expected_members.len());
+        assert_eq!(second.len(), expected_members.len());
+        for ((first, second), members) in first.iter().zip(&second).zip(&expected_members) {
+            assert_eq!(first.claim_identity.resource_ids(), members);
+            assert_eq!(second.claim_identity.resource_ids(), members);
+            assert_eq!(first.claim_identity.pool_id(), &h.pool_ids[0]);
+            assert_eq!(first.claim_identity, second.claim_identity);
+            assert!(std::ptr::eq(
+                first.claim_identity.resource_ids(),
+                second.claim_identity.resource_ids(),
+            ));
+            assert_eq!(first.capacity_size_bytes, 64);
+            assert_eq!(second.capacity_size_bytes, 128);
+            assert_eq!(first.projections.len(), members.len());
+            for ((first, second), resource_id) in first
+                .projections
+                .iter()
+                .zip(&second.projections)
+                .zip(members)
+            {
+                assert_eq!(first.descriptor.base_resource_id(), resource_id);
+                assert_eq!(second.descriptor.base_resource_id(), resource_id);
+                assert_eq!(first.logical_size_bytes, 64);
+                assert_eq!(second.logical_size_bytes, 128);
+                assert_eq!(first.physical_offset_bytes, 0);
+                assert_eq!(second.physical_offset_bytes, 0);
+            }
+        }
+        assert!(
+            demand(5, 5).is_err(),
+            "immediate demand still enforces the descriptor ceiling"
+        );
+        assert!(
+            demand(1, 5).is_err(),
+            "fit demand still enforces the descriptor ceiling"
+        );
+        assert_eq!(runtime.allocate_calls(), 0);
+        let mut reordered = h.root.dynamic_pools.domains[0].clone();
+        reordered.descriptors.reverse();
+        let layouts = compile_step_resource_slot_layouts(&reordered).unwrap();
+        for (layout, members) in layouts.iter().zip(&expected_members) {
+            assert_eq!(layout.claim_identity.resource_ids(), members);
+            assert_eq!(layout.descriptor_indices.len(), members.len());
+            for (&index, member) in layout.descriptor_indices.iter().zip(members) {
+                assert_eq!(reordered.descriptors[index].base_resource_id(), member);
+            }
+        }
+        drop(binding);
+        close_dynamic_test_root(h.root);
+    }
+}
+
+#[test]
+fn compiled_step_slots_reject_missing_duplicate_and_non_step_descriptors() {
+    let catalog = shared_step_activation_catalog(linear_profile());
+    let runtime = new_runtime(&catalog, 256);
+    let h = harness(runtime, catalog, 256, false);
+    let domain = &h.root.dynamic_pools.domains[0];
+    let mut missing = domain.clone();
+    missing.descriptors.pop();
+    assert!(compile_step_resource_slot_layouts(&missing).is_err());
+    let mut duplicate = domain.clone();
+    duplicate.descriptors.push(duplicate.descriptors[0].clone());
+    assert!(compile_step_resource_slot_layouts(&duplicate).is_err());
+    let mut wrong_lifetime = domain.clone();
+    let mut descriptor = serde_json::to_value(&wrong_lifetime.descriptors[0]).unwrap();
+    descriptor["lifetime"] = serde_json::json!("request");
+    wrong_lifetime.descriptors[0] = serde_json::from_value(descriptor).unwrap();
+    assert!(compile_step_resource_slot_layouts(&wrong_lifetime).is_err());
+    let mut uncovered = domain.clone();
+    let mut descriptor = serde_json::to_value(&domain.descriptors[0]).unwrap();
+    descriptor["base_resource_id"] = serde_json::json!("resource/not-in-any-step-slot");
+    uncovered
+        .descriptors
+        .push(serde_json::from_value(descriptor).unwrap());
+    assert!(compile_step_resource_slot_layouts(&uncovered).is_err());
+    close_dynamic_test_root(h.root);
+}
+
+#[test]
 fn initial_bundle_rejects_joint_fit_before_allocating_or_creating_an_owner() {
     let catalog = two_state_pools_with_workspace();
     let runtime = new_runtime(&catalog, 384);

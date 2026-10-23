@@ -7,8 +7,9 @@
 //! Opaque allowances are declarations, not measured memory qualification.
 
 use super::{
-    ImageCudaAttentionPolicy, ImageCudaPrecisionPolicy, ImagePipelineConfig, QwenImage21Assets,
-    QwenImage21Pipeline, QwenImage21Profiles,
+    ImageCudaAttentionPolicy, ImageCudaPrecisionPolicy, ImagePipelineConfig, ImageStreamLimit,
+    ImageStreamPlan, ImageStreamRequirements, QwenImage21Assets, QwenImage21Pipeline,
+    QwenImage21Profiles,
 };
 use anyhow::{ensure, Context, Result};
 use ferrum_diffusion::Bf16EulerProfile;
@@ -56,12 +57,14 @@ pub struct ImageCudaPipelineLimits {
     pub edit_prefix_policy: super::ImageEditPrefixPolicy,
     pub plan_cache: super::ImagePlanCachePolicy,
     pub residency: super::ImageResidencyPolicy,
+    pub dynamic_residency: super::ImageDynamicResidencyPolicy,
     pub static_initialization: StaticInitializationPolicy,
     pub executor: ferrum_execution::TensorExecutorConfig,
 }
 impl ImageCudaPipelineLimits {
     pub fn validate(&self) -> Result<()> {
         self.plan_cache.validate()?;
+        self.dynamic_residency.validate(self.residency)?;
         ensure!(
             self.maximum_width > 0 && self.maximum_height > 0,
             "image dimension limits must be positive"
@@ -87,6 +90,7 @@ impl ImageCudaPipelineLimits {
             edit_prefix_policy: self.edit_prefix_policy,
             plan_cache: self.plan_cache,
             residency: self.residency,
+            dynamic_residency: self.dynamic_residency,
             static_initialization: self.static_initialization,
             executor: self.executor,
         }
@@ -96,6 +100,7 @@ impl ImageCudaPipelineLimits {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ImageCudaCompositionReceipt {
     pub memory_policy: &'static str,
+    pub stream_plan: ImageStreamPlan,
     pub device_capacity_bytes: u64,
     pub observed_memory: Option<CudaTensorMemoryObservation>,
     /// Absolute path passed to the admitted native loader. The generated
@@ -121,7 +126,7 @@ pub struct QwenImage21CudaConfig {
     pub memory: ImageCudaMemoryPolicy,
     pub bootstrap_memory_bytes: u64,
     pub stream_memory_bytes: u64,
-    pub maximum_streams: usize,
+    pub maximum_streams: ImageStreamLimit,
     pub maximum_in_flight_per_stream: usize,
     pub maximum_commands_per_submission: usize,
     pub opaque_memory_profile: String,
@@ -133,12 +138,22 @@ pub struct QwenImage21CudaConfig {
 }
 
 impl QwenImage21CudaConfig {
+    /// Pure schedule planning, before context creation or any native allocation.
+    pub fn stream_plan(&self) -> Result<ImageStreamPlan> {
+        self.maximum_streams
+            .resolve(ImageStreamRequirements::for_serial_pipeline(
+                self.pipeline.static_initialization,
+                self.pipeline.executor,
+            ))
+    }
+
     /// Pure configuration checks. No driver query, context, library load,
     /// account construction, source mapping, or payload allocation occurs.
     /// Request-specific shapes still pass through the pipeline's compilation
     /// and ordinary Host/device admission before their execution.
     pub fn validate(&self) -> Result<()> {
         self.pipeline.validate()?;
+        let maximum_streams = self.stream_plan()?.resolved_streams();
         ensure!(
             self.pipeline.edit_prefix_policy != super::ImageEditPrefixPolicy::RequestCache
                 || self.attention_policy == ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
@@ -171,13 +186,12 @@ impl QwenImage21CudaConfig {
             "cuDNN needs positive opaque bytes and addressable workspace"
         );
         ensure!(
-            self.maximum_streams > 0
-                && self.maximum_in_flight_per_stream > 0
+            self.maximum_in_flight_per_stream > 0
                 && self.maximum_commands_per_submission > 0
                 && self.maximum_commands_per_submission <= u32::MAX as usize,
             "CUDA stream/flight limits must be positive and commands fit u32"
         );
-        self.maximum_streams
+        maximum_streams
             .checked_mul(self.maximum_in_flight_per_stream)
             .and_then(|n| n.checked_mul(self.maximum_commands_per_submission))
             .and_then(|n| {
@@ -233,6 +247,7 @@ impl QwenImage21CudaConfig {
         ImageCudaCompositionReceipt,
     )> {
         self.validate()?;
+        let stream_plan = self.stream_plan()?;
         let profiles = cuda_profiles_with_precision(self.attention_policy, self.precision_policy)?;
         let editing = assets.editing.is_some();
         let mut contracts = contracts(self.attention_policy)?;
@@ -255,7 +270,7 @@ impl QwenImage21CudaConfig {
                     usable_memory_bytes: bytes.get(),
                     bootstrap_memory_bytes: self.bootstrap_memory_bytes,
                     stream_memory_bytes: self.stream_memory_bytes,
-                    maximum_streams: self.maximum_streams,
+                    maximum_streams: stream_plan.resolved_streams(),
                     maximum_in_flight_per_stream: self.maximum_in_flight_per_stream,
                     maximum_commands_per_submission: self.maximum_commands_per_submission,
                     opaque_memory_profile: self.opaque_memory_profile.clone(),
@@ -270,7 +285,7 @@ impl QwenImage21CudaConfig {
                 maximum_memory_bytes: maximum_bytes.map(NonZeroU64::get),
                 bootstrap_memory_bytes: self.bootstrap_memory_bytes,
                 stream_memory_bytes: self.stream_memory_bytes,
-                maximum_streams: self.maximum_streams,
+                maximum_streams: stream_plan.resolved_streams(),
                 maximum_in_flight_per_stream: self.maximum_in_flight_per_stream,
                 maximum_commands_per_submission: self.maximum_commands_per_submission,
                 opaque_memory_profile: self.opaque_memory_profile.clone(),
@@ -289,6 +304,7 @@ impl QwenImage21CudaConfig {
         self.validate_capacity(capacity.get())?;
         self.validate_weight_capacity(&execution_weight_bytes, capacity.get())?;
         let receipt = ImageCudaCompositionReceipt {
+            stream_plan,
             memory_policy: match self.memory {
                 ImageCudaMemoryPolicy::ExplicitTotal(_) => "explicit_total",
                 ImageCudaMemoryPolicy::AutoAvailable { .. } => "auto_available",
@@ -407,7 +423,7 @@ impl QwenImage21CudaConfig {
 
     fn opaque_bytes(&self) -> Result<u64> {
         self.stream_memory_bytes
-            .checked_mul(u64::try_from(self.maximum_streams)?)
+            .checked_mul(u64::try_from(self.stream_plan()?.resolved_streams())?)
             .and_then(|n| n.checked_add(self.bootstrap_memory_bytes))
             .and_then(|n| n.checked_add(self.cudnn.opaque_memory_bytes))
             .and_then(|n| n.checked_add(self.attention_policy.additional_opaque_bytes()))
@@ -696,7 +712,7 @@ mod tests {
             memory: ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(1024 * 1024).unwrap()),
             bootstrap_memory_bytes: 4096,
             stream_memory_bytes: 1024,
-            maximum_streams: 1,
+            maximum_streams: ImageStreamLimit::Auto,
             maximum_in_flight_per_stream: 1,
             maximum_commands_per_submission: 1024,
             opaque_memory_profile: "experimental-unqualified-test-v1".into(),
@@ -728,6 +744,7 @@ mod tests {
                 edit_prefix_policy: crate::image_generation::ImageEditPrefixPolicy::default(),
                 plan_cache: crate::image_generation::ImagePlanCachePolicy::default(),
                 residency: crate::image_generation::ImageResidencyPolicy::default(),
+                dynamic_residency: crate::image_generation::ImageDynamicResidencyPolicy::default(),
                 static_initialization: StaticInitializationPolicy::new(1024, 32).unwrap(),
                 executor: TensorExecutorConfig::default(),
             },
@@ -735,10 +752,32 @@ mod tests {
     }
 
     #[test]
+    fn stream_schedule_resolution_drives_native_limit_and_opaque_allowance() {
+        let mut c = config();
+        let automatic = c.stream_plan().unwrap();
+        assert_eq!(
+            automatic.source(),
+            super::super::ImageStreamLimitSource::Auto
+        );
+        assert_eq!(automatic.required_streams(), 1);
+        assert_eq!(automatic.resolved_streams(), 1);
+        let automatic_opaque = c.opaque_bytes().unwrap();
+        c.maximum_streams = ImageStreamLimit::Explicit(4);
+        c.validate().unwrap();
+        let explicit = c.stream_plan().unwrap();
+        assert_eq!(explicit.required_streams(), automatic.required_streams());
+        assert_eq!(explicit.resolved_streams(), 4);
+        assert_eq!(
+            c.opaque_bytes().unwrap(),
+            automatic_opaque + 3 * c.stream_memory_bytes
+        );
+    }
+
+    #[test]
     fn numeric_and_host_budgets_validate_without_a_device_or_library_load() {
         config().validate().unwrap();
         let edits: &[fn(&mut QwenImage21CudaConfig)] = &[
-            |c: &mut QwenImage21CudaConfig| c.maximum_streams = 0,
+            |c: &mut QwenImage21CudaConfig| c.maximum_streams = ImageStreamLimit::Explicit(0),
             |c: &mut QwenImage21CudaConfig| c.maximum_in_flight_per_stream = 0,
             |c: &mut QwenImage21CudaConfig| c.maximum_commands_per_submission = 0,
             |c: &mut QwenImage21CudaConfig| c.maximum_commands_per_submission = 31,

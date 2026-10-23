@@ -318,12 +318,30 @@ impl OperationDispatch {
     {
         let plan = resolved.execution_plan();
         let node_id = resources.node_id()?;
-        let node = plan
-            .payload()
-            .nodes()
-            .iter()
-            .find(|node| node.id() == node_id)
-            .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
+        let node = match resources {
+            OperationInvocationResources::Invocation(_) => plan
+                .payload()
+                .nodes()
+                .iter()
+                .find(|node| node.id() == node_id)
+                .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?,
+            OperationInvocationResources::Wave { wave, node_index } => {
+                let prepared = wave.nodes().get(node_index).ok_or_else(|| {
+                    invalid_operation("submission wave node index is out of bounds")
+                })?;
+                // A determinism subset's wave ordinal can differ from its
+                // immutable-plan index. Retain the exact node identity check.
+                plan.payload()
+                    .nodes()
+                    .get(prepared.plan_node_index())
+                    .filter(|node| node.id() == node_id)
+                    .ok_or_else(|| {
+                        invalid_operation(
+                            "submission wave node differs from its immutable plan index",
+                        )
+                    })?
+            }
+        };
         // Wave construction proves every node shares this authority by Arc identity.
         let validate_common_authority = match resources {
             OperationInvocationResources::Invocation(_) => true,

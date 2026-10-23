@@ -1,4 +1,4 @@
-//! Explicit plan-owner release of fully idle dynamic residency.
+//! Explicit plan-owner retention or release of fully idle dynamic residency.
 use super::*;
 use crate::CapacitySnapshot;
 
@@ -35,6 +35,33 @@ pub enum IdleDynamicReleaseOutcome {
     Busy(IdleDynamicReleaseBusy),
 }
 
+/// An observation of backing kept by its original plan and capacity grants.
+/// This receipt grants no execution authority and does not retain any owners.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IdleDynamicRetentionReceipt {
+    retained_bytes: u64,
+    retained_chunks: usize,
+}
+
+impl IdleDynamicRetentionReceipt {
+    pub const fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+
+    pub const fn retained_chunks(&self) -> usize {
+        self.retained_chunks
+    }
+}
+
+/// An atomic idle observation followed by bounded retention or full release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "receipt", rename_all = "snake_case")]
+pub enum IdleDynamicBackingOutcome {
+    Released(DynamicPoolRebalanceReceipt),
+    Retained(IdleDynamicRetentionReceipt),
+    Busy(IdleDynamicReleaseBusy),
+}
+
 impl<R: DeviceRuntime> PlanRuntimeResources<R> {
     /// Release all dynamic backing only when this entire plan is idle.
     ///
@@ -51,10 +78,38 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
     pub fn try_release_idle_dynamic_backing(
         &self,
     ) -> Result<IdleDynamicReleaseOutcome, VNextError> {
+        match self.try_manage_idle_dynamic_backing(0)? {
+            IdleDynamicBackingOutcome::Released(receipt) => {
+                Ok(IdleDynamicReleaseOutcome::Released(receipt))
+            }
+            IdleDynamicBackingOutcome::Busy(reason) => Ok(IdleDynamicReleaseOutcome::Busy(reason)),
+            IdleDynamicBackingOutcome::Retained(_) => Err(invalid_resource(
+                "zero idle retention limit must release backing",
+            )),
+        }
+    }
+
+    /// Keep the original chunks and capacity grants only when the entire plan
+    /// is idle and their total bytes fit a nonzero bound. Zero or an exceeded
+    /// bound uses the same full release as `try_release_idle_dynamic_backing`.
+    /// All idle/ownership checks and the decision share one exclusive lock
+    /// scope. Retention changes neither capacity nor execution authority; the
+    /// next execution must still pass ordinary admission.
+    pub fn try_retain_idle_dynamic_backing(
+        &self,
+        maximum_bytes: u64,
+    ) -> Result<IdleDynamicBackingOutcome, VNextError> {
+        self.try_manage_idle_dynamic_backing(maximum_bytes)
+    }
+
+    fn try_manage_idle_dynamic_backing(
+        &self,
+        maximum_retained_bytes: u64,
+    ) -> Result<IdleDynamicBackingOutcome, VNextError> {
         let lifecycle = match self.lifecycle.try_write() {
             Ok(gate) => gate,
             Err(std::sync::TryLockError::WouldBlock) => {
-                return Ok(IdleDynamicReleaseOutcome::Busy(
+                return Ok(IdleDynamicBackingOutcome::Busy(
                     IdleDynamicReleaseBusy::LifecycleInUse,
                 ));
             }
@@ -69,7 +124,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         }
         let cleanup = self.deferred_cleanup_status();
         if cleanup.pending() != 0 {
-            return Ok(IdleDynamicReleaseOutcome::Busy(
+            return Ok(IdleDynamicBackingOutcome::Busy(
                 IdleDynamicReleaseBusy::DeferredCleanup {
                     pending: cleanup.pending(),
                 },
@@ -82,7 +137,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             match pool.maintenance.try_lock() {
                 Ok(gate) => maintenance.push(gate),
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    return Ok(IdleDynamicReleaseOutcome::Busy(
+                    return Ok(IdleDynamicBackingOutcome::Busy(
                         IdleDynamicReleaseBusy::PoolMaintenance {
                             pool_id: pool.domain.pool_id().clone(),
                         },
@@ -118,7 +173,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                 .iter()
                 .any(|domain| domain.used().get() != 0)
         {
-            return Ok(IdleDynamicReleaseOutcome::Busy(
+            return Ok(IdleDynamicBackingOutcome::Busy(
                 IdleDynamicReleaseBusy::LogicalAuthorities { snapshot: logical },
             ));
         }
@@ -142,7 +197,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                 || externally_retained_chunks != 0
                 || !state.quarantined.is_empty()
             {
-                return Ok(IdleDynamicReleaseOutcome::Busy(
+                return Ok(IdleDynamicBackingOutcome::Busy(
                     IdleDynamicReleaseBusy::Pool {
                         pool_id: pool.domain.pool_id().clone(),
                         pending_growth_bytes: state.pending_growth_bytes,
@@ -212,6 +267,15 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             }
         }
 
+        if maximum_retained_bytes != 0 && released_bytes <= maximum_retained_bytes {
+            return Ok(IdleDynamicBackingOutcome::Retained(
+                IdleDynamicRetentionReceipt {
+                    retained_bytes: released_bytes,
+                    retained_chunks: released_chunks,
+                },
+            ));
+        }
+
         // All validation/allocation precedes publication. A publication error
         // leaves every physical chunk and allocator unchanged. No fallible
         // pool mutation follows successful atomic publication.
@@ -242,7 +306,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         // original DeviceCapacityGrant; no new accounting authority is made.
         drop(removed);
         let availability = self.dynamic_pools.budget.availability_snapshot()?;
-        Ok(IdleDynamicReleaseOutcome::Released(
+        Ok(IdleDynamicBackingOutcome::Released(
             DynamicPoolRebalanceReceipt {
                 pools: receipts,
                 reclaimed_chunks: released_chunks,

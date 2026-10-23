@@ -62,7 +62,33 @@ pub struct StaticInitializationPolicy {
     maximum_commands_per_batch: usize,
 }
 
+/// Scheduling metadata for one blocking operation. Its streams have retired
+/// on success; an error may retain recovery owners and must stop normal work.
+/// This declaration is not a capacity grant or permission to create a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BlockingStreamRequirement {
+    maximum_live_streams: usize,
+}
+
+impl BlockingStreamRequirement {
+    pub const fn new(maximum_live_streams: usize) -> Self {
+        Self {
+            maximum_live_streams,
+        }
+    }
+
+    pub const fn maximum_live_streams(self) -> usize {
+        self.maximum_live_streams
+    }
+}
+
 impl StaticInitializationPolicy {
+    /// Initialization owns one upload stream, waits every submission batch,
+    /// and drops that stream before returning initialized resources.
+    pub const fn stream_requirement(self) -> BlockingStreamRequirement {
+        BlockingStreamRequirement::new(1)
+    }
+
     pub fn new(
         maximum_staging_bytes: u64,
         maximum_commands_per_batch: usize,

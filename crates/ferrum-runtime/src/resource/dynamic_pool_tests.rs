@@ -6394,6 +6394,13 @@ fn descriptor_mismatch_is_observable_and_explicit_cleanup_returns_its_grant() {
             ..
         })
     ));
+    assert!(matches!(
+        harness.root.try_retain_idle_dynamic_backing(64).unwrap(),
+        IdleDynamicBackingOutcome::Busy(IdleDynamicReleaseBusy::Pool {
+            quarantined_chunks: 1,
+            ..
+        })
+    ));
     assert_eq!(&harness.root.dynamic_pool_status().unwrap(), quarantined);
     let before_release = harness
         .root
@@ -6703,6 +6710,122 @@ mod idle_trim_tests {
     use super::*;
 
     #[test]
+    fn exact_retention_bound_preserves_chunks_and_grants_until_original_root_close() {
+        let catalogs = ['a', 'b'].map(|layout| {
+            pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Request,
+                layout,
+                1,
+                64,
+                TestDemand::Fixed,
+            )
+        });
+        let catalog = combine_catalogs(&catalogs);
+        let runtime = new_runtime(&catalog, 128);
+        let harness = harness(runtime.clone(), catalog, 128, false);
+        harness
+            .root
+            .maintenance_controller
+            .initialize_pools(&harness.pool_ids)
+            .unwrap();
+        let budget = Arc::clone(&harness.root.dynamic_pools.budget);
+        let original_backing = harness
+            .root
+            .dynamic_pools
+            .pools
+            .values()
+            .map(|pool| {
+                let state = pool.state.lock().unwrap();
+                Arc::downgrade(&state.chunks.values().next().unwrap().backing)
+            })
+            .collect::<Vec<_>>();
+        let before = harness.root.dynamic_pool_status().unwrap();
+        let allocation_calls = runtime.allocate_calls();
+        let IdleDynamicBackingOutcome::Retained(receipt) =
+            harness.root.try_retain_idle_dynamic_backing(128).unwrap()
+        else {
+            panic!("the exact total bound retains both idle pools");
+        };
+        assert_eq!(receipt.retained_bytes(), 128);
+        assert_eq!(receipt.retained_chunks(), 2);
+        assert_eq!(harness.root.dynamic_pool_status().unwrap(), before);
+        assert!(original_backing
+            .iter()
+            .all(|backing| backing.upgrade().is_some()));
+        assert!(matches!(
+            DeviceCapacityReservation::reserve(&budget, 1),
+            Err(VNextError::DeviceCapacityUnavailable(_))
+        ));
+
+        // Retention is not an admission permit: the next real request claims
+        // the existing extents through ordinary authority checks.
+        let request = admitted_request(&harness.root, "retained-idle-backing");
+        assert_eq!(runtime.allocate_calls(), allocation_calls);
+        drop(request);
+        assert_eq!(
+            harness
+                .root
+                .dynamic_pool_status()
+                .unwrap()
+                .budget_claimed_bytes(),
+            128
+        );
+
+        close_dynamic_test_root(harness.root);
+        assert!(original_backing
+            .iter()
+            .all(|backing| backing.upgrade().is_none()));
+        // The receipt and independent budget reference survive close, but
+        // neither keeps any native backing or physical capacity grant alive.
+        assert_eq!(receipt.retained_bytes(), 128);
+        let full_capacity = DeviceCapacityReservation::reserve(&budget, 128).unwrap();
+        drop(full_capacity);
+    }
+
+    #[test]
+    fn retention_below_total_or_zero_releases_all_pools_atomically() {
+        for maximum_bytes in [127, 0] {
+            let catalogs = ['a', 'b'].map(|layout| {
+                pool_catalog(
+                    linear_profile(),
+                    AllocationLifetime::Request,
+                    layout,
+                    1,
+                    64,
+                    TestDemand::Fixed,
+                )
+            });
+            let catalog = combine_catalogs(&catalogs);
+            let runtime = new_runtime(&catalog, 128);
+            let harness = harness(runtime, catalog, 128, false);
+            harness
+                .root
+                .maintenance_controller
+                .initialize_pools(&harness.pool_ids)
+                .unwrap();
+            let IdleDynamicBackingOutcome::Released(receipt) = harness
+                .root
+                .try_retain_idle_dynamic_backing(maximum_bytes)
+                .unwrap()
+            else {
+                panic!("an exceeded or zero retention bound releases all idle backing");
+            };
+            assert_eq!(receipt.reclaimed_bytes(), 128);
+            assert_eq!(receipt.reclaimed_chunks(), 2);
+            let after = harness.root.dynamic_pool_status().unwrap();
+            assert_eq!(after.budget_claimed_bytes(), 0);
+            assert_eq!(after.process_claimed_bytes(), 0);
+            assert!(after.pools().iter().all(|pool| pool.resident_bytes() == 0));
+            assert!(matches!(
+                harness.root.try_retain_idle_dynamic_backing(0).unwrap(),
+                IdleDynamicBackingOutcome::Released(receipt) if receipt.reclaimed_bytes() == 0
+            ));
+            close_dynamic_test_root(harness.root);
+        }
+    }
+
+    #[test]
     fn idle_trim_is_atomic_across_pools_and_rejects_live_authorities_and_backing_aliases() {
         let catalogs = ['a', 'b'].map(|layout| {
             pool_catalog(
@@ -6728,6 +6851,10 @@ mod idle_trim_tests {
             harness.root.try_release_idle_dynamic_backing().unwrap(),
             IdleDynamicReleaseOutcome::Busy(IdleDynamicReleaseBusy::LogicalAuthorities { .. })
         ));
+        assert!(matches!(
+            harness.root.try_retain_idle_dynamic_backing(512).unwrap(),
+            IdleDynamicBackingOutcome::Busy(IdleDynamicReleaseBusy::LogicalAuthorities { .. })
+        ));
         assert_eq!(harness.root.dynamic_pool_status().unwrap(), before);
         drop(request);
         let pool = &harness.root.dynamic_pools.pools[&harness.pool_ids[1]];
@@ -6742,6 +6869,13 @@ mod idle_trim_tests {
         assert!(matches!(
             harness.root.try_release_idle_dynamic_backing().unwrap(),
             IdleDynamicReleaseOutcome::Busy(IdleDynamicReleaseBusy::Pool {
+                externally_retained_chunks: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            harness.root.try_retain_idle_dynamic_backing(512).unwrap(),
+            IdleDynamicBackingOutcome::Busy(IdleDynamicReleaseBusy::Pool {
                 externally_retained_chunks: 1,
                 ..
             })
@@ -6788,7 +6922,7 @@ mod idle_trim_tests {
         let entered = Arc::new(std::sync::Barrier::new(2));
         let resume = Arc::new(std::sync::Barrier::new(2));
         runtime.set_allocation_rendezvous(entered.clone(), resume.clone());
-        let (outcome, before, after) = std::thread::scope(|scope| {
+        let (outcome, retention, before, after) = std::thread::scope(|scope| {
             let controller = &harness.root.maintenance_controller;
             let pool = &harness.pool_ids[0];
             let worker = std::thread::Builder::new()
@@ -6798,16 +6932,21 @@ mod idle_trim_tests {
             entered.wait();
             let before = harness.root.dynamic_pool_status().unwrap();
             let outcome = harness.root.try_release_idle_dynamic_backing();
+            let retention = harness.root.try_retain_idle_dynamic_backing(512);
             let after = harness.root.dynamic_pool_status().unwrap();
             resume.wait();
             worker.join().unwrap().unwrap();
-            (outcome, before, after)
+            (outcome, retention, before, after)
         });
         assert!(before.pools()[0].pending_growth_bytes() > 0);
         assert_eq!(before, after);
         assert!(matches!(
             outcome.unwrap(),
             IdleDynamicReleaseOutcome::Busy(IdleDynamicReleaseBusy::PoolMaintenance { .. })
+        ));
+        assert!(matches!(
+            retention.unwrap(),
+            IdleDynamicBackingOutcome::Busy(IdleDynamicReleaseBusy::PoolMaintenance { .. })
         ));
         assert!(matches!(
             harness.root.try_release_idle_dynamic_backing().unwrap(),

@@ -124,7 +124,8 @@ pub struct CudaConfig {
     pub usable_memory_bytes: u64,
     pub bootstrap_memory_bytes: u64,
     pub stream_memory_bytes: u64,
-    pub maximum_streams: usize,
+    #[serde(default)]
+    pub maximum_streams: ferrum_engine::image_generation::ImageStreamLimit,
     pub maximum_in_flight_per_stream: usize,
     pub maximum_commands_per_submission: usize,
     pub opaque_memory_profile: String,
@@ -187,6 +188,8 @@ pub struct PipelineConfig {
     pub plan_cache: ferrum_engine::image_generation::ImagePlanCachePolicy,
     #[serde(default)]
     pub residency: ferrum_engine::image_generation::ImageResidencyPolicy,
+    #[serde(default)]
+    pub dynamic_residency: ferrum_engine::image_generation::ImageDynamicResidencyPolicy,
     pub maximum_staging_bytes: u64,
     pub maximum_initialization_commands: usize,
     pub maximum_backing_maintenance_passes: usize,
@@ -200,6 +203,7 @@ impl PipelineConfig {
         device_capacity_bytes: u64,
     ) -> Result<ferrum_engine::image_generation::ImagePipelineConfig> {
         self.plan_cache.validate()?;
+        self.dynamic_residency.validate(self.residency)?;
         ensure!(
             device_capacity_bytes > 0 && self.maximum_width > 0 && self.maximum_height > 0,
             "backend usable_memory_bytes and image pixel bounds must be positive"
@@ -223,6 +227,7 @@ impl PipelineConfig {
             edit_prefix_policy: self.edit_prefix_policy,
             plan_cache: self.plan_cache,
             residency: self.residency,
+            dynamic_residency: self.dynamic_residency,
             static_initialization: StaticInitializationPolicy::new(
                 self.maximum_staging_bytes,
                 self.maximum_initialization_commands,
@@ -286,7 +291,24 @@ impl CudaConfig {
     pub fn resolved_pipeline(
         &self,
     ) -> Result<ferrum_engine::image_generation::ImagePipelineConfig> {
-        self.pipeline.resolved(self.usable_memory_bytes)
+        let pipeline = self.pipeline.resolved(self.usable_memory_bytes)?;
+        self.maximum_streams.resolve(
+            ferrum_engine::image_generation::ImageStreamRequirements::for_serial_pipeline(
+                pipeline.static_initialization,
+                pipeline.executor,
+            ),
+        )?;
+        Ok(pipeline)
+    }
+
+    pub fn stream_plan(&self) -> Result<ferrum_engine::image_generation::ImageStreamPlan> {
+        let pipeline = self.resolved_pipeline()?;
+        self.maximum_streams.resolve(
+            ferrum_engine::image_generation::ImageStreamRequirements::for_serial_pipeline(
+                pipeline.static_initialization,
+                pipeline.executor,
+            ),
+        )
     }
 }
 
@@ -466,6 +488,7 @@ impl PipelineConfig {
             edit_prefix_policy: self.edit_prefix_policy,
             plan_cache: self.plan_cache,
             residency: self.residency,
+            dynamic_residency: self.dynamic_residency,
             static_initialization: StaticInitializationPolicy::new(
                 self.maximum_staging_bytes,
                 self.maximum_initialization_commands,

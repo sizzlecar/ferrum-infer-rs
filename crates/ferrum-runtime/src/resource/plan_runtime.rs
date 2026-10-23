@@ -25,6 +25,72 @@ use crate::{
     ResolvedReusableExecutionBucket, ReusableExecutionBucketId, ReusableExecutionBucketSpec,
 };
 
+/// Immutable membership only. Work-shape demand and physical backing authority
+/// are evaluated again for every Step admission.
+pub(super) struct StepResourceSlotLayout {
+    pub(super) descriptor_indices: Vec<usize>,
+    pub(super) claim_identity: PhysicalBackingClaimIdentity,
+}
+
+pub(super) fn compile_step_resource_slot_layouts(
+    domain: &super::DynamicPoolDomainSpec,
+) -> Result<Vec<StepResourceSlotLayout>, VNextError> {
+    let mut descriptor_indices = super::BTreeMap::new();
+    for (index, descriptor) in domain.descriptors.iter().enumerate() {
+        if descriptor_indices
+            .insert(descriptor.base_resource_id(), index)
+            .is_some()
+        {
+            return Err(invalid_resource(
+                "step slot layout requires unique pool descriptors",
+            ));
+        }
+    }
+    let mut covered = super::BTreeSet::new();
+    let mut layouts = Vec::with_capacity(domain.pool.step_resource_slots().len());
+    for slot in domain.pool.step_resource_slots() {
+        let indices = slot
+            .resource_ids()
+            .iter()
+            .map(|resource_id| {
+                let &index = descriptor_indices.get(resource_id).ok_or_else(|| {
+                    invalid_resource("step physical slot references a descriptor outside its pool")
+                })?;
+                if domain.descriptors[index].lifetime() != AllocationLifetime::Step {
+                    return Err(invalid_resource(
+                        "step physical slot references a non-Step descriptor",
+                    ));
+                }
+                if !covered.insert(index) {
+                    return Err(invalid_resource(
+                        "step physical slots repeat a logical resource",
+                    ));
+                }
+                Ok(index)
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        layouts.push(StepResourceSlotLayout {
+            descriptor_indices: indices,
+            claim_identity: PhysicalBackingClaimIdentity::new(
+                domain.pool_id().clone(),
+                slot.resource_ids().to_vec(),
+            )?,
+        });
+    }
+    if covered.len()
+        != domain
+            .descriptors
+            .iter()
+            .filter(|descriptor| descriptor.lifetime() == AllocationLifetime::Step)
+            .count()
+    {
+        return Err(invalid_resource(
+            "step physical slots do not cover immutable Step descriptors exactly",
+        ));
+    }
+    Ok(layouts)
+}
+
 pub(super) const PLAN_RUNTIME_OPEN: u8 = 0;
 const PLAN_RUNTIME_CLOSING: u8 = 1;
 
@@ -1249,21 +1315,45 @@ where
         let mut immediate_entries = Vec::new();
         let mut fit_entries = Vec::new();
         let mut requested_slices = Vec::new();
-        for domain in &self.dynamic_pools().domains {
+        let pools = self.dynamic_pools();
+        if lifetime == AllocationLifetime::Step
+            && pools.domains.len() != pools.step_resource_slot_layouts.len()
+        {
+            return Err(invalid_resource(
+                "step slot layout count differs from immutable plan domains",
+            ));
+        }
+        for (domain_index, domain) in pools.domains.iter().enumerate() {
             let mut immediate_pool_bytes = 0_u64;
             let mut fit_pool_bytes = 0_u64;
             let mut matched = false;
             if lifetime == AllocationLifetime::Step {
-                for slot in domain.pool.step_resource_slots() {
+                let layouts = &pools.step_resource_slot_layouts[domain_index];
+                if layouts.len() != domain.pool.step_resource_slots().len() {
+                    return Err(invalid_resource(
+                        "step slot layout count differs from its immutable pool",
+                    ));
+                }
+                for (slot, layout) in domain.pool.step_resource_slots().iter().zip(layouts) {
+                    if layout.claim_identity.pool_id() != domain.pool_id()
+                        || layout.claim_identity.resource_ids() != slot.resource_ids()
+                        || layout.descriptor_indices.len() != slot.resource_ids().len()
+                    {
+                        return Err(invalid_resource(
+                            "step slot layout differs from its immutable pool membership",
+                        ));
+                    }
                     let mut projections = Vec::with_capacity(slot.resource_ids().len());
                     let mut immediate_slot_bytes = 0_u64;
                     let mut fit_slot_bytes = 0_u64;
                     let mut capacity_slot_bytes = 0_u64;
-                    for resource_id in slot.resource_ids() {
+                    for (resource_id, &descriptor_index) in
+                        slot.resource_ids().iter().zip(&layout.descriptor_indices)
+                    {
                         let descriptor = domain
                             .descriptors
-                            .iter()
-                            .find(|descriptor| descriptor.base_resource_id() == resource_id)
+                            .get(descriptor_index)
+                            .filter(|descriptor| descriptor.base_resource_id() == resource_id)
                             .ok_or_else(|| {
                                 invalid_resource(
                                     "step physical slot references a descriptor outside its pool",
@@ -1299,10 +1389,7 @@ where
                         .ok_or_else(|| invalid_resource("dynamic pool fit demand overflows u64"))?;
                     requested_slices.push(EvaluatedBackingRequest {
                         domain,
-                        claim_identity: PhysicalBackingClaimIdentity::new(
-                            domain.pool_id().clone(),
-                            slot.resource_ids().to_vec(),
-                        )?,
+                        claim_identity: layout.claim_identity.clone(),
                         capacity_size_bytes: capacity_slot_bytes,
                         reusable_execution_bucket_id: reusable_execution_bucket
                             .map(|bucket| bucket.bucket_id().clone()),

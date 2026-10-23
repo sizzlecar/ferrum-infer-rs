@@ -1,5 +1,6 @@
 //! Dynamic pool-set orchestration over backing owned by `dynamic_pool`.
 
+use super::plan_runtime::{compile_step_resource_slot_layouts, StepResourceSlotLayout};
 use super::{
     align_up_resource, backing_segment_range, backing_segment_range_matches,
     bind_lane_stable_slot_projections, compile_program_binding_layouts,
@@ -79,6 +80,7 @@ where
     pub(in crate::resource) pools: BTreeMap<DynamicBackingPoolId, Arc<DynamicBackingPool<R>>>,
     pub(in crate::resource) domains: Vec<DynamicPoolDomainSpec>,
     pub(in crate::resource) nodes: Arc<[PlanNode]>,
+    pub(in crate::resource) step_resource_slot_layouts: Vec<Vec<StepResourceSlotLayout>>,
     pub(in crate::resource) submission_wave_layouts: Vec<Option<SubmissionWaveDomainLayout>>,
     pub(in crate::resource) submission_wave_reusable_capacity_layouts:
         BTreeMap<ReusableExecutionBucketId, Vec<Option<SubmissionWaveDomainCapacityLayout>>>,
@@ -163,6 +165,10 @@ where
         reusable_execution: Option<ReusableExecutionMemoryPlan>,
     ) -> Result<Self, VNextError> {
         let request_state_hazards = RequestStateHazardCoordinator::compile(&nodes)?;
+        let step_resource_slot_layouts = domains
+            .iter()
+            .map(compile_step_resource_slot_layouts)
+            .collect::<Result<Vec<_>, _>>()?;
         let submission_wave_layouts = domains
             .iter()
             .map(|domain| compile_submission_wave_domain_layout(domain, &nodes))
@@ -221,6 +227,7 @@ where
             domains,
             pools,
             nodes,
+            step_resource_slot_layouts,
             submission_wave_layouts,
             submission_wave_reusable_capacity_layouts,
             program_binding_layouts,

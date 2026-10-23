@@ -33,12 +33,81 @@ impl ImageResidencyPolicy {
     }
 }
 
+/// Controls idle dynamic backing independently of static model residency.
+/// Retention never reserves extra capacity or grants another root reclamation
+/// authority. The selected ceiling is included in cross-stage preflight peaks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImageDynamicResidencyPolicy {
+    #[default]
+    Release,
+    RetainDecoder {
+        maximum_bytes: u64,
+    },
+    RetainSmallStages {
+        maximum_bytes_per_stage: u64,
+    },
+}
+impl ImageDynamicResidencyPolicy {
+    pub fn validate(self, residency: ImageResidencyPolicy) -> anyhow::Result<()> {
+        if let Self::RetainDecoder { maximum_bytes } = self {
+            ensure!(
+                maximum_bytes > 0,
+                "decoder dynamic retention ceiling must be positive"
+            );
+            ensure!(
+                residency.retains(ImageStage::Decoder),
+                "decoder dynamic retention requires decoder session residency"
+            );
+        }
+        if let Self::RetainSmallStages {
+            maximum_bytes_per_stage,
+        } = self
+        {
+            ensure!(
+                maximum_bytes_per_stage > 0,
+                "stage dynamic retention ceiling must be positive"
+            );
+            ensure!(
+                residency != ImageResidencyPolicy::Cold,
+                "stage dynamic retention requires resident sessions"
+            );
+        }
+        Ok(())
+    }
+
+    fn stage_ceiling(self, stage: ImageStage) -> u64 {
+        match self {
+            Self::Release => 0,
+            Self::RetainDecoder { maximum_bytes } if stage == ImageStage::Decoder => maximum_bytes,
+            Self::RetainSmallStages {
+                maximum_bytes_per_stage,
+            } if stage != ImageStage::Noise => maximum_bytes_per_stage,
+            _ => 0,
+        }
+    }
+}
+
+const RETAINABLE_STAGES: [ImageStage; 5] = [
+    ImageStage::TextEncoder,
+    ImageStage::VisionEncoder,
+    ImageStage::VaeEncoder,
+    ImageStage::Denoiser,
+    ImageStage::Decoder,
+];
+
+fn resident_stage_index(stage: ImageStage) -> Option<usize> {
+    RETAINABLE_STAGES.iter().position(|&kind| kind == stage)
+}
+
 pub(super) struct ResidentStages<R: DeviceRuntime> {
     text_encoder: Option<ActiveImageStage<R>>,
     vision_encoder: Option<ActiveImageStage<R>>,
     vae_encoder: Option<ActiveImageStage<R>>,
     denoiser: Option<ActiveImageStage<R>>,
     decoder: Option<ActiveImageStage<R>>,
+    /// Last successful idle-retention receipts, including older shapes' pools.
+    dynamic_bytes: [u64; 5],
     text_encoder_weights: Option<ResidentWeights<R>>,
     vision_encoder_weights: Option<ResidentWeights<R>>,
     vae_encoder_weights: Option<ResidentWeights<R>>,
@@ -57,6 +126,7 @@ impl<R: DeviceRuntime> ResidentStages<R> {
             vae_encoder: None,
             denoiser: None,
             decoder: None,
+            dynamic_bytes: [0; 5],
             text_encoder_weights: None,
             vision_encoder_weights: None,
             vae_encoder_weights: None,
@@ -84,6 +154,14 @@ impl<R: DeviceRuntime> ResidentStages<R> {
             _ => None,
         }
     }
+    fn dynamic_bytes(&self, stage: ImageStage) -> u64 {
+        resident_stage_index(stage).map_or(0, |index| self.dynamic_bytes[index])
+    }
+    fn set_dynamic_bytes(&mut self, stage: ImageStage, bytes: u64) {
+        if let Some(index) = resident_stage_index(stage) {
+            self.dynamic_bytes[index] = bytes;
+        }
+    }
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
@@ -93,6 +171,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
 
     /// Batch planning evidence, not an allocation permit. All retained model
     /// installations coexist; only one stage's dynamic pools execute at once.
+    /// Explicitly retained idle pools coexist with every other active stage.
     /// The shared device ledger remains authoritative under outside contention.
     #[cfg(test)]
     pub(super) fn validate_resident_capacity(
@@ -107,7 +186,35 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         stages: &[&PreparedStage<R>],
         prefix: Option<(&PreparedStage<R>, &PreparedStage<R>)>,
     ) -> anyhow::Result<()> {
-        if self.config.residency == ImageResidencyPolicy::Cold && prefix.is_none() {
+        self.config
+            .dynamic_residency
+            .validate(self.config.residency)?;
+        let retained_dynamic_by_stage = RETAINABLE_STAGES.map(|stage| {
+            let ceiling = if self.config.residency.retains(stage) {
+                self.config.dynamic_residency.stage_ceiling(stage)
+            } else {
+                0
+            };
+            ceiling.max(self.resident_stages.dynamic_bytes(stage))
+        });
+        let retained_dynamic = retained_dynamic_by_stage
+            .iter()
+            .try_fold(0_u64, |sum, bytes| {
+                sum.checked_add(*bytes)
+                    .context("retained dynamic allowances overflow")
+            })?;
+        let other_dynamic = |stage| {
+            let own = if self.config.residency.retains(stage) {
+                resident_stage_index(stage).map_or(0, |index| retained_dynamic_by_stage[index])
+            } else {
+                0
+            };
+            retained_dynamic - own
+        };
+        if self.config.residency == ImageResidencyPolicy::Cold
+            && prefix.is_none()
+            && retained_dynamic == 0
+        {
             return Ok(());
         }
         let mut retained_static = 0_u64;
@@ -130,10 +237,18 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             // Fixed demand includes actual compiled provider scratch, per-pool
             // alignment, and proven activation/invocation lifetime reuse. Do
             // not add the cuDNN workspace limit again or sum all dynamic plans.
-            let active = memory
+            let mut active = memory
                 .minimum_runnable_request_bytes()
                 .checked_add(if retained { 0 } else { memory.static_bytes() })
                 .context("active component bytes overflow")?;
+            if retained {
+                // Reuse the same plan's pools, or close the previous plan before
+                // replacement. Its own idle allowance is not counted twice.
+                active = active.max(self.resident_stages.dynamic_bytes(stage.plan.stage));
+            }
+            active = active
+                .checked_add(other_dynamic(stage.plan.stage))
+                .context("retained pools plus active component bytes overflow")?;
             active_peak = active_peak.max(active);
         }
         if let Some((prefill, decode)) = prefix {
@@ -160,6 +275,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .minimum_runnable_request_bytes()
                 .checked_add(decode.minimum_request_bytes())
                 .and_then(|n| n.checked_add(decode.minimum_sequence_bytes()))
+                .map(|n| n.max(self.resident_stages.dynamic_bytes(ImageStage::Denoiser)))
+                .and_then(|n| n.checked_add(other_dynamic(ImageStage::Denoiser)))
                 .and_then(|n| {
                     n.checked_add(if self.config.residency.retains(ImageStage::Denoiser) {
                         0
@@ -173,6 +290,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             // snapshot, including weights no longer consumed by decode.
             let decode_peak = decode
                 .minimum_runnable_request_bytes()
+                .max(self.resident_stages.dynamic_bytes(ImageStage::Denoiser))
+                .checked_add(other_dynamic(ImageStage::Denoiser))
+                .context("retained pools plus prefix decode capacity overflows")?
                 .checked_add(if self.config.residency.retains(ImageStage::Denoiser) {
                     0
                 } else {
@@ -204,7 +324,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .and_then(|n| n.checked_add(self.device_opaque_allowance_bytes))
             .context("resident batch capacity overflows")?;
         ensure!(required <= self.config.device_capacity_bytes,
-            "resident image batch needs {required} device bytes (retained static {retained_static}, active stage peak {active_peak}, native allowance {}), exceeding total ceiling {}",
+            "resident image batch needs {required} device bytes (retained static {retained_static}, active stage peak {active_peak}, total idle dynamic allowance {retained_dynamic}, native allowance {}), exceeding total ceiling {}",
             self.device_opaque_allowance_bytes, self.config.device_capacity_bytes);
         Ok(())
     }
@@ -277,6 +397,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 // The old plan was compiled during an earlier acquisition.
                 previous.receipt.plan.compile_wall_duration_us = 0;
                 stages.push(previous.close()?);
+                self.resident_stages
+                    .set_dynamic_bytes(prepared.plan.stage, 0);
             }
             if let Some(weights) = self
                 .resident_stages
@@ -353,23 +475,58 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     );
                 }
                 let started = std::time::Instant::now();
-                let idle_release = match active.session.try_release_idle_dynamic_backing() {
-                    Ok(IdleDynamicReleaseOutcome::Released(receipt)) => receipt,
-                    Ok(IdleDynamicReleaseOutcome::Busy(reason)) => {
-                        return Err(active.processing(anyhow::anyhow!(
-                            "stage is not idle for residency: {reason:?}"
-                        )))
+                let ceiling = self
+                    .config
+                    .dynamic_residency
+                    .stage_ceiling(active.receipt.plan.stage);
+                let retirement = if ceiling > 0 {
+                    match active.session.try_retain_idle_dynamic_backing(ceiling) {
+                        Ok(IdleDynamicBackingOutcome::Retained(retention)) => {
+                            ImageStageRetirement::ResidentBackingRetained { retention }
+                        }
+                        Ok(IdleDynamicBackingOutcome::Released(idle_release)) => {
+                            ImageStageRetirement::Resident { idle_release }
+                        }
+                        Ok(IdleDynamicBackingOutcome::Busy(reason)) => {
+                            return Err(active.processing(anyhow::anyhow!(
+                                "stage is not idle for residency: {reason:?}"
+                            )))
+                        }
+                        Err(error) => return Err(active.processing(error.into())),
                     }
-                    Err(error) => return Err(active.processing(error.into())),
+                } else {
+                    match active.session.try_release_idle_dynamic_backing() {
+                        Ok(IdleDynamicReleaseOutcome::Released(idle_release)) => {
+                            ImageStageRetirement::Resident { idle_release }
+                        }
+                        Ok(IdleDynamicReleaseOutcome::Busy(reason)) => {
+                            return Err(active.processing(anyhow::anyhow!(
+                                "stage is not idle for residency: {reason:?}"
+                            )))
+                        }
+                        Err(error) => return Err(active.processing(error.into())),
+                    }
                 };
                 let close_wall_duration_us = trace_elapsed_us(started);
+                let stage = active.receipt.plan.stage;
+                let retained_bytes = match &retirement {
+                    ImageStageRetirement::ResidentBackingRetained { retention } => {
+                        retention.retained_bytes()
+                    }
+                    _ => 0,
+                };
+                self.resident_stages
+                    .set_dynamic_bytes(stage, retained_bytes);
                 stages.push(ImageStageReceipt {
                     execution: active.receipt.clone(),
                     close: None,
-                    retirement: ImageStageRetirement::Resident { idle_release },
+                    retirement,
                     close_wall_duration_us,
                 });
-                *slot = Some(active);
+                *self
+                    .resident_stages
+                    .slot(stage)
+                    .expect("resident stage slot") = Some(active);
                 return Ok(());
             }
         }
@@ -399,7 +556,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 active.receipt.session_reused = true;
                 active.receipt.weights_reused = true;
                 match active.close() {
-                    Ok(receipt) => completed_stages.push(receipt),
+                    Ok(receipt) => {
+                        completed_stages.push(receipt);
+                        self.resident_stages.set_dynamic_bytes(stage, 0);
+                    }
                     Err(failure) => {
                         return Err(ImageGenerationError {
                             failure,

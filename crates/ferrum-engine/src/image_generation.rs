@@ -32,15 +32,19 @@ mod prepare;
 mod residency;
 pub mod service;
 mod stage;
+mod stream_requirements;
 pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources};
 pub use attention_policy::ImageCudaAttentionPolicy;
 pub use plan_cache::{ImagePlanCachePolicy, ImagePlanCacheReceipt};
 pub use precision::ImageCudaPrecisionPolicy;
-pub use residency::ImageResidencyPolicy;
+pub use residency::{ImageDynamicResidencyPolicy, ImageResidencyPolicy};
 pub use stage::{
     ActiveImageStage, ImageGenerationError, ImageGenerationFailure, ImageStage,
     ImageStageExecutionReceipt, ImageStagePlanReceipt, ImageStagePlanRole, ImageStageReceipt,
     ImageStageRetirement,
+};
+pub use stream_requirements::{
+    ImageStreamLimit, ImageStreamLimitSource, ImageStreamPlan, ImageStreamRequirements,
 };
 
 use anyhow::{ensure, Context};
@@ -117,6 +121,7 @@ pub struct ImagePipelineConfig {
     pub edit_prefix_policy: ImageEditPrefixPolicy,
     pub plan_cache: ImagePlanCachePolicy,
     pub residency: ImageResidencyPolicy,
+    pub dynamic_residency: ImageDynamicResidencyPolicy,
     pub static_initialization: StaticInitializationPolicy,
     pub executor: TensorExecutorConfig,
 }
@@ -125,6 +130,7 @@ impl ImagePipelineConfig {
 
     fn validate(&self) -> anyhow::Result<()> {
         self.plan_cache.validate()?;
+        self.dynamic_residency.validate(self.residency)?;
         ensure!(
             self.device_capacity_bytes > 0 && self.maximum_width > 0 && self.maximum_height > 0,
             "image capacity and dimension limits must be positive"

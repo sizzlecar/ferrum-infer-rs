@@ -4,6 +4,7 @@ use ferrum_models::qwen_image21::{IMAGE_PROJECTION_INPUT_ID, IMAGE_PROJECTION_OU
 use half::bf16;
 
 mod all_components;
+mod dynamic;
 
 pub(super) fn numeric_pipeline() -> (
     QwenImage21Pipeline<ReferenceDeviceRuntime>,

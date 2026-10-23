@@ -22,6 +22,7 @@ fn config() -> ImagePipelineConfig {
         edit_prefix_policy: ImageEditPrefixPolicy::default(),
         plan_cache: ImagePlanCachePolicy::default(),
         residency: ImageResidencyPolicy::default(),
+        dynamic_residency: ImageDynamicResidencyPolicy::default(),
         static_initialization: StaticInitializationPolicy::new(256, 8).unwrap(),
         executor: TensorExecutorConfig::default(),
     }

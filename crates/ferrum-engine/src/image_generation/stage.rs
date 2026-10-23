@@ -96,6 +96,9 @@ pub enum ImageStageRetirement {
     Resident {
         idle_release: DynamicPoolRebalanceReceipt,
     },
+    ResidentBackingRetained {
+        retention: IdleDynamicRetentionReceipt,
+    },
 }
 
 /// Recovery owns the actual active session rather than a formatted diagnostic.

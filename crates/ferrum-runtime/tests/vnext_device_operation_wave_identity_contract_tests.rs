@@ -213,6 +213,42 @@ fn unsubmitted_step_retry_keeps_the_first_physical_journal_identity() {
 }
 
 #[test]
+fn subset_wave_identity_uses_the_immutable_plan_index() {
+    let (fixture, sequence, session, batch, step) = setup();
+    let expected_node = &fixture.plan.payload().nodes()[1];
+    let wave = prepare_determinism_wave_for_nodes(
+        &fixture.plan_resources,
+        &fixture.plan,
+        &step,
+        &[expected_node.id().clone()],
+    );
+    assert_eq!(wave.nodes()[0].node_id(), expected_node.id());
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        step.execution_lane(),
+    )
+    .unwrap();
+    let node = &identity.nodes()[0];
+    let parts = node.participants()[0].identity().parts();
+    assert_eq!(parts.node_id.as_ref(), Some(expected_node.id()));
+    assert_eq!(
+        parts.operation_id.as_ref(),
+        Some(expected_node.operation_id())
+    );
+    assert_eq!(
+        parts.provider_id.as_ref(),
+        Some(expected_node.selection().selected_provider())
+    );
+    drop(identity);
+    drop(active_bindings);
+    drop(wave);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn wrong_wave_topology_rejects_before_legal_wave_can_prepare() {
     let (fixture, sequence, session, batch, step) = setup();
     let wrong = InvocationResourceAdmissionRequest::for_all_step_participants(
@@ -230,6 +266,28 @@ fn wrong_wave_topology_rejects_before_legal_wave_can_prepare() {
     assert!(error
         .to_string()
         .contains("cover every plan node exactly once"));
+
+    let reordered = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .rev()
+        .map(|node| {
+            InvocationResourceAdmissionRequest::for_all_step_participants(
+                node.id().clone(),
+                step.bind_all_invocation_work_shape(vec![one_token_span()])
+                    .unwrap(),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(step.try_prepare_submission_wave(reordered.clone()).is_err());
+    assert!(step
+        .try_prepare_determinism_submission_wave(reordered)
+        .is_err());
 
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     drop(wave);

@@ -148,6 +148,98 @@ fn rotary_frequency_exponents_and_invalid_destinations_are_checked() {
     let mut output = [123.0; 7];
     assert!(descriptor.write_into(&layout, &mut output).is_err());
     assert_eq!(output, [123.0; 7]);
+    let mut output = [123.0; 256];
+    assert!(descriptor
+        .write_range(&layout, layout.sequence_length() - 1, 2, &mut output)
+        .is_err());
+    assert_eq!(output, [123.0; 256]);
     assert!(checked_elements::<f32>(u64::MAX, 128).is_err());
     assert!(checked_elements::<f32>(isize::MAX as u64, 1).is_err());
+}
+
+#[test]
+fn rotary_edit_phases_match_independent_positions_and_analytic_frequencies() {
+    use super::super::QwenImage21TransformerPhase;
+    let edit = QwenImage21TransformerConfig::new(
+        config(true).transformer().clone(),
+        QwenImage21T2iLayout::new(5, 2, 2, vec![5]).unwrap(),
+    )
+    .unwrap()
+    .with_reference_image(1, 1, 2, 2)
+    .unwrap();
+    let positions = [
+        [0, 0, 0],
+        [1, -1, -1],
+        [1, -1, 0],
+        [1, 0, -1],
+        [1, 0, 0],
+        [3, 3, 3],
+        [4, 4, 4],
+        [5, 5, 5],
+        [6, -1, -1],
+        [6, -1, 0],
+        [6, 0, -1],
+        [6, 0, 0],
+    ];
+    let descriptor = edit.rotary_frequencies().unwrap();
+    for (phase, expected_positions) in [
+        (
+            QwenImage21TransformerPhase::PrefixPrefill,
+            positions.as_slice(),
+        ),
+        (QwenImage21TransformerPhase::PrefixDecode, &positions[8..]),
+    ] {
+        let config = edit.clone().with_execution_phase(phase).unwrap();
+        let mut output = vec![f32::NAN; descriptor.phase_output_elements(&config).unwrap()];
+        descriptor.write_phase_into(&config, &mut output).unwrap();
+        assert_eq!(output.len(), expected_positions.len() * 8);
+        for (row, &[frame, height, width]) in expected_positions.iter().enumerate() {
+            // Axes [2,2,4]: only width's second pair has inverse sqrt(10000)=.01.
+            let angles = [
+                frame as f32,
+                height as f32,
+                width as f32,
+                width as f32 * 0.01,
+            ];
+            for (pair, angle) in angles.into_iter().enumerate() {
+                let offset = row * 8 + pair * 2;
+                assert_eq!(output[offset].to_bits(), libm::cosf(angle).to_bits());
+                assert_eq!(output[offset + 1].to_bits(), libm::sinf(angle).to_bits());
+            }
+        }
+    }
+}
+
+#[test]
+fn rotary_wide_axes_preserve_pair_boundaries_without_input_sized_scratch() {
+    let descriptor = QwenImage21RotaryFrequencies::new([256, 256, 4]).unwrap();
+    let layout = QwenImage21T2iLayout::new(2, 2, 2, vec![1]).unwrap();
+    let positions = [
+        [0, 0, 0],
+        [1, 1, 1],
+        [2, -1, -1],
+        [2, -1, 0],
+        [2, 0, -1],
+        [2, 0, 0],
+    ];
+    let mut output = vec![f32::NAN; descriptor.output_elements(&layout).unwrap()];
+    descriptor.write_into(&layout, &mut output).unwrap();
+    assert!(output.iter().all(|value| value.is_finite()));
+    for (row, positions) in positions.into_iter().enumerate() {
+        // Known exponents 0 and 1/2 give exact inverse frequencies 1 and .01.
+        // Include both full wide axes and every pair of the final short axis.
+        for (pair, axis, inverse) in [
+            (0, 0, 1.0),
+            (64, 0, 0.01),
+            (128, 1, 1.0),
+            (192, 1, 0.01),
+            (256, 2, 1.0),
+            (257, 2, 0.01),
+        ] {
+            let angle = positions[axis] as f32 * inverse;
+            let offset = row * 516 + pair * 2;
+            assert_eq!(output[offset].to_bits(), libm::cosf(angle).to_bits());
+            assert_eq!(output[offset + 1].to_bits(), libm::sinf(angle).to_bits());
+        }
+    }
 }

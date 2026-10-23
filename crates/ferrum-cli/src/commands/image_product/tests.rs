@@ -26,6 +26,59 @@ fn configuration() -> Value {
                 "maximum_initialization_commands":32,"maximum_backing_maintenance_passes":8}}
     })
 }
+
+#[test]
+fn stream_capacity_auto_and_explicit_limits_are_shared_by_run_and_serve() {
+    use ferrum_engine::image_generation::{ImageStreamLimit, ImageStreamLimitSource};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    for serving in [false, true] {
+        let mut wire = configuration();
+        if serving {
+            wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+                "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
+                "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+        }
+        wire["backend"]
+            .as_object_mut()
+            .unwrap()
+            .remove("maximum_streams");
+        let ImageBackendConfig::Cuda(omitted) = load(&wire).unwrap().backend;
+        assert_eq!(omitted.maximum_streams, ImageStreamLimit::Auto);
+        let automatic = omitted.stream_plan().unwrap();
+        assert_eq!(automatic.source(), ImageStreamLimitSource::Auto);
+        assert_eq!(automatic.required_streams(), 1);
+        assert_eq!(automatic.resolved_streams(), 1);
+        wire["backend"]["maximum_streams"] = json!("auto");
+        let ImageBackendConfig::Cuda(named) = load(&wire).unwrap().backend;
+        assert_eq!(named.stream_plan().unwrap(), automatic);
+        for limit in [1, 4] {
+            wire["backend"]["maximum_streams"] = json!(limit);
+            let ImageBackendConfig::Cuda(explicit) = load(&wire).unwrap().backend;
+            let plan = explicit.stream_plan().unwrap();
+            assert_eq!(plan.source(), ImageStreamLimitSource::Explicit);
+            assert_eq!(plan.required_streams(), automatic.required_streams());
+            assert_eq!(plan.resolved_streams(), limit);
+            #[cfg(feature = "cuda")]
+            assert_eq!(explicit.resolved().unwrap().stream_plan().unwrap(), plan);
+        }
+        for invalid in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!(null),
+            json!("automatic"),
+        ] {
+            wire["backend"]["maximum_streams"] = invalid;
+            assert!(load(&wire).is_err());
+        }
+    }
+}
+
 #[test]
 fn fp8_precision_is_shared_by_run_and_serve_without_changing_residency_or_attention() {
     use ferrum_engine::image_generation::{
@@ -403,6 +456,59 @@ fn decoder_batch_policy_is_explicit_independent_and_strict() {
     ] {
         wire["backend"]["pipeline"]["decoder_batch_policy"] = invalid;
         assert!(serde_json::from_value::<ImageProductConfig>(wire.clone()).is_err());
+    }
+}
+
+#[test]
+fn decoder_backing_retention_is_bounded_and_shared_by_run_and_serve() {
+    use ferrum_engine::image_generation::ImageDynamicResidencyPolicy;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    let mut wire = configuration();
+    let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+    assert_eq!(
+        cuda.resolved_pipeline().unwrap().dynamic_residency,
+        ImageDynamicResidencyPolicy::Release
+    );
+    wire["backend"]["pipeline"]["dynamic_residency"] =
+        json!({"retain_decoder":{"maximum_bytes":1024}});
+    assert!(load(&wire).is_err());
+    wire["execution_profile"] = json!("experimental_resident_v1");
+    wire["backend"]["pipeline"]["residency"] = json!("all_model_components");
+    for serving in [false, true] {
+        wire["serving"] = Value::Null;
+        if serving {
+            wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+                "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
+                "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+        }
+        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+        assert_eq!(
+            cuda.resolved_pipeline().unwrap().dynamic_residency,
+            ImageDynamicResidencyPolicy::RetainDecoder {
+                maximum_bytes: 1024
+            }
+        );
+        #[cfg(feature = "cuda")]
+        assert_eq!(
+            cuda.resolved().unwrap().pipeline.dynamic_residency,
+            ImageDynamicResidencyPolicy::RetainDecoder {
+                maximum_bytes: 1024
+            }
+        );
+    }
+    for invalid in [
+        json!({"retain_decoder":{"maximum_bytes":0}}),
+        json!({"retain_decoder":{"maximum_bytes":-1}}),
+        json!({"retain_decoder":{"maximum_bytes":1024,"unaccounted":true}}),
+        json!("automatic"),
+    ] {
+        wire["backend"]["pipeline"]["dynamic_residency"] = invalid;
+        assert!(load(&wire).is_err());
     }
 }
 

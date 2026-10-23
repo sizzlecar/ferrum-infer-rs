@@ -505,6 +505,19 @@ impl<R: DeviceRuntime> TensorComponentSession<R> {
             .try_release_idle_dynamic_backing()
     }
 
+    /// Keep fully idle dynamic backing within the explicit byte bound, with
+    /// its original device capacity grants. Zero or an exceeded bound releases
+    /// all idle backing. Busy preserves the session and every resource owner.
+    pub fn try_retain_idle_dynamic_backing(
+        &mut self,
+        maximum_bytes: u64,
+    ) -> Result<IdleDynamicBackingOutcome, VNextError> {
+        self.resources
+            .as_ref()
+            .expect("live session owns resource root")
+            .try_retain_idle_dynamic_backing(maximum_bytes)
+    }
+
     /// Stops further admission and returns the actual runtime close outcome.
     /// `Referenced` preserves the root for a retry after outstanding execution
     /// errors/completion handles retire. Host outputs may outlive this receipt.
