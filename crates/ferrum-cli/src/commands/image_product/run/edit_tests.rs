@@ -34,6 +34,51 @@ fn edit_cli_input_is_read_into_one_admitted_backing_and_retires() {
 }
 
 #[test]
+fn edit_cli_reads_own_two_k_png_and_preserves_encoded_file_boundaries() {
+    use ferrum_models::qwen_image21::image_input::{ImageInputLimits, ManagedRgba8Image};
+    use ferrum_output::png::{write_rgba8_png, PngDimensions, PngLimits};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("output.png");
+    let dimensions = PngDimensions::new(2048, 2048).unwrap();
+    let row = [1, 17, 255, 128].repeat(2048);
+    let receipt = write_rgba8_png(
+        &mut fs::File::create(&path).unwrap(),
+        dimensions,
+        PngLimits::default(),
+        |writer| {
+            for _ in 0..2048 {
+                writer.write_all(&row)?;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    let (file, length) = open_image(&path).unwrap();
+    assert_eq!(length as u64, receipt.encoded_bytes());
+    assert!(length > dimensions.rgba_bytes());
+    let account = host(length + dimensions.rgba_bytes());
+    let encoded = read_image(&account, file, length).unwrap();
+    let decoded =
+        ManagedRgba8Image::decode_png(&account, &encoded, ImageInputLimits::default()).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (2048, 2048));
+    for actual in decoded.bytes().bytes().chunks_exact(row.len()) {
+        assert_eq!(actual, row);
+    }
+    drop((decoded, encoded));
+    assert_eq!(account.usage().unwrap().committed_bytes(), 0);
+
+    // File admission checks extent before allocating or treating bytes as PNG.
+    let maximum = ImageInputLimits::default().maximum_encoded_bytes();
+    let sparse = dir.path().join("extent.png");
+    let file = fs::File::create(&sparse).unwrap();
+    file.set_len(maximum as u64).unwrap();
+    assert_eq!(open_image(&sparse).unwrap().1, maximum);
+    file.set_len(maximum as u64 + 1).unwrap();
+    let error = open_image(&sparse).unwrap_err();
+    assert!(error.to_string().contains(&maximum.to_string()));
+}
+
+#[test]
 fn edit_cli_rejects_invalid_extent_capacity_and_file_changes_without_leaking() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("input.png");

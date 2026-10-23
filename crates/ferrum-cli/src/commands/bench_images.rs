@@ -94,7 +94,7 @@ pub struct BenchImagesCommand {
     pub maximum_dataset_bytes: usize,
     /// One shared reference PNG allocation, loaded/validated before timing.
     /// Decoder dimensions/workspace use the same explicit limits as responses.
-    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    #[arg(long, default_value_t = ferrum_models::qwen_image21::image_input::ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES)]
     pub maximum_reference_image_bytes: usize,
     #[arg(long, default_value_t = 100_000)]
     pub maximum_total_requests: usize,

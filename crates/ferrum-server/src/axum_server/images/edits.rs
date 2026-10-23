@@ -12,7 +12,8 @@ use ferrum_models::qwen_image21::image_input::ImageInputLimits;
 use ferrum_runtime::{HostMemoryAccount, HostMemoryClass, ManagedHostBytes};
 use std::collections::BTreeSet;
 
-pub(in crate::axum_server) const EDIT_BODY_LIMIT: usize = 18 * 1024 * 1024;
+pub(in crate::axum_server) const EDIT_BODY_LIMIT: usize =
+    ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES + 2 * 1024 * 1024;
 const PROMPT_LIMIT: usize = 1024 * 1024;
 
 pub(in crate::axum_server) async fn edits_handler(
@@ -112,7 +113,7 @@ async fn parse(
                 let end = count
                     .checked_add(chunk.len())
                     .filter(|&n| n <= maximum)
-                    .ok_or_else(|| invalid("encoded image exceeds 16 MiB"))?;
+                    .ok_or_else(|| invalid(format!("encoded image exceeds {maximum} bytes")))?;
                 backing.as_mut()[count..end].copy_from_slice(&chunk);
                 count = end;
             }

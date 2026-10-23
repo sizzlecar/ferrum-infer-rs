@@ -41,6 +41,55 @@ fn png_bytes(width: u32, height: u32, color: ::png::ColorType, data: &[u8]) -> V
 }
 
 #[test]
+fn own_two_k_png_roundtrips_default_ingress_with_exact_host_capacity() {
+    use ferrum_output::png::{write_rgba8_png, PngDimensions, PngLimits};
+    let dimensions = PngDimensions::new(2048, 2048).unwrap();
+    let fill_row = |y: usize, row: &mut [u8]| {
+        for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+            pixel.copy_from_slice(&[x as u8, y as u8, (x ^ y) as u8, (3 * x + 5 * y) as u8]);
+        }
+    };
+    let mut wire = Vec::new();
+    write_rgba8_png(&mut wire, dimensions, PngLimits::default(), |writer| {
+        let mut row = [0; 2048 * 4];
+        for y in 0..2048 {
+            fill_row(y, &mut row);
+            writer.write_all(&row)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    // A raw-pixel-sized encoded cap rejects real stored-DEFLATE PNG framing.
+    assert!(wire.len() > dimensions.rgba_bytes());
+    assert!(wire.len() <= ImageInputLimits::default().maximum_encoded_bytes());
+    let exact = wire.len() + dimensions.rgba_bytes();
+    let account = host(exact);
+    let encoded = managed(&account, &wire);
+    let decoded =
+        ManagedRgba8Image::decode_png(&account, &encoded, ImageInputLimits::default()).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (2048, 2048));
+    assert!(decoded.source_has_alpha());
+    assert_eq!(account.usage().unwrap().allocated_bytes(), exact);
+    let mut row = [0; 2048 * 4];
+    for (y, actual) in decoded.bytes().bytes().chunks_exact(row.len()).enumerate() {
+        fill_row(y, &mut row);
+        assert_eq!(actual, row);
+    }
+    drop((decoded, encoded));
+    assert_eq!(account.usage().unwrap().committed_bytes(), 0);
+
+    let short = host(exact - 1);
+    let encoded = managed(&short, &wire);
+    assert!(matches!(
+        ManagedRgba8Image::decode_png(&short, &encoded, ImageInputLimits::default()),
+        Err(ImageInputError::Host(HostMemoryError::Capacity { .. }))
+    ));
+    assert_eq!(short.usage().unwrap().allocated_bytes(), wire.len());
+    drop(encoded);
+    assert_eq!(short.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
 fn png_rgb_and_rgba_have_exact_pixels_and_retained_parent_charges() {
     for (color, input, expected, alpha) in [
         (

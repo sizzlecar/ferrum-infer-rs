@@ -89,7 +89,10 @@ async fn streaming_fields_preserve_png_owner_and_use_common_image_controls() {
     assert!(account.owns(&image));
     assert_eq!(image.class(), HostMemoryClass::InputPreprocess);
     // The exact range is exposed; the admitted maximum backing remains charged.
-    assert_eq!(account.usage().unwrap().allocated_bytes(), 16 * 1024 * 1024);
+    assert_eq!(
+        account.usage().unwrap().allocated_bytes(),
+        ImageInputLimits::default().maximum_encoded_bytes()
+    );
     drop(image);
     assert_eq!(account.usage().unwrap().committed_bytes(), 0);
 }
@@ -164,6 +167,7 @@ async fn ingress_capacity_and_text_bounds_fail_before_worker_submission() {
 struct DecoderOnly {
     host: HostMemoryAccount,
     calls: Arc<std::sync::atomic::AtomicUsize>,
+    decoded: Arc<std::sync::Mutex<Option<(u32, u32, usize)>>>,
 }
 impl ferrum_engine::image_generation::service::ImageGenerator for DecoderOnly {
     fn host_account(&self) -> &HostMemoryAccount {
@@ -221,23 +225,32 @@ impl ferrum_engine::image_generation::service::ImageGenerator for DecoderOnly {
             Err(error) => Err(ImageBatchError::Rejected(error.to_string())),
             // This test verifies HTTP/queue/codec admission, not fabricated
             // native image execution or a forged TensorExecutionOutput.
-            Ok(_) => Err(ImageBatchError::Rejected(
-                "PNG decoded; fixture has no model executor".into(),
-            )),
+            Ok(image) => {
+                *self.decoded.lock().unwrap() =
+                    Some((image.width(), image.height(), image.bytes().len()));
+                Err(ImageBatchError::Rejected(
+                    "PNG decoded; fixture has no model executor".into(),
+                ))
+            }
         }
     }
 }
 
 #[tokio::test]
-async fn invalid_png_crc_and_pixel_count_return_400_without_stopping_the_worker() {
+async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
-    let host = account(32 * 1024 * 1024);
+    // The encoded range retains its maximum backing while decoded RGBA is live.
+    let encoded_limit = ImageInputLimits::default().maximum_encoded_bytes();
+    let rgba_bytes = 2048 * 2048 * 4;
+    let host = account(encoded_limit + rgba_bytes);
     let calls = Arc::new(AtomicUsize::new(0));
+    let decoded = Arc::new(std::sync::Mutex::new(None));
     let service = ImageService::new(
         DecoderOnly {
             host: host.clone(),
             calls: calls.clone(),
+            decoded: decoded.clone(),
         },
         ferrum_engine::image_generation::service::ImageServiceConfig {
             maximum_pending: 2,
@@ -260,11 +273,19 @@ async fn invalid_png_crc_and_pixel_count_return_400_without_stopping_the_worker(
     let mut png = Vec::new();
     ferrum_output::png::write_rgba8_png(
         &mut png,
-        PngDimensions::new(1, 1).unwrap(),
+        PngDimensions::new(2048, 2048).unwrap(),
         PngLimits::default(),
-        |writer| writer.write_all(&[1, 2, 3, 255]),
+        |writer| {
+            let row = [1, 2, 3, 255].repeat(2048);
+            for _ in 0..2048 {
+                writer.write_all(&row)?;
+            }
+            Ok(())
+        },
     )
     .unwrap();
+    assert!(png.len() > rgba_bytes);
+    assert!(png.len() <= encoded_limit);
     let mut crc = png.clone();
     crc[29] ^= 1;
     let mut pixels = png.clone();
@@ -300,6 +321,61 @@ async fn invalid_png_crc_and_pixel_count_return_400_without_stopping_the_worker(
         assert!(images.service().is_accepting());
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
         assert_eq!(calls.load(Ordering::SeqCst), index + 1);
+        assert_eq!(
+            *decoded.lock().unwrap(),
+            (index == 2).then_some((2048, 2048, rgba_bytes))
+        );
+    }
+    // Both transport and encoded-image caps reject before worker submission.
+    // Large fixtures use one Body chunk, avoiding millions of tiny fragments.
+    let envelope_bytes = wire(&[
+        ("model", b"image", false),
+        ("prompt", b"edit", false),
+        ("image", b"", true),
+    ])
+    .len();
+    for encoded_rejection in [true, false] {
+        let payload_bytes = if encoded_rejection {
+            encoded_limit + 1
+        } else {
+            EDIT_BODY_LIMIT + 1 - envelope_bytes
+        };
+        let mut bytes = vec![0; payload_bytes];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let body = wire(&[
+            ("model", b"image", false),
+            ("prompt", b"edit", false),
+            ("image", &bytes, true),
+        ]);
+        if !encoded_rejection {
+            assert_eq!(body.len(), EDIT_BODY_LIMIT + 1);
+        }
+        assert_eq!(body.len() <= EDIT_BODY_LIMIT, encoded_rejection);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/edits")
+                    .header("content-type", "multipart/form-data; boundary=bound")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+        let response = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let message = String::from_utf8(response.to_vec()).unwrap();
+        assert_eq!(
+            message.contains(&format!("encoded image exceeds {encoded_limit} bytes")),
+            encoded_rejection,
+            "{message}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(images.service().is_accepting());
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     }
     images.shutdown().await.unwrap();
     assert!(!images.take_shutdown().await.unwrap().has_failure());

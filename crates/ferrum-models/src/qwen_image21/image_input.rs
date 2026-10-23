@@ -48,12 +48,12 @@ pub struct ImageInputLimits {
 }
 
 impl Default for ImageInputLimits {
-    /// Initial single-image ingress preset: 16 MiB encoded PNG, 24 million
+    /// Initial single-image ingress preset: 17 MiB encoded PNG, 24 million
     /// decoded pixels, at most 8192 pixels per axis, and a 64 MiB best-effort
     /// PNG codec workspace limit. These are caps, not reserved Host payload.
     fn default() -> Self {
         Self {
-            maximum_encoded_bytes: 16 * 1024 * 1024,
+            maximum_encoded_bytes: Self::DEFAULT_MAXIMUM_ENCODED_BYTES,
             maximum_pixels: 24_000_000,
             maximum_width: 8192,
             maximum_height: 8192,
@@ -63,6 +63,10 @@ impl Default for ImageInputLimits {
 }
 
 impl ImageInputLimits {
+    /// Includes PNG framing above the 16 MiB RGBA payload of a 2048² image.
+    /// This is an ingress cap; every retained backing still needs Host admission.
+    pub const DEFAULT_MAXIMUM_ENCODED_BYTES: usize = 17 * 1024 * 1024;
+
     pub fn new(
         maximum_encoded_bytes: usize,
         maximum_pixels: usize,

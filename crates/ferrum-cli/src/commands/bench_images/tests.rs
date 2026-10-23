@@ -66,7 +66,7 @@ pub(super) fn config(url: String) -> ImageBenchmarkConfig {
         latency_slo_p99_ms: None,
         limits: ImageResponseLimits::default(),
         maximum_total_requests: 100,
-        maximum_reference_image_bytes: 16 * 1024 * 1024,
+        maximum_reference_image_bytes: ferrum_models::qwen_image21::image_input::ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES,
         capture: None,
     }
 }
@@ -305,6 +305,11 @@ async fn cli_writes_reusable_artifact_and_refuses_existing_path_before_new_reque
     ])
     .unwrap()
     .command;
+    assert_eq!(
+        cmd.maximum_reference_image_bytes,
+        ferrum_models::qwen_image21::image_input::ImageInputLimits::default()
+            .maximum_encoded_bytes()
+    );
     execute_inner(cmd.clone()).await.unwrap();
     let original = std::fs::read(&output).unwrap();
     let report: serde_json::Value = serde_json::from_slice(&original).unwrap();

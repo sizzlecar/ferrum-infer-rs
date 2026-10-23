@@ -188,9 +188,10 @@ fn open_image(path: &Path) -> anyhow::Result<(std::fs::File, usize)> {
     let metadata = file.metadata()?;
     anyhow::ensure!(metadata.is_file(), "edit image must be a regular file");
     let length = usize::try_from(metadata.len())?;
+    let maximum = ImageInputLimits::default().maximum_encoded_bytes();
     anyhow::ensure!(
-        length > 0 && length <= ImageInputLimits::default().maximum_encoded_bytes(),
-        "edit image must contain 1..=16 MiB encoded bytes"
+        length > 0 && length <= maximum,
+        "edit image must contain 1..={maximum} encoded bytes"
     );
     Ok((file, length))
 }
