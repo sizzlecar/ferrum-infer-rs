@@ -902,6 +902,94 @@ extern "C" __global__ void ferrum_vnext_spatial_attention_bf16(
 }
 #undef FERRUM_SPATIAL_SLOTS
 
+// Bounded matrix spatial attention support. Rust admits one scratch region
+// holding V in F32, one query tile of scores/probabilities, and its F32 result.
+// These helpers allocate nothing and never narrow probabilities to BF16.
+// input_v already points at this sample's contiguous V[C,S] channel block.
+extern "C" __global__ void ferrum_vnext_spatial_values_f32(
+    const uint16_t* input_v, float* values, uint64_t elements) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t i = first; i < elements; i += stride) {
+        values[i] = ferrum_bf16_decode(input_v[i]);
+    }
+}
+
+// Exactly 256 threads and one block per query, with no dynamic shared memory.
+// scores[k + query*S] is the full, unscaled QK dot product for every key.
+// The profile is strided FP32 local sums followed by a 256-lane halving tree;
+// it deliberately differs from the original ascending-key online profile.
+extern "C" __global__ void ferrum_vnext_spatial_softmax_f32(
+    float* scores, uint64_t spatial, uint32_t queries, float scale) {
+    const uint64_t query = blockIdx.x;
+    if (query >= queries) return;
+    const uint32_t lane = threadIdx.x;
+    float* row = scores + query * spatial;
+    __shared__ float reduction[256];
+    float maximum = -INFINITY;
+    int poisoned = 0;
+    for (uint64_t key = lane; key < spatial; key += 256) {
+        const float score = __fmul_rn(row[key], scale);
+        row[key] = score;
+        if (!isfinite(score)) poisoned = 1;
+        else maximum = fmaxf(maximum, score);
+    }
+    // Check every key before max/exp: fmaxf must never hide a NaN, and an
+    // infinite score must poison the whole query rather than select one key.
+    if (__syncthreads_or(poisoned)) {
+        for (uint64_t key = lane; key < spatial; key += 256) {
+            row[key] = __uint_as_float(0x7fc00000U);
+        }
+        return;
+    }
+    reduction[lane] = maximum;
+    __syncthreads();
+    for (uint32_t span = 128; span != 0; span /= 2) {
+        if (lane < span) reduction[lane] = fmaxf(reduction[lane], reduction[lane + span]);
+        __syncthreads();
+    }
+    maximum = reduction[0];
+    // All lanes must read the maximum before lane zero can reuse its slot.
+    __syncthreads();
+    float denominator = 0.0f;
+    for (uint64_t key = lane; key < spatial; key += 256) {
+        const float probability = expf(__fsub_rn(row[key], maximum));
+        row[key] = probability;
+        denominator = __fadd_rn(denominator, probability);
+    }
+    reduction[lane] = denominator;
+    __syncthreads();
+    for (uint32_t span = 128; span != 0; span /= 2) {
+        if (lane < span) reduction[lane] = __fadd_rn(reduction[lane], reduction[lane + span]);
+        __syncthreads();
+    }
+    denominator = reduction[0];
+    for (uint64_t key = lane; key < spatial; key += 256) {
+        row[key] = __fdiv_rn(row[key], denominator);
+    }
+}
+
+// result is column-major [queries,C]; output is this sample's NCHW [C,S].
+// The original probability row preserves a score-poison sentinel, so the
+// whole-query NaN rule is explicit even across the intervening vendor GEMM.
+// Other nonfinite results (including 0*Inf from V) are never sanitized.
+extern "C" __global__ void ferrum_vnext_spatial_output_bf16(
+    const float* result, const float* probabilities, uint16_t* output,
+    uint64_t spatial, uint32_t channels, uint32_t query_start, uint32_t queries) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    const uint64_t elements = static_cast<uint64_t>(channels) * queries;
+    for (uint64_t i = first; i < elements; i += stride) {
+        const uint64_t channel = i / queries;
+        const uint64_t query = i % queries;
+        const uint64_t position = static_cast<uint64_t>(query_start) + query;
+        if (position < spatial) {
+            output[channel * spatial + position] = isnan(probabilities[query * spatial])
+                ? static_cast<uint16_t>(0x7fc0U) : ferrum_bf16_rne(result[i]);
+        }
+    }
+}
+
 struct FerrumSpatialGather {
     uint64_t offsets[64];
     uint64_t input_channels, input_height, input_width;

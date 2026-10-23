@@ -21,6 +21,7 @@ pub(super) struct RetainedFunctions {
     gqa_attention_function: CudaFunction,
     spatial_functions: [CudaFunction; 3],
     extended_spatial_functions: [CudaFunction; 3],
+    spatial_matmul_functions: [CudaFunction; 3],
     philox_function: CudaFunction,
     primitive_function: CudaFunction,
     _provider: CudaTensorProviderRetention,
@@ -147,6 +148,19 @@ impl RetainedFunctions {
                     CudaDeviceRuntimeError::driver("BF16 spatial group mean function load", e)
                 })?,
             ];
+            let load_spatial_matmul = |name| {
+                module.load_function(name).map_err(|error| {
+                    CudaDeviceRuntimeError::driver(
+                        "BF16 spatial matrix attention support function load",
+                        error,
+                    )
+                })
+            };
+            let spatial_matmul_functions = [
+                load_spatial_matmul("ferrum_vnext_spatial_values_f32")?,
+                load_spatial_matmul("ferrum_vnext_spatial_softmax_f32")?,
+                load_spatial_matmul("ferrum_vnext_spatial_output_bf16")?,
+            ];
             let philox_function = module.load_function(philox::FUNCTION).map_err(|e| {
                 CudaDeviceRuntimeError::driver("BF16 Philox normal function load", e)
             })?;
@@ -164,6 +178,7 @@ impl RetainedFunctions {
                 gqa_attention_function,
                 spatial_functions,
                 extended_spatial_functions,
+                spatial_matmul_functions,
                 philox_function,
                 primitive_function,
             ))
@@ -179,6 +194,7 @@ impl RetainedFunctions {
             gqa_attention_function,
             spatial_functions,
             extended_spatial_functions,
+            spatial_matmul_functions,
             philox_function,
             primitive_function,
         ) = match loaded {
@@ -204,6 +220,7 @@ impl RetainedFunctions {
             gqa_attention_function,
             spatial_functions,
             extended_spatial_functions,
+            spatial_matmul_functions,
             philox_function,
             primitive_function,
             _provider: provider,
@@ -228,6 +245,10 @@ impl RetainedFunctions {
 
     pub(super) fn spatial_function(&self, index: usize) -> &CudaFunction {
         &self.spatial_functions[index]
+    }
+
+    pub(super) fn spatial_matmul_function(&self, index: usize) -> &CudaFunction {
+        &self.spatial_matmul_functions[index]
     }
 
     pub(super) fn norm_function(&self, kind: norm::Kind) -> &CudaFunction {

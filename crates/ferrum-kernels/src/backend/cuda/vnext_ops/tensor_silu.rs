@@ -54,6 +54,7 @@ mod rope;
 mod selection;
 mod spatial;
 mod spatial_extended;
+mod spatial_matmul;
 mod text_projection;
 mod transport;
 pub use attention::{
@@ -97,6 +98,7 @@ pub use spatial_extended::{
     GATHER_PROFILE_ID as SPATIAL_GATHER_PROFILE_ID,
     GROUP_MEAN_PROFILE_ID as SPATIAL_GROUP_MEAN_PROFILE_ID,
 };
+pub use spatial_matmul::NUMERICAL_PROFILE_ID as SPATIAL_MATMUL_PROFILE_ID;
 pub use text_projection::{
     GELU_TANH_PROFILE_ID, NUMERICAL_IDENTITY as TEXT_PROJECTION_NUMERICAL_IDENTITY,
     ZERO_CENTERED_RMS_NORM_PROFILE_ID,

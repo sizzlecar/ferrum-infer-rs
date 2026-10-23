@@ -99,6 +99,16 @@ fn providers_impl(
         .transpose()?;
     let segmented_sdpa =
         sdpa.is_some() && selected.contains(&CudaTensorOperation::SegmentedAttention);
+    let spatial_matmul =
+        sdpa.is_some() && selected.contains(&CudaTensorOperation::SpatialAttention);
+    if spatial_matmul {
+        descriptors.retain(|descriptor| {
+            !matches!(
+                descriptor,
+                selection::SelectedDescriptor::Fixed(CudaTensorOperation::SpatialAttention, _)
+            )
+        });
+    }
     if segmented_sdpa {
         // Replace the selected implementation only in this explicit vendor
         // composition; never register two providers for implicit selection.
@@ -143,6 +153,9 @@ fn providers_impl(
     .with_fixed_tensor_work(true);
     let kernels = RetainedFunctions::load(runtime)?;
     let mut providers = selection::providers_from_descriptors(descriptors, &kernels);
+    if spatial_matmul {
+        providers.push(spatial_matmul::provider(runtime, &kernels)?);
+    }
     if let Some(cache) = sdpa {
         if cross_attention {
             providers.push(cudnn_cross_attention::provider(
