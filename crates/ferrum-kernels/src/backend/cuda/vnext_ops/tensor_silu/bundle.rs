@@ -117,6 +117,19 @@ impl RetainedFunctions {
             let spatial_functions: [CudaFunction; 3] = spatial_functions
                 .try_into()
                 .unwrap_or_else(|_| unreachable!());
+            // Inspect the function held by this admitted module. This is the
+            // driver's loaded implementation, not a separately loaded probe.
+            // Dynamic shared memory remains a per-launch provider requirement.
+            tracing::debug!(
+                target: "ferrum_kernels::cuda::resources",
+                kernel = "ferrum_vnext_channel_l2_norm_bf16",
+                registers = ?spatial_functions[2].num_regs(),
+                local_bytes = ?spatial_functions[2].local_size_bytes(),
+                static_shared_bytes = ?spatial_functions[2].shared_size_bytes(),
+                ptx_version = ?spatial_functions[2].ptx_version(),
+                binary_version = ?spatial_functions[2].binary_version(),
+                "managed CUDA function resources"
+            );
             let extended_spatial_functions = [
                 module.load_function(spatial_extended::Kind::Attention.function()),
                 module.load_function(spatial_extended::Kind::Gather.function()),

@@ -1,6 +1,7 @@
 //! Independent replay of the original level-by-level padded FP32 tree. This
 //! deliberately does not use the new kernel's binary-carry accumulation.
 use super::*;
+use half::bf16;
 
 fn input_bits(channel: usize, position: usize, channels: usize) -> u16 {
     let sign = if (channel + position) % 2 == 0 {
