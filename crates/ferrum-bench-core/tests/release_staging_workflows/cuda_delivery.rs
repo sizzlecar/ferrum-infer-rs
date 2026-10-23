@@ -86,7 +86,7 @@ fn cuda_staging_keeps_architecture_inputs_and_package_metadata_separate() {
         .contains("--features cuda,vllm-moe-marlin,vllm-paged-attn-v2"));
     assert!(
         script(production, "cargo build --release --locked -p ferrum-cli")
-            .contains("--features cuda,cuda-production")
+            .contains("--features cuda,cuda-production,cuda-cutlass-fp8")
     );
     assert_ne!(old["container"]["image"], production["container"]["image"]);
     assert_ne!(
@@ -101,7 +101,7 @@ fn cuda_staging_keeps_architecture_inputs_and_package_metadata_separate() {
         package.contains(image),
         "ABI must record the actual build image"
     );
-    assert!(package.contains("--cargo-features cuda,cuda-production"));
+    assert!(package.contains("--cargo-features cuda,cuda-production,cuda-cutlass-fp8"));
     assert!(package.contains("--cuda-compute-capability \"$CUDA_COMPUTE_CAP\""));
     assert!(package.contains("${NATIVE_OPERATOR_SET_ARCHIVE_SHA256}"));
     // The automatic installer owns a strict archive member allowlist. Changing
@@ -123,6 +123,55 @@ fn cuda_staging_keeps_architecture_inputs_and_package_metadata_separate() {
         "unverified native bytes must not be extracted"
     );
     assert!(staging["jobs"]["windows-x86_64-cuda-sm89"]["uses"].is_string());
+}
+
+#[test]
+fn sm120_rebuilds_verified_production_sources_with_fp8_before_linking() {
+    let staging = workflow("release-cuda.yml");
+    let job = &staging["jobs"]["linux-x86_64-cuda-sm120"];
+    let prepare = script(job, "lock-source-dependencies");
+    assert!(prepare.contains("release_sm120_native reference"));
+    assert!(prepare.contains("cutlass_fp8_catalog_declaration"));
+    assert!(prepare.contains("\"$work/base-catalog.json\""));
+    assert!(
+        prepare.find("$CUTLASS_ARCHIVE_SHA256").unwrap()
+            < prepare.find("tar -xzf \"$work/cutlass.tar.gz\"").unwrap()
+    );
+    assert!(prepare.contains("--source-root \"$work/fp8-source\" --depfile \"$work/fp8.d\""));
+    let native = script(job, "release_sm120_native build");
+    assert!(native.contains("--reference-lock \"$SM120_REFERENCE_LOCK\""));
+    assert!(native.contains("--object-cache \"$RUNNER_TEMP/sm120-native-object-cache\""));
+    assert!(
+        native.find("release_sm120_native verify").unwrap()
+            < native.find("FERRUM_NATIVE_OPERATOR_SET_LOCK=").unwrap()
+    );
+    let position = |needle: &str| {
+        steps(job)
+            .iter()
+            .position(|step| step["run"].as_str().is_some_and(|run| run.contains(needle)))
+            .unwrap()
+    };
+    assert!(
+        position("release_sm120_native build")
+            < position("cargo build --release --locked -p ferrum-cli")
+    );
+    // The old archive is provenance, never the feature-expanded link input.
+    assert!(!script(job, "zstd --decompress").contains("FERRUM_NATIVE_OPERATOR_SET_LOCK="));
+    assert!(
+        script(job, "release_candidate manifest").contains("Native production source baseline:")
+    );
+    assert!(steps(job).iter().any(|step| {
+        step["uses"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("actions/upload-artifact@"))
+            && step["with"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("native-sm120-production-fp8-"))
+    }));
+    let sm89 = &staging["jobs"]["linux-x86_64-cuda-sm89"];
+    assert!(
+        !script(sm89, "cargo build --release --locked -p ferrum-cli").contains("cuda-cutlass-fp8")
+    );
 }
 
 #[test]
