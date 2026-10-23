@@ -1,3 +1,9 @@
+#pragma once
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+
 // Conceptual [C, temporal phase, dy, dx] grouping. The real single frame
 // occupies the last temporal phase; preceding phases are positive zero.
 struct FerrumSpatialGroupMean {
