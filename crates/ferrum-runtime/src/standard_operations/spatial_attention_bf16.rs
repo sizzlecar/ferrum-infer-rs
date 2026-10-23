@@ -14,6 +14,11 @@ pub const SPATIAL_ATTENTION_BF16_MAX_CHANNELS: u64 = 2048;
 /// assert PyTorch SDPA bitwise equivalence. Output BF16, NoAlias.
 /// A nonfinite score makes its entire query output NaN. Nonfinite V propagates
 /// component-wise through the declared arithmetic. All keys are visible.
+/// Providers may declare invocation scratch for matrix products and temporary
+/// F32 values. Every byte must be estimated, core-admitted and retained through
+/// completion. Optional scratch also permits the original zero-workspace online
+/// implementation; it does not authorize unreported allocations. Binding and
+/// persistent storage remain forbidden.
 pub fn spatial_attention_bf16_contract() -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(SPATIAL_ATTENTION_BF16_OPERATION_ID)?,
@@ -39,7 +44,10 @@ pub fn spatial_attention_bf16_contract() -> Result<StandardOperationContract, VN
             TensorAccess::Write,
         )?],
         attributes: AttributeSchema::new(BTreeMap::from([positive_rational_attribute("scale")?]))?,
-        resources: no_auxiliary_resources(),
+        resources: ResourceRequirements {
+            scratch: ResourcePresenceRequirement::Optional,
+            ..no_auxiliary_resources()
+        },
         oracle: OracleSpec::OperationDefined,
         provider: provider_requirement(
             SPATIAL_ATTENTION_BF16_CAPABILITY_ID,

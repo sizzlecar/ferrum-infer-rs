@@ -101,6 +101,38 @@ fn spatial_attention_validates_packed_layout_non_power_width_and_work() {
         assert!(SpatialAttentionBf16Geometry::new(&x, &y, &scale()).is_err());
     }
 }
+
+#[test]
+fn spatial_attention_permits_estimated_scratch_and_rejects_other_auxiliary_storage() {
+    let contract = spatial_attention_bf16_contract().unwrap();
+    let resources = &contract.descriptor().resources;
+    // The compiler tests these declarations against each real provider's
+    // estimate. Both online (none) and matrix (some) scratch must be eligible;
+    // neither provider may acquire binding or persistent storage this way.
+    for scratch in [false, true] {
+        for binding in [false, true] {
+            for persistent in [false, true] {
+                let allowed = resources.scratch.accepts(scratch)
+                    && resources.binding.accepts(binding)
+                    && resources.persistent.accepts(persistent);
+                assert_eq!(allowed, !binding && !persistent);
+            }
+        }
+    }
+    assert_eq!(resources.minimum_value_alignment_bytes, 16);
+    contract.descriptor().validate().unwrap();
+
+    // Plans/providers pinned to the former no-scratch contract must receive a
+    // different contract identity, rather than silently gaining permission.
+    let mut previous = contract.descriptor().clone();
+    previous.resources.scratch = ResourcePresenceRequirement::Forbidden;
+    previous.validate().unwrap();
+    assert_ne!(
+        previous.fingerprint().unwrap(),
+        contract.descriptor().fingerprint().unwrap()
+    );
+}
+
 #[test]
 fn upsample_checks_output_shape_tile_metadata_and_source_channel_bound() {
     let x = t(&[2, 4, 3, 5]);
