@@ -1182,9 +1182,7 @@ fn copy_staged_upload(
     {
         return Err(HostMemoryError::InvalidReservation);
     }
-    let mut staging = reservation.allocate_zeroed()?;
-    staging.as_mut().copy_from_slice(bytes);
-    Ok(staging.freeze())
+    Ok(reservation.allocate_copy(bytes)?.freeze())
 }
 
 fn submit_pending<R>(

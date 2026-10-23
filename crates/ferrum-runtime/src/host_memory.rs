@@ -382,6 +382,38 @@ impl HostMemoryReservation {
         self.charge.class
     }
 
+    /// Allocate and fully initialize an admitted backing from an exact source.
+    /// No uninitialized buffer or byte slice is exposed, including on failure.
+    /// The source and its owners remain independently charged while copying.
+    pub(crate) fn allocate_copy(
+        mut self,
+        source: &[u8],
+    ) -> Result<ManagedHostBuffer, HostMemoryError> {
+        let length = self.bytes();
+        if length == 0 || source.len() != length {
+            return Err(HostMemoryError::InvalidReservation);
+        }
+        let layout =
+            Layout::array::<u8>(length).map_err(|_| HostMemoryError::InvalidReservation)?;
+        // SAFETY: admission proved this nonzero layout is addressable. A fresh
+        // allocation cannot overlap the live, initialized source byte slice.
+        let pointer = unsafe { std::alloc::alloc(layout) };
+        if pointer.is_null() {
+            return Err(HostMemoryError::AllocationFailed { bytes: length });
+        }
+        // SAFETY: initialize every byte before constructing any Box<[u8]> or
+        // reference to the backing. The exact-length copy cannot unwind.
+        unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), pointer, length) };
+        // SAFETY: all length bytes are initialized; Box uses the allocation's
+        // original u8 layout and owns it before the fallible accounting update.
+        let bytes = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer, length)) };
+        self.charge.mark_allocated()?;
+        Ok(ManagedHostBuffer {
+            bytes,
+            charge: self.charge,
+        })
+    }
+
     pub fn allocate_zeroed(mut self) -> Result<ManagedHostBuffer, HostMemoryError> {
         let length = self.bytes();
         let layout =

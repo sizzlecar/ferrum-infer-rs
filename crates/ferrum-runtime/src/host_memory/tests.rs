@@ -40,6 +40,73 @@ fn reservations_precede_allocation_and_rollback_when_dropped() {
 }
 
 #[test]
+fn admitted_copy_is_independent_and_aliases_keep_the_full_initialized_charge() {
+    let account = account(8);
+    let reservation = account
+        .reserve(HostMemoryClass::TransferStaging, 8)
+        .unwrap();
+    assert_eq!(account.usage().unwrap().committed_bytes(), 8);
+    assert_eq!(account.usage().unwrap().allocated_bytes(), 0);
+    let expected = [0xff, 0, 0x80, 0x7f, 0x35, 0xa1, 0, 0xff];
+    let mut source = expected;
+    let buffer = reservation.allocate_copy(&source).unwrap();
+    source.fill(0x11);
+    assert_eq!(buffer.as_ref(), &expected);
+    assert_ne!(buffer.as_ref(), &source);
+    assert_eq!(buffer.class(), HostMemoryClass::TransferStaging);
+    let usage = account.usage().unwrap();
+    assert_eq!(usage.committed_bytes(), 8);
+    assert_eq!(usage.allocated_bytes(), 8);
+    assert_eq!(usage.reserved_bytes(), 0);
+    let bytes = buffer.freeze();
+    assert!(account.owns(&bytes));
+    let clone = bytes.clone();
+    let slice = clone.slice(2..6).unwrap();
+    let empty = slice.slice(4..4).unwrap();
+    drop((bytes, clone));
+    assert_eq!(slice.bytes(), &expected[2..6]);
+    assert_eq!(
+        account
+            .usage()
+            .unwrap()
+            .class_allocated_bytes(HostMemoryClass::TransferStaging),
+        8
+    );
+    assert!(account
+        .reserve(HostMemoryClass::TransferStaging, 1)
+        .is_err());
+    drop(slice);
+    assert!(empty.is_empty());
+    assert_eq!(account.usage().unwrap().allocated_bytes(), 8);
+    drop(empty);
+    assert_eq!(account.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(account.usage().unwrap().allocated_bytes(), 0);
+}
+
+#[test]
+fn admitted_copy_rejects_empty_or_mismatched_source_and_rolls_back_reservation() {
+    let account = account(4);
+    let source = [1, 2, 3, 4, 5];
+    for length in [0, 3, 5] {
+        let reservation = account
+            .reserve(HostMemoryClass::TransferStaging, 4)
+            .unwrap();
+        assert!(matches!(
+            reservation.allocate_copy(&source[..length]),
+            Err(HostMemoryError::InvalidReservation)
+        ));
+        let usage = account.usage().unwrap();
+        assert_eq!(usage.committed_bytes(), 0);
+        assert_eq!(usage.allocated_bytes(), 0);
+        assert_eq!(usage.reserved_bytes(), 0);
+    }
+    assert!(matches!(
+        account.reserve(HostMemoryClass::TransferStaging, 0),
+        Err(HostMemoryError::InvalidReservation)
+    ));
+}
+
+#[test]
 fn batch_admission_is_atomic_across_parent_and_repeated_classes() {
     let account = HostMemoryAccount::new(
         HostMemoryLimits::new(

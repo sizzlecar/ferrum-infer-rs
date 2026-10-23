@@ -409,8 +409,28 @@ fn initialize_resources<R: DeviceRuntime>(
         }
     }
     .map_err(ComponentInitializationError::Static)?;
+    let static_receipt = initialized.receipt();
+    tracing::debug!(
+        target: "ferrum_execution::component",
+        run_id = %config.run_id,
+        request_id = %config.request_id,
+        initialized_resource_count = static_receipt.initialized_resource_count(),
+        uploaded_component_count = static_receipt.uploaded_component_count(),
+        uploaded_bytes = static_receipt.uploaded_bytes(),
+        upload_command_count = static_receipt.upload_command_count(),
+        transform_command_count = static_receipt.transform_command_count(),
+        submission_batch_count = static_receipt.submission_batch_count(),
+        total_duration_us = static_receipt.total_duration_us(),
+        setup_duration_us = static_receipt.setup_duration_us(),
+        source_materialization_duration_us = static_receipt.source_materialization_duration_us(),
+        device_encode_duration_us = static_receipt.device_encode_duration_us(),
+        device_import_duration_us = static_receipt.device_import_duration_us(),
+        submission_wait_duration_us = static_receipt.submission_wait_duration_us(),
+        import_seal_duration_us = static_receipt.import_seal_duration_us(),
+        "tensor component static initialization completed"
+    );
     let receipt = ComponentInitializationReceipt::Initialized {
-        receipt: initialized.receipt().clone(),
+        receipt: static_receipt.clone(),
     };
     if share_weights {
         match initialized.into_shared_plan_runtime(plan) {
