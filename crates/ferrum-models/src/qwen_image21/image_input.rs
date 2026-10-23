@@ -10,6 +10,7 @@ mod png;
 mod preprocess;
 mod resize;
 
+pub use png::png_dimensions_hint;
 pub use preprocess::{QwenImage21ConditionInputs, QwenImage21ImageProcessor};
 
 use ferrum_runtime::{HostMemoryAccount, HostMemoryClass, HostMemoryError, ManagedHostBytes};

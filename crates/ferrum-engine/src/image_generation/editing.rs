@@ -1,5 +1,6 @@
-//! Additional managed conditioning stages for one reference image. All six
-//! plans are compiled and admitted before any model upload or device execution.
+//! One independent reference image per request. Vision and VAE encoding reuse
+//! B1 plans while text and denoising execute the real request batch. Every plan
+//! compiles and passes capacity preflight before any upload or device execution.
 use super::*;
 use ferrum_models::qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionFamily, Qwen3VLVisionGrid};
 use ferrum_models::qwen_image21::image_input::{
@@ -26,19 +27,28 @@ pub struct QwenImage21EditProfiles {
 
 pub(super) struct EditInputs {
     pub prompt: QwenImage21EditPrompt,
-    pub inputs: QwenImage21ConditionInputs,
+    pub inputs: Vec<QwenImage21ConditionInputs>,
     vision: Qwen3VLVisionConfig,
     encoder: QwenImage21VaeEncoderConfig,
 }
 pub(super) struct PreparedEdit<R: DeviceRuntime> {
     pub prompt: QwenImage21EditPrompt,
-    pub inputs: QwenImage21ConditionInputs,
+    pub inputs: Vec<QwenImage21ConditionInputs>,
     pub vision: Qwen3VLVisionConfig,
     pub encoder: QwenImage21VaeEncoderConfig,
     pub vision_stage: PreparedStage<R>,
     pub encoder_stage: PreparedStage<R>,
 }
 impl EditInputs {
+    pub(super) fn dimensions(&self, batch: usize) -> anyhow::Result<(u32, u32)> {
+        ensure!(
+            self.prompt.prompts().batch() == batch,
+            "edit prompt batch differs from request count"
+        );
+        let geometry = condition_geometry(&self.inputs, batch)?;
+        Ok((geometry.height, geometry.width))
+    }
+
     pub fn compile<R: DeviceRuntime>(
         self,
         pipeline: &QwenImage21Pipeline<R>,
@@ -109,6 +119,17 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         &mut self,
         request: ImageEditRequest,
     ) -> Result<ImageGenerationOutput, ImageGenerationError<R>> {
+        let mut outputs = self.edit_batch(vec![request])?;
+        Ok(outputs.remove(0))
+    }
+
+    /// One reference per request, in caller order. Processed reference geometry
+    /// and output dimensions must be shared; reference pixels and prompts need
+    /// not match. All plans and capacity checks precede the first device work.
+    pub fn edit_batch(
+        &mut self,
+        requests: Vec<ImageEditRequest>,
+    ) -> Result<Vec<ImageGenerationOutput>, ImageGenerationError<R>> {
         let preflight = |source| ImageGenerationError {
             failure: ImageGenerationFailure::Preflight(source),
             completed_stages: Vec::new(),
@@ -121,33 +142,55 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 completed_steps: Vec::new(),
             });
         }
-        let prepared = (|| -> anyhow::Result<_> {
+        let (prepared, generation) = (|| -> anyhow::Result<_> {
             ensure!(self.supports_edits(), "image editing is not configured");
-            request
-                .generation
-                .latent_dimensions(&self.config, self.assets.spatial_scale()?)?;
+            self.config.validate()?;
+            ensure!(
+                (1..=self.config.maximum_batch_size).contains(&requests.len()),
+                "image request batch exceeds configured maximum_batch_size"
+            );
+            let (generation, images): (Vec<_>, Vec<_>) = requests
+                .into_iter()
+                .map(|request| (request.generation, request.image))
+                .unzip();
+            super::prepare::batch_dimensions(
+                &generation,
+                &self.config,
+                self.assets.spatial_scale()?,
+            )?;
             let assets = self
                 .assets
                 .editing
                 .as_ref()
                 .context("editing assets are missing")?;
             let limits = ImageInputLimits::default();
+            let mut decode_png_us = 0_u64;
+            let mut reference_preprocess_us = 0_u64;
+            let mut inputs = Vec::with_capacity(generation.len());
+            for image in images {
+                let started = std::time::Instant::now();
+                let decoded = ManagedRgba8Image::decode_png(&self.host, &image, limits)?;
+                decode_png_us = decode_png_us.saturating_add(trace_elapsed_us(started));
+                let started = std::time::Instant::now();
+                inputs.push(assets.processor.prepare(&self.host, &decoded, limits)?);
+                reference_preprocess_us =
+                    reference_preprocess_us.saturating_add(trace_elapsed_us(started));
+                // Each prepared image owns its distinct admitted payload. Release
+                // encoded/decoded input owners without retaining extra clones.
+                drop(decoded);
+                drop(image);
+            }
             let started = std::time::Instant::now();
-            let decoded = ManagedRgba8Image::decode_png(&self.host, &request.image, limits)?;
-            let decode_png_us = trace_elapsed_us(started);
-            let started = std::time::Instant::now();
-            let inputs = assets.processor.prepare(&self.host, &decoded, limits)?;
-            let reference_preprocess_us = trace_elapsed_us(started);
-            drop(decoded);
-            let started = std::time::Instant::now();
-            let [temporal, height, width] = inputs.grid_thw();
+            let geometry = condition_geometry(&inputs, generation.len())?;
+            let [temporal, height, width] = geometry.grid;
             let vision = Qwen3VLVisionConfig::new(
                 assets.vision.clone(),
                 vec![Qwen3VLVisionGrid::new(temporal, height, width)?],
             )?;
-            let encoder = assets.encoder_config(inputs.height(), inputs.width())?;
-            let prompt = self.assets.tokenizer.prepare_edit(
-                &request.generation.prompt,
+            let encoder = assets.encoder_config(geometry.height, geometry.width)?;
+            let prompt_text: Vec<_> = generation.iter().map(|r| r.prompt.as_str()).collect();
+            let prompt = self.assets.tokenizer.prepare_edit_batch(
+                &prompt_text,
                 self.config.maximum_user_tokens,
                 height,
                 width,
@@ -155,7 +198,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             )?;
             let edit_layout_and_prompt_us = trace_elapsed_us(started);
             let prepared = self.prepare_batch_with_edit(
-                std::slice::from_ref(&request.generation),
+                &generation,
                 Some(EditInputs {
                     prompt,
                     inputs,
@@ -166,20 +209,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             tracing::debug!(
                 target: "ferrum_engine::image_generation::timing",
                 job = self.next_job,
+                batch_size = generation.len(),
                 decode_png_us,
                 reference_preprocess_us,
                 edit_layout_and_prompt_us,
                 "image edit inputs prepared"
             );
-            Ok(prepared)
+            Ok((prepared, generation))
         })()
         .map_err(preflight)?;
-        // Encoded bytes are no longer needed; decoded model inputs own their
-        // separate claims. Queue cancellation drops this same admitted owner.
-        drop(request.image);
-        let mut outputs =
-            self.execute_prepared(prepared, std::slice::from_ref(&request.generation))?;
-        Ok(outputs.remove(0))
+        self.execute_prepared(prepared, &generation)
     }
 
     pub(super) fn run_edit_conditioning(
@@ -212,12 +251,23 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .managed_position_inputs(&self.host, &positions)
             .map_err(process)?;
         let vision_position_us = trace_elapsed_us(started);
-        let (patches, rgba) = inputs.into_tensors();
-        let mut vision_inputs = Vec::from(position_inputs);
-        vision_inputs.insert(0, patches);
-        let active = self.start_stage(vision_stage, job, stages)?;
-        let (active, outputs) = self.execute_stage(active, job, vision_inputs)?;
+        let batch = inputs.len();
+        let mut rgba_inputs = Vec::with_capacity(batch);
+        let mut vision_outputs = Vec::with_capacity(batch);
+        let mut active = self.start_stage(vision_stage, job, stages)?;
+        for input in inputs {
+            let (patches, rgba) = input.into_tensors();
+            // Position owners are immutable and common to the validated grid;
+            // the patch owner is fresh for this particular request.
+            let mut vision_inputs = Vec::from(position_inputs.clone());
+            vision_inputs.insert(0, patches);
+            let (next, outputs) = self.execute_stage(active, job, vision_inputs)?;
+            active = next;
+            vision_outputs.push(outputs);
+            rgba_inputs.push(rgba);
+        }
         self.finish_stage(active, stages)?;
+        drop(position_inputs);
         let started = std::time::Instant::now();
         let embedding = self
             .assets
@@ -226,7 +276,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .tensor(Qwen3VLTextEncoderFamily::EMBEDDING_EXTERNAL_NAME)
             .map_err(|e| process(e.into()))?;
         let text_inputs = prompt
-            .managed_text_inputs(&self.host, &self.assets.text, &embedding, outputs)
+            .managed_text_batch_inputs(&self.host, &self.assets.text, &embedding, vision_outputs)
             .map_err(process)?;
         let text_bridge_us = trace_elapsed_us(started);
         let active = self.start_stage(text_stage, job, stages)?;
@@ -242,12 +292,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         drop(hidden);
         let hidden_crop_us = trace_elapsed_us(started);
 
-        let active = self.start_stage(encoder_stage, job, stages)?;
-        let (active, outputs) = self.execute_stage(active, job, vec![rgba])?;
-        self.finish_stage(active, stages)?;
         let started = std::time::Instant::now();
-        let encoded =
-            only_output(outputs, QwenImage21VaeEncoderFamily::OUTPUT_ID).map_err(process)?;
         let scale = encoder.spatial_scale();
         let shape = QwenImage21LatentShape::new(
             1,
@@ -255,32 +300,202 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             usize::try_from(encoder.width() / scale).map_err(|e| process(e.into()))?,
         )
         .map_err(process)?;
-        let posterior = QwenImage21ManagedLatents::from_output(
-            &self.host,
-            &encoded,
-            shape,
-            QwenImage21LatentLayout::Nchw,
-            QwenImage21LatentDomain::Denormalized,
-        )
-        .map_err(process)?;
-        let reference = posterior
-            .normalize_from_vae(
-                &self.host,
-                &self.assets.statistics,
-                id(QwenImage21TransformerFamily::REFERENCE_LATENTS_ID).map_err(process)?,
-            )
-            .map_err(process)?
-            .into_input_tensor()
-            .map_err(process)?;
+        let mut references =
+            ReferenceLatentBatch::new(&self.host, batch, shape).map_err(process)?;
+        let mut reference_latent_bridge_us = trace_elapsed_us(started);
+        let mut active = self.start_stage(encoder_stage, job, stages)?;
+        for rgba in rgba_inputs {
+            let (next, outputs) = self.execute_stage(active, job, vec![rgba])?;
+            active = next;
+            let started = std::time::Instant::now();
+            let normalize = (|| -> anyhow::Result<()> {
+                let encoded = only_output(outputs, QwenImage21VaeEncoderFamily::OUTPUT_ID)?;
+                let posterior = QwenImage21ManagedLatents::from_output(
+                    &self.host,
+                    &encoded,
+                    shape,
+                    QwenImage21LatentLayout::Nchw,
+                    QwenImage21LatentDomain::Denormalized,
+                )?;
+                // Keep the original staged BF16 subtraction/division unchanged.
+                let reference = posterior
+                    .normalize_from_vae(
+                        &self.host,
+                        &self.assets.statistics,
+                        id(QwenImage21TransformerFamily::REFERENCE_LATENTS_ID)?,
+                    )?
+                    .into_input_tensor()?;
+                references.push(reference)
+            })();
+            if let Err(source) = normalize {
+                return Err(active.processing(source));
+            }
+            reference_latent_bridge_us =
+                reference_latent_bridge_us.saturating_add(trace_elapsed_us(started));
+        }
+        let reference = match references.finish() {
+            Ok(reference) => reference,
+            Err(source) => return Err(active.processing(source)),
+        };
+        self.finish_stage(active, stages)?;
         tracing::debug!(
             target: "ferrum_engine::image_generation::timing",
             job,
             vision_position_us,
             text_bridge_us,
             hidden_crop_us,
-            reference_latent_bridge_us = trace_elapsed_us(started),
+            reference_latent_bridge_us,
             "image edit conditioning bridges completed"
         );
         Ok((text, reference))
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConditionGeometry {
+    height: u32,
+    width: u32,
+    grid: [u64; 3],
+}
+
+fn condition_geometry(
+    inputs: &[QwenImage21ConditionInputs],
+    batch: usize,
+) -> anyhow::Result<ConditionGeometry> {
+    shared_condition_geometry(
+        inputs.iter().map(|input| ConditionGeometry {
+            height: input.height(),
+            width: input.width(),
+            grid: input.grid_thw(),
+        }),
+        batch,
+    )
+}
+
+fn shared_condition_geometry(
+    geometries: impl IntoIterator<Item = ConditionGeometry>,
+    batch: usize,
+) -> anyhow::Result<ConditionGeometry> {
+    ensure!(
+        (1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&batch),
+        "invalid reference batch size"
+    );
+    let mut geometries = geometries.into_iter();
+    let first = geometries
+        .next()
+        .context("edit batch has no processed references")?;
+    ensure!(
+        first.height > 0 && first.width > 0 && first.grid.into_iter().all(|n| n > 0),
+        "reference geometry must be positive"
+    );
+    let mut count = 1;
+    for geometry in geometries {
+        ensure!(
+            geometry == first,
+            "edit batch requires equal processed reference height, width and vision grid"
+        );
+        count += 1;
+        ensure!(count <= batch, "reference count exceeds request batch");
+    }
+    ensure!(count == batch, "reference count differs from request batch");
+    Ok(first)
+}
+
+/// Only bounded owners/metadata live outside the Host ledger. B1 keeps its
+/// original normalized input owner; B>1 copies samples in order into one exact
+/// admitted packed backing and drops each temporary normalized owner promptly.
+struct ReferenceLatentBatch {
+    host: HostMemoryAccount,
+    shape: QwenImage21LatentShape,
+    item_shape: QwenImage21LatentShape,
+    appended: usize,
+    backing: Option<ManagedHostBuffer>,
+    single: Option<ManagedHostTensor>,
+}
+
+impl ReferenceLatentBatch {
+    fn new(
+        host: &HostMemoryAccount,
+        batch: usize,
+        item_shape: QwenImage21LatentShape,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            (1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&batch),
+            "invalid packed reference batch size"
+        );
+        let [item_batch, _, height, width] = item_shape.nchw_dimensions();
+        ensure!(item_batch == 1, "reference encoder must use B1 geometry");
+        let shape = QwenImage21LatentShape::new(batch, height, width)?;
+        let backing = if batch == 1 {
+            None
+        } else {
+            Some(host.allocate_zeroed(HostMemoryClass::InputPreprocess, shape.byte_len())?)
+        };
+        Ok(Self {
+            host: host.clone(),
+            shape,
+            item_shape,
+            appended: 0,
+            backing,
+            single: None,
+        })
+    }
+
+    fn push(&mut self, reference: ManagedHostTensor) -> anyhow::Result<()> {
+        ensure!(
+            self.appended < self.shape.nchw_dimensions()[0],
+            "too many reference samples"
+        );
+        // ManagedHostTensor seals immutable InputPreprocess bytes with exactly
+        // its contiguous tensor's storage length. Matching the complete packed
+        // spec therefore proves the copy stride, also preserving B1's class.
+        ensure!(
+            self.host.owns(reference.bytes())
+                && reference.value_id().as_str()
+                    == QwenImage21TransformerFamily::REFERENCE_LATENTS_ID
+                && reference.tensor()
+                    == &self.item_shape.tensor(QwenImage21LatentLayout::Packed)?,
+            "reference sample has a foreign owner, semantic ID or packed geometry"
+        );
+        if let Some(backing) = &mut self.backing {
+            let stride = self.item_shape.byte_len();
+            let start = self
+                .appended
+                .checked_mul(stride)
+                .context("reference offset overflows")?;
+            let end = start
+                .checked_add(stride)
+                .context("reference end overflows")?;
+            backing
+                .as_mut()
+                .get_mut(start..end)
+                .context("reference exceeds admitted batch")?
+                .copy_from_slice(reference.bytes().bytes());
+        } else {
+            self.single = Some(reference);
+        }
+        self.appended += 1;
+        Ok(())
+    }
+
+    fn finish(self) -> anyhow::Result<ManagedHostTensor> {
+        ensure!(
+            self.appended == self.shape.nchw_dimensions()[0],
+            "reference batch is incomplete"
+        );
+        if let Some(single) = self.single {
+            return Ok(single);
+        }
+        Ok(ManagedHostTensor::new(
+            id(QwenImage21TransformerFamily::REFERENCE_LATENTS_ID)?,
+            self.shape.tensor(QwenImage21LatentLayout::Packed)?,
+            self.backing
+                .context("missing packed reference backing")?
+                .freeze(),
+        )?)
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/edit_batch.rs"]
+mod tests;

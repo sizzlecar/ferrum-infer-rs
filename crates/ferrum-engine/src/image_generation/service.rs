@@ -1,14 +1,14 @@
 //! Bounded request batching around one injected image generator.
 //!
-//! The worker calls `generate_batch` once per compatible FIFO batch. The current
-//! Qwen adapter exposes its configured batch ceiling and delegates one batch to
-//! real shared component forwards. It still cold-loads components per batch:
-//! this is an experimental functional path, not G3 throughput qualification.
-//! A future resident generator can use the same queue. Pending prompts are bounded separately
+//! The worker calls one generation or editing entrypoint per compatible FIFO
+//! batch. Each generator declares its editing ceiling separately; old custom
+//! generators keep single-request edits. Pending prompts are bounded separately
 //! from the generator's shared Host tensor account.
 
 use super::{ImageEditRequest, ImageGenerationOutput, ImageGenerationRequest, QwenImage21Pipeline};
-use ferrum_models::qwen_image21::image_input::ImageInputLimits;
+use ferrum_models::qwen_image21::image_input::{
+    png_dimensions_hint, ImageInputLimits, QwenImage21ImageProcessor,
+};
 use ferrum_runtime::{DeviceRuntime, HostMemoryAccount};
 use serde::Serialize;
 use std::{
@@ -93,6 +93,26 @@ pub trait ImageGenerator: Send + 'static {
             "image editing is not supported by this generator".into(),
         ))
     }
+    /// Existing generators retain their single-request editing contract.
+    fn maximum_edit_batch_size(&self) -> usize {
+        1
+    }
+    /// Scheduling only; full input validation remains in `edit_batch`.
+    fn compatible_edits(&self, _a: &ImageEditRequest, _b: &ImageEditRequest) -> bool {
+        false
+    }
+    fn edit_batch(
+        &mut self,
+        mut requests: Vec<ImageEditRequest>,
+    ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError> {
+        if requests.len() != 1 {
+            return Err(ImageBatchError::Rejected(
+                "this generator supports only single-request editing".into(),
+            ));
+        }
+        self.edit(requests.pop().unwrap())
+            .map(|output| vec![output])
+    }
     fn compatible(&self, _a: &ImageGenerationRequest, _b: &ImageGenerationRequest) -> bool {
         true
     }
@@ -118,6 +138,21 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
     ) -> Result<ImageGenerationOutput, ImageBatchError> {
         match QwenImage21Pipeline::edit(self, request) {
             Ok(output) => Ok(output),
+            Err(error) => Err(qwen_batch_error(self.is_stopped(), error)),
+        }
+    }
+    fn maximum_edit_batch_size(&self) -> usize {
+        self.config.maximum_batch_size
+    }
+    fn compatible_edits(&self, a: &ImageEditRequest, b: &ImageEditRequest) -> bool {
+        self.supports_edits() && compatible_edit_geometry(a, b)
+    }
+    fn edit_batch(
+        &mut self,
+        requests: Vec<ImageEditRequest>,
+    ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError> {
+        match QwenImage21Pipeline::edit_batch(self, requests) {
+            Ok(outputs) => Ok(outputs),
             Err(error) => Err(qwen_batch_error(self.is_stopped(), error)),
         }
     }
@@ -163,6 +198,18 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
             Ok(outputs) => Ok(outputs),
             Err(error) => Err(qwen_batch_error(self.is_stopped(), error)),
         }
+    }
+}
+
+fn compatible_edit_geometry(a: &ImageEditRequest, b: &ImageEditRequest) -> bool {
+    let geometry = |request: &ImageEditRequest| {
+        let (width, height) =
+            png_dimensions_hint(request.image.bytes(), ImageInputLimits::default())?;
+        QwenImage21ImageProcessor::condition_dimensions(width, height).ok()
+    };
+    match (geometry(a), geometry(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -245,6 +292,7 @@ pub struct ImageService {
     host: HostMemoryAccount,
     capabilities: ImageGeneratorCapabilities,
     supports_edits: bool,
+    maximum_edit_batch_size: usize,
 }
 
 impl ImageService {
@@ -258,11 +306,23 @@ impl ImageService {
         validate_config(config, capabilities)?;
         let host = generator.host_account().clone();
         let supports_edits = generator.supports_edits();
+        let edit_cap = generator.maximum_edit_batch_size();
+        if edit_cap == 0 || edit_cap > capabilities.maximum_batch_size {
+            return Err(service_error(
+                ImageServiceErrorKind::InvalidRequest,
+                "editing batch ceiling must be positive and within the generator batch capability",
+            ));
+        }
         Ok(Self {
             core: ServiceCore::start(Box::new(GeneratorAdapter(generator)), config)?,
             host,
             capabilities,
             supports_edits,
+            maximum_edit_batch_size: if supports_edits {
+                edit_cap.min(config.max_num_seqs)
+            } else {
+                0
+            },
         })
     }
 
@@ -274,6 +334,11 @@ impl ImageService {
     }
     pub fn supports_edits(&self) -> bool {
         self.supports_edits
+    }
+    /// Effective editing ceiling after service admission limits, or zero when
+    /// the generator does not support editing.
+    pub fn maximum_edit_batch_size(&self) -> usize {
+        self.maximum_edit_batch_size
     }
     pub fn snapshot(&self) -> ImageServiceSnapshot {
         self.core.snapshot()
@@ -329,8 +394,8 @@ impl ImageService {
         Ok(())
     }
 
-    /// Edits share the generator worker and retirement authority. The initial
-    /// single-image edit path never batches edits or mixes them with generation.
+    /// Edits share the worker and retirement authority. Compatible edits may
+    /// batch up to their own declared ceiling and never mix with generation.
     pub fn try_submit_edit(
         &self,
         request: ImageEditRequest,
@@ -463,6 +528,24 @@ trait BatchWorker: Send + 'static {
             "image editing is not supported by this worker".into(),
         ))
     }
+    fn maximum_edit_batch_size(&self) -> usize {
+        1
+    }
+    fn compatible_edits(&self, _a: &ImageEditRequest, _b: &ImageEditRequest) -> bool {
+        false
+    }
+    fn edit_batch(
+        &mut self,
+        mut requests: Vec<ImageEditRequest>,
+    ) -> Result<Vec<Self::Output>, ImageBatchError> {
+        if requests.len() != 1 {
+            return Err(ImageBatchError::Rejected(
+                "this worker supports only single-request editing".into(),
+            ));
+        }
+        self.edit(requests.pop().unwrap())
+            .map(|output| vec![output])
+    }
     fn shutdown(&mut self) -> Result<(), GeneratorError> {
         Ok(())
     }
@@ -470,15 +553,20 @@ trait BatchWorker: Send + 'static {
 struct GeneratorAdapter<P>(P);
 impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
     type Output = ImageGenerationOutput;
-    fn edit(&mut self, request: ImageEditRequest) -> Result<Self::Output, ImageBatchError> {
+    fn maximum_edit_batch_size(&self) -> usize {
+        self.0.maximum_edit_batch_size()
+    }
+    fn compatible_edits(&self, a: &ImageEditRequest, b: &ImageEditRequest) -> bool {
+        self.0.compatible_edits(a, b)
+    }
+    fn edit_batch(
+        &mut self,
+        requests: Vec<ImageEditRequest>,
+    ) -> Result<Vec<Self::Output>, ImageBatchError> {
+        let batch_size = requests.len();
         let started = Instant::now();
-        let outcome = self.0.edit(request);
-        trace_request_timing(
-            "edit",
-            1,
-            started,
-            outcome.as_ref().map(std::slice::from_ref),
-        );
+        let outcome = self.0.edit_batch(requests);
+        trace_request_timing("edit", batch_size, started, outcome.as_deref());
         outcome
     }
     fn shutdown(&mut self) -> Result<(), GeneratorError> {
@@ -823,23 +911,33 @@ fn take_batch<O: Send + 'static>(
                 .unwrap_or_else(|e| e.into_inner());
             continue;
         };
-        if matches!(first.request, QueuedRequest::Edit(_)) {
-            state.active = 1;
-            return Some(state.queue.drain(..1).collect());
-        }
+        let maximum_batch = match &first.request {
+            QueuedRequest::Generate(_) => shared.config.max_num_seqs,
+            QueuedRequest::Edit(_) => shared
+                .config
+                .max_num_seqs
+                .min(worker.maximum_edit_batch_size().max(1)),
+        };
         let mut count = 1;
         let mut incompatible = false;
         for job in state
             .queue
             .iter()
             .skip(1)
-            .take(shared.config.max_num_seqs.saturating_sub(1))
+            .take(maximum_batch.saturating_sub(1))
         {
-            if matches!(job.request, QueuedRequest::Edit(_))
-                || job.request.generation().width != first.request.generation().width
-                || job.request.generation().height != first.request.generation().height
-                || !worker.compatible(first.request.generation(), job.request.generation())
-            {
+            let compatible = job.request.generation().width == first.request.generation().width
+                && job.request.generation().height == first.request.generation().height
+                && match (&first.request, &job.request) {
+                    (QueuedRequest::Generate(a), QueuedRequest::Generate(b)) => {
+                        worker.compatible(a, b)
+                    }
+                    (QueuedRequest::Edit(a), QueuedRequest::Edit(b)) => {
+                        worker.compatible_edits(a, b)
+                    }
+                    _ => false,
+                };
+            if !compatible {
                 incompatible = true;
                 break;
             }
@@ -850,7 +948,7 @@ fn take_batch<O: Send + 'static>(
         ));
         let remaining =
             deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()));
-        if count == shared.config.max_num_seqs
+        if count == maximum_batch
             || incompatible
             || remaining.is_none()
             || remaining == Some(Duration::ZERO)
@@ -879,13 +977,17 @@ fn worker_loop<O: Send + 'static>(
                 responses.push((job.cancelled, job.response));
             }
             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                if requests.len() == 1 && matches!(requests.first(), Some(QueuedRequest::Edit(_))) {
-                    match requests.pop().unwrap() {
-                        QueuedRequest::Edit(request) => {
-                            worker.edit(request).map(|output| vec![output])
-                        }
-                        QueuedRequest::Generate(_) => unreachable!(),
-                    }
+                if matches!(requests.first(), Some(QueuedRequest::Edit(_))) {
+                    let edits = requests
+                        .into_iter()
+                        .map(|request| match request {
+                            QueuedRequest::Edit(request) => Ok(request),
+                            QueuedRequest::Generate(_) => Err(ImageBatchError::Rejected(
+                                "mixed editing batch is unsupported".into(),
+                            )),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    worker.edit_batch(edits)
                 } else {
                     let generated = requests
                         .into_iter()

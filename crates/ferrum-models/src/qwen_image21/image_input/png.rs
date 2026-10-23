@@ -2,6 +2,27 @@ use super::*;
 use ::png::{BitDepth, ColorType, DecodeOptions, Decoder};
 use std::io::Cursor;
 
+/// Allocation-free scheduling hint from the first IHDR. This does not validate
+/// CRC, image data, subsequent chunks or decoded pixels, and grants no admission
+/// authority. Callers must still use the ordinary strict managed decoder.
+pub fn png_dimensions_hint(bytes: &[u8], limits: ImageInputLimits) -> Option<(u32, u32)> {
+    let header = bytes.get(..33)?;
+    if bytes.len() > limits.maximum_encoded_bytes
+        || &header[..8] != b"\x89PNG\r\n\x1a\n"
+        || header[8..12] != 13_u32.to_be_bytes()
+        || &header[12..16] != b"IHDR"
+        || header[24] != 8
+        || !matches!(header[25], 2 | 6)
+        || header[26..29] != [0, 0, 0]
+    {
+        return None;
+    }
+    let width = u32::from_be_bytes(header[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(header[20..24].try_into().ok()?);
+    limits.rgba_bytes(width, height).ok()?;
+    Some((width, height))
+}
+
 pub(super) fn decode(
     host: &HostMemoryAccount,
     encoded: &ManagedHostBytes,

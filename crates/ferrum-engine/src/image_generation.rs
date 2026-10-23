@@ -12,7 +12,9 @@
 //! Metadata preparation is separate from backend construction. The pipeline
 //! never constructs a runtime or Host account, launches a helper process, or
 //! exchanges tensor payloads through files. All component plans compile before
-//! the first upload. A single-reference edit may reuse the timestep-zero prefix
+//! the first upload. Each edit request has its own reference image; compatible
+//! edits share batched text/denoising while B1 vision/encoding sessions process
+//! distinct references in caller order. Edits may reuse the timestep-zero prefix
 //! through admitted fixed Request state. Its D2D handoff accounts for both cache
 //! copies; the request retires before decoding. Failures retain recovery owners
 //! and stop this pipeline instance. CFG and video are not implemented.

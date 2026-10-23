@@ -562,6 +562,10 @@ async fn generation_failure_keeps_original_owner_through_http_shutdown() {
 #[tokio::test]
 async fn incompatible_existing_registry_is_a_startup_error() {
     let (images, _) = image_service();
+    assert_eq!(
+        images.health()["capabilities"]["maximum_edit_batch_size"],
+        0
+    );
     let text_registry =
         ServedModelRegistry::try_new("text", ServedModelKind::Llm, vec!["text".into()], vec![])
             .unwrap();

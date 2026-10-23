@@ -192,6 +192,265 @@ fn edit_inputs_copy_output_backings_under_one_host_and_preserve_visual_rows() {
     drop(inputs);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }
+#[test]
+fn edit_batch_keeps_each_single_reference_span_after_left_padding() {
+    let tokenizer = tokenizer();
+    let texts = ["cat", "blue cat"];
+    let batch = tokenizer.prepare_edit_batch(&texts, 64, 4, 4, 2).unwrap();
+    assert_eq!(batch.prompts().batch(), 2);
+    let sequence = batch.prompts().sequence_length();
+    let runs = batch.text_config(&architecture_with_layers(3)).unwrap();
+    let runs = runs.deepstack().unwrap().runs();
+    assert_eq!(runs.len(), 2);
+    assert!(sequence > batch.prompts().valid_input_lengths()[0]);
+    for (index, text) in texts.into_iter().enumerate() {
+        let single = tokenizer.prepare_edit(text, 64, 4, 4, 2).unwrap();
+        let length = single.prompts().sequence_length();
+        let left = sequence - length;
+        assert_eq!(
+            &batch.prompts().input_ids()[index * sequence + left..(index + 1) * sequence],
+            single.prompts().input_ids()
+        );
+        assert_eq!(batch.image_slot_start(), single.image_slot_start());
+        assert_eq!(batch.image_slots(), single.image_slots());
+        assert_eq!(
+            runs[index].start(),
+            (index * sequence
+                + left
+                + single.prompts().drop_prefix_tokens()
+                + single.image_slot_start() as usize) as u64
+        );
+        assert_eq!(runs[index].length(), 4);
+        let explicit_single = tokenizer.prepare_edit_batch(&[text], 64, 4, 4, 2).unwrap();
+        assert_eq!(
+            explicit_single.prompts().input_ids(),
+            single.prompts().input_ids()
+        );
+        assert_eq!(explicit_single.spans, single.spans);
+    }
+    assert!(tokenizer.prepare_edit_batch(&[], 64, 4, 4, 2).is_err());
+    assert!(tokenizer
+        .prepare_edit_batch(
+            &["cat"; STRUCTURED_ATTENTION_BF16_MAX_BATCH + 1],
+            64,
+            4,
+            4,
+            2
+        )
+        .is_err());
+    assert!(tokenizer
+        .prepare_edit_batch(&["cat", "<|image_pad|>"], 64, 4, 4, 2)
+        .is_err());
+    let oversized = "x".repeat(512 * 1024 + 1);
+    assert!(tokenizer
+        .prepare_edit_batch(&[&oversized, &oversized], 8192, 4, 4, 2)
+        .is_err());
+}
+
+type EditVisionPart = (ProgramValueId, ResolvedTensorSpec, ManagedHostBytes);
+
+fn edit_vision_outputs(host: &HostMemoryAccount) -> Vec<Vec<EditVisionPart>> {
+    use crate::qwen3_vl_vision::Qwen3VLVisionFamily as Vision;
+    (0..2)
+        .map(|sample| {
+            std::iter::once(Vision::OUTPUT_ID)
+                .chain(Vision::DEEPSTACK_IDS)
+                .enumerate()
+                .map(|(part, id)| {
+                    let mut bytes = host.allocate_zeroed(HostMemoryClass::Output, 32).unwrap();
+                    for (element, b) in bytes.as_mut().chunks_exact_mut(2).enumerate() {
+                        b.copy_from_slice(
+                            &(0x3f00_u16 + sample * 256 + part as u16 * 32 + element as u16)
+                                .to_le_bytes(),
+                        );
+                    }
+                    (
+                        ProgramValueId::new(id).unwrap(),
+                        ResolvedTensorSpec::new(
+                            vec![4, 4],
+                            ElementType::Bf16,
+                            ResolvedTensorLayout::Contiguous,
+                        )
+                        .unwrap(),
+                        bytes.freeze(),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn edit_vision_parts(
+    outputs: &[Vec<EditVisionPart>],
+) -> Vec<Vec<(&ProgramValueId, &ResolvedTensorSpec, &ManagedHostBytes)>> {
+    outputs
+        .iter()
+        .map(|sample| {
+            sample
+                .iter()
+                .map(|(id, spec, bytes)| (id, spec, bytes))
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn edit_batch_bridge_keeps_distinct_images_rotary_and_host_capacity() {
+    use crate::qwen3_vl_text::Qwen3VLTextEncoderFamily as Text;
+    let tokenizer = tokenizer();
+    let texts = ["cat", "blue cat"];
+    let prompt = tokenizer.prepare_edit_batch(&texts, 64, 4, 4, 2).unwrap();
+    let a = architecture_with_layers(3);
+    let sequence = prompt.prompts().sequence_length();
+    let source_bytes = 2 * 4 * 32;
+    let input_bytes = 2 * sequence * 4 * 2 * 3 + 2 * 32 * 3;
+    let host = account(source_bytes + input_bytes);
+    let outputs = edit_vision_outputs(&host);
+    let mut parts = edit_vision_parts(&outputs);
+    parts[1].reverse(); // Output IDs, not incidental Vec order, select each level.
+    let table = embedding_bytes();
+    let occupied = host
+        .allocate_zeroed(HostMemoryClass::InputPreprocess, 1)
+        .unwrap();
+    assert!(prompt
+        .managed_text_batch_parts(&host, &a, &table, &parts)
+        .is_err());
+    assert_eq!(host.usage().unwrap().committed_bytes(), source_bytes + 1);
+    drop(occupied);
+    let inputs = prompt
+        .managed_text_batch_parts(&host, &a, &table, &parts)
+        .unwrap();
+    assert_eq!(inputs.len(), 6);
+    let embedding = inputs
+        .iter()
+        .find(|t| t.value_id().as_str() == Text::EMBEDDINGS_ID)
+        .unwrap();
+    for (row, token) in prompt.prompts().input_ids().iter().enumerate() {
+        let sample = row / sequence;
+        let start = prompt.spans[sample].visual_run().start() as usize;
+        let expected = if (start..start + 4).contains(&row) {
+            &outputs[sample][0].2.bytes()[(row - start) * 8..(row - start + 1) * 8]
+        } else {
+            &table[*token as usize * 8..(*token as usize + 1) * 8]
+        };
+        assert_eq!(&embedding.bytes().bytes()[row * 8..(row + 1) * 8], expected);
+    }
+    for (part, input) in inputs[3..].iter().enumerate() {
+        assert_eq!(input.tensor().dimensions(), [8, 4]);
+        for sample in 0..2 {
+            assert_eq!(
+                &input.bytes().bytes()[sample * 32..(sample + 1) * 32],
+                outputs[sample][part + 1].2.bytes()
+            );
+            assert!(!input.bytes().same_region(&outputs[sample][part + 1].2));
+        }
+    }
+    for (sample, text) in texts.into_iter().enumerate() {
+        let single = tokenizer.prepare_edit(text, 64, 4, 4, 2).unwrap();
+        let single_host = account(4096);
+        let rotary = single
+            .text_config(&a)
+            .unwrap()
+            .managed_edit_mrope(&single_host, &single.spans)
+            .unwrap();
+        let length = single.prompts().sequence_length();
+        let start = (sample * sequence + sequence - length) * 8;
+        for row in sample * sequence..sample * sequence + sequence - length {
+            assert_eq!(
+                bits(&inputs[1].bytes().bytes()[row * 8..(row + 1) * 8]),
+                [0x3f80; 4]
+            );
+            assert_eq!(
+                bits(&inputs[2].bytes().bytes()[row * 8..(row + 1) * 8]),
+                [0; 4]
+            );
+        }
+        for part in 0..2 {
+            assert_eq!(
+                &inputs[part + 1].bytes().bytes()[start..(sample + 1) * sequence * 8],
+                rotary[part].bytes().bytes()
+            );
+        }
+        drop(rotary);
+        assert_eq!(single_host.usage().unwrap().committed_bytes(), 0);
+    }
+    assert_eq!(
+        host.usage().unwrap().allocated_bytes(),
+        source_bytes + input_bytes
+    );
+    drop(parts);
+    drop(outputs);
+    assert_eq!(host.usage().unwrap().committed_bytes(), input_bytes);
+    drop(inputs);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn edit_batch_bridge_rejects_invalid_groups_before_publishing_inputs() {
+    let prompt = tokenizer()
+        .prepare_edit_batch(&["cat", "blue cat"], 64, 4, 4, 2)
+        .unwrap();
+    let host = account(16384);
+    let a = architecture_with_layers(3);
+    let outputs = edit_vision_outputs(&host);
+    let table = embedding_bytes();
+    let baseline = host.usage().unwrap().committed_bytes();
+    let check = |bad: &[Vec<EditVisionPart>]| {
+        let before = host.usage().unwrap();
+        assert!(prompt
+            .managed_text_batch_parts(&host, &a, &table, &edit_vision_parts(bad))
+            .is_err());
+        assert_eq!(host.usage().unwrap(), before);
+    };
+    check(&outputs[..1]);
+    let mut bad = outputs.clone();
+    bad[1].pop();
+    check(&bad);
+    bad = outputs.clone();
+    bad[1][3].0 = bad[1][2].0.clone();
+    check(&bad);
+    bad = outputs.clone();
+    bad[1][0].1 = ResolvedTensorSpec::new(
+        vec![2, 8],
+        ElementType::Bf16,
+        ResolvedTensorLayout::Contiguous,
+    )
+    .unwrap();
+    check(&bad);
+    let foreign = account(32);
+    bad = outputs.clone();
+    bad[1][0].2 = foreign
+        .allocate_zeroed(HostMemoryClass::Output, 32)
+        .unwrap()
+        .freeze();
+    check(&bad);
+    bad = outputs.clone();
+    bad[1][0].2 = host
+        .allocate_zeroed(HostMemoryClass::InputPreprocess, 32)
+        .unwrap()
+        .freeze();
+    check(&bad);
+    bad = outputs.clone();
+    let mut nonfinite = host.allocate_zeroed(HostMemoryClass::Output, 32).unwrap();
+    nonfinite.as_mut()[..2].copy_from_slice(&0x7f80_u16.to_le_bytes());
+    bad[1][0].2 = nonfinite.freeze();
+    check(&bad);
+    drop(bad);
+    let parts = edit_vision_parts(&outputs);
+    assert!(prompt
+        .managed_text_parts(&host, &a, &table, &parts[0])
+        .is_err());
+    let nonfinite_table = vec![0xff; table.len()];
+    assert!(prompt
+        .managed_text_batch_parts(&host, &a, &nonfinite_table, &parts)
+        .is_err());
+    assert_eq!(host.usage().unwrap().committed_bytes(), baseline);
+    drop(parts);
+    drop(outputs);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(foreign.usage().unwrap().committed_bytes(), 0);
+}
+
 fn account(bytes: usize) -> HostMemoryAccount {
     HostMemoryAccount::new(
         HostMemoryLimits::new(

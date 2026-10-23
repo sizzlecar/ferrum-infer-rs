@@ -248,6 +248,10 @@ async fn invalid_png_crc_and_pixel_count_return_400_without_stopping_the_worker(
     )
     .unwrap();
     let images = ImageHttpService::new("image", service, super::super::tests::config()).unwrap();
+    assert_eq!(
+        images.health()["capabilities"]["maximum_edit_batch_size"],
+        1
+    );
     let router = super::super::super::AxumServer::from_state(
         AppState::default().with_images(images.clone()),
     )

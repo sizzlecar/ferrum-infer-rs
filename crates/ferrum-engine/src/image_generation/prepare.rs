@@ -93,8 +93,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map(|r| r.prompt.as_str())
             .collect::<Vec<_>>();
         let (prompts, order) = if let Some(edit) = &edit {
-            ensure!(batch == 1, "single-reference editing requires one request");
-            (edit.prompt.prompts().clone(), vec![0])
+            edit.dimensions(batch)?;
+            // Reference inputs and vision outputs use caller order. Do not
+            // apply generation's prompt-length canonicalization to edits.
+            (edit.prompt.prompts().clone(), (0..batch).collect())
         } else {
             self.assets
                 .tokenizer
@@ -119,11 +121,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let mut transformer =
             QwenImage21TransformerConfig::new(self.assets.transformer.clone(), layout)?;
         if let Some(edit) = &edit {
+            let (reference_height, reference_width) = edit.dimensions(batch)?;
             transformer = transformer.with_reference_image(
                 edit.prompt.image_slot_start(),
                 edit.prompt.image_slots(),
-                edit.inputs.height() / 16,
-                edit.inputs.width() / 16,
+                reference_height / 16,
+                reference_width / 16,
             )?;
         }
         let prefix_decode_config = if edit.is_some()

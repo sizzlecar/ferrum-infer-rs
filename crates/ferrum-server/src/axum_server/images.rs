@@ -170,6 +170,7 @@ impl ImageHttpService {
             "capabilities":{
                 "generations":true,
                 "edits":self.service.supports_edits(),
+                "maximum_edit_batch_size":self.service.maximum_edit_batch_size(),
                 "edit_input":if self.service.supports_edits() { Some("one static RGB/RGBA8 PNG; no mask") } else { None },
             },
             "scheduler":self.service.snapshot(),

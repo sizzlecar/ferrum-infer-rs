@@ -119,6 +119,84 @@ impl QwenImage21T2iTokenizer {
         grid_width: u64,
         merge: u64,
     ) -> Result<QwenImage21EditPrompt> {
+        self.prepare_edit_batch(
+            &[prompt],
+            maximum_user_tokens,
+            grid_height,
+            grid_width,
+            merge,
+        )
+    }
+
+    /// One independent reference per prompt, with common processed image
+    /// geometry. Preserve input order; left padding shifts each TE image span
+    /// while the cropped DiT slot location stays common to the whole batch.
+    pub fn prepare_edit_batch(
+        &self,
+        prompts: &[&str],
+        maximum_user_tokens: usize,
+        grid_height: u64,
+        grid_width: u64,
+        merge: u64,
+    ) -> Result<QwenImage21EditPrompt> {
+        use crate::qwen3_vl_text::Qwen3VLTextImageSpan;
+        ensure!(
+            !prompts.is_empty()
+                && prompts.len() <= ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH,
+            "edit batch requires nonempty prompts within the structured-attention bound"
+        );
+        let bytes = prompts
+            .iter()
+            .try_fold(0usize, |n, prompt| n.checked_add(prompt.len()))
+            .ok_or_else(|| anyhow::anyhow!("edit prompt byte count overflows"))?;
+        ensure!(
+            bytes <= MAX_TOTAL_PROMPT_BYTES,
+            "batch raw prompts exceed 1 MiB"
+        );
+        let (samples, starts): (Vec<_>, Vec<_>) = prompts
+            .iter()
+            .map(|prompt| {
+                self.encode_edit_sample(prompt, maximum_user_tokens, grid_height, grid_width, merge)
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
+        ensure!(
+            starts.iter().all(|start| *start == starts[0]),
+            "edit batch requires a common cropped image slot location"
+        );
+        let image_slot_start = u32::try_from(starts[0] - self.prefix.len())?;
+        let batch = QwenImage21T2iPromptBatch::from_encoded(samples, self.prefix.len(), self.pad)?;
+        let spans = starts
+            .into_iter()
+            .zip(batch.valid_input_lengths())
+            .enumerate()
+            .map(|(sample, (start, length))| {
+                let absolute = sample
+                    .checked_mul(batch.sequence_length())
+                    .and_then(|n| n.checked_add(batch.sequence_length() - length))
+                    .and_then(|n| n.checked_add(start))
+                    .ok_or_else(|| anyhow::anyhow!("edit image span offset overflows"))?;
+                Qwen3VLTextImageSpan::new(u64::try_from(absolute)?, grid_height, grid_width, merge)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let image_slots = u32::try_from(spans[0].visual_run().length())?;
+        Ok(QwenImage21EditPrompt {
+            batch,
+            spans,
+            image_slot_start,
+            image_slots,
+        })
+    }
+
+    fn encode_edit_sample(
+        &self,
+        prompt: &str,
+        maximum_user_tokens: usize,
+        grid_height: u64,
+        grid_width: u64,
+        merge: u64,
+    ) -> Result<(Vec<u32>, usize)> {
         use crate::qwen3_vl_text::Qwen3VLTextImageSpan;
         ensure!(
             (1..=8192).contains(&maximum_user_tokens) && prompt.len() <= MAX_TOTAL_PROMPT_BYTES,
@@ -176,10 +254,7 @@ impl QwenImage21T2iTokenizer {
         );
         ids.try_reserve_exact(slots - 1)?;
         ids.splice(start..start + 1, std::iter::repeat_n(image_id, slots));
-        Ok(QwenImage21EditPrompt {
-            batch: QwenImage21T2iPromptBatch::from_encoded(vec![ids], self.prefix.len(), self.pad)?,
-            span,
-        })
+        Ok((ids, start))
     }
     /// Mirrors Omni's user-token budget: max(full_tokens - empty_template, 0).
     /// Empty strings become one space. No truncation occurs. Raw prompt bytes
