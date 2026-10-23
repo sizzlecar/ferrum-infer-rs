@@ -14,6 +14,8 @@ mod rotary;
 mod spatial;
 #[path = "vnext_tensor_cuda_runtime/spatial_decoder.rs"]
 mod spatial_decoder;
+#[path = "vnext_tensor_cuda_runtime/spatial_matmul.rs"]
+mod spatial_matmul;
 #[path = "vnext_tensor_cuda_runtime/text.rs"]
 mod text;
 #[path = "vnext_tensor_cuda_runtime/torch_philox.rs"]
