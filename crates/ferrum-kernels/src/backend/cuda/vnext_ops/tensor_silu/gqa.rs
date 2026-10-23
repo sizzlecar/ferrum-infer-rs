@@ -20,8 +20,11 @@ pub const NUMERICAL_IDENTITY: &str = concat!(
     "empty-visible-set=positive-zero-without-QKV-read;masked-KV-never-read;",
     "nonfinite-visible-score=whole-head-NaN;visible-V-IEEE-per-channel;",
     "integer-BF16-RNE;gradual-underflow;fmad=false;no-fast-math;NaN-class-only;",
-    "one-CTA-per-query-head;one-scalar-Q-and-acc-per-thread;zero-global-scratch;",
-    "dynamic-shared=4*D;static-nine-scalars=36-source-bytes-with-target-padding;",
+    "D128:four-independent-full-warps-per-128-thread-CTA;four-contiguous-Q-and-acc-scalars-per-lane;",
+    "D128:local-(p0+p1)+(p2+p3)-then-adjacent-warp-strides1,2,4,8,16;",
+    "D128:lane0-original-scalar-online-order;full-mask-shuffle;no-CTA-barriers;dynamic-shared=0;",
+    "other-D:one-CTA-per-query-head;one-Q-and-acc-scalar-per-thread;dynamic-shared=4*D;",
+    "zero-global-scratch;same-entry-legacy-static-nine-scalars=36-source-bytes-with-target-padding;",
     "bounded-by-value-mask;NoAlias;",
     "logical-arithmetic-from-geometry;not-hardware-FLOPs;",
     "general-FP32-expf-unqualified;no-BF16-SiLU-qualification-inheritance;",
@@ -219,17 +222,14 @@ impl GqaAttentionProvider {
                     .arg(&shape.width)
                     .arg(&shape.scale)
                     .arg(&shape.mask);
-                unsafe {
-                    builder.launch(LaunchConfig {
-                        grid_dim: (shape.groups.min(MAX_BLOCKS) as u32, 1, 1),
-                        block_dim: (shape.width, 1, 1),
-                        shared_mem_bytes: shape.width * 4,
+                unsafe { builder.launch(shape.launch_config()) }
+                    .map(|_| ())
+                    .map_err(|error| {
+                        CudaDeviceRuntimeError::driver(
+                            "BF16 structured GQA attention launch",
+                            error,
+                        )
                     })
-                }
-                .map(|_| ())
-                .map_err(|error| {
-                    CudaDeviceRuntimeError::driver("BF16 structured GQA attention launch", error)
-                })
             },
         )
         .and_then(|command| command.with_tensor_work(shape.elements, shape.operations, 1, 0))
@@ -253,6 +253,24 @@ struct Shape {
 }
 
 impl Shape {
+    fn launch_config(&self) -> LaunchConfig {
+        if self.width == 128 {
+            // Four independent groups per CTA. The last CTA and grid-stride
+            // tail may leave whole warps idle, never a partial active warp.
+            LaunchConfig {
+                grid_dim: (self.groups.div_ceil(4).min(MAX_BLOCKS) as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            }
+        } else {
+            LaunchConfig {
+                grid_dim: (self.groups.min(MAX_BLOCKS) as u32, 1, 1),
+                block_dim: (self.width, 1, 1),
+                shared_mem_bytes: self.width * 4,
+            }
+        }
+    }
+
     fn new(checked: StructuredGqaAttentionBf16Geometry) -> Result<Self, String> {
         let query_bytes = checked
             .element_count()

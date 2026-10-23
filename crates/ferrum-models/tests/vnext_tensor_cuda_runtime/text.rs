@@ -4,6 +4,9 @@ use super::normalization::managed_input;
 use super::*;
 use ferrum_kernels::backend::cuda::vnext_ops::{cuda_vnext_tensor_providers, CudaTensorOperation};
 
+#[path = "text/gqa_d128.rs"]
+mod gqa_d128;
+
 const QUERY: &str = "value.text.query";
 const KEY: &str = "value.text.key";
 const VALUE: &str = "value.text.value";

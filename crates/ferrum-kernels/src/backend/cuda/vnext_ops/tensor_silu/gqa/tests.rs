@@ -181,3 +181,89 @@ fn wrong_group_ratio_rows_dtype_shape_mask_and_ports_are_rejected() {
     assert!(nonoverlapping_ranges(16, 32, 32, 64).is_err());
     assert!(nonoverlapping_ranges(16, 32, 48, 64).is_ok());
 }
+
+#[test]
+fn d128_launch_covers_whole_warps_tails_and_grid_stride_without_dynamic_shared() {
+    for groups in [1, 3, 4, 5, 4 * MAX_BLOCKS, 4 * MAX_BLOCKS + 1] {
+        let q = spec(groups, 128);
+        let shape = validate_specs(&q, &q, &q, &q, &attrs(groups, 128, 1)).unwrap();
+        let launch = shape.launch_config();
+        assert_eq!(launch.block_dim, (128, 1, 1));
+        assert_eq!(launch.shared_mem_bytes, 0);
+        assert_eq!(
+            launch.grid_dim,
+            (groups.div_ceil(4).min(MAX_BLOCKS) as u32, 1, 1)
+        );
+        let stride = u64::from(launch.grid_dim.0) * 4;
+        // Each group has exactly one (block, warp, grid-stride iteration)
+        // decomposition, including a final CTA with only one live warp.
+        let mut visits = vec![0_u8; groups as usize];
+        for first in 0..stride.min(groups) {
+            for group in (first..groups).step_by(stride as usize) {
+                visits[group as usize] += 1;
+            }
+        }
+        assert!(visits.iter().all(|&count| count == 1));
+    }
+    for width in [2, 4, 8, 16, 32, 64, 256] {
+        let q = spec(5, width);
+        let shape = validate_specs(&q, &q, &q, &q, &attrs(5, width, 1)).unwrap();
+        let launch = shape.launch_config();
+        assert_eq!(launch.grid_dim, (5, 1, 1));
+        assert_eq!(launch.block_dim, (width as u32, 1, 1));
+        assert_eq!(launch.shared_mem_bytes, width as u32 * 4);
+    }
+}
+
+#[test]
+fn four_dimensional_subtrees_preserve_adjacent_rounding_and_signed_zero() {
+    fn adjacent(values: &[f32]) -> f32 {
+        if values.len() == 1 {
+            values[0]
+        } else {
+            let half = values.len() / 2;
+            adjacent(&values[..half]) + adjacent(&values[half..])
+        }
+    }
+    fn warp(values: &[f32; 128]) -> f32 {
+        let mut lane = [0.0_f32; 32];
+        for (out, four) in lane.iter_mut().zip(values.chunks_exact(4)) {
+            *out = (four[0] + four[1]) + (four[2] + four[3]);
+        }
+        for stride in [1, 2, 4, 8, 16] {
+            for left in (0..32).step_by(2 * stride) {
+                let right = lane[left + stride];
+                lane[left] += right;
+            }
+        }
+        lane[0]
+    }
+    // BF16-exact products. Adjacent pairs cancel to +0; a sequential fold
+    // instead leaves +1. Place the cancellation across every subtree level.
+    for separation in [1, 2, 4, 8, 16, 32] {
+        let mut values = [0.0_f32; 128];
+        for (index, value) in [33_554_432.0, 1.0, -33_554_432.0, 1.0]
+            .into_iter()
+            .enumerate()
+        {
+            values[index * separation] = value;
+        }
+        assert_eq!(adjacent(&values).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(warp(&values).to_bits(), adjacent(&values).to_bits());
+        assert_eq!(values.into_iter().fold(0.0_f32, |a, b| a + b), 1.0);
+    }
+    let negative_zero = [-0.0_f32; 128];
+    assert_eq!(warp(&negative_zero).to_bits(), (-0.0_f32).to_bits());
+    assert_eq!(
+        warp(&negative_zero).to_bits(),
+        adjacent(&negative_zero).to_bits()
+    );
+    let tiny = [f32::from_bits(1); 128];
+    assert_eq!(warp(&tiny).to_bits(), 128);
+    assert_eq!(warp(&tiny).to_bits(), adjacent(&tiny).to_bits());
+    let mut poison = [0.0_f32; 128];
+    poison[0] = f32::INFINITY;
+    poison[127] = f32::NEG_INFINITY;
+    assert!(warp(&poison).is_nan());
+    assert!(adjacent(&poison).is_nan());
+}

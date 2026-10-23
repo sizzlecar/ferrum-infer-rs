@@ -361,13 +361,125 @@ extern "C" __global__ void ferrum_vnext_structured_attention_bf16(
         heads, heads, sequence, width, scale, mask, 0, sequence, 0);
 }
 
+// D128 maps four consecutive dimensions to each lane. The local subtree is
+// exactly the original adjacent tree's first two levels: (p0+p1)+(p2+p3).
+// Warp stride s then joins original dimension subtrees of width 4*s, with
+// the same left/right operand order and RN32 boundaries as shared-memory
+// strides 4,8,16,32,64. This is not a butterfly or a sum starting from zero.
+// Four independent warps share a CTA, without shared payload or CTA barriers.
+__device__ __forceinline__ void ferrum_structured_gqa_attention_d128_warp(
+    const uint16_t* query, const uint16_t* key, const uint16_t* value,
+    uint16_t* output, uint64_t groups, uint64_t query_heads, uint64_t key_value_heads,
+    uint32_t sequence, float scale, const FerrumStructuredAttentionMask& mask) {
+    const uint32_t lane = threadIdx.x & 31U;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t warps_per_block = blockDim.x >> 5;
+    const uint64_t first_group = static_cast<uint64_t>(blockIdx.x) * warps_per_block + warp;
+    const uint64_t group_stride = static_cast<uint64_t>(gridDim.x) * warps_per_block;
+    // A partial last CTA exits whole warps. Every live warp therefore keeps
+    // all 32 lanes participating in every full-mask shuffle below.
+    for (uint64_t group = first_group; group < groups; group += group_stride) {
+        const uint64_t head = group % query_heads;
+        const uint64_t kv_head = head / (query_heads / key_value_heads);
+        const uint64_t row = group / query_heads;
+        const uint32_t batch = static_cast<uint32_t>(row / sequence);
+        const uint32_t q = static_cast<uint32_t>(row % sequence);
+        const uint64_t query_offset = row * (query_heads * 128) + head * 128 + lane * 4;
+        const uint64_t kv_columns = key_value_heads * 128;
+        uint32_t visible_end = q + 1;
+        for (uint32_t segment = 0; segment < mask.segment_count; ++segment) {
+            if (q < mask.segment_ends[segment]) {
+                if ((mask.bidirectional_mask >> segment) & 1U) {
+                    visible_end = mask.segment_ends[segment];
+                }
+                break;
+            }
+        }
+        float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+        float maximum = 0.0f, denominator = 0.0f;
+        uint32_t seen = 0, poisoned = 0, run = 0;
+        for (uint32_t k = 0; k < visible_end; ++k) {
+            while (run + 1 < mask.key_run_counts[batch]
+                   && k >= mask.key_run_ends[batch * 32 + run]) {
+                ++run;
+            }
+            if (((mask.key_valid_masks[batch] >> run) & 1U) == 0) continue;
+            // Empty rows never load Q/K/V, including poisoned masked payloads.
+            const uint32_t first_key = !seen;
+            if (first_key) {
+                q0 = ferrum_bf16_decode(query[query_offset]);
+                q1 = ferrum_bf16_decode(query[query_offset + 1]);
+                q2 = ferrum_bf16_decode(query[query_offset + 2]);
+                q3 = ferrum_bf16_decode(query[query_offset + 3]);
+            }
+            const uint64_t kv_offset = (static_cast<uint64_t>(batch) * sequence + k)
+                * kv_columns + kv_head * 128 + lane * 4;
+            const float p0 = __fmul_rn(q0, ferrum_bf16_decode(key[kv_offset]));
+            const float p1 = __fmul_rn(q1, ferrum_bf16_decode(key[kv_offset + 1]));
+            const float p2 = __fmul_rn(q2, ferrum_bf16_decode(key[kv_offset + 2]));
+            const float p3 = __fmul_rn(q3, ferrum_bf16_decode(key[kv_offset + 3]));
+            float dot = __fadd_rn(__fadd_rn(p0, p1), __fadd_rn(p2, p3));
+            for (uint32_t stride = 1; stride < 32; stride *= 2) {
+                const float right = __shfl_down_sync(0xffffffffU, dot, stride);
+                if ((lane & (2 * stride - 1)) == 0) dot = __fadd_rn(dot, right);
+            }
+            float correction = 0.0f, weight = 0.0f;
+            if (lane == 0) {
+                const float score = __fmul_rn(dot, scale);
+                if (!isfinite(score)) {
+                    poisoned = 1;
+                } else if (first_key) {
+                    maximum = score;
+                    denominator = 1.0f;
+                } else {
+                    const float next_maximum = fmaxf(maximum, score);
+                    correction = expf(__fsub_rn(maximum, next_maximum));
+                    weight = expf(__fsub_rn(score, next_maximum));
+                    denominator = __fadd_rn(__fmul_rn(denominator, correction), weight);
+                    maximum = next_maximum;
+                }
+            }
+            poisoned = __shfl_sync(0xffffffffU, poisoned, 0);
+            if (poisoned) break;
+            correction = __shfl_sync(0xffffffffU, correction, 0);
+            weight = __shfl_sync(0xffffffffU, weight, 0);
+            seen = 1;
+            const float v0 = ferrum_bf16_decode(value[kv_offset]);
+            const float v1 = ferrum_bf16_decode(value[kv_offset + 1]);
+            const float v2 = ferrum_bf16_decode(value[kv_offset + 2]);
+            const float v3 = ferrum_bf16_decode(value[kv_offset + 3]);
+            acc0 = first_key ? v0 : __fadd_rn(__fmul_rn(acc0, correction), __fmul_rn(weight, v0));
+            acc1 = first_key ? v1 : __fadd_rn(__fmul_rn(acc1, correction), __fmul_rn(weight, v1));
+            acc2 = first_key ? v2 : __fadd_rn(__fmul_rn(acc2, correction), __fmul_rn(weight, v2));
+            acc3 = first_key ? v3 : __fadd_rn(__fmul_rn(acc3, correction), __fmul_rn(weight, v3));
+        }
+        float inverse = 0.0f;
+        if (lane == 0 && seen && !poisoned) inverse = __fdiv_rn(1.0f, denominator);
+        inverse = __shfl_sync(0xffffffffU, inverse, 0);
+        output[query_offset] = poisoned ? 0x7fc0U :
+            (seen ? ferrum_bf16_rne(__fmul_rn(acc0, inverse)) : 0U);
+        output[query_offset + 1] = poisoned ? 0x7fc0U :
+            (seen ? ferrum_bf16_rne(__fmul_rn(acc1, inverse)) : 0U);
+        output[query_offset + 2] = poisoned ? 0x7fc0U :
+            (seen ? ferrum_bf16_rne(__fmul_rn(acc2, inverse)) : 0U);
+        output[query_offset + 3] = poisoned ? 0x7fc0U :
+            (seen ? ferrum_bf16_rne(__fmul_rn(acc3, inverse)) : 0U);
+    }
+}
+
 // GQA has a separate semantic contract, but does not repeat the KV tensors.
 extern "C" __global__ void ferrum_vnext_structured_gqa_attention_bf16(
     const uint16_t* query, const uint16_t* key, const uint16_t* value,
     uint16_t* output, uint64_t groups, uint64_t query_heads, uint64_t key_value_heads,
     uint32_t sequence, uint32_t width, float scale, const FerrumStructuredAttentionMask mask) {
-    ferrum_structured_attention_body(query, key, value, output, groups,
-        query_heads, key_value_heads, sequence, width, scale, mask, 0, sequence, 0);
+    if (width == 128) {
+        ferrum_structured_gqa_attention_d128_warp(query, key, value, output,
+            groups, query_heads, key_value_heads, sequence, scale, mask);
+    } else {
+        ferrum_structured_attention_body(query, key, value, output, groups,
+            query_heads, key_value_heads, sequence, width, scale, mask, 0, sequence, 0);
+    }
 }
 
 // The fallback runs only these query rows; it never computes the whole graph
