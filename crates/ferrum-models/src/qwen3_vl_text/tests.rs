@@ -355,7 +355,7 @@ fn deepstack_rejects_overlap_padding_cross_sample_and_unchecked_wire() {
 #[test]
 fn edit_mrope_uses_image_axes_and_resumes_text_after_maximum_axis() {
     let mut raw = hf(3, 8, 12, 2, 1, 8);
-    raw["text_config"]["rope_theta"] = json!(1);
+    raw["text_config"]["rope_theta"] = json!(256);
     raw["text_config"]["rope_scaling"]["mrope_section"] = json!([2, 1, 1]);
     let architecture = Qwen3VLTextArchitecture::from_hf_value(&raw).unwrap();
     let layout = Qwen3VLTextLayout::new(
@@ -397,10 +397,13 @@ fn edit_mrope_uses_image_axes_and_resumes_text_after_maximum_axis() {
     ];
     for (row, phases) in expected.into_iter().enumerate() {
         for (column, p) in phases.into_iter().enumerate() {
-            let c = half::bf16::from_f32(libm::cosf(p as f32))
+            // 256^(pair/4) is exactly 1, 4, 16, 64. The oracle uses
+            // analytical inverse frequencies rather than the production powf.
+            let phase = p as f32 * [1.0, 0.25, 0.0625, 0.015625][column];
+            let c = half::bf16::from_f32(libm::cosf(phase))
                 .to_bits()
                 .to_le_bytes();
-            let s = half::bf16::from_f32(libm::sinf(p as f32))
+            let s = half::bf16::from_f32(libm::sinf(phase))
                 .to_bits()
                 .to_le_bytes();
             for col in [column, column + 4] {

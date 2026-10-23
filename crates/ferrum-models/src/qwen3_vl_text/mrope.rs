@@ -86,6 +86,24 @@ impl Qwen3VLTextConfig {
         let mut cos = reservations.next().unwrap().allocate_zeroed()?;
         let mut sin = reservations.next().unwrap().allocate_zeroed()?;
         let sections = self.architecture().mrope_sections();
+        // Validated architectures bound head_dim to 256. Pair parameters are
+        // independent of token positions; keep only this bounded table on stack.
+        let mut rotary_pairs = [(0_usize, 0.0_f32); 128];
+        for (pair, parameters) in rotary_pairs[..d / 2].iter_mut().enumerate() {
+            let axis = if pair % 3 == 1 && (pair as u64) < sections[1] * 3 {
+                1
+            } else if pair % 3 == 2 && (pair as u64) < sections[2] * 3 {
+                2
+            } else {
+                0
+            };
+            let inverse = 1.0_f32
+                / libm::powf(
+                    self.architecture().rope_theta() as f32,
+                    (2 * pair) as f32 / d as f32,
+                );
+            *parameters = (axis, inverse);
+        }
         let sequence = u64::from(self.layout().sequence_length());
         for (batch, runs) in self.layout().key_runs().iter().enumerate() {
             let mut local = 0_u64;
@@ -118,19 +136,7 @@ impl Qwen3VLTextConfig {
                         next_position += 1;
                         p
                     };
-                    for pair in 0..d / 2 {
-                        let axis = if pair % 3 == 1 && (pair as u64) < sections[1] * 3 {
-                            1
-                        } else if pair % 3 == 2 && (pair as u64) < sections[2] * 3 {
-                            2
-                        } else {
-                            0
-                        };
-                        let inverse = 1.0_f32
-                            / libm::powf(
-                                self.architecture().rope_theta() as f32,
-                                (2 * pair) as f32 / d as f32,
-                            );
+                    for (pair, &(axis, inverse)) in rotary_pairs[..d / 2].iter().enumerate() {
                         let phase = position[axis] as f32 * inverse;
                         let c = bf16::from_f32(libm::cosf(phase)).to_bits().to_le_bytes();
                         let s = bf16::from_f32(libm::sinf(phase)).to_bits().to_le_bytes();

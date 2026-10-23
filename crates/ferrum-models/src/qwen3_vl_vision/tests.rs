@@ -187,7 +187,9 @@ fn grids_are_identity_and_invalid_shapes_fail_before_preparation() {
 
 #[test]
 fn governed_position_tables_use_merge_block_order_and_release_all_bytes() {
-    let architecture = Qwen3VLVisionArchitecture::from_hf_value(&hf(false)).unwrap();
+    let mut raw = hf(false);
+    raw["vision_config"]["num_heads"] = json!(1);
+    let architecture = Qwen3VLVisionArchitecture::from_hf_value(&raw).unwrap();
     let c = Qwen3VLVisionConfig::new(architecture, vec![Qwen3VLVisionGrid::new(1, 4, 4).unwrap()])
         .unwrap();
     let account = |n| {
@@ -209,8 +211,8 @@ fn governed_position_tables_use_merge_block_order_and_release_all_bytes() {
             std::iter::repeat_n(half::bf16::from_f32(p as f32).to_bits().to_le_bytes(), 8).flatten()
         })
         .collect::<Vec<_>>();
-    // 16 rows: BF16 positions[8] + two FP32 rotary tables[4].
-    let bytes = 16 * (8 * 2 + 2 * 4 * 4);
+    // 16 rows: BF16 positions[8] + two FP32 rotary tables[8].
+    let bytes = 16 * (8 * 2 + 2 * 8 * 4);
     let host = account(bytes);
     let output = c.position_inputs_bytes(&host, &table).unwrap();
     let expected = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
@@ -220,20 +222,20 @@ fn governed_position_tables_use_merge_block_order_and_release_all_bytes() {
             &output[0].bytes().as_ref()[offset..offset + 2],
             &half::bf16::from_f32(value as f32).to_bits().to_le_bytes()
         );
+        // Merge-block order supplies the independent row/column oracle.
+        // With head_dim=8, each axis has inverse frequencies 1 and 1/100.
+        let y = (value / 4) as f32;
+        let x = (value % 4) as f32;
+        for (pair, phase) in [y, y * 0.01, x, x * 0.01].into_iter().enumerate() {
+            let cos = libm::cosf(phase).to_le_bytes();
+            let sin = libm::sinf(phase).to_le_bytes();
+            for channel in [pair, pair + 4] {
+                let offset = (row * 8 + channel) * 4;
+                assert_eq!(&output[1].bytes().as_ref()[offset..offset + 4], &cos);
+                assert_eq!(&output[2].bytes().as_ref()[offset..offset + 4], &sin);
+            }
+        }
     }
-    let f32_at = |index: usize| {
-        f32::from_le_bytes(
-            output[1].bytes().as_ref()[index * 4..index * 4 + 4]
-                .try_into()
-                .unwrap(),
-        )
-    };
-    assert_eq!(f32_at(0), 1.0);
-    assert_eq!(f32_at(1), 1.0);
-    assert_eq!(f32_at(4), 1.0);
-    assert_eq!(f32_at(5), libm::cosf(1.0));
-    assert_eq!(f32_at(8), libm::cosf(1.0));
-    assert_eq!(f32_at(9), 1.0);
     assert_eq!(host.usage().unwrap().allocated_bytes(), bytes);
     drop(output);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);

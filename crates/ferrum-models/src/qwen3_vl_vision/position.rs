@@ -90,6 +90,15 @@ impl Qwen3VLVisionConfig {
         let mut cos = reserved.next().unwrap().allocate_zeroed()?;
         let mut sin = reserved.next().unwrap().allocate_zeroed()?;
         let merge = usize::try_from(a.merge_size())?;
+        // Validated architectures bound head_dim to 256. Reuse pair parameters
+        // within this call without retaining any image or position-table payload.
+        let mut rotary_pairs = [(0_usize, 0.0_f32); 128];
+        for (pair, parameters) in rotary_pairs[..d / 2].iter_mut().enumerate() {
+            let axis = pair / (d / 4);
+            let frequency = pair % (d / 4);
+            let inverse = 1.0_f32 / libm::powf(10000.0, (2 * frequency) as f32 / (d / 2) as f32);
+            *parameters = (axis, inverse);
+        }
         let mut global = 0;
         for grid in self.grids() {
             let height = usize::try_from(grid.height())?;
@@ -123,11 +132,7 @@ impl Qwen3VLVisionConfig {
                     let offset = (global * h + channel) * 2;
                     pos.as_mut()[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
                 }
-                for pair in 0..d / 2 {
-                    let axis = pair / (d / 4);
-                    let frequency = pair % (d / 4);
-                    let inv =
-                        1.0_f32 / libm::powf(10000.0, (2 * frequency) as f32 / (d / 2) as f32);
+                for (pair, &(axis, inv)) in rotary_pairs[..d / 2].iter().enumerate() {
                     let phase = if axis == 0 { row } else { col } as f32 * inv;
                     let cv = libm::cosf(phase).to_le_bytes();
                     let sv = libm::sinf(phase).to_le_bytes();
