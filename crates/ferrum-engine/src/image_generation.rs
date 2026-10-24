@@ -80,7 +80,7 @@ use ferrum_models::qwen_image21::{
     QwenImage21TransformerFamily, QwenImage21VaeDecoderConfig, QwenImage21VaeDecoderFamily,
     StructureLimits,
 };
-use ferrum_quantization::SafetensorsArchive;
+use ferrum_quantization::{SafetensorsArchive, TensorArchive};
 use ferrum_runtime::*;
 use prepare::PreparedRequest;
 use serde::{Deserialize, Serialize};

@@ -89,6 +89,34 @@ impl GgufWeightComponentSource {
     }
 }
 
+impl crate::TensorArchive for GgufWeightComponentSource {
+    fn tensor(&self, external_name: &str) -> Result<crate::ArchiveTensor<'_>> {
+        let (name, info) = self.file.tensor_entry(external_name).ok_or_else(|| {
+            FerrumError::model(format!("tensor {external_name:?} is absent from GGUF"))
+        })?;
+        let (offset, bytes) = self.file.tensor_byte_range(external_name).ok_or_else(|| {
+            FerrumError::model(format!("tensor {external_name:?} has no GGUF payload"))
+        })?;
+        let retained = RetainedHostMemoryRegion::new(Arc::clone(&self.file), offset, bytes)
+            .map_err(|e| FerrumError::model(e.to_string()))?;
+        crate::ArchiveTensor::new(
+            name,
+            &self.source_file,
+            &info.dimensions,
+            info.encoding.clone(),
+            retained,
+        )
+    }
+
+    fn tensor_count(&self) -> usize {
+        self.file.tensor_count()
+    }
+
+    fn tensor_names(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        Box::new(self.file.tensor_names())
+    }
+}
+
 impl WeightComponentSource for GgufWeightComponentSource {
     fn component<'source>(
         &'source self,

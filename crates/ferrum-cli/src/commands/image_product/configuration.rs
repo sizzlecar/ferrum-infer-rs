@@ -110,6 +110,7 @@ pub struct WeightPaths {
 pub enum WeightSource {
     Single { directory: PathBuf, file: String },
     Index { directory: PathBuf, file: String },
+    Gguf { directory: PathBuf, file: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -430,8 +431,9 @@ impl ImageProductConfig {
             &mut self.weights.transformer,
             &mut self.weights.vae,
         ] {
-            let (WeightSource::Single { directory, .. } | WeightSource::Index { directory, .. }) =
-                source;
+            let (WeightSource::Single { directory, .. }
+            | WeightSource::Index { directory, .. }
+            | WeightSource::Gguf { directory, .. }) = source;
             if directory.is_relative() {
                 *directory = base.join(&*directory);
             }

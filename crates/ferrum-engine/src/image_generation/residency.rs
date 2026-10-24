@@ -1,7 +1,8 @@
 //! Bounded model session/snapshot slots. Compatible plans share the same sealed
 //! physical weights; dynamic storage remains independently admitted.
 use super::*;
-use ferrum_quantization::bf16_whole_tensor_fp8::ExactBf16SafetensorsSource;
+use ferrum_quantization::bf16_whole_tensor_fp8::ExactBf16TensorSource;
+use ferrum_quantization::ManagedDenseArchiveSource;
 use std::num::NonZeroU64;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -513,7 +514,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .clone();
             Ok((active, weights, false))
         } else {
-            let dit_source = ExactBf16SafetensorsSource::new(&self.assets.sources.transformer);
+            let dit_source = ExactBf16TensorSource::new(self.assets.sources.transformer.as_ref());
+            let native_source = ManagedDenseArchiveSource::new(
+                self.assets.sources.transformer.as_ref(),
+                &self.host,
+            );
             let source = if matches!(
                 prepared.plan.profile.as_str(),
                 QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
@@ -521,7 +526,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             ) {
                 ComponentWeightSource::Stored(&dit_source)
             } else {
-                ComponentWeightSource::Stored(self.assets.sources.transformer.as_ref())
+                ComponentWeightSource::Stored(&native_source)
             };
             prepared
                 .start_shared(self, job, source)
@@ -589,8 +594,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         // Keep the archive's optional implicit dtype conversion out of the
         // managed FP8 conversion path. These wrappers borrow the original mmap
         // and stay alive throughout synchronous static initialization.
-        let text_source = ExactBf16SafetensorsSource::new(&self.assets.sources.text_encoder);
-        let dit_source = ExactBf16SafetensorsSource::new(&self.assets.sources.transformer);
+        let text_source = ExactBf16TensorSource::new(self.assets.sources.text_encoder.as_ref());
+        let dit_source = ExactBf16TensorSource::new(self.assets.sources.transformer.as_ref());
+        let native_source =
+            ManagedDenseArchiveSource::new(self.assets.sources.transformer.as_ref(), &self.host);
         let profile = prepared.plan.profile.as_str();
         let source = match prepared.plan.stage {
             ImageStage::TextEncoder if profile == Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID => {
@@ -615,9 +622,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             {
                 ComponentWeightSource::Stored(&dit_source)
             }
-            ImageStage::Denoiser => {
-                ComponentWeightSource::Stored(self.assets.sources.transformer.as_ref())
-            }
+            ImageStage::Denoiser => ComponentWeightSource::Stored(&native_source),
             ImageStage::Decoder => ComponentWeightSource::Stored(self.assets.sources.vae.as_ref()),
         };
         let stage = prepared.plan.stage;

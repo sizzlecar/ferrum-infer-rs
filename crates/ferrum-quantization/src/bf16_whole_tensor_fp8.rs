@@ -17,7 +17,9 @@ mod host_cache;
 mod plan;
 mod quality;
 mod source;
-pub use source::ExactBf16SafetensorsSource;
+pub use source::ExactBf16TensorSource;
+/// Backward-compatible spelling; the source now accepts any tensor archive.
+pub type ExactBf16SafetensorsSource<'a> = ExactBf16TensorSource<'a>;
 #[cfg(test)]
 mod tests;
 

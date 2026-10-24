@@ -7,7 +7,7 @@ use crate::qwen3_vl_text::{
 };
 use crate::qwen3_vl_vision::Qwen3VLVisionFamily as Vision;
 use ferrum_execution::TensorExecutionOutput;
-use ferrum_quantization::SafetensorsTensor;
+use ferrum_quantization::ArchiveTensor;
 use ferrum_runtime::*;
 
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ impl QwenImage21EditPrompt {
         &self,
         host: &HostMemoryAccount,
         a: &Qwen3VLTextArchitecture,
-        embedding: &SafetensorsTensor<'_>,
+        embedding: &ArchiveTensor<'_>,
         outputs: Vec<TensorExecutionOutput>,
     ) -> Result<Vec<ManagedHostTensor>> {
         ensure!(
@@ -58,7 +58,7 @@ impl QwenImage21EditPrompt {
         &self,
         host: &HostMemoryAccount,
         a: &Qwen3VLTextArchitecture,
-        embedding: &SafetensorsTensor<'_>,
+        embedding: &ArchiveTensor<'_>,
         outputs: Vec<Vec<TensorExecutionOutput>>,
     ) -> Result<Vec<ManagedHostTensor>> {
         ensure!(

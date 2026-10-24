@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <math.h>
 #include "vnext_gguf_codebooks.cuh"
+#include "vnext_gguf_blocks.cuh"
 
 using byte = unsigned char;
 
@@ -25,27 +26,10 @@ __device__ __forceinline__ float native_block_value(const byte* b, unsigned i, u
             return (native_half(b, 108) * float(scale)) * float(int(q) - offset);
         }
         case 12:
-        case 13: {
-            const unsigned group = i / 32;
-            const byte* s = b + 4;
-            const unsigned scale = group < 4 ? s[group] & 63
-                : (s[group + 4] & 15) | ((s[group - 4] >> 6) << 4);
-            const unsigned minimum = group < 4 ? s[group + 4] & 63
-                : (s[group + 4] >> 4) | ((s[group] >> 6) << 4);
-            const unsigned start = format == 13 ? 48 : 16;
-            unsigned q = (b[start + (i / 64) * 32 + i % 32] >> (4 * ((i % 64) / 32))) & 15;
-            if (format == 13 && (b[16 + i % 32] & (1 << group))) q += 16;
-            return (native_half(b, 0) * float(scale)) * float(q) - native_half(b, 2) * float(minimum);
-        }
-        case 14: {
-            const unsigned group = (i % 128) / 32;
-            const unsigned lo = (b[(i / 128) * 64 + (group % 2) * 32 + i % 32] >> (4 * (group / 2))) & 15;
-            const unsigned hi = (b[128 + (i / 128) * 32 + i % 32] >> (2 * group)) & 3;
-            return (native_half(b, 208) * float(static_cast<signed char>(b[192 + i / 16])))
-                * float(int(lo | (hi << 4)) - 32);
-        }
+        case 13:
+        case 14:
         case 8:
-            return native_half(b, 0) * float(static_cast<signed char>(b[2 + i]));
+            return ferrum_gguf_matrix_value(b, i, format);
         case 142: {
             // PQ2_0: one F16 scale and 128 values packed low slot first.
             // All four physical codes are defined, including code 3 = +2.

@@ -104,7 +104,8 @@ impl CudaTensorDenseBf16Provider {
             runtime.descriptor().id.clone(),
             BTreeSet::from([capability]),
             BTreeSet::from([
-                WeightFormatId::new(super::DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?
+                WeightFormatId::new(super::DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
+                WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
             ]),
             BTreeSet::new(),
             super::transformer::contiguous_bindings(2),
@@ -232,7 +233,14 @@ impl CudaTensorDenseBf16Provider {
             vec![input, weight, output],
             move |stream, blas, regions| {
                 let _bootstrap = &bootstrap;
-                launch(stream, blas, &regions[0], &regions[1], &regions[2], shape)
+                launch(
+                    stream,
+                    blas,
+                    &regions[0],
+                    regions[1].device_ptr(),
+                    &regions[2],
+                    shape,
+                )
             },
         )
         .and_then(|command| {
@@ -243,15 +251,15 @@ impl CudaTensorDenseBf16Provider {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Shape {
-    rows: i32,
-    inputs: i32,
-    outputs: i32,
-    input_bytes: u64,
-    weight_bytes: u64,
-    output_bytes: u64,
-    output_elements: u64,
-    arithmetic_operations: u64,
+pub(super) struct Shape {
+    pub(super) rows: i32,
+    pub(super) inputs: i32,
+    pub(super) outputs: i32,
+    pub(super) input_bytes: u64,
+    pub(super) weight_bytes: u64,
+    pub(super) output_bytes: u64,
+    pub(super) output_elements: u64,
+    pub(super) arithmetic_operations: u64,
 }
 
 impl Shape {
@@ -317,7 +325,7 @@ fn geometry(
     )
 }
 
-fn validate_specs(
+pub(super) fn validate_specs(
     input: &ResolvedTensorSpec,
     weight: &ResolvedTensorSpec,
     output: &ResolvedTensorSpec,
@@ -340,7 +348,7 @@ fn validate_specs(
     Shape::new(*rows, inputs, outputs)
 }
 
-fn retained_region<'a, W: InvocationWorkProjection<'a>>(
+pub(super) fn retained_region<'a, W: InvocationWorkProjection<'a>>(
     participant: &OperationInvocation<'a, CudaDeviceBuffer, W>,
     binding: &ResolvedValueBinding,
     expected_bytes: u64,
@@ -381,7 +389,12 @@ fn retained_region<'a, W: InvocationWorkProjection<'a>>(
     Ok(retained)
 }
 
-fn disjoint(read: u64, read_bytes: u64, write: u64, write_bytes: u64) -> Result<(), String> {
+pub(super) fn disjoint(
+    read: u64,
+    read_bytes: u64,
+    write: u64,
+    write_bytes: u64,
+) -> Result<(), String> {
     let read_end = read
         .checked_add(read_bytes)
         .ok_or("CUDA Dense read address overflows")?;
@@ -394,11 +407,11 @@ fn disjoint(read: u64, read_bytes: u64, write: u64, write_bytes: u64) -> Result<
     Ok(())
 }
 
-fn launch(
+pub(super) fn launch(
     stream: &CudaStream,
     blas: &CudaBlas,
     input: &CudaBufferRegion,
-    weight: &CudaBufferRegion,
+    weight: u64,
     output: &CudaBufferRegion,
     shape: Shape,
 ) -> Result<(), CudaDeviceRuntimeError> {
@@ -436,7 +449,7 @@ fn launch(
             shape.rows,
             shape.inputs,
             &ALPHA as *const f32 as *const c_void,
-            weight.device_ptr() as *const c_void,
+            weight as *const c_void,
             sys::cudaDataType_t::CUDA_R_16BF,
             shape.inputs,
             input.device_ptr() as *const c_void,

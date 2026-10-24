@@ -9,6 +9,8 @@ use ferrum_runtime::TensorPrimitiveBf16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum CudaTensorOperation {
+    /// Native block weights, BF16 decode scratch, and the admitted lane BLAS.
+    BlockLinear,
     Silu,
     SiluMul,
     Tanh,
@@ -46,7 +48,8 @@ pub enum CudaTensorOperation {
 }
 
 impl CudaTensorOperation {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
+        Self::BlockLinear,
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -131,6 +134,7 @@ impl CudaTensorOperation {
             return norm::descriptor(device, kind);
         }
         match self {
+            Self::BlockLinear => block_linear::descriptor(device),
             Self::ChannelL2NormImage => {
                 spatial::descriptor(device, spatial::SpatialKind::ChannelL2Image)
             }
@@ -181,6 +185,7 @@ impl CudaTensorOperation {
             return norm::provider(kind, descriptor, kernels);
         }
         match self {
+            Self::BlockLinear => block_linear::provider(descriptor, kernels),
             Self::ChannelL2NormImage => {
                 spatial::provider(spatial::SpatialKind::ChannelL2Image, descriptor, kernels)
             }

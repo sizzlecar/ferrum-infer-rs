@@ -121,6 +121,11 @@ impl NativeGgufFile {
     pub fn tensor_info(&self, name: &str) -> Option<&NativeGgufTensor> {
         self.tensors.get(name)
     }
+    pub(crate) fn tensor_entry(&self, name: &str) -> Option<(&str, &NativeGgufTensor)> {
+        self.tensors
+            .get_key_value(name)
+            .map(|(name, info)| (name.as_str(), info))
+    }
     pub fn has_tensor(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
     }

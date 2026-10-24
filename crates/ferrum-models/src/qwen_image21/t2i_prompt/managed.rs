@@ -4,7 +4,7 @@ use crate::qwen3_vl_text::{
 };
 use crate::qwen_image21::QwenImage21TransformerFamily;
 use ferrum_execution::TensorExecutionOutput;
-use ferrum_quantization::SafetensorsTensor;
+use ferrum_quantization::ArchiveTensor;
 use ferrum_runtime::*;
 use half::bf16;
 
@@ -54,7 +54,7 @@ impl QwenImage21T2iPromptBatch {
         &self,
         account: &HostMemoryAccount,
         architecture: &Qwen3VLTextArchitecture,
-        embedding: &SafetensorsTensor<'_>,
+        embedding: &ArchiveTensor<'_>,
     ) -> Result<QwenImage21T2iManagedInputs> {
         ensure!(
             embedding.external_name() == Family::EMBEDDING_EXTERNAL_NAME,

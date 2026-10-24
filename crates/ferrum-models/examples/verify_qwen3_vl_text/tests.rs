@@ -125,7 +125,8 @@ fn one_account_survives_real_text_execution_crop_and_device_retirement() {
         .managed_inputs(
             &host,
             &architecture,
-            &source.tensor(Family::EMBEDDING_EXTERNAL_NAME).unwrap(),
+            &ferrum_quantization::TensorArchive::tensor(&source, Family::EMBEDDING_EXTERNAL_NAME)
+                .unwrap(),
         )
         .unwrap();
     let args = Arguments {

@@ -33,6 +33,7 @@ use super::super::vnext_runtime::{
 use super::{binding, contract_error, implementation_fingerprint, provider_failure};
 
 mod attention;
+mod block_linear;
 mod bundle;
 mod conv2d;
 mod cudnn_attention;

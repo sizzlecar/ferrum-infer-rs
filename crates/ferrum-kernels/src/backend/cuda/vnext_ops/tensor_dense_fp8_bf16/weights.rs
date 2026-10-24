@@ -1,5 +1,7 @@
 //! Exact WholeTensor storage resolution, independent of container/file names.
 
+use super::super::tensor_storage::component;
+pub(super) use super::super::tensor_storage::scratch;
 use super::*;
 use ferrum_runtime::{
     InvocationWorkProjection, OperationInvocation, PhysicalStorageLayout, PhysicalWeightLayout,
@@ -124,71 +126,4 @@ pub(super) fn plain<'a, W: InvocationWorkProjection<'a>>(
         return Err("FP8 X/Y storage differs from the logical BF16 tensor".into());
     }
     component(participant, stored, 16)
-}
-
-fn component<'a, W: InvocationWorkProjection<'a>>(
-    participant: &OperationInvocation<'a, CudaDeviceBuffer, W>,
-    stored: &ResolvedStorageComponent,
-    alignment: u64,
-) -> Result<CudaBufferRegion, String> {
-    let mut views = participant
-        .views()
-        .iter()
-        .filter(|view| view.resource_id() == stored.resource_id());
-    let view = views
-        .next()
-        .ok_or("FP8 binding lacks committed resource view")?;
-    if views.next().is_some() {
-        return Err("FP8 binding has ambiguous resource views".into());
-    }
-    let translated = view
-        .translate(stored.offset_bytes(), stored.length_bytes())
-        .map_err(|e| e.to_string())?;
-    let mut pieces = translated.iter();
-    let piece = pieces
-        .next()
-        .ok_or("FP8 binding resolved to no physical range")?;
-    if pieces.next().is_some() {
-        return Err("FP8 binding must be physically contiguous".into());
-    }
-    let (buffer, range, retention) = piece.buffer_and_physical_range();
-    let region = buffer
-        .retained_region(range, retention)
-        .map_err(|e| e.to_string())?;
-    if region.element_type() != stored.element_type()
-        || region.length_bytes() != stored.length_bytes()
-        || region.device_ptr() % alignment != 0
-    {
-        return Err("FP8 binding physical dtype/extent/alignment mismatch".into());
-    }
-    Ok(region)
-}
-
-pub(super) fn scratch<'a, W: InvocationWorkProjection<'a>>(
-    participant: &OperationInvocation<'a, CudaDeviceBuffer, W>,
-    bytes: u64,
-    alignment: u64,
-) -> Result<CudaBufferRegion, String> {
-    let view = participant
-        .scratch_view()
-        .ok_or("FP8 invocation scratch was not admitted")?;
-    let translated = view.translate(0, bytes).map_err(|e| e.to_string())?;
-    let mut pieces = translated.iter();
-    let piece = pieces
-        .next()
-        .ok_or("FP8 scratch resolved to no physical range")?;
-    if pieces.next().is_some() {
-        return Err("FP8 scratch must be physically contiguous".into());
-    }
-    let (buffer, range, retention) = piece.buffer_and_physical_range();
-    let region = buffer
-        .retained_region(range, retention)
-        .map_err(|e| e.to_string())?;
-    if region.element_type() != ElementType::U8
-        || region.length_bytes() != bytes
-        || region.device_ptr() % alignment != 0
-    {
-        return Err("FP8 scratch physical dtype/extent/alignment mismatch".into());
-    }
-    Ok(region)
 }

@@ -24,9 +24,9 @@ pub struct QwenImage21Metadata<'a> {
 /// sources are outside the Host payload account; only managed static staging
 /// is charged by component initialization. Sources must remain immutable.
 pub struct QwenImage21Sources {
-    pub text_encoder: Arc<SafetensorsArchive>,
-    pub transformer: Arc<SafetensorsArchive>,
-    pub vae: Arc<SafetensorsArchive>,
+    pub text_encoder: Arc<dyn TensorArchive>,
+    pub transformer: Arc<dyn TensorArchive>,
+    pub vae: Arc<dyn TensorArchive>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +42,7 @@ pub struct QwenImage21Assets {
     pub(super) sources: QwenImage21Sources,
     pub(super) text: Qwen3VLTextArchitecture,
     pub(super) transformer: QwenImage21Config,
+    pub(super) transformer_encodings: BTreeMap<String, WeightEncoding>,
     pub(super) vae: QwenImage21VaeDecoderConfig,
     pub(super) tokenizer: QwenImage21T2iTokenizer,
     pub(super) statistics: QwenImage21LatentStatistics,
@@ -104,13 +105,26 @@ impl QwenImage21Assets {
             Qwen3VLTextLayout::new(1, vec![vec![Qwen3VLTextKeyRun::new(1, true)]])?,
         )?;
         let text_schema = Qwen3VLTextEncoderFamily::new()?.weights(&text_config)?;
-        let dit_schema = ExpectedWeights::from_config(&transformer, StructureLimits::default())?
-            .weight_schema()?;
+        let expected_dit = ExpectedWeights::from_config(&transformer, StructureLimits::default())?;
+        let transformer_encodings = expected_dit.archive_encodings(sources.transformer.as_ref())?;
+        let dit_schema = expected_dit.weight_schema_with_encodings(&transformer_encodings)?;
+        let dit_bytes = if transformer_encodings.is_empty() {
+            validate_archive(&dit_schema, sources.transformer.as_ref())?
+        } else {
+            dit_schema
+                .components
+                .iter()
+                .try_fold(0_u64, |total, component| {
+                    total
+                        .checked_add(component.physical_bytes()?)
+                        .context("native denoiser weight bytes overflow")
+                })?
+        };
         let vae_schema = QwenImage21VaeDecoderFamily::new()?.weights(&vae)?;
         let required_weight_bytes = [
-            validate_archive(text_schema.stored_schema()?, &sources.text_encoder)?,
-            validate_archive(&dit_schema, &sources.transformer)?,
-            validate_archive(vae_schema.stored_schema()?, &sources.vae)?,
+            validate_archive(text_schema.stored_schema()?, sources.text_encoder.as_ref())?,
+            dit_bytes,
+            validate_archive(vae_schema.stored_schema()?, sources.vae.as_ref())?,
         ];
         let embedding = sources
             .text_encoder
@@ -128,10 +142,20 @@ impl QwenImage21Assets {
             "tokenizer".into(),
             format!("{:x}", Sha256::digest(metadata.tokenizer)),
         );
+        if !transformer_encodings.is_empty() {
+            metadata_sha256.insert(
+                "transformer_weight_encodings".into(),
+                format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&transformer_encodings)?)
+                ),
+            );
+        }
         Ok(Self {
             sources,
             text,
             transformer,
+            transformer_encodings,
             vae,
             tokenizer,
             statistics,
@@ -183,7 +207,7 @@ impl QwenImage21Assets {
 
 pub(super) fn validate_archive(
     schema: &WeightSchema,
-    source: &SafetensorsArchive,
+    source: &dyn TensorArchive,
 ) -> anyhow::Result<u64> {
     let mut total = 0_u64;
     for component in &schema.components {

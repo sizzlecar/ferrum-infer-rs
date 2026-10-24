@@ -252,7 +252,20 @@ impl QwenImage21CudaConfig {
     )> {
         self.validate()?;
         let stream_plan = self.stream_plan()?;
-        let profiles = cuda_profiles_with_precision(self.attention_policy, self.precision_policy)?;
+        let mut profiles =
+            cuda_profiles_with_precision(self.attention_policy, self.precision_policy)?;
+        if !assets.transformer_encodings.is_empty() {
+            ensure!(self.precision_policy == ImageCudaPrecisionPolicy::Bf16,
+                "native denoiser blocks require BF16 activation precision; an FP8 weight materializer cannot replace native source encodings");
+            profiles.denoiser = NumericalProfileId::new(match self.attention_policy {
+                ImageCudaAttentionPolicy::Sequential => {
+                    QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_PROFILE_ID
+                }
+                ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
+                    QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID
+                }
+            })?;
+        }
         let editing = assets.editing.is_some();
         let mut contracts = contracts(self.attention_policy)?;
         // Exactly one Host ledger, also used by CPU weight conversion.
@@ -475,7 +488,8 @@ impl QwenImage21CudaConfig {
         let dit = QwenImage21TransformerConfig::new(
             assets.transformer.clone(),
             QwenImage21T2iLayout::new(1, 2, 2, vec![1])?,
-        )?;
+        )?
+        .with_weight_encodings(assets.transformer_encodings.clone())?;
         let decoder = assets.decoder(2, 2)?;
         let noise = NormalNoiseConfig::new(64, 2, 2)?;
         let mut families = vec![
@@ -596,6 +610,7 @@ fn prefix_command_families(
         dit.transformer().clone(),
         QwenImage21T2iLayout::new(3, 2, 2, vec![3])?,
     )?
+    .with_weight_encodings(dit.weight_encodings().clone())?
     .with_reference_image(1, 1, 2, 2)?;
     let copies = config.prefix_cache_ports()?.len();
     let family = TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?);
@@ -643,6 +658,7 @@ fn editing_command_families(
         dit.transformer().clone(),
         QwenImage21T2iLayout::new(3, 2, 2, vec![3])?,
     )?
+    .with_weight_encodings(dit.weight_encodings().clone())?
     .with_reference_image(1, 1, 2, 2)?;
     Ok([
         TypedFamilyRegistration::new(Qwen3VLVisionFamily::new()?).prepare_with_profile(
@@ -739,6 +755,7 @@ fn contracts(attention: ImageCudaAttentionPolicy) -> Result<Vec<Box<dyn Operatio
         Box::new(philox_normal_bf16_contract()?),
         Box::new(conv2d_bf16_contract()?),
         Box::new(dense_linear_bf16_contract()?),
+        Box::new(dense_linear_block_bf16_contract()?),
     ];
     for kind in TensorPrimitiveBf16::ALL {
         contracts.push(Box::new(kind.contract()?));

@@ -45,6 +45,10 @@ impl QwenImage21TransformerFamily {
         "qwen_image21.transformer.t2i.cuda.fp8_linear.experimental.v1";
     pub const CUDA_FP8_FUSED_PROFILE_ID: &'static str =
         "qwen_image21.transformer.t2i.cuda.fp8_linear.fused_attention.experimental.v1";
+    pub const CUDA_NATIVE_BLOCK_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.cuda.native_block.bf16_f32.v1";
+    pub const CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.cuda.native_block.fused_attention.bf16_f32.v1";
     pub const LATENTS_ID: &'static str = "value.qwen_image21.transformer.latents";
     pub const REFERENCE_LATENTS_ID: &'static str =
         "value.qwen_image21.transformer.reference_latents";
@@ -137,7 +141,7 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
         config.validate()?;
         let mut schema =
             ExpectedWeights::from_config(config.transformer(), StructureLimits::default())
-                .and_then(|weights| weights.weight_schema())
+                .and_then(|weights| weights.weight_schema_with_encodings(config.weight_encodings()))
                 .map_err(|e| invalid("weights", e.to_string()))?;
         // Prefix decode starts from projected target rows and consumes no text
         // entrance weights. Logical references are therefore phase-optional in
@@ -170,6 +174,9 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
         let source = block.numerical_profiles(&block_config)?;
         let mut profiles = Vec::new();
         for (name, source_name) in profile_sources() {
+            if is_native_block(name) != !config.weight_encodings().is_empty() {
+                continue;
+            }
             if source_name == Block::CUDA_FUSED_PROFILE_ID && config.transformer().head_dim() != 128
             {
                 continue;
@@ -220,6 +227,24 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
                 let op = crate::fp8_linear::operation()?;
                 operations.insert(op.operation_id.clone(), op);
             }
+            if is_native_block(name) {
+                let operation = crate::block_quantized_linear::operation()?;
+                operations.insert(operation.operation_id.clone(), operation);
+                // Every dense projection may be quantized in native archives.
+                // Keep BF16 Dense only when the actual graph still uses it.
+                let selected = crate::block_quantized_linear::select(
+                    graph.clone(),
+                    &config.native_block_weight_ids()?,
+                )?;
+                if !selected
+                    .blocks()
+                    .iter()
+                    .flat_map(|b| &b.nodes)
+                    .any(|node| node.operation_id.as_str() == DENSE_LINEAR_BF16_OPERATION_ID)
+                {
+                    operations.remove(&OperationId::new(DENSE_LINEAR_BF16_OPERATION_ID)?);
+                }
+            }
             if config.is_decode() {
                 for unused in [
                     ZERO_CENTERED_RMS_NORM_BF16_OPERATION_ID,
@@ -254,7 +279,11 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
             &self.id,
             ContractVersion::new(1, 0),
             profiles,
-            vec![profile_id(Self::REFERENCE_PROFILE_ID)?],
+            vec![profile_id(if config.weight_encodings().is_empty() {
+                Self::REFERENCE_PROFILE_ID
+            } else {
+                Self::CUDA_NATIVE_BLOCK_PROFILE_ID
+            })?],
         )
     }
     fn semantic_program(
@@ -275,6 +304,8 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
         let program = program::build(self, config, source)?;
         if is_fp8(profile.id.as_str()) {
             crate::fp8_linear::select(program, &Self::fp8_weight_groups(config)?)
+        } else if is_native_block(profile.id.as_str()) {
+            crate::block_quantized_linear::select(program, &config.native_block_weight_ids()?)
         } else {
             Ok(program)
         }
@@ -291,8 +322,23 @@ fn is_fp8(name: &str) -> bool {
             | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
     )
 }
-fn profile_sources() -> [(&'static str, &'static str); 5] {
+fn is_native_block(name: &str) -> bool {
+    matches!(
+        name,
+        QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_PROFILE_ID
+            | QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID
+    )
+}
+fn profile_sources() -> [(&'static str, &'static str); 7] {
     [
+        (
+            QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_PROFILE_ID,
+            Block::CUDA_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID,
+            Block::CUDA_FUSED_PROFILE_ID,
+        ),
         (
             QwenImage21TransformerFamily::REFERENCE_PROFILE_ID,
             Block::REFERENCE_PROFILE_ID,

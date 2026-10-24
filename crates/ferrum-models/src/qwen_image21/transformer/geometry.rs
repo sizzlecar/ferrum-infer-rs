@@ -179,6 +179,8 @@ impl QwenImage21T2iLayout {
 pub struct QwenImage21TransformerConfig {
     transformer: QwenImage21Config,
     layout: QwenImage21T2iLayout,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    weight_encodings: BTreeMap<String, WeightEncoding>,
     #[serde(default, skip_serializing_if = "QwenImage21TransformerPhase::is_full")]
     pub(super) phase: QwenImage21TransformerPhase,
 }
@@ -188,12 +190,15 @@ struct ConfigWire {
     transformer: QwenImage21Config,
     layout: QwenImage21T2iLayout,
     #[serde(default)]
+    weight_encodings: BTreeMap<String, WeightEncoding>,
+    #[serde(default)]
     phase: QwenImage21TransformerPhase,
 }
 impl<'de> Deserialize<'de> for QwenImage21TransformerConfig {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let wire = ConfigWire::deserialize(d)?;
         Self::new(wire.transformer, wire.layout)
+            .and_then(|config| config.with_weight_encodings(wire.weight_encodings))
             .and_then(|config| config.with_execution_phase(wire.phase))
             .map_err(serde::de::Error::custom)
     }
@@ -207,12 +212,35 @@ impl QwenImage21TransformerConfig {
             transformer,
             layout,
             phase: QwenImage21TransformerPhase::Full,
+            weight_encodings: BTreeMap::new(),
         };
         config.validate()?;
         Ok(config)
     }
     pub fn transformer(&self) -> &QwenImage21Config {
         &self.transformer
+    }
+    /// Bind a complete source encoding inventory to this semantic geometry.
+    /// File paths are not model identity; the checked physical encodings are.
+    pub fn with_weight_encodings(
+        mut self,
+        encodings: BTreeMap<String, WeightEncoding>,
+    ) -> Result<Self, VNextError> {
+        ExpectedWeights::from_config(&self.transformer, StructureLimits::default())
+            .and_then(|expected| expected.weight_schema_with_encodings(&encodings))
+            .map_err(|e| invalid("weight_encodings", e.to_string()))?;
+        self.weight_encodings = encodings;
+        Ok(self)
+    }
+    pub fn weight_encodings(&self) -> &BTreeMap<String, WeightEncoding> {
+        &self.weight_encodings
+    }
+    pub fn native_block_weight_ids(&self) -> Result<BTreeSet<WeightId>, VNextError> {
+        self.weight_encodings
+            .iter()
+            .filter(|(_, encoding)| matches!(encoding, WeightEncoding::BlockQuantized(_)))
+            .map(|(name, _)| WeightId::new(format!("weight.qwen_image21.{name}")))
+            .collect()
     }
     pub fn layout(&self) -> &QwenImage21T2iLayout {
         &self.layout

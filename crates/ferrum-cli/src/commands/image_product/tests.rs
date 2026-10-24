@@ -817,6 +817,56 @@ fn bounded_metadata_and_declared_architecture_fail_before_missing_weight_sources
 }
 
 #[test]
+fn gguf_weight_source_is_explicit_relative_and_never_selects_safetensors() {
+    use candle_core::quantized::gguf_file::{self, Value};
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::{Device, Tensor};
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("selected.gguf");
+    let tensor = QTensor::quantize(
+        &Tensor::new(&[1.0_f32; 32], &Device::Cpu).unwrap(),
+        GgmlDType::Q8_0,
+    )
+    .unwrap();
+    let mut writer = std::fs::File::create(&file).unwrap();
+    gguf_file::write(
+        &mut writer,
+        &[("general.architecture", &Value::String("fixture".into()))],
+        &[("w", &tensor)],
+    )
+    .unwrap();
+    let mut wire = configuration();
+    wire["weights"]["transformer"] = serde_json::json!({
+        "kind": "gguf", "directory": ".", "file": "selected.gguf"
+    });
+    let path = dir.path().join("image.json");
+    std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+    let config = ImageProductConfig::load(&path).unwrap();
+    let archive = config.weights.transformer.open().unwrap();
+    assert_eq!(archive.tensor("w").unwrap().shape(), &[32]);
+    assert!(matches!(
+        archive.tensor("w").unwrap().encoding(),
+        ferrum_runtime::WeightEncoding::BlockQuantized(_)
+    ));
+    for file in [
+        "missing.gguf",
+        "../selected.gguf",
+        "dir/selected.gguf",
+        "C:selected.gguf",
+        "selected.safetensors",
+        ".gguf",
+    ] {
+        assert!(WeightSource::Gguf {
+            directory: dir.path().into(),
+            file: file.into()
+        }
+        .open()
+        .is_err());
+    }
+}
+
+#[test]
 fn exact_weight_source_never_falls_back_to_another_filename() {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     let dir = tempfile::tempdir().unwrap();

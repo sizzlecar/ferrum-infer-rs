@@ -3,6 +3,107 @@ use serde_json::json;
 type F = QwenImage21TransformerFamily;
 
 #[test]
+fn native_archive_profiles_preserve_mixed_blocks_and_prefix_storage_identity() {
+    let architecture = transformer(1, true, true);
+    let expected = ExpectedWeights::from_config(&architecture, StructureLimits::default()).unwrap();
+    let encodings = expected
+        .tensors()
+        .values()
+        .map(|tensor| {
+            let encoding = if tensor.dimensions().len() == 1 {
+                WeightEncoding::Dense {
+                    element_type: ElementType::F32,
+                }
+            } else {
+                let (format, values, bytes) = if tensor.dimensions()[1].is_multiple_of(256) {
+                    ("quantization.gguf.q4-k", 256, 144)
+                } else {
+                    ("quantization.gguf.q8-0", 32, 34)
+                };
+                WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+                    format_id: QuantizationFormatId::new(format).unwrap(),
+                    logical_values_per_block: values,
+                    bytes_per_block: bytes,
+                })
+            };
+            (tensor.external_name().to_owned(), encoding)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let config = QwenImage21TransformerConfig::new(
+        architecture,
+        QwenImage21T2iLayout::new(3, 2, 2, vec![3]).unwrap(),
+    )
+    .unwrap()
+    .with_weight_encodings(encodings.clone())
+    .unwrap();
+    assert_eq!(
+        serde_json::from_value::<QwenImage21TransformerConfig>(
+            serde_json::to_value(&config).unwrap()
+        )
+        .unwrap(),
+        config
+    );
+    let family = F::new().unwrap();
+    let mut storage = None;
+    for phase in [
+        QwenImage21TransformerPhase::Full,
+        QwenImage21TransformerPhase::PrefixPrefill,
+        QwenImage21TransformerPhase::PrefixDecode,
+    ] {
+        let current = config.clone().with_execution_phase(phase).unwrap();
+        let prepared = TypedFamilyRegistration::new(family.clone())
+            .prepare_with_profile(
+                &serde_json::to_value(&current).unwrap(),
+                &NumericalProfileId::new(F::CUDA_NATIVE_BLOCK_PROFILE_ID).unwrap(),
+            )
+            .unwrap();
+        let schema = prepared.stored_weight_schema().unwrap();
+        assert_eq!(schema.format_id.as_str(), "weight-format.gguf.native-block");
+        let bytes: u64 = schema
+            .components
+            .iter()
+            .map(|component| component.physical_bytes().unwrap())
+            .sum();
+        assert!(bytes < expected.payload_bytes());
+        if let Some(previous) = &storage {
+            assert_eq!(schema, previous);
+        } else {
+            storage = Some(schema.clone());
+        }
+        let mut projections = 0;
+        for node in prepared
+            .program()
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.nodes)
+        {
+            assert_ne!(
+                node.operation_id.as_str(),
+                DENSE_LINEAR_FP8_BF16_OPERATION_ID
+            );
+            assert_ne!(node.operation_id.as_str(), DENSE_LINEAR_BF16_OPERATION_ID);
+            if node.operation_id.as_str() == DENSE_LINEAR_BLOCK_BF16_OPERATION_ID {
+                projections += 1;
+            }
+        }
+        assert!(projections > 0);
+    }
+    let mut incomplete = encodings.clone();
+    incomplete.pop_first();
+    assert!(config.clone().with_weight_encodings(incomplete).is_err());
+    let mut wrong_role = encodings;
+    wrong_role.insert(
+        "txt_in.text_norm.weight".into(),
+        WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+            format_id: QuantizationFormatId::new("quantization.gguf.q8-0").unwrap(),
+            logical_values_per_block: 32,
+            bytes_per_block: 34,
+        }),
+    );
+    assert!(config.with_weight_encodings(wrong_role).is_err());
+}
+
+#[test]
 fn reference_image_layout_preserves_four_segments_padding_and_rotary_progression() {
     let base = QwenImage21TransformerConfig::new(
         transformer(2, true, false),
