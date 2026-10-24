@@ -163,7 +163,7 @@ pub(super) fn verify() {
             // compiled component. Encoding must reconstruct the same admitted
             // plan and preserve its arithmetic and charged scratch boundary.
             let displaced_shape = Shape {
-                m: shape.m + 1,
+                m: if shape.m == 1 { 2 } else { 1 },
                 ..shape.clone()
             };
             let displaced_options = ProgramPlanCompileOptions::new(BTreeMap::from([(
