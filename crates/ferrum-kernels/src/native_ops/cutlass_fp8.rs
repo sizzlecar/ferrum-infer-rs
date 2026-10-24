@@ -9,6 +9,8 @@ pub use ferrum_native_ops::cutlass_fp8::{
 };
 use std::ffi::c_void;
 
+#[cfg(any(feature = "cuda", test))]
+pub(crate) mod cache;
 mod catalog;
 pub use catalog::{
     provider_catalog_declaration, source_declaration_fingerprint, CutlassFp8CatalogConfig,

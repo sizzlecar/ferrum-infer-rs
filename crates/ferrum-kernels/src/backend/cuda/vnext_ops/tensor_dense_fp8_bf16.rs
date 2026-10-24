@@ -8,7 +8,7 @@ use super::super::vnext_runtime::{
 };
 use super::{binding, contract_error, implementation_fingerprint, provider_failure};
 use crate::native_ops::cutlass_fp8::{
-    self, Bindings, Device, DeviceSpan, PreparedCutlassFp8, Request,
+    self, cache::PreparedPlanCache, Bindings, Device, DeviceSpan, PreparedCutlassFp8, Request,
 };
 use ferrum_runtime::{
     dense_linear_fp8_bf16_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
@@ -45,6 +45,8 @@ const ESTIMATOR: &str = "resource-estimator.cuda.dense_linear_fp8.bf16.cutlass.s
 #[derive(Clone, Debug)]
 pub struct CudaCutlassFp8Config {
     pub opaque_memory_bytes: u64,
+    /// Maximum reusable Host planning records, not a lifetime geometry limit.
+    /// Encoded commands retain their records independently of cache eviction.
     pub maximum_plans: usize,
     pub opaque_memory_profile: String,
 }
@@ -95,6 +97,7 @@ pub(super) fn source_fingerprint() -> Result<String, String> {
         include_bytes!("tensor_dense_fp8_bf16.rs"),
         include_bytes!("tensor_dense_fp8_bf16/weights.rs"),
         include_bytes!("../../../native_ops/cutlass_fp8.rs"),
+        include_bytes!("../../../native_ops/cutlass_fp8/cache.rs"),
         include_bytes!("../vnext_runtime/tensor_eager/cutlass_owner.rs"),
     ]))
 }
@@ -102,8 +105,7 @@ pub(super) fn source_fingerprint() -> Result<String, String> {
 pub(super) struct Provider {
     descriptor: OperationProviderDescriptor,
     device: Device,
-    plans: Mutex<BTreeMap<(u32, u32, u32), Arc<PreparedCutlassFp8>>>,
-    maximum_plans: usize,
+    plans: Mutex<PreparedPlanCache>,
     probe: Option<Arc<CudaCutlassFp8Probe>>,
     // Retained after all plan records. Commands also keep this owner alive.
     owner: Arc<CudaTensorCutlassRetention>,
@@ -210,38 +212,28 @@ impl Provider {
         Ok(Self {
             descriptor,
             device,
-            plans: Mutex::new(BTreeMap::new()),
-            maximum_plans: config.maximum_plans,
+            plans: Mutex::new(
+                PreparedPlanCache::new(config.maximum_plans)
+                    .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?,
+            ),
             probe,
             owner,
         })
     }
 
-    fn plan(
-        &self,
-        g: DenseLinearFp8Bf16Geometry,
-        prepare: bool,
-    ) -> Result<Arc<PreparedCutlassFp8>, String> {
+    fn plan(&self, g: DenseLinearFp8Bf16Geometry) -> Result<Arc<PreparedCutlassFp8>, String> {
         let cvt = |n| u32::try_from(n).map_err(|_| "FP8 geometry exceeds native u32".to_owned());
         let key = (cvt(g.rows())?, cvt(g.inputs())?, cvt(g.outputs())?);
         let request = Request::new(key.0, key.1, key.2, self.device).map_err(|e| e.to_string())?;
         let mut cache = self.plans.lock().map_err(|_| "FP8 plan cache poisoned")?;
-        if let Some(plan) = cache.get(&key) {
-            return Ok(Arc::clone(plan));
-        }
-        if !prepare {
-            return Err("FP8 plan was not prepared by the admitted estimator".into());
-        }
-        if cache.len() >= self.maximum_plans {
-            return Err("FP8 prepared plan capacity exhausted".into());
+        if let Some(plan) = cache.cached(request) {
+            return Ok(plan);
         }
         self.owner
             .context()
             .bind_to_thread()
             .map_err(|e| e.to_string())?;
-        let plan = Arc::new(PreparedCutlassFp8::new(request).map_err(|e| e.to_string())?);
-        cache.insert(key, Arc::clone(&plan));
-        Ok(plan)
+        cache.get_or_prepare(request).map_err(|e| e.to_string())
     }
 
     fn prepared_fingerprint(&self, plan: &PreparedCutlassFp8) -> String {
@@ -290,7 +282,7 @@ impl OperationResourceEstimator for Provider {
             return Err(invalid("FP8 estimator received another operation"));
         }
         let geometry = geometry(request.values(), request.attributes()).map_err(invalid)?;
-        let plan = self.plan(geometry, true).map_err(invalid)?;
+        let plan = self.plan(geometry).map_err(invalid)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::fixed(plan.scratch_bytes())?,
             plan.alignment(),
@@ -356,10 +348,14 @@ impl Provider {
             return Err("FP8 dense requires its fixed tensor contract".into());
         }
         let g = geometry(participant.bindings(), participant.attributes())?;
-        let plan = self.plan(g, false)?;
-        if invocation.prepared_implementation_fingerprint()
-            != Some(self.prepared_fingerprint(&plan).as_str())
-        {
+        let admitted = invocation
+            .prepared_implementation_fingerprint()
+            .ok_or("FP8 invocation has no admitted prepared implementation")?;
+        // Native planning is allocation-free and enqueues no device work. A
+        // cache miss may reconstruct a record, but it must match the exact
+        // implementation and scratch geometry admitted by the estimator.
+        let plan = self.plan(g)?;
+        if admitted != self.prepared_fingerprint(&plan).as_str() {
             return Err("FP8 native plan differs from admitted prepared implementation".into());
         }
         let input = weights::plain(
