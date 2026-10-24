@@ -142,11 +142,15 @@ fn cuda_operator_source(path: &str) -> bool {
 }
 
 fn cuda_operator_distribution(path: &str) -> bool {
-    path == "native-operators/cuda/README.md"
-        || matches!(
-            cuda_operator_member(path),
-            Some("README.md" | "llama-MIT.txt")
-        )
+    matches!(
+        path,
+        "native-operators/cuda/README.md"
+            | "native-operators/cuda/cutlass-fp8/README.md"
+            | "native-operators/cuda/cutlass-fp8/CUTLASS-BSD-3-Clause.txt"
+    ) || matches!(
+        cuda_operator_member(path),
+        Some("README.md" | "llama-MIT.txt")
+    )
 }
 
 fn cargo_integration_target(relative: &str) -> bool {
@@ -577,6 +581,12 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     if component == "ferrum-bench-core" {
         return classify_bench_core(relative);
     }
+    if component == "ferrum-diffusion" {
+        return (relative.starts_with("src/") && relative.ends_with(".rs")).then(|| {
+            (vec![Kernel, Architecture],
+                "shared diffusion schedules, numerical integration and latent layouts: retain numerical boundaries and model execution across declared backends")
+        });
+    }
     let (areas, reason) = match component {
         "ferrum-types" | "ferrum-interfaces" | "ferrum-runtime" | "ferrum-execution" => (
             ALL_AREAS.to_vec(),
@@ -658,6 +668,7 @@ fn known_component(component: &str) -> bool {
             | "ferrum-output"
             | "ferrum-journal"
             | "ferrum-slo"
+            | "ferrum-diffusion"
             | "ferrum-engine"
             | "ferrum-sampler"
             | "ferrum-tokenizer"
@@ -698,9 +709,18 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "src/env.rs"
             | "src/report.rs"
             | "src/stats.rs"
+            | "src/images.rs"
+            | "src/images/png_response.rs"
+            | "src/images/request_mode.rs"
+            | "src/images/tests.rs"
             | "src/sse_text_event_gap.rs"
             | "src/sse_text_event_gap/tests.rs"
             | "examples/model_gate.rs"
+            | "examples/compare_png_pixels.rs"
+            | "examples/image_run_comparison.rs"
+            | "examples/image_run_comparison/fieller.rs"
+            | "examples/image_run_comparison/input.rs"
+            | "examples/image_run_comparison/tests.rs"
             | "examples/checkpoint_diff.rs"
             | "examples/checkpoint_diff/directory.rs"
             | "examples/checkpoint_diff/tests.rs"
@@ -856,6 +876,8 @@ mod tests {
             "native-operators/cuda/vllm-paged-attention-indexed/README.md",
             "native-operators/cuda/vllm-moe-marlin-profiler-free/README.md",
             "native-operators/cuda/marlin-instance-policy/README.md",
+            "native-operators/cuda/cutlass-fp8/README.md",
+            "native-operators/cuda/cutlass-fp8/CUTLASS-BSD-3-Clause.txt",
         ] {
             assert_eq!(analyze_paths([path]).areas, [ChangeArea::Build]);
             assert_eq!(path_backend(path), Some(Backend::Cuda));
@@ -867,6 +889,7 @@ mod tests {
             "native-operators/cuda/upstream-linear/unknown.txt",
             "native-operators/cuda/upstream-linear/.cu",
             "native-operators/cuda/upstream-linear/../mmq.cu",
+            "native-operators/cuda/cutlass-fp8/unreviewed.cu",
         ] {
             let impact = analyze_paths([sources[0], unknown]);
             assert_eq!(impact.areas, ALL_AREAS, "{unknown}");
@@ -1450,6 +1473,9 @@ mod tests {
             "crates/ferrum-bench-core/examples/regression_plan/readme_tests.rs",
             "crates/ferrum-bench-core/examples/release_candidate/workspace.rs",
             "crates/ferrum-bench-core/src/stats.rs",
+            "crates/ferrum-bench-core/src/images/png_response.rs",
+            "crates/ferrum-bench-core/examples/compare_png_pixels.rs",
+            "crates/ferrum-bench-core/examples/image_run_comparison/fieller.rs",
             "crates/ferrum-bench-core/tests/release_staging_workflows/installer.rs",
             "crates/ferrum-bench-core/tests/release_staging_workflows/windows_build.rs",
         ] {
