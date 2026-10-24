@@ -8,7 +8,9 @@
 
 # Ferrum
 
-Rust LLM inference and an OpenAI-compatible server in one binary, without a Python runtime.
+Text and image inference in one Rust binary, with CLI and OpenAI-compatible APIs.
+
+**[v0.15.0](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.15.0)** adds Qwen-Image generation and editing.
 
 **Goal: maximize output throughput while meeting TTFT, TPOT and ITL SLOs.**
 
@@ -55,6 +57,40 @@ Weights download automatically. API URL: **`http://127.0.0.1:8000/v1`**, model `
 
 Defaults adapt execution and capacity to capabilities, hardware and memory; explicit settings prevail. Qualified SM120 GGUF paths can use 8-bit activation quantization and integer dot products. `--numerical-profile qwen3_5.f32-master` retains the original mixed-precision reference. Batch layouts can change output. [Numerical profiles](docs/numerical-execution.zh.md) · [Caching](docs/cache-product.md).
 
+## Image generation and editing
+
+Use a complete local copy of [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo). Validated on RTX 5090 with Linux CUDA 12.8, cuDNN 9, FP8 text encoder/DiT and BF16 vision/VAE.
+
+~~~sh
+ferrum run /path/to/Qwen-Image-2.1-Turbo \
+  --image-precision fp8_linear_experimental_v1 \
+  --prompt "A red fox in a snowy forest" --width 1024 --height 1024 --output fox.png
+
+ferrum run /path/to/Qwen-Image-2.1-Turbo --image fox.png \
+  --image-precision fp8_linear_experimental_v1 \
+  --prompt "Make the fox blue" --width 1024 --height 1024 --output edited.png
+
+ferrum serve --model /path/to/Qwen-Image-2.1-Turbo --served-model-name qwen-image \
+  --image-precision fp8_linear_experimental_v1 --port 8000
+~~~
+
+HTTP: `POST /v1/images/generations` (JSON) and `POST /v1/images/edits` (multipart). Edits accept one 8-bit RGB/RGBA PNG; responses contain PNG as `b64_json`. Editing can redraw background/details.
+
+The local-directory preset supports up to 1024×1024. 2K and the resident service configurations measured below use `--image-config`.
+
+### Throughput vs vLLM-Omni
+
+RTX 5090 · Qwen-Image-2.1-Turbo · 8 steps · FP8 text encoder/DiT, BF16 VAE. Four paired pre-release runs per workload, 640 measured requests, zero errors. Mean images/s; C is client concurrency.
+
+| Workload | C | Ferrum | vLLM-Omni | Ferrum / Omni |
+|---|---:|---:|---:|---:|
+| 1024² generation | 8 | 0.5193 | 0.4428 | 1.173× |
+| 1024² editing | 1 | 0.2943 | 0.2631 | 1.119× |
+| 2048² generation | 2 | 0.0799 | 0.0772 | 1.035× |
+| 2048² editing | 2 | 0.0686 | 0.0685 | ≈1.00×* |
+
+Both implementations met the declared P99 limits: 20 / 5 / 30 / 30 seconds, in row order. *2K editing's 95% ratio interval is 0.9976–1.0077; the difference is inconclusive. These are resident-service measurements, not cold CLI defaults. [Configuration, latency and memory](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.15.0#qwen-image-performance).
+
 ## Supported scope
 
 | Scope | Supported paths |
@@ -62,12 +98,13 @@ Defaults adapt execution and capacity to capabilities, hardware and memory; expl
 | Text architectures | Llama, Mistral, Qwen2, Qwen3 dense/MoE, Qwen3.5 hybrid dense/MoE, Gemma 3 text |
 | Weights | GGUF, including Q4_K/Q5_K/Q6_K/Q8_0; SafeTensors. Selected CUDA paths: GPTQ INT4, compressed-tensors INT4, block-FP8 |
 | Specific paths | Gemma 4 compressed-tensors W4A16 and GPT-OSS MXFP4: CUDA. PQ2_0: complete-model validation on Metal; CUDA operator coverage only |
+| Images | Qwen-Image-2.1-Turbo generation and single-PNG editing; validated on Linux CUDA SM120 |
 
 Support varies by combination; CPU is a compatibility backend. See [validation scope](docs/release-regression-catalog.md).
 
 This architecture update retires embedding, ASR, TTS and legacy execution APIs. See [migration notes](https://github.com/sizzlecar/ferrum-infer-rs/pull/441).
 
-## Recent throughput
+## Text throughput (0.13 candidate)
 
 **0.13 candidate · RTX 5090 · Qwen3.8-27B · ShareGPT.** Fixed 32 slots, context/batch 2048. Each cell: 200 requests × 2 repeats, 8 warmups per repeat, zero protocol errors. Throughput = total output tokens / total measured time; C is client concurrency.
 

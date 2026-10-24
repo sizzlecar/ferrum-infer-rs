@@ -8,7 +8,9 @@
 
 # Ferrum
 
-Rust 编写的本地大模型推理引擎，一个二进制提供终端对话和 OpenAI 兼容 API，无需 Python 运行时。
+Rust 文本与图像推理，一个二进制提供 CLI 和 OpenAI 兼容 API。
+
+**[v0.15.0](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.15.0)** 新增 Qwen-Image 图像生成与编辑。
 
 核心目标是在满足延迟 SLO 的前提下，最大化输出吞吐：
 
@@ -59,6 +61,40 @@ ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thin
 
 应用的 API 地址设为 `http://127.0.0.1:8000/v1`，模型名设为 `ferrum`。支持 Chat Completions、无状态 Responses、流式输出、工具调用和结构化输出，具体字段见 [API 兼容说明](docs/openai-api-compatibility.md)。下载资产与发行状态见 [Releases](https://github.com/sizzlecar/ferrum-infer-rs/releases)。
 
+## 图像生成与编辑
+
+使用完整的本地 [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) 模型目录。已验证 RTX 5090、Linux CUDA 12.8、cuDNN 9；文本编码器/DiT 使用 FP8，视觉编码器/VAE 使用 BF16。
+
+~~~sh
+ferrum run /path/to/Qwen-Image-2.1-Turbo \
+  --image-precision fp8_linear_experimental_v1 \
+  --prompt "A red fox in a snowy forest" --width 1024 --height 1024 --output fox.png
+
+ferrum run /path/to/Qwen-Image-2.1-Turbo --image fox.png \
+  --image-precision fp8_linear_experimental_v1 \
+  --prompt "Make the fox blue" --width 1024 --height 1024 --output edited.png
+
+ferrum serve --model /path/to/Qwen-Image-2.1-Turbo --served-model-name qwen-image \
+  --image-precision fp8_linear_experimental_v1 --port 8000
+~~~
+
+HTTP：`POST /v1/images/generations` 接收 JSON，`POST /v1/images/edits` 接收 multipart。编辑支持单张 8 位 RGB/RGBA PNG，返回 PNG 的 `b64_json`；背景和细节可能重绘。
+
+本地目录预设最高支持 1024×1024；2K 及下表的常驻服务配置使用 `--image-config`。
+
+### 对比 vLLM-Omni
+
+RTX 5090 · Qwen-Image-2.1-Turbo · 8 步 · 文本编码器/DiT FP8、VAE BF16。每项 4 对发布候选配对测试，共 640 个正式请求，零错误。单位：张/秒；并发为客户端并发。
+
+| 任务 | 并发 | Ferrum | vLLM-Omni | Ferrum / Omni |
+|---|---:|---:|---:|---:|
+| 1024² 生成 | 8 | 0.5193 | 0.4428 | 1.173× |
+| 1024² 编辑 | 1 | 0.2943 | 0.2631 | 1.119× |
+| 2048² 生成 | 2 | 0.0799 | 0.0772 | 1.035× |
+| 2048² 编辑 | 2 | 0.0686 | 0.0685 | ≈1.00×* |
+
+两端均满足对应 P99 上限：20 / 5 / 30 / 30 秒。*2K 编辑的比值 95% 区间为 0.9976–1.0077，差异尚不显著。表格采用常驻服务配置，不代表默认 CLI 冷启动性能。[配置、延迟与内存](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.15.0#qwen-image-performance)。
+
 ## 模型与格式
 
 文本架构包括 Llama、Mistral、Qwen2/Qwen3、Qwen3 MoE、Qwen3.5 dense/MoE 和 Gemma 3。支持 GGUF（含 Q4_K/Q5_K/Q6_K/Q8_0）与 SafeTensors；部分 CUDA 路径支持 GPTQ INT4、compressed-tensors INT4 和 block-FP8。Gemma 4 W4A16、GPT-OSS MXFP4 为专用 CUDA 文本路径；PQ2_0 完整模型目前仅在 Metal 实测。
@@ -69,7 +105,7 @@ ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thin
 
 默认执行策略按设备、算子能力和容量选择；合资格的 SM120 GGUF 路径可采用 8 位激活量化及整数点积，数值路径或批布局可能改变输出。`--numerical-profile qwen3_5.f32-master` 保留原混合精度参考路径，见[数值执行策略](docs/numerical-execution.zh.md)与[缓存说明](docs/cache-product.md)。
 
-## 近期性能
+## 文本性能（0.13 候选）
 
 RTX 5090、Qwen3.8-27B、固定 ShareGPT 样本；服务容量保持 32 槽、上下文及批处理上限均为 2048。每格正式 200 请求 × 2 轮，每轮另有 8 次预热，协议错误为 0。以下为 v0.13.0 候选的正式测量，单位为输出 token/s；两轮按总成功输出 usage token ÷ 总正式时长合并。
 

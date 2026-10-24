@@ -3,6 +3,8 @@ import powerShellInstaller from "../scripts/install.ps1";
 
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
+const RELEASE_VERSION = "0.15.0";
+const RELEASE_URL = `${REPOSITORY}/releases/tag/v${RELEASE_VERSION}`;
 
 const css = String.raw`
 :root {
@@ -79,6 +81,9 @@ pre { margin: 0; padding: 24px; overflow-x: auto; color: #e6e3dc; font: 500 .92r
 .code-shell pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .command { color: #ffad80; }
 .note { margin-top: 18px; padding: 15px 18px; border-left: 3px solid var(--rust); background: rgba(240,104,47,.07); color: #cdd1d4; }
+details { margin-top: 24px; }
+summary { cursor: pointer; color: var(--rust-light); font-weight: 700; }
+details .section-head { margin-top: 24px; }
 .support-list { margin: 0; }
 .support-list > div { display: grid; grid-template-columns: 180px 1fr; gap: 18px; padding: 18px 0; border-bottom: 1px solid var(--line); }
 .support-list dt { font-weight: 700; }
@@ -133,18 +138,25 @@ const throughput = {
   ],
 };
 
+const imageThroughput = [
+  ["generation", "1024²", 8, "0.5193", "0.4428", "1.173×"],
+  ["editing", "1024²", 1, "0.2943", "0.2631", "1.119×"],
+  ["generation", "2048²", 2, "0.0799", "0.0772", "1.035×"],
+  ["editing", "2048²", 2, "0.0686", "0.0685", "≈1.00×*"],
+];
+
 const pages = {
   en: {
     lang: "en",
     path: "/",
     alternatePath: "/zh/",
     alternateLabel: "中文",
-    title: "Ferrum — Rust LLM inference",
-    description: "Local LLM inference and an OpenAI-compatible server in one Rust binary. Ferrum 0.14.0 unifies the execution architecture.",
-    nav: [["Quick start", "#quick-start"], ["Supported scope", "#support"], ["Throughput", "#performance"], ["Project", "#project"]],
-    eyebrow: "v0.14.0 · Released",
-    h1: "Local LLMs.<br>One Rust binary.",
-    lead: "Terminal chat and an OpenAI-compatible API, without a Python runtime.",
+    title: "Ferrum — Text and image inference in Rust",
+    description: "Local text inference, Qwen-Image generation and editing, and OpenAI-compatible APIs in one Rust binary.",
+    nav: [["Quick start", "#quick-start"], ["Images", "#images"], ["Supported scope", "#support"], ["Throughput", "#performance"], ["Project", "#project"]],
+    eyebrow: `v${RELEASE_VERSION} · Released`,
+    h1: "Text and images.<br>One Rust binary.",
+    lead: "Run LLMs and Qwen-Image locally, with CLI and OpenAI-compatible APIs.",
     goal: "Goal: maximize output throughput while meeting TTFT, TPOT and ITL SLOs.",
     goalContext: "Fix hardware, model and output policy; choose execution policy π from eligible policies Π under predeclared SLOs.",
     goalMathLabel: "Maximize valid output tokens from requests completed within fixed window T, divided by T, over eligible execution policies pi; require each latency percentile limit and completion fraction at least rho.",
@@ -153,7 +165,7 @@ const pages = {
       'L_k is the latency sample distribution, Q_p_k its chosen quantile, and S_k its upper limit. TTFT includes queueing; missing latency does not count as meeting its SLO. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">Sampling rules</a>.',
       "C is the fraction of W successfully completed by the cutoff; its denominator includes rejected, failed, timed-out and unfinished requests. Declare p_k, S_k and 0 < ρ ≤ 1 before measuring.",
     ],
-    primary: "Install 0.14.0",
+    primary: `Install ${RELEASE_VERSION}`,
     secondary: "View on GitHub",
     quickTitle: "Install and run",
     installTitle: "Installation commands",
@@ -167,11 +179,25 @@ const pages = {
     runNote: "Weights download on first use. Omit --disable-thinking to preserve the model template's default reasoning behavior.",
     apiNote: 'API URL: <code>http://127.0.0.1:8000/v1</code>, model <code>ferrum</code>. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/openai-api-compatibility.md">Streaming, tools and structured output</a>.',
     defaultsNote: 'Defaults adapt execution and capacity to capabilities, hardware and memory; explicit settings prevail. Qualified SM120 GGUF paths can use 8-bit activation quantization and integer dot products. <code>--numerical-profile qwen3_5.f32-master</code> retains the original mixed-precision reference. Batch layouts can change output. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/numerical-execution.zh.md">Numerical profiles</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/cache-product.md">Caching</a>.',
+    imageTitle: "Generate and edit images",
+    imageLead: 'Use a complete local <a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> directory. Validated on RTX 5090, Linux CUDA 12.8 and cuDNN 9.',
+    imageRunLabel: "Text to image",
+    imageEditLabel: "Edit one PNG",
+    imageServeLabel: "Image API server",
+    imageApi: 'HTTP: <code>POST /v1/images/generations</code> (JSON), <code>POST /v1/images/edits</code> (multipart). One 8-bit RGB/RGBA PNG input; PNG output as <code>b64_json</code>. Editing may redraw background/details.',
+    imageConfigNote: 'The local-directory preset supports up to 1024×1024. 2K and the measured resident-service configurations use <code>--image-config</code>.',
+    imagePerformanceTitle: "Qwen-Image vs vLLM-Omni",
+    imagePerformanceLead: "RTX 5090 · 8 steps · FP8 text encoder/DiT, BF16 VAE. Four paired pre-release runs per workload; 640 measured requests, zero errors. Mean images/s; C is client concurrency.",
+    imageTasks: { generation: "generation", editing: "editing" },
+    workloadLabel: "Workload",
+    imagePerformanceNote: `Both implementations met P99 limits of 20 / 5 / 30 / 30 seconds, in row order. *2K editing is approximately equal: its 95% ratio interval, 0.9976–1.0077, includes 1. Resident-service measurements do not represent cold CLI defaults. <a href="${RELEASE_URL}#qwen-image-performance">Configuration, latency and memory</a>.`,
+    textPerformanceLabel: "Historical text results · 0.13 candidate",
     supportTitle: "Architectures and formats",
     supportRows: [
       ["Text architectures", "Llama, Mistral, Qwen2, Qwen3 dense/MoE, Qwen3.5 hybrid dense/MoE, Gemma 3 text."],
       ["Weights", "GGUF, including Q4_K/Q5_K/Q6_K/Q8_0; SafeTensors. Selected CUDA paths: GPTQ INT4, compressed-tensors INT4, block-FP8."],
       ["Specific paths", "Gemma 4 compressed-tensors W4A16 and GPT-OSS MXFP4: CUDA. PQ2_0: complete-model validation on Metal; CUDA operator coverage only."],
+      ["Images", "Qwen-Image-2.1-Turbo generation and single-PNG editing; validated on Linux CUDA SM120."],
     ],
     supportNote: 'Support varies by architecture, format and backend. CPU is a compatibility backend; text support does not imply vision support. Embedding, ASR and TTS APIs were removed in 0.14.0. <a href="https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.14.0">Release notes</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">Validation scope</a>.',
     performanceTitle: "Recent 27B throughput",
@@ -185,7 +211,7 @@ const pages = {
     projectBody: "Ferrum uses AI-assisted development and iterates quickly. Internal APIs may change; model coverage and performance evolve. Quality remains a priority through correctness checks, model validation and honest reporting of failures. Personal GPU resources are limited; hardware access and contributions are welcome.",
     attribution: 'Thanks to <a href="https://github.com/vllm-project/vllm">vLLM</a> and <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> for code and implementation references. Component licenses and notices are preserved.',
     docsLabel: "Documentation",
-    releaseLabel: "0.14.0 release",
+    releaseLabel: `${RELEASE_VERSION} release`,
     footer: "Ferrum · MIT licensed",
   },
   zh: {
@@ -193,12 +219,12 @@ const pages = {
     path: "/zh/",
     alternatePath: "/",
     alternateLabel: "English",
-    title: "Ferrum — Rust 大模型推理",
-    description: "一个 Rust 二进制提供本地大模型推理与 OpenAI 兼容 API。Ferrum 0.14.0 统一执行架构。",
-    nav: [["快速开始", "#quick-start"], ["支持范围", "#support"], ["吞吐结果", "#performance"], ["项目说明", "#project"]],
-    eyebrow: "v0.14.0 · 已发布",
-    h1: "本地推理，<br>一个 Rust 二进制。",
-    lead: "终端对话与 OpenAI 兼容 API，无需 Python 运行时。",
+    title: "Ferrum — Rust 文本与图像推理",
+    description: "一个 Rust 二进制提供本地大模型推理、Qwen-Image 图像生成与编辑，以及 OpenAI 兼容 API。",
+    nav: [["快速开始", "#quick-start"], ["图像", "#images"], ["支持范围", "#support"], ["吞吐结果", "#performance"], ["项目说明", "#project"]],
+    eyebrow: `v${RELEASE_VERSION} · 已发布`,
+    h1: "对话与生图，<br>一个 Rust 二进制。",
+    lead: "本地大模型与 Qwen-Image 图像生成、编辑，提供 CLI 和 OpenAI 兼容 API。",
     goal: "目标：在满足 TTFT、TPOT、ITL SLO 的前提下，最大化输出吞吐。",
     goalContext: "固定硬件、模型与输出策略，在预设 SLO 下从可用策略集合 Π 中选择执行策略 π。",
     goalMathLabel: "在可用执行策略π中，最大化固定窗口T内成功完成请求的有效输出token数除以T，并满足各延迟分位上限及最低完成比例ρ。",
@@ -207,7 +233,7 @@ const pages = {
       'L_k 为延迟采样分布，Q_p_k 为指定分位数，S_k 为上限。TTFT 包含排队；缺失延迟不视为达标。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">采样规则</a>。',
       "C 为同一 W 在截止前成功完成的比例，分母包含拒绝、失败、超时和未完成请求；p_k、S_k 与 0 < ρ ≤ 1 均须预先给定。",
     ],
-    primary: "安装 0.14.0",
+    primary: `安装 ${RELEASE_VERSION}`,
     secondary: "查看 GitHub",
     quickTitle: "安装与使用",
     installTitle: "安装命令",
@@ -221,11 +247,25 @@ const pages = {
     runNote: "首次运行自动下载权重；删除 --disable-thinking 即恢复模型模板默认的思考行为。",
     apiNote: 'API 地址：<code>http://127.0.0.1:8000/v1</code>，模型名 <code>ferrum</code>。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/openai-api-compatibility.md">流式输出、工具与结构化输出</a>。',
     defaultsNote: '默认执行与容量按声明能力、硬件和内存选择，显式设置优先。合资格的 SM120 GGUF 路径可采用 8 位激活量化及整数点积。<code>--numerical-profile qwen3_5.f32-master</code> 保留原混合精度参考路径；批布局可能改变输出。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/numerical-execution.zh.md">数值策略</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/cache-product.md">缓存说明</a>。',
+    imageTitle: "图像生成与编辑",
+    imageLead: '使用完整的本地 <a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> 模型目录。已验证 RTX 5090、Linux CUDA 12.8、cuDNN 9。',
+    imageRunLabel: "文生图",
+    imageEditLabel: "编辑单张 PNG",
+    imageServeLabel: "图像 API 服务",
+    imageApi: 'HTTP：<code>POST /v1/images/generations</code> 接收 JSON，<code>POST /v1/images/edits</code> 接收 multipart。编辑支持单张 8 位 RGB/RGBA PNG，返回 PNG 的 <code>b64_json</code>；背景和细节可能重绘。',
+    imageConfigNote: '本地目录预设最高支持 1024×1024；2K 及下表的常驻服务配置使用 <code>--image-config</code>。',
+    imagePerformanceTitle: "Qwen-Image 对比 vLLM-Omni",
+    imagePerformanceLead: "RTX 5090 · 8 步 · 文本编码器/DiT FP8、VAE BF16。每项 4 对发布候选配对测试，共 640 个正式请求，零错误。单位：张/秒；C 为客户端并发。",
+    imageTasks: { generation: "生成", editing: "编辑" },
+    workloadLabel: "任务",
+    imagePerformanceNote: `两端均满足对应 P99 上限：20 / 5 / 30 / 30 秒。*2K 编辑约持平，比值 95% 区间为 0.9976–1.0077，差异尚不显著。表格采用常驻服务配置，不代表默认 CLI 冷启动性能。<a href="${RELEASE_URL}#qwen-image-performance">配置、延迟与内存</a>。`,
+    textPerformanceLabel: "历史文本结果 · 0.13 候选",
     supportTitle: "架构与格式",
     supportRows: [
       ["文本架构", "Llama、Mistral、Qwen2、Qwen3 dense/MoE、Qwen3.5 hybrid dense/MoE、Gemma 3 文本。"],
       ["权重格式", "GGUF（含 Q4_K/Q5_K/Q6_K/Q8_0）、SafeTensors。部分 CUDA 路径支持 GPTQ INT4、compressed-tensors INT4、block-FP8。"],
       ["专用路径", "Gemma 4 compressed-tensors W4A16、GPT-OSS MXFP4 为 CUDA 路径。PQ2_0 完整模型仅在 Metal 实测，CUDA 目前为算子级验证。"],
+      ["图像", "Qwen-Image-2.1-Turbo 生成与单张 PNG 编辑；已验证 Linux CUDA SM120。"],
     ],
     supportNote: '支持范围取决于架构、格式与后端组合。CPU 为兼容后端，文本支持不代表视觉支持。0.14.0 已移除 embedding、ASR 和 TTS API。<a href="https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.14.0">发布说明</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">验证范围</a>。',
     performanceTitle: "近期 27B 吞吐",
@@ -239,7 +279,7 @@ const pages = {
     projectBody: "Ferrum 使用 AI 辅助开发，仍在快速迭代。内部 API 暂不承诺稳定，模型支持与性能持续更新。质量始终重要：保留正确性检查、模型验证并如实报告失败。个人 GPU 资源有限，欢迎提供硬件测试支持和贡献。",
     attribution: '感谢 <a href="https://github.com/vllm-project/vllm">vLLM</a> 与 <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a>，部分实现参考或复用了其代码；相关许可证与署名随组件保留。',
     docsLabel: "文档",
-    releaseLabel: "0.14.0 发布说明",
+    releaseLabel: `${RELEASE_VERSION} 发布说明`,
     footer: "Ferrum · MIT 开源",
   },
 };
@@ -262,7 +302,7 @@ function render(page) {
     name: "Ferrum",
     applicationCategory: "DeveloperApplication",
     operatingSystem: "macOS, Linux, Windows",
-    softwareVersion: "0.14.0",
+    softwareVersion: RELEASE_VERSION,
     description: page.description,
     url: canonical,
     codeRepository: REPOSITORY,
@@ -282,6 +322,12 @@ function render(page) {
     [page.serveLabel, "ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000"],
   ].map(([label, command], index) => codeBlock(label, command, `run-command-${index}`)).join("");
   const table = (caption, baseline, values) => `<div class="table-wrap"><table><caption>${caption}<span>output tok/s</span></caption><thead><tr><th scope="col">${page.concurrency}</th><th scope="col">Ferrum</th><th scope="col">${baseline}</th><th scope="col">${page.ratio}</th></tr></thead><tbody>${values.map(([c, ferrum, reference, ratio]) => `<tr><th scope="row">${c}</th><td>${ferrum}</td><td>${reference}</td><td>${ratio}</td></tr>`).join("")}</tbody></table></div>`;
+  const imageCommands = [
+    [page.imageRunLabel, 'ferrum run /path/to/Qwen-Image-2.1-Turbo --image-precision fp8_linear_experimental_v1 --prompt "A red fox in a snowy forest" --width 1024 --height 1024 --output fox.png'],
+    [page.imageEditLabel, 'ferrum run /path/to/Qwen-Image-2.1-Turbo --image fox.png --image-precision fp8_linear_experimental_v1 --prompt "Make the fox blue" --width 1024 --height 1024 --output edited.png'],
+    [page.imageServeLabel, "ferrum serve --model /path/to/Qwen-Image-2.1-Turbo --served-model-name qwen-image --image-precision fp8_linear_experimental_v1 --port 8000"],
+  ].map(([label, command], index) => codeBlock(label, command, `image-command-${index}`)).join("");
+  const imageTable = `<div class="table-wrap"><table><caption>Qwen-Image-2.1-Turbo<span>images/s</span></caption><thead><tr><th scope="col">${page.workloadLabel}</th><th scope="col">C</th><th scope="col">Ferrum</th><th scope="col">vLLM-Omni</th><th scope="col">${page.ratio}</th></tr></thead><tbody>${imageThroughput.map(([task, size, c, ferrum, omni, ratio]) => `<tr><th scope="row">${size} ${page.imageTasks[task]}</th><td>${c}</td><td>${ferrum}</td><td>${omni}</td><td>${ratio}</td></tr>`).join("")}</tbody></table></div>`;
   return `<!doctype html>
 <html lang="${page.lang}">
 <head>
@@ -313,7 +359,7 @@ function render(page) {
   </div></nav>
   <main>
     <header><div class="wrap">
-      <a class="eyebrow" href="${REPOSITORY}/releases/tag/v0.14.0">${page.eyebrow}</a>
+      <a class="eyebrow" href="${RELEASE_URL}">${page.eyebrow}</a>
       <h1>${page.h1}</h1>
       <p class="hero-copy">${page.lead}</p>
       <div class="objective">
@@ -343,21 +389,33 @@ function render(page) {
       <p>${page.apiNote}</p>
       <p class="note">${page.defaultsNote}</p>
     </div></section>
+    <section id="images"><div class="wrap">
+      <div class="section-head"><h2>${page.imageTitle}</h2><p>${page.imageLead}</p></div>
+      <div class="install-commands">${imageCommands}</div>
+      <p class="copy-status" role="status" aria-live="polite"></p>
+      <p>${page.imageApi}</p>
+      <p class="note">${page.imageConfigNote}</p>
+    </div></section>
     <section id="support"><div class="wrap">
       <div class="section-head"><h2>${page.supportTitle}</h2></div>
       <dl class="support-list">${support}</dl>
       <p class="muted">${page.supportNote}</p>
     </div></section>
     <section id="performance"><div class="wrap">
-      <div class="section-head"><h2>${page.performanceTitle}</h2><p>${page.performanceLead}</p></div>
-      <div class="benchmark-grid">${table(page.ggufCaption, "llama.cpp b11429", throughput.gguf)}${table(page.ctCaption, "vLLM 0.31", throughput.ct)}</div>
-      <p class="note">${page.performanceNote}</p>
+      <div class="section-head"><h2>${page.imagePerformanceTitle}</h2><p>${page.imagePerformanceLead}</p></div>
+      ${imageTable}
+      <p class="note">${page.imagePerformanceNote}</p>
+      <details><summary>${page.textPerformanceLabel}</summary>
+        <div class="section-head"><h3>${page.performanceTitle}</h3><p>${page.performanceLead}</p></div>
+        <div class="benchmark-grid">${table(page.ggufCaption, "llama.cpp b11429", throughput.gguf)}${table(page.ctCaption, "vLLM 0.31", throughput.ct)}</div>
+        <p class="note">${page.performanceNote}</p>
+      </details>
     </div></section>
     <section id="project"><div class="wrap">
       <div class="section-head"><h2>${page.projectTitle}</h2></div>
       <p>${page.projectBody}</p>
       <p class="muted">${page.attribution}</p>
-      <div class="actions"><a class="button" href="${REPOSITORY}${page.lang === "en" ? "#readme" : "/blob/main/README_zh.md"}">${page.docsLabel}</a><a class="button" href="${REPOSITORY}/releases/tag/v0.14.0">${page.releaseLabel}</a></div>
+      <div class="actions"><a class="button" href="${REPOSITORY}${page.lang === "en" ? "#readme" : "/blob/main/README_zh.md"}">${page.docsLabel}</a><a class="button" href="${RELEASE_URL}">${page.releaseLabel}</a></div>
     </div></section>
   </main>
   <footer><div class="wrap footer-inner"><span>${page.footer}</span><span><a href="${REPOSITORY}">GitHub</a> · <a href="${REPOSITORY}/blob/main/LICENSE">MIT License</a></span></div></footer>
