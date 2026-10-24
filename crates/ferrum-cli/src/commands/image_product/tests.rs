@@ -123,6 +123,51 @@ fn fp8_precision_is_shared_by_run_and_serve_without_changing_residency_or_attent
 }
 
 #[test]
+fn gguf_component_precision_config_and_cli_share_explicit_stage_choices() {
+    use ferrum_engine::image_generation::{
+        ImageCudaPrecisionPolicy, ImageDenoiserPrecision, ImageStage,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image.json");
+    let mut wire = configuration();
+    wire["weights"]["transformer"] =
+        json!({"kind":"gguf", "directory":"weights", "file":"dit.gguf"});
+    wire["backend"]["precision_policy"] = json!({"components":{
+        "text_encoder":"fp8_linear_experimental_v1", "denoiser":"native_source"
+    }});
+    wire["backend"]["host"]["weight_backing_bytes"] = json!(1024);
+    for serving in [false, true] {
+        wire["serving"] = if serving {
+            json!({"maximum_pending":2,"maximum_prompt_bytes":4096,"max_num_seqs":1,
+                "request_batch_max_wait_ms":0,"default_width":512,"default_height":512,
+                "default_seed":0,"rgba_scratch_bytes":16384,"output":{}})
+        } else {
+            Value::Null
+        };
+        fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+        let ImageBackendConfig::Cuda(config) = ImageProductConfig::load(&path).unwrap().backend;
+        assert!(config
+            .precision_policy
+            .stage_uses_fp8(ImageStage::TextEncoder));
+        assert_eq!(
+            config.precision_policy.denoiser(),
+            ImageDenoiserPrecision::NativeSource
+        );
+        assert_eq!(
+            config
+                .precision_policy
+                .as_str()
+                .parse::<ImageCudaPrecisionPolicy>()
+                .unwrap(),
+            config.precision_policy
+        );
+    }
+    wire["backend"]["host"]["weight_backing_bytes"] = json!(0);
+    fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+    assert!(ImageProductConfig::load(&path).is_err());
+}
+
+#[test]
 fn fp8_host_cache_is_explicit_budgeted_and_shared_by_run_and_serve() {
     use ferrum_engine::image_generation::{ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy};
     use std::num::NonZeroU64;

@@ -350,9 +350,7 @@ impl ImageProductConfig {
         );
         cuda.fp8_host_cache
             .validate(cuda.precision_policy, cuda.host.limits()?)?;
-        if cuda.precision_policy
-            == ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1
-        {
+        if cuda.precision_policy.uses_fp8() {
             ensure!(
                 cuda.host.weight_backing_bytes > 0,
                 "FP8 requires a nonzero backend.host.weight_backing_bytes allowance"

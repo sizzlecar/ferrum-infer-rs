@@ -73,6 +73,9 @@ impl DirectoryOptions {
             ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 => {
                 "experimental_fp8_linear_cold_v1"
             }
+            ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Components(_) => {
+                "component_precision_cold_v1"
+            }
         }
     }
     pub fn validate(&self) -> Result<()> {
@@ -114,9 +117,10 @@ impl DirectoryOptions {
             input_preprocess_bytes: 768 * MIB as usize,
             transfer_staging_bytes: 16 * MIB as usize,
             output_bytes: 256 * MIB as usize,
-            weight_backing_bytes: match self.precision {
-                ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Bf16 => 0,
-                ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 => 128 * MIB as usize,
+            weight_backing_bytes: if self.precision.uses_fp8() {
+                128 * MIB as usize
+            } else {
+                0
             },
         }
     }

@@ -48,8 +48,9 @@ pub enum CudaTensorOperation {
 }
 
 impl CudaTensorOperation {
+    // Legacy factories select the original leading operation subsets.
+    // Append new capabilities so those callers never acquire a new dependency.
     pub const ALL: [Self; 33] = [
-        Self::BlockLinear,
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -82,6 +83,7 @@ impl CudaTensorOperation {
         Self::ReshapeCopy,
         Self::SegmentedAttention,
         Self::PhiloxNormal,
+        Self::BlockLinear,
     ];
 
     fn primitive(self) -> Option<TensorPrimitiveBf16> {
