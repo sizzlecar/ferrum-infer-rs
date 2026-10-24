@@ -264,7 +264,8 @@ impl QwenImage21CudaConfig {
                 ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
                     QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID
                 }
-            })?;
+            })
+            .map_err(anyhow::Error::msg)?;
         }
         let editing = assets.editing.is_some();
         let mut contracts = contracts(self.attention_policy)?;
