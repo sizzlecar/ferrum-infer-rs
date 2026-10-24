@@ -103,7 +103,7 @@ impl OperationResourceEstimator for Provider {
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
-        OperationResourceEstimate::new(
+        Ok(OperationResourceEstimate::new(
             self.descriptor.resource_estimator_id(),
             self.descriptor.resource_estimator_version(),
             self.descriptor
@@ -112,7 +112,7 @@ impl OperationResourceEstimator for Provider {
             16,
             Some(scratch),
             None,
-        )
+        ))
     }
 }
 impl OperationProvider<CudaDeviceRuntime> for Provider {
