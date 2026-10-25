@@ -32,7 +32,7 @@ impl Config {
             SiluMul | ModulationScale | PlainResidualAdd => 2,
             GatedResidual => 3,
             DenseLinear => 2,
-            BlockLinear => unreachable!("stored weights use the block fixture"),
+            _ => unreachable!("other operations use a separate fixture"),
         }
     }
     pub fn dimensions(&self, port: usize) -> Vec<u64> {

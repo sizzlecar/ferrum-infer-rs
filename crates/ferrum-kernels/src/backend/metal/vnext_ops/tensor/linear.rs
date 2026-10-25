@@ -214,26 +214,6 @@ impl LinearProvider {
     }
 }
 
-fn set_region(encoder: &metal::ComputeCommandEncoderRef, index: u64, region: &MetalBufferRegion) {
-    encoder.set_buffer(index, Some(region.buffer()), region.offset_bytes());
-}
-fn set_params<T>(encoder: &metal::ComputeCommandEncoderRef, index: u64, params: &T) {
-    encoder.set_bytes(
-        index,
-        std::mem::size_of::<T>() as u64,
-        (params as *const T).cast(),
-    );
-}
-fn disjoint(read: &MetalBufferRegion, write: &MetalBufferRegion) -> Result<(), String> {
-    if read
-        .overlaps_shared_region(write)
-        .map_err(|e| e.to_string())?
-    {
-        return Err("Metal linear live input/output/scratch ranges overlap".into());
-    }
-    Ok(())
-}
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LinearParams {

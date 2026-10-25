@@ -19,6 +19,10 @@ use std::sync::{Arc, OnceLock};
 mod family;
 #[path = "vnext_tensor_metal_runtime/linear.rs"]
 mod linear;
+#[path = "vnext_tensor_metal_runtime/qwen_qk.rs"]
+mod qwen_qk;
+#[path = "vnext_tensor_metal_runtime/transforms.rs"]
+mod transforms;
 use family::{Config, Family, TensorPolicy};
 
 const OUTPUT: &str = "value.metal.tensor.output";
@@ -56,7 +60,7 @@ fn expected(kind: MetalTensorOperation, x: f32, p: f32, u: f32) -> u16 {
         GatedResidual => x + rounds(p * u),
         GeluTanh => (0.5 * x) * (1.0 + libm::tanhf(0.797_884_6 * (x + 0.044_715 * ((x * x) * x)))),
         PlainResidualAdd => x + p,
-        DenseLinear | BlockLinear => unreachable!("matrix operations have their own oracle"),
+        _ => unreachable!("other operations have their own oracle"),
     })
     .to_bits()
 }
@@ -203,6 +207,7 @@ fn managed_metal_tensor_operations_match_independent_arithmetic_and_retire_resou
     let selected: Vec<_> = MetalTensorOperation::POINTWISE
         .into_iter()
         .chain(std::iter::once(MetalTensorOperation::DenseLinear))
+        .chain(transforms::OPERATIONS)
         .collect();
     let registry = OperationRuntimeRegistry::new(
         selected
@@ -322,6 +327,8 @@ fn managed_metal_tensor_operations_match_independent_arithmetic_and_retire_resou
     }
     concurrent_executors(&runtime, &registry, &catalog, &policy, &host);
     linear::verify(&runtime, &registry, &catalog, &policy, &host);
+    transforms::verify(&runtime, &registry, &catalog, &host);
+    qwen_qk::verify(&runtime, &registry, &catalog, &host);
     drop(registry);
     // Pipeline ownership and queue reservations are reusable after retirement.
     drop(metal_tensor_providers(&runtime, &MetalTensorOperation::POINTWISE).unwrap());

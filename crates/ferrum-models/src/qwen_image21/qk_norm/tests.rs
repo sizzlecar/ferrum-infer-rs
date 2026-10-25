@@ -102,7 +102,11 @@ fn rotary_is_a_distinct_family_with_explicit_frequencies_and_two_more_nodes() {
         .semantic_program(&config, &norm_profiles.profiles()[0])
         .is_err());
     let profiles = rotary.numerical_profiles(&config).unwrap();
-    assert_eq!(profiles.profiles().len(), 2);
+    profiles
+        .resolve(
+            &NumericalProfileId::new(QwenImage21QkFrontend::Rotary.metal_profile_id()).unwrap(),
+        )
+        .unwrap();
     for profile in profiles.profiles() {
         let program = rotary.semantic_program(&config, profile).unwrap();
         assert_eq!(

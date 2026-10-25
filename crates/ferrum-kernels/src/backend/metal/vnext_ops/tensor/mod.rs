@@ -3,13 +3,20 @@ use super::super::vnext_runtime::{MetalDeviceCommand, MetalTensorProviderRetenti
 use super::*;
 use ferrum_runtime::{
     DeviceCommandLogicalWork, EncodedDeviceOperation, NodeWorkContract, OperationResourceEstimator,
-    ReusableExecutionTopologyRequest, TensorOperationInvocation,
+    ReusableExecutionTopologyRequest, TensorInvocationWork, TensorOperationInvocation,
 };
 use metal::{CompileOptions, ComputePipelineState, MTLSize};
 
 mod linear;
+mod norm;
+mod operation;
 mod pointwise;
-pub use pointwise::MetalTensorOperation;
+mod rope;
+#[cfg(test)]
+mod tests;
+pub use operation::MetalTensorOperation;
+
+type TensorParticipant<'a> = OperationInvocation<'a, MetalDeviceBuffer, TensorInvocationWork<'a>>;
 
 pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "metal-std-f32;fast-math=false;fp-contract=off;bf16-integer-rne;",
@@ -17,6 +24,9 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "gated-residual=round-gate-times-update-then-add;nan-class-only;",
     "gemm=simdgroup-f32-m32n64k32;OI;BF16-final-boundary;",
     "native-block=decode-f32-then-BF16;admitted-invocation-scratch;",
+    "norm=zero-padded-adjacent-FP32-tree;separate-sqrt-div;device-bounded-threadgroup;",
+    "head-rms=BF16-normalized-before-gamma;zero-centered=FP32-one-plus-gamma;",
+    "adjacent-rope=F32-frequency-explicit-FMA;half-split=BF16-staged-products;",
     "independent-Metal-profile;no-CUDA-or-Reference-bitwise-claim"
 );
 
@@ -40,12 +50,17 @@ pub fn metal_tensor_runtime_config(
 fn fingerprint() -> String {
     implementation_fingerprint(&[
         include_bytes!("mod.rs"),
+        include_bytes!("operation.rs"),
         include_bytes!("pointwise.rs"),
         include_bytes!("bf16.metal"),
         include_bytes!("pointwise.metal"),
         include_bytes!("linear.rs"),
         include_bytes!("linear.metal"),
         include_bytes!("block_decode.metal"),
+        include_bytes!("norm.rs"),
+        include_bytes!("norm.metal"),
+        include_bytes!("rope.rs"),
+        include_bytes!("rope.metal"),
         native_blocks::FINGERPRINT_SOURCE.as_bytes(),
         METAL_TENSOR_NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("../mod.rs"),
@@ -56,6 +71,10 @@ struct Pipelines {
     pointwise: Option<ComputePipelineState>,
     linear: Option<ComputePipelineState>,
     block_decode: Option<ComputePipelineState>,
+    norm: Option<ComputePipelineState>,
+    norm_shared_limit: u64,
+    adjacent_rope: Option<ComputePipelineState>,
+    half_split_rope: Option<ComputePipelineState>,
     // Last field: native pipeline states release before their budget owner.
     _retention: MetalTensorProviderRetention,
 }
@@ -75,7 +94,9 @@ pub fn metal_tensor_providers(
         .map(|&kind| {
             let contract = kind.contract().map_err(contract_error)?;
             let weights: &[&str] = match kind {
-                MetalTensorOperation::DenseLinear => {
+                MetalTensorOperation::DenseLinear
+                | MetalTensorOperation::HeadRmsNorm
+                | MetalTensorOperation::ZeroCenteredRmsNorm => {
                     &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID]
                 }
                 MetalTensorOperation::BlockLinear => &[GGUF_NATIVE_BLOCK_FORMAT_ID],
@@ -104,9 +125,11 @@ pub fn metal_tensor_providers(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let retention = runtime.retain_tensor_provider()?;
-    let has_pointwise = selected.iter().any(|op| !op.is_linear());
+    let has_pointwise = selected.iter().any(|op| op.is_pointwise());
     let has_linear = selected.iter().any(|op| op.is_linear());
     let has_blocks = selected.contains(&MetalTensorOperation::BlockLinear);
+    let has_norm = selected.iter().any(|op| op.is_norm());
+    let has_rope = selected.iter().any(|op| op.is_rope());
     let mut source = String::from(include_str!("bf16.metal"));
     if has_blocks {
         source.push_str(&native_blocks::decoder_source());
@@ -119,6 +142,12 @@ pub fn metal_tensor_providers(
     }
     if has_blocks {
         source.push_str(include_str!("block_decode.metal"));
+    }
+    if has_norm {
+        source.push_str(include_str!("norm.metal"));
+    }
+    if has_rope {
+        source.push_str(include_str!("rope.metal"));
     }
     let options = CompileOptions::new();
     options.set_fast_math_enabled(false);
@@ -142,6 +171,25 @@ pub fn metal_tensor_providers(
     let pointwise = pipeline(has_pointwise, "ferrum_tensor_pointwise_bf16")?;
     let linear = pipeline(has_linear, "ferrum_tensor_linear_bf16")?;
     let block_decode = pipeline(has_blocks, "ferrum_tensor_block_decode_bf16")?;
+    let norm = pipeline(has_norm, "ferrum_tensor_norm_bf16")?;
+    let norm_shared_limit = match &norm {
+        Some(p) => runtime
+            .device()
+            .max_threadgroup_memory_length()
+            .checked_sub(p.static_threadgroup_memory_length())
+            .ok_or_else(|| {
+                MetalDeviceRuntimeError::contract("Metal normalization exceeds threadgroup memory")
+            })?,
+        None => 0,
+    };
+    let adjacent_rope = pipeline(
+        selected.contains(&MetalTensorOperation::AdjacentRope),
+        "ferrum_tensor_adjacent_rope_bf16",
+    )?;
+    let half_split_rope = pipeline(
+        selected.contains(&MetalTensorOperation::HalfSplitRope),
+        "ferrum_tensor_half_split_rope_bf16",
+    )?;
     if let Some(pipeline) = &linear {
         if pipeline.thread_execution_width() != 32
             || pipeline.max_total_threads_per_threadgroup() < 128
@@ -157,6 +205,10 @@ pub fn metal_tensor_providers(
         pointwise,
         linear,
         block_decode,
+        norm,
+        norm_shared_limit,
+        adjacent_rope,
+        half_split_rope,
         _retention: retention,
     });
     Ok(selected
@@ -172,7 +224,7 @@ pub fn metal_tensor_providers(
                         pipelines: Arc::clone(&pipelines),
                     });
                 }
-                Box::new(PointwiseProvider {
+                Box::new(TensorProvider {
                     kind,
                     descriptor,
                     pipelines: Arc::clone(&pipelines),
@@ -182,13 +234,13 @@ pub fn metal_tensor_providers(
         .collect())
 }
 
-struct PointwiseProvider {
+struct TensorProvider {
     kind: MetalTensorOperation,
     descriptor: OperationProviderDescriptor,
     pipelines: Arc<Pipelines>,
 }
 
-impl OperationResourceEstimator for PointwiseProvider {
+impl OperationResourceEstimator for TensorProvider {
     fn descriptor(&self) -> &OperationProviderDescriptor {
         &self.descriptor
     }
@@ -198,13 +250,26 @@ impl OperationResourceEstimator for PointwiseProvider {
     ) -> Result<OperationResourceEstimate, VNextError> {
         let estimate =
             estimate_without_workspace(&self.descriptor, &request, self.kind.operation())?;
-        pointwise::geometry(self.kind, request.values(), request.attributes())
+        if self.kind.is_norm() {
+            norm::geometry(
+                self.kind,
+                request.values(),
+                request.attributes(),
+                self.pipelines.norm_shared_limit,
+            )
             .map_err(invalid_plan)?;
+        } else if self.kind.is_rope() {
+            rope::geometry(self.kind, request.values(), request.attributes())
+                .map_err(invalid_plan)?;
+        } else {
+            pointwise::geometry(self.kind, request.values(), request.attributes())
+                .map_err(invalid_plan)?;
+        }
         Ok(estimate)
     }
 }
 
-impl OperationProvider<MetalDeviceRuntime> for PointwiseProvider {
+impl OperationProvider<MetalDeviceRuntime> for TensorProvider {
     fn reusable_execution_topology(
         &self,
         _: ReusableExecutionTopologyRequest<'_>,
@@ -218,8 +283,8 @@ impl OperationProvider<MetalDeviceRuntime> for PointwiseProvider {
     ) -> Result<EncodedDeviceOperation<MetalDeviceCommand>, OperationFailure> {
         Err(provider_failure(
             invocation.participants()[0].identity().clone(),
-            "metal.tensor.pointwise",
-            "Metal pointwise requires fixed tensor work".into(),
+            "metal.tensor",
+            "Metal tensor operation requires fixed tensor work".into(),
         ))
     }
 
@@ -231,23 +296,29 @@ impl OperationProvider<MetalDeviceRuntime> for PointwiseProvider {
         self.encode(invocation)
             .map(EncodedDeviceOperation::compute)
             .map(Some)
-            .map_err(|reason| provider_failure(identity, "metal.tensor.pointwise", reason))
+            .map_err(|reason| provider_failure(identity, "metal.tensor", reason))
     }
 }
 
-impl PointwiseProvider {
+impl TensorProvider {
     fn encode(
         &self,
         invocation: TensorOperationInvocation<'_, MetalDeviceBuffer>,
     ) -> Result<MetalDeviceCommand, String> {
         let [participant] = invocation.participants() else {
-            return Err("Metal pointwise requires one fixed tensor participant".into());
+            return Err("Metal operation requires one fixed tensor participant".into());
         };
         if invocation.operation().id.as_str() != self.kind.operation()
             || !matches!(participant.work(), NodeWorkContract::Fixed)
             || !invocation.resource_work_shape().resource_work().is_tensor()
         {
-            return Err("Metal pointwise received a different operation or work contract".into());
+            return Err("Metal operation received a different operation or work contract".into());
+        }
+        if self.kind.is_norm() {
+            return norm::encode(self.kind, participant, Arc::clone(&self.pipelines));
+        }
+        if self.kind.is_rope() {
+            return rope::encode(self.kind, participant, Arc::clone(&self.pipelines));
         }
         let shape =
             pointwise::geometry(self.kind, participant.bindings(), participant.attributes())?;
@@ -342,6 +413,45 @@ impl PointwiseProvider {
 fn validate_region(region: &MetalBufferRegion, bytes: u64) -> Result<(), String> {
     if region.length_bytes() != bytes || !region.offset_bytes().is_multiple_of(2) {
         return Err("Metal pointwise requires an exact aligned BF16 region".into());
+    }
+    Ok(())
+}
+
+fn tensor_port_region(
+    participant: &TensorParticipant<'_>,
+    role: ResolvedValueRole,
+    ordinal: u32,
+    element: ElementType,
+    bytes: u64,
+) -> Result<MetalBufferRegion, String> {
+    let region = contiguous_region(
+        participant,
+        binding(participant.bindings(), role, ordinal)?,
+        element,
+    )?;
+    if region.length_bytes() != bytes || !region.offset_bytes().is_multiple_of(element.size_bytes())
+    {
+        return Err("Metal tensor port requires an exact typed aligned range".into());
+    }
+    Ok(region)
+}
+
+fn set_region(encoder: &metal::ComputeCommandEncoderRef, index: u64, region: &MetalBufferRegion) {
+    encoder.set_buffer(index, Some(region.buffer()), region.offset_bytes());
+}
+fn set_params<T>(encoder: &metal::ComputeCommandEncoderRef, index: u64, params: &T) {
+    encoder.set_bytes(
+        index,
+        std::mem::size_of::<T>() as u64,
+        (params as *const T).cast(),
+    );
+}
+fn disjoint(read: &MetalBufferRegion, write: &MetalBufferRegion) -> Result<(), String> {
+    if read
+        .overlaps_shared_region(write)
+        .map_err(|e| e.to_string())?
+    {
+        return Err("Metal tensor live input/output/scratch ranges overlap".into());
     }
     Ok(())
 }

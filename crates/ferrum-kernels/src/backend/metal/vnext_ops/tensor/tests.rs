@@ -1,0 +1,190 @@
+//! Metadata and capacity checks; native numerical evidence lives in models tests.
+use super::*;
+use ferrum_runtime::{
+    AliasPolicy, BufferUsage, CanonicalRational, ProgramValueId, ResolvedTensorSpec,
+    ResolvedValueStorage, ResourceId, TensorAccess,
+};
+
+fn value(
+    name: &str,
+    role: ResolvedValueRole,
+    ordinal: u32,
+    dims: &[u64],
+    element: ElementType,
+) -> ResolvedValueBinding {
+    let spec =
+        ResolvedTensorSpec::new(dims.to_vec(), element, ResolvedTensorLayout::Contiguous).unwrap();
+    let storage = ResolvedValueStorage::single(
+        ResourceId::new(format!("resource.{name}")).unwrap(),
+        0,
+        spec.minimum_storage_bytes().unwrap(),
+        element,
+    )
+    .unwrap();
+    ResolvedValueBinding::new(
+        ProgramValueId::new(name).unwrap(),
+        role,
+        ordinal,
+        spec,
+        if role == ResolvedValueRole::Input {
+            TensorAccess::Read
+        } else {
+            TensorAccess::Write
+        },
+        AliasPolicy::NoAlias,
+        BufferUsage::Activations,
+        None,
+        storage,
+    )
+    .unwrap()
+}
+fn norm_values(
+    kind: MetalTensorOperation,
+    width: u64,
+    dtype: ElementType,
+) -> Vec<ResolvedValueBinding> {
+    let columns = if kind == MetalTensorOperation::HeadRmsNorm {
+        3 * width
+    } else {
+        width
+    };
+    let mut values = vec![value(
+        "x",
+        ResolvedValueRole::Input,
+        0,
+        &[2, columns],
+        dtype,
+    )];
+    if kind != MetalTensorOperation::LayerNorm {
+        values.push(value(
+            "gamma",
+            ResolvedValueRole::Input,
+            1,
+            &[width],
+            ElementType::Bf16,
+        ));
+    }
+    values.push(value(
+        "y",
+        ResolvedValueRole::Output,
+        0,
+        &[2, columns],
+        ElementType::Bf16,
+    ));
+    values
+}
+fn norm_attrs(kind: MetalTensorOperation, width: u64) -> BTreeMap<AttributeId, SemanticValue> {
+    let mut attrs = BTreeMap::from([(
+        AttributeId::new("epsilon").unwrap(),
+        SemanticValue::Rational(CanonicalRational::new(1, 1_000_000).unwrap()),
+    )]);
+    if kind != MetalTensorOperation::ZeroCenteredRmsNorm {
+        attrs.insert(
+            AttributeId::new(if kind == MetalTensorOperation::LayerNorm {
+                "hidden_size"
+            } else {
+                "head_dim"
+            })
+            .unwrap(),
+            SemanticValue::Unsigned(width),
+        );
+    }
+    attrs
+}
+
+#[test]
+fn normalization_admits_exact_aligned_threadgroup_capacity_and_rejects_one_byte_short() {
+    for kind in [
+        MetalTensorOperation::LayerNorm,
+        MetalTensorOperation::HeadRmsNorm,
+        MetalTensorOperation::ZeroCenteredRmsNorm,
+    ] {
+        // Narrow allocations still require Metal's 16-byte dynamic alignment;
+        // a larger declared device can support widths beyond an 8K tile.
+        for (width, required) in [(1, 16), (6, 32), (4096, 16384), (8193, 65536)] {
+            let values = norm_values(kind, width, ElementType::Bf16);
+            let attrs = norm_attrs(kind, width);
+            assert!(norm::geometry(kind, &values, &attrs, required).is_ok());
+            assert!(norm::geometry(kind, &values, &attrs, required - 1).is_err());
+        }
+        let attrs = norm_attrs(kind, 6);
+        assert!(norm::geometry(kind, &norm_values(kind, 6, ElementType::F16), &attrs, 32).is_err());
+        let mut extra = attrs.clone();
+        extra.insert(
+            AttributeId::new("unexpected").unwrap(),
+            SemanticValue::Unsigned(1),
+        );
+        assert!(
+            norm::geometry(kind, &norm_values(kind, 6, ElementType::Bf16), &extra, 32).is_err()
+        );
+    }
+}
+
+#[test]
+fn rotary_frequency_dtypes_and_shapes_cannot_be_interchanged() {
+    use MetalTensorOperation::*;
+    let attrs = BTreeMap::from([(
+        AttributeId::new("head_dim").unwrap(),
+        SemanticValue::Unsigned(6),
+    )]);
+    for kind in [AdjacentRope, HalfSplitRope] {
+        let frequency_type = if kind == AdjacentRope {
+            ElementType::F32
+        } else {
+            ElementType::Bf16
+        };
+        let shape: &[u64] = if kind == AdjacentRope {
+            &[3, 3, 2]
+        } else {
+            &[6, 6]
+        };
+        let mut values = vec![
+            value(
+                "x",
+                ResolvedValueRole::Input,
+                0,
+                &[6, 12],
+                ElementType::Bf16,
+            ),
+            value(
+                "frequency",
+                ResolvedValueRole::Input,
+                1,
+                shape,
+                frequency_type,
+            ),
+        ];
+        if kind == HalfSplitRope {
+            values.push(value(
+                "sine",
+                ResolvedValueRole::Input,
+                2,
+                shape,
+                frequency_type,
+            ));
+        }
+        values.push(value(
+            "y",
+            ResolvedValueRole::Output,
+            0,
+            &[6, 12],
+            ElementType::Bf16,
+        ));
+        assert!(rope::geometry(kind, &values, &attrs).is_ok());
+        let wrong_type = if kind == AdjacentRope {
+            ElementType::Bf16
+        } else {
+            ElementType::F32
+        };
+        values[1] = value("frequency", ResolvedValueRole::Input, 1, shape, wrong_type);
+        assert!(rope::geometry(kind, &values, &attrs).is_err());
+        values[1] = value(
+            "frequency",
+            ResolvedValueRole::Input,
+            1,
+            &[6, 3],
+            frequency_type,
+        );
+        assert!(rope::geometry(kind, &values, &attrs).is_err());
+    }
+}
