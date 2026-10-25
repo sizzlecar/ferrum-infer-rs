@@ -10,7 +10,7 @@ pub(super) mod fixture;
 pub(super) mod oracle;
 use fixture::{Fixture, TransformFamily};
 
-pub(super) const OPERATIONS: [MetalTensorOperation; 7] = [
+pub(super) const OPERATIONS: [MetalTensorOperation; 9] = [
     MetalTensorOperation::LayerNorm,
     MetalTensorOperation::HeadRmsNorm,
     MetalTensorOperation::ZeroCenteredRmsNorm,
@@ -18,6 +18,8 @@ pub(super) const OPERATIONS: [MetalTensorOperation; 7] = [
     MetalTensorOperation::HalfSplitRope,
     MetalTensorOperation::StructuredAttention,
     MetalTensorOperation::StructuredGqaAttention,
+    MetalTensorOperation::RowGather,
+    MetalTensorOperation::BatchedRowConcat,
 ];
 pub(super) fn spec(dimensions: Vec<u64>, element_type: ElementType) -> ProgramTensorSpec {
     ProgramTensorSpec {
@@ -95,7 +97,12 @@ pub(super) fn run_case(
             &id(fixture.kind().profile()),
         )
         .unwrap();
-    let options = ProgramPlanCompileOptions::new(fixture.specs()).unwrap();
+    let mut options = ProgramPlanCompileOptions::new(fixture.specs()).unwrap();
+    if let Some(spec) = &fixture.output {
+        options
+            .insert_tensor_spec(id(OUTPUT), spec.clone())
+            .unwrap();
+    }
     let component = CompiledTensorComponent::compile(
         prepared,
         registry,

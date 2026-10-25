@@ -15,6 +15,7 @@ mod pointwise;
 mod rope;
 #[cfg(test)]
 mod tests;
+mod transport;
 pub use operation::MetalTensorOperation;
 
 type TensorParticipant<'a> = OperationInvocation<'a, MetalDeviceBuffer, TensorInvocationWork<'a>>;
@@ -33,6 +34,7 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "GQA=indexed-KV-no-replication;empty-row=positive-zero;",
     "masked-score-discard;nonfinite-visible-score=whole-head-NaN;",
     "nonfinite-V=visible-only-scalar-PV;zero-global-scratch;device-bounded-on-chip;",
+    "transport=BF16-bitcopy;bounded-row-runs;per-batch-concat;zero-arithmetic;",
     "independent-Metal-profile;no-CUDA-or-Reference-bitwise-claim"
 );
 
@@ -69,6 +71,8 @@ fn fingerprint() -> String {
         include_bytes!("rope.metal"),
         include_bytes!("attention.rs"),
         include_bytes!("attention.metal"),
+        include_bytes!("transport.rs"),
+        include_bytes!("transport.metal"),
         native_blocks::FINGERPRINT_SOURCE.as_bytes(),
         METAL_TENSOR_NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("../mod.rs"),
@@ -85,6 +89,7 @@ struct Pipelines {
     half_split_rope: Option<ComputePipelineState>,
     attention: Option<ComputePipelineState>,
     attention_shared_limit: u64,
+    transport: Option<ComputePipelineState>,
     // Last field: native pipeline states release before their budget owner.
     _retention: MetalTensorProviderRetention,
 }
@@ -106,7 +111,9 @@ pub fn metal_tensor_providers(
             let weights: &[&str] = match kind {
                 MetalTensorOperation::DenseLinear
                 | MetalTensorOperation::HeadRmsNorm
-                | MetalTensorOperation::ZeroCenteredRmsNorm => {
+                | MetalTensorOperation::ZeroCenteredRmsNorm
+                | MetalTensorOperation::RowGather
+                | MetalTensorOperation::BatchedRowConcat => {
                     &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID]
                 }
                 MetalTensorOperation::BlockLinear => &[GGUF_NATIVE_BLOCK_FORMAT_ID],
@@ -141,6 +148,7 @@ pub fn metal_tensor_providers(
     let has_norm = selected.iter().any(|op| op.is_norm());
     let has_rope = selected.iter().any(|op| op.is_rope());
     let has_attention = selected.iter().any(|op| op.is_attention());
+    let has_transport = selected.iter().any(|op| op.is_transport());
     let mut source = String::from(include_str!("bf16.metal"));
     if has_blocks {
         source.push_str(&native_blocks::decoder_source());
@@ -162,6 +170,9 @@ pub fn metal_tensor_providers(
     }
     if has_attention {
         source.push_str(include_str!("attention.metal"));
+    }
+    if has_transport {
+        source.push_str(include_str!("transport.metal"));
     }
     let options = CompileOptions::new();
     options.set_fast_math_enabled(false);
@@ -205,6 +216,7 @@ pub fn metal_tensor_providers(
         "ferrum_tensor_half_split_rope_bf16",
     )?;
     let attention = pipeline(has_attention, "ferrum_tensor_attention_bf16")?;
+    let transport = pipeline(has_transport, "ferrum_tensor_transport_bf16")?;
     let attention_shared_limit = match &attention {
         Some(p) => {
             if p.thread_execution_width() != 32 || p.max_total_threads_per_threadgroup() < 128 {
@@ -243,6 +255,7 @@ pub fn metal_tensor_providers(
         half_split_rope,
         attention,
         attention_shared_limit,
+        transport,
         _retention: retention,
     });
     Ok(selected
@@ -303,6 +316,9 @@ impl OperationResourceEstimator for TensorProvider {
                 self.pipelines.attention_shared_limit,
             )
             .map_err(invalid_plan)?;
+        } else if self.kind.is_transport() {
+            transport::geometry(self.kind, request.values(), request.attributes())
+                .map_err(invalid_plan)?;
         } else {
             pointwise::geometry(self.kind, request.values(), request.attributes())
                 .map_err(invalid_plan)?;
@@ -364,6 +380,9 @@ impl TensorProvider {
         }
         if self.kind.is_attention() {
             return attention::encode(self.kind, participant, Arc::clone(&self.pipelines));
+        }
+        if self.kind.is_transport() {
+            return transport::encode(self.kind, participant, Arc::clone(&self.pipelines));
         }
         let shape =
             pointwise::geometry(self.kind, participant.bindings(), participant.attributes())?;

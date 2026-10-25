@@ -6,6 +6,7 @@ pub(crate) struct Fixture {
     operation: OperationId,
     pub inputs: Vec<ProgramTensorSpec>,
     pub attributes: BTreeMap<AttributeId, SemanticValue>,
+    pub output: Option<ProgramTensorSpec>,
 }
 impl Fixture {
     pub fn new(
@@ -17,6 +18,7 @@ impl Fixture {
             operation: kind.contract().unwrap().descriptor().id.clone(),
             inputs,
             attributes,
+            output: None,
         }
     }
     pub fn kind(&self) -> MetalTensorOperation {
@@ -86,8 +88,16 @@ impl ModelFamilyProvider for TransformFamily {
                 operations: vec![NumericalOperationContract {
                     operation_id: config.operation.clone(),
                     version: ContractVersion::new(1, 0),
-                    multiplication_type: Some(ElementType::F32),
-                    accumulation_type: Some(ElementType::F32),
+                    multiplication_type: (!matches!(
+                        config.kind(),
+                        MetalTensorOperation::RowGather | MetalTensorOperation::BatchedRowConcat
+                    ))
+                    .then_some(ElementType::F32),
+                    accumulation_type: (!matches!(
+                        config.kind(),
+                        MetalTensorOperation::RowGather | MetalTensorOperation::BatchedRowConcat
+                    ))
+                    .then_some(ElementType::F32),
                     staged_arithmetic: None,
                     composite_arithmetic: None,
                 }],

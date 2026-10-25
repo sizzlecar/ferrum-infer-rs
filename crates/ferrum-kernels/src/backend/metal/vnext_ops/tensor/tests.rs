@@ -289,3 +289,108 @@ fn attention_validates_gqa_mapping_and_exact_threadgroup_capacity() {
         }
     }
 }
+
+#[test]
+fn transport_rejects_out_of_bounds_runs_columns_and_invalid_batch_before_submission() {
+    use MetalTensorOperation::*;
+    let values = vec![
+        value(
+            "source",
+            ResolvedValueRole::Input,
+            0,
+            &[10, 8],
+            ElementType::Bf16,
+        ),
+        value(
+            "result",
+            ResolvedValueRole::Output,
+            0,
+            &[6, 3],
+            ElementType::Bf16,
+        ),
+    ];
+    let mut attrs = BTreeMap::from([
+        (
+            AttributeId::new("batch").unwrap(),
+            SemanticValue::Unsigned(2),
+        ),
+        (
+            AttributeId::new("column_start").unwrap(),
+            SemanticValue::Unsigned(5),
+        ),
+        (
+            AttributeId::new("column_count").unwrap(),
+            SemanticValue::Unsigned(3),
+        ),
+    ]);
+    for (name, numbers) in [
+        ("run_lengths", vec![3]),
+        ("source_starts", vec![1]),
+        ("source_batch_strides", vec![4]),
+        ("source_row_strides", vec![1]),
+    ] {
+        attrs.insert(
+            AttributeId::new(name).unwrap(),
+            SemanticValue::Integers(numbers),
+        );
+    }
+    assert!(transport::geometry(RowGather, &values, &attrs).is_ok());
+    for (name, bad) in [
+        ("column_start", SemanticValue::Unsigned(6)),
+        ("column_start", SemanticValue::Unsigned(u64::MAX)),
+        ("batch", SemanticValue::Unsigned(u64::MAX)),
+        ("source_starts", SemanticValue::Integers(vec![4])),
+        ("source_starts", SemanticValue::Integers(vec![-1])),
+        ("source_row_strides", SemanticValue::Integers(vec![2])),
+        ("source_batch_strides", SemanticValue::Integers(vec![4, 4])),
+    ] {
+        let mut changed = attrs.clone();
+        changed.insert(AttributeId::new(name).unwrap(), bad);
+        assert!(
+            transport::geometry(RowGather, &values, &changed).is_err(),
+            "{name}"
+        );
+    }
+    let mut wrong_dtype = values.clone();
+    wrong_dtype[0] = value(
+        "source",
+        ResolvedValueRole::Input,
+        0,
+        &[10, 8],
+        ElementType::F16,
+    );
+    assert!(transport::geometry(RowGather, &wrong_dtype, &attrs).is_err());
+    let values = vec![
+        value(
+            "left",
+            ResolvedValueRole::Input,
+            0,
+            &[4, 3],
+            ElementType::Bf16,
+        ),
+        value(
+            "right",
+            ResolvedValueRole::Input,
+            1,
+            &[6, 3],
+            ElementType::Bf16,
+        ),
+        value(
+            "result",
+            ResolvedValueRole::Output,
+            0,
+            &[10, 3],
+            ElementType::Bf16,
+        ),
+    ];
+    for (batch, accepted) in [(2, true), (0, false), (3, false)] {
+        let attrs = BTreeMap::from([(
+            AttributeId::new("batch").unwrap(),
+            SemanticValue::Unsigned(batch),
+        )]);
+        assert_eq!(
+            transport::geometry(BatchedRowConcat, &values, &attrs).is_ok(),
+            accepted
+        );
+    }
+}

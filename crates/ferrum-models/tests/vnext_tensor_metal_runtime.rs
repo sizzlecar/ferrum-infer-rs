@@ -23,10 +23,14 @@ mod family;
 mod linear;
 #[path = "vnext_tensor_metal_runtime/qwen_attention.rs"]
 mod qwen_attention;
+#[path = "vnext_tensor_metal_runtime/qwen_graph.rs"]
+mod qwen_graph;
 #[path = "vnext_tensor_metal_runtime/qwen_qk.rs"]
 mod qwen_qk;
 #[path = "vnext_tensor_metal_runtime/transforms.rs"]
 mod transforms;
+#[path = "vnext_tensor_metal_runtime/transport.rs"]
+mod transport;
 use family::{Config, Family, TensorPolicy};
 
 const OUTPUT: &str = "value.metal.tensor.output";
@@ -203,14 +207,17 @@ fn managed_metal_tensor_operations_match_independent_arithmetic_and_retire_resou
             stream_memory_bytes: 1 << 20,
             maximum_streams: 2,
             maximum_in_flight_per_stream: 1,
-            maximum_commands_per_submission: 16,
+            maximum_commands_per_submission: qwen_graph::maximum_command_count(),
             opaque_memory_profile: "metal.pointwise.test.declared.v1".into(),
         })
         .unwrap(),
     );
     let selected: Vec<_> = MetalTensorOperation::POINTWISE
         .into_iter()
-        .chain(std::iter::once(MetalTensorOperation::DenseLinear))
+        .chain([
+            MetalTensorOperation::DenseLinear,
+            MetalTensorOperation::BlockLinear,
+        ])
         .chain(transforms::OPERATIONS)
         .collect();
     let registry = OperationRuntimeRegistry::new(
@@ -335,8 +342,10 @@ fn managed_metal_tensor_operations_match_independent_arithmetic_and_retire_resou
     linear::verify(&runtime, &registry, &catalog, &policy, &host);
     transforms::verify(&runtime, &registry, &catalog, &host);
     attention::verify(&runtime, &registry, &catalog, &host);
+    transport::verify(&runtime, &registry, &catalog, &host);
     qwen_qk::verify(&runtime, &registry, &catalog, &host);
     qwen_attention::verify(&runtime, &registry, &catalog, &host);
+    qwen_graph::verify(&runtime, &registry, &catalog);
     drop(registry);
     // Pipeline ownership and queue reservations are reusable after retirement.
     drop(metal_tensor_providers(&runtime, &MetalTensorOperation::POINTWISE).unwrap());

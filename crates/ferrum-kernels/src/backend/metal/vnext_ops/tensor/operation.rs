@@ -20,6 +20,8 @@ pub enum MetalTensorOperation {
     HalfSplitRope,
     StructuredAttention,
     StructuredGqaAttention,
+    RowGather,
+    BatchedRowConcat,
 }
 
 impl MetalTensorOperation {
@@ -32,7 +34,7 @@ impl MetalTensorOperation {
         Self::GeluTanh,
         Self::PlainResidualAdd,
     ];
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -49,6 +51,8 @@ impl MetalTensorOperation {
         Self::HalfSplitRope,
         Self::StructuredAttention,
         Self::StructuredGqaAttention,
+        Self::RowGather,
+        Self::BatchedRowConcat,
     ];
     pub(super) fn is_pointwise(self) -> bool {
         Self::POINTWISE.contains(&self)
@@ -71,6 +75,9 @@ impl MetalTensorOperation {
             Self::StructuredAttention | Self::StructuredGqaAttention
         )
     }
+    pub(super) fn is_transport(self) -> bool {
+        matches!(self, Self::RowGather | Self::BatchedRowConcat)
+    }
     pub fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::Silu => silu_bf16_contract(),
@@ -89,6 +96,8 @@ impl MetalTensorOperation {
             Self::HalfSplitRope => half_split_rope_bf16_contract(),
             Self::StructuredAttention => structured_attention_bf16_contract(),
             Self::StructuredGqaAttention => structured_gqa_attention_bf16_contract(),
+            Self::RowGather => row_gather_bf16_contract(),
+            Self::BatchedRowConcat => batched_row_concat_bf16_contract(),
         }
     }
     pub fn profile(self) -> &'static str {
@@ -115,6 +124,8 @@ impl MetalTensorOperation {
             Self::StructuredGqaAttention => {
                 "metal.simdgroup.f32.structured_gqa_attention.bf16.tile16x32_online.v1"
             }
+            Self::RowGather => "metal.bitcopy.row_gather.bf16.v1",
+            Self::BatchedRowConcat => "metal.bitcopy.batched_row_concat.bf16.v1",
         }
     }
     pub(super) fn capability(self) -> &'static str {
@@ -135,6 +146,8 @@ impl MetalTensorOperation {
             Self::HalfSplitRope => HALF_SPLIT_ROPE_BF16_CAPABILITY_ID,
             Self::StructuredAttention => STRUCTURED_ATTENTION_BF16_CAPABILITY_ID,
             Self::StructuredGqaAttention => STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID,
+            Self::RowGather => ROW_GATHER_BF16_CAPABILITY_ID,
+            Self::BatchedRowConcat => BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID,
         }
     }
     pub(super) fn operation(self) -> &'static str {
@@ -155,6 +168,8 @@ impl MetalTensorOperation {
             Self::HalfSplitRope => HALF_SPLIT_ROPE_BF16_OPERATION_ID,
             Self::StructuredAttention => STRUCTURED_ATTENTION_BF16_OPERATION_ID,
             Self::StructuredGqaAttention => STRUCTURED_GQA_ATTENTION_BF16_OPERATION_ID,
+            Self::RowGather => ROW_GATHER_BF16_OPERATION_ID,
+            Self::BatchedRowConcat => BATCHED_ROW_CONCAT_BF16_OPERATION_ID,
         }
     }
     pub(super) fn name(self) -> &'static str {
@@ -175,6 +190,8 @@ impl MetalTensorOperation {
             Self::HalfSplitRope => "half_split_rope",
             Self::StructuredAttention => "structured_attention",
             Self::StructuredGqaAttention => "structured_gqa_attention",
+            Self::RowGather => "row_gather",
+            Self::BatchedRowConcat => "batched_row_concat",
         }
     }
     pub(super) fn inputs(self) -> u32 {
@@ -187,6 +204,8 @@ impl MetalTensorOperation {
             Self::HeadRmsNorm | Self::ZeroCenteredRmsNorm | Self::AdjacentRope => 2,
             Self::HalfSplitRope => 3,
             Self::StructuredAttention | Self::StructuredGqaAttention => 3,
+            Self::RowGather => 1,
+            Self::BatchedRowConcat => 2,
         }
     }
     pub(super) fn broadcasts(self) -> bool {

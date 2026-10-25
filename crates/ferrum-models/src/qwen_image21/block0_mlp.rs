@@ -16,6 +16,7 @@ impl QwenImage21Block0MlpFamily {
     pub const FAMILY_ID: &'static str = "family.qwen_image21.block0_mlp";
     pub const REFERENCE_PROFILE_ID: &'static str = "qwen_image21.block0_mlp.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen_image21.block0_mlp.cuda.bf16_f32.v1";
+    pub const METAL_PROFILE_ID: &'static str = "qwen_image21.block0_mlp.metal.bf16_f32.v1";
     pub const INPUT_ID: &'static str = "value.qwen_image21.block0_mlp.z";
     pub const GATE_ID: &'static str = "value.qwen_image21.block0_mlp.gate";
     pub const UP_ID: &'static str = "value.qwen_image21.block0_mlp.up";
@@ -101,7 +102,11 @@ impl ModelFamilyProvider for QwenImage21Block0MlpFamily {
         let reference = NumericalProfileId::new(Self::REFERENCE_PROFILE_ID)
             .map_err(|reason| invalid("profile", reason))?;
         let mut profiles = Vec::new();
-        for name in [Self::REFERENCE_PROFILE_ID, Self::CUDA_PROFILE_ID] {
+        for name in [
+            Self::REFERENCE_PROFILE_ID,
+            Self::CUDA_PROFILE_ID,
+            Self::METAL_PROFILE_ID,
+        ] {
             let operations = [DENSE_LINEAR_BF16_OPERATION_ID, SILU_MUL_BF16_OPERATION_ID]
                 .into_iter()
                 .map(|operation| {
