@@ -17,6 +17,8 @@ use std::sync::{Arc, OnceLock};
 
 #[path = "vnext_tensor_metal_runtime/family.rs"]
 mod family;
+#[path = "vnext_tensor_metal_runtime/linear.rs"]
+mod linear;
 use family::{Config, Family, TensorPolicy};
 
 const OUTPUT: &str = "value.metal.tensor.output";
@@ -54,6 +56,7 @@ fn expected(kind: MetalTensorOperation, x: f32, p: f32, u: f32) -> u16 {
         GatedResidual => x + rounds(p * u),
         GeluTanh => (0.5 * x) * (1.0 + libm::tanhf(0.797_884_6 * (x + 0.044_715 * ((x * x) * x)))),
         PlainResidualAdd => x + p,
+        DenseLinear | BlockLinear => unreachable!("matrix operations have their own oracle"),
     })
     .to_bits()
 }
@@ -183,7 +186,7 @@ fn verify(config: &Config, values: &[Vec<f32>], bytes: &[u8]) {
 }
 
 #[test]
-fn managed_metal_pointwise_matches_independent_arithmetic_and_retires_resources() {
+fn managed_metal_tensor_operations_match_independent_arithmetic_and_retire_resources() {
     let runtime = Arc::new(
         MetalDeviceRuntime::new_tensor_eager(MetalTensorRuntimeConfig {
             device: metal_tensor_runtime_config(id("device.metal.0")).unwrap(),
@@ -197,15 +200,20 @@ fn managed_metal_pointwise_matches_independent_arithmetic_and_retires_resources(
         })
         .unwrap(),
     );
+    let selected: Vec<_> = MetalTensorOperation::POINTWISE
+        .into_iter()
+        .chain(std::iter::once(MetalTensorOperation::DenseLinear))
+        .collect();
     let registry = OperationRuntimeRegistry::new(
-        MetalTensorOperation::ALL
-            .into_iter()
+        selected
+            .iter()
+            .copied()
             .map(|kind| Box::new(kind.contract().unwrap()) as Box<dyn OperationContract>)
             .collect(),
-        metal_tensor_providers(&runtime, &MetalTensorOperation::ALL).unwrap(),
+        metal_tensor_providers(&runtime, &selected).unwrap(),
     )
     .unwrap();
-    assert!(metal_tensor_providers(&runtime, &MetalTensorOperation::ALL).is_err());
+    assert!(metal_tensor_providers(&runtime, &MetalTensorOperation::POINTWISE).is_err());
     let engine = EngineProviderDescriptor::new(
         id("provider.engine.metal.tensor.test"),
         ContractVersion::new(1, 0),
@@ -243,7 +251,7 @@ fn managed_metal_pointwise_matches_independent_arithmetic_and_retires_resources(
             .copied()
             .collect(),
     };
-    for kind in MetalTensorOperation::ALL {
+    for kind in MetalTensorOperation::POINTWISE {
         let modes: &[bool] = if matches!(
             kind,
             MetalTensorOperation::ModulationScale | MetalTensorOperation::GatedResidual
@@ -313,9 +321,10 @@ fn managed_metal_pointwise_matches_independent_arithmetic_and_retires_resources(
         }
     }
     concurrent_executors(&runtime, &registry, &catalog, &policy, &host);
+    linear::verify(&runtime, &registry, &catalog, &policy, &host);
     drop(registry);
     // Pipeline ownership and queue reservations are reusable after retirement.
-    drop(metal_tensor_providers(&runtime, &MetalTensorOperation::ALL).unwrap());
+    drop(metal_tensor_providers(&runtime, &MetalTensorOperation::POINTWISE).unwrap());
     let first = runtime.create_stream().unwrap();
     let second = runtime.create_stream().unwrap();
     assert!(runtime.create_stream().is_err());

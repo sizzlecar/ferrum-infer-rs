@@ -721,8 +721,8 @@ pub(crate) fn shared_binding_region(
     Ok(region)
 }
 
-fn contiguous_scratch_region(
-    participant: &OperationInvocation<'_, MetalDeviceBuffer>,
+pub(crate) fn contiguous_scratch_region<'a, W: ferrum_runtime::InvocationWorkProjection<'a>>(
+    participant: &OperationInvocation<'a, MetalDeviceBuffer, W>,
     required_bytes: u64,
 ) -> Result<MetalBufferRegion, String> {
     let view = participant

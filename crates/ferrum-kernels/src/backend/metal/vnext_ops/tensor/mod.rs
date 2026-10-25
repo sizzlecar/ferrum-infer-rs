@@ -7,14 +7,16 @@ use ferrum_runtime::{
 };
 use metal::{CompileOptions, ComputePipelineState, MTLSize};
 
+mod linear;
 mod pointwise;
 pub use pointwise::MetalTensorOperation;
 
-const SOURCE: &str = include_str!("pointwise.metal");
 pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "metal-std-f32;fast-math=false;fp-contract=off;bf16-integer-rne;",
     "silu_mul=round-silu-then-mul;modulation=round-one-plus-scale-then-mul;",
     "gated-residual=round-gate-times-update-then-add;nan-class-only;",
+    "gemm=simdgroup-f32-m32n64k32;OI;BF16-final-boundary;",
+    "native-block=decode-f32-then-BF16;admitted-invocation-scratch;",
     "independent-Metal-profile;no-CUDA-or-Reference-bitwise-claim"
 );
 
@@ -39,14 +41,21 @@ fn fingerprint() -> String {
     implementation_fingerprint(&[
         include_bytes!("mod.rs"),
         include_bytes!("pointwise.rs"),
-        SOURCE.as_bytes(),
+        include_bytes!("bf16.metal"),
+        include_bytes!("pointwise.metal"),
+        include_bytes!("linear.rs"),
+        include_bytes!("linear.metal"),
+        include_bytes!("block_decode.metal"),
+        native_blocks::FINGERPRINT_SOURCE.as_bytes(),
         METAL_TENSOR_NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("../mod.rs"),
     ])
 }
 
 struct Pipelines {
-    pointwise: ComputePipelineState,
+    pointwise: Option<ComputePipelineState>,
+    linear: Option<ComputePipelineState>,
+    block_decode: Option<ComputePipelineState>,
     // Last field: native pipeline states release before their budget owner.
     _retention: MetalTensorProviderRetention,
 }
@@ -65,6 +74,21 @@ pub fn metal_tensor_providers(
         .iter()
         .map(|&kind| {
             let contract = kind.contract().map_err(contract_error)?;
+            let weights: &[&str] = match kind {
+                MetalTensorOperation::DenseLinear => {
+                    &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID]
+                }
+                MetalTensorOperation::BlockLinear => &[GGUF_NATIVE_BLOCK_FORMAT_ID],
+                _ => &[],
+            };
+            let quantization: Vec<_> = if kind == MetalTensorOperation::BlockLinear {
+                linear::FORMATS
+                    .iter()
+                    .map(|format| format.format_id())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             provider_descriptor(
                 runtime,
                 &contract,
@@ -72,42 +96,89 @@ pub fn metal_tensor_providers(
                 kind.capability(),
                 &format!("resource-estimator.metal.{}.bf16", kind.name()),
                 contiguous_bindings(kind.inputs()),
-                &[],
-                &[],
+                weights,
+                &quantization,
                 implementation_fingerprint(&[fingerprint().as_bytes(), kind.profile().as_bytes()]),
             )
             .map(|d| d.with_fixed_tensor_work(true))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let retention = runtime.retain_tensor_provider()?;
+    let has_pointwise = selected.iter().any(|op| !op.is_linear());
+    let has_linear = selected.iter().any(|op| op.is_linear());
+    let has_blocks = selected.contains(&MetalTensorOperation::BlockLinear);
+    let mut source = String::from(include_str!("bf16.metal"));
+    if has_blocks {
+        source.push_str(&native_blocks::decoder_source());
+    }
+    if has_pointwise {
+        source.push_str(include_str!("pointwise.metal"));
+    }
+    if has_linear {
+        source.push_str(include_str!("linear.metal"));
+    }
+    if has_blocks {
+        source.push_str(include_str!("block_decode.metal"));
+    }
     let options = CompileOptions::new();
     options.set_fast_math_enabled(false);
     let library = runtime
         .device()
-        .new_library_with_source(SOURCE, &options)
+        .new_library_with_source(&source, &options)
         .map_err(MetalDeviceRuntimeError::contract)?;
-    let function = library
-        .get_function("ferrum_tensor_pointwise_bf16", None)
-        .map_err(MetalDeviceRuntimeError::contract)?;
-    let pipeline = runtime
-        .device()
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(MetalDeviceRuntimeError::contract)?;
+    let pipeline = |selected: bool, name: &str| -> Result<_, MetalDeviceRuntimeError> {
+        if !selected {
+            return Ok(None);
+        }
+        let function = library
+            .get_function(name, None)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        runtime
+            .device()
+            .new_compute_pipeline_state_with_function(&function)
+            .map(Some)
+            .map_err(MetalDeviceRuntimeError::contract)
+    };
+    let pointwise = pipeline(has_pointwise, "ferrum_tensor_pointwise_bf16")?;
+    let linear = pipeline(has_linear, "ferrum_tensor_linear_bf16")?;
+    let block_decode = pipeline(has_blocks, "ferrum_tensor_block_decode_bf16")?;
+    if let Some(pipeline) = &linear {
+        if pipeline.thread_execution_width() != 32
+            || pipeline.max_total_threads_per_threadgroup() < 128
+            || pipeline.static_threadgroup_memory_length()
+                > runtime.device().max_threadgroup_memory_length()
+        {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal BF16 GEMM needs four 32-lane SIMD groups and its declared on-chip storage",
+            ));
+        }
+    }
     let pipelines = Arc::new(Pipelines {
-        pointwise: pipeline,
+        pointwise,
+        linear,
+        block_decode,
         _retention: retention,
     });
     Ok(selected
         .iter()
         .copied()
         .zip(descriptors)
-        .map(|(kind, descriptor)| {
-            Box::new(PointwiseProvider {
-                kind,
-                descriptor,
-                pipelines: Arc::clone(&pipelines),
-            }) as Box<dyn OperationProvider<MetalDeviceRuntime>>
-        })
+        .map(
+            |(kind, descriptor)| -> Box<dyn OperationProvider<MetalDeviceRuntime>> {
+                if kind.is_linear() {
+                    return Box::new(linear::LinearProvider {
+                        kind,
+                        descriptor,
+                        pipelines: Arc::clone(&pipelines),
+                    });
+                }
+                Box::new(PointwiseProvider {
+                    kind,
+                    descriptor,
+                    pipelines: Arc::clone(&pipelines),
+                })
+            },
+        )
         .collect())
 }
 
@@ -235,7 +306,11 @@ impl PointwiseProvider {
             work,
             move |encoder, regions| {
                 let compute = encoder.compute_encoder();
-                compute.set_compute_pipeline_state(&pipelines.pointwise);
+                let pipeline = pipelines
+                    .pointwise
+                    .as_ref()
+                    .expect("selected pointwise pipeline");
+                compute.set_compute_pipeline_state(pipeline);
                 for (slot, index) in [
                     0,
                     if kind.inputs() > 1 { 1 } else { 0 },
@@ -253,10 +328,7 @@ impl PointwiseProvider {
                     std::mem::size_of::<Params>() as u64,
                     (&params as *const Params).cast(),
                 );
-                let threads = pipelines
-                    .pointwise
-                    .max_total_threads_per_threadgroup()
-                    .min(256);
+                let threads = pipeline.max_total_threads_per_threadgroup().min(256);
                 compute.dispatch_threads(
                     MTLSize::new(shape.elements, 1, 1),
                     MTLSize::new(threads, 1, 1),

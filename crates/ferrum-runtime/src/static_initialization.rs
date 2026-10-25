@@ -613,15 +613,16 @@ where
         )
     }
 
-    /// Uploads stored weights through account-owned, bounded staging chunks.
+    /// Initializes weights through bounded staging or an explicit managed import.
     ///
     /// Each chunk is admitted as [`HostMemoryClass::TransferStaging`] before
     /// allocating or copying bytes. The backend must retain that exact owner
     /// until its upload is quiescent; unsupported managed uploads never fall
-    /// back to a raw-byte upload. Device transforms and native weight imports
-    /// are not used by this entrypoint. Existing source/materializer backing,
-    /// including mmap pages or format conversion allocations, is outside this
-    /// staging budget; this is not a bound on total host RSS.
+    /// back to a raw-byte upload. A backend may instead provide a managed
+    /// import transaction with no temporary host staging. The ordinary import
+    /// hook and device transforms are not used. Existing source/materializer
+    /// backing, including mmap pages or format conversion allocations, is outside
+    /// this staging budget; this is not a bound on total host RSS.
     pub fn initialize_static_managed(
         self,
         family: &PreparedModelFamily,
@@ -721,18 +722,39 @@ where
         .execution_weights()
         .static_weight_transforms()
         .is_empty();
+    let mut weight_import = if placements.is_empty() || has_required_weight_transforms {
+        None
+    } else {
+        let import = if managed_host.is_some() {
+            runtime.begin_managed_static_weight_import()
+        } else {
+            runtime.begin_static_weight_import()
+        };
+        match import {
+            None => None,
+            Some(Ok(import)) => Some(import),
+            Some(Err(error)) => {
+                return Err(InitializationStepFailure::Quiescent(device_failure(
+                    &runtime,
+                    &error,
+                    "static_weight_import_begin",
+                )))
+            }
+        }
+    };
     if managed_host.is_some()
-        && (has_required_weight_transforms || !runtime.supports_managed_tensor_io())
+        && (has_required_weight_transforms
+            || (weight_import.is_none() && !runtime.supports_managed_tensor_io()))
     {
         return Err(contract_failure(VNextError::InvalidExecutionPlan {
-            reason: "managed static initialization requires managed host upload support and no device weight transforms".to_owned(),
+            reason: "managed static initialization requires managed host upload support or managed import, and no device weight transforms".to_owned(),
         }));
     }
     // Admit the first real chunk before even a zero batch can be submitted.
     // Holding this reservation (rather than merely observing free capacity)
     // prevents a concurrent host user from taking its admission in between.
     let mut first_staging = match (managed_host, stored) {
-        (Some(host), Some((_, weights))) => {
+        (Some(host), Some((_, weights))) if weight_import.is_none() => {
             let first = weights
                 .schema()
                 .components
@@ -767,22 +789,6 @@ where
         }
         _ => None,
     };
-    let mut weight_import =
-        if placements.is_empty() || has_required_weight_transforms || managed_host.is_some() {
-            None
-        } else {
-            match runtime.begin_static_weight_import() {
-                None => None,
-                Some(Ok(import)) => Some(import),
-                Some(Err(error)) => {
-                    return Err(InitializationStepFailure::Quiescent(device_failure(
-                        &runtime,
-                        &error,
-                        "static_weight_import_begin",
-                    )))
-                }
-            }
-        };
     let created_stream = runtime.create_stream().map_err(|error| {
         InitializationStepFailure::Quiescent(device_failure(
             &runtime,

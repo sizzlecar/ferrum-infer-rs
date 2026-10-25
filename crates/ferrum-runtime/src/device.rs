@@ -3929,6 +3929,23 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         None
     }
 
+    /// Optional static import for callers which require managed transfers.
+    ///
+    /// An implementation must not allocate hidden temporary host staging. It
+    /// may retain source backing or fill the exact admitted destination; all
+    /// native owners must obey the static import transaction's lifetime and
+    /// quiescence contract. Source/materializer backing remains outside the
+    /// transfer-staging budget, just as for bounded managed uploads.
+    /// `None` selects bounded managed upload, never raw-byte upload. The
+    /// ordinary import hook is deliberately not used as an implicit fallback.
+    fn begin_managed_static_weight_import(
+        &self,
+    ) -> Option<
+        Result<Box<dyn StaticWeightImportSession<Self::Buffer, Self::Error> + '_>, Self::Error>,
+    > {
+        None
+    }
+
     /// Encode a required source-to-execution static weight transform.
     ///
     /// `None` means this runtime does not implement the exact transform. Core

@@ -2496,6 +2496,18 @@ impl DeviceRuntime for MetalDeviceRuntime {
         )
     }
 
+    fn begin_managed_static_weight_import(
+        &self,
+    ) -> Option<
+        Result<Box<dyn StaticWeightImportSession<Self::Buffer, Self::Error> + '_>, Self::Error>,
+    > {
+        if self.tensor_eager.is_some() {
+            self.begin_static_weight_import()
+        } else {
+            None
+        }
+    }
+
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {
         let id = NEXT_STREAM_INSTANCE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {

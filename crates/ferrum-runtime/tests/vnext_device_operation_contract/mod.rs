@@ -1575,6 +1575,14 @@ pub(crate) enum ReadbackBehavior {
     Panic,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) enum ManagedStaticImportBehavior {
+    #[default]
+    Unsupported,
+    Import,
+    Reject,
+}
+
 #[derive(Default)]
 pub(crate) struct RuntimeTrace {
     pub(crate) device_facts_templates: Option<Arc<[ProjectionInvocationTemplate]>>,
@@ -1646,6 +1654,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) stream_failed: bool,
     pub(crate) describe_error_panics: bool,
     pub(crate) static_weight_import_enabled: bool,
+    pub(crate) managed_static_import: ManagedStaticImportBehavior,
     pub(crate) static_weight_import_begin_calls: u64,
     pub(crate) static_weight_import_seal_calls: u64,
     pub(crate) imported_component_count: usize,
@@ -2276,6 +2285,23 @@ impl DeviceRuntime for TestRuntime {
             trace: Arc::clone(&self.trace),
             components: Vec::new(),
         })))
+    }
+
+    fn begin_managed_static_weight_import(
+        &self,
+    ) -> Option<
+        Result<Box<dyn StaticWeightImportSession<Self::Buffer, Self::Error> + '_>, Self::Error>,
+    > {
+        match self.trace.lock().unwrap().managed_static_import {
+            ManagedStaticImportBehavior::Unsupported => None,
+            ManagedStaticImportBehavior::Import => Some(Ok(Box::new(TestStaticWeightImport {
+                trace: Arc::clone(&self.trace),
+                components: Vec::new(),
+            }))),
+            ManagedStaticImportBehavior::Reject => {
+                Some(Err(TestRuntimeError("managed import rejected")))
+            }
+        }
     }
 
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {

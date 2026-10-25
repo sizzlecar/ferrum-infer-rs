@@ -16,6 +16,9 @@ use std::{
 
 #[path = "vnext_tensor_block_linear/family.rs"]
 mod family;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[path = "vnext_tensor_block_linear/metal_runtime.rs"]
+mod metal_runtime;
 #[cfg(feature = "cuda")]
 #[path = "vnext_tensor_block_linear/runtime.rs"]
 mod runtime;
@@ -244,4 +247,10 @@ fn basis_oracle_checks_every_weight_without_relaxing_decode_tolerance() {
 #[ignore = "requires an exclusive CUDA test window"]
 fn managed_native_block_projection_oracle_capacity_and_retirement() {
     runtime::verify();
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn managed_metal_block_projection_oracle_capacity_and_retirement() {
+    metal_runtime::verify();
 }

@@ -7,6 +7,7 @@ pub(super) struct Config {
     pub rows: u64,
     pub width: u64,
     pub row_broadcast: bool,
+    pub outputs: Option<u64>,
 }
 impl Config {
     pub fn new(kind: MetalTensorOperation, rows: u64, width: u64, row_broadcast: bool) -> Self {
@@ -15,6 +16,7 @@ impl Config {
             rows,
             width,
             row_broadcast,
+            outputs: None,
         }
     }
     pub fn kind(&self) -> MetalTensorOperation {
@@ -29,9 +31,14 @@ impl Config {
             Silu | Tanh | GeluTanh => 1,
             SiluMul | ModulationScale | PlainResidualAdd => 2,
             GatedResidual => 3,
+            DenseLinear => 2,
+            BlockLinear => unreachable!("stored weights use the block fixture"),
         }
     }
     pub fn dimensions(&self, port: usize) -> Vec<u64> {
+        if self.kind() == MetalTensorOperation::DenseLinear && port == 1 {
+            return vec![self.outputs.unwrap(), self.width];
+        }
         vec![
             if port == 1 && self.row_broadcast {
                 1
@@ -72,12 +79,20 @@ impl ModelFamilyProvider for Family {
             || config.width == 0
             || config.rows.checked_mul(config.width).is_none()
             || serde_json::to_value(config).unwrap() != *raw
-            || !MetalTensorOperation::ALL
+            || !MetalTensorOperation::POINTWISE
                 .into_iter()
+                .chain(std::iter::once(MetalTensorOperation::DenseLinear))
                 .any(|kind| kind.contract().unwrap().descriptor().id == config.operation)
         {
             return Err(invalid(
                 "pointwise fixture requires a known operation and positive shape",
+            ));
+        }
+        if (config.kind() == MetalTensorOperation::DenseLinear) != config.outputs.is_some()
+            || config.outputs == Some(0)
+        {
+            return Err(invalid(
+                "only linear fixtures declare a positive output width",
             ));
         }
         if config.row_broadcast
@@ -139,7 +154,15 @@ impl ModelFamilyProvider for Family {
         _: &NumericalExecutionProfile,
     ) -> Result<ModelProgram, VNextError> {
         let inputs: Vec<_> = (0..config.input_count()).map(input_id).collect();
-        let attributes = if matches!(
+        let attributes = if config.kind() == MetalTensorOperation::DenseLinear {
+            BTreeMap::from([
+                (id("in_features"), SemanticValue::Unsigned(config.width)),
+                (
+                    id("out_features"),
+                    SemanticValue::Unsigned(config.outputs.unwrap()),
+                ),
+            ])
+        } else if matches!(
             config.kind(),
             MetalTensorOperation::ModulationScale | MetalTensorOperation::GatedResidual
         ) {

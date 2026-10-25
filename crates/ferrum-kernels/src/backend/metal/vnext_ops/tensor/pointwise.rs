@@ -11,10 +11,12 @@ pub enum MetalTensorOperation {
     GatedResidual,
     GeluTanh,
     PlainResidualAdd,
+    DenseLinear,
+    BlockLinear,
 }
 
 impl MetalTensorOperation {
-    pub const ALL: [Self; 7] = [
+    pub const POINTWISE: [Self; 7] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -23,6 +25,20 @@ impl MetalTensorOperation {
         Self::GeluTanh,
         Self::PlainResidualAdd,
     ];
+    pub const ALL: [Self; 9] = [
+        Self::Silu,
+        Self::SiluMul,
+        Self::Tanh,
+        Self::ModulationScale,
+        Self::GatedResidual,
+        Self::GeluTanh,
+        Self::PlainResidualAdd,
+        Self::DenseLinear,
+        Self::BlockLinear,
+    ];
+    pub(super) fn is_linear(self) -> bool {
+        matches!(self, Self::DenseLinear | Self::BlockLinear)
+    }
     pub fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::Silu => silu_bf16_contract(),
@@ -32,6 +48,8 @@ impl MetalTensorOperation {
             Self::GatedResidual => gated_residual_bf16_contract(),
             Self::GeluTanh => gelu_tanh_bf16_contract(),
             Self::PlainResidualAdd => plain_residual_add_bf16_contract(),
+            Self::DenseLinear => dense_linear_bf16_contract(),
+            Self::BlockLinear => dense_linear_block_bf16_contract(),
         }
     }
     pub fn profile(self) -> &'static str {
@@ -43,6 +61,8 @@ impl MetalTensorOperation {
             Self::GatedResidual => "metal.precise.gated_residual.bf16.v1",
             Self::GeluTanh => "metal.precise.gelu_tanh.bf16.v1",
             Self::PlainResidualAdd => "metal.precise.plain_residual_add.bf16.v1",
+            Self::DenseLinear => super::linear::DENSE_PROFILE,
+            Self::BlockLinear => super::linear::BLOCK_PROFILE,
         }
     }
     pub(super) fn capability(self) -> &'static str {
@@ -54,6 +74,8 @@ impl MetalTensorOperation {
             Self::GatedResidual => GATED_RESIDUAL_BF16_CAPABILITY_ID,
             Self::GeluTanh => GELU_TANH_BF16_CAPABILITY_ID,
             Self::PlainResidualAdd => PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID,
+            Self::DenseLinear => DENSE_LINEAR_BF16_CAPABILITY_ID,
+            Self::BlockLinear => DENSE_LINEAR_BLOCK_BF16_CAPABILITY_ID,
         }
     }
     pub(super) fn operation(self) -> &'static str {
@@ -65,6 +87,8 @@ impl MetalTensorOperation {
             Self::GatedResidual => GATED_RESIDUAL_BF16_OPERATION_ID,
             Self::GeluTanh => GELU_TANH_BF16_OPERATION_ID,
             Self::PlainResidualAdd => PLAIN_RESIDUAL_ADD_BF16_OPERATION_ID,
+            Self::DenseLinear => DENSE_LINEAR_BF16_OPERATION_ID,
+            Self::BlockLinear => DENSE_LINEAR_BLOCK_BF16_OPERATION_ID,
         }
     }
     pub(super) fn name(self) -> &'static str {
@@ -76,6 +100,8 @@ impl MetalTensorOperation {
             Self::GatedResidual => "gated_residual",
             Self::GeluTanh => "gelu_tanh",
             Self::PlainResidualAdd => "plain_residual_add",
+            Self::DenseLinear => "dense_linear",
+            Self::BlockLinear => "native_block_linear",
         }
     }
     pub(super) fn inputs(self) -> u32 {
@@ -83,6 +109,7 @@ impl MetalTensorOperation {
             Self::Silu | Self::Tanh | Self::GeluTanh => 1,
             Self::SiluMul | Self::ModulationScale | Self::PlainResidualAdd => 2,
             Self::GatedResidual => 3,
+            Self::DenseLinear | Self::BlockLinear => 2,
         }
     }
     pub(super) fn broadcasts(self) -> bool {
@@ -95,6 +122,9 @@ impl MetalTensorOperation {
             Self::Tanh | Self::PlainResidualAdd => 1,
             Self::ModulationScale | Self::GatedResidual => 2,
             Self::GeluTanh => 9,
+            Self::DenseLinear | Self::BlockLinear => {
+                unreachable!("matrix work is computed by its own geometry")
+            }
         }
     }
 }
@@ -114,6 +144,9 @@ pub(super) fn geometry(
     values: &[ResolvedValueBinding],
     attributes: &BTreeMap<AttributeId, SemanticValue>,
 ) -> Result<Shape, String> {
+    if kind.is_linear() {
+        return Err("matrix operations require the linear provider".into());
+    }
     if values.len() != kind.inputs() as usize + 1 {
         return Err("Metal pointwise port count differs".into());
     }

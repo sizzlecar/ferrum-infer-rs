@@ -14,6 +14,7 @@ use crate::gguf_blocks::{GgufBlockFormat, IQ3_S_GRID, IQ4_NL_VALUES};
 pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("native_blocks.rs"),
     include_str!("native_blocks.metal"),
+    include_str!("native_block_decode.metal"),
     include_str!("group_dot.metal"),
     include_str!("../../../gguf_blocks/iq3s_grid.rs"),
     include_str!("../../../gguf_blocks/iq4nl_values.rs"),
@@ -234,19 +235,25 @@ pub(super) struct MetalNativeBlockPipelines {
     pub(super) decode: ComputePipelineState,
 }
 
-impl MetalNativeBlockPipelines {
-    pub(super) fn new(device: &Device) -> Result<Self, MetalDeviceRuntimeError> {
-        let mut shader = String::from(
+pub(super) fn decoder_source() -> String {
+    let mut shader = String::from(
             "#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\nconstant uint iq3_s_grid[512] = {\n",
         );
-        for value in IQ3_S_GRID {
-            write!(&mut shader, "0x{value:08x},").expect("writing a String cannot fail");
-        }
-        shader.push_str("\n};\nconstant char iq4_nl_values[16] = {");
-        for value in IQ4_NL_VALUES {
-            write!(&mut shader, "{value},").expect("writing a String cannot fail");
-        }
-        shader.push_str("};\n");
+    for value in IQ3_S_GRID {
+        write!(&mut shader, "0x{value:08x},").expect("writing a String cannot fail");
+    }
+    shader.push_str("\n};\nconstant char iq4_nl_values[16] = {");
+    for value in IQ4_NL_VALUES {
+        write!(&mut shader, "{value},").expect("writing a String cannot fail");
+    }
+    shader.push_str("};\n");
+    shader.push_str(include_str!("native_block_decode.metal"));
+    shader
+}
+
+impl MetalNativeBlockPipelines {
+    pub(super) fn new(device: &Device) -> Result<Self, MetalDeviceRuntimeError> {
+        let mut shader = decoder_source();
         shader.push_str(include_str!("native_blocks.metal"));
         shader.push_str(include_str!("group_dot.metal"));
         let options = CompileOptions::new();
