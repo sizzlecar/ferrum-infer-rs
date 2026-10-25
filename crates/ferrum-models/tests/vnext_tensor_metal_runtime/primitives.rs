@@ -227,48 +227,56 @@ pub(super) fn verify(
         );
     };
     for kind in [AffineLinear, PatchProjection] {
-        let inputs = vec![
-            matrix(33, 36),
-            if kind == AffineLinear {
-                matrix(65, 36)
-            } else {
-                spec(vec![65, 3, 2, 2, 3], ElementType::Bf16)
-            },
-            vector(65),
-        ];
-        let attributes = if kind == AffineLinear {
-            attrs(vec![
-                unsigned("in_features", 36),
-                unsigned("out_features", 65),
-            ])
-        } else {
-            BTreeMap::new()
-        };
-        let values = inputs.iter().enumerate().map(|(p, s)| data(s, p)).collect();
-        run(kind, inputs, matrix(33, 65), attributes, values);
-        // The two projection contracts intentionally differ at the dot boundary.
-        run(
-            kind,
-            vec![
-                matrix(1, 1),
+        for (rows, outputs) in [(33, 65), (64, 128)] {
+            let inputs = vec![
+                matrix(rows, 36),
                 if kind == AffineLinear {
-                    matrix(1, 1)
+                    matrix(outputs, 36)
                 } else {
-                    spec(vec![1, 1, 1, 1, 1], ElementType::Bf16)
+                    spec(vec![outputs, 3, 2, 2, 3], ElementType::Bf16)
                 },
-                vector(1),
-            ],
-            matrix(1, 1),
-            if kind == AffineLinear {
+                vector(outputs),
+            ];
+            let attributes = if kind == AffineLinear {
                 attrs(vec![
-                    unsigned("in_features", 1),
-                    unsigned("out_features", 1),
+                    unsigned("in_features", 36),
+                    unsigned("out_features", outputs),
                 ])
             } else {
                 BTreeMap::new()
-            },
-            vec![vec![1.0078125], vec![1.5], vec![-1.5]],
-        );
+            };
+            let values = inputs.iter().enumerate().map(|(p, s)| data(s, p)).collect();
+            run(kind, inputs, matrix(rows, outputs), attributes, values);
+        }
+        // The two projection contracts intentionally differ at the dot boundary.
+        for (rows, outputs) in [(1, 1), (32, 64)] {
+            run(
+                kind,
+                vec![
+                    matrix(rows, 1),
+                    if kind == AffineLinear {
+                        matrix(outputs, 1)
+                    } else {
+                        spec(vec![outputs, 1, 1, 1, 1], ElementType::Bf16)
+                    },
+                    vector(outputs),
+                ],
+                matrix(rows, outputs),
+                if kind == AffineLinear {
+                    attrs(vec![
+                        unsigned("in_features", 1),
+                        unsigned("out_features", outputs),
+                    ])
+                } else {
+                    BTreeMap::new()
+                },
+                vec![
+                    vec![1.0078125; rows as usize],
+                    vec![1.5; outputs as usize],
+                    vec![-1.5; outputs as usize],
+                ],
+            );
+        }
     }
     for width in [1, 7, 1152, 4608] {
         let inputs = vec![matrix(3, width), vector(width), vector(width)];

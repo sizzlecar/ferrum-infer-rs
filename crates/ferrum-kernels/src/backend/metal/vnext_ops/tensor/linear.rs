@@ -8,8 +8,11 @@ use ferrum_runtime::{
     WeightComponentRole, WeightEncoding,
 };
 
-pub(super) const DENSE_PROFILE: &str = "metal.simdgroup.f32.bf16.v1";
-pub(super) const BLOCK_PROFILE: &str = "metal.native_block.decode_f32_rn_bf16.simdgroup_f32.v1";
+pub(super) mod mpp;
+
+pub(super) const DENSE_PROFILE: &str = "metal.mpp_or_simdgroup.f32.bf16.v2";
+pub(super) const BLOCK_PROFILE: &str =
+    "metal.native_block.decode_f32_rn_bf16.mpp_or_simdgroup_f32.v2";
 pub(super) const FORMATS: [GgufBlockFormat; 4] = [
     GgufBlockFormat::Q8_0,
     GgufBlockFormat::Q4K,
@@ -158,6 +161,8 @@ impl LinearProvider {
             }
             regions.push(scratch);
         }
+        let use_mpp = self.pipelines.linear_mpp.is_some()
+            && mpp::supports_shape(shape.rows, shape.inputs, shape.outputs);
         let pipelines = Arc::clone(&self.pipelines);
         let parameters = LinearParams {
             rows: shape.rows,
@@ -168,10 +173,11 @@ impl LinearProvider {
         let work = DeviceCommandLogicalWork::tensor(shape.output_bytes / 2, shape.operations)
             .map_err(|e| e.to_string())?;
         MetalDeviceCommand::tensor_operation(
-            if format.is_some() {
-                "metal.native_block_linear.bf16"
-            } else {
-                "metal.dense_linear.bf16"
+            match (format.is_some(), use_mpp) {
+                (true, true) => "metal.native_block_linear.bf16.mpp",
+                (true, false) => "metal.native_block_linear.bf16",
+                (false, true) => "metal.dense_linear.bf16.mpp",
+                (false, false) => "metal.dense_linear.bf16",
             },
             regions,
             work,
@@ -208,9 +214,15 @@ impl LinearProvider {
                     1
                 };
                 let compute = encoder.compute_encoder();
-                compute.set_compute_pipeline_state(
-                    pipelines.linear.as_ref().expect("selected linear pipeline"),
-                );
+                let pipeline = if use_mpp {
+                    pipelines
+                        .linear_mpp
+                        .as_ref()
+                        .expect("selected full-tile MPP linear pipeline")
+                } else {
+                    pipelines.linear.as_ref().expect("selected linear pipeline")
+                };
+                compute.set_compute_pipeline_state(pipeline);
                 set_region(compute, 0, &regions[0]);
                 set_region(compute, 1, &regions[weight_index]);
                 set_region(compute, 2, &regions[2]);
