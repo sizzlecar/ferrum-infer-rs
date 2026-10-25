@@ -10,7 +10,13 @@ pub(in crate::backend::metal::vnext_ops::tensor) const FINGERPRINT_SOURCE: &str 
     include_str!("register128.metal")
 );
 pub(in crate::backend::metal::vnext_ops::tensor) const NUMERICAL_IDENTITY: &str =
-    "metal.attention.head128.simdgroup-f32-bq32-bk16;ushort-staging-exact-bf16-decode;register-p2-o16;coordinate-calibrated-xor1-xor8-or-dynamic-four-peer-or-full-shuffle-row-reduction;f32-exp;finite-pv-guarded-explicit-f32-rescale-then-inplace-mma-c;sticky-v-above-2p93-or-o-nonfinite-above-2p124-or-p-alpha-outside-0-2-fallback-zero-pv-mma-separate-add;nonfinite-v-visible-only-scalar-pv-then-separate-rescale-add;key-runs-or-validated-all-batch-all-valid-specialization;same-causal-segment-tail-ieee-and-arithmetic-order;bf16-final-only;shared15120;fast-math=false.v4";
+    "metal.attention.head128.simdgroup-f32-bq32-bk16;ushort-staging-exact-bf16-decode;register-p2-o16;coordinate-calibrated-xor1-xor8-or-dynamic-four-peer-or-full-shuffle-row-reduction;f32-exp;finite-pv-guarded-explicit-f32-rescale-then-inplace-mma-c;sticky-v-above-2p93-or-o-nonfinite-above-2p124-or-p-alpha-outside-0-2-fallback-zero-pv-mma-separate-add;nonfinite-v-visible-only-scalar-pv-then-separate-rescale-add;key-runs-or-validated-all-batch-all-valid-specialization;typed-structured-or-cross-independent-query-key-lengths;same-structured-causal-segment-tail-ieee-and-arithmetic-order;bf16-final-only;shared15120;fast-math=false.v4";
+
+#[derive(Debug, Clone, Copy)]
+enum Domain {
+    Structured,
+    Cross,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum KeyVisibility {
@@ -32,6 +38,70 @@ impl KeyVisibility {
             Self::MaskRuns
         }
     }
+
+    pub(super) fn from_cross_mask(mask: &ferrum_runtime::CrossAttentionBf16Geometry) -> Self {
+        let sequence = mask.key_value_length() as u32;
+        if (0..mask.batch() as usize).all(|batch| {
+            mask.key_run_ends(batch) == Some([sequence].as_slice())
+                && mask.key_run_valid(batch) == Some([true].as_slice())
+        }) {
+            Self::AllValid
+        } else {
+            Self::MaskRuns
+        }
+    }
+}
+
+// Only register kernels consume this packet. The legacy structured (56 B)
+// and cross (64 B) packets and dispatch grids remain independent and unchanged.
+#[repr(C)]
+pub(super) struct RegisterParams {
+    pub(super) jobs: u64,
+    pub(super) grid_groups: u64,
+    pub(super) query_tiles: u64,
+    pub(super) query_sequence: u64,
+    pub(super) query_heads: u64,
+    pub(super) key_value_heads: u64,
+    pub(super) key_sequence: u64,
+    pub(super) head_dim: u32,
+    pub(super) scale: f32,
+}
+const _: () = assert!(std::mem::size_of::<RegisterParams>() == 64);
+
+impl RegisterParams {
+    pub(super) fn new(
+        batch_heads: u64,
+        query_sequence: u64,
+        key_sequence: u64,
+        query_heads: u64,
+        key_value_heads: u64,
+        scale: f32,
+    ) -> Result<Self, String> {
+        if !supports_cross_shape(query_sequence, key_sequence, 128)
+            || batch_heads == 0
+            || query_heads == 0
+            || key_value_heads == 0
+            || query_heads % key_value_heads != 0
+            || batch_heads % query_heads != 0
+        {
+            return Err("Metal register attention requires checked sequence/head geometry".into());
+        }
+        let query_tiles = query_sequence.div_ceil(QUERY_ROWS);
+        let jobs = batch_heads
+            .checked_mul(query_tiles)
+            .ok_or("Metal register attention grid overflows")?;
+        Ok(Self {
+            jobs,
+            grid_groups: jobs.min(65535),
+            query_tiles,
+            query_sequence,
+            query_heads,
+            key_value_heads,
+            key_sequence,
+            head_dim: 128,
+            scale,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -39,16 +109,34 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
     runtime: &MetalDeviceRuntime,
 ) -> Result<Option<ComputePipelineState>, MetalDeviceRuntimeError> {
     let library = compile_library(runtime)?;
-    compile_pipeline(runtime, &library, KeyVisibility::MaskRuns)
+    compile_pipeline(
+        runtime,
+        &library,
+        Domain::Structured,
+        KeyVisibility::MaskRuns,
+    )
 }
 
 pub(in crate::backend::metal::vnext_ops::tensor) fn compile_variants(
     runtime: &MetalDeviceRuntime,
 ) -> Result<[Option<ComputePipelineState>; 2], MetalDeviceRuntimeError> {
+    compile_domain(runtime, Domain::Structured)
+}
+
+pub(super) fn compile_cross_variants(
+    runtime: &MetalDeviceRuntime,
+) -> Result<[Option<ComputePipelineState>; 2], MetalDeviceRuntimeError> {
+    compile_domain(runtime, Domain::Cross)
+}
+
+fn compile_domain(
+    runtime: &MetalDeviceRuntime,
+    domain: Domain,
+) -> Result<[Option<ComputePipelineState>; 2], MetalDeviceRuntimeError> {
     let library = compile_library(runtime)?;
     Ok([
-        compile_pipeline(runtime, &library, KeyVisibility::MaskRuns)?,
-        compile_pipeline(runtime, &library, KeyVisibility::AllValid)?,
+        compile_pipeline(runtime, &library, domain, KeyVisibility::MaskRuns)?,
+        compile_pipeline(runtime, &library, domain, KeyVisibility::AllValid)?,
     ])
 }
 
@@ -75,6 +163,7 @@ fn compile_library(
 fn compile_pipeline(
     runtime: &MetalDeviceRuntime,
     library: &metal::LibraryRef,
+    domain: Domain,
     key_visibility: KeyVisibility,
 ) -> Result<Option<ComputePipelineState>, MetalDeviceRuntimeError> {
     let all_valid = u32::from(key_visibility == KeyVisibility::AllValid);
@@ -83,6 +172,12 @@ fn compile_pipeline(
         (&all_valid as *const u32).cast(),
         metal::MTLDataType::UInt,
         104,
+    );
+    let cross = u32::from(matches!(domain, Domain::Cross));
+    constants.set_constant_value_at_index(
+        (&cross as *const u32).cast(),
+        metal::MTLDataType::UInt,
+        105,
     );
     let function = library
         .get_function("ferrum_tensor_attention_register128_bf16", Some(constants))
@@ -99,6 +194,7 @@ fn compile_pipeline(
             .is_some_and(|n| n <= runtime.device().max_threadgroup_memory_length());
     tracing::info!(
         supported,
+        ?domain,
         ?key_visibility,
         query_rows = QUERY_ROWS,
         key_rows = 16,
@@ -117,18 +213,8 @@ pub(super) fn supports_shape(sequence: u64, head_dim: u32) -> bool {
     head_dim == 128 && sequence >= QUERY_ROWS && sequence <= u32::MAX as u64
 }
 
-pub(super) fn retile(params: &mut super::Params) -> Result<(), String> {
-    // Only the selected register kernel changes tile geometry. A missing
-    // capability retains the original 16-row MPP/SIMD grid unchanged.
-    let batch_heads = params.jobs / params.query_tiles;
-    let query_tiles = params.sequence.div_ceil(QUERY_ROWS);
-    let jobs = batch_heads
-        .checked_mul(query_tiles)
-        .ok_or("Metal register attention grid overflows")?;
-    params.query_tiles = query_tiles;
-    params.jobs = jobs;
-    params.grid_groups = jobs.min(65535);
-    Ok(())
+pub(super) fn supports_cross_shape(query: u64, key: u64, head_dim: u32) -> bool {
+    supports_shape(query, head_dim) && key > 0 && key <= u32::MAX as u64
 }
 
 #[cfg(test)]
@@ -246,15 +332,20 @@ mod tests {
         assert!(!supports_shape(31, 128));
         assert!(!supports_shape(65, 64));
         assert!(!supports_shape(u32::MAX as u64 + 1, 128));
+        assert!(supports_cross_shape(32, 1, 128));
+        assert!(supports_cross_shape(33, 17, 128));
+        assert!(!supports_cross_shape(31, 65, 128));
+        assert!(!supports_cross_shape(32, 0, 128));
+        assert!(!supports_cross_shape(32, u32::MAX as u64 + 1, 128));
     }
 
     #[test]
-    fn retiled_attention_covers_each_batch_head_query_once_including_the_tail() {
-        for sequence in [32_u64, 33, 63, 64, 65] {
+    fn register_packets_cover_each_batch_head_query_once_with_independent_key_length() {
+        for (sequence, key_sequence) in [(32_u64, 1_u64), (33, 16), (63, 17), (64, 65), (65, 33)] {
             let batch = 2;
             let query_heads = 3;
             let old_tiles = sequence.div_ceil(16);
-            let mut params = super::super::Params {
+            let legacy = super::super::Params {
                 jobs: batch * query_heads * old_tiles,
                 grid_groups: batch * query_heads * old_tiles,
                 query_tiles: old_tiles,
@@ -264,7 +355,18 @@ mod tests {
                 head_dim: 128,
                 scale: 0.125,
             };
-            retile(&mut params).unwrap();
+            let params = RegisterParams::new(
+                legacy.jobs / legacy.query_tiles,
+                sequence,
+                key_sequence,
+                query_heads,
+                1,
+                legacy.scale,
+            )
+            .unwrap();
+            assert_eq!(legacy.query_tiles, old_tiles);
+            assert_eq!(params.query_sequence, sequence);
+            assert_eq!(params.key_sequence, key_sequence);
             let mut visits = vec![0; (batch * query_heads * sequence) as usize];
             for job in 0..params.jobs {
                 let batch_head = job / params.query_tiles;
@@ -275,5 +377,6 @@ mod tests {
             }
             assert!(visits.iter().all(|&count| count == 1));
         }
+        assert!(RegisterParams::new(u64::MAX, 65, 33, 1, 1, 0.125).is_err());
     }
 }

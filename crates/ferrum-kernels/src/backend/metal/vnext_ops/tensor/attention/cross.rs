@@ -1,10 +1,10 @@
 //! Rectangular attention over the shared bounded online-attention shader.
 use super::super::*;
-use super::{NativeMask, CACHED_SHARED_BYTES};
+use super::{register128, NativeMask, CACHED_SHARED_BYTES};
 use ferrum_runtime::CrossAttentionBf16Geometry;
 
 pub(in crate::backend::metal::vnext_ops::tensor) const PROFILE: &str =
-    "metal.mpp_qstaged_pv_or_simdgroup.f32.cross_attention.bf16.tile16x32_online.v2";
+    "metal.register_guarded_accum32x16_or_mpp_simd16x32.f32.cross_attention.bf16.online.v3";
 pub(in crate::backend::metal::vnext_ops::tensor) const FINGERPRINT_SOURCE: &str =
     concat!(include_str!("cross.rs"), include_str!("cross.metal"));
 
@@ -12,6 +12,8 @@ pub(in crate::backend::metal::vnext_ops::tensor) struct CrossPipelines {
     generic: ComputePipelineState,
     cached: Option<ComputePipelineState>,
     mpp: Option<ComputePipelineState>,
+    register: Option<ComputePipelineState>,
+    register_all_valid: Option<ComputePipelineState>,
     pub(in crate::backend::metal::vnext_ops::tensor) shared_limit: u64,
 }
 
@@ -105,10 +107,13 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn pipelines(
             }
         }
     };
+    let [register, register_all_valid] = register128::compile_cross_variants(runtime)?;
     Ok(CrossPipelines {
         generic,
         cached,
         mpp,
+        register,
+        register_all_valid,
         shared_limit,
     })
 }
@@ -132,6 +137,7 @@ const _: () = assert!(std::mem::size_of::<Params>() == 64);
 pub(in crate::backend::metal::vnext_ops::tensor) struct Shape {
     params: Params,
     mask: NativeMask,
+    key_visibility: register128::KeyVisibility,
     query_bytes: u64,
     key_value_bytes: u64,
     shared_bytes: u64,
@@ -201,6 +207,7 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn geometry(
             scale: checked.effective_scale(),
         },
         mask,
+        key_visibility: register128::KeyVisibility::from_cross_mask(&checked),
         query_bytes: checked.query_bytes(),
         key_value_bytes: checked.key_value_bytes(),
         shared_bytes,
@@ -257,53 +264,100 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn encode(
         disjoint(input, &output)?;
     }
     regions.push(output);
-    let use_mpp = cross.mpp.is_some()
+    let register_supported = register128::supports_cross_shape(
+        shape.params.sequence,
+        shape.params.key_sequence,
+        shape.params.head_dim,
+    );
+    let use_all_valid_register = register_supported
+        && shape.key_visibility == register128::KeyVisibility::AllValid
+        && cross.register_all_valid.is_some();
+    let use_register = use_all_valid_register || (register_supported && cross.register.is_some());
+    let register_params = if use_register {
+        Some(register128::RegisterParams::new(
+            shape.params.jobs / shape.params.query_tiles,
+            shape.params.sequence,
+            shape.params.key_sequence,
+            shape.params.query_heads,
+            shape.params.key_value_heads,
+            shape.params.scale,
+        )?)
+    } else {
+        None
+    };
+    let use_mpp = !use_register
+        && cross.mpp.is_some()
         && supports_mpp(
             shape.params.sequence,
             shape.params.key_sequence,
             shape.params.query_heads,
             shape.params.head_dim,
         );
-    let cached = use_mpp || (shape.params.head_dim == 128 && cross.cached.is_some());
+    let cached =
+        !use_register && (use_mpp || (shape.params.head_dim == 128 && cross.cached.is_some()));
+    let kernel = if use_all_valid_register {
+        "metal.cross_attention.bf16.register32x16.all_valid_keys"
+    } else if use_register {
+        "metal.cross_attention.bf16.register32x16"
+    } else if use_mpp {
+        "metal.cross_attention.bf16.mpp_qk"
+    } else {
+        "metal.cross_attention.bf16"
+    };
+    let shared_bytes = if use_register {
+        register128::SHARED_BYTES
+    } else if cached {
+        CACHED_SHARED_BYTES
+    } else {
+        shape.shared_bytes
+    };
+    tracing::debug!(
+        kernel,
+        query_tile_rows = if use_register {
+            register128::QUERY_ROWS
+        } else {
+            16
+        },
+        shared_bytes,
+        query_sequence = shape.params.sequence,
+        key_sequence = shape.params.key_sequence,
+        query_heads = shape.params.query_heads,
+        "Metal cross attention dispatch selected"
+    );
     let work = DeviceCommandLogicalWork::tensor(shape.query_bytes / 2, shape.operations)
         .map_err(|e| e.to_string())?;
-    MetalDeviceCommand::tensor_operation(
-        "metal.cross_attention.bf16",
-        regions,
-        work,
-        move |encoder, regions| {
-            let cross = pipelines
-                .cross_attention
-                .as_ref()
-                .expect("selected cross attention pipelines");
-            let compute = encoder.compute_encoder();
-            compute.set_compute_pipeline_state(if use_mpp {
-                cross.mpp.as_ref().unwrap()
-            } else if cached {
-                cross.cached.as_ref().unwrap()
-            } else {
-                &cross.generic
-            });
-            for (index, region) in regions.iter().enumerate() {
-                set_region(compute, index as u64, region);
-            }
+    MetalDeviceCommand::tensor_operation(kernel, regions, work, move |encoder, regions| {
+        let cross = pipelines
+            .cross_attention
+            .as_ref()
+            .expect("selected cross attention pipelines");
+        let compute = encoder.compute_encoder();
+        compute.set_compute_pipeline_state(if use_all_valid_register {
+            cross.register_all_valid.as_ref().unwrap()
+        } else if use_register {
+            cross.register.as_ref().unwrap()
+        } else if use_mpp {
+            cross.mpp.as_ref().unwrap()
+        } else if cached {
+            cross.cached.as_ref().unwrap()
+        } else {
+            &cross.generic
+        });
+        for (index, region) in regions.iter().enumerate() {
+            set_region(compute, index as u64, region);
+        }
+        let grid_groups = if let Some(params) = &register_params {
+            set_params(compute, 4, params);
+            params.grid_groups
+        } else {
             set_params(compute, 4, &shape.params);
-            set_params(compute, 5, &shape.mask);
-            compute.set_threadgroup_memory_length(
-                0,
-                if cached {
-                    CACHED_SHARED_BYTES
-                } else {
-                    shape.shared_bytes
-                },
-            );
-            compute.dispatch_thread_groups(
-                MTLSize::new(shape.params.grid_groups, 1, 1),
-                MTLSize::new(128, 1, 1),
-            );
-            Ok(())
-        },
-    )
+            shape.params.grid_groups
+        };
+        set_params(compute, 5, &shape.mask);
+        compute.set_threadgroup_memory_length(0, shared_bytes);
+        compute.dispatch_thread_groups(MTLSize::new(grid_groups, 1, 1), MTLSize::new(128, 1, 1));
+        Ok(())
+    })
     .map_err(|e| e.to_string())
 }
 
@@ -377,6 +431,37 @@ mod tests {
             assert_eq!(&shape.mask.key_run_ends[..3], &[1, 32, 33]);
             assert_eq!(shape.mask.key_run_ends[32], 33);
             assert_eq!(&shape.mask.key_valid_masks[..2], &[2, 0]);
+            assert_eq!(shape.key_visibility, register128::KeyVisibility::MaskRuns);
+            // The proof must cover KV=33, not Q=17, and every batch slot.
+            let mut all_valid = attributes.clone();
+            all_valid.insert(id("key_run_counts"), SemanticValue::Integers(vec![1, 1]));
+            all_valid.insert(id("key_run_lengths"), SemanticValue::Integers(vec![33, 33]));
+            all_valid.insert(id("key_run_valid"), SemanticValue::Integers(vec![1, 1]));
+            assert_eq!(
+                geometry(&values, &all_valid, required)
+                    .unwrap()
+                    .key_visibility,
+                register128::KeyVisibility::AllValid
+            );
+            all_valid.insert(id("key_run_valid"), SemanticValue::Integers(vec![1, 0]));
+            assert_eq!(
+                geometry(&values, &all_valid, required)
+                    .unwrap()
+                    .key_visibility,
+                register128::KeyVisibility::MaskRuns
+            );
+            // Cross remains the same-head contract, not rectangular GQA.
+            let mut unequal_heads = values.clone();
+            for (port, name) in [(1, "k"), (2, "v")] {
+                unequal_heads[port] = value(
+                    name,
+                    ResolvedValueRole::Input,
+                    port as u32,
+                    &[66, width],
+                    ElementType::Bf16,
+                );
+            }
+            assert!(geometry(&unequal_heads, &attributes, required).is_err());
             // V cannot silently inherit Q's shorter sequence or bypass the
             // standard contract just because its storage region is valid.
             values[2] = value(

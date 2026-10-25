@@ -3,6 +3,8 @@ use super::*;
 
 #[path = "cross_oracle.rs"]
 mod oracle;
+#[path = "cross_register.rs"]
+mod register;
 
 struct CrossCase {
     query_length: usize,
@@ -187,5 +189,6 @@ pub(super) fn verify(
         }
         run(&finite, &values);
     }
+    register::verify(runtime, registry, catalog, &policy, host);
     eprintln!("Metal cross attention: rectangular FP64/IEEE, mask, empty, repeat and retirement checks passed");
 }

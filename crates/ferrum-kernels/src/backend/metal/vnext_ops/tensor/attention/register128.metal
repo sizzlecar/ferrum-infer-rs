@@ -1,5 +1,24 @@
-// This independent kernel reuses AttentionParams/AttentionMask and their mask
-// helpers, but not the previous kernel's 16-query dispatch geometry.
+// Both domains share the same arithmetic and register-only P/O. Their explicit
+// 64-byte packet does not change either legacy kernel's parameter ABI.
+struct RegisterAttentionParams {
+    ulong jobs, grid_groups, query_tiles, query_sequence, query_heads, key_value_heads, key_sequence;
+    uint head_dim;
+    float scale;
+};
+
+constant uint ATTENTION_REGISTER_DOMAIN [[function_constant(105)]];
+constant bool attention_register_cross = is_function_constant_defined(ATTENTION_REGISTER_DOMAIN)
+    ? ATTENTION_REGISTER_DOMAIN != 0 : false;
+
+inline uint attention_register_visible_start(constant AttentionMask& mask, uint query) {
+    return attention_register_cross ? 0 : attention_visible_start(mask, query);
+}
+inline uint attention_register_visible_end(
+    constant AttentionMask& mask, uint query, constant RegisterAttentionParams& p) {
+    // Cross masks intentionally have no segments. Do not infer their range
+    // through the structured helper, whose empty segment list returns zero.
+    return attention_register_cross ? uint(p.key_sequence) : attention_visible_end(mask, query);
+}
 
 constant uint ATTENTION_REGISTER_ALL_KEYS_VALID [[function_constant(104)]];
 constant bool attention_register_all_keys_valid =
@@ -75,7 +94,7 @@ kernel void ferrum_tensor_attention_register128_bf16(
     device const ushort* key [[buffer(1)]],
     device const ushort* value [[buffer(2)]],
     device ushort* output [[buffer(3)]],
-    constant AttentionParams& p [[buffer(4)]],
+    constant RegisterAttentionParams& p [[buffer(4)]],
     constant AttentionMask& mask [[buffer(5)]],
     threadgroup uchar* workspace [[threadgroup(0)]],
     uint group [[threadgroup_position_in_grid]],
@@ -99,15 +118,15 @@ kernel void ferrum_tensor_attention_register128_bf16(
         const ulong q_head = (job / p.query_tiles) % p.query_heads;
         const uint batch = uint(job / (p.query_tiles * p.query_heads));
         const ulong kv_head = q_head / (p.query_heads / p.key_value_heads);
-        const ulong q_base = (ulong(batch) * p.sequence * p.query_heads + q_head) * 128;
-        const ulong kv_base = (ulong(batch) * p.sequence * p.key_value_heads + kv_head) * 128;
-        const uint min_start = attention_visible_start(mask, uint(q_start));
-        const uint max_end = attention_visible_end(mask, uint(min(q_start + 31, p.sequence - 1)));
+        const ulong q_base = (ulong(batch) * p.query_sequence * p.query_heads + q_head) * 128;
+        const ulong kv_base = (ulong(batch) * p.key_sequence * p.key_value_heads + kv_head) * 128;
+        const uint min_start = attention_register_visible_start(mask, uint(q_start));
+        const uint max_end = attention_register_visible_end(mask, uint(min(q_start + 31, p.query_sequence - 1)), p);
         uint2 row_start, row_end;
         for (uint e = 0; e < 2; ++e) {
             ulong q = q_start + sid * 8 + rows[e];
-            row_start[e] = q < p.sequence ? attention_visible_start(mask, uint(q)) : 0;
-            row_end[e] = q < p.sequence ? attention_visible_end(mask, uint(q)) : 0;
+            row_start[e] = q < p.query_sequence ? attention_register_visible_start(mask, uint(q)) : 0;
+            row_end[e] = q < p.query_sequence ? attention_register_visible_end(mask, uint(q), p) : 0;
         }
         float2 row_max = float2(-INFINITY), row_sum = float2(0.0f);
         bool2 poisoned = bool2(false), seen = bool2(false);
@@ -122,10 +141,10 @@ kernel void ferrum_tensor_attention_register128_bf16(
         // read Q even when the batch has valid keys outside this row's range.
         if (tid < 32) {
             ulong q = q_start + tid;
-            q_tile[tid * 136 + 128] = ushort(q < p.sequence
+            q_tile[tid * 136 + 128] = ushort(q < p.query_sequence
                 && attention_register_has_key(mask, batch,
-                    attention_visible_start(mask, uint(q)),
-                    attention_visible_end(mask, uint(q))));
+                    attention_register_visible_start(mask, uint(q)),
+                    attention_register_visible_end(mask, uint(q), p)));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = tid; i < 32 * 128; i += 128) {
@@ -312,7 +331,7 @@ kernel void ferrum_tensor_attention_register128_bf16(
         #pragma unroll
         for (uint d = 0; d < 128; d += 8) for (uint e = 0; e < 2; ++e) {
             ulong q = q_start + sid * 8 + rows[e];
-            if (q < p.sequence) {
+            if (q < p.query_sequence) {
                 ushort result = poisoned[e] ? ushort(0x7fc0) : !seen[e] ? ushort(0)
                     : encode_bf16(accumulated[d / 8].thread_elements()[e] * (1.0f / row_sum[e]));
                 output[q_base + q * p.query_heads * 128 + d + columns[e]] = result;

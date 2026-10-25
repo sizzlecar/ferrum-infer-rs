@@ -21,6 +21,12 @@ enum Case {
         heads: u64,
         width: u64,
     },
+    CrossAttention {
+        queries: u64,
+        keys: u64,
+        heads: u64,
+        width: u64,
+    },
     Conv {
         channels: u64,
         side: u64,
@@ -90,6 +96,33 @@ impl Case {
                     ]),
                 )
             }
+            Self::CrossAttention {
+                queries,
+                keys,
+                heads,
+                width,
+            } => (
+                MetalTensorOperation::CrossAttention,
+                [queries, keys, keys]
+                    .into_iter()
+                    .map(|rows| bf16(vec![rows, heads * width]))
+                    .collect(),
+                bf16(vec![queries, heads * width]),
+                BTreeMap::from([
+                    (id("batch"), SemanticValue::Unsigned(1)),
+                    (id("head_dim"), SemanticValue::Unsigned(width)),
+                    (
+                        id("scale"),
+                        SemanticValue::Rational(CanonicalRational::new(1, 8).unwrap()),
+                    ),
+                    (id("key_run_counts"), SemanticValue::Integers(vec![1])),
+                    (
+                        id("key_run_lengths"),
+                        SemanticValue::Integers(vec![keys as i64]),
+                    ),
+                    (id("key_run_valid"), SemanticValue::Integers(vec![1])),
+                ]),
+            ),
             Self::Conv { channels, side } => (
                 MetalTensorOperation::Conv2d,
                 vec![
@@ -154,13 +187,15 @@ impl Case {
                 1 => (((index / inputs * 7 + index % inputs * 13) % 31) as i32 - 15) as f32 / 32.0,
                 _ => 0.0,
             },
-            Self::Attention { heads, width, .. } => match port {
-                0 => 0.0,
-                1 => ((index % 7) as i32 - 3) as f32 / 16.0,
-                // Each channel is constant over keys: every query must return
-                // the same channel value after the full online softmax/PV.
-                _ => (((index % (heads * width)) % 17) as i32 - 8) as f32 / 16.0,
-            },
+            Self::Attention { heads, width, .. } | Self::CrossAttention { heads, width, .. } => {
+                match port {
+                    0 => 0.0,
+                    1 => ((index % 7) as i32 - 3) as f32 / 16.0,
+                    // Each channel is constant over keys: every query must return
+                    // the same channel value after the full online softmax/PV.
+                    _ => (((index % (heads * width)) % 17) as i32 - 8) as f32 / 16.0,
+                }
+            }
             Self::Conv { channels, .. } | Self::PaddedConv { channels, .. } => match port {
                 0 => 1.0 / 64.0,
                 1 => (((index / (channels * 9)) % 7) as i32 - 3) as f32 / 256.0,
@@ -189,7 +224,7 @@ impl Case {
                 self.value(0, row * inputs + inner)
                     * self.value(1, (index % outputs) * inputs + inner)
             }
-            Self::Attention { .. } => self.value(2, index),
+            Self::Attention { .. } | Self::CrossAttention { .. } => self.value(2, index),
             Self::Conv { channels, side } => {
                 let channel = index / (side * side);
                 rounds(channels as f32 * 9.0 / 64.0 * self.value(1, channel * channels * 9))
@@ -247,6 +282,33 @@ fn managed_image_kernel_microbench() {
         Case::Conv {
             channels: 128,
             side: 512,
+        },
+    ]);
+}
+
+#[test]
+#[ignore = "real Metal rectangular image attention timing; requires exclusive GPU access"]
+fn managed_cross_attention_microbench() {
+    // Cached image editing has fewer query tokens than retained key tokens.
+    // Keep output validation independent of either implementation and include
+    // a tail plus a square-attention control using the same measured scope.
+    run_microbench(&[
+        Case::CrossAttention {
+            queries: 4096,
+            keys: 8192,
+            heads: 32,
+            width: 128,
+        },
+        Case::CrossAttention {
+            queries: 4096,
+            keys: 8228,
+            heads: 32,
+            width: 128,
+        },
+        Case::Attention {
+            sequence: 4096,
+            heads: 32,
+            width: 128,
         },
     ]);
 }

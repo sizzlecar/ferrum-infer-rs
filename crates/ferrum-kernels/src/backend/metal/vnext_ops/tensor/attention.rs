@@ -235,7 +235,7 @@ pub(super) fn encode(
     participant: &TensorParticipant<'_>,
     pipelines: Arc<Pipelines>,
 ) -> Result<MetalDeviceCommand, String> {
-    let mut shape = geometry(
+    let shape = geometry(
         kind,
         participant.bindings(),
         participant.attributes(),
@@ -280,9 +280,18 @@ pub(super) fn encode(
             shape.params.key_value_heads,
             shape.params.head_dim,
         );
-    if use_register {
-        register128::retile(&mut shape.params)?;
-    }
+    let register_params = if use_register {
+        Some(register128::RegisterParams::new(
+            shape.params.jobs / shape.params.query_tiles,
+            shape.params.sequence,
+            shape.params.sequence,
+            shape.params.query_heads,
+            shape.params.key_value_heads,
+            shape.params.scale,
+        )?)
+    } else {
+        None
+    };
     let kernel = if use_all_valid_register {
         "metal.structured_attention.bf16.register32x16.all_valid_keys"
     } else if use_register {
@@ -335,13 +344,16 @@ pub(super) fn encode(
         for (i, region) in regions.iter().enumerate() {
             set_region(compute, i as u64, region);
         }
-        set_params(compute, 4, &shape.params);
+        let grid_groups = if let Some(params) = &register_params {
+            set_params(compute, 4, params);
+            params.grid_groups
+        } else {
+            set_params(compute, 4, &shape.params);
+            shape.params.grid_groups
+        };
         set_params(compute, 5, &shape.mask);
         compute.set_threadgroup_memory_length(0, shared_bytes);
-        compute.dispatch_thread_groups(
-            MTLSize::new(shape.params.grid_groups, 1, 1),
-            MTLSize::new(128, 1, 1),
-        );
+        compute.dispatch_thread_groups(MTLSize::new(grid_groups, 1, 1), MTLSize::new(128, 1, 1));
         Ok(())
     })
     .map_err(|e| e.to_string())
