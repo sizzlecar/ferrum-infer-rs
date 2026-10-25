@@ -371,12 +371,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             };
             retained_dynamic - own
         };
-        if self.config.residency == ImageResidencyPolicy::Cold
-            && prefix.is_none()
-            && retained_dynamic == 0
-        {
-            return Ok(());
-        }
+        // Cold stages still coexist with the native allowance. Their static
+        // bytes contribute only to the active peak, not a resident sum.
         let mut retained_static = 0_u64;
         let mut active_peak = 0_u64;
         let mut counted_static = Vec::new();
