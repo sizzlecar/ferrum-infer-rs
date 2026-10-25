@@ -25,6 +25,7 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
 
 pub(super) struct Pipelines {
     conv: Option<ComputePipelineState>,
+    conv_1x1: Option<ComputePipelineState>,
     conv_3x3: Option<ComputePipelineState>,
     pad: Option<ComputePipelineState>,
     channel: Option<ComputePipelineState>,
@@ -83,10 +84,13 @@ pub(super) fn pipelines(
         selected.contains(&MetalTensorOperation::Conv2d),
         "ferrum_tensor_conv2d_bf16",
     )?;
-    let conv_3x3 = if conv.is_some() {
-        conv::direct_3x3_pipeline(runtime, library)?
+    let (conv_1x1, conv_3x3) = if conv.is_some() {
+        (
+            conv::direct_square_pipeline(runtime, library, 1)?,
+            conv::direct_square_pipeline(runtime, library, 3)?,
+        )
     } else {
-        None
+        (None, None)
     };
     let pad = create(conv.is_some(), "ferrum_tensor_pad_nchw_bf16")?;
     let channel = create(
@@ -132,6 +136,7 @@ pub(super) fn pipelines(
     Ok(Pipelines {
         mean,
         conv,
+        conv_1x1,
         conv_3x3,
         pad,
         channel,

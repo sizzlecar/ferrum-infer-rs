@@ -1,13 +1,14 @@
 use super::*;
 
-pub(super) fn direct_3x3_pipeline(
+pub(super) fn direct_square_pipeline(
     runtime: &MetalDeviceRuntime,
     library: &metal::LibraryRef,
+    kernel_size: u32,
 ) -> Result<Option<ComputePipelineState>, MetalDeviceRuntimeError> {
     let constants = metal::FunctionConstantValues::new();
     constants.set_constant_value_at_index(
-        (&true as *const bool).cast(),
-        metal::MTLDataType::Bool,
+        (&kernel_size as *const u32).cast(),
+        metal::MTLDataType::UInt,
         102,
     );
     let function = library
@@ -159,16 +160,16 @@ pub(super) fn encode(
             .map_err(|e| e.to_string())?;
     // Padding has already been materialized when scratch is present. The
     // specialization only omits bounds checks proven by the resolved geometry.
-    let direct_3x3 = params.kernel_height == 3
-        && params.kernel_width == 3
+    let direct_square = matches!(params.kernel_height, 1 | 3)
+        && params.kernel_height == params.kernel_width
         && params.stride_h == 1
         && params.stride_w == 1
         && params.dilation_h == 1
         && params.dilation_w == 1
         && params.pad_top == 0
         && params.pad_left == 0
-        && params.output_height + 2 <= params.input_height
-        && params.output_width + 2 <= params.input_width;
+        && params.output_height + params.kernel_height - 1 <= params.input_height
+        && params.output_width + params.kernel_width - 1 <= params.input_width;
     MetalDeviceCommand::tensor_operation(
         "metal.conv2d.bf16",
         regions,
@@ -195,8 +196,12 @@ pub(super) fn encode(
                 0
             };
             let compute = encoder.compute_encoder();
-            let pipeline = direct_3x3
-                .then_some(pipelines.spatial.conv_3x3.as_ref())
+            let pipeline = direct_square
+                .then(|| match params.kernel_width {
+                    1 => pipelines.spatial.conv_1x1.as_ref(),
+                    3 => pipelines.spatial.conv_3x3.as_ref(),
+                    _ => None,
+                })
                 .flatten()
                 .or(pipelines.spatial.conv.as_ref())
                 .expect("selected convolution pipeline");

@@ -1,6 +1,7 @@
 #include <metal_simdgroup_matrix>
-constant bool TENSOR_CONV_3X3 [[function_constant(102)]];
-constant bool direct_3x3 = is_function_constant_defined(TENSOR_CONV_3X3) ? TENSOR_CONV_3X3 : false;
+constant uint TENSOR_CONV_KERNEL [[function_constant(102)]];
+constant bool direct_square = is_function_constant_defined(TENSOR_CONV_KERNEL);
+constant uint direct_kernel = direct_square ? TENSOR_CONV_KERNEL : 1;
 struct PadParams {
     ulong elements, grid_threads, channels, height, width, padded_height, padded_width, top, left;
 };
@@ -33,7 +34,7 @@ kernel void ferrum_tensor_conv2d_bf16(
     ulong spatial = p.output_height * p.output_width;
     ulong input_spatial = p.input_height * p.input_width;
     ulong ic = p.input_channels / p.groups, oc = p.output_channels / p.groups;
-    ulong kernel_area = direct_3x3 ? 9 : p.kernel_height * p.kernel_width;
+    ulong kernel_area = direct_square ? direct_kernel * direct_kernel : p.kernel_height * p.kernel_width;
     ulong inner_columns = ic * kernel_area;
     uint local_row = (sid / 2) * 16, local_col = (sid % 2) * 32;
     for (ulong job = group; job < p.jobs; job += p.grid_groups) {
@@ -42,8 +43,8 @@ kernel void ferrum_tensor_conv2d_bf16(
         ulong batch_group = job / (p.spatial_tiles * p.output_tiles);
         ulong batch = batch_group / p.groups, channel_group = batch_group % p.groups;
         // Spatial division is invariant across all channel/kernel tiles. Cache
-        // it once on chip; the admitted padded input makes every 3x3 tap valid.
-        if (direct_3x3) {
+        // it once on chip; the admitted input makes every selected tap valid.
+        if (direct_square) {
             if (tid < 32) {
                 ulong position = row_start + tid;
                 source_origins[tid] = (position / p.output_width) * p.input_width
@@ -54,10 +55,10 @@ kernel void ferrum_tensor_conv2d_bf16(
         simdgroup_float8x8 sums[8];
         for (uint i = 0; i < 8; ++i) sums[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
         for (ulong k = 0; k < inner_columns; k += 32) {
-            if (direct_3x3) {
+            if (direct_square) {
                 ulong inner = k + tid % 32;
-                ulong channel = channel_group * ic + inner / 9;
-                ulong tap = (inner % 9) / 3 * p.input_width + inner % 3;
+                ulong channel = channel_group * ic + inner / kernel_area;
+                ulong tap = (inner % kernel_area) / direct_kernel * p.input_width + inner % direct_kernel;
                 ulong base = (batch * p.input_channels + channel) * input_spatial + tap;
                 for (uint i = tid; i < 1024; i += 128) {
                     ulong position = row_start + i / 32;
