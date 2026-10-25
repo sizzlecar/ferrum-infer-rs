@@ -10,6 +10,9 @@ pub(super) mod fixture;
 pub(super) mod oracle;
 use fixture::{Fixture, TransformFamily};
 
+#[path = "transforms/benchmark.rs"]
+mod benchmark;
+
 pub(super) const OPERATIONS: [MetalTensorOperation; 25] = [
     MetalTensorOperation::LayerNorm,
     MetalTensorOperation::HeadRmsNorm,

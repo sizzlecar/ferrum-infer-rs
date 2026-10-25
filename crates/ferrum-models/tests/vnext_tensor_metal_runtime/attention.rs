@@ -165,6 +165,15 @@ pub(super) fn verify(
                 keys: vec![vec![(33, false)]],
                 scale: CanonicalRational::new(1, 8).unwrap(),
             },
+            Case {
+                sequence: 97,
+                width: 128,
+                heads: 4,
+                kv_heads: if kind == StructuredAttention { 4 } else { 1 },
+                segments: vec![(97, true)],
+                keys: vec![vec![(97, true)], vec![(97, false)]],
+                scale: CanonicalRational::new(1, 8).unwrap(),
+            },
         ] {
             let mut values = case.values();
             if case.keys.iter().all(|runs| runs.iter().all(|v| !v.1)) {
@@ -244,10 +253,14 @@ pub(super) fn verify(
         }
         // Future masked nonfinite keys and values must not contaminate earlier
         // causal rows. Visible score poison is whole-head; V poison per channel.
-        for poison in ["key", "value", "query", "score_overflow"] {
+        for (width, poison) in [8, 128].into_iter().flat_map(|width| {
+            ["key", "value", "query", "score_overflow"]
+                .into_iter()
+                .map(move |poison| (width, poison))
+        }) {
             let case = Case {
                 sequence: 33,
-                width: 8,
+                width,
                 heads: 4,
                 kv_heads: if kind == StructuredAttention { 4 } else { 1 },
                 segments: vec![(33, false)],
@@ -279,7 +292,9 @@ pub(super) fn verify(
                 &values,
                 |actual| case.check(&values, actual),
             );
-            eprintln!("Metal {kind:?}: {poison}, mask and nonfinite classification passed");
+            eprintln!(
+                "Metal {kind:?}: D={width} {poison}, mask and nonfinite classification passed"
+            );
         }
     }
 }

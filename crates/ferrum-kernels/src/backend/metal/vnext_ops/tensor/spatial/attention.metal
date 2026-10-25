@@ -52,26 +52,26 @@ kernel void ferrum_tensor_spatial_attention_bf16(
             }
             for (uint n = 0; n < 2; ++n) simdgroup_store(dot[n], scores + local_row * 32 + local_col + n * 8, 32, 0, false);
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid < 16) {
-                bool valid = q_start + tid < p.spatial;
-                float maximum = row_max[tid];
-                if (valid) for (uint j = 0; j < 32 && k_start + j < p.spatial; ++j) {
-                    float s = scores[tid * 32 + j] * p.scale;
-                    scores[tid * 32 + j] = s;
-                    if (!isfinite(s)) poisoned[tid] = 1;
-                    else maximum = max(maximum, s);
+            // Cooperatively reduce one spatial row per SIMD group, retaining
+            // FP32 probabilities and the existing managed accumulator.
+            const uint lane = tid % 32;
+            for (uint r = sid; r < 16; r += 4) {
+                bool visible = q_start + r < p.spatial && k_start + lane < p.spatial;
+                float score = visible ? scores[r * 32 + lane] * p.scale : 0.0f;
+                bool bad = simd_any(visible && !isfinite(score)) || poisoned[r];
+                float maximum = max(row_max[r], simd_max(visible && isfinite(score) ? score : -INFINITY));
+                float rescale = 1.0f;
+                if (q_start + r < p.spatial && !bad)
+                    rescale = row_sum[r] == 0.0f ? 0.0f : exp(row_max[r] - maximum);
+                float probability = visible && !bad ? exp(score - maximum) : 0.0f;
+                scores[r * 32 + lane] = probability;
+                float total = simd_sum(probability);
+                if (lane == 0) {
+                    poisoned[r] = uint(bad);
+                    alpha[r] = rescale;
+                    row_sum[r] = row_sum[r] * rescale + total;
+                    row_max[r] = maximum;
                 }
-                float rescale = 1.0f, total = 0.0f;
-                if (valid && !poisoned[tid]) rescale = row_sum[tid] == 0.0f ? 0.0f : exp(row_max[tid] - maximum);
-                for (uint j = 0; j < 32; ++j) {
-                    float probability = valid && !poisoned[tid] && k_start + j < p.spatial
-                        ? exp(scores[tid * 32 + j] - maximum) : 0.0f;
-                    scores[tid * 32 + j] = probability;
-                    total = total + probability;
-                }
-                alpha[tid] = rescale;
-                row_sum[tid] = row_sum[tid] * rescale + total;
-                row_max[tid] = maximum;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint d = 0; d < p.channels; d += 32) {

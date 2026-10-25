@@ -114,32 +114,29 @@ kernel void ferrum_tensor_attention_bf16(
                 for (uint n = 0; n < 2; ++n)
                     simdgroup_store(dot[n], scores + local_row * 32 + local_col + n * 8, 32, 0, false);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (tid < 16) {
-                    float maximum = row_max[tid];
-                    bool present = false;
-                    for (uint j = 0; j < 32; ++j) {
-                        ulong k = k_start + j;
-                        if (k >= start[tid] && k < end[tid] && attention_key_valid(mask, batch, k)) {
-                            float score = scores[tid * 32 + j] * p.scale;
-                            scores[tid * 32 + j] = score;
-                            if (!isfinite(score)) poisoned[tid] = 1;
-                            else maximum = max(maximum, score);
-                            present = true;
-                        }
-                    }
+                // A SIMD group handles one row's keys in parallel. Only the
+                // reduction order changes; scores, exp, sums and rescaling all
+                // remain FP32 with no probability quantization boundary.
+                const uint lane = tid % 32;
+                for (uint r = sid; r < 16; r += 4) {
+                    ulong k = k_start + lane;
+                    bool visible = k >= start[r] && k < end[r] && attention_key_valid(mask, batch, k);
+                    float score = visible ? scores[r * 32 + lane] * p.scale : 0.0f;
+                    bool bad = simd_any(visible && !isfinite(score)) || poisoned[r];
+                    bool present = simd_any(visible);
+                    float maximum = max(row_max[r], simd_max(visible && isfinite(score) ? score : -INFINITY));
                     float rescale = 1.0f, total = 0.0f;
-                    if (present && !poisoned[tid])
-                        rescale = row_sum[tid] == 0.0f ? 0.0f : exp(row_max[tid] - maximum);
-                    for (uint j = 0; j < 32; ++j) {
-                        ulong k = k_start + j;
-                        float probability = !poisoned[tid] && k >= start[tid] && k < end[tid] && attention_key_valid(mask, batch, k)
-                            ? exp(scores[tid * 32 + j] - maximum) : 0.0f;
-                        scores[tid * 32 + j] = probability;
-                        total = total + probability;
+                    if (present && !bad)
+                        rescale = row_sum[r] == 0.0f ? 0.0f : exp(row_max[r] - maximum);
+                    float probability = visible && !bad ? exp(score - maximum) : 0.0f;
+                    scores[r * 32 + lane] = probability;
+                    total = simd_sum(probability);
+                    if (lane == 0) {
+                        poisoned[r] = uint(bad);
+                        alpha[r] = rescale;
+                        row_sum[r] = row_sum[r] * rescale + total;
+                        row_max[r] = maximum;
                     }
-                    alpha[tid] = rescale;
-                    row_sum[tid] = row_sum[tid] * rescale + total;
-                    row_max[tid] = maximum;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (uint d = 0; d < p.head_dim; d += 32) {
