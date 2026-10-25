@@ -1,6 +1,9 @@
 #include <metal_simdgroup_matrix>
 
-struct LinearParams { uint rows; uint inputs; uint outputs; uint bias_mode; };
+struct LinearParams {
+    uint rows; uint inputs; uint outputs; uint bias_mode;
+    uint row_offset; uint column_offset;
+};
 
 // Each SIMD group owns a 16 x 32 rectangle in a 32 x 64 output tile.
 // BF16 values are decoded directly to FP32; no intermediate FP16 boundary.
@@ -17,8 +20,8 @@ kernel void ferrum_tensor_linear_bf16(
     threadgroup float workspace[3072];
     threadgroup float* a = workspace;
     threadgroup float* b = workspace + 1024;
-    ulong row_start = ulong(group.x) * 32;
-    ulong col_start = ulong(group.y) * 64;
+    ulong row_start = ulong(p.row_offset) + ulong(group.x) * 32;
+    ulong col_start = ulong(p.column_offset) + ulong(group.y) * 64;
     uint local_row = (sid / 2) * 16;
     uint local_col = (sid % 2) * 32;
     simdgroup_float8x8 sums[8];

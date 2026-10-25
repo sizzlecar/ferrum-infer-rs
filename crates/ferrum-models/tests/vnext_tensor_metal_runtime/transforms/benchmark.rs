@@ -268,6 +268,30 @@ fn managed_masked_conv_microbench() {
 }
 
 #[test]
+#[ignore = "real Metal matrix-tail timing; requires exclusive GPU access"]
+fn managed_linear_tail_microbench() {
+    // Row, column and combined tails exercise disjoint interior/edge writes.
+    // These are operator diagnostics, not complete image-edit measurements.
+    run_microbench(&[
+        Case::Linear {
+            rows: 4112,
+            inputs: 4096,
+            outputs: 4096,
+        },
+        Case::Linear {
+            rows: 4096,
+            inputs: 4096,
+            outputs: 4097,
+        },
+        Case::Linear {
+            rows: 8208,
+            inputs: 4096,
+            outputs: 12289,
+        },
+    ]);
+}
+
+#[test]
 #[ignore = "real Metal spatial attention timing; requires exclusive GPU access"]
 fn managed_vae_attention_microbench() {
     // Smaller spatial grid for hotspot diagnosis; this is not a complete VAE

@@ -16,7 +16,7 @@ pub(in crate::backend::metal::vnext_ops::tensor) const THREADS: u64 = 128;
 pub(in crate::backend::metal::vnext_ops::tensor) const TILE_ROWS: u32 = 32;
 pub(in crate::backend::metal::vnext_ops::tensor) const TILE_COLUMNS: u32 = 64;
 pub(in crate::backend::metal::vnext_ops::tensor) const NUMERICAL_IDENTITY: &str =
-    "metal.mpp.bf16-bf16-f32.m32n64.dynamic-k;relaxed=false;integer-BF16-epilogue.v1";
+    "metal.mpp.bf16-bf16-f32.m32n64.interior;simdgroup-f32-tails;dynamic-k;relaxed=false;integer-BF16-epilogue.v2";
 pub(in crate::backend::metal::vnext_ops::tensor) const FINGERPRINT_SOURCE: &str =
     concat!(include_str!("mpp.rs"), include_str!("mpp.metal"));
 
@@ -105,20 +105,19 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
     Ok(MppPipelineAvailability::Ready(pipeline))
 }
 
-/// Full output tiles only. MPP tensor dimensions/strides use `int`; conservatively
+/// At least one full output tile. MPP tensor dimensions/strides use `int`; conservatively
 /// keep every flattened operand and output within its positive indexing range.
-/// The caller keeps the existing GEMM for all other shapes, including empty ones.
+/// The caller runs MPP only for the full interior and the existing GEMM for tails.
+/// Shapes without a full interior, including empty ones, use only the existing GEMM.
 pub(in crate::backend::metal::vnext_ops::tensor) fn supports_shape(
     rows: u32,
     inputs: u32,
     outputs: u32,
 ) -> bool {
     let maximum = i32::MAX as u64;
-    rows > 0
+    rows >= TILE_ROWS
         && inputs > 0
-        && outputs > 0
-        && rows % TILE_ROWS == 0
-        && outputs % TILE_COLUMNS == 0
+        && outputs >= TILE_COLUMNS
         && u64::from(rows) * u64::from(inputs) <= maximum
         && u64::from(outputs) * u64::from(inputs) <= maximum
         && u64::from(rows) * u64::from(outputs) <= maximum
@@ -162,11 +161,13 @@ mod tests {
     use super::supports_shape;
 
     #[test]
-    fn full_tiles_allow_dynamic_k_and_reject_unsafe_tensor_extents() {
+    fn interior_tiles_allow_tails_and_dynamic_k_but_reject_unsafe_tensor_extents() {
         assert!(supports_shape(32, 1, 64));
         assert!(supports_shape(64, 129, 192));
+        assert!(supports_shape(33, 129, 65));
+        assert!(supports_shape(65, 129, 129));
         assert!(!supports_shape(31, 129, 64));
-        assert!(!supports_shape(32, 129, 65));
+        assert!(!supports_shape(32, 129, 63));
         assert!(!supports_shape(0, 1, 64));
         assert!(!supports_shape(32, 0, 64));
         assert!(!supports_shape(32, 1, 0));

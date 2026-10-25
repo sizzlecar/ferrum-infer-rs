@@ -10,9 +10,9 @@ use ferrum_runtime::{
 
 pub(super) mod mpp;
 
-pub(super) const DENSE_PROFILE: &str = "metal.mpp_or_simdgroup.f32.bf16.v2";
+pub(super) const DENSE_PROFILE: &str = "metal.mpp_interior_simdgroup_tails.f32.bf16.v3";
 pub(super) const BLOCK_PROFILE: &str =
-    "metal.native_block.decode_f32_rn_bf16.mpp_or_simdgroup_f32.v2";
+    "metal.native_block.decode_f32_rn_bf16.mpp_interior_simdgroup_tails_f32.v3";
 pub(super) const FORMATS: [GgufBlockFormat; 4] = [
     GgufBlockFormat::Q8_0,
     GgufBlockFormat::Q4K,
@@ -169,7 +169,10 @@ impl LinearProvider {
             inputs: shape.inputs,
             outputs: shape.outputs,
             bias_mode,
+            row_offset: 0,
+            column_offset: 0,
         };
+        let dispatches = linear_dispatches(shape.rows, shape.outputs, use_mpp);
         let work = DeviceCommandLogicalWork::tensor(shape.output_bytes / 2, shape.operations)
             .map_err(|e| e.to_string())?;
         MetalDeviceCommand::tensor_operation(
@@ -214,29 +217,45 @@ impl LinearProvider {
                     1
                 };
                 let compute = encoder.compute_encoder();
-                let pipeline = if use_mpp {
-                    pipelines
-                        .linear_mpp
-                        .as_ref()
-                        .expect("selected full-tile MPP linear pipeline")
-                } else {
-                    pipelines.linear.as_ref().expect("selected linear pipeline")
-                };
-                compute.set_compute_pipeline_state(pipeline);
                 set_region(compute, 0, &regions[0]);
                 set_region(compute, 1, &regions[weight_index]);
                 set_region(compute, 2, &regions[2]);
-                set_params(compute, 3, &parameters);
                 // The no-bias mode never reads its typed placeholder.
                 set_region(compute, 4, &regions[if bias_mode == 0 { 0 } else { 3 }]);
-                compute.dispatch_thread_groups(
-                    MTLSize::new(
-                        u64::from(shape.rows).div_ceil(32),
-                        u64::from(shape.outputs).div_ceil(64),
-                        1,
-                    ),
-                    MTLSize::new(128, 1, 1),
-                );
+                // These rectangles cover the output exactly once. They share
+                // the admitted inputs/decode scratch and write disjoint output
+                // ranges, so no intermediate buffer or encoder boundary is needed.
+                for dispatch in dispatches {
+                    if dispatch.row_groups == 0 || dispatch.column_groups == 0 {
+                        continue;
+                    }
+                    let pipeline = if dispatch.mpp {
+                        pipelines
+                            .linear_mpp
+                            .as_ref()
+                            .expect("selected interior MPP linear pipeline")
+                    } else {
+                        pipelines.linear.as_ref().expect("selected linear pipeline")
+                    };
+                    compute.set_compute_pipeline_state(pipeline);
+                    set_params(
+                        compute,
+                        3,
+                        &LinearParams {
+                            row_offset: dispatch.row_offset,
+                            column_offset: dispatch.column_offset,
+                            ..parameters
+                        },
+                    );
+                    compute.dispatch_thread_groups(
+                        MTLSize::new(
+                            u64::from(dispatch.row_groups),
+                            u64::from(dispatch.column_groups),
+                            1,
+                        ),
+                        MTLSize::new(128, 1, 1),
+                    );
+                }
                 Ok(())
             },
         )
@@ -251,6 +270,88 @@ struct LinearParams {
     inputs: u32,
     outputs: u32,
     bias_mode: u32,
+    row_offset: u32,
+    column_offset: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LinearDispatch {
+    row_offset: u32,
+    column_offset: u32,
+    row_groups: u32,
+    column_groups: u32,
+    mpp: bool,
+}
+
+fn linear_dispatches(rows: u32, outputs: u32, use_mpp: bool) -> [LinearDispatch; 3] {
+    let mut dispatches = [LinearDispatch::default(); 3];
+    if !use_mpp {
+        dispatches[0] = LinearDispatch {
+            row_groups: rows.div_ceil(mpp::TILE_ROWS),
+            column_groups: outputs.div_ceil(mpp::TILE_COLUMNS),
+            ..LinearDispatch::default()
+        };
+        return dispatches;
+    }
+    let row_groups = rows / mpp::TILE_ROWS;
+    let column_groups = outputs / mpp::TILE_COLUMNS;
+    dispatches[0] = LinearDispatch {
+        row_groups,
+        column_groups,
+        mpp: true,
+        ..LinearDispatch::default()
+    };
+    // The bottom strip owns the bottom-right corner as well.
+    dispatches[1] = LinearDispatch {
+        row_offset: row_groups * mpp::TILE_ROWS,
+        row_groups: u32::from(rows % mpp::TILE_ROWS != 0),
+        column_groups: outputs.div_ceil(mpp::TILE_COLUMNS),
+        ..LinearDispatch::default()
+    };
+    dispatches[2] = LinearDispatch {
+        column_offset: column_groups * mpp::TILE_COLUMNS,
+        row_groups,
+        column_groups: u32::from(outputs % mpp::TILE_COLUMNS != 0),
+        ..LinearDispatch::default()
+    };
+    dispatches
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn interior_and_tail_dispatches_cover_each_output_once() {
+        for (rows, outputs) in [
+            (1, 1),
+            (31, 65),
+            (33, 63),
+            (32, 64),
+            (33, 64),
+            (32, 65),
+            (65, 129),
+        ] {
+            for available in [false, true] {
+                let use_mpp = available && mpp::supports_shape(rows, 129, outputs);
+                let mut visits = vec![0_u8; (rows * outputs) as usize];
+                for dispatch in linear_dispatches(rows, outputs, use_mpp) {
+                    let row_end = dispatch.row_offset + dispatch.row_groups * mpp::TILE_ROWS;
+                    let column_end =
+                        dispatch.column_offset + dispatch.column_groups * mpp::TILE_COLUMNS;
+                    if dispatch.mpp {
+                        assert!(row_end <= rows && column_end <= outputs);
+                    }
+                    for row in dispatch.row_offset..row_end.min(rows) {
+                        for column in dispatch.column_offset..column_end.min(outputs) {
+                            visits[(row * outputs + column) as usize] += 1;
+                        }
+                    }
+                }
+                assert!(visits.into_iter().all(|count| count == 1));
+            }
+        }
+    }
 }
 #[repr(C)]
 struct BlockDecodeParams {

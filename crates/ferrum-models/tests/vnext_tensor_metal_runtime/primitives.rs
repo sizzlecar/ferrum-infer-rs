@@ -249,7 +249,7 @@ pub(super) fn verify(
             run(kind, inputs, matrix(rows, outputs), attributes, values);
         }
         // The two projection contracts intentionally differ at the dot boundary.
-        for (rows, outputs) in [(1, 1), (32, 64)] {
+        for (rows, outputs) in [(1, 1), (32, 64), (33, 65)] {
             run(
                 kind,
                 vec![

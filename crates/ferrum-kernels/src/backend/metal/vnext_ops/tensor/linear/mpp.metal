@@ -10,10 +10,13 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-// Same buffer(3) layout as the existing LinearParams: four consecutive uints.
-struct MppLinearParams { uint rows; uint inputs; uint outputs; uint bias_mode; };
+// Same buffer(3) layout as LinearParams: six consecutive uints.
+struct MppLinearParams {
+    uint rows; uint inputs; uint outputs; uint bias_mode;
+    uint row_offset; uint column_offset;
+};
 
-// Host-side selection admits complete 32x64 output tiles, positive int-range
+// Host-side dispatch admits only complete 32x64 output tiles, positive int-range
 // extents, and exactly four 32-thread SIMD groups. K is dynamic, including tails.
 kernel void ferrum_tensor_linear_bf16_mpp(
     device const bfloat* input [[buffer(0)]],
@@ -25,8 +28,8 @@ kernel void ferrum_tensor_linear_bf16_mpp(
     uint tid [[thread_index_in_threadgroup]]) {
     constexpr int TM = 32;
     constexpr int TN = 64;
-    int row_start = int(group.x) * TM;
-    int col_start = int(group.y) * TN;
+    int row_start = int(p.row_offset) + int(group.x) * TM;
+    int col_start = int(p.column_offset) + int(group.y) * TN;
     // These are borrowed views of the original admitted buffers. Weight is OI,
     // so the descriptor transposes the right operand without a global copy.
     // MPP's cooperative type checker requires an unqualified element type.
