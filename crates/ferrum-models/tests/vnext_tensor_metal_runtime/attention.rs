@@ -3,10 +3,14 @@ use super::*;
 use ferrum_execution::component::TensorComponentPolicy;
 use transforms::{fixture::Fixture, run_case, spec};
 
+#[path = "attention/accumulation.rs"]
+mod accumulation;
 #[path = "attention/cross.rs"]
 mod cross;
 #[path = "attention/oracle.rs"]
 mod oracle;
+#[path = "attention/underflow.rs"]
+mod underflow;
 
 pub(super) struct Case {
     pub sequence: usize,
@@ -363,5 +367,7 @@ pub(super) fn verify(
             eprintln!("Metal {kind:?}: finite V scaled by 2^{exponent}, FP32 PV range, FP64 bound and retirement passed");
         }
     }
+    underflow::verify(runtime, registry, catalog, &policy, host);
+    accumulation::verify(runtime, registry, catalog, &policy, host);
     cross::verify(runtime, registry, catalog, host);
 }

@@ -36,9 +36,16 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "norm=zero-padded-adjacent-FP32-tree;separate-sqrt-div;device-bounded-threadgroup;",
     "head-rms=BF16-normalized-before-gamma;zero-centered=FP32-one-plus-gamma;",
     "adjacent-rope=F32-frequency-explicit-FMA;half-split=BF16-staged-products;",
-    "attention=MPP-BF16xBF16-F32-QK-head128-full-visible-tiles-or-FP32-simdgroup-QK;",
-    "attention-Q-fragments=generic-head128-cache;MPP-fallback-staged32;head128-output-cache-unchanged;",
-    "PV=MPP-FP32xFP32-FP32-finite-threadgroup-tiles-or-FP32-simdgroup;16-query-32-key-online-softmax;",
+    "attention-fallback=MPP-BF16xBF16-F32-QK-head128-full-visible-tiles-or-FP32-simdgroup-QK;",
+    "attention-head128-primary=SIMD-FP32-register-P2-O16-BQ32-BK16;ushort-exact-BF16-staging;",
+    "register-softmax=coordinate-calibrated-xor1-xor8-or-dynamic-four-peer-or-full-shuffle-FP32-reduction;exp;",
+    "register-finite-PV=guarded-explicit-FP32-output-rescale-then-inplace-MMA-C;",
+    "register-guards=sticky-V-above-2p93-O-nonfinite-or-above-2p124-P-alpha-outside-0-2;fallback=zero-PV-MMA-separate-add;",
+    "register-nonfinite-V=scalar-PV-then-separate-rescale-add;",
+    "register-key-runs=generic-or-validated-all-batch-all-valid;causal-segment-tail-ieee-order-unchanged;",
+    "register-attention=shared15120;previous-MPP-SIMD-tile16x32-fallback;cross-path-unchanged;",
+    "fallback-Q-fragments=generic-head128-cache;MPP-fallback-staged32;head128-output-cache-unchanged;",
+    "fallback-PV=MPP-FP32xFP32-FP32-finite-threadgroup-tiles-or-FP32-simdgroup;16-query-32-key-online-softmax;",
     "FP32-tile-SIMD-exp-reduction;separate-online-rescale;BF16-final-only;",
     "GQA=indexed-KV-no-replication;empty-row=positive-zero;",
     "cross-attention=independent-Q-KV-strides;key-only-mask;shared-online-QK-PV;",
@@ -105,6 +112,8 @@ fn fingerprint() -> String {
         include_bytes!("attention.metal"),
         attention::mpp::FINGERPRINT_SOURCE.as_bytes(),
         attention::mpp::NUMERICAL_IDENTITY.as_bytes(),
+        attention::register128::FINGERPRINT_SOURCE.as_bytes(),
+        attention::register128::NUMERICAL_IDENTITY.as_bytes(),
         attention::cross::FINGERPRINT_SOURCE.as_bytes(),
         attention::cross::PROFILE.as_bytes(),
         include_bytes!("transport.rs"),
@@ -134,6 +143,8 @@ struct Pipelines {
     attention: Option<ComputePipelineState>,
     attention_head128: Option<ComputePipelineState>,
     attention_mpp_head128: Option<ComputePipelineState>,
+    attention_register128: Option<ComputePipelineState>,
+    attention_register128_all_valid: Option<ComputePipelineState>,
     attention_shared_limit: u64,
     cross_attention: Option<attention::cross::CrossPipelines>,
     transport: Option<ComputePipelineState>,
@@ -341,6 +352,11 @@ pub fn metal_tensor_providers(
     } else {
         None
     };
+    let [attention_register128, attention_register128_all_valid] = if has_attention {
+        attention::register128::compile_variants(runtime)?
+    } else {
+        [None, None]
+    };
     let attention_mpp_head128 = if has_attention {
         match attention::mpp::compile(runtime.device())
             .map_err(MetalDeviceRuntimeError::contract)?
@@ -412,6 +428,8 @@ pub fn metal_tensor_providers(
         attention,
         attention_head128,
         attention_mpp_head128,
+        attention_register128,
+        attention_register128_all_valid,
         attention_shared_limit,
         transport,
         scatter,

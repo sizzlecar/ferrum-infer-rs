@@ -7,6 +7,7 @@ use ferrum_runtime::{
 
 pub(super) mod cross;
 pub(super) mod mpp;
+pub(super) mod register128;
 
 const CACHED_SHARED_BYTES: u64 = (2048 + 96) * 4;
 
@@ -106,6 +107,7 @@ const _: () = assert!(std::mem::size_of::<Params>() == 56);
 pub(super) struct Shape {
     params: Params,
     mask: NativeMask,
+    key_visibility: register128::KeyVisibility,
     query_bytes: u64,
     key_value_bytes: u64,
     shared_bytes: u64,
@@ -177,6 +179,7 @@ pub(super) fn geometry(
                 scale: g.scalar,
             },
             mask,
+            key_visibility: register128::KeyVisibility::AllValid,
             query_bytes: g.output_bytes,
             key_value_bytes: g.output_bytes,
             shared_bytes,
@@ -216,6 +219,10 @@ pub(super) fn geometry(
             scale: checked.effective_scale(),
         },
         mask: NativeMask::new(checked.mask(), checked.sequence_length() as u32),
+        key_visibility: register128::KeyVisibility::from_mask(
+            checked.mask(),
+            checked.sequence_length() as u32,
+        ),
         query_bytes,
         key_value_bytes,
         shared_bytes,
@@ -228,7 +235,7 @@ pub(super) fn encode(
     participant: &TensorParticipant<'_>,
     pipelines: Arc<Pipelines>,
 ) -> Result<MetalDeviceCommand, String> {
-    let shape = geometry(
+    let mut shape = geometry(
         kind,
         participant.bindings(),
         participant.attributes(),
@@ -259,57 +266,83 @@ pub(super) fn encode(
         disjoint(input, &output)?;
     }
     regions.push(output);
-    let use_mpp = pipelines.attention_mpp_head128.is_some()
+    let use_all_valid_register = shape.key_visibility == register128::KeyVisibility::AllValid
+        && pipelines.attention_register128_all_valid.is_some()
+        && register128::supports_shape(shape.params.sequence, shape.params.head_dim);
+    let use_register = use_all_valid_register
+        || (pipelines.attention_register128.is_some()
+            && register128::supports_shape(shape.params.sequence, shape.params.head_dim));
+    let use_mpp = !use_register
+        && pipelines.attention_mpp_head128.is_some()
         && mpp::supports_shape(
             shape.params.sequence,
             shape.params.query_heads,
             shape.params.key_value_heads,
             shape.params.head_dim,
         );
+    if use_register {
+        register128::retile(&mut shape.params)?;
+    }
+    let kernel = if use_all_valid_register {
+        "metal.structured_attention.bf16.register32x16.all_valid_keys"
+    } else if use_register {
+        "metal.structured_attention.bf16.register32x16"
+    } else if use_mpp {
+        "metal.structured_attention.bf16.mpp_qk"
+    } else {
+        "metal.structured_attention.bf16"
+    };
+    let shared_bytes = if use_register {
+        register128::SHARED_BYTES
+    } else if use_mpp || (shape.params.head_dim == 128 && pipelines.attention_head128.is_some()) {
+        CACHED_SHARED_BYTES
+    } else {
+        shape.shared_bytes
+    };
+    tracing::debug!(
+        kernel,
+        query_tile_rows = if use_register {
+            register128::QUERY_ROWS
+        } else {
+            16
+        },
+        shared_bytes,
+        sequence = shape.params.sequence,
+        query_heads = shape.params.query_heads,
+        "Metal attention dispatch selected"
+    );
     let work = DeviceCommandLogicalWork::tensor(shape.query_bytes / 2, shape.operations)
         .map_err(|e| e.to_string())?;
-    MetalDeviceCommand::tensor_operation(
-        if use_mpp {
-            "metal.structured_attention.bf16.mpp_qk"
-        } else {
-            "metal.structured_attention.bf16"
-        },
-        regions,
-        work,
-        move |encoder, regions| {
-            let compute = encoder.compute_encoder();
-            compute.set_compute_pipeline_state(
-                (if use_mpp {
-                    pipelines.attention_mpp_head128.as_ref()
-                } else if shape.params.head_dim == 128 {
-                    pipelines
-                        .attention_head128
-                        .as_ref()
-                        .or(pipelines.attention.as_ref())
-                } else {
-                    pipelines.attention.as_ref()
-                })
-                .expect("selected attention pipeline"),
-            );
-            for (i, region) in regions.iter().enumerate() {
-                set_region(compute, i as u64, region);
-            }
-            set_params(compute, 4, &shape.params);
-            set_params(compute, 5, &shape.mask);
-            let shared_bytes = if use_mpp
-                || (shape.params.head_dim == 128 && pipelines.attention_head128.is_some())
-            {
-                CACHED_SHARED_BYTES
+    MetalDeviceCommand::tensor_operation(kernel, regions, work, move |encoder, regions| {
+        let compute = encoder.compute_encoder();
+        compute.set_compute_pipeline_state(
+            (if use_all_valid_register {
+                pipelines.attention_register128_all_valid.as_ref()
+            } else if use_register {
+                pipelines.attention_register128.as_ref()
+            } else if use_mpp {
+                pipelines.attention_mpp_head128.as_ref()
+            } else if shape.params.head_dim == 128 {
+                pipelines
+                    .attention_head128
+                    .as_ref()
+                    .or(pipelines.attention.as_ref())
             } else {
-                shape.shared_bytes
-            };
-            compute.set_threadgroup_memory_length(0, shared_bytes);
-            compute.dispatch_thread_groups(
-                MTLSize::new(shape.params.grid_groups, 1, 1),
-                MTLSize::new(128, 1, 1),
-            );
-            Ok(())
-        },
-    )
+                pipelines.attention.as_ref()
+            })
+            .expect("selected attention pipeline"),
+        );
+        for (i, region) in regions.iter().enumerate() {
+            set_region(compute, i as u64, region);
+        }
+        set_params(compute, 4, &shape.params);
+        set_params(compute, 5, &shape.mask);
+        compute.set_threadgroup_memory_length(0, shared_bytes);
+        compute.dispatch_thread_groups(
+            MTLSize::new(shape.params.grid_groups, 1, 1),
+            MTLSize::new(128, 1, 1),
+        );
+        Ok(())
+    })
     .map_err(|e| e.to_string())
 }

@@ -313,7 +313,7 @@ pub(super) fn verify(
         attrs(vec![unsigned("rows", 128), unsigned("columns", 512)]),
         vec![all_bf16],
     );
-    for width in [2, 6, 72, 256] {
+    for width in [2, 6, 72, 128, 256] {
         let inputs = vec![
             matrix(3, width * 2),
             spec(vec![3, width], ElementType::F32),
