@@ -50,8 +50,16 @@ pub(super) fn geometry(
         if kind.inputs() == 2 && binding(values, ResolvedValueRole::Input, 1)?.tensor() != input {
             return Err("Metal binary pointwise operands must match exactly".into());
         }
-        let shape = Bf16SameShapeGeometry::new(input, output).map_err(|e| e.to_string())?;
-        (shape.rows(), shape.width(), false)
+        if matches!(
+            kind,
+            MetalTensorOperation::SiluNchw | MetalTensorOperation::PlainResidualAddNchw
+        ) {
+            let shape = Bf16NchwGeometry::new(input, output).map_err(|e| e.to_string())?;
+            (shape.element_count(), 1, false)
+        } else {
+            let shape = Bf16SameShapeGeometry::new(input, output).map_err(|e| e.to_string())?;
+            (shape.rows(), shape.width(), false)
+        }
     };
     let elements = rows
         .checked_mul(width)

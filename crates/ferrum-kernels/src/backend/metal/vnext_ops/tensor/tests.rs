@@ -5,7 +5,7 @@ use ferrum_runtime::{
     ResolvedValueStorage, ResourceId, TensorAccess,
 };
 
-fn value(
+pub(super) fn value(
     name: &str,
     role: ResolvedValueRole,
     ordinal: u32,

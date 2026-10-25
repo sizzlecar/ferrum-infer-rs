@@ -93,11 +93,15 @@ impl ModelFamilyProvider for TransformFamily {
                         MetalTensorOperation::RowGather
                             | MetalTensorOperation::BatchedRowConcat
                             | MetalTensorOperation::RowScatterAdd
+                            | MetalTensorOperation::PlainResidualAddNchw
+                            | MetalTensorOperation::SpatialUpsampleGather
                     ))
                     .then_some(ElementType::F32),
                     accumulation_type: (!matches!(
                         config.kind(),
-                        MetalTensorOperation::RowGather | MetalTensorOperation::BatchedRowConcat
+                        MetalTensorOperation::RowGather
+                            | MetalTensorOperation::BatchedRowConcat
+                            | MetalTensorOperation::SpatialUpsampleGather
                     ))
                     .then_some(ElementType::F32),
                     staged_arithmetic: None,

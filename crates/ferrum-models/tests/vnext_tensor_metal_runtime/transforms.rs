@@ -10,7 +10,7 @@ pub(super) mod fixture;
 pub(super) mod oracle;
 use fixture::{Fixture, TransformFamily};
 
-pub(super) const OPERATIONS: [MetalTensorOperation; 10] = [
+pub(super) const OPERATIONS: [MetalTensorOperation; 18] = [
     MetalTensorOperation::LayerNorm,
     MetalTensorOperation::HeadRmsNorm,
     MetalTensorOperation::ZeroCenteredRmsNorm,
@@ -21,6 +21,14 @@ pub(super) const OPERATIONS: [MetalTensorOperation; 10] = [
     MetalTensorOperation::RowGather,
     MetalTensorOperation::BatchedRowConcat,
     MetalTensorOperation::RowScatterAdd,
+    MetalTensorOperation::Conv2d,
+    MetalTensorOperation::ChannelL2Norm,
+    MetalTensorOperation::ChannelL2NormImage,
+    MetalTensorOperation::SiluNchw,
+    MetalTensorOperation::PlainResidualAddNchw,
+    MetalTensorOperation::SpatialAttention,
+    MetalTensorOperation::SpatialUpsampleGather,
+    MetalTensorOperation::SpatialGroupMean,
 ];
 pub(super) fn spec(dimensions: Vec<u64>, element_type: ElementType) -> ProgramTensorSpec {
     ProgramTensorSpec {
@@ -113,6 +121,46 @@ pub(super) fn run_case(
         &options,
     )
     .unwrap();
+    if component.executable().execution_plan().payload().nodes()[0]
+        .provider_resources()
+        .scratch()
+        .is_some()
+    {
+        let memory = component.executable().execution_plan().payload().memory();
+        let minimum = memory.static_bytes() + memory.minimum_runnable_request_bytes();
+        let compile = |capacity| {
+            let prepared = TypedFamilyRegistration::new(TransformFamily)
+                .prepare_with_profile(
+                    &serde_json::to_value(fixture).unwrap(),
+                    &id(fixture.kind().profile()),
+                )
+                .unwrap();
+            CompiledTensorComponent::compile(
+                prepared,
+                registry,
+                catalog,
+                &TensorComponentPolicy::new(
+                    capacity,
+                    runtime
+                        .descriptor()
+                        .dynamic_storage_profiles
+                        .iter()
+                        .copied()
+                        .collect(),
+                )
+                .unwrap(),
+                &WeightMaterializerRegistry::identity_only().unwrap(),
+                &options,
+            )
+        };
+        assert!(
+            matches!(compile(minimum-1), Err(VNextError::PlanCapacityExceeded { required_bytes, usable_capacity_bytes })
+            if required_bytes == minimum && usable_capacity_bytes == minimum-1)
+        );
+        // This is the plan compiler's boundary. Execution uses the unchanged
+        // physical device ceiling, which also contains native bootstrap claims.
+        compile(minimum).unwrap();
+    }
     let mut session = component
         .initialize(
             runtime.clone(),

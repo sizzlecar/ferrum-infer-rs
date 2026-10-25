@@ -23,6 +23,14 @@ pub enum MetalTensorOperation {
     RowGather,
     BatchedRowConcat,
     RowScatterAdd,
+    Conv2d,
+    ChannelL2Norm,
+    ChannelL2NormImage,
+    SiluNchw,
+    PlainResidualAddNchw,
+    SpatialAttention,
+    SpatialUpsampleGather,
+    SpatialGroupMean,
 }
 
 impl MetalTensorOperation {
@@ -35,7 +43,7 @@ impl MetalTensorOperation {
         Self::GeluTanh,
         Self::PlainResidualAdd,
     ];
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 27] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -55,9 +63,18 @@ impl MetalTensorOperation {
         Self::RowGather,
         Self::BatchedRowConcat,
         Self::RowScatterAdd,
+        Self::Conv2d,
+        Self::ChannelL2Norm,
+        Self::ChannelL2NormImage,
+        Self::SiluNchw,
+        Self::PlainResidualAddNchw,
+        Self::SpatialAttention,
+        Self::SpatialUpsampleGather,
+        Self::SpatialGroupMean,
     ];
     pub(super) fn is_pointwise(self) -> bool {
         Self::POINTWISE.contains(&self)
+            || matches!(self, Self::SiluNchw | Self::PlainResidualAddNchw)
     }
     pub(super) fn is_linear(self) -> bool {
         matches!(self, Self::DenseLinear | Self::BlockLinear)
@@ -80,6 +97,26 @@ impl MetalTensorOperation {
     pub(super) fn is_transport(self) -> bool {
         matches!(self, Self::RowGather | Self::BatchedRowConcat)
     }
+    pub(super) fn is_channel_norm(self) -> bool {
+        matches!(self, Self::ChannelL2Norm | Self::ChannelL2NormImage)
+    }
+    pub(super) fn is_spatial(self) -> bool {
+        self.is_channel_norm()
+            || matches!(
+                self,
+                Self::Conv2d
+                    | Self::SpatialAttention
+                    | Self::SpatialUpsampleGather
+                    | Self::SpatialGroupMean
+            )
+    }
+    pub(super) fn pointwise_shader_kind(self) -> u32 {
+        match self {
+            Self::SiluNchw => Self::Silu as u32,
+            Self::PlainResidualAddNchw => Self::PlainResidualAdd as u32,
+            _ => self as u32,
+        }
+    }
     pub fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::Silu => silu_bf16_contract(),
@@ -101,6 +138,14 @@ impl MetalTensorOperation {
             Self::RowGather => row_gather_bf16_contract(),
             Self::BatchedRowConcat => batched_row_concat_bf16_contract(),
             Self::RowScatterAdd => row_scatter_add_bf16_contract(),
+            Self::Conv2d => conv2d_bf16_contract(),
+            Self::ChannelL2Norm => channel_l2_norm_bf16_contract(),
+            Self::ChannelL2NormImage => channel_l2_norm_image_bf16_contract(),
+            Self::SiluNchw => silu_nchw_bf16_contract(),
+            Self::PlainResidualAddNchw => plain_residual_add_nchw_bf16_contract(),
+            Self::SpatialAttention => spatial_attention_bf16_contract(),
+            Self::SpatialUpsampleGather => spatial_upsample_gather_bf16_contract(),
+            Self::SpatialGroupMean => spatial_group_mean_bf16_contract(),
         }
     }
     pub fn profile(self) -> &'static str {
@@ -130,6 +175,20 @@ impl MetalTensorOperation {
             Self::RowGather => "metal.bitcopy.row_gather.bf16.v1",
             Self::BatchedRowConcat => "metal.bitcopy.batched_row_concat.bf16.v1",
             Self::RowScatterAdd => "metal.precise.row_scatter_add.bf16.v1",
+            Self::Conv2d => "metal.simdgroup.f32.conv2d.bf16.pad_then_dot_then_bias.v1",
+            Self::ChannelL2Norm => "metal.precise.channel_l2_norm.bf16.padded_pairwise_staged.v1",
+            Self::ChannelL2NormImage => {
+                "metal.precise.channel_l2_norm_image.bf16.padded_pairwise_staged.v1"
+            }
+            Self::SiluNchw => "metal.precise.silu.nchw.bf16.v1",
+            Self::PlainResidualAddNchw => "metal.precise.plain_residual_add.nchw.bf16.v1",
+            Self::SpatialAttention => {
+                "metal.simdgroup.f32.spatial_attention.bf16.tile16x32_managed_accum.v1"
+            }
+            Self::SpatialUpsampleGather => "metal.bitcopy.spatial_upsample_gather.bf16.v1",
+            Self::SpatialGroupMean => {
+                "metal.precise.spatial_group_mean.bf16.serial_first_element.v1"
+            }
         }
     }
     pub(super) fn capability(self) -> &'static str {
@@ -153,6 +212,14 @@ impl MetalTensorOperation {
             Self::RowGather => ROW_GATHER_BF16_CAPABILITY_ID,
             Self::BatchedRowConcat => BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID,
             Self::RowScatterAdd => ROW_SCATTER_ADD_BF16_CAPABILITY_ID,
+            Self::Conv2d => CONV2D_BF16_CAPABILITY_ID,
+            Self::ChannelL2Norm => CHANNEL_L2_NORM_BF16_CAPABILITY_ID,
+            Self::ChannelL2NormImage => CHANNEL_L2_NORM_IMAGE_BF16_CAPABILITY_ID,
+            Self::SiluNchw => SILU_NCHW_BF16_CAPABILITY_ID,
+            Self::PlainResidualAddNchw => PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID,
+            Self::SpatialAttention => SPATIAL_ATTENTION_BF16_CAPABILITY_ID,
+            Self::SpatialUpsampleGather => SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID,
+            Self::SpatialGroupMean => SPATIAL_GROUP_MEAN_BF16_CAPABILITY_ID,
         }
     }
     pub(super) fn operation(self) -> &'static str {
@@ -176,6 +243,14 @@ impl MetalTensorOperation {
             Self::RowGather => ROW_GATHER_BF16_OPERATION_ID,
             Self::BatchedRowConcat => BATCHED_ROW_CONCAT_BF16_OPERATION_ID,
             Self::RowScatterAdd => ROW_SCATTER_ADD_BF16_OPERATION_ID,
+            Self::Conv2d => CONV2D_BF16_OPERATION_ID,
+            Self::ChannelL2Norm => CHANNEL_L2_NORM_BF16_OPERATION_ID,
+            Self::ChannelL2NormImage => CHANNEL_L2_NORM_IMAGE_BF16_OPERATION_ID,
+            Self::SiluNchw => SILU_NCHW_BF16_OPERATION_ID,
+            Self::PlainResidualAddNchw => PLAIN_RESIDUAL_ADD_NCHW_BF16_OPERATION_ID,
+            Self::SpatialAttention => SPATIAL_ATTENTION_BF16_OPERATION_ID,
+            Self::SpatialUpsampleGather => SPATIAL_UPSAMPLE_GATHER_BF16_OPERATION_ID,
+            Self::SpatialGroupMean => SPATIAL_GROUP_MEAN_BF16_OPERATION_ID,
         }
     }
     pub(super) fn name(self) -> &'static str {
@@ -199,6 +274,14 @@ impl MetalTensorOperation {
             Self::RowGather => "row_gather",
             Self::BatchedRowConcat => "batched_row_concat",
             Self::RowScatterAdd => "row_scatter_add",
+            Self::Conv2d => "conv2d",
+            Self::ChannelL2Norm => "channel_l2_norm",
+            Self::ChannelL2NormImage => "channel_l2_norm_image",
+            Self::SiluNchw => "silu_nchw",
+            Self::PlainResidualAddNchw => "plain_residual_add_nchw",
+            Self::SpatialAttention => "spatial_attention",
+            Self::SpatialUpsampleGather => "spatial_upsample_gather",
+            Self::SpatialGroupMean => "spatial_group_mean",
         }
     }
     pub(super) fn inputs(self) -> u32 {
@@ -214,6 +297,10 @@ impl MetalTensorOperation {
             Self::RowGather => 1,
             Self::BatchedRowConcat => 2,
             Self::RowScatterAdd => 2,
+            Self::Conv2d => 3,
+            Self::ChannelL2Norm | Self::ChannelL2NormImage | Self::PlainResidualAddNchw => 2,
+            Self::SiluNchw | Self::SpatialAttention | Self::SpatialUpsampleGather => 1,
+            Self::SpatialGroupMean => 1,
         }
     }
     pub(super) fn broadcasts(self) -> bool {
@@ -221,9 +308,9 @@ impl MetalTensorOperation {
     }
     pub(super) fn pointwise_operations(self) -> u64 {
         match self {
-            Self::Silu => 4,
+            Self::Silu | Self::SiluNchw => 4,
             Self::SiluMul => 5,
-            Self::Tanh | Self::PlainResidualAdd => 1,
+            Self::Tanh | Self::PlainResidualAdd | Self::PlainResidualAddNchw => 1,
             Self::ModulationScale | Self::GatedResidual => 2,
             Self::GeluTanh => 9,
             _ => unreachable!("non-pointwise work is computed by its own geometry"),

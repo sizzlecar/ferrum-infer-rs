@@ -1,0 +1,86 @@
+#include <metal_simdgroup_matrix>
+struct PadParams {
+    ulong elements, grid_threads, channels, height, width, padded_height, padded_width, top, left;
+};
+kernel void ferrum_tensor_pad_nchw_bf16(
+    device const ushort* input [[buffer(0)]], device ushort* output [[buffer(1)]],
+    constant PadParams& p [[buffer(2)]], uint tid [[thread_position_in_grid]]) {
+    for (ulong i = tid; i < p.elements; i += p.grid_threads) {
+        ulong x = i % p.padded_width, y = (i / p.padded_width) % p.padded_height;
+        ulong plane = i / (p.padded_width * p.padded_height);
+        output[i] = y >= p.top && y - p.top < p.height && x >= p.left && x - p.left < p.width
+            ? input[(plane * p.height + y - p.top) * p.width + x - p.left] : ushort(0);
+    }
+}
+struct ConvParams {
+    ulong jobs, grid_groups, spatial_tiles, output_tiles, groups;
+    ulong input_channels, input_height, input_width, output_channels, output_height, output_width;
+    ulong kernel_height, kernel_width, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_left;
+};
+// 32 spatial positions x 64 output channels; im2col exists only on chip.
+// Explicit padding is a prior managed stage; implicit padding is loaded here.
+kernel void ferrum_tensor_conv2d_bf16(
+    device const ushort* input [[buffer(0)]], device const ushort* weight [[buffer(1)]],
+    device const ushort* bias [[buffer(2)]], device ushort* output [[buffer(3)]],
+    constant ConvParams& p [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sid [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float workspace[3072];
+    threadgroup float* a = workspace;
+    threadgroup float* b = workspace + 1024;
+    ulong spatial = p.output_height * p.output_width;
+    ulong input_spatial = p.input_height * p.input_width;
+    ulong ic = p.input_channels / p.groups, oc = p.output_channels / p.groups;
+    ulong kernel_area = p.kernel_height * p.kernel_width, inner_columns = ic * kernel_area;
+    uint local_row = (sid / 2) * 16, local_col = (sid % 2) * 32;
+    for (ulong job = group; job < p.jobs; job += p.grid_groups) {
+        ulong row_start = (job % p.spatial_tiles) * 32;
+        ulong col_start = ((job / p.spatial_tiles) % p.output_tiles) * 64;
+        ulong batch_group = job / (p.spatial_tiles * p.output_tiles);
+        ulong batch = batch_group / p.groups, channel_group = batch_group % p.groups;
+        simdgroup_float8x8 sums[8];
+        for (uint i = 0; i < 8; ++i) sums[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        for (ulong k = 0; k < inner_columns; k += 32) {
+            for (uint i = tid; i < 1024; i += 128) {
+                ulong position = row_start + i / 32, inner = k + i % 32;
+                float x = 0.0f;
+                if (position < spatial && inner < inner_columns) {
+                    ulong ky = (inner % kernel_area) / p.kernel_width, kx = inner % p.kernel_width;
+                    ulong y = (position / p.output_width) * p.stride_h + ky * p.dilation_h;
+                    ulong xcol = (position % p.output_width) * p.stride_w + kx * p.dilation_w;
+                    if (y >= p.pad_top && y - p.pad_top < p.input_height && xcol >= p.pad_left && xcol - p.pad_left < p.input_width) {
+                        ulong channel = channel_group * ic + inner / kernel_area;
+                        x = decode_bf16(input[(batch * p.input_channels + channel) * input_spatial
+                            + (y - p.pad_top) * p.input_width + xcol - p.pad_left]);
+                    }
+                }
+                a[i] = x;
+            }
+            for (uint i = tid; i < 2048; i += 128) {
+                ulong channel = col_start + i % 64, inner = k + i / 64;
+                b[i] = channel < oc && inner < inner_columns
+                    ? decode_bf16(weight[(channel_group * oc + channel) * inner_columns + inner]) : 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint chunk = 0; chunk < 32; chunk += 8) {
+                simdgroup_float8x8 av[2], bv[4];
+                for (uint m = 0; m < 2; ++m) simdgroup_load(av[m], a + (local_row + m * 8) * 32 + chunk, 32, 0, false);
+                for (uint n = 0; n < 4; ++n) simdgroup_load(bv[n], b + chunk * 64 + local_col + n * 8, 64, 0, false);
+                for (uint m = 0; m < 2; ++m) for (uint n = 0; n < 4; ++n)
+                    simdgroup_multiply_accumulate(sums[m * 4 + n], av[m], bv[n], sums[m * 4 + n]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (uint m = 0; m < 2; ++m) for (uint n = 0; n < 4; ++n)
+            simdgroup_store(sums[m * 4 + n], b + (local_row + m * 8) * 64 + local_col + n * 8, 64, 0, false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < 2048; i += 128) {
+            ulong position = row_start + i / 64, channel = col_start + i % 64;
+            if (position < spatial && channel < oc) {
+                ulong output_channel = channel_group * oc + channel;
+                output[(batch * p.output_channels + output_channel) * spatial + position]
+                    = encode_bf16(rounded_bf16(b[i]) + decode_bf16(bias[output_channel]));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}

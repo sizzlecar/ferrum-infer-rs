@@ -14,6 +14,7 @@ mod operation;
 mod pointwise;
 mod rope;
 mod scatter;
+mod spatial;
 #[cfg(test)]
 mod tests;
 mod transport;
@@ -37,6 +38,11 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "nonfinite-V=visible-only-scalar-PV;zero-global-scratch;device-bounded-on-chip;",
     "transport=BF16-bitcopy;bounded-row-runs;per-batch-concat;zero-arithmetic;",
     "row-scatter=ordered-disjoint-runs;F32-add-BF16-final;untouched-bitcopy;",
+    "conv=F32-simdgroup-implicit-im2col;explicit-pad-admitted-before-GEMM;BF16-dot-before-bias;",
+    "channel-L2=padded-pairwise-F32;sqrt-clamp-div;BF16-div-scale-gamma-plus-zero;",
+    "spatial-attention=16x32-online-F32;NCHW-QKV;admitted-F32-accumulator;",
+    "spatial-upsample=bitcopy-explicit-channel-map;",
+    "spatial-group-mean=last-real-frame;serial-F32-first-element;F32-div;BF16-final;",
     "independent-Metal-profile;no-CUDA-or-Reference-bitwise-claim"
 );
 
@@ -77,6 +83,8 @@ fn fingerprint() -> String {
         include_bytes!("transport.metal"),
         include_bytes!("scatter.rs"),
         include_bytes!("scatter.metal"),
+        include_bytes!("spatial.rs"),
+        spatial::FINGERPRINT_SOURCE.as_bytes(),
         native_blocks::FINGERPRINT_SOURCE.as_bytes(),
         METAL_TENSOR_NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("../mod.rs"),
@@ -95,6 +103,7 @@ struct Pipelines {
     attention_shared_limit: u64,
     transport: Option<ComputePipelineState>,
     scatter: Option<ComputePipelineState>,
+    spatial: spatial::Pipelines,
     // Last field: native pipeline states release before their budget owner.
     _retention: MetalTensorProviderRetention,
 }
@@ -119,6 +128,11 @@ pub fn metal_tensor_providers(
                 | MetalTensorOperation::ZeroCenteredRmsNorm
                 | MetalTensorOperation::RowGather
                 | MetalTensorOperation::RowScatterAdd
+                | MetalTensorOperation::Conv2d
+                | MetalTensorOperation::ChannelL2Norm
+                | MetalTensorOperation::ChannelL2NormImage
+                | MetalTensorOperation::SpatialUpsampleGather
+                | MetalTensorOperation::SpatialGroupMean
                 | MetalTensorOperation::BatchedRowConcat => {
                     &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID]
                 }
@@ -184,6 +198,7 @@ pub fn metal_tensor_providers(
     if has_scatter {
         source.push_str(include_str!("scatter.metal"));
     }
+    spatial::append_source(selected, &mut source);
     let options = CompileOptions::new();
     options.set_fast_math_enabled(false);
     let library = runtime
@@ -257,6 +272,7 @@ pub fn metal_tensor_providers(
         }
     }
     let pipelines = Arc::new(Pipelines {
+        spatial: spatial::pipelines(runtime, selected, &library)?,
         pointwise,
         linear,
         block_decode,
@@ -333,6 +349,15 @@ impl OperationResourceEstimator for TensorProvider {
                 .map_err(invalid_plan)?;
         } else if self.kind == MetalTensorOperation::RowScatterAdd {
             scatter::geometry(request.values(), request.attributes()).map_err(invalid_plan)?;
+        } else if self.kind.is_spatial() {
+            let bytes = spatial::scratch_bytes(
+                self.kind,
+                request.values(),
+                request.attributes(),
+                &self.pipelines.spatial,
+            )
+            .map_err(invalid_plan)?;
+            return spatial::estimate_workspace(&self.descriptor, &request, estimate, bytes);
         } else {
             pointwise::geometry(self.kind, request.values(), request.attributes())
                 .map_err(invalid_plan)?;
@@ -401,6 +426,9 @@ impl TensorProvider {
         if self.kind == MetalTensorOperation::RowScatterAdd {
             return scatter::encode(participant, Arc::clone(&self.pipelines));
         }
+        if self.kind.is_spatial() {
+            return spatial::encode(self.kind, participant, Arc::clone(&self.pipelines));
+        }
         let shape =
             pointwise::geometry(self.kind, participant.bindings(), participant.attributes())?;
         let mut regions = Vec::with_capacity(self.kind.inputs() as usize + 1);
@@ -447,7 +475,7 @@ impl TensorProvider {
         let params = Params {
             elements: shape.elements,
             width: shape.width,
-            kind: kind as u32,
+            kind: kind.pointwise_shader_kind(),
             row_broadcast: u32::from(shape.row_broadcast),
         };
         let work = DeviceCommandLogicalWork::tensor(shape.elements, shape.operations)

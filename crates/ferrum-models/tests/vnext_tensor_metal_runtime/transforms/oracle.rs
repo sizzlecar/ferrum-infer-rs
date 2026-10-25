@@ -91,6 +91,76 @@ fn tree_sum(values: &[Interval]) -> Interval {
     )
 }
 
+pub(crate) fn channel_l2(
+    input: &[f32],
+    gamma: &[f32],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    epsilon: f32,
+    scale: f32,
+    actual: &[f32],
+) {
+    assert_eq!(input.len(), batch * channels * spatial);
+    assert_eq!(actual.len(), input.len());
+    for n in 0..batch {
+        for pixel in 0..spatial {
+            let indices: Vec<_> = (0..channels)
+                .map(|c| (n * channels + c) * spatial + pixel)
+                .collect();
+            let source: Vec<_> = indices.iter().map(|&i| input[i]).collect();
+            if source.iter().any(|x| !x.is_finite()) {
+                let nan = source.iter().any(|x| x.is_nan());
+                for (&i, &x) in indices.iter().zip(&source) {
+                    if nan || x.is_infinite() {
+                        assert!(actual[i].is_nan());
+                    } else {
+                        assert_eq!(actual[i].to_bits(), 0);
+                    }
+                }
+                continue;
+            }
+            if source.iter().all(|&x| x == 0.0) {
+                for &i in &indices {
+                    assert_eq!(actual[i].to_bits(), 0);
+                }
+                continue;
+            }
+            let squares: Vec<_> = source
+                .iter()
+                .map(|&v| Interval::point(v).square().fp32())
+                .collect();
+            let length = tree_sum(&squares).sqrt();
+            let inverse = Interval {
+                lo: length.lo.max(epsilon as f64),
+                hi: length.hi.max(epsilon as f64),
+            }
+            .inverse();
+            for (c, &i) in indices.iter().enumerate() {
+                let bound = Interval::point(input[i])
+                    .mul(inverse)
+                    .fp32()
+                    .bf16()
+                    .mul(Interval::point(scale))
+                    .fp32()
+                    .bf16()
+                    .mul(Interval::point(gamma[c]))
+                    .fp32()
+                    .bf16();
+                assert!(
+                    actual[i].is_finite()
+                        && actual[i] as f64 >= bound.lo
+                        && actual[i] as f64 <= bound.hi,
+                    "channel L2 index={i}: {} outside [{}, {}]",
+                    actual[i],
+                    bound.lo,
+                    bound.hi
+                );
+            }
+        }
+    }
+}
+
 pub(crate) fn norm(
     kind: MetalTensorOperation,
     input: &[f32],

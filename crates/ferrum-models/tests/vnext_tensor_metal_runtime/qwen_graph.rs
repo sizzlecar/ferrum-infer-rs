@@ -1,4 +1,4 @@
-//! Complete text encoder and multi-layer DiT graphs, including native Q8 matrices.
+//! Complete text, DiT and VAE graphs, including native Q8 DiT matrices.
 //! Generated weights qualify arithmetic/composition, not trained image quality.
 use super::*;
 use ferrum_execution::component::{
@@ -12,6 +12,8 @@ mod fixture;
 mod oracle;
 #[path = "qwen_graph/text.rs"]
 mod text;
+#[path = "qwen_graph/vae.rs"]
+mod vae;
 use fixture::{Data, Inspect, Source};
 
 fn architecture(layers: u64) -> QwenImage21Config {
@@ -180,7 +182,7 @@ fn transformer_case(native: bool, editing: bool) -> (QwenImage21TransformerConfi
 
 pub(super) fn maximum_command_count() -> usize {
     // Resolve before constructing the runtime, like a product factory. Include
-    // both DiT and text graphs, with one upload command per input as well as
+    // DiT, text and VAE graphs, with one upload command per input as well as
     // their compute nodes, like the existing CUDA composition.
     [false, true]
         .into_iter()
@@ -203,6 +205,7 @@ pub(super) fn maximum_command_count() -> usize {
         .max()
         .unwrap()
         .max(text::maximum_command_count())
+        .max(vae::maximum_command_count())
 }
 
 pub(super) fn verify(
@@ -304,4 +307,5 @@ pub(super) fn verify(
         }
     }
     text::verify(runtime, registry, catalog, &host);
+    vae::verify(runtime, registry, catalog, &host);
 }

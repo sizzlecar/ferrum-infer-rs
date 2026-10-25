@@ -98,6 +98,21 @@ pub(super) fn graph(graph: &ModelProgram, data: &BTreeMap<ProgramValueId, Data>)
         let y = &output.values;
         match kind {
             DenseLinear | BlockLinear => dense(inputs[0], inputs[1], y),
+            Conv2d
+            | ChannelL2Norm
+            | ChannelL2NormImage
+            | SpatialAttention
+            | SpatialUpsampleGather
+            | SpatialGroupMean => spatial::check(
+                kind,
+                &node.attributes,
+                &inputs
+                    .iter()
+                    .map(|v| (&v.spec, v.values.as_slice()))
+                    .collect::<Vec<_>>(),
+                &output.spec,
+                y,
+            ),
             LayerNorm | HeadRmsNorm | ZeroCenteredRmsNorm => {
                 let width = if kind == HeadRmsNorm {
                     unsigned(node, "head_dim")
@@ -228,7 +243,17 @@ pub(super) fn graph(graph: &ModelProgram, data: &BTreeMap<ProgramValueId, Data>)
                 for (i, (&x, &got)) in x.iter().zip(y).enumerate() {
                     let p = inputs.get(1).map_or(0.0, |v| v.values[i % v.values.len()]);
                     let u = inputs.get(2).map_or(0.0, |v| v.values[i]);
-                    pointwise(kind, x, p, u, got);
+                    pointwise(
+                        match kind {
+                            SiluNchw => Silu,
+                            PlainResidualAddNchw => PlainResidualAdd,
+                            _ => kind,
+                        },
+                        x,
+                        p,
+                        u,
+                        got,
+                    );
                 }
                 assert_eq!(x.len(), y.len());
             }
