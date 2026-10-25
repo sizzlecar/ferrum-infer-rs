@@ -50,6 +50,7 @@ mod native_blocks;
 #[cfg(test)]
 mod numerical_tolerance;
 mod primitives;
+pub mod tensor;
 mod weights;
 
 use causal_attention::{MetalCausalAttentionPipelines, MetalCausalPagedAttentionProvider};
@@ -151,6 +152,11 @@ pub fn metal_vnext_runtime_config(
 pub fn metal_vnext_operation_registry(
     runtime: &MetalDeviceRuntime,
 ) -> Result<OperationRuntimeRegistry<MetalDeviceRuntime>, MetalDeviceRuntimeError> {
+    if runtime.tensor_capacity_bytes().is_some() {
+        return Err(MetalDeviceRuntimeError::contract(
+            "Metal tensor runtime requires its admitted fixed-tensor provider bundle",
+        ));
+    }
     let pipelines = Arc::new(MetalPrimitivePipelines::new(runtime.device())?);
     let linear_pipelines = Arc::new(MetalLinearPipelines::new(runtime.device())?);
     let moe_pipelines = Arc::new(MetalMoePipelines::new(runtime.device())?);
@@ -525,8 +531,8 @@ pub(crate) fn rational_attribute(
     Ok(value)
 }
 
-pub(crate) fn contiguous_region(
-    participant: &OperationInvocation<'_, MetalDeviceBuffer>,
+pub(crate) fn contiguous_region<'a, W: ferrum_runtime::InvocationWorkProjection<'a>>(
+    participant: &OperationInvocation<'a, MetalDeviceBuffer, W>,
     binding: &ResolvedValueBinding,
     element_type: ElementType,
 ) -> Result<MetalBufferRegion, String> {
@@ -580,8 +586,8 @@ pub(crate) fn contiguous_token_region(
     contiguous_region_range(participant, binding, element_type, offset, length)
 }
 
-fn contiguous_region_range(
-    participant: &OperationInvocation<'_, MetalDeviceBuffer>,
+fn contiguous_region_range<'a, W: ferrum_runtime::InvocationWorkProjection<'a>>(
+    participant: &OperationInvocation<'a, MetalDeviceBuffer, W>,
     binding: &ResolvedValueBinding,
     element_type: ElementType,
     logical_offset_bytes: u64,

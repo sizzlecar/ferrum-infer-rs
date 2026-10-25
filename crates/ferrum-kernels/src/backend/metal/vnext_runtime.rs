@@ -49,7 +49,10 @@ use super::st;
 
 mod counter_readback;
 mod managed_tensor;
+mod tensor_eager;
 use counter_readback::CounterReadbackStats;
+pub(crate) use tensor_eager::MetalTensorProviderRetention;
+pub use tensor_eager::MetalTensorRuntimeConfig;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -96,6 +99,7 @@ where
 ///
 /// Capability and storage profiles describe the installed provider bundle;
 /// the runtime never infers them from a model name or machine memory size.
+#[derive(Debug, Clone)]
 pub struct MetalDeviceRuntimeConfig {
     pub device_id: DeviceId,
     pub runtime_implementation_fingerprint: String,
@@ -106,6 +110,7 @@ pub struct MetalDeviceRuntimeConfig {
 #[derive(Debug, Clone)]
 pub enum MetalDeviceRuntimeError {
     Contract(String),
+    Capacity(VNextError),
     CommandBuffer {
         operation: &'static str,
         status: MTLCommandBufferStatus,
@@ -143,6 +148,7 @@ impl fmt::Display for MetalDeviceRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Contract(message) => formatter.write_str(message),
+            Self::Capacity(error) => error.fmt(formatter),
             Self::CommandBuffer {
                 operation,
                 status,
@@ -188,6 +194,7 @@ struct MetalAllocation {
     requested_bytes: u64,
     // The Metal handle must be released before its no-copy host allocation.
     _retained_host_memory: Option<RetainedHostMemoryRegion>,
+    _tensor_owner: Option<Arc<tensor_eager::TensorEagerState>>,
 }
 
 struct MetalStaticWeightSegment {
@@ -325,6 +332,7 @@ struct MetalStaticWeightImport<'runtime> {
     _permit: MutexGuard<'runtime, ()>,
     residency: Arc<MetalStaticWeightResidency>,
     arenas: BTreeMap<usize, PendingMetalStaticWeightArena>,
+    tensor_owner: Option<Arc<tensor_eager::TensorEagerState>>,
 }
 
 impl<'runtime> MetalStaticWeightImport<'runtime> {
@@ -332,15 +340,23 @@ impl<'runtime> MetalStaticWeightImport<'runtime> {
         device: metal::Device,
         runtime_instance: u64,
         permit: MutexGuard<'runtime, ()>,
+        tensor_owner: Option<Arc<tensor_eager::TensorEagerState>>,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        let set = super::residency::MetalResidencySet::new(&device)
-            .map_err(|error| MetalDeviceRuntimeError::contract(error.to_string()))?;
+        // Tensor execution uses command-buffer resource retention. Per-plan
+        // residency sets need a separate opaque-memory admission profile.
+        let set = if tensor_owner.is_some() {
+            None
+        } else {
+            super::residency::MetalResidencySet::new(&device)
+                .map_err(|error| MetalDeviceRuntimeError::contract(error.to_string()))?
+        };
         Ok(Self {
             device,
             runtime_instance,
             _permit: permit,
             residency: Arc::new(MetalStaticWeightResidency { set }),
             arenas: BTreeMap::new(),
+            tensor_owner,
         })
     }
 }
@@ -390,6 +406,7 @@ impl StaticWeightImportSession<MetalDeviceBuffer, MetalDeviceRuntimeError>
             &self.device,
             payload,
             destination.descriptor.alignment_bytes,
+            self.tensor_owner.as_ref(),
         )?;
         let key = Arc::as_ptr(arena) as usize;
         self.arenas
@@ -460,6 +477,7 @@ fn metal_static_weight_allocation(
     device: &metal::DeviceRef,
     payload: &WeightComponentPayload<'_>,
     required_alignment_bytes: u64,
+    tensor_owner: Option<&Arc<tensor_eager::TensorEagerState>>,
 ) -> Result<Arc<MetalAllocation>, MetalDeviceRuntimeError> {
     let required_alignment = usize::try_from(required_alignment_bytes).map_err(|_| {
         MetalDeviceRuntimeError::contract("Metal static-weight alignment exceeds usize")
@@ -483,6 +501,7 @@ fn metal_static_weight_allocation(
                 aligned_offset_bytes: native.byte_offset as u64,
                 requested_bytes: retained.length_bytes() as u64,
                 _retained_host_memory: Some(retained.clone()),
+                _tensor_owner: tensor_owner.cloned(),
             }));
         }
     }
@@ -491,7 +510,11 @@ fn metal_static_weight_allocation(
     let length_bytes = u64::try_from(bytes.len()).map_err(|_| {
         MetalDeviceRuntimeError::contract("Metal static-weight payload exceeds u64")
     })?;
-    let extra_alignment = required_alignment_bytes - 1;
+    let extra_alignment = if tensor_owner.is_some() {
+        0
+    } else {
+        required_alignment_bytes - 1
+    };
     let allocation_bytes = length_bytes.checked_add(extra_alignment).ok_or_else(|| {
         MetalDeviceRuntimeError::contract("Metal static-weight allocation size overflows")
     })?;
@@ -500,6 +523,11 @@ fn metal_static_weight_allocation(
     if base_address == 0 {
         return Err(MetalDeviceRuntimeError::contract(
             "Metal static-weight allocation returned a null host address",
+        ));
+    }
+    if tensor_owner.is_some() && !base_address.is_multiple_of(required_alignment) {
+        return Err(MetalDeviceRuntimeError::contract(
+            "Metal weight allocation did not satisfy its admitted alignment",
         ));
     }
     let aligned_address = base_address
@@ -538,6 +566,7 @@ fn metal_static_weight_allocation(
         aligned_offset_bytes,
         requested_bytes: length_bytes,
         _retained_host_memory: None,
+        _tensor_owner: tensor_owner.cloned(),
     }))
 }
 
@@ -594,6 +623,35 @@ impl MetalBufferRegion {
             && self.offset_bytes == other.offset_bytes
             && self.length_bytes == other.length_bytes
             && self.element_type == other.element_type
+    }
+
+    /// No-copy imports can expose overlapping ranges through distinct buffers.
+    /// Compare shared addresses, rather than only native object identity.
+    pub(crate) fn overlaps_shared_region(
+        &self,
+        other: &Self,
+    ) -> Result<bool, MetalDeviceRuntimeError> {
+        let extent = |region: &Self| {
+            if region.buffer().storage_mode() != MTLStorageMode::Shared
+                || region.buffer().contents().is_null()
+            {
+                return Err(MetalDeviceRuntimeError::contract(
+                    "Metal alias validation requires shared storage",
+                ));
+            }
+            let start = (region.buffer().contents() as usize as u64)
+                .checked_add(region.offset_bytes)
+                .ok_or_else(|| {
+                    MetalDeviceRuntimeError::contract("Metal shared address overflows")
+                })?;
+            let end = start.checked_add(region.length_bytes).ok_or_else(|| {
+                MetalDeviceRuntimeError::contract("Metal shared extent overflows")
+            })?;
+            Ok((start, end))
+        };
+        let (start, end) = extent(self)?;
+        let (other_start, other_end) = extent(other)?;
+        Ok(start < other_end && other_start < end)
     }
 }
 
@@ -1443,6 +1501,27 @@ impl fmt::Debug for MetalDeviceCommand {
 }
 
 impl MetalDeviceCommand {
+    pub(crate) fn tensor_operation(
+        operation: &'static str,
+        regions: Vec<MetalBufferRegion>,
+        work: DeviceCommandLogicalWork,
+        encode: impl Fn(
+                &mut MetalSubmissionEncoder,
+                &[MetalBufferRegion],
+            ) -> Result<(), MetalDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        if work.token_count().is_some() {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal tensor command cannot carry token work",
+            ));
+        }
+        let mut command = Self::operation(operation, regions, encode)?;
+        command.participant_count = 0;
+        command.bind_core_logical_work(work)
+    }
+
     /// Backend-local providers use this after translating every logical view
     /// into retained physical regions.
     pub(crate) fn operation(
@@ -1697,6 +1776,7 @@ pub struct MetalDeviceStream {
     queue: CommandQueue,
     state: Arc<MetalStreamState>,
     pending: Arc<MetalPendingSubmissions>,
+    tensor_lane: Option<Arc<tensor_eager::TensorLaneRetention>>,
 }
 
 impl fmt::Debug for MetalDeviceStream {
@@ -1769,6 +1849,9 @@ pub struct MetalDeviceFence {
     completed_status: OnceLock<Result<(), MetalDeviceRuntimeError>>,
     commands: Vec<MetalDeviceCommand>,
     attribution: Option<DeviceSubmissionAttribution>,
+    commit_started: bool,
+    submitted: bool,
+    tensor_flight: Option<tensor_eager::TensorFlightRetention>,
 }
 
 impl fmt::Debug for MetalDeviceFence {
@@ -1893,6 +1976,14 @@ impl Drop for MetalDeviceFence {
         if self.terminal_accounted.load(Ordering::Acquire) {
             return;
         }
+        if !self.commit_started {
+            self.mark_terminal();
+            return;
+        }
+        if !self.submitted {
+            self.retain_indeterminate();
+            return;
+        }
         self.command_buffer.wait_until_completed();
         match self.command_buffer.status() {
             MTLCommandBufferStatus::Completed => self.mark_terminal(),
@@ -1904,11 +1995,20 @@ impl Drop for MetalDeviceFence {
                 // Retain a second command-buffer reference and all command
                 // ownership if Metal ever violates wait-until-completed's
                 // terminal guarantee.
-                self.stream_state.fail();
-                std::mem::forget(self.command_buffer.clone());
-                std::mem::forget(std::mem::take(&mut self.commands));
+                self.retain_indeterminate();
             }
         }
+    }
+}
+
+impl MetalDeviceFence {
+    fn retain_indeterminate(&mut self) {
+        self.stream_state.fail();
+        std::mem::forget(self.command_buffer.clone());
+        std::mem::forget(std::mem::take(&mut self.commands));
+        // The queue, bootstrap, and global budget must survive with unknown
+        // native work, even when the outer runtime and stream have been dropped.
+        std::mem::forget(self.tensor_flight.take());
     }
 }
 
@@ -1921,6 +2021,7 @@ pub struct MetalDeviceRuntime {
     timestamp_counter_support: OnceLock<MetalTimestampCounterSupport>,
     counter_readback_stats: Arc<CounterReadbackStats>,
     static_weight_import_gate: Mutex<()>,
+    tensor_eager: Option<Arc<tensor_eager::TensorEagerState>>,
 }
 
 impl fmt::Debug for MetalDeviceRuntime {
@@ -1936,6 +2037,14 @@ impl fmt::Debug for MetalDeviceRuntime {
 impl MetalDeviceRuntime {
     pub fn new(config: MetalDeviceRuntimeConfig) -> Result<Self, MetalDeviceRuntimeError> {
         let device = st().pipes.device().clone();
+        Self::new_on_device(config, device, None)
+    }
+
+    fn new_on_device(
+        config: MetalDeviceRuntimeConfig,
+        device: metal::Device,
+        tensor_eager: Option<Arc<tensor_eager::TensorEagerState>>,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
         let descriptor = DeviceDescriptor {
             id: config.device_id,
             class: DeviceClass::Accelerator,
@@ -1962,6 +2071,7 @@ impl MetalDeviceRuntime {
             timestamp_counter_support: OnceLock::new(),
             counter_readback_stats,
             static_weight_import_gate: Mutex::new(()),
+            tensor_eager,
         })
     }
 
@@ -2006,9 +2116,13 @@ impl MetalDeviceRuntime {
                 )),
             });
         }
-        let extra_alignment = request.alignment_bytes().checked_sub(1).ok_or_else(|| {
-            MetalDeviceRuntimeError::contract("Metal allocation alignment is zero")
-        })?;
+        let extra_alignment = if self.tensor_eager.is_some() {
+            0
+        } else {
+            request.alignment_bytes().checked_sub(1).ok_or_else(|| {
+                MetalDeviceRuntimeError::contract("Metal allocation alignment is zero")
+            })?
+        };
         let allocation_bytes = request
             .size_bytes()
             .checked_add(extra_alignment)
@@ -2024,6 +2138,11 @@ impl MetalDeviceRuntime {
             ));
         }
         let alignment = request.alignment_bytes();
+        if self.tensor_eager.is_some() && !base_address.is_multiple_of(alignment) {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal tensor allocation did not satisfy its admitted alignment",
+            ));
+        }
         let aligned_address = base_address
             .checked_add(alignment - 1)
             .map(|address| address & !(alignment - 1))
@@ -2045,6 +2164,7 @@ impl MetalDeviceRuntime {
                 aligned_offset_bytes,
                 requested_bytes: request.size_bytes(),
                 _retained_host_memory: None,
+                _tensor_owner: self.tensor_eager.clone(),
             })),
         })
     }
@@ -2104,6 +2224,19 @@ impl MetalDeviceRuntime {
         if let Err(error) = self.validate_stream(stream) {
             return Err(DefinitelyNotSubmitted::new(error));
         }
+        let tensor_flight = if let Some(state) = &self.tensor_eager {
+            state
+                .validate_submission(entries.len(), timing_mode)
+                .map_err(DefinitelyNotSubmitted::new)?;
+            let lane = stream.tensor_lane.as_ref().ok_or_else(|| {
+                DefinitelyNotSubmitted::new(MetalDeviceRuntimeError::contract(
+                    "Metal tensor submission lacks its admitted lane",
+                ))
+            })?;
+            Some(lane.reserve_flight().map_err(DefinitelyNotSubmitted::new)?)
+        } else {
+            None
+        };
         if entries.is_empty() {
             return Err(DefinitelyNotSubmitted::new(
                 MetalDeviceRuntimeError::contract("Metal command batch is empty"),
@@ -2260,8 +2393,7 @@ impl MetalDeviceRuntime {
             return Err(DefinitelyNotSubmitted::new(error));
         }
         stream.pending.insert(submission_id, command_buffer.clone());
-        command_buffer.commit();
-        let fence = MetalDeviceFence {
+        let mut fence = MetalDeviceFence {
             submission_id,
             command_buffer,
             timing,
@@ -2272,7 +2404,15 @@ impl MetalDeviceRuntime {
             completed_status: OnceLock::new(),
             commands,
             attribution,
+            commit_started: false,
+            submitted: false,
+            tensor_flight,
         };
+        // Install all native/ledger owners before the first possible enqueue.
+        // An unwind inside commit cannot release an unproven live allocation.
+        fence.commit_started = true;
+        fence.command_buffer.commit();
+        fence.submitted = true;
         drop(fence_stage);
         Ok(fence)
     }
@@ -2346,8 +2486,13 @@ impl DeviceRuntime for MetalDeviceRuntime {
             }
         };
         Some(
-            MetalStaticWeightImport::new(self.device.clone(), self.runtime_instance, permit)
-                .map(|import| Box::new(import) as Box<_>),
+            MetalStaticWeightImport::new(
+                self.device.clone(),
+                self.runtime_instance,
+                permit,
+                self.tensor_eager.clone(),
+            )
+            .map(|import| Box::new(import) as Box<_>),
         )
     }
 
@@ -2357,12 +2502,22 @@ impl DeviceRuntime for MetalDeviceRuntime {
                 current.checked_add(1)
             })
             .map_err(|_| MetalDeviceRuntimeError::contract("Metal stream identity exhausted"))?;
+        let tensor_lane = self
+            .tensor_eager
+            .as_ref()
+            .map(|state| state.create_lane(&self.device))
+            .transpose()?;
+        let queue = tensor_lane
+            .as_ref()
+            .map(|lane| lane.queue().clone())
+            .unwrap_or_else(|| self.device.new_command_queue());
         Ok(MetalDeviceStream {
             id,
             runtime_instance: self.runtime_instance,
-            queue: self.device.new_command_queue(),
+            queue,
             state: Arc::new(MetalStreamState::new()),
             pending: Arc::new(MetalPendingSubmissions::new()),
+            tensor_lane,
         })
     }
 
@@ -2429,6 +2584,11 @@ impl DeviceRuntime for MetalDeviceRuntime {
         destination: &Self::Buffer,
         destination_offset_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
+        if self.tensor_eager.is_some() {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal tensor runtime requires accounted no-copy uploads",
+            ));
+        }
         self.validate_buffer(destination)?;
         if destination.descriptor.usage == BufferUsage::Weights {
             return Err(MetalDeviceRuntimeError::contract(
@@ -2557,6 +2717,15 @@ impl DeviceRuntime for MetalDeviceRuntime {
         S: DeviceSubmissionTimingSink,
     {
         let timing_mode = commands.timing_mode();
+        if self.tensor_eager.is_some()
+            && commands.execution_facts_capture() != ferrum_runtime::ExecutionFactsCapture::Off
+        {
+            return Err(DefinitelyNotSubmitted::new(
+                MetalDeviceRuntimeError::contract(
+                    "Metal tensor runtime does not admit execution-fact capture allocations",
+                ),
+            ));
+        }
         if matches!(
             commands.compute_path_requirement(),
             DeviceComputePathRequirement::ReplayedOnly
@@ -2701,6 +2870,10 @@ impl DeviceRuntime for MetalDeviceRuntime {
 
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError> {
         let (code, retryable) = match error {
+            MetalDeviceRuntimeError::Capacity(VNextError::DeviceCapacityUnavailable(_)) => {
+                ("metal_device_capacity_unavailable", true)
+            }
+            MetalDeviceRuntimeError::Capacity(_) => ("metal_device_capacity_contract", false),
             MetalDeviceRuntimeError::Contract(_) => ("metal_runtime_contract", false),
             MetalDeviceRuntimeError::CommandBuffer {
                 error_code: Some(8),
