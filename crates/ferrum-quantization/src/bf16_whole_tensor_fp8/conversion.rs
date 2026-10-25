@@ -65,6 +65,27 @@ pub(super) fn scale(maximum: f32) -> Result<(f32, f32), VNextError> {
     Ok((scale, inverse))
 }
 
+/// Source lengths and BF16 encodings are validated before this scan. Clearing
+/// the sign bit gives the same ordering as finite, nonnegative F32 magnitudes.
+/// Every NaN/Inf encoding is above every finite magnitude, so reject once after
+/// reducing all source slices without a per-element floating-point operation.
+pub(super) fn finite_bf16_amax<'a>(
+    sources: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<f32, VNextError> {
+    let mut maximum = 0_u16;
+    for source in sources {
+        for bytes in source.chunks_exact(2) {
+            maximum = maximum.max(u16::from_le_bytes([bytes[0], bytes[1]]) & 0x7fff);
+        }
+    }
+    if maximum >= 0x7f80 {
+        return Err(invalid(
+            "nonfinite BF16 source is outside the conversion profile",
+        ));
+    }
+    Ok(f32::from_bits(u32::from(maximum) << 16))
+}
+
 pub(super) fn materialize<'source>(
     host: &HostMemoryAccount,
     source: &'source dyn WeightComponentSource,
@@ -168,20 +189,7 @@ fn materialize_observed<'source>(
         }
     }
     let maximum = timing.measure(Phase::Amax, || {
-        let mut maximum = 0_f32;
-        for payload in &payloads {
-            for bytes in payload.bytes().chunks_exact(2) {
-                let value =
-                    f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16);
-                if !value.is_finite() {
-                    return Err(invalid(
-                        "nonfinite BF16 source is outside the conversion profile",
-                    ));
-                }
-                maximum = maximum.max(value.abs());
-            }
-        }
-        Ok(maximum)
+        finite_bf16_amax(payloads.iter().map(|payload| payload.bytes()))
     })?;
     let (scale, inverse) = scale(maximum)?;
     if let (Some(cache), Some(state)) = (cache, state.as_mut()) {

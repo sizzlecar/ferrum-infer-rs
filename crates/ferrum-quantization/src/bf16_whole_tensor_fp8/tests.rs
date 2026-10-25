@@ -4,6 +4,8 @@ use half::bf16;
 use safetensors::tensor::{serialize_to_file, TensorView};
 use safetensors::Dtype;
 
+#[path = "amax_tests.rs"]
+mod amax_tests;
 #[path = "host_cache_tests.rs"]
 mod host_cache_tests;
 
