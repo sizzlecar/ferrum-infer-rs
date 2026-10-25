@@ -58,8 +58,10 @@ kernel void ferrum_tensor_attention_bf16(
     threadgroup float* a = workspace;
     threadgroup float* b = workspace + 512;
     threadgroup float* scores = workspace + 1536;
-    threadgroup float* accum = workspace + 2048;
-    threadgroup float* row_max = accum + 16 * p.head_dim;
+    // The cached path writes its final register accumulator over the retired
+    // Q/K/P/V staging area; row state stays outside that reused interval.
+    threadgroup float* accum = cache_query_128 ? workspace : workspace + 2048;
+    threadgroup float* row_max = workspace + 2048 + (cache_query_128 ? 0 : 16 * p.head_dim);
     threadgroup float* row_sum = row_max + 16;
     threadgroup float* alpha = row_sum + 16;
     threadgroup uint* end = reinterpret_cast<threadgroup uint*>(alpha + 16);
@@ -92,7 +94,16 @@ kernel void ferrum_tensor_attention_bf16(
             // Retain exactly decoded Q fragments, without more shared or
             // device storage. The generic variant keeps its bounded staging.
             simdgroup_float8x8 cached_query[16];
+            simdgroup_float8x8 cached_output[8], row_coordinates;
             if (cache_query_128) {
+                // Obtain the fragment row mapping through Metal's own load,
+                // without assuming a particular SIMD lane/element layout.
+                for (uint i = tid; i < 512; i += 128) a[i] = float(i / 32);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                simdgroup_load(row_coordinates, a + local_row * 32 + local_col, 32, 0, false);
+                for (uint i = 0; i < 8; ++i)
+                    cached_output[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
                 #pragma unroll
                 for (uint d = 0; d < 128; d += 32) {
                     for (uint i = tid; i < 512; i += 128) {
@@ -164,7 +175,8 @@ kernel void ferrum_tensor_attention_bf16(
                     }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint d = 0; d < p.head_dim; d += 32) {
+                #pragma unroll
+                for (uint d = 0; d < (cache_query_128 ? 128 : p.head_dim); d += 32) {
                     if (tid == 0) atomic_store_explicit(&nonfinite_value, 0, memory_order_relaxed);
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     for (uint i = tid; i < 1024; i += 128) {
@@ -176,8 +188,8 @@ kernel void ferrum_tensor_attention_bf16(
                         if (!isfinite(v)) atomic_store_explicit(&nonfinite_value, 1, memory_order_relaxed);
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
+                    simdgroup_float8x8 pv[2];
                     if (atomic_load_explicit(&nonfinite_value, memory_order_relaxed) == 0) {
-                        simdgroup_float8x8 pv[2];
                         for (uint n = 0; n < 2; ++n) pv[n] = make_filled_simdgroup_matrix<float, 8>(0.0f);
                         for (uint chunk = 0; chunk < 32; chunk += 8) {
                             simdgroup_float8x8 av, bv;
@@ -187,7 +199,7 @@ kernel void ferrum_tensor_attention_bf16(
                                 simdgroup_multiply_accumulate(pv[n], av, bv, pv[n]);
                             }
                         }
-                        for (uint n = 0; n < 2; ++n)
+                        if (!cache_query_128) for (uint n = 0; n < 2; ++n)
                             simdgroup_store(pv[n], a + local_row * 32 + local_col + n * 8, 32, 0, false);
                     } else {
                         // Dense P*V would evaluate masked 0*NaN/Inf. Preserve
@@ -204,7 +216,21 @@ kernel void ferrum_tensor_attention_bf16(
                         }
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
-                    for (uint i = tid; i < 512; i += 128) {
+                    if (cache_query_128) {
+                        #pragma unroll
+                        for (uint n = 0; n < 2; ++n) {
+                            if (atomic_load_explicit(&nonfinite_value, memory_order_relaxed) != 0)
+                                simdgroup_load(pv[n], a + local_row * 32 + local_col + n * 8, 32, 0, false);
+                            #pragma unroll
+                            for (uint e = 0; e < 2; ++e) {
+                                uint row = uint(row_coordinates.thread_elements()[e]);
+                                uint index = (d / 32) * 2 + n;
+                                cached_output[index].thread_elements()[e] =
+                                    cached_output[index].thread_elements()[e] * alpha[row]
+                                    + pv[n].thread_elements()[e];
+                            }
+                        }
+                    } else for (uint i = tid; i < 512; i += 128) {
                         uint r = i / 32, c = d + i % 32;
                         if (c < p.head_dim) {
                             uint index = r * p.head_dim + c;
@@ -214,7 +240,14 @@ kernel void ferrum_tensor_attention_bf16(
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
             }
+            if (cache_query_128) {
+                #pragma unroll
+                for (uint d = 0; d < 128; d += 32)
+                    for (uint n = 0; n < 2; ++n)
+                        simdgroup_store(cached_output[(d / 32) * 2 + n], accum + local_row * 128 + d + local_col + n * 8, 128, 0, false);
+            }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = tid; i < 16 * p.head_dim; i += 128) {
             uint r = i / p.head_dim, c = i % p.head_dim;
             if (q_start + r < p.sequence) {

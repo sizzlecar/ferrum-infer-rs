@@ -5,6 +5,8 @@ use ferrum_runtime::{
     StructuredGqaAttentionBf16Geometry,
 };
 
+const CACHED_SHARED_BYTES: u64 = (2048 + 96) * 4;
+
 pub(super) fn head128_pipeline(
     runtime: &MetalDeviceRuntime,
     library: &metal::LibraryRef,
@@ -22,7 +24,7 @@ pub(super) fn head128_pipeline(
         .device()
         .new_compute_pipeline_state_with_function(&function)
         .map_err(MetalDeviceRuntimeError::contract)?;
-    let dynamic_bytes = (2048 + 16 * 128 + 96) * 4;
+    let dynamic_bytes = CACHED_SHARED_BYTES;
     Ok((pipeline.thread_execution_width() == 32
         && pipeline.max_total_threads_per_threadgroup() >= 128
         && pipeline
@@ -278,7 +280,13 @@ pub(super) fn encode(
             }
             set_params(compute, 4, &shape.params);
             set_params(compute, 5, &shape.mask);
-            compute.set_threadgroup_memory_length(0, shape.shared_bytes);
+            let shared_bytes =
+                if shape.params.head_dim == 128 && pipelines.attention_head128.is_some() {
+                    CACHED_SHARED_BYTES
+                } else {
+                    shape.shared_bytes
+                };
+            compute.set_threadgroup_memory_length(0, shared_bytes);
             compute.dispatch_thread_groups(
                 MTLSize::new(shape.params.grid_groups, 1, 1),
                 MTLSize::new(128, 1, 1),
