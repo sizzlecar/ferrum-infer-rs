@@ -37,7 +37,7 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "head-rms=BF16-normalized-before-gamma;zero-centered=FP32-one-plus-gamma;",
     "adjacent-rope=F32-frequency-explicit-FMA;half-split=BF16-staged-products;",
     "attention=MPP-BF16xBF16-F32-QK-head128-full-visible-tiles-or-FP32-simdgroup-QK;",
-    "FP32-simdgroup-PV;16-query-32-key-online-softmax;",
+    "PV=MPP-FP32xFP32-FP32-finite-threadgroup-tiles-or-FP32-simdgroup;16-query-32-key-online-softmax;",
     "FP32-tile-SIMD-exp-reduction;separate-online-rescale;BF16-final-only;",
     "GQA=indexed-KV-no-replication;empty-row=positive-zero;",
     "masked-score-discard;nonfinite-visible-score=whole-head-NaN;",
@@ -333,13 +333,13 @@ pub fn metal_tensor_providers(
             .map_err(MetalDeviceRuntimeError::contract)?
         {
             linear::mpp::MppPipelineAvailability::Unsupported { reason } => {
-                tracing::info!(%reason, "Metal MPP BF16 QK unavailable; using SIMD-group fallback");
+                tracing::info!(%reason, "Metal MPP attention unavailable; using SIMD-group fallback");
                 None
             }
             linear::mpp::MppPipelineAvailability::Ready(pipeline) => {
                 tracing::info!(
                     static_threadgroup_bytes = pipeline.static_threadgroup_memory_length(),
-                    "Metal MPP BF16 QK enabled for complete visible Head128 tiles"
+                    "Metal MPP Head128 attention enabled: complete visible BF16 QK and finite FP32 PV tiles"
                 );
                 Some(pipeline)
             }

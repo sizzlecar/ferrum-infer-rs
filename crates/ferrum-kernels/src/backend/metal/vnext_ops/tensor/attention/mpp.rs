@@ -1,5 +1,5 @@
-//! Optional Head128 QK only: borrowed BF16 operands, FP32 score tiles.
-//! The shared shader keeps its original online softmax, PV and boundary paths.
+//! Optional Head128 QK/PV: borrowed BF16 Q/K and FP32 probability/value tiles.
+//! The shared shader keeps its online softmax and visible-only nonfinite PV.
 use crate::backend::metal::vnext_ops::tensor::linear::mpp::{
     compile_options, MppCompileOptions, MppPipelineAvailability,
 };
@@ -8,7 +8,7 @@ use metal::DeviceRef;
 pub(in crate::backend::metal::vnext_ops::tensor) const FINGERPRINT_SOURCE: &str =
     concat!(include_str!("mpp.rs"), include_str!("mpp.metal"));
 pub(in crate::backend::metal::vnext_ops::tensor) const NUMERICAL_IDENTITY: &str =
-    "metal.attention.qk-mpp-bf16-bf16-f32-m16n32k128-full-visible;simdgroup-f32-fallback;unchanged-f32-softmax-pv;relaxed=false.v1";
+    "metal.attention.qk-mpp-bf16-bf16-f32-m16n32k128-full-visible;simdgroup-f32-qk-fallback;pv-mpp-f32-f32-f32-m16n32k32-finite-threadgroup-tiles;unchanged-f32-softmax-and-visible-only-nonfinite-pv;relaxed=false.v2";
 
 pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
     device: &DeviceRef,
@@ -28,7 +28,7 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
     );
     let library = device
         .new_library_with_source(source, &options)
-        .map_err(|error| format!("MPP QK MSL 4 library compilation failed: {error}"))?;
+        .map_err(|error| format!("MPP attention MSL 4 library compilation failed: {error}"))?;
     let constants = metal::FunctionConstantValues::new();
     constants.set_constant_value_at_index(
         (&128_u32 as *const u32).cast(),
@@ -37,10 +37,10 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
     );
     let function = library
         .get_function("ferrum_tensor_attention_bf16", Some(constants))
-        .map_err(|error| format!("MPP QK kernel lookup failed: {error}"))?;
+        .map_err(|error| format!("MPP attention kernel lookup failed: {error}"))?;
     let pipeline = device
         .new_compute_pipeline_state_with_function(&function)
-        .map_err(|error| format!("MPP QK pipeline creation failed: {error}"))?;
+        .map_err(|error| format!("MPP attention pipeline creation failed: {error}"))?;
     let required = pipeline
         .static_threadgroup_memory_length()
         .checked_add(super::CACHED_SHARED_BYTES);
@@ -50,7 +50,7 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
     {
         return Ok(MppPipelineAvailability::Unsupported {
             reason: format!(
-                "MPP QK requires four 32-thread SIMD groups and static+dynamic threadgroup memory within the device limit; width={}, maximum_threads={}, static_bytes={}, dynamic_bytes={}, limit={}",
+                "MPP attention requires four 32-thread SIMD groups and static+dynamic threadgroup memory within the device limit; width={}, maximum_threads={}, static_bytes={}, dynamic_bytes={}, limit={}",
                 pipeline.thread_execution_width(),
                 pipeline.max_total_threads_per_threadgroup(),
                 pipeline.static_threadgroup_memory_length(),

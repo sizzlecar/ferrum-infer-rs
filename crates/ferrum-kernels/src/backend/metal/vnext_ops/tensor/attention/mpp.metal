@@ -6,6 +6,7 @@
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #define FERRUM_ATTENTION_MPP_QK 1
+#define FERRUM_ATTENTION_MPP_PV 1
 using namespace mpp::tensor_ops;
 
 inline void ferrum_attention_mpp_qk(
@@ -30,5 +31,21 @@ inline void ferrum_attention_mpp_qk(
     operation.run(q, k, result);
     // Reuse the original 16x32 FP32 score tile; no added shared/device storage.
     auto destination = tensor(scores, dextents<int, 2>{32, 16}, array<int, 2>{1, 32});
+    result.store(destination);
+}
+
+inline void ferrum_attention_mpp_pv(
+    threadgroup float* probabilities,
+    threadgroup float* values,
+    threadgroup float* output) {
+    // Borrow disjoint, already populated FP32 tiles. In particular neither
+    // probability nor V is converted to a narrower input element type.
+    auto p = tensor(probabilities, dextents<int, 2>{32, 16}, array<int, 2>{1, 32});
+    auto v = tensor(values, dextents<int, 2>{32, 32}, array<int, 2>{1, 32});
+    constexpr auto descriptor = matmul2d_descriptor(16, 32, 32, false, false, false);
+    matmul2d<descriptor, execution_simdgroups<4>> operation;
+    auto result = operation.get_destination_cooperative_tensor<decltype(p), decltype(v), float>();
+    operation.run(p, v, result);
+    auto destination = tensor(output, dextents<int, 2>{32, 16}, array<int, 2>{1, 32});
     result.store(destination);
 }

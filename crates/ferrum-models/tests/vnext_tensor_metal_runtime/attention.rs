@@ -339,5 +339,26 @@ pub(super) fn verify(
             &values,
             |actual| case.check(&values, actual),
         );
+        // Keep Q/K moderate so the original softmax oracle applies. V alone
+        // spans outside FP16's finite and nonzero ranges, exercising the FP32
+        // PV operands independently of the QK range case above. S=65 also
+        // crosses complete key tiles and a partial final query/key tile.
+        for exponent in [80, -80] {
+            let mut values = case.values();
+            for value in &mut values[2] {
+                *value *= 2_f32.powi(exponent);
+            }
+            run_case(
+                runtime,
+                registry,
+                catalog,
+                &policy,
+                host,
+                &case.fixture(kind),
+                &values,
+                |actual| case.check(&values, actual),
+            );
+            eprintln!("Metal {kind:?}: finite V scaled by 2^{exponent}, FP32 PV range, FP64 bound and retirement passed");
+        }
     }
 }

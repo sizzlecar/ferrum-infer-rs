@@ -212,6 +212,14 @@ kernel void ferrum_tensor_attention_bf16(
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     simdgroup_float8x8 pv[2];
                     if (atomic_load_explicit(&nonfinite_value, memory_order_relaxed) == 0) {
+                        #ifdef FERRUM_ATTENTION_MPP_PV
+                        // Q is already retained in registers. Its retired a
+                        // tile is disjoint from b and scores; the cached final
+                        // accumulator is stored there only after all key tiles.
+                        // Reuse a for the finite FP32 PV result without
+                        // another buffer.
+                        ferrum_attention_mpp_pv(scores, b, a);
+                        #else
                         for (uint n = 0; n < 2; ++n) pv[n] = make_filled_simdgroup_matrix<float, 8>(0.0f);
                         for (uint chunk = 0; chunk < 32; chunk += 8) {
                             simdgroup_float8x8 av, bv;
@@ -223,6 +231,7 @@ kernel void ferrum_tensor_attention_bf16(
                         }
                         if (!cache_query_128) for (uint n = 0; n < 2; ++n)
                             simdgroup_store(pv[n], a + local_row * 32 + local_col + n * 8, 32, 0, false);
+                        #endif
                     } else {
                         // Dense P*V would evaluate masked 0*NaN/Inf. Preserve
                         // key-only masking with a visible-only IEEE fallback.
@@ -241,8 +250,15 @@ kernel void ferrum_tensor_attention_bf16(
                     if (cache_query_128) {
                         #pragma unroll
                         for (uint n = 0; n < 2; ++n) {
+                            #ifdef FERRUM_ATTENTION_MPP_PV
+                            // Both MPP and the nonfinite fallback wrote a.
+                            // The preceding group barrier publishes the tile
+                            // before restoring the original SIMD accumulator.
+                            simdgroup_load(pv[n], a + local_row * 32 + local_col + n * 8, 32, 0, false);
+                            #else
                             if (atomic_load_explicit(&nonfinite_value, memory_order_relaxed) != 0)
                                 simdgroup_load(pv[n], a + local_row * 32 + local_col + n * 8, 32, 0, false);
+                            #endif
                             #pragma unroll
                             for (uint e = 0; e < 2; ++e) {
                                 uint row = uint(row_coordinates.thread_elements()[e]);
