@@ -4,6 +4,8 @@ use super::*;
 use crate::image_generation::metal::{ImageMetalMemoryPolicy, QwenImage21MetalConfig};
 use std::num::NonZeroU64;
 
+mod cancellation;
+
 // Native factories share one physical device and its capacity owner. Tests that
 // intentionally change its capacity must not register conflicting owners at once.
 static METAL_FACTORY_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
