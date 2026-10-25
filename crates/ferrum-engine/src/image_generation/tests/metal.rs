@@ -143,6 +143,27 @@ fn metal_factory_generates_real_managed_batches_and_retires_cold_and_resident_st
         let second = pipeline
             .generate_batch(vec![request("cat", 7), request("blue cat", 1 << 40)])
             .unwrap_or_else(|e| panic!("Metal repeat: {e:?}"));
+        let first_memory = first[0].receipt.native_memory.unwrap();
+        let second_memory = second[0].receipt.native_memory.unwrap();
+        assert_eq!(
+            first[0].receipt.native_memory,
+            first[1].receipt.native_memory
+        );
+        assert_eq!(
+            second[0].receipt.native_memory,
+            second[1].receipt.native_memory
+        );
+        assert_eq!(first_memory.scope, DeviceNativeMemoryScope::DeviceHandle);
+        // Cold stages have already retired when the receipt is produced. The
+        // high-water observation must still include their native allocations,
+        // and subsequent jobs must not reset a shared runtime's history.
+        assert!(first_memory.observed_peak_allocated_bytes > 0);
+        assert!(first_memory.observed_peak_allocated_bytes >= first_memory.allocated_bytes);
+        assert!(
+            second_memory.observed_peak_allocated_bytes
+                >= first_memory.observed_peak_allocated_bytes
+        );
+        assert!(second_memory.samples > first_memory.samples);
         assert_eq!(first.len(), 2);
         for (a, b) in first.iter().zip(&second) {
             assert_eq!(a.rgba.tensor().dimensions(), [1, 4, 32, 32]);

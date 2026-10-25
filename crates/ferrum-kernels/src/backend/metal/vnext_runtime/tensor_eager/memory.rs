@@ -1,6 +1,35 @@
 //! Recommended working-set selection, not a claim to observe system free RAM.
 use super::*;
 
+/// Only sampled native resources: no reservations, allocations or GPU waits.
+#[derive(Default)]
+pub(super) struct NativeAllocationObservations {
+    peak: AtomicU64,
+    samples: AtomicU64,
+}
+
+impl NativeAllocationObservations {
+    pub(super) fn observe(&self, allocated: u64) -> ferrum_runtime::DeviceNativeMemorySnapshot {
+        let peak = self
+            .peak
+            .fetch_max(allocated, Ordering::Relaxed)
+            .max(allocated);
+        let previous = self
+            .samples
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(1))
+            })
+            .expect("native memory observation counter always accepts a sample");
+        ferrum_runtime::DeviceNativeMemorySnapshot {
+            source: "metal.MTLDevice.currentAllocatedSize",
+            scope: ferrum_runtime::DeviceNativeMemoryScope::DeviceHandle,
+            allocated_bytes: allocated,
+            observed_peak_allocated_bytes: peak,
+            samples: previous.saturating_add(1),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MetalTensorRuntimeAutoConfig {
     pub device: MetalDeviceRuntimeConfig,

@@ -74,6 +74,7 @@ pub(super) struct TensorEagerState {
     maximum_commands: usize,
     streams: AtomicUsize,
     provider_live: AtomicBool,
+    native_memory: memory::NativeAllocationObservations,
 }
 
 pub(crate) struct MetalTensorProviderRetention {
@@ -129,6 +130,13 @@ impl Drop for TensorFlightRetention {
 }
 
 impl TensorEagerState {
+    pub(super) fn observe_memory(
+        &self,
+        device: &metal::DeviceRef,
+    ) -> ferrum_runtime::DeviceNativeMemorySnapshot {
+        self.native_memory.observe(device.current_allocated_size())
+    }
+
     pub(super) fn create_lane(
         self: &Arc<Self>,
         device: &metal::Device,
@@ -142,6 +150,7 @@ impl TensorEagerState {
             .reserve(DeviceOpaqueMemoryKind::Stream, self.stream_bytes)
             .map_err(MetalDeviceRuntimeError::Capacity)?;
         let queue = device.new_command_queue();
+        self.observe_memory(device);
         Ok(Arc::new(TensorLaneRetention {
             queue,
             _capacity: capacity,
@@ -199,6 +208,7 @@ impl MetalDeviceRuntime {
         hash.update(include_bytes!("tensor_eager.rs"));
         hash.update(include_bytes!("../vnext_runtime.rs"));
         hash.update(include_bytes!("managed_tensor.rs"));
+        hash.update(include_bytes!("tensor_eager/memory.rs"));
         config.device.runtime_implementation_fingerprint = format!("{:x}", hash.finalize());
         let descriptor = DeviceDescriptor {
             id: config.device.device_id.clone(),
@@ -230,7 +240,9 @@ impl MetalDeviceRuntime {
             maximum_commands: config.maximum_commands_per_submission,
             streams: AtomicUsize::new(0),
             provider_live: AtomicBool::new(false),
+            native_memory: memory::NativeAllocationObservations::default(),
         });
+        state.observe_memory(&device);
         Self::new_on_device(config.device, device, Some(state))
     }
 

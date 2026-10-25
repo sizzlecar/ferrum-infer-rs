@@ -504,6 +504,9 @@ fn metal_static_weight_allocation(
         )
         .map_err(|error| MetalDeviceRuntimeError::contract(error.to_string()))?
         {
+            if let Some(owner) = tensor_owner {
+                owner.observe_memory(device);
+            }
             return Ok(Arc::new(MetalAllocation {
                 base: native.buffer,
                 aligned_offset_bytes: native.byte_offset as u64,
@@ -527,6 +530,9 @@ fn metal_static_weight_allocation(
         MetalDeviceRuntimeError::contract("Metal static-weight allocation size overflows")
     })?;
     let base = device.new_buffer(allocation_bytes, MTLResourceOptions::StorageModeShared);
+    if let Some(owner) = tensor_owner {
+        owner.observe_memory(device);
+    }
     let base_address = base.contents() as usize;
     if base_address == 0 {
         return Err(MetalDeviceRuntimeError::contract(
@@ -2138,6 +2144,7 @@ impl MetalDeviceRuntime {
         let base = self
             .device
             .new_buffer(allocation_bytes, MTLResourceOptions::StorageModeShared);
+        let _ = self.native_memory_snapshot();
         let base_address = u64::try_from(base.contents() as usize)
             .map_err(|_| MetalDeviceRuntimeError::contract("Metal buffer address exceeds u64"))?;
         if base_address == 0 {
@@ -2458,6 +2465,12 @@ impl DeviceRuntime for MetalDeviceRuntime {
 
     fn descriptor(&self) -> &DeviceDescriptor {
         &self.descriptor
+    }
+
+    fn native_memory_snapshot(&self) -> Option<ferrum_runtime::DeviceNativeMemorySnapshot> {
+        self.tensor_eager
+            .as_ref()
+            .map(|state| state.observe_memory(&self.device))
     }
 
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {

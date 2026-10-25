@@ -16,6 +16,8 @@ pub use immutable_metadata::{
 };
 mod program_binding_upload;
 pub use program_binding_upload::DeviceProgramBindingUploadSnapshot;
+mod native_memory;
+pub use native_memory::{DeviceNativeMemoryScope, DeviceNativeMemorySnapshot};
 mod resident_program;
 mod tensor_state_copy;
 mod terminal_readback;
@@ -4090,6 +4092,14 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     /// Successful copies mean the host CUDA API returned success, not that a
     /// GPU fence completed. Unsupported backends retain the default `None`.
     fn program_binding_upload_snapshot(&self) -> Option<DeviceProgramBindingUploadSnapshot> {
+        None
+    }
+
+    /// Samples native resource allocation without synchronizing device work,
+    /// reserving capacity, or granting resource-release authority. Backends
+    /// must identify the metric and scope and keep observed peaks distinct
+    /// from plan budgets, process RSS and physical device residency.
+    fn native_memory_snapshot(&self) -> Option<DeviceNativeMemorySnapshot> {
         None
     }
 

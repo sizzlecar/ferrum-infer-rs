@@ -43,6 +43,7 @@ pub(super) fn upload(
         // page size. Decline before submission instead of copying the payload.
         return Ok(None);
     };
+    let _ = runtime.native_memory_snapshot();
     let byte_offset = native.byte_offset as u64;
     Ok(Some(MetalDeviceCommand::transfer(
         runtime.runtime_instance,
