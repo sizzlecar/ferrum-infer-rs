@@ -24,6 +24,10 @@ enum Case {
         channels: u64,
         side: u64,
     },
+    PaddedConv {
+        channels: u64,
+        side: u64,
+    },
     SpatialAttention {
         channels: u64,
         side: u64,
@@ -104,6 +108,25 @@ impl Case {
                     ),
                 ]),
             ),
+            Self::PaddedConv { channels, side } => (
+                MetalTensorOperation::Conv2d,
+                vec![
+                    bf16(vec![1, channels, side, side]),
+                    bf16(vec![channels, channels, 3, 3]),
+                    bf16(vec![channels]),
+                ],
+                bf16(vec![1, channels, side, side]),
+                BTreeMap::from([
+                    (id("padding"), SemanticValue::Integers(vec![1; 4])),
+                    (id("stride"), SemanticValue::Integers(vec![1; 2])),
+                    (id("dilation"), SemanticValue::Integers(vec![1; 2])),
+                    (id("groups"), SemanticValue::Unsigned(1)),
+                    (
+                        id("padding_mode"),
+                        SemanticValue::Text("implicit_zero".into()),
+                    ),
+                ]),
+            ),
             Self::SpatialAttention { channels, side } => (
                 MetalTensorOperation::SpatialAttention,
                 vec![bf16(vec![1, 3 * channels, side, side])],
@@ -137,7 +160,7 @@ impl Case {
                 // the same channel value after the full online softmax/PV.
                 _ => (((index % (heads * width)) % 17) as i32 - 8) as f32 / 16.0,
             },
-            Self::Conv { channels, .. } => match port {
+            Self::Conv { channels, .. } | Self::PaddedConv { channels, .. } => match port {
                 0 => 1.0 / 64.0,
                 1 => (((index / (channels * 9)) % 7) as i32 - 3) as f32 / 256.0,
                 _ => (index % 3) as f32 / 128.0,
@@ -170,6 +193,19 @@ impl Case {
                 let channel = index / (side * side);
                 rounds(channels as f32 * 9.0 / 64.0 * self.value(1, channel * channels * 9))
                     + self.value(2, channel)
+            }
+            Self::PaddedConv { channels, side } => {
+                let channel = index / (side * side);
+                let y = (index / side) % side;
+                let x = index % side;
+                // Constant input/weights make every output independently
+                // checkable, including four-/six-tap corners and edges.
+                let rows = 1 + u64::from(y > 0) + u64::from(y + 1 < side);
+                let columns = 1 + u64::from(x > 0) + u64::from(x + 1 < side);
+                rounds(
+                    channels as f32 * (rows * columns) as f32 / 64.0
+                        * self.value(1, channel * channels * 9),
+                ) + self.value(2, channel)
             }
             Self::SpatialAttention { channels, side } => {
                 self.value(0, 2 * channels * side * side + index)
@@ -208,6 +244,23 @@ fn managed_image_kernel_microbench() {
             side: 128,
         },
         Case::Conv {
+            channels: 128,
+            side: 512,
+        },
+    ]);
+}
+
+#[test]
+#[ignore = "real Metal implicit-padding convolution timing; requires exclusive GPU access"]
+fn managed_masked_conv_microbench() {
+    // True padding=1 selects the bounded masked path when it is supported.
+    // Keep the existing six-case control benchmark unchanged.
+    run_microbench(&[
+        Case::PaddedConv {
+            channels: 512,
+            side: 128,
+        },
+        Case::PaddedConv {
             channels: 128,
             side: 512,
         },

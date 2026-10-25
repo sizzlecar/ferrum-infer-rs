@@ -27,6 +27,7 @@ pub(super) struct Pipelines {
     conv: Option<ComputePipelineState>,
     conv_1x1: Option<ComputePipelineState>,
     conv_3x3: Option<ComputePipelineState>,
+    conv_3x3_masked: Option<ComputePipelineState>,
     pad: Option<ComputePipelineState>,
     channel: Option<ComputePipelineState>,
     channel_shared_limit: u64,
@@ -84,13 +85,14 @@ pub(super) fn pipelines(
         selected.contains(&MetalTensorOperation::Conv2d),
         "ferrum_tensor_conv2d_bf16",
     )?;
-    let (conv_1x1, conv_3x3) = if conv.is_some() {
+    let (conv_1x1, conv_3x3, conv_3x3_masked) = if conv.is_some() {
         (
             conv::direct_square_pipeline(runtime, library, 1)?,
             conv::direct_square_pipeline(runtime, library, 3)?,
+            conv::masked_3x3_pipeline(runtime, library)?,
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
     let pad = create(conv.is_some(), "ferrum_tensor_pad_nchw_bf16")?;
     let channel = create(
@@ -138,6 +140,7 @@ pub(super) fn pipelines(
         conv,
         conv_1x1,
         conv_3x3,
+        conv_3x3_masked,
         pad,
         channel,
         channel_shared_limit,

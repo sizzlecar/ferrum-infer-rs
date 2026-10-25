@@ -74,6 +74,7 @@ pub(super) fn verify(
         (2, 6, 66, 7, 13, 3, 3, 2, [1, 2, 0, 3], [1, 1], [1, 1]),
         (1, 5, 65, 5, 13, 3, 3, 1, [0, 0, 0, 0], [1, 1], [1, 1]),
         (2, 6, 66, 7, 13, 1, 1, 2, [1, 2, 0, 3], [1, 1], [1, 1]),
+        (2, 4, 6, 1, 2, 3, 3, 2, [3, 2, 2, 4], [1, 1], [1, 1]),
     ] {
         let inputs = vec![
             spec(vec![batch, ic, h, w], ElementType::Bf16),
@@ -132,6 +133,7 @@ pub(super) fn verify(
         ]),
         vec![vec![1.0078125], vec![1.5], vec![-1.5]],
     );
+    verify_convolution_padding_special_values(runtime, registry, catalog, &policy, host);
     for kind in [ChannelL2Norm, ChannelL2NormImage] {
         for c in [1, 3, 1152] {
             let input = spec(vec![2, c, 3, 5], ElementType::Bf16);
@@ -247,4 +249,57 @@ pub(super) fn verify(
         );
     }
     eprintln!("Metal spatial operators: grouped/padded/strided convolution, staged L2, C=1152/2048 attention, exceptional values, exact upsample, single-frame group mean and retirement passed");
+}
+
+fn verify_convolution_padding_special_values(
+    runtime: &Arc<MetalDeviceRuntime>,
+    registry: &OperationRuntimeRegistry<MetalDeviceRuntime>,
+    catalog: &CapabilityCatalog,
+    policy: &TensorComponentPolicy,
+    host: &HostMemoryAccount,
+) {
+    for mode in ["explicit_zero", "implicit_zero"] {
+        for special in [f32::INFINITY, f32::NAN] {
+            let mut fixture = Fixture::new(
+                MetalTensorOperation::Conv2d,
+                vec![
+                    spec(vec![1, 1, 1, 1], ElementType::Bf16),
+                    spec(vec![1, 1, 3, 3], ElementType::Bf16),
+                    spec(vec![1], ElementType::Bf16),
+                ],
+                attrs(vec![
+                    ("padding", SemanticValue::Integers(vec![3; 4])),
+                    ("stride", SemanticValue::Integers(vec![1; 2])),
+                    ("dilation", SemanticValue::Integers(vec![1; 2])),
+                    ("groups", SemanticValue::Unsigned(1)),
+                    ("padding_mode", SemanticValue::Text(mode.into())),
+                ]),
+            );
+            fixture.output = Some(spec(vec![1, 1, 5, 5], ElementType::Bf16));
+            let mut weights = vec![0.0; 9];
+            weights[8] = special;
+            run_case(
+                runtime,
+                registry,
+                catalog,
+                policy,
+                host,
+                &fixture,
+                &[vec![2.0], weights, vec![0.0]],
+                |actual| {
+                    assert_eq!(actual.len(), 25);
+                    for (i, value) in actual.iter().enumerate() {
+                        // Only output [1,1] sees the input through tap [2,2].
+                        // Every other position must still multiply +0 by the
+                        // nonfinite weight, including fully padded windows.
+                        if i == 6 && special.is_infinite() {
+                            assert_eq!(*value, f32::INFINITY, "{mode}: visible infinity");
+                        } else {
+                            assert!(value.is_nan(), "{mode}: padded product at {i}");
+                        }
+                    }
+                },
+            );
+        }
+    }
 }

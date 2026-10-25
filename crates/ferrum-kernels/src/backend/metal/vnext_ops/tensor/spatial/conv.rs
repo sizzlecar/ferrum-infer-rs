@@ -11,6 +11,28 @@ pub(super) fn direct_square_pipeline(
         metal::MTLDataType::UInt,
         102,
     );
+    specialized_pipeline(runtime, library, constants)
+}
+
+pub(super) fn masked_3x3_pipeline(
+    runtime: &MetalDeviceRuntime,
+    library: &metal::LibraryRef,
+) -> Result<Option<ComputePipelineState>, MetalDeviceRuntimeError> {
+    let constants = metal::FunctionConstantValues::new();
+    let masked = true;
+    constants.set_constant_value_at_index(
+        (&masked as *const bool).cast(),
+        metal::MTLDataType::Bool,
+        103,
+    );
+    specialized_pipeline(runtime, library, constants)
+}
+
+fn specialized_pipeline(
+    runtime: &MetalDeviceRuntime,
+    library: &metal::LibraryRef,
+    constants: metal::FunctionConstantValues,
+) -> Result<Option<ComputePipelineState>, MetalDeviceRuntimeError> {
     let function = library
         .get_function("ferrum_tensor_conv2d_bf16", Some(constants))
         .map_err(MetalDeviceRuntimeError::contract)?;
@@ -170,6 +192,14 @@ pub(super) fn encode(
         && params.pad_left == 0
         && params.output_height + params.kernel_height - 1 <= params.input_height
         && params.output_width + params.kernel_width - 1 <= params.input_width;
+    let masked_3x3 = !direct_square
+        && g.padding_mode() == Conv2dPaddingMode::ImplicitZero
+        && params.kernel_height == 3
+        && params.kernel_width == 3
+        && params.stride_h == 1
+        && params.stride_w == 1
+        && params.dilation_h == 1
+        && params.dilation_w == 1;
     MetalDeviceCommand::tensor_operation(
         "metal.conv2d.bf16",
         regions,
@@ -203,6 +233,11 @@ pub(super) fn encode(
                     _ => None,
                 })
                 .flatten()
+                .or_else(|| {
+                    masked_3x3
+                        .then_some(pipelines.spatial.conv_3x3_masked.as_ref())
+                        .flatten()
+                })
                 .or(pipelines.spatial.conv.as_ref())
                 .expect("selected convolution pipeline");
             compute.set_compute_pipeline_state(pipeline);
