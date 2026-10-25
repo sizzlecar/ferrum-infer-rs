@@ -357,7 +357,7 @@ impl<'source> WeightComponentPayload<'source> {
                 ),
             });
         }
-        let retained = RetainedHostMemoryRegion::new(Arc::new(bytes.clone()), 0, bytes.len())?;
+        let retained = bytes.retained_region()?;
         Ok(Self {
             component_id: component.id.clone(),
             external_names,

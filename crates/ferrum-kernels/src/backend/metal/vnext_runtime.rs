@@ -48,6 +48,7 @@ use metal::{
 use super::st;
 
 mod counter_readback;
+mod managed_tensor;
 use counter_readback::CounterReadbackStats;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -1417,6 +1418,7 @@ pub struct MetalDeviceCommand {
     participant_start: u32,
     participant_count: u32,
     token_count: u64,
+    tensor_work: Option<DeviceCommandLogicalWork>,
     regions: Vec<MetalBufferRegion>,
     staging: Vec<Buffer>,
     encode: EncodeAction,
@@ -1433,6 +1435,7 @@ impl fmt::Debug for MetalDeviceCommand {
             .field("participant_start", &self.participant_start)
             .field("participant_count", &self.participant_count)
             .field("token_count", &self.token_count)
+            .field("tensor_work", &self.tensor_work)
             .field("region_count", &self.regions.len())
             .field("staging_count", &self.staging.len())
             .finish_non_exhaustive()
@@ -1460,6 +1463,7 @@ impl MetalDeviceCommand {
             participant_start: 0,
             participant_count: 1,
             token_count: 0,
+            tensor_work: None,
             regions,
             staging: Vec::new(),
             encode: Box::new(move |encoder, regions, _staging| encode(encoder, regions)),
@@ -1533,9 +1537,9 @@ impl MetalDeviceCommand {
         participant_count: u32,
         token_count: u64,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        if participant_count == 0 {
+        if participant_count == 0 || self.tensor_work.is_some() {
             return Err(MetalDeviceRuntimeError::contract(
-                "Metal command attribution has zero participants",
+                "Metal token attribution has zero participants or replaces tensor work",
             ));
         }
         self.batching_form = batching_form;
@@ -1549,7 +1553,7 @@ impl MetalDeviceCommand {
         mut self,
         logical_work: DeviceCommandLogicalWork,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        if self.participant_count != 0 || self.token_count != 0 {
+        if self.participant_count != 0 || self.token_count != 0 || self.tensor_work.is_some() {
             return Err(MetalDeviceRuntimeError::contract(
                 "Metal core logical work cannot replace provider command attribution",
             ));
@@ -1557,9 +1561,10 @@ impl MetalDeviceCommand {
         self.batching_form = logical_work.batching_form();
         self.participant_start = logical_work.participant_start();
         self.participant_count = logical_work.participant_count();
-        self.token_count = logical_work.token_count().ok_or_else(|| {
-            MetalDeviceRuntimeError::contract("backend does not support tensor logical attribution")
-        })?;
+        match logical_work.token_count() {
+            Some(tokens) => self.token_count = tokens,
+            None => self.tensor_work = Some(logical_work),
+        }
         Ok(self)
     }
 
@@ -1577,6 +1582,7 @@ impl MetalDeviceCommand {
             participant_start: 0,
             participant_count: 0,
             token_count: 0,
+            tensor_work: None,
             regions,
             staging,
             encode,
@@ -2183,21 +2189,36 @@ impl MetalDeviceRuntime {
             }
             if let Some(attribution) = attribution.as_mut() {
                 let (compute_dispatch_count, transfer_command_count) = encoder.command_counts();
-                if let Some(observation) = DeviceNativeWorkAttribution::with_participant_range(
-                    command_index,
-                    *node_index,
-                    *phase,
-                    DeviceNativeOperationId::new(command.operation)
-                        .expect("Metal command identity was validated before submission"),
-                    DeviceExecutionPath::Eager,
-                    command.batching_form,
-                    command.participant_start,
-                    command.participant_count,
-                    command.token_count,
-                    compute_dispatch_count,
-                    transfer_command_count,
-                    None,
-                ) {
+                let native_op = DeviceNativeOperationId::new(command.operation)
+                    .expect("Metal command identity was validated before submission");
+                let observation = if let Some(work) = command.tensor_work {
+                    DeviceNativeWorkAttribution::with_logical_work(
+                        command_index,
+                        *node_index,
+                        *phase,
+                        native_op,
+                        DeviceExecutionPath::Eager,
+                        work,
+                        compute_dispatch_count,
+                        transfer_command_count,
+                    )
+                } else {
+                    DeviceNativeWorkAttribution::with_participant_range(
+                        command_index,
+                        *node_index,
+                        *phase,
+                        native_op,
+                        DeviceExecutionPath::Eager,
+                        command.batching_form,
+                        command.participant_start,
+                        command.participant_count,
+                        command.token_count,
+                        compute_dispatch_count,
+                        transfer_command_count,
+                        None,
+                    )
+                };
+                if let Some(observation) = observation {
                     attribution.push(observation);
                 }
             }
@@ -2454,6 +2475,31 @@ impl DeviceRuntime for MetalDeviceRuntime {
                 Ok(())
             }),
         ))
+    }
+
+    fn supports_managed_tensor_io(&self) -> bool {
+        true
+    }
+
+    fn encode_managed_upload(
+        &self,
+        source: ferrum_runtime::ManagedHostBytes,
+        layout: HostTransferLayout,
+        destination: &Self::Buffer,
+        destination_offset_bytes: u64,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        managed_tensor::upload(self, source, layout, destination, destination_offset_bytes)
+    }
+
+    fn readback_managed_into(
+        &self,
+        stream: &mut Self::Stream,
+        source: &Self::Buffer,
+        region: CopyRegion,
+        layout: HostTransferLayout,
+        destination: &mut ferrum_runtime::ManagedHostBuffer,
+    ) -> Result<bool, Self::Error> {
+        managed_tensor::readback(self, stream, source, region, layout, destination)
     }
 
     fn encode_zero(

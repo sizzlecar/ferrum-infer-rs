@@ -1,5 +1,107 @@
 use super::*;
 
+#[test]
+fn aligned_backing_charges_padding_before_allocation_and_retains_sliced_owner() {
+    let alignment: usize = 4096;
+    for length in [1, alignment, alignment + 1] {
+        let required = length.div_ceil(alignment) * alignment + alignment - 1;
+        let aligned =
+            HostMemoryAccount::with_allocation_alignment(account(required).limits(), alignment)
+                .unwrap();
+        let short =
+            HostMemoryAccount::with_allocation_alignment(account(required - 1).limits(), alignment)
+                .unwrap();
+        assert!(matches!(
+            short.allocate_zeroed(HostMemoryClass::InputPreprocess, length),
+            Err(HostMemoryError::Capacity { .. })
+        ));
+        assert_eq!(short.usage().unwrap().committed_bytes(), 0);
+        let reservation = aligned
+            .reserve(HostMemoryClass::InputPreprocess, length)
+            .unwrap();
+        assert_eq!(reservation.bytes(), length);
+        assert_eq!(reservation.backing_bytes(), required);
+        assert_eq!(aligned.usage().unwrap().reserved_bytes(), required);
+        let mut buffer = reservation.allocate_zeroed().unwrap();
+        assert_eq!(buffer.len(), length);
+        assert_eq!(buffer.as_ref().as_ptr() as usize % alignment, 0);
+        assert!(buffer.as_ref().iter().all(|&byte| byte == 0));
+        buffer.as_mut().fill(17);
+        let bytes = buffer.freeze();
+        let slice = bytes.slice(length - 1..length).unwrap();
+        let region = slice.retained_region().unwrap();
+        assert_eq!(region.bytes(), &[17]);
+        assert_eq!(region.owner_bytes().len(), required);
+        let owner_start = region.owner_bytes().as_ptr() as usize;
+        let page_start = region.bytes().as_ptr() as usize & !(alignment - 1);
+        assert!(page_start >= owner_start);
+        assert!(page_start + alignment <= owner_start + required);
+        assert!(region.owner_bytes()[..bytes.range.start]
+            .iter()
+            .all(|&byte| byte == 0));
+        assert!(region.owner_bytes()[bytes.range.end..]
+            .iter()
+            .all(|&byte| byte == 0));
+        drop((bytes, slice));
+        assert_eq!(aligned.usage().unwrap().allocated_bytes(), required);
+        assert_eq!(region.bytes(), &[17]);
+        drop(region);
+        assert_eq!(aligned.usage().unwrap().committed_bytes(), 0);
+    }
+}
+
+#[test]
+fn aligned_copy_and_multi_reservation_preserve_logical_extents_and_atomicity() {
+    let alignment = 16;
+    let single_backing = 2 * alignment - 1;
+    let aligned = HostMemoryAccount::with_allocation_alignment(
+        account(2 * single_backing).limits(),
+        alignment,
+    )
+    .unwrap();
+    let mut reservations = aligned
+        .reserve_many(&[
+            (HostMemoryClass::InputPreprocess, 3),
+            (HostMemoryClass::Output, 5),
+        ])
+        .unwrap();
+    let output = reservations
+        .pop()
+        .unwrap()
+        .allocate_copy(&[1, 2, 3, 4, 5])
+        .unwrap()
+        .freeze();
+    assert_eq!(output.bytes(), &[1, 2, 3, 4, 5]);
+    assert_eq!(output.bytes().as_ptr() as usize % alignment, 0);
+    assert!(aligned.owns(&output));
+    assert!(aligned.reserve(HostMemoryClass::Output, 1).is_err());
+    assert_eq!(
+        aligned.usage().unwrap().committed_bytes(),
+        2 * single_backing
+    );
+    drop(reservations);
+    assert_eq!(aligned.usage().unwrap().committed_bytes(), single_backing);
+    assert!(aligned
+        .reserve_many(&[(HostMemoryClass::Output, 1), (HostMemoryClass::Output, 1)])
+        .is_err());
+    assert_eq!(aligned.usage().unwrap().committed_bytes(), single_backing);
+    drop(output);
+    assert_eq!(aligned.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn aligned_allocation_rejects_invalid_layouts_without_changing_capacity() {
+    let limits = account(usize::MAX).limits();
+    for alignment in [0, 3, usize::MAX] {
+        assert!(HostMemoryAccount::with_allocation_alignment(limits, alignment).is_err());
+    }
+    let aligned = HostMemoryAccount::with_allocation_alignment(limits, 4096).unwrap();
+    for length in [0, isize::MAX as usize, usize::MAX] {
+        assert!(aligned.reserve(HostMemoryClass::Output, length).is_err());
+        assert_eq!(aligned.usage().unwrap().committed_bytes(), 0);
+    }
+}
+
 fn account(total: usize) -> HostMemoryAccount {
     HostMemoryAccount::new(
         HostMemoryLimits::new(
