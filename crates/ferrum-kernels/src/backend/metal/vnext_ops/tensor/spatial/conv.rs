@@ -1,5 +1,29 @@
 use super::*;
 
+pub(super) fn direct_3x3_pipeline(
+    runtime: &MetalDeviceRuntime,
+    library: &metal::LibraryRef,
+) -> Result<Option<ComputePipelineState>, MetalDeviceRuntimeError> {
+    let constants = metal::FunctionConstantValues::new();
+    constants.set_constant_value_at_index(
+        (&true as *const bool).cast(),
+        metal::MTLDataType::Bool,
+        102,
+    );
+    let function = library
+        .get_function("ferrum_tensor_conv2d_bf16", Some(constants))
+        .map_err(MetalDeviceRuntimeError::contract)?;
+    let pipeline = runtime
+        .device()
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(MetalDeviceRuntimeError::contract)?;
+    Ok((pipeline.thread_execution_width() == 32
+        && pipeline.max_total_threads_per_threadgroup() >= 128
+        && pipeline.static_threadgroup_memory_length()
+            <= runtime.device().max_threadgroup_memory_length())
+    .then_some(pipeline))
+}
+
 pub(super) struct Shape {
     g: Conv2dBf16Geometry,
     bytes: Vec<u64>,
@@ -133,6 +157,18 @@ pub(super) fn encode(
     let work =
         DeviceCommandLogicalWork::tensor(g.element_count(), g.logical_arithmetic_operations())
             .map_err(|e| e.to_string())?;
+    // Padding has already been materialized when scratch is present. The
+    // specialization only omits bounds checks proven by the resolved geometry.
+    let direct_3x3 = params.kernel_height == 3
+        && params.kernel_width == 3
+        && params.stride_h == 1
+        && params.stride_w == 1
+        && params.dilation_h == 1
+        && params.dilation_w == 1
+        && params.pad_top == 0
+        && params.pad_left == 0
+        && params.output_height + 2 <= params.input_height
+        && params.output_width + 2 <= params.input_width;
     MetalDeviceCommand::tensor_operation(
         "metal.conv2d.bf16",
         regions,
@@ -159,13 +195,12 @@ pub(super) fn encode(
                 0
             };
             let compute = encoder.compute_encoder();
-            compute.set_compute_pipeline_state(
-                pipelines
-                    .spatial
-                    .conv
-                    .as_ref()
-                    .expect("selected convolution pipeline"),
-            );
+            let pipeline = direct_3x3
+                .then_some(pipelines.spatial.conv_3x3.as_ref())
+                .flatten()
+                .or(pipelines.spatial.conv.as_ref())
+                .expect("selected convolution pipeline");
+            compute.set_compute_pipeline_state(pipeline);
             set_region(compute, 0, &regions[source]);
             for port in 1..4 {
                 set_region(compute, port, &regions[port as usize]);

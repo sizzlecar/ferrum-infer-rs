@@ -1,4 +1,6 @@
 #include <metal_simdgroup_matrix>
+constant bool TENSOR_CONV_3X3 [[function_constant(102)]];
+constant bool direct_3x3 = is_function_constant_defined(TENSOR_CONV_3X3) ? TENSOR_CONV_3X3 : false;
 struct PadParams {
     ulong elements, grid_threads, channels, height, width, padded_height, padded_width, top, left;
 };
@@ -25,35 +27,59 @@ kernel void ferrum_tensor_conv2d_bf16(
     constant ConvParams& p [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]], uint sid [[simdgroup_index_in_threadgroup]]) {
     threadgroup float workspace[3072];
+    threadgroup ulong source_origins[32];
     threadgroup float* a = workspace;
     threadgroup float* b = workspace + 1024;
     ulong spatial = p.output_height * p.output_width;
     ulong input_spatial = p.input_height * p.input_width;
     ulong ic = p.input_channels / p.groups, oc = p.output_channels / p.groups;
-    ulong kernel_area = p.kernel_height * p.kernel_width, inner_columns = ic * kernel_area;
+    ulong kernel_area = direct_3x3 ? 9 : p.kernel_height * p.kernel_width;
+    ulong inner_columns = ic * kernel_area;
     uint local_row = (sid / 2) * 16, local_col = (sid % 2) * 32;
     for (ulong job = group; job < p.jobs; job += p.grid_groups) {
         ulong row_start = (job % p.spatial_tiles) * 32;
         ulong col_start = ((job / p.spatial_tiles) % p.output_tiles) * 64;
         ulong batch_group = job / (p.spatial_tiles * p.output_tiles);
         ulong batch = batch_group / p.groups, channel_group = batch_group % p.groups;
+        // Spatial division is invariant across all channel/kernel tiles. Cache
+        // it once on chip; the admitted padded input makes every 3x3 tap valid.
+        if (direct_3x3) {
+            if (tid < 32) {
+                ulong position = row_start + tid;
+                source_origins[tid] = (position / p.output_width) * p.input_width
+                    + position % p.output_width;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         simdgroup_float8x8 sums[8];
         for (uint i = 0; i < 8; ++i) sums[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
         for (ulong k = 0; k < inner_columns; k += 32) {
-            for (uint i = tid; i < 1024; i += 128) {
-                ulong position = row_start + i / 32, inner = k + i % 32;
-                float x = 0.0f;
-                if (position < spatial && inner < inner_columns) {
-                    ulong ky = (inner % kernel_area) / p.kernel_width, kx = inner % p.kernel_width;
-                    ulong y = (position / p.output_width) * p.stride_h + ky * p.dilation_h;
-                    ulong xcol = (position % p.output_width) * p.stride_w + kx * p.dilation_w;
-                    if (y >= p.pad_top && y - p.pad_top < p.input_height && xcol >= p.pad_left && xcol - p.pad_left < p.input_width) {
-                        ulong channel = channel_group * ic + inner / kernel_area;
-                        x = decode_bf16(input[(batch * p.input_channels + channel) * input_spatial
-                            + (y - p.pad_top) * p.input_width + xcol - p.pad_left]);
-                    }
+            if (direct_3x3) {
+                ulong inner = k + tid % 32;
+                ulong channel = channel_group * ic + inner / 9;
+                ulong tap = (inner % 9) / 3 * p.input_width + inner % 3;
+                ulong base = (batch * p.input_channels + channel) * input_spatial + tap;
+                for (uint i = tid; i < 1024; i += 128) {
+                    ulong position = row_start + i / 32;
+                    a[i] = position < spatial && inner < inner_columns
+                        ? decode_bf16(input[base + source_origins[i / 32]]) : 0.0f;
                 }
-                a[i] = x;
+            } else {
+                for (uint i = tid; i < 1024; i += 128) {
+                    ulong position = row_start + i / 32, inner = k + i % 32;
+                    float x = 0.0f;
+                    if (position < spatial && inner < inner_columns) {
+                        ulong ky = (inner % kernel_area) / p.kernel_width, kx = inner % p.kernel_width;
+                        ulong y = (position / p.output_width) * p.stride_h + ky * p.dilation_h;
+                        ulong xcol = (position % p.output_width) * p.stride_w + kx * p.dilation_w;
+                        if (y >= p.pad_top && y - p.pad_top < p.input_height && xcol >= p.pad_left && xcol - p.pad_left < p.input_width) {
+                            ulong channel = channel_group * ic + inner / kernel_area;
+                            x = decode_bf16(input[(batch * p.input_channels + channel) * input_spatial
+                                + (y - p.pad_top) * p.input_width + xcol - p.pad_left]);
+                        }
+                    }
+                    a[i] = x;
+                }
             }
             for (uint i = tid; i < 2048; i += 128) {
                 ulong channel = col_start + i % 64, inner = k + i / 64;

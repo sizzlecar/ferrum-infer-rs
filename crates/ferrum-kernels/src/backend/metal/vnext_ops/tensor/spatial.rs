@@ -25,6 +25,7 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
 
 pub(super) struct Pipelines {
     conv: Option<ComputePipelineState>,
+    conv_3x3: Option<ComputePipelineState>,
     pad: Option<ComputePipelineState>,
     channel: Option<ComputePipelineState>,
     channel_shared_limit: u64,
@@ -70,7 +71,7 @@ pub(super) fn pipelines(
             return Ok(None);
         }
         let function = library
-            .get_function(name, None)
+            .get_function(name, Some(metal::FunctionConstantValues::new()))
             .map_err(MetalDeviceRuntimeError::contract)?;
         runtime
             .device()
@@ -82,6 +83,11 @@ pub(super) fn pipelines(
         selected.contains(&MetalTensorOperation::Conv2d),
         "ferrum_tensor_conv2d_bf16",
     )?;
+    let conv_3x3 = if conv.is_some() {
+        conv::direct_3x3_pipeline(runtime, library)?
+    } else {
+        None
+    };
     let pad = create(conv.is_some(), "ferrum_tensor_pad_nchw_bf16")?;
     let channel = create(
         selected.iter().any(|k| k.is_channel_norm()),
@@ -126,6 +132,7 @@ pub(super) fn pipelines(
     Ok(Pipelines {
         mean,
         conv,
+        conv_3x3,
         pad,
         channel,
         channel_shared_limit,
