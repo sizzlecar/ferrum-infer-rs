@@ -47,8 +47,11 @@ impl QwenImage21Assets {
         let vision_schema = Qwen3VLVisionFamily::new()?.weights(&config)?;
         let encoder_schema = QwenImage21VaeEncoderFamily::new()?.weights(&encoder)?;
         let required_weight_bytes = [
-            validate_archive(vision_schema.stored_schema()?, &self.sources.text_encoder)?,
-            validate_archive(encoder_schema.stored_schema()?, &self.sources.vae)?,
+            validate_archive(
+                vision_schema.stored_schema()?,
+                self.sources.text_encoder.as_ref(),
+            )?,
+            validate_archive(encoder_schema.stored_schema()?, self.sources.vae.as_ref())?,
         ];
         let positions = self
             .sources

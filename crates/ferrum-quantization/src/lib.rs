@@ -29,6 +29,7 @@ pub mod mxfp4_safetensors_source;
 pub mod native_safetensors;
 pub mod quant_linear;
 pub mod safetensors_archive;
+pub mod tensor_archive;
 pub mod traits;
 
 pub use bf16_whole_tensor_fp8::Bf16WholeTensorFp8Materializer;
@@ -49,6 +50,7 @@ pub use mxfp4_safetensors_source::{Mxfp4SafetensorsSource, MXFP4_E2M1_E8M0_SOURC
 pub use native_safetensors::{NativeSafetensorsLoadOptions, NativeSafetensorsLoader};
 pub use quant_linear::QuantLinear;
 pub use safetensors_archive::{SafetensorsArchive, SafetensorsTensor};
+pub use tensor_archive::{ArchiveTensor, ManagedDenseArchiveSource, TensorArchive};
 pub use traits::Linear;
 
 // Quant config types — populated from safetensors metadata or GGUF header.

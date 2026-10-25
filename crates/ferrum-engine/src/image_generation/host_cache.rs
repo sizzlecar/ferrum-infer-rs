@@ -54,10 +54,12 @@ impl ImageFp8HostCachePolicy {
         if self == Self::Off {
             return Ok(());
         }
-        ensure!(
-            precision == ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1,
-            "converted FP8 Host caching requires FP8 materializer precision"
-        );
+        for stage in [ImageStage::TextEncoder, ImageStage::Denoiser] {
+            ensure!(
+                self.maximum_bytes(stage).is_none() || precision.stage_uses_fp8(stage),
+                "{stage:?} converted FP8 Host caching requires an FP8 materializer for that stage"
+            );
+        }
         ensure!(
             self.retained_ceiling()? > 0,
             "FP8 Host cache must select a stage"
@@ -217,5 +219,22 @@ mod tests {
                 host(1024, 800)
             )
             .is_err());
+    }
+
+    #[test]
+    fn native_denoiser_allows_only_the_text_converted_weight_cache() {
+        use super::super::{ImageComponentPrecision, ImageDenoiserPrecision, ImageTextPrecision};
+        let precision = ImageCudaPrecisionPolicy::Components(ImageComponentPrecision {
+            text_encoder: ImageTextPrecision::Fp8LinearExperimentalV1,
+            denoiser: ImageDenoiserPrecision::NativeSource,
+        });
+        let text_only = ImageFp8HostCachePolicy::StageBudgets {
+            maximum_bytes_by_stage: ImageFp8HostCacheBudgets {
+                text_encoder: NonZeroU64::new(400),
+                denoiser: None,
+            },
+        };
+        text_only.validate(precision, host(1024, 800)).unwrap();
+        assert!(policy().validate(precision, host(1024, 800)).is_err());
     }
 }

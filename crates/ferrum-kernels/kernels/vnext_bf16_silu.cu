@@ -7,6 +7,7 @@
 #include <curand_kernel.h>
 #include <math.h>
 #include <stdint.h>
+#include "vnext_gguf_blocks.cuh"
 
 __device__ __forceinline__ float ferrum_silu_exp(float value) {
     return expf(value);
@@ -24,6 +25,18 @@ __device__ __forceinline__ uint16_t ferrum_bf16_rne(float value) {
 
 __device__ __forceinline__ float ferrum_bf16_decode(uint16_t value) {
     return __uint_as_float(static_cast<uint32_t>(value) << 16);
+}
+
+// A single matrix is decoded into invocation scratch. The source remains
+// compressed; the core releases scratch after its dependent GEMM completes.
+extern "C" __global__ void ferrum_vnext_block_decode_bf16(
+    const unsigned char* input, uint16_t* output, uint64_t count,
+    unsigned format, unsigned values, unsigned bytes) {
+    const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride) {
+        const float value = ferrum_gguf_matrix_value(input + (i / values) * bytes, unsigned(i % values), format);
+        output[i] = ferrum_bf16_rne(value);
+    }
 }
 
 // Torch v2.13.0 DistributionTemplates.h contiguous 32-bit launch mapping.

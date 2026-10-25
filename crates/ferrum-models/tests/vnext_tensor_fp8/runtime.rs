@@ -44,7 +44,7 @@ pub(super) fn verify() {
     let probe = CudaCutlassFp8Probe::new(host.clone());
     let native = CudaCutlassFp8Config {
         opaque_memory_bytes: 64 << 20,
-        maximum_plans: 16,
+        maximum_plans: 1,
         opaque_memory_profile: "experimental-fp8-native-fixture-v1".into(),
     };
     let provider =
@@ -159,6 +159,29 @@ pub(super) fn verify() {
             .unwrap();
         let mut retained = None;
         for repetition in 0..2 {
+            // Evict this session's native planning record without retiring the
+            // compiled component. Encoding must reconstruct the same admitted
+            // plan and preserve its arithmetic and charged scratch boundary.
+            let displaced_shape = Shape {
+                m: if shape.m == 1 { 2 } else { 1 },
+                ..shape.clone()
+            };
+            let displaced_options = ProgramPlanCompileOptions::new(BTreeMap::from([(
+                id(X),
+                tensor(vec![displaced_shape.m, displaced_shape.k]),
+            )]))
+            .unwrap();
+            drop(
+                CompiledTensorComponent::compile(
+                    family::prepare(&displaced_shape),
+                    &registry,
+                    &catalog,
+                    &policy,
+                    &WeightMaterializerRegistry::identity_only().unwrap(),
+                    &displaced_options,
+                )
+                .unwrap(),
+            );
             // Both capture destinations are charged to this same Host parent
             // before any device admission. The ordinary provider has no probe.
             let ticket = probe.arm(shape.m as u32, shape.k as u32).unwrap();

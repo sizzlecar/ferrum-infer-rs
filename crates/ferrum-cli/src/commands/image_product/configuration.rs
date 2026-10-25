@@ -110,6 +110,7 @@ pub struct WeightPaths {
 pub enum WeightSource {
     Single { directory: PathBuf, file: String },
     Index { directory: PathBuf, file: String },
+    Gguf { directory: PathBuf, file: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,9 +350,7 @@ impl ImageProductConfig {
         );
         cuda.fp8_host_cache
             .validate(cuda.precision_policy, cuda.host.limits()?)?;
-        if cuda.precision_policy
-            == ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1
-        {
+        if cuda.precision_policy.uses_fp8() {
             ensure!(
                 cuda.host.weight_backing_bytes > 0,
                 "FP8 requires a nonzero backend.host.weight_backing_bytes allowance"
@@ -430,8 +429,9 @@ impl ImageProductConfig {
             &mut self.weights.transformer,
             &mut self.weights.vae,
         ] {
-            let (WeightSource::Single { directory, .. } | WeightSource::Index { directory, .. }) =
-                source;
+            let (WeightSource::Single { directory, .. }
+            | WeightSource::Index { directory, .. }
+            | WeightSource::Gguf { directory, .. }) = source;
             if directory.is_relative() {
                 *directory = base.join(&*directory);
             }

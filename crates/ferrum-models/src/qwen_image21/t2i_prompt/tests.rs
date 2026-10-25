@@ -647,9 +647,11 @@ fn borrowed_archive_lookup_validates_name_dtype_and_shape_before_host_admission(
         .managed_inputs(
             &host,
             &architecture(),
-            &source
-                .tensor(Qwen3VLTextEncoderFamily::EMBEDDING_EXTERNAL_NAME)
-                .unwrap(),
+            &ferrum_quantization::TensorArchive::tensor(
+                &source,
+                Qwen3VLTextEncoderFamily::EMBEDDING_EXTERNAL_NAME,
+            )
+            .unwrap(),
         )
         .unwrap();
     assert_eq!(selected.tensors()[0].bytes().len(), 16);
@@ -678,7 +680,11 @@ fn borrowed_archive_lookup_validates_name_dtype_and_shape_before_host_admission(
         .unwrap();
         let source = SafetensorsArchive::open(d.path()).unwrap();
         assert!(batch
-            .managed_inputs(&host, &architecture(), &source.tensor(name).unwrap())
+            .managed_inputs(
+                &host,
+                &architecture(),
+                &ferrum_quantization::TensorArchive::tensor(&source, name).unwrap()
+            )
             .is_err());
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     }

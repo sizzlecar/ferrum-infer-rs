@@ -10,6 +10,7 @@
     unused_assignments
 )]
 
+mod block_quantized_linear;
 pub mod common;
 pub mod definition;
 pub mod deltanet_s1;

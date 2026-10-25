@@ -2,7 +2,7 @@ use super::configuration::*;
 use anyhow::{ensure, Context, Result};
 use ferrum_engine::image_generation::{QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources};
 use ferrum_models::pipeline_source::{PipelineArchitecture, PipelineDeclaration};
-use ferrum_quantization::SafetensorsArchive;
+use ferrum_quantization::{GgufWeightComponentSource, SafetensorsArchive, TensorArchive};
 use std::{fs::File, io::Read, path::Path, sync::Arc};
 
 pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
@@ -25,15 +25,27 @@ pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 }
 
 impl WeightSource {
-    pub fn open(&self) -> Result<Arc<SafetensorsArchive>> {
-        Ok(Arc::new(match self {
-            Self::Single { directory, file } => {
-                SafetensorsArchive::open_single_file(directory, file)?
+    pub fn open(&self) -> Result<Arc<dyn TensorArchive>> {
+        match self {
+            Self::Single { directory, file } => Ok(Arc::new(SafetensorsArchive::open_single_file(
+                directory, file,
+            )?)),
+            Self::Index { directory, file } => Ok(Arc::new(SafetensorsArchive::open_with_index(
+                directory, file,
+            )?)),
+            Self::Gguf { directory, file } => {
+                ensure!(
+                    file.len() > ".gguf".len()
+                        && file.ends_with(".gguf")
+                        && !file.contains(['/', '\\', ':'])
+                        && !file.chars().any(char::is_control),
+                    "GGUF source must name one explicit .gguf basename within its directory"
+                );
+                Ok(Arc::new(GgufWeightComponentSource::open(
+                    directory.join(file),
+                )?))
             }
-            Self::Index { directory, file } => {
-                SafetensorsArchive::open_with_index(directory, file)?
-            }
-        }))
+        }
     }
 }
 

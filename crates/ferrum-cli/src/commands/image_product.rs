@@ -37,9 +37,10 @@ pub struct ImageProductArgs {
     /// Otherwise use LD_LIBRARY_PATH, the system cache and standard library directories.
     #[arg(long, value_name = "LIBRARY")]
     pub image_cudnn_library: Option<PathBuf>,
-    /// Explicit image Linear precision. Default bf16; experimental FP8 changes
-    /// TE/DiT projections only. Residency is configured independently.
-    #[arg(long, value_name = "bf16|fp8_linear_experimental_v1")]
+    /// Image Linear precision: bf16 (default), fp8_linear_experimental_v1, or
+    /// {"components":{"text_encoder":"bf16","denoiser":"fp8_linear_experimental_v1"}}.
+    /// An explicit GGUF image config can select denoiser native_source.
+    #[arg(long, value_name = "PRESET|JSON")]
     pub image_precision: Option<ferrum_engine::image_generation::ImageCudaPrecisionPolicy>,
 }
 

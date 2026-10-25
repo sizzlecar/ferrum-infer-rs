@@ -234,6 +234,32 @@ impl SafetensorsArchive {
     }
 }
 
+impl crate::TensorArchive for SafetensorsArchive {
+    fn tensor(&self, external_name: &str) -> Result<crate::ArchiveTensor<'_>> {
+        let tensor = self.tensor(external_name)?;
+        let element_type = tensor.element_type().ok_or_else(|| {
+            FerrumError::model(format!(
+                "tensor {external_name:?} has no declared runtime storage encoding"
+            ))
+        })?;
+        crate::ArchiveTensor::new(
+            tensor.external_name(),
+            tensor.source_file(),
+            tensor.shape(),
+            WeightEncoding::Dense { element_type },
+            tensor.retained_host_memory().clone(),
+        )
+    }
+
+    fn tensor_count(&self) -> usize {
+        self.tensor_count()
+    }
+
+    fn tensor_names(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        Box::new(self.tensor_names())
+    }
+}
+
 impl WeightComponentSource for SafetensorsArchive {
     fn component<'source>(
         &'source self,

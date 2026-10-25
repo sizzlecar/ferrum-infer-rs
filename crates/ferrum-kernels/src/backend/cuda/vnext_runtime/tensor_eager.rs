@@ -324,6 +324,7 @@ impl CudaDeviceRuntime {
                     ferrum_runtime::SILU_BF16_CAPABILITY_ID
                         | ferrum_runtime::PHILOX_NORMAL_BF16_CAPABILITY_ID
                         | ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID
+                        | ferrum_runtime::DENSE_LINEAR_BLOCK_BF16_CAPABILITY_ID
                         | ferrum_runtime::DENSE_LINEAR_FP8_BF16_CAPABILITY_ID
                         | ferrum_runtime::SILU_MUL_BF16_CAPABILITY_ID
                         | ferrum_runtime::TANH_BF16_CAPABILITY_ID

@@ -3,7 +3,7 @@
 //! explicit implementation profile, not a Torch/CUDA bitwise-parity claim.
 use super::{Qwen3VLVisionConfig, Qwen3VLVisionFamily as Family};
 use anyhow::{ensure, Result};
-use ferrum_quantization::SafetensorsTensor;
+use ferrum_quantization::ArchiveTensor;
 use ferrum_runtime::*;
 use half::bf16;
 
@@ -15,7 +15,7 @@ impl Qwen3VLVisionConfig {
     pub fn managed_position_inputs(
         &self,
         host: &HostMemoryAccount,
-        position_table: &SafetensorsTensor<'_>,
+        position_table: &ArchiveTensor<'_>,
     ) -> Result<[ManagedHostTensor; 3]> {
         ensure!(
             position_table.external_name() == Family::POSITION_EXTERNAL_NAME,

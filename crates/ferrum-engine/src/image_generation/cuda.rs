@@ -163,7 +163,7 @@ impl QwenImage21CudaConfig {
                 || self.attention_policy == ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
             "CUDA request-cache editing requires the explicit cuDNN SDPA attention policy"
         );
-        if self.precision_policy == ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 {
+        if self.precision_policy.uses_fp8() {
             ensure!(
                 ferrum_kernels::native_ops::cutlass_fp8::compiled(),
                 "FP8 requires cuda-cutlass-fp8 and its locked native artifact"
@@ -252,7 +252,21 @@ impl QwenImage21CudaConfig {
     )> {
         self.validate()?;
         let stream_plan = self.stream_plan()?;
-        let profiles = cuda_profiles_with_precision(self.attention_policy, self.precision_policy)?;
+        let mut profiles =
+            cuda_profiles_with_precision(self.attention_policy, self.precision_policy)?;
+        self.precision_policy
+            .validate_denoiser_source(!assets.transformer_encodings.is_empty())?;
+        if !assets.transformer_encodings.is_empty() {
+            profiles.denoiser = NumericalProfileId::new(match self.attention_policy {
+                ImageCudaAttentionPolicy::Sequential => {
+                    QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_PROFILE_ID
+                }
+                ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
+                    QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID
+                }
+            })
+            .map_err(anyhow::Error::msg)?;
+        }
         let editing = assets.editing.is_some();
         let mut contracts = contracts(self.attention_policy)?;
         // Exactly one Host ledger, also used by CPU weight conversion.
@@ -260,12 +274,11 @@ impl QwenImage21CudaConfig {
         let (materializers, execution_weight_bytes) =
             self.prepare_assets(&assets, &profiles, &host)?;
         let device_id = DeviceId::new(format!("device.cuda.{}", self.ordinal))?;
-        let device = match self.precision_policy {
-            ImageCudaPrecisionPolicy::Bf16 => cuda_tensor_runtime_config(self.ordinal, device_id)?,
-            ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 => {
-                contracts.push(Box::new(dense_linear_fp8_bf16_contract()?));
-                cuda_tensor_runtime_config_with_cutlass_fp8(self.ordinal, device_id)?
-            }
+        let device = if self.precision_policy.uses_fp8() {
+            contracts.push(Box::new(dense_linear_fp8_bf16_contract()?));
+            cuda_tensor_runtime_config_with_cutlass_fp8(self.ordinal, device_id)?
+        } else {
+            cuda_tensor_runtime_config(self.ordinal, device_id)?
         };
         let runtime = Arc::new(match self.memory {
             ImageCudaMemoryPolicy::ExplicitTotal(bytes) => {
@@ -348,7 +361,7 @@ impl QwenImage21CudaConfig {
             }
         };
         providers.push(cuda_vnext_dense_bf16_provider(&runtime)?);
-        if self.precision_policy == ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 {
+        if self.precision_policy.uses_fp8() {
             providers.push(cuda_vnext_dense_linear_fp8_bf16_provider(
                 &runtime,
                 &CudaCutlassFp8Config {
@@ -370,11 +383,10 @@ impl QwenImage21CudaConfig {
         let catalog = materializers
             .augment_catalog(registry.capability_catalog(descriptor.clone(), vec![engine])?)?;
         let native_units: &[ferrum_kernels::native_ops::CudaNativeBuildUnit] =
-            match self.precision_policy {
-                ImageCudaPrecisionPolicy::Bf16 => &[],
-                ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 => {
-                    &[ferrum_kernels::native_ops::CudaNativeBuildUnit::CutlassFp8ScaledMm]
-                }
+            if self.precision_policy.uses_fp8() {
+                &[ferrum_kernels::native_ops::CudaNativeBuildUnit::CutlassFp8ScaledMm]
+            } else {
+                &[]
             };
         ferrum_kernels::native_ops::validate_compiled_native_operator_provider_catalog_for_units(
             &catalog.native_operator_provider_catalog(ferrum_types::NativeOperatorBackend::Cuda)?,
@@ -475,7 +487,8 @@ impl QwenImage21CudaConfig {
         let dit = QwenImage21TransformerConfig::new(
             assets.transformer.clone(),
             QwenImage21T2iLayout::new(1, 2, 2, vec![1])?,
-        )?;
+        )?
+        .with_weight_encodings(assets.transformer_encodings.clone())?;
         let decoder = assets.decoder(2, 2)?;
         let noise = NormalNoiseConfig::new(64, 2, 2)?;
         let mut families = vec![
@@ -511,64 +524,50 @@ impl QwenImage21CudaConfig {
         }
         validate_family_command_limits(&families, self.maximum_commands_per_submission)?;
         let mut execution_bytes = assets.receipt().required_weight_bytes;
-        let materializers = if self.precision_policy == ImageCudaPrecisionPolicy::Bf16 {
-            WeightMaterializerRegistry::identity_only()?
-        } else {
-            let mut text_materializer = super::precision::materializer(
+        let mut selected: Vec<Box<dyn WeightMaterializer>> = Vec::new();
+        let mut maximum_group_bytes = 0;
+        for (index, stage, family, materializer_id) in [
+            (
+                0,
+                super::ImageStage::TextEncoder,
+                &families[0],
                 super::precision::TEXT_MATERIALIZER,
-                host,
-                Qwen3VLTextEncoderFamily::fp8_weight_groups(&text)?,
-            )?;
-            let mut dit_materializer = super::precision::materializer(
+            ),
+            (
+                1,
+                super::ImageStage::Denoiser,
+                &families[2],
                 super::precision::DIT_MATERIALIZER,
-                host,
-                QwenImage21TransformerFamily::fp8_weight_groups(&dit)?,
-            )?;
-            // Physical execution-schema lower bounds include every required scale
-            // scalar. They are not peak/alignment/activation estimates.
-            let mut maximum_group_bytes = 0;
-            for (index, stage, family, materializer) in [
-                (
-                    0,
-                    super::ImageStage::TextEncoder,
-                    &families[0],
-                    &text_materializer,
-                ),
-                (
-                    1,
-                    super::ImageStage::Denoiser,
-                    &families[2],
-                    &dit_materializer,
-                ),
-            ] {
-                super::precision::validate_backing(family, materializer, host)?;
-                maximum_group_bytes =
-                    maximum_group_bytes.max(materializer.maximum_group_backing_bytes(family)?);
-                if self.fp8_host_cache.maximum_bytes(stage).is_some() {
-                    self.fp8_host_cache
-                        .validate_stage(stage, materializer.converted_cache_bytes(family)?)?;
+            ),
+        ] {
+            if !self.precision_policy.stage_uses_fp8(stage) {
+                continue;
+            }
+            let groups = match stage {
+                super::ImageStage::TextEncoder => {
+                    Qwen3VLTextEncoderFamily::fp8_weight_groups(&text)?
                 }
-                execution_bytes[index] = materializer.execution_weight_bytes(family)?;
+                super::ImageStage::Denoiser => {
+                    QwenImage21TransformerFamily::fp8_weight_groups(&dit)?
+                }
+                _ => unreachable!("only materialized stages are enumerated"),
+            };
+            let mut materializer = super::precision::materializer(materializer_id, host, groups)?;
+            super::precision::validate_backing(family, &materializer, host)?;
+            maximum_group_bytes =
+                maximum_group_bytes.max(materializer.maximum_group_backing_bytes(family)?);
+            // Schema bytes include scales, but are not a peak/activation estimate.
+            execution_bytes[index] = materializer.execution_weight_bytes(family)?;
+            if let Some(capacity) = self.fp8_host_cache.maximum_bytes(stage) {
+                self.fp8_host_cache
+                    .validate_stage(stage, materializer.converted_cache_bytes(family)?)?;
+                materializer = materializer.with_host_cache(capacity)?;
             }
-            self.fp8_host_cache
-                .validate_peak(self.host, maximum_group_bytes)?;
-            if let Some(capacity) = self
-                .fp8_host_cache
-                .maximum_bytes(super::ImageStage::TextEncoder)
-            {
-                text_materializer = text_materializer.with_host_cache(capacity)?;
-            }
-            if let Some(capacity) = self
-                .fp8_host_cache
-                .maximum_bytes(super::ImageStage::Denoiser)
-            {
-                dit_materializer = dit_materializer.with_host_cache(capacity)?;
-            }
-            WeightMaterializerRegistry::new(vec![
-                Box::new(text_materializer),
-                Box::new(dit_materializer),
-            ])?
-        };
+            selected.push(Box::new(materializer));
+        }
+        self.fp8_host_cache
+            .validate_peak(self.host, maximum_group_bytes)?;
+        let materializers = WeightMaterializerRegistry::new(selected)?;
         if let Some(capacity) = self.declared_maximum() {
             self.validate_weight_capacity(&execution_bytes, capacity.get())?;
         }
@@ -596,6 +595,7 @@ fn prefix_command_families(
         dit.transformer().clone(),
         QwenImage21T2iLayout::new(3, 2, 2, vec![3])?,
     )?
+    .with_weight_encodings(dit.weight_encodings().clone())?
     .with_reference_image(1, 1, 2, 2)?;
     let copies = config.prefix_cache_ports()?.len();
     let family = TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?);
@@ -643,6 +643,7 @@ fn editing_command_families(
         dit.transformer().clone(),
         QwenImage21T2iLayout::new(3, 2, 2, vec![3])?,
     )?
+    .with_weight_encodings(dit.weight_encodings().clone())?
     .with_reference_image(1, 1, 2, 2)?;
     Ok([
         TypedFamilyRegistration::new(Qwen3VLVisionFamily::new()?).prepare_with_profile(
@@ -681,30 +682,34 @@ fn cuda_profiles_with_precision(
     attention: ImageCudaAttentionPolicy,
     precision: ImageCudaPrecisionPolicy,
 ) -> Result<QwenImage21Profiles> {
+    use super::{ImageDenoiserPrecision as Denoiser, ImageTextPrecision as Text};
     let id = |value: &str| NumericalProfileId::new(value).map_err(anyhow::Error::msg);
     Ok(QwenImage21Profiles {
-        text_encoder: id(match precision {
-            ImageCudaPrecisionPolicy::Bf16 => Qwen3VLTextEncoderFamily::CUDA_PROFILE_ID,
-            ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 => {
-                Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID
-            }
+        text_encoder: id(match precision.text_encoder() {
+            Text::Bf16 => Qwen3VLTextEncoderFamily::CUDA_PROFILE_ID,
+            Text::Fp8LinearExperimentalV1 => Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID,
         })?,
         noise: id(CUDA_PHILOX_NORMAL_BF16_NUMERICAL_PROFILE_ID)?,
-        denoiser: id(match (attention, precision) {
-            (ImageCudaAttentionPolicy::Sequential, ImageCudaPrecisionPolicy::Bf16) => {
+        denoiser: id(match (attention, precision.denoiser()) {
+            (ImageCudaAttentionPolicy::Sequential, Denoiser::Bf16) => {
                 QwenImage21TransformerFamily::CUDA_PROFILE_ID
             }
-            (ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1, ImageCudaPrecisionPolicy::Bf16) => {
+            (ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1, Denoiser::Bf16) => {
                 QwenImage21TransformerFamily::CUDA_FUSED_PROFILE_ID
             }
-            (
-                ImageCudaAttentionPolicy::Sequential,
-                ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1,
-            ) => QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID,
+            (ImageCudaAttentionPolicy::Sequential, Denoiser::Fp8LinearExperimentalV1) => {
+                QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
+            }
             (
                 ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
-                ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1,
+                Denoiser::Fp8LinearExperimentalV1,
             ) => QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID,
+            (ImageCudaAttentionPolicy::Sequential, Denoiser::NativeSource) => {
+                QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_PROFILE_ID
+            }
+            (ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1, Denoiser::NativeSource) => {
+                QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID
+            }
         })?,
         decoder: id(QwenImage21VaeDecoderFamily::CUDA_PROFILE_ID)?,
         euler: Bf16EulerProfile::CudaScalarBf16StagedRneV1,
@@ -739,6 +744,7 @@ fn contracts(attention: ImageCudaAttentionPolicy) -> Result<Vec<Box<dyn Operatio
         Box::new(philox_normal_bf16_contract()?),
         Box::new(conv2d_bf16_contract()?),
         Box::new(dense_linear_bf16_contract()?),
+        Box::new(dense_linear_block_bf16_contract()?),
     ];
     for kind in TensorPrimitiveBf16::ALL {
         contracts.push(Box::new(kind.contract()?));
@@ -1053,6 +1059,47 @@ mod tests {
             );
             assert_ne!(fp8.text_encoder, bf16.text_encoder);
             assert_ne!(fp8.denoiser, bf16.denoiser);
+        }
+    }
+
+    #[test]
+    fn component_precision_selects_independent_text_and_native_denoiser_profiles() {
+        use super::super::{ImageComponentPrecision, ImageDenoiserPrecision, ImageTextPrecision};
+        for attention in [
+            ImageCudaAttentionPolicy::Sequential,
+            ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
+        ] {
+            for text in [
+                ImageTextPrecision::Bf16,
+                ImageTextPrecision::Fp8LinearExperimentalV1,
+            ] {
+                let precision = ImageCudaPrecisionPolicy::Components(ImageComponentPrecision {
+                    text_encoder: text,
+                    denoiser: ImageDenoiserPrecision::NativeSource,
+                });
+                let profiles = cuda_profiles_with_precision(attention, precision).unwrap();
+                let bf16 = cuda_profiles(attention).unwrap();
+                assert_eq!(
+                    profiles.text_encoder.as_str(),
+                    match text {
+                        ImageTextPrecision::Bf16 => Qwen3VLTextEncoderFamily::CUDA_PROFILE_ID,
+                        ImageTextPrecision::Fp8LinearExperimentalV1 =>
+                            Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID,
+                    }
+                );
+                assert_eq!(
+                    profiles.denoiser.as_str(),
+                    match attention {
+                        ImageCudaAttentionPolicy::Sequential =>
+                            QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_PROFILE_ID,
+                        ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 =>
+                            QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID,
+                    }
+                );
+                assert_eq!(profiles.decoder, bf16.decoder);
+                assert_eq!(profiles.noise, bf16.noise);
+                assert_eq!(profiles.euler, bf16.euler);
+            }
         }
     }
 

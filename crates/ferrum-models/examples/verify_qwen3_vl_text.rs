@@ -78,7 +78,8 @@ fn run(args: arguments::Arguments) -> Result<()> {
             w.external_name()
         );
     }
-    let embedding = source.tensor(Family::EMBEDDING_EXTERNAL_NAME)?;
+    let embedding =
+        ferrum_quantization::TensorArchive::tensor(&source, Family::EMBEDDING_EXTERNAL_NAME)?;
     let inputs = prompts.managed_inputs(&host, &architecture, &embedding)?;
     let output = artifacts::Artifacts::create(&args.artifact_dir)?;
     let weights=weights.iter().map(|w| {

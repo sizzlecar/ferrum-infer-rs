@@ -53,6 +53,54 @@ fn native_fixture(tensors: &[NativeTensorFixture<'_>]) -> tempfile::NamedTempFil
 }
 
 #[test]
+fn archive_inventory_keeps_mixed_encodings_logical_shapes_and_retained_blocks() {
+    use ferrum_quantization::TensorArchive;
+    use std::sync::Arc;
+
+    let packed = [0x3c; 68];
+    let dense = 1.25_f32.to_le_bytes();
+    let file = native_fixture(&[
+        NativeTensorFixture {
+            name: "projection.weight",
+            ggml_type: 8,
+            dimensions: &[2, 32],
+            payload: &packed,
+        },
+        NativeTensorFixture {
+            name: "norm.weight",
+            ggml_type: 0,
+            dimensions: &[1],
+            payload: &dense,
+        },
+    ]);
+    let source = GgufWeightComponentSource::open(file.path()).unwrap();
+    let pointer = source
+        .file()
+        .tensor_byte_slice("projection.weight")
+        .unwrap()
+        .as_ptr();
+    let archive: Arc<dyn TensorArchive> = Arc::new(source);
+    assert_eq!(archive.tensor_count(), 2);
+    assert_eq!(
+        archive.tensor_names().collect::<Vec<_>>(),
+        ["norm.weight", "projection.weight"]
+    );
+    assert_eq!(
+        archive.tensor("norm.weight").unwrap().element_type(),
+        Some(ElementType::F32)
+    );
+    let tensor = archive.tensor("projection.weight").unwrap();
+    assert_eq!(tensor.shape(), &[2, 32]);
+    assert_eq!(tensor.element_type(), None);
+    assert_eq!(tensor.bytes().as_ptr(), pointer);
+    assert_eq!(tensor.bytes(), &packed);
+    let retained = tensor.retained_host_memory().clone();
+    drop(tensor);
+    drop(archive);
+    assert_eq!(retained.bytes(), &packed);
+}
+
+#[test]
 fn native_pq2_source_keeps_group_128_packing_and_mmap_ownership() {
     use ferrum_quantization::gguf::{gguf_weight_encoding, GgufInventory};
 

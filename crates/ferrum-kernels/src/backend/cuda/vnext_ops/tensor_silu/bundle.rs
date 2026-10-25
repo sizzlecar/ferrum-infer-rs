@@ -24,6 +24,7 @@ pub(super) struct RetainedFunctions {
     spatial_matmul_functions: [CudaFunction; 3],
     philox_function: CudaFunction,
     primitive_function: CudaFunction,
+    block_decode_function: CudaFunction,
     _provider: CudaTensorProviderRetention,
 }
 
@@ -167,6 +168,11 @@ impl RetainedFunctions {
             let primitive_function = module
                 .load_function(primitives::FUNCTION)
                 .map_err(|e| CudaDeviceRuntimeError::driver("tensor primitive function load", e))?;
+            let block_decode_function = module
+                .load_function("ferrum_vnext_block_decode_bf16")
+                .map_err(|e| {
+                    CudaDeviceRuntimeError::driver("native block BF16 decode function load", e)
+                })?;
             Ok::<_, CudaDeviceRuntimeError>((
                 pointwise,
                 normalization,
@@ -181,6 +187,7 @@ impl RetainedFunctions {
                 spatial_matmul_functions,
                 philox_function,
                 primitive_function,
+                block_decode_function,
             ))
         }));
         let (
@@ -197,6 +204,7 @@ impl RetainedFunctions {
             spatial_matmul_functions,
             philox_function,
             primitive_function,
+            block_decode_function,
         ) = match loaded {
             Ok(Ok(functions)) => functions,
             Ok(Err(error)) => {
@@ -223,6 +231,7 @@ impl RetainedFunctions {
             spatial_matmul_functions,
             philox_function,
             primitive_function,
+            block_decode_function,
             _provider: provider,
         }))
     }
@@ -233,6 +242,9 @@ impl RetainedFunctions {
 
     pub(super) fn primitive_function(&self) -> &CudaFunction {
         &self.primitive_function
+    }
+    pub(super) fn block_decode_function(&self) -> &CudaFunction {
+        &self.block_decode_function
     }
 
     pub(super) fn philox_function(&self) -> &CudaFunction {

@@ -119,7 +119,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .collect::<Result<_, _>>()?,
         )?;
         let mut transformer =
-            QwenImage21TransformerConfig::new(self.assets.transformer.clone(), layout)?;
+            QwenImage21TransformerConfig::new(self.assets.transformer.clone(), layout)?
+                .with_weight_encodings(self.assets.transformer_encodings.clone())?;
         if let Some(edit) = &edit {
             let (reference_height, reference_width) = edit.dimensions(batch)?;
             transformer = transformer.with_reference_image(

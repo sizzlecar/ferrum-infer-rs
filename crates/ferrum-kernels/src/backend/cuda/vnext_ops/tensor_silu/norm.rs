@@ -141,6 +141,7 @@ pub(super) fn descriptor(
         BTreeSet::from([
             WeightFormatId::new(super::super::DENSE_SAFETENSORS_FORMAT_ID)
                 .map_err(contract_error)?,
+            WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
         ])
     } else {
         BTreeSet::new()

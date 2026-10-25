@@ -2,28 +2,102 @@
 use super::*;
 use ferrum_quantization::Bf16WholeTensorFp8Materializer;
 
-/// FP8 selects text Linear weights independently and all DiT block Linear
-/// weights (Q/K/V share a scale). VAE and non-block DiT weights remain BF16.
-/// This is an experimental scope, not proof that an Omni ignore rule matched.
+/// Storage/compute policy for each weighted stage. Legacy string presets retain
+/// their behavior; component selection does not imply a change in residency.
+/// VAE, vision and activation boundaries remain BF16 in every current policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImageCudaPrecisionPolicy {
     #[default]
     Bf16,
     Fp8LinearExperimentalV1,
+    Components(ImageComponentPrecision),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageComponentPrecision {
+    pub text_encoder: ImageTextPrecision,
+    pub denoiser: ImageDenoiserPrecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageTextPrecision {
+    Bf16,
+    Fp8LinearExperimentalV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDenoiserPrecision {
+    Bf16,
+    Fp8LinearExperimentalV1,
+    /// Preserve the bound archive encodings; native blocks decode into
+    /// plan-admitted scratch, with BF16 activation/weight compute boundaries.
+    NativeSource,
 }
 impl ImageCudaPrecisionPolicy {
-    pub const fn as_str(self) -> &'static str {
+    /// Canonical CLI spelling, including an explicit object for component policies.
+    pub fn as_str(self) -> std::borrow::Cow<'static, str> {
         match self {
-            Self::Bf16 => "bf16",
-            Self::Fp8LinearExperimentalV1 => "fp8_linear_experimental_v1",
+            Self::Bf16 => "bf16".into(),
+            Self::Fp8LinearExperimentalV1 => "fp8_linear_experimental_v1".into(),
+            Self::Components(_) => serde_json::to_string(&self)
+                .expect("precision contains only enum and struct values")
+                .into(),
         }
+    }
+    pub const fn text_encoder(self) -> ImageTextPrecision {
+        match self {
+            Self::Bf16 => ImageTextPrecision::Bf16,
+            Self::Fp8LinearExperimentalV1 => ImageTextPrecision::Fp8LinearExperimentalV1,
+            Self::Components(components) => components.text_encoder,
+        }
+    }
+    pub const fn denoiser(self) -> ImageDenoiserPrecision {
+        match self {
+            Self::Bf16 => ImageDenoiserPrecision::Bf16,
+            Self::Fp8LinearExperimentalV1 => ImageDenoiserPrecision::Fp8LinearExperimentalV1,
+            Self::Components(components) => components.denoiser,
+        }
+    }
+    pub const fn stage_uses_fp8(self, stage: ImageStage) -> bool {
+        match stage {
+            ImageStage::TextEncoder => matches!(
+                self.text_encoder(),
+                ImageTextPrecision::Fp8LinearExperimentalV1
+            ),
+            ImageStage::Denoiser => matches!(
+                self.denoiser(),
+                ImageDenoiserPrecision::Fp8LinearExperimentalV1
+            ),
+            _ => false,
+        }
+    }
+    pub const fn uses_fp8(self) -> bool {
+        self.stage_uses_fp8(ImageStage::TextEncoder) || self.stage_uses_fp8(ImageStage::Denoiser)
+    }
+    /// Reject a conversion policy incompatible with the declared source before
+    /// creating a CUDA context. Legacy BF16 still means BF16 compute on native
+    /// source storage when that inventory is explicitly supplied.
+    pub fn validate_denoiser_source(self, native: bool) -> anyhow::Result<()> {
+        ensure!(
+            !native || self.denoiser() != ImageDenoiserPrecision::Fp8LinearExperimentalV1,
+            "native denoiser encodings cannot be replaced by an FP8 weight materializer"
+        );
+        ensure!(
+            native || self.denoiser() != ImageDenoiserPrecision::NativeSource,
+            "native_source denoiser precision requires a native encoding inventory"
+        );
+        Ok(())
     }
     /// Declared process-retained CUTLASS module allowance, not measured VRAM.
     pub const fn additional_opaque_bytes(self) -> u64 {
-        match self {
-            Self::Bf16 => 0,
-            Self::Fp8LinearExperimentalV1 => 128 * 1024 * 1024,
+        if self.uses_fp8() {
+            128 * 1024 * 1024
+        } else {
+            0
         }
     }
 }
@@ -33,7 +107,9 @@ impl std::str::FromStr for ImageCudaPrecisionPolicy {
         match value {
             "bf16" => Ok(Self::Bf16),
             "fp8_linear_experimental_v1" => Ok(Self::Fp8LinearExperimentalV1),
-            _ => Err("image precision must be bf16 or fp8_linear_experimental_v1".into()),
+            value if value.trim_start().starts_with('{') =>
+                serde_json::from_str(value).map_err(|error| format!("invalid component precision: {error}")),
+            _ => Err("image precision must be bf16, fp8_linear_experimental_v1, or a components JSON object".into()),
         }
     }
 }
@@ -103,6 +179,48 @@ mod tests {
         }
         for value in ["fp8", "omni", "auto", "BF16"] {
             assert!(value.parse::<ImageCudaPrecisionPolicy>().is_err());
+        }
+    }
+
+    #[test]
+    fn component_precision_roundtrips_and_rejects_incompatible_source_materialization() {
+        let mixed = ImageCudaPrecisionPolicy::Components(ImageComponentPrecision {
+            text_encoder: ImageTextPrecision::Fp8LinearExperimentalV1,
+            denoiser: ImageDenoiserPrecision::NativeSource,
+        });
+        let wire = serde_json::json!({"components": {
+            "text_encoder": "fp8_linear_experimental_v1", "denoiser": "native_source"
+        }});
+        assert_eq!(serde_json::to_value(mixed).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<ImageCudaPrecisionPolicy>(wire).unwrap(),
+            mixed
+        );
+        assert_eq!(
+            mixed.as_str().parse::<ImageCudaPrecisionPolicy>().unwrap(),
+            mixed
+        );
+        assert!(mixed.stage_uses_fp8(ImageStage::TextEncoder));
+        for stage in [ImageStage::Denoiser, ImageStage::Decoder] {
+            assert!(!mixed.stage_uses_fp8(stage));
+        }
+        mixed.validate_denoiser_source(true).unwrap();
+        assert!(mixed.validate_denoiser_source(false).is_err());
+        assert!(ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1
+            .validate_denoiser_source(true)
+            .is_err());
+        ImageCudaPrecisionPolicy::Bf16
+            .validate_denoiser_source(true)
+            .unwrap();
+        for invalid in [
+            serde_json::json!({"text_encoder":"native_source", "denoiser":"bf16"}),
+            serde_json::json!({"text_encoder":"bf16"}),
+            serde_json::json!({"text_encoder":"bf16", "denoiser":"native_source", "decoder":"fp8"}),
+        ] {
+            assert!(serde_json::from_value::<ImageCudaPrecisionPolicy>(
+                serde_json::json!({"components": invalid})
+            )
+            .is_err());
         }
     }
 }

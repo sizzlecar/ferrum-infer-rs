@@ -97,6 +97,7 @@ const CORE_PTX_KERNELS: &[&str] = &[
 ];
 
 const CORE_PTX_HEADERS: &[&str] = &["kernels/common.cuh"];
+const BLOCK_DECODE_HEADER: &str = "kernels/vnext_gguf_blocks.cuh";
 
 fn cuda_root_from_env() -> Option<PathBuf> {
     for key in [
@@ -1326,6 +1327,9 @@ fn core_ptx_signature(kernel: &str, flags: &[String]) -> String {
     lines.extend(flags.iter().map(|f| format!("flag={f}")));
     lines.push(file_fingerprint(kernel));
     lines.extend(CORE_PTX_HEADERS.iter().map(|p| file_fingerprint(p)));
+    if matches!(kernel, gguf::KERNEL | "kernels/vnext_bf16_silu.cu") {
+        lines.push(file_fingerprint(BLOCK_DECODE_HEADER));
+    }
     if kernel == gguf::KERNEL {
         lines.extend(gguf::INPUTS.iter().map(|path| file_fingerprint(path)));
     }
@@ -1343,6 +1347,9 @@ fn content_core_ptx_signature(kernel: &str, flags: &[String]) -> String {
             .iter()
             .map(|path| sha256_file_fingerprint(Path::new(path))),
     );
+    if matches!(kernel, gguf::KERNEL | "kernels/vnext_bf16_silu.cu") {
+        lines.push(sha256_file_fingerprint(Path::new(BLOCK_DECODE_HEADER)));
+    }
     if kernel == gguf::KERNEL {
         lines.extend(
             gguf::INPUTS
@@ -1404,6 +1411,7 @@ fn write_core_ptx_bindings(out_dir: &Path) {
 }
 
 fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildCache>) {
+    println!("cargo:rerun-if-changed={BLOCK_DECODE_HEADER}");
     for path in CORE_PTX_KERNELS.iter().chain(CORE_PTX_HEADERS.iter()) {
         println!("cargo:rerun-if-changed={path}");
     }

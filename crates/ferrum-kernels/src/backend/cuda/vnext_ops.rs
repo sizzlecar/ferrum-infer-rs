@@ -68,6 +68,7 @@ pub use q6_head::CudaQ6MmqF32LastTokenProvider;
 mod selection;
 mod tensor_dense_bf16;
 mod tensor_dense_fp8_bf16;
+mod tensor_storage;
 pub use tensor_dense_fp8_bf16::{
     CudaCutlassFp8Config, CudaCutlassFp8Probe, CudaCutlassFp8ProbeReceipt,
     CudaCutlassFp8ProbeTicket,
@@ -392,6 +393,7 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::MODULATION_SCALE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::GATED_RESIDUAL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::DENSE_LINEAR_BLOCK_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::LAYER_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ADJACENT_ROPE_BF16_CAPABILITY_ID)?,

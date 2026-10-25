@@ -7,6 +7,7 @@ use ferrum_runtime::{
 };
 use ferrum_types::Result;
 use serde::Serialize;
+mod archive;
 
 use super::{invalid, QwenImage21Config, StructureLimits, FAMILY_ID};
 

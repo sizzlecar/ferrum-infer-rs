@@ -41,7 +41,9 @@ pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, Qwen
 pub use attention_policy::ImageCudaAttentionPolicy;
 pub use host_cache::{ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy};
 pub use plan_cache::{ImagePlanCachePolicy, ImagePlanCacheReceipt};
-pub use precision::ImageCudaPrecisionPolicy;
+pub use precision::{
+    ImageComponentPrecision, ImageCudaPrecisionPolicy, ImageDenoiserPrecision, ImageTextPrecision,
+};
 pub use residency::{
     ImageDynamicResidencyPolicy, ImageResidencyPolicy, ImageResidentStageSet,
     ImageStageRetentionBudgets,
@@ -80,7 +82,7 @@ use ferrum_models::qwen_image21::{
     QwenImage21TransformerFamily, QwenImage21VaeDecoderConfig, QwenImage21VaeDecoderFamily,
     StructureLimits,
 };
-use ferrum_quantization::SafetensorsArchive;
+use ferrum_quantization::{SafetensorsArchive, TensorArchive};
 use ferrum_runtime::*;
 use prepare::PreparedRequest;
 use serde::{Deserialize, Serialize};
