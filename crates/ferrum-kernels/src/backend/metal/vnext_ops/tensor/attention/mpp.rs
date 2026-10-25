@@ -8,7 +8,7 @@ use metal::DeviceRef;
 pub(in crate::backend::metal::vnext_ops::tensor) const FINGERPRINT_SOURCE: &str =
     concat!(include_str!("mpp.rs"), include_str!("mpp.metal"));
 pub(in crate::backend::metal::vnext_ops::tensor) const NUMERICAL_IDENTITY: &str =
-    "metal.attention.qk-mpp-bf16-bf16-f32-m16n32k128-full-visible;simdgroup-f32-qk-fallback;pv-mpp-f32-f32-f32-m16n32k32-finite-threadgroup-tiles;unchanged-f32-softmax-and-visible-only-nonfinite-pv;relaxed=false.v2";
+    "metal.attention.qk-mpp-bf16-bf16-f32-m16n32k128-full-visible;simdgroup-f32-qk-fallback-staged-query32;head128-output-cache-without-q-fragment-cache;pv-mpp-f32-f32-f32-m16n32k32-finite-threadgroup-tiles;unchanged-f32-softmax-and-visible-only-nonfinite-pv;relaxed=false.v3";
 
 pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
     device: &DeviceRef,

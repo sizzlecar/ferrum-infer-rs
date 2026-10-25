@@ -4,7 +4,7 @@ use super::{NativeMask, CACHED_SHARED_BYTES};
 use ferrum_runtime::CrossAttentionBf16Geometry;
 
 pub(in crate::backend::metal::vnext_ops::tensor) const PROFILE: &str =
-    "metal.mpp_qk_pv_or_simdgroup.f32.cross_attention.bf16.tile16x32_online.v1";
+    "metal.mpp_qstaged_pv_or_simdgroup.f32.cross_attention.bf16.tile16x32_online.v2";
 pub(in crate::backend::metal::vnext_ops::tensor) const FINGERPRINT_SOURCE: &str =
     concat!(include_str!("cross.rs"), include_str!("cross.metal"));
 

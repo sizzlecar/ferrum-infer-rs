@@ -37,6 +37,7 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "head-rms=BF16-normalized-before-gamma;zero-centered=FP32-one-plus-gamma;",
     "adjacent-rope=F32-frequency-explicit-FMA;half-split=BF16-staged-products;",
     "attention=MPP-BF16xBF16-F32-QK-head128-full-visible-tiles-or-FP32-simdgroup-QK;",
+    "attention-Q-fragments=generic-head128-cache;MPP-fallback-staged32;head128-output-cache-unchanged;",
     "PV=MPP-FP32xFP32-FP32-finite-threadgroup-tiles-or-FP32-simdgroup;16-query-32-key-online-softmax;",
     "FP32-tile-SIMD-exp-reduction;separate-online-rescale;BF16-final-only;",
     "GQA=indexed-KV-no-replication;empty-row=positive-zero;",

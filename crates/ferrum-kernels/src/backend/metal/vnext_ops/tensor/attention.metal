@@ -3,6 +3,14 @@
 constant uint TENSOR_ATTENTION_HEAD [[function_constant(101)]];
 constant bool cache_query_128 = is_function_constant_defined(TENSOR_ATTENTION_HEAD)
     ? TENSOR_ATTENTION_HEAD == 128 : false;
+// MPP reads Q directly for complete visible tiles. Only the independent SIMD
+// library retains full-head Q fragments; MPP fallbacks stage one 32-wide slice.
+// Output fragments and their shared-memory layout still use cache_query_128.
+#ifdef FERRUM_ATTENTION_MPP_QK
+constant bool cache_q_fragments = false;
+#else
+constant bool cache_q_fragments = cache_query_128;
+#endif
 
 struct AttentionParams {
     ulong jobs, grid_groups, query_tiles, sequence, query_heads, key_value_heads;
@@ -108,8 +116,8 @@ kernel void ferrum_tensor_attention_bf16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // No valid key in this query tile: do not read any Q/K/V data.
         if (mask.first_valid_keys[batch] < max_end) {
-            // Retain exactly decoded Q fragments, without more shared or
-            // device storage. The generic variant keeps its bounded staging.
+            // Compile away Q fragment retention in the MPP library without
+            // disabling the independent cached output or row-coordinate state.
             simdgroup_float8x8 cached_query[16];
             simdgroup_float8x8 cached_output[8], row_coordinates;
             if (cache_query_128) {
@@ -121,6 +129,8 @@ kernel void ferrum_tensor_attention_bf16(
                 for (uint i = 0; i < 8; ++i)
                     cached_output[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (cache_q_fragments) {
                 #pragma unroll
                 for (uint d = 0; d < 128; d += 32) {
                     for (uint i = tid; i < 512; i += 128) {
@@ -161,7 +171,7 @@ kernel void ferrum_tensor_attention_bf16(
                 for (uint i = 0; i < 2; ++i) dot[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
                 #pragma unroll
                 for (uint d = 0; d < (cache_query_128 ? 128 : p.head_dim); d += 32) {
-                    if (!cache_query_128) for (uint i = tid; i < 512; i += 128) {
+                    if (!cache_q_fragments) for (uint i = tid; i < 512; i += 128) {
                         uint r = i / 32, c = d + i % 32;
                         a[i] = end[r] > mask.first_valid_keys[batch] && !poisoned[r] && c < p.head_dim
                             ? decode_bf16(query[q_base + (q_start + r) * p.query_heads * p.head_dim + c]) : 0.0f;
@@ -176,7 +186,7 @@ kernel void ferrum_tensor_attention_bf16(
                     #pragma unroll
                     for (uint chunk = 0; chunk < 32; chunk += 8) {
                         simdgroup_float8x8 av, bv;
-                        if (cache_query_128) av = cached_query[(d + chunk) / 8];
+                        if (cache_q_fragments) av = cached_query[(d + chunk) / 8];
                         else simdgroup_load(av, a + local_row * 32 + chunk, 32, 0, false);
                         for (uint n = 0; n < 2; ++n) {
                             simdgroup_load(bv, b + chunk * 32 + local_col + n * 8, 32, 0, false);
@@ -230,8 +240,8 @@ kernel void ferrum_tensor_attention_bf16(
                     simdgroup_float8x8 pv[2];
                     if (atomic_load_explicit(&nonfinite_value, memory_order_relaxed) == 0) {
                         #ifdef FERRUM_ATTENTION_MPP_PV
-                        // Q is already retained in registers. Its retired a
-                        // tile is disjoint from b and scores; the cached final
+                        // QK has finished consuming its a staging tile, which
+                        // is disjoint from b and scores; the cached final
                         // accumulator is stored there only after all key tiles.
                         // Reuse a for the finite FP32 PV result without
                         // another buffer.
