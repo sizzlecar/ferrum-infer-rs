@@ -47,18 +47,24 @@ fn stream_capacity_auto_and_explicit_limits_are_shared_by_run_and_serve() {
             .as_object_mut()
             .unwrap()
             .remove("maximum_streams");
-        let ImageBackendConfig::Cuda(omitted) = load(&wire).unwrap().backend;
+        let ImageBackendConfig::Cuda(omitted) = load(&wire).unwrap().backend else {
+            panic!("expected CUDA configuration")
+        };
         assert_eq!(omitted.maximum_streams, ImageStreamLimit::Auto);
         let automatic = omitted.stream_plan().unwrap();
         assert_eq!(automatic.source(), ImageStreamLimitSource::Auto);
         assert_eq!(automatic.required_streams(), 2);
         assert_eq!(automatic.resolved_streams(), 2);
         wire["backend"]["maximum_streams"] = json!("auto");
-        let ImageBackendConfig::Cuda(named) = load(&wire).unwrap().backend;
+        let ImageBackendConfig::Cuda(named) = load(&wire).unwrap().backend else {
+            panic!("expected CUDA configuration")
+        };
         assert_eq!(named.stream_plan().unwrap(), automatic);
         for limit in [2, 4] {
             wire["backend"]["maximum_streams"] = json!(limit);
-            let ImageBackendConfig::Cuda(explicit) = load(&wire).unwrap().backend;
+            let ImageBackendConfig::Cuda(explicit) = load(&wire).unwrap().backend else {
+                panic!("expected CUDA configuration")
+            };
             let plan = explicit.stream_plan().unwrap();
             assert_eq!(plan.source(), ImageStreamLimitSource::Explicit);
             assert_eq!(plan.required_streams(), automatic.required_streams());
@@ -92,7 +98,9 @@ fn fp8_precision_is_shared_by_run_and_serve_without_changing_residency_or_attent
         ImageProductConfig::load(&path)
     };
     let mut wire = configuration();
-    let ImageBackendConfig::Cuda(original) = load(&wire).unwrap().backend;
+    let ImageBackendConfig::Cuda(original) = load(&wire).unwrap().backend else {
+        panic!("expected CUDA configuration")
+    };
     assert_eq!(original.precision_policy, ImageCudaPrecisionPolicy::Bf16);
     wire["backend"]["precision_policy"] = json!("fp8_linear_experimental_v1");
     assert!(load(&wire).is_err());
@@ -105,7 +113,9 @@ fn fp8_precision_is_shared_by_run_and_serve_without_changing_residency_or_attent
         } else {
             Value::Null
         };
-        let ImageBackendConfig::Cuda(config) = load(&wire).unwrap().backend;
+        let ImageBackendConfig::Cuda(config) = load(&wire).unwrap().backend else {
+            panic!("expected CUDA configuration")
+        };
         assert_eq!(
             config.precision_policy,
             ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1
@@ -145,7 +155,10 @@ fn gguf_component_precision_config_and_cli_share_explicit_stage_choices() {
             Value::Null
         };
         fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
-        let ImageBackendConfig::Cuda(config) = ImageProductConfig::load(&path).unwrap().backend;
+        let ImageBackendConfig::Cuda(config) = ImageProductConfig::load(&path).unwrap().backend
+        else {
+            panic!("expected CUDA configuration")
+        };
         assert!(config
             .precision_policy
             .stage_uses_fp8(ImageStage::TextEncoder));
@@ -178,7 +191,9 @@ fn fp8_host_cache_is_explicit_budgeted_and_shared_by_run_and_serve() {
         ImageProductConfig::load(&path)
     };
     let mut wire = configuration();
-    let ImageBackendConfig::Cuda(defaults) = load(&wire).unwrap().backend;
+    let ImageBackendConfig::Cuda(defaults) = load(&wire).unwrap().backend else {
+        panic!("expected CUDA configuration")
+    };
     assert_eq!(defaults.fp8_host_cache, ImageFp8HostCachePolicy::Off);
     let cache = json!({"stage_budgets":{"maximum_bytes_by_stage":{"text_encoder":1024}}});
     wire["backend"]["fp8_host_cache"] = cache.clone();
@@ -201,7 +216,9 @@ fn fp8_host_cache_is_explicit_budgeted_and_shared_by_run_and_serve() {
             Value::Null
         };
         wire["backend"]["fp8_host_cache"] = cache.clone();
-        let ImageBackendConfig::Cuda(config) = load(&wire).unwrap().backend;
+        let ImageBackendConfig::Cuda(config) = load(&wire).unwrap().backend else {
+            panic!("expected CUDA configuration")
+        };
         assert_eq!(config.fp8_host_cache, expected);
         #[cfg(feature = "cuda")]
         assert_eq!(config.resolved().unwrap().fp8_host_cache, expected);
@@ -236,7 +253,9 @@ fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
         config.metadata.transformer,
         base.join("transformer/config.json")
     );
-    let ImageBackendConfig::Cuda(cuda) = config.backend;
+    let ImageBackendConfig::Cuda(cuda) = config.backend else {
+        panic!("expected CUDA configuration")
+    };
     assert_eq!(cuda.pipeline.maximum_batch_size, 1);
     assert_eq!(
         cuda.resolved_pipeline().unwrap().decoder_batch_policy,
@@ -378,7 +397,9 @@ fn explicit_cudnn_dependencies_keep_declared_order_without_loading_native_code()
         json!(["lib/libnvrtc.so.13", "lib/libnvJitLink.so.13"]);
     fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
     let config = ImageProductConfig::load(&path).unwrap();
-    let ImageBackendConfig::Cuda(cuda) = config.backend;
+    let ImageBackendConfig::Cuda(cuda) = config.backend else {
+        panic!("expected CUDA configuration")
+    };
     let base = fs::canonicalize(directory.path()).unwrap();
     assert_eq!(
         cuda.cudnn.dependency_libraries,
@@ -418,7 +439,9 @@ fn one_device_budget_drives_plan_resolution_and_obsolete_override_is_rejected() 
         for budget in [1024, 30 * 1024 * 1024 * 1024_u64] {
             wire["backend"]["usable_memory_bytes"] = json!(budget);
             let config = load(&wire).unwrap();
-            let ImageBackendConfig::Cuda(cuda) = config.backend;
+            let ImageBackendConfig::Cuda(cuda) = config.backend else {
+                panic!("expected CUDA configuration")
+            };
             assert_eq!(
                 cuda.resolved_pipeline().unwrap().device_capacity_bytes,
                 budget
@@ -462,6 +485,11 @@ fn one_device_budget_drives_plan_resolution_and_obsolete_override_is_rejected() 
 
 #[path = "directory_tests.rs"]
 mod directory_tests;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[path = "metal_integration.rs"]
+mod metal_integration;
+#[path = "metal_tests.rs"]
+mod metal_tests;
 
 #[test]
 fn experimental_batch_profile_connects_service_limit_to_real_pipeline_capacity() {
@@ -484,7 +512,9 @@ fn experimental_batch_profile_connects_service_limit_to_real_pipeline_capacity()
         config.execution_profile.as_str(),
         "experimental_batched_cold"
     );
-    let ImageBackendConfig::Cuda(cuda) = &config.backend;
+    let ImageBackendConfig::Cuda(cuda) = &config.backend else {
+        panic!("expected CUDA configuration")
+    };
     assert_eq!(cuda.resolved_pipeline().unwrap().maximum_batch_size, 2);
     assert_eq!(config.serving.as_ref().unwrap().max_num_seqs, 2);
     wire["serving"]["max_num_seqs"] = json!(3);
@@ -509,7 +539,9 @@ fn edit_prefix_policy_is_explicit_and_shared_by_run_and_serve_configuration() {
     use ferrum_engine::image_generation::ImageEditPrefixPolicy;
     let mut wire = configuration();
     let config: ImageProductConfig = serde_json::from_value(wire.clone()).unwrap();
-    let ImageBackendConfig::Cuda(cuda) = config.backend;
+    let ImageBackendConfig::Cuda(cuda) = config.backend else {
+        panic!("expected CUDA configuration")
+    };
     assert_eq!(
         cuda.resolved_pipeline().unwrap().edit_prefix_policy,
         ImageEditPrefixPolicy::Recompute
@@ -520,7 +552,9 @@ fn edit_prefix_policy_is_explicit_and_shared_by_run_and_serve_configuration() {
     ] {
         wire["backend"]["pipeline"]["edit_prefix_policy"] = json!(name);
         let config: ImageProductConfig = serde_json::from_value(wire.clone()).unwrap();
-        let ImageBackendConfig::Cuda(cuda) = config.backend;
+        let ImageBackendConfig::Cuda(cuda) = config.backend else {
+            panic!("expected CUDA configuration")
+        };
         assert_eq!(
             cuda.resolved_pipeline().unwrap().edit_prefix_policy,
             expected
@@ -547,7 +581,9 @@ fn decoder_batch_policy_is_explicit_independent_and_strict() {
         wire["backend"]["pipeline"]["decoder_batch_policy"] = json!(name);
         fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
         let config = ImageProductConfig::load(&path).unwrap();
-        let ImageBackendConfig::Cuda(cuda) = config.backend;
+        let ImageBackendConfig::Cuda(cuda) = config.backend else {
+            panic!("expected CUDA configuration")
+        };
         let resolved = cuda.resolved_pipeline().unwrap();
         assert_eq!(resolved.maximum_batch_size, 8);
         assert_eq!(resolved.decoder_batch_policy, expected);
@@ -573,7 +609,9 @@ fn decoder_backing_retention_is_bounded_and_shared_by_run_and_serve() {
         ImageProductConfig::load(&path)
     };
     let mut wire = configuration();
-    let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+    let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend else {
+        panic!("expected CUDA configuration")
+    };
     assert_eq!(
         cuda.resolved_pipeline().unwrap().dynamic_residency,
         ImageDynamicResidencyPolicy::Release
@@ -590,7 +628,9 @@ fn decoder_backing_retention_is_bounded_and_shared_by_run_and_serve() {
                 "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
                 "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
         }
-        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend else {
+            panic!("expected CUDA configuration")
+        };
         assert_eq!(
             cuda.resolved_pipeline().unwrap().dynamic_residency,
             ImageDynamicResidencyPolicy::RetainDecoder {
@@ -655,7 +695,9 @@ fn per_stage_dynamic_budgets_are_shared_by_run_and_serve_and_reject_ineligible_s
         }
         wire["backend"]["pipeline"]["dynamic_residency"] = selected.clone();
         wire["backend"]["pipeline"]["residency"] = json!("all_model_components");
-        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend else {
+            panic!("expected CUDA configuration")
+        };
         assert_eq!(
             cuda.resolved_pipeline().unwrap().dynamic_residency,
             expected
@@ -682,7 +724,9 @@ fn per_stage_dynamic_budgets_are_shared_by_run_and_serve_and_reject_ineligible_s
         wire["backend"]["pipeline"]["dynamic_residency"] = json!({
             "retain_stage_budgets":{"maximum_bytes_by_stage":{"noise":1024}}
         });
-        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend else {
+            panic!("expected CUDA configuration")
+        };
         assert_eq!(
             cuda.resolved_pipeline().unwrap().residency,
             ferrum_engine::image_generation::ImageResidencyPolicy::AllStages
@@ -704,7 +748,9 @@ fn residency_is_explicit_and_shared_by_run_and_serve_configuration() {
         ImageProductConfig::load(&path)
     };
     let mut wire = configuration();
-    let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+    let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend else {
+        panic!("expected CUDA configuration")
+    };
     assert_eq!(
         cuda.resolved_pipeline().unwrap().residency,
         ImageResidencyPolicy::Cold
@@ -737,7 +783,9 @@ fn residency_is_explicit_and_shared_by_run_and_serve_configuration() {
                 config.execution_profile.as_str(),
                 "experimental_resident_v1"
             );
-            let ImageBackendConfig::Cuda(cuda) = config.backend;
+            let ImageBackendConfig::Cuda(cuda) = config.backend else {
+                panic!("expected CUDA configuration")
+            };
             assert_eq!(cuda.resolved_pipeline().unwrap().residency, policy);
             #[cfg(feature = "cuda")]
             assert_eq!(cuda.resolved().unwrap().pipeline.residency, policy);
@@ -791,7 +839,9 @@ fn selected_stage_residency_is_bounded_and_shared_by_run_and_serve() {
         } else {
             Value::Null
         };
-        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+        let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend else {
+            panic!("expected CUDA configuration")
+        };
         let pipeline = cuda.resolved_pipeline().unwrap();
         assert_eq!(pipeline.residency, policy);
         assert_eq!(
@@ -1058,9 +1108,9 @@ fn run_image_controls_reject_explicit_text_defaults_and_keep_text_commands() {
     assert!(validate(&["ferrum", "run", "text-model", "--width", "512"]).is_err());
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))))]
 #[test]
-fn non_cuda_image_run_rejects_before_file_or_asset_io() {
+fn image_run_without_a_device_backend_rejects_before_file_or_asset_io() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("image.png");
     let error = execute_run(
@@ -1138,7 +1188,9 @@ fn bounded_plan_cache_configuration_is_strict_and_shared_by_run_and_serve() {
         ImageProductConfig::load(&path)
     };
     let mut wire = configuration();
-    let ImageBackendConfig::Cuda(default) = load(&wire).unwrap().backend;
+    let ImageBackendConfig::Cuda(default) = load(&wire).unwrap().backend else {
+        panic!("expected CUDA configuration")
+    };
     assert_eq!(
         default.resolved_pipeline().unwrap().plan_cache,
         ImagePlanCachePolicy::LastPerStage
@@ -1161,7 +1213,9 @@ fn bounded_plan_cache_configuration_is_strict_and_shared_by_run_and_serve() {
             policy,
         ] {
             wire["backend"]["pipeline"]["plan_cache"] = serde_json::to_value(selected).unwrap();
-            let ImageBackendConfig::Cuda(config) = load(&wire).unwrap().backend;
+            let ImageBackendConfig::Cuda(config) = load(&wire).unwrap().backend else {
+                panic!("expected CUDA configuration")
+            };
             assert_eq!(config.resolved_pipeline().unwrap().plan_cache, selected);
         }
     }

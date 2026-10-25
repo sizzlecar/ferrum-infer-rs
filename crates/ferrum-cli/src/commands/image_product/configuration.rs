@@ -2,6 +2,10 @@ use anyhow::{ensure, Result};
 use ferrum_runtime::{HostMemoryClassLimits, HostMemoryLimits, StaticInitializationPolicy};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+mod metal;
+pub use metal::MetalConfig;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use metal::MetalMemoryConfig;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +121,15 @@ pub enum WeightSource {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImageBackendConfig {
     Cuda(CudaConfig),
+    Metal(MetalConfig),
+}
+impl ImageBackendConfig {
+    pub fn pipeline(&self) -> &PipelineConfig {
+        match self {
+            Self::Cuda(config) => &config.pipeline,
+            Self::Metal(config) => &config.pipeline,
+        }
+    }
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -343,20 +356,24 @@ impl ImageProductConfig {
             .parent()
             .expect("canonical configuration path has a parent");
         config.resolve_paths(base);
-        let ImageBackendConfig::Cuda(cuda) = &config.backend;
-        ensure!(
-            cuda.cudnn.dependency_libraries.len() <= 16,
-            "cuDNN dependency list exceeds 16 libraries"
-        );
-        cuda.fp8_host_cache
-            .validate(cuda.precision_policy, cuda.host.limits()?)?;
-        if cuda.precision_policy.uses_fp8() {
-            ensure!(
-                cuda.host.weight_backing_bytes > 0,
-                "FP8 requires a nonzero backend.host.weight_backing_bytes allowance"
-            );
+        match &config.backend {
+            ImageBackendConfig::Cuda(cuda) => {
+                ensure!(
+                    cuda.cudnn.dependency_libraries.len() <= 16,
+                    "cuDNN dependency list exceeds 16 libraries"
+                );
+                cuda.fp8_host_cache
+                    .validate(cuda.precision_policy, cuda.host.limits()?)?;
+                if cuda.precision_policy.uses_fp8() {
+                    ensure!(
+                        cuda.host.weight_backing_bytes > 0,
+                        "FP8 requires a nonzero backend.host.weight_backing_bytes allowance"
+                    );
+                }
+                cuda.resolved_pipeline()?;
+            }
+            ImageBackendConfig::Metal(metal) => metal.validate()?,
         }
-        cuda.resolved_pipeline()?;
         if let Some(serving) = &config.serving {
             serving.validate()?;
         }
@@ -364,11 +381,11 @@ impl ImageProductConfig {
         Ok(config)
     }
     fn validate_execution_profile(&self) -> Result<()> {
-        let ImageBackendConfig::Cuda(cuda) = &self.backend;
+        let pipeline = self.backend.pipeline();
         use ferrum_engine::image_generation::ImageResidencyPolicy;
         ensure!(
             matches!(
-                (self.execution_profile, cuda.pipeline.residency),
+                (self.execution_profile, pipeline.residency),
                 (
                     ImageExecutionProfile::ExperimentalResidentV1,
                     ImageResidencyPolicy::DenoiserAndDecoder
@@ -385,13 +402,13 @@ impl ImageProductConfig {
         );
         if self.execution_profile == ImageExecutionProfile::ExperimentalSerialCold {
             ensure!(
-                cuda.pipeline.maximum_batch_size == 1,
+                pipeline.maximum_batch_size == 1,
                 "experimental_serial_cold requires pipeline maximum_batch_size=1"
             );
         }
         if let Some(serving) = &self.serving {
             ensure!(
-                serving.max_num_seqs <= cuda.pipeline.maximum_batch_size,
+                serving.max_num_seqs <= pipeline.maximum_batch_size,
                 "serving max_num_seqs exceeds configured pipeline maximum_batch_size"
             );
             ensure!(
@@ -436,13 +453,14 @@ impl ImageProductConfig {
                 *directory = base.join(&*directory);
             }
         }
-        let ImageBackendConfig::Cuda(cuda) = &mut self.backend;
-        if cuda.cudnn.library_path.is_relative() {
-            cuda.cudnn.library_path = base.join(&cuda.cudnn.library_path);
-        }
-        for path in &mut cuda.cudnn.dependency_libraries {
-            if path.is_relative() {
-                *path = base.join(&*path);
+        if let ImageBackendConfig::Cuda(cuda) = &mut self.backend {
+            if cuda.cudnn.library_path.is_relative() {
+                cuda.cudnn.library_path = base.join(&cuda.cudnn.library_path);
+            }
+            for path in &mut cuda.cudnn.dependency_libraries {
+                if path.is_relative() {
+                    *path = base.join(&*path);
+                }
             }
         }
     }
@@ -481,12 +499,11 @@ impl CudaConfig {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl PipelineConfig {
     pub(super) fn resolved_limits(
         &self,
-    ) -> Result<ferrum_engine::image_generation::cuda::ImageCudaPipelineLimits> {
-        let limits = ferrum_engine::image_generation::cuda::ImageCudaPipelineLimits {
+    ) -> Result<ferrum_engine::image_generation::ImagePipelineLimits> {
+        let limits = ferrum_engine::image_generation::ImagePipelineLimits {
             maximum_user_tokens: self.maximum_user_tokens,
             maximum_width: self.maximum_width,
             maximum_height: self.maximum_height,

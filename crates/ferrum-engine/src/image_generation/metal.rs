@@ -29,6 +29,7 @@ pub enum ImageMetalMemoryPolicy {
 #[derive(Debug, Clone)]
 pub struct QwenImage21MetalConfig {
     pub memory: ImageMetalMemoryPolicy,
+    pub precision_policy: ImagePrecisionPolicy,
     pub bootstrap_memory_bytes: u64,
     pub stream_memory_bytes: u64,
     pub maximum_streams: ImageStreamLimit,
@@ -42,6 +43,7 @@ pub struct QwenImage21MetalConfig {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ImageMetalCompositionReceipt {
     pub memory_policy: &'static str,
+    pub precision_policy: ImagePrecisionPolicy,
     pub stream_plan: ImageStreamPlan,
     pub device_capacity_bytes: u64,
     pub observed_memory: Option<MetalTensorMemoryObservation>,
@@ -90,6 +92,7 @@ impl QwenImage21MetalConfig {
     }
     pub fn validate(&self) -> Result<()> {
         self.pipeline.validate()?;
+        ensure!(!self.precision_policy.uses_fp8(), "Metal image Linear currently supports BF16 or native source blocks; FP8 is not implemented");
         ensure!(
             self.pipeline.edit_prefix_policy == ImageEditPrefixPolicy::Recompute,
             "Metal image editing requires recompute; request-cache attention is not implemented"
@@ -194,6 +197,8 @@ impl QwenImage21MetalConfig {
     )> {
         self.validate()?;
         let native_block_denoiser = !assets.transformer_encodings.is_empty();
+        self.precision_policy
+            .validate_denoiser_source(native_block_denoiser)?;
         let profiles = profiles(native_block_denoiser)?;
         let editing_profiles = editing_profiles()?;
         let required_component_commands = self.prepare(&assets, &profiles, &editing_profiles)?;
@@ -272,6 +277,7 @@ impl QwenImage21MetalConfig {
         Ok((
             pipeline,
             ImageMetalCompositionReceipt {
+                precision_policy: self.precision_policy,
                 memory_policy: if observed_memory.is_some() {
                     "auto_recommended"
                 } else {

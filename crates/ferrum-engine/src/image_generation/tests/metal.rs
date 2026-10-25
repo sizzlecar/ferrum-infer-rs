@@ -10,6 +10,7 @@ static METAL_FACTORY_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn metal_config() -> QwenImage21MetalConfig {
     QwenImage21MetalConfig {
+        precision_policy: ImagePrecisionPolicy::Bf16,
         memory: ImageMetalMemoryPolicy::AutoRecommended {
             utilization: 0.75,
             maximum_bytes: NonZeroU64::new(fixture::DEVICE_BYTES),
@@ -55,6 +56,9 @@ fn metal_configuration_rejects_unavailable_modes_and_impossible_capacity() {
     let _guard = METAL_FACTORY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let mut config = metal_config();
     config.validate().unwrap();
+    config.precision_policy = ImagePrecisionPolicy::Fp8LinearExperimentalV1;
+    assert!(config.validate().is_err());
+    config.precision_policy = ImagePrecisionPolicy::Bf16;
     let required = config.stream_plan().unwrap().resolved_streams();
     config.maximum_streams = ImageStreamLimit::Explicit(required - 1);
     assert!(config.validate().is_err());

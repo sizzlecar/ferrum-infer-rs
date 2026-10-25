@@ -45,6 +45,8 @@ pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, Qwen
 pub use attention_policy::ImageCudaAttentionPolicy;
 pub use host_cache::{ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy};
 pub use plan_cache::{ImagePlanCachePolicy, ImagePlanCacheReceipt};
+/// Shared component precision contract; keep the original CUDA spelling compatible.
+pub use precision::ImageCudaPrecisionPolicy as ImagePrecisionPolicy;
 pub use precision::{
     ImageComponentPrecision, ImageCudaPrecisionPolicy, ImageDenoiserPrecision, ImageTextPrecision,
 };

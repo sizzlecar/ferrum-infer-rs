@@ -50,7 +50,7 @@ impl WeightSource {
 }
 
 impl ImageProductConfig {
-    /// All metadata is retained and validated before the caller creates CUDA.
+    /// All metadata is retained and validated before the caller creates a device runtime.
     /// Explicit archive filenames never fall back or discover another source.
     /// An explicit processor path enables editing validation; missing or
     /// incompatible editing assets never silently fall back to generation.

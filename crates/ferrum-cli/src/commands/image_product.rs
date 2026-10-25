@@ -5,6 +5,8 @@
 
 mod configuration;
 mod directory;
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+mod factory;
 #[cfg(all(test, feature = "cuda"))]
 mod gpu_tests;
 #[cfg(any(feature = "cuda", test))]
@@ -39,9 +41,10 @@ pub struct ImageProductArgs {
     pub image_cudnn_library: Option<PathBuf>,
     /// Image Linear precision: bf16 (default), fp8_linear_experimental_v1, or
     /// {"components":{"text_encoder":"bf16","denoiser":"fp8_linear_experimental_v1"}}.
-    /// An explicit GGUF image config can select denoiser native_source.
+    /// FP8 requires CUDA. An explicit GGUF image config can select denoiser
+    /// native_source on CUDA or Metal.
     #[arg(long, value_name = "PRESET|JSON")]
-    pub image_precision: Option<ferrum_engine::image_generation::ImageCudaPrecisionPolicy>,
+    pub image_precision: Option<ferrum_engine::image_generation::ImagePrecisionPolicy>,
 }
 
 impl ImageProductArgs {
@@ -78,7 +81,7 @@ impl ImageProductArgs {
                 gpu_devices,
                 self.image_cudnn_library.clone(),
             )?
-            .with_precision(self.image_precision.unwrap_or_default()),
+            .with_precision(self.image_precision.unwrap_or_default())?,
         }))
     }
 }
@@ -203,6 +206,13 @@ pub fn validate_cli_matches(
                 .unwrap_or("auto"),
             args.get_one::<String>("gpu_devices").map(String::as_str),
             args.get_one::<PathBuf>("image_cudnn_library").cloned(),
+        )?
+        .with_precision(
+            args.get_one::<ferrum_engine::image_generation::ImagePrecisionPolicy>(
+                "image_precision",
+            )
+            .copied()
+            .unwrap_or_default(),
         )?;
     }
     if command == "run" {
@@ -230,23 +240,30 @@ pub fn validate_cli_matches(
 pub enum ImageProductError {
     Configuration(anyhow::Error),
     Unsupported(&'static str),
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     Generation {
-        source: ferrum_engine::image_generation::ImageGenerationError<
-            ferrum_kernels::backend::cuda::vnext_runtime::CudaDeviceRuntime,
-        >,
-        pipeline: Box<
-            ferrum_engine::image_generation::QwenImage21Pipeline<
-                ferrum_kernels::backend::cuda::vnext_runtime::CudaDeviceRuntime,
-            >,
-        >,
+        source: Box<dyn std::error::Error + Send>,
+        pipeline: Box<dyn ferrum_engine::image_generation::service::ImageGenerator>,
     },
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     Server {
         source: anyhow::Error,
         service: ferrum_server::ImageHttpService,
         shutdown: Option<ferrum_engine::image_generation::service::ImageServiceShutdown>,
     },
+}
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+impl ImageProductError {
+    fn generation<R: ferrum_runtime::DeviceRuntime>(
+        source: ferrum_engine::image_generation::ImageGenerationError<R>,
+        pipeline: Box<ferrum_engine::image_generation::QwenImage21Pipeline<R>>,
+    ) -> Self {
+        // Erase only the backend type: both original recovery owners survive.
+        Self::Generation {
+            source: Box::new(source),
+            pipeline,
+        }
+    }
 }
 impl From<anyhow::Error> for ImageProductError {
     fn from(value: anyhow::Error) -> Self {
@@ -258,9 +275,9 @@ impl fmt::Display for ImageProductError {
         match self {
             Self::Configuration(e) => write!(f, "image configuration/output: {e:#}"),
             Self::Unsupported(reason) => f.write_str(reason),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
             Self::Generation { source, .. } => write!(f, "{source}"),
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
             Self::Server { source, .. } => write!(f, "image server: {source:#}"),
         }
     }

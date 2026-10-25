@@ -59,7 +59,9 @@ fn requests(config: &ImageProductConfig) -> Result<Vec<ImageGenerationRequest>> 
             },
         ]
     };
-    let ImageBackendConfig::Cuda(cuda) = &config.backend;
+    let ImageBackendConfig::Cuda(cuda) = &config.backend else {
+        return Err(anyhow::anyhow!("CUDA fixture requires a CUDA backend").into());
+    };
     ensure!(
         requests.len() >= 2 && requests.len() <= cuda.pipeline.maximum_batch_size,
         "fixture batch must contain at least two requests within declared pipeline capacity"
@@ -175,7 +177,9 @@ fn cuda_product_one_real_batch_preserves_outputs_and_retires_host() -> Result<()
     let config = ImageProductConfig::load(&config_path)?;
     let requests = requests(&config)?;
     let batch_size = requests.len();
-    let ImageBackendConfig::Cuda(cuda) = &config.backend;
+    let ImageBackendConfig::Cuda(cuda) = &config.backend else {
+        return Err(anyhow::anyhow!("CUDA fixture requires a CUDA backend").into());
+    };
     let cuda = cuda.resolved()?;
     let decoder_policy = cuda.pipeline.decoder_batch_policy;
     cuda.validate()?;
@@ -193,7 +197,7 @@ fn cuda_product_one_real_batch_preserves_outputs_and_retires_host() -> Result<()
     let host = pipeline.host_account().clone();
     let outputs = match pipeline.generate_batch(requests.clone()) {
         Ok(outputs) => outputs,
-        Err(source) => return Err(ImageProductError::Generation { source, pipeline }),
+        Err(source) => return Err(ImageProductError::generation(source, pipeline)),
     };
     let inspect = (|| -> Result<(Vec<Value>, usize)> {
         ensure!(
