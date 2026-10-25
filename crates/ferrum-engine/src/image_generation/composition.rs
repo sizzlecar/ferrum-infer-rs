@@ -1,10 +1,15 @@
 //! Backend-independent admission limits and real-graph command accounting.
 use super::*;
-use anyhow::{ensure, Context, Result};
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+use anyhow::Context;
+use anyhow::{ensure, Result};
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 use ferrum_models::qwen3_vl_text::Qwen3VLTextImageSpan;
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 use ferrum_models::qwen3_vl_vision::{
     Qwen3VLVisionArchitecture, Qwen3VLVisionConfig, Qwen3VLVisionFamily, Qwen3VLVisionGrid,
 };
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 use ferrum_models::qwen_image21::{QwenImage21VaeEncoderConfig, QwenImage21VaeEncoderFamily};
 use std::num::NonZeroU64;
 
@@ -60,6 +65,7 @@ impl ImagePipelineLimits {
     }
 }
 
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 pub(super) fn component_command_count(family: &PreparedModelFamily) -> Result<usize> {
     family
         .program()
@@ -71,6 +77,7 @@ pub(super) fn component_command_count(family: &PreparedModelFamily) -> Result<us
         .context("component command count overflows")
 }
 
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 pub(super) fn validate_family_command_limits(
     families: &[PreparedModelFamily],
     maximum: usize,
@@ -86,6 +93,7 @@ pub(super) fn validate_family_command_limits(
 
 /// Small metadata-only representatives of every additional editing topology.
 /// Tensor contents and request dimensions cannot reduce these command counts.
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 pub(super) fn editing_command_families(
     text: &Qwen3VLTextConfig,
     dit: &QwenImage21TransformerConfig,
