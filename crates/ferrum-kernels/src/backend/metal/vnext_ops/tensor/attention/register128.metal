@@ -157,11 +157,27 @@ kernel void ferrum_tensor_attention_register128_bf16(
 
         for (ulong k_start = min_start; k_start < max_end; k_start += 16) {
             if (tid == 0) atomic_store_explicit(nonfinite_value, 0, memory_order_relaxed);
-            for (uint i = tid; i < 128 * 16; i += 128) {
-                uint d = i / 16, c = i % 16;
-                ulong k = k_start + c;
-                kv_tile[d * 24 + c] = k < max_end && attention_register_key_valid(mask, batch, k)
-                    ? key[kv_base + k * p.key_value_heads * 128 + d] : ushort(0);
+            // Each SIMD transposes one 8-dimension x 8-key block per round.
+            // Four adjacent lanes read adjacent dimension pairs from one key;
+            // two shuffles turn these into adjacent key pairs for the same D.
+            for (uint tile_round = 0; tile_round < 8; ++tile_round) {
+                uint tile = 8 * sid + tile_round;
+                uint d_base = (tile / 2) * 8, c_base = (tile % 2) * 8;
+                uint read_d = d_base + 2 * (lane % 4);
+                ulong k = k_start + c_base + lane / 4;
+                uint packed = 0;
+                if (k < max_end && attention_register_key_valid(mask, batch, k)) {
+                    ulong offset = kv_base + k * p.key_value_heads * 128 + read_d;
+                    // The input contract guarantees only ushort alignment.
+                    packed = uint(key[offset]) | (uint(key[offset + 1]) << 16);
+                }
+                ushort source = ushort(8 * (lane % 4) + lane / 8);
+                uint first = simd_shuffle(packed, source);
+                uint second = simd_shuffle(packed, ushort(source + 4));
+                uint shift = 16 * ((lane / 4) % 2);
+                uint write_d = d_base + lane / 4, write_c = c_base + 2 * (lane % 4);
+                kv_tile[write_d * 24 + write_c] = ushort(first >> shift);
+                kv_tile[write_d * 24 + write_c + 1] = ushort(second >> shift);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             simdgroup_float8x8 probability[2];
