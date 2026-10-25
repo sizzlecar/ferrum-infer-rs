@@ -124,8 +124,8 @@ async fn actual_cpu_attempt_observer_does_not_enable_product_timing_or_charge_ou
     let baseline_session = baseline.output_session().clone();
     let observed_session = observed.output_session().clone();
     assert_eq!(
-        observed_session.semantic_usage(),
-        baseline_session.semantic_usage()
+        semantic_usage_without_created_at(&observed),
+        semantic_usage_without_created_at(&baseline)
     );
     let samples = recorder.take();
     assert!(samples.iter().any(|sample| sample
@@ -139,6 +139,53 @@ async fn actual_cpu_attempt_observer_does_not_enable_product_timing_or_charge_ou
     drop((baseline, observed));
     assert_eq!(baseline_session.semantic_usage(), 0);
     assert_eq!(observed_session.semantic_usage(), 0);
+}
+
+fn semantic_usage_without_created_at(output: &InferenceOutput) -> usize {
+    let response = output.response();
+    let response_cost = semantic_cost(response).unwrap();
+    assert_eq!(output.output_session().semantic_usage(), response_cost);
+    // Chrono's RFC3339 serialization uses variable fractional-second precision.
+    // Independent completions need not retain equally long creation timestamps;
+    // each still pays its full actual cost before comparing the other content.
+    response_cost
+        .checked_sub(semantic_cost(&response.created_at).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn response_quota_accounts_for_creation_timestamp_precision() {
+    let millis = InferenceResponse {
+        request_id: RequestId::new(),
+        text: "token".into(),
+        tokens: vec![TokenId(1)],
+        finish_reason: FinishReason::Length,
+        usage: TokenUsage::new(2, 1),
+        latency_ms: 1,
+        created_at: chrono::DateTime::from_timestamp(1_700_000_000, 123_000_000).unwrap(),
+        metadata: HashMap::new(),
+        api_response: None,
+        execution_evidence: None,
+    };
+    let mut micros = millis.clone();
+    micros.created_at = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_000).unwrap();
+    let budget = OutputBudget::new(EngineConfig::default().output).unwrap();
+    let retain = |response| {
+        let session = budget.try_open_session().unwrap();
+        InferenceOutput::new(response, session.try_reserve_semantic(0).unwrap()).unwrap()
+    };
+    let millis = retain(millis);
+    let micros = retain(micros);
+    assert_ne!(
+        millis.output_session().semantic_usage(),
+        micros.output_session().semantic_usage()
+    );
+    assert_eq!(
+        semantic_usage_without_created_at(&millis),
+        semantic_usage_without_created_at(&micros)
+    );
+    drop((millis, micros));
+    assert_eq!(budget.usage().semantic_bytes, 0);
 }
 
 fn request() -> InferenceRequest {
