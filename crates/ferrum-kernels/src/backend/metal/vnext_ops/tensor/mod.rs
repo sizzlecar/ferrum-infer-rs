@@ -29,9 +29,9 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "metal-std-f32;fast-math=false;fp-contract=off;bf16-integer-rne;",
     "silu_mul=round-silu-then-mul;modulation=round-one-plus-scale-then-mul;",
     "gated-residual=round-gate-times-update-then-add;nan-class-only;",
-    "gemm=MPP-BF16xBF16-F32-m32n64-dynamicK-relaxed-false-full-interior-int-range;",
+    "gemm=MPP-BF16xBF16-F32-m64n64-interior-m32n64-remainder-dynamicK-relaxed-false-int-range;",
     "gemm-tails-and-fallback=simdgroup-f32-m32n64k32;disjoint-bottom-then-right;",
-    "gemm=at-most-three-dispatches;OI;BF16-final-boundary;",
+    "gemm=at-most-four-dispatches;OI;BF16-final-boundary;",
     "native-block=decode-f32-then-BF16;admitted-invocation-scratch;",
     "norm=zero-padded-adjacent-FP32-tree;separate-sqrt-div;device-bounded-threadgroup;",
     "head-rms=BF16-normalized-before-gamma;zero-centered=FP32-one-plus-gamma;",
@@ -122,6 +122,7 @@ struct Pipelines {
     pointwise: Option<ComputePipelineState>,
     linear: Option<ComputePipelineState>,
     linear_mpp: Option<ComputePipelineState>,
+    linear_mpp_large: Option<ComputePipelineState>,
     block_decode: Option<ComputePipelineState>,
     fp8_quantize: Option<ComputePipelineState>,
     fp8_linear: Option<ComputePipelineState>,
@@ -277,22 +278,29 @@ pub fn metal_tensor_providers(
     // MPP belongs to the same admitted provider bundle, but uses a separate
     // MSL 4 library. Older systems never compile its headers; actual compiler
     // errors on an eligible device remain errors rather than silent fallback.
-    let linear_mpp = if has_linear {
-        match linear::mpp::compile(runtime.device()).map_err(MetalDeviceRuntimeError::contract)? {
+    let [linear_mpp, linear_mpp_large] = if has_linear {
+        let [small, large] =
+            linear::mpp::compile(runtime.device()).map_err(MetalDeviceRuntimeError::contract)?;
+        [
+            (linear::mpp::TILE_ROWS, small),
+            (linear::mpp::LARGE_TILE_ROWS, large),
+        ]
+        .map(|(tile_rows, availability)| match availability {
             linear::mpp::MppPipelineAvailability::Unsupported { reason } => {
-                tracing::info!(%reason, "Metal MPP BF16 GEMM unavailable; using SIMD-group fallback");
+                tracing::info!(tile_rows, %reason, "Metal MPP BF16 GEMM tile unavailable");
                 None
             }
             linear::mpp::MppPipelineAvailability::Ready(pipeline) => {
                 tracing::info!(
+                    tile_rows,
                     static_threadgroup_bytes = pipeline.static_threadgroup_memory_length(),
                     "Metal MPP BF16 GEMM enabled for supported full-tile shapes"
                 );
                 Some(pipeline)
             }
-        }
+        })
     } else {
-        None
+        [None, None]
     };
     let block_decode = pipeline(has_blocks, "ferrum_tensor_block_decode_bf16")?;
     let fp8_quantize = pipeline(has_fp8, "ferrum_tensor_fp8_quantize")?;
@@ -392,6 +400,7 @@ pub fn metal_tensor_providers(
         pointwise,
         linear,
         linear_mpp,
+        linear_mpp_large,
         block_decode,
         fp8_quantize,
         fp8_linear,

@@ -163,6 +163,8 @@ impl LinearProvider {
         }
         let use_mpp = self.pipelines.linear_mpp.is_some()
             && mpp::supports_shape(shape.rows, shape.inputs, shape.outputs);
+        let use_large_mpp = self.pipelines.linear_mpp_large.is_some()
+            && mpp::supports_large_shape(shape.rows, shape.inputs, shape.outputs);
         let pipelines = Arc::clone(&self.pipelines);
         let parameters = LinearParams {
             rows: shape.rows,
@@ -172,11 +174,11 @@ impl LinearProvider {
             row_offset: 0,
             column_offset: 0,
         };
-        let dispatches = linear_dispatches(shape.rows, shape.outputs, use_mpp);
+        let dispatches = linear_dispatches(shape.rows, shape.outputs, use_mpp, use_large_mpp);
         let work = DeviceCommandLogicalWork::tensor(shape.output_bytes / 2, shape.operations)
             .map_err(|e| e.to_string())?;
         MetalDeviceCommand::tensor_operation(
-            match (format.is_some(), use_mpp) {
+            match (format.is_some(), use_mpp || use_large_mpp) {
                 (true, true) => "metal.native_block_linear.bf16.mpp",
                 (true, false) => "metal.native_block_linear.bf16",
                 (false, true) => "metal.dense_linear.bf16.mpp",
@@ -229,13 +231,18 @@ impl LinearProvider {
                     if dispatch.row_groups == 0 || dispatch.column_groups == 0 {
                         continue;
                     }
-                    let pipeline = if dispatch.mpp {
-                        pipelines
+                    let pipeline = match dispatch.kernel {
+                        LinearKernel::Mpp32 => pipelines
                             .linear_mpp
                             .as_ref()
-                            .expect("selected interior MPP linear pipeline")
-                    } else {
-                        pipelines.linear.as_ref().expect("selected linear pipeline")
+                            .expect("selected 32-row MPP linear pipeline"),
+                        LinearKernel::Mpp64 => pipelines
+                            .linear_mpp_large
+                            .as_ref()
+                            .expect("selected 64-row MPP linear pipeline"),
+                        LinearKernel::Simd => {
+                            pipelines.linear.as_ref().expect("selected linear pipeline")
+                        }
                     };
                     compute.set_compute_pipeline_state(pipeline);
                     set_params(
@@ -274,44 +281,80 @@ struct LinearParams {
     column_offset: u32,
 }
 
-#[derive(Clone, Copy, Default)]
+// These are the actual fallback shader's dimensions, independent of MPP tiles.
+const SIMD_TILE_ROWS: u32 = 32;
+const SIMD_TILE_COLUMNS: u32 = 64;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LinearKernel {
+    #[default]
+    Simd,
+    Mpp32,
+    Mpp64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct LinearDispatch {
     row_offset: u32,
     column_offset: u32,
     row_groups: u32,
     column_groups: u32,
-    mpp: bool,
+    kernel: LinearKernel,
 }
 
-fn linear_dispatches(rows: u32, outputs: u32, use_mpp: bool) -> [LinearDispatch; 3] {
-    let mut dispatches = [LinearDispatch::default(); 3];
-    if !use_mpp {
+fn linear_dispatches(
+    rows: u32,
+    outputs: u32,
+    use_mpp: bool,
+    use_large_mpp: bool,
+) -> [LinearDispatch; 4] {
+    let mut dispatches = [LinearDispatch::default(); 4];
+    if !use_mpp && !use_large_mpp {
         dispatches[0] = LinearDispatch {
-            row_groups: rows.div_ceil(mpp::TILE_ROWS),
-            column_groups: outputs.div_ceil(mpp::TILE_COLUMNS),
+            row_groups: rows.div_ceil(SIMD_TILE_ROWS),
+            column_groups: outputs.div_ceil(SIMD_TILE_COLUMNS),
             ..LinearDispatch::default()
         };
         return dispatches;
     }
-    let row_groups = rows / mpp::TILE_ROWS;
     let column_groups = outputs / mpp::TILE_COLUMNS;
+    let large_groups = if use_large_mpp {
+        rows / mpp::LARGE_TILE_ROWS
+    } else {
+        0
+    };
     dispatches[0] = LinearDispatch {
-        row_groups,
+        row_groups: large_groups,
         column_groups,
-        mpp: true,
+        kernel: LinearKernel::Mpp64,
         ..LinearDispatch::default()
     };
-    // The bottom strip owns the bottom-right corner as well.
+    let large_rows = large_groups * mpp::LARGE_TILE_ROWS;
+    let small_groups = if use_mpp {
+        (rows - large_rows) / mpp::TILE_ROWS
+    } else {
+        0
+    };
     dispatches[1] = LinearDispatch {
-        row_offset: row_groups * mpp::TILE_ROWS,
-        row_groups: u32::from(rows % mpp::TILE_ROWS != 0),
-        column_groups: outputs.div_ceil(mpp::TILE_COLUMNS),
+        row_offset: large_rows,
+        row_groups: small_groups,
+        column_groups,
+        kernel: LinearKernel::Mpp32,
         ..LinearDispatch::default()
     };
+    let complete_rows = large_rows + small_groups * mpp::TILE_ROWS;
+    // The bottom SIMD strip owns the bottom-right corner as well. It can
+    // include a full 32-row tile if only the large MPP pipeline is available.
     dispatches[2] = LinearDispatch {
+        row_offset: complete_rows,
+        row_groups: (rows - complete_rows).div_ceil(SIMD_TILE_ROWS),
+        column_groups: outputs.div_ceil(SIMD_TILE_COLUMNS),
+        ..LinearDispatch::default()
+    };
+    dispatches[3] = LinearDispatch {
         column_offset: column_groups * mpp::TILE_COLUMNS,
-        row_groups,
-        column_groups: u32::from(outputs % mpp::TILE_COLUMNS != 0),
+        row_groups: complete_rows / SIMD_TILE_ROWS,
+        column_groups: u32::from(outputs % SIMD_TILE_COLUMNS != 0),
         ..LinearDispatch::default()
     };
     dispatches
@@ -323,32 +366,56 @@ mod dispatch_tests {
 
     #[test]
     fn interior_and_tail_dispatches_cover_each_output_once() {
-        for (rows, outputs) in [
-            (1, 1),
-            (31, 65),
-            (33, 63),
-            (32, 64),
-            (33, 64),
-            (32, 65),
-            (65, 129),
-        ] {
-            for available in [false, true] {
-                let use_mpp = available && mpp::supports_shape(rows, 129, outputs);
-                let mut visits = vec![0_u8; (rows * outputs) as usize];
-                for dispatch in linear_dispatches(rows, outputs, use_mpp) {
-                    let row_end = dispatch.row_offset + dispatch.row_groups * mpp::TILE_ROWS;
-                    let column_end =
-                        dispatch.column_offset + dispatch.column_groups * mpp::TILE_COLUMNS;
-                    if dispatch.mpp {
-                        assert!(row_end <= rows && column_end <= outputs);
-                    }
-                    for row in dispatch.row_offset..row_end.min(rows) {
-                        for column in dispatch.column_offset..column_end.min(outputs) {
-                            visits[(row * outputs + column) as usize] += 1;
+        for rows in [0, 1, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129] {
+            for outputs in [0, 1, 63, 64, 65, 127, 128, 129] {
+                for (small_available, large_available) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    let use_mpp = small_available && mpp::supports_shape(rows, 129, outputs);
+                    let use_large_mpp =
+                        large_available && mpp::supports_large_shape(rows, 129, outputs);
+                    let mut visits = vec![0_u8; (rows * outputs) as usize];
+                    let dispatches = linear_dispatches(rows, outputs, use_mpp, use_large_mpp);
+                    assert_eq!(
+                        dispatches
+                            .iter()
+                            .any(|dispatch| dispatch.kernel == LinearKernel::Mpp64
+                                && dispatch.row_groups > 0
+                                && dispatch.column_groups > 0),
+                        use_large_mpp,
+                        "available large tiles must execute the complete interior"
+                    );
+                    for dispatch in dispatches {
+                        if dispatch.row_groups == 0 || dispatch.column_groups == 0 {
+                            continue;
+                        }
+                        // Independently model the actual shader extents, including
+                        // the unchanged 32x64 SIMD fallback, rather than reusing
+                        // the dispatch arithmetic to manufacture expected visits.
+                        let tile_rows = match dispatch.kernel {
+                            LinearKernel::Simd => 32,
+                            LinearKernel::Mpp32 => {
+                                assert!(use_mpp);
+                                32
+                            }
+                            LinearKernel::Mpp64 => {
+                                assert!(use_large_mpp);
+                                64
+                            }
+                        };
+                        let row_end = dispatch.row_offset + dispatch.row_groups * tile_rows;
+                        let column_end = dispatch.column_offset + dispatch.column_groups * 64;
+                        if dispatch.kernel != LinearKernel::Simd {
+                            assert!(row_end <= rows && column_end <= outputs);
+                        }
+                        for row in dispatch.row_offset..row_end.min(rows) {
+                            for column in dispatch.column_offset..column_end.min(outputs) {
+                                visits[(row * outputs + column) as usize] += 1;
+                            }
                         }
                     }
+                    assert!(visits.into_iter().all(|count| count == 1), "rows={rows} outputs={outputs} small={small_available} large={large_available}");
                 }
-                assert!(visits.into_iter().all(|count| count == 1));
             }
         }
     }

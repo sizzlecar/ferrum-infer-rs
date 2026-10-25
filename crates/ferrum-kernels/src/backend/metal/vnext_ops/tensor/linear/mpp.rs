@@ -14,9 +14,10 @@ use std::ffi::CStr;
 
 pub(in crate::backend::metal::vnext_ops::tensor) const THREADS: u64 = 128;
 pub(in crate::backend::metal::vnext_ops::tensor) const TILE_ROWS: u32 = 32;
+pub(in crate::backend::metal::vnext_ops::tensor) const LARGE_TILE_ROWS: u32 = 64;
 pub(in crate::backend::metal::vnext_ops::tensor) const TILE_COLUMNS: u32 = 64;
 pub(in crate::backend::metal::vnext_ops::tensor) const NUMERICAL_IDENTITY: &str =
-    "metal.mpp.bf16-bf16-f32.m32n64.interior;simdgroup-f32-tails;dynamic-k;relaxed=false;integer-BF16-epilogue.v2";
+    "metal.mpp.bf16-bf16-f32.m64n64-interior.m32n64-remainder;simdgroup-f32-tails;dynamic-k;relaxed=false;integer-BF16-epilogue.v3";
 pub(in crate::backend::metal::vnext_ops::tensor) const FINGERPRINT_SOURCE: &str =
     concat!(include_str!("mpp.rs"), include_str!("mpp.metal"));
 
@@ -74,10 +75,15 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn compile_options(
 /// `Err`, including Metal's text. No application device buffer is allocated.
 pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
     device: &DeviceRef,
-) -> Result<MppPipelineAvailability, String> {
+) -> Result<[MppPipelineAvailability; 2], String> {
     let options = match compile_options(device)? {
         MppCompileOptions::Unsupported { reason } => {
-            return Ok(MppPipelineAvailability::Unsupported { reason });
+            return Ok([
+                MppPipelineAvailability::Unsupported {
+                    reason: reason.clone(),
+                },
+                MppPipelineAvailability::Unsupported { reason },
+            ]);
         }
         MppCompileOptions::Ready(options) => options,
     };
@@ -89,38 +95,45 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
     let library = device
         .new_library_with_source(source, &options)
         .map_err(|error| format!("MPP BF16 MSL 4 library compilation failed: {error}"))?;
-    let function = library
-        .get_function("ferrum_tensor_linear_bf16_mpp", None)
-        .map_err(|error| format!("MPP BF16 kernel lookup failed: {error}"))?;
-    let pipeline = device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(|error| format!("MPP BF16 compute pipeline creation failed: {error}"))?;
-    if pipeline.thread_execution_width() != 32 {
-        return Ok(MppPipelineAvailability::Unsupported {
-            reason: format!(
-                "MPP candidate requires four 32-thread SIMD groups; device reports width {}",
-                pipeline.thread_execution_width()
-            ),
-        });
-    }
-    if pipeline.max_total_threads_per_threadgroup() < THREADS {
-        return Ok(MppPipelineAvailability::Unsupported {
-            reason: format!(
-                "MPP candidate requires {THREADS} threads; pipeline permits {}",
-                pipeline.max_total_threads_per_threadgroup()
-            ),
-        });
-    }
-    let required = pipeline.static_threadgroup_memory_length();
-    let available = device.max_threadgroup_memory_length();
-    if required > available {
-        return Ok(MppPipelineAvailability::Unsupported {
-            reason: format!(
+    let compile_pipeline = |name: &str| -> Result<MppPipelineAvailability, String> {
+        let function = library
+            .get_function(name, None)
+            .map_err(|error| format!("MPP BF16 kernel {name} lookup failed: {error}"))?;
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|error| {
+                format!("MPP BF16 compute pipeline {name} creation failed: {error}")
+            })?;
+        if pipeline.thread_execution_width() != 32 {
+            return Ok(MppPipelineAvailability::Unsupported {
+                reason: format!(
+                    "MPP candidate requires four 32-thread SIMD groups; device reports width {}",
+                    pipeline.thread_execution_width()
+                ),
+            });
+        }
+        if pipeline.max_total_threads_per_threadgroup() < THREADS {
+            return Ok(MppPipelineAvailability::Unsupported {
+                reason: format!(
+                    "MPP candidate requires {THREADS} threads; pipeline permits {}",
+                    pipeline.max_total_threads_per_threadgroup()
+                ),
+            });
+        }
+        let required = pipeline.static_threadgroup_memory_length();
+        let available = device.max_threadgroup_memory_length();
+        if required > available {
+            let reason = format!(
                 "MPP candidate requires {required} bytes of static threadgroup memory; device permits {available}"
-            ),
-        });
-    }
-    Ok(MppPipelineAvailability::Ready(pipeline))
+            );
+            return Ok(MppPipelineAvailability::Unsupported { reason });
+        }
+        Ok(MppPipelineAvailability::Ready(pipeline))
+    };
+    Ok([
+        compile_pipeline("ferrum_tensor_linear_bf16_mpp")?,
+        compile_pipeline("ferrum_tensor_linear_bf16_mpp_m64n64")?,
+    ])
 }
 
 /// At least one full output tile. MPP tensor dimensions/strides use `int`; conservatively
@@ -139,6 +152,14 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn supports_shape(
         && u64::from(rows) * u64::from(inputs) <= maximum
         && u64::from(outputs) * u64::from(inputs) <= maximum
         && u64::from(rows) * u64::from(outputs) <= maximum
+}
+
+pub(in crate::backend::metal::vnext_ops::tensor) fn supports_large_shape(
+    rows: u32,
+    inputs: u32,
+    outputs: u32,
+) -> bool {
+    rows >= LARGE_TILE_ROWS && supports_shape(rows, inputs, outputs)
 }
 
 fn macos_version() -> Result<(u32, u32), String> {
@@ -176,7 +197,7 @@ fn macos_version() -> Result<(u32, u32), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::supports_shape;
+    use super::{supports_large_shape, supports_shape};
 
     #[test]
     fn interior_tiles_allow_tails_and_dynamic_k_but_reject_unsafe_tensor_extents() {
@@ -193,5 +214,17 @@ mod tests {
         assert!(!supports_shape(65_536, 32, 65_536));
         assert!(supports_shape(32, 33_554_431, 64));
         assert!(!supports_shape(32, 33_554_432, 64));
+    }
+
+    #[test]
+    fn large_tiles_keep_the_original_checked_view_limits() {
+        assert!(!supports_large_shape(63, 129, 64));
+        assert!(supports_large_shape(64, 1, 64));
+        assert!(supports_large_shape(97, 129, 129));
+        assert!(!supports_large_shape(64, 129, 63));
+        assert!(!supports_large_shape(64, 0, 64));
+        assert!(supports_large_shape(64, 33_554_431, 64));
+        assert!(!supports_large_shape(64, 33_554_432, 64));
+        assert!(!supports_large_shape(65_536, 32, 65_536));
     }
 }

@@ -16,17 +16,18 @@ struct MppLinearParams {
     uint row_offset; uint column_offset;
 };
 
-// Host-side dispatch admits only complete 32x64 output tiles, positive int-range
+// Host-side dispatch admits only complete output tiles, positive int-range
 // extents, and exactly four 32-thread SIMD groups. K is dynamic, including tails.
-kernel void ferrum_tensor_linear_bf16_mpp(
-    device const bfloat* input [[buffer(0)]],
-    device const bfloat* weight [[buffer(1)]],
-    device ushort* output [[buffer(2)]],
-    constant MppLinearParams& p [[buffer(3)]],
-    device const ushort* bias [[buffer(4)]],
-    uint3 group [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]) {
-    constexpr int TM = 32;
+template<int TM>
+inline void ferrum_tensor_linear_bf16_mpp_tile(
+    device const bfloat* input,
+    device const bfloat* weight,
+    device ushort* output,
+    constant MppLinearParams& p,
+    device const ushort* bias,
+    uint3 group,
+    uint tid,
+    threadgroup float* results) {
     constexpr int TN = 64;
     int row_start = int(p.row_offset) + int(group.x) * TM;
     int col_start = int(p.column_offset) + int(group.y) * TN;
@@ -44,14 +45,13 @@ kernel void ferrum_tensor_linear_bf16_mpp(
     constexpr auto descriptor = matmul2d_descriptor(
         TM, TN, dynamic_length_v<int>, false, true, false);
     matmul2d<descriptor, execution_simdgroups<4>> operation;
-    auto accumulator = operation.get_destination_cooperative_tensor<
+    auto accumulator = operation.template get_destination_cooperative_tensor<
         decltype(a_tile), decltype(w_tile), float>();
     operation.run(a_tile, w_tile, accumulator);
 
     // Preserve the existing per-column bias and integer BF16 epilogue without
     // depending on the implementation-defined cooperative element ownership.
     // All scratch here is on-chip; check the compiled PSO's actual static usage.
-    threadgroup float results[TM * TN];
     auto result_tile = tensor(results, dextents<int, 2>{TN, TM},
                               array<int, 2>{1, TN});
     accumulator.store(result_tile);
@@ -65,4 +65,28 @@ kernel void ferrum_tensor_linear_bf16_mpp(
             output[row * p.outputs + col] = encode_bf16(value);
         }
     }
+}
+
+kernel void ferrum_tensor_linear_bf16_mpp(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device ushort* output [[buffer(2)]],
+    constant MppLinearParams& p [[buffer(3)]],
+    device const ushort* bias [[buffer(4)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float results[32 * 64];
+    ferrum_tensor_linear_bf16_mpp_tile<32>(input, weight, output, p, bias, group, tid, results);
+}
+
+kernel void ferrum_tensor_linear_bf16_mpp_m64n64(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device ushort* output [[buffer(2)]],
+    constant MppLinearParams& p [[buffer(3)]],
+    device const ushort* bias [[buffer(4)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float results[64 * 64];
+    ferrum_tensor_linear_bf16_mpp_tile<64>(input, weight, output, p, bias, group, tid, results);
 }
