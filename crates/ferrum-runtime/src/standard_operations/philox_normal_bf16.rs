@@ -7,7 +7,8 @@ pub const PHILOX_NORMAL_BF16_CAPABILITY_ID: &str = "capability.operation.philox_
 
 /// U32[4] is [seed low, seed high, offset low, offset high]. It is a real
 /// read-only input, never hidden global RNG state. Output is contiguous BF16
-/// [1,C,H,W]. Every u64 offset has the provider's documented cuRAND semantics;
+/// [1,C,H,W]. Every u64 offset has the provider's documented sequence semantics
+/// (for example CUDA's cuRAND subsequence or Metal's flat normal ordinal);
 /// this operation does not advance or mutate its input state.
 ///
 /// The provider identifies the device-dependent launch mapping and normal

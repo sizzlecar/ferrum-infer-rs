@@ -3,6 +3,8 @@ use super::*;
 use ferrum_runtime::{DeviceCapacityOwner, DeviceCapacityRetention, DeviceOpaqueMemoryKind};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::AtomicUsize;
+mod memory;
+pub use memory::{MetalTensorMemoryObservation, MetalTensorRuntimeAutoConfig};
 
 #[derive(Debug, Clone)]
 pub struct MetalTensorRuntimeConfig {
@@ -165,11 +167,19 @@ impl TensorEagerState {
 impl MetalDeviceRuntime {
     /// Uses a device handle directly; never initializes legacy global providers.
     pub fn new_tensor_eager(
-        mut config: MetalTensorRuntimeConfig,
+        config: MetalTensorRuntimeConfig,
     ) -> Result<Self, MetalDeviceRuntimeError> {
         config.validate()?;
         let device =
             metal::Device::system_default().ok_or_else(|| invalid("no default Metal device"))?;
+        Self::new_tensor_eager_on_device(config, device)
+    }
+
+    fn new_tensor_eager_on_device(
+        mut config: MetalTensorRuntimeConfig,
+        device: metal::Device,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        config.validate()?;
         let mut hash = Sha256::new();
         for part in [
             "ferrum-metal-tensor-eager-v1".to_owned(),

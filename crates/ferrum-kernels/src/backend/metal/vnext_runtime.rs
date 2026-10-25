@@ -52,7 +52,9 @@ mod managed_tensor;
 mod tensor_eager;
 use counter_readback::CounterReadbackStats;
 pub(crate) use tensor_eager::MetalTensorProviderRetention;
-pub use tensor_eager::MetalTensorRuntimeConfig;
+pub use tensor_eager::{
+    MetalTensorMemoryObservation, MetalTensorRuntimeAutoConfig, MetalTensorRuntimeConfig,
+};
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);

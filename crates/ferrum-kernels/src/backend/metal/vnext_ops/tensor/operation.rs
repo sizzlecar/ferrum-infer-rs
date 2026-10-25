@@ -38,6 +38,7 @@ pub enum MetalTensorOperation {
     HalfRotary,
     ReshapeCopy,
     SegmentedAttention,
+    PhiloxNormal,
 }
 
 impl MetalTensorOperation {
@@ -50,7 +51,7 @@ impl MetalTensorOperation {
         Self::GeluTanh,
         Self::PlainResidualAdd,
     ];
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -85,6 +86,7 @@ impl MetalTensorOperation {
         Self::HalfRotary,
         Self::ReshapeCopy,
         Self::SegmentedAttention,
+        Self::PhiloxNormal,
     ];
     pub(super) fn is_pointwise(self) -> bool {
         Self::POINTWISE.contains(&self)
@@ -181,11 +183,13 @@ impl MetalTensorOperation {
             Self::SpatialAttention => spatial_attention_bf16_contract(),
             Self::SpatialUpsampleGather => spatial_upsample_gather_bf16_contract(),
             Self::SpatialGroupMean => spatial_group_mean_bf16_contract(),
+            Self::PhiloxNormal => philox_normal_bf16_contract(),
             _ => unreachable!("primitive contracts handled above"),
         }
     }
     pub fn profile(self) -> &'static str {
         match self {
+            Self::PhiloxNormal => super::philox::PROFILE,
             Self::Silu => "metal.precise.silu.bf16.v1",
             Self::SiluMul => "metal.precise.silu_mul.bf16.v1",
             Self::Tanh => "metal.precise.tanh.bf16.v1",
@@ -268,6 +272,7 @@ impl MetalTensorOperation {
             Self::SpatialAttention => SPATIAL_ATTENTION_BF16_CAPABILITY_ID,
             Self::SpatialUpsampleGather => SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID,
             Self::SpatialGroupMean => SPATIAL_GROUP_MEAN_BF16_CAPABILITY_ID,
+            Self::PhiloxNormal => PHILOX_NORMAL_BF16_CAPABILITY_ID,
             _ => unreachable!("primitive capabilities handled above"),
         }
     }
@@ -303,6 +308,7 @@ impl MetalTensorOperation {
             Self::SpatialAttention => SPATIAL_ATTENTION_BF16_OPERATION_ID,
             Self::SpatialUpsampleGather => SPATIAL_UPSAMPLE_GATHER_BF16_OPERATION_ID,
             Self::SpatialGroupMean => SPATIAL_GROUP_MEAN_BF16_OPERATION_ID,
+            Self::PhiloxNormal => PHILOX_NORMAL_BF16_OPERATION_ID,
             _ => unreachable!("primitive operations handled above"),
         }
     }
@@ -338,6 +344,7 @@ impl MetalTensorOperation {
             Self::SpatialAttention => "spatial_attention",
             Self::SpatialUpsampleGather => "spatial_upsample_gather",
             Self::SpatialGroupMean => "spatial_group_mean",
+            Self::PhiloxNormal => "philox_normal",
             _ => unreachable!("primitive names handled above"),
         }
     }
@@ -361,6 +368,7 @@ impl MetalTensorOperation {
             Self::ChannelL2Norm | Self::ChannelL2NormImage | Self::PlainResidualAddNchw => 2,
             Self::SiluNchw | Self::SpatialAttention | Self::SpatialUpsampleGather => 1,
             Self::SpatialGroupMean => 1,
+            Self::PhiloxNormal => 1,
             _ => unreachable!("primitive ports handled above"),
         }
     }

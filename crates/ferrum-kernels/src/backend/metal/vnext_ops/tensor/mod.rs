@@ -11,6 +11,7 @@ mod attention;
 mod linear;
 mod norm;
 mod operation;
+mod philox;
 mod pointwise;
 mod primitives;
 mod rope;
@@ -47,6 +48,7 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "affine=F32-dot-plus-bias;patch=BF16-dot-before-bias;affine-norm=F32-scale-bias;",
     "vision-rotary=F32-tables-products-add;gelu-erf=SunPro-F32-piecewise;",
     "segmented-attention=isolated-noncausal;reshape=exact-bitcopy;",
+    "noise=Philox4x32-10;flat-normal-ordinal;open-U23-midpoint;Box-Muller-F32;",
     "independent-Metal-profile;no-CUDA-or-Reference-bitwise-claim"
 );
 
@@ -71,6 +73,8 @@ fn fingerprint() -> String {
     implementation_fingerprint(&[
         include_bytes!("mod.rs"),
         include_bytes!("operation.rs"),
+        include_bytes!("philox.rs"),
+        include_bytes!("philox.metal"),
         include_bytes!("pointwise.rs"),
         include_bytes!("primitives.rs"),
         include_bytes!("primitives.metal"),
@@ -111,6 +115,7 @@ struct Pipelines {
     transport: Option<ComputePipelineState>,
     scatter: Option<ComputePipelineState>,
     primitives: Option<ComputePipelineState>,
+    philox: Option<ComputePipelineState>,
     spatial: spatial::Pipelines,
     // Last field: native pipeline states release before their budget owner.
     _retention: MetalTensorProviderRetention,
@@ -182,6 +187,7 @@ pub fn metal_tensor_providers(
     let has_transport = selected.iter().any(|op| op.is_transport());
     let has_scatter = selected.contains(&MetalTensorOperation::RowScatterAdd);
     let has_primitives = selected.iter().any(|op| op.is_element_primitive());
+    let has_philox = selected.contains(&MetalTensorOperation::PhiloxNormal);
     let mut source = String::from(include_str!("bf16.metal"));
     if has_blocks {
         source.push_str(&native_blocks::decoder_source());
@@ -213,6 +219,9 @@ pub fn metal_tensor_providers(
     if has_primitives {
         source.push_str(include_str!("erf.metal"));
         source.push_str(include_str!("primitives.metal"));
+    }
+    if has_philox {
+        source.push_str(include_str!("philox.metal"));
     }
     spatial::append_source(selected, &mut source);
     let options = CompileOptions::new();
@@ -260,6 +269,7 @@ pub fn metal_tensor_providers(
     let transport = pipeline(has_transport, "ferrum_tensor_transport_bf16")?;
     let scatter = pipeline(has_scatter, "ferrum_tensor_row_scatter_add_bf16")?;
     let primitives = pipeline(has_primitives, "ferrum_tensor_primitive_bf16")?;
+    let philox = pipeline(has_philox, "ferrum_tensor_philox_normal_bf16")?;
     let attention_shared_limit = match &attention {
         Some(p) => {
             if p.thread_execution_width() != 32 || p.max_total_threads_per_threadgroup() < 128 {
@@ -302,6 +312,7 @@ pub fn metal_tensor_providers(
         transport,
         scatter,
         primitives,
+        philox,
         _retention: retention,
     });
     Ok(selected
@@ -343,7 +354,9 @@ impl OperationResourceEstimator for TensorProvider {
     ) -> Result<OperationResourceEstimate, VNextError> {
         let estimate =
             estimate_without_workspace(&self.descriptor, &request, self.kind.operation())?;
-        if self.kind.is_norm() {
+        if self.kind == MetalTensorOperation::PhiloxNormal {
+            philox::geometry(request.values(), request.attributes()).map_err(invalid_plan)?;
+        } else if self.kind.is_norm() {
             norm::geometry(
                 self.kind,
                 request.values(),
@@ -431,6 +444,9 @@ impl TensorProvider {
             || !invocation.resource_work_shape().resource_work().is_tensor()
         {
             return Err("Metal operation received a different operation or work contract".into());
+        }
+        if self.kind == MetalTensorOperation::PhiloxNormal {
+            return philox::encode(participant, Arc::clone(&self.pipelines));
         }
         if self.kind.is_norm() {
             return norm::encode(self.kind, participant, Arc::clone(&self.pipelines));

@@ -23,11 +23,15 @@
 
 mod assets;
 mod attention_policy;
+mod composition;
+pub use composition::ImagePipelineLimits;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 mod decoder;
 mod editing;
 mod host_cache;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
 mod prefix_denoising;
 pub use editing::{ImageEditPrefixPolicy, QwenImage21EditProfiles};
 mod plan_cache;
@@ -322,7 +326,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// Include the composition's one aggregate native allowance in resident
     /// batch planning. Reference has no native overhead and keeps zero. This
     /// does not reduce the runtime ceiling or duplicate a capacity reservation.
-    #[cfg(any(feature = "cuda", test))]
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos"), test))]
     pub(super) fn with_device_opaque_allowance(mut self, bytes: u64) -> anyhow::Result<Self> {
         ensure!(
             bytes < self.config.device_capacity_bytes,
