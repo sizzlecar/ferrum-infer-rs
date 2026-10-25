@@ -1,4 +1,4 @@
-//! Complete block and multi-layer DiT execution, including native Q8 matrices.
+//! Complete text encoder and multi-layer DiT graphs, including native Q8 matrices.
 //! Generated weights qualify arithmetic/composition, not trained image quality.
 use super::*;
 use ferrum_execution::component::{
@@ -10,6 +10,8 @@ use transforms::{decode, initialization, upload_values};
 mod fixture;
 #[path = "qwen_graph/oracle.rs"]
 mod oracle;
+#[path = "qwen_graph/text.rs"]
+mod text;
 use fixture::{Data, Inspect, Source};
 
 fn architecture(layers: u64) -> QwenImage21Config {
@@ -177,9 +179,9 @@ fn transformer_case(native: bool, editing: bool) -> (QwenImage21TransformerConfi
 }
 
 pub(super) fn maximum_command_count() -> usize {
-    // Resolve before constructing the runtime, like a product factory. The
-    // largest full DiT includes its block operations and one upload command
-    // per input, as in the existing CUDA composition's command calculation.
+    // Resolve before constructing the runtime, like a product factory. Include
+    // both DiT and text graphs, with one upload command per input as well as
+    // their compute nodes, like the existing CUDA composition.
     [false, true]
         .into_iter()
         .flat_map(|native| {
@@ -200,6 +202,7 @@ pub(super) fn maximum_command_count() -> usize {
         })
         .max()
         .unwrap()
+        .max(text::maximum_command_count())
 }
 
 pub(super) fn verify(
@@ -300,4 +303,5 @@ pub(super) fn verify(
             eprintln!("Metal 2-layer DiT native_q8={native} editing={editing}: every numerical boundary and actual target-only product graph agree");
         }
     }
+    text::verify(runtime, registry, catalog, &host);
 }

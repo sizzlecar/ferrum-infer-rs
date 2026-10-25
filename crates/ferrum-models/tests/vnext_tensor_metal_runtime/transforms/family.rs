@@ -90,7 +90,9 @@ impl ModelFamilyProvider for TransformFamily {
                     version: ContractVersion::new(1, 0),
                     multiplication_type: (!matches!(
                         config.kind(),
-                        MetalTensorOperation::RowGather | MetalTensorOperation::BatchedRowConcat
+                        MetalTensorOperation::RowGather
+                            | MetalTensorOperation::BatchedRowConcat
+                            | MetalTensorOperation::RowScatterAdd
                     ))
                     .then_some(ElementType::F32),
                     accumulation_type: (!matches!(

@@ -13,6 +13,7 @@ mod norm;
 mod operation;
 mod pointwise;
 mod rope;
+mod scatter;
 #[cfg(test)]
 mod tests;
 mod transport;
@@ -35,6 +36,7 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "masked-score-discard;nonfinite-visible-score=whole-head-NaN;",
     "nonfinite-V=visible-only-scalar-PV;zero-global-scratch;device-bounded-on-chip;",
     "transport=BF16-bitcopy;bounded-row-runs;per-batch-concat;zero-arithmetic;",
+    "row-scatter=ordered-disjoint-runs;F32-add-BF16-final;untouched-bitcopy;",
     "independent-Metal-profile;no-CUDA-or-Reference-bitwise-claim"
 );
 
@@ -73,6 +75,8 @@ fn fingerprint() -> String {
         include_bytes!("attention.metal"),
         include_bytes!("transport.rs"),
         include_bytes!("transport.metal"),
+        include_bytes!("scatter.rs"),
+        include_bytes!("scatter.metal"),
         native_blocks::FINGERPRINT_SOURCE.as_bytes(),
         METAL_TENSOR_NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("../mod.rs"),
@@ -90,6 +94,7 @@ struct Pipelines {
     attention: Option<ComputePipelineState>,
     attention_shared_limit: u64,
     transport: Option<ComputePipelineState>,
+    scatter: Option<ComputePipelineState>,
     // Last field: native pipeline states release before their budget owner.
     _retention: MetalTensorProviderRetention,
 }
@@ -113,6 +118,7 @@ pub fn metal_tensor_providers(
                 | MetalTensorOperation::HeadRmsNorm
                 | MetalTensorOperation::ZeroCenteredRmsNorm
                 | MetalTensorOperation::RowGather
+                | MetalTensorOperation::RowScatterAdd
                 | MetalTensorOperation::BatchedRowConcat => {
                     &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID]
                 }
@@ -149,6 +155,7 @@ pub fn metal_tensor_providers(
     let has_rope = selected.iter().any(|op| op.is_rope());
     let has_attention = selected.iter().any(|op| op.is_attention());
     let has_transport = selected.iter().any(|op| op.is_transport());
+    let has_scatter = selected.contains(&MetalTensorOperation::RowScatterAdd);
     let mut source = String::from(include_str!("bf16.metal"));
     if has_blocks {
         source.push_str(&native_blocks::decoder_source());
@@ -173,6 +180,9 @@ pub fn metal_tensor_providers(
     }
     if has_transport {
         source.push_str(include_str!("transport.metal"));
+    }
+    if has_scatter {
+        source.push_str(include_str!("scatter.metal"));
     }
     let options = CompileOptions::new();
     options.set_fast_math_enabled(false);
@@ -217,6 +227,7 @@ pub fn metal_tensor_providers(
     )?;
     let attention = pipeline(has_attention, "ferrum_tensor_attention_bf16")?;
     let transport = pipeline(has_transport, "ferrum_tensor_transport_bf16")?;
+    let scatter = pipeline(has_scatter, "ferrum_tensor_row_scatter_add_bf16")?;
     let attention_shared_limit = match &attention {
         Some(p) => {
             if p.thread_execution_width() != 32 || p.max_total_threads_per_threadgroup() < 128 {
@@ -256,6 +267,7 @@ pub fn metal_tensor_providers(
         attention,
         attention_shared_limit,
         transport,
+        scatter,
         _retention: retention,
     });
     Ok(selected
@@ -319,6 +331,8 @@ impl OperationResourceEstimator for TensorProvider {
         } else if self.kind.is_transport() {
             transport::geometry(self.kind, request.values(), request.attributes())
                 .map_err(invalid_plan)?;
+        } else if self.kind == MetalTensorOperation::RowScatterAdd {
+            scatter::geometry(request.values(), request.attributes()).map_err(invalid_plan)?;
         } else {
             pointwise::geometry(self.kind, request.values(), request.attributes())
                 .map_err(invalid_plan)?;
@@ -383,6 +397,9 @@ impl TensorProvider {
         }
         if self.kind.is_transport() {
             return transport::encode(self.kind, participant, Arc::clone(&self.pipelines));
+        }
+        if self.kind == MetalTensorOperation::RowScatterAdd {
+            return scatter::encode(participant, Arc::clone(&self.pipelines));
         }
         let shape =
             pointwise::geometry(self.kind, participant.bindings(), participant.attributes())?;

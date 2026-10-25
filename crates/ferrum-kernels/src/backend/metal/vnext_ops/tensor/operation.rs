@@ -22,6 +22,7 @@ pub enum MetalTensorOperation {
     StructuredGqaAttention,
     RowGather,
     BatchedRowConcat,
+    RowScatterAdd,
 }
 
 impl MetalTensorOperation {
@@ -34,7 +35,7 @@ impl MetalTensorOperation {
         Self::GeluTanh,
         Self::PlainResidualAdd,
     ];
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -53,6 +54,7 @@ impl MetalTensorOperation {
         Self::StructuredGqaAttention,
         Self::RowGather,
         Self::BatchedRowConcat,
+        Self::RowScatterAdd,
     ];
     pub(super) fn is_pointwise(self) -> bool {
         Self::POINTWISE.contains(&self)
@@ -98,6 +100,7 @@ impl MetalTensorOperation {
             Self::StructuredGqaAttention => structured_gqa_attention_bf16_contract(),
             Self::RowGather => row_gather_bf16_contract(),
             Self::BatchedRowConcat => batched_row_concat_bf16_contract(),
+            Self::RowScatterAdd => row_scatter_add_bf16_contract(),
         }
     }
     pub fn profile(self) -> &'static str {
@@ -126,6 +129,7 @@ impl MetalTensorOperation {
             }
             Self::RowGather => "metal.bitcopy.row_gather.bf16.v1",
             Self::BatchedRowConcat => "metal.bitcopy.batched_row_concat.bf16.v1",
+            Self::RowScatterAdd => "metal.precise.row_scatter_add.bf16.v1",
         }
     }
     pub(super) fn capability(self) -> &'static str {
@@ -148,6 +152,7 @@ impl MetalTensorOperation {
             Self::StructuredGqaAttention => STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID,
             Self::RowGather => ROW_GATHER_BF16_CAPABILITY_ID,
             Self::BatchedRowConcat => BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID,
+            Self::RowScatterAdd => ROW_SCATTER_ADD_BF16_CAPABILITY_ID,
         }
     }
     pub(super) fn operation(self) -> &'static str {
@@ -170,6 +175,7 @@ impl MetalTensorOperation {
             Self::StructuredGqaAttention => STRUCTURED_GQA_ATTENTION_BF16_OPERATION_ID,
             Self::RowGather => ROW_GATHER_BF16_OPERATION_ID,
             Self::BatchedRowConcat => BATCHED_ROW_CONCAT_BF16_OPERATION_ID,
+            Self::RowScatterAdd => ROW_SCATTER_ADD_BF16_OPERATION_ID,
         }
     }
     pub(super) fn name(self) -> &'static str {
@@ -192,6 +198,7 @@ impl MetalTensorOperation {
             Self::StructuredGqaAttention => "structured_gqa_attention",
             Self::RowGather => "row_gather",
             Self::BatchedRowConcat => "batched_row_concat",
+            Self::RowScatterAdd => "row_scatter_add",
         }
     }
     pub(super) fn inputs(self) -> u32 {
@@ -206,6 +213,7 @@ impl MetalTensorOperation {
             Self::StructuredAttention | Self::StructuredGqaAttention => 3,
             Self::RowGather => 1,
             Self::BatchedRowConcat => 2,
+            Self::RowScatterAdd => 2,
         }
     }
     pub(super) fn broadcasts(self) -> bool {

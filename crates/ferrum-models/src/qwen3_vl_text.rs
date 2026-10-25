@@ -32,6 +32,7 @@ impl Qwen3VLTextEncoderFamily {
     pub const FAMILY_ID: &'static str = "family.qwen3_vl.text_encoder";
     pub const REFERENCE_PROFILE_ID: &'static str = "qwen3vl.text.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen3vl.text.cuda.bf16_f32.v1";
+    pub const METAL_PROFILE_ID: &'static str = "qwen3vl.text.metal.bf16_f32.v1";
     pub const CUDA_FP8_PROFILE_ID: &'static str = "qwen3vl.text.cuda.fp8_linear.experimental.v1";
     pub const EMBEDDINGS_ID: &'static str = "value.qwen3_vl.text.embeddings";
     pub const COSINE_ID: &'static str = "value.qwen3_vl.text.cosine";
@@ -185,6 +186,7 @@ impl ModelFamilyProvider for Qwen3VLTextEncoderFamily {
             vec![
                 profile(Self::REFERENCE_PROFILE_ID)?,
                 profile(Self::CUDA_PROFILE_ID)?,
+                profile(Self::METAL_PROFILE_ID)?,
                 profile(Self::CUDA_FP8_PROFILE_ID)?,
             ],
             vec![NumericalProfileId::new(Self::REFERENCE_PROFILE_ID)

@@ -124,6 +124,16 @@ pub(super) fn graph(graph: &ModelProgram, data: &BTreeMap<ProgramValueId, Data>)
                 inputs[1].spec.dimensions[0] as usize,
                 y,
             ),
+            HalfSplitRope => transforms_oracle::rope(
+                kind,
+                x,
+                &inputs[1].values,
+                &inputs[2].values,
+                inputs[0].spec.dimensions[1] as usize,
+                unsigned(node, "head_dim"),
+                inputs[0].spec.dimensions[0] as usize,
+                y,
+            ),
             StructuredAttention | StructuredGqaAttention => {
                 let width = unsigned(node, "head_dim");
                 let lengths = integers(node, "key_run_lengths");
@@ -196,6 +206,23 @@ pub(super) fn graph(graph: &ModelProgram, data: &BTreeMap<ProgramValueId, Data>)
                     }
                 }
                 assert_eq!(y, &reference, "concat {}", node.id);
+            }
+            RowScatterAdd => {
+                let width = inputs[0].spec.dimensions[1] as usize;
+                let selected_rows: Vec<_> = integers(node, "destination_starts")
+                    .into_iter()
+                    .zip(integers(node, "run_lengths"))
+                    .flat_map(|(start, length)| start..start + length)
+                    .collect();
+                let mut reference = x.clone();
+                for (destination, update) in selected_rows
+                    .iter()
+                    .flat_map(|row| row * width..(row + 1) * width)
+                    .zip(&inputs[1].values)
+                {
+                    reference[destination] = rounds(reference[destination] + update);
+                }
+                assert_eq!(y, &reference, "scatter {}", node.id);
             }
             _ => {
                 for (i, (&x, &got)) in x.iter().zip(y).enumerate() {

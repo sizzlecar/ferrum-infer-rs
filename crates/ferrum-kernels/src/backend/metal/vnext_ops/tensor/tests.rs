@@ -394,3 +394,63 @@ fn transport_rejects_out_of_bounds_runs_columns_and_invalid_batch_before_submiss
         );
     }
 }
+
+#[test]
+fn row_scatter_rejects_overlaps_out_of_bounds_and_unconsumed_updates() {
+    let values = vec![
+        value(
+            "x",
+            ResolvedValueRole::Input,
+            0,
+            &[10, 3],
+            ElementType::Bf16,
+        ),
+        value(
+            "updates",
+            ResolvedValueRole::Input,
+            1,
+            &[4, 3],
+            ElementType::Bf16,
+        ),
+        value(
+            "y",
+            ResolvedValueRole::Output,
+            0,
+            &[10, 3],
+            ElementType::Bf16,
+        ),
+    ];
+    let attributes = |starts, lengths| {
+        BTreeMap::from([
+            (
+                AttributeId::new("destination_starts").unwrap(),
+                SemanticValue::Integers(starts),
+            ),
+            (
+                AttributeId::new("run_lengths").unwrap(),
+                SemanticValue::Integers(lengths),
+            ),
+        ])
+    };
+    let attrs = attributes(vec![0, 8], vec![2, 2]);
+    assert!(scatter::geometry(&values, &attrs).is_ok());
+    for (starts, lengths) in [
+        (vec![0, 1], vec![2, 2]), // overlap
+        (vec![8, 0], vec![2, 2]), // unordered
+        (vec![0, 9], vec![2, 2]), // past end
+        (vec![-1, 8], vec![2, 2]),
+        (vec![0, 8], vec![0, 4]),
+        (vec![0, 8], vec![1, 2]), // unused update row
+        (vec![0, 8], vec![3, 2]), // more updates than the input
+        (vec![0], vec![2, 2]),
+        (vec![], vec![]),
+        (vec![0; 33], vec![1; 33]),
+    ] {
+        assert!(scatter::geometry(&values, &attributes(starts, lengths)).is_err());
+    }
+    for (shape, element) in [([4, 2], ElementType::Bf16), ([4, 3], ElementType::F16)] {
+        let mut wrong = values.clone();
+        wrong[1] = value("updates", ResolvedValueRole::Input, 1, &shape, element);
+        assert!(scatter::geometry(&wrong, &attrs).is_err());
+    }
+}

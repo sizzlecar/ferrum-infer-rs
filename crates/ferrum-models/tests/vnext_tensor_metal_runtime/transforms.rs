@@ -10,7 +10,7 @@ pub(super) mod fixture;
 pub(super) mod oracle;
 use fixture::{Fixture, TransformFamily};
 
-pub(super) const OPERATIONS: [MetalTensorOperation; 9] = [
+pub(super) const OPERATIONS: [MetalTensorOperation; 10] = [
     MetalTensorOperation::LayerNorm,
     MetalTensorOperation::HeadRmsNorm,
     MetalTensorOperation::ZeroCenteredRmsNorm,
@@ -20,6 +20,7 @@ pub(super) const OPERATIONS: [MetalTensorOperation; 9] = [
     MetalTensorOperation::StructuredGqaAttention,
     MetalTensorOperation::RowGather,
     MetalTensorOperation::BatchedRowConcat,
+    MetalTensorOperation::RowScatterAdd,
 ];
 pub(super) fn spec(dimensions: Vec<u64>, element_type: ElementType) -> ProgramTensorSpec {
     ProgramTensorSpec {

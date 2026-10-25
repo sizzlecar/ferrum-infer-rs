@@ -4,7 +4,7 @@ use ferrum_runtime::*;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
-pub(super) const SCATTER_ADD_OPERATION_ID: &str = "operation.row_scatter_add.bf16";
+pub(super) const SCATTER_ADD_OPERATION_ID: &str = ROW_SCATTER_ADD_BF16_OPERATION_ID;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

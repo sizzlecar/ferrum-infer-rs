@@ -27,6 +27,8 @@ mod qwen_attention;
 mod qwen_graph;
 #[path = "vnext_tensor_metal_runtime/qwen_qk.rs"]
 mod qwen_qk;
+#[path = "vnext_tensor_metal_runtime/scatter.rs"]
+mod scatter;
 #[path = "vnext_tensor_metal_runtime/transforms.rs"]
 mod transforms;
 #[path = "vnext_tensor_metal_runtime/transport.rs"]
@@ -343,6 +345,7 @@ fn managed_metal_tensor_operations_match_independent_arithmetic_and_retire_resou
     transforms::verify(&runtime, &registry, &catalog, &host);
     attention::verify(&runtime, &registry, &catalog, &host);
     transport::verify(&runtime, &registry, &catalog, &host);
+    scatter::verify(&runtime, &registry, &catalog, &host);
     qwen_qk::verify(&runtime, &registry, &catalog, &host);
     qwen_attention::verify(&runtime, &registry, &catalog, &host);
     qwen_graph::verify(&runtime, &registry, &catalog);
