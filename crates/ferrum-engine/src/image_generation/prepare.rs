@@ -185,7 +185,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let mut text_options = text.compile_options()?;
         let text_compile_options_us = trace_elapsed_us(started);
         let started = std::time::Instant::now();
-        if self.profiles.text_encoder.as_str() == Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID {
+        if Qwen3VLTextEncoderFamily::is_fp8_profile(self.profiles.text_encoder.as_str()) {
             let conversion = precision::materializer(
                 precision::TEXT_MATERIALIZER,
                 &self.host,
@@ -287,11 +287,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let mut options = transformer.compile_options()?;
         let compile_options_us = trace_elapsed_us(started);
         let started = std::time::Instant::now();
-        if matches!(
-            self.profiles.denoiser.as_str(),
-            QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
-                | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
-        ) {
+        if QwenImage21TransformerFamily::is_fp8_profile(self.profiles.denoiser.as_str()) {
             let conversion = precision::materializer(
                 precision::DIT_MATERIALIZER,
                 &self.host,

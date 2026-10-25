@@ -41,8 +41,8 @@ pub struct ImageProductArgs {
     pub image_cudnn_library: Option<PathBuf>,
     /// Image Linear precision: bf16 (default), fp8_linear_experimental_v1, or
     /// {"components":{"text_encoder":"bf16","denoiser":"fp8_linear_experimental_v1"}}.
-    /// FP8 requires CUDA. An explicit GGUF image config can select denoiser
-    /// native_source on CUDA or Metal.
+    /// FP8 Linear is available on CUDA and Metal. An explicit GGUF image
+    /// config can select denoiser native_source.
     #[arg(long, value_name = "PRESET|JSON")]
     pub image_precision: Option<ferrum_engine::image_generation::ImagePrecisionPolicy>,
 }

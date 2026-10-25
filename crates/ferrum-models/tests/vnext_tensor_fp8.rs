@@ -6,12 +6,18 @@ use half::bf16;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(feature = "cuda-cutlass-fp8")]
+#[cfg(any(
+    feature = "cuda-cutlass-fp8",
+    all(feature = "metal", target_os = "macos")
+))]
 use std::sync::Arc;
 use std::sync::OnceLock;
 
 #[path = "vnext_tensor_fp8/family.rs"]
 mod family;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[path = "vnext_tensor_fp8/metal.rs"]
+mod metal;
 #[path = "vnext_tensor_fp8/oracle.rs"]
 mod oracle;
 #[cfg(feature = "cuda-cutlass-fp8")]
@@ -23,6 +29,7 @@ const W: &str = "value.fp8.weight";
 const Y: &str = "value.fp8.output";
 const OP: &str = "operation.dense_linear_fp8.bf16";
 const PROFILE: &str = "cuda.cutlass.sm120.w8a8.bf16.rowwise_e4m3fn.v1";
+const METAL_PROFILE: &str = "metal.simdgroup.f32.w8a8.bf16.rowwise_e4m3fn.v1";
 fn id<T: TryFrom<String>>(name: impl Into<String>) -> T
 where
     T::Error: std::fmt::Debug,
@@ -166,4 +173,10 @@ fn tiny_weight_source_retains_whole_tensor_encoding_and_independent_scale() {
 #[ignore = "requires exclusive SM120 CUDA and locked CUTLASS FP8 native artifact"]
 fn managed_fp8_projection_independent_oracle_shapes_and_retirement() {
     runtime::verify();
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn managed_metal_fp8_projection_matches_independent_oracle_and_retires() {
+    metal::verify();
 }

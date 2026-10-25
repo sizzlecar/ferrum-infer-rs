@@ -99,10 +99,6 @@ impl DirectoryOptions {
                 self.ordinal == 0 && self.cudnn_library.is_none(),
                 "Metal does not accept CUDA ordinals or cuDNN libraries"
             );
-            ensure!(
-                !self.precision.uses_fp8(),
-                "Metal image precision does not support FP8"
-            );
         }
         ensure!(
             self.utilization.is_finite() && self.utilization > 0.0 && self.utilization <= 1.0,

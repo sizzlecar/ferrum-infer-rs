@@ -8,6 +8,7 @@ use ferrum_runtime::{
 use metal::{CompileOptions, ComputePipelineState, MTLSize};
 
 mod attention;
+mod fp8;
 mod linear;
 mod norm;
 mod operation;
@@ -49,6 +50,8 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "vision-rotary=F32-tables-products-add;gelu-erf=SunPro-F32-piecewise;",
     "segmented-attention=isolated-noncausal;reshape=exact-bitcopy;",
     "noise=Philox4x32-10;flat-normal-ordinal;open-U23-midpoint;Box-Muller-F32;",
+    "FP8=E4M3FN-RNE;row-scale=max(amax/448,1/229376);nonfinite-row=NaN;",
+    "FP8-GEMM=packed-on-chip-decode;F32-dot-times-row-scale-times-weight-scale;",
     "independent-Metal-profile;no-CUDA-or-Reference-bitwise-claim"
 );
 
@@ -73,6 +76,9 @@ fn fingerprint() -> String {
     implementation_fingerprint(&[
         include_bytes!("mod.rs"),
         include_bytes!("operation.rs"),
+        include_bytes!("fp8.rs"),
+        include_bytes!("fp8/storage.rs"),
+        include_bytes!("fp8.metal"),
         include_bytes!("philox.rs"),
         include_bytes!("philox.metal"),
         include_bytes!("pointwise.rs"),
@@ -106,6 +112,8 @@ struct Pipelines {
     pointwise: Option<ComputePipelineState>,
     linear: Option<ComputePipelineState>,
     block_decode: Option<ComputePipelineState>,
+    fp8_quantize: Option<ComputePipelineState>,
+    fp8_linear: Option<ComputePipelineState>,
     norm: Option<ComputePipelineState>,
     norm_shared_limit: u64,
     adjacent_rope: Option<ComputePipelineState>,
@@ -153,6 +161,7 @@ pub fn metal_tensor_providers(
                     &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID]
                 }
                 MetalTensorOperation::BlockLinear => &[GGUF_NATIVE_BLOCK_FORMAT_ID],
+                MetalTensorOperation::Fp8Linear => &[DENSE_SAFETENSORS_FORMAT_ID],
                 _ => &[],
             };
             let quantization: Vec<_> = if kind == MetalTensorOperation::BlockLinear {
@@ -160,6 +169,8 @@ pub fn metal_tensor_providers(
                     .iter()
                     .map(|format| format.format_id())
                     .collect()
+            } else if kind == MetalTensorOperation::Fp8Linear {
+                vec![ferrum_runtime::FP8_E4M3FN_WHOLE_TENSOR_F32_FORMAT_ID]
             } else {
                 Vec::new()
             };
@@ -181,6 +192,7 @@ pub fn metal_tensor_providers(
     let has_pointwise = selected.iter().any(|op| op.is_pointwise());
     let has_linear = selected.iter().any(|op| op.is_linear());
     let has_blocks = selected.contains(&MetalTensorOperation::BlockLinear);
+    let has_fp8 = selected.contains(&MetalTensorOperation::Fp8Linear);
     let has_norm = selected.iter().any(|op| op.is_norm());
     let has_rope = selected.iter().any(|op| op.is_rope());
     let has_attention = selected.iter().any(|op| op.is_attention());
@@ -223,6 +235,9 @@ pub fn metal_tensor_providers(
     if has_philox {
         source.push_str(include_str!("philox.metal"));
     }
+    if has_fp8 {
+        source.push_str(include_str!("fp8.metal"));
+    }
     spatial::append_source(selected, &mut source);
     let options = CompileOptions::new();
     options.set_fast_math_enabled(false);
@@ -246,6 +261,18 @@ pub fn metal_tensor_providers(
     let pointwise = pipeline(has_pointwise, "ferrum_tensor_pointwise_bf16")?;
     let linear = pipeline(has_linear, "ferrum_tensor_linear_bf16")?;
     let block_decode = pipeline(has_blocks, "ferrum_tensor_block_decode_bf16")?;
+    let fp8_quantize = pipeline(has_fp8, "ferrum_tensor_fp8_quantize")?;
+    let fp8_linear = pipeline(has_fp8, "ferrum_tensor_linear_fp8_bf16")?;
+    if let Some(p) = &fp8_quantize {
+        if p.max_total_threads_per_threadgroup() < 256
+            || p.static_threadgroup_memory_length()
+                > runtime.device().max_threadgroup_memory_length()
+        {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal FP8 row reduction requires 256 threads and declared on-chip memory",
+            ));
+        }
+    }
     let norm = pipeline(has_norm, "ferrum_tensor_norm_bf16")?;
     let norm_shared_limit = match &norm {
         Some(p) => runtime
@@ -287,7 +314,7 @@ pub fn metal_tensor_providers(
         }
         None => 0,
     };
-    if let Some(pipeline) = &linear {
+    for pipeline in [&linear, &fp8_linear].into_iter().flatten() {
         if pipeline.thread_execution_width() != 32
             || pipeline.max_total_threads_per_threadgroup() < 128
             || pipeline.static_threadgroup_memory_length()
@@ -303,6 +330,8 @@ pub fn metal_tensor_providers(
         pointwise,
         linear,
         block_decode,
+        fp8_quantize,
+        fp8_linear,
         norm,
         norm_shared_limit,
         adjacent_rope,
@@ -352,6 +381,9 @@ impl OperationResourceEstimator for TensorProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
+        if self.kind == MetalTensorOperation::Fp8Linear {
+            return fp8::estimate(&self.descriptor, &request);
+        }
         let estimate =
             estimate_without_workspace(&self.descriptor, &request, self.kind.operation())?;
         if self.kind == MetalTensorOperation::PhiloxNormal {
@@ -444,6 +476,9 @@ impl TensorProvider {
             || !invocation.resource_work_shape().resource_work().is_tensor()
         {
             return Err("Metal operation received a different operation or work contract".into());
+        }
+        if self.kind == MetalTensorOperation::Fp8Linear {
+            return fp8::encode(participant, Arc::clone(&self.pipelines));
         }
         if self.kind == MetalTensorOperation::PhiloxNormal {
             return philox::encode(participant, Arc::clone(&self.pipelines));

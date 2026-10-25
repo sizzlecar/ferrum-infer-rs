@@ -50,6 +50,15 @@ pub struct ImageMetalCompositionReceipt {
     pub required_component_commands: usize,
     pub runtime_opaque_profile: String,
     pub native_block_denoiser: bool,
+    /// Physical execution schemas, including FP8 scales; not peak residency.
+    pub execution_weight_bytes: [u64; 3],
+}
+
+struct PreparedComponents {
+    commands: usize,
+    text: Qwen3VLTextConfig,
+    denoiser: QwenImage21TransformerConfig,
+    families: Vec<PreparedModelFamily>,
 }
 
 impl QwenImage21MetalConfig {
@@ -92,7 +101,11 @@ impl QwenImage21MetalConfig {
     }
     pub fn validate(&self) -> Result<()> {
         self.pipeline.validate()?;
-        ensure!(!self.precision_policy.uses_fp8(), "Metal image Linear currently supports BF16 or native source blocks; FP8 is not implemented");
+        ensure!(
+            !self.precision_policy.uses_fp8()
+                || self.host.class_bytes(HostMemoryClass::WeightBacking) > 0,
+            "Metal FP8 conversion requires a nonzero host weight backing allowance"
+        );
         ensure!(
             self.pipeline.edit_prefix_policy == ImageEditPrefixPolicy::Recompute,
             "Metal image editing requires recompute; request-cache attention is not implemented"
@@ -125,7 +138,7 @@ impl QwenImage21MetalConfig {
         assets: &QwenImage21Assets,
         profiles: &QwenImage21Profiles,
         edit_profiles: &QwenImage21EditProfiles,
-    ) -> Result<usize> {
+    ) -> Result<PreparedComponents> {
         let minimum = assets
             .spatial_scale()?
             .checked_mul(2)
@@ -173,13 +186,19 @@ impl QwenImage21MetalConfig {
             &families,
             self.maximum_commands_per_submission,
         )?;
-        families
+        let commands = families
             .iter()
             .map(super::composition::component_command_count)
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .max()
-            .context("missing image components")
+            .context("missing image components")?;
+        Ok(PreparedComponents {
+            commands,
+            text,
+            denoiser: dit,
+            families,
+        })
     }
     pub fn create_pipeline(
         self,
@@ -199,9 +218,10 @@ impl QwenImage21MetalConfig {
         let native_block_denoiser = !assets.transformer_encodings.is_empty();
         self.precision_policy
             .validate_denoiser_source(native_block_denoiser)?;
-        let profiles = profiles(native_block_denoiser)?;
+        let profiles = profiles(native_block_denoiser, self.precision_policy)?;
         let editing_profiles = editing_profiles()?;
-        let required_component_commands = self.prepare(&assets, &profiles, &editing_profiles)?;
+        let components = self.prepare(&assets, &profiles, &editing_profiles)?;
+        let required_component_commands = components.commands;
         let stream_plan = self.stream_plan()?;
         let (runtime, observed_memory) = match self.memory {
             ImageMetalMemoryPolicy::ExplicitTotal(bytes) => (
@@ -230,15 +250,47 @@ impl QwenImage21MetalConfig {
         let storage = capacity
             .checked_sub(opaque)
             .context("Metal allowances exceed capacity")?;
-        for bytes in assets
-            .receipt()
-            .required_weight_bytes
+        let host = runtime.tensor_host_account(self.host)?;
+        let mut execution_weight_bytes = assets.receipt().required_weight_bytes;
+        let mut selected: Vec<Box<dyn WeightMaterializer>> = Vec::new();
+        for (index, stage, family, materializer_id) in [
+            (
+                0,
+                ImageStage::TextEncoder,
+                &components.families[0],
+                precision::TEXT_MATERIALIZER,
+            ),
+            (
+                1,
+                ImageStage::Denoiser,
+                &components.families[2],
+                precision::DIT_MATERIALIZER,
+            ),
+        ] {
+            if !self.precision_policy.stage_uses_fp8(stage) {
+                continue;
+            }
+            let groups = match stage {
+                ImageStage::TextEncoder => {
+                    Qwen3VLTextEncoderFamily::fp8_weight_groups(&components.text)?
+                }
+                ImageStage::Denoiser => {
+                    QwenImage21TransformerFamily::fp8_weight_groups(&components.denoiser)?
+                }
+                _ => unreachable!("only materialized stages are enumerated"),
+            };
+            let materializer = precision::materializer(materializer_id, &host, groups)?;
+            precision::validate_backing(family, &materializer, &host)?;
+            execution_weight_bytes[index] = materializer.execution_weight_bytes(family)?;
+            selected.push(Box::new(materializer));
+        }
+        let materializers = WeightMaterializerRegistry::new(selected)?;
+        for bytes in execution_weight_bytes
             .into_iter()
             .chain(assets.editing_weight_bytes().into_iter().flatten())
         {
             ensure!(bytes < storage, "component weight bytes {bytes} leave no activation capacity under Metal storage ceiling {storage}");
         }
-        let host = runtime.tensor_host_account(self.host)?;
         let contracts = MetalTensorOperation::ALL
             .into_iter()
             .map(|kind| Ok(Box::new(kind.contract()?) as Box<dyn OperationContract>))
@@ -255,7 +307,6 @@ impl QwenImage21MetalConfig {
             descriptor.id.clone(),
             descriptor.capabilities.clone(),
         )?;
-        let materializers = WeightMaterializerRegistry::identity_only()?;
         let catalog = materializers
             .augment_catalog(registry.capability_catalog(descriptor.clone(), vec![engine])?)?;
         let editing = assets.editing.is_some();
@@ -289,17 +340,24 @@ impl QwenImage21MetalConfig {
                 required_component_commands,
                 runtime_opaque_profile: self.opaque_memory_profile,
                 native_block_denoiser,
+                execution_weight_bytes,
             },
         ))
     }
 }
-fn profiles(native_block: bool) -> Result<QwenImage21Profiles> {
+fn profiles(native_block: bool, precision: ImagePrecisionPolicy) -> Result<QwenImage21Profiles> {
     let id = |name| NumericalProfileId::new(name).map_err(anyhow::Error::msg);
     Ok(QwenImage21Profiles {
-        text_encoder: id(Qwen3VLTextEncoderFamily::METAL_PROFILE_ID)?,
+        text_encoder: id(if precision.stage_uses_fp8(ImageStage::TextEncoder) {
+            Qwen3VLTextEncoderFamily::METAL_FP8_PROFILE_ID
+        } else {
+            Qwen3VLTextEncoderFamily::METAL_PROFILE_ID
+        })?,
         noise: id(MetalTensorOperation::PhiloxNormal.profile())?,
         denoiser: id(if native_block {
             QwenImage21TransformerFamily::METAL_NATIVE_BLOCK_PROFILE_ID
+        } else if precision.stage_uses_fp8(ImageStage::Denoiser) {
+            QwenImage21TransformerFamily::METAL_FP8_PROFILE_ID
         } else {
             QwenImage21TransformerFamily::METAL_PROFILE_ID
         })?,

@@ -79,7 +79,7 @@ impl ImageCudaPrecisionPolicy {
         self.stage_uses_fp8(ImageStage::TextEncoder) || self.stage_uses_fp8(ImageStage::Denoiser)
     }
     /// Reject a conversion policy incompatible with the declared source before
-    /// creating a CUDA context. Legacy BF16 still means BF16 compute on native
+    /// creating a device runtime. Legacy BF16 still means BF16 compute on native
     /// source storage when that inventory is explicitly supplied.
     pub fn validate_denoiser_source(self, native: bool) -> anyhow::Result<()> {
         ensure!(

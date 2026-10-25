@@ -111,7 +111,10 @@ impl Expected {
         }
         Ok(())
     }
-    #[cfg(feature = "cuda-cutlass-fp8")]
+    #[cfg(any(
+        feature = "cuda-cutlass-fp8",
+        all(feature = "metal", target_os = "macos")
+    ))]
     pub fn check(&self, actual: &[u8], k: usize) -> (f64, f64) {
         assert_eq!(actual.len(), self.quantized_dot.len() * 2);
         let mut maximum_error = 0_f64;

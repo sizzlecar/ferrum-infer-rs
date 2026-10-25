@@ -39,6 +39,7 @@ pub enum MetalTensorOperation {
     ReshapeCopy,
     SegmentedAttention,
     PhiloxNormal,
+    Fp8Linear,
 }
 
 impl MetalTensorOperation {
@@ -51,7 +52,7 @@ impl MetalTensorOperation {
         Self::GeluTanh,
         Self::PlainResidualAdd,
     ];
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -87,6 +88,7 @@ impl MetalTensorOperation {
         Self::ReshapeCopy,
         Self::SegmentedAttention,
         Self::PhiloxNormal,
+        Self::Fp8Linear,
     ];
     pub(super) fn is_pointwise(self) -> bool {
         Self::POINTWISE.contains(&self)
@@ -184,12 +186,14 @@ impl MetalTensorOperation {
             Self::SpatialUpsampleGather => spatial_upsample_gather_bf16_contract(),
             Self::SpatialGroupMean => spatial_group_mean_bf16_contract(),
             Self::PhiloxNormal => philox_normal_bf16_contract(),
+            Self::Fp8Linear => dense_linear_fp8_bf16_contract(),
             _ => unreachable!("primitive contracts handled above"),
         }
     }
     pub fn profile(self) -> &'static str {
         match self {
             Self::PhiloxNormal => super::philox::PROFILE,
+            Self::Fp8Linear => super::fp8::PROFILE,
             Self::Silu => "metal.precise.silu.bf16.v1",
             Self::SiluMul => "metal.precise.silu_mul.bf16.v1",
             Self::Tanh => "metal.precise.tanh.bf16.v1",
@@ -273,6 +277,7 @@ impl MetalTensorOperation {
             Self::SpatialUpsampleGather => SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID,
             Self::SpatialGroupMean => SPATIAL_GROUP_MEAN_BF16_CAPABILITY_ID,
             Self::PhiloxNormal => PHILOX_NORMAL_BF16_CAPABILITY_ID,
+            Self::Fp8Linear => DENSE_LINEAR_FP8_BF16_CAPABILITY_ID,
             _ => unreachable!("primitive capabilities handled above"),
         }
     }
@@ -309,6 +314,7 @@ impl MetalTensorOperation {
             Self::SpatialUpsampleGather => SPATIAL_UPSAMPLE_GATHER_BF16_OPERATION_ID,
             Self::SpatialGroupMean => SPATIAL_GROUP_MEAN_BF16_OPERATION_ID,
             Self::PhiloxNormal => PHILOX_NORMAL_BF16_OPERATION_ID,
+            Self::Fp8Linear => DENSE_LINEAR_FP8_BF16_OPERATION_ID,
             _ => unreachable!("primitive operations handled above"),
         }
     }
@@ -345,6 +351,7 @@ impl MetalTensorOperation {
             Self::SpatialUpsampleGather => "spatial_upsample_gather",
             Self::SpatialGroupMean => "spatial_group_mean",
             Self::PhiloxNormal => "philox_normal",
+            Self::Fp8Linear => "dense_linear_fp8",
             _ => unreachable!("primitive names handled above"),
         }
     }
@@ -356,7 +363,7 @@ impl MetalTensorOperation {
             Self::Silu | Self::Tanh | Self::GeluTanh => 1,
             Self::SiluMul | Self::ModulationScale | Self::PlainResidualAdd => 2,
             Self::GatedResidual => 3,
-            Self::DenseLinear | Self::BlockLinear => 2,
+            Self::DenseLinear | Self::BlockLinear | Self::Fp8Linear => 2,
             Self::LayerNorm => 1,
             Self::HeadRmsNorm | Self::ZeroCenteredRmsNorm | Self::AdjacentRope => 2,
             Self::HalfSplitRope => 3,

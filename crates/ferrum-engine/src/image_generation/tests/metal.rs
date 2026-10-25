@@ -78,11 +78,42 @@ fn metal_configuration_rejects_unavailable_modes_and_impossible_capacity() {
 #[test]
 fn metal_factory_generates_real_managed_batches_and_retires_cold_and_resident_stages() {
     let _guard = METAL_FACTORY_TEST.lock().unwrap_or_else(|e| e.into_inner());
-    for residency in [ImageResidencyPolicy::Cold, ImageResidencyPolicy::AllStages] {
+    for (precision, residency) in [
+        ImagePrecisionPolicy::Bf16,
+        ImagePrecisionPolicy::Fp8LinearExperimentalV1,
+    ]
+    .into_iter()
+    .flat_map(|precision| {
+        [ImageResidencyPolicy::Cold, ImageResidencyPolicy::AllStages]
+            .into_iter()
+            .map(move |residency| (precision, residency))
+    }) {
         let (assets, _directory) = assets();
         let mut config = metal_config();
         config.pipeline.residency = residency;
+        config.precision_policy = precision;
+        if precision.uses_fp8() {
+            config.host = HostMemoryLimits::new(
+                36 << 20,
+                HostMemoryClassLimits {
+                    input_preprocess_bytes: 16 << 20,
+                    output_bytes: 16 << 20,
+                    transfer_staging_bytes: 0,
+                    weight_backing_bytes: 4 << 20,
+                },
+            )
+            .unwrap();
+        }
+        let original_weights = assets.receipt().required_weight_bytes;
         let (mut pipeline, composition) = config.create_pipeline_with_receipt(assets).unwrap();
+        assert_eq!(composition.precision_policy, precision);
+        if precision.uses_fp8() {
+            assert!(composition.execution_weight_bytes[0] < original_weights[0]);
+            assert!(composition.execution_weight_bytes[1] < original_weights[1]);
+            assert_eq!(composition.execution_weight_bytes[2], original_weights[2]);
+        } else {
+            assert_eq!(composition.execution_weight_bytes, original_weights);
+        }
         let observation = composition.observed_memory.unwrap();
         assert_eq!(
             observation.effective_ceiling_bytes,
@@ -151,7 +182,7 @@ fn metal_factory_generates_real_managed_batches_and_retires_cold_and_resident_st
         drop(first);
         drop(second);
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
-        eprintln!("Metal full image pipeline {residency:?}: true B2 text/DiT, separate seeds, Euler, VAE, repeat and release passed");
+        eprintln!("Metal full image pipeline {precision:?} {residency:?}: true B2 text/DiT, separate seeds, Euler, VAE, repeat and release passed");
     }
 }
 

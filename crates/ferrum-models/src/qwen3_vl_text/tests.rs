@@ -153,7 +153,11 @@ fn two_layer_program_has_seventeen_fixed_nodes_per_layer_and_only_pre_final_norm
             [ProgramValueId::new(Qwen3VLTextEncoderFamily::OUTPUT_ID).unwrap()]
         );
         assert_eq!(p.input_tensor_specs(), &c.input_tensor_specs().unwrap());
-        let dense = if profile.id.as_str() == Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID {
+        let dense = if matches!(
+            profile.id.as_str(),
+            Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID
+                | Qwen3VLTextEncoderFamily::METAL_FP8_PROFILE_ID
+        ) {
             DENSE_LINEAR_FP8_BF16_OPERATION_ID
         } else {
             DENSE_LINEAR_BF16_OPERATION_ID

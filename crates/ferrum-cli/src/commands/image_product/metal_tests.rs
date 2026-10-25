@@ -122,12 +122,14 @@ fn metal_directory_routes_run_and_serve_and_validates_backend_options() {
         for extra in [
             ["--image-cudnn-library", "libcudnn.so.9"],
             ["--gpu-devices", "0"],
-            ["--image-precision", "fp8_linear_experimental_v1"],
         ] {
             let mut invalid = args.clone();
             invalid.extend(extra);
             assert!(validate(&invalid).is_err(), "accepted {extra:?}");
         }
+        let mut fp8 = args.clone();
+        fp8.extend(["--image-precision", "fp8_linear_experimental_v1"]);
+        assert!(validate(&fp8).is_ok());
         if command == "run" {
             args.extend(["--image", "source.png"]);
             assert!(validate(&args).is_ok());

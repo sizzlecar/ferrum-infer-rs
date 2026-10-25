@@ -39,8 +39,9 @@ impl MetalConfig {
         let limits = self.pipeline.resolved_limits()?;
         let host = self.host.limits()?;
         ensure!(
-            !self.precision_policy.uses_fp8(),
-            "Metal image precision does not support FP8"
+            !self.precision_policy.uses_fp8()
+                || host.class_bytes(ferrum_runtime::HostMemoryClass::WeightBacking) > 0,
+            "Metal FP8 conversion requires a nonzero host weight backing allowance"
         );
         ensure!(
             limits.edit_prefix_policy == ImageEditPrefixPolicy::Recompute,

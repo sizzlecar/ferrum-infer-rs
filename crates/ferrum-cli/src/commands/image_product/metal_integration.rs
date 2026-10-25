@@ -8,7 +8,10 @@ use std::{path::Path, sync::Arc, time::Duration};
 #[path = "metal_integration/assets.rs"]
 mod assets;
 
-fn explicit_config(root: &Path) -> PathBuf {
+fn explicit_config(
+    root: &Path,
+    precision: ferrum_engine::image_generation::ImagePrecisionPolicy,
+) -> PathBuf {
     let mut wire = configuration();
     wire["model"] = json!("tiny-metal");
     wire["metadata"] = json!({"model_index":"model_index.json","text_encoder":"text_encoder/config.json",
@@ -27,6 +30,11 @@ fn explicit_config(root: &Path) -> PathBuf {
         "host":{"total_bytes":268435456,"input_preprocess_bytes":201326592,"output_bytes":67108864,"transfer_staging_bytes":0,"weight_backing_bytes":0},
         "pipeline":{"maximum_user_tokens":512,"maximum_width":64,"maximum_height":64,"maximum_batch_size":2,
         "residency":"all_stages","maximum_staging_bytes":1048576,"maximum_initialization_commands":32,"maximum_backing_maintenance_passes":8}});
+    wire["backend"]["precision_policy"] = serde_json::to_value(precision).unwrap();
+    if precision.uses_fp8() {
+        wire["backend"]["host"]["weight_backing_bytes"] = json!(4 << 20);
+        wire["backend"]["host"]["total_bytes"] = json!(272 << 20);
+    }
     wire["serving"] = json!({"maximum_pending":4,"maximum_prompt_bytes":4096,"max_num_seqs":2,
         "request_batch_max_wait_ms":10,"default_width":32,"default_height":32,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
     let path = root.join("metal.json");
@@ -71,10 +79,20 @@ async fn verify_response(response: reqwest::Response) -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metal_cli_png_and_http_generation_editing_use_real_managed_pipeline() -> anyhow::Result<()>
 {
+    use ferrum_engine::image_generation::ImagePrecisionPolicy as Precision;
+    for precision in [Precision::Bf16, Precision::Fp8LinearExperimentalV1] {
+        verify_entrypoints(precision).await?;
+    }
+    Ok(())
+}
+
+async fn verify_entrypoints(
+    precision: ferrum_engine::image_generation::ImagePrecisionPolicy,
+) -> anyhow::Result<()> {
     use ferrum_server::{axum_server::AppState, AxumServer, HttpServer, ServerConfig};
     let package = assets::package();
     let root = package.path();
-    let path = explicit_config(root);
+    let path = explicit_config(root, precision);
     let generated = root.join("generated.png");
     // The ordinary CLI adapter validates metadata, creates the Metal runtime,
     // runs every generation stage, retires sessions and writes its normal PNG.
@@ -104,7 +122,8 @@ async fn metal_cli_png_and_http_generation_editing_use_real_managed_pipeline() -
             "metal",
             None,
             None,
-        )?,
+        )?
+        .with_precision(precision)?,
     };
     let from_directory = root.join("directory.png");
     execute_run_source(directory_source, "cat".into(), 32, 32, 7, &from_directory)
@@ -232,6 +251,6 @@ async fn metal_cli_png_and_http_generation_editing_use_real_managed_pipeline() -
         host.usage()?.committed_bytes() == 0,
         "HTTP shutdown retained host payloads"
     );
-    eprintln!("Metal CLI explicit/directory PNG + edit, concurrent HTTP generations + edit, rejection recovery and shutdown passed (tiny zero weights)");
+    eprintln!("Metal CLI explicit/directory PNG + edit, concurrent HTTP generations + edit, rejection recovery and shutdown passed (tiny zero weights, {precision:?})");
     Ok(())
 }

@@ -519,15 +519,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 self.assets.sources.transformer.as_ref(),
                 &self.host,
             );
-            let source = if matches!(
-                prepared.plan.profile.as_str(),
-                QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
-                    | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
-            ) {
-                ComponentWeightSource::Stored(&dit_source)
-            } else {
-                ComponentWeightSource::Stored(&native_source)
-            };
+            let source =
+                if QwenImage21TransformerFamily::is_fp8_profile(prepared.plan.profile.as_str()) {
+                    ComponentWeightSource::Stored(&dit_source)
+                } else {
+                    ComponentWeightSource::Stored(&native_source)
+                };
             prepared
                 .start_shared(self, job, source)
                 .map(|(active, weights)| (active, weights, true))
@@ -600,7 +597,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             ManagedDenseArchiveSource::new(self.assets.sources.transformer.as_ref(), &self.host);
         let profile = prepared.plan.profile.as_str();
         let source = match prepared.plan.stage {
-            ImageStage::TextEncoder if profile == Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID => {
+            ImageStage::TextEncoder if Qwen3VLTextEncoderFamily::is_fp8_profile(profile) => {
                 ComponentWeightSource::Stored(&text_source)
             }
             ImageStage::TextEncoder => {
@@ -613,13 +610,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             ImageStage::VaeEncoder => {
                 ComponentWeightSource::Stored(self.assets.sources.vae.as_ref())
             }
-            ImageStage::Denoiser
-                if matches!(
-                    profile,
-                    QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
-                        | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
-                ) =>
-            {
+            ImageStage::Denoiser if QwenImage21TransformerFamily::is_fp8_profile(profile) => {
                 ComponentWeightSource::Stored(&dit_source)
             }
             ImageStage::Denoiser => ComponentWeightSource::Stored(&native_source),

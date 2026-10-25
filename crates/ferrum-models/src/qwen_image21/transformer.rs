@@ -37,6 +37,11 @@ impl QwenImage21TransformerFamily {
     pub const REFERENCE_PROFILE_ID: &'static str =
         "qwen_image21.transformer.t2i.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen_image21.transformer.t2i.cuda.bf16_f32.v1";
+    pub const METAL_FP8_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.metal.fp8_linear.experimental.v1";
+    pub fn is_fp8_profile(name: &str) -> bool {
+        is_fp8(name)
+    }
     pub const METAL_PROFILE_ID: &'static str = "qwen_image21.transformer.t2i.metal.bf16_f32.v1";
     pub const METAL_NATIVE_BLOCK_PROFILE_ID: &'static str =
         "qwen_image21.transformer.t2i.metal.native_block.bf16_f32.v1";
@@ -323,6 +328,7 @@ fn is_fp8(name: &str) -> bool {
         name,
         QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
             | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
+            | QwenImage21TransformerFamily::METAL_FP8_PROFILE_ID
     )
 }
 fn is_native_block(name: &str) -> bool {
@@ -333,7 +339,7 @@ fn is_native_block(name: &str) -> bool {
             | QwenImage21TransformerFamily::METAL_NATIVE_BLOCK_PROFILE_ID
     )
 }
-fn profile_sources() -> [(&'static str, &'static str); 9] {
+fn profile_sources() -> [(&'static str, &'static str); 10] {
     [
         (
             QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_PROFILE_ID,
@@ -362,6 +368,10 @@ fn profile_sources() -> [(&'static str, &'static str); 9] {
         (
             QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID,
             Block::CUDA_FUSED_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::METAL_FP8_PROFILE_ID,
+            Block::METAL_PROFILE_ID,
         ),
         (
             QwenImage21TransformerFamily::METAL_PROFILE_ID,
