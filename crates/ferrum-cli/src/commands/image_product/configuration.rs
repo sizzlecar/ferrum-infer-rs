@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 mod metal;
 pub use metal::MetalConfig;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 pub use metal::MetalMemoryConfig;
 
 #[derive(Debug, Deserialize)]

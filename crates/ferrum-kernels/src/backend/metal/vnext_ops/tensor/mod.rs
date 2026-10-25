@@ -40,6 +40,7 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "PV=MPP-FP32xFP32-FP32-finite-threadgroup-tiles-or-FP32-simdgroup;16-query-32-key-online-softmax;",
     "FP32-tile-SIMD-exp-reduction;separate-online-rescale;BF16-final-only;",
     "GQA=indexed-KV-no-replication;empty-row=positive-zero;",
+    "cross-attention=independent-Q-KV-strides;key-only-mask;shared-online-QK-PV;",
     "masked-score-discard;nonfinite-visible-score=whole-head-NaN;",
     "nonfinite-V=visible-only-scalar-PV;zero-global-scratch;device-bounded-on-chip;",
     "transport=BF16-bitcopy;bounded-row-runs;per-batch-concat;zero-arithmetic;",
@@ -103,6 +104,8 @@ fn fingerprint() -> String {
         include_bytes!("attention.metal"),
         attention::mpp::FINGERPRINT_SOURCE.as_bytes(),
         attention::mpp::NUMERICAL_IDENTITY.as_bytes(),
+        attention::cross::FINGERPRINT_SOURCE.as_bytes(),
+        attention::cross::PROFILE.as_bytes(),
         include_bytes!("transport.rs"),
         include_bytes!("transport.metal"),
         include_bytes!("scatter.rs"),
@@ -130,6 +133,7 @@ struct Pipelines {
     attention_head128: Option<ComputePipelineState>,
     attention_mpp_head128: Option<ComputePipelineState>,
     attention_shared_limit: u64,
+    cross_attention: Option<attention::cross::CrossPipelines>,
     transport: Option<ComputePipelineState>,
     scatter: Option<ComputePipelineState>,
     primitives: Option<ComputePipelineState>,
@@ -381,6 +385,10 @@ pub fn metal_tensor_providers(
     }
     let pipelines = Arc::new(Pipelines {
         spatial: spatial::pipelines(runtime, selected, &library)?,
+        cross_attention: selected
+            .contains(&MetalTensorOperation::CrossAttention)
+            .then(|| attention::cross::pipelines(runtime))
+            .transpose()?,
         pointwise,
         linear,
         linear_mpp,
@@ -456,6 +464,17 @@ impl OperationResourceEstimator for TensorProvider {
         } else if self.kind.is_rope() {
             rope::geometry(self.kind, request.values(), request.attributes())
                 .map_err(invalid_plan)?;
+        } else if self.kind == MetalTensorOperation::CrossAttention {
+            attention::cross::geometry(
+                request.values(),
+                request.attributes(),
+                self.pipelines
+                    .cross_attention
+                    .as_ref()
+                    .expect("selected cross attention pipelines")
+                    .shared_limit,
+            )
+            .map_err(invalid_plan)?;
         } else if self.kind.is_attention() {
             attention::geometry(
                 self.kind,
@@ -545,6 +564,9 @@ impl TensorProvider {
         }
         if self.kind.is_rope() {
             return rope::encode(self.kind, participant, Arc::clone(&self.pipelines));
+        }
+        if self.kind == MetalTensorOperation::CrossAttention {
+            return attention::cross::encode(participant, Arc::clone(&self.pipelines));
         }
         if self.kind.is_attention() {
             return attention::encode(self.kind, participant, Arc::clone(&self.pipelines));

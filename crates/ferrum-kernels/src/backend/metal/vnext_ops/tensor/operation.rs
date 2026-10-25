@@ -40,6 +40,7 @@ pub enum MetalTensorOperation {
     SegmentedAttention,
     PhiloxNormal,
     Fp8Linear,
+    CrossAttention,
 }
 
 impl MetalTensorOperation {
@@ -52,7 +53,7 @@ impl MetalTensorOperation {
         Self::GeluTanh,
         Self::PlainResidualAdd,
     ];
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -89,6 +90,7 @@ impl MetalTensorOperation {
         Self::SegmentedAttention,
         Self::PhiloxNormal,
         Self::Fp8Linear,
+        Self::CrossAttention,
     ];
     pub(super) fn is_pointwise(self) -> bool {
         Self::POINTWISE.contains(&self)
@@ -187,6 +189,7 @@ impl MetalTensorOperation {
             Self::SpatialGroupMean => spatial_group_mean_bf16_contract(),
             Self::PhiloxNormal => philox_normal_bf16_contract(),
             Self::Fp8Linear => dense_linear_fp8_bf16_contract(),
+            Self::CrossAttention => cross_attention_bf16_contract(),
             _ => unreachable!("primitive contracts handled above"),
         }
     }
@@ -194,6 +197,7 @@ impl MetalTensorOperation {
         match self {
             Self::PhiloxNormal => super::philox::PROFILE,
             Self::Fp8Linear => super::fp8::PROFILE,
+            Self::CrossAttention => super::attention::cross::PROFILE,
             Self::Silu => "metal.precise.silu.bf16.v1",
             Self::SiluMul => "metal.precise.silu_mul.bf16.v1",
             Self::Tanh => "metal.precise.tanh.bf16.v1",
@@ -278,6 +282,7 @@ impl MetalTensorOperation {
             Self::SpatialGroupMean => SPATIAL_GROUP_MEAN_BF16_CAPABILITY_ID,
             Self::PhiloxNormal => PHILOX_NORMAL_BF16_CAPABILITY_ID,
             Self::Fp8Linear => DENSE_LINEAR_FP8_BF16_CAPABILITY_ID,
+            Self::CrossAttention => CROSS_ATTENTION_BF16_CAPABILITY_ID,
             _ => unreachable!("primitive capabilities handled above"),
         }
     }
@@ -315,6 +320,7 @@ impl MetalTensorOperation {
             Self::SpatialGroupMean => SPATIAL_GROUP_MEAN_BF16_OPERATION_ID,
             Self::PhiloxNormal => PHILOX_NORMAL_BF16_OPERATION_ID,
             Self::Fp8Linear => DENSE_LINEAR_FP8_BF16_OPERATION_ID,
+            Self::CrossAttention => CROSS_ATTENTION_BF16_OPERATION_ID,
             _ => unreachable!("primitive operations handled above"),
         }
     }
@@ -352,6 +358,7 @@ impl MetalTensorOperation {
             Self::SpatialGroupMean => "spatial_group_mean",
             Self::PhiloxNormal => "philox_normal",
             Self::Fp8Linear => "dense_linear_fp8",
+            Self::CrossAttention => "cross_attention",
             _ => unreachable!("primitive names handled above"),
         }
     }
@@ -367,7 +374,7 @@ impl MetalTensorOperation {
             Self::LayerNorm => 1,
             Self::HeadRmsNorm | Self::ZeroCenteredRmsNorm | Self::AdjacentRope => 2,
             Self::HalfSplitRope => 3,
-            Self::StructuredAttention | Self::StructuredGqaAttention => 3,
+            Self::StructuredAttention | Self::StructuredGqaAttention | Self::CrossAttention => 3,
             Self::RowGather => 1,
             Self::BatchedRowConcat => 2,
             Self::RowScatterAdd => 2,

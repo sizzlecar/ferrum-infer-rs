@@ -13,7 +13,7 @@ use fixture::{Fixture, TransformFamily};
 #[path = "transforms/benchmark.rs"]
 mod benchmark;
 
-pub(super) const OPERATIONS: [MetalTensorOperation; 25] = [
+pub(super) const OPERATIONS: [MetalTensorOperation; 26] = [
     MetalTensorOperation::LayerNorm,
     MetalTensorOperation::HeadRmsNorm,
     MetalTensorOperation::ZeroCenteredRmsNorm,
@@ -21,6 +21,7 @@ pub(super) const OPERATIONS: [MetalTensorOperation; 25] = [
     MetalTensorOperation::HalfSplitRope,
     MetalTensorOperation::StructuredAttention,
     MetalTensorOperation::StructuredGqaAttention,
+    MetalTensorOperation::CrossAttention,
     MetalTensorOperation::RowGather,
     MetalTensorOperation::BatchedRowConcat,
     MetalTensorOperation::RowScatterAdd,

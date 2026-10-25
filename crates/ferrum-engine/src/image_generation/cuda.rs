@@ -6,7 +6,11 @@
 //! cuDNN retains its separately admitted opaque owner inside that same runtime.
 //! Opaque allowances are declarations, not measured memory qualification.
 
-use super::composition::{component_command_count, validate_family_command_limits};
+#[cfg(test)]
+use super::composition::component_command_count;
+use super::composition::{
+    prefix_command_families, validate_family_command_limits, validate_prefix_command_limit,
+};
 #[cfg(test)]
 use super::ImagePipelineConfig;
 pub use super::ImagePipelineLimits as ImageCudaPipelineLimits;
@@ -462,12 +466,11 @@ impl QwenImage21CudaConfig {
             )?);
             if self.pipeline.edit_prefix_policy == super::ImageEditPrefixPolicy::RequestCache {
                 let (prefix, copies) = prefix_command_families(&dit, profiles)?;
-                let prefill_commands = component_command_count(&prefix[0])?
-                    .checked_add(copies)
-                    .context("prefix D2D command count overflows")?;
-                ensure!(prefill_commands <= self.maximum_commands_per_submission,
-                    "prefix prefill requires {prefill_commands} compute/upload/state-copy commands, exceeding configured {}",
-                    self.maximum_commands_per_submission);
+                validate_prefix_command_limit(
+                    &prefix[0],
+                    copies,
+                    self.maximum_commands_per_submission,
+                )?;
                 families.extend(prefix);
             }
         }
@@ -522,32 +525,6 @@ impl QwenImage21CudaConfig {
         }
         Ok((materializers, execution_bytes))
     }
-}
-
-fn prefix_command_families(
-    dit: &QwenImage21TransformerConfig,
-    profiles: &QwenImage21Profiles,
-) -> Result<([PreparedModelFamily; 2], usize)> {
-    use ferrum_models::qwen_image21::QwenImage21TransformerPhase;
-    let config = QwenImage21TransformerConfig::new(
-        dit.transformer().clone(),
-        QwenImage21T2iLayout::new(3, 2, 2, vec![3])?,
-    )?
-    .with_weight_encodings(dit.weight_encodings().clone())?
-    .with_reference_image(1, 1, 2, 2)?;
-    let copies = config.prefix_cache_ports()?.len();
-    let family = TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?);
-    let prefill = config
-        .clone()
-        .with_execution_phase(QwenImage21TransformerPhase::PrefixPrefill)?;
-    let decode = config.with_execution_phase(QwenImage21TransformerPhase::PrefixDecode)?;
-    Ok((
-        [
-            family.prepare_with_profile(&serde_json::to_value(prefill)?, &profiles.denoiser)?,
-            family.prepare_with_profile(&serde_json::to_value(decode)?, &profiles.denoiser)?,
-        ],
-        copies,
-    ))
 }
 
 fn editing_command_families(

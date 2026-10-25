@@ -106,10 +106,11 @@ impl QwenImage21MetalConfig {
                 || self.host.class_bytes(HostMemoryClass::WeightBacking) > 0,
             "Metal FP8 conversion requires a nonzero host weight backing allowance"
         );
-        ensure!(
-            self.pipeline.edit_prefix_policy == ImageEditPrefixPolicy::Recompute,
-            "Metal image editing requires recompute; request-cache attention is not implemented"
-        );
+        if self.pipeline.edit_prefix_policy == ImageEditPrefixPolicy::RequestCache {
+            let contracts = operation_contracts()?;
+            let device = metal_tensor_runtime_config(DeviceId::new("device.metal.0")?)?;
+            validate_request_cache_support(&contracts, &device.capabilities)?;
+        }
         match self.memory {
             ImageMetalMemoryPolicy::ExplicitTotal(capacity) => {
                 self.explicit(capacity.get())?.validate()?
@@ -172,6 +173,7 @@ impl QwenImage21MetalConfig {
                     &profiles.decoder,
                 )?,
         ];
+        let mut prefix_commands = 0;
         if let Some(edit) = &assets.editing {
             families.extend(super::composition::editing_command_families(
                 &text,
@@ -181,6 +183,15 @@ impl QwenImage21MetalConfig {
                 profiles,
                 edit_profiles,
             )?);
+            if self.pipeline.edit_prefix_policy == ImageEditPrefixPolicy::RequestCache {
+                let (prefix, copies) = super::composition::prefix_command_families(&dit, profiles)?;
+                prefix_commands = super::composition::validate_prefix_command_limit(
+                    &prefix[0],
+                    copies,
+                    self.maximum_commands_per_submission,
+                )?;
+                families.extend(prefix);
+            }
         }
         super::composition::validate_family_command_limits(
             &families,
@@ -192,7 +203,13 @@ impl QwenImage21MetalConfig {
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .max()
-            .context("missing image components")?;
+            .context("missing image components")?
+            .max(prefix_commands);
+        // Check the selected real programs before creating the device. A wire
+        // policy cannot substitute a missing operation or advertise its capability.
+        let contracts = operation_contracts()?;
+        let device = metal_tensor_runtime_config(DeviceId::new("device.metal.0")?)?;
+        validate_family_support(&families, &contracts, &device.capabilities)?;
         Ok(PreparedComponents {
             commands,
             text,
@@ -291,10 +308,10 @@ impl QwenImage21MetalConfig {
         {
             ensure!(bytes < storage, "component weight bytes {bytes} leave no activation capacity under Metal storage ceiling {storage}");
         }
-        let contracts = MetalTensorOperation::ALL
+        let contracts = operation_contracts()?
             .into_iter()
-            .map(|kind| Ok(Box::new(kind.contract()?) as Box<dyn OperationContract>))
-            .collect::<Result<Vec<_>, VNextError>>()?;
+            .map(|contract| Box::new(contract) as Box<dyn OperationContract>)
+            .collect();
         let registry = OperationRuntimeRegistry::new(
             contracts,
             metal_tensor_providers(&runtime, &MetalTensorOperation::ALL)?,
@@ -345,6 +362,72 @@ impl QwenImage21MetalConfig {
         ))
     }
 }
+
+fn operation_contracts() -> Result<Vec<StandardOperationContract>> {
+    MetalTensorOperation::ALL
+        .into_iter()
+        .map(|kind| kind.contract().map_err(Into::into))
+        .collect()
+}
+
+fn validate_request_cache_support(
+    contracts: &[StandardOperationContract],
+    capabilities: &std::collections::BTreeSet<CapabilityId>,
+) -> Result<()> {
+    let contract = contracts
+        .iter()
+        .find(|contract| contract.descriptor().id.as_str() == CROSS_ATTENTION_BF16_OPERATION_ID)
+        .context("Metal request-cache editing requires the cross-attention provider")?;
+    ensure!(
+        contract
+            .descriptor()
+            .provider
+            .required_capabilities
+            .is_subset(capabilities),
+        "Metal request-cache editing requires declared cross-attention capabilities"
+    );
+    Ok(())
+}
+
+fn validate_family_support(
+    families: &[PreparedModelFamily],
+    contracts: &[StandardOperationContract],
+    capabilities: &std::collections::BTreeSet<CapabilityId>,
+) -> Result<()> {
+    for contract in contracts {
+        let descriptor = contract.descriptor();
+        ensure!(
+            descriptor
+                .provider
+                .required_capabilities
+                .is_subset(capabilities),
+            "Metal operation {} requires undeclared device capabilities",
+            descriptor.id
+        );
+    }
+    for family in families {
+        for node in family
+            .program()
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.nodes)
+        {
+            ensure!(
+                contracts.iter().any(|contract| {
+                    let descriptor = contract.descriptor();
+                    descriptor.id == node.operation_id
+                        && descriptor.version.satisfies(node.required_version)
+                }),
+                "Metal family {} requires unavailable operation {} version {}",
+                family.family_id(),
+                node.operation_id,
+                node.required_version
+            );
+        }
+    }
+    Ok(())
+}
+
 fn profiles(native_block: bool, precision: ImagePrecisionPolicy) -> Result<QwenImage21Profiles> {
     let id = |name| NumericalProfileId::new(name).map_err(anyhow::Error::msg);
     Ok(QwenImage21Profiles {
@@ -372,4 +455,69 @@ fn editing_profiles() -> Result<QwenImage21EditProfiles> {
         encoder: NumericalProfileId::new(QwenImage21VaeEncoderFamily::METAL_PROFILE_ID)
             .map_err(anyhow::Error::msg)?,
     })
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    // No Metal device is opened: these are real selected model programs and
+    // checked-in operation descriptors, not a declaration that kernels ran.
+    #[test]
+    fn metal_request_cache_preflight_requires_registered_operations_and_capabilities() {
+        let contracts = operation_contracts().unwrap();
+        let device = metal_tensor_runtime_config(DeviceId::new("device.metal.0").unwrap()).unwrap();
+        validate_request_cache_support(&contracts, &device.capabilities).unwrap();
+        let mut missing_capability = device.capabilities.clone();
+        assert!(missing_capability
+            .remove(&CapabilityId::new(CROSS_ATTENTION_BF16_CAPABILITY_ID).unwrap()));
+        assert!(validate_request_cache_support(&contracts, &missing_capability).is_err());
+
+        let architecture = QwenImage21Config::from_hf_json(
+            &serde_json::to_vec(&serde_json::json!({
+                "_class_name":"QwenImage21Transformer2DModel",
+                "num_layers":2,"num_attention_heads":1,"attention_head_dim":8,
+                "context_in_dim":8,"in_channels":64,"out_channels":64,
+                "patch_size":1,"mlp_ratio":2,"axes_dims_rope":[2,2,4],
+                "causal_condition":true,"eps":0.000001
+            }))
+            .unwrap(),
+            StructureLimits::default(),
+        )
+        .unwrap();
+        let config = QwenImage21TransformerConfig::new(
+            architecture,
+            QwenImage21T2iLayout::new(1, 2, 2, vec![1]).unwrap(),
+        )
+        .unwrap();
+        for precision in [
+            ImagePrecisionPolicy::Bf16,
+            ImagePrecisionPolicy::Fp8LinearExperimentalV1,
+        ] {
+            let (families, _) = super::super::composition::prefix_command_families(
+                &config,
+                &profiles(false, precision).unwrap(),
+            )
+            .unwrap();
+            validate_family_support(&families, &contracts, &device.capabilities).unwrap();
+            assert!(validate_family_support(&families, &contracts, &missing_capability).is_err());
+            let without_concat: Vec<_> = operation_contracts()
+                .unwrap()
+                .into_iter()
+                .filter(|contract| {
+                    contract.descriptor().id.as_str() != BATCHED_ROW_CONCAT_BF16_OPERATION_ID
+                })
+                .collect();
+            assert!(
+                validate_family_support(&families, &without_concat, &device.capabilities).is_err()
+            );
+        }
+        let without_cross: Vec<_> = contracts
+            .into_iter()
+            .filter(|contract| {
+                contract.descriptor().id.as_str() != CROSS_ATTENTION_BF16_OPERATION_ID
+            })
+            .collect();
+        assert!(validate_request_cache_support(&without_cross, &device.capabilities).is_err());
+    }
 }

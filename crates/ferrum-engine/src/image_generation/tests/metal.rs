@@ -5,6 +5,7 @@ use crate::image_generation::metal::{ImageMetalMemoryPolicy, QwenImage21MetalCon
 use std::num::NonZeroU64;
 
 mod cancellation;
+mod prefix;
 
 // Native factories share one physical device and its capacity owner. Tests that
 // intentionally change its capacity must not register conflicting owners at once.
@@ -66,7 +67,7 @@ fn metal_configuration_rejects_unavailable_modes_and_impossible_capacity() {
     assert!(config.validate().is_err());
     config.maximum_streams = ImageStreamLimit::Auto;
     config.pipeline.edit_prefix_policy = ImageEditPrefixPolicy::RequestCache;
-    assert!(config.validate().is_err());
+    config.validate().unwrap();
     config.pipeline.edit_prefix_policy = ImageEditPrefixPolicy::Recompute;
     let overhead = config.bootstrap_memory_bytes + config.stream_memory_bytes * required as u64;
     config.memory = ImageMetalMemoryPolicy::ExplicitTotal(NonZeroU64::new(overhead).unwrap());

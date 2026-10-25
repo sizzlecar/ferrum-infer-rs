@@ -3,6 +3,8 @@ use super::*;
 use ferrum_execution::component::TensorComponentPolicy;
 use transforms::{fixture::Fixture, run_case, spec};
 
+#[path = "attention/cross.rs"]
+mod cross;
 #[path = "attention/oracle.rs"]
 mod oracle;
 
@@ -361,4 +363,5 @@ pub(super) fn verify(
             eprintln!("Metal {kind:?}: finite V scaled by 2^{exponent}, FP32 PV range, FP64 bound and retirement passed");
         }
     }
+    cross::verify(runtime, registry, catalog, host);
 }

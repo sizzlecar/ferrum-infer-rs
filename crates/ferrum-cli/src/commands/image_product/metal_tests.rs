@@ -96,8 +96,87 @@ fn metal_configuration_rejects_ignored_cuda_controls_and_capacity_errors() {
         );
     }
     let mut wire = original;
-    wire["backend"]["pipeline"]["edit_prefix_policy"] = json!("request_cache");
+    wire["backend"]["pipeline"]["edit_prefix_policy"] = json!("unknown_cache");
     assert!(load_wire(directory.path(), &wire).is_err());
+}
+
+#[test]
+fn metal_request_cache_is_explicit_and_preserves_run_and_serve_limits() {
+    use ferrum_engine::image_generation::{
+        ImageDynamicResidencyPolicy, ImageEditPrefixPolicy, ImageResidencyPolicy,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    for serving in [false, true] {
+        let mut wire = metal_wire();
+        if serving {
+            wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+                "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
+                "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+        }
+        let ImageBackendConfig::Metal(default) =
+            load_wire(directory.path(), &wire).unwrap().backend
+        else {
+            panic!("Metal config")
+        };
+        assert_eq!(
+            default.pipeline.edit_prefix_policy,
+            ImageEditPrefixPolicy::Recompute
+        );
+        wire["backend"]["pipeline"]["edit_prefix_policy"] = json!("request_cache");
+        let ImageBackendConfig::Metal(cached) = load_wire(directory.path(), &wire).unwrap().backend
+        else {
+            panic!("Metal config")
+        };
+        let limits = cached.pipeline.resolved_limits().unwrap();
+        assert_eq!(
+            limits.edit_prefix_policy,
+            ImageEditPrefixPolicy::RequestCache
+        );
+        assert_eq!(limits.residency, ImageResidencyPolicy::Cold);
+        assert_eq!(
+            limits.dynamic_residency,
+            ImageDynamicResidencyPolicy::Release
+        );
+        assert_eq!(
+            cached.host.limits().unwrap(),
+            default.host.limits().unwrap()
+        );
+        assert_eq!(
+            cached.maximum_commands_per_submission,
+            default.maximum_commands_per_submission
+        );
+        assert_eq!(
+            cached.bootstrap_memory_bytes,
+            default.bootstrap_memory_bytes
+        );
+        assert_eq!(cached.stream_memory_bytes, default.stream_memory_bytes);
+        match (cached.memory, default.memory) {
+            (
+                configuration::MetalMemoryConfig::AutoRecommended {
+                    utilization: a,
+                    maximum_bytes: ac,
+                },
+                configuration::MetalMemoryConfig::AutoRecommended {
+                    utilization: b,
+                    maximum_bytes: bc,
+                },
+            ) => assert_eq!((a, ac), (b, bc)),
+            _ => panic!("auto memory policy must remain unchanged"),
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let resolved = cached.resolved().unwrap();
+            assert_eq!(
+                resolved.pipeline.edit_prefix_policy,
+                ImageEditPrefixPolicy::RequestCache
+            );
+            assert_eq!(resolved.pipeline.residency, ImageResidencyPolicy::Cold);
+            assert_eq!(
+                resolved.maximum_commands_per_submission,
+                cached.maximum_commands_per_submission
+            );
+        }
+    }
 }
 
 #[test]

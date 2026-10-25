@@ -6,6 +6,9 @@ constant bool cache_query_128 = is_function_constant_defined(TENSOR_ATTENTION_HE
 
 struct AttentionParams {
     ulong jobs, grid_groups, query_tiles, sequence, query_heads, key_value_heads;
+    #ifdef FERRUM_ATTENTION_CROSS
+    ulong key_sequence;
+    #endif
     uint head_dim;
     float scale;
 };
@@ -70,18 +73,32 @@ kernel void ferrum_tensor_attention_bf16(
     threadgroup atomic_uint nonfinite_value;
     const uint local_row = (sid / 2) * 8;
     const uint local_col = (sid % 2) * 16;
+    #ifdef FERRUM_ATTENTION_CROSS
+    const ulong key_sequence = p.key_sequence;
+    #else
+    const ulong key_sequence = p.sequence;
+    #endif
     for (ulong job = group; job < p.jobs; job += p.grid_groups) {
         const ulong q_start = (job % p.query_tiles) * 16;
         const ulong q_head = (job / p.query_tiles) % p.query_heads;
         const uint batch = uint(job / (p.query_tiles * p.query_heads));
         const ulong kv_head = q_head / (p.query_heads / p.key_value_heads);
         const ulong q_base = (ulong(batch) * p.sequence * p.query_heads + q_head) * p.head_dim;
-        const ulong kv_base = (ulong(batch) * p.sequence * p.key_value_heads + kv_head) * p.head_dim;
+        const ulong kv_base = (ulong(batch) * key_sequence * p.key_value_heads + kv_head) * p.head_dim;
+        #ifdef FERRUM_ATTENTION_CROSS
+        const uint max_end = uint(key_sequence), min_start = 0;
+        #else
         const uint max_end = attention_visible_end(mask, uint(min(q_start + 15, p.sequence - 1)));
         const uint min_start = attention_visible_start(mask, uint(q_start));
+        #endif
         if (tid < 16) {
+            #ifdef FERRUM_ATTENTION_CROSS
+            end[tid] = q_start + tid < p.sequence ? uint(key_sequence) : 0;
+            start[tid] = 0;
+            #else
             end[tid] = q_start + tid < p.sequence ? attention_visible_end(mask, uint(q_start + tid)) : 0;
             start[tid] = q_start + tid < p.sequence ? attention_visible_start(mask, uint(q_start + tid)) : 0;
+            #endif
             row_max[tid] = -INFINITY;
             row_sum[tid] = 0.0f;
             alpha[tid] = 1.0f;
@@ -125,7 +142,7 @@ kernel void ferrum_tensor_attention_bf16(
                 // tails, mask holes and differing row ranges use the original
                 // QK path below. No softmax/PV boundary changes.
                 bool mpp_tile = cache_query_128 && q_start + 16 <= p.sequence
-                    && k_start + 32 <= p.sequence;
+                    && k_start + 32 <= key_sequence;
                 if (mpp_tile) {
                     for (uint r = 0; r < 16; ++r)
                         mpp_tile = mpp_tile && k_start >= start[r] && k_start + 32 <= end[r];

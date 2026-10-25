@@ -1,6 +1,6 @@
 use super::*;
 use ferrum_engine::image_generation::{
-    ImageEditPrefixPolicy, ImagePrecisionPolicy, ImageStreamLimit, ImageStreamRequirements,
+    ImagePrecisionPolicy, ImageStreamLimit, ImageStreamRequirements,
 };
 use std::num::NonZeroU64;
 
@@ -42,10 +42,6 @@ impl MetalConfig {
             !self.precision_policy.uses_fp8()
                 || host.class_bytes(ferrum_runtime::HostMemoryClass::WeightBacking) > 0,
             "Metal FP8 conversion requires a nonzero host weight backing allowance"
-        );
-        ensure!(
-            limits.edit_prefix_policy == ImageEditPrefixPolicy::Recompute,
-            "Metal editing requires recompute"
         );
         ensure!(
             host.class_bytes(ferrum_runtime::HostMemoryClass::InputPreprocess) >= 16

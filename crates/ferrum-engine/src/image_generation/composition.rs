@@ -1,6 +1,6 @@
 //! Backend-independent admission limits and real-graph command accounting.
 use super::*;
-#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
 use anyhow::Context;
 use anyhow::{ensure, Result};
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
@@ -65,7 +65,7 @@ impl ImagePipelineLimits {
     }
 }
 
-#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
 pub(super) fn component_command_count(family: &PreparedModelFamily) -> Result<usize> {
     family
         .program()
@@ -75,6 +75,50 @@ pub(super) fn component_command_count(family: &PreparedModelFamily) -> Result<us
             n.checked_add(block.nodes.len())
         })
         .context("component command count overflows")
+}
+
+/// Real prefix programs retain the architecture, storage encodings and selected
+/// numerical profile. The small geometry changes neither their topology nor the
+/// number of request-state copies required by the prefill handoff.
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
+pub(super) fn prefix_command_families(
+    dit: &QwenImage21TransformerConfig,
+    profiles: &QwenImage21Profiles,
+) -> Result<([PreparedModelFamily; 2], usize)> {
+    use ferrum_models::qwen_image21::QwenImage21TransformerPhase;
+    let config = QwenImage21TransformerConfig::new(
+        dit.transformer().clone(),
+        QwenImage21T2iLayout::new(3, 2, 2, vec![3])?,
+    )?
+    .with_weight_encodings(dit.weight_encodings().clone())?
+    .with_reference_image(1, 1, 2, 2)?;
+    let copies = config.prefix_cache_ports()?.len();
+    let family = TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?);
+    let prefill = config
+        .clone()
+        .with_execution_phase(QwenImage21TransformerPhase::PrefixPrefill)?;
+    let decode = config.with_execution_phase(QwenImage21TransformerPhase::PrefixDecode)?;
+    Ok((
+        [
+            family.prepare_with_profile(&serde_json::to_value(prefill)?, &profiles.denoiser)?,
+            family.prepare_with_profile(&serde_json::to_value(decode)?, &profiles.denoiser)?,
+        ],
+        copies,
+    ))
+}
+
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
+pub(super) fn validate_prefix_command_limit(
+    prefill: &PreparedModelFamily,
+    copies: usize,
+    maximum: usize,
+) -> Result<usize> {
+    let commands = component_command_count(prefill)?
+        .checked_add(copies)
+        .context("prefix D2D command count overflows")?;
+    ensure!(commands <= maximum,
+        "prefix prefill requires {commands} compute/upload/state-copy commands, exceeding configured {maximum}");
+    Ok(commands)
 }
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]

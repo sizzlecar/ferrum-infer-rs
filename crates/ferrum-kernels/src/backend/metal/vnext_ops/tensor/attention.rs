@@ -5,6 +5,7 @@ use ferrum_runtime::{
     StructuredGqaAttentionBf16Geometry,
 };
 
+pub(super) mod cross;
 pub(super) mod mpp;
 
 const CACHED_SHARED_BYTES: u64 = (2048 + 96) * 4;
