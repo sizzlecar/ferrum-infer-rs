@@ -8,6 +8,7 @@ use ferrum_runtime::{
 // All fields initialized, no padding; each set_bytes packet is below 4 KiB.
 #[repr(C)]
 struct NativeMask {
+    isolated_segments: u32,
     segment_count: u32,
     segment_ends: [u32; 32],
     bidirectional_mask: u32,
@@ -16,11 +17,12 @@ struct NativeMask {
     key_valid_masks: [u32; 16],
     first_valid_keys: [u32; 16],
 }
-const _: () = assert!(std::mem::size_of::<NativeMask>() == 2376);
+const _: () = assert!(std::mem::size_of::<NativeMask>() == 2380);
 
 impl NativeMask {
     fn new(mask: &StructuredAttentionBf16Mask, sequence: u32) -> Self {
         let mut result = Self {
+            isolated_segments: 0,
             segment_count: mask.segment_ends().len() as u32,
             segment_ends: [0; 32],
             bidirectional_mask: 0,
@@ -91,6 +93,64 @@ pub(super) fn geometry(
     let k = binding(values, ResolvedValueRole::Input, 1)?.tensor();
     let v = binding(values, ResolvedValueRole::Input, 2)?.tensor();
     let y = binding(values, ResolvedValueRole::Output, 0)?.tensor();
+    if kind == MetalTensorOperation::SegmentedAttention {
+        let g = primitives::geometry(kind, values, attributes)?;
+        let sequence = u32::try_from(g.rows).map_err(|_| "Metal attention sequence exceeds u32")?;
+        let shared_bytes = (2048 + 16 * g.head_dim + 96) * 4;
+        if shared_bytes > shared_limit {
+            return Err("Metal attention exceeds device threadgroup storage".into());
+        }
+        let heads = g.columns / g.head_dim;
+        let query_tiles = g.rows.div_ceil(16);
+        let jobs = heads
+            .checked_mul(query_tiles)
+            .ok_or("Metal attention grid overflows")?;
+        let pairs = g
+            .lengths
+            .iter()
+            .try_fold(0_u64, |sum, &length| {
+                length.checked_mul(length).and_then(|n| sum.checked_add(n))
+            })
+            .ok_or("Metal segmented attention pair count overflows")?;
+        let operations = pairs
+            .checked_mul(heads)
+            .and_then(|n| n.checked_mul(4 * g.head_dim + 5))
+            .ok_or("Metal segmented attention work overflows")?;
+        let mut mask = NativeMask {
+            isolated_segments: 1,
+            segment_count: g.lengths.len() as u32,
+            segment_ends: [0; 32],
+            bidirectional_mask: u32::MAX,
+            key_run_counts: [0; 16],
+            key_run_ends: [0; 512],
+            key_valid_masks: [0; 16],
+            first_valid_keys: [sequence; 16],
+        };
+        for (i, (&start, &length)) in g.starts.iter().zip(&g.lengths).enumerate() {
+            mask.segment_ends[i] = (start + length) as u32;
+        }
+        mask.key_run_counts[0] = 1;
+        mask.key_run_ends[0] = sequence;
+        mask.key_valid_masks[0] = 1;
+        mask.first_valid_keys[0] = 0;
+        return Ok(Shape {
+            params: Params {
+                jobs,
+                grid_groups: jobs.min(65535),
+                query_tiles,
+                sequence: g.rows,
+                query_heads: heads,
+                key_value_heads: heads,
+                head_dim: g.head_dim as u32,
+                scale: g.scalar,
+            },
+            mask,
+            query_bytes: g.output_bytes,
+            key_value_bytes: g.output_bytes,
+            shared_bytes,
+            operations,
+        });
+    }
     // Validate MHA's stricter equal-width contract before unifying the geometry.
     if kind == MetalTensorOperation::StructuredAttention {
         StructuredAttentionBf16Geometry::new(q, k, v, y, attributes).map_err(|e| e.to_string())?;
@@ -102,7 +162,7 @@ pub(super) fn geometry(
     if query_bytes > isize::MAX as u64 || key_value_bytes > isize::MAX as u64 {
         return Err("Metal attention byte extent exceeds address space".into());
     }
-    let shared_bytes = (2048 + 16 * checked.head_dim() + 80) * 4;
+    let shared_bytes = (2048 + 16 * checked.head_dim() + 96) * 4;
     if shared_bytes > shared_limit {
         return Err("Metal attention exceeds device threadgroup storage".into());
     }

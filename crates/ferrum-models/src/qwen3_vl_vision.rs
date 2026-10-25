@@ -24,6 +24,7 @@ impl Qwen3VLVisionFamily {
     pub const FAMILY_ID: &'static str = "family.qwen3_vl.vision";
     pub const REFERENCE_PROFILE_ID: &'static str = "qwen3vl.vision.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen3vl.vision.cuda.bf16_f32.v1";
+    pub const METAL_PROFILE_ID: &'static str = "qwen3vl.vision.metal.bf16_f32.v1";
     pub const PATCHES_ID: &'static str = "value.qwen3_vl.vision.patches";
     pub const POSITIONS_ID: &'static str = "value.qwen3_vl.vision.positions";
     pub const COSINE_ID: &'static str = "value.qwen3_vl.vision.cosine";
@@ -112,7 +113,11 @@ impl ModelFamilyProvider for Qwen3VLVisionFamily {
             })
             .collect::<Vec<_>>();
         let mut profiles = Vec::new();
-        for name in [Self::REFERENCE_PROFILE_ID, Self::CUDA_PROFILE_ID] {
+        for name in [
+            Self::REFERENCE_PROFILE_ID,
+            Self::CUDA_PROFILE_ID,
+            Self::METAL_PROFILE_ID,
+        ] {
             profiles.push(NumericalExecutionProfile {
                 id: NumericalProfileId::new(name).map_err(|e| invalid("profile", e))?,
                 family_id: self.id.clone(),

@@ -98,6 +98,17 @@ pub(super) fn graph(graph: &ModelProgram, data: &BTreeMap<ProgramValueId, Data>)
         let y = &output.values;
         match kind {
             DenseLinear | BlockLinear => dense(inputs[0], inputs[1], y),
+            AffineLinear | PatchProjection | AffineLayerNorm | GeluErf | HalfRotary
+            | ReshapeCopy | SegmentedAttention => primitives::check(
+                kind,
+                &node.attributes,
+                &inputs
+                    .iter()
+                    .map(|v| (&v.spec, v.values.as_slice()))
+                    .collect::<Vec<_>>(),
+                &output.spec,
+                y,
+            ),
             Conv2d
             | ChannelL2Norm
             | ChannelL2NormImage

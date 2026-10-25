@@ -21,6 +21,8 @@ mod attention;
 mod family;
 #[path = "vnext_tensor_metal_runtime/linear.rs"]
 mod linear;
+#[path = "vnext_tensor_metal_runtime/primitives.rs"]
+mod primitives;
 #[path = "vnext_tensor_metal_runtime/qwen_attention.rs"]
 mod qwen_attention;
 #[path = "vnext_tensor_metal_runtime/qwen_graph.rs"]
@@ -349,6 +351,7 @@ fn managed_metal_tensor_operations_match_independent_arithmetic_and_retire_resou
     transport::verify(&runtime, &registry, &catalog, &host);
     scatter::verify(&runtime, &registry, &catalog, &host);
     spatial::verify(&runtime, &registry, &catalog, &host);
+    primitives::verify(&runtime, &registry, &catalog, &host);
     qwen_qk::verify(&runtime, &registry, &catalog, &host);
     qwen_attention::verify(&runtime, &registry, &catalog, &host);
     qwen_graph::verify(&runtime, &registry, &catalog);

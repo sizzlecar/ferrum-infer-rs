@@ -12,6 +12,7 @@ mod linear;
 mod norm;
 mod operation;
 mod pointwise;
+mod primitives;
 mod rope;
 mod scatter;
 mod spatial;
@@ -43,6 +44,9 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "spatial-attention=16x32-online-F32;NCHW-QKV;admitted-F32-accumulator;",
     "spatial-upsample=bitcopy-explicit-channel-map;",
     "spatial-group-mean=last-real-frame;serial-F32-first-element;F32-div;BF16-final;",
+    "affine=F32-dot-plus-bias;patch=BF16-dot-before-bias;affine-norm=F32-scale-bias;",
+    "vision-rotary=F32-tables-products-add;gelu-erf=SunPro-F32-piecewise;",
+    "segmented-attention=isolated-noncausal;reshape=exact-bitcopy;",
     "independent-Metal-profile;no-CUDA-or-Reference-bitwise-claim"
 );
 
@@ -68,6 +72,9 @@ fn fingerprint() -> String {
         include_bytes!("mod.rs"),
         include_bytes!("operation.rs"),
         include_bytes!("pointwise.rs"),
+        include_bytes!("primitives.rs"),
+        include_bytes!("primitives.metal"),
+        include_bytes!("erf.metal"),
         include_bytes!("bf16.metal"),
         include_bytes!("pointwise.metal"),
         include_bytes!("linear.rs"),
@@ -103,6 +110,7 @@ struct Pipelines {
     attention_shared_limit: u64,
     transport: Option<ComputePipelineState>,
     scatter: Option<ComputePipelineState>,
+    primitives: Option<ComputePipelineState>,
     spatial: spatial::Pipelines,
     // Last field: native pipeline states release before their budget owner.
     _retention: MetalTensorProviderRetention,
@@ -124,6 +132,9 @@ pub fn metal_tensor_providers(
             let contract = kind.contract().map_err(contract_error)?;
             let weights: &[&str] = match kind {
                 MetalTensorOperation::DenseLinear
+                | MetalTensorOperation::AffineLinear
+                | MetalTensorOperation::PatchProjection
+                | MetalTensorOperation::AffineLayerNorm
                 | MetalTensorOperation::HeadRmsNorm
                 | MetalTensorOperation::ZeroCenteredRmsNorm
                 | MetalTensorOperation::RowGather
@@ -170,6 +181,7 @@ pub fn metal_tensor_providers(
     let has_attention = selected.iter().any(|op| op.is_attention());
     let has_transport = selected.iter().any(|op| op.is_transport());
     let has_scatter = selected.contains(&MetalTensorOperation::RowScatterAdd);
+    let has_primitives = selected.iter().any(|op| op.is_element_primitive());
     let mut source = String::from(include_str!("bf16.metal"));
     if has_blocks {
         source.push_str(&native_blocks::decoder_source());
@@ -197,6 +209,10 @@ pub fn metal_tensor_providers(
     }
     if has_scatter {
         source.push_str(include_str!("scatter.metal"));
+    }
+    if has_primitives {
+        source.push_str(include_str!("erf.metal"));
+        source.push_str(include_str!("primitives.metal"));
     }
     spatial::append_source(selected, &mut source);
     let options = CompileOptions::new();
@@ -243,6 +259,7 @@ pub fn metal_tensor_providers(
     let attention = pipeline(has_attention, "ferrum_tensor_attention_bf16")?;
     let transport = pipeline(has_transport, "ferrum_tensor_transport_bf16")?;
     let scatter = pipeline(has_scatter, "ferrum_tensor_row_scatter_add_bf16")?;
+    let primitives = pipeline(has_primitives, "ferrum_tensor_primitive_bf16")?;
     let attention_shared_limit = match &attention {
         Some(p) => {
             if p.thread_execution_width() != 32 || p.max_total_threads_per_threadgroup() < 128 {
@@ -284,6 +301,7 @@ pub fn metal_tensor_providers(
         attention_shared_limit,
         transport,
         scatter,
+        primitives,
         _retention: retention,
     });
     Ok(selected
@@ -349,6 +367,9 @@ impl OperationResourceEstimator for TensorProvider {
                 .map_err(invalid_plan)?;
         } else if self.kind == MetalTensorOperation::RowScatterAdd {
             scatter::geometry(request.values(), request.attributes()).map_err(invalid_plan)?;
+        } else if self.kind.is_element_primitive() {
+            primitives::geometry(self.kind, request.values(), request.attributes())
+                .map_err(invalid_plan)?;
         } else if self.kind.is_spatial() {
             let bytes = spatial::scratch_bytes(
                 self.kind,
@@ -425,6 +446,9 @@ impl TensorProvider {
         }
         if self.kind == MetalTensorOperation::RowScatterAdd {
             return scatter::encode(participant, Arc::clone(&self.pipelines));
+        }
+        if self.kind.is_element_primitive() {
+            return primitives::encode(self.kind, participant, Arc::clone(&self.pipelines));
         }
         if self.kind.is_spatial() {
             return spatial::encode(self.kind, participant, Arc::clone(&self.pipelines));

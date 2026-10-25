@@ -1,6 +1,6 @@
 #include <metal_simdgroup_matrix>
 
-struct LinearParams { uint rows; uint inputs; uint outputs; uint reserved; };
+struct LinearParams { uint rows; uint inputs; uint outputs; uint bias_mode; };
 
 // Each SIMD group owns a 16 x 32 rectangle in a 32 x 64 output tile.
 // BF16 values are decoded directly to FP32; no intermediate FP16 boundary.
@@ -10,6 +10,7 @@ kernel void ferrum_tensor_linear_bf16(
     device const ushort* weight [[buffer(1)]],
     device ushort* output [[buffer(2)]],
     constant LinearParams& p [[buffer(3)]],
+    device const ushort* bias [[buffer(4)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint sid [[simdgroup_index_in_threadgroup]]) {
@@ -54,6 +55,10 @@ kernel void ferrum_tensor_linear_bf16(
     for (uint i = tid; i < 2048; i += 128) {
         ulong row = row_start + i / 64;
         ulong col = col_start + i % 64;
-        if (row < p.rows && col < p.outputs) output[row * p.outputs + col] = encode_bf16(b[i]);
+        if (row < p.rows && col < p.outputs) {
+            float result = p.bias_mode == 2 ? rounded_bf16(b[i]) : b[i];
+            if (p.bias_mode != 0) result = result + decode_bf16(bias[col]);
+            output[row * p.outputs + col] = encode_bf16(result);
+        }
     }
 }

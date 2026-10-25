@@ -169,7 +169,38 @@ pub(crate) fn norm(
     epsilon: f32,
     actual: &[f32],
 ) {
+    norm_impl(kind, input, gamma, &[], width, epsilon, actual);
+}
+
+pub(crate) fn affine_norm(
+    input: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    width: usize,
+    epsilon: f32,
+    actual: &[f32],
+) {
+    norm_impl(
+        MetalTensorOperation::AffineLayerNorm,
+        input,
+        gamma,
+        beta,
+        width,
+        epsilon,
+        actual,
+    );
+}
+fn norm_impl(
+    kind: MetalTensorOperation,
+    input: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    width: usize,
+    epsilon: f32,
+    actual: &[f32],
+) {
     use MetalTensorOperation::*;
+    let centered_norm = matches!(kind, LayerNorm | AffineLayerNorm);
     assert_eq!(input.len(), actual.len());
     for (group, (x, y)) in input
         .chunks_exact(width)
@@ -180,7 +211,7 @@ pub(crate) fn norm(
         let has_inf = x.iter().any(|v| v.is_infinite());
         if has_nan || has_inf {
             for (&x, &y) in x.iter().zip(y) {
-                if has_nan || kind == LayerNorm || x.is_infinite() {
+                if has_nan || centered_norm || x.is_infinite() {
                     assert!(y.is_nan());
                 } else {
                     assert_eq!(y, 0.0);
@@ -194,7 +225,7 @@ pub(crate) fn norm(
             continue;
         }
         let source: Vec<_> = x.iter().copied().map(Interval::point).collect();
-        let mean = if kind == LayerNorm {
+        let mean = if centered_norm {
             tree_sum(&source).divide(width as f64)
         } else {
             Interval::point(0.0)
@@ -219,6 +250,13 @@ pub(crate) fn norm(
                             .add(Interval::point(1.0))
                             .fp32(),
                     )
+                    .fp32();
+            }
+            if kind == AffineLayerNorm {
+                result = result
+                    .mul(Interval::point(gamma[column]))
+                    .fp32()
+                    .add(Interval::point(beta[column]))
                     .fp32();
             }
             let expected = result.bf16();

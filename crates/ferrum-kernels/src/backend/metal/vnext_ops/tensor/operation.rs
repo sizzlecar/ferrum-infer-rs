@@ -31,6 +31,13 @@ pub enum MetalTensorOperation {
     SpatialAttention,
     SpatialUpsampleGather,
     SpatialGroupMean,
+    AffineLinear,
+    PatchProjection,
+    AffineLayerNorm,
+    GeluErf,
+    HalfRotary,
+    ReshapeCopy,
+    SegmentedAttention,
 }
 
 impl MetalTensorOperation {
@@ -43,7 +50,7 @@ impl MetalTensorOperation {
         Self::GeluTanh,
         Self::PlainResidualAdd,
     ];
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 34] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -71,18 +78,28 @@ impl MetalTensorOperation {
         Self::SpatialAttention,
         Self::SpatialUpsampleGather,
         Self::SpatialGroupMean,
+        Self::AffineLinear,
+        Self::PatchProjection,
+        Self::AffineLayerNorm,
+        Self::GeluErf,
+        Self::HalfRotary,
+        Self::ReshapeCopy,
+        Self::SegmentedAttention,
     ];
     pub(super) fn is_pointwise(self) -> bool {
         Self::POINTWISE.contains(&self)
             || matches!(self, Self::SiluNchw | Self::PlainResidualAddNchw)
     }
     pub(super) fn is_linear(self) -> bool {
-        matches!(self, Self::DenseLinear | Self::BlockLinear)
+        matches!(
+            self,
+            Self::DenseLinear | Self::BlockLinear | Self::AffineLinear | Self::PatchProjection
+        )
     }
     pub(super) fn is_norm(self) -> bool {
         matches!(
             self,
-            Self::LayerNorm | Self::HeadRmsNorm | Self::ZeroCenteredRmsNorm
+            Self::LayerNorm | Self::HeadRmsNorm | Self::ZeroCenteredRmsNorm | Self::AffineLayerNorm
         )
     }
     pub(super) fn is_rope(self) -> bool {
@@ -91,11 +108,26 @@ impl MetalTensorOperation {
     pub(super) fn is_attention(self) -> bool {
         matches!(
             self,
-            Self::StructuredAttention | Self::StructuredGqaAttention
+            Self::StructuredAttention | Self::StructuredGqaAttention | Self::SegmentedAttention
         )
     }
     pub(super) fn is_transport(self) -> bool {
         matches!(self, Self::RowGather | Self::BatchedRowConcat)
+    }
+    pub(super) fn primitive(self) -> Option<TensorPrimitiveBf16> {
+        Some(match self {
+            Self::AffineLinear => TensorPrimitiveBf16::AffineLinear,
+            Self::PatchProjection => TensorPrimitiveBf16::PatchProjection,
+            Self::AffineLayerNorm => TensorPrimitiveBf16::AffineLayerNorm,
+            Self::GeluErf => TensorPrimitiveBf16::GeluErf,
+            Self::HalfRotary => TensorPrimitiveBf16::HalfRotary,
+            Self::ReshapeCopy => TensorPrimitiveBf16::ReshapeCopy,
+            Self::SegmentedAttention => TensorPrimitiveBf16::SegmentedAttention,
+            _ => return None,
+        })
+    }
+    pub(super) fn is_element_primitive(self) -> bool {
+        matches!(self, Self::GeluErf | Self::HalfRotary | Self::ReshapeCopy)
     }
     pub(super) fn is_channel_norm(self) -> bool {
         matches!(self, Self::ChannelL2Norm | Self::ChannelL2NormImage)
@@ -118,6 +150,9 @@ impl MetalTensorOperation {
         }
     }
     pub fn contract(self) -> Result<StandardOperationContract, VNextError> {
+        if let Some(kind) = self.primitive() {
+            return kind.contract();
+        }
         match self {
             Self::Silu => silu_bf16_contract(),
             Self::SiluMul => silu_mul_bf16_contract(),
@@ -146,6 +181,7 @@ impl MetalTensorOperation {
             Self::SpatialAttention => spatial_attention_bf16_contract(),
             Self::SpatialUpsampleGather => spatial_upsample_gather_bf16_contract(),
             Self::SpatialGroupMean => spatial_group_mean_bf16_contract(),
+            _ => unreachable!("primitive contracts handled above"),
         }
     }
     pub fn profile(self) -> &'static str {
@@ -189,9 +225,21 @@ impl MetalTensorOperation {
             Self::SpatialGroupMean => {
                 "metal.precise.spatial_group_mean.bf16.serial_first_element.v1"
             }
+            Self::AffineLinear => "metal.simdgroup.f32.affine_linear.bf16.v1",
+            Self::PatchProjection => "metal.simdgroup.f32.patch_projection.bf16.dot_then_bias.v1",
+            Self::AffineLayerNorm => "metal.precise.affine_layer_norm.bf16.padded_pairwise.v1",
+            Self::GeluErf => "metal.precise.gelu_erf.bf16.sunpro_f32.v1",
+            Self::HalfRotary => "metal.precise.half_rotary.bf16.f32_tables.v1",
+            Self::ReshapeCopy => "metal.bitcopy.reshape.bf16.v1",
+            Self::SegmentedAttention => {
+                "metal.simdgroup.f32.segmented_attention.bf16.tile16x32_online.v1"
+            }
         }
     }
     pub(super) fn capability(self) -> &'static str {
+        if let Some(kind) = self.primitive() {
+            return kind.capability_id();
+        }
         match self {
             Self::Silu => SILU_BF16_CAPABILITY_ID,
             Self::SiluMul => SILU_MUL_BF16_CAPABILITY_ID,
@@ -220,9 +268,13 @@ impl MetalTensorOperation {
             Self::SpatialAttention => SPATIAL_ATTENTION_BF16_CAPABILITY_ID,
             Self::SpatialUpsampleGather => SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID,
             Self::SpatialGroupMean => SPATIAL_GROUP_MEAN_BF16_CAPABILITY_ID,
+            _ => unreachable!("primitive capabilities handled above"),
         }
     }
     pub(super) fn operation(self) -> &'static str {
+        if let Some(kind) = self.primitive() {
+            return kind.operation_id();
+        }
         match self {
             Self::Silu => SILU_BF16_OPERATION_ID,
             Self::SiluMul => SILU_MUL_BF16_OPERATION_ID,
@@ -251,9 +303,13 @@ impl MetalTensorOperation {
             Self::SpatialAttention => SPATIAL_ATTENTION_BF16_OPERATION_ID,
             Self::SpatialUpsampleGather => SPATIAL_UPSAMPLE_GATHER_BF16_OPERATION_ID,
             Self::SpatialGroupMean => SPATIAL_GROUP_MEAN_BF16_OPERATION_ID,
+            _ => unreachable!("primitive operations handled above"),
         }
     }
     pub(super) fn name(self) -> &'static str {
+        if let Some(kind) = self.primitive() {
+            return kind.name();
+        }
         match self {
             Self::Silu => "silu",
             Self::SiluMul => "silu_mul",
@@ -282,9 +338,13 @@ impl MetalTensorOperation {
             Self::SpatialAttention => "spatial_attention",
             Self::SpatialUpsampleGather => "spatial_upsample_gather",
             Self::SpatialGroupMean => "spatial_group_mean",
+            _ => unreachable!("primitive names handled above"),
         }
     }
     pub(super) fn inputs(self) -> u32 {
+        if let Some(kind) = self.primitive() {
+            return kind.input_count();
+        }
         match self {
             Self::Silu | Self::Tanh | Self::GeluTanh => 1,
             Self::SiluMul | Self::ModulationScale | Self::PlainResidualAdd => 2,
@@ -301,6 +361,7 @@ impl MetalTensorOperation {
             Self::ChannelL2Norm | Self::ChannelL2NormImage | Self::PlainResidualAddNchw => 2,
             Self::SiluNchw | Self::SpatialAttention | Self::SpatialUpsampleGather => 1,
             Self::SpatialGroupMean => 1,
+            _ => unreachable!("primitive ports handled above"),
         }
     }
     pub(super) fn broadcasts(self) -> bool {

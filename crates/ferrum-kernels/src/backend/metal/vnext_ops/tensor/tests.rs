@@ -253,7 +253,7 @@ fn attention_validates_gqa_mapping_and_exact_threadgroup_capacity() {
                 ]
             };
             let heads = if kind == StructuredAttention { 4 } else { 2 };
-            let required = (2048 + 16 * width + 80) * 4;
+            let required = (2048 + 16 * width + 96) * 4;
             assert!(
                 attention::geometry(kind, &values(heads, ElementType::Bf16), &attrs, required)
                     .is_ok()

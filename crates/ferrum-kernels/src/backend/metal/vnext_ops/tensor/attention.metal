@@ -6,6 +6,7 @@ struct AttentionParams {
     float scale;
 };
 struct AttentionMask {
+    uint isolated_segments;
     uint segment_count;
     uint segment_ends[32];
     uint bidirectional_mask;
@@ -14,6 +15,15 @@ struct AttentionMask {
     uint key_valid_masks[16];
     uint first_valid_keys[16];
 };
+inline uint attention_visible_start(constant AttentionMask& mask, uint query) {
+    if (!mask.isolated_segments) return 0;
+    uint start = 0;
+    for (uint i = 0; i < mask.segment_count; ++i) {
+        if (query < mask.segment_ends[i]) return start;
+        start = mask.segment_ends[i];
+    }
+    return start;
+}
 inline uint attention_visible_end(constant AttentionMask& mask, uint query) {
     for (uint i = 0; i < mask.segment_count; ++i)
         if (query < mask.segment_ends[i])
@@ -50,6 +60,7 @@ kernel void ferrum_tensor_attention_bf16(
     threadgroup float* alpha = row_sum + 16;
     threadgroup uint* end = reinterpret_cast<threadgroup uint*>(alpha + 16);
     threadgroup uint* poisoned = end + 16;
+    threadgroup uint* start = poisoned + 16;
     threadgroup atomic_uint nonfinite_value;
     const uint local_row = (sid / 2) * 8;
     const uint local_col = (sid % 2) * 16;
@@ -61,8 +72,10 @@ kernel void ferrum_tensor_attention_bf16(
         const ulong q_base = (ulong(batch) * p.sequence * p.query_heads + q_head) * p.head_dim;
         const ulong kv_base = (ulong(batch) * p.sequence * p.key_value_heads + kv_head) * p.head_dim;
         const uint max_end = attention_visible_end(mask, uint(min(q_start + 15, p.sequence - 1)));
+        const uint min_start = attention_visible_start(mask, uint(q_start));
         if (tid < 16) {
             end[tid] = q_start + tid < p.sequence ? attention_visible_end(mask, uint(q_start + tid)) : 0;
+            start[tid] = q_start + tid < p.sequence ? attention_visible_start(mask, uint(q_start + tid)) : 0;
             row_max[tid] = -INFINITY;
             row_sum[tid] = 0.0f;
             alpha[tid] = 1.0f;
@@ -72,7 +85,7 @@ kernel void ferrum_tensor_attention_bf16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // No valid key in this query tile: do not read any Q/K/V data.
         if (mask.first_valid_keys[batch] < max_end) {
-            for (ulong k_start = 0; k_start < max_end; k_start += 32) {
+            for (ulong k_start = min_start; k_start < max_end; k_start += 32) {
                 simdgroup_float8x8 dot[2];
                 for (uint i = 0; i < 2; ++i) dot[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
                 for (uint d = 0; d < p.head_dim; d += 32) {
@@ -106,7 +119,7 @@ kernel void ferrum_tensor_attention_bf16(
                     bool present = false;
                     for (uint j = 0; j < 32; ++j) {
                         ulong k = k_start + j;
-                        if (k < end[tid] && attention_key_valid(mask, batch, k)) {
+                        if (k >= start[tid] && k < end[tid] && attention_key_valid(mask, batch, k)) {
                             float score = scores[tid * 32 + j] * p.scale;
                             scores[tid * 32 + j] = score;
                             if (!isfinite(score)) poisoned[tid] = 1;
@@ -119,7 +132,7 @@ kernel void ferrum_tensor_attention_bf16(
                         rescale = row_sum[tid] == 0.0f ? 0.0f : exp(row_max[tid] - maximum);
                     for (uint j = 0; j < 32; ++j) {
                         ulong k = k_start + j;
-                        float probability = !poisoned[tid] && k < end[tid] && attention_key_valid(mask, batch, k)
+                        float probability = !poisoned[tid] && k >= start[tid] && k < end[tid] && attention_key_valid(mask, batch, k)
                             ? exp(scores[tid * 32 + j] - maximum) : 0.0f;
                         scores[tid * 32 + j] = probability;
                         total = total + probability;
@@ -162,7 +175,7 @@ kernel void ferrum_tensor_attention_bf16(
                             float sum = 0.0f;
                             if (!poisoned[r]) for (uint j = 0; j < 32; ++j) {
                                 ulong k = k_start + j;
-                                if (k < end[r] && attention_key_valid(mask, batch, k))
+                                if (k >= start[r] && k < end[r] && attention_key_valid(mask, batch, k))
                                     sum = sum + scores[r * 32 + j] * b[j * 32 + c];
                             }
                             a[i] = sum;

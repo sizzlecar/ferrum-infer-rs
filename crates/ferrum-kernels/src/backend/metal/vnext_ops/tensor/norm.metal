@@ -6,8 +6,10 @@ struct NormParams {
 
 inline void tensor_pairwise_sum(threadgroup float* values, uint padded, uint tid, uint threads) {
     for (uint stride = 1; stride < padded; stride *= 2) {
-        for (uint left = tid * (2 * stride); left < padded; left += threads * (2 * stride))
+        for (uint pair = tid; pair < padded / (2 * stride); pair += threads) {
+            uint left = pair * (2 * stride);
             values[left] = values[left] + values[left + stride];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
@@ -19,13 +21,14 @@ kernel void ferrum_tensor_norm_bf16(
     device const ushort* gamma [[buffer(1)]],
     device ushort* output [[buffer(2)]],
     constant NormParams& p [[buffer(3)]],
+    device const ushort* beta [[buffer(4)]],
     threadgroup float* values [[threadgroup(0)]],
     uint gid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]) {
     for (ulong group = gid; group < p.groups; group += p.grid_groups) {
         ulong start = group * p.width;
         float mean = 0.0f;
-        if (p.kind == 0) {
+        if (p.kind == 0 || p.kind == 3) {
             for (uint i = tid; i < p.padded; i += p.threads)
                 values[i] = i < p.width ? decode_bf16(input[start + i]) : 0.0f;
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -48,6 +51,7 @@ kernel void ferrum_tensor_norm_bf16(
             float normalized = x * inverse;
             if (p.kind == 1) normalized = rounded_bf16(normalized) * decode_bf16(gamma[i]);
             if (p.kind == 2) normalized = normalized * (1.0f + decode_bf16(gamma[i]));
+            if (p.kind == 3) normalized = normalized * decode_bf16(gamma[i]) + decode_bf16(beta[i]);
             output[start + i] = encode_bf16(normalized);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

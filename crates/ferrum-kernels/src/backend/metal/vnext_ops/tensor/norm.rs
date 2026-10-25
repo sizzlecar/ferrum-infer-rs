@@ -51,6 +51,10 @@ pub(super) fn geometry(
         None
     };
     let (rows, columns, width, epsilon, index, per_width) = match kind {
+        AffineLayerNorm => {
+            let g = primitives::geometry(kind, values, attributes)?;
+            (g.rows, g.columns, g.columns, g.scalar, 3, 8_u64)
+        }
         LayerNorm => {
             let g = LayerNormBf16Geometry::new(
                 input,
@@ -212,6 +216,15 @@ pub(super) fn encode(
             set_region(compute, 1, &regions[if output_index == 1 { 0 } else { 1 }]);
             set_region(compute, 2, &regions[output_index]);
             set_params(compute, 3, &params);
+            set_region(
+                compute,
+                4,
+                &regions[if kind == MetalTensorOperation::AffineLayerNorm {
+                    2
+                } else {
+                    0
+                }],
+            );
             compute.set_threadgroup_memory_length(0, shape.shared_bytes);
             compute.dispatch_thread_groups(
                 MTLSize::new(params.grid_groups, 1, 1),

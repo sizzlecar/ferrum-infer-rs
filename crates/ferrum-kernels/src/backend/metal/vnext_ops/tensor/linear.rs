@@ -35,7 +35,7 @@ impl OperationResourceEstimator for LinearProvider {
             estimate_without_workspace(&self.descriptor, &request, self.kind.operation())?;
         let (shape, _) =
             geometry(self.kind, request.values(), request.attributes()).map_err(invalid_plan)?;
-        if self.kind == MetalTensorOperation::DenseLinear {
+        if self.kind != MetalTensorOperation::BlockLinear {
             return Ok(estimate);
         }
         let scratch = ProviderWorkspaceRequirement::from_formula(
@@ -132,6 +132,22 @@ impl LinearProvider {
             disjoint(read, &output)?;
         }
         let mut regions = vec![input, weight, output];
+        let bias_mode = match self.kind {
+            MetalTensorOperation::AffineLinear => 1,
+            MetalTensorOperation::PatchProjection => 2,
+            _ => 0,
+        };
+        if bias_mode != 0 {
+            let bias = tensor_port_region(
+                participant,
+                ResolvedValueRole::Input,
+                2,
+                ElementType::Bf16,
+                u64::from(shape.outputs) * 2,
+            )?;
+            disjoint(&bias, &regions[2])?;
+            regions.push(bias);
+        }
         if format.is_some() {
             let scratch = contiguous_scratch_region(participant, shape.weight_bytes)?;
             if !scratch.offset_bytes().is_multiple_of(2) {
@@ -147,7 +163,7 @@ impl LinearProvider {
             rows: shape.rows,
             inputs: shape.inputs,
             outputs: shape.outputs,
-            reserved: 0,
+            bias_mode,
         };
         let work = DeviceCommandLogicalWork::tensor(shape.output_bytes / 2, shape.operations)
             .map_err(|e| e.to_string())?;
@@ -199,6 +215,8 @@ impl LinearProvider {
                 set_region(compute, 1, &regions[weight_index]);
                 set_region(compute, 2, &regions[2]);
                 set_params(compute, 3, &parameters);
+                // The no-bias mode never reads its typed placeholder.
+                set_region(compute, 4, &regions[if bias_mode == 0 { 0 } else { 3 }]);
                 compute.dispatch_thread_groups(
                     MTLSize::new(
                         u64::from(shape.rows).div_ceil(32),
@@ -220,7 +238,7 @@ struct LinearParams {
     rows: u32,
     inputs: u32,
     outputs: u32,
-    reserved: u32,
+    bias_mode: u32,
 }
 #[repr(C)]
 struct BlockDecodeParams {
@@ -247,6 +265,32 @@ fn geometry(
     values: &[ResolvedValueBinding],
     attributes: &BTreeMap<AttributeId, SemanticValue>,
 ) -> Result<(Shape, Option<GgufBlockFormat>), String> {
+    if matches!(
+        kind,
+        MetalTensorOperation::AffineLinear | MetalTensorOperation::PatchProjection
+    ) {
+        let g = primitives::geometry(kind, values, attributes)?;
+        // The original rank-five patch ABI was checked above; only its dense
+        // physical reduction axis is flattened for this GEMM's launch shape.
+        let weight = ResolvedTensorSpec::new(
+            vec![g.columns, g.inner],
+            ElementType::Bf16,
+            ResolvedTensorLayout::Contiguous,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut shape = validate_specs(
+            binding(values, ResolvedValueRole::Input, 0)?.tensor(),
+            &weight,
+            binding(values, ResolvedValueRole::Output, 0)?.tensor(),
+            g.inner,
+            g.columns,
+        )?;
+        shape.operations = shape
+            .operations
+            .checked_add(g.elements())
+            .ok_or("Metal affine work overflows")?;
+        return Ok((shape, None));
+    }
     if values.len() != 3 || attributes.len() != 2 {
         return Err("Metal linear requires three ports and two shape attributes".into());
     }

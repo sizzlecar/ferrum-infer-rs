@@ -95,6 +95,7 @@ impl ModelFamilyProvider for TransformFamily {
                             | MetalTensorOperation::RowScatterAdd
                             | MetalTensorOperation::PlainResidualAddNchw
                             | MetalTensorOperation::SpatialUpsampleGather
+                            | MetalTensorOperation::ReshapeCopy
                     ))
                     .then_some(ElementType::F32),
                     accumulation_type: (!matches!(
@@ -102,6 +103,7 @@ impl ModelFamilyProvider for TransformFamily {
                         MetalTensorOperation::RowGather
                             | MetalTensorOperation::BatchedRowConcat
                             | MetalTensorOperation::SpatialUpsampleGather
+                            | MetalTensorOperation::ReshapeCopy
                     ))
                     .then_some(ElementType::F32),
                     staged_arithmetic: None,

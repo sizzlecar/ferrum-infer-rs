@@ -14,6 +14,8 @@ mod oracle;
 mod text;
 #[path = "qwen_graph/vae.rs"]
 mod vae;
+#[path = "qwen_graph/vision.rs"]
+mod vision;
 use fixture::{Data, Inspect, Source};
 
 fn architecture(layers: u64) -> QwenImage21Config {
@@ -206,6 +208,7 @@ pub(super) fn maximum_command_count() -> usize {
         .unwrap()
         .max(text::maximum_command_count())
         .max(vae::maximum_command_count())
+        .max(vision::maximum_command_count())
 }
 
 pub(super) fn verify(
@@ -308,4 +311,5 @@ pub(super) fn verify(
     }
     text::verify(runtime, registry, catalog, &host);
     vae::verify(runtime, registry, catalog, &host);
+    vision::verify(runtime, registry, catalog, &host);
 }
