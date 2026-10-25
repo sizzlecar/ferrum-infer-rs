@@ -188,3 +188,104 @@ fn rotary_frequency_dtypes_and_shapes_cannot_be_interchanged() {
         assert!(rope::geometry(kind, &values, &attrs).is_err());
     }
 }
+
+#[test]
+fn attention_validates_gqa_mapping_and_exact_threadgroup_capacity() {
+    use MetalTensorOperation::*;
+    for kind in [StructuredAttention, StructuredGqaAttention] {
+        for width in [2, 128, 256] {
+            let mut attrs = BTreeMap::from([
+                (
+                    AttributeId::new("sequence_length").unwrap(),
+                    SemanticValue::Unsigned(3),
+                ),
+                (
+                    AttributeId::new("head_dim").unwrap(),
+                    SemanticValue::Unsigned(width),
+                ),
+                (
+                    AttributeId::new("scale").unwrap(),
+                    SemanticValue::Rational(CanonicalRational::new(1, 8).unwrap()),
+                ),
+            ]);
+            for (name, values) in [
+                ("segment_lengths", vec![3]),
+                ("segment_bidirectional", vec![1]),
+                ("key_run_counts", vec![1, 1]),
+                ("key_run_lengths", vec![3, 3]),
+                ("key_run_valid", vec![1, 0]),
+            ] {
+                attrs.insert(
+                    AttributeId::new(name).unwrap(),
+                    SemanticValue::Integers(values),
+                );
+            }
+            let values = |kv_heads, dtype| {
+                vec![
+                    value(
+                        "q",
+                        ResolvedValueRole::Input,
+                        0,
+                        &[6, 4 * width],
+                        ElementType::Bf16,
+                    ),
+                    value(
+                        "k",
+                        ResolvedValueRole::Input,
+                        1,
+                        &[6, kv_heads * width],
+                        dtype,
+                    ),
+                    value(
+                        "v",
+                        ResolvedValueRole::Input,
+                        2,
+                        &[6, kv_heads * width],
+                        dtype,
+                    ),
+                    value(
+                        "y",
+                        ResolvedValueRole::Output,
+                        0,
+                        &[6, 4 * width],
+                        ElementType::Bf16,
+                    ),
+                ]
+            };
+            let heads = if kind == StructuredAttention { 4 } else { 2 };
+            let required = (2048 + 16 * width + 80) * 4;
+            assert!(
+                attention::geometry(kind, &values(heads, ElementType::Bf16), &attrs, required)
+                    .is_ok()
+            );
+            assert!(attention::geometry(
+                kind,
+                &values(heads, ElementType::Bf16),
+                &attrs,
+                required - 1
+            )
+            .is_err());
+            assert!(
+                attention::geometry(kind, &values(heads, ElementType::F16), &attrs, required)
+                    .is_err()
+            );
+            assert!(
+                attention::geometry(kind, &values(3, ElementType::Bf16), &attrs, required).is_err()
+            );
+            if kind == StructuredAttention {
+                assert!(
+                    attention::geometry(kind, &values(2, ElementType::Bf16), &attrs, required)
+                        .is_err()
+                );
+            }
+            attrs.insert(
+                AttributeId::new("key_run_counts").unwrap(),
+                SemanticValue::Integers(vec![1]),
+            );
+            assert!(
+                attention::geometry(kind, &values(heads, ElementType::Bf16), &attrs, required)
+                    .is_err()
+            );
+        }
+    }
+}

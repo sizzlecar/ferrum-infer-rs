@@ -2,7 +2,7 @@ use super::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     operation: OperationId,
     pub inputs: Vec<ProgramTensorSpec>,
     pub attributes: BTreeMap<AttributeId, SemanticValue>,

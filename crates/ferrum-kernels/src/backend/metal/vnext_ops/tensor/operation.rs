@@ -18,6 +18,8 @@ pub enum MetalTensorOperation {
     ZeroCenteredRmsNorm,
     AdjacentRope,
     HalfSplitRope,
+    StructuredAttention,
+    StructuredGqaAttention,
 }
 
 impl MetalTensorOperation {
@@ -30,7 +32,7 @@ impl MetalTensorOperation {
         Self::GeluTanh,
         Self::PlainResidualAdd,
     ];
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -45,6 +47,8 @@ impl MetalTensorOperation {
         Self::ZeroCenteredRmsNorm,
         Self::AdjacentRope,
         Self::HalfSplitRope,
+        Self::StructuredAttention,
+        Self::StructuredGqaAttention,
     ];
     pub(super) fn is_pointwise(self) -> bool {
         Self::POINTWISE.contains(&self)
@@ -60,6 +64,12 @@ impl MetalTensorOperation {
     }
     pub(super) fn is_rope(self) -> bool {
         matches!(self, Self::AdjacentRope | Self::HalfSplitRope)
+    }
+    pub(super) fn is_attention(self) -> bool {
+        matches!(
+            self,
+            Self::StructuredAttention | Self::StructuredGqaAttention
+        )
     }
     pub fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
@@ -77,6 +87,8 @@ impl MetalTensorOperation {
             Self::ZeroCenteredRmsNorm => zero_centered_rms_norm_bf16_contract(),
             Self::AdjacentRope => adjacent_rope_bf16_contract(),
             Self::HalfSplitRope => half_split_rope_bf16_contract(),
+            Self::StructuredAttention => structured_attention_bf16_contract(),
+            Self::StructuredGqaAttention => structured_gqa_attention_bf16_contract(),
         }
     }
     pub fn profile(self) -> &'static str {
@@ -97,6 +109,12 @@ impl MetalTensorOperation {
             }
             Self::AdjacentRope => "metal.precise.adjacent_rope.bf16.fma.v1",
             Self::HalfSplitRope => "metal.precise.half_split_rope.bf16.staged.v1",
+            Self::StructuredAttention => {
+                "metal.simdgroup.f32.structured_attention.bf16.tile16x32_online.v1"
+            }
+            Self::StructuredGqaAttention => {
+                "metal.simdgroup.f32.structured_gqa_attention.bf16.tile16x32_online.v1"
+            }
         }
     }
     pub(super) fn capability(self) -> &'static str {
@@ -115,6 +133,8 @@ impl MetalTensorOperation {
             Self::ZeroCenteredRmsNorm => ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID,
             Self::AdjacentRope => ADJACENT_ROPE_BF16_CAPABILITY_ID,
             Self::HalfSplitRope => HALF_SPLIT_ROPE_BF16_CAPABILITY_ID,
+            Self::StructuredAttention => STRUCTURED_ATTENTION_BF16_CAPABILITY_ID,
+            Self::StructuredGqaAttention => STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID,
         }
     }
     pub(super) fn operation(self) -> &'static str {
@@ -133,6 +153,8 @@ impl MetalTensorOperation {
             Self::ZeroCenteredRmsNorm => ZERO_CENTERED_RMS_NORM_BF16_OPERATION_ID,
             Self::AdjacentRope => ADJACENT_ROPE_BF16_OPERATION_ID,
             Self::HalfSplitRope => HALF_SPLIT_ROPE_BF16_OPERATION_ID,
+            Self::StructuredAttention => STRUCTURED_ATTENTION_BF16_OPERATION_ID,
+            Self::StructuredGqaAttention => STRUCTURED_GQA_ATTENTION_BF16_OPERATION_ID,
         }
     }
     pub(super) fn name(self) -> &'static str {
@@ -151,6 +173,8 @@ impl MetalTensorOperation {
             Self::ZeroCenteredRmsNorm => "zero_centered_rms_norm",
             Self::AdjacentRope => "adjacent_rope",
             Self::HalfSplitRope => "half_split_rope",
+            Self::StructuredAttention => "structured_attention",
+            Self::StructuredGqaAttention => "structured_gqa_attention",
         }
     }
     pub(super) fn inputs(self) -> u32 {
@@ -162,6 +186,7 @@ impl MetalTensorOperation {
             Self::LayerNorm => 1,
             Self::HeadRmsNorm | Self::ZeroCenteredRmsNorm | Self::AdjacentRope => 2,
             Self::HalfSplitRope => 3,
+            Self::StructuredAttention | Self::StructuredGqaAttention => 3,
         }
     }
     pub(super) fn broadcasts(self) -> bool {

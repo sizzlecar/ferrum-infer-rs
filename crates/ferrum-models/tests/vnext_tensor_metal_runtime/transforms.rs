@@ -5,17 +5,19 @@ use ferrum_execution::component::{
 };
 
 #[path = "transforms/family.rs"]
-mod fixture;
+pub(super) mod fixture;
 #[path = "transforms/oracle.rs"]
 pub(super) mod oracle;
 use fixture::{Fixture, TransformFamily};
 
-pub(super) const OPERATIONS: [MetalTensorOperation; 5] = [
+pub(super) const OPERATIONS: [MetalTensorOperation; 7] = [
     MetalTensorOperation::LayerNorm,
     MetalTensorOperation::HeadRmsNorm,
     MetalTensorOperation::ZeroCenteredRmsNorm,
     MetalTensorOperation::AdjacentRope,
     MetalTensorOperation::HalfSplitRope,
+    MetalTensorOperation::StructuredAttention,
+    MetalTensorOperation::StructuredGqaAttention,
 ];
 pub(super) fn spec(dimensions: Vec<u64>, element_type: ElementType) -> ProgramTensorSpec {
     ProgramTensorSpec {
@@ -77,7 +79,7 @@ pub(super) fn initialization(name: &str) -> ComponentInitializationConfig {
     }
 }
 
-fn run_case(
+pub(super) fn run_case(
     runtime: &Arc<MetalDeviceRuntime>,
     registry: &OperationRuntimeRegistry<MetalDeviceRuntime>,
     catalog: &CapabilityCatalog,

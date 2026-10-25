@@ -15,10 +15,14 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
+#[path = "vnext_tensor_metal_runtime/attention.rs"]
+mod attention;
 #[path = "vnext_tensor_metal_runtime/family.rs"]
 mod family;
 #[path = "vnext_tensor_metal_runtime/linear.rs"]
 mod linear;
+#[path = "vnext_tensor_metal_runtime/qwen_attention.rs"]
+mod qwen_attention;
 #[path = "vnext_tensor_metal_runtime/qwen_qk.rs"]
 mod qwen_qk;
 #[path = "vnext_tensor_metal_runtime/transforms.rs"]
@@ -236,10 +240,12 @@ fn managed_metal_tensor_operations_match_independent_arithmetic_and_retire_resou
     let host = runtime
         .tensor_host_account(
             HostMemoryLimits::new(
-                2 << 20,
+                3 << 20,
                 HostMemoryClassLimits {
                     input_preprocess_bytes: 1 << 20,
-                    output_bytes: 1 << 20,
+                    // Retain both executions of the nine-output Qwen branch,
+                    // including page-rounded no-copy backing for every output.
+                    output_bytes: 2 << 20,
                     transfer_staging_bytes: 0,
                     weight_backing_bytes: 0,
                 },
@@ -328,7 +334,9 @@ fn managed_metal_tensor_operations_match_independent_arithmetic_and_retire_resou
     concurrent_executors(&runtime, &registry, &catalog, &policy, &host);
     linear::verify(&runtime, &registry, &catalog, &policy, &host);
     transforms::verify(&runtime, &registry, &catalog, &host);
+    attention::verify(&runtime, &registry, &catalog, &host);
     qwen_qk::verify(&runtime, &registry, &catalog, &host);
+    qwen_attention::verify(&runtime, &registry, &catalog, &host);
     drop(registry);
     // Pipeline ownership and queue reservations are reusable after retirement.
     drop(metal_tensor_providers(&runtime, &MetalTensorOperation::POINTWISE).unwrap());

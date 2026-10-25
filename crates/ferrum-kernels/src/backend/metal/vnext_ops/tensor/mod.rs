@@ -7,6 +7,7 @@ use ferrum_runtime::{
 };
 use metal::{CompileOptions, ComputePipelineState, MTLSize};
 
+mod attention;
 mod linear;
 mod norm;
 mod operation;
@@ -27,6 +28,11 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "norm=zero-padded-adjacent-FP32-tree;separate-sqrt-div;device-bounded-threadgroup;",
     "head-rms=BF16-normalized-before-gamma;zero-centered=FP32-one-plus-gamma;",
     "adjacent-rope=F32-frequency-explicit-FMA;half-split=BF16-staged-products;",
+    "attention=FP32-simdgroup-QK-PV;16-query-32-key-online-softmax;",
+    "FP32-tile-sequential-exp-sum;separate-online-rescale;BF16-final-only;",
+    "GQA=indexed-KV-no-replication;empty-row=positive-zero;",
+    "masked-score-discard;nonfinite-visible-score=whole-head-NaN;",
+    "nonfinite-V=visible-only-scalar-PV;zero-global-scratch;device-bounded-on-chip;",
     "independent-Metal-profile;no-CUDA-or-Reference-bitwise-claim"
 );
 
@@ -61,6 +67,8 @@ fn fingerprint() -> String {
         include_bytes!("norm.metal"),
         include_bytes!("rope.rs"),
         include_bytes!("rope.metal"),
+        include_bytes!("attention.rs"),
+        include_bytes!("attention.metal"),
         native_blocks::FINGERPRINT_SOURCE.as_bytes(),
         METAL_TENSOR_NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("../mod.rs"),
@@ -75,6 +83,8 @@ struct Pipelines {
     norm_shared_limit: u64,
     adjacent_rope: Option<ComputePipelineState>,
     half_split_rope: Option<ComputePipelineState>,
+    attention: Option<ComputePipelineState>,
+    attention_shared_limit: u64,
     // Last field: native pipeline states release before their budget owner.
     _retention: MetalTensorProviderRetention,
 }
@@ -130,6 +140,7 @@ pub fn metal_tensor_providers(
     let has_blocks = selected.contains(&MetalTensorOperation::BlockLinear);
     let has_norm = selected.iter().any(|op| op.is_norm());
     let has_rope = selected.iter().any(|op| op.is_rope());
+    let has_attention = selected.iter().any(|op| op.is_attention());
     let mut source = String::from(include_str!("bf16.metal"));
     if has_blocks {
         source.push_str(&native_blocks::decoder_source());
@@ -148,6 +159,9 @@ pub fn metal_tensor_providers(
     }
     if has_rope {
         source.push_str(include_str!("rope.metal"));
+    }
+    if has_attention {
+        source.push_str(include_str!("attention.metal"));
     }
     let options = CompileOptions::new();
     options.set_fast_math_enabled(false);
@@ -190,6 +204,24 @@ pub fn metal_tensor_providers(
         selected.contains(&MetalTensorOperation::HalfSplitRope),
         "ferrum_tensor_half_split_rope_bf16",
     )?;
+    let attention = pipeline(has_attention, "ferrum_tensor_attention_bf16")?;
+    let attention_shared_limit = match &attention {
+        Some(p) => {
+            if p.thread_execution_width() != 32 || p.max_total_threads_per_threadgroup() < 128 {
+                return Err(MetalDeviceRuntimeError::contract(
+                    "Metal attention needs four 32-lane SIMD groups",
+                ));
+            }
+            runtime
+                .device()
+                .max_threadgroup_memory_length()
+                .checked_sub(p.static_threadgroup_memory_length())
+                .ok_or_else(|| {
+                    MetalDeviceRuntimeError::contract("Metal attention exceeds threadgroup memory")
+                })?
+        }
+        None => 0,
+    };
     if let Some(pipeline) = &linear {
         if pipeline.thread_execution_width() != 32
             || pipeline.max_total_threads_per_threadgroup() < 128
@@ -209,6 +241,8 @@ pub fn metal_tensor_providers(
         norm_shared_limit,
         adjacent_rope,
         half_split_rope,
+        attention,
+        attention_shared_limit,
         _retention: retention,
     });
     Ok(selected
@@ -261,6 +295,14 @@ impl OperationResourceEstimator for TensorProvider {
         } else if self.kind.is_rope() {
             rope::geometry(self.kind, request.values(), request.attributes())
                 .map_err(invalid_plan)?;
+        } else if self.kind.is_attention() {
+            attention::geometry(
+                self.kind,
+                request.values(),
+                request.attributes(),
+                self.pipelines.attention_shared_limit,
+            )
+            .map_err(invalid_plan)?;
         } else {
             pointwise::geometry(self.kind, request.values(), request.attributes())
                 .map_err(invalid_plan)?;
@@ -319,6 +361,9 @@ impl TensorProvider {
         }
         if self.kind.is_rope() {
             return rope::encode(self.kind, participant, Arc::clone(&self.pipelines));
+        }
+        if self.kind.is_attention() {
+            return attention::encode(self.kind, participant, Arc::clone(&self.pipelines));
         }
         let shape =
             pointwise::geometry(self.kind, participant.bindings(), participant.attributes())?;

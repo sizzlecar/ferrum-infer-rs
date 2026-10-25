@@ -9,12 +9,12 @@ use ferrum_models::qwen_image21::{
 };
 use transforms::{decode, initialization, oracle, spec, upload_values};
 
-struct Source {
-    values: [Vec<f32>; 4],
+pub(super) struct Source {
+    pub values: [Vec<f32>; 4],
     bytes: [Vec<u8>; 4],
 }
 impl Source {
-    fn new(hidden: usize, head: usize) -> Self {
+    pub fn new(hidden: usize, head: usize) -> Self {
         let values: [Vec<f32>; 4] = std::array::from_fn(|branch| {
             (0..if branch < 2 { hidden * hidden } else { head })
                 .map(|i| {
@@ -66,7 +66,7 @@ fn config(head: u64) -> QwenImage21Config {
         "patch_size": 1, "mlp_ratio": 3, "axes_dims_rope": axes, "causal_condition": true, "eps": 0.000001
     })).unwrap(), StructureLimits::default()).unwrap()
 }
-fn check_projection(input: &[f32], weight: &[f32], hidden: usize, actual: &[f32]) {
+pub(super) fn check_projection(input: &[f32], weight: &[f32], hidden: usize, actual: &[f32]) {
     for (index, &actual) in actual.iter().enumerate() {
         let row = index / hidden;
         let column = index % hidden;
