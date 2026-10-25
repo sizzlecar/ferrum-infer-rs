@@ -1,6 +1,7 @@
 //! Opt-in paired native Q4_K decode+GEMM versus the identical decoded BF16 OI
 //! weight. Both weights are installed before timing. Each sample measures
-//! managed execute/admission/encode/wait/readback, not GPU kernel timestamps.
+//! managed execute/admission/encode/wait/readback including scoped linear
+//! diagnostics, not GPU kernel timestamps.
 //! Run the ignored `managed_metal_q4k_vs_dense_microbench` test with exclusive
 //! GPU access and --nocapture --test-threads=1; preserve its JSON sample lines.
 use super::*;
@@ -127,11 +128,28 @@ fn check_output(shape: &Shape, decoded: &[bf16], bytes: &[u8]) -> Result<(), Str
 #[test]
 #[ignore = "large paired Metal Q4_K/dense timing; requires exclusive GPU access"]
 fn managed_metal_q4k_vs_dense_microbench() {
-    // The final row count is a representative previously measured R210 tail,
-    // not a claim about a particular real edit's tokenized sequence length.
-    for (case, (m, n, k)) in [(4096, 4096, 4096), (4096, 12288, 4096), (8208, 4096, 4096)]
-        .into_iter()
-        .enumerate()
+    // Keep dispatch diagnostics within the measured execute scope, using a
+    // thread-local subscriber rather than changing process-global logging.
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "off,ferrum_kernels::backend::metal::vnext_ops::tensor::linear=debug",
+        ))
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _diagnostics = tracing::subscriber::set_default(subscriber);
+    // Preserve the previously measured square/expansion/tail cases and cover
+    // the reverse FFN projection with both a longer reduction and a row tail.
+    // These operator shapes do not replace trained-model measurements.
+    for (case, (m, n, k)) in [
+        (4096, 4096, 4096),
+        (4096, 12288, 4096),
+        (8208, 4096, 4096),
+        (4128, 4096, 12288),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let shape = Shape {
             m,
@@ -266,7 +284,7 @@ fn managed_metal_q4k_vs_dense_microbench() {
                 "device_budget_bytes":DEVICE_BYTES,"host_budget_bytes":HOST_BYTES,
                 "fixture_preparation_reservation_bytes":preparation_bytes,"fixture_retained_reservation_bytes":retained_fixture_bytes,
                 "runtime_fingerprint":runtime.descriptor().runtime_implementation_fingerprint,
-                "timing_scope":"managed_execute_admission_encode_wait_readback",
+                "timing_scope":"managed_execute_admission_encode_wait_readback_including_linear_logging",
                 "native_memory_scope":"sampled_device_handle_peak_since_this_shape_runtime_creation_not_per_arm_or_RSS",
             })
         );

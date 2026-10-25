@@ -85,6 +85,8 @@ pub(super) fn verify() {
             (1, 7, 256, false),
             (33, 65, 512, false),
             (32, 64, 512, false),
+            (64, 128, 512, false),
+            (97, 193, 256, false),
             (256, 64, 256, true),
         ]
         .into_iter()

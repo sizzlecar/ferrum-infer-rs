@@ -3,7 +3,7 @@
 //! --test vnext_tensor_metal_runtime managed_image_kernel_microbench --
 //! --ignored --nocapture --test-threads=1` after coordinating GPU access.
 //! Timings include admission, encoding, device completion, readback and the
-//! scoped attention diagnostic logging, but exclude input construction and
+//! scoped attention and linear diagnostic logging, but exclude input construction and
 //! output checking. They are not kernel-only timestamps, a trained-model
 //! benchmark or a performance acceptance threshold.
 
@@ -366,12 +366,12 @@ fn managed_vae_attention_microbench() {
 }
 
 fn run_microbench(cases: &[Case]) {
-    // This thread-local scope reports attention capability and actual dispatch
+    // This thread-local scope reports attention/linear capability and actual dispatch
     // selection without installing a global subscriber or reading an env filter.
     // Dispatch diagnostics run inside the measured execute call below.
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(
-            "off,ferrum_kernels::backend::metal::vnext_ops::tensor::attention=debug",
+            "off,ferrum_kernels::backend::metal::vnext_ops::tensor::attention=debug,ferrum_kernels::backend::metal::vnext_ops::tensor::linear=debug",
         ))
         .with_writer(std::io::stderr)
         .with_ansi(false)
@@ -553,7 +553,7 @@ fn run_microbench(cases: &[Case]) {
             serde_json::json!({
                 "operation": format!("{:?}", fixture.kind()), "inputs": fixture.inputs,
                 "output": fixture.output, "warmup_ms": timings[0], "measured_ms": &timings[1..],
-                "timing_scope": "managed_execute_admission_encode_wait_readback_including_attention_logging",
+                "timing_scope": "managed_execute_admission_encode_wait_readback_including_attention_and_linear_logging",
                 "runtime_fingerprint": runtime.descriptor().runtime_implementation_fingerprint,
                 "native_memory": runtime.native_memory_snapshot(),
             })
