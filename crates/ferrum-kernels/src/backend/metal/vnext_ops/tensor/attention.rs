@@ -5,6 +5,33 @@ use ferrum_runtime::{
     StructuredGqaAttentionBf16Geometry,
 };
 
+pub(super) fn head128_pipeline(
+    runtime: &MetalDeviceRuntime,
+    library: &metal::LibraryRef,
+) -> Result<Option<ComputePipelineState>, MetalDeviceRuntimeError> {
+    let constants = metal::FunctionConstantValues::new();
+    constants.set_constant_value_at_index(
+        (&128_u32 as *const u32).cast(),
+        metal::MTLDataType::UInt,
+        101,
+    );
+    let function = library
+        .get_function("ferrum_tensor_attention_bf16", Some(constants))
+        .map_err(MetalDeviceRuntimeError::contract)?;
+    let pipeline = runtime
+        .device()
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(MetalDeviceRuntimeError::contract)?;
+    let dynamic_bytes = (2048 + 16 * 128 + 96) * 4;
+    Ok((pipeline.thread_execution_width() == 32
+        && pipeline.max_total_threads_per_threadgroup() >= 128
+        && pipeline
+            .static_threadgroup_memory_length()
+            .checked_add(dynamic_bytes)
+            .is_some_and(|n| n <= runtime.device().max_threadgroup_memory_length()))
+    .then_some(pipeline))
+}
+
 // All fields initialized, no padding; each set_bytes packet is below 4 KiB.
 #[repr(C)]
 struct NativeMask {
@@ -236,10 +263,15 @@ pub(super) fn encode(
         move |encoder, regions| {
             let compute = encoder.compute_encoder();
             compute.set_compute_pipeline_state(
-                pipelines
-                    .attention
-                    .as_ref()
-                    .expect("selected attention pipeline"),
+                (if shape.params.head_dim == 128 {
+                    pipelines
+                        .attention_head128
+                        .as_ref()
+                        .or(pipelines.attention.as_ref())
+                } else {
+                    pipelines.attention.as_ref()
+                })
+                .expect("selected attention pipeline"),
             );
             for (i, region) in regions.iter().enumerate() {
                 set_region(compute, i as u64, region);

@@ -119,6 +119,7 @@ struct Pipelines {
     adjacent_rope: Option<ComputePipelineState>,
     half_split_rope: Option<ComputePipelineState>,
     attention: Option<ComputePipelineState>,
+    attention_head128: Option<ComputePipelineState>,
     attention_shared_limit: u64,
     transport: Option<ComputePipelineState>,
     scatter: Option<ComputePipelineState>,
@@ -250,7 +251,7 @@ pub fn metal_tensor_providers(
             return Ok(None);
         }
         let function = library
-            .get_function(name, None)
+            .get_function(name, Some(metal::FunctionConstantValues::new()))
             .map_err(MetalDeviceRuntimeError::contract)?;
         runtime
             .device()
@@ -293,6 +294,11 @@ pub fn metal_tensor_providers(
         "ferrum_tensor_half_split_rope_bf16",
     )?;
     let attention = pipeline(has_attention, "ferrum_tensor_attention_bf16")?;
+    let attention_head128 = if has_attention {
+        attention::head128_pipeline(runtime, &library)?
+    } else {
+        None
+    };
     let transport = pipeline(has_transport, "ferrum_tensor_transport_bf16")?;
     let scatter = pipeline(has_scatter, "ferrum_tensor_row_scatter_add_bf16")?;
     let primitives = pipeline(has_primitives, "ferrum_tensor_primitive_bf16")?;
@@ -337,6 +343,7 @@ pub fn metal_tensor_providers(
         adjacent_rope,
         half_split_rope,
         attention,
+        attention_head128,
         attention_shared_limit,
         transport,
         scatter,

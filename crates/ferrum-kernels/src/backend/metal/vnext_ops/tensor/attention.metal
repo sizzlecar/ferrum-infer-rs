@@ -1,5 +1,9 @@
 #include <metal_simdgroup_matrix>
 
+constant uint TENSOR_ATTENTION_HEAD [[function_constant(101)]];
+constant bool cache_query_128 = is_function_constant_defined(TENSOR_ATTENTION_HEAD)
+    ? TENSOR_ATTENTION_HEAD == 128 : false;
+
 struct AttentionParams {
     ulong jobs, grid_groups, query_tiles, sequence, query_heads, key_value_heads;
     uint head_dim;
@@ -85,11 +89,30 @@ kernel void ferrum_tensor_attention_bf16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // No valid key in this query tile: do not read any Q/K/V data.
         if (mask.first_valid_keys[batch] < max_end) {
+            // Retain exactly decoded Q fragments, without more shared or
+            // device storage. The generic variant keeps its bounded staging.
+            simdgroup_float8x8 cached_query[16];
+            if (cache_query_128) {
+                #pragma unroll
+                for (uint d = 0; d < 128; d += 32) {
+                    for (uint i = tid; i < 512; i += 128) {
+                        uint r = i / 32, c = d + i % 32;
+                        a[i] = end[r] > mask.first_valid_keys[batch]
+                            ? decode_bf16(query[q_base + (q_start + r) * p.query_heads * p.head_dim + c]) : 0.0f;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    #pragma unroll
+                    for (uint chunk = 0; chunk < 32; chunk += 8)
+                        simdgroup_load(cached_query[(d + chunk) / 8], a + local_row * 32 + chunk, 32, 0, false);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
             for (ulong k_start = min_start; k_start < max_end; k_start += 32) {
                 simdgroup_float8x8 dot[2];
                 for (uint i = 0; i < 2; ++i) dot[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
-                for (uint d = 0; d < p.head_dim; d += 32) {
-                    for (uint i = tid; i < 512; i += 128) {
+                #pragma unroll
+                for (uint d = 0; d < (cache_query_128 ? 128 : p.head_dim); d += 32) {
+                    if (!cache_query_128) for (uint i = tid; i < 512; i += 128) {
                         uint r = i / 32, c = d + i % 32;
                         a[i] = end[r] > mask.first_valid_keys[batch] && !poisoned[r] && c < p.head_dim
                             ? decode_bf16(query[q_base + (q_start + r) * p.query_heads * p.head_dim + c]) : 0.0f;
@@ -101,9 +124,11 @@ kernel void ferrum_tensor_attention_bf16(
                             ? decode_bf16(key[kv_base + k * p.key_value_heads * p.head_dim + c]) : 0.0f;
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
+                    #pragma unroll
                     for (uint chunk = 0; chunk < 32; chunk += 8) {
                         simdgroup_float8x8 av, bv;
-                        simdgroup_load(av, a + local_row * 32 + chunk, 32, 0, false);
+                        if (cache_query_128) av = cached_query[(d + chunk) / 8];
+                        else simdgroup_load(av, a + local_row * 32 + chunk, 32, 0, false);
                         for (uint n = 0; n < 2; ++n) {
                             simdgroup_load(bv, b + chunk * 32 + local_col + n * 8, 32, 0, false);
                             simdgroup_multiply_accumulate(dot[n], av, bv, dot[n]);
