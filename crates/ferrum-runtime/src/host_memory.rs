@@ -190,7 +190,9 @@ impl HostMemoryAccount {
         self.0.allocation_alignment
     }
 
-    fn backing_bytes(&self, bytes: usize) -> Result<usize, HostMemoryError> {
+    /// Physical capacity required for a logical allocation, including alignment.
+    /// This metadata calculation neither reserves nor allocates memory.
+    pub fn backing_bytes(&self, bytes: usize) -> Result<usize, HostMemoryError> {
         if bytes == 0 || bytes > isize::MAX as usize {
             return Err(HostMemoryError::InvalidReservation);
         }
@@ -587,6 +589,10 @@ unsafe impl crate::StableHostMemory for FrozenHostAllocation {
     fn stable_bytes(&self) -> &[u8] {
         &self.0.bytes
     }
+
+    fn managed_memory_class(&self) -> Option<HostMemoryClass> {
+        Some(self.0.class())
+    }
 }
 
 impl std::fmt::Debug for ManagedHostBytes {
@@ -610,6 +616,10 @@ impl AsRef<[u8]> for ManagedHostBytes {
 unsafe impl crate::StableHostMemory for ManagedHostBytes {
     fn stable_bytes(&self) -> &[u8] {
         self.bytes()
+    }
+
+    fn managed_memory_class(&self) -> Option<HostMemoryClass> {
+        Some(self.class())
     }
 }
 

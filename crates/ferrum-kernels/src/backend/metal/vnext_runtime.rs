@@ -489,7 +489,13 @@ fn metal_static_weight_allocation(
             "Metal static-weight alignment is not a non-zero power of two",
         ));
     }
-    if let Some(retained) = payload.retained_host_memory() {
+    // Conversion backing is bounded by the largest materializer group. A native
+    // alias would pin that Host claim for the entire weight installation and
+    // exhaust the next group's allowance. Copy into the admitted device storage;
+    // immutable archive mappings can still use their original no-copy path.
+    if let Some(retained) = payload.retained_host_memory().filter(|memory| {
+        memory.managed_memory_class() != Some(ferrum_runtime::HostMemoryClass::WeightBacking)
+    }) {
         if let Some(native) = super::retained_memory::new_retained_buffer(
             device,
             retained.clone(),

@@ -144,9 +144,10 @@ pub(super) fn validate_backing(
     materializer: &Bf16WholeTensorFp8Materializer,
     host: &HostMemoryAccount,
 ) -> anyhow::Result<()> {
-    let peak = materializer.maximum_group_backing_bytes(family)?;
+    let logical = materializer.maximum_group_backing_bytes(family)?;
+    let peak = host.backing_bytes(usize::try_from(logical)?)?;
     ensure!(
-        peak <= host.limits().class_bytes(HostMemoryClass::WeightBacking) as u64,
+        peak <= host.limits().class_bytes(HostMemoryClass::WeightBacking),
         "FP8 conversion group needs {peak} WeightBacking bytes before transfer staging"
     );
     Ok(())

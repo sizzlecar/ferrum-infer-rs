@@ -52,6 +52,94 @@ fn invalid_tensor_runtime_limits_fail_before_device_creation() {
 }
 
 #[test]
+fn static_import_releases_converted_host_groups_before_loading_the_next_group() {
+    use ferrum_runtime::{
+        HostMemoryClass, HostMemoryClassLimits, HostMemoryLimits, WeightComponentRole,
+        WeightComponentSpec, WeightEncoding, WeightId,
+    };
+    let _guard = tensor_test_guard();
+    metal::objc::rc::autoreleasepool(|| {
+        let runtime = MetalDeviceRuntime::new_tensor_eager(config()).unwrap();
+        let page = crate::backend::metal::retained_memory::native_page_size().unwrap();
+        // One page-aligned conversion group fits, but two retained groups do not.
+        let limit = page * 2;
+        let host = runtime
+            .tensor_host_account(
+                HostMemoryLimits::new(
+                    limit,
+                    HostMemoryClassLimits {
+                        input_preprocess_bytes: 0,
+                        output_bytes: 0,
+                        transfer_staging_bytes: 0,
+                        weight_backing_bytes: limit,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let weights = runtime
+            .allocate_request(
+                &BufferRequest::new(
+                    ResourceId::new("resource.metal.converted.groups").unwrap(),
+                    (page * 2) as u64,
+                    64,
+                    BufferUsage::Weights,
+                    ElementType::U8,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut import = runtime.begin_static_weight_import().unwrap().unwrap();
+        for (index, value) in [0x35_u8, 0xa6].into_iter().enumerate() {
+            let component = WeightComponentSpec {
+                id: WeightId::new(format!("weight.metal.converted.{index}")).unwrap(),
+                role: WeightComponentRole::Values,
+                external_names: vec![format!("projection.{index}.weight")],
+                dimensions: vec![page as u64],
+                encoding: WeightEncoding::Dense {
+                    element_type: ElementType::U8,
+                },
+                required: true,
+            };
+            let mut backing = host
+                .allocate_zeroed(HostMemoryClass::WeightBacking, page)
+                .unwrap();
+            backing.as_mut().fill(value);
+            let payload = WeightComponentPayload::from_managed_host(
+                &component,
+                component.external_names.clone(),
+                vec!["model.safetensors".into()],
+                component.dimensions.clone(),
+                ElementType::U8,
+                backing.freeze(),
+            )
+            .unwrap();
+            import
+                .import_component(&payload, &weights, (index * page) as u64)
+                .unwrap();
+            drop(payload);
+            assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+        }
+        import.seal().unwrap();
+        for (index, value) in [0x35_u8, 0xa6].into_iter().enumerate() {
+            let region = weights
+                .region((index * page) as u64..((index + 1) * page) as u64)
+                .unwrap();
+            let pointer = unsafe {
+                region
+                    .buffer()
+                    .contents()
+                    .add(region.offset_bytes() as usize)
+            };
+            // SAFETY: the live checked region owns these initialized shared bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), page) };
+            assert!(bytes.iter().all(|&byte| byte == value));
+        }
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    });
+}
+
+#[test]
 fn queues_and_provider_owners_keep_the_same_device_budget_alive() {
     let _guard = tensor_test_guard();
     metal::objc::rc::autoreleasepool(|| {
