@@ -1642,6 +1642,7 @@ dependencies = [
  "ferrum-runtime",
  "ferrum-types",
  "half",
+ "libc",
  "memmap2",
  "safetensors 0.4.5",
  "serde",

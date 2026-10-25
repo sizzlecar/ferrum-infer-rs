@@ -17,6 +17,7 @@ mod host_cache;
 mod plan;
 mod quality;
 mod source;
+mod timing;
 pub use source::ExactBf16TensorSource;
 /// Backward-compatible spelling; the source now accepts any tensor archive.
 pub type ExactBf16SafetensorsSource<'a> = ExactBf16TensorSource<'a>;
@@ -88,6 +89,7 @@ impl Bf16WholeTensorFp8Materializer {
                 include_bytes!("bf16_whole_tensor_fp8.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/plan.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/conversion.rs"),
+                include_bytes!("bf16_whole_tensor_fp8/timing.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/host_cache.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/quality.rs"),
             ]),
