@@ -22,18 +22,46 @@ pub fn run(
     budget: &Budget,
     source: &SafetensorsArchive,
     args: &Arguments,
+    runtime: &super::backend::Runtime,
     weight_bytes: u64,
     inspect: impl FnOnce(&TensorExecutionOutput) -> Result<Value>,
 ) -> Result<(Value, Value, Value)> {
     let profile = match &args.backend {
         Backend::Reference => Family::REFERENCE_PROFILE_ID,
         Backend::Cuda(_) => Family::CUDA_PROFILE_ID,
+        Backend::Metal(_) => Family::METAL_PROFILE_ID,
     };
     let family = TypedFamilyRegistration::new(Family::new()?).prepare_with_profile(
         &serde_json::to_value(config)?,
         &NumericalProfileId::new(profile).map_err(anyhow::Error::msg)?,
     )?;
     match &args.backend {
+        Backend::Metal(options) => {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                super::metal::run(
+                    runtime
+                        .metal
+                        .as_ref()
+                        .context("missing admitted Metal runtime")?
+                        .clone(),
+                    &family,
+                    config,
+                    input,
+                    host,
+                    budget,
+                    source,
+                    weight_bytes,
+                    options,
+                    inspect,
+                )
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            {
+                let _ = (options, inspect, runtime);
+                bail!("Metal requires macOS and --features metal")
+            }
+        }
         Backend::Reference => {
             let c = ReferenceVNextComposition::create_with_capacity(
                 id("device.reference.qwen_image21.vae")?,
@@ -156,7 +184,7 @@ pub fn run(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute<R: DeviceRuntime>(
+pub(super) fn execute<R: DeviceRuntime>(
     family: &PreparedModelFamily,
     config: &Config,
     input: ManagedHostTensor,
@@ -207,6 +235,7 @@ fn execute<R: DeviceRuntime>(
                 == budget.output,
         "compiled output differs from admitted Host extent"
     );
+    let initialization_started = std::time::Instant::now();
     let resources = shared::initialize_resources(
         c.runtime.clone(),
         family,
@@ -216,6 +245,7 @@ fn execute<R: DeviceRuntime>(
         host,
         budget.staging,
     )?;
+    let initialization_us = initialization_started.elapsed().as_micros();
     let execution: Result<_> = (|| {
         let mut executor = PreparedTensorExecutor::new(
             executable.clone(),
@@ -225,8 +255,9 @@ fn execute<R: DeviceRuntime>(
             TensorExecutorConfig::default(),
         )
         .map_err(|e| anyhow::anyhow!("decoder executor: {e}"))?;
-        let provenance = json!({"family":family.family_id(),"profile":family.numerical_profile().id,"family_fingerprint":family.fingerprint()?,"canonical_config":family.canonical_config(),"plan_hash":plan.plan_hash(),"runtime_fingerprint":c.runtime.descriptor().runtime_implementation_fingerprint,"backend":c.provenance,"initialized_weight_bytes":weight_bytes,"managed_host_budget":budget,
+        let mut provenance = json!({"family":family.family_id(),"profile":family.numerical_profile().id,"family_fingerprint":family.fingerprint()?,"canonical_config":family.canonical_config(),"plan_hash":plan.plan_hash(),"runtime_fingerprint":c.runtime.descriptor().runtime_implementation_fingerprint,"backend":c.provenance,"initialized_weight_bytes":weight_bytes,"managed_host_budget":budget,
             "nodes":plan.payload().nodes().iter().map(|n|json!({"node":n.id(),"operation":n.operation_id(),"provider":n.provider_resources().provider_id(),"implementation_fingerprint":n.provider_implementation_fingerprint()})).collect::<Vec<_>>()});
+        let execution_started = std::time::Instant::now();
         let outputs = executor
             .execute(
                 id("run.vae.decoder.verify")?,
@@ -234,6 +265,7 @@ fn execute<R: DeviceRuntime>(
                 vec![input],
             )
             .map_err(|e| anyhow::anyhow!("decoder execution: {e}"))?;
+        provenance["timing"] = json!({"initialization_us":initialization_us,"execution_us":execution_started.elapsed().as_micros(),"scope":"managed static initialization and one executor call including input/output transfers; excludes weight hashing, compilation, image encoding and resource retirement"});
         let [rgba] = outputs.as_slice() else {
             bail!("decoder returned unexpected output ports")
         };
