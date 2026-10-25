@@ -14,6 +14,9 @@ use ferrum_kernels::backend::metal::{
 };
 use std::sync::Arc;
 
+#[path = "metal_benchmark.rs"]
+mod benchmark;
+
 pub(super) fn verify() {
     let capacity = 64 << 20;
     let operation = MetalTensorOperation::BlockLinear;

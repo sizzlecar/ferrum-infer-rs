@@ -1,6 +1,6 @@
 use super::*;
 pub(super) struct Family {
-    profile: &'static str,
+    pub(super) profile: &'static str,
 }
 impl ModelFamilyProvider for Family {
     type Config = Shape;
