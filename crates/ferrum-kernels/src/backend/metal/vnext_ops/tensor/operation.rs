@@ -211,10 +211,10 @@ impl MetalTensorOperation {
             Self::AdjacentRope => "metal.precise.adjacent_rope.bf16.fma.v1",
             Self::HalfSplitRope => "metal.precise.half_split_rope.bf16.staged.v1",
             Self::StructuredAttention => {
-                "metal.simdgroup.f32.structured_attention.bf16.tile16x32_online.v1"
+                "metal.mpp_qk_or_simdgroup.f32.structured_attention.bf16.tile16x32_online.v2"
             }
             Self::StructuredGqaAttention => {
-                "metal.simdgroup.f32.structured_gqa_attention.bf16.tile16x32_online.v1"
+                "metal.mpp_qk_or_simdgroup.f32.structured_gqa_attention.bf16.tile16x32_online.v2"
             }
             Self::RowGather => "metal.bitcopy.row_gather.bf16.v1",
             Self::BatchedRowConcat => "metal.bitcopy.batched_row_concat.bf16.v1",
@@ -240,7 +240,7 @@ impl MetalTensorOperation {
             Self::HalfRotary => "metal.precise.half_rotary.bf16.f32_tables.v1",
             Self::ReshapeCopy => "metal.bitcopy.reshape.bf16.v1",
             Self::SegmentedAttention => {
-                "metal.simdgroup.f32.segmented_attention.bf16.tile16x32_online.v1"
+                "metal.mpp_qk_or_simdgroup.f32.segmented_attention.bf16.tile16x32_online.v2"
             }
         }
     }

@@ -25,15 +25,19 @@ pub(in crate::backend::metal::vnext_ops::tensor) enum MppPipelineAvailability {
     Ready(ComputePipelineState),
 }
 
-/// Only capability absence returns `Unsupported`. A supported device with a
-/// shader, function, or PSO creation error returns `Err`, including Metal's text.
-/// This compiles a separate library and allocates no application device buffers.
-pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
+pub(in crate::backend::metal::vnext_ops::tensor) enum MppCompileOptions {
+    Unsupported { reason: String },
+    Ready(CompileOptions),
+}
+
+/// Capability absence is explicit. Share the same non-relaxed MSL 4 options
+/// across optional libraries without constructing an invalid Rust enum value.
+pub(in crate::backend::metal::vnext_ops::tensor) fn compile_options(
     device: &DeviceRef,
-) -> Result<MppPipelineAvailability, String> {
+) -> Result<MppCompileOptions, String> {
     let version = macos_version()?;
     if version < (26, 1) {
-        return Ok(MppPipelineAvailability::Unsupported {
+        return Ok(MppCompileOptions::Unsupported {
             reason: format!(
                 "MPP BF16 tensors require macOS 26.1 or newer; found {}.{}",
                 version.0, version.1
@@ -41,7 +45,7 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
         });
     }
     if !device.supports_family(MTLGPUFamily::Apple7) {
-        return Ok(MppPipelineAvailability::Unsupported {
+        return Ok(MppCompileOptions::Unsupported {
             reason: "MPP candidate requires an Apple GPU supporting the Apple7 feature family"
                 .into(),
         });
@@ -63,6 +67,20 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
             ));
         }
     }
+    Ok(MppCompileOptions::Ready(options))
+}
+
+/// A supported device with a shader, function, or PSO creation error returns
+/// `Err`, including Metal's text. No application device buffer is allocated.
+pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
+    device: &DeviceRef,
+) -> Result<MppPipelineAvailability, String> {
+    let options = match compile_options(device)? {
+        MppCompileOptions::Unsupported { reason } => {
+            return Ok(MppPipelineAvailability::Unsupported { reason });
+        }
+        MppCompileOptions::Ready(options) => options,
+    };
     let source = concat!(
         include_str!("../bf16.metal"),
         "\n",

@@ -174,6 +174,17 @@ pub(super) fn verify(
                 keys: vec![vec![(97, true)], vec![(97, false)]],
                 scale: CanonicalRational::new(1, 8).unwrap(),
             },
+            Case {
+                sequence: 97,
+                width: 128,
+                heads: 4,
+                kv_heads: if kind == StructuredAttention { 4 } else { 2 },
+                segments: vec![(97, true)],
+                // Complete key tiles on either side of a masked nonfinite key,
+                // plus a partial final tile, must share the same online state.
+                keys: vec![vec![(32, true), (1, false), (64, true)]],
+                scale: CanonicalRational::new(1, 8).unwrap(),
+            },
         ] {
             let mut values = case.values();
             if case.keys.iter().all(|runs| runs.iter().all(|v| !v.1)) {
@@ -253,18 +264,22 @@ pub(super) fn verify(
         }
         // Future masked nonfinite keys and values must not contaminate earlier
         // causal rows. Visible score poison is whole-head; V poison per channel.
-        for (width, poison) in [8, 128].into_iter().flat_map(|width| {
-            ["key", "value", "query", "score_overflow"]
+        for (width, sequence, bidirectional, poison) in
+            [(8, 33, false), (128, 33, false), (128, 97, true)]
                 .into_iter()
-                .map(move |poison| (width, poison))
-        }) {
+                .flat_map(|(width, sequence, bidirectional)| {
+                    ["key", "value", "query", "score_overflow"]
+                        .into_iter()
+                        .map(move |poison| (width, sequence, bidirectional, poison))
+                })
+        {
             let case = Case {
-                sequence: 33,
+                sequence,
                 width,
                 heads: 4,
                 kv_heads: if kind == StructuredAttention { 4 } else { 1 },
-                segments: vec![(33, false)],
-                keys: vec![vec![(33, true)]],
+                segments: vec![(sequence, bidirectional)],
+                keys: vec![vec![(sequence, true)]],
                 scale: CanonicalRational::new(1, 8).unwrap(),
             };
             let mut values = case.values();
@@ -293,8 +308,36 @@ pub(super) fn verify(
                 |actual| case.check(&values, actual),
             );
             eprintln!(
-                "Metal {kind:?}: D={width} {poison}, mask and nonfinite classification passed"
+                "Metal {kind:?}: S={sequence} D={width} bidirectional={bidirectional} {poison}, mask and nonfinite classification passed"
             );
         }
+        // Both operands are valid BF16 values outside FP16's range. Their
+        // product is moderate: an implicit FP16 conversion would be observable.
+        let case = Case {
+            sequence: 65,
+            width: 128,
+            heads: 4,
+            kv_heads: if kind == StructuredAttention { 4 } else { 2 },
+            segments: vec![(65, true)],
+            keys: vec![vec![(65, true)]],
+            scale: CanonicalRational::new(1, 8).unwrap(),
+        };
+        let mut values = case.values();
+        for value in &mut values[0] {
+            *value *= 2_f32.powi(80);
+        }
+        for value in &mut values[1] {
+            *value *= 2_f32.powi(-80);
+        }
+        run_case(
+            runtime,
+            registry,
+            catalog,
+            &policy,
+            host,
+            &case.fixture(kind),
+            &values,
+            |actual| case.check(&values, actual),
+        );
     }
 }

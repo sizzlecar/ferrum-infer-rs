@@ -119,6 +119,27 @@ kernel void ferrum_tensor_attention_bf16(
                 }
             }
             for (ulong k_start = min_start; k_start < max_end; k_start += 32) {
+                #ifdef FERRUM_ATTENTION_MPP_QK
+                // Every thread takes the same collective branch. Borrowed
+                // tensor views may read only complete, visible Q/K tiles;
+                // tails, mask holes and differing row ranges use the original
+                // QK path below. No softmax/PV boundary changes.
+                bool mpp_tile = cache_query_128 && q_start + 16 <= p.sequence
+                    && k_start + 32 <= p.sequence;
+                if (mpp_tile) {
+                    for (uint r = 0; r < 16; ++r)
+                        mpp_tile = mpp_tile && k_start >= start[r] && k_start + 32 <= end[r];
+                    for (uint j = 0; j < 32; ++j)
+                        mpp_tile = mpp_tile && attention_key_valid(mask, batch, k_start + j);
+                }
+                if (mpp_tile) {
+                    ferrum_attention_mpp_qk(query, key,
+                        q_base + q_start * p.query_heads * 128,
+                        kv_base + k_start * p.key_value_heads * 128,
+                        int(p.query_heads * 128), int(p.key_value_heads * 128), scores);
+                } else
+                #endif
+                {
                 simdgroup_float8x8 dot[2];
                 for (uint i = 0; i < 2; ++i) dot[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
                 #pragma unroll
@@ -149,6 +170,7 @@ kernel void ferrum_tensor_attention_bf16(
                 }
                 for (uint n = 0; n < 2; ++n)
                     simdgroup_store(dot[n], scores + local_row * 32 + local_col + n * 8, 32, 0, false);
+                }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 // A SIMD group handles one row's keys in parallel. Only the
                 // reduction order changes; scores, exp, sums and rescaling all

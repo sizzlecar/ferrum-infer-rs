@@ -5,6 +5,8 @@ use ferrum_runtime::{
     StructuredGqaAttentionBf16Geometry,
 };
 
+pub(super) mod mpp;
+
 const CACHED_SHARED_BYTES: u64 = (2048 + 96) * 4;
 
 pub(super) fn head128_pipeline(
@@ -256,16 +258,29 @@ pub(super) fn encode(
         disjoint(input, &output)?;
     }
     regions.push(output);
+    let use_mpp = pipelines.attention_mpp_head128.is_some()
+        && mpp::supports_shape(
+            shape.params.sequence,
+            shape.params.query_heads,
+            shape.params.key_value_heads,
+            shape.params.head_dim,
+        );
     let work = DeviceCommandLogicalWork::tensor(shape.query_bytes / 2, shape.operations)
         .map_err(|e| e.to_string())?;
     MetalDeviceCommand::tensor_operation(
-        "metal.structured_attention.bf16",
+        if use_mpp {
+            "metal.structured_attention.bf16.mpp_qk"
+        } else {
+            "metal.structured_attention.bf16"
+        },
         regions,
         work,
         move |encoder, regions| {
             let compute = encoder.compute_encoder();
             compute.set_compute_pipeline_state(
-                (if shape.params.head_dim == 128 {
+                (if use_mpp {
+                    pipelines.attention_mpp_head128.as_ref()
+                } else if shape.params.head_dim == 128 {
                     pipelines
                         .attention_head128
                         .as_ref()
@@ -280,12 +295,13 @@ pub(super) fn encode(
             }
             set_params(compute, 4, &shape.params);
             set_params(compute, 5, &shape.mask);
-            let shared_bytes =
-                if shape.params.head_dim == 128 && pipelines.attention_head128.is_some() {
-                    CACHED_SHARED_BYTES
-                } else {
-                    shape.shared_bytes
-                };
+            let shared_bytes = if use_mpp
+                || (shape.params.head_dim == 128 && pipelines.attention_head128.is_some())
+            {
+                CACHED_SHARED_BYTES
+            } else {
+                shape.shared_bytes
+            };
             compute.set_threadgroup_memory_length(0, shared_bytes);
             compute.dispatch_thread_groups(
                 MTLSize::new(shape.params.grid_groups, 1, 1),

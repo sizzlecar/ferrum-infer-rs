@@ -36,7 +36,8 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "norm=zero-padded-adjacent-FP32-tree;separate-sqrt-div;device-bounded-threadgroup;",
     "head-rms=BF16-normalized-before-gamma;zero-centered=FP32-one-plus-gamma;",
     "adjacent-rope=F32-frequency-explicit-FMA;half-split=BF16-staged-products;",
-    "attention=FP32-simdgroup-QK-PV;16-query-32-key-online-softmax;",
+    "attention=MPP-BF16xBF16-F32-QK-head128-full-visible-tiles-or-FP32-simdgroup-QK;",
+    "FP32-simdgroup-PV;16-query-32-key-online-softmax;",
     "FP32-tile-SIMD-exp-reduction;separate-online-rescale;BF16-final-only;",
     "GQA=indexed-KV-no-replication;empty-row=positive-zero;",
     "masked-score-discard;nonfinite-visible-score=whole-head-NaN;",
@@ -100,6 +101,8 @@ fn fingerprint() -> String {
         include_bytes!("rope.metal"),
         include_bytes!("attention.rs"),
         include_bytes!("attention.metal"),
+        attention::mpp::FINGERPRINT_SOURCE.as_bytes(),
+        attention::mpp::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("transport.rs"),
         include_bytes!("transport.metal"),
         include_bytes!("scatter.rs"),
@@ -125,6 +128,7 @@ struct Pipelines {
     half_split_rope: Option<ComputePipelineState>,
     attention: Option<ComputePipelineState>,
     attention_head128: Option<ComputePipelineState>,
+    attention_mpp_head128: Option<ComputePipelineState>,
     attention_shared_limit: u64,
     transport: Option<ComputePipelineState>,
     scatter: Option<ComputePipelineState>,
@@ -324,6 +328,25 @@ pub fn metal_tensor_providers(
     } else {
         None
     };
+    let attention_mpp_head128 = if has_attention {
+        match attention::mpp::compile(runtime.device())
+            .map_err(MetalDeviceRuntimeError::contract)?
+        {
+            linear::mpp::MppPipelineAvailability::Unsupported { reason } => {
+                tracing::info!(%reason, "Metal MPP BF16 QK unavailable; using SIMD-group fallback");
+                None
+            }
+            linear::mpp::MppPipelineAvailability::Ready(pipeline) => {
+                tracing::info!(
+                    static_threadgroup_bytes = pipeline.static_threadgroup_memory_length(),
+                    "Metal MPP BF16 QK enabled for complete visible Head128 tiles"
+                );
+                Some(pipeline)
+            }
+        }
+    } else {
+        None
+    };
     let transport = pipeline(has_transport, "ferrum_tensor_transport_bf16")?;
     let scatter = pipeline(has_scatter, "ferrum_tensor_row_scatter_add_bf16")?;
     let primitives = pipeline(has_primitives, "ferrum_tensor_primitive_bf16")?;
@@ -370,6 +393,7 @@ pub fn metal_tensor_providers(
         half_split_rope,
         attention,
         attention_head128,
+        attention_mpp_head128,
         attention_shared_limit,
         transport,
         scatter,
