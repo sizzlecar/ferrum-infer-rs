@@ -63,7 +63,41 @@ ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thin
 
 ## 图像生成与编辑
 
-使用完整的本地 [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) 模型目录。已验证 RTX 5090、Linux CUDA 12.8、cuDNN 9；文本编码器/DiT 使用 FP8，视觉编码器/VAE 使用 BF16。
+CUDA 使用完整的本地 [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) 模型目录。已验证 RTX 5090、Linux CUDA 12.8、cuDNN 9；文本编码器/DiT 使用 FP8，视觉编码器/VAE 使用 BF16。
+
+Metal 图像后端正在为下一版本完成验收。M4 Mac mini、16 GiB 统一内存已完成 1024×1024 生成与编辑，使用 Q4_K_M GGUF DiT、FP8 文本编码器和 BF16 视觉编码器/VAE。该组合通过 `--image-config` 显式配置 Metal 后端、模型资产与内存上限；这套 16 GiB 配置尚未完成 2K 出图，吞吐验收仍在进行。
+
+**Metal 配置：**将 [qwen-image-2.1-turbo-metal.json](crates/ferrum-cli/examples/config/qwen-image-2.1-turbo-metal.json) 复制为 `image-metal.json`，与 `models/` 目录并列。原模型的文本编码器、VAE 和元数据放在 `models/Qwen-Image-2.1-Turbo/`，[Q4_K_M DiT](https://huggingface.co/m9ter1a/Qwen-Image-2.1-Turbo-GGUF/blob/a94df596a422bc8dfe406655154c0364f79ba042/qwen-image-2.1-turbo-Q4_K_M.gguf) 放在 `models/Qwen-Image-2.1-Turbo-GGUF/`；也可直接修改 JSON 路径，相对路径以配置文件所在目录为基准。示例保留单个活动图像、组件按阶段加载释放、请求内编辑缓存、2 GiB Host 预算和 Metal 推荐工作集的 90%，仍需通过容量检查；不需要原始 BF16 DiT 权重。
+
+<details>
+<summary>模型快照缺少 transformer/config.json 时</summary>
+
+将下面匹配 Qwen-Image-2.1-Turbo 的架构保存为 `models/Qwen-Image-2.1-Turbo/transformer/config.json`；已有匹配文件则保留：
+
+```json
+{
+  "_class_name": "QwenImage21Transformer2DModel",
+  "_diffusers_version": "0.41.0.dev0",
+  "attention_head_dim": 128, "axes_dims_rope": [16, 56, 56],
+  "causal_condition": true, "context_in_dim": 4096, "eps": 0.000001,
+  "in_channels": 64, "mlp_ratio": 3, "num_attention_heads": 32,
+  "num_layers": 32, "out_channels": 64, "patch_size": 1
+}
+```
+
+</details>
+
+```sh
+ferrum run --image-config image-metal.json \
+  --prompt "A red ceramic mug on a white table" --width 1024 --height 1024 --seed 42 --output mug.png
+ferrum run --image-config image-metal.json --image mug.png \
+  --prompt "Make the mug blue" --width 1024 --height 1024 --seed 43 --output edited.png
+ferrum serve --image-config image-metal.json --host 127.0.0.1 --port 8000
+```
+
+API 模型名为 `qwen-image-turbo-metal`。精度在该 JSON 中配置；`--image-config` 不与位置参数模型或 `--image-precision` 同用。
+
+CUDA 示例：
 
 ~~~sh
 ferrum run /path/to/Qwen-Image-2.1-Turbo \
