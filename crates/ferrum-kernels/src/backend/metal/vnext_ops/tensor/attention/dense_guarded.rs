@@ -12,7 +12,7 @@ pub(in crate::backend::metal::vnext_ops::tensor) const FINGERPRINT_SOURCE: &str 
     include_str!("dense_core.metal")
 );
 pub(in crate::backend::metal::vnext_ops::tensor) const NUMERICAL_IDENTITY: &str =
-    "steel-v0.32.2-d128-bq32-bk16-native-bfloat-f32-fragments;scale-log2e-fast-exp2-final-div;all-valid-dense-suffix-only;input-abs<=2^20-scale<=2^20-K<=65536;actual-PSO-coordinate-check;final-finite-positive-denominator-output<=2^21-check;per-original-job-flags;strict-full-grid-fallback;independent-fused-profile-not-IEEE-bitwise.v1";
+    "steel-v0.32.2-d128-bq32-bk16-native-bfloat-f32-fragments;scale-log2e-fast-exp2-final-div;dense-suffix-only;all-valid-original-specialization;key-runs-masked-KV-load-zero-masked-P-zero-empty-key-tiles-skipped;visible-input-abs<=2^20-scale<=2^20-K<=65536;empty-key-batches-strict;actual-PSO-coordinate-check;final-finite-positive-denominator-output<=2^21-check;per-original-job-flags;matching-key-visibility-strict-full-grid-fallback;independent-fused-profile-not-IEEE-bitwise.v2";
 
 #[repr(C)]
 struct DenseParams {
@@ -61,6 +61,7 @@ pub(in crate::backend::metal::vnext_ops::tensor) struct Schedule {
     gate: GateParams,
     query_offset_bytes: u64,
     flag_bytes: u64,
+    masked_keys: bool,
 }
 
 impl Schedule {
@@ -68,8 +69,7 @@ impl Schedule {
         let Some(start) = g.dense_start else {
             return Ok(None);
         };
-        if !g.all_keys_valid
-            || g.head_dim != 128
+        if g.head_dim != 128
             || g.query_heads != g.key_value_heads
             || g.query_heads == 0
             || g.query_heads > i32::MAX as u64
@@ -156,6 +156,7 @@ impl Schedule {
             },
             strict,
             flag_bytes,
+            masked_keys: !g.all_keys_valid,
         }))
     }
 
@@ -192,6 +193,19 @@ pub(in crate::backend::metal::vnext_ops::tensor) struct DensePipelines {
     prepass: ComputePipelineState,
     fast: Vec<ComputePipelineState>,
     strict: [ComputePipelineState; 2],
+    masked: Option<MaskedPipelines>,
+}
+
+struct MaskedPipelines {
+    prepass: ComputePipelineState,
+    fast: Vec<ComputePipelineState>,
+    strict: [ComputePipelineState; 2],
+}
+
+impl DensePipelines {
+    pub(in crate::backend::metal::vnext_ops::tensor) fn supports(&self, plan: &Schedule) -> bool {
+        !plan.masked_keys || self.masked.is_some()
+    }
 }
 
 pub(in crate::backend::metal::vnext_ops::tensor) fn compile(
@@ -273,16 +287,82 @@ fn compile_checked(
         };
         fast.push(pipeline);
     }
-    let Some(structured) = register128::compile_gated(runtime, false)? else {
+    let Some(structured) =
+        register128::compile_gated(runtime, false, register128::KeyVisibility::AllValid)?
+    else {
         return Ok(None);
     };
-    let Some(cross) = register128::compile_gated(runtime, true)? else {
+    let Some(cross) =
+        register128::compile_gated(runtime, true, register128::KeyVisibility::AllValid)?
+    else {
         return Ok(None);
+    };
+    // A masked specialization failure must not remove the original all-valid
+    // pipelines. The containing provider retains both sets under its admitted
+    // opaque native owner; no independent device allocation is introduced.
+    let masked = (|| -> Result<Option<MaskedPipelines>, MetalDeviceRuntimeError> {
+        let constants = metal::FunctionConstantValues::new();
+        constants.set_constant_value_at_index(
+            (&true as *const bool).cast(),
+            metal::MTLDataType::Bool,
+            203,
+        );
+        let Some(prepass) = create("ferrum_dense_attention_prepass", constants, 16)? else {
+            return Ok(None);
+        };
+        let mut fast = Vec::with_capacity(4);
+        for aligned in 0..4 {
+            let constants = metal::FunctionConstantValues::new();
+            for (index, value) in [
+                (200, aligned & 2 != 0),
+                (201, aligned & 1 != 0),
+                (202, true),
+                (203, true),
+            ] {
+                constants.set_constant_value_at_index(
+                    (&value as *const bool).cast(),
+                    metal::MTLDataType::Bool,
+                    index,
+                );
+            }
+            let Some(pipeline) =
+                create("ferrum_dense_attention_bf16_bq32_bk16_d128", constants, 0)?
+            else {
+                return Ok(None);
+            };
+            fast.push(pipeline);
+        }
+        // Prefix rows and rejected suffix jobs still consume the original
+        // mask. An all-valid specialization would load masked NaN/Inf and
+        // produce nonzero/NaN output for rows with no visible valid keys.
+        let Some(structured) =
+            register128::compile_gated(runtime, false, register128::KeyVisibility::MaskRuns)?
+        else {
+            return Ok(None);
+        };
+        let Some(cross) =
+            register128::compile_gated(runtime, true, register128::KeyVisibility::MaskRuns)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(MaskedPipelines {
+            prepass,
+            fast,
+            strict: [structured, cross],
+        }))
+    })();
+    let masked = match masked {
+        Ok(pipelines) => pipelines,
+        Err(error) => {
+            tracing::warn!(%error, "Metal masked dense pipeline unavailable; masked attention keeps strict path");
+            None
+        }
     };
     Ok(Some(DensePipelines {
         prepass,
         fast,
         strict: [structured, cross],
+        masked,
     }))
 }
 
@@ -332,6 +412,15 @@ pub(super) fn encode(
     pipelines: &DensePipelines,
     cross: bool,
 ) {
+    let (prepass, fast, strict) = if plan.masked_keys {
+        let masked = pipelines
+            .masked
+            .as_ref()
+            .expect("selected masked dense pipelines");
+        (&masked.prepass, &masked.fast, &masked.strict)
+    } else {
+        (&pipelines.prepass, &pipelines.fast, &pipelines.strict)
+    };
     // Tracked buffers + encoder boundaries publish flags and output on-device.
     // Retained full regions remain authoritative even when Q/O start at a suffix.
     for phase in 0..3 {
@@ -345,10 +434,15 @@ pub(super) fn encode(
             set_region(compute, slot as u64, region);
         }
         set_region(compute, 6, &regions[4]);
+        if plan.masked_keys && phase != 2 {
+            // Same checked 2380-byte mask packet as the strict fallback. This
+            // bounded inline constant copy adds no provider workspace buffer.
+            set_params(compute, 7, mask);
+        }
         if phase == 1 {
             let variant = usize::from(plan.dense.query_remainder == 0) * 2
                 + usize::from(plan.dense.key_remainder == 0);
-            compute.set_compute_pipeline_state(&pipelines.fast[variant]);
+            compute.set_compute_pipeline_state(&fast[variant]);
             for slot in [0_usize, 3] {
                 compute.set_buffer(
                     slot as u64,
@@ -368,9 +462,9 @@ pub(super) fn encode(
             );
         } else {
             compute.set_compute_pipeline_state(if phase == 0 {
-                &pipelines.prepass
+                prepass
             } else {
-                &pipelines.strict[usize::from(cross)]
+                &strict[usize::from(cross)]
             });
             set_params(compute, 4, &plan.strict);
             if phase == 0 {

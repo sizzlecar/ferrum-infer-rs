@@ -231,6 +231,50 @@ pub(super) fn verify(
         let case = FusedCase::new(33, keys, true);
         run(&case, &case.values());
     }
+    // Invalid K/V are deliberately nonfinite in values(). Cover an entirely
+    // empty first tile, a hole crossing 31/32, a middle empty tile and the tail.
+    // Both batch pitches remain physical even when validity differs by batch.
+    for cross in [false, true] {
+        let mut holes = FusedCase::new(if cross { 33 } else { 65 }, 65, cross);
+        holes.layout.keys = vec![
+            vec![(16, false), (15, true), (2, false), (15, true), (17, false)],
+            vec![(17, true), (16, false), (32, true)],
+        ];
+        run(&holes, &holes.values());
+
+        let mut suffix = FusedCase::new(97, if cross { 65 } else { 97 }, cross);
+        if !cross {
+            suffix.layout.segments = vec![(17, false), (80, true)];
+        }
+        suffix.layout.keys = vec![
+            vec![
+                (32, false),
+                (16, true),
+                (16, false),
+                (suffix.keys - 64, true),
+            ],
+            vec![(suffix.keys, false)],
+        ];
+        let mut values = suffix.values();
+        // Entirely masked rows must return +0 without evaluating poisoned Q.
+        values[0][97 * 2 * 128..].fill(f32::NAN);
+        if !cross {
+            values[0][..17 * 2 * 128].fill(f32::NAN);
+        }
+        run(&suffix, &values);
+
+        let mut reusable = FusedCase::new(65, 65, cross);
+        reusable.layout.keys = vec![
+            vec![(16, true), (1, false), (48, true)],
+            vec![(32, false), (33, true)],
+        ];
+        reuse_with_guard_changes(runtime, registry, catalog, policy, host, &reusable);
+    }
+    // First or last complete K tile empty, with exactly one visible key. This
+    // catches exp(-Inf - -Inf), stale online state and tail-key off-by-one.
+    let mut one_key = FusedCase::new(33, 17, true);
+    one_key.layout.keys = vec![vec![(16, false), (1, true)], vec![(1, true), (16, false)]];
+    run(&one_key, &one_key.values());
     for cross in [false, true] {
         let mut masked = FusedCase::new(33, 33, cross);
         masked.layout.keys = vec![vec![(16, true), (1, false), (16, true)], vec![(33, false)]];

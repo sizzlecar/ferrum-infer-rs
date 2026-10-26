@@ -38,12 +38,48 @@ fn invalid(reason: impl Into<String>) -> VNextError {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ProbeShape;
+#[derive(Clone, Copy, Debug)]
+enum ProbeShape {
+    AllValid,
+    Holes,
+    MixedEmpty,
+}
 impl ProbeShape {
     const BATCH: u64 = 2;
     const HEADS: u64 = 2;
     const SEQUENCE: u64 = 65;
+    fn key_runs(self) -> Vec<Vec<(i64, bool)>> {
+        match self {
+            Self::AllValid => vec![vec![(65, true)]; 2],
+            Self::Holes => vec![
+                vec![(16, false), (15, true), (2, false), (15, true), (17, false)],
+                vec![(17, true), (16, false), (32, true)],
+            ],
+            Self::MixedEmpty => vec![
+                vec![(32, false), (16, true), (16, false), (1, true)],
+                vec![(65, false)],
+            ],
+        }
+    }
+    fn key_valid(self, batch: u64, key: u64) -> bool {
+        let mut end = 0;
+        for (length, valid) in &self.key_runs()[batch as usize] {
+            end += *length as u64;
+            if key < end {
+                return *valid;
+            }
+        }
+        panic!("probe key outside physical tensor");
+    }
+    fn row_has_key(self, batch: u64, query: u64) -> bool {
+        (0..Self::SEQUENCE).any(|key| self.key_valid(batch, key) && (query >= 17 || key <= query))
+    }
+    fn constant_value(self, index: u64) -> f32 {
+        let channel = index % 128;
+        let head = (index / 128) % Self::HEADS;
+        let batch = index / (Self::SEQUENCE * Self::HEADS * 128);
+        1.0 + ((batch * Self::HEADS + head + channel) % 8) as f32 / 8.0
+    }
     fn tensor(self) -> ProgramTensorSpec {
         ProgramTensorSpec {
             dimensions: vec![Self::BATCH * Self::SEQUENCE, Self::HEADS * 128],
@@ -72,12 +108,22 @@ impl ProbeShape {
                 SemanticValue::Rational(CanonicalRational::new(1, 8).unwrap()),
             ),
         ]);
+        let runs = self.key_runs();
         for (name, values) in [
             ("segment_lengths", vec![17, 48]),
             ("segment_bidirectional", vec![0, 1]),
-            ("key_run_counts", vec![1, 1]),
-            ("key_run_lengths", vec![65, 65]),
-            ("key_run_valid", vec![1, 1]),
+            (
+                "key_run_counts",
+                runs.iter().map(|run| run.len() as i64).collect(),
+            ),
+            (
+                "key_run_lengths",
+                runs.iter().flatten().map(|run| run.0).collect(),
+            ),
+            (
+                "key_run_valid",
+                runs.iter().flatten().map(|run| i64::from(run.1)).collect(),
+            ),
         ] {
             attributes.insert(id(name), SemanticValue::Integers(values));
         }
@@ -96,7 +142,7 @@ impl ProbeShape {
             key_value_heads: Self::HEADS,
             head_dim: 128,
             scale: 0.125,
-            all_keys_valid: true,
+            all_keys_valid: matches!(self, Self::AllValid),
             dense_start: dense_start(&self.mask(), Self::SEQUENCE),
         })
         .unwrap()
@@ -117,10 +163,30 @@ impl ProbeShape {
         let head = (index / 128) % Self::HEADS;
         let row = (index / (Self::HEADS * 128)) % Self::SEQUENCE;
         let batch = index / (Self::SEQUENCE * Self::HEADS * 128);
+        if port > 0 && !self.key_valid(batch, row) {
+            // A masked nonfinite payload must not reject an otherwise admitted
+            // head. The actual flag assertion observes that qualification.
+            return if port == 1 {
+                f32::NAN
+            } else {
+                f32::NEG_INFINITY
+            };
+        }
+        if port == 0 && !(0..Self::SEQUENCE).any(|key| self.key_valid(batch, key)) {
+            return f32::NAN;
+        }
+        if batch == 0 && row == 33 {
+            if case == Case::VisibleKeyNan && port == 1 && head == 0 && channel == 0 {
+                return f32::NAN;
+            }
+            if case == Case::VisibleValueInf && port == 2 && head == 1 && channel == 127 {
+                return f32::INFINITY;
+            }
+        }
         if port == 2 {
             // Constant across sequence: exact independent attention answer for
             // all finite Q/K, including strict prefix and huge finite scores.
-            return 1.0 + ((batch * Self::HEADS + head + channel) % 8) as f32 / 8.0;
+            return self.constant_value(index);
         }
         if port == 0 && row == 32 && channel == 0 {
             if case == Case::AllReject {
@@ -139,6 +205,8 @@ enum Case {
     Finite,
     AllReject,
     OneHeadNan,
+    VisibleKeyNan,
+    VisibleValueInf,
 }
 
 struct Contract(OperationDescriptor);
@@ -348,7 +416,7 @@ impl OperationProvider<MetalDeviceRuntime> for Provider {
 
 #[test]
 fn dense_flag_probe_declares_real_outputs_and_distinct_guard_cases() {
-    let shape = ProbeShape;
+    let shape = ProbeShape::AllValid;
     Contract::new(shape);
     TypedFamilyRegistration::new(family::Family { shape })
         .prepare_with_profile(&serde_json::json!({}), &id(PROFILE))
@@ -370,15 +438,54 @@ fn dense_flag_probe_declares_real_outputs_and_distinct_guard_cases() {
 }
 
 #[test]
+fn masked_flag_probe_uses_validated_runs_and_poisoned_invisible_payloads() {
+    for shape in [ProbeShape::Holes, ProbeShape::MixedEmpty] {
+        Contract::new(shape);
+        TypedFamilyRegistration::new(family::Family { shape })
+            .prepare_with_profile(&serde_json::json!({}), &id(PROFILE))
+            .unwrap();
+        assert!(shape.plan().masked_keys);
+        for batch in 0..ProbeShape::BATCH {
+            for key in 0..ProbeShape::SEQUENCE {
+                let index = (batch * ProbeShape::SEQUENCE + key) * ProbeShape::HEADS * 128;
+                for port in [1, 2] {
+                    assert_eq!(
+                        shape.value(Case::Finite, port, index).is_finite(),
+                        shape.key_valid(batch, key)
+                    );
+                }
+            }
+        }
+        assert!(shape.key_valid(0, 33));
+        assert!(!shape.row_has_key(0, 0));
+    }
+    assert!(!ProbeShape::MixedEmpty.row_has_key(1, 64));
+    assert!(ProbeShape::Holes.row_has_key(1, 0));
+}
+
+#[test]
 #[ignore = "real production dense PSO flags through managed scratch/outputs; requires exclusive Metal GPU"]
 fn managed_metal_dense_attention_actual_fast_flags_and_rejection() {
+    run_probe(ProbeShape::AllValid);
+}
+
+#[test]
+#[ignore = "masked production three-phase flags through managed scratch/outputs; requires exclusive Metal GPU"]
+fn managed_metal_masked_dense_attention_actual_fast_flags_and_rejection() {
+    for shape in [ProbeShape::Holes, ProbeShape::MixedEmpty] {
+        run_probe(shape);
+    }
+}
+
+fn run_probe(shape: ProbeShape) {
     metal::objc::rc::autoreleasepool(|| {
-        let shape = ProbeShape;
+        let shape_identity = format!("{shape:?}");
         let fingerprint = implementation_fingerprint(&[
             FINGERPRINT_SOURCE.as_bytes(),
             register128::FINGERPRINT_SOURCE.as_bytes(),
             include_bytes!("probe.rs"),
             include_bytes!("probe/family.rs"),
+            shape_identity.as_bytes(),
         ]);
         let mut device = metal_tensor_runtime_config(id("device.metal.0")).unwrap();
         device.capabilities.insert(id(CAPABILITY));
@@ -402,9 +509,33 @@ fn managed_metal_dense_attention_actual_fast_flags_and_rejection() {
         let retention = runtime.retain_tensor_provider().unwrap();
         let actual = compile(&runtime)
             .expect("production dense pipelines must be available for this diagnostic");
-        let pso = actual.fast.iter().map(|p| serde_json::json!({
+        assert!(
+            actual.supports(&shape.plan()),
+            "selected production mask PSOs must be available"
+        );
+        let selected_fast = if shape.plan().masked_keys {
+            &actual.masked.as_ref().expect("masked PSOs required").fast
+        } else {
+            &actual.fast
+        };
+        let pso = selected_fast.iter().map(|p| serde_json::json!({
             "simd_width":p.thread_execution_width(), "maximum_threads":p.max_total_threads_per_threadgroup(),
             "static_threadgroup_bytes":p.static_threadgroup_memory_length()})).collect::<Vec<_>>();
+        let selected_strict = if shape.plan().masked_keys {
+            &actual.masked.as_ref().expect("masked PSOs required").strict
+        } else {
+            &actual.strict
+        };
+        let strict_pso = selected_strict
+            .iter()
+            .zip(["Structured", "Cross"])
+            .map(|(p, domain)| {
+                serde_json::json!({
+            "domain":domain, "simd_width":p.thread_execution_width(),
+            "maximum_threads":p.max_total_threads_per_threadgroup(),
+            "static_threadgroup_bytes":p.static_threadgroup_memory_length()})
+            })
+            .collect::<Vec<_>>();
         let pipelines = Arc::new(ProbePipelines {
             actual,
             _retention: retention,
@@ -518,6 +649,10 @@ fn managed_metal_dense_attention_actual_fast_flags_and_rejection() {
             Case::AllReject,
             Case::OneHeadNan,
             Case::Finite,
+            Case::VisibleKeyNan,
+            Case::Finite,
+            Case::VisibleValueInf,
+            Case::Finite,
         ]
         .into_iter()
         .enumerate()
@@ -565,14 +700,18 @@ fn managed_metal_dense_attention_actual_fast_flags_and_rejection() {
             assert_eq!(words.len() as u64, plan.strict.jobs);
             for (job, &flag) in words.iter().enumerate() {
                 let head = job as u64 / plan.strict.query_tiles;
+                let batch = head / ProbeShape::HEADS;
                 let tile = job as u64 % plan.strict.query_tiles;
                 let expected = tile >= plan.gate.first_fast_tile
+                    && (0..ProbeShape::SEQUENCE).any(|key| shape.key_valid(batch, key))
                     && case != Case::AllReject
-                    && !(case == Case::OneHeadNan && head == ProbeShape::HEADS);
+                    && !(case == Case::OneHeadNan && head == ProbeShape::HEADS)
+                    && !(case == Case::VisibleKeyNan && head == 0)
+                    && !(case == Case::VisibleValueInf && head == 1);
                 assert_eq!(
                     flag,
                     u32::from(expected),
-                    "{case:?}: actual production flag job {job}"
+                    "shape={shape:?} case={case:?} request={request} batch={batch} job={job} tile={tile}: actual production flags={words:?}"
                 );
             }
             if case == Case::Finite {
@@ -592,16 +731,41 @@ fn managed_metal_dense_attention_actual_fast_flags_and_rejection() {
                     * ProbeShape::HEADS
                     + (index / 128) % ProbeShape::HEADS;
                 let actual = half::bf16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap()));
-                if case == Case::OneHeadNan && row == 32 && batch_head == ProbeShape::HEADS {
+                let batch = batch_head / ProbeShape::HEADS;
+                let head = batch_head % ProbeShape::HEADS;
+                let channel = index % 128;
+                let row_has_key = shape.row_has_key(batch, row);
+                let own_job = batch_head * plan.strict.query_tiles + row / 32;
+                let own_job_flag = words[own_job as usize];
+                if !row_has_key {
+                    assert_eq!(
+                        actual.to_bits(),
+                        0,
+                        "all masked row must be +0 despite poison: shape={shape:?} case={case:?} request={request} batch={batch} head={head} query={row} channel={channel} row_has_key={row_has_key} own_job={own_job} own_job_flag={own_job_flag} actual_flags={words:?}"
+                    );
+                } else if (case == Case::OneHeadNan && row == 32 && batch_head == ProbeShape::HEADS)
+                    || (case == Case::VisibleKeyNan && batch_head == 0 && row >= 17)
+                {
                     assert!(
                         actual.is_nan(),
-                        "strict rejected query must preserve NaN classification"
+                        "strict rejected query must preserve NaN classification: shape={shape:?} case={case:?} request={request} batch={batch} head={head} query={row} channel={channel} row_has_key={row_has_key} own_job={own_job} own_job_flag={own_job_flag} actual_bits={:#06x} actual_flags={words:?}",
+                        actual.to_bits()
+                    );
+                } else if case == Case::VisibleValueInf
+                    && batch_head == 1
+                    && row >= 17
+                    && index % 128 == 127
+                {
+                    assert_eq!(
+                        actual.to_f32(),
+                        f32::INFINITY,
+                        "visible nonfinite V uses strict fallback: shape={shape:?} case={case:?} request={request} batch={batch} head={head} query={row} channel={channel} row_has_key={row_has_key} own_job={own_job} own_job_flag={own_job_flag} actual_flags={words:?}"
                     );
                 } else {
                     assert_eq!(
                         actual.to_bits(),
-                        half::bf16::from_f32(shape.value(case, 2, index)).to_bits(),
-                        "{case:?}: independent constant-V oracle, element {index}"
+                        half::bf16::from_f32(shape.constant_value(index)).to_bits(),
+                        "independent constant-V oracle: shape={shape:?} case={case:?} request={request} batch={batch} head={head} query={row} channel={channel} index={index} row_has_key={row_has_key} own_job={own_job} own_job_flag={own_job_flag} actual_flags={words:?}"
                     );
                 }
             }
@@ -635,7 +799,11 @@ fn managed_metal_dense_attention_actual_fast_flags_and_rejection() {
             "metal_dense_attention_actual_flags={}",
             serde_json::json!({
                 "source_fingerprint":fingerprint, "runtime_fingerprint":runtime_fingerprint,
-                "fast_pso":pso, "observations":observations, "scratch_bytes":shape.plan().flag_bytes(),
+                "mask_case":format!("{shape:?}"), "key_runs":shape.key_runs(),
+                "fast_pso":pso, "strict_pso":strict_pso,
+                "selected_strict_domain":"Structured",
+                "selected_key_visibility":if shape.plan().masked_keys { "MaskRuns" } else { "AllValid" },
+                "observations":observations, "scratch_bytes":shape.plan().flag_bytes(),
                 "snapshot_bytes":shape.plan().strict.jobs*4, "host_committed_after_close":0,
                 "device_full_capacity_reclaimed":true,
                 "scope":"production compile/encode with two additional managed diagnostic blits; not performance evidence"

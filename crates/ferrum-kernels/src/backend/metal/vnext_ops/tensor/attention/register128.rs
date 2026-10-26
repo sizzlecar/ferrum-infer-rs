@@ -217,6 +217,7 @@ fn compile_pipeline(
 pub(super) fn compile_gated(
     runtime: &MetalDeviceRuntime,
     cross: bool,
+    key_visibility: KeyVisibility,
 ) -> Result<Option<ComputePipelineState>, MetalDeviceRuntimeError> {
     let library = compile_library(runtime)?;
     compile_pipeline_with_gate(
@@ -227,7 +228,7 @@ pub(super) fn compile_gated(
         } else {
             Domain::Structured
         },
-        KeyVisibility::AllValid,
+        key_visibility,
         true,
     )
 }

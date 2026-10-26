@@ -240,8 +240,8 @@ fn key_tails_and_scale_boundaries_are_explicit_admission_limits() {
 }
 
 #[test]
-fn unsupported_shapes_and_missing_visibility_keep_strict_attention() {
-    let variants: [fn(&mut GuardGeometry); 9] = [
+fn unsupported_shapes_and_missing_dense_segment_keep_strict_attention() {
+    let variants: [fn(&mut GuardGeometry); 8] = [
         |g| g.head_dim = 64,
         |g| g.key_value_heads = 1,
         |g| {
@@ -252,7 +252,6 @@ fn unsupported_shapes_and_missing_visibility_keep_strict_attention() {
         |g| g.batch_heads = 7,
         |g| g.batch_heads = 17 * g.query_heads,
         |g| g.query = i32::MAX as u64 + 1,
-        |g| g.all_keys_valid = false,
         |g| g.dense_start = None,
     ];
     for mutate in variants {
@@ -263,7 +262,7 @@ fn unsupported_shapes_and_missing_visibility_keep_strict_attention() {
 }
 
 #[test]
-fn final_bidirectional_segment_is_dense_only_with_all_batch_keys_valid() {
+fn final_bidirectional_segment_selects_mask_variant_without_changing_query_pitch() {
     for (segments, expected) in [
         (vec![(65, true)], Some(0)),
         (vec![(17, false), (48, true)], Some(17)),
@@ -284,7 +283,18 @@ fn final_bidirectional_segment_is_dense_only_with_all_batch_keys_valid() {
             g.dense_start = dense_start(&NativeMask::new(checked.mask(), 65), 65);
             g.all_keys_valid = register128::KeyVisibility::from_mask(checked.mask(), 65)
                 == register128::KeyVisibility::AllValid;
-            assert!(Schedule::new(g).unwrap().is_none());
+            let plan = Schedule::new(g).unwrap().unwrap();
+            assert!(plan.masked_keys);
+            // Key validity changes the PSO, not the physical B2 tensor pitch,
+            // original fallback grid, dense suffix or admitted flag extent.
+            let all_valid = schedule(65, 65, 17);
+            assert!(!all_valid.masked_keys);
+            assert_eq!(plan.gate.first_fast_tile, all_valid.gate.first_fast_tile);
+            assert_eq!(plan.strict.jobs, all_valid.strict.jobs);
+            assert_eq!(plan.flag_bytes(), all_valid.flag_bytes());
+            assert_eq!(plan.query_offset_bytes, all_valid.query_offset_bytes);
+            assert_eq!(plan.dense.query_strides, all_valid.dense.query_strides);
+            assert_eq!(plan.dense.key_strides, all_valid.dense.key_strides);
         }
     }
     assert!(checked_mask(&[(65, true)], &[vec![(64, true)]]).is_err());
@@ -299,6 +309,36 @@ fn final_bidirectional_segment_is_dense_only_with_all_batch_keys_valid() {
     assert_eq!(dense_start(&mask, 65), None);
     mask.segment_count = 33;
     assert_eq!(dense_start(&mask, 65), None);
+}
+
+#[test]
+fn masked_schedule_keeps_tail_tiles_and_all_empty_batches_for_gpu_qualification() {
+    for sequence in [32_u64, 33, 65] {
+        for runs in [
+            vec![vec![(1, false), (sequence as i64 - 1, true)]; 2],
+            vec![
+                vec![(sequence as i64, true)],
+                vec![(sequence as i64, false)],
+            ],
+            vec![vec![(sequence as i64, false)]; 2],
+        ] {
+            let checked = checked_mask(&[(sequence as i64, true)], &runs).unwrap();
+            let mask = NativeMask::new(checked.mask(), sequence as u32);
+            let mut g = geometry(sequence, sequence, 0);
+            g.all_keys_valid =
+                register128::KeyVisibility::from_mask(checked.mask(), sequence as u32)
+                    == register128::KeyVisibility::AllValid;
+            g.dense_start = dense_start(&mask, sequence);
+            let plan = Schedule::new(g).unwrap().unwrap();
+            assert!(plan.masked_keys);
+            assert_eq!(plan.strict.query_tiles, sequence.div_ceil(32));
+            assert_eq!(plan.dense.query_tiles as u64, sequence.div_ceil(32));
+            assert_eq!(plan.dense.query_remainder as u64, sequence % 32);
+            // An empty batch is a real zero-output request, not a reason to
+            // discard another batch's work. The GPU probe checks flags/output.
+            assert_eq!(plan.strict.jobs, 6 * sequence.div_ceil(32));
+        }
+    }
 }
 
 #[test]
