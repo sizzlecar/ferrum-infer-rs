@@ -6,7 +6,7 @@ struct FerrumDenseGuardOriginalParams {
 };
 
 // Sufficient overflow envelope, distinct from the original exp-based profile:
-// abs(Q/K/V)<=2^20, D128, scale<=2^20 give |scaled log2 scores|<2^69,
+// abs(Q/visible-K/V)<=2^20, D128, scale<=2^20 give |scaled log2 scores|<2^69,
 // including ample F32 rounding margin. Max subtraction feeds exp2 nonpositive
 // arguments; underflow to zero is allowed by this independent fused profile.
 // For an ordinary finite exp2 result near [0,1], K<=65536 keeps the numerator
@@ -21,6 +21,7 @@ kernel void ferrum_dense_attention_prepass(
     constant FerrumDenseGuardOriginalParams& p [[buffer(4)]],
     constant FerrumDenseGateParams& gate [[buffer(5)]],
     device uint* flags [[buffer(6)]],
+    constant FerrumDenseAttentionMask& mask [[buffer(7)]],
     threadgroup uchar* workspace [[threadgroup(0)]],
     uint group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]) {
@@ -35,12 +36,16 @@ kernel void ferrum_dense_attention_prepass(
         const ulong h = head % p.query_heads;
         const ulong q_base = (batch * p.query_sequence * p.query_heads + h) * 128;
         const ulong kv_base = (batch * p.key_sequence * p.key_value_heads + h) * 128;
-        bool bad = false;
+        // All-masked batches keep strict's zero-without-reading-Q semantics.
+        // This test and each skipped key are uniform across this head's CTA.
+        bool bad = ferrum_dense_masked && mask.first_valid_keys[batch] >= p.key_sequence;
         for (ulong i = first_query * 128 + tid; i < p.query_sequence * 128; i += 128) {
             const ulong offset = q_base + (i / 128) * p.query_heads * 128 + i % 128;
             bad = bad || (query[offset] & ushort(0x7fff)) > ushort(0x4980);
         }
         for (ulong i = tid; i < p.key_sequence * 128; i += 128) {
+            if (ferrum_dense_masked && !ferrum_dense::key_valid(mask, uint(batch), uint(i / 128)))
+                continue;
             const ulong offset = kv_base + (i / 128) * p.key_value_heads * 128 + i % 128;
             bad = bad || (key[offset] & ushort(0x7fff)) > ushort(0x4980)
                 || (value[offset] & ushort(0x7fff)) > ushort(0x4980);

@@ -516,7 +516,16 @@ impl OperationResourceEstimator for TensorProvider {
             if self.kind == MetalTensorOperation::CrossAttentionFused
                 && self.pipelines.dense_attention.is_some()
             {
-                if let Some(plan) = shape.dense_schedule().map_err(invalid_plan)? {
+                if let Some(plan) = shape
+                    .dense_schedule()
+                    .map_err(invalid_plan)?
+                    .filter(|plan| {
+                        self.pipelines
+                            .dense_attention
+                            .as_ref()
+                            .is_some_and(|dense| dense.supports(plan))
+                    })
+                {
                     return attention::dense_guarded::estimate_workspace(
                         &self.descriptor,
                         &request,
@@ -535,7 +544,16 @@ impl OperationResourceEstimator for TensorProvider {
             if self.kind == MetalTensorOperation::StructuredAttentionFused
                 && self.pipelines.dense_attention.is_some()
             {
-                if let Some(plan) = shape.dense_schedule().map_err(invalid_plan)? {
+                if let Some(plan) = shape
+                    .dense_schedule()
+                    .map_err(invalid_plan)?
+                    .filter(|plan| {
+                        self.pipelines
+                            .dense_attention
+                            .as_ref()
+                            .is_some_and(|dense| dense.supports(plan))
+                    })
+                {
                     return attention::dense_guarded::estimate_workspace(
                         &self.descriptor,
                         &request,

@@ -284,7 +284,12 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn encode(
     }
     regions.push(output);
     if kind == MetalTensorOperation::CrossAttentionFused && pipelines.dense_attention.is_some() {
-        if let Some(plan) = shape.dense_schedule()? {
+        if let Some(plan) = shape.dense_schedule()?.filter(|plan| {
+            pipelines
+                .dense_attention
+                .as_ref()
+                .is_some_and(|dense| dense.supports(plan))
+        }) {
             dense_guarded::append_flags(participant, &plan, &mut regions)?;
             let work = DeviceCommandLogicalWork::tensor(shape.query_bytes / 2, shape.operations)
                 .map_err(|e| e.to_string())?;
