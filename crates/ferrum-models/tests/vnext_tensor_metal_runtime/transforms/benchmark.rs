@@ -350,7 +350,23 @@ fn managed_nonuniform_attention_microbench() {
     // Nonzero, exact BF16 half-integer Q/K exercise nonzero exponent arguments.
     // Constant-channel V still gives the original exact full-output oracle.
     // Both implementations must use this same harness and input construction.
-    run_microbench(&[
+    run_microbench(&nonuniform_attention_cases());
+}
+
+#[test]
+#[ignore = "real Metal execution host timing diagnostic; requires exclusive GPU access"]
+fn managed_nonuniform_attention_host_timing_diagnostic() {
+    // Existing execute_bound wall timers include host encoding/submission and
+    // completion wait plus readback. They are not GPU timestamps, and this
+    // extra logging must not be mixed into the original benchmark samples.
+    run_microbench_with_diagnostics(
+        &nonuniform_attention_cases(),
+        MicrobenchDiagnostics::ExecutionHost,
+    );
+}
+
+fn nonuniform_attention_cases() -> [Case; 3] {
+    [
         Case::NonuniformAttention {
             sequence: 4096,
             heads: 32,
@@ -367,7 +383,7 @@ fn managed_nonuniform_attention_microbench() {
             heads: 32,
             width: 128,
         },
-    ]);
+    ]
 }
 
 #[test]
@@ -463,14 +479,38 @@ fn managed_vae_attention_microbench() {
     }]);
 }
 
+#[derive(Clone, Copy)]
+enum MicrobenchDiagnostics {
+    DispatchSelection,
+    ExecutionHost,
+}
+
+impl MicrobenchDiagnostics {
+    fn filter(self) -> &'static str {
+        match self {
+            Self::DispatchSelection => "off,ferrum_kernels::backend::metal::vnext_ops::tensor::attention=debug,ferrum_kernels::backend::metal::vnext_ops::tensor::linear=debug",
+            Self::ExecutionHost => "off,ferrum_kernels::backend::metal::vnext_ops::tensor::attention=debug,ferrum_kernels::backend::metal::vnext_ops::tensor::linear=debug,ferrum_execution::tensor=debug",
+        }
+    }
+
+    fn timing_scope(self) -> &'static str {
+        match self {
+            Self::DispatchSelection => "managed_execute_admission_encode_wait_readback_including_attention_and_linear_logging",
+            Self::ExecutionHost => "managed_execute_admission_encode_wait_readback_including_attention_linear_and_execution_host_logging_not_gpu_timestamps",
+        }
+    }
+}
+
 fn run_microbench(cases: &[Case]) {
+    run_microbench_with_diagnostics(cases, MicrobenchDiagnostics::DispatchSelection);
+}
+
+fn run_microbench_with_diagnostics(cases: &[Case], diagnostics: MicrobenchDiagnostics) {
     // This thread-local scope reports attention/linear capability and actual dispatch
     // selection without installing a global subscriber or reading an env filter.
     // Dispatch diagnostics run inside the measured execute call below.
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(
-            "off,ferrum_kernels::backend::metal::vnext_ops::tensor::attention=debug,ferrum_kernels::backend::metal::vnext_ops::tensor::linear=debug",
-        ))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(diagnostics.filter()))
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .without_time()
@@ -651,7 +691,7 @@ fn run_microbench(cases: &[Case]) {
             serde_json::json!({
                 "operation": format!("{:?}", fixture.kind()), "inputs": fixture.inputs,
                 "output": fixture.output, "warmup_ms": timings[0], "measured_ms": &timings[1..],
-                "timing_scope": "managed_execute_admission_encode_wait_readback_including_attention_and_linear_logging",
+                "timing_scope": diagnostics.timing_scope(),
                 "runtime_fingerprint": runtime.descriptor().runtime_implementation_fingerprint,
                 "native_memory": runtime.native_memory_snapshot(),
             })
