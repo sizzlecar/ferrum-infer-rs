@@ -1,9 +1,10 @@
 //! Shared admission and ownership of explicitly managed host byte allocations.
 //!
 //! Product composition injects one account into all cooperating engines. Limits
-//! cover requested backing bytes and reservations, not allocator metadata, page
-//! cache, network buffers, or total process RSS. A transfer classification does
-//! not prove page locking: this module currently allocates pageable memory only.
+//! cover physical backing bytes (including configured padding) and reservations,
+//! not allocator metadata, page cache, network buffers, or total process RSS.
+//! A transfer classification does not prove page locking: this module currently
+//! allocates pageable memory only.
 
 use std::{
     alloc::Layout,
@@ -151,6 +152,7 @@ struct State {
 #[derive(Debug)]
 struct AccountInner {
     limits: HostMemoryLimits,
+    allocation_alignment: usize,
     state: Mutex<State>,
 }
 
@@ -162,8 +164,45 @@ impl HostMemoryAccount {
     pub fn new(limits: HostMemoryLimits) -> Self {
         Self(Arc::new(AccountInner {
             limits,
+            allocation_alignment: 1,
             state: Mutex::new(State::default()),
         }))
+    }
+
+    /// Align payloads and pad their enclosing backing for native no-copy views.
+    /// Every padding byte is reserved before allocation, in the same class and
+    /// total account. This remains pageable memory; alignment is not pinning.
+    pub fn with_allocation_alignment(
+        limits: HostMemoryLimits,
+        alignment: usize,
+    ) -> Result<Self, HostMemoryError> {
+        if !alignment.is_power_of_two() || alignment > isize::MAX as usize {
+            return Err(HostMemoryError::InvalidReservation);
+        }
+        Ok(Self(Arc::new(AccountInner {
+            limits,
+            allocation_alignment: alignment,
+            state: Mutex::new(State::default()),
+        })))
+    }
+
+    pub fn allocation_alignment(&self) -> usize {
+        self.0.allocation_alignment
+    }
+
+    /// Physical capacity required for a logical allocation, including alignment.
+    /// This metadata calculation neither reserves nor allocates memory.
+    pub fn backing_bytes(&self, bytes: usize) -> Result<usize, HostMemoryError> {
+        if bytes == 0 || bytes > isize::MAX as usize {
+            return Err(HostMemoryError::InvalidReservation);
+        }
+        let padding = self.0.allocation_alignment - 1;
+        bytes
+            .checked_add(padding)
+            .map(|n| n & !padding)
+            .and_then(|n| n.checked_add(padding))
+            .filter(|&n| n <= isize::MAX as usize)
+            .ok_or(HostMemoryError::ArithmeticOverflow)
     }
 
     pub fn limits(&self) -> HostMemoryLimits {
@@ -209,11 +248,8 @@ impl HostMemoryAccount {
         }
         let mut demand = Counters::default();
         for &(class, bytes) in requests {
-            if bytes == 0 || bytes > isize::MAX as usize {
-                return Err(HostMemoryError::InvalidReservation);
-            }
             demand = demand
-                .add(Counters::single(class, bytes))
+                .add(Counters::single(class, self.backing_bytes(bytes)?))
                 .ok_or(HostMemoryError::ArithmeticOverflow)?;
         }
         // Allocate reservation bookkeeping before charging. These small control
@@ -257,10 +293,13 @@ impl HostMemoryAccount {
         // Capacity is already allocated, and these operations cannot fail.
         for &(class, bytes) in requests {
             reservations.push(HostMemoryReservation {
+                logical_bytes: bytes,
                 charge: Charge {
                     account: self.clone(),
                     class,
-                    bytes,
+                    bytes: self
+                        .backing_bytes(bytes)
+                        .expect("validated before admission"),
                     allocated: false,
                 },
             });
@@ -372,10 +411,15 @@ impl Drop for Charge {
 #[derive(Debug)]
 pub struct HostMemoryReservation {
     charge: Charge,
+    logical_bytes: usize,
 }
 
 impl HostMemoryReservation {
     pub fn bytes(&self) -> usize {
+        self.logical_bytes
+    }
+    /// Physical backing demand, including an account's explicit alignment.
+    pub fn backing_bytes(&self) -> usize {
         self.charge.bytes
     }
     pub fn class(&self) -> HostMemoryClass {
@@ -385,51 +429,51 @@ impl HostMemoryReservation {
     /// Allocate and fully initialize an admitted backing from an exact source.
     /// No uninitialized buffer or byte slice is exposed, including on failure.
     /// The source and its owners remain independently charged while copying.
-    pub(crate) fn allocate_copy(
-        mut self,
-        source: &[u8],
-    ) -> Result<ManagedHostBuffer, HostMemoryError> {
+    pub(crate) fn allocate_copy(self, source: &[u8]) -> Result<ManagedHostBuffer, HostMemoryError> {
         let length = self.bytes();
         if length == 0 || source.len() != length {
             return Err(HostMemoryError::InvalidReservation);
         }
-        let layout =
-            Layout::array::<u8>(length).map_err(|_| HostMemoryError::InvalidReservation)?;
-        // SAFETY: admission proved this nonzero layout is addressable. A fresh
-        // allocation cannot overlap the live, initialized source byte slice.
-        let pointer = unsafe { std::alloc::alloc(layout) };
-        if pointer.is_null() {
-            return Err(HostMemoryError::AllocationFailed { bytes: length });
-        }
-        // SAFETY: initialize every byte before constructing any Box<[u8]> or
-        // reference to the backing. The exact-length copy cannot unwind.
-        unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), pointer, length) };
-        // SAFETY: all length bytes are initialized; Box uses the allocation's
-        // original u8 layout and owns it before the fallible accounting update.
-        let bytes = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer, length)) };
-        self.charge.mark_allocated()?;
-        Ok(ManagedHostBuffer {
-            bytes,
-            charge: self.charge,
-        })
+        self.allocate(Some(source))
     }
 
-    pub fn allocate_zeroed(mut self) -> Result<ManagedHostBuffer, HostMemoryError> {
-        let length = self.bytes();
+    pub fn allocate_zeroed(self) -> Result<ManagedHostBuffer, HostMemoryError> {
+        self.allocate(None)
+    }
+
+    fn allocate(mut self, source: Option<&[u8]>) -> Result<ManagedHostBuffer, HostMemoryError> {
+        let length = self.charge.bytes;
         let layout =
             Layout::array::<u8>(length).map_err(|_| HostMemoryError::InvalidReservation)?;
-        // SAFETY: a non-zero, addressable Layout was validated before admission.
-        // The exact requested layout is charged; allocator metadata is excluded.
-        let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+        // Padding is initialized too: a native no-copy view can include it.
+        let zeroed = source.is_none() || self.charge.account.allocation_alignment() > 1;
+        // SAFETY: the complete, nonzero allocation was admitted, including padding.
+        let pointer = unsafe {
+            if zeroed {
+                std::alloc::alloc_zeroed(layout)
+            } else {
+                std::alloc::alloc(layout)
+            }
+        };
         if pointer.is_null() {
             return Err(HostMemoryError::AllocationFailed { bytes: length });
         }
-        // SAFETY: alloc_zeroed initialized exactly length u8s with alignment 1.
-        // Box owns this allocation exclusively and will use the same layout.
+        let alignment = self.charge.account.allocation_alignment();
+        let offset = (pointer as usize).wrapping_neg() & (alignment - 1);
+        let range = offset..offset + self.logical_bytes;
+        if let Some(source) = source {
+            // SAFETY: admission includes alignment-1 leading bytes plus the
+            // rounded payload. The fresh destination cannot alias the source.
+            unsafe {
+                std::ptr::copy_nonoverlapping(source.as_ptr(), pointer.add(offset), source.len())
+            };
+        }
+        // SAFETY: all bytes are initialized. Box uses the original u8 layout.
         let bytes = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer, length)) };
         self.charge.mark_allocated()?;
         Ok(ManagedHostBuffer {
             bytes,
+            range,
             charge: self.charge,
         })
     }
@@ -439,16 +483,17 @@ impl HostMemoryReservation {
 /// so the actual bytes are freed before their capacity charge is returned.
 pub struct ManagedHostBuffer {
     bytes: Box<[u8]>,
+    range: Range<usize>,
     charge: Charge,
 }
 
 impl ManagedHostBuffer {
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.range.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.range.is_empty()
     }
 
     pub fn class(&self) -> HostMemoryClass {
@@ -456,22 +501,22 @@ impl ManagedHostBuffer {
     }
 
     pub fn freeze(self) -> ManagedHostBytes {
-        let length = self.bytes.len();
+        let range = self.range.clone();
         ManagedHostBytes {
             backing: Arc::new(self),
-            range: 0..length,
+            range,
         }
     }
 }
 
 impl AsRef<[u8]> for ManagedHostBuffer {
     fn as_ref(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[self.range.clone()]
     }
 }
 impl AsMut<[u8]> for ManagedHostBuffer {
     fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.bytes
+        &mut self.bytes[self.range.clone()]
     }
 }
 
@@ -479,7 +524,8 @@ impl std::fmt::Debug for ManagedHostBuffer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ManagedHostBuffer")
-            .field("bytes", &self.bytes.len())
+            .field("bytes", &self.len())
+            .field("backing_bytes", &self.bytes.len())
             .field("class", &self.charge.class)
             .finish_non_exhaustive()
     }
@@ -494,6 +540,16 @@ pub struct ManagedHostBytes {
 }
 
 impl ManagedHostBytes {
+    /// Retains the full initialized backing, including accounted padding, while
+    /// exposing only this logical slice as the payload. A backend must still
+    /// validate its own native page and alignment requirements.
+    pub fn retained_region(&self) -> Result<crate::RetainedHostMemoryRegion, crate::VNextError> {
+        crate::RetainedHostMemoryRegion::new(
+            Arc::new(FrozenHostAllocation(Arc::clone(&self.backing))),
+            self.range.start,
+            self.range.len(),
+        )
+    }
     pub fn bytes(&self) -> &[u8] {
         &self.backing.bytes[self.range.clone()]
     }
@@ -525,6 +581,20 @@ impl ManagedHostBytes {
     }
 }
 
+struct FrozenHostAllocation(Arc<ManagedHostBuffer>);
+
+// SAFETY: constructed only after freeze. The Arc is private, never converted
+// back into a writable buffer, and retains the full allocation and its charge.
+unsafe impl crate::StableHostMemory for FrozenHostAllocation {
+    fn stable_bytes(&self) -> &[u8] {
+        &self.0.bytes
+    }
+
+    fn managed_memory_class(&self) -> Option<HostMemoryClass> {
+        Some(self.0.class())
+    }
+}
+
 impl std::fmt::Debug for ManagedHostBytes {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -546,6 +616,10 @@ impl AsRef<[u8]> for ManagedHostBytes {
 unsafe impl crate::StableHostMemory for ManagedHostBytes {
     fn stable_bytes(&self) -> &[u8] {
         self.bytes()
+    }
+
+    fn managed_memory_class(&self) -> Option<HostMemoryClass> {
+        Some(self.class())
     }
 }
 

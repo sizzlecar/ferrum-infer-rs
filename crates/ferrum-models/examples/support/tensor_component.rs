@@ -105,8 +105,13 @@ pub fn initialize_resources<R: DeviceRuntime>(
             StaticInitializationPolicy::new(u64::try_from(staging_bytes)?, 64)?,
         )
         .map_err(|error| anyhow::anyhow!("static initialization failed: {error:?}"))?;
-    if initialized.receipt().uploaded_bytes() != expected_bytes {
-        bail!("static initialization upload does not match the complete component weight");
+    if initialized
+        .receipt()
+        .uploaded_bytes()
+        .checked_add(initialized.receipt().imported_bytes())
+        != Some(expected_bytes)
+    {
+        bail!("static initialization upload/import does not match the complete component weight");
     }
     initialized
         .into_plan_runtime()

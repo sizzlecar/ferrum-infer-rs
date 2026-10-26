@@ -1,4 +1,5 @@
 use super::*;
+use timing::{GroupTiming, Phase};
 
 /// Integer rounding of the finite F32 representation. No enumeration/search in
 /// the large-matrix path. Subnormals, ties-even and signed zeros are explicit.
@@ -64,6 +65,27 @@ pub(super) fn scale(maximum: f32) -> Result<(f32, f32), VNextError> {
     Ok((scale, inverse))
 }
 
+/// Source lengths and BF16 encodings are validated before this scan. Clearing
+/// the sign bit gives the same ordering as finite, nonnegative F32 magnitudes.
+/// Every NaN/Inf encoding is above every finite magnitude, so reject once after
+/// reducing all source slices without a per-element floating-point operation.
+pub(super) fn finite_bf16_amax<'a>(
+    sources: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<f32, VNextError> {
+    let mut maximum = 0_u16;
+    for source in sources {
+        for bytes in source.chunks_exact(2) {
+            maximum = maximum.max(u16::from_le_bytes([bytes[0], bytes[1]]) & 0x7fff);
+        }
+    }
+    if maximum >= 0x7f80 {
+        return Err(invalid(
+            "nonfinite BF16 source is outside the conversion profile",
+        ));
+    }
+    Ok(f32::from_bits(u32::from(maximum) << 16))
+}
+
 pub(super) fn materialize<'source>(
     host: &HostMemoryAccount,
     source: &'source dyn WeightComponentSource,
@@ -80,18 +102,36 @@ pub(super) fn materialize_with_cache<'source>(
     outputs: &[&WeightComponentSpec],
     cache: Option<&host_cache::HostCache>,
 ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+    let mut timing = GroupTiming::new();
+    let result = materialize_observed(host, source, sources, outputs, cache, &mut timing);
+    timing.report(sources, outputs, result.is_ok());
+    result
+}
+
+fn materialize_observed<'source>(
+    host: &HostMemoryAccount,
+    source: &'source dyn WeightComponentSource,
+    sources: &[&WeightComponentSpec],
+    outputs: &[&WeightComponentSpec],
+    cache: Option<&host_cache::HostCache>,
+    timing: &mut GroupTiming,
+) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
     if outputs.is_empty() {
         return Err(invalid("empty requested component group"));
     }
     if let ([original], [output]) = (sources, outputs) {
         if original == output {
-            return source.component(original).map(|payload| vec![payload]);
+            timing.mode = "borrowed";
+            return timing.measure(Phase::SourceResolve, || {
+                source.component(original).map(|payload| vec![payload])
+            });
         }
     }
     let derived = plan::derive_group(sources)?;
     let mut indices = Vec::with_capacity(outputs.len());
     let mut seen = BTreeSet::new();
     let mut total = 0usize;
+    let mut packed_elements = 0_u64;
     for output in outputs {
         let index = derived
             .iter()
@@ -102,6 +142,11 @@ pub(super) fn materialize_with_cache<'source>(
         }
         let bytes = usize::try_from(output.physical_bytes()?)
             .map_err(|_| invalid("payload exceeds usize"))?;
+        if index < sources.len() {
+            packed_elements = packed_elements
+                .checked_add(bytes as u64)
+                .ok_or_else(|| invalid("requested packed elements overflow"))?;
+        }
         let start = total;
         total = total
             .checked_add(bytes)
@@ -111,24 +156,26 @@ pub(super) fn materialize_with_cache<'source>(
     }
     // Retain the exact immutable sources through both passes. This rejects
     // implicit source transcoding into an unaccounted, whole-matrix Vec.
-    let payloads = sources
-        .iter()
-        .map(|spec| {
-            let payload = source.component(spec)?;
-            if payload.component_id() != &spec.id
-                || payload.dimensions() != spec.dimensions
-                || payload.element_type() != ElementType::Bf16
-                || payload.external_names() != spec.external_names
-                || payload.bytes().len() as u64 != spec.physical_bytes()?
-                || payload.retained_host_memory().is_none()
-            {
-                return Err(invalid(
-                    "source must expose its exact retained BF16 backing without transcoding",
-                ));
-            }
-            Ok(payload)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let payloads = timing.measure(Phase::SourceResolve, || {
+        sources
+            .iter()
+            .map(|spec| {
+                let payload = source.component(spec)?;
+                if payload.component_id() != &spec.id
+                    || payload.dimensions() != spec.dimensions
+                    || payload.element_type() != ElementType::Bf16
+                    || payload.external_names() != spec.external_names
+                    || payload.bytes().len() as u64 != spec.physical_bytes()?
+                    || payload.retained_host_memory().is_none()
+                {
+                    return Err(invalid(
+                        "source must expose its exact retained BF16 backing without transcoding",
+                    ));
+                }
+                Ok(payload)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     let files = payloads
         .iter()
         .map(|payload| payload.source_file().to_owned())
@@ -143,43 +190,49 @@ pub(super) fn materialize_with_cache<'source>(
     let mut state = cache.map(host_cache::HostCache::lock).transpose()?;
     if let (Some(state), Some(key)) = (state.as_mut(), key.as_ref()) {
         if let Some((backing, ranges)) = state.get(key) {
+            timing.mode = "cache_hit";
             return payloads_from_backing(outputs, &files, &backing, ranges);
         }
     }
-    let mut maximum = 0_f32;
-    for payload in &payloads {
-        for bytes in payload.bytes().chunks_exact(2) {
-            let value = f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16);
-            if !value.is_finite() {
-                return Err(invalid(
-                    "nonfinite BF16 source is outside the conversion profile",
-                ));
-            }
-            maximum = maximum.max(value.abs());
-        }
-    }
+    let maximum = timing.measure(Phase::Amax, || {
+        finite_bf16_amax(payloads.iter().map(|payload| payload.bytes()))
+    })?;
     let (scale, inverse) = scale(maximum)?;
     if let (Some(cache), Some(state)) = (cache, state.as_mut()) {
         cache.make_room(state, total);
     }
-    let mut backing = host
-        .allocate_zeroed(HostMemoryClass::WeightBacking, total)
-        .map_err(|e| invalid(format!("WeightBacking admission: {e}")))?;
-    for (index, range) in &indices {
-        let target = &mut backing.as_mut()[range.clone()];
-        if *index >= sources.len() {
-            target.copy_from_slice(&scale.to_le_bytes());
-        } else {
-            for (byte, original) in target
-                .iter_mut()
-                .zip(payloads[*index].bytes().chunks_exact(2))
-            {
-                let value =
-                    f32::from_bits(u32::from(u16::from_le_bytes([original[0], original[1]])) << 16);
-                *byte = encode(value * inverse);
+    let mut backing = timing.measure(Phase::HostAllocateZeroed, || {
+        host.allocate_zeroed(HostMemoryClass::WeightBacking, total)
+            .map_err(|e| invalid(format!("WeightBacking admission: {e}")))
+    })?;
+    timing.measure(Phase::Encode, || -> Result<(), VNextError> {
+        // Only requested packed outputs amortize lookup construction. In
+        // particular scale-only subsets do not allocate this temporary claim.
+        // It is dropped before returning/freeze/cache publication, including on
+        // failure. All immutable sources still participate in the amax scan.
+        let lookup = (lookup::workspace_bytes(packed_elements) != 0)
+            .then(|| lookup::LookupTable::new(host, maximum, inverse))
+            .transpose()?;
+        for (index, range) in &indices {
+            let target = &mut backing.as_mut()[range.clone()];
+            if *index >= sources.len() {
+                target.copy_from_slice(&scale.to_le_bytes());
+            } else if let Some(lookup) = &lookup {
+                lookup.encode_into(payloads[*index].bytes(), target);
+            } else {
+                for (byte, original) in target
+                    .iter_mut()
+                    .zip(payloads[*index].bytes().chunks_exact(2))
+                {
+                    let value = f32::from_bits(
+                        u32::from(u16::from_le_bytes([original[0], original[1]])) << 16,
+                    );
+                    *byte = encode(value * inverse);
+                }
             }
         }
-    }
+        Ok(())
+    })?;
     let backing = backing.freeze();
     let ranges = indices
         .into_iter()

@@ -1,7 +1,7 @@
 use super::*;
 use crate::commands::image_product::directory;
 
-fn metadata_fixture(root: &std::path::Path) {
+pub(super) fn metadata_fixture(root: &std::path::Path) {
     let write = |name: &str, value: Value| {
         let path = root.join(name);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -69,7 +69,9 @@ fn explicit_image_precision_routes_both_entrypoints_and_rejects_text_or_config_m
         "--output",
         "picture.png",
         "--image-precision",
-        "fp8_linear_experimental_v1"
+        "fp8_linear_experimental_v1",
+        "--backend",
+        "cuda"
     ])
     .is_ok());
     assert!(validate(&[
@@ -77,7 +79,9 @@ fn explicit_image_precision_routes_both_entrypoints_and_rejects_text_or_config_m
         "serve",
         model,
         "--image-precision",
-        "fp8_linear_experimental_v1"
+        "fp8_linear_experimental_v1",
+        "--backend",
+        "cuda"
     ])
     .is_ok());
     assert!(validate(&["ferrum", "serve", model, "--image-precision", "omni"]).is_err());
@@ -150,7 +154,9 @@ fn local_pipeline_routes_both_commands_without_names_or_weight_payloads() {
         "--model",
         model,
         "--image-cudnn-library",
-        "/explicit/libcudnn.so.9"
+        "/explicit/libcudnn.so.9",
+        "--backend",
+        "cuda"
     ])
     .is_ok());
     let args = ImageProductArgs {
@@ -290,7 +296,7 @@ fn named_cold_preset_has_one_real_batch_limit_and_finite_host_bounds() {
     .is_err());
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))))]
 #[tokio::test]
 async fn both_product_wrappers_route_local_pipeline_to_explicit_backend_error() {
     let root = tempfile::tempdir().unwrap();

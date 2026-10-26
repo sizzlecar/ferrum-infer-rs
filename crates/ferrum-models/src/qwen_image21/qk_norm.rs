@@ -36,6 +36,12 @@ impl QwenImage21QkFrontend {
             Self::Rotary => "qwen_image21.block0_qk_rotary.cuda.bf16_f32.v1",
         }
     }
+    pub const fn metal_profile_id(self) -> &'static str {
+        match self {
+            Self::Norm => "qwen_image21.block0_qk_norm.metal.bf16_f32.v1",
+            Self::Rotary => "qwen_image21.block0_qk_rotary.metal.bf16_f32.v1",
+        }
+    }
     pub const fn output_ids(self) -> &'static [&'static str] {
         use QwenImage21Block0QkNormFamily as F;
         match self {
@@ -186,6 +192,7 @@ impl ModelFamilyProvider for QwenImage21Block0QkNormFamily {
         for name in [
             self.frontend.reference_profile_id(),
             self.frontend.cuda_profile_id(),
+            self.frontend.metal_profile_id(),
         ] {
             profiles.push(NumericalExecutionProfile {
                 id: NumericalProfileId::new(name)

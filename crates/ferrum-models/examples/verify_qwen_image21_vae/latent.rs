@@ -90,6 +90,34 @@ impl Budget {
             },
         )?))
     }
+
+    #[cfg(any(test, all(feature = "metal", target_os = "macos")))]
+    pub fn aligned_limits(
+        &self,
+        account: &HostMemoryAccount,
+        maximum: usize,
+    ) -> Result<HostMemoryLimits> {
+        let input = account.backing_bytes(self.input)?;
+        let output = account.backing_bytes(self.output)?;
+        let staging = account.backing_bytes(self.staging)?;
+        let total = input
+            .checked_add(output)
+            .and_then(|n| n.checked_add(staging))
+            .context("aligned Host budget overflow")?;
+        ensure!(
+            total <= maximum,
+            "aligned Host backing {total} exceeds budget {maximum}"
+        );
+        Ok(HostMemoryLimits::new(
+            total,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: input,
+                output_bytes: output,
+                transfer_staging_bytes: staging,
+                weight_backing_bytes: 0,
+            },
+        )?)
+    }
 }
 pub struct Loaded {
     pub tensor: ManagedHostTensor,

@@ -4,12 +4,15 @@
 mod arguments;
 #[path = "verify_qwen_image21_projection/artifacts.rs"]
 mod artifacts;
-#[path = "verify_qwen_image21_projection/arguments.rs"]
+#[path = "verify_qwen_image21_vae/backend.rs"]
 mod backend;
 #[path = "verify_qwen_image21_vae/execution.rs"]
 mod execution;
 #[path = "verify_qwen_image21_vae/latent.rs"]
 mod latent;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[path = "verify_qwen_image21_vae/metal.rs"]
+mod metal;
 #[path = "verify_qwen_image21_vae/output.rs"]
 mod output;
 #[path = "verify_qwen_image21_vae/png_output.rs"]
@@ -44,7 +47,8 @@ fn run(args: Arguments) -> Result<()> {
         None
     };
     let budget = latent::Budget::new(&config, args.staging_bytes(), args.maximum_host_bytes)?;
-    let host = budget.account()?;
+    let runtime = backend::Runtime::new(&args.backend)?;
+    let host = runtime.host_account(&budget, args.maximum_host_bytes)?;
     let loaded = latent::load(
         &args.latent_file,
         &config,
@@ -81,7 +85,7 @@ fn run(args: Arguments) -> Result<()> {
         "schema":"ferrum.qwen_image21.vae-decoder-execution.v1","model_root":args.model_root.canonicalize()?,"config_path":args.config.canonicalize()?,"config_sha256":artifacts::sha256(&config_bytes),"config":config,"backend":args.backend,"cudnn":args.cudnn,"index_file":args.index_file,"weight_file":args.weight_file,
         "latent":{"path":args.latent_file.canonicalize()?,"layout":args.layout,"domain":args.domain,"input_shape":loaded.tensor.tensor().dimensions(),"source_sha256":loaded.source_sha256,"prepared_nchw_sha256":loaded.prepared_sha256,"arithmetic":"statistics: JSON->F32->BF16; normalized: B(B(x*B(std))+B(mean)); denormalized: unchanged bits"},
         "weights":weights,"selected_weight_bytes":weight_bytes,"integrity":"observed selected payload SHA-256; not checkpoint authentication or full shard hashes",
-        "managed_host_budget":budget,"memory_scope":"input/output/static upload backing uses one Host account; source mmap residency, small metadata/weight digests/control allocations, fixed 8/16 KiB I/O stack buffers and bounded PNG codec state are outside this backing budget; CUDA opaque allowances remain experimental",
+        "managed_host_budget":budget,"managed_host_limits":{"total_bytes":host.limits().total_bytes(),"allocation_alignment":host.allocation_alignment()},"memory_scope":"input/output/static upload backing uses one Host account; Metal limits include native page alignment; source mmap residency, small metadata/weight digests/control allocations, fixed 8/16 KiB I/O stack buffers and bounded PNG codec state are outside this backing budget; opaque allowances remain declarations",
         "png_memory":{"strategy":"streaming, no complete image/PNG buffer","maximum_rgba_row_bytes":png_output::MAX_ROW_BYTES,"encoder_row_buffers":3,"idat_buffer_bytes":16384,"decoder_allocation_limit_bytes":8388608,"scope":"png crate row/deflate/decoder internals; not a managed-Host or total-RSS claim"},
         "scope":"full single-frame decoder without temporal cache/time_conv; raw RGBA and clamped pixel artifact; no DiT/scheduler, no image-generation end-to-end or Torch parity claim",
         "source":"https://github.com/vllm-project/vllm-omni/blob/c0551d22674d0db81305c800b66ad83035fdc980/vllm_omni/diffusion/models/qwen_image_21/pipeline_qwen_image_21.py#L1025"
@@ -97,6 +101,7 @@ fn run(args: Arguments) -> Result<()> {
         &budget,
         &source,
         &args,
+        &runtime,
         weight_bytes,
         |rgba| output::save(rgba, &artifacts),
     );
@@ -130,7 +135,12 @@ fn main() -> Result<()> {
     match Arguments::parse(std::env::args_os().skip(1))? {
         Some(args) => run(args),
         None => {
-            println!("{}\n{}", arguments::USAGE, backend::USAGE);
+            println!(
+                "{}\n{}\n{}",
+                arguments::USAGE,
+                backend::USAGE,
+                backend::CUDA_USAGE
+            );
             Ok(())
         }
     }

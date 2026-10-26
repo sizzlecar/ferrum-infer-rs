@@ -1241,6 +1241,102 @@ fn static_initialization_seals_backend_weight_import_without_upload_commands() {
     close(handoff(initialized));
 }
 
+fn host_without_staging() -> HostMemoryAccount {
+    HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            1,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: 0,
+                transfer_staging_bytes: 0,
+                output_bytes: 0,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn explicit_managed_import_initializes_without_upload_support_or_staging() {
+    let (resolved, plan, runtime, trace) = test_plan();
+    trace.lock().unwrap().managed_static_import = ManagedStaticImportBehavior::Import;
+    assert!(!runtime.supports_managed_tensor_io());
+    let host = host_without_staging();
+    let initialized = committed_transaction(&plan, runtime, "managed-import")
+        .initialize_static_managed(
+            &resolved.parts().prepared_family,
+            &plan,
+            &ZeroWeightSource,
+            &host,
+            StaticInitializationPolicy::new(8, 2).unwrap(),
+        )
+        .unwrap();
+    let weights = plan
+        .payload()
+        .execution_weights()
+        .stored()
+        .unwrap()
+        .schema();
+    let expected_bytes: u64 = weights
+        .components
+        .iter()
+        .map(|component| component.physical_bytes().unwrap())
+        .sum();
+    assert_eq!(
+        initialized.receipt().imported_component_count(),
+        weights.components.len()
+    );
+    assert_eq!(initialized.receipt().imported_bytes(), expected_bytes);
+    assert_eq!(initialized.receipt().upload_command_count(), 0);
+    assert_eq!(initialized.receipt().submission_batch_count(), 0);
+    {
+        let trace = trace.lock().unwrap();
+        assert_eq!(trace.static_weight_import_begin_calls, 0);
+        assert_eq!(trace.static_weight_import_seal_calls, 1);
+        assert_eq!(trace.imported_bytes, expected_bytes);
+        assert!(trace.uploaded_payloads.is_empty());
+        assert_eq!(trace.submit_calls, 0);
+    }
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    close(handoff(initialized));
+}
+
+#[test]
+fn managed_initialization_never_falls_back_to_ordinary_import_or_raw_upload() {
+    for behavior in [
+        ManagedStaticImportBehavior::Unsupported,
+        ManagedStaticImportBehavior::Reject,
+    ] {
+        let (resolved, plan, runtime, trace) = test_plan();
+        {
+            let mut trace = trace.lock().unwrap();
+            trace.static_weight_import_enabled = true;
+            trace.managed_static_import = behavior;
+        }
+        let host = host_without_staging();
+        let mut failure = committed_transaction(&plan, runtime, "managed-reject")
+            .initialize_static_managed(
+                &resolved.parts().prepared_family,
+                &plan,
+                &ZeroWeightSource,
+                &host,
+                StaticInitializationPolicy::new(8, 2).unwrap(),
+            )
+            .err()
+            .expect("managed initialization must fail closed");
+        assert!(!failure.is_indeterminate());
+        assert!(!failure.is_retired());
+        failure.retire_in_place().unwrap();
+        assert!(failure.is_retired());
+        let trace = trace.lock().unwrap();
+        assert_eq!(trace.static_weight_import_begin_calls, 0);
+        assert_eq!(trace.static_weight_import_seal_calls, 0);
+        assert!(trace.uploaded_payloads.is_empty());
+        assert_eq!(trace.submit_calls, 0);
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    }
+}
+
 #[test]
 fn fence_wait_panic_requires_stream_recovery_before_retry() {
     let (resolved, plan, runtime, trace) = test_plan();

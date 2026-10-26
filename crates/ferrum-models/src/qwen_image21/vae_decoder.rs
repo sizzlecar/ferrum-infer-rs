@@ -32,6 +32,7 @@ impl QwenImage21VaeDecoderFamily {
     pub const FAMILY_ID: &'static str = "family.qwen_image21.vae.decoder";
     pub const REFERENCE_PROFILE_ID: &'static str = "qwen_image21.vae.decoder.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen_image21.vae.decoder.cuda.bf16_f32.v1";
+    pub const METAL_PROFILE_ID: &'static str = "qwen_image21.vae.decoder.metal.bf16_f32.v1";
     pub const INPUT_ID: &'static str = "value.qwen_image21.vae.decoder.denormalized_latent";
     pub const OUTPUT_ID: &'static str = "value.qwen_image21.vae.decoder.decoder.conv_out";
     pub fn new() -> Result<Self, VNextError> {
@@ -112,21 +113,25 @@ impl ModelFamilyProvider for QwenImage21VaeDecoderFamily {
             .into_keys()
             .map(|id| (id, ElementType::Bf16))
             .collect::<BTreeMap<_, _>>();
-        let profiles = [Self::REFERENCE_PROFILE_ID, Self::CUDA_PROFILE_ID]
-            .into_iter()
-            .map(|id| {
-                Ok(NumericalExecutionProfile {
-                    id: NumericalProfileId::new(id).map_err(|e| invalid("profile", e))?,
-                    family_id: self.id.clone(),
-                    version: ContractVersion::new(1, 0),
-                    primary_activation: ProgramValueId::new(Self::OUTPUT_ID)?,
-                    boundaries: boundaries.clone(),
-                    operations: operations.clone(),
-                    kv_storage: vec![],
-                    states: vec![],
-                })
+        let profiles = [
+            Self::REFERENCE_PROFILE_ID,
+            Self::CUDA_PROFILE_ID,
+            Self::METAL_PROFILE_ID,
+        ]
+        .into_iter()
+        .map(|id| {
+            Ok(NumericalExecutionProfile {
+                id: NumericalProfileId::new(id).map_err(|e| invalid("profile", e))?,
+                family_id: self.id.clone(),
+                version: ContractVersion::new(1, 0),
+                primary_activation: ProgramValueId::new(Self::OUTPUT_ID)?,
+                boundaries: boundaries.clone(),
+                operations: operations.clone(),
+                kv_storage: vec![],
+                states: vec![],
             })
-            .collect::<Result<Vec<_>, VNextError>>()?;
+        })
+        .collect::<Result<Vec<_>, VNextError>>()?;
         FamilyNumericalProfiles::new(
             &self.id,
             ContractVersion::new(1, 0),

@@ -1,5 +1,7 @@
 use super::*;
-pub(super) struct Family;
+pub(super) struct Family {
+    pub(super) profile: &'static str,
+}
 impl ModelFamilyProvider for Family {
     type Config = Shape;
     fn family_id(&self) -> &ModelFamilyId {
@@ -65,7 +67,7 @@ impl ModelFamilyProvider for Family {
         }))
     }
     fn numerical_profiles(&self, _: &Shape) -> Result<FamilyNumericalProfiles, VNextError> {
-        let profile = id::<NumericalProfileId>(PROFILE);
+        let profile = id::<NumericalProfileId>(self.profile);
         FamilyNumericalProfiles::new(
             self.family_id(),
             ContractVersion::new(1, 0),
@@ -127,7 +129,10 @@ impl ModelFamilyProvider for Family {
     }
 }
 pub(super) fn prepare(shape: &Shape) -> PreparedModelFamily {
-    TypedFamilyRegistration::new(Family)
-        .prepare_with_profile(&serde_json::to_value(shape).unwrap(), &id(PROFILE))
+    prepare_with_profile(shape, PROFILE)
+}
+pub(super) fn prepare_with_profile(shape: &Shape, profile: &'static str) -> PreparedModelFamily {
+    TypedFamilyRegistration::new(Family { profile })
+        .prepare_with_profile(&serde_json::to_value(shape).unwrap(), &id(profile))
         .unwrap()
 }

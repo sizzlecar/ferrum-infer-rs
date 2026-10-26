@@ -242,6 +242,95 @@ fn real_qwen_adapter_exposes_configured_capacity_and_delegates_b2_preflight() {
 }
 
 #[tokio::test]
+async fn real_plan_capacity_error_retains_stage_source_and_run_serve_diagnostics() {
+    let (mut pipeline, _sources) = pipeline(1);
+    // Force the real text plan to exceed its policy before the deliberately
+    // absent Reference Philox provider is reached. No fabricated error is used.
+    let available = 1;
+    pipeline.config.device_capacity_bytes = available;
+    pipeline.policy = TensorComponentPolicy::new(
+        available,
+        pipeline
+            .runtime
+            .descriptor()
+            .dynamic_storage_profiles
+            .iter()
+            .copied()
+            .collect(),
+    )
+    .unwrap();
+    let runtime = pipeline.runtime.clone();
+    let host = pipeline.host.clone();
+    let before = runtime.snapshot();
+    let request = two_requests().remove(0);
+    let error = pipeline
+        .generate_batch(vec![request.clone()])
+        .err()
+        .expect("the real text plan must exceed its capacity");
+    let ImageGenerationFailure::Preflight(source) = &error.failure else {
+        panic!("capacity failure must remain an owner-free preflight rejection")
+    };
+    let Some(VNextError::PlanCapacityExceeded {
+        required_bytes,
+        usable_capacity_bytes,
+    }) = source.downcast_ref::<VNextError>()
+    else {
+        panic!("stage context must retain the original typed capacity error")
+    };
+    assert!(*required_bytes > *usable_capacity_bytes);
+    assert_eq!(*usable_capacity_bytes, available);
+    let required = *required_bytes;
+    // ImageProductError::Generation uses this Display for `ferrum run`.
+    let run_message = error.to_string();
+    for detail in [
+        "TextEncoder".to_owned(),
+        "WholeStage".to_owned(),
+        "batch 1".to_owned(),
+        format!("requires {required} bytes"),
+        format!("usable capacity {available}"),
+    ] {
+        assert!(run_message.contains(&detail), "{run_message}");
+    }
+    assert!(error.completed_stages.is_empty());
+    assert!(error.completed_steps.is_empty());
+    drop(error);
+    assert!(!pipeline.is_stopped());
+
+    let service = ImageService::new(
+        pipeline,
+        ImageServiceConfig {
+            maximum_pending: 2,
+            maximum_prompt_bytes: 4096,
+            max_num_seqs: 1,
+            request_batch_max_wait_ms: 0,
+        },
+    )
+    .unwrap();
+    let served = service
+        .try_submit(request)
+        .unwrap()
+        .wait()
+        .await
+        .err()
+        .expect("serving must expose the same real capacity rejection");
+    // The existing HTTP handler forwards this message for Generation errors;
+    // its status and routing policy remain unchanged.
+    assert_eq!(served.kind(), ImageServiceErrorKind::Generation);
+    assert_eq!(served.to_string(), run_message);
+    assert!(service.is_accepting());
+    assert_eq!(service.snapshot().active_requests, 0);
+    assert_eq!(service.snapshot().pending_requests, 0);
+    let retired = service.shutdown().await.unwrap();
+    assert!(!retired.has_failure());
+    drop(retired);
+    let after = runtime.snapshot();
+    assert_eq!(after.allocations, before.allocations);
+    assert_eq!(after.submissions, before.submissions);
+    assert_eq!(after.uploaded_bytes, before.uploaded_bytes);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[tokio::test]
 async fn real_qwen_service_rejects_excess_capacity_and_preserves_default_one() {
     let (mut single, _single_sources) = pipeline(1);
     assert_eq!(

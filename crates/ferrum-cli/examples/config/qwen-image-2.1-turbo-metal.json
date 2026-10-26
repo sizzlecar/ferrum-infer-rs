@@ -1,0 +1,88 @@
+{
+  "model": "qwen-image-turbo-metal",
+  "execution_profile": "experimental_serial_cold",
+  "metadata": {
+    "model_index": "models/Qwen-Image-2.1-Turbo/model_index.json",
+    "text_encoder": "models/Qwen-Image-2.1-Turbo/text_encoder/config.json",
+    "transformer": "models/Qwen-Image-2.1-Turbo/transformer/config.json",
+    "vae": "models/Qwen-Image-2.1-Turbo/vae/config.json",
+    "scheduler": "models/Qwen-Image-2.1-Turbo/scheduler/scheduler_config.json",
+    "tokenizer": "models/Qwen-Image-2.1-Turbo/processor/tokenizer.json",
+    "tokenizer_config": "models/Qwen-Image-2.1-Turbo/processor/tokenizer_config.json",
+    "chat_template": "models/Qwen-Image-2.1-Turbo/processor/chat_template.jinja",
+    "processor": "models/Qwen-Image-2.1-Turbo/processor/processor_config.json"
+  },
+  "weights": {
+    "text_encoder": {
+      "kind": "single",
+      "directory": "models/Qwen-Image-2.1-Turbo/text_encoder",
+      "file": "model.safetensors",
+      "read_ahead": {
+        "will_need": {
+          "maximum_range_bytes": 134217728
+        }
+      }
+    },
+    "transformer": {
+      "kind": "gguf",
+      "directory": "models/Qwen-Image-2.1-Turbo-GGUF",
+      "file": "qwen-image-2.1-turbo-Q4_K_M.gguf"
+    },
+    "vae": {
+      "kind": "single",
+      "directory": "models/Qwen-Image-2.1-Turbo/vae",
+      "file": "diffusion_pytorch_model.safetensors"
+    }
+  },
+  "backend": {
+    "kind": "metal",
+    "attention_policy": "fused_dense",
+    "memory": {
+      "kind": "auto_recommended",
+      "utilization": 0.9
+    },
+    "precision_policy": {
+      "components": {
+        "text_encoder": "fp8_linear_experimental_v1",
+        "denoiser": "native_source"
+      }
+    },
+    "bootstrap_memory_bytes": 134217728,
+    "stream_memory_bytes": 2097152,
+    "maximum_streams": "auto",
+    "maximum_in_flight_per_stream": 1,
+    "maximum_commands_per_submission": 2048,
+    "opaque_memory_profile": "metal.image.declared-runtime-v1",
+    "host": {
+      "total_bytes": 2147483648,
+      "input_preprocess_bytes": 1073741824,
+      "output_bytes": 268435456,
+      "transfer_staging_bytes": 0,
+      "weight_backing_bytes": 134217728
+    },
+    "pipeline": {
+      "maximum_user_tokens": 1024,
+      "maximum_width": 1024,
+      "maximum_height": 1024,
+      "maximum_batch_size": 1,
+      "decoder_batch_policy": "single_image",
+      "residency": "cold",
+      "edit_prefix_policy": "request_cache",
+      "dynamic_residency": "release",
+      "maximum_staging_bytes": 16777216,
+      "maximum_initialization_commands": 64,
+      "maximum_backing_maintenance_passes": 8
+    }
+  },
+  "serving": {
+    "maximum_pending": 4,
+    "maximum_prompt_bytes": 65536,
+    "max_num_seqs": 1,
+    "request_batch_max_wait_ms": 0,
+    "default_width": 512,
+    "default_height": 512,
+    "default_seed": 42,
+    "rgba_scratch_bytes": 16384,
+    "output": {}
+  }
+}

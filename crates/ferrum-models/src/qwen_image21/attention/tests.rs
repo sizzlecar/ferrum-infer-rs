@@ -30,7 +30,13 @@ fn attention_family_reuses_frontend_and_preserves_all_nine_bf16_boundaries() {
         );
         assert_eq!(
             nodes[7].operation_id.as_str(),
-            STRUCTURED_ATTENTION_BF16_OPERATION_ID
+            match profile.id.as_str() {
+                QwenImage21Block0AttentionFamily::METAL_FUSED_PROFILE_ID
+                | QwenImage21Block0AttentionFamily::CUDA_FUSED_PROFILE_ID => {
+                    STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID
+                }
+                _ => STRUCTURED_ATTENTION_BF16_OPERATION_ID,
+            }
         );
         assert_eq!(
             nodes[8].operation_id.as_str(),

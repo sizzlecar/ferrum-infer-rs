@@ -32,6 +32,11 @@ impl Qwen3VLTextEncoderFamily {
     pub const FAMILY_ID: &'static str = "family.qwen3_vl.text_encoder";
     pub const REFERENCE_PROFILE_ID: &'static str = "qwen3vl.text.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen3vl.text.cuda.bf16_f32.v1";
+    pub const METAL_PROFILE_ID: &'static str = "qwen3vl.text.metal.bf16_f32.v1";
+    pub const METAL_FP8_PROFILE_ID: &'static str = "qwen3vl.text.metal.fp8_linear.experimental.v1";
+    pub fn is_fp8_profile(name: &str) -> bool {
+        matches!(name, Self::CUDA_FP8_PROFILE_ID | Self::METAL_FP8_PROFILE_ID)
+    }
     pub const CUDA_FP8_PROFILE_ID: &'static str = "qwen3vl.text.cuda.fp8_linear.experimental.v1";
     pub const EMBEDDINGS_ID: &'static str = "value.qwen3_vl.text.embeddings";
     pub const COSINE_ID: &'static str = "value.qwen3_vl.text.cosine";
@@ -167,7 +172,7 @@ impl ModelFamilyProvider for Qwen3VLTextEncoderFamily {
                 boundaries: boundaries.clone(),
                 states: vec![],
                 kv_storage: vec![],
-                operations: if name == Self::CUDA_FP8_PROFILE_ID {
+                operations: if Self::is_fp8_profile(name) {
                     operations
                         .iter()
                         .filter(|op| op.operation_id.as_str() != DENSE_LINEAR_BF16_OPERATION_ID)
@@ -185,7 +190,9 @@ impl ModelFamilyProvider for Qwen3VLTextEncoderFamily {
             vec![
                 profile(Self::REFERENCE_PROFILE_ID)?,
                 profile(Self::CUDA_PROFILE_ID)?,
+                profile(Self::METAL_PROFILE_ID)?,
                 profile(Self::CUDA_FP8_PROFILE_ID)?,
+                profile(Self::METAL_FP8_PROFILE_ID)?,
             ],
             vec![NumericalProfileId::new(Self::REFERENCE_PROFILE_ID)
                 .map_err(|e| invalid("profile", e))?],
@@ -203,7 +210,7 @@ impl ModelFamilyProvider for Qwen3VLTextEncoderFamily {
             ));
         }
         let program = program::build(config, &self.id)?;
-        if profile.id.as_str() == Self::CUDA_FP8_PROFILE_ID {
+        if Self::is_fp8_profile(profile.id.as_str()) {
             crate::fp8_linear::select(program, &Self::fp8_weight_groups(config)?)
         } else {
             Ok(program)

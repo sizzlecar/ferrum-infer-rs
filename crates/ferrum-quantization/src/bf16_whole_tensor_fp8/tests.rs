@@ -4,8 +4,12 @@ use half::bf16;
 use safetensors::tensor::{serialize_to_file, TensorView};
 use safetensors::Dtype;
 
+#[path = "amax_tests.rs"]
+mod amax_tests;
 #[path = "host_cache_tests.rs"]
 mod host_cache_tests;
+#[path = "lookup_tests.rs"]
+mod lookup_tests;
 
 fn id<T: TryFrom<String>>(value: impl Into<String>) -> T
 where
@@ -372,6 +376,68 @@ fn schema_preserves_three_dense_nodes_with_distinct_scales_and_untouched_bf16() 
         element_type: ElementType::F16,
     };
     assert!(plan::prepare_program(&wrong, &program, &groups).is_err());
+}
+
+#[test]
+fn lookup_preflight_charges_each_aligned_allocation_without_changing_weight_bytes() {
+    let (mut original, program, groups) = fixture(DENSE_LINEAR_FP8_BF16_OPERATION_ID);
+    let columns = lookup::MINIMUM_PACKED_ELEMENTS / 3;
+    for component in &mut original.components {
+        component.dimensions = vec![1, columns];
+    }
+    for tensor in &mut original.tensors {
+        tensor.dimensions = vec![1, columns];
+    }
+    let mut weights = program.weights().to_vec();
+    for weight in &mut weights {
+        weight.tensor.dimensions = vec![1, columns];
+    }
+    let mut blocks = program.blocks().to_vec();
+    for node in &mut blocks[0].nodes {
+        node.attributes
+            .insert(id("in_features"), SemanticValue::Unsigned(columns));
+    }
+    let program = ModelProgram::new(
+        program.family_id().clone(),
+        program.inputs().to_vec(),
+        blocks,
+        program.states().to_vec(),
+        weights,
+        program.outputs().to_vec(),
+    )
+    .unwrap();
+    let prepared = plan::prepare_program(&original, &program, &groups).unwrap();
+    let payload = 3 * columns + 3 * 4;
+    let temporary = lookup::MAGNITUDE_ENTRIES as u64;
+    assert_eq!(prepared.maximum_group_bytes, payload + temporary);
+    assert_eq!(prepared.converted_bytes, payload);
+    assert_eq!(
+        prepared.execution_weight_bytes().unwrap(),
+        payload + 2 * columns
+    );
+    for alignment in [1, 4096, 16384] {
+        let host =
+            HostMemoryAccount::with_allocation_alignment(account(1 << 20).limits(), alignment)
+                .unwrap();
+        let expected = host.backing_bytes(payload as usize).unwrap()
+            + host.backing_bytes(temporary as usize).unwrap();
+        assert_eq!(
+            prepared.maximum_group_accounted_bytes(&host).unwrap(),
+            expected as u64
+        );
+        if alignment > 1 {
+            assert!(expected > host.backing_bytes((payload + temporary) as usize).unwrap());
+        }
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    }
+    let (small, program, groups) = fixture(DENSE_LINEAR_FP8_BF16_OPERATION_ID);
+    let small = plan::prepare_program(&small, &program, &groups).unwrap();
+    let host =
+        HostMemoryAccount::with_allocation_alignment(account(1 << 20).limits(), 4096).unwrap();
+    assert_eq!(
+        small.maximum_group_accounted_bytes(&host).unwrap(),
+        host.backing_bytes(24).unwrap() as u64
+    );
 }
 
 #[test]

@@ -33,6 +33,12 @@ impl std::ops::Deref for WeightPayloadBytes<'_> {
 /// dropped.
 pub unsafe trait StableHostMemory: Send + Sync + 'static {
     fn stable_bytes(&self) -> &[u8];
+
+    /// The Host class retained by this owner, when it is an accounted allocation.
+    /// Immutable checkpoint mappings do not carry a Host allocation claim.
+    fn managed_memory_class(&self) -> Option<HostMemoryClass> {
+        None
+    }
 }
 
 /// An owned, bounds-checked subregion of stable host memory.
@@ -78,6 +84,11 @@ impl RetainedHostMemoryRegion {
     /// retained owner.
     pub fn owner_bytes(&self) -> &[u8] {
         self.owner.stable_bytes()
+    }
+
+    /// Retaining this region also retains this Host allocation's capacity.
+    pub fn managed_memory_class(&self) -> Option<HostMemoryClass> {
+        self.owner.managed_memory_class()
     }
 
     pub const fn offset_bytes(&self) -> usize {
@@ -357,7 +368,7 @@ impl<'source> WeightComponentPayload<'source> {
                 ),
             });
         }
-        let retained = RetainedHostMemoryRegion::new(Arc::new(bytes.clone()), 0, bytes.len())?;
+        let retained = bytes.retained_region()?;
         Ok(Self {
             component_id: component.id.clone(),
             external_names,
@@ -521,6 +532,10 @@ mod tests {
             .retained_host_memory()
             .unwrap()
             .clone();
+        assert_eq!(
+            retained.managed_memory_class(),
+            Some(HostMemoryClass::WeightBacking)
+        );
         drop(backing);
         drop(segments);
         assert_eq!(retained.bytes().as_ptr(), pointer);

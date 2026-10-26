@@ -18,6 +18,8 @@ const PARALLEL_DENSE_TRANSCODE_MIN_ELEMENTS: usize = 256 * 1024;
 
 mod standard;
 pub use standard::SafetensorsNaming;
+mod read_ahead;
+pub use read_ahead::SafetensorsReadAheadPolicy;
 
 #[derive(Debug, Clone)]
 struct TensorMeta {
@@ -46,6 +48,7 @@ unsafe impl StableHostMemory for SafetensorsShard {
 pub struct SafetensorsArchive {
     shards: Vec<Arc<SafetensorsShard>>,
     tensors: BTreeMap<String, TensorMeta>,
+    read_ahead: SafetensorsReadAheadPolicy,
 }
 
 pub struct SafetensorsTensor<'archive> {
@@ -89,6 +92,18 @@ impl<'archive> SafetensorsTensor<'archive> {
 }
 
 impl SafetensorsArchive {
+    /// Best-effort, bounded advice for borrowed component payloads only.
+    /// Metadata access and archive opening never request read-ahead.
+    pub fn with_read_ahead(mut self, policy: SafetensorsReadAheadPolicy) -> Result<Self> {
+        policy.validate()?;
+        self.read_ahead = policy;
+        Ok(self)
+    }
+
+    pub fn read_ahead_policy(&self) -> SafetensorsReadAheadPolicy {
+        self.read_ahead
+    }
+
     pub fn open(model_dir: impl AsRef<Path>) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         let shard_paths = discover_shards(model_dir)?;
@@ -182,7 +197,11 @@ impl SafetensorsArchive {
                 "safetensors archive contains no tensors",
             ));
         }
-        Ok(Self { shards, tensors })
+        Ok(Self {
+            shards,
+            tensors,
+            read_ahead: SafetensorsReadAheadPolicy::Off,
+        })
     }
 
     pub fn tensor(&self, external_name: &str) -> Result<SafetensorsTensor<'_>> {
@@ -401,7 +420,22 @@ impl WeightComponentSource for SafetensorsArchive {
             bytes,
         )?;
         match retained_host_memory {
-            Some(retained_host_memory) => payload.with_retained_host_memory(retained_host_memory),
+            Some(retained_host_memory) => {
+                let payload = payload.with_retained_host_memory(retained_host_memory)?;
+                // Only advise after the exact source/shape/encoding and retained
+                // range have passed validation. This remains part of ordinary
+                // source materialization timing and never changes its payload.
+                if self.read_ahead != SafetensorsReadAheadPolicy::Off {
+                    let meta = &self.tensors[external_name];
+                    self.read_ahead.apply(
+                        &self.shards[meta.shard].mmap,
+                        meta.data_start,
+                        meta.data_end,
+                        external_name,
+                    );
+                }
+                Ok(payload)
+            }
             None => Ok(payload),
         }
     }

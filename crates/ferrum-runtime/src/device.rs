@@ -16,6 +16,8 @@ pub use immutable_metadata::{
 };
 mod program_binding_upload;
 pub use program_binding_upload::DeviceProgramBindingUploadSnapshot;
+mod native_memory;
+pub use native_memory::{DeviceNativeMemoryScope, DeviceNativeMemorySnapshot};
 mod resident_program;
 mod tensor_state_copy;
 mod terminal_readback;
@@ -3929,6 +3931,23 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         None
     }
 
+    /// Optional static import for callers which require managed transfers.
+    ///
+    /// An implementation must not allocate hidden temporary host staging. It
+    /// may retain source backing or fill the exact admitted destination; all
+    /// native owners must obey the static import transaction's lifetime and
+    /// quiescence contract. Source/materializer backing remains outside the
+    /// transfer-staging budget, just as for bounded managed uploads.
+    /// `None` selects bounded managed upload, never raw-byte upload. The
+    /// ordinary import hook is deliberately not used as an implicit fallback.
+    fn begin_managed_static_weight_import(
+        &self,
+    ) -> Option<
+        Result<Box<dyn StaticWeightImportSession<Self::Buffer, Self::Error> + '_>, Self::Error>,
+    > {
+        None
+    }
+
     /// Encode a required source-to-execution static weight transform.
     ///
     /// `None` means this runtime does not implement the exact transform. Core
@@ -4073,6 +4092,14 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     /// Successful copies mean the host CUDA API returned success, not that a
     /// GPU fence completed. Unsupported backends retain the default `None`.
     fn program_binding_upload_snapshot(&self) -> Option<DeviceProgramBindingUploadSnapshot> {
+        None
+    }
+
+    /// Samples native resource allocation without synchronizing device work,
+    /// reserving capacity, or granting resource-release authority. Backends
+    /// must identify the metric and scope and keep observed peaks distinct
+    /// from plan budgets, process RSS and physical device residency.
+    fn native_memory_snapshot(&self) -> Option<DeviceNativeMemorySnapshot> {
         None
     }
 

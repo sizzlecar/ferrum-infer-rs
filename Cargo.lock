@@ -1501,6 +1501,7 @@ dependencies = [
  "block",
  "candle-core",
  "cudarc 0.19.4",
+ "ferrum-execution",
  "ferrum-interfaces",
  "ferrum-native-ops",
  "ferrum-runtime",
@@ -1587,6 +1588,7 @@ dependencies = [
  "tokio-test",
  "toml 0.8.23",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1642,6 +1644,7 @@ dependencies = [
  "ferrum-runtime",
  "ferrum-types",
  "half",
+ "libc",
  "memmap2",
  "safetensors 0.4.5",
  "serde",

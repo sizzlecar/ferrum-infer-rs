@@ -5,6 +5,8 @@ mod batch_order;
 mod decoder;
 mod directory;
 mod fixture;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod metal;
 mod ownership;
 mod plan_cache;
 mod prefix;

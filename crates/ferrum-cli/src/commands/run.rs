@@ -825,8 +825,9 @@ pub struct RunCommand {
     /// Fraction of currently available device memory used by native startup
     /// planning (default: 0.9). Legacy CUDA models use this fraction of total
     /// GPU memory for their KV pool estimate.
-    /// Local image pipelines use min(observed free, total * fraction) as a
-    /// conservative total ceiling including declared native overhead.
+    /// CUDA image pipelines use min(observed free, total * fraction). Metal
+    /// image pipelines use the recommended working set, bounded by its remaining
+    /// process allowance. Both ceilings include declared native overhead.
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 

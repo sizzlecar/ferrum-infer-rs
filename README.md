@@ -59,7 +59,43 @@ Defaults adapt execution and capacity to capabilities, hardware and memory; expl
 
 ## Image generation and editing
 
-Use a complete local copy of [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo). Validated on RTX 5090 with Linux CUDA 12.8, cuDNN 9, FP8 text encoder/DiT and BF16 vision/VAE.
+CUDA uses a complete local copy of [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo). Validated on RTX 5090 with Linux CUDA 12.8, cuDNN 9, FP8 text encoder/DiT and BF16 vision/VAE.
+
+Metal image support is being validated for the next release. On an M4 Mac mini with 16 GiB unified memory, 1024×1024 generation and editing have completed with a Q4_K_M GGUF DiT, FP8 text encoder and BF16 vision/VAE. This combination uses an explicit `--image-config` for the Metal backend, model assets and memory limits. The tested 16 GiB configuration has not completed 2K generation; throughput qualification remains in progress.
+
+**Metal configuration:** copy [qwen-image-2.1-turbo-metal.json](crates/ferrum-cli/examples/config/qwen-image-2.1-turbo-metal.json) to `image-metal.json` beside your `models/` directory. Place the original model's text encoder, VAE and metadata under `models/Qwen-Image-2.1-Turbo/`, and [the Q4_K_M DiT](https://huggingface.co/m9ter1a/Qwen-Image-2.1-Turbo-GGUF/blob/a94df596a422bc8dfe406655154c0364f79ba042/qwen-image-2.1-turbo-Q4_K_M.gguf) under `models/Qwen-Image-2.1-Turbo-GGUF/`. Alternatively, edit the JSON paths; relative paths resolve from the JSON file's directory. The example keeps one active image, cold component residency, request-scoped edit caching, a 2 GiB Host budget and 90% of Metal's recommended working set, subject to capacity checks. It does not need the original BF16 DiT weights.
+
+The preset enables fused attention and text-encoder weight prefetch in ranges of up to 128 MiB; set `backend.attention_policy` to `reference` to use the original attention path.
+
+<details>
+<summary>If the model snapshot omits transformer/config.json</summary>
+
+Save this matching Qwen-Image-2.1-Turbo architecture as `models/Qwen-Image-2.1-Turbo/transformer/config.json`; keep an existing matching file:
+
+```json
+{
+  "_class_name": "QwenImage21Transformer2DModel",
+  "_diffusers_version": "0.41.0.dev0",
+  "attention_head_dim": 128, "axes_dims_rope": [16, 56, 56],
+  "causal_condition": true, "context_in_dim": 4096, "eps": 0.000001,
+  "in_channels": 64, "mlp_ratio": 3, "num_attention_heads": 32,
+  "num_layers": 32, "out_channels": 64, "patch_size": 1
+}
+```
+
+</details>
+
+```sh
+ferrum run --image-config image-metal.json \
+  --prompt "A red ceramic mug on a white table" --width 1024 --height 1024 --seed 42 --output mug.png
+ferrum run --image-config image-metal.json --image mug.png \
+  --prompt "Make the mug blue" --width 1024 --height 1024 --seed 43 --output edited.png
+ferrum serve --image-config image-metal.json --host 127.0.0.1 --port 8000
+```
+
+The API model name is `qwen-image-turbo-metal`. Set precision in this JSON; do not combine `--image-config` with a positional model or `--image-precision`.
+
+CUDA examples:
 
 ~~~sh
 ferrum run /path/to/Qwen-Image-2.1-Turbo \
@@ -98,7 +134,7 @@ Both implementations met the declared P99 limits: 20 / 5 / 30 / 30 seconds, in r
 | Text architectures | Llama, Mistral, Qwen2, Qwen3 dense/MoE, Qwen3.5 hybrid dense/MoE, Gemma 3 text |
 | Weights | GGUF, including Q4_K/Q5_K/Q6_K/Q8_0; SafeTensors. Selected CUDA paths: GPTQ INT4, compressed-tensors INT4, block-FP8 |
 | Specific paths | Gemma 4 compressed-tensors W4A16 and GPT-OSS MXFP4: CUDA. PQ2_0: complete-model validation on Metal; CUDA operator coverage only |
-| Images | Qwen-Image-2.1-Turbo generation and single-PNG editing; validated on Linux CUDA SM120 |
+| Images | Qwen-Image-2.1-Turbo generation and single-PNG editing; validated on Linux CUDA SM120. Upcoming Metal support: 1024×1024 validated on M4 16 GiB with the precision/configuration above |
 
 Support varies by combination; CPU is a compatibility backend. See [validation scope](docs/release-regression-catalog.md).
 

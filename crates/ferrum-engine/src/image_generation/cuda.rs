@@ -6,10 +6,18 @@
 //! cuDNN retains its separately admitted opaque owner inside that same runtime.
 //! Opaque allowances are declarations, not measured memory qualification.
 
+#[cfg(test)]
+use super::composition::component_command_count;
+use super::composition::{
+    prefix_command_families, validate_family_command_limits, validate_prefix_command_limit,
+};
+#[cfg(test)]
+use super::ImagePipelineConfig;
+pub use super::ImagePipelineLimits as ImageCudaPipelineLimits;
 use super::{
-    ImageCudaAttentionPolicy, ImageCudaPrecisionPolicy, ImageFp8HostCachePolicy,
-    ImagePipelineConfig, ImageStreamLimit, ImageStreamPlan, ImageStreamRequirements,
-    QwenImage21Assets, QwenImage21Pipeline, QwenImage21Profiles,
+    ImageCudaAttentionPolicy, ImageCudaPrecisionPolicy, ImageFp8HostCachePolicy, ImageStreamLimit,
+    ImageStreamPlan, ImageStreamRequirements, QwenImage21Assets, QwenImage21Pipeline,
+    QwenImage21Profiles,
 };
 use anyhow::{ensure, Context, Result};
 use ferrum_diffusion::Bf16EulerProfile;
@@ -21,12 +29,9 @@ use ferrum_kernels::backend::cuda::{
 };
 use ferrum_models::normal_noise::{NormalNoiseConfig, NormalNoiseFamily};
 use ferrum_models::qwen3_vl_text::{
-    Qwen3VLTextConfig, Qwen3VLTextEncoderFamily, Qwen3VLTextImageSpan, Qwen3VLTextKeyRun,
-    Qwen3VLTextLayout,
+    Qwen3VLTextConfig, Qwen3VLTextEncoderFamily, Qwen3VLTextKeyRun, Qwen3VLTextLayout,
 };
-use ferrum_models::qwen3_vl_vision::{
-    Qwen3VLVisionArchitecture, Qwen3VLVisionConfig, Qwen3VLVisionFamily, Qwen3VLVisionGrid,
-};
+use ferrum_models::qwen3_vl_vision::{Qwen3VLVisionArchitecture, Qwen3VLVisionFamily};
 use ferrum_models::qwen_image21::{
     QwenImage21T2iLayout, QwenImage21TransformerConfig, QwenImage21TransformerFamily,
     QwenImage21VaeDecoderFamily, QwenImage21VaeEncoderConfig, QwenImage21VaeEncoderFamily,
@@ -43,58 +48,6 @@ pub enum ImageCudaMemoryPolicy {
         utilization: CudaMemoryUtilization,
         maximum_bytes: Option<NonZeroU64>,
     },
-}
-
-/// Request limits without an independent device budget. The factory supplies
-/// the actual runtime ceiling to every component plan after context creation.
-#[derive(Debug, Clone)]
-pub struct ImageCudaPipelineLimits {
-    pub maximum_user_tokens: usize,
-    pub maximum_width: u32,
-    pub maximum_height: u32,
-    pub maximum_batch_size: usize,
-    pub decoder_batch_policy: super::ImageDecoderBatchPolicy,
-    pub edit_prefix_policy: super::ImageEditPrefixPolicy,
-    pub plan_cache: super::ImagePlanCachePolicy,
-    pub residency: super::ImageResidencyPolicy,
-    pub dynamic_residency: super::ImageDynamicResidencyPolicy,
-    pub static_initialization: StaticInitializationPolicy,
-    pub executor: ferrum_execution::TensorExecutorConfig,
-}
-impl ImageCudaPipelineLimits {
-    pub fn validate(&self) -> Result<()> {
-        self.plan_cache.validate()?;
-        self.dynamic_residency.validate(self.residency)?;
-        ensure!(
-            self.maximum_width > 0 && self.maximum_height > 0,
-            "image dimension limits must be positive"
-        );
-        ensure!(
-            (1..=8192).contains(&self.maximum_user_tokens),
-            "user-token limit must be 1..=8192"
-        );
-        ensure!(
-            (1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&self.maximum_batch_size),
-            "image maximum_batch_size exceeds supported attention capacity"
-        );
-        Ok(())
-    }
-    pub fn with_device_capacity(self, capacity: NonZeroU64) -> ImagePipelineConfig {
-        ImagePipelineConfig {
-            device_capacity_bytes: capacity.get(),
-            maximum_user_tokens: self.maximum_user_tokens,
-            maximum_width: self.maximum_width,
-            maximum_height: self.maximum_height,
-            maximum_batch_size: self.maximum_batch_size,
-            decoder_batch_policy: self.decoder_batch_policy,
-            edit_prefix_policy: self.edit_prefix_policy,
-            plan_cache: self.plan_cache,
-            residency: self.residency,
-            dynamic_residency: self.dynamic_residency,
-            static_initialization: self.static_initialization,
-            executor: self.executor,
-        }
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -513,12 +466,11 @@ impl QwenImage21CudaConfig {
             )?);
             if self.pipeline.edit_prefix_policy == super::ImageEditPrefixPolicy::RequestCache {
                 let (prefix, copies) = prefix_command_families(&dit, profiles)?;
-                let prefill_commands = component_command_count(&prefix[0])?
-                    .checked_add(copies)
-                    .context("prefix D2D command count overflows")?;
-                ensure!(prefill_commands <= self.maximum_commands_per_submission,
-                    "prefix prefill requires {prefill_commands} compute/upload/state-copy commands, exceeding configured {}",
-                    self.maximum_commands_per_submission);
+                validate_prefix_command_limit(
+                    &prefix[0],
+                    copies,
+                    self.maximum_commands_per_submission,
+                )?;
                 families.extend(prefix);
             }
         }
@@ -575,55 +527,6 @@ impl QwenImage21CudaConfig {
     }
 }
 
-fn component_command_count(family: &PreparedModelFamily) -> Result<usize> {
-    family
-        .program()
-        .blocks()
-        .iter()
-        .try_fold(family.program().inputs().len(), |n, block| {
-            n.checked_add(block.nodes.len())
-        })
-        .context("component command count overflows")
-}
-
-fn prefix_command_families(
-    dit: &QwenImage21TransformerConfig,
-    profiles: &QwenImage21Profiles,
-) -> Result<([PreparedModelFamily; 2], usize)> {
-    use ferrum_models::qwen_image21::QwenImage21TransformerPhase;
-    let config = QwenImage21TransformerConfig::new(
-        dit.transformer().clone(),
-        QwenImage21T2iLayout::new(3, 2, 2, vec![3])?,
-    )?
-    .with_weight_encodings(dit.weight_encodings().clone())?
-    .with_reference_image(1, 1, 2, 2)?;
-    let copies = config.prefix_cache_ports()?.len();
-    let family = TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?);
-    let prefill = config
-        .clone()
-        .with_execution_phase(QwenImage21TransformerPhase::PrefixPrefill)?;
-    let decode = config.with_execution_phase(QwenImage21TransformerPhase::PrefixDecode)?;
-    Ok((
-        [
-            family.prepare_with_profile(&serde_json::to_value(prefill)?, &profiles.denoiser)?,
-            family.prepare_with_profile(&serde_json::to_value(decode)?, &profiles.denoiser)?,
-        ],
-        copies,
-    ))
-}
-
-fn validate_family_command_limits(families: &[PreparedModelFamily], maximum: usize) -> Result<()> {
-    for family in families {
-        let commands = component_command_count(family)?;
-        ensure!(commands <= maximum,
-            "{} requires at least {commands} compute/upload commands, exceeding configured {maximum}",
-            family.family_id());
-    }
-    Ok(())
-}
-
-/// Small metadata-only representatives of every additional editing topology.
-/// Tensor contents and request dimensions cannot reduce these command counts.
 fn editing_command_families(
     text: &Qwen3VLTextConfig,
     dit: &QwenImage21TransformerConfig,
@@ -631,36 +534,19 @@ fn editing_command_families(
     encoder: &QwenImage21VaeEncoderConfig,
     profiles: &QwenImage21Profiles,
 ) -> Result<[PreparedModelFamily; 4]> {
-    let merge = vision.merge_size();
-    let visual = Qwen3VLVisionConfig::new(
-        vision.clone(),
-        vec![Qwen3VLVisionGrid::new(1, merge, merge)?],
-    )?;
-    let text = text
-        .clone()
-        .with_image_spans(&[Qwen3VLTextImageSpan::new(0, merge, merge, merge)?])?;
-    let dit = QwenImage21TransformerConfig::new(
-        dit.transformer().clone(),
-        QwenImage21T2iLayout::new(3, 2, 2, vec![3])?,
-    )?
-    .with_weight_encodings(dit.weight_encodings().clone())?
-    .with_reference_image(1, 1, 2, 2)?;
-    Ok([
-        TypedFamilyRegistration::new(Qwen3VLVisionFamily::new()?).prepare_with_profile(
-            &serde_json::to_value(visual)?,
-            &NumericalProfileId::new(Qwen3VLVisionFamily::CUDA_PROFILE_ID)
+    super::composition::editing_command_families(
+        text,
+        dit,
+        vision,
+        encoder,
+        profiles,
+        &super::QwenImage21EditProfiles {
+            vision: NumericalProfileId::new(Qwen3VLVisionFamily::CUDA_PROFILE_ID)
                 .map_err(anyhow::Error::msg)?,
-        )?,
-        TypedFamilyRegistration::new(QwenImage21VaeEncoderFamily::new()?).prepare_with_profile(
-            &serde_json::to_value(encoder)?,
-            &NumericalProfileId::new(QwenImage21VaeEncoderFamily::CUDA_PROFILE_ID)
+            encoder: NumericalProfileId::new(QwenImage21VaeEncoderFamily::CUDA_PROFILE_ID)
                 .map_err(anyhow::Error::msg)?,
-        )?,
-        TypedFamilyRegistration::new(Qwen3VLTextEncoderFamily::new()?)
-            .prepare_with_profile(&serde_json::to_value(text)?, &profiles.text_encoder)?,
-        TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?)
-            .prepare_with_profile(&serde_json::to_value(dit)?, &profiles.denoiser)?,
-    ])
+        },
+    )
 }
 
 fn validate_profile(profile: &str, label: &str) -> Result<()> {

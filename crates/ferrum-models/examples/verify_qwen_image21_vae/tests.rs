@@ -125,6 +125,56 @@ fn explicit_domain_layout_backend_and_cudnn_budgets_are_required() {
     cuda[i + 1] = "relative.so".into();
     assert!(Arguments::parse(cuda).is_err());
 }
+
+#[test]
+fn metal_options_require_capacity_and_reject_overflow_or_foreign_budgets() {
+    let mut args = cli();
+    *args.last_mut().unwrap() = "metal".into();
+    assert!(Arguments::parse(args.clone()).is_err());
+    args.extend(["--metal-usable-memory-bytes", "2147483648"].map(OsString::from));
+    let parsed = Arguments::parse(args.clone()).unwrap().unwrap();
+    assert!(matches!(parsed.backend, backend::Backend::Metal(_)));
+    assert_eq!(parsed.staging_bytes(), 16 << 20);
+    assert!(parsed.cudnn.is_none());
+    for (flag, value) in [
+        ("--reference-memory-bytes", "2147483648"),
+        ("--cuda-device", "0"),
+        ("--cudnn-library", "/lib/cudnn"),
+        ("--metal-bootstrap-memory-bytes", "2147483648"),
+        ("--metal-stream-memory-bytes", "18446744073709551615"),
+        ("--metal-maximum-streams", "0"),
+        ("--metal-maximum-in-flight-per-stream", "0"),
+        ("--metal-maximum-commands-per-submission", "0"),
+        ("--metal-transfer-staging-bytes", "3"),
+    ] {
+        let mut invalid = args.clone();
+        invalid.extend([flag, value].map(OsString::from));
+        assert!(Arguments::parse(invalid).is_err(), "{flag}={value}");
+    }
+    let mut reference = cli();
+    reference.extend(["--metal-usable-memory-bytes", "2147483648"].map(OsString::from));
+    assert!(Arguments::parse(reference).is_err());
+}
+
+#[test]
+fn aligned_decoder_host_budget_charges_physical_backing_before_loading() {
+    let c = config(2, 2, 1, 2);
+    let budget = latent::Budget::new(&c, 2, 1024).unwrap();
+    let prototype = ferrum_runtime::HostMemoryAccount::with_allocation_alignment(
+        budget.account().unwrap().limits(),
+        64,
+    )
+    .unwrap();
+    let physical = [budget.input, budget.output, budget.staging]
+        .into_iter()
+        .map(|n| prototype.backing_bytes(n).unwrap())
+        .sum::<usize>();
+    assert!(physical > budget.total);
+    assert!(budget.aligned_limits(&prototype, physical - 1).is_err());
+    let limits = budget.aligned_limits(&prototype, physical).unwrap();
+    let account = ferrum_runtime::HostMemoryAccount::with_allocation_alignment(limits, 64).unwrap();
+    assert_eq!(account.limits().total_bytes(), physical);
+}
 #[test]
 fn packed_latent_is_unpatched_cross_batch_transpose_with_one_backing() {
     let c = config(2, 2, 1, 2);

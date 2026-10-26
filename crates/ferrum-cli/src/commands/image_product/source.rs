@@ -27,12 +27,22 @@ pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 impl WeightSource {
     pub fn open(&self) -> Result<Arc<dyn TensorArchive>> {
         match self {
-            Self::Single { directory, file } => Ok(Arc::new(SafetensorsArchive::open_single_file(
-                directory, file,
-            )?)),
-            Self::Index { directory, file } => Ok(Arc::new(SafetensorsArchive::open_with_index(
-                directory, file,
-            )?)),
+            Self::Single {
+                directory,
+                file,
+                read_ahead,
+            } => Ok(Arc::new(
+                SafetensorsArchive::open_single_file(directory, file)?
+                    .with_read_ahead(*read_ahead)?,
+            )),
+            Self::Index {
+                directory,
+                file,
+                read_ahead,
+            } => Ok(Arc::new(
+                SafetensorsArchive::open_with_index(directory, file)?
+                    .with_read_ahead(*read_ahead)?,
+            )),
             Self::Gguf { directory, file } => {
                 ensure!(
                     file.len() > ".gguf".len()
@@ -50,7 +60,7 @@ impl WeightSource {
 }
 
 impl ImageProductConfig {
-    /// All metadata is retained and validated before the caller creates CUDA.
+    /// All metadata is retained and validated before the caller creates a device runtime.
     /// Explicit archive filenames never fall back or discover another source.
     /// An explicit processor path enables editing validation; missing or
     /// incompatible editing assets never silently fall back to generation.

@@ -3,7 +3,7 @@ use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
-pub const USAGE: &str = "verify_qwen_image21_vae --model-root MODEL_ROOT --latent-file RAW_LITTLE_ENDIAN_BF16 --latent-layout packed|nchw --latent-domain normalized|denormalized --latent-height H --latent-width W --batch B --artifact-dir NEW_EXTERNAL_DIRECTORY --backend reference|cuda [--config VAE_CONFIG] [--index-file BASENAME | --weight-file BASENAME.safetensors] [--maximum-host-bytes N (268435456)] [--reference-memory-bytes N (2147483648)] [CUDA budgets] [--cudnn-library ABSOLUTE_PATH --cudnn-opaque-memory-bytes N --cudnn-workspace-bytes N --cudnn-memory-profile NAME]\nH/W are LATENT spatial dimensions. Packed is [B,H*W,C], not 2x2 patches. Output is raw BF16 NCHW RGBA plus per-sample interleaved RGBA8 and PNG (straight alpha retained; PNG rows limited to 65536 bytes). No denoising, numerical parity or throughput claim. Real 148-node decoder requires a CUDA command budget covering compute and input upload (use 256).";
+pub const USAGE: &str = "verify_qwen_image21_vae --model-root MODEL_ROOT --latent-file RAW_LITTLE_ENDIAN_BF16 --latent-layout packed|nchw --latent-domain normalized|denormalized --latent-height H --latent-width W --batch B --artifact-dir NEW_EXTERNAL_DIRECTORY --backend reference|cuda|metal [--config VAE_CONFIG] [--index-file BASENAME | --weight-file BASENAME.safetensors] [--maximum-host-bytes N (268435456)] [--reference-memory-bytes N (2147483648)] [CUDA budgets] [--cudnn-library ABSOLUTE_PATH --cudnn-opaque-memory-bytes N --cudnn-workspace-bytes N --cudnn-memory-profile NAME]\nH/W are LATENT spatial dimensions. Packed is [B,H*W,C], not 2x2 patches. Output is raw BF16 NCHW RGBA plus per-sample interleaved RGBA8 and PNG (straight alpha retained; PNG rows limited to 65536 bytes). No denoising, numerical parity or throughput claim. Real 148-node decoder requires a GPU command budget covering compute and input upload (use 256).";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -133,12 +133,12 @@ impl Arguments {
         let backend_name = values
             .get("--backend")
             .and_then(|v| v.to_str())
-            .context("choose --backend reference|cuda explicitly")?;
+            .context("choose --backend reference|cuda|metal explicitly")?;
+        ensure!(
+            !explicit_reference || backend_name == "reference",
+            "Reference budget applies only to Reference"
+        );
         let cudnn = if backend_name == "cuda" {
-            ensure!(
-                !explicit_reference,
-                "Reference budget applies only to Reference"
-            );
             let library: PathBuf = values
                 .remove("--cudnn-library")
                 .context("CUDA requires --cudnn-library")?
@@ -191,6 +191,7 @@ impl Arguments {
         match &self.backend {
             Backend::Reference => 65_536,
             Backend::Cuda(c) => c.transfer_staging_bytes,
+            Backend::Metal(c) => c.transfer_staging_bytes,
         }
     }
 }
@@ -201,7 +202,7 @@ fn text(values: &mut BTreeMap<String, OsString>, key: &str) -> Result<String> {
         .into_string()
         .map_err(|_| anyhow::anyhow!("{key} requires UTF-8"))
 }
-fn required_number<T: std::str::FromStr>(
+pub(super) fn required_number<T: std::str::FromStr>(
     values: &mut BTreeMap<String, OsString>,
     key: &str,
 ) -> Result<T> {
@@ -209,7 +210,7 @@ fn required_number<T: std::str::FromStr>(
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid {key}"))
 }
-fn number<T: std::str::FromStr>(
+pub(super) fn number<T: std::str::FromStr>(
     values: &mut BTreeMap<String, OsString>,
     key: &str,
     default: T,

@@ -13,8 +13,15 @@ use std::{
 pub const PRESET_NAME: &str = "experimental_bf16_cold_v1";
 const MIB: u64 = 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageBackendKind {
+    Cuda,
+    Metal,
+}
+
 #[derive(Debug, Clone)]
 pub struct DirectoryOptions {
+    pub backend: ImageBackendKind,
     pub utilization: f64,
     pub maximum_memory_bytes: Option<NonZeroU64>,
     pub maximum_batch_size: usize,
@@ -31,9 +38,15 @@ impl DirectoryOptions {
         gpu_devices: Option<&str>,
         cudnn_library: Option<PathBuf>,
     ) -> Result<Self> {
+        let backend = match backend {
+            "auto" if cfg!(all(feature = "metal", target_os = "macos")) => ImageBackendKind::Metal,
+            "auto" | "cuda" => ImageBackendKind::Cuda,
+            "metal" => ImageBackendKind::Metal,
+            _ => anyhow::bail!("image generation supports --backend auto, cuda or metal"),
+        };
         ensure!(
-            matches!(backend, "auto" | "cuda"),
-            "image generation currently supports --backend auto or cuda"
+            backend != ImageBackendKind::Metal || gpu_devices.is_none(),
+            "Metal uses the default Apple GPU; --gpu-devices is a CUDA ordinal option"
         );
         let ordinal = match gpu_devices {
             None => 0,
@@ -48,6 +61,7 @@ impl DirectoryOptions {
             }
         };
         let result = Self {
+            backend,
             utilization: f64::from(utilization),
             maximum_memory_bytes: maximum
                 .map(|v| u64::try_from(v.get()).map(|n| NonZeroU64::new(n).unwrap()))
@@ -63,9 +77,10 @@ impl DirectoryOptions {
     pub fn with_precision(
         mut self,
         precision: ferrum_engine::image_generation::ImageCudaPrecisionPolicy,
-    ) -> Self {
+    ) -> Result<Self> {
         self.precision = precision;
-        self
+        self.validate()?;
+        Ok(self)
     }
     pub const fn preset_name(&self) -> &'static str {
         match self.precision {
@@ -79,6 +94,12 @@ impl DirectoryOptions {
         }
     }
     pub fn validate(&self) -> Result<()> {
+        if self.backend == ImageBackendKind::Metal {
+            ensure!(
+                self.ordinal == 0 && self.cudnn_library.is_none(),
+                "Metal does not accept CUDA ordinals or cuDNN libraries"
+            );
+        }
         ensure!(
             self.utilization.is_finite() && self.utilization > 0.0 && self.utilization <= 1.0,
             "gpu-memory-utilization must be finite and in (0, 1]"
@@ -115,7 +136,11 @@ impl DirectoryOptions {
         HostConfig {
             total_bytes: 1024 * MIB as usize,
             input_preprocess_bytes: 768 * MIB as usize,
-            transfer_staging_bytes: 16 * MIB as usize,
+            transfer_staging_bytes: if self.backend == ImageBackendKind::Cuda {
+                16 * MIB as usize
+            } else {
+                0
+            },
             output_bytes: 256 * MIB as usize,
             weight_backing_bytes: if self.precision.uses_fp8() {
                 128 * MIB as usize
@@ -146,6 +171,10 @@ impl DirectoryOptions {
     pub fn cuda(&self) -> Result<ferrum_engine::image_generation::cuda::QwenImage21CudaConfig> {
         use ferrum_engine::image_generation::cuda::{ImageCudaMemoryPolicy, QwenImage21CudaConfig};
         self.validate()?;
+        ensure!(
+            self.backend == ImageBackendKind::Cuda,
+            "image backend is not CUDA"
+        );
         Ok(QwenImage21CudaConfig {
             ordinal: self.ordinal,
             memory: ImageCudaMemoryPolicy::AutoAvailable {
@@ -174,6 +203,32 @@ impl DirectoryOptions {
             host: self.host().limits()?,
             pipeline: self.pipeline().resolved_limits()?,
         })
+    }
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub fn metal(&self) -> Result<ferrum_engine::image_generation::metal::QwenImage21MetalConfig> {
+        use super::configuration::{MetalConfig, MetalMemoryConfig};
+        self.validate()?;
+        ensure!(
+            self.backend == ImageBackendKind::Metal,
+            "image backend is not Metal"
+        );
+        MetalConfig {
+            memory: MetalMemoryConfig::AutoRecommended {
+                utilization: self.utilization,
+                maximum_bytes: self.maximum_memory_bytes,
+            },
+            precision_policy: self.precision,
+            attention_policy: ferrum_engine::image_generation::ImageMetalAttentionPolicy::Reference,
+            bootstrap_memory_bytes: 128 * MIB,
+            stream_memory_bytes: 2 * MIB,
+            maximum_streams: ferrum_engine::image_generation::ImageStreamLimit::Auto,
+            maximum_in_flight_per_stream: 1,
+            maximum_commands_per_submission: 2048,
+            opaque_memory_profile: "metal.image.declared-runtime-v1".into(),
+            host: self.host(),
+            pipeline: self.pipeline(),
+        }
+        .resolved()
     }
 }
 
@@ -210,44 +265,40 @@ pub enum ImageProductSource {
     },
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 pub(super) struct PreparedProduct {
     pub model: String,
     pub profile: &'static str,
     pub serving: Option<ServingConfig>,
-    pub cuda: ferrum_engine::image_generation::cuda::QwenImage21CudaConfig,
+    pub backend: super::factory::PreparedBackend,
     pub assets: ferrum_engine::image_generation::QwenImage21Assets,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 impl ImageProductSource {
     pub(super) fn prepare(&self) -> Result<PreparedProduct> {
         match self {
             Self::ExplicitConfig(path) => {
                 let config = super::ImageProductConfig::load(path)?;
-                let super::configuration::ImageBackendConfig::Cuda(cuda) = &config.backend;
-                let mut cuda = cuda.resolved()?;
-                cuda.cudnn.library_path = super::library::resolve(Some(&cuda.cudnn.library_path))?;
-                cuda.validate()?;
+                let backend = super::factory::PreparedBackend::from_config(&config.backend)?;
                 let assets = config.prepare_assets()?;
                 Ok(PreparedProduct {
                     model: config.model,
                     profile: config.execution_profile.as_str(),
                     serving: config.serving,
-                    cuda,
+                    backend,
                     assets,
                 })
             }
             Self::LocalDirectory { path, options } => {
                 options.validate()?;
+                let backend = super::factory::PreparedBackend::from_directory(options)?;
                 // Complete metadata and actual archive headers precede any
                 // device context, provider, or native library construction.
                 let assets = ferrum_engine::image_generation::QwenImage21Assets::from_directory(
                     path,
                     PipelineSourceLimits::default(),
                 )?;
-                let cuda = options.cuda()?;
-                cuda.validate()?;
                 let model = path
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -258,7 +309,7 @@ impl ImageProductSource {
                     model,
                     profile: options.preset_name(),
                     serving: Some(options.serving()?),
-                    cuda,
+                    backend,
                     assets,
                 })
             }

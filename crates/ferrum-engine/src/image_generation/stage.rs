@@ -166,7 +166,7 @@ pub struct ImageGenerationError<R: DeviceRuntime> {
 impl<R: DeviceRuntime> fmt::Display for ImageGenerationFailure<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ImageGenerationFailure::Preflight(e) => write!(f, "image preflight: {e}"),
+            ImageGenerationFailure::Preflight(e) => write!(f, "image preflight: {e:#}"),
             ImageGenerationFailure::Unavailable => f.write_str(
                 "image pipeline stopped; recover any retained failure owners before replacing it",
             ),
@@ -288,7 +288,10 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             &pipeline.policy,
             &pipeline.materializers,
             options,
-        )?;
+        )
+        .with_context(|| {
+            format!("image {stage:?} {role:?} plan compilation (batch {batch_size})")
+        })?;
         let plan_hash = component
             .executable()
             .execution_plan()

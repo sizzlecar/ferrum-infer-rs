@@ -413,3 +413,67 @@ fn resident_preflight_uses_physical_plan_bytes_and_one_native_allowance_at_exact
         assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
     }
 }
+
+#[test]
+fn cold_preflight_counts_one_active_stage_and_native_allowance_before_execution() {
+    let (pipeline, _directory) = pipeline("device.image.residency.cold.preflight");
+    let opaque = 256;
+    let mut pipeline = pipeline.with_device_opaque_allowance(opaque).unwrap();
+    pipeline.config.residency = ImageResidencyPolicy::Cold;
+    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
+    pipeline.config.edit_prefix_policy = ImageEditPrefixPolicy::Recompute;
+    pipeline.config.plan_cache = ImagePlanCachePolicy::Disabled;
+    let plans = capacity_stages(&pipeline);
+    let memories = plans.each_ref().map(|plan| {
+        plan.component
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory()
+    });
+    let active_peak = memories
+        .iter()
+        .map(|memory| memory.static_bytes() + memory.minimum_runnable_request_bytes())
+        .max()
+        .unwrap();
+    let exact = active_peak + opaque;
+    let resident_requirement = memories.iter().map(|m| m.static_bytes()).sum::<u64>()
+        + memories
+            .iter()
+            .map(|m| m.minimum_runnable_request_bytes())
+            .max()
+            .unwrap()
+        + opaque;
+    // This fixture distinguishes sequential cold stages from simultaneous
+    // residency: charging all static installations would reject `exact`.
+    assert!(exact < resident_requirement);
+    drop(plans);
+
+    for (capacity, accepted) in [(exact - 1, false), (exact, true)] {
+        pipeline.config.device_capacity_bytes = capacity;
+        pipeline.policy = TensorComponentPolicy::new(
+            capacity,
+            pipeline
+                .runtime
+                .descriptor()
+                .dynamic_storage_profiles
+                .iter()
+                .copied()
+                .collect(),
+        )
+        .unwrap();
+        let before = pipeline.runtime.snapshot();
+        // All actual component plans fit independently at both ceilings. The
+        // lower one fails only when their peak includes the native allowance.
+        let plans = capacity_stages(&pipeline);
+        let result = pipeline.validate_resident_capacity(&plans.iter().collect::<Vec<_>>());
+        assert_eq!(result.is_ok(), accepted, "{result:?}");
+        assert!(!pipeline.is_stopped());
+        let after = pipeline.runtime.snapshot();
+        assert_eq!(after.allocations, before.allocations);
+        assert_eq!(after.submissions, before.submissions);
+        assert_eq!(after.uploaded_bytes, before.uploaded_bytes);
+        assert_eq!(after.live_allocations, 0);
+        assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    }
+}

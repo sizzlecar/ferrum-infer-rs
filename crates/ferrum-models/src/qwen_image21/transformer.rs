@@ -37,6 +37,20 @@ impl QwenImage21TransformerFamily {
     pub const REFERENCE_PROFILE_ID: &'static str =
         "qwen_image21.transformer.t2i.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen_image21.transformer.t2i.cuda.bf16_f32.v1";
+    pub const METAL_FP8_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.metal.fp8_linear.experimental.v1";
+    pub fn is_fp8_profile(name: &str) -> bool {
+        is_fp8(name)
+    }
+    pub const METAL_PROFILE_ID: &'static str = "qwen_image21.transformer.t2i.metal.bf16_f32.v1";
+    pub const METAL_NATIVE_BLOCK_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.metal.native_block.bf16_f32.v1";
+    pub const METAL_FUSED_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.metal.fused_dense.bf16_f32.v1";
+    pub const METAL_FP8_FUSED_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.metal.fp8_linear.fused_dense.v1";
+    pub const METAL_NATIVE_BLOCK_FUSED_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.metal.native_block.fused_dense.bf16_f32.v1";
     /// All DiT attention nodes use the distinct vendor-fused operation. This
     /// does not select VAE attention or alter the legacy CUDA profile.
     pub const CUDA_FUSED_PROFILE_ID: &'static str =
@@ -252,7 +266,8 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
                 ] {
                     operations.remove(&OperationId::new(unused)?);
                 }
-                let fused = source_name == Block::CUDA_FUSED_PROFILE_ID;
+                let vendor_fused = source_name == Block::CUDA_FUSED_PROFILE_ID;
+                let fused = vendor_fused || source_name == Block::METAL_FUSED_PROFILE_ID;
                 operations.remove(&OperationId::new(if fused {
                     STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID
                 } else {
@@ -265,8 +280,8 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
                         CROSS_ATTENTION_BF16_OPERATION_ID
                     })?,
                     version: ContractVersion::new(1, 0),
-                    multiplication_type: (!fused).then_some(ElementType::F32),
-                    accumulation_type: (!fused).then_some(ElementType::F32),
+                    multiplication_type: (!vendor_fused).then_some(ElementType::F32),
+                    accumulation_type: (!vendor_fused).then_some(ElementType::F32),
                     staged_arithmetic: None,
                     composite_arithmetic: None,
                 };
@@ -320,6 +335,8 @@ fn is_fp8(name: &str) -> bool {
         name,
         QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
             | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
+            | QwenImage21TransformerFamily::METAL_FP8_PROFILE_ID
+            | QwenImage21TransformerFamily::METAL_FP8_FUSED_PROFILE_ID
     )
 }
 fn is_native_block(name: &str) -> bool {
@@ -327,9 +344,11 @@ fn is_native_block(name: &str) -> bool {
         name,
         QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_PROFILE_ID
             | QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID
+            | QwenImage21TransformerFamily::METAL_NATIVE_BLOCK_PROFILE_ID
+            | QwenImage21TransformerFamily::METAL_NATIVE_BLOCK_FUSED_PROFILE_ID
     )
 }
-fn profile_sources() -> [(&'static str, &'static str); 7] {
+fn profile_sources() -> [(&'static str, &'static str); 13] {
     [
         (
             QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_PROFILE_ID,
@@ -358,6 +377,30 @@ fn profile_sources() -> [(&'static str, &'static str); 7] {
         (
             QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID,
             Block::CUDA_FUSED_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::METAL_FP8_PROFILE_ID,
+            Block::METAL_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::METAL_PROFILE_ID,
+            Block::METAL_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::METAL_NATIVE_BLOCK_PROFILE_ID,
+            Block::METAL_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::METAL_FUSED_PROFILE_ID,
+            Block::METAL_FUSED_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::METAL_FP8_FUSED_PROFILE_ID,
+            Block::METAL_FUSED_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::METAL_NATIVE_BLOCK_FUSED_PROFILE_ID,
+            Block::METAL_FUSED_PROFILE_ID,
         ),
     ]
 }

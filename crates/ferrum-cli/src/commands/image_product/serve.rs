@@ -22,68 +22,20 @@ pub async fn execute_serve_source(
     port: u16,
     aliases: Vec<String>,
 ) -> Result<(), ImageProductError> {
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))))]
     {
         let _ = (source, host, port, aliases);
         Err(ImageProductError::Unsupported(
-            "image serving currently requires a Ferrum binary built with the cuda feature",
+            "image serving requires the cuda feature or the metal feature on macOS",
         ))
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     {
-        use ferrum_engine::image_generation::service::{ImageService, ImageServiceConfig};
-        use ferrum_output::png::PngLimits;
-        use ferrum_server::{
-            axum_server::AppState, AxumServer, HttpServer, ImageHttpConfig, ImageHttpService,
-            ServerConfig,
-        };
+        use ferrum_server::{axum_server::AppState, AxumServer, HttpServer, ServerConfig};
         use std::sync::Arc;
 
-        let product = source.prepare()?;
-        let serving = product.serving.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("image serve requires an explicit serving configuration")
-        })?;
-        serving.validate()?;
-        if aliases.len() > 1 || aliases.first().is_some_and(|name| name.trim().is_empty()) {
-            return Err(anyhow::anyhow!(
-                "image serve accepts at most one nonempty --served-model-name"
-            )
-            .into());
-        }
-        let model = aliases
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| product.model.clone());
-        ferrum_server::ServedModelRegistry::try_new(
-            model.clone(),
-            ferrum_server::ServedModelKind::ImageGeneration,
-            vec![model.clone()],
-            vec![],
-        )
-        .map_err(anyhow::Error::from)?;
-        let (pipeline, composition) = product.cuda.create_pipeline_with_receipt(product.assets)?;
-        let service = ImageService::new(
-            pipeline,
-            ImageServiceConfig {
-                maximum_pending: serving.maximum_pending,
-                maximum_prompt_bytes: serving.maximum_prompt_bytes,
-                max_num_seqs: serving.max_num_seqs,
-                request_batch_max_wait_ms: serving.request_batch_max_wait_ms,
-            },
-        )
-        .map_err(anyhow::Error::from)?;
-        let images = ImageHttpService::new(
-            model,
-            service,
-            ImageHttpConfig {
-                output: serving.output.clone(),
-                default_width: serving.default_width,
-                default_height: serving.default_height,
-                default_seed: serving.default_seed,
-                rgba_scratch_bytes: serving.rgba_scratch_bytes,
-                png_limits: PngLimits::default(),
-            },
-        )?;
+        let prepared = prepare_http(source, aliases)?;
+        let images = prepared.images;
         let server = Arc::new(AxumServer::from_state(
             AppState::default().with_images(images.clone()),
         ));
@@ -92,8 +44,8 @@ pub async fn execute_serve_source(
             port,
             ..Default::default()
         };
-        tracing::info!(composition=%serde_json::to_string(&composition).map_err(anyhow::Error::from)?, "image CUDA composition and observed conservative memory ceiling");
-        tracing::warn!(profile=product.profile, max_num_seqs=serving.max_num_seqs,
+        tracing::info!(composition=%serde_json::to_string(&prepared.composition).map_err(anyhow::Error::from)?, "image backend composition and device capacity");
+        tracing::warn!(profile=prepared.profile, max_num_seqs=prepared.max_num_seqs,
             "experimental image HTTP uses its declared residency policy; no G3 throughput qualification");
         let mut task = {
             let server = server.clone();
@@ -130,4 +82,72 @@ pub async fn execute_serve_source(
         drop(shutdown);
         Ok(())
     }
+}
+
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+pub(super) struct PreparedHttp {
+    pub images: ferrum_server::ImageHttpService,
+    profile: &'static str,
+    composition: serde_json::Value,
+    max_num_seqs: usize,
+}
+
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+pub(super) fn prepare_http(
+    source: ImageProductSource,
+    aliases: Vec<String>,
+) -> Result<PreparedHttp, ImageProductError> {
+    use ferrum_engine::image_generation::service::ImageServiceConfig;
+    use ferrum_output::png::PngLimits;
+    use ferrum_server::{ImageHttpConfig, ImageHttpService};
+    let product = source.prepare()?;
+    let serving = product
+        .serving
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("image serve requires an explicit serving configuration"))?;
+    serving.validate()?;
+    if aliases.len() > 1 || aliases.first().is_some_and(|name| name.trim().is_empty()) {
+        return Err(anyhow::anyhow!(
+            "image serve accepts at most one nonempty --served-model-name"
+        )
+        .into());
+    }
+    let model = aliases
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| product.model.clone());
+    ferrum_server::ServedModelRegistry::try_new(
+        model.clone(),
+        ferrum_server::ServedModelKind::ImageGeneration,
+        vec![model.clone()],
+        vec![],
+    )
+    .map_err(anyhow::Error::from)?;
+    let (pipeline, composition) = product.backend.create(product.assets)?;
+    let service = pipeline
+        .into_service(ImageServiceConfig {
+            maximum_pending: serving.maximum_pending,
+            maximum_prompt_bytes: serving.maximum_prompt_bytes,
+            max_num_seqs: serving.max_num_seqs,
+            request_batch_max_wait_ms: serving.request_batch_max_wait_ms,
+        })
+        .map_err(anyhow::Error::from)?;
+    let images = ImageHttpService::new(
+        model,
+        service,
+        ImageHttpConfig {
+            output: serving.output.clone(),
+            default_width: serving.default_width,
+            default_height: serving.default_height,
+            default_seed: serving.default_seed,
+            rgba_scratch_bytes: serving.rgba_scratch_bytes,
+            png_limits: PngLimits::default(),
+        },
+    )?;
+    Ok(PreparedHttp {
+        images,
+        profile: product.profile,
+        composition,
+        max_num_seqs: serving.max_num_seqs,
+    })
 }

@@ -16,8 +16,6 @@ impl ModelFamilyProvider for Family {
             || config.n > 128
             || config.k == 0
             || config.k > 128
-            || config.k % 16 != 0
-            || config.n % 16 != 0
             || serde_json::to_value(config).unwrap() != *raw
         {
             return Err(invalid(
@@ -89,23 +87,26 @@ impl ModelFamilyProvider for Family {
         FamilyNumericalProfiles::new(
             self.family_id(),
             ContractVersion::new(1, 0),
-            vec![NumericalExecutionProfile {
-                id: profile.clone(),
-                family_id: self.family_id().clone(),
-                version: ContractVersion::new(1, 0),
-                kv_storage: vec![],
-                primary_activation: id(Y),
-                boundaries: BTreeMap::from([(id(Y), ElementType::Bf16)]),
-                states: vec![],
-                operations: vec![NumericalOperationContract {
-                    operation_id: id(OP),
+            [PROFILE, METAL_PROFILE]
+                .into_iter()
+                .map(|name| NumericalExecutionProfile {
+                    id: id(name),
+                    family_id: self.family_id().clone(),
                     version: ContractVersion::new(1, 0),
-                    multiplication_type: None,
-                    accumulation_type: Some(ElementType::F32),
-                    staged_arithmetic: None,
-                    composite_arithmetic: None,
-                }],
-            }],
+                    kv_storage: vec![],
+                    primary_activation: id(Y),
+                    boundaries: BTreeMap::from([(id(Y), ElementType::Bf16)]),
+                    states: vec![],
+                    operations: vec![NumericalOperationContract {
+                        operation_id: id(OP),
+                        version: ContractVersion::new(1, 0),
+                        multiplication_type: None,
+                        accumulation_type: Some(ElementType::F32),
+                        staged_arithmetic: None,
+                        composite_arithmetic: None,
+                    }],
+                })
+                .collect(),
             vec![profile],
         )
     }

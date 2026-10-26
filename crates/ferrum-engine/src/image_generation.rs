@@ -23,11 +23,17 @@
 
 mod assets;
 mod attention_policy;
+mod composition;
+pub use composition::ImagePipelineLimits;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 mod decoder;
 mod editing;
 mod host_cache;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
+mod metal_attention_policy;
+pub use metal_attention_policy::ImageMetalAttentionPolicy;
 mod prefix_denoising;
 pub use editing::{ImageEditPrefixPolicy, QwenImage21EditProfiles};
 mod plan_cache;
@@ -41,6 +47,8 @@ pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, Qwen
 pub use attention_policy::ImageCudaAttentionPolicy;
 pub use host_cache::{ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy};
 pub use plan_cache::{ImagePlanCachePolicy, ImagePlanCacheReceipt};
+/// Shared component precision contract; keep the original CUDA spelling compatible.
+pub use precision::ImageCudaPrecisionPolicy as ImagePrecisionPolicy;
 pub use precision::{
     ImageComponentPrecision, ImageCudaPrecisionPolicy, ImageDenoiserPrecision, ImageTextPrecision,
 };
@@ -231,6 +239,10 @@ pub struct ImageGenerationReceipt {
     pub stages: Vec<ImageStageReceipt>,
     pub steps: Vec<ImageDenoiseStepReceipt>,
     pub runtime_fingerprint: String,
+    /// Runtime-lifetime native samples, independent of this request's plan
+    /// budgets. Shared by CLI receipts and the serving worker's diagnostic log.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_memory: Option<DeviceNativeMemorySnapshot>,
     pub assets: ImageAssetReceipt,
     pub euler_profile: &'static str,
 }
@@ -322,7 +334,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// Include the composition's one aggregate native allowance in resident
     /// batch planning. Reference has no native overhead and keeps zero. This
     /// does not reduce the runtime ceiling or duplicate a capacity reservation.
-    #[cfg(any(feature = "cuda", test))]
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos"), test))]
     pub(super) fn with_device_opaque_allowance(mut self, bytes: u64) -> anyhow::Result<Self> {
         ensure!(
             bytes < self.config.device_capacity_bytes,
@@ -398,45 +410,59 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         })?;
         let mut stages = Vec::with_capacity(4);
         let mut steps = Vec::with_capacity(self.assets.schedule.evaluation_count());
-        let result = self
-            .run(prepared, &requests, job, &mut stages, &mut steps)
-            .and_then(|outputs| {
-                if outputs.len() != requests.len() {
-                    return Err(ImageGenerationFailure::Processing {
-                        source: anyhow::anyhow!("decoder returned an unexpected image count"),
-                        active: None,
-                    });
-                }
-                requests
-                    .iter()
-                    .zip(outputs)
-                    .enumerate()
-                    .map(|(batch_index, (request, rgba))| {
-                        Ok(ImageGenerationOutput {
-                            rgba,
-                            receipt: ImageGenerationReceipt {
-                                job,
-                                batch_size: requests.len(),
-                                batch_index,
-                                decoder_batch_policy: self.config.decoder_batch_policy,
-                                residency: self.config.residency,
-                                width: request.width,
-                                height: request.height,
-                                seed: request.seed,
-                                stages: stages.clone(),
-                                steps: steps.clone(),
-                                runtime_fingerprint: self
-                                    .runtime
-                                    .descriptor()
-                                    .runtime_implementation_fingerprint
-                                    .clone(),
-                                assets: self.assets.receipt().clone(),
-                                euler_profile: self.profiles.euler.id(),
-                            },
-                        })
+        let executed = self.run(prepared, &requests, job, &mut stages, &mut steps);
+        let native_memory = self.runtime.native_memory_snapshot();
+        if let Some(memory) = native_memory {
+            tracing::info!(
+                target: "ferrum_engine::image_generation::native_memory",
+                job,
+                source = memory.source,
+                scope = ?memory.scope,
+                allocated_bytes = memory.allocated_bytes,
+                observed_peak_allocated_bytes = memory.observed_peak_allocated_bytes,
+                samples = memory.samples,
+                execution_succeeded = executed.is_ok(),
+                "image native resource allocation observation"
+            );
+        }
+        let result = executed.and_then(|outputs| {
+            if outputs.len() != requests.len() {
+                return Err(ImageGenerationFailure::Processing {
+                    source: anyhow::anyhow!("decoder returned an unexpected image count"),
+                    active: None,
+                });
+            }
+            requests
+                .iter()
+                .zip(outputs)
+                .enumerate()
+                .map(|(batch_index, (request, rgba))| {
+                    Ok(ImageGenerationOutput {
+                        rgba,
+                        receipt: ImageGenerationReceipt {
+                            job,
+                            batch_size: requests.len(),
+                            batch_index,
+                            decoder_batch_policy: self.config.decoder_batch_policy,
+                            residency: self.config.residency,
+                            width: request.width,
+                            height: request.height,
+                            seed: request.seed,
+                            stages: stages.clone(),
+                            steps: steps.clone(),
+                            runtime_fingerprint: self
+                                .runtime
+                                .descriptor()
+                                .runtime_implementation_fingerprint
+                                .clone(),
+                            native_memory,
+                            assets: self.assets.receipt().clone(),
+                            euler_profile: self.profiles.euler.id(),
+                        },
                     })
-                    .collect()
-            });
+                })
+                .collect()
+        });
         match result {
             Ok(outputs) => Ok(outputs),
             Err(failure) => {

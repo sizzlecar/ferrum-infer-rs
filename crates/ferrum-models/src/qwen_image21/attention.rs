@@ -27,6 +27,11 @@ impl QwenImage21Block0AttentionFamily {
     pub const REFERENCE_PROFILE_ID: &'static str =
         "qwen_image21.block0_attention.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen_image21.block0_attention.cuda.bf16_f32.v1";
+    pub const METAL_PROFILE_ID: &'static str = "qwen_image21.block0_attention.metal.bf16_f32.v1";
+    /// Guarded Metal dense attention with strict fallback for other domains.
+    /// Its softmax implementation is distinct from the reference Metal path.
+    pub const METAL_FUSED_PROFILE_ID: &'static str =
+        "qwen_image21.block0_attention.metal.fused_dense.bf16_f32.v1";
     /// Explicit vendor-fused attention choice; does not change the legacy CUDA
     /// profile or claim its sequential FP32 softmax rounding. Initial providers
     /// support head_dim 128; numerical qualification is separate evidence.
@@ -173,9 +178,18 @@ impl ModelFamilyProvider for QwenImage21Block0AttentionFamily {
                 Self::CUDA_FUSED_PROFILE_ID,
                 QwenImage21QkFrontend::Rotary.cuda_profile_id(),
             ),
+            (
+                Self::METAL_PROFILE_ID,
+                QwenImage21QkFrontend::Rotary.metal_profile_id(),
+            ),
+            (
+                Self::METAL_FUSED_PROFILE_ID,
+                QwenImage21QkFrontend::Rotary.metal_profile_id(),
+            ),
         ] {
-            let fused = name == Self::CUDA_FUSED_PROFILE_ID;
-            if fused && config.transformer().head_dim() != 128 {
+            let vendor_fused = name == Self::CUDA_FUSED_PROFILE_ID;
+            let fused = vendor_fused || name == Self::METAL_FUSED_PROFILE_ID;
+            if vendor_fused && config.transformer().head_dim() != 128 {
                 continue;
             }
             let source_id =
@@ -199,8 +213,8 @@ impl ModelFamilyProvider for QwenImage21Block0AttentionFamily {
                 // Vendor SDPA does not expose each internal probability/
                 // reduction rounding boundary. Its distinct operation version
                 // owns that contract; do not mislabel it as all-FP32 online.
-                multiplication_type: (!fused).then_some(ElementType::F32),
-                accumulation_type: (!fused).then_some(ElementType::F32),
+                multiplication_type: (!vendor_fused).then_some(ElementType::F32),
+                accumulation_type: (!vendor_fused).then_some(ElementType::F32),
                 staged_arithmetic: None,
                 composite_arithmetic: None,
             });
@@ -228,9 +242,20 @@ impl ModelFamilyProvider for QwenImage21Block0AttentionFamily {
         }
         let frontend = Qk::with_frontend(QwenImage21QkFrontend::Rotary)?;
         let base_profiles = frontend.numerical_profiles(config.transformer())?;
-        let fused = profile.id.as_str() == Self::CUDA_FUSED_PROFILE_ID;
-        let base_name = if profile.id.as_str() == Self::CUDA_PROFILE_ID || fused {
+        let fused = matches!(
+            profile.id.as_str(),
+            Self::CUDA_FUSED_PROFILE_ID | Self::METAL_FUSED_PROFILE_ID
+        );
+        let base_name = if matches!(
+            profile.id.as_str(),
+            Self::CUDA_PROFILE_ID | Self::CUDA_FUSED_PROFILE_ID
+        ) {
             QwenImage21QkFrontend::Rotary.cuda_profile_id()
+        } else if matches!(
+            profile.id.as_str(),
+            Self::METAL_PROFILE_ID | Self::METAL_FUSED_PROFILE_ID
+        ) {
+            QwenImage21QkFrontend::Rotary.metal_profile_id()
         } else {
             QwenImage21QkFrontend::Rotary.reference_profile_id()
         };

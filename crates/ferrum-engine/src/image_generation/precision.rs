@@ -79,7 +79,7 @@ impl ImageCudaPrecisionPolicy {
         self.stage_uses_fp8(ImageStage::TextEncoder) || self.stage_uses_fp8(ImageStage::Denoiser)
     }
     /// Reject a conversion policy incompatible with the declared source before
-    /// creating a CUDA context. Legacy BF16 still means BF16 compute on native
+    /// creating a device runtime. Legacy BF16 still means BF16 compute on native
     /// source storage when that inventory is explicitly supplied.
     pub fn validate_denoiser_source(self, native: bool) -> anyhow::Result<()> {
         ensure!(
@@ -144,9 +144,9 @@ pub(super) fn validate_backing(
     materializer: &Bf16WholeTensorFp8Materializer,
     host: &HostMemoryAccount,
 ) -> anyhow::Result<()> {
-    let peak = materializer.maximum_group_backing_bytes(family)?;
+    let peak = usize::try_from(materializer.maximum_group_accounted_bytes(family)?)?;
     ensure!(
-        peak <= host.limits().class_bytes(HostMemoryClass::WeightBacking) as u64,
+        peak <= host.limits().class_bytes(HostMemoryClass::WeightBacking),
         "FP8 conversion group needs {peak} WeightBacking bytes before transfer staging"
     );
     Ok(())
