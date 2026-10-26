@@ -15,6 +15,8 @@ pub(super) enum Mode {
     QkSoftmaxState,
     ValueWidth64,
     ValueWidth128,
+    ProductionBf16,
+    SteelReference,
 }
 impl Mode {
     pub(super) fn is_qk(&self) -> bool {
@@ -24,7 +26,24 @@ impl Mode {
         match self {
             Self::QkSoftmaxState => 2,
             Self::ValueWidth64 => 64,
-            Self::ValueWidth128 => 128,
+            Self::ValueWidth128 | Self::ProductionBf16 | Self::SteelReference => 128,
+        }
+    }
+    pub(super) fn is_bf16(self) -> bool {
+        matches!(self, Self::ProductionBf16 | Self::SteelReference)
+    }
+    pub(super) fn output_element(self) -> ElementType {
+        if self.is_bf16() {
+            ElementType::Bf16
+        } else {
+            ElementType::F32
+        }
+    }
+    pub(super) fn dynamic_bytes(self) -> u64 {
+        if self == Self::SteelReference {
+            0
+        } else {
+            SHARED_BYTES
         }
     }
     pub(super) fn inputs(self) -> &'static [&'static str] {
@@ -35,21 +54,29 @@ impl Mode {
         }
     }
     pub(super) fn operation(self) -> &'static str {
-        if self.is_qk() {
+        if self.is_bf16() {
+            BF16_OP
+        } else if self.is_qk() {
             OP
         } else {
             VALUE_OP
         }
     }
     pub(super) fn output(self) -> &'static str {
-        if self.is_qk() {
+        if self.is_bf16() {
+            BF16_OUTPUT
+        } else if self.is_qk() {
             OUTPUT
         } else {
             VALUE_OUTPUT
         }
     }
     pub(super) fn profile(self) -> &'static str {
-        if self.is_qk() {
+        if self == Self::SteelReference {
+            STEEL_PROFILE
+        } else if self == Self::ProductionBf16 {
+            BF16_PROFILE
+        } else if self.is_qk() {
             PROFILE
         } else {
             VALUE_PROFILE
@@ -60,7 +87,22 @@ impl Mode {
             Self::QkSoftmaxState => "ferrum_tensor_attention_qk_prefix_f32",
             Self::ValueWidth64 => "ferrum_tensor_attention_values64_f32",
             Self::ValueWidth128 => "ferrum_tensor_attention_values128_f32",
+            Self::ProductionBf16 => "ferrum_tensor_attention_register128_bf16",
+            Self::SteelReference => steel::KERNEL,
         }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ValueFixture {
+    #[default]
+    PositivePeriodic,
+    ChannelConstant,
+}
+impl ValueFixture {
+    fn is_positive(&self) -> bool {
+        *self == Self::PositivePeriodic
     }
 }
 
@@ -73,6 +115,8 @@ pub(super) struct Config {
     pub(super) visibility: Visibility,
     #[serde(default, skip_serializing_if = "Mode::is_qk")]
     pub(super) mode: Mode,
+    #[serde(default, skip_serializing_if = "ValueFixture::is_positive")]
+    pub(super) value_fixture: ValueFixture,
 }
 
 impl Config {
@@ -81,6 +125,14 @@ impl Config {
             return Err(invalid(
                 "attention diagnostic requires batch1..16 and nonzero heads",
             ));
+        }
+        if self.value_fixture == ValueFixture::ChannelConstant && !self.mode.is_bf16() {
+            return Err(invalid(
+                "constant-channel fixture requires a BF16 comparison mode",
+            ));
+        }
+        if self.mode == Mode::SteelReference {
+            steel::Params::new(self)?;
         }
         let rows = self
             .batch
@@ -95,7 +147,7 @@ impl Config {
             .ok_or_else(|| invalid("input byte extent overflow"))?;
         rows.checked_mul(self.heads)
             .and_then(|n| n.checked_mul(self.mode.columns()))
-            .and_then(|n| n.checked_mul(4))
+            .and_then(|n| n.checked_mul(self.mode.output_element().size_bytes()))
             .ok_or_else(|| invalid("output byte extent overflow"))?;
         RegisterParams::new(
             self.batch
@@ -129,7 +181,7 @@ impl Config {
     pub(super) fn output_spec(self) -> ProgramTensorSpec {
         ProgramTensorSpec {
             dimensions: vec![self.batch * self.sequence, self.heads, self.mode.columns()],
-            element_type: ElementType::F32,
+            element_type: self.mode.output_element(),
             layout: ResolvedTensorLayout::Contiguous,
         }
     }
@@ -179,7 +231,10 @@ impl ModelFamilyProvider for Family {
                 family_id: self.family_id().clone(),
                 version: ContractVersion::new(1, 0),
                 primary_activation: id(config.mode.output()),
-                boundaries: BTreeMap::from([(id(config.mode.output()), ElementType::F32)]),
+                boundaries: BTreeMap::from([(
+                    id(config.mode.output()),
+                    config.mode.output_element(),
+                )]),
                 kv_storage: vec![],
                 states: vec![],
                 operations: vec![NumericalOperationContract {
@@ -264,6 +319,7 @@ fn value_width_profiles_declare_three_inputs_and_real_f32_boundaries() {
             heads: 2,
             visibility: Visibility::AllValidBidirectional,
             mode,
+            value_fixture: ValueFixture::PositivePeriodic,
         };
         let raw = serde_json::to_value(config).unwrap();
         TypedFamilyRegistration::new(Family)
@@ -282,5 +338,38 @@ fn value_width_profiles_declare_three_inputs_and_real_f32_boundaries() {
             ..config
         };
         assert!(huge.validate().is_err());
+    }
+}
+
+#[test]
+fn bf16_comparison_profiles_and_official_parameter_abi_are_explicit() {
+    for mode in [Mode::ProductionBf16, Mode::SteelReference] {
+        let c = Config {
+            batch: 2,
+            sequence: 33,
+            heads: 2,
+            visibility: Visibility::AllValidBidirectional,
+            mode,
+            value_fixture: ValueFixture::PositivePeriodic,
+        };
+        TypedFamilyRegistration::new(Family)
+            .prepare_with_profile(&serde_json::to_value(c).unwrap(), &id(mode.profile()))
+            .unwrap();
+        assert_eq!(c.output_spec().element_type, ElementType::Bf16);
+        let p = steel::Params::new(c).unwrap();
+        assert_eq!(p.q_strides, [8448, 128, 256]);
+        assert_eq!(p.o_strides, p.q_strides);
+        assert_eq!(
+            (p.nq, p.nk, p.nq_aligned, p.nk_aligned, p.ql_rem, p.kl_rem),
+            (2, 3, 1, 2, 1, 1)
+        );
+        assert_eq!(std::mem::size_of::<steel::Params>(), 152);
+        assert_eq!(std::mem::align_of::<steel::Params>(), 8);
+        assert_eq!(std::mem::offset_of!(steel::Params, q_strides), 56);
+        assert!(steel::Params::new(Config {
+            sequence: i32::MAX as u64 + 1,
+            ..c
+        })
+        .is_err());
     }
 }

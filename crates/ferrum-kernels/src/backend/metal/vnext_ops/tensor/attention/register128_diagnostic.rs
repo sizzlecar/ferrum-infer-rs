@@ -18,10 +18,16 @@ use std::time::Instant;
 mod family;
 #[path = "register128_diagnostic/oracle.rs"]
 mod oracle;
+#[path = "register128_diagnostic/steel.rs"]
+mod steel;
 
 const OP: &str = "operation.diagnostic.metal.qk_softmax_state";
 const CAPABILITY: &str = "capability.diagnostic.metal.attention_diagnostic";
 const PROFILE: &str = "metal.diagnostic.qk_softmax_state.f32.v1";
+const BF16_OP: &str = "operation.diagnostic.metal.sdpa_bf16_comparison";
+const BF16_OUTPUT: &str = "value.diagnostic.sdpa_bf16";
+const BF16_PROFILE: &str = "metal.diagnostic.production_sdpa.bf16.natural_exp.v1";
+const STEEL_PROFILE: &str = "metal.diagnostic.official_steel_sdpa.bf16.log2e_fast_exp2_division.v1";
 const VALUE_OP: &str = "operation.diagnostic.metal.attention_value_width";
 const VALUE_PROFILE: &str = "metal.diagnostic.attention_value_width.f32.v1";
 const VALUE_OUTPUT: &str = "value.diagnostic.attention_values";
@@ -120,18 +126,28 @@ impl OperationContract for Contract {
 }
 
 struct Pipelines {
-    states: Vec<(family::Mode, ComputePipelineState)>,
+    states: Vec<Pipeline>,
     // PSO drops before its admitted native owner.
     _retention: MetalTensorProviderRetention,
 }
+struct Pipeline {
+    mode: family::Mode,
+    aligned: [bool; 2],
+    state: ComputePipelineState,
+}
 impl Pipelines {
-    fn select(&self, mode: family::Mode) -> &ComputePipelineState {
+    fn select(&self, c: family::Config) -> &ComputePipelineState {
+        let aligned = if c.mode == family::Mode::SteelReference {
+            [c.sequence.is_multiple_of(32), c.sequence.is_multiple_of(16)]
+        } else {
+            [false, false]
+        };
         &self
             .states
             .iter()
-            .find(|(candidate, _)| *candidate == mode)
+            .find(|candidate| candidate.mode == c.mode && candidate.aligned == aligned)
             .expect("diagnostic PSO compiled")
-            .1
+            .state
     }
 }
 struct Provider {
@@ -203,7 +219,7 @@ impl OperationProvider<MetalDeviceRuntime> for Provider {
                 participant,
                 ResolvedValueRole::Output,
                 0,
-                ElementType::F32,
+                c.mode.output_element(),
                 output_bytes,
             )?);
             for (i, region) in regions.iter().enumerate() {
@@ -254,25 +270,38 @@ impl OperationProvider<MetalDeviceRuntime> for Provider {
                     )
                 })
                 .ok_or("attention diagnostic logical work overflows")?;
+            let steel_params = (c.mode == family::Mode::SteelReference)
+                .then(|| steel::Params::new(c))
+                .transpose()
+                .map_err(|e| e.to_string())?;
             let pipelines = Arc::clone(&self.pipelines);
             MetalDeviceCommand::tensor_operation(
                 c.mode.operation(),
                 regions,
-                DeviceCommandLogicalWork::tensor(operations, 0).map_err(|e| e.to_string())?,
+                DeviceCommandLogicalWork::tensor(input_bytes / 2, operations)
+                    .map_err(|e| e.to_string())?,
                 move |encoder, regions| {
                     let compute = encoder.compute_encoder();
-                    compute.set_compute_pipeline_state(pipelines.select(c.mode));
+                    compute.set_compute_pipeline_state(pipelines.select(c));
                     for (slot, region) in regions[..c.mode.inputs().len()].iter().enumerate() {
                         set_region(compute, slot as u64, region);
                     }
                     set_region(compute, 3, &regions[c.mode.inputs().len()]);
-                    set_params(compute, 4, &params);
-                    set_params(compute, 5, &mask);
-                    compute.set_threadgroup_memory_length(0, SHARED_BYTES);
-                    compute.dispatch_thread_groups(
-                        MTLSize::new(params.grid_groups, 1, 1),
-                        MTLSize::new(128, 1, 1),
-                    );
+                    compute.set_threadgroup_memory_length(0, c.mode.dynamic_bytes());
+                    if let Some(steel_params) = &steel_params {
+                        set_params(compute, 4, steel_params);
+                        compute.dispatch_thread_groups(
+                            MTLSize::new(c.sequence.div_ceil(32), c.heads, c.batch),
+                            MTLSize::new(32, 4, 1),
+                        );
+                    } else {
+                        set_params(compute, 4, &params);
+                        set_params(compute, 5, &mask);
+                        compute.dispatch_thread_groups(
+                            MTLSize::new(params.grid_groups, 1, 1),
+                            MTLSize::new(128, 1, 1),
+                        );
+                    }
                     Ok(())
                 },
             )
@@ -401,7 +430,14 @@ fn run_case(
                     let head = (i / 128) % config.heads;
                     let key = (i / (128 * config.heads)) % config.sequence;
                     let batch = i / (128 * config.heads * config.sequence);
-                    oracle::positive_value(batch, key, head, column)
+                    match config.value_fixture {
+                        family::ValueFixture::PositivePeriodic => {
+                            oracle::positive_value(batch, key, head, column)
+                        }
+                        family::ValueFixture::ChannelConstant => {
+                            oracle::constant_value(head, column)
+                        }
+                    }
                 } else {
                     oracle::value(
                         i,
@@ -451,8 +487,16 @@ fn run_case(
         samples.push(started.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(output.len(), 1);
         assert_eq!(output[0].value_id().as_str(), config.mode.output());
-        assert_eq!(output[0].tensor().element_type(), ElementType::F32);
-        errors.push(if let Some(value_reference) = &value_reference {
+        assert_eq!(
+            output[0].tensor().element_type(),
+            config.mode.output_element()
+        );
+        errors.push(if config.mode.is_bf16() {
+            value_reference
+                .as_ref()
+                .unwrap()
+                .verify_bf16(output[0].bytes().bytes())
+        } else if let Some(value_reference) = &value_reference {
             value_reference.verify(output[0].bytes().bytes())
         } else {
             reference.verify(config, output[0].bytes().bytes())
@@ -484,6 +528,15 @@ fn run_case(
             serde_json::json!(oracle::Reference::relative_bound(config.sequence));
         result["row_max"] =
             serde_json::json!("all output rows exact F32 bits versus independent FP64");
+    } else if config.mode.is_bf16() {
+        result["max_relative_output_errors"] = serde_json::json!(errors);
+        result["reference"] = if config.value_fixture == family::ValueFixture::ChannelConstant {
+            serde_json::json!(
+                "all BF16 output bits equal channel-constant V; Q/K are nonuniform periodic"
+            )
+        } else {
+            serde_json::json!({"independent_fp64_positive_values":true,"relative_bound":oracle::ValueReference::bf16_relative_bound(config),"profile":config.mode.profile()})
+        };
     } else {
         result["max_relative_output_errors"] = serde_json::json!(errors);
         result["output_relative_bound"] =
@@ -495,11 +548,27 @@ fn run_case(
 
 fn run_diagnostic(modes: &[family::Mode]) -> Value {
     metal::objc::rc::autoreleasepool(|| {
+        let steel_source = modes
+            .contains(&family::Mode::SteelReference)
+            .then(steel::Source::from_locator)
+            .transpose()
+            .unwrap();
+        let requested_language = if modes.iter().any(|mode| mode.is_bf16()) {
+            "MSL3.1 explicit, both comparison modes"
+        } else {
+            "system_default"
+        };
         let fingerprint = implementation_fingerprint(&[
             SOURCE.as_bytes(),
             include_str!("register128_diagnostic.rs").as_bytes(),
             include_str!("register128_diagnostic/family.rs").as_bytes(),
             include_str!("register128_diagnostic/oracle.rs").as_bytes(),
+            include_str!("register128_diagnostic/steel.rs").as_bytes(),
+            requested_language.as_bytes(),
+            steel_source
+                .as_ref()
+                .map(|s| s.fingerprint.as_bytes())
+                .unwrap_or(&[]),
         ]);
         let mut device = metal_tensor_runtime_config(id("device.metal.0")).unwrap();
         device.capabilities.insert(id(CAPABILITY));
@@ -523,43 +592,86 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
         let retention = runtime.retain_tensor_provider().unwrap();
         let options = CompileOptions::new();
         options.set_fast_math_enabled(false);
+        if modes.iter().any(|mode| mode.is_bf16()) {
+            options.set_language_version(metal::MTLLanguageVersion::V3_1);
+        }
         let library = runtime
             .device()
             .new_library_with_source(SOURCE, &options)
             .unwrap();
+        // Separate library: official source never receives Ferrum BF16 helpers.
+        let steel_library = steel_source.as_ref().map(|source| {
+            runtime
+                .device()
+                .new_library_with_source(&source.source, &options)
+                .unwrap()
+        });
         let mut states = Vec::new();
         let mut properties = Vec::new();
         for &mode in modes {
-            let constants = metal::FunctionConstantValues::new();
-            constants.set_constant_value_at_index(
-                (&1_u32 as *const u32).cast(),
-                metal::MTLDataType::UInt,
-                104,
-            );
-            constants.set_constant_value_at_index(
-                (&0_u32 as *const u32).cast(),
-                metal::MTLDataType::UInt,
-                105,
-            );
-            let function = library
-                .get_function(mode.kernel(), Some(constants))
-                .unwrap();
-            let state = runtime
-                .device()
-                .new_compute_pipeline_state_with_function(&function)
-                .unwrap();
-            assert_eq!(state.thread_execution_width(), 32);
-            assert!(state.max_total_threads_per_threadgroup() >= 128);
-            assert!(state
-                .static_threadgroup_memory_length()
-                .checked_add(SHARED_BYTES)
-                .is_some_and(|n| n <= runtime.device().max_threadgroup_memory_length()));
-            properties.push(serde_json::json!({"mode":mode,"kernel":mode.kernel(),
-                "thread_execution_width":state.thread_execution_width(),"maximum_threads":state.max_total_threads_per_threadgroup(),
-                "static_threadgroup_bytes":state.static_threadgroup_memory_length(),"dynamic_threadgroup_bytes":SHARED_BYTES}));
-            states.push((mode, state));
+            let alignments: &[[bool; 2]] = if mode == family::Mode::SteelReference {
+                &[[false, false], [false, true], [true, false], [true, true]]
+            } else {
+                &[[false, false]]
+            };
+            for &aligned in alignments {
+                let constants = metal::FunctionConstantValues::new();
+                if mode == family::Mode::SteelReference {
+                    for (index, value) in [
+                        (200, aligned[0]),
+                        (201, aligned[1]),
+                        (300, false),
+                        (301, false),
+                        (302, false),
+                    ] {
+                        constants.set_constant_value_at_index(
+                            (&value as *const bool).cast(),
+                            metal::MTLDataType::Bool,
+                            index,
+                        );
+                    }
+                } else {
+                    constants.set_constant_value_at_index(
+                        (&1_u32 as *const u32).cast(),
+                        metal::MTLDataType::UInt,
+                        104,
+                    );
+                    constants.set_constant_value_at_index(
+                        (&0_u32 as *const u32).cast(),
+                        metal::MTLDataType::UInt,
+                        105,
+                    );
+                }
+                let selected_library = if mode == family::Mode::SteelReference {
+                    steel_library.as_ref().unwrap()
+                } else {
+                    &library
+                };
+                let function = selected_library
+                    .get_function(mode.kernel(), Some(constants))
+                    .unwrap();
+                let state = runtime
+                    .device()
+                    .new_compute_pipeline_state_with_function(&function)
+                    .unwrap();
+                assert_eq!(state.thread_execution_width(), 32);
+                assert!(state.max_total_threads_per_threadgroup() >= 128);
+                assert!(state
+                    .static_threadgroup_memory_length()
+                    .checked_add(mode.dynamic_bytes())
+                    .is_some_and(|n| n <= runtime.device().max_threadgroup_memory_length()));
+                properties.push(serde_json::json!({"mode":mode,"kernel":mode.kernel(),"aligned_q":aligned[0],"aligned_k":aligned[1],
+                    "requested_language":requested_language,"fast_math_enabled":false,
+                    "thread_execution_width":state.thread_execution_width(),"maximum_threads":state.max_total_threads_per_threadgroup(),
+                    "static_threadgroup_bytes":state.static_threadgroup_memory_length(),"dynamic_threadgroup_bytes":mode.dynamic_bytes()}));
+                states.push(Pipeline {
+                    mode,
+                    aligned,
+                    state,
+                });
+            }
         }
-        drop(library);
+        drop((library, steel_library));
         let pipelines = Arc::new(Pipelines {
             states,
             _retention: retention,
@@ -594,6 +706,7 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
                     heads: 2,
                     visibility: family::Visibility::AllValidBidirectional,
                     mode,
+                    value_fixture: family::ValueFixture::PositivePeriodic,
                 },
                 1,
                 3,
@@ -601,7 +714,7 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
                 trial,
             ));
         }
-        // One process balances the two widths: 64 -> 128 -> 128 -> 64.
+        // One process balances the two compared modes in A -> B -> B -> A order.
         // Each group owns fresh inputs/session and keeps warmup + all samples.
         // The single QK-state mode retains its original one-large-case scope.
         let large_modes: Vec<_> = modes
@@ -621,6 +734,11 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
                     heads: 32,
                     visibility: family::Visibility::AllValidBidirectional,
                     mode,
+                    value_fixture: if mode.is_bf16() {
+                        family::ValueFixture::ChannelConstant
+                    } else {
+                        family::ValueFixture::PositivePeriodic
+                    },
                 },
                 0,
                 0,
@@ -642,10 +760,11 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
         assert!(capacity.reserve(DeviceOpaqueMemoryKind::Stream, 1).is_err());
         drop(all);
         serde_json::json!({"source_fingerprint":fingerprint,
-            "runtime_fingerprint":runtime_fingerprint,"pso":properties,"large_case_order":large_modes,"cases":cases,"native_memory":native,
+            "runtime_fingerprint":runtime_fingerprint,"pso":properties,"reference_source":steel_source.map(|source|source.report),"requested_language":requested_language,"large_case_order":large_modes,"cases":cases,"native_memory":native,
             "host_committed_after_close":host.usage().unwrap().committed_bytes(),"device_full_capacity_reclaimed":true,
-            "timing_scope":"managed_execute_admission_encode_wait_readback; input preparation and independent FP64 full-output checks excluded; DeviceTimingOff",
-            "limits":"Test-only QK-state or PV/output-width diagnostics. F32 output IO and register liveness differ from production BF16. Both value widths retain all D128 K/V loading, IEEE guards for their computed columns and source synchronization points; the positive fixture keeps range guards inactive. Widths need not choose identical overflow fallback for arbitrary extreme values; no machine barrier/register/spill observation. Timing differences are not pure PV or GPU timestamps."})
+            "timing_scope":"managed_execute_admission_encode_wait_readback; input preparation and independent full-output checks excluded; DeviceTimingOff",
+            "bf16_comparison":if modes.iter().any(|mode|mode.is_bf16()) {serde_json::json!({"both_arms":"BF16 contiguous BSHD inputs and output, explicit MSL3.1 fast_math=false", "baseline":"production shader source at explicit MSL3.1; historical production measurements used system-default language and a different binary", "reference":"official Steel native bfloat, F32 fragments, original log2e/fast::exp2/division; independent numerical profile, not Ferrum IEEE equivalence", "r263_difference":"R263 MLX API exposed BHSD output and copied to BSHD; this reference writes BSHD directly", "qualification":"small positive nonconstant V, independent FP64; large channel-constant V, every BF16 output bit checked"})} else {serde_json::Value::Null},
+            "limits":if modes.iter().any(|mode|mode.is_bf16()) {"Test-only self attention comparison with all-valid keys. The official reference is qualified only for the declared positive finite fixture, not production masked/nonfinite semantics. Both arms request MSL3.1; neither timing is a pure GPU timestamp, nor does it reproduce the earlier MLX API or system-default production binary. No machine shader/register/spill observation."} else {"Test-only QK-state or PV/output-width diagnostics. F32 output IO and register liveness differ from production BF16. Both value widths retain all D128 K/V loading, IEEE guards for their computed columns and source synchronization points; the positive fixture keeps range guards inactive. Widths need not choose identical overflow fallback for arbitrary extreme values; no machine barrier/register/spill observation. Timing differences are not pure PV or GPU timestamps."}})
     })
 }
 
@@ -664,5 +783,14 @@ fn managed_metal_attention_value_width_diagnostic() {
     eprintln!(
         "metal_attention_value_width={}",
         run_diagnostic(&[family::Mode::ValueWidth64, family::Mode::ValueWidth128])
+    );
+}
+
+#[test]
+#[ignore = "official Steel source versus production-source BF16, explicit manifest and exclusive GPU required"]
+fn managed_metal_official_steel_reference_diagnostic() {
+    eprintln!(
+        "metal_attention_steel_reference={}",
+        run_diagnostic(&[family::Mode::ProductionBf16, family::Mode::SteelReference])
     );
 }

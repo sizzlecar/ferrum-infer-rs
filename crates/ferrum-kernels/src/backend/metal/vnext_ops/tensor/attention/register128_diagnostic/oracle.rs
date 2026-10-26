@@ -111,6 +111,7 @@ fn phase_counts_match_explicit_scalar_rows_across_batch_head_and_tail() {
             heads,
             visibility: super::family::Visibility::AllValidBidirectional,
             mode: super::family::Mode::QkSoftmaxState,
+            value_fixture: super::family::ValueFixture::PositivePeriodic,
         };
         let r = Reference::new(1, 3);
         for row in 0..c.batch * c.sequence * c.heads {
@@ -263,6 +264,7 @@ fn weighted_phase_cache_matches_direct_fp64_rows_for_both_output_widths() {
             heads,
             visibility: Visibility::AllValidBidirectional,
             mode: Mode::ValueWidth64,
+            value_fixture: super::family::ValueFixture::PositivePeriodic,
         };
         for (query_phase, key_phase) in [(1, 3), (5, 0)] {
             let narrow = ValueReference::new(c, query_phase, key_phase);
@@ -314,5 +316,112 @@ fn weighted_phase_cache_matches_direct_fp64_rows_for_both_output_widths() {
     for sequence in [33, 4096] {
         let bound = ValueReference::relative_bound(sequence);
         assert!(bound.is_finite() && bound > Reference::relative_bound(sequence));
+    }
+}
+
+pub(super) fn constant_value(head: u64, column: u64) -> f64 {
+    (((head * 128 + column) % 17) as i64 - 8) as f64 / 16.0
+}
+
+impl ValueReference {
+    pub(super) fn bf16_relative_bound(c: Config) -> f64 {
+        use super::family::Mode;
+        let bf16_u = 2_f64.powi(-8); // MSL float->bfloat round-to-nearest/ties-even.
+        if c.mode == Mode::ProductionBf16 {
+            return ((1.0 + Self::relative_bound(c.sequence)).next_up() * (1.0 + bf16_u) - 1.0)
+                .next_up();
+        }
+        assert_eq!(c.mode, Mode::SteelReference);
+        // Independent Steel reference profile, not Ferrum's exp<=4ULP bound.
+        // The 49 exact natural-score table has |log2 score|<25 and spread<36.
+        // u=2^-23: log2e constant+scale+score multiply perturb each score by
+        // <4u*25; subtraction adds rounding, giving argument error <251u.
+        // MSL fast::exp2 error <=3+floor(|2x|) ULP (<=75 here). Combining its
+        // normal-range error and argument perturbation gives eP=2^-14.
+        // After the first tile all reachable phases occur; alpha=exp2(0),
+        // conservatively bounded by eA=2^-20, not assumed exactly one.
+        // Positive numerator/denominator paths have no cancellation. The final
+        // original Steel division adds one rounding, then native BF16 RNE.
+        let m = c.sequence.div_ceil(16) as f64;
+        let u = 2_f64.powi(-23);
+        let ep = 2_f64.powi(-14);
+        let ea = 2_f64.powi(-20);
+        let td = (ep + m * ea + (2.0 * m + 16.0) * u).next_up();
+        let tn = (ep + m * ea + (2.0 * c.sequence as f64 + 2.0 * m + 32.0) * u).next_up();
+        assert!(
+            tn < 1.0 && td < 1.0,
+            "Steel diagnostic error envelope exhausted"
+        );
+        let dn = (tn / (1.0 - tn).next_down()).next_up();
+        let dd = (td / (1.0 - td).next_down()).next_up();
+        let upper = ((1.0 + dn).next_up() * (1.0 + u)).next_up();
+        let upper = (upper / (1.0 - dd).next_down()).next_up();
+        (upper * (1.0 + bf16_u) - 1.0).next_up()
+    }
+
+    pub(super) fn verify_bf16(&self, bytes: &[u8]) -> f64 {
+        use super::family::ValueFixture;
+        let c = self.config;
+        assert!(c.mode.is_bf16());
+        assert_eq!(bytes.len() as u64, c.batch * c.sequence * c.heads * 128 * 2);
+        let relative = Self::bf16_relative_bound(c);
+        let mut max_error = 0.0_f64;
+        for (i, word) in bytes.chunks_exact(2).enumerate() {
+            let bits = u16::from_le_bytes(word.try_into().unwrap());
+            let row = i as u64 / 128;
+            let column = i as u64 % 128;
+            if c.value_fixture == ValueFixture::ChannelConstant {
+                let expected = constant_value(row % c.heads, column) as f32;
+                assert_eq!(expected.to_bits() & 0xffff, 0);
+                assert_eq!(
+                    bits,
+                    (expected.to_bits() >> 16) as u16,
+                    "constant-channel BF16 output {i}"
+                );
+            } else {
+                let actual = f32::from_bits((bits as u32) << 16);
+                let expected = self.expected(row, column);
+                let error = (actual as f64 - expected).abs();
+                let bound = (expected * (relative + 128.0 * f64::EPSILON)).next_up();
+                assert!(actual.is_finite() && error <= bound,
+                    "BF16 output {i}: actual={actual}, FP64={expected}, error={error}, bound={bound}, mode={:?}", c.mode);
+                max_error = max_error.max(error / expected);
+            }
+        }
+        max_error
+    }
+}
+
+#[test]
+fn bf16_reference_bound_declares_steel_log2_domain_and_constant_channels() {
+    let reference = Reference::new(0, 0);
+    for scores in reference.scores {
+        assert!(scores
+            .iter()
+            .all(|v| (v * std::f64::consts::LOG2_E).abs() < 25.0));
+        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(scores
+            .iter()
+            .all(|v| (max - v) * std::f64::consts::LOG2_E < 36.0));
+    }
+    for head in 0..3 {
+        for column in 0..128 {
+            let value = constant_value(head, column) as f32;
+            assert_eq!(value.to_bits() & 0xffff, 0);
+        }
+    }
+    for mode in [
+        super::family::Mode::ProductionBf16,
+        super::family::Mode::SteelReference,
+    ] {
+        let config = Config {
+            batch: 2,
+            sequence: 33,
+            heads: 2,
+            visibility: super::family::Visibility::AllValidBidirectional,
+            mode,
+            value_fixture: super::family::ValueFixture::PositivePeriodic,
+        };
+        assert!(ValueReference::bf16_relative_bound(config).is_finite());
     }
 }
