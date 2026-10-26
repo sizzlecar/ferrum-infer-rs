@@ -3,7 +3,7 @@ import powerShellInstaller from "../scripts/install.ps1";
 
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
-const RELEASE_VERSION = "0.15.0";
+const RELEASE_VERSION = "0.16.0";
 const RELEASE_URL = `${REPOSITORY}/releases/tag/v${RELEASE_VERSION}`;
 const IMAGE_PERFORMANCE_URL = `${REPOSITORY}/releases/tag/v0.15.0#qwen-image-performance`;
 
@@ -181,8 +181,8 @@ const pages = {
     apiNote: 'API URL: <code>http://127.0.0.1:8000/v1</code>, model <code>ferrum</code>. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/openai-api-compatibility.md">Streaming, tools and structured output</a>.',
     defaultsNote: 'Defaults adapt execution and capacity to capabilities, hardware and memory; explicit settings prevail. Qualified SM120 GGUF paths can use 8-bit activation quantization and integer dot products. <code>--numerical-profile qwen3_5.f32-master</code> retains the original mixed-precision reference. Batch layouts can change output. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/numerical-execution.zh.md">Numerical profiles</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/cache-product.md">Caching</a>.',
     imageTitle: "Generate and edit images",
-    imageLead: 'Use a complete local <a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> directory. Validated on RTX 5090, Linux CUDA 12.8 and cuDNN 9.',
-    imageMetalNote: 'Metal image support is being validated for the next release. M4 Mac mini, 16 GiB unified memory: 1024×1024 generation and editing completed with a Q4_K_M GGUF DiT, FP8 text encoder and BF16 vision/VAE, using an explicit <code>--image-config</code> for the backend, model assets and memory limits. This configuration has not completed 2K generation; throughput qualification remains in progress.',
+    imageLead: 'CUDA: use a complete local <a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> directory. Validated on RTX 5090, Linux CUDA 12.8 and cuDNN 9.',
+    imageMetalNote: 'Metal supports Qwen-Image generation and single-PNG editing with a Q4_K_M GGUF DiT, FP8 text encoder and BF16 vision/VAE. Validated at 1024×1024 on an M4 Mac mini with 16 GiB unified memory. Use <code>--image-config</code> to select the backend, assets and memory budget.',
     imageMetalSetup: 'Metal: <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README.md#image-generation-and-editing">configuration and commands</a>.',
     imageRunLabel: "CUDA: text to image",
     imageEditLabel: "CUDA: edit one PNG",
@@ -190,7 +190,7 @@ const pages = {
     imageApi: 'HTTP: <code>POST /v1/images/generations</code> (JSON), <code>POST /v1/images/edits</code> (multipart). One 8-bit RGB/RGBA PNG input; PNG output as <code>b64_json</code>. Editing may redraw background/details.',
     imageConfigNote: 'The local-directory preset supports up to 1024×1024. 2K and the measured resident-service configurations use <code>--image-config</code>.',
     imagePerformanceTitle: "Qwen-Image vs vLLM-Omni",
-    imagePerformanceLead: "RTX 5090 · 8 steps · FP8 text encoder/DiT, BF16 VAE. Four paired pre-release runs per workload; 640 measured requests, zero errors. Mean images/s; C is client concurrency.",
+    imagePerformanceLead: "v0.15.0 candidate measurements · RTX 5090 · 8 steps · FP8 text encoder/DiT, BF16 VAE. Four paired pre-release runs per workload; 640 measured requests, zero errors. Mean images/s; C is client concurrency.",
     imageTasks: { generation: "generation", editing: "editing" },
     workloadLabel: "Workload",
     imagePerformanceNote: `Both implementations met P99 limits of 20 / 5 / 30 / 30 seconds, in row order. *2K editing is approximately equal: its 95% ratio interval, 0.9976–1.0077, includes 1. Resident-service measurements do not represent cold CLI defaults. <a href="${IMAGE_PERFORMANCE_URL}">Configuration, latency and memory</a>.`,
@@ -200,7 +200,7 @@ const pages = {
       ["Text architectures", "Llama, Mistral, Qwen2, Qwen3 dense/MoE, Qwen3.5 hybrid dense/MoE, Gemma 3 text."],
       ["Weights", "GGUF, including Q4_K/Q5_K/Q6_K/Q8_0; SafeTensors. Selected CUDA paths: GPTQ INT4, compressed-tensors INT4, block-FP8."],
       ["Specific paths", "Gemma 4 compressed-tensors W4A16 and GPT-OSS MXFP4: CUDA. PQ2_0: complete-model validation on Metal; CUDA operator coverage only."],
-      ["Images", "Qwen-Image-2.1-Turbo generation and single-PNG editing; validated on Linux CUDA SM120. Upcoming Metal support: 1024×1024 validated on M4 16 GiB with the configuration above."],
+      ["Images", "Qwen-Image-2.1-Turbo generation and single-PNG editing; validated on Linux CUDA SM120 and at 1024×1024 on M4 Metal with the configuration above."],
     ],
     supportNote: 'Support varies by architecture, format and backend. CPU is a compatibility backend; text support does not imply vision support. Embedding, ASR and TTS APIs were removed in 0.14.0. <a href="https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.14.0">Release notes</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">Validation scope</a>.',
     performanceTitle: "Recent 27B throughput",
@@ -251,8 +251,8 @@ const pages = {
     apiNote: 'API 地址：<code>http://127.0.0.1:8000/v1</code>，模型名 <code>ferrum</code>。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/openai-api-compatibility.md">流式输出、工具与结构化输出</a>。',
     defaultsNote: '默认执行与容量按声明能力、硬件和内存选择，显式设置优先。合资格的 SM120 GGUF 路径可采用 8 位激活量化及整数点积。<code>--numerical-profile qwen3_5.f32-master</code> 保留原混合精度参考路径；批布局可能改变输出。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/numerical-execution.zh.md">数值策略</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/cache-product.md">缓存说明</a>。',
     imageTitle: "图像生成与编辑",
-    imageLead: '使用完整的本地 <a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> 模型目录。已验证 RTX 5090、Linux CUDA 12.8、cuDNN 9。',
-    imageMetalNote: 'Metal 图像后端正在为下一版本完成验收。M4 Mac mini、16 GiB 统一内存已完成 1024×1024 生成与编辑，使用 Q4_K_M GGUF DiT、FP8 文本编码器和 BF16 视觉编码器/VAE，通过 <code>--image-config</code> 显式配置后端、模型资产与内存上限。这套配置尚未完成 2K 出图，吞吐验收仍在进行。',
+    imageLead: 'CUDA：使用完整的本地 <a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> 模型目录。已验证 RTX 5090、Linux CUDA 12.8、cuDNN 9。',
+    imageMetalNote: 'Metal 支持 Qwen-Image 生图与单张 PNG 编辑，使用 Q4_K_M GGUF DiT、FP8 文本编码器和 BF16 视觉编码器/VAE。已在 M4 Mac mini、16 GiB 统一内存上验证 1024×1024。通过 <code>--image-config</code> 配置后端、资产和内存预算。',
     imageMetalSetup: 'Metal：<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#图像生成与编辑">配置与使用命令</a>。',
     imageRunLabel: "CUDA 文生图",
     imageEditLabel: "CUDA 编辑单张 PNG",
@@ -260,7 +260,7 @@ const pages = {
     imageApi: 'HTTP：<code>POST /v1/images/generations</code> 接收 JSON，<code>POST /v1/images/edits</code> 接收 multipart。编辑支持单张 8 位 RGB/RGBA PNG，返回 PNG 的 <code>b64_json</code>；背景和细节可能重绘。',
     imageConfigNote: '本地目录预设最高支持 1024×1024；2K 及下表的常驻服务配置使用 <code>--image-config</code>。',
     imagePerformanceTitle: "Qwen-Image 对比 vLLM-Omni",
-    imagePerformanceLead: "RTX 5090 · 8 步 · 文本编码器/DiT FP8、VAE BF16。每项 4 对发布候选配对测试，共 640 个正式请求，零错误。单位：张/秒；C 为客户端并发。",
+    imagePerformanceLead: "v0.15.0 候选版实测 · RTX 5090 · 8 步 · 文本编码器/DiT FP8、VAE BF16。每项 4 对发布候选配对测试，共 640 个正式请求，零错误。单位：张/秒；C 为客户端并发。",
     imageTasks: { generation: "生成", editing: "编辑" },
     workloadLabel: "任务",
     imagePerformanceNote: `两端均满足对应 P99 上限：20 / 5 / 30 / 30 秒。*2K 编辑约持平，比值 95% 区间为 0.9976–1.0077，差异尚不显著。表格采用常驻服务配置，不代表默认 CLI 冷启动性能。<a href="${IMAGE_PERFORMANCE_URL}">配置、延迟与内存</a>。`,
@@ -270,7 +270,7 @@ const pages = {
       ["文本架构", "Llama、Mistral、Qwen2、Qwen3 dense/MoE、Qwen3.5 hybrid dense/MoE、Gemma 3 文本。"],
       ["权重格式", "GGUF（含 Q4_K/Q5_K/Q6_K/Q8_0）、SafeTensors。部分 CUDA 路径支持 GPTQ INT4、compressed-tensors INT4、block-FP8。"],
       ["专用路径", "Gemma 4 compressed-tensors W4A16、GPT-OSS MXFP4 为 CUDA 路径。PQ2_0 完整模型仅在 Metal 实测，CUDA 目前为算子级验证。"],
-      ["图像", "Qwen-Image-2.1-Turbo 生成与单张 PNG 编辑；已验证 Linux CUDA SM120。下一版本的 Metal 支持已在 M4 16 GiB、上述配置下验证 1024×1024。"],
+      ["图像", "Qwen-Image-2.1-Turbo 生成与单张 PNG 编辑；已验证 Linux CUDA SM120，以及上述配置下 M4 Metal 的 1024×1024。"],
     ],
     supportNote: '支持范围取决于架构、格式与后端组合。CPU 为兼容后端，文本支持不代表视觉支持。0.14.0 已移除 embedding、ASR 和 TTS API。<a href="https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.14.0">发布说明</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">验证范围</a>。',
     performanceTitle: "近期 27B 吞吐",

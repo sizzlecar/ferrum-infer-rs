@@ -556,8 +556,8 @@
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "83d7d1459ad215bc479d6e56111a213dbfcfeb057efe413653e602211468fa5d",
-      "after_sha256": "e22a286a25b8d1b2b54513d2ebfacf52effc907f1e5091305199344c0d80ea73",
+      "before_sha256": "e22a286a25b8d1b2b54513d2ebfacf52effc907f1e5091305199344c0d80ea73",
+      "after_sha256": "a79571d606783a2cdb21af99647e501c57075821d48057e192beb5fc855def52",
       "areas": [
         "build",
         "backend_submission",
@@ -568,12 +568,12 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the v0.15.0-to-v0.16.0 candidate README changes: image generation and single-PNG editing use explicit CLI or OpenAI-compatible HTTP interfaces; editing may redraw background and details. CUDA image claims remain scoped to the documented SM120 precision/configuration. Metal uses explicit asset paths, Q4_K_M DiT, FP8 text encoder, BF16 vision/VAE, capacity-checked memory limits, cold residency, request-scoped edit caching, fused attention and bounded weight prefetch with a reference fallback. The documented M4 16 GiB evidence covers 1024 generation/editing; 2K completion and throughput qualification are not claimed. Image throughput is historical v0.15 pre-release resident-service evidence, and text throughput remains historical 0.13 evidence; neither validates this candidate or its staged packages. Retain all existing distribution, submission, protocol, scheduler, KV, execution, capacity and performance obligations and deferrals. This content review certifies no execution, package, model or performance result."
+      "rationale": "Reviewed the post-v0.16.0 publication README update: the release label identifies Metal Qwen-Image generation and single-PNG editing with GGUF DiT. Metal scope remains 1024x1024 on M4 16 GiB with the documented Q4_K_M DiT, FP8 text encoder and BF16 vision/VAE configuration; no 2K outcome, Metal concurrency, throughput or SLO claim is added. CUDA image throughput values remain unchanged, explicitly labeled as historical v0.15.0 candidate evidence with the original source link; text throughput remains historical 0.13 evidence. Retain all existing distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution or publication result."
     },
     {
       "path": "README_zh.md",
-      "before_sha256": "42ee70627220366a6238664fd7dfd6fd8a37c0c288c4c432c00f9b3c5ef625aa",
-      "after_sha256": "fc70122d4610c5d0cb9521fa14034ab947a58709b7afafdb2e346251f0ed32f1",
+      "before_sha256": "fc70122d4610c5d0cb9521fa14034ab947a58709b7afafdb2e346251f0ed32f1",
+      "after_sha256": "5fcdad1b4cf1ec34bf17d73931b4ed315e2f6ee00fed3116980d2c6e002fb218",
       "areas": [
         "build",
         "backend_submission",
@@ -584,7 +584,7 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the v0.15.0-to-v0.16.0 candidate Chinese README changes: image generation and single-PNG editing use explicit CLI or OpenAI-compatible HTTP interfaces; editing may redraw background and details. CUDA image claims remain scoped to the documented SM120 precision/configuration. Metal uses explicit asset paths, Q4_K_M DiT, FP8 text encoder, BF16 vision/VAE, capacity-checked memory limits, cold residency, request-scoped edit caching, fused attention and bounded weight prefetch with a reference fallback. The documented M4 16 GiB evidence covers 1024 generation/editing; 2K completion and throughput qualification are not claimed. Image throughput is historical v0.15 pre-release resident-service evidence, and text throughput remains historical 0.13 evidence; neither validates this candidate or its staged packages. Retain all existing distribution, submission, protocol, scheduler, KV, execution, capacity and performance obligations and deferrals. This content review certifies no execution, package, model or performance result."
+      "rationale": "Reviewed the post-v0.16.0 publication README update: the release label identifies Metal Qwen-Image generation and single-PNG editing with GGUF DiT. Metal scope remains 1024x1024 on M4 16 GiB with the documented Q4_K_M DiT, FP8 text encoder and BF16 vision/VAE configuration; no 2K outcome, Metal concurrency, throughput or SLO claim is added. CUDA image throughput values remain unchanged, explicitly labeled as historical v0.15.0 candidate evidence with the original source link; text throughput remains historical 0.13 evidence. Retain all existing distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution or publication result."
     }
   ],
   "release_profile_ids": [
