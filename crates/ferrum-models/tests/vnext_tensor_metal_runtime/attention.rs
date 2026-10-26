@@ -7,6 +7,8 @@ use transforms::{fixture::Fixture, run_case, spec};
 mod accumulation;
 #[path = "attention/cross.rs"]
 mod cross;
+#[path = "attention/exp_range.rs"]
+mod exp_range;
 #[path = "attention/oracle.rs"]
 mod oracle;
 #[path = "attention/underflow.rs"]
@@ -369,5 +371,6 @@ pub(super) fn verify(
     }
     underflow::verify(runtime, registry, catalog, &policy, host);
     accumulation::verify(runtime, registry, catalog, &policy, host);
+    exp_range::verify(runtime, registry, catalog, &policy, host);
     cross::verify(runtime, registry, catalog, host);
 }

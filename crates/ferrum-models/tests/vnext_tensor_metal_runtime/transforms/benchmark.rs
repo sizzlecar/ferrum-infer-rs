@@ -21,7 +21,18 @@ enum Case {
         heads: u64,
         width: u64,
     },
+    NonuniformAttention {
+        sequence: u64,
+        heads: u64,
+        width: u64,
+    },
     CrossAttention {
+        queries: u64,
+        keys: u64,
+        heads: u64,
+        width: u64,
+    },
+    NonuniformCrossAttention {
         queries: u64,
         keys: u64,
         heads: u64,
@@ -66,6 +77,11 @@ impl Case {
                 sequence,
                 heads,
                 width,
+            }
+            | Self::NonuniformAttention {
+                sequence,
+                heads,
+                width,
             } => {
                 let shape = bf16(vec![sequence, heads * width]);
                 (
@@ -97,6 +113,12 @@ impl Case {
                 )
             }
             Self::CrossAttention {
+                queries,
+                keys,
+                heads,
+                width,
+            }
+            | Self::NonuniformCrossAttention {
                 queries,
                 keys,
                 heads,
@@ -196,6 +218,12 @@ impl Case {
                     _ => (((index % (heads * width)) % 17) as i32 - 8) as f32 / 16.0,
                 }
             }
+            Self::NonuniformAttention { heads, width, .. }
+            | Self::NonuniformCrossAttention { heads, width, .. } => match port {
+                0 | 1 => ((index % 7) as i32 - 3) as f32 / 2.0,
+                // Keep the original constant-channel V and exact output oracle.
+                _ => (((index % (heads * width)) % 17) as i32 - 8) as f32 / 16.0,
+            },
             Self::Conv { channels, .. } | Self::PaddedConv { channels, .. } => match port {
                 0 => 1.0 / 64.0,
                 1 => (((index / (channels * 9)) % 7) as i32 - 3) as f32 / 256.0,
@@ -224,7 +252,10 @@ impl Case {
                 self.value(0, row * inputs + inner)
                     * self.value(1, (index % outputs) * inputs + inner)
             }
-            Self::Attention { .. } | Self::CrossAttention { .. } => self.value(2, index),
+            Self::Attention { .. }
+            | Self::CrossAttention { .. }
+            | Self::NonuniformAttention { .. }
+            | Self::NonuniformCrossAttention { .. } => self.value(2, index),
             Self::Conv { channels, side } => {
                 let channel = index / (side * side);
                 rounds(channels as f32 * 9.0 / 64.0 * self.value(1, channel * channels * 9))
@@ -311,6 +342,73 @@ fn managed_cross_attention_microbench() {
             width: 128,
         },
     ]);
+}
+
+#[test]
+#[ignore = "real Metal nonuniform attention timing; requires exclusive GPU access"]
+fn managed_nonuniform_attention_microbench() {
+    // Nonzero, exact BF16 half-integer Q/K exercise nonzero exponent arguments.
+    // Constant-channel V still gives the original exact full-output oracle.
+    // Both implementations must use this same harness and input construction.
+    run_microbench(&[
+        Case::NonuniformAttention {
+            sequence: 4096,
+            heads: 32,
+            width: 128,
+        },
+        Case::NonuniformAttention {
+            sequence: 8192,
+            heads: 32,
+            width: 128,
+        },
+        Case::NonuniformCrossAttention {
+            queries: 4096,
+            keys: 8228,
+            heads: 32,
+            width: 128,
+        },
+    ]);
+}
+
+#[test]
+fn nonuniform_attention_inputs_have_distinct_nonzero_scores() {
+    let cases = [
+        Case::NonuniformAttention {
+            sequence: 7,
+            heads: 32,
+            width: 128,
+        },
+        Case::NonuniformCrossAttention {
+            queries: 3,
+            keys: 7,
+            heads: 32,
+            width: 128,
+        },
+    ];
+    for case in cases {
+        let fixture = case.fixture();
+        let columns = fixture.inputs[0].dimensions[1];
+        let keys = fixture.inputs[1].dimensions[0];
+        let width = 128;
+        assert!((0..width).any(|channel| case.value(0, channel) != 0.0));
+        let scores: Vec<f64> = (0..keys)
+            .map(|key| {
+                (0..width)
+                    .map(|channel| {
+                        let q = case.value(0, channel);
+                        let k = case.value(1, key * columns + channel);
+                        assert_eq!(rounds(q).to_bits(), q.to_bits());
+                        assert_eq!(rounds(k).to_bits(), k.to_bits());
+                        f64::from(q) * f64::from(k)
+                    })
+                    .sum::<f64>()
+                    / 8.0
+            })
+            .collect();
+        assert!(scores.iter().all(|score| score.is_finite()));
+        assert!(scores.iter().any(|score| *score != 0.0));
+        assert!(scores.iter().any(|score| *score != scores[0]));
+    }
 }
 
 #[test]
