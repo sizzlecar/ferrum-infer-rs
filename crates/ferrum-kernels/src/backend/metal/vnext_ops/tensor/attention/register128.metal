@@ -183,11 +183,15 @@ kernel void ferrum_tensor_attention_register128_bf16(
             simdgroup_float8x8 probability[2];
             for (uint n = 0; n < 2; ++n)
                 probability[n] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            #pragma clang loop unroll(full)
             for (uint d = 0; d < 128; d += 8) {
                 simdgroup_float8x8 q, k;
+                #pragma clang loop unroll(full)
                 for (uint e = 0; e < 2; ++e)
                     q.thread_elements()[e] = decode_bf16(q_tile[(sid * 8 + rows[e]) * 136 + d + columns[e]]);
+                #pragma clang loop unroll(full)
                 for (uint n = 0; n < 2; ++n) {
+                    #pragma clang loop unroll(full)
                     for (uint e = 0; e < 2; ++e)
                         k.thread_elements()[e] = decode_bf16(kv_tile[(d + rows[e]) * 24 + n * 8 + columns[e]]);
                     simdgroup_multiply_accumulate(probability[n], q, k, probability[n]);
