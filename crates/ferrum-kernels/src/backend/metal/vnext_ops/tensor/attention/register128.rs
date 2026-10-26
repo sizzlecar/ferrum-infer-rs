@@ -222,6 +222,10 @@ pub(super) fn supports_cross_shape(query: u64, key: u64, head_dim: u32) -> bool 
 mod probe;
 
 #[cfg(test)]
+#[path = "register128_prefix.rs"]
+mod prefix;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ferrum_runtime::{CanonicalRational, ResolvedTensorSpec, StructuredAttentionBf16Geometry};
