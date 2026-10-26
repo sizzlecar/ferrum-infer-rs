@@ -18,10 +18,21 @@ pub(super) enum Mode {
     ProductionBf16,
     ProductionNativeBf16,
     SteelReference,
+    DecodeShift,
+    DecodeNative,
 }
 impl Mode {
     pub(super) fn is_qk(&self) -> bool {
         *self == Self::QkSoftmaxState
+    }
+    pub(super) fn is_decode(self) -> bool {
+        matches!(self, Self::DecodeShift | Self::DecodeNative)
+    }
+    pub(super) fn native_decode(self) -> bool {
+        matches!(self, Self::ProductionNativeBf16 | Self::DecodeNative)
+    }
+    pub(super) fn explicit_msl31(self) -> bool {
+        self.is_bf16() || self.is_decode()
     }
     pub(super) fn columns(self) -> u64 {
         match self {
@@ -30,7 +41,9 @@ impl Mode {
             Self::ValueWidth128
             | Self::ProductionBf16
             | Self::ProductionNativeBf16
-            | Self::SteelReference => 128,
+            | Self::SteelReference
+            | Self::DecodeShift
+            | Self::DecodeNative => 128,
         }
     }
     pub(super) fn is_bf16(self) -> bool {
@@ -47,21 +60,25 @@ impl Mode {
         }
     }
     pub(super) fn dynamic_bytes(self) -> u64 {
-        if self == Self::SteelReference {
+        if self == Self::SteelReference || self.is_decode() {
             0
         } else {
             SHARED_BYTES
         }
     }
     pub(super) fn inputs(self) -> &'static [&'static str] {
-        if self.is_qk() {
+        if self.is_decode() {
+            &[QUERY]
+        } else if self.is_qk() {
             &[QUERY, KEY]
         } else {
             &[QUERY, KEY, VALUE]
         }
     }
     pub(super) fn operation(self) -> &'static str {
-        if self.is_bf16() {
+        if self.is_decode() {
+            DECODE_OP
+        } else if self.is_bf16() {
             BF16_OP
         } else if self.is_qk() {
             OP
@@ -70,7 +87,9 @@ impl Mode {
         }
     }
     pub(super) fn output(self) -> &'static str {
-        if self.is_bf16() {
+        if self.is_decode() {
+            DECODE_OUTPUT
+        } else if self.is_bf16() {
             BF16_OUTPUT
         } else if self.is_qk() {
             OUTPUT
@@ -79,7 +98,11 @@ impl Mode {
         }
     }
     pub(super) fn profile(self) -> &'static str {
-        if self == Self::SteelReference {
+        if self == Self::DecodeShift {
+            DECODE_SHIFT_PROFILE
+        } else if self == Self::DecodeNative {
+            DECODE_NATIVE_PROFILE
+        } else if self == Self::SteelReference {
             STEEL_PROFILE
         } else if self == Self::ProductionBf16 {
             BF16_PROFILE
@@ -100,6 +123,7 @@ impl Mode {
                 "ferrum_tensor_attention_register128_bf16"
             }
             Self::SteelReference => steel::KERNEL,
+            Self::DecodeShift | Self::DecodeNative => "ferrum_diagnostic_bf16_decode",
         }
     }
 }
@@ -156,6 +180,11 @@ impl Config {
         rows.checked_mul(columns)
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| invalid("input byte extent overflow"))?;
+        if self.mode.is_decode() && rows * columns > u32::MAX as u64 {
+            return Err(invalid(
+                "direct decode diagnostic exceeds u32 dispatch index",
+            ));
+        }
         rows.checked_mul(self.heads)
             .and_then(|n| n.checked_mul(self.mode.columns()))
             .and_then(|n| n.checked_mul(self.mode.output_element().size_bytes()))
@@ -386,5 +415,47 @@ fn bf16_comparison_profiles_and_official_parameter_abi_are_explicit() {
             ..c
         })
         .is_err());
+    }
+}
+
+#[test]
+fn direct_decode_profiles_admit_one_bf16_input_and_real_f32_output() {
+    for mode in [Mode::DecodeShift, Mode::DecodeNative] {
+        let config = Config {
+            batch: 1,
+            sequence: 512,
+            heads: 1,
+            visibility: Visibility::AllValidBidirectional,
+            mode,
+            value_fixture: ValueFixture::PositivePeriodic,
+        };
+        TypedFamilyRegistration::new(Family)
+            .prepare_with_profile(&serde_json::to_value(config).unwrap(), &id(mode.profile()))
+            .unwrap();
+        let descriptor = Contract::new(config);
+        assert_eq!(descriptor.descriptor().inputs.len(), 1);
+        assert_eq!(config.input_spec().element_type, ElementType::Bf16);
+        assert_eq!(config.output_spec().element_type, ElementType::F32);
+        assert_eq!(
+            resolved(config.input_spec())
+                .minimum_storage_bytes()
+                .unwrap(),
+            128 << 10
+        );
+        assert_eq!(
+            resolved(config.output_spec())
+                .minimum_storage_bytes()
+                .unwrap(),
+            256 << 10
+        );
+        assert!(
+            Config {
+                sequence: 1 << 25,
+                ..config
+            }
+            .validate()
+            .is_err(),
+            "uint thread index must not wrap"
+        );
     }
 }

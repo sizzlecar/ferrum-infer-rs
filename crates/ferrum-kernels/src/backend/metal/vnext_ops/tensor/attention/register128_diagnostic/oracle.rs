@@ -323,6 +323,24 @@ pub(super) fn constant_value(head: u64, column: u64) -> f64 {
     (((head * 128 + column) % 17) as i64 - 8) as f64 / 16.0
 }
 
+pub(super) fn verify_decode_payloads(bytes: &[u8], count: u64) {
+    assert_eq!(bytes.len() as u64, count * 4);
+    for (i, word) in bytes.chunks_exact(4).enumerate() {
+        let input_bits = i as u16;
+        let actual = u32::from_le_bytes(word.try_into().unwrap());
+        let expected = u32::from(input_bits) << 16;
+        if input_bits & 0x7fff > 0x7f80 {
+            // Conversion may canonicalize any signaling or quiet NaN payload.
+            assert!(
+                f32::from_bits(actual).is_nan(),
+                "BF16 NaN {input_bits:#06x}"
+            );
+        } else {
+            assert_eq!(actual, expected, "BF16 decode {input_bits:#06x}; includes signed zeros, both subnormal ranges and infinities");
+        }
+    }
+}
+
 impl ValueReference {
     pub(super) fn bf16_relative_bound(c: Config) -> f64 {
         use super::family::Mode;

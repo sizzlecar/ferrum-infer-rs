@@ -10,7 +10,7 @@ pub(in crate::backend::metal::vnext_ops::tensor) const FINGERPRINT_SOURCE: &str 
     include_str!("register128.metal")
 );
 pub(in crate::backend::metal::vnext_ops::tensor) const NUMERICAL_IDENTITY: &str =
-    "metal.attention.head128.simdgroup-f32-bq32-bk16;ushort-staging-exact-bf16-decode;register-p2-o16;coordinate-calibrated-xor1-xor8-or-dynamic-four-peer-or-full-shuffle-row-reduction;f32-exp;finite-pv-guarded-explicit-f32-rescale-then-inplace-mma-c;sticky-v-above-2p93-or-o-nonfinite-above-2p124-or-p-alpha-outside-0-2-fallback-zero-pv-mma-separate-add;nonfinite-v-visible-only-scalar-pv-then-separate-rescale-add;key-runs-or-validated-all-batch-all-valid-specialization;typed-structured-or-cross-independent-query-key-lengths;same-structured-causal-segment-tail-ieee-and-arithmetic-order;bf16-final-only;shared15120;fast-math=false.v4";
+    "metal.attention.head128.simdgroup-f32-bq32-bk16;ushort-staging-native-bfloat-decode-msl3.1-or-original-shift-decode-system-default-on-library-compile-rejection;original-integer-bf16-encode-and-rounded-bf16;register-p2-o16;coordinate-calibrated-xor1-xor8-or-dynamic-four-peer-or-full-shuffle-row-reduction;f32-exp;finite-pv-guarded-explicit-f32-rescale-then-inplace-mma-c;sticky-v-above-2p93-or-o-nonfinite-above-2p124-or-p-alpha-outside-0-2-fallback-zero-pv-mma-separate-add;nonfinite-v-visible-only-scalar-pv-then-separate-rescale-add;key-runs-or-validated-all-batch-all-valid-specialization;typed-structured-or-cross-independent-query-key-lengths;same-structured-causal-segment-tail-ieee-and-arithmetic-order;bf16-final-only;shared15120;fast-math=false.v5";
 
 #[derive(Debug, Clone, Copy)]
 enum Domain {
@@ -143,21 +143,66 @@ fn compile_domain(
 fn compile_library(
     runtime: &MetalDeviceRuntime,
 ) -> Result<metal::Library, MetalDeviceRuntimeError> {
-    let source = concat!(
-        include_str!("../bf16.metal"),
-        "\n",
-        include_str!("../attention.metal"),
-        "\n",
-        include_str!("register128_calibration.metal"),
-        "\n",
-        include_str!("register128.metal")
-    );
+    // Both libraries share every kernel body. Renaming only while including
+    // the header preserves encode_bf16 and rounded_bf16's original arithmetic.
+    macro_rules! source {
+        ($prefix:literal, $suffix:literal) => {
+            concat!(
+                $prefix,
+                include_str!("../bf16.metal"),
+                $suffix,
+                "\n",
+                include_str!("../attention.metal"),
+                "\n",
+                include_str!("register128_calibration.metal"),
+                "\n",
+                include_str!("register128.metal")
+            )
+        };
+    }
     let options = CompileOptions::new();
     options.set_fast_math_enabled(false);
-    runtime
+    options.set_language_version(metal::MTLLanguageVersion::V3_1);
+    let native_error = match runtime.device().new_library_with_source(
+        source!(
+            "#define decode_bf16 decode_bf16_shift\n",
+            "\n#undef decode_bf16\ninline float decode_bf16(ushort bits) { return float(as_type<bfloat>(bits)); }\n"
+        ),
+        &options,
+    ) {
+        Ok(library) => {
+            tracing::info!(
+                selected_decode = "native_bfloat",
+                requested_language = "MSL3.1",
+                fast_math = false,
+                "Metal register Head128 attention library compiled"
+            );
+            return Ok(library);
+        }
+        Err(reason) => reason,
+    };
+    // Compiler rejection can indicate an older SDK/device. Preserve the real
+    // reason rather than guessing from a platform name or an error substring.
+    // Function specialization and PSO creation errors remain fatal below.
+    tracing::warn!(
+        native_error = %native_error,
+        "Metal native BF16 attention library rejected; trying original decode and system-default language"
+    );
+    let fallback_options = CompileOptions::new();
+    fallback_options.set_fast_math_enabled(false);
+    let library = runtime
         .device()
-        .new_library_with_source(source, &options)
-        .map_err(MetalDeviceRuntimeError::contract)
+        .new_library_with_source(source!("", ""), &fallback_options)
+        .map_err(|fallback_error| MetalDeviceRuntimeError::contract(format!(
+            "Metal register Head128 attention library compilation failed; native BF16/MSL3.1: {native_error}; original shift decode/system-default: {fallback_error}"
+        )))?;
+    tracing::info!(
+        selected_decode = "original_shift",
+        requested_language = "system_default",
+        fast_math = false,
+        "Metal register Head128 attention fallback library compiled"
+    );
+    Ok(library)
 }
 
 fn compile_pipeline(
