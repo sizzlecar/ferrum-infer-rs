@@ -10,7 +10,7 @@
 
 Rust 文本与图像推理，一个二进制提供 CLI 和 OpenAI 兼容 API。
 
-**[v0.15.0](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.15.0)** 新增 Qwen-Image 图像生成与编辑。
+**[v0.16.0](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.16.0)** 新增 Metal Qwen-Image 图像生成与编辑，支持 GGUF DiT。
 
 核心目标是在满足延迟 SLO 的前提下，最大化输出吞吐：
 
@@ -65,7 +65,7 @@ ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thin
 
 CUDA 使用完整的本地 [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) 模型目录。已验证 RTX 5090、Linux CUDA 12.8、cuDNN 9；文本编码器/DiT 使用 FP8，视觉编码器/VAE 使用 BF16。
 
-Metal 图像后端正在为下一版本完成验收。M4 Mac mini、16 GiB 统一内存已完成 1024×1024 生成与编辑，使用 Q4_K_M GGUF DiT、FP8 文本编码器和 BF16 视觉编码器/VAE。该组合通过 `--image-config` 显式配置 Metal 后端、模型资产与内存上限；这套 16 GiB 配置尚未完成 2K 出图，吞吐验收仍在进行。
+Metal 支持 Qwen-Image 生图与单张 PNG 编辑，使用 Q4_K_M GGUF DiT、FP8 文本编码器和 BF16 视觉编码器/VAE。已在 M4 Mac mini、16 GiB 统一内存上验证 1024×1024。通过 `--image-config` 配置后端、资产和内存预算。
 
 **Metal 配置：**将 [qwen-image-2.1-turbo-metal.json](crates/ferrum-cli/examples/config/qwen-image-2.1-turbo-metal.json) 复制为 `image-metal.json`，与 `models/` 目录并列。原模型的文本编码器、VAE 和元数据放在 `models/Qwen-Image-2.1-Turbo/`，[Q4_K_M DiT](https://huggingface.co/m9ter1a/Qwen-Image-2.1-Turbo-GGUF/blob/a94df596a422bc8dfe406655154c0364f79ba042/qwen-image-2.1-turbo-Q4_K_M.gguf) 放在 `models/Qwen-Image-2.1-Turbo-GGUF/`；也可直接修改 JSON 路径，相对路径以配置文件所在目录为基准。示例保留单个活动图像、组件按阶段加载释放、请求内编辑缓存、2 GiB Host 预算和 Metal 推荐工作集的 90%，仍需通过容量检查；不需要原始 BF16 DiT 权重。
 
@@ -120,7 +120,7 @@ HTTP：`POST /v1/images/generations` 接收 JSON，`POST /v1/images/edits` 接�
 
 ### 对比 vLLM-Omni
 
-RTX 5090 · Qwen-Image-2.1-Turbo · 8 步 · 文本编码器/DiT FP8、VAE BF16。每项 4 对发布候选配对测试，共 640 个正式请求，零错误。单位：张/秒；并发为客户端并发。
+v0.15.0 候选版实测 · RTX 5090 · Qwen-Image-2.1-Turbo · 8 步 · 文本编码器/DiT FP8、VAE BF16。每项 4 对发布候选配对测试，共 640 个正式请求，零错误。单位：张/秒；并发为客户端并发。
 
 | 任务 | 并发 | Ferrum | vLLM-Omni | Ferrum / Omni |
 |---|---:|---:|---:|---:|

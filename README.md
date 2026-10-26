@@ -10,7 +10,7 @@
 
 Text and image inference in one Rust binary, with CLI and OpenAI-compatible APIs.
 
-**[v0.15.0](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.15.0)** adds Qwen-Image generation and editing.
+**[v0.16.0](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.16.0)** adds Metal Qwen-Image generation and editing with a GGUF DiT.
 
 **Goal: maximize output throughput while meeting TTFT, TPOT and ITL SLOs.**
 
@@ -61,7 +61,7 @@ Defaults adapt execution and capacity to capabilities, hardware and memory; expl
 
 CUDA uses a complete local copy of [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo). Validated on RTX 5090 with Linux CUDA 12.8, cuDNN 9, FP8 text encoder/DiT and BF16 vision/VAE.
 
-Metal image support is being validated for the next release. On an M4 Mac mini with 16 GiB unified memory, 1024×1024 generation and editing have completed with a Q4_K_M GGUF DiT, FP8 text encoder and BF16 vision/VAE. This combination uses an explicit `--image-config` for the Metal backend, model assets and memory limits. The tested 16 GiB configuration has not completed 2K generation; throughput qualification remains in progress.
+Metal supports Qwen-Image generation and single-PNG editing with a Q4_K_M GGUF DiT, FP8 text encoder and BF16 vision/VAE. Validated at 1024×1024 on an M4 Mac mini with 16 GiB unified memory. Use `--image-config` to select the backend, assets and memory budget.
 
 **Metal configuration:** copy [qwen-image-2.1-turbo-metal.json](crates/ferrum-cli/examples/config/qwen-image-2.1-turbo-metal.json) to `image-metal.json` beside your `models/` directory. Place the original model's text encoder, VAE and metadata under `models/Qwen-Image-2.1-Turbo/`, and [the Q4_K_M DiT](https://huggingface.co/m9ter1a/Qwen-Image-2.1-Turbo-GGUF/blob/a94df596a422bc8dfe406655154c0364f79ba042/qwen-image-2.1-turbo-Q4_K_M.gguf) under `models/Qwen-Image-2.1-Turbo-GGUF/`. Alternatively, edit the JSON paths; relative paths resolve from the JSON file's directory. The example keeps one active image, cold component residency, request-scoped edit caching, a 2 GiB Host budget and 90% of Metal's recommended working set, subject to capacity checks. It does not need the original BF16 DiT weights.
 
@@ -116,7 +116,7 @@ The local-directory preset supports up to 1024×1024. 2K and the resident servic
 
 ### Throughput vs vLLM-Omni
 
-RTX 5090 · Qwen-Image-2.1-Turbo · 8 steps · FP8 text encoder/DiT, BF16 VAE. Four paired pre-release runs per workload, 640 measured requests, zero errors. Mean images/s; C is client concurrency.
+v0.15.0 candidate measurements · RTX 5090 · Qwen-Image-2.1-Turbo · 8 steps · FP8 text encoder/DiT, BF16 VAE. Four paired pre-release runs per workload, 640 measured requests, zero errors. Mean images/s; C is client concurrency.
 
 | Workload | C | Ferrum | vLLM-Omni | Ferrum / Omni |
 |---|---:|---:|---:|---:|
@@ -134,7 +134,7 @@ Both implementations met the declared P99 limits: 20 / 5 / 30 / 30 seconds, in r
 | Text architectures | Llama, Mistral, Qwen2, Qwen3 dense/MoE, Qwen3.5 hybrid dense/MoE, Gemma 3 text |
 | Weights | GGUF, including Q4_K/Q5_K/Q6_K/Q8_0; SafeTensors. Selected CUDA paths: GPTQ INT4, compressed-tensors INT4, block-FP8 |
 | Specific paths | Gemma 4 compressed-tensors W4A16 and GPT-OSS MXFP4: CUDA. PQ2_0: complete-model validation on Metal; CUDA operator coverage only |
-| Images | Qwen-Image-2.1-Turbo generation and single-PNG editing; validated on Linux CUDA SM120. Upcoming Metal support: 1024×1024 validated on M4 16 GiB with the precision/configuration above |
+| Images | Qwen-Image-2.1-Turbo generation and single-PNG editing; validated on Linux CUDA SM120 and at 1024×1024 on M4 Metal with the configuration above |
 
 Support varies by combination; CPU is a compatibility backend. See [validation scope](docs/release-regression-catalog.md).
 
