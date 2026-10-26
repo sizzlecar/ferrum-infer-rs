@@ -352,8 +352,12 @@ impl ValueReference {
             return ((1.0 + Self::relative_bound(c.sequence)).next_up() * (1.0 + bf16_u) - 1.0)
                 .next_up();
         }
-        assert_eq!(c.mode, Mode::SteelReference);
-        // Independent Steel reference profile, not Ferrum's exp<=4ULP bound.
+        assert!(matches!(
+            c.mode,
+            Mode::SteelReference | Mode::CompactDenseBf16
+        ));
+        // Independent Steel and derived compact-core profiles: both preserve
+        // log2e/fast-exp2/division, not the natural-exp<=4ULP profile.
         // The 49 exact natural-score table has |log2 score|<25 and spread<36.
         // u=2^-23: log2e constant+scale+score multiply perturb each score by
         // <4u*25; subtraction adds rounding, giving argument error <251u.
@@ -435,6 +439,7 @@ fn bf16_reference_bound_declares_steel_log2_domain_and_constant_channels() {
         super::family::Mode::ProductionBf16,
         super::family::Mode::ProductionNativeBf16,
         super::family::Mode::SteelReference,
+        super::family::Mode::CompactDenseBf16,
     ] {
         let config = Config {
             batch: 2,

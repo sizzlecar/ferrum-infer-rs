@@ -34,6 +34,9 @@ const DECODE_OUTPUT: &str = "value.diagnostic.decoded_f32";
 const DECODE_SHIFT_PROFILE: &str = "metal.diagnostic.bf16_decode.shift.f32_payload.v1";
 const DECODE_NATIVE_PROFILE: &str = "metal.diagnostic.bf16_decode.native.f32_payload.v1";
 const STEEL_PROFILE: &str = "metal.diagnostic.official_steel_sdpa.bf16.log2e_fast_exp2_division.v1";
+const COMPACT_DENSE_PROFILE: &str =
+    "metal.diagnostic.compact_dense_sdpa.bf16.log2e_fast_exp2_division.finite_fixture.v1";
+const COMPACT_DENSE_SOURCE: &str = include_str!("dense_core.metal");
 const VALUE_OP: &str = "operation.diagnostic.metal.attention_value_width";
 const VALUE_PROFILE: &str = "metal.diagnostic.attention_value_width.f32.v1";
 const VALUE_OUTPUT: &str = "value.diagnostic.attention_values";
@@ -164,7 +167,7 @@ struct Pipeline {
 }
 impl Pipelines {
     fn select(&self, c: family::Config) -> &ComputePipelineState {
-        let aligned = if c.mode == family::Mode::SteelReference {
+        let aligned = if c.mode.uses_dense_params() {
             [c.sequence.is_multiple_of(32), c.sequence.is_multiple_of(16)]
         } else {
             [false, false]
@@ -300,7 +303,9 @@ impl OperationProvider<MetalDeviceRuntime> for Provider {
                     })
                     .ok_or("attention diagnostic logical work overflows")?
             };
-            let steel_params = (c.mode == family::Mode::SteelReference)
+            let dense_params = c
+                .mode
+                .uses_dense_params()
                 .then(|| steel::Params::new(c))
                 .transpose()
                 .map_err(|e| e.to_string())?;
@@ -325,8 +330,8 @@ impl OperationProvider<MetalDeviceRuntime> for Provider {
                             MTLSize::new(count.div_ceil(128), 1, 1),
                             MTLSize::new(128, 1, 1),
                         );
-                    } else if let Some(steel_params) = &steel_params {
-                        set_params(compute, 4, steel_params);
+                    } else if let Some(dense_params) = &dense_params {
+                        set_params(compute, 4, dense_params);
                         compute.dispatch_thread_groups(
                             MTLSize::new(c.sequence.div_ceil(32), c.heads, c.batch),
                             MTLSize::new(32, 4, 1),
@@ -604,13 +609,14 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
             .transpose()
             .unwrap();
         let requested_language = if modes.iter().any(|mode| mode.explicit_msl31()) {
-            "MSL3.1 explicit, both comparison modes"
+            "MSL3.1 explicit, all comparison modes"
         } else {
             "system_default"
         };
         let fingerprint = implementation_fingerprint(&[
             SOURCE.as_bytes(),
             NATIVE_BF16_SOURCE.as_bytes(),
+            COMPACT_DENSE_SOURCE.as_bytes(),
             include_str!("register128_diagnostic.rs").as_bytes(),
             include_str!("register128_diagnostic/family.rs").as_bytes(),
             include_str!("register128_diagnostic/oracle.rs").as_bytes(),
@@ -663,29 +669,38 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
                 .new_library_with_source(&source.source, &options)
                 .unwrap()
         });
+        let compact_library = modes.contains(&family::Mode::CompactDenseBf16).then(|| {
+            runtime
+                .device()
+                .new_library_with_source(COMPACT_DENSE_SOURCE, &options)
+                .unwrap()
+        });
         let mut states = Vec::new();
         let mut properties = Vec::new();
         for &mode in modes {
-            let alignments: &[[bool; 2]] = if mode == family::Mode::SteelReference {
+            let alignments: &[[bool; 2]] = if mode.uses_dense_params() {
                 &[[false, false], [false, true], [true, false], [true, true]]
             } else {
                 &[[false, false]]
             };
             for &aligned in alignments {
                 let constants = metal::FunctionConstantValues::new();
-                if mode == family::Mode::SteelReference {
-                    for (index, value) in [
-                        (200, aligned[0]),
-                        (201, aligned[1]),
-                        (300, false),
-                        (301, false),
-                        (302, false),
-                    ] {
+                if mode.uses_dense_params() {
+                    for (index, value) in [(200, aligned[0]), (201, aligned[1])] {
                         constants.set_constant_value_at_index(
                             (&value as *const bool).cast(),
                             metal::MTLDataType::Bool,
                             index,
                         );
+                    }
+                    if mode == family::Mode::SteelReference {
+                        for index in [300, 301, 302] {
+                            constants.set_constant_value_at_index(
+                                (&false as *const bool).cast(),
+                                metal::MTLDataType::Bool,
+                                index,
+                            );
+                        }
                     }
                 } else {
                     constants.set_constant_value_at_index(
@@ -701,6 +716,8 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
                 }
                 let selected_library = if mode == family::Mode::SteelReference {
                     steel_library.as_ref().unwrap()
+                } else if mode == family::Mode::CompactDenseBf16 {
+                    compact_library.as_ref().unwrap()
                 } else if mode.native_decode() {
                     native_bf16_library.as_ref().unwrap()
                 } else {
@@ -728,7 +745,7 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
                     .is_some_and(|n| n <= runtime.device().max_threadgroup_memory_length()));
                 properties.push(serde_json::json!({"mode":mode,"kernel":mode.kernel(),"aligned_q":aligned[0],"aligned_k":aligned[1],
                     "requested_language":requested_language,"fast_math_enabled":false,
-                    "input_decode":if mode.native_decode() {"float(as_type<bfloat>(ushort_bits))"} else if mode == family::Mode::SteelReference {"official native bfloat input"} else {"as_type<float>(uint(ushort_bits)<<16)"},
+                    "input_decode":if mode.native_decode() {"float(as_type<bfloat>(ushort_bits))"} else if mode.uses_dense_params() {"native bfloat input"} else {"as_type<float>(uint(ushort_bits)<<16)"},
                     "thread_execution_width":state.thread_execution_width(),"maximum_threads":state.max_total_threads_per_threadgroup(),
                     "static_threadgroup_bytes":state.static_threadgroup_memory_length(),"dynamic_threadgroup_bytes":mode.dynamic_bytes()}));
                 states.push(Pipeline {
@@ -738,7 +755,7 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
                 });
             }
         }
-        drop((library, steel_library, native_bf16_library));
+        drop((library, steel_library, compact_library, native_bf16_library));
         let pipelines = Arc::new(Pipelines {
             states,
             _retention: retention,
@@ -781,7 +798,8 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
                 trial,
             ));
         }
-        // One process balances the two compared modes in A -> B -> B -> A order.
+        // One process balances compared modes forward then reverse: ABBA for
+        // two modes, ABCCBA for three. Each mode keeps six measured samples.
         // Each group owns fresh inputs/session and keeps warmup + all samples.
         // The single QK-state mode retains its original one-large-case scope.
         let large_modes: Vec<_> = modes
@@ -834,11 +852,11 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
         assert!(capacity.reserve(DeviceOpaqueMemoryKind::Stream, 1).is_err());
         drop(all);
         serde_json::json!({"source_fingerprint":fingerprint,
-            "runtime_fingerprint":runtime_fingerprint,"pso":properties,"reference_source":steel_source.map(|source|source.report),"requested_language":requested_language,"large_case_order":large_modes,"cases":cases,"native_memory":native,
+            "runtime_fingerprint":runtime_fingerprint,"pso":properties,"reference_source":steel_source.map(|source|source.report),"compact_source_fingerprint":modes.contains(&family::Mode::CompactDenseBf16).then(|| implementation_fingerprint(&[COMPACT_DENSE_SOURCE.as_bytes()])),"requested_language":requested_language,"large_case_order":large_modes,"cases":cases,"native_memory":native,
             "host_committed_after_close":host.usage().unwrap().committed_bytes(),"device_full_capacity_reclaimed":true,
             "timing_scope":if modes.iter().all(|mode| mode.is_decode()) {"correctness only; no performance samples; DeviceTimingOff"} else {"managed_execute_admission_encode_wait_readback; input preparation and independent full-output checks excluded; DeviceTimingOff"},
-            "bf16_comparison":if modes.iter().any(|mode|mode.is_bf16()) {serde_json::json!({"both_arms":"BF16 contiguous BSHD inputs and output, explicit MSL3.1 fast_math=false", "baseline":"production shader source at explicit MSL3.1; historical production measurements used system-default language and a different binary", "reference":if modes.contains(&family::Mode::SteelReference) {"official Steel native bfloat, F32 fragments, original log2e/fast::exp2/division; independent numerical profile, not Ferrum IEEE equivalence"} else {"same production kernel bodies, only decode_bf16 uses float(as_type<bfloat>(bits)); original encode and rounded_bf16 unchanged; finite fixture qualification only"}, "r263_difference":if modes.contains(&family::Mode::SteelReference) {Some("R263 MLX API exposed BHSD output and copied to BSHD; this reference writes BSHD directly")} else {None}, "qualification":"small positive nonconstant V, independent FP64; large channel-constant V, every BF16 output bit checked"})} else {serde_json::Value::Null},
-            "limits":if modes.iter().all(|mode|mode.is_decode()) {"Managed direct BF16-to-F32 decode/store qualification only; exact non-NaN payload preservation and NaN classification do not establish attention arithmetic/FTZ/IEEE correctness. No timing claim."} else if modes.iter().any(|mode|mode.is_bf16()) {"Test-only self attention comparison with all-valid keys, qualified only for the declared finite fixtures, not full production masked/nonfinite/subnormal semantics. Both arms request MSL3.1; neither timing is a pure GPU timestamp, nor does it reproduce the earlier MLX API or system-default production binary. No machine shader/register/spill observation."} else {"Test-only QK-state or PV/output-width diagnostics. F32 output IO and register liveness differ from production BF16. Both value widths retain all D128 K/V loading, IEEE guards for their computed columns and source synchronization points; the positive fixture keeps range guards inactive. Widths need not choose identical overflow fallback for arbitrary extreme values; no machine barrier/register/spill observation. Timing differences are not pure PV or GPU timestamps."}})
+            "bf16_comparison":if modes.iter().any(|mode|mode.is_bf16()) {serde_json::json!({"all_arms":"BF16 contiguous BSHD inputs and output, explicit MSL3.1 fast_math=false", "baseline":if modes.contains(&family::Mode::CompactDenseBf16) {"production-source native BF16 decode at explicit MSL3.1, with the same managed fixture and readback as both controls"} else {"production shader source at explicit MSL3.1; historical system-default measurements used a different binary"}, "reference":if modes.contains(&family::Mode::SteelReference) {"official Steel native bfloat, F32 fragments, original log2e/fast::exp2/division; independent numerical profile, not Ferrum IEEE equivalence"} else {"same production kernel bodies, only decode_bf16 uses float(as_type<bfloat>(bits)); original encode and rounded_bf16 unchanged; finite fixture qualification only"}, "compact":modes.contains(&family::Mode::CompactDenseBf16).then_some("independent compact source; native bfloat, F32 fragments, log2e/fast::exp2/division; same predeclared positive-fixture bound as Steel, separate profile"), "r263_difference":if modes.contains(&family::Mode::SteelReference) {Some("R263 MLX API exposed BHSD output and copied to BSHD; these controls write BSHD directly")} else {None}, "qualification":"small positive nonconstant V, independent FP64; large channel-constant V, every BF16 output bit checked"})} else {serde_json::Value::Null},
+            "limits":if modes.iter().all(|mode|mode.is_decode()) {"Managed direct BF16-to-F32 decode/store qualification only; exact non-NaN payload preservation and NaN classification do not establish attention arithmetic/FTZ/IEEE correctness. No timing claim."} else if modes.iter().any(|mode|mode.is_bf16()) {"Test-only self attention comparison with all-valid keys, qualified only for the declared finite fixtures, not full production masked/nonfinite/subnormal, Cross or dense-suffix semantics. All compared modes request MSL3.1; timing is not a pure GPU timestamp and does not reproduce the earlier MLX API or system-default production binary. No machine shader/register/spill observation."} else {"Test-only QK-state or PV/output-width diagnostics. F32 output IO and register liveness differ from production BF16. Both value widths retain all D128 K/V loading, IEEE guards for their computed columns and source synchronization points; the positive fixture keeps range guards inactive. Widths need not choose identical overflow fallback for arbitrary extreme values; no machine barrier/register/spill observation. Timing differences are not pure PV or GPU timestamps."}})
     })
 }
 
@@ -887,5 +905,18 @@ fn managed_metal_bf16_decode_all_payloads() {
     eprintln!(
         "metal_bf16_decode_all_payloads={}",
         run_diagnostic(&[family::Mode::DecodeShift, family::Mode::DecodeNative])
+    );
+}
+
+#[test]
+#[ignore = "native production/compact core/official Steel self-attention comparison; reference manifest and exclusive GPU required"]
+fn managed_metal_compact_dense_reference_diagnostic() {
+    eprintln!(
+        "metal_attention_compact_dense_reference={}",
+        run_diagnostic(&[
+            family::Mode::ProductionNativeBf16,
+            family::Mode::CompactDenseBf16,
+            family::Mode::SteelReference,
+        ])
     );
 }

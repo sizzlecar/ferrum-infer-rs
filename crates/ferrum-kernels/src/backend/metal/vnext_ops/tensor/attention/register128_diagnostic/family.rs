@@ -18,6 +18,7 @@ pub(super) enum Mode {
     ProductionBf16,
     ProductionNativeBf16,
     SteelReference,
+    CompactDenseBf16,
     DecodeShift,
     DecodeNative,
 }
@@ -34,6 +35,9 @@ impl Mode {
     pub(super) fn explicit_msl31(self) -> bool {
         self.is_bf16() || self.is_decode()
     }
+    pub(super) fn uses_dense_params(self) -> bool {
+        matches!(self, Self::SteelReference | Self::CompactDenseBf16)
+    }
     pub(super) fn columns(self) -> u64 {
         match self {
             Self::QkSoftmaxState => 2,
@@ -42,6 +46,7 @@ impl Mode {
             | Self::ProductionBf16
             | Self::ProductionNativeBf16
             | Self::SteelReference
+            | Self::CompactDenseBf16
             | Self::DecodeShift
             | Self::DecodeNative => 128,
         }
@@ -49,7 +54,10 @@ impl Mode {
     pub(super) fn is_bf16(self) -> bool {
         matches!(
             self,
-            Self::ProductionBf16 | Self::ProductionNativeBf16 | Self::SteelReference
+            Self::ProductionBf16
+                | Self::ProductionNativeBf16
+                | Self::SteelReference
+                | Self::CompactDenseBf16
         )
     }
     pub(super) fn output_element(self) -> ElementType {
@@ -60,7 +68,7 @@ impl Mode {
         }
     }
     pub(super) fn dynamic_bytes(self) -> u64 {
-        if self == Self::SteelReference || self.is_decode() {
+        if self.uses_dense_params() || self.is_decode() {
             0
         } else {
             SHARED_BYTES
@@ -104,6 +112,8 @@ impl Mode {
             DECODE_NATIVE_PROFILE
         } else if self == Self::SteelReference {
             STEEL_PROFILE
+        } else if self == Self::CompactDenseBf16 {
+            COMPACT_DENSE_PROFILE
         } else if self == Self::ProductionBf16 {
             BF16_PROFILE
         } else if self == Self::ProductionNativeBf16 {
@@ -123,6 +133,7 @@ impl Mode {
                 "ferrum_tensor_attention_register128_bf16"
             }
             Self::SteelReference => steel::KERNEL,
+            Self::CompactDenseBf16 => "ferrum_dense_attention_bf16_bq32_bk16_d128",
             Self::DecodeShift | Self::DecodeNative => "ferrum_diagnostic_bf16_decode",
         }
     }
@@ -166,7 +177,7 @@ impl Config {
                 "constant-channel fixture requires a BF16 comparison mode",
             ));
         }
-        if self.mode == Mode::SteelReference {
+        if self.mode.uses_dense_params() {
             steel::Params::new(self)?;
         }
         let rows = self
@@ -387,6 +398,7 @@ fn bf16_comparison_profiles_and_official_parameter_abi_are_explicit() {
         Mode::ProductionBf16,
         Mode::ProductionNativeBf16,
         Mode::SteelReference,
+        Mode::CompactDenseBf16,
     ] {
         let c = Config {
             batch: 2,
