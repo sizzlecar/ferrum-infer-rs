@@ -218,6 +218,7 @@ impl DirectoryOptions {
                 maximum_bytes: self.maximum_memory_bytes,
             },
             precision_policy: self.precision,
+            attention_policy: ferrum_engine::image_generation::ImageMetalAttentionPolicy::Reference,
             bootstrap_memory_bytes: 128 * MIB,
             stream_memory_bytes: 2 * MIB,
             maximum_streams: ferrum_engine::image_generation::ImageStreamLimit::Auto,

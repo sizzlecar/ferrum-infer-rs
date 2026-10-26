@@ -24,6 +24,7 @@ impl Fixture {
     pub fn kind(&self) -> MetalTensorOperation {
         MetalTensorOperation::ALL
             .into_iter()
+            .chain(MetalTensorOperation::FUSED_DENSE)
             .find(|kind| kind.contract().unwrap().descriptor().id == self.operation)
             .unwrap()
     }
@@ -36,7 +37,7 @@ impl Fixture {
             .collect()
     }
 }
-pub(super) struct TransformFamily;
+pub(crate) struct TransformFamily;
 impl ModelFamilyProvider for TransformFamily {
     type Config = Fixture;
     fn family_id(&self) -> &ModelFamilyId {
@@ -50,6 +51,7 @@ impl ModelFamilyProvider for TransformFamily {
         if serde_json::to_value(config).unwrap() != *raw
             || !OPERATIONS
                 .into_iter()
+                .chain(MetalTensorOperation::FUSED_DENSE)
                 .any(|kind| kind.contract().unwrap().descriptor().id == config.operation)
         {
             return Err(invalid("unknown transform fixture operation"));

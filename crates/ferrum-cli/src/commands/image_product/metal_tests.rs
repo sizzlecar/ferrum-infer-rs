@@ -21,6 +21,61 @@ fn load_wire(directory: &std::path::Path, wire: &Value) -> anyhow::Result<ImageP
 }
 
 #[test]
+fn metal_attention_policy_is_explicit_and_shared_by_run_and_serve_configuration() {
+    use ferrum_engine::image_generation::ImageMetalAttentionPolicy;
+    let directory = tempfile::tempdir().unwrap();
+    for serving in [false, true] {
+        let mut wire = metal_wire();
+        if serving {
+            wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+                "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
+                "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+        }
+        let ImageBackendConfig::Metal(original) =
+            load_wire(directory.path(), &wire).unwrap().backend
+        else {
+            panic!("Metal config")
+        };
+        assert_eq!(
+            original.attention_policy,
+            ImageMetalAttentionPolicy::Reference
+        );
+        for (value, expected) in [
+            ("reference", ImageMetalAttentionPolicy::Reference),
+            ("fused_dense", ImageMetalAttentionPolicy::FusedDense),
+        ] {
+            wire["backend"]["attention_policy"] = json!(value);
+            let ImageBackendConfig::Metal(selected) =
+                load_wire(directory.path(), &wire).unwrap().backend
+            else {
+                panic!("Metal config")
+            };
+            assert_eq!(selected.attention_policy, expected);
+            assert_eq!(selected.precision_policy, original.precision_policy);
+            assert_eq!(
+                selected.host.limits().unwrap(),
+                original.host.limits().unwrap()
+            );
+            assert_eq!(
+                selected.pipeline.edit_prefix_policy,
+                original.pipeline.edit_prefix_policy
+            );
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            assert_eq!(selected.resolved().unwrap().attention_policy, expected);
+        }
+        for invalid in [
+            json!("cudnn_sdpa_experimental_v1"),
+            json!("fast"),
+            json!(null),
+            json!({"kind":"fused_dense"}),
+        ] {
+            wire["backend"]["attention_policy"] = invalid;
+            assert!(load_wire(directory.path(), &wire).is_err());
+        }
+    }
+}
+
+#[test]
 fn metal_configuration_shares_residency_batch_limits_and_explicit_capacity() {
     let directory = tempfile::tempdir().unwrap();
     for serving in [false, true] {

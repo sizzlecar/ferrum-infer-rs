@@ -211,8 +211,42 @@ fn compile_pipeline(
     domain: Domain,
     key_visibility: KeyVisibility,
 ) -> Result<Option<ComputePipelineState>, MetalDeviceRuntimeError> {
+    compile_pipeline_with_gate(runtime, library, domain, key_visibility, false)
+}
+
+pub(super) fn compile_gated(
+    runtime: &MetalDeviceRuntime,
+    cross: bool,
+) -> Result<Option<ComputePipelineState>, MetalDeviceRuntimeError> {
+    let library = compile_library(runtime)?;
+    compile_pipeline_with_gate(
+        runtime,
+        &library,
+        if cross {
+            Domain::Cross
+        } else {
+            Domain::Structured
+        },
+        KeyVisibility::AllValid,
+        true,
+    )
+}
+
+fn compile_pipeline_with_gate(
+    runtime: &MetalDeviceRuntime,
+    library: &metal::LibraryRef,
+    domain: Domain,
+    key_visibility: KeyVisibility,
+    gated: bool,
+) -> Result<Option<ComputePipelineState>, MetalDeviceRuntimeError> {
     let all_valid = u32::from(key_visibility == KeyVisibility::AllValid);
     let constants = metal::FunctionConstantValues::new();
+    let gate = u32::from(gated);
+    constants.set_constant_value_at_index(
+        (&gate as *const u32).cast(),
+        metal::MTLDataType::UInt,
+        106,
+    );
     constants.set_constant_value_at_index(
         (&all_valid as *const u32).cast(),
         metal::MTLDataType::UInt,

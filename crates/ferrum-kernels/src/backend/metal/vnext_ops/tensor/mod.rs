@@ -75,6 +75,7 @@ pub fn metal_tensor_runtime_config(
         runtime_implementation_fingerprint: fingerprint(),
         capabilities: MetalTensorOperation::ALL
             .into_iter()
+            .chain(MetalTensorOperation::FUSED_DENSE)
             .map(|op| CapabilityId::new(op.capability()))
             .collect::<Result<_, _>>()?,
         dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
@@ -116,6 +117,8 @@ fn fingerprint() -> String {
         attention::register128::NUMERICAL_IDENTITY.as_bytes(),
         attention::cross::FINGERPRINT_SOURCE.as_bytes(),
         attention::cross::PROFILE.as_bytes(),
+        attention::dense_guarded::FINGERPRINT_SOURCE.as_bytes(),
+        attention::dense_guarded::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("transport.rs"),
         include_bytes!("transport.metal"),
         include_bytes!("scatter.rs"),
@@ -147,6 +150,7 @@ struct Pipelines {
     attention_register128_all_valid: Option<ComputePipelineState>,
     attention_shared_limit: u64,
     cross_attention: Option<attention::cross::CrossPipelines>,
+    dense_attention: Option<attention::dense_guarded::DensePipelines>,
     transport: Option<ComputePipelineState>,
     scatter: Option<ComputePipelineState>,
     primitives: Option<ComputePipelineState>,
@@ -411,9 +415,15 @@ pub fn metal_tensor_providers(
     let pipelines = Arc::new(Pipelines {
         spatial: spatial::pipelines(runtime, selected, &library)?,
         cross_attention: selected
-            .contains(&MetalTensorOperation::CrossAttention)
+            .iter()
+            .any(|op| op.is_cross_attention())
             .then(|| attention::cross::pipelines(runtime))
             .transpose()?,
+        dense_attention: selected
+            .iter()
+            .any(|op| MetalTensorOperation::FUSED_DENSE.contains(op))
+            .then(|| attention::dense_guarded::compile(runtime))
+            .flatten(),
         pointwise,
         linear,
         linear_mpp,
@@ -492,8 +502,8 @@ impl OperationResourceEstimator for TensorProvider {
         } else if self.kind.is_rope() {
             rope::geometry(self.kind, request.values(), request.attributes())
                 .map_err(invalid_plan)?;
-        } else if self.kind == MetalTensorOperation::CrossAttention {
-            attention::cross::geometry(
+        } else if self.kind.is_cross_attention() {
+            let shape = attention::cross::geometry(
                 request.values(),
                 request.attributes(),
                 self.pipelines
@@ -503,14 +513,36 @@ impl OperationResourceEstimator for TensorProvider {
                     .shared_limit,
             )
             .map_err(invalid_plan)?;
+            if self.kind == MetalTensorOperation::CrossAttentionFused
+                && self.pipelines.dense_attention.is_some()
+            {
+                if let Some(plan) = shape.dense_schedule().map_err(invalid_plan)? {
+                    return attention::dense_guarded::estimate_workspace(
+                        &self.descriptor,
+                        &request,
+                        plan.flag_bytes(),
+                    );
+                }
+            }
         } else if self.kind.is_attention() {
-            attention::geometry(
+            let shape = attention::geometry(
                 self.kind,
                 request.values(),
                 request.attributes(),
                 self.pipelines.attention_shared_limit,
             )
             .map_err(invalid_plan)?;
+            if self.kind == MetalTensorOperation::StructuredAttentionFused
+                && self.pipelines.dense_attention.is_some()
+            {
+                if let Some(plan) = shape.dense_schedule().map_err(invalid_plan)? {
+                    return attention::dense_guarded::estimate_workspace(
+                        &self.descriptor,
+                        &request,
+                        plan.flag_bytes(),
+                    );
+                }
+            }
         } else if self.kind.is_transport() {
             transport::geometry(self.kind, request.values(), request.attributes())
                 .map_err(invalid_plan)?;
@@ -593,8 +625,8 @@ impl TensorProvider {
         if self.kind.is_rope() {
             return rope::encode(self.kind, participant, Arc::clone(&self.pipelines));
         }
-        if self.kind == MetalTensorOperation::CrossAttention {
-            return attention::cross::encode(participant, Arc::clone(&self.pipelines));
+        if self.kind.is_cross_attention() {
+            return attention::cross::encode(self.kind, participant, Arc::clone(&self.pipelines));
         }
         if self.kind.is_attention() {
             return attention::encode(self.kind, participant, Arc::clone(&self.pipelines));

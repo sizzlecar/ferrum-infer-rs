@@ -9,6 +9,8 @@ mod accumulation;
 mod cross;
 #[path = "attention/exp_range.rs"]
 mod exp_range;
+#[path = "attention/fused.rs"]
+mod fused;
 #[path = "attention/oracle.rs"]
 mod oracle;
 #[path = "attention/underflow.rs"]
@@ -373,4 +375,5 @@ pub(super) fn verify(
     accumulation::verify(runtime, registry, catalog, &policy, host);
     exp_range::verify(runtime, registry, catalog, &policy, host);
     cross::verify(runtime, registry, catalog, host);
+    fused::verify(runtime, registry, catalog, &policy, host);
 }

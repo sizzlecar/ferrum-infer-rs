@@ -6,6 +6,10 @@ struct RegisterAttentionParams {
     float scale;
 };
 
+constant uint ATTENTION_REGISTER_GATED [[function_constant(106)]];
+constant bool attention_register_gated = is_function_constant_defined(ATTENTION_REGISTER_GATED)
+    ? ATTENTION_REGISTER_GATED != 0 : false;
+
 constant uint ATTENTION_REGISTER_DOMAIN [[function_constant(105)]];
 constant bool attention_register_cross = is_function_constant_defined(ATTENTION_REGISTER_DOMAIN)
     ? ATTENTION_REGISTER_DOMAIN != 0 : false;
@@ -96,6 +100,7 @@ kernel void ferrum_tensor_attention_register128_bf16(
     device ushort* output [[buffer(3)]],
     constant RegisterAttentionParams& p [[buffer(4)]],
     constant AttentionMask& mask [[buffer(5)]],
+    device const uint* job_flags [[buffer(6)]],
     threadgroup uchar* workspace [[threadgroup(0)]],
     uint group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
@@ -114,6 +119,9 @@ kernel void ferrum_tensor_attention_register128_bf16(
         peer_count, column_mask, peer_mask, four_peers, xor_peers);
 
     for (ulong job = group; job < p.jobs; job += p.grid_groups) {
+        // Full original grid/pitch is retained. Only a successfully completed
+        // dense tile is skipped; prefix and rejected suffix jobs remain strict.
+        if (attention_register_gated && job_flags[job] != 0) continue;
         const ulong q_start = (job % p.query_tiles) * 32;
         const ulong q_head = (job / p.query_tiles) % p.query_heads;
         const uint batch = uint(job / (p.query_tiles * p.query_heads));

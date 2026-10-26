@@ -34,6 +34,8 @@ impl QwenImage21Block0Family {
     pub const REFERENCE_PROFILE_ID: &'static str = "qwen_image21.block0.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen_image21.block0.cuda.bf16_f32.v1";
     pub const METAL_PROFILE_ID: &'static str = "qwen_image21.block0.metal.bf16_f32.v1";
+    pub const METAL_FUSED_PROFILE_ID: &'static str =
+        "qwen_image21.block0.metal.fused_dense.bf16_f32.v1";
     /// Explicit experimental vendor-fused attention; other block operations
     /// keep the existing CUDA numerical choices.
     pub const CUDA_FUSED_PROFILE_ID: &'static str =
@@ -294,7 +296,7 @@ impl ModelFamilyProvider for QwenImage21Block0Family {
     }
 }
 
-fn profile_sources() -> [(&'static str, &'static str, &'static str); 4] {
+fn profile_sources() -> [(&'static str, &'static str, &'static str); 5] {
     [
         (
             QwenImage21Block0Family::REFERENCE_PROFILE_ID,
@@ -314,6 +316,11 @@ fn profile_sources() -> [(&'static str, &'static str, &'static str); 4] {
         (
             QwenImage21Block0Family::METAL_PROFILE_ID,
             Attention::METAL_PROFILE_ID,
+            Mlp::METAL_PROFILE_ID,
+        ),
+        (
+            QwenImage21Block0Family::METAL_FUSED_PROFILE_ID,
+            Attention::METAL_FUSED_PROFILE_ID,
             Mlp::METAL_PROFILE_ID,
         ),
     ]

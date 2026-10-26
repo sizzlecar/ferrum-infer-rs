@@ -41,9 +41,13 @@ pub enum MetalTensorOperation {
     PhiloxNormal,
     Fp8Linear,
     CrossAttention,
+    StructuredAttentionFused,
+    CrossAttentionFused,
 }
 
 impl MetalTensorOperation {
+    /// Explicit opt-in; the original provider bundle does not acquire these PSOs.
+    pub const FUSED_DENSE: [Self; 2] = [Self::StructuredAttentionFused, Self::CrossAttentionFused];
     pub const POINTWISE: [Self; 7] = [
         Self::Silu,
         Self::SiluMul,
@@ -114,8 +118,14 @@ impl MetalTensorOperation {
     pub(super) fn is_attention(self) -> bool {
         matches!(
             self,
-            Self::StructuredAttention | Self::StructuredGqaAttention | Self::SegmentedAttention
+            Self::StructuredAttention
+                | Self::StructuredAttentionFused
+                | Self::StructuredGqaAttention
+                | Self::SegmentedAttention
         )
+    }
+    pub(super) fn is_cross_attention(self) -> bool {
+        matches!(self, Self::CrossAttention | Self::CrossAttentionFused)
     }
     pub(super) fn is_transport(self) -> bool {
         matches!(self, Self::RowGather | Self::BatchedRowConcat)
@@ -190,6 +200,8 @@ impl MetalTensorOperation {
             Self::PhiloxNormal => philox_normal_bf16_contract(),
             Self::Fp8Linear => dense_linear_fp8_bf16_contract(),
             Self::CrossAttention => cross_attention_bf16_contract(),
+            Self::StructuredAttentionFused => structured_attention_fused_bf16_contract(),
+            Self::CrossAttentionFused => cross_attention_fused_bf16_contract(),
             _ => unreachable!("primitive contracts handled above"),
         }
     }
@@ -198,6 +210,8 @@ impl MetalTensorOperation {
             Self::PhiloxNormal => super::philox::PROFILE,
             Self::Fp8Linear => super::fp8::PROFILE,
             Self::CrossAttention => super::attention::cross::PROFILE,
+            Self::StructuredAttentionFused => "metal.steel_dense_guarded.structured_attention.bf16.v1",
+            Self::CrossAttentionFused => "metal.steel_dense_guarded.cross_attention.bf16.v1",
             Self::Silu => "metal.precise.silu.bf16.v1",
             Self::SiluMul => "metal.precise.silu_mul.bf16.v1",
             Self::Tanh => "metal.precise.tanh.bf16.v1",
@@ -283,6 +297,8 @@ impl MetalTensorOperation {
             Self::PhiloxNormal => PHILOX_NORMAL_BF16_CAPABILITY_ID,
             Self::Fp8Linear => DENSE_LINEAR_FP8_BF16_CAPABILITY_ID,
             Self::CrossAttention => CROSS_ATTENTION_BF16_CAPABILITY_ID,
+            Self::StructuredAttentionFused => STRUCTURED_ATTENTION_FUSED_BF16_CAPABILITY_ID,
+            Self::CrossAttentionFused => CROSS_ATTENTION_FUSED_BF16_CAPABILITY_ID,
             _ => unreachable!("primitive capabilities handled above"),
         }
     }
@@ -321,6 +337,8 @@ impl MetalTensorOperation {
             Self::PhiloxNormal => PHILOX_NORMAL_BF16_OPERATION_ID,
             Self::Fp8Linear => DENSE_LINEAR_FP8_BF16_OPERATION_ID,
             Self::CrossAttention => CROSS_ATTENTION_BF16_OPERATION_ID,
+            Self::StructuredAttentionFused => STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID,
+            Self::CrossAttentionFused => CROSS_ATTENTION_FUSED_BF16_OPERATION_ID,
             _ => unreachable!("primitive operations handled above"),
         }
     }
@@ -359,6 +377,8 @@ impl MetalTensorOperation {
             Self::PhiloxNormal => "philox_normal",
             Self::Fp8Linear => "dense_linear_fp8",
             Self::CrossAttention => "cross_attention",
+            Self::StructuredAttentionFused => "structured_attention_fused",
+            Self::CrossAttentionFused => "cross_attention_fused",
             _ => unreachable!("primitive names handled above"),
         }
     }
@@ -374,7 +394,11 @@ impl MetalTensorOperation {
             Self::LayerNorm => 1,
             Self::HeadRmsNorm | Self::ZeroCenteredRmsNorm | Self::AdjacentRope => 2,
             Self::HalfSplitRope => 3,
-            Self::StructuredAttention | Self::StructuredGqaAttention | Self::CrossAttention => 3,
+            Self::StructuredAttention
+            | Self::StructuredGqaAttention
+            | Self::CrossAttention
+            | Self::StructuredAttentionFused
+            | Self::CrossAttentionFused => 3,
             Self::RowGather => 1,
             Self::BatchedRowConcat => 2,
             Self::RowScatterAdd => 2,

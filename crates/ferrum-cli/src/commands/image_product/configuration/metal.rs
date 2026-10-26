@@ -1,6 +1,6 @@
 use super::*;
 use ferrum_engine::image_generation::{
-    ImagePrecisionPolicy, ImageStreamLimit, ImageStreamRequirements,
+    ImageMetalAttentionPolicy, ImagePrecisionPolicy, ImageStreamLimit, ImageStreamRequirements,
 };
 use std::num::NonZeroU64;
 
@@ -22,6 +22,8 @@ pub struct MetalConfig {
     pub memory: MetalMemoryConfig,
     #[serde(default)]
     pub precision_policy: ImagePrecisionPolicy,
+    #[serde(default)]
+    pub attention_policy: ImageMetalAttentionPolicy,
     pub bootstrap_memory_bytes: u64,
     pub stream_memory_bytes: u64,
     #[serde(default)]
@@ -120,6 +122,7 @@ impl MetalConfig {
                 },
             },
             precision_policy: self.precision_policy,
+            attention_policy: self.attention_policy,
             bootstrap_memory_bytes: self.bootstrap_memory_bytes,
             stream_memory_bytes: self.stream_memory_bytes,
             maximum_streams: self.maximum_streams,

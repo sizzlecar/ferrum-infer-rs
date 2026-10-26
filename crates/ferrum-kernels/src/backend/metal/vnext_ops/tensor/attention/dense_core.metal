@@ -64,6 +64,14 @@ using namespace metal;
 
 constant bool ferrum_dense_align_q [[function_constant(200)]];
 constant bool ferrum_dense_align_k [[function_constant(201)]];
+constant bool ferrum_dense_guard_requested [[function_constant(202)]];
+constant bool ferrum_dense_guarded = is_function_constant_defined(ferrum_dense_guard_requested)
+    ? ferrum_dense_guard_requested : false;
+
+struct FerrumDenseGateParams {
+  ulong original_query_tiles;
+  ulong first_fast_tile;
+};
 
 // Identical field order and widths to the upstream 152-byte AttnParams ABI.
 struct FerrumDenseAttentionParams {
@@ -174,10 +182,19 @@ void ferrum_dense_attention_bf16_bq32_bk16_d128(
     const device bfloat* V [[buffer(2)]],
     device bfloat* O [[buffer(3)]],
     const constant FerrumDenseAttentionParams* params [[buffer(4)]],
+    const constant FerrumDenseGateParams* gate [[buffer(5)]],
+    device uint* job_flags [[buffer(6)]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]]) {
   using namespace ferrum_dense;
+
+  ulong job = 0;
+  if (ferrum_dense_guarded) {
+    job = (ulong(tid.z) * ulong(params->H) + tid.y) * gate->original_query_tiles
+        + gate->first_fast_tile + tid.x;
+    if (job_flags[job] == 0) return; // CTA-uniform, before any barrier/load.
+  }
 
   const ulong3 block{tid.x, tid.y, tid.z};
   Q += block.z * params->Q_strides[0] + block.y * params->Q_strides[1] +
@@ -189,6 +206,26 @@ void ferrum_dense_attention_bf16_bq32_bk16_d128(
 
   threadgroup bfloat q_shared[32 * 136];
   threadgroup bfloat kv_shared[128 * 24];
+  threadgroup float calibration_coordinates[64];
+  threadgroup atomic_uint rejected;
+  if (ferrum_dense_guarded) {
+    const uint thread_id = simd_id * 32 + lane;
+    if (thread_id == 0) atomic_store_explicit(&rejected, 0, memory_order_relaxed);
+    if (thread_id < 64) calibration_coordinates[thread_id] = float(thread_id);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_matrix<float, 8, 8> coordinate_fragment;
+    simdgroup_load(coordinate_fragment, calibration_coordinates, 8, 0, false);
+    const float2 actual = reinterpret_cast<thread float2&>(coordinate_fragment.thread_elements());
+    const uint row = ((lane / 4) & 4u) + ((lane / 2) % 4);
+    const uint col = ((lane / 4) & 2u) * 2 + (lane % 2) * 2;
+    if (any(actual != float2(float(row * 8 + col), float(row * 8 + col + 1))))
+      atomic_fetch_or_explicit(&rejected, 1, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (atomic_load_explicit(&rejected, memory_order_relaxed) != 0) {
+      if (thread_id == 0) job_flags[job] = 0;
+      return;
+    }
+  }
   BlockLoader<32, 136, 1> loader_q(Q, params->Q_strides[2], q_shared, simd_id, lane);
   BlockLoader<16, 1, 24> loader_k(K, params->K_strides[2], kv_shared, simd_id, lane);
   BlockLoader<16, 136, 1> loader_v(V, params->V_strides[2], kv_shared, simd_id, lane);
@@ -316,6 +353,22 @@ void ferrum_dense_attention_bf16_bq32_bk16_d128(
     FERRUM_DENSE_UNROLL
     for (short j = 0; j < 2; ++j) {
       output[id][j] /= denominator;
+    }
+  }
+  if (ferrum_dense_guarded) {
+    // Validate the actual result before any store. The wide 2^21 bound is
+    // twice the admitted |V| bound; it is not an accuracy tolerance. No extra
+    // rounding or arithmetic is inserted into the attention recurrence.
+    bool bad = !isfinite(denominator) || denominator <= 0.0f;
+    FERRUM_DENSE_UNROLL
+    for (short id = 0; id < 16; ++id) {
+      bad = bad || any(!isfinite(output[id])) || any(abs(output[id]) > float2(0x1p21f));
+    }
+    if (bad) atomic_fetch_or_explicit(&rejected, 1, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (atomic_load_explicit(&rejected, memory_order_relaxed) != 0) {
+      if (simd_id == 0 && lane == 0) job_flags[job] = 0;
+      return;
     }
   }
   threadgroup_barrier(mem_flags::mem_none);

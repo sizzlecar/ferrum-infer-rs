@@ -32,6 +32,8 @@ mod editing;
 mod host_cache;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
+mod metal_attention_policy;
+pub use metal_attention_policy::ImageMetalAttentionPolicy;
 mod prefix_denoising;
 pub use editing::{ImageEditPrefixPolicy, QwenImage21EditProfiles};
 mod plan_cache;

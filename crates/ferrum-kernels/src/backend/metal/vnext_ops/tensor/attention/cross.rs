@@ -1,6 +1,6 @@
 //! Rectangular attention over the shared bounded online-attention shader.
 use super::super::*;
-use super::{register128, NativeMask, CACHED_SHARED_BYTES};
+use super::{dense_guarded, register128, NativeMask, CACHED_SHARED_BYTES};
 use ferrum_runtime::CrossAttentionBf16Geometry;
 
 pub(in crate::backend::metal::vnext_ops::tensor) const PROFILE: &str =
@@ -144,6 +144,24 @@ pub(in crate::backend::metal::vnext_ops::tensor) struct Shape {
     operations: u64,
 }
 
+impl Shape {
+    pub(in crate::backend::metal::vnext_ops::tensor) fn dense_schedule(
+        &self,
+    ) -> Result<Option<dense_guarded::Schedule>, String> {
+        dense_guarded::Schedule::new(dense_guarded::GuardGeometry {
+            batch_heads: self.params.jobs / self.params.query_tiles,
+            query: self.params.sequence,
+            key: self.params.key_sequence,
+            query_heads: self.params.query_heads,
+            key_value_heads: self.params.key_value_heads,
+            head_dim: self.params.head_dim,
+            scale: self.params.scale,
+            all_keys_valid: self.key_visibility == register128::KeyVisibility::AllValid,
+            dense_start: Some(0),
+        })
+    }
+}
+
 pub(in crate::backend::metal::vnext_ops::tensor) fn geometry(
     values: &[ResolvedValueBinding],
     attributes: &BTreeMap<AttributeId, SemanticValue>,
@@ -227,6 +245,7 @@ fn supports_mpp(q: u64, kv: u64, heads: u64, width: u32) -> bool {
 }
 
 pub(in crate::backend::metal::vnext_ops::tensor) fn encode(
+    kind: MetalTensorOperation,
     participant: &TensorParticipant<'_>,
     pipelines: Arc<Pipelines>,
 ) -> Result<MetalDeviceCommand, String> {
@@ -264,6 +283,33 @@ pub(in crate::backend::metal::vnext_ops::tensor) fn encode(
         disjoint(input, &output)?;
     }
     regions.push(output);
+    if kind == MetalTensorOperation::CrossAttentionFused && pipelines.dense_attention.is_some() {
+        if let Some(plan) = shape.dense_schedule()? {
+            dense_guarded::append_flags(participant, &plan, &mut regions)?;
+            let work = DeviceCommandLogicalWork::tensor(shape.query_bytes / 2, shape.operations)
+                .map_err(|e| e.to_string())?;
+            return MetalDeviceCommand::tensor_operation(
+                "metal.cross_attention.fused_dense_guarded",
+                regions,
+                work,
+                move |encoder, regions| {
+                    dense_guarded::encode(
+                        encoder,
+                        regions,
+                        &plan,
+                        &shape.mask,
+                        pipelines
+                            .dense_attention
+                            .as_ref()
+                            .expect("selected dense pipelines"),
+                        true,
+                    );
+                    Ok(())
+                },
+            )
+            .map_err(|e| e.to_string());
+        }
+    }
     let register_supported = register128::supports_cross_shape(
         shape.params.sequence,
         shape.params.key_sequence,

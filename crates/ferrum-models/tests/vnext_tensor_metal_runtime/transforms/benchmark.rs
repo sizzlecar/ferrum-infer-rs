@@ -53,6 +53,23 @@ enum Case {
 }
 
 impl Case {
+    fn fixture_for_profile(&self, profile: AttentionBenchmarkProfile) -> Fixture {
+        let fixture = self.fixture();
+        if profile == AttentionBenchmarkProfile::Reference {
+            return fixture;
+        }
+        let kind = match fixture.kind() {
+            MetalTensorOperation::StructuredAttention => {
+                MetalTensorOperation::StructuredAttentionFused
+            }
+            MetalTensorOperation::CrossAttention => MetalTensorOperation::CrossAttentionFused,
+            _ => panic!("fused attention benchmark requires an attention fixture"),
+        };
+        let mut fused = Fixture::new(kind, fixture.inputs, fixture.attributes);
+        fused.output = fixture.output;
+        fused
+    }
+
     fn fixture(&self) -> Fixture {
         let bf16 = |shape| spec(shape, ElementType::Bf16);
         let (kind, inputs, output, attributes) = match *self {
@@ -354,6 +371,60 @@ fn managed_nonuniform_attention_microbench() {
 }
 
 #[test]
+#[ignore = "real Metal paired production attention timing; requires exclusive GPU access"]
+fn managed_nonuniform_attention_fused_paired_microbench() {
+    // Both profiles use the same compiled binary, runtime budget and inputs.
+    // Each A/B/B/A group warms once and measures three executions; validation
+    // covers every output, including warmups. The fused timing includes its
+    // prepass, dense dispatch and strict fallback dispatch, not just the core.
+    run_microbench_schedule(
+        &nonuniform_attention_cases(),
+        MicrobenchDiagnostics::DispatchSelection,
+        MicrobenchSchedule::PairedAttention,
+    );
+}
+
+#[test]
+fn paired_attention_profiles_preserve_fixture_precision_layout_and_data() {
+    for case in nonuniform_attention_cases() {
+        let reference = case.fixture_for_profile(AttentionBenchmarkProfile::Reference);
+        let fused = case.fixture_for_profile(AttentionBenchmarkProfile::FusedDense);
+        assert_eq!(reference.inputs, fused.inputs);
+        assert_eq!(reference.output, fused.output);
+        assert_eq!(reference.attributes, fused.attributes);
+        assert!(fused.inputs.iter().all(|input| {
+            input.element_type == ElementType::Bf16
+                && input.layout == ResolvedTensorLayout::Contiguous
+        }));
+        assert_eq!(
+            fused.kind(),
+            match reference.kind() {
+                MetalTensorOperation::StructuredAttention => {
+                    MetalTensorOperation::StructuredAttentionFused
+                }
+                MetalTensorOperation::CrossAttention => MetalTensorOperation::CrossAttentionFused,
+                _ => unreachable!(),
+            }
+        );
+        for fixture in [reference, fused] {
+            TypedFamilyRegistration::new(TransformFamily)
+                .prepare_with_profile(
+                    &serde_json::to_value(&fixture).unwrap(),
+                    &id(fixture.kind().profile()),
+                )
+                .unwrap();
+            for (port, input) in fixture.inputs.iter().enumerate() {
+                let elements = input.dimensions.iter().product::<u64>();
+                for index in [0, 1, elements / 2, elements - 1] {
+                    let value = case.value(port, index);
+                    assert_eq!(rounds(value), value);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "real Metal execution host timing diagnostic; requires exclusive GPU access"]
 fn managed_nonuniform_attention_host_timing_diagnostic() {
     // Existing execute_bound wall timers include host encoding/submission and
@@ -485,6 +556,28 @@ enum MicrobenchDiagnostics {
     ExecutionHost,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttentionBenchmarkProfile {
+    Reference,
+    FusedDense,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MicrobenchSchedule {
+    Original,
+    PairedAttention,
+}
+
+impl MicrobenchSchedule {
+    fn profiles(self) -> &'static [AttentionBenchmarkProfile] {
+        use AttentionBenchmarkProfile::*;
+        match self {
+            Self::Original => &[Reference],
+            Self::PairedAttention => &[Reference, FusedDense, FusedDense, Reference],
+        }
+    }
+}
+
 impl MicrobenchDiagnostics {
     fn filter(self) -> &'static str {
         match self {
@@ -506,6 +599,14 @@ fn run_microbench(cases: &[Case]) {
 }
 
 fn run_microbench_with_diagnostics(cases: &[Case], diagnostics: MicrobenchDiagnostics) {
+    run_microbench_schedule(cases, diagnostics, MicrobenchSchedule::Original);
+}
+
+fn run_microbench_schedule(
+    cases: &[Case],
+    diagnostics: MicrobenchDiagnostics,
+    schedule: MicrobenchSchedule,
+) {
     // This thread-local scope reports attention/linear capability and actual dispatch
     // selection without installing a global subscriber or reading an env filter.
     // Dispatch diagnostics run inside the measured execute call below.
@@ -531,9 +632,11 @@ fn run_microbench_with_diagnostics(cases: &[Case], diagnostics: MicrobenchDiagno
         .unwrap(),
     );
     let selected = cases.iter().fold(Vec::new(), |mut kinds, case| {
-        let kind = case.fixture().kind();
-        if !kinds.contains(&kind) {
-            kinds.push(kind);
+        for &profile in schedule.profiles() {
+            let kind = case.fixture_for_profile(profile).kind();
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
         }
         kinds
     });
@@ -586,8 +689,16 @@ fn run_microbench_with_diagnostics(cases: &[Case], diagnostics: MicrobenchDiagno
 
     // Image-token projections/FFN, generation/edit attention lengths and VAE
     // channel/spatial regimes. Synthetic data isolates costs, not model quality.
-    for (number, case) in cases.iter().enumerate() {
-        let fixture = case.fixture();
+    let runs = cases.iter().enumerate().flat_map(|(number, case)| {
+        schedule
+            .profiles()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(move |(group, profile)| (number, case, group, profile))
+    });
+    for (number, case, group, profile) in runs {
+        let fixture = case.fixture_for_profile(profile);
         let prepared = TypedFamilyRegistration::new(TransformFamily)
             .prepare_with_profile(
                 &serde_json::to_value(&fixture).unwrap(),
@@ -607,6 +718,16 @@ fn run_microbench_with_diagnostics(cases: &[Case], diagnostics: MicrobenchDiagno
             &options,
         )
         .unwrap();
+        let scratch_admitted = component.executable().execution_plan().payload().nodes()[0]
+            .provider_resources()
+            .scratch()
+            .is_some();
+        if profile == AttentionBenchmarkProfile::FusedDense {
+            // Supported finite-domain fixtures must select the production
+            // guarded schedule, not silently benchmark an unavailable PSO's
+            // no-scratch strict compatibility fallback.
+            assert!(scratch_admitted, "production fused schedule is unavailable");
+        }
         let mut session = component
             .initialize(
                 runtime.clone(),
@@ -647,11 +768,16 @@ fn run_microbench_with_diagnostics(cases: &[Case], diagnostics: MicrobenchDiagno
         let mut timings = Vec::new();
         for repetition in 0..4 {
             let input = inputs.clone();
+            let suffix = if schedule == MicrobenchSchedule::Original {
+                format!("{number}.{repetition}")
+            } else {
+                format!("paired.{number}.{group}.{repetition}")
+            };
             let start = Instant::now();
             let output = session
                 .execute(
-                    id(format!("run.image.microbench.{number}.{repetition}")),
-                    id(format!("request.image.microbench.{number}.{repetition}")),
+                    id(format!("run.image.microbench.{suffix}")),
+                    id(format!("request.image.microbench.{suffix}")),
                     input,
                 )
                 .unwrap();
@@ -686,15 +812,38 @@ fn run_microbench_with_diagnostics(cases: &[Case], diagnostics: MicrobenchDiagno
             PlanRuntimeCloseOutcome::Closed(_)
         ));
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
-        eprintln!(
-            "image_kernel_microbench={}",
-            serde_json::json!({
-                "operation": format!("{:?}", fixture.kind()), "inputs": fixture.inputs,
-                "output": fixture.output, "warmup_ms": timings[0], "measured_ms": &timings[1..],
-                "timing_scope": diagnostics.timing_scope(),
-                "runtime_fingerprint": runtime.descriptor().runtime_implementation_fingerprint,
-                "native_memory": runtime.native_memory_snapshot(),
-            })
-        );
+        if schedule == MicrobenchSchedule::Original {
+            eprintln!(
+                "image_kernel_microbench={}",
+                serde_json::json!({
+                    "operation": format!("{:?}", fixture.kind()), "inputs": fixture.inputs,
+                    "output": fixture.output, "warmup_ms": timings[0], "measured_ms": &timings[1..],
+                    "timing_scope": diagnostics.timing_scope(),
+                    "runtime_fingerprint": runtime.descriptor().runtime_implementation_fingerprint,
+                    "native_memory": runtime.native_memory_snapshot(),
+                })
+            );
+        } else {
+            eprintln!(
+                "image_attention_paired_microbench={}",
+                serde_json::json!({
+                    "case": number, "group": group,
+                    "order": "Reference/FusedDense/FusedDense/Reference",
+                    "selection": format!("{profile:?}"),
+                    "operation": format!("{:?}", fixture.kind()),
+                    "profile": fixture.kind().profile(),
+                    "inputs": fixture.inputs, "output": fixture.output,
+                    "warmup_ms": timings[0], "measured_ms": &timings[1..],
+                    "measured_samples": timings.len() - 1,
+                    "full_output_checks": timings.len(), "errors": 0,
+                    "oracle": "exact_bf16_constant_channel_value_full_output",
+                    "timing_scope": "managed_execute_admission_encode_all_dispatches_wait_readback_including_attention_and_linear_logging;fused_includes_guard_dense_and_strict_fallback;not_kernel_gpu_timestamps",
+                    "provider_scratch_admitted": scratch_admitted,
+                    "host_committed_bytes_after_close": host.usage().unwrap().committed_bytes(),
+                    "runtime_fingerprint": runtime.descriptor().runtime_implementation_fingerprint,
+                    "native_memory": runtime.native_memory_snapshot(),
+                })
+            );
+        }
     }
 }

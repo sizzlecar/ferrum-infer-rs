@@ -6,6 +6,7 @@ use ferrum_runtime::{
 };
 
 pub(super) mod cross;
+pub(super) mod dense_guarded;
 pub(super) mod mpp;
 pub(super) mod register128;
 
@@ -114,6 +115,24 @@ pub(super) struct Shape {
     operations: u64,
 }
 
+impl Shape {
+    pub(in crate::backend::metal::vnext_ops::tensor) fn dense_schedule(
+        &self,
+    ) -> Result<Option<dense_guarded::Schedule>, String> {
+        dense_guarded::Schedule::new(dense_guarded::GuardGeometry {
+            batch_heads: self.params.jobs / self.params.query_tiles,
+            query: self.params.sequence,
+            key: self.params.sequence,
+            query_heads: self.params.query_heads,
+            key_value_heads: self.params.key_value_heads,
+            head_dim: self.params.head_dim,
+            scale: self.params.scale,
+            all_keys_valid: self.key_visibility == register128::KeyVisibility::AllValid,
+            dense_start: dense_guarded::dense_start(&self.mask, self.params.sequence),
+        })
+    }
+}
+
 pub(super) fn geometry(
     kind: MetalTensorOperation,
     values: &[ResolvedValueBinding],
@@ -187,7 +206,10 @@ pub(super) fn geometry(
         });
     }
     // Validate MHA's stricter equal-width contract before unifying the geometry.
-    if kind == MetalTensorOperation::StructuredAttention {
+    if matches!(
+        kind,
+        MetalTensorOperation::StructuredAttention | MetalTensorOperation::StructuredAttentionFused
+    ) {
         StructuredAttentionBf16Geometry::new(q, k, v, y, attributes).map_err(|e| e.to_string())?;
     }
     let checked = StructuredGqaAttentionBf16Geometry::new(q, k, v, y, attributes)
@@ -266,6 +288,34 @@ pub(super) fn encode(
         disjoint(input, &output)?;
     }
     regions.push(output);
+    if kind == MetalTensorOperation::StructuredAttentionFused && pipelines.dense_attention.is_some()
+    {
+        if let Some(plan) = shape.dense_schedule()? {
+            dense_guarded::append_flags(participant, &plan, &mut regions)?;
+            let work = DeviceCommandLogicalWork::tensor(shape.query_bytes / 2, shape.operations)
+                .map_err(|e| e.to_string())?;
+            return MetalDeviceCommand::tensor_operation(
+                "metal.structured_attention.fused_dense_guarded",
+                regions,
+                work,
+                move |encoder, regions| {
+                    dense_guarded::encode(
+                        encoder,
+                        regions,
+                        &plan,
+                        &shape.mask,
+                        pipelines
+                            .dense_attention
+                            .as_ref()
+                            .expect("selected dense pipelines"),
+                        false,
+                    );
+                    Ok(())
+                },
+            )
+            .map_err(|e| e.to_string());
+        }
+    }
     let use_all_valid_register = shape.key_visibility == register128::KeyVisibility::AllValid
         && pipelines.attention_register128_all_valid.is_some()
         && register128::supports_shape(shape.params.sequence, shape.params.head_dim);

@@ -6,29 +6,7 @@ type F = QwenImage21TransformerFamily;
 fn native_archive_profiles_preserve_mixed_blocks_and_prefix_storage_identity() {
     let architecture = transformer(1, true, true);
     let expected = ExpectedWeights::from_config(&architecture, StructureLimits::default()).unwrap();
-    let encodings = expected
-        .tensors()
-        .values()
-        .map(|tensor| {
-            let encoding = if tensor.dimensions().len() == 1 {
-                WeightEncoding::Dense {
-                    element_type: ElementType::F32,
-                }
-            } else {
-                let (format, values, bytes) = if tensor.dimensions()[1].is_multiple_of(256) {
-                    ("quantization.gguf.q4-k", 256, 144)
-                } else {
-                    ("quantization.gguf.q8-0", 32, 34)
-                };
-                WeightEncoding::BlockQuantized(BlockQuantizationSpec {
-                    format_id: QuantizationFormatId::new(format).unwrap(),
-                    logical_values_per_block: values,
-                    bytes_per_block: bytes,
-                })
-            };
-            (tensor.external_name().to_owned(), encoding)
-        })
-        .collect::<BTreeMap<_, _>>();
+    let encodings = native_encodings(&expected);
     let config = QwenImage21TransformerConfig::new(
         architecture,
         QwenImage21T2iLayout::new(3, 2, 2, vec![3]).unwrap(),
@@ -364,6 +342,139 @@ fn fused_transformer_profile_selects_every_dit_attention_without_changing_transp
     assert_eq!(prepared.program(), &candidate);
 }
 
+fn native_encodings(expected: &ExpectedWeights) -> BTreeMap<String, WeightEncoding> {
+    expected
+        .tensors()
+        .values()
+        .map(|tensor| {
+            let encoding = if tensor.dimensions().len() == 1 {
+                WeightEncoding::Dense {
+                    element_type: ElementType::F32,
+                }
+            } else {
+                let (format, values, bytes) = if tensor.dimensions()[1].is_multiple_of(256) {
+                    ("quantization.gguf.q4-k", 256, 144)
+                } else {
+                    ("quantization.gguf.q8-0", 32, 34)
+                };
+                WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+                    format_id: QuantizationFormatId::new(format).unwrap(),
+                    logical_values_per_block: values,
+                    bytes_per_block: bytes,
+                })
+            };
+            (tensor.external_name().to_owned(), encoding)
+        })
+        .collect()
+}
+
+#[test]
+fn metal_fused_profiles_preserve_precision_masks_and_prefix_graphs() {
+    let architecture = transformer(2, true, true);
+    let expected = ExpectedWeights::from_config(&architecture, StructureLimits::default()).unwrap();
+    let full = QwenImage21TransformerConfig::new(
+        architecture,
+        QwenImage21T2iLayout::new(7, 2, 2, vec![7, 5]).unwrap(),
+    )
+    .unwrap()
+    .with_reference_image(2, 2, 2, 4)
+    .unwrap();
+    for (plain, fused, native) in [
+        (F::METAL_PROFILE_ID, F::METAL_FUSED_PROFILE_ID, false),
+        (
+            F::METAL_FP8_PROFILE_ID,
+            F::METAL_FP8_FUSED_PROFILE_ID,
+            false,
+        ),
+        (
+            F::METAL_NATIVE_BLOCK_PROFILE_ID,
+            F::METAL_NATIVE_BLOCK_FUSED_PROFILE_ID,
+            true,
+        ),
+    ] {
+        let full = if native {
+            full.clone()
+                .with_weight_encodings(native_encodings(&expected))
+                .unwrap()
+        } else {
+            full.clone()
+        };
+        for phase in [
+            QwenImage21TransformerPhase::Full,
+            QwenImage21TransformerPhase::PrefixPrefill,
+            QwenImage21TransformerPhase::PrefixDecode,
+        ] {
+            let config = full.clone().with_execution_phase(phase).unwrap();
+            let registration = TypedFamilyRegistration::new(F::new().unwrap());
+            let wire = serde_json::to_value(&config).unwrap();
+            let original = registration
+                .prepare_with_profile(&wire, &profile_id(plain).unwrap())
+                .unwrap();
+            let candidate = registration
+                .prepare_with_profile(&wire, &profile_id(fused).unwrap())
+                .unwrap();
+            assert_eq!(original.weights(), candidate.weights());
+            let (left, right) = (original.program(), candidate.program());
+            assert_eq!(left.inputs(), right.inputs());
+            assert_eq!(left.input_tensor_specs(), right.input_tensor_specs());
+            assert_eq!(left.outputs(), right.outputs());
+            assert_eq!(left.weights(), right.weights());
+            assert_eq!(left.states(), right.states());
+            assert_eq!(left.blocks().len(), right.blocks().len());
+            let mut changed = 0;
+            for (a, b) in left.blocks().iter().zip(right.blocks()) {
+                assert_eq!(a.nodes.len(), b.nodes.len());
+                for (a, b) in a.nodes.iter().zip(&b.nodes) {
+                    let mut restored = b.clone();
+                    let expected_fused = match a.operation_id.as_str() {
+                        STRUCTURED_ATTENTION_BF16_OPERATION_ID => {
+                            Some(STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID)
+                        }
+                        CROSS_ATTENTION_BF16_OPERATION_ID => {
+                            Some(CROSS_ATTENTION_FUSED_BF16_OPERATION_ID)
+                        }
+                        _ => None,
+                    };
+                    if let Some(expected) = expected_fused {
+                        assert_eq!(b.operation_id.as_str(), expected);
+                        restored.operation_id = a.operation_id.clone();
+                        changed += 1;
+                    }
+                    // This includes batch-specific key holes, causal segments,
+                    // prefix K/V joins and capture ports, not just operation IDs.
+                    assert_eq!(&restored, a);
+                }
+            }
+            assert_eq!(changed, config.transformer().layers());
+            let profiles = F::new().unwrap().numerical_profiles(&config).unwrap();
+            let profile = profiles.resolve(&profile_id(fused).unwrap()).unwrap();
+            assert!(!profiles.auto_preference().contains(&profile.id));
+            assert!(profile.validate_program(left).is_err());
+            profile.validate_program(right).unwrap();
+            let attention_id = if config.is_decode() {
+                CROSS_ATTENTION_FUSED_BF16_OPERATION_ID
+            } else {
+                STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID
+            };
+            let arithmetic = profile
+                .operations
+                .iter()
+                .find(|op| op.operation_id.as_str() == attention_id)
+                .unwrap();
+            assert_eq!(arithmetic.multiplication_type, Some(ElementType::F32));
+            assert_eq!(arithmetic.accumulation_type, Some(ElementType::F32));
+        }
+    }
+    // Geometry outside the compact core remains valid for backend fallback.
+    let tiny = config(true);
+    TypedFamilyRegistration::new(F::new().unwrap())
+        .prepare_with_profile(
+            &serde_json::to_value(tiny).unwrap(),
+            &profile_id(F::METAL_FUSED_PROFILE_ID).unwrap(),
+        )
+        .unwrap();
+}
+
 fn transformer(layers: u64, causal_condition: bool, real: bool) -> QwenImage21Config {
     QwenImage21Config::from_hf_json(
         &serde_json::to_vec(&json!({
@@ -542,6 +653,21 @@ fn full_graph_reuses_two_distinct_layers_and_only_retains_target_velocity() {
                     assert_eq!(
                         actual.operation_id.as_str(),
                         DENSE_LINEAR_FP8_BF16_OPERATION_ID
+                    );
+                } else if matches!(
+                    profile.id.as_str(),
+                    F::METAL_FUSED_PROFILE_ID
+                        | F::METAL_FP8_FUSED_PROFILE_ID
+                        | F::METAL_NATIVE_BLOCK_FUSED_PROFILE_ID
+                        | F::CUDA_FUSED_PROFILE_ID
+                        | F::CUDA_FP8_FUSED_PROFILE_ID
+                        | F::CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID
+                ) && original.operation_id.as_str()
+                    == STRUCTURED_ATTENTION_BF16_OPERATION_ID
+                {
+                    assert_eq!(
+                        actual.operation_id.as_str(),
+                        STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID
                     );
                 } else {
                     assert_eq!(actual.operation_id, original.operation_id);

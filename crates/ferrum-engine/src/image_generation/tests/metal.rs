@@ -14,6 +14,7 @@ static METAL_FACTORY_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn metal_config() -> QwenImage21MetalConfig {
     QwenImage21MetalConfig {
         precision_policy: ImagePrecisionPolicy::Bf16,
+        attention_policy: ImageMetalAttentionPolicy::Reference,
         memory: ImageMetalMemoryPolicy::AutoRecommended {
             utilization: 0.75,
             maximum_bytes: NonZeroU64::new(fixture::DEVICE_BYTES),

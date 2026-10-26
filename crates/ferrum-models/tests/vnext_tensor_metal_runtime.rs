@@ -228,6 +228,7 @@ fn managed_metal_tensor_operations_match_independent_arithmetic_and_retire_resou
             MetalTensorOperation::PhiloxNormal,
         ])
         .chain(transforms::OPERATIONS)
+        .chain(MetalTensorOperation::FUSED_DENSE)
         .collect();
     let registry = OperationRuntimeRegistry::new(
         selected
