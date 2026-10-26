@@ -27,12 +27,22 @@ pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 impl WeightSource {
     pub fn open(&self) -> Result<Arc<dyn TensorArchive>> {
         match self {
-            Self::Single { directory, file } => Ok(Arc::new(SafetensorsArchive::open_single_file(
-                directory, file,
-            )?)),
-            Self::Index { directory, file } => Ok(Arc::new(SafetensorsArchive::open_with_index(
-                directory, file,
-            )?)),
+            Self::Single {
+                directory,
+                file,
+                read_ahead,
+            } => Ok(Arc::new(
+                SafetensorsArchive::open_single_file(directory, file)?
+                    .with_read_ahead(*read_ahead)?,
+            )),
+            Self::Index {
+                directory,
+                file,
+                read_ahead,
+            } => Ok(Arc::new(
+                SafetensorsArchive::open_with_index(directory, file)?
+                    .with_read_ahead(*read_ahead)?,
+            )),
             Self::Gguf { directory, file } => {
                 ensure!(
                     file.len() > ".gguf".len()

@@ -112,9 +112,22 @@ pub struct WeightPaths {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WeightSource {
-    Single { directory: PathBuf, file: String },
-    Index { directory: PathBuf, file: String },
-    Gguf { directory: PathBuf, file: String },
+    Single {
+        directory: PathBuf,
+        file: String,
+        #[serde(default)]
+        read_ahead: ferrum_quantization::SafetensorsReadAheadPolicy,
+    },
+    Index {
+        directory: PathBuf,
+        file: String,
+        #[serde(default)]
+        read_ahead: ferrum_quantization::SafetensorsReadAheadPolicy,
+    },
+    Gguf {
+        directory: PathBuf,
+        file: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]

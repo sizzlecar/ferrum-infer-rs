@@ -264,7 +264,7 @@ fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
     assert_eq!(cuda.cudnn.library_path, base.join("lib/libcudnn.so.9"));
     assert!(cuda.cudnn.dependency_libraries.is_empty());
     assert!(
-        matches!(config.weights.vae, WeightSource::Single{directory,file}
+        matches!(config.weights.vae, WeightSource::Single{directory,file,..}
         if directory == base.join("vae") && file == "diffusion.safetensors")
     );
     for (key, value) in [
@@ -975,6 +975,7 @@ fn exact_weight_source_never_falls_back_to_another_filename() {
     let source = WeightSource::Single {
         directory: dir.path().into(),
         file: "chosen.safetensors".into(),
+        read_ahead: Default::default(),
     };
     assert!(source.open().is_ok());
     for file in [
@@ -984,17 +985,145 @@ fn exact_weight_source_never_falls_back_to_another_filename() {
     ] {
         assert!(WeightSource::Single {
             directory: dir.path().into(),
-            file: file.into()
+            file: file.into(),
+            read_ahead: Default::default(),
         }
         .open()
         .is_err());
     }
     assert!(WeightSource::Index {
         directory: dir.path().into(),
-        file: "missing.index.json".into()
+        file: "missing.index.json".into(),
+        read_ahead: Default::default(),
     }
     .open()
     .is_err());
+}
+
+#[test]
+fn bounded_read_ahead_is_explicit_for_shared_run_and_serve_weight_sources() {
+    use ferrum_quantization::SafetensorsReadAheadPolicy;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    let policy = |source: &WeightSource| match source {
+        WeightSource::Single { read_ahead, .. } | WeightSource::Index { read_ahead, .. } => {
+            *read_ahead
+        }
+        WeightSource::Gguf { .. } => panic!("expected safetensors source"),
+    };
+    let metal_template: Value = serde_json::from_str(include_str!(
+        "../../../examples/config/qwen-image-2.1-turbo-metal.json"
+    ))
+    .unwrap();
+    for template in [configuration(), metal_template] {
+        for serving in [false, true] {
+            let mut wire = template.clone();
+            if serving {
+                wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+                    "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
+                    "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+            } else {
+                wire.as_object_mut().unwrap().remove("serving");
+            }
+            let default = load(&wire).unwrap();
+            assert_eq!(
+                policy(&default.weights.text_encoder),
+                SafetensorsReadAheadPolicy::Off
+            );
+            assert_eq!(
+                policy(&default.weights.vae),
+                SafetensorsReadAheadPolicy::Off
+            );
+            wire["weights"]["text_encoder"]["read_ahead"] = json!({
+                "will_need": {"maximum_range_bytes": 134_217_728}
+            });
+            let opted_in = load(&wire).unwrap();
+            assert_eq!(
+                policy(&opted_in.weights.text_encoder),
+                SafetensorsReadAheadPolicy::WillNeed {
+                    maximum_range_bytes: 134_217_728,
+                }
+            );
+            assert_eq!(
+                policy(&opted_in.weights.vae),
+                SafetensorsReadAheadPolicy::Off
+            );
+            for invalid in [
+                json!({"will_need":{"maximum_range_bytes":0}}),
+                json!({"will_need":{"maximum_range_bytes":u64::MAX}}),
+                json!({"will_need":{"maximum_range_bytes":1,"whole_map":true}}),
+                json!(null),
+            ] {
+                wire["weights"]["text_encoder"]["read_ahead"] = invalid;
+                assert!(load(&wire).is_err());
+            }
+        }
+    }
+    for read_ahead in [
+        json!("off"),
+        json!({"will_need":{"maximum_range_bytes":134_217_728}}),
+    ] {
+        assert!(serde_json::from_value::<WeightSource>(json!({
+            "kind":"gguf", "directory":".", "file":"weights.gguf", "read_ahead":read_ahead
+        }))
+        .is_err());
+    }
+}
+
+#[test]
+fn bounded_read_ahead_single_and_index_open_the_same_validated_payload() {
+    use ferrum_runtime::{ElementType, WeightComponentRole, WeightComponentSpec, WeightEncoding};
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = [0x80, 0x3f, 0x00, 0xc0];
+    serialize_to_file(
+        [("w", TensorView::new(Dtype::BF16, vec![2], &bytes).unwrap())],
+        &None,
+        &dir.path().join("chosen.safetensors"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("chosen.index.json"),
+        serde_json::to_vec(&json!({
+            "weight_map":{"w":"chosen.safetensors"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let component = WeightComponentSpec {
+        id: "component.weight".to_owned().try_into().unwrap(),
+        role: WeightComponentRole::Values,
+        external_names: vec!["w".into()],
+        dimensions: vec![2],
+        required: true,
+        encoding: WeightEncoding::Dense {
+            element_type: ElementType::Bf16,
+        },
+    };
+    for (kind, file) in [
+        ("single", "chosen.safetensors"),
+        ("index", "chosen.index.json"),
+    ] {
+        let source: WeightSource = serde_json::from_value(json!({
+            "kind":kind,"directory":dir.path(),"file":file,
+            "read_ahead":{"will_need":{"maximum_range_bytes":134_217_728}}
+        }))
+        .unwrap();
+        let archive = source.open().unwrap();
+        let metadata = archive.tensor("w").unwrap();
+        let payload = archive.component(&component).unwrap();
+        assert_eq!(payload.bytes(), bytes);
+        assert_eq!(payload.bytes().as_ptr(), metadata.bytes().as_ptr());
+        let retained = payload.retained_host_memory().unwrap().clone();
+        drop(payload);
+        drop(metadata);
+        drop(archive);
+        assert_eq!(retained.bytes(), bytes);
+    }
 }
 
 #[derive(Parser)]
