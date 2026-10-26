@@ -8,6 +8,62 @@ pub(super) enum Visibility {
     AllValidBidirectional,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Mode {
+    #[default]
+    QkSoftmaxState,
+    ValueWidth64,
+    ValueWidth128,
+}
+impl Mode {
+    pub(super) fn is_qk(&self) -> bool {
+        *self == Self::QkSoftmaxState
+    }
+    pub(super) fn columns(self) -> u64 {
+        match self {
+            Self::QkSoftmaxState => 2,
+            Self::ValueWidth64 => 64,
+            Self::ValueWidth128 => 128,
+        }
+    }
+    pub(super) fn inputs(self) -> &'static [&'static str] {
+        if self.is_qk() {
+            &[QUERY, KEY]
+        } else {
+            &[QUERY, KEY, VALUE]
+        }
+    }
+    pub(super) fn operation(self) -> &'static str {
+        if self.is_qk() {
+            OP
+        } else {
+            VALUE_OP
+        }
+    }
+    pub(super) fn output(self) -> &'static str {
+        if self.is_qk() {
+            OUTPUT
+        } else {
+            VALUE_OUTPUT
+        }
+    }
+    pub(super) fn profile(self) -> &'static str {
+        if self.is_qk() {
+            PROFILE
+        } else {
+            VALUE_PROFILE
+        }
+    }
+    pub(super) fn kernel(self) -> &'static str {
+        match self {
+            Self::QkSoftmaxState => "ferrum_tensor_attention_qk_prefix_f32",
+            Self::ValueWidth64 => "ferrum_tensor_attention_values64_f32",
+            Self::ValueWidth128 => "ferrum_tensor_attention_values128_f32",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Config {
@@ -15,13 +71,15 @@ pub(super) struct Config {
     pub(super) sequence: u64,
     pub(super) heads: u64,
     pub(super) visibility: Visibility,
+    #[serde(default, skip_serializing_if = "Mode::is_qk")]
+    pub(super) mode: Mode,
 }
 
 impl Config {
     pub(super) fn validate(self) -> Result<Self, VNextError> {
         if self.batch == 0 || self.batch > 16 || self.heads == 0 {
             return Err(invalid(
-                "prefix diagnostic requires batch1..16 and nonzero heads",
+                "attention diagnostic requires batch1..16 and nonzero heads",
             ));
         }
         let rows = self
@@ -36,7 +94,8 @@ impl Config {
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| invalid("input byte extent overflow"))?;
         rows.checked_mul(self.heads)
-            .and_then(|n| n.checked_mul(8))
+            .and_then(|n| n.checked_mul(self.mode.columns()))
+            .and_then(|n| n.checked_mul(4))
             .ok_or_else(|| invalid("output byte extent overflow"))?;
         RegisterParams::new(
             self.batch
@@ -53,7 +112,7 @@ impl Config {
             let bytes = ResolvedTensorSpec::new(spec.dimensions, spec.element_type, spec.layout)?
                 .minimum_storage_bytes()?;
             if bytes > isize::MAX as u64 {
-                return Err(invalid("prefix tensor exceeds address space"));
+                return Err(invalid("diagnostic tensor exceeds address space"));
             }
         }
         Ok(self)
@@ -69,7 +128,7 @@ impl Config {
 
     pub(super) fn output_spec(self) -> ProgramTensorSpec {
         ProgramTensorSpec {
-            dimensions: vec![self.batch * self.sequence, self.heads, 2],
+            dimensions: vec![self.batch * self.sequence, self.heads, self.mode.columns()],
             element_type: ElementType::F32,
             layout: ResolvedTensorLayout::Contiguous,
         }
@@ -81,15 +140,15 @@ impl ModelFamilyProvider for Family {
     type Config = Config;
     fn family_id(&self) -> &ModelFamilyId {
         static ID: OnceLock<ModelFamilyId> = OnceLock::new();
-        ID.get_or_init(|| id("family.metal.qk_prefix"))
+        ID.get_or_init(|| id("family.metal.attention_diagnostic"))
     }
     fn external_metadata_ids(&self) -> BTreeSet<ExternalModelMetadataId> {
-        BTreeSet::from([id("metadata.metal.qk_prefix")])
+        BTreeSet::from([id("metadata.metal.attention_diagnostic")])
     }
     fn validate_config_identity(&self, raw: &Value, config: &Config) -> Result<(), VNextError> {
         config.validate()?;
         if serde_json::to_value(config).unwrap() != *raw {
-            return Err(invalid("noncanonical prefix diagnostic configuration"));
+            return Err(invalid("noncanonical attention diagnostic configuration"));
         }
         Ok(())
     }
@@ -99,7 +158,7 @@ impl ModelFamilyProvider for Family {
         config: &Config,
     ) -> Result<ExternalModelMetadataId, VNextError> {
         self.validate_config_identity(raw, config)?;
-        Ok(id("metadata.metal.qk_prefix"))
+        Ok(id("metadata.metal.attention_diagnostic"))
     }
     fn parse_config(&self, raw: &Value) -> Result<Config, VNextError> {
         let config: Config =
@@ -110,8 +169,8 @@ impl ModelFamilyProvider for Family {
     fn weights(&self, _: &Config) -> Result<ModelWeights, VNextError> {
         Ok(ModelWeights::None)
     }
-    fn numerical_profiles(&self, _: &Config) -> Result<FamilyNumericalProfiles, VNextError> {
-        let profile = id::<NumericalProfileId>(PROFILE);
+    fn numerical_profiles(&self, config: &Config) -> Result<FamilyNumericalProfiles, VNextError> {
+        let profile = id::<NumericalProfileId>(config.mode.profile());
         FamilyNumericalProfiles::new(
             self.family_id(),
             ContractVersion::new(1, 0),
@@ -119,12 +178,12 @@ impl ModelFamilyProvider for Family {
                 id: profile.clone(),
                 family_id: self.family_id().clone(),
                 version: ContractVersion::new(1, 0),
-                primary_activation: id(OUTPUT),
-                boundaries: BTreeMap::from([(id(OUTPUT), ElementType::F32)]),
+                primary_activation: id(config.mode.output()),
+                boundaries: BTreeMap::from([(id(config.mode.output()), ElementType::F32)]),
                 kv_storage: vec![],
                 states: vec![],
                 operations: vec![NumericalOperationContract {
-                    operation_id: id(OP),
+                    operation_id: id(config.mode.operation()),
                     version: ContractVersion::new(1, 0),
                     multiplication_type: None,
                     accumulation_type: None,
@@ -142,27 +201,31 @@ impl ModelFamilyProvider for Family {
     ) -> Result<ModelProgram, VNextError> {
         ModelProgram::new(
             self.family_id().clone(),
-            vec![id(QUERY), id(KEY)],
+            config.mode.inputs().iter().map(|name| id(*name)).collect(),
             vec![ProgramBlock {
-                id: "block.qk_prefix".into(),
+                id: "block.attention_diagnostic".into(),
                 nodes: vec![ProgramNode {
-                    id: id("node.qk_prefix"),
-                    operation_id: id(OP),
+                    id: id("node.attention_diagnostic"),
+                    operation_id: id(config.mode.operation()),
                     required_version: ContractVersion::new(1, 0),
                     work: ProgramNodeWorkSpec::Fixed,
-                    inputs: vec![id(QUERY), id(KEY)],
-                    outputs: vec![id(OUTPUT)],
+                    inputs: config.mode.inputs().iter().map(|name| id(*name)).collect(),
+                    outputs: vec![id(config.mode.output())],
                     attributes: BTreeMap::new(),
                 }],
             }],
             vec![],
             vec![],
-            vec![id(OUTPUT)],
+            vec![id(config.mode.output())],
         )?
-        .with_input_tensor_specs(BTreeMap::from([
-            (id(QUERY), config.input_spec()),
-            (id(KEY), config.input_spec()),
-        ]))
+        .with_input_tensor_specs(
+            config
+                .mode
+                .inputs()
+                .iter()
+                .map(|name| (id(*name), config.input_spec()))
+                .collect(),
+        )
     }
     fn semantic_metadata(&self, _: &Config) -> Result<ModelSemanticMetadata, VNextError> {
         Ok(ModelSemanticMetadata::TensorComponent)
@@ -190,4 +253,34 @@ fn prefix_profile_has_real_f32_output_and_rejects_unsupported_masks() {
     assert!(TypedFamilyRegistration::new(Family)
         .prepare_with_profile(&short, &id(PROFILE))
         .is_err());
+}
+
+#[test]
+fn value_width_profiles_declare_three_inputs_and_real_f32_boundaries() {
+    for mode in [Mode::ValueWidth64, Mode::ValueWidth128] {
+        let config = Config {
+            batch: 2,
+            sequence: 33,
+            heads: 2,
+            visibility: Visibility::AllValidBidirectional,
+            mode,
+        };
+        let raw = serde_json::to_value(config).unwrap();
+        TypedFamilyRegistration::new(Family)
+            .prepare_with_profile(&raw, &id(mode.profile()))
+            .unwrap();
+        let profile = Family.numerical_profiles(&config).unwrap();
+        assert_eq!(config.mode.inputs(), &[QUERY, KEY, VALUE]);
+        assert_eq!(config.output_spec().dimensions, vec![66, 2, mode.columns()]);
+        assert_eq!(config.output_spec().element_type, ElementType::F32);
+        drop(profile);
+        let mut invalid = raw.clone();
+        invalid["mode"] = serde_json::json!("value_width96");
+        assert!(Family.parse_config(&invalid).is_err());
+        let huge = Config {
+            heads: 1 << 60,
+            ..config
+        };
+        assert!(huge.validate().is_err());
+    }
 }

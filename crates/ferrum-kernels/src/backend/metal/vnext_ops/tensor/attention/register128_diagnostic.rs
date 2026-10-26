@@ -1,4 +1,4 @@
-//! Managed QK -> online-softmax state diagnostic, not an Attention replacement.
+//! Managed attention stage/output-width diagnostics, not Attention replacements.
 //! Its output/register liveness/IO differ from full attention; subtracting the
 //! durations does not measure pure PV time or pure GPU timestamps.
 use super::*;
@@ -14,14 +14,18 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-#[path = "register128_prefix/family.rs"]
+#[path = "register128_diagnostic/family.rs"]
 mod family;
-#[path = "register128_prefix/oracle.rs"]
+#[path = "register128_diagnostic/oracle.rs"]
 mod oracle;
 
 const OP: &str = "operation.diagnostic.metal.qk_softmax_state";
-const CAPABILITY: &str = "capability.diagnostic.metal.qk_softmax_state";
+const CAPABILITY: &str = "capability.diagnostic.metal.attention_diagnostic";
 const PROFILE: &str = "metal.diagnostic.qk_softmax_state.f32.v1";
+const VALUE_OP: &str = "operation.diagnostic.metal.attention_value_width";
+const VALUE_PROFILE: &str = "metal.diagnostic.attention_value_width.f32.v1";
+const VALUE_OUTPUT: &str = "value.diagnostic.attention_values";
+const VALUE: &str = "value.diagnostic.values";
 const QUERY: &str = "value.prefix.query";
 const KEY: &str = "value.prefix.key";
 const OUTPUT: &str = "value.prefix.row_state";
@@ -35,7 +39,9 @@ const SOURCE: &str = concat!(
     "\n",
     include_str!("register128.metal"),
     "\n",
-    include_str!("register128_prefix.metal")
+    include_str!("register128_prefix.metal"),
+    "\n",
+    include_str!("register128_diagnostic/value_width.metal")
 );
 
 fn id<T: TryFrom<String>>(value: impl Into<String>) -> T
@@ -70,12 +76,14 @@ impl Contract {
             .unwrap()
         };
         let descriptor = OperationDescriptor {
-            id: id(OP),
+            id: id(config.mode.operation()),
             version: ContractVersion::new(1, 0),
-            inputs: vec![
-                tensor(config.input_spec(), TensorAccess::Read),
-                tensor(config.input_spec(), TensorAccess::Read),
-            ],
+            inputs: config
+                .mode
+                .inputs()
+                .iter()
+                .map(|_| tensor(config.input_spec(), TensorAccess::Read))
+                .collect(),
             outputs: vec![tensor(config.output_spec(), TensorAccess::Write)],
             attributes: AttributeSchema::empty(),
             resources: ResourceRequirements {
@@ -105,16 +113,26 @@ impl OperationContract for Contract {
         outputs: &[TensorContract],
     ) -> Result<(), VNextError> {
         if inputs != self.0.inputs || outputs != self.0.outputs {
-            return Err(invalid("prefix diagnostic signature differs"));
+            return Err(invalid("attention diagnostic signature differs"));
         }
         Ok(())
     }
 }
 
 struct Pipelines {
-    prefix: ComputePipelineState,
+    states: Vec<(family::Mode, ComputePipelineState)>,
     // PSO drops before its admitted native owner.
     _retention: MetalTensorProviderRetention,
+}
+impl Pipelines {
+    fn select(&self, mode: family::Mode) -> &ComputePipelineState {
+        &self
+            .states
+            .iter()
+            .find(|(candidate, _)| *candidate == mode)
+            .expect("diagnostic PSO compiled")
+            .1
+    }
 }
 struct Provider {
     descriptor: OperationProviderDescriptor,
@@ -129,7 +147,7 @@ impl OperationResourceEstimator for Provider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        estimate_without_workspace(&self.descriptor, &request, OP)
+        estimate_without_workspace(&self.descriptor, &request, self.config.mode.operation())
     }
 }
 impl OperationProvider<MetalDeviceRuntime> for Provider {
@@ -145,8 +163,8 @@ impl OperationProvider<MetalDeviceRuntime> for Provider {
     ) -> Result<EncodedDeviceOperation<MetalDeviceCommand>, OperationFailure> {
         Err(provider_failure(
             invocation.participants()[0].identity().clone(),
-            OP,
-            "prefix requires fixed tensor work".into(),
+            self.config.mode.operation(),
+            "diagnostic requires fixed tensor work".into(),
         ))
     }
     fn encode_tensor_selected(
@@ -156,13 +174,13 @@ impl OperationProvider<MetalDeviceRuntime> for Provider {
         let identity = invocation.participants()[0].identity().clone();
         let encode = || -> Result<MetalDeviceCommand, String> {
             let [participant] = invocation.participants() else {
-                return Err("prefix requires one participant".into());
+                return Err("attention diagnostic requires one participant".into());
             };
-            if invocation.operation().id.as_str() != OP
+            if invocation.operation().id.as_str() != self.config.mode.operation()
                 || !matches!(participant.work(), NodeWorkContract::Fixed)
                 || !invocation.resource_work_shape().resource_work().is_tensor()
             {
-                return Err("prefix operation/work mismatch".into());
+                return Err("attention diagnostic operation/work mismatch".into());
             }
             let c = self.config;
             let input_bytes = resolved(c.input_spec())
@@ -171,30 +189,28 @@ impl OperationProvider<MetalDeviceRuntime> for Provider {
             let output_bytes = resolved(c.output_spec())
                 .minimum_storage_bytes()
                 .map_err(|e| e.to_string())?;
-            let q = tensor_port_region(
-                participant,
-                ResolvedValueRole::Input,
-                0,
-                ElementType::Bf16,
-                input_bytes,
-            )?;
-            let k = tensor_port_region(
-                participant,
-                ResolvedValueRole::Input,
-                1,
-                ElementType::Bf16,
-                input_bytes,
-            )?;
-            let output = tensor_port_region(
+            let mut regions = Vec::new();
+            for port in 0..c.mode.inputs().len() {
+                regions.push(tensor_port_region(
+                    participant,
+                    ResolvedValueRole::Input,
+                    u32::try_from(port).unwrap(),
+                    ElementType::Bf16,
+                    input_bytes,
+                )?);
+            }
+            regions.push(tensor_port_region(
                 participant,
                 ResolvedValueRole::Output,
                 0,
                 ElementType::F32,
                 output_bytes,
-            )?;
-            disjoint(&q, &k)?;
-            disjoint(&q, &output)?;
-            disjoint(&k, &output)?;
+            )?);
+            for (i, region) in regions.iter().enumerate() {
+                for other in &regions[i + 1..] {
+                    disjoint(region, other)?;
+                }
+            }
             let params = RegisterParams::new(
                 c.batch * c.heads,
                 c.sequence,
@@ -226,19 +242,30 @@ impl OperationProvider<MetalDeviceRuntime> for Provider {
                 .checked_mul(c.heads)
                 .and_then(|n| n.checked_mul(c.sequence))
                 .and_then(|n| n.checked_mul(c.sequence))
-                .and_then(|n| n.checked_mul(2 * 128 + 5))
-                .ok_or("prefix logical work overflows")?;
+                .and_then(|n| {
+                    n.checked_mul(
+                        2 * 128
+                            + 5
+                            + if c.mode.is_qk() {
+                                0
+                            } else {
+                                2 * c.mode.columns()
+                            },
+                    )
+                })
+                .ok_or("attention diagnostic logical work overflows")?;
             let pipelines = Arc::clone(&self.pipelines);
             MetalDeviceCommand::tensor_operation(
-                OP,
-                vec![q, k, output],
+                c.mode.operation(),
+                regions,
                 DeviceCommandLogicalWork::tensor(operations, 0).map_err(|e| e.to_string())?,
                 move |encoder, regions| {
                     let compute = encoder.compute_encoder();
-                    compute.set_compute_pipeline_state(&pipelines.prefix);
-                    set_region(compute, 0, &regions[0]);
-                    set_region(compute, 1, &regions[1]);
-                    set_region(compute, 3, &regions[2]);
+                    compute.set_compute_pipeline_state(pipelines.select(c.mode));
+                    for (slot, region) in regions[..c.mode.inputs().len()].iter().enumerate() {
+                        set_region(compute, slot as u64, region);
+                    }
+                    set_region(compute, 3, &regions[c.mode.inputs().len()]);
                     set_params(compute, 4, &params);
                     set_params(compute, 5, &mask);
                     compute.set_threadgroup_memory_length(0, SHARED_BYTES);
@@ -254,7 +281,7 @@ impl OperationProvider<MetalDeviceRuntime> for Provider {
         encode()
             .map(EncodedDeviceOperation::compute)
             .map(Some)
-            .map_err(|reason| provider_failure(identity, OP, reason))
+            .map_err(|reason| provider_failure(identity, self.config.mode.operation(), reason))
     }
 }
 
@@ -267,16 +294,17 @@ fn run_case(
     query_phase: u64,
     key_phase: u64,
     timed: bool,
+    trial: usize,
 ) -> Value {
     let config = config.validate().unwrap();
     let contract = Contract::new(config);
     let descriptor = provider_descriptor(
         runtime,
         &contract,
-        "provider.metal.qk_prefix",
+        "provider.metal.attention_diagnostic",
         CAPABILITY,
-        "resource-estimator.metal.qk_prefix",
-        contiguous_bindings(2),
+        "resource-estimator.metal.attention_diagnostic",
+        contiguous_bindings(u32::try_from(config.mode.inputs().len()).unwrap()),
         &[],
         &[],
         fingerprint.to_owned(),
@@ -293,7 +321,7 @@ fn run_case(
     )
     .unwrap();
     let engine = EngineProviderDescriptor::new(
-        id("provider.engine.metal.qk_prefix"),
+        id("provider.engine.metal.attention_diagnostic"),
         ContractVersion::new(1, 0),
         fingerprint.to_owned(),
         runtime.descriptor().id.clone(),
@@ -304,15 +332,22 @@ fn run_case(
         .capability_catalog(runtime.descriptor().clone(), vec![engine])
         .unwrap();
     let prepared = TypedFamilyRegistration::new(family::Family)
-        .prepare_with_profile(&serde_json::to_value(config).unwrap(), &id(PROFILE))
+        .prepare_with_profile(
+            &serde_json::to_value(config).unwrap(),
+            &id(config.mode.profile()),
+        )
         .unwrap();
-    let mut options = ProgramPlanCompileOptions::new(BTreeMap::from([
-        (id(QUERY), config.input_spec()),
-        (id(KEY), config.input_spec()),
-    ]))
+    let mut options = ProgramPlanCompileOptions::new(
+        config
+            .mode
+            .inputs()
+            .iter()
+            .map(|name| (id(*name), config.input_spec()))
+            .collect(),
+    )
     .unwrap();
     options
-        .insert_tensor_spec(id(OUTPUT), config.output_spec())
+        .insert_tensor_spec(id(config.mode.output()), config.output_spec())
         .unwrap();
     let policy = TensorComponentPolicy::new(
         DEVICE_BYTES,
@@ -339,9 +374,9 @@ fn run_case(
             host.clone(),
             ComponentWeightSource::None,
             ComponentInitializationConfig {
-                request_id: id("request.qk_prefix.init"),
-                run_id: id("run.qk_prefix.init"),
-                transaction_id: id("transaction.qk_prefix.init"),
+                request_id: id(format!("request.attention_diagnostic.{trial}.init")),
+                run_id: id(format!("run.attention_diagnostic.{trial}.init")),
+                transaction_id: id(format!("transaction.attention_diagnostic.{trial}.init")),
                 static_policy: StaticInitializationPolicy::new(1 << 20, 16).unwrap(),
                 executor: TensorExecutorConfig::default(),
             },
@@ -351,14 +386,32 @@ fn run_case(
         .minimum_storage_bytes()
         .unwrap();
     let input_allocation_bytes = usize::try_from(input_bytes).unwrap();
-    let inputs: Vec<_> = [(QUERY, query_phase), (KEY, key_phase)]
-        .into_iter()
-        .map(|(name, phase)| {
+    let inputs: Vec<_> = config
+        .mode
+        .inputs()
+        .iter()
+        .map(|&name| {
             let mut bytes = host
                 .allocate_zeroed(HostMemoryClass::InputPreprocess, input_allocation_bytes)
                 .unwrap();
             for (i, word) in bytes.as_mut().chunks_exact_mut(2).enumerate() {
-                let value = oracle::value(i as u64, phase) as f32;
+                let i = i as u64;
+                let value = if name == VALUE {
+                    let column = i % 128;
+                    let head = (i / 128) % config.heads;
+                    let key = (i / (128 * config.heads)) % config.sequence;
+                    let batch = i / (128 * config.heads * config.sequence);
+                    oracle::positive_value(batch, key, head, column)
+                } else {
+                    oracle::value(
+                        i,
+                        if name == QUERY {
+                            query_phase
+                        } else {
+                            key_phase
+                        },
+                    )
+                } as f32;
                 // Fixture values are exactly representable; no rounding is hidden.
                 assert_eq!(value.to_bits() & 0xffff, 0);
                 word.copy_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
@@ -370,6 +423,8 @@ fn run_case(
     // logical payload for the small tail fixture.
     let input_committed_bytes = host.usage().unwrap().committed_bytes();
     let reference = oracle::Reference::new(query_phase, key_phase);
+    let value_reference =
+        (!config.mode.is_qk()).then(|| oracle::ValueReference::new(config, query_phase, key_phase));
     let mut samples = Vec::new();
     let mut errors = Vec::new();
     let repeats = if timed { 4 } else { 2 };
@@ -379,21 +434,29 @@ fn run_case(
         let output = session
             .execute(
                 id(format!(
-                    "run.qk_prefix.{}.{}.{repetition}",
-                    config.sequence, config.heads
+                    "run.attention_diagnostic.{trial}.{}.{}.{}.{repetition}",
+                    config.mode.columns(),
+                    config.sequence,
+                    config.heads
                 )),
                 id(format!(
-                    "request.qk_prefix.{}.{}.{repetition}",
-                    config.sequence, config.heads
+                    "request.attention_diagnostic.{trial}.{}.{}.{}.{repetition}",
+                    config.mode.columns(),
+                    config.sequence,
+                    config.heads
                 )),
                 input,
             )
             .unwrap();
         samples.push(started.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(output.len(), 1);
-        assert_eq!(output[0].value_id().as_str(), OUTPUT);
+        assert_eq!(output[0].value_id().as_str(), config.mode.output());
         assert_eq!(output[0].tensor().element_type(), ElementType::F32);
-        errors.push(reference.verify(config, output[0].bytes().bytes()));
+        errors.push(if let Some(value_reference) = &value_reference {
+            value_reference.verify(output[0].bytes().bytes())
+        } else {
+            reference.verify(config, output[0].bytes().bytes())
+        });
         drop(output);
         assert_eq!(
             host.usage().unwrap().committed_bytes(),
@@ -409,24 +472,34 @@ fn run_case(
     ));
     drop((component, registry));
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
-    serde_json::json!({"config":config,"query_phase":query_phase,"key_phase":key_phase,"timed":timed,
+    let mut result = serde_json::json!({"config":config,"trial":trial,"query_phase":query_phase,"key_phase":key_phase,"timed":timed,
         "samples_ms":samples,"warmup_ms":if timed {Some(samples[0])}else{None},
-        "measured_ms":if timed {&samples[1..]}else{&[]},"max_relative_sum_errors":errors,
-        "sum_relative_bound":oracle::Reference::relative_bound(config.sequence),"row_max":"all output rows exact F32 bits versus independent FP64",
+        "measured_ms":if timed {&samples[1..]}else{&[]},
         "output_bytes":resolved(config.output_spec()).minimum_storage_bytes().unwrap(),"full_output_checks":repeats,
-        "input_logical_bytes":input_bytes*2,"input_committed_bytes":input_committed_bytes,
-        "host_committed_after_close":host.usage().unwrap().committed_bytes(),"native_memory":runtime.native_memory_snapshot()})
+        "input_logical_bytes":input_bytes*config.mode.inputs().len() as u64,"input_committed_bytes":input_committed_bytes,
+        "host_committed_after_close":host.usage().unwrap().committed_bytes(),"native_memory":runtime.native_memory_snapshot()});
+    if config.mode.is_qk() {
+        result["max_relative_sum_errors"] = serde_json::json!(errors);
+        result["sum_relative_bound"] =
+            serde_json::json!(oracle::Reference::relative_bound(config.sequence));
+        result["row_max"] =
+            serde_json::json!("all output rows exact F32 bits versus independent FP64");
+    } else {
+        result["max_relative_output_errors"] = serde_json::json!(errors);
+        result["output_relative_bound"] =
+            serde_json::json!(oracle::ValueReference::relative_bound(config.sequence));
+        result["reference"] = serde_json::json!("independent FP64 phase-count weighted positive V; every F32 output checked; no BF16 narrowing");
+    }
+    result
 }
 
-#[test]
-#[ignore = "real managed Metal QK/softmax prefix diagnostic; requires exclusive GPU access"]
-fn managed_metal_attention_qk_softmax_prefix_diagnostic() {
+fn run_diagnostic(modes: &[family::Mode]) -> Value {
     metal::objc::rc::autoreleasepool(|| {
         let fingerprint = implementation_fingerprint(&[
             SOURCE.as_bytes(),
-            include_str!("register128_prefix.rs").as_bytes(),
-            include_str!("register128_prefix/family.rs").as_bytes(),
-            include_str!("register128_prefix/oracle.rs").as_bytes(),
+            include_str!("register128_diagnostic.rs").as_bytes(),
+            include_str!("register128_diagnostic/family.rs").as_bytes(),
+            include_str!("register128_diagnostic/oracle.rs").as_bytes(),
         ]);
         let mut device = metal_tensor_runtime_config(id("device.metal.0")).unwrap();
         device.capabilities.insert(id(CAPABILITY));
@@ -441,7 +514,7 @@ fn managed_metal_attention_qk_softmax_prefix_diagnostic() {
                     maximum_streams: 2,
                     maximum_in_flight_per_stream: 1,
                     maximum_commands_per_submission: 8,
-                    opaque_memory_profile: "metal.qk_prefix.declared.v1".into(),
+                    opaque_memory_profile: "metal.attention_diagnostic.declared.v1".into(),
                 },
             )
             .unwrap(),
@@ -454,45 +527,50 @@ fn managed_metal_attention_qk_softmax_prefix_diagnostic() {
             .device()
             .new_library_with_source(SOURCE, &options)
             .unwrap();
-        let constants = metal::FunctionConstantValues::new();
-        constants.set_constant_value_at_index(
-            (&1_u32 as *const u32).cast(),
-            metal::MTLDataType::UInt,
-            104,
-        );
-        constants.set_constant_value_at_index(
-            (&0_u32 as *const u32).cast(),
-            metal::MTLDataType::UInt,
-            105,
-        );
-        let function = library
-            .get_function("ferrum_tensor_attention_qk_prefix_f32", Some(constants))
-            .unwrap();
-        let prefix = runtime
-            .device()
-            .new_compute_pipeline_state_with_function(&function)
-            .unwrap();
-        drop((function, library));
-        assert_eq!(prefix.thread_execution_width(), 32);
-        assert!(prefix.max_total_threads_per_threadgroup() >= 128);
-        assert!(prefix
-            .static_threadgroup_memory_length()
-            .checked_add(SHARED_BYTES)
-            .is_some_and(|n| n <= runtime.device().max_threadgroup_memory_length()));
-        let properties = serde_json::json!({"thread_execution_width":prefix.thread_execution_width(),
-            "maximum_threads":prefix.max_total_threads_per_threadgroup(),"static_threadgroup_bytes":prefix.static_threadgroup_memory_length(),
-            "dynamic_threadgroup_bytes":SHARED_BYTES});
+        let mut states = Vec::new();
+        let mut properties = Vec::new();
+        for &mode in modes {
+            let constants = metal::FunctionConstantValues::new();
+            constants.set_constant_value_at_index(
+                (&1_u32 as *const u32).cast(),
+                metal::MTLDataType::UInt,
+                104,
+            );
+            constants.set_constant_value_at_index(
+                (&0_u32 as *const u32).cast(),
+                metal::MTLDataType::UInt,
+                105,
+            );
+            let function = library
+                .get_function(mode.kernel(), Some(constants))
+                .unwrap();
+            let state = runtime
+                .device()
+                .new_compute_pipeline_state_with_function(&function)
+                .unwrap();
+            assert_eq!(state.thread_execution_width(), 32);
+            assert!(state.max_total_threads_per_threadgroup() >= 128);
+            assert!(state
+                .static_threadgroup_memory_length()
+                .checked_add(SHARED_BYTES)
+                .is_some_and(|n| n <= runtime.device().max_threadgroup_memory_length()));
+            properties.push(serde_json::json!({"mode":mode,"kernel":mode.kernel(),
+                "thread_execution_width":state.thread_execution_width(),"maximum_threads":state.max_total_threads_per_threadgroup(),
+                "static_threadgroup_bytes":state.static_threadgroup_memory_length(),"dynamic_threadgroup_bytes":SHARED_BYTES}));
+            states.push((mode, state));
+        }
+        drop(library);
         let pipelines = Arc::new(Pipelines {
-            prefix,
+            states,
             _retention: retention,
         });
         let host = runtime
             .tensor_host_account(
                 HostMemoryLimits::new(
-                    128 << 20,
+                    256 << 20,
                     HostMemoryClassLimits {
-                        input_preprocess_bytes: 96 << 20,
-                        output_bytes: 16 << 20,
+                        input_preprocess_bytes: 128 << 20,
+                        output_bytes: 96 << 20,
                         transfer_staging_bytes: 0,
                         weight_backing_bytes: 0,
                     },
@@ -500,36 +578,56 @@ fn managed_metal_attention_qk_softmax_prefix_diagnostic() {
                 .unwrap(),
             )
             .unwrap();
-        let small = run_case(
-            &runtime,
-            &pipelines,
-            &host,
-            &fingerprint,
-            family::Config {
-                batch: 2,
-                sequence: 33,
-                heads: 2,
-                visibility: family::Visibility::AllValidBidirectional,
-            },
-            1,
-            3,
-            false,
-        );
-        let large = run_case(
-            &runtime,
-            &pipelines,
-            &host,
-            &fingerprint,
-            family::Config {
-                batch: 1,
-                sequence: 4096,
-                heads: 32,
-                visibility: family::Visibility::AllValidBidirectional,
-            },
-            0,
-            0,
-            true,
-        );
+        // Logical large inputs total 96MiB; no-copy alignment costs additional
+        // pages per owner. The explicit limits above admit these real claims
+        // and a single 64MiB F32 output (64 columns use 32MiB).
+        let mut cases = Vec::new();
+        for (trial, &mode) in modes.iter().enumerate() {
+            cases.push(run_case(
+                &runtime,
+                &pipelines,
+                &host,
+                &fingerprint,
+                family::Config {
+                    batch: 2,
+                    sequence: 33,
+                    heads: 2,
+                    visibility: family::Visibility::AllValidBidirectional,
+                    mode,
+                },
+                1,
+                3,
+                false,
+                trial,
+            ));
+        }
+        // One process balances the two widths: 64 -> 128 -> 128 -> 64.
+        // Each group owns fresh inputs/session and keeps warmup + all samples.
+        // The single QK-state mode retains its original one-large-case scope.
+        let large_modes: Vec<_> = modes
+            .iter()
+            .copied()
+            .chain(modes.iter().rev().copied().filter(|mode| !mode.is_qk()))
+            .collect();
+        for (index, &mode) in large_modes.iter().enumerate() {
+            cases.push(run_case(
+                &runtime,
+                &pipelines,
+                &host,
+                &fingerprint,
+                family::Config {
+                    batch: 1,
+                    sequence: 4096,
+                    heads: 32,
+                    visibility: family::Visibility::AllValidBidirectional,
+                    mode,
+                },
+                0,
+                0,
+                true,
+                modes.len() + index,
+            ));
+        }
         drop(pipelines);
         drop(runtime.retain_tensor_provider().unwrap());
         let native = runtime.native_memory_snapshot();
@@ -543,13 +641,28 @@ fn managed_metal_attention_qk_softmax_prefix_diagnostic() {
             .unwrap();
         assert!(capacity.reserve(DeviceOpaqueMemoryKind::Stream, 1).is_err());
         drop(all);
-        eprintln!(
-            "metal_attention_qk_prefix={}",
-            serde_json::json!({"source_fingerprint":fingerprint,
-            "runtime_fingerprint":runtime_fingerprint,"pso":properties,"cases":[small,large],"native_memory":native,
+        serde_json::json!({"source_fingerprint":fingerprint,
+            "runtime_fingerprint":runtime_fingerprint,"pso":properties,"large_case_order":large_modes,"cases":cases,"native_memory":native,
             "host_committed_after_close":host.usage().unwrap().committed_bytes(),"device_full_capacity_reclaimed":true,
             "timing_scope":"managed_execute_admission_encode_wait_readback; input preparation and independent FP64 full-output checks excluded; DeviceTimingOff",
-            "limits":"QK/online-softmax prefix only; removing V/PV/O changes register liveness and IO. Source synchronization points retained, machine barriers not counted. Full minus prefix is not pure PV time or a GPU timestamp."})
-        );
-    });
+            "limits":"Test-only QK-state or PV/output-width diagnostics. F32 output IO and register liveness differ from production BF16. Both value widths retain all D128 K/V loading, IEEE guards for their computed columns and source synchronization points; the positive fixture keeps range guards inactive. Widths need not choose identical overflow fallback for arbitrary extreme values; no machine barrier/register/spill observation. Timing differences are not pure PV or GPU timestamps."})
+    })
+}
+
+#[test]
+#[ignore = "real managed Metal QK/softmax prefix diagnostic; requires exclusive GPU access"]
+fn managed_metal_attention_qk_softmax_prefix_diagnostic() {
+    eprintln!(
+        "metal_attention_qk_prefix={}",
+        run_diagnostic(&[family::Mode::QkSoftmaxState])
+    );
+}
+
+#[test]
+#[ignore = "real managed Metal F32 output-width diagnostic; requires exclusive GPU access"]
+fn managed_metal_attention_value_width_diagnostic() {
+    eprintln!(
+        "metal_attention_value_width={}",
+        run_diagnostic(&[family::Mode::ValueWidth64, family::Mode::ValueWidth128])
+    );
 }

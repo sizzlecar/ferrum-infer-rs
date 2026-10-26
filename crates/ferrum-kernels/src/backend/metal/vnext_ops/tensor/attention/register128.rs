@@ -222,8 +222,8 @@ pub(super) fn supports_cross_shape(query: u64, key: u64, head_dim: u32) -> bool 
 mod probe;
 
 #[cfg(test)]
-#[path = "register128_prefix.rs"]
-mod prefix;
+#[path = "register128_diagnostic.rs"]
+mod diagnostic;
 
 #[cfg(test)]
 mod tests {
