@@ -40,14 +40,14 @@ fn convolution_padding_has_exact_workspace_and_checked_grouped_geometry() {
         ("padding_mode", SemanticValue::Text("explicit_zero".into())),
     ]);
     assert_eq!(
-        conv::geometry(&values, &a).unwrap().scratch_bytes,
+        conv::geometry(&values, &a, true).unwrap().scratch_bytes,
         2 * 2 * 4 * 8 * 8
     );
     a.insert(
         AttributeId::new("padding_mode").unwrap(),
         SemanticValue::Text("implicit_zero".into()),
     );
-    assert_eq!(conv::geometry(&values, &a).unwrap().scratch_bytes, 0);
+    assert_eq!(conv::geometry(&values, &a, true).unwrap().scratch_bytes, 0);
     for (name, bad) in [
         ("groups", SemanticValue::Unsigned(3)),
         ("stride", SemanticValue::Integers(vec![0, 1])),
@@ -56,7 +56,70 @@ fn convolution_padding_has_exact_workspace_and_checked_grouped_geometry() {
     ] {
         let mut changed = a.clone();
         changed.insert(AttributeId::new(name).unwrap(), bad);
-        assert!(conv::geometry(&values, &changed).is_err());
+        assert!(conv::geometry(&values, &changed, true).is_err());
+    }
+}
+#[test]
+fn virtual_external_padding_requires_actual_pipeline_and_bounded_3x3_geometry() {
+    for (kernel, stride, dilation, eligible) in [
+        (3, [1, 1], [1, 1], true),
+        (1, [1, 1], [1, 1], false),
+        (3, [2, 1], [1, 1], false),
+        (3, [1, 1], [2, 1], false),
+    ] {
+        // Rectangular/grouped, asymmetric padding, K=27 and output-channel
+        // tails exercise the same eligibility with both capability outcomes.
+        let output_h = (10 - ((kernel - 1) * dilation[0] + 1)) / stride[0] + 1;
+        let output_w = (16 - ((kernel - 1) * dilation[1] + 1)) / stride[1] + 1;
+        let values = vec![
+            value(
+                "x",
+                ResolvedValueRole::Input,
+                0,
+                &[2, 6, 7, 13],
+                ElementType::Bf16,
+            ),
+            value(
+                "w",
+                ResolvedValueRole::Input,
+                1,
+                &[66, 3, kernel, kernel],
+                ElementType::Bf16,
+            ),
+            value("b", ResolvedValueRole::Input, 2, &[66], ElementType::Bf16),
+            value(
+                "y",
+                ResolvedValueRole::Output,
+                0,
+                &[2, 66, output_h, output_w],
+                ElementType::Bf16,
+            ),
+        ];
+        let a = attrs(&[
+            ("padding", SemanticValue::Integers(vec![2, 1, 0, 3])),
+            (
+                "stride",
+                SemanticValue::Integers(stride.map(|v| v as i64).to_vec()),
+            ),
+            (
+                "dilation",
+                SemanticValue::Integers(dilation.map(|v| v as i64).to_vec()),
+            ),
+            ("groups", SemanticValue::Unsigned(2)),
+            ("padding_mode", SemanticValue::Text("explicit_zero".into())),
+        ]);
+        for available in [false, true] {
+            assert_eq!(
+                conv::geometry(&values, &a, available)
+                    .unwrap()
+                    .scratch_bytes,
+                if available && eligible {
+                    0
+                } else {
+                    2 * 2 * 6 * 10 * 16
+                },
+            );
+        }
     }
 }
 #[test]

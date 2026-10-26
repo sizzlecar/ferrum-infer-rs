@@ -134,6 +134,7 @@ pub(super) fn verify(
         vec![vec![1.0078125], vec![1.5], vec![-1.5]],
     );
     verify_convolution_padding_special_values(runtime, registry, catalog, &policy, host);
+    verify_virtual_padding_matches_materialized_bits(runtime, registry, catalog, &policy, host);
     for kind in [ChannelL2Norm, ChannelL2NormImage] {
         for c in [1, 3, 1152] {
             let input = spec(vec![2, c, 3, 5], ElementType::Bf16);
@@ -248,7 +249,9 @@ pub(super) fn verify(
             vec![values],
         );
     }
-    eprintln!("Metal spatial operators: grouped/padded/strided convolution, staged L2, C=1152/2048 attention, exceptional values, exact upsample, single-frame group mean and retirement passed");
+    eprintln!(
+        "Metal spatial operators: grouped/padded/strided convolution, staged L2, C=1152/2048 attention, exceptional values, exact upsample, single-frame group mean and retirement passed"
+    );
 }
 
 fn verify_convolution_padding_special_values(
@@ -301,5 +304,82 @@ fn verify_convolution_padding_special_values(
                 },
             );
         }
+    }
+}
+
+fn verify_virtual_padding_matches_materialized_bits(
+    runtime: &Arc<MetalDeviceRuntime>,
+    registry: &OperationRuntimeRegistry<MetalDeviceRuntime>,
+    catalog: &CapabilityCatalog,
+    policy: &TensorComponentPolicy,
+    host: &HostMemoryAccount,
+) {
+    // Grouped rectangular input, asymmetric padding, K=27, 33 output
+    // channels per group and 112 spatial positions exercise all three tails.
+    let x = spec(vec![2, 6, 7, 13], ElementType::Bf16);
+    let padded = spec(vec![2, 6, 10, 16], ElementType::Bf16);
+    let w = spec(vec![66, 3, 3, 3], ElementType::Bf16);
+    let b = spec(vec![66], ElementType::Bf16);
+    let output = spec(vec![2, 66, 8, 14], ElementType::Bf16);
+    let mut input = data(&x, 1);
+    for (value, bits) in input.iter_mut().zip([0x8000, 0, 1, 0x8001, 0x0080]) {
+        *value = bf16::from_bits(bits).to_f32();
+    }
+    let mut weights = data(&w, 2);
+    weights[..27].fill(-0.0);
+    let mut bias = data(&b, 3);
+    bias[0] = -0.0;
+    // Bitcopy materialization is the previous pad dispatch's semantics:
+    // preserve every input word, and fill only external positions with +0.
+    let mut materialized = vec![0.0; 2 * 6 * 10 * 16];
+    for plane in 0..12 {
+        for y in 0..7 {
+            for col in 0..13 {
+                materialized[(plane * 10 + y + 2) * 16 + col] = input[(plane * 7 + y) * 13 + col];
+            }
+        }
+    }
+    let baseline = std::cell::RefCell::new(None::<Vec<f32>>);
+    for (is_materialized, source, values, padding) in [
+        (true, padded, materialized, vec![0; 4]),
+        (false, x, input, vec![2, 1, 0, 3]),
+    ] {
+        let mut fixture = Fixture::new(
+            MetalTensorOperation::Conv2d,
+            vec![source, w.clone(), b.clone()],
+            attrs(vec![
+                ("padding", SemanticValue::Integers(padding)),
+                ("stride", SemanticValue::Integers(vec![1; 2])),
+                ("dilation", SemanticValue::Integers(vec![1; 2])),
+                ("groups", SemanticValue::Unsigned(2)),
+                ("padding_mode", SemanticValue::Text("explicit_zero".into())),
+            ]),
+        );
+        fixture.output = Some(output.clone());
+        run_case(
+            runtime,
+            registry,
+            catalog,
+            policy,
+            host,
+            &fixture,
+            &[values, weights.clone(), bias.clone()],
+            |actual| {
+                if is_materialized {
+                    *baseline.borrow_mut() = Some(actual.to_vec());
+                } else {
+                    let reference = baseline.borrow();
+                    let reference = reference.as_ref().unwrap();
+                    assert_eq!(actual.len(), reference.len());
+                    for (index, (&actual, &expected)) in actual.iter().zip(reference).enumerate() {
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "padding bitcopy {index}"
+                        );
+                    }
+                }
+            },
+        );
     }
 }

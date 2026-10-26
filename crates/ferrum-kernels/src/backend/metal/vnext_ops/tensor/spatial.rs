@@ -156,7 +156,9 @@ pub(super) fn scratch_bytes(
 ) -> Result<u64, String> {
     use MetalTensorOperation::*;
     match kind {
-        Conv2d => Ok(conv::geometry(values, attrs)?.scratch_bytes),
+        Conv2d => {
+            Ok(conv::geometry(values, attrs, pipelines.conv_3x3_masked.is_some())?.scratch_bytes)
+        }
         ChannelL2Norm | ChannelL2NormImage => {
             channel::geometry(kind, values, attrs, pipelines.channel_shared_limit).map(|_| 0)
         }

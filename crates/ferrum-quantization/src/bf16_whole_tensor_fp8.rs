@@ -14,6 +14,7 @@ use std::num::NonZeroU64;
 
 mod conversion;
 mod host_cache;
+mod lookup;
 mod plan;
 mod quality;
 mod source;
@@ -89,6 +90,7 @@ impl Bf16WholeTensorFp8Materializer {
                 include_bytes!("bf16_whole_tensor_fp8.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/plan.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/conversion.rs"),
+                include_bytes!("bf16_whole_tensor_fp8/lookup.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/timing.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/host_cache.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/quality.rs"),
@@ -156,13 +158,25 @@ impl Bf16WholeTensorFp8Materializer {
         )
     }
 
-    /// Exact peak converted backing for a single initializer group, excluding
-    /// the separately governed transfer-staging chunk and immutable mmap RSS.
+    /// Peak logical bytes of converted payload plus temporary lookup for one
+    /// complete initializer group. Separate allocation padding is excluded;
+    /// use `maximum_group_accounted_bytes` for Host capacity admission.
     pub fn maximum_group_backing_bytes(
         &self,
         family: &PreparedModelFamily,
     ) -> Result<u64, VNextError> {
         Ok(plan::prepare(family, &self.groups)?.maximum_group_bytes)
+    }
+
+    /// Peak charged bytes for a complete conversion group on this materializer's
+    /// injected Host account. Payload and temporary lookup are distinct claims,
+    /// so each allocation's alignment padding is included independently.
+    /// Retained cache entries, transfer staging and mmap residency are excluded.
+    pub fn maximum_group_accounted_bytes(
+        &self,
+        family: &PreparedModelFamily,
+    ) -> Result<u64, VNextError> {
+        plan::prepare(family, &self.groups)?.maximum_group_accounted_bytes(&self.host)
     }
 
     /// Required physical execution payload bytes, including every matrix's

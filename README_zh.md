@@ -69,6 +69,8 @@ Metal 图像后端正在为下一版本完成验收。M4 Mac mini、16 GiB 统�
 
 **Metal 配置：**将 [qwen-image-2.1-turbo-metal.json](crates/ferrum-cli/examples/config/qwen-image-2.1-turbo-metal.json) 复制为 `image-metal.json`，与 `models/` 目录并列。原模型的文本编码器、VAE 和元数据放在 `models/Qwen-Image-2.1-Turbo/`，[Q4_K_M DiT](https://huggingface.co/m9ter1a/Qwen-Image-2.1-Turbo-GGUF/blob/a94df596a422bc8dfe406655154c0364f79ba042/qwen-image-2.1-turbo-Q4_K_M.gguf) 放在 `models/Qwen-Image-2.1-Turbo-GGUF/`；也可直接修改 JSON 路径，相对路径以配置文件所在目录为基准。示例保留单个活动图像、组件按阶段加载释放、请求内编辑缓存、2 GiB Host 预算和 Metal 推荐工作集的 90%，仍需通过容量检查；不需要原始 BF16 DiT 权重。
 
+推荐配置启用融合注意力和单次范围不超过 128 MiB 的文本编码器权重预读；将 `backend.attention_policy` 设为 `reference` 可切回原注意力路径。
+
 <details>
 <summary>模型快照缺少 transformer/config.json 时</summary>
 

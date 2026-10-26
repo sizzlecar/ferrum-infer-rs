@@ -53,7 +53,7 @@ pub const METAL_TENSOR_NUMERICAL_IDENTITY: &str = concat!(
     "nonfinite-V=visible-only-scalar-PV;zero-global-scratch;device-bounded-on-chip;",
     "transport=BF16-bitcopy;bounded-row-runs;per-batch-concat;zero-arithmetic;",
     "row-scatter=ordered-disjoint-runs;F32-add-BF16-final;untouched-bitcopy;",
-    "conv=F32-simdgroup-implicit-im2col;explicit-pad-admitted-before-GEMM;BF16-dot-before-bias;",
+    "conv=F32-simdgroup-implicit-im2col;explicit-pad=virtual-3x3-or-admitted-before-GEMM;BF16-dot-before-bias;",
     "channel-L2=padded-pairwise-F32;sqrt-clamp-div;BF16-div-scale-gamma-plus-zero;",
     "spatial-attention=16x32-online-F32;SIMD-exp-reduction;NCHW-QKV;admitted-F32-accumulator;",
     "spatial-upsample=bitcopy-explicit-channel-map;",

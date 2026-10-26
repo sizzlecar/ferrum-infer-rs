@@ -1002,6 +1002,7 @@ fn exact_weight_source_never_falls_back_to_another_filename() {
 
 #[test]
 fn bounded_read_ahead_is_explicit_for_shared_run_and_serve_weight_sources() {
+    use ferrum_engine::image_generation::ImageMetalAttentionPolicy;
     use ferrum_quantization::SafetensorsReadAheadPolicy;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("image.json");
@@ -1019,7 +1020,15 @@ fn bounded_read_ahead_is_explicit_for_shared_run_and_serve_weight_sources() {
         "../../../examples/config/qwen-image-2.1-turbo-metal.json"
     ))
     .unwrap();
-    for template in [configuration(), metal_template] {
+    for (template, expected_read_ahead) in [
+        (configuration(), SafetensorsReadAheadPolicy::Off),
+        (
+            metal_template,
+            SafetensorsReadAheadPolicy::WillNeed {
+                maximum_range_bytes: 134_217_728,
+            },
+        ),
+    ] {
         for serving in [false, true] {
             let mut wire = template.clone();
             if serving {
@@ -1030,12 +1039,28 @@ fn bounded_read_ahead_is_explicit_for_shared_run_and_serve_weight_sources() {
                 wire.as_object_mut().unwrap().remove("serving");
             }
             let default = load(&wire).unwrap();
-            assert_eq!(
-                policy(&default.weights.text_encoder),
-                SafetensorsReadAheadPolicy::Off
-            );
+            assert_eq!(policy(&default.weights.text_encoder), expected_read_ahead);
             assert_eq!(
                 policy(&default.weights.vae),
+                SafetensorsReadAheadPolicy::Off
+            );
+            if let ImageBackendConfig::Metal(metal) = &default.backend {
+                assert_eq!(
+                    metal.attention_policy,
+                    ImageMetalAttentionPolicy::FusedDense
+                );
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                assert_eq!(
+                    metal.resolved().unwrap().attention_policy,
+                    ImageMetalAttentionPolicy::FusedDense
+                );
+            }
+            wire["weights"]["text_encoder"]
+                .as_object_mut()
+                .unwrap()
+                .remove("read_ahead");
+            assert_eq!(
+                policy(&load(&wire).unwrap().weights.text_encoder),
                 SafetensorsReadAheadPolicy::Off
             );
             wire["weights"]["text_encoder"]["read_ahead"] = json!({

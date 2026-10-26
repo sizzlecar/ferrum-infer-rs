@@ -131,6 +131,7 @@ fn materialize_observed<'source>(
     let mut indices = Vec::with_capacity(outputs.len());
     let mut seen = BTreeSet::new();
     let mut total = 0usize;
+    let mut packed_elements = 0_u64;
     for output in outputs {
         let index = derived
             .iter()
@@ -141,6 +142,11 @@ fn materialize_observed<'source>(
         }
         let bytes = usize::try_from(output.physical_bytes()?)
             .map_err(|_| invalid("payload exceeds usize"))?;
+        if index < sources.len() {
+            packed_elements = packed_elements
+                .checked_add(bytes as u64)
+                .ok_or_else(|| invalid("requested packed elements overflow"))?;
+        }
         let start = total;
         total = total
             .checked_add(bytes)
@@ -199,11 +205,20 @@ fn materialize_observed<'source>(
         host.allocate_zeroed(HostMemoryClass::WeightBacking, total)
             .map_err(|e| invalid(format!("WeightBacking admission: {e}")))
     })?;
-    timing.measure(Phase::Encode, || {
+    timing.measure(Phase::Encode, || -> Result<(), VNextError> {
+        // Only requested packed outputs amortize lookup construction. In
+        // particular scale-only subsets do not allocate this temporary claim.
+        // It is dropped before returning/freeze/cache publication, including on
+        // failure. All immutable sources still participate in the amax scan.
+        let lookup = (lookup::workspace_bytes(packed_elements) != 0)
+            .then(|| lookup::LookupTable::new(host, maximum, inverse))
+            .transpose()?;
         for (index, range) in &indices {
             let target = &mut backing.as_mut()[range.clone()];
             if *index >= sources.len() {
                 target.copy_from_slice(&scale.to_le_bytes());
+            } else if let Some(lookup) = &lookup {
+                lookup.encode_into(payloads[*index].bytes(), target);
             } else {
                 for (byte, original) in target
                     .iter_mut()
@@ -216,7 +231,8 @@ fn materialize_observed<'source>(
                 }
             }
         }
-    });
+        Ok(())
+    })?;
     let backing = backing.freeze();
     let ranges = indices
         .into_iter()

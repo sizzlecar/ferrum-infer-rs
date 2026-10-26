@@ -46,6 +46,14 @@ enum Case {
         channels: u64,
         side: u64,
     },
+    ExplicitPaddedConv {
+        channels: u64,
+        side: u64,
+    },
+    ChannelL2 {
+        channels: u64,
+        side: u64,
+    },
     SpatialAttention {
         channels: u64,
         side: u64,
@@ -181,7 +189,7 @@ impl Case {
                     ),
                 ]),
             ),
-            Self::PaddedConv { channels, side } => (
+            Self::PaddedConv { channels, side } | Self::ExplicitPaddedConv { channels, side } => (
                 MetalTensorOperation::Conv2d,
                 vec![
                     bf16(vec![1, channels, side, side]),
@@ -196,10 +204,41 @@ impl Case {
                     (id("groups"), SemanticValue::Unsigned(1)),
                     (
                         id("padding_mode"),
-                        SemanticValue::Text("implicit_zero".into()),
+                        SemanticValue::Text(
+                            if matches!(self, Self::ExplicitPaddedConv { .. }) {
+                                "explicit_zero"
+                            } else {
+                                "implicit_zero"
+                            }
+                            .into(),
+                        ),
                     ),
                 ]),
             ),
+            Self::ChannelL2 { channels, side } => {
+                // Match the decoder's effective F32 sqrt(C) scale exactly.
+                let scale_bits = ((channels as f64).sqrt() as f32).to_bits();
+                let scale = CanonicalRational::new(
+                    i64::from((scale_bits & 0x7fffff) | (1 << 23)),
+                    1_u64 << (150 - ((scale_bits >> 23) & 255)),
+                )
+                .unwrap();
+                let image = bf16(vec![1, channels, side, side]);
+                (
+                    MetalTensorOperation::ChannelL2Norm,
+                    vec![image.clone(), bf16(vec![channels, 1, 1, 1])],
+                    image,
+                    BTreeMap::from([
+                        (
+                            id("epsilon"),
+                            SemanticValue::Rational(
+                                CanonicalRational::new(1, 1_000_000_000_000).unwrap(),
+                            ),
+                        ),
+                        (id("scale"), SemanticValue::Rational(scale)),
+                    ]),
+                )
+            }
             Self::SpatialAttention { channels, side } => (
                 MetalTensorOperation::SpatialAttention,
                 vec![bf16(vec![1, 3 * channels, side, side])],
@@ -241,10 +280,18 @@ impl Case {
                 // Keep the original constant-channel V and exact output oracle.
                 _ => (((index % (heads * width)) % 17) as i32 - 8) as f32 / 16.0,
             },
-            Self::Conv { channels, .. } | Self::PaddedConv { channels, .. } => match port {
+            Self::Conv { channels, .. }
+            | Self::PaddedConv { channels, .. }
+            | Self::ExplicitPaddedConv { channels, .. } => match port {
                 0 => 1.0 / 64.0,
                 1 => (((index / (channels * 9)) % 7) as i32 - 3) as f32 / 256.0,
                 _ => (index % 3) as f32 / 128.0,
+            },
+            Self::ChannelL2 { .. } => match port {
+                // Signed pixels and varying gamma retain an analytical norm:
+                // every squared input is exactly 1/4096, including BF16 input.
+                0 => (if index % 2 == 0 { 1.0 } else { -1.0 }) / 64.0,
+                _ => ((index % 7) as i32 - 3) as f32 / 8.0,
             },
             Self::SpatialAttention { channels, side } => {
                 let channel = index / (side * side);
@@ -278,7 +325,7 @@ impl Case {
                 rounds(channels as f32 * 9.0 / 64.0 * self.value(1, channel * channels * 9))
                     + self.value(2, channel)
             }
-            Self::PaddedConv { channels, side } => {
+            Self::PaddedConv { channels, side } | Self::ExplicitPaddedConv { channels, side } => {
                 let channel = index / (side * side);
                 let y = (index / side) % side;
                 let x = index % side;
@@ -290,6 +337,13 @@ impl Case {
                     channels as f32 * (rows * columns) as f32 / 64.0
                         * self.value(1, channel * channels * 9),
                 ) + self.value(2, channel)
+            }
+            Self::ChannelL2 { channels, side } => {
+                let norm = (channels as f64 / 4096.0).sqrt() as f32;
+                let scale = (channels as f64).sqrt() as f32;
+                let normalized = rounds(self.value(0, index) / norm);
+                let scaled = rounds(normalized * scale);
+                rounds(scaled * self.value(1, index / (side * side))) + 0.0
             }
             Self::SpatialAttention { channels, side } => {
                 self.value(0, 2 * channels * side * side + index)
@@ -516,6 +570,71 @@ fn managed_masked_conv_microbench() {
 }
 
 #[test]
+#[ignore = "real Metal VAE convolution and channel norm timing; requires exclusive GPU access"]
+fn managed_vae_real_shape_microbench() {
+    // Decoder base=144 and multipliers=[1,2,4,8,8]. Include both the
+    // residual's explicit pad+conv and the upsampler's implicit-pad path.
+    // These isolated operators do not replace a complete decoder profile.
+    let cases: Vec<_> = [(1152, 128), (144, 1024)]
+        .into_iter()
+        .flat_map(|(channels, side)| {
+            [
+                Case::ExplicitPaddedConv { channels, side },
+                Case::PaddedConv { channels, side },
+                Case::ChannelL2 { channels, side },
+            ]
+        })
+        .collect();
+    run_microbench_with_budget(
+        &cases,
+        MicrobenchDiagnostics::VaeOperators,
+        MicrobenchSchedule::Original,
+        MicrobenchBudget::VaeRealShape,
+    );
+}
+
+#[test]
+fn vae_channel_norm_analytical_output_matches_independent_oracle() {
+    // Use actual channel counts but a tiny spatial domain for the CPU check.
+    for channels in [144, 1152] {
+        let case = Case::ChannelL2 { channels, side: 3 };
+        let fixture = case.fixture();
+        TypedFamilyRegistration::new(TransformFamily)
+            .prepare_with_profile(
+                &serde_json::to_value(&fixture).unwrap(),
+                &id(fixture.kind().profile()),
+            )
+            .unwrap();
+        let values: Vec<Vec<f32>> = fixture
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(port, spec)| {
+                (0..spec.dimensions.iter().product::<u64>())
+                    .map(|index| case.value(port, index))
+                    .collect()
+            })
+            .collect();
+        let output = fixture.output.as_ref().unwrap();
+        let expected: Vec<_> = (0..output.dimensions.iter().product::<u64>())
+            .map(|index| bf16::from_bits(case.expected(index)).to_f32())
+            .collect();
+        super::super::spatial::check(
+            fixture.kind(),
+            &fixture.attributes,
+            &fixture
+                .inputs
+                .iter()
+                .zip(&values)
+                .map(|(spec, values)| (spec, values.as_slice()))
+                .collect::<Vec<_>>(),
+            output,
+            &expected,
+        );
+    }
+}
+
+#[test]
 #[ignore = "real Metal matrix-tail timing; requires exclusive GPU access"]
 fn managed_linear_tail_microbench() {
     // Row, column and combined tails exercise disjoint interior/edge writes.
@@ -554,6 +673,7 @@ fn managed_vae_attention_microbench() {
 enum MicrobenchDiagnostics {
     DispatchSelection,
     ExecutionHost,
+    VaeOperators,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -566,6 +686,24 @@ enum AttentionBenchmarkProfile {
 enum MicrobenchSchedule {
     Original,
     PairedAttention,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MicrobenchBudget {
+    Original,
+    VaeRealShape,
+}
+
+impl MicrobenchBudget {
+    fn host_class_bytes(self) -> usize {
+        match self {
+            Self::Original => 256 << 20,
+            // C144x1024x1024 BF16 is 288 MiB for input and output each.
+            // Input also owns the conv weights/bias. The separate Device
+            // allowance remains 1 GiB, covering input, output and pad scratch.
+            Self::VaeRealShape => 384 << 20,
+        }
+    }
 }
 
 impl MicrobenchSchedule {
@@ -581,15 +719,29 @@ impl MicrobenchSchedule {
 impl MicrobenchDiagnostics {
     fn filter(self) -> &'static str {
         match self {
-            Self::DispatchSelection => "off,ferrum_kernels::backend::metal::vnext_ops::tensor::attention=debug,ferrum_kernels::backend::metal::vnext_ops::tensor::linear=debug",
-            Self::ExecutionHost => "off,ferrum_kernels::backend::metal::vnext_ops::tensor::attention=debug,ferrum_kernels::backend::metal::vnext_ops::tensor::linear=debug,ferrum_execution::tensor=debug",
+            Self::VaeOperators => {
+                "off,ferrum_kernels::backend::metal::vnext_ops::tensor::spatial::conv=info"
+            }
+            Self::DispatchSelection => {
+                "off,ferrum_kernels::backend::metal::vnext_ops::tensor::attention=debug,ferrum_kernels::backend::metal::vnext_ops::tensor::linear=debug"
+            }
+            Self::ExecutionHost => {
+                "off,ferrum_kernels::backend::metal::vnext_ops::tensor::attention=debug,ferrum_kernels::backend::metal::vnext_ops::tensor::linear=debug,ferrum_execution::tensor=debug"
+            }
         }
     }
 
     fn timing_scope(self) -> &'static str {
         match self {
-            Self::DispatchSelection => "managed_execute_admission_encode_wait_readback_including_attention_and_linear_logging",
-            Self::ExecutionHost => "managed_execute_admission_encode_wait_readback_including_attention_linear_and_execution_host_logging_not_gpu_timestamps",
+            Self::VaeOperators => {
+                "managed_execute_admission_encode_wait_readback_including_conv_dispatch_logging_not_gpu_timestamps"
+            }
+            Self::DispatchSelection => {
+                "managed_execute_admission_encode_wait_readback_including_attention_and_linear_logging"
+            }
+            Self::ExecutionHost => {
+                "managed_execute_admission_encode_wait_readback_including_attention_linear_and_execution_host_logging_not_gpu_timestamps"
+            }
         }
     }
 }
@@ -606,6 +758,15 @@ fn run_microbench_schedule(
     cases: &[Case],
     diagnostics: MicrobenchDiagnostics,
     schedule: MicrobenchSchedule,
+) {
+    run_microbench_with_budget(cases, diagnostics, schedule, MicrobenchBudget::Original);
+}
+
+fn run_microbench_with_budget(
+    cases: &[Case],
+    diagnostics: MicrobenchDiagnostics,
+    schedule: MicrobenchSchedule,
+    budget: MicrobenchBudget,
 ) {
     // This thread-local scope reports attention/linear capability and actual dispatch
     // selection without installing a global subscriber or reading an env filter.
@@ -675,10 +836,10 @@ fn run_microbench_schedule(
     let host = runtime
         .tensor_host_account(
             HostMemoryLimits::new(
-                512 << 20,
+                2 * budget.host_class_bytes(),
                 HostMemoryClassLimits {
-                    input_preprocess_bytes: 256 << 20,
-                    output_bytes: 256 << 20,
+                    input_preprocess_bytes: budget.host_class_bytes(),
+                    output_bytes: budget.host_class_bytes(),
                     transfer_staging_bytes: 0,
                     weight_backing_bytes: 0,
                 },
@@ -812,7 +973,30 @@ fn run_microbench_schedule(
             PlanRuntimeCloseOutcome::Closed(_)
         ));
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
-        if schedule == MicrobenchSchedule::Original {
+        if budget == MicrobenchBudget::VaeRealShape {
+            eprintln!(
+                "vae_operator_microbench={}",
+                serde_json::json!({
+                    "operation": format!("{:?}", fixture.kind()),
+                    "profile": fixture.kind().profile(),
+                    "inputs": fixture.inputs, "output": fixture.output,
+                    "attributes": fixture.attributes,
+                    "warmup_ms": timings[0], "measured_ms": &timings[1..],
+                    "measured_samples": timings.len() - 1,
+                    "full_output_checks": timings.len(), "errors": 0,
+                    "oracle": "analytical_exact_bf16_full_output",
+                    "timing_scope": "managed_execute_admission_encode_all_dispatches_wait_readback_including_conv_dispatch_logging;materialized_explicit_conv_includes_pad_dispatch;not_kernel_gpu_timestamps_or_complete_decoder_profile",
+                    "provider_scratch_admitted": scratch_admitted,
+                    "declared_device_bytes": DEVICE_BYTES,
+                    "declared_host_total_bytes": 2 * budget.host_class_bytes(),
+                    "declared_host_input_bytes": budget.host_class_bytes(),
+                    "declared_host_output_bytes": budget.host_class_bytes(),
+                    "host_committed_bytes_after_close": host.usage().unwrap().committed_bytes(),
+                    "runtime_fingerprint": runtime.descriptor().runtime_implementation_fingerprint,
+                    "native_memory": runtime.native_memory_snapshot(),
+                })
+            );
+        } else if schedule == MicrobenchSchedule::Original {
             eprintln!(
                 "image_kernel_microbench={}",
                 serde_json::json!({

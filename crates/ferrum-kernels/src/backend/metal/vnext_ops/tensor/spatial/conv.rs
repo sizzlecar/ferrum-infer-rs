@@ -51,11 +51,13 @@ pub(super) struct Shape {
     g: Conv2dBf16Geometry,
     bytes: Vec<u64>,
     pub scratch_bytes: u64,
+    virtual_padding: bool,
     jobs: u64,
 }
 pub(super) fn geometry(
     values: &[ResolvedValueBinding],
     attrs: &BTreeMap<AttributeId, SemanticValue>,
+    masked_3x3_available: bool,
 ) -> Result<Shape, String> {
     let bytes = dense_ports(MetalTensorOperation::Conv2d, values)?;
     let input = |i| binding(values, ResolvedValueRole::Input, i).map(|v| v.tensor());
@@ -67,12 +69,25 @@ pub(super) fn geometry(
         attrs,
     )
     .map_err(|e| e.to_string())?;
-    let scratch_bytes =
-        if g.padding_mode() == Conv2dPaddingMode::ExplicitZero && g.padding() != [0; 4] {
-            g.padded_input_bytes()
-        } else {
-            0
-        };
+    // The bounded loader presents the same conceptual external +0 padding
+    // and still multiplies every padded tap by its original weight. Only
+    // physical materialization is omitted; dot order and BF16 boundaries stay.
+    // Estimation and encoding use this same actual-PSO capability decision.
+    let virtual_padding = masked_3x3_available
+        && g.padding_mode() == Conv2dPaddingMode::ExplicitZero
+        && g.padding() != [0; 4]
+        && g.kernel_height() == 3
+        && g.kernel_width() == 3
+        && g.stride() == [1, 1]
+        && g.dilation() == [1, 1];
+    let scratch_bytes = if g.padding_mode() == Conv2dPaddingMode::ExplicitZero
+        && g.padding() != [0; 4]
+        && !virtual_padding
+    {
+        g.padded_input_bytes()
+    } else {
+        0
+    };
     if scratch_bytes > isize::MAX as u64 {
         return Err("Metal padded convolution exceeds address space".into());
     }
@@ -86,6 +101,7 @@ pub(super) fn geometry(
         g,
         bytes,
         scratch_bytes,
+        virtual_padding,
         jobs,
     })
 }
@@ -130,7 +146,11 @@ pub(super) fn encode(
     participant: &TensorParticipant<'_>,
     pipelines: Arc<super::super::Pipelines>,
 ) -> Result<MetalDeviceCommand, String> {
-    let shape = geometry(participant.bindings(), participant.attributes())?;
+    let shape = geometry(
+        participant.bindings(),
+        participant.attributes(),
+        pipelines.spatial.conv_3x3_masked.is_some(),
+    )?;
     let g = shape.g;
     let mut regions = regions(participant, &shape.bytes)?;
     if shape.scratch_bytes != 0 {
@@ -193,7 +213,7 @@ pub(super) fn encode(
         && params.output_height + params.kernel_height - 1 <= params.input_height
         && params.output_width + params.kernel_width - 1 <= params.input_width;
     let masked_3x3 = !direct_square
-        && g.padding_mode() == Conv2dPaddingMode::ImplicitZero
+        && (g.padding_mode() == Conv2dPaddingMode::ImplicitZero || shape.virtual_padding)
         && params.kernel_height == 3
         && params.kernel_width == 3
         && params.stride_h == 1
@@ -226,20 +246,38 @@ pub(super) fn encode(
                 0
             };
             let compute = encoder.compute_encoder();
-            let pipeline = direct_square
+            let (pipeline, implementation) = direct_square
                 .then(|| match params.kernel_width {
                     1 => pipelines.spatial.conv_1x1.as_ref(),
                     3 => pipelines.spatial.conv_3x3.as_ref(),
                     _ => None,
                 })
                 .flatten()
+                .map(|p| (p, "direct_square"))
                 .or_else(|| {
                     masked_3x3
                         .then_some(pipelines.spatial.conv_3x3_masked.as_ref())
                         .flatten()
+                        .map(|p| (p, "masked_3x3"))
                 })
-                .or(pipelines.spatial.conv.as_ref())
+                .or_else(|| pipelines.spatial.conv.as_ref().map(|p| (p, "generic")))
                 .expect("selected convolution pipeline");
+            tracing::info!(
+                implementation,
+                padding_mode = g.padding_mode().as_str(),
+                virtual_padding = shape.virtual_padding,
+                scratch_bytes = shape.scratch_bytes,
+                input_height = params.input_height,
+                input_width = params.input_width,
+                output_height = params.output_height,
+                output_width = params.output_width,
+                input_channels = params.input_channels,
+                output_channels = params.output_channels,
+                simd_width = pipeline.thread_execution_width(),
+                max_threads = pipeline.max_total_threads_per_threadgroup(),
+                static_threadgroup_bytes = pipeline.static_threadgroup_memory_length(),
+                "Metal convolution actual dispatch"
+            );
             compute.set_compute_pipeline_state(pipeline);
             set_region(compute, 0, &regions[source]);
             for port in 1..4 {

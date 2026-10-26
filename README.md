@@ -65,6 +65,8 @@ Metal image support is being validated for the next release. On an M4 Mac mini w
 
 **Metal configuration:** copy [qwen-image-2.1-turbo-metal.json](crates/ferrum-cli/examples/config/qwen-image-2.1-turbo-metal.json) to `image-metal.json` beside your `models/` directory. Place the original model's text encoder, VAE and metadata under `models/Qwen-Image-2.1-Turbo/`, and [the Q4_K_M DiT](https://huggingface.co/m9ter1a/Qwen-Image-2.1-Turbo-GGUF/blob/a94df596a422bc8dfe406655154c0364f79ba042/qwen-image-2.1-turbo-Q4_K_M.gguf) under `models/Qwen-Image-2.1-Turbo-GGUF/`. Alternatively, edit the JSON paths; relative paths resolve from the JSON file's directory. The example keeps one active image, cold component residency, request-scoped edit caching, a 2 GiB Host budget and 90% of Metal's recommended working set, subject to capacity checks. It does not need the original BF16 DiT weights.
 
+The preset enables fused attention and text-encoder weight prefetch in ranges of up to 128 MiB; set `backend.attention_policy` to `reference` to use the original attention path.
+
 <details>
 <summary>If the model snapshot omits transformer/config.json</summary>
 

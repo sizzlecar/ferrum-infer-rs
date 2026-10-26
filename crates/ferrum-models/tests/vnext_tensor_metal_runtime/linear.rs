@@ -9,12 +9,16 @@ pub(super) fn verify(
 ) {
     let kind = MetalTensorOperation::DenseLinear;
     // Exact tiles, every axis with a tail, singleton GEMV and a longer K.
+    // K4096 covers the MPP64 specialization alone and together with the
+    // unchanged MPP32 remainder and SIMD bottom/right strips.
     for (case, (m, n, k)) in [
         (1, 1, 1),
         (31, 63, 31),
         (32, 64, 32),
         (32, 64, 1),
         (64, 128, 256),
+        (64, 64, 4096),
+        (97, 129, 4096),
         (64, 192, 129),
         (96, 192, 129),
         (97, 193, 129),

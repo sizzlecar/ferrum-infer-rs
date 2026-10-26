@@ -16,7 +16,12 @@
     "text_encoder": {
       "kind": "single",
       "directory": "models/Qwen-Image-2.1-Turbo/text_encoder",
-      "file": "model.safetensors"
+      "file": "model.safetensors",
+      "read_ahead": {
+        "will_need": {
+          "maximum_range_bytes": 134217728
+        }
+      }
     },
     "transformer": {
       "kind": "gguf",
@@ -31,6 +36,7 @@
   },
   "backend": {
     "kind": "metal",
+    "attention_policy": "fused_dense",
     "memory": {
       "kind": "auto_recommended",
       "utilization": 0.9

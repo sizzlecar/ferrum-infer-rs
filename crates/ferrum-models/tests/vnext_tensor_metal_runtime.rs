@@ -257,9 +257,10 @@ fn managed_metal_tensor_operations_match_independent_arithmetic_and_retire_resou
     let host = runtime
         .tensor_host_account(
             HostMemoryLimits::new(
-                3 << 20,
+                4 << 20,
                 HostMemoryClassLimits {
-                    input_preprocess_bytes: 1 << 20,
+                    // K4096 MPP64 plus remainder/tails uses 1,851,392 input bytes.
+                    input_preprocess_bytes: 2 << 20,
                     // Retain both executions of the nine-output Qwen branch,
                     // including page-rounded no-copy backing for every output.
                     output_bytes: 2 << 20,

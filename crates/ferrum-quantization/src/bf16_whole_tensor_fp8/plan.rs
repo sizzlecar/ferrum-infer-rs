@@ -4,10 +4,41 @@ pub(super) struct Prepared {
     pub schema: WeightSchema,
     pub sources: BTreeMap<WeightId, Vec<WeightId>>,
     pub maximum_group_bytes: u64,
+    // Largest payload allocation among scalar groups and lookup groups. Taking
+    // each maximum before Host alignment is exact because backing_bytes is
+    // monotone, and lookup groups all have the same bounded temporary allocation.
+    maximum_payload_bytes: [u64; 2],
     pub converted_bytes: u64,
 }
 
 impl Prepared {
+    pub(super) fn maximum_group_accounted_bytes(
+        &self,
+        host: &HostMemoryAccount,
+    ) -> Result<u64, VNextError> {
+        let mut maximum = 0_u64;
+        for (lookup_group, &payload) in self.maximum_payload_bytes.iter().enumerate() {
+            if payload == 0 {
+                continue;
+            }
+            let payload =
+                usize::try_from(payload).map_err(|_| invalid("group payload exceeds usize"))?;
+            let mut charged = host
+                .backing_bytes(payload)
+                .map_err(|error| invalid(format!("group backing: {error}")))?;
+            if lookup_group == 1 {
+                charged = charged
+                    .checked_add(
+                        host.backing_bytes(lookup::MAGNITUDE_ENTRIES)
+                            .map_err(|error| invalid(format!("lookup backing: {error}")))?,
+                    )
+                    .ok_or_else(|| invalid("group accounted bytes overflow"))?;
+            }
+            maximum = maximum.max(charged as u64);
+        }
+        Ok(maximum)
+    }
+
     pub fn execution_weight_bytes(&self) -> Result<u64, VNextError> {
         self.schema
             .components
@@ -79,6 +110,7 @@ pub(super) fn prepare_program(
         .collect();
     let mut used_sources = BTreeSet::new();
     let mut maximum_group_bytes = 0;
+    let mut maximum_payload_bytes = [0_u64; 2];
     let mut converted_bytes = 0_u64;
     for group in groups {
         let mut source_specs = Vec::with_capacity(group.len());
@@ -117,7 +149,21 @@ pub(super) fn prepare_program(
         if group_bytes > isize::MAX as u64 {
             return Err(invalid("group backing exceeds address space"));
         }
-        maximum_group_bytes = maximum_group_bytes.max(group_bytes);
+        let packed_elements =
+            derived[..source_specs.len()]
+                .iter()
+                .try_fold(0_u64, |total, component| {
+                    total
+                        .checked_add(component.physical_bytes()?)
+                        .ok_or_else(|| invalid("group packed elements overflow"))
+                })?;
+        let lookup_bytes = lookup::workspace_bytes(packed_elements) as u64;
+        let peak_bytes = group_bytes
+            .checked_add(lookup_bytes)
+            .ok_or_else(|| invalid("group temporary bytes overflow"))?;
+        maximum_group_bytes = maximum_group_bytes.max(peak_bytes);
+        let kind = usize::from(lookup_bytes != 0);
+        maximum_payload_bytes[kind] = maximum_payload_bytes[kind].max(group_bytes);
         converted_bytes = converted_bytes
             .checked_add(group_bytes)
             .ok_or_else(|| invalid("converted cache bytes overflow"))?;
@@ -171,6 +217,7 @@ pub(super) fn prepare_program(
         schema,
         sources: source_map,
         maximum_group_bytes,
+        maximum_payload_bytes,
         converted_bytes,
     })
 }

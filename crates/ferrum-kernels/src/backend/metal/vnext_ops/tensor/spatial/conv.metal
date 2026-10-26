@@ -23,7 +23,7 @@ struct ConvParams {
     ulong kernel_height, kernel_width, stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_left;
 };
 // 32 spatial positions x 64 output channels; im2col exists only on chip.
-// Explicit padding is a prior managed stage; implicit padding is loaded here.
+// External +0 padding is loaded here or materialized by a prior managed stage.
 kernel void ferrum_tensor_conv2d_bf16(
     device const ushort* input [[buffer(0)]], device const ushort* weight [[buffer(1)]],
     device const ushort* bias [[buffer(2)]], device ushort* output [[buffer(3)]],
