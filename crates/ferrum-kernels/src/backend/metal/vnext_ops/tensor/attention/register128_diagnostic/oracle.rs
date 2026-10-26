@@ -327,7 +327,10 @@ impl ValueReference {
     pub(super) fn bf16_relative_bound(c: Config) -> f64 {
         use super::family::Mode;
         let bf16_u = 2_f64.powi(-8); // MSL float->bfloat round-to-nearest/ties-even.
-        if c.mode == Mode::ProductionBf16 {
+                                     // Both production-source modes use the same finite-fixture arithmetic
+                                     // and output rounding. This does not certify native decode over IEEE
+                                     // exceptional/subnormal payloads outside this diagnostic's inputs.
+        if matches!(c.mode, Mode::ProductionBf16 | Mode::ProductionNativeBf16) {
             return ((1.0 + Self::relative_bound(c.sequence)).next_up() * (1.0 + bf16_u) - 1.0)
                 .next_up();
         }
@@ -412,6 +415,7 @@ fn bf16_reference_bound_declares_steel_log2_domain_and_constant_channels() {
     }
     for mode in [
         super::family::Mode::ProductionBf16,
+        super::family::Mode::ProductionNativeBf16,
         super::family::Mode::SteelReference,
     ] {
         let config = Config {

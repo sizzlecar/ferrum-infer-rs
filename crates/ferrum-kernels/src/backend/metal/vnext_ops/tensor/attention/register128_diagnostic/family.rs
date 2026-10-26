@@ -16,6 +16,7 @@ pub(super) enum Mode {
     ValueWidth64,
     ValueWidth128,
     ProductionBf16,
+    ProductionNativeBf16,
     SteelReference,
 }
 impl Mode {
@@ -26,11 +27,17 @@ impl Mode {
         match self {
             Self::QkSoftmaxState => 2,
             Self::ValueWidth64 => 64,
-            Self::ValueWidth128 | Self::ProductionBf16 | Self::SteelReference => 128,
+            Self::ValueWidth128
+            | Self::ProductionBf16
+            | Self::ProductionNativeBf16
+            | Self::SteelReference => 128,
         }
     }
     pub(super) fn is_bf16(self) -> bool {
-        matches!(self, Self::ProductionBf16 | Self::SteelReference)
+        matches!(
+            self,
+            Self::ProductionBf16 | Self::ProductionNativeBf16 | Self::SteelReference
+        )
     }
     pub(super) fn output_element(self) -> ElementType {
         if self.is_bf16() {
@@ -76,6 +83,8 @@ impl Mode {
             STEEL_PROFILE
         } else if self == Self::ProductionBf16 {
             BF16_PROFILE
+        } else if self == Self::ProductionNativeBf16 {
+            NATIVE_BF16_PROFILE
         } else if self.is_qk() {
             PROFILE
         } else {
@@ -87,7 +96,9 @@ impl Mode {
             Self::QkSoftmaxState => "ferrum_tensor_attention_qk_prefix_f32",
             Self::ValueWidth64 => "ferrum_tensor_attention_values64_f32",
             Self::ValueWidth128 => "ferrum_tensor_attention_values128_f32",
-            Self::ProductionBf16 => "ferrum_tensor_attention_register128_bf16",
+            Self::ProductionBf16 | Self::ProductionNativeBf16 => {
+                "ferrum_tensor_attention_register128_bf16"
+            }
             Self::SteelReference => steel::KERNEL,
         }
     }
@@ -343,7 +354,11 @@ fn value_width_profiles_declare_three_inputs_and_real_f32_boundaries() {
 
 #[test]
 fn bf16_comparison_profiles_and_official_parameter_abi_are_explicit() {
-    for mode in [Mode::ProductionBf16, Mode::SteelReference] {
+    for mode in [
+        Mode::ProductionBf16,
+        Mode::ProductionNativeBf16,
+        Mode::SteelReference,
+    ] {
         let c = Config {
             batch: 2,
             sequence: 33,

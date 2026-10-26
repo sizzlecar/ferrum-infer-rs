@@ -27,6 +27,8 @@ const PROFILE: &str = "metal.diagnostic.qk_softmax_state.f32.v1";
 const BF16_OP: &str = "operation.diagnostic.metal.sdpa_bf16_comparison";
 const BF16_OUTPUT: &str = "value.diagnostic.sdpa_bf16";
 const BF16_PROFILE: &str = "metal.diagnostic.production_sdpa.bf16.natural_exp.v1";
+const NATIVE_BF16_PROFILE: &str =
+    "metal.diagnostic.production_sdpa.native_bfloat_decode.finite_fixture.v1";
 const STEEL_PROFILE: &str = "metal.diagnostic.official_steel_sdpa.bf16.log2e_fast_exp2_division.v1";
 const VALUE_OP: &str = "operation.diagnostic.metal.attention_value_width";
 const VALUE_PROFILE: &str = "metal.diagnostic.attention_value_width.f32.v1";
@@ -39,6 +41,23 @@ const DEVICE_BYTES: u64 = 512 << 20;
 const SOURCE: &str = concat!(
     include_str!("../bf16.metal"),
     "\n",
+    include_str!("../attention.metal"),
+    "\n",
+    include_str!("register128_calibration.metal"),
+    "\n",
+    include_str!("register128.metal"),
+    "\n",
+    include_str!("register128_prefix.metal"),
+    "\n",
+    include_str!("register128_diagnostic/value_width.metal")
+);
+// Only the input decode helper changes. The original rounded_bf16 helper
+// retains its shift-based decode, and encode_bf16 is included verbatim.
+// All subsequent kernel bodies are the same sources as SOURCE.
+const NATIVE_BF16_SOURCE: &str = concat!(
+    "#define decode_bf16 decode_bf16_shift\n",
+    include_str!("../bf16.metal"),
+    "\n#undef decode_bf16\ninline float decode_bf16(ushort bits) { return float(as_type<bfloat>(bits)); }\n",
     include_str!("../attention.metal"),
     "\n",
     include_str!("register128_calibration.metal"),
@@ -560,6 +579,7 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
         };
         let fingerprint = implementation_fingerprint(&[
             SOURCE.as_bytes(),
+            NATIVE_BF16_SOURCE.as_bytes(),
             include_str!("register128_diagnostic.rs").as_bytes(),
             include_str!("register128_diagnostic/family.rs").as_bytes(),
             include_str!("register128_diagnostic/oracle.rs").as_bytes(),
@@ -599,6 +619,14 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
             .device()
             .new_library_with_source(SOURCE, &options)
             .unwrap();
+        let native_bf16_library = modes
+            .contains(&family::Mode::ProductionNativeBf16)
+            .then(|| {
+                runtime
+                    .device()
+                    .new_library_with_source(NATIVE_BF16_SOURCE, &options)
+                    .unwrap()
+            });
         // Separate library: official source never receives Ferrum BF16 helpers.
         let steel_library = steel_source.as_ref().map(|source| {
             runtime
@@ -644,6 +672,8 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
                 }
                 let selected_library = if mode == family::Mode::SteelReference {
                     steel_library.as_ref().unwrap()
+                } else if mode == family::Mode::ProductionNativeBf16 {
+                    native_bf16_library.as_ref().unwrap()
                 } else {
                     &library
                 };
@@ -662,6 +692,7 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
                     .is_some_and(|n| n <= runtime.device().max_threadgroup_memory_length()));
                 properties.push(serde_json::json!({"mode":mode,"kernel":mode.kernel(),"aligned_q":aligned[0],"aligned_k":aligned[1],
                     "requested_language":requested_language,"fast_math_enabled":false,
+                    "input_decode":if mode == family::Mode::ProductionNativeBf16 {"float(as_type<bfloat>(ushort_bits))"} else if mode == family::Mode::SteelReference {"official native bfloat input"} else {"as_type<float>(uint(ushort_bits)<<16)"},
                     "thread_execution_width":state.thread_execution_width(),"maximum_threads":state.max_total_threads_per_threadgroup(),
                     "static_threadgroup_bytes":state.static_threadgroup_memory_length(),"dynamic_threadgroup_bytes":mode.dynamic_bytes()}));
                 states.push(Pipeline {
@@ -671,7 +702,7 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
                 });
             }
         }
-        drop((library, steel_library));
+        drop((library, steel_library, native_bf16_library));
         let pipelines = Arc::new(Pipelines {
             states,
             _retention: retention,
@@ -763,8 +794,8 @@ fn run_diagnostic(modes: &[family::Mode]) -> Value {
             "runtime_fingerprint":runtime_fingerprint,"pso":properties,"reference_source":steel_source.map(|source|source.report),"requested_language":requested_language,"large_case_order":large_modes,"cases":cases,"native_memory":native,
             "host_committed_after_close":host.usage().unwrap().committed_bytes(),"device_full_capacity_reclaimed":true,
             "timing_scope":"managed_execute_admission_encode_wait_readback; input preparation and independent full-output checks excluded; DeviceTimingOff",
-            "bf16_comparison":if modes.iter().any(|mode|mode.is_bf16()) {serde_json::json!({"both_arms":"BF16 contiguous BSHD inputs and output, explicit MSL3.1 fast_math=false", "baseline":"production shader source at explicit MSL3.1; historical production measurements used system-default language and a different binary", "reference":"official Steel native bfloat, F32 fragments, original log2e/fast::exp2/division; independent numerical profile, not Ferrum IEEE equivalence", "r263_difference":"R263 MLX API exposed BHSD output and copied to BSHD; this reference writes BSHD directly", "qualification":"small positive nonconstant V, independent FP64; large channel-constant V, every BF16 output bit checked"})} else {serde_json::Value::Null},
-            "limits":if modes.iter().any(|mode|mode.is_bf16()) {"Test-only self attention comparison with all-valid keys. The official reference is qualified only for the declared positive finite fixture, not production masked/nonfinite semantics. Both arms request MSL3.1; neither timing is a pure GPU timestamp, nor does it reproduce the earlier MLX API or system-default production binary. No machine shader/register/spill observation."} else {"Test-only QK-state or PV/output-width diagnostics. F32 output IO and register liveness differ from production BF16. Both value widths retain all D128 K/V loading, IEEE guards for their computed columns and source synchronization points; the positive fixture keeps range guards inactive. Widths need not choose identical overflow fallback for arbitrary extreme values; no machine barrier/register/spill observation. Timing differences are not pure PV or GPU timestamps."}})
+            "bf16_comparison":if modes.iter().any(|mode|mode.is_bf16()) {serde_json::json!({"both_arms":"BF16 contiguous BSHD inputs and output, explicit MSL3.1 fast_math=false", "baseline":"production shader source at explicit MSL3.1; historical production measurements used system-default language and a different binary", "reference":if modes.contains(&family::Mode::SteelReference) {"official Steel native bfloat, F32 fragments, original log2e/fast::exp2/division; independent numerical profile, not Ferrum IEEE equivalence"} else {"same production kernel bodies, only decode_bf16 uses float(as_type<bfloat>(bits)); original encode and rounded_bf16 unchanged; finite fixture qualification only"}, "r263_difference":if modes.contains(&family::Mode::SteelReference) {Some("R263 MLX API exposed BHSD output and copied to BSHD; this reference writes BSHD directly")} else {None}, "qualification":"small positive nonconstant V, independent FP64; large channel-constant V, every BF16 output bit checked"})} else {serde_json::Value::Null},
+            "limits":if modes.iter().any(|mode|mode.is_bf16()) {"Test-only self attention comparison with all-valid keys, qualified only for the declared finite fixtures, not full production masked/nonfinite/subnormal semantics. Both arms request MSL3.1; neither timing is a pure GPU timestamp, nor does it reproduce the earlier MLX API or system-default production binary. No machine shader/register/spill observation."} else {"Test-only QK-state or PV/output-width diagnostics. F32 output IO and register liveness differ from production BF16. Both value widths retain all D128 K/V loading, IEEE guards for their computed columns and source synchronization points; the positive fixture keeps range guards inactive. Widths need not choose identical overflow fallback for arbitrary extreme values; no machine barrier/register/spill observation. Timing differences are not pure PV or GPU timestamps."}})
     })
 }
 
@@ -792,5 +823,17 @@ fn managed_metal_official_steel_reference_diagnostic() {
     eprintln!(
         "metal_attention_steel_reference={}",
         run_diagnostic(&[family::Mode::ProductionBf16, family::Mode::SteelReference])
+    );
+}
+
+#[test]
+#[ignore = "production-source BF16 decode comparison, explicit MSL3.1; requires exclusive GPU access"]
+fn managed_metal_native_bf16_decode_diagnostic() {
+    eprintln!(
+        "metal_attention_native_bf16_decode={}",
+        run_diagnostic(&[
+            family::Mode::ProductionBf16,
+            family::Mode::ProductionNativeBf16
+        ])
     );
 }
