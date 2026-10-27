@@ -2,6 +2,10 @@
 use clap::{Parser, Subcommand};
 use std::{path::PathBuf, process::ExitCode};
 
+#[cfg(unix)]
+#[path = "../process_group.rs"]
+mod process_group;
+
 #[path = "release_delivery/cloud.rs"]
 mod cloud;
 #[path = "release_delivery/fetch_verified.rs"]

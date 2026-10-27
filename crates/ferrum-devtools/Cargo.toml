@@ -39,6 +39,10 @@ path = "src/bin/reference_teacher_compare.rs"
 name = "reference_quality"
 path = "src/bin/reference_quality.rs"
 
+[[bin]]
+name = "image_process_bench"
+path = "src/bin/image_process_bench.rs"
+
 [dependencies]
 ferrum-runtime = { workspace = true }
 anyhow = { workspace = true }

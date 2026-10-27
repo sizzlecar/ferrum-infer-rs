@@ -204,52 +204,8 @@ fn runner_arguments(
     words
 }
 
-// model_regression's Process::Drop kills and waits for Ferrum on normal Rust
-// teardown. Killing the runner externally skips that Drop, so its descendants
-// must inherit a separate process group owned by this controller.
 #[cfg(unix)]
-pub(super) struct ProcessGroup {
-    pub(super) child: tokio::process::Child,
-    pub(super) id: i32,
-    pub(super) armed: bool,
-}
-#[cfg(unix)]
-impl ProcessGroup {
-    fn kill(&self) -> Result<(), String> {
-        // SAFETY: id is the positive PID of our freshly spawned group leader;
-        // the negative value addresses only that group, never the controller.
-        let result = unsafe { libc::kill(-self.id, libc::SIGKILL) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(format!("kill runner process group: {error}"))
-        }
-    }
-    pub(super) async fn cleanup(&mut self) -> Result<(), String> {
-        let killed = self.kill();
-        let waited = tokio::time::timeout(Duration::from_secs(5), self.child.wait())
-            .await
-            .map_err(|_| "runner did not reap after process-group kill".to_string())
-            .and_then(|value| value.map_err(|error| format!("reap runner: {error}")));
-        if killed.is_ok() && waited.is_ok() {
-            self.armed = false;
-        }
-        killed.and(waited.map(|_| ()))
-    }
-}
-#[cfg(unix)]
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = self.kill();
-            let _ = self.child.start_kill();
-        }
-    }
-}
+pub(super) use crate::process_group::ProcessGroup;
 
 #[cfg(unix)]
 pub(super) async fn run_command(
