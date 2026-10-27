@@ -93,6 +93,11 @@ async fn streaming_fields_preserve_png_owner_and_use_common_image_controls() {
         account.usage().unwrap().allocated_bytes(),
         ImageInputLimits::default().maximum_encoded_bytes()
     );
+    assert_eq!(
+        image.backing_bytes(),
+        ImageInputLimits::default().maximum_encoded_bytes()
+    );
+    assert!(image.backing_bytes() > image.len());
     drop(image);
     assert_eq!(account.usage().unwrap().committed_bytes(), 0);
 }
@@ -240,10 +245,13 @@ impl ferrum_engine::image_generation::service::ImageGenerator for DecoderOnly {
 async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
-    // The encoded range retains its maximum backing while decoded RGBA is live.
+    // The encoded range retains its maximum backing while decoded RGBA and
+    // the admitted prompt/queue metadata are live. This test exercises codec
+    // limits; queue Host pressure has a separate HTTP 429 regression.
     let encoded_limit = ImageInputLimits::default().maximum_encoded_bytes();
     let rgba_bytes = 2048 * 2048 * 4;
-    let host = account(encoded_limit + rgba_bytes);
+    let queue_bytes = 4096;
+    let host = account(encoded_limit + rgba_bytes + queue_bytes);
     let calls = Arc::new(AtomicUsize::new(0));
     let decoded = Arc::new(std::sync::Mutex::new(None));
     let service = ImageService::new(
@@ -253,7 +261,9 @@ async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
             decoded: decoded.clone(),
         },
         ferrum_engine::image_generation::service::ImageServiceConfig {
+            batching: ferrum_types::ImageBatchPolicy::Configured,
             maximum_pending: 2,
+            maximum_pending_bytes: encoded_limit + queue_bytes,
             maximum_prompt_bytes: 1024,
             max_num_seqs: 1,
             request_batch_max_wait_ms: 0,

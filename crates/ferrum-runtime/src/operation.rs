@@ -123,6 +123,7 @@ pub use provider::{
     MAX_OPERATION_FAILURE_WIRE_BYTES, PROVIDER_EXECUTION_SEMANTICS_VERSION,
 };
 pub(crate) use registry::OperationRegistryAuthority;
+pub(crate) use registry::PreparedImplementationRetention;
 pub use registry::{
     BoundOperationProvider, BoundOperationProviderSet, OperationPlanningHandle,
     OperationPlanningRegistry, OperationProvider, OperationResourceEstimate,

@@ -53,7 +53,7 @@ pub fn execute_run_source_with_image(
         use ferrum_engine::image_generation::ImageGenerationRequest;
         use ferrum_output::png::{PngDimensions, PngLimits};
 
-        let product = source.prepare()?;
+        let product = source.prepare_for_run()?;
         // Reject absent/oversized input before device construction. Keep this
         // open handle and recheck the read extent rather than trusting a path.
         let image_file = image.map(open_image).transpose()?;

@@ -29,6 +29,12 @@ fn aligned_backing_charges_padding_before_allocation_and_retains_sliced_owner() 
         buffer.as_mut().fill(17);
         let bytes = buffer.freeze();
         let slice = bytes.slice(length - 1..length).unwrap();
+        let empty = slice.slice(1..1).unwrap();
+        assert_eq!(bytes.backing_bytes(), required);
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice.backing_bytes(), required);
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.backing_bytes(), required);
         let region = slice.retained_region().unwrap();
         assert_eq!(region.bytes(), &[17]);
         assert_eq!(region.owner_bytes().len(), required);
@@ -46,6 +52,14 @@ fn aligned_backing_charges_padding_before_allocation_and_retains_sliced_owner() 
         assert_eq!(aligned.usage().unwrap().allocated_bytes(), required);
         assert_eq!(region.bytes(), &[17]);
         drop(region);
+        assert_eq!(
+            aligned.usage().unwrap().committed_bytes(),
+            empty.backing_bytes()
+        );
+        assert!(aligned
+            .reserve(HostMemoryClass::InputPreprocess, 1)
+            .is_err());
+        drop(empty);
         assert_eq!(aligned.usage().unwrap().committed_bytes(), 0);
     }
 }
@@ -179,6 +193,9 @@ fn admitted_copy_is_independent_and_aliases_keep_the_full_initialized_charge() {
         .is_err());
     drop(slice);
     assert!(empty.is_empty());
+    for owner in [&bytes, &clone, &middle, &nested, &empty] {
+        assert_eq!(owner.backing_bytes(), 8);
+    }
     assert_eq!(account.usage().unwrap().allocated_bytes(), 8);
     drop(empty);
     assert_eq!(account.usage().unwrap().committed_bytes(), 0);

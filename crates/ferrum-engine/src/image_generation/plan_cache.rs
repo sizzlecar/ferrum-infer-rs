@@ -3,7 +3,12 @@
 //! Eviction releases this cache's Arc, never another request's compiled component.
 //! Encoded size measures serialization, not heap usage or Host payload bytes.
 use super::*;
-use std::{collections::VecDeque, io, sync::Mutex, time::Instant};
+use std::{
+    collections::VecDeque,
+    io,
+    sync::{Mutex, MutexGuard},
+    time::Instant,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +94,7 @@ pub struct ImagePlanCacheReceipt {
 }
 
 struct CachedStage<R: DeviceRuntime> {
+    insertion: u64,
     options: ProgramPlanCompileOptions,
     component: Arc<CompiledTensorComponent<R>>,
     receipt: ImageStagePlanReceipt,
@@ -184,6 +190,7 @@ struct CacheState<R: DeviceRuntime> {
     misses: u64,
     evictions: u64,
     oversized: u64,
+    next_insertion: u64,
 }
 impl<R: DeviceRuntime> CacheState<R> {
     fn new(policy: ImagePlanCachePolicy) -> Self {
@@ -195,6 +202,7 @@ impl<R: DeviceRuntime> CacheState<R> {
             misses: 0,
             evictions: 0,
             oversized: 0,
+            next_insertion: 0,
         }
     }
     fn configure(&mut self, policy: ImagePlanCachePolicy) -> VecDeque<CachedStage<R>> {
@@ -203,7 +211,9 @@ impl<R: DeviceRuntime> CacheState<R> {
         } else {
             // Production pipeline configuration is immutable; this also makes
             // explicit policy changes in injected tests release old metadata.
-            std::mem::replace(self, Self::new(policy)).entries
+            let mut next = Self::new(policy);
+            next.next_insertion = self.next_insertion;
+            std::mem::replace(self, next).entries
         }
     }
     fn snapshot(&self, stage: ImageStage, retained: bool) -> ImagePlanCacheReceipt {
@@ -235,12 +245,70 @@ impl<R: DeviceRuntime> CacheState<R> {
 
 pub(super) struct StagePlanCache<R: DeviceRuntime> {
     state: Mutex<CacheState<R>>,
+    candidate: Mutex<()>,
+}
+
+/// A candidate owns all newly retained stages until every plan and the combined
+/// capacity proof succeed. Failure releases these cache references, including
+/// their native leases. Existing callers' compiled Arcs remain valid even if
+/// normal bounded-cache insertion evicted their old cache entry.
+pub(super) struct CandidatePlanCache<'a, R: DeviceRuntime> {
+    cache: &'a StagePlanCache<R>,
+    first_insertion: u64,
+    committed: bool,
+    _serial: MutexGuard<'a, ()>,
+}
+impl<R: DeviceRuntime> CandidatePlanCache<'_, R> {
+    pub(super) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+impl<R: DeviceRuntime> Drop for CandidatePlanCache<'_, R> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Cleanup must also release owners while unwinding. Keep a poisoned
+        // cache poisoned for future callers, but recover its entries here.
+        let mut state = self.cache.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut removed = VecDeque::new();
+        let mut index = 0;
+        while index < state.entries.len() {
+            if state.entries[index].insertion >= self.first_insertion {
+                state.evict(index, &mut removed);
+            } else {
+                index += 1;
+            }
+        }
+        drop(state);
+        drop(removed);
+    }
 }
 impl<R: DeviceRuntime> StagePlanCache<R> {
     pub(super) fn new() -> Self {
         Self {
             state: Mutex::new(CacheState::new(ImagePlanCachePolicy::default())),
+            candidate: Mutex::new(()),
         }
+    }
+    pub(super) fn begin_candidate(&self) -> anyhow::Result<CandidatePlanCache<'_, R>> {
+        // This separate guard serializes candidate preparations without holding
+        // the cache state lock across compilation or native destruction.
+        let serial = self
+            .candidate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image candidate preparation poisoned"))?;
+        let first_insertion = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image plan cache poisoned"))?
+            .next_insertion;
+        Ok(CandidatePlanCache {
+            cache: self,
+            first_insertion,
+            committed: false,
+            _serial: serial,
+        })
     }
     /// This metadata lookup neither adds an entry nor changes LRU/counters.
     /// Only the later exact plan/options acquisition counts as a cache hit.
@@ -346,6 +414,10 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
         let snapshot = if let Some(encoded_bytes) =
             encoded.filter(|_| policy != ImagePlanCachePolicy::Disabled)
         {
+            let insertion = state.next_insertion;
+            state.next_insertion = insertion
+                .checked_add(1)
+                .context("image plan cache insertion identity exhausted")?;
             // Concurrent preparations of the same key must not create duplicates;
             // each caller still owns its independently compiled component.
             if let Some(index) = state.entries.iter().position(|e| {
@@ -391,6 +463,7 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
             }
             state.encoded_bytes += encoded_bytes;
             state.entries.push_back(CachedStage {
+                insertion,
                 options,
                 component,
                 receipt,

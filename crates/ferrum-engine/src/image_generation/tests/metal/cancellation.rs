@@ -94,7 +94,9 @@ async fn metal_service_cancellation_executes_active_work_then_recovers_and_relea
             completed: completed.clone(),
         },
         ImageServiceConfig {
+            batching: ferrum_types::ImageBatchPolicy::Configured,
             maximum_pending: 1,
+            maximum_pending_bytes: 1024 * 1024,
             maximum_prompt_bytes: 1024,
             max_num_seqs: 1,
             request_batch_max_wait_ms: 0,

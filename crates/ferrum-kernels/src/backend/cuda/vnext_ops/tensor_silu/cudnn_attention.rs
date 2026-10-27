@@ -249,7 +249,8 @@ impl OperationResourceEstimator for Provider {
             scratch,
             None,
         )
-        .with_prepared_implementation_fingerprint(prepared)
+        .with_prepared_implementation_fingerprint(prepared)?
+        .with_prepared_implementation_retention(Arc::new(stages))
     }
 }
 

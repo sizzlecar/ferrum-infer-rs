@@ -31,6 +31,8 @@ pub mod gguf_rn_fragment_materializer;
 #[cfg(test)]
 pub(crate) mod hadamard;
 pub mod native_ops;
+#[cfg(any(feature = "cuda", test))]
+mod retained_plan_cache;
 
 pub mod linear;
 pub use linear::{Linear, LinearMetadata, LinearProjectionRole};

@@ -244,7 +244,7 @@ fn automatic_image_route_rejects_text_controls_and_invalid_product_limits() {
         vec!["--gpu-memory-utilization", "1.01"],
         vec!["--runtime-memory-budget-bytes", "0"],
         vec!["--width", "0"],
-        vec!["--height", "1025"],
+        vec!["--height", "2049"],
     ] {
         let mut arguments = vec![
             "ferrum", "run", model, "--prompt", "cat", "--output", "x.png",
@@ -276,12 +276,21 @@ fn automatic_image_route_rejects_text_controls_and_invalid_product_limits() {
 
 #[test]
 fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
-    let one = DirectoryOptions::from_cli(0.9, None, None, "auto", None, None).unwrap();
+    let one = DirectoryOptions::from_cli(0.9, None, None, "cuda", None, None).unwrap();
     assert_eq!(directory::PRESET_NAME, "bf16_adaptive_v1");
     assert_eq!(one.serving().unwrap().request_batch_max_wait_ms, 0);
+    assert_eq!(one.batching, ferrum_types::ImageBatchPolicy::Auto);
+    assert_eq!(
+        one.maximum_batch_size,
+        ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH
+    );
+    assert_eq!(
+        one.serving().unwrap().maximum_pending_bytes.unwrap().get(),
+        one.host().input_preprocess_bytes / 2
+    );
     assert_eq!(
         (one.pipeline().maximum_width, one.pipeline().maximum_height),
-        (1024, 1024)
+        (2048, 2048)
     );
     one.host().limits().unwrap();
     for backend in ["cuda", "metal"] {
@@ -299,7 +308,11 @@ fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
     let eight = DirectoryOptions::from_cli(0.9, None, Some(8), "cuda", Some("0"), None).unwrap();
     assert_eq!(eight.serving().unwrap().max_num_seqs, 8);
     assert_eq!(eight.pipeline().maximum_batch_size, 8);
-    assert_eq!(eight.serving().unwrap().request_batch_max_wait_ms, 200);
+    assert_eq!(eight.serving().unwrap().request_batch_max_wait_ms, 0);
+    assert_eq!(
+        eight.serving().unwrap().batching,
+        ferrum_types::ImageBatchPolicy::Auto
+    );
     assert!(eight.maximum_memory_bytes.is_none());
     assert!(DirectoryOptions::from_cli(
         1.0,
@@ -310,6 +323,51 @@ fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
         None
     )
     .is_err());
+}
+
+#[test]
+fn run_has_single_request_capacity_and_metal_keeps_configured_batching() {
+    for explicit_cap in [None, Some(3)] {
+        let cuda = DirectoryOptions::from_cli(0.9, None, explicit_cap, "cuda", None, None).unwrap();
+        let run = cuda.single_request();
+        assert_eq!(run.pipeline().maximum_batch_size, 1);
+        assert_eq!(run.pipeline().maximum_width, 2048);
+        assert_eq!(run.serving().unwrap().request_batch_max_wait_ms, 0);
+        let metal =
+            DirectoryOptions::from_cli(0.9, None, explicit_cap, "metal", None, None).unwrap();
+        assert_eq!(metal.batching, ferrum_types::ImageBatchPolicy::Configured);
+        assert_eq!(metal.pipeline().maximum_width, 1024);
+        assert_eq!(metal.maximum_batch_size, explicit_cap.unwrap_or(1));
+        assert_eq!(
+            metal.serving().unwrap().request_batch_max_wait_ms,
+            if explicit_cap.is_some() { 200 } else { 0 }
+        );
+    }
+}
+
+#[test]
+fn cuda_directory_run_admits_2k_geometry_without_changing_metal_bounds() {
+    let root = tempfile::tempdir().unwrap();
+    metadata_fixture(root.path());
+    let model = root.path().to_str().unwrap();
+    for backend in ["cuda", "metal"] {
+        let result = validate(&[
+            "ferrum",
+            "run",
+            model,
+            "--prompt",
+            "cat",
+            "--output",
+            "x.png",
+            "--backend",
+            backend,
+            "--width",
+            "2048",
+            "--height",
+            "2048",
+        ]);
+        assert_eq!(result.is_ok(), backend == "cuda");
+    }
 }
 
 #[cfg(not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))))]

@@ -25,6 +25,9 @@ pub struct ProviderResourcePlan {
     pub(super) projection_numerics: Option<crate::PreparedProjectionNumerics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) prepared_implementation_fingerprint: Option<String>,
+    #[serde(skip)]
+    pub(super) prepared_implementation_retention:
+        Option<crate::operation::PreparedImplementationRetention>,
 }
 
 impl ProviderResourcePlan {
@@ -61,6 +64,9 @@ impl ProviderResourcePlan {
             prepared_implementation_fingerprint: estimate
                 .prepared_implementation_fingerprint()
                 .map(str::to_owned),
+            prepared_implementation_retention: estimate
+                .prepared_implementation_retention()
+                .cloned(),
         };
         plan.validate_fields()?;
         plan.estimate_fingerprint = plan.compute_estimate_fingerprint()?;

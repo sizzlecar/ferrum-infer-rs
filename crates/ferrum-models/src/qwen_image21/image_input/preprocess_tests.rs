@@ -56,7 +56,19 @@ fn rectangular_patch_rows_merge_axes_and_repeat_temporal_channels() {
     assert!(host.owns(prepared.vision_patches().bytes()));
     assert!(host.owns(prepared.vae_rgba().bytes()));
     assert_eq!(host.usage().unwrap().allocated_bytes(), 32 + 96 + 64);
+    let candidate = prepared.clone();
+    assert!(candidate
+        .vision_patches()
+        .bytes()
+        .same_region(prepared.vision_patches().bytes()));
+    assert!(candidate
+        .vae_rgba()
+        .bytes()
+        .same_region(prepared.vae_rgba().bytes()));
+    assert_eq!(host.usage().unwrap().allocated_bytes(), 32 + 96 + 64);
     drop(prepared);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 32 + 96 + 64);
+    drop(candidate);
     assert_eq!(host.usage().unwrap().committed_bytes(), 32);
     assert_eq!(image.bytes().bytes(), rgba);
     drop(image);
@@ -156,4 +168,70 @@ fn target_geometry_is_area_based_axis_aligned_and_not_output_resolution() {
     );
     assert!(QwenImage21ImageProcessor::condition_dimensions(0, 1).is_err());
     assert!(QwenImage21ImageProcessor::condition_dimensions(201, 1).is_err());
+}
+
+#[test]
+fn retained_backing_prediction_matches_preparation_with_resize_and_alignment() {
+    let processor = processor();
+    for (width, height, alignment) in [(32, 32, 1), (64, 16, 4096)] {
+        let host = HostMemoryAccount::with_allocation_alignment(
+            host(64 * 1024 * 1024).limits(),
+            alignment,
+        )
+        .unwrap();
+        let predicted = processor
+            .prepared_backing_bytes(&host, width, height)
+            .unwrap();
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+        let source = host
+            .allocate_zeroed(
+                HostMemoryClass::InputPreprocess,
+                width as usize * height as usize * 4,
+            )
+            .unwrap()
+            .freeze();
+        let image = ManagedRgba8Image::from_rgba8(&host, source, width, height, limits()).unwrap();
+        let before = host.usage().unwrap().committed_bytes();
+        let output = processor.prepare(&host, &image, limits()).unwrap();
+        assert_eq!(host.usage().unwrap().allocated_bytes() - before, predicted);
+        assert_eq!(host.usage().unwrap().committed_bytes() - before, predicted);
+        assert_eq!(
+            (output.width(), output.height()),
+            QwenImage21ImageProcessor::condition_dimensions(width, height).unwrap()
+        );
+        let logical = output.vision_patches().bytes().len() + output.vae_rgba().bytes().len();
+        if alignment > 1 {
+            assert!(
+                predicted > logical,
+                "physical accounting includes alignment padding"
+            );
+        } else {
+            assert_eq!(predicted, logical);
+        }
+        drop(output);
+        assert_eq!(host.usage().unwrap().committed_bytes(), before);
+    }
+}
+
+#[test]
+fn retained_backing_prediction_is_metadata_only_and_preserves_geometry_rejections() {
+    let host = host(1);
+    let processor = processor();
+    assert!(processor.prepared_backing_bytes(&host, 32, 32).unwrap() > host.limits().total_bytes());
+    for (width, height) in [(0, 32), (201, 1)] {
+        assert!(processor
+            .prepared_backing_bytes(&host, width, height)
+            .is_err());
+    }
+    let mut metadata = config();
+    metadata["image_processor"]["size"]["longest_edge"] = json!(1024);
+    let bounded =
+        QwenImage21ImageProcessor::from_json(&serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert!(matches!(
+        bounded.prepared_backing_bytes(&host, 32, 32),
+        Err(ImageInputError::Unsupported(
+            "processor requires an additional bicubic resize"
+        ))
+    ));
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

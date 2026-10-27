@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+mod retention;
+pub(crate) use retention::PreparedImplementationRetention;
+
 use super::super::{
     BatchWorkShape, ClaimedSubmissionWaveBacking, ContractVersion, DeviceDescriptor,
     DeviceReusableAddressScope, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
@@ -435,6 +438,7 @@ pub struct OperationResourceEstimate {
     persistent: Option<ProviderWorkspaceRequirement>,
     projection_numerics: Option<crate::PreparedProjectionNumerics>,
     prepared_implementation_fingerprint: Option<String>,
+    prepared_implementation_retention: Option<PreparedImplementationRetention>,
 }
 
 impl OperationResourceEstimate {
@@ -459,6 +463,7 @@ impl OperationResourceEstimate {
             persistent,
             projection_numerics: None,
             prepared_implementation_fingerprint: None,
+            prepared_implementation_retention: None,
         }
     }
 
@@ -488,8 +493,44 @@ impl OperationResourceEstimate {
                 "prepared implementation fingerprint must be canonical SHA-256",
             ));
         }
+        if self
+            .prepared_implementation_retention
+            .as_ref()
+            .is_some_and(|retention| retention.fingerprint != fingerprint)
+        {
+            return Err(invalid_operation(
+                "prepared implementation fingerprint differs from its retained owner",
+            ));
+        }
         self.prepared_implementation_fingerprint = Some(fingerprint);
         Ok(self)
+    }
+
+    /// Keep the exact implementation selected during estimation alive through
+    /// all cloned resolutions and compiled plans. Failed candidates release the
+    /// owner when their estimates/plans are dropped. The owner must itself carry
+    /// any required runtime capacity retention; this is not an allocation grant.
+    pub fn with_prepared_implementation_retention(
+        mut self,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<Self, VNextError> {
+        let fingerprint = self
+            .prepared_implementation_fingerprint
+            .clone()
+            .ok_or_else(|| {
+                invalid_operation("prepared implementation retention requires its fingerprint")
+            })?;
+        self.prepared_implementation_retention = Some(PreparedImplementationRetention {
+            fingerprint,
+            _owner: owner,
+        });
+        Ok(self)
+    }
+
+    pub(crate) fn prepared_implementation_retention(
+        &self,
+    ) -> Option<&PreparedImplementationRetention> {
+        self.prepared_implementation_retention.as_ref()
     }
 
     pub fn prepared_implementation_fingerprint(&self) -> Option<&str> {

@@ -115,6 +115,100 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         self.assets.editing.is_some() && self.editing_profiles.is_some()
     }
 
+    /// Decode each admitted reference once. The queue can retain this owner
+    /// across candidate reductions without retaining a second decoded payload.
+    pub(super) fn preprocess_edit(
+        &self,
+        request: &ImageEditRequest,
+    ) -> anyhow::Result<QwenImage21ConditionInputs> {
+        ensure!(self.supports_edits(), "editing assets/profiles are missing");
+        request
+            .generation
+            .latent_dimensions(&self.config, self.assets.spatial_scale()?)?;
+        ensure!(
+            self.host.owns(&request.image),
+            "edit reference belongs to another Host account"
+        );
+        let assets = self
+            .assets
+            .editing
+            .as_ref()
+            .context("editing assets are missing")?;
+        let limits = ImageInputLimits::default();
+        let started = std::time::Instant::now();
+        let decoded = ManagedRgba8Image::decode_png(&self.host, &request.image, limits)?;
+        let decode_png_us = trace_elapsed_us(started);
+        let started = std::time::Instant::now();
+        let input = assets.processor.prepare(&self.host, &decoded, limits)?;
+        tracing::debug!(
+            target: "ferrum_engine::image_generation::timing",
+            job = self.next_job,
+            decode_png_us,
+            reference_preprocess_us = trace_elapsed_us(started),
+            "image edit reference prepared"
+        );
+        Ok(input)
+    }
+
+    /// Compile one compatible prefix of already preprocessed request owners.
+    /// Failed candidates release their clones; the original queue owners remain
+    /// admitted and can be used by the next smaller candidate without decoding.
+    pub(super) fn prepare_preprocessed_edits(
+        &self,
+        requests: &[ImageGenerationRequest],
+        inputs: &[QwenImage21ConditionInputs],
+    ) -> anyhow::Result<PreparedRequest<R>> {
+        ensure!(self.supports_edits(), "editing assets/profiles are missing");
+        super::prepare::batch_dimensions(requests, &self.config, self.assets.spatial_scale()?)?;
+        for input in inputs {
+            ensure!(
+                self.host.owns(input.vision_patches().bytes())
+                    && self.host.owns(input.vae_rgba().bytes()),
+                "preprocessed edit input belongs to another Host account"
+            );
+        }
+        let started = std::time::Instant::now();
+        let assets = self
+            .assets
+            .editing
+            .as_ref()
+            .context("editing assets are missing")?;
+        let geometry = condition_geometry(inputs, requests.len())?;
+        let [temporal, height, width] = geometry.grid;
+        let vision = Qwen3VLVisionConfig::new(
+            assets.vision.clone(),
+            vec![Qwen3VLVisionGrid::new(temporal, height, width)?],
+        )?;
+        let encoder = assets.encoder_config(geometry.height, geometry.width)?;
+        let prompt_text: Vec<_> = requests
+            .iter()
+            .map(|request| request.prompt.as_str())
+            .collect();
+        let prompt = self.assets.tokenizer.prepare_edit_batch(
+            &prompt_text,
+            self.config.maximum_user_tokens,
+            height,
+            width,
+            assets.vision.merge_size(),
+        )?;
+        tracing::debug!(
+            target: "ferrum_engine::image_generation::timing",
+            job = self.next_job,
+            batch_size = requests.len(),
+            edit_layout_and_prompt_us = trace_elapsed_us(started),
+            "image edit batch metadata prepared"
+        );
+        self.prepare_batch_with_edit(
+            requests,
+            Some(EditInputs {
+                prompt,
+                inputs: inputs.to_vec(),
+                vision,
+                encoder,
+            }),
+        )
+    }
+
     pub fn edit(
         &mut self,
         request: ImageEditRequest,
@@ -149,72 +243,20 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 (1..=self.config.maximum_batch_size).contains(&requests.len()),
                 "image request batch exceeds configured maximum_batch_size"
             );
-            let (generation, images): (Vec<_>, Vec<_>) = requests
-                .into_iter()
-                .map(|request| (request.generation, request.image))
-                .unzip();
+            let generation: Vec<_> = requests
+                .iter()
+                .map(|request| request.generation.clone())
+                .collect();
             super::prepare::batch_dimensions(
                 &generation,
                 &self.config,
                 self.assets.spatial_scale()?,
             )?;
-            let assets = self
-                .assets
-                .editing
-                .as_ref()
-                .context("editing assets are missing")?;
-            let limits = ImageInputLimits::default();
-            let mut decode_png_us = 0_u64;
-            let mut reference_preprocess_us = 0_u64;
             let mut inputs = Vec::with_capacity(generation.len());
-            for image in images {
-                let started = std::time::Instant::now();
-                let decoded = ManagedRgba8Image::decode_png(&self.host, &image, limits)?;
-                decode_png_us = decode_png_us.saturating_add(trace_elapsed_us(started));
-                let started = std::time::Instant::now();
-                inputs.push(assets.processor.prepare(&self.host, &decoded, limits)?);
-                reference_preprocess_us =
-                    reference_preprocess_us.saturating_add(trace_elapsed_us(started));
-                // Each prepared image owns its distinct admitted payload. Release
-                // encoded/decoded input owners without retaining extra clones.
-                drop(decoded);
-                drop(image);
+            for request in requests {
+                inputs.push(self.preprocess_edit(&request)?);
             }
-            let started = std::time::Instant::now();
-            let geometry = condition_geometry(&inputs, generation.len())?;
-            let [temporal, height, width] = geometry.grid;
-            let vision = Qwen3VLVisionConfig::new(
-                assets.vision.clone(),
-                vec![Qwen3VLVisionGrid::new(temporal, height, width)?],
-            )?;
-            let encoder = assets.encoder_config(geometry.height, geometry.width)?;
-            let prompt_text: Vec<_> = generation.iter().map(|r| r.prompt.as_str()).collect();
-            let prompt = self.assets.tokenizer.prepare_edit_batch(
-                &prompt_text,
-                self.config.maximum_user_tokens,
-                height,
-                width,
-                assets.vision.merge_size(),
-            )?;
-            let edit_layout_and_prompt_us = trace_elapsed_us(started);
-            let prepared = self.prepare_batch_with_edit(
-                &generation,
-                Some(EditInputs {
-                    prompt,
-                    inputs,
-                    vision,
-                    encoder,
-                }),
-            )?;
-            tracing::debug!(
-                target: "ferrum_engine::image_generation::timing",
-                job = self.next_job,
-                batch_size = generation.len(),
-                decode_png_us,
-                reference_preprocess_us,
-                edit_layout_and_prompt_us,
-                "image edit inputs prepared"
-            );
+            let prepared = self.prepare_preprocessed_edits(&generation, &inputs)?;
             Ok((prepared, generation))
         })()
         .map_err(preflight)?;

@@ -1,10 +1,10 @@
 //! Fixed-shape cuDNN SDPA plans. Capacity is reserved before graph creation;
 //! queried workspace is supplied by the operation's admitted scratch region.
-//! The finite cache has no eviction: compiled Ferrum plans keep using the exact
-//! native plan selected while their resource estimate was produced.
+//! Compiled Ferrum plans retain the exact native plans selected during resource
+//! estimation. The finite cache reclaims only entries with no remaining lease.
 
 use super::*;
-use std::collections::BTreeMap;
+use crate::retained_plan_cache::{PlanCacheError, RetainedPlanCache};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod native;
@@ -138,7 +138,7 @@ pub(crate) struct CudaCudnnSdpaCache {
     policy: CudnnSdpaPlanPolicy,
     opaque: DeviceCapacityRetention,
     bindings: Arc<BindingLimit>,
-    plans: Mutex<BTreeMap<CudnnSdpaSignature, Arc<CudnnSdpaPlan>>>,
+    plans: Mutex<RetainedPlanCache<CudnnSdpaSignature, CudnnSdpaPlan>>,
     fingerprint: String,
 }
 impl CudaCudnnSdpaCache {
@@ -185,7 +185,7 @@ impl CudaCudnnSdpaCache {
                 live: AtomicUsize::new(0),
                 maximum: policy.maximum_live_bindings,
             }),
-            plans: Mutex::new(BTreeMap::new()),
+            plans: Mutex::new(RetainedPlanCache::new(policy.maximum_plans)),
             fingerprint: format!("{:x}", digest.finalize()),
         })
     }
@@ -207,22 +207,21 @@ impl CudaCudnnSdpaCache {
             .plans
             .lock()
             .map_err(|_| CudaDeviceRuntimeError::contract("SDPA cache poisoned"))?;
-        if let Some(plan) = plans.get(&signature) {
-            return Ok(Arc::clone(plan));
-        }
-        if plans.len() >= self.policy.maximum_plans {
-            return Err(CudaDeviceRuntimeError::contract(
-                "cuDNN SDPA plan cache limit exhausted",
-            ));
-        }
-        let plan = self.owner.prepare_sdpa(
-            signature,
-            self.policy.workspace_limit_bytes,
-            self.opaque.clone(),
-            Arc::clone(&self.bindings),
-        )?;
-        plans.insert(signature, Arc::clone(&plan));
-        Ok(plan)
+        plans
+            .get_or_try_insert_with(signature, || {
+                self.owner.prepare_sdpa(
+                    signature,
+                    self.policy.workspace_limit_bytes,
+                    self.opaque.clone(),
+                    Arc::clone(&self.bindings),
+                )
+            })
+            .map_err(|error| match error {
+                PlanCacheError::AllPlansRetained => CudaDeviceRuntimeError::contract(
+                    "cuDNN SDPA plan cache limit exhausted by retained plans",
+                ),
+                PlanCacheError::Prepare(error) => error,
+            })
     }
 
     /// Encoding never compiles or reselects an engine after scratch admission.
@@ -234,7 +233,6 @@ impl CudaCudnnSdpaCache {
             .lock()
             .map_err(|_| CudaDeviceRuntimeError::contract("SDPA cache poisoned"))?
             .get(signature)
-            .cloned()
             .ok_or_else(|| {
                 CudaDeviceRuntimeError::contract(
                     "SDPA plan was not prepared during resource estimation",

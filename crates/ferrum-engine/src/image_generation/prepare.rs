@@ -83,6 +83,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         requests: &[ImageGenerationRequest],
         edit: Option<super::editing::EditInputs>,
     ) -> anyhow::Result<PreparedRequest<R>> {
+        let candidate_cache = self.plan_cache.begin_candidate()?;
         let prepare_started = std::time::Instant::now();
         let (height, width) =
             batch_dimensions(requests, &self.config, self.assets.spatial_scale()?)?;
@@ -253,7 +254,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             capacity_us,
             "image batch plans prepared"
         );
-        Ok(PreparedRequest {
+        let prepared = PreparedRequest {
             prompts,
             request_order,
             transformer,
@@ -265,7 +266,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             prefix_decode,
             decode_stage,
             edit,
-        })
+        };
+        candidate_cache.commit();
+        Ok(prepared)
     }
 
     pub(super) fn prepare_denoiser(

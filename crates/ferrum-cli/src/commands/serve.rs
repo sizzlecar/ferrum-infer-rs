@@ -111,7 +111,7 @@ pub struct ServeCommand {
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
 
-    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`; maximum real image batch size (default 1).
+    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`; optional CUDA image Auto batch ceiling.
     #[arg(long, value_name = "N")]
     pub max_num_seqs: Option<usize>,
 

@@ -26,6 +26,8 @@
 
 mod assets;
 mod attention_policy;
+mod capacity;
+pub use capacity::{ImageDeviceCapacityExceeded, ImageDeviceCapacityReport};
 mod composition;
 pub use composition::ImagePipelineLimits;
 #[cfg(feature = "cuda")]
@@ -270,6 +272,9 @@ pub struct QwenImage21Pipeline<R: DeviceRuntime> {
     policy: TensorComponentPolicy,
     next_job: u64,
     stopped: bool,
+    // Prepared service owners may move between threads, but can only be
+    // consumed by this exact pipeline instance, even with a shared runtime.
+    service_preparation_identity: Arc<()>,
     plan_cache: plan_cache::StagePlanCache<R>,
     resident_stages: residency::ResidentStages<R>,
     // Composition-supplied planning allowance. Actual native owners still
@@ -327,6 +332,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             policy,
             next_job: 0,
             stopped: false,
+            service_preparation_identity: Arc::new(()),
             plan_cache: plan_cache::StagePlanCache::new(),
             resident_stages: residency::ResidentStages::new(),
             device_opaque_allowance_bytes: 0,

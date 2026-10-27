@@ -49,6 +49,16 @@ struct PixelBounds {
     longest_edge: usize,
 }
 
+struct ConditionLayout {
+    pixels: usize,
+    gh: usize,
+    gw: usize,
+    rows: usize,
+    columns: usize,
+    patch_bytes: usize,
+    vae_bytes: usize,
+}
+
 impl QwenImage21ImageProcessor {
     pub const PATCHES_ID: &'static str = "value.qwen3_vl.vision.patches";
     pub const VAE_INPUT_ID: &'static str = "value.qwen_image21.vae.encoder.normalized_rgba";
@@ -187,14 +197,28 @@ impl QwenImage21ImageProcessor {
         self.prepare_resized(host, &resized)
     }
 
-    fn prepare_resized(
+    /// Physical Host backing retained by the prepared vision patches and VAE
+    /// input for an original image's dimensions. This uses the same condition
+    /// resizing and processor geometry checks as `prepare`, without decoding,
+    /// reserving or allocating. Encoded input, decoded RGBA and resize scratch
+    /// have separate lifetimes and are not included in this retained total.
+    pub fn prepared_backing_bytes(
         &self,
         host: &HostMemoryAccount,
-        image: &ManagedRgba8Image,
-    ) -> ImageInputResult<QwenImage21ConditionInputs> {
-        image.validate_parent(host)?;
-        let width = image.width as usize;
-        let height = image.height as usize;
+        width: u32,
+        height: u32,
+    ) -> ImageInputResult<usize> {
+        let (width, height) = Self::condition_dimensions(width, height)?;
+        let layout = self.condition_layout(width, height)?;
+        host.backing_bytes(layout.patch_bytes)?
+            .checked_add(host.backing_bytes(layout.vae_bytes)?)
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or(ImageInputError::Limit("prepared image backing bytes"))
+    }
+
+    fn condition_layout(&self, width: u32, height: u32) -> ImageInputResult<ConditionLayout> {
+        let width = width as usize;
+        let height = height as usize;
         let pixels = width
             .checked_mul(height)
             .ok_or(ImageInputError::Limit("image pixels"))?;
@@ -220,6 +244,33 @@ impl QwenImage21ImageProcessor {
             .ok_or(ImageInputError::Limit("patch columns"))?;
         let patch_bytes = byte_len(rows.checked_mul(columns))?;
         let vae_bytes = byte_len(pixels.checked_mul(4))?;
+        Ok(ConditionLayout {
+            pixels,
+            gh,
+            gw,
+            rows,
+            columns,
+            patch_bytes,
+            vae_bytes,
+        })
+    }
+
+    fn prepare_resized(
+        &self,
+        host: &HostMemoryAccount,
+        image: &ManagedRgba8Image,
+    ) -> ImageInputResult<QwenImage21ConditionInputs> {
+        image.validate_parent(host)?;
+        let width = image.width as usize;
+        let ConditionLayout {
+            pixels,
+            gh,
+            gw,
+            rows,
+            columns,
+            patch_bytes,
+            vae_bytes,
+        } = self.condition_layout(image.width, image.height)?;
         let patch_spec = tensor_spec(vec![rows as u64, columns as u64])?;
         let vae_spec = tensor_spec(vec![1, 4, u64::from(image.height), u64::from(image.width)])?;
         let mut reservations = host
@@ -277,7 +328,10 @@ impl QwenImage21ImageProcessor {
     }
 }
 
-#[derive(Debug)]
+/// Cloning retains immutable, already admitted Host owners; it does not copy
+/// the reference payload. Candidate batch preparation can borrow these owners
+/// while a queue keeps them for capacity-driven batch reduction.
+#[derive(Debug, Clone)]
 pub struct QwenImage21ConditionInputs {
     patches: ManagedHostTensor,
     vae: ManagedHostTensor,

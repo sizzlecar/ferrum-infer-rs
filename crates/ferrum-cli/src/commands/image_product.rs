@@ -193,8 +193,8 @@ pub fn validate_cli_matches(
             );
         }
     }
-    if automatic {
-        DirectoryOptions::from_cli(
+    let maximum_dimension = if automatic {
+        let options = DirectoryOptions::from_cli(
             *args
                 .get_one::<f32>("gpu_memory_utilization")
                 .ok_or_else(|| anyhow::anyhow!("missing gpu-memory-utilization default"))?,
@@ -214,7 +214,10 @@ pub fn validate_cli_matches(
             .copied()
             .unwrap_or_default(),
         )?;
-    }
+        options.pipeline().maximum_width
+    } else {
+        u32::MAX
+    };
     if command == "run" {
         anyhow::ensure!(
             args.get_one::<String>("prompt").is_some(),
@@ -227,8 +230,8 @@ pub fn validate_cli_matches(
         for dimension in ["width", "height"] {
             if let Some(value) = args.get_one::<u32>(dimension) {
                 anyhow::ensure!(
-                    *value > 0 && (!automatic || *value <= 1024),
-                    "image {dimension} exceeds the positive preset bound (1024)"
+                    *value > 0 && *value <= maximum_dimension,
+                    "image {dimension} exceeds the positive preset bound ({maximum_dimension})"
                 );
             }
         }

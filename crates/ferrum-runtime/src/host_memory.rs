@@ -559,6 +559,12 @@ impl ManagedHostBytes {
     pub fn is_empty(&self) -> bool {
         self.range.is_empty()
     }
+    /// Physical capacity retained by this owner, including alignment padding.
+    /// A clone or slice (even an empty slice) retains the entire allocation's
+    /// charge; its logical `len()` is not the retained memory footprint.
+    pub fn backing_bytes(&self) -> usize {
+        self.backing.charge.bytes
+    }
     pub fn class(&self) -> HostMemoryClass {
         self.backing.charge.class
     }

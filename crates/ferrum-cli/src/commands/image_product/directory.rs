@@ -25,11 +25,20 @@ pub struct DirectoryOptions {
     pub utilization: f64,
     pub maximum_memory_bytes: Option<NonZeroU64>,
     pub maximum_batch_size: usize,
+    pub batching: ferrum_types::ImageBatchPolicy,
     pub ordinal: usize,
     pub cudnn_library: Option<PathBuf>,
     pub precision: ferrum_engine::image_generation::ImageCudaPrecisionPolicy,
 }
 impl DirectoryOptions {
+    /// A direct invocation has exactly one image request, regardless of the
+    /// serving capacity ceiling supplied on the command line.
+    pub fn single_request(&self) -> Self {
+        let mut options = self.clone();
+        options.maximum_batch_size = 1;
+        options
+    }
+
     pub fn from_cli(
         utilization: f32,
         maximum: Option<std::num::NonZeroUsize>,
@@ -66,7 +75,14 @@ impl DirectoryOptions {
             maximum_memory_bytes: maximum
                 .map(|v| u64::try_from(v.get()).map(|n| NonZeroU64::new(n).unwrap()))
                 .transpose()?,
-            maximum_batch_size: batch.unwrap_or(1),
+            maximum_batch_size: batch.unwrap_or(match backend {
+                ImageBackendKind::Cuda => ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH,
+                ImageBackendKind::Metal => 1,
+            }),
+            batching: match backend {
+                ImageBackendKind::Cuda => ferrum_types::ImageBatchPolicy::Auto,
+                ImageBackendKind::Metal => ferrum_types::ImageBatchPolicy::Configured,
+            },
             ordinal,
             cudnn_library,
             precision: Default::default(),
@@ -116,10 +132,18 @@ impl DirectoryOptions {
         self.validate()?;
         let pending = self.maximum_batch_size.max(4);
         let serving = ServingConfig {
+            batching: self.batching,
             maximum_pending: pending,
+            maximum_pending_bytes: Some(self.host().default_pending_bytes()?),
             maximum_prompt_bytes: (1024 * 1024 / self.maximum_batch_size).min(65536),
             max_num_seqs: self.maximum_batch_size,
-            request_batch_max_wait_ms: if self.maximum_batch_size == 1 { 0 } else { 200 },
+            request_batch_max_wait_ms: if self.batching == ferrum_types::ImageBatchPolicy::Auto
+                || self.maximum_batch_size == 1
+            {
+                0
+            } else {
+                200
+            },
             default_width: 512,
             default_height: 512,
             default_seed: 0,
@@ -150,10 +174,14 @@ impl DirectoryOptions {
         }
     }
     pub fn pipeline(&self) -> PipelineConfig {
+        let maximum_dimension = match self.backend {
+            ImageBackendKind::Cuda => 2048,
+            ImageBackendKind::Metal => 1024,
+        };
         PipelineConfig {
             maximum_user_tokens: 1024,
-            maximum_width: 1024,
-            maximum_height: 1024,
+            maximum_width: maximum_dimension,
+            maximum_height: maximum_dimension,
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy:
                 ferrum_engine::image_generation::ImageDecoderBatchPolicy::SingleImage,
@@ -276,6 +304,21 @@ pub(super) struct PreparedProduct {
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 impl ImageProductSource {
+    pub(super) fn prepare_for_run(&self) -> Result<PreparedProduct> {
+        match self {
+            Self::LocalDirectory { path, options } => {
+                // `run` has one request. Do not size initialization or resources
+                // for the serving ceiling even when the user supplied one.
+                Self::LocalDirectory {
+                    path: path.clone(),
+                    options: options.single_request(),
+                }
+                .prepare()
+            }
+            Self::ExplicitConfig(_) => self.prepare(),
+        }
+    }
+
     pub(super) fn prepare(&self) -> Result<PreparedProduct> {
         match self {
             Self::ExplicitConfig(path) => {

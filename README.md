@@ -112,7 +112,11 @@ ferrum serve --model /path/to/Qwen-Image-2.1-Turbo --served-model-name qwen-imag
 
 HTTP: `POST /v1/images/generations` (JSON) and `POST /v1/images/edits` (multipart). Edits accept one 8-bit RGB/RGBA PNG; responses contain PNG as `b64_json`. Editing can redraw background/details.
 
-The local-directory preset supports up to 1024×1024. 2K and the resident service configurations measured below use `--image-config`.
+CUDA directory serving uses automatic image batching: an idle GPU starts available work immediately; compatible requests accumulated during execution form the next batch. No batch or gathering-delay option is required. `--max-num-seqs` optionally tightens the model/operator batch ceiling; it does not reserve that many images or select a fixed batch size. Capacity is checked before execution, and oversized candidates are reduced only on an explicit capacity rejection. Scheduling occurs between complete batches, so a large image can delay a later small image.
+
+The CUDA directory preset admits output sizes up to 2048×2048 subject to managed capacity; the Metal preset retains its 1024×1024 bound and configured scheduling. `ferrum run` directly executes one request. Pending requests are bounded by count and Host bytes (one half of the Host input allowance by default); overload returns HTTP 429. The effective policy, limits, rejection count and actual batch counters are exposed in `/health` under `images.scheduler`.
+
+Existing `--image-config` JSON keeps configured batching when `serving.batching` is omitted. Explicit JSON can select `"batching":"auto"` with `"request_batch_max_wait_ms":0`, and optionally set a positive `maximum_pending_bytes`. The historical measurements below used explicit resident service configurations; they do not establish the performance of automatic batching.
 
 ### Throughput vs vLLM-Omni
 

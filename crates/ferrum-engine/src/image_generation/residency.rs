@@ -366,6 +366,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         stages: &[&PreparedStage<R>],
         prefix: Option<(&PreparedStage<R>, &PreparedStage<R>)>,
     ) -> anyhow::Result<()> {
+        self.capacity_with_prefix(stages, prefix)?.validate()?;
+        Ok(())
+    }
+
+    pub(super) fn capacity_with_prefix(
+        &self,
+        stages: &[&PreparedStage<R>],
+        prefix: Option<(&PreparedStage<R>, &PreparedStage<R>)>,
+    ) -> anyhow::Result<ImageDeviceCapacityReport> {
         self.config
             .dynamic_residency
             .validate(self.config.residency)?;
@@ -523,10 +532,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .checked_add(active_peak)
             .and_then(|n| n.checked_add(self.device_opaque_allowance_bytes))
             .context("resident batch capacity overflows")?;
-        ensure!(required <= self.config.device_capacity_bytes,
-            "resident image batch needs {required} device bytes (retained static {retained_static}, active stage peak {active_peak}, total idle dynamic allowance {retained_dynamic}, native allowance {}), exceeding total ceiling {}",
-            self.device_opaque_allowance_bytes, self.config.device_capacity_bytes);
-        Ok(())
+        Ok(ImageDeviceCapacityReport {
+            complete_batch: true,
+            required_bytes: required,
+            capacity_bytes: self.config.device_capacity_bytes,
+            retained_static_bytes: retained_static,
+            active_stage_peak_bytes: active_peak,
+            retained_dynamic_allowance_bytes: retained_dynamic,
+            native_allowance_bytes: self.device_opaque_allowance_bytes,
+        })
     }
 
     /// The second phase binds this immutable installation while the first

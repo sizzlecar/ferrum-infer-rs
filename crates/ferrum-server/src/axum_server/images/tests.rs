@@ -383,15 +383,38 @@ fn image_service() -> (ImageHttpService, Arc<AtomicUsize>) {
 fn image_service_with_gate(
     gate: Option<Arc<GenerationGate>>,
 ) -> (ImageHttpService, Arc<AtomicUsize>) {
+    // Queued prompts/metadata and encoded outputs share the injected account.
+    // Keep host_account() output-only for the exact encoder capacity tests.
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            4096,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: 4096,
+                output_bytes: 4096,
+                transfer_staging_bytes: 0,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    image_service_with_host(host, gate)
+}
+
+fn image_service_with_host(
+    host: HostMemoryAccount,
+    gate: Option<Arc<GenerationGate>>,
+) -> (ImageHttpService, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let service = ImageService::new(
         FailingGenerator {
-            host: host_account(4096),
+            host,
             calls: calls.clone(),
             gate,
         },
         ferrum_engine::image_generation::service::ImageServiceConfig {
+            batching: ferrum_types::ImageBatchPolicy::Configured,
             maximum_pending: 2,
+            maximum_pending_bytes: 4096,
             maximum_prompt_bytes: 64,
             max_num_seqs: 1,
             request_batch_max_wait_ms: 0,
@@ -402,6 +425,37 @@ fn image_service_with_gate(
         ImageHttpService::new("image", service, config()).unwrap(),
         calls,
     )
+}
+
+#[tokio::test]
+async fn queue_host_pressure_returns_429_before_generator_execution() {
+    // Output capacity is available, but the separate input class has no room
+    // for the admitted prompt and queue metadata.
+    let host = host_account(4096);
+    let (images, calls) = image_service_with_host(host.clone(), None);
+    let router =
+        super::super::AxumServer::from_state(AppState::default().with_images(images.clone()))
+            .build_router()
+            .unwrap();
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"image","prompt":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(images.service().snapshot().rejected_requests, 1);
+    assert_eq!(images.service().snapshot().pending_requests, 0);
+    assert_eq!(images.output_usage().sessions, 0);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    images.shutdown().await.unwrap();
+    assert!(!images.take_shutdown().await.unwrap().has_failure());
 }
 
 async fn json_get(router: axum::Router, path: &str) -> serde_json::Value {
@@ -435,6 +489,8 @@ async fn image_only_health_models_and_validation_do_not_claim_a_ready_text_engin
     assert_eq!(health["engine"]["text_ready"], false);
     assert_eq!(health["images"]["ready"], true);
     assert_eq!(health["images"]["scheduler"]["max_num_seqs"], 1);
+    assert_eq!(health["images"]["scheduler"]["batching"], "configured");
+    assert_eq!(health["images"]["scheduler"]["maximum_pending_bytes"], 4096);
     assert_eq!(health["images"]["host"]["allocated_bytes"], 0);
     assert_eq!(health["images"]["host"]["committed_bytes"], 0);
     // An image-only service must not present fallback text configuration as

@@ -333,6 +333,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             &pipeline.materializers,
             options,
         )
+        .map_err(|source| super::capacity::classify_plan_error(source.into()))
         .with_context(|| {
             format!("image {stage:?} {role:?} plan compilation (batch {batch_size})")
         })?;
