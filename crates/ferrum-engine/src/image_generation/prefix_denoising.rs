@@ -175,6 +175,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let output =
                 output.map_err(|source| ImageGenerationFailure::RequestExecution { source })?;
             prefill.receipt.completed_executions += 1;
+            prefill.receipt.record_device_timing(&output);
             let started = Instant::now();
             advance(solver, &mut sample, output, steps).map_err(process)?;
             let mut euler_us = elapsed_us(started);
@@ -201,6 +202,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 let output =
                     output.map_err(|source| ImageGenerationFailure::RequestExecution { source })?;
                 active.receipt.completed_executions += 1;
+                active.receipt.record_device_timing(&output);
                 let started = Instant::now();
                 advance(solver, &mut sample, output, steps).map_err(process)?;
                 euler_us = euler_us.saturating_add(elapsed_us(started));
@@ -246,6 +248,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 let mut origin = origin;
                 origin.completed_executions = 0;
                 origin.execution_wall_durations_us.clear();
+                origin.device_timings.clear();
                 origin.initialization_wall_duration_us = 0;
                 origin.plan.compile_wall_duration_us = 0;
                 stages.push(ImageStageReceipt {

@@ -12,6 +12,7 @@ mod plan_cache;
 mod prefix;
 mod preflight;
 mod residency;
+mod timing;
 
 fn config() -> ImagePipelineConfig {
     ImagePipelineConfig {

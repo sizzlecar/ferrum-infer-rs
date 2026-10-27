@@ -31,6 +31,48 @@ fn configuration() -> Value {
 }
 
 #[test]
+fn device_timing_configuration_is_shared_by_image_run_and_serve() {
+    use ferrum_runtime::DeviceTimingMode;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image.json");
+    for metal in [false, true] {
+        for serve in [false, true] {
+            for requested in [None, Some(DeviceTimingMode::Kernel)] {
+                let mut wire = configuration();
+                if metal {
+                    let backend = wire["backend"].as_object_mut().unwrap();
+                    for key in ["ordinal", "usable_memory_bytes", "cudnn"] {
+                        backend.remove(key);
+                    }
+                    backend.insert("kind".into(), json!("metal"));
+                    backend.insert(
+                        "memory".into(),
+                        json!({"kind":"explicit_total","bytes":268435456}),
+                    );
+                }
+                if serve {
+                    wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+                        "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
+                        "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+                }
+                if let Some(mode) = requested {
+                    wire["backend"]["pipeline"]["device_timing"] =
+                        serde_json::to_value(mode).unwrap();
+                }
+                fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+                let config = ImageProductConfig::load(&path).unwrap();
+                assert_eq!(config.serving.is_some(), serve);
+                let limits = config.backend.pipeline().resolved_limits().unwrap();
+                assert_eq!(
+                    limits.executor.device_timing,
+                    requested.unwrap_or(DeviceTimingMode::Off)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn stream_capacity_auto_and_explicit_limits_are_shared_by_run_and_serve() {
     use ferrum_engine::image_generation::{ImageStreamLimit, ImageStreamLimitSource};
     let dir = tempfile::tempdir().unwrap();

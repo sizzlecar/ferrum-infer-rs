@@ -74,6 +74,21 @@ pub struct ImageStageExecutionReceipt {
     /// submission, completion wait and readback. A failed final attempt is
     /// retained here; this is not a CUDA event or kernel-only measurement.
     pub execution_wall_durations_us: Vec<u64>,
+    /// Optional terminal backend evidence, once per successful execution.
+    /// Host wall and device intervals use different clocks and may overlap.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub device_timings: Vec<ferrum_execution::TensorExecutionTiming>,
+}
+
+impl ImageStageExecutionReceipt {
+    pub(super) fn record_device_timing(&mut self, outputs: &[TensorExecutionOutput]) {
+        if let Some(timing) = outputs
+            .first()
+            .and_then(TensorExecutionOutput::device_timing)
+        {
+            self.device_timings.push(timing.clone());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -428,6 +443,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                         completed_executions: 0,
                         initialization_wall_duration_us: elapsed_us(started),
                         execution_wall_durations_us: Vec::new(),
+                        device_timings: Vec::new(),
                     },
                     session,
                 },
@@ -491,6 +507,7 @@ impl<R: DeviceRuntime> ActiveImageStage<R> {
             .push(elapsed_us(started));
         match result {
             Ok(outputs) => {
+                self.receipt.record_device_timing(&outputs);
                 self.receipt.completed_executions += 1;
                 Ok((self, outputs))
             }

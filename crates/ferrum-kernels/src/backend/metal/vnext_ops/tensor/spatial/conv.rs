@@ -226,6 +226,7 @@ pub(super) fn encode(
         work,
         move |encoder, regions| {
             let source = if shape.scratch_bytes != 0 {
+                encoder.begin_compute_subwork("metal.conv2d.materialize_padding");
                 let compute = encoder.compute_encoder();
                 let p = pipelines
                     .spatial
@@ -240,11 +241,13 @@ pub(super) fn encode(
                     MTLSize::new(padding.grid_threads, 1, 1),
                     MTLSize::new(p.max_total_threads_per_threadgroup().min(256), 1, 1),
                 );
+                encoder.record_compute_dispatches(1);
                 encoder.end_compute();
                 4
             } else {
                 0
             };
+            encoder.begin_compute_subwork("metal.conv2d.convolution");
             let compute = encoder.compute_encoder();
             let (pipeline, implementation) = direct_square
                 .then(|| match params.kernel_width {
@@ -288,6 +291,7 @@ pub(super) fn encode(
                 MTLSize::new(params.grid_groups, 1, 1),
                 MTLSize::new(128, 1, 1),
             );
+            encoder.record_compute_dispatches(1);
             Ok(())
         },
     )

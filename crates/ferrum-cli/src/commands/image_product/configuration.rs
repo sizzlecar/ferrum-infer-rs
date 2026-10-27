@@ -235,6 +235,9 @@ pub struct PipelineConfig {
     pub maximum_staging_bytes: u64,
     pub maximum_initialization_commands: usize,
     pub maximum_backing_maintenance_passes: usize,
+    /// Opt-in backend timing; shared by run and serve, independent of verbosity.
+    #[serde(default)]
+    pub device_timing: ferrum_runtime::DeviceTimingMode,
 }
 fn default_maximum_batch_size() -> usize {
     ferrum_engine::image_generation::ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE
@@ -276,6 +279,7 @@ impl PipelineConfig {
             )?,
             executor: ferrum_execution::TensorExecutorConfig {
                 maximum_backing_maintenance_passes: self.maximum_backing_maintenance_passes,
+                device_timing: self.device_timing,
             },
         })
     }
@@ -322,6 +326,60 @@ mod attention_policy_tests {
         ] {
             wire["attention_policy"] = value;
             assert!(serde_json::from_value::<CudaConfig>(wire.clone()).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod device_timing_tests {
+    use super::*;
+    use ferrum_runtime::DeviceTimingMode;
+
+    #[test]
+    fn typed_image_pipeline_device_timing_defaults_off_and_reaches_both_resolvers() {
+        let mut wire = serde_json::json!({
+            "maximum_user_tokens":128,"maximum_width":1024,"maximum_height":1024,
+            "maximum_staging_bytes":4096,"maximum_initialization_commands":8,
+            "maximum_backing_maintenance_passes":8
+        });
+        let legacy: PipelineConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(legacy.device_timing, DeviceTimingMode::Off);
+        assert_eq!(
+            legacy.resolved(1 << 20).unwrap().executor.device_timing,
+            DeviceTimingMode::Off
+        );
+        for mode in [
+            DeviceTimingMode::Completion,
+            DeviceTimingMode::Replay,
+            DeviceTimingMode::Kernel,
+        ] {
+            wire["device_timing"] = serde_json::to_value(mode).unwrap();
+            let explicit: PipelineConfig = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(
+                explicit.resolved(1 << 20).unwrap().executor.device_timing,
+                mode
+            );
+            let limits = explicit.resolved_limits().unwrap();
+            assert_eq!(limits.executor.device_timing, mode);
+            assert_eq!(
+                limits
+                    .with_device_capacity(std::num::NonZeroU64::new(1 << 20).unwrap())
+                    .executor
+                    .device_timing,
+                mode
+            );
+            assert_eq!(
+                explicit.maximum_backing_maintenance_passes,
+                legacy.maximum_backing_maintenance_passes
+            );
+        }
+        for invalid in [
+            serde_json::json!("gpu"),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            wire["device_timing"] = invalid;
+            assert!(serde_json::from_value::<PipelineConfig>(wire.clone()).is_err());
         }
     }
 }
@@ -546,6 +604,7 @@ impl PipelineConfig {
             )?,
             executor: ferrum_execution::TensorExecutorConfig {
                 maximum_backing_maintenance_passes: self.maximum_backing_maintenance_passes,
+                device_timing: self.device_timing,
             },
         };
         limits.validate()?;

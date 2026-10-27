@@ -165,6 +165,7 @@ impl DirectoryOptions {
             maximum_staging_bytes: 16 * MIB,
             maximum_initialization_commands: 64,
             maximum_backing_maintenance_passes: 8,
+            device_timing: ferrum_runtime::DeviceTimingMode::Off,
         }
     }
     #[cfg(feature = "cuda")]

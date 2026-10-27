@@ -27,6 +27,7 @@ fn batch_views_keep_the_entire_physical_output_charged_until_last_release() {
         )
         .unwrap(),
         bytes: backing.freeze(),
+        timing: None,
     };
     assert!(source.batch_item(2).is_err());
     let first = source.batch_item(0).unwrap();

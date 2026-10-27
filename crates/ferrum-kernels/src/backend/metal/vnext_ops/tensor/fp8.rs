@@ -171,6 +171,7 @@ pub(super) fn encode(
         vec![input, packed, scale, output, scratch],
         work,
         move |encoder, regions| {
+            encoder.begin_compute_subwork("metal.fp8.activation_quantize");
             let quantize = pipelines
                 .fp8_quantize
                 .as_ref()
@@ -184,7 +185,9 @@ pub(super) fn encode(
                 MTLSize::new(u64::from(p.rows), 1, 1),
                 MTLSize::new(256, 1, 1),
             );
+            encoder.record_compute_dispatches(1);
             encoder.end_compute();
+            encoder.begin_compute_subwork("metal.fp8.gemm");
             let compute = encoder.compute_encoder();
             compute.set_compute_pipeline_state(
                 pipelines.fp8_linear.as_ref().expect("selected FP8 GEMM"),
@@ -202,6 +205,7 @@ pub(super) fn encode(
                 ),
                 MTLSize::new(128, 1, 1),
             );
+            encoder.record_compute_dispatches(1);
             Ok(())
         },
     )

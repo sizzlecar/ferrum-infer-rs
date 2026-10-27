@@ -188,6 +188,7 @@ impl LinearProvider {
             work,
             move |encoder, regions| {
                 let weight_index = if let Some(format) = format {
+                    encoder.begin_compute_subwork("metal.linear.block_decode");
                     let decode = pipelines
                         .block_decode
                         .as_ref()
@@ -211,6 +212,7 @@ impl LinearProvider {
                         MTLSize::new(grid_width, 1, 1),
                         MTLSize::new(decode.max_total_threads_per_threadgroup().min(256), 1, 1),
                     );
+                    encoder.record_compute_dispatches(1);
                     // End the decode encoder before the dependent GEMM reads
                     // its tracked, invocation-owned scratch buffer.
                     encoder.end_compute();
@@ -218,15 +220,9 @@ impl LinearProvider {
                 } else {
                     1
                 };
-                let compute = encoder.compute_encoder();
-                set_region(compute, 0, &regions[0]);
-                set_region(compute, 1, &regions[weight_index]);
-                set_region(compute, 2, &regions[2]);
-                // The no-bias mode never reads its typed placeholder.
-                set_region(compute, 4, &regions[if bias_mode == 0 { 0 } else { 3 }]);
                 // These rectangles cover the output exactly once. They share
                 // the admitted inputs/decode scratch and write disjoint output
-                // ranges, so no intermediate buffer or encoder boundary is needed.
+                // ranges. Only explicit timing adds boundaries for attribution.
                 for dispatch in dispatches {
                     if dispatch.row_groups == 0 || dispatch.column_groups == 0 {
                         continue;
@@ -244,6 +240,17 @@ impl LinearProvider {
                             pipelines.linear.as_ref().expect("selected linear pipeline")
                         }
                     };
+                    encoder.begin_compute_subwork(match dispatch.kernel {
+                        LinearKernel::Mpp32 => "metal.linear.gemm.mpp32",
+                        LinearKernel::Mpp64 => "metal.linear.gemm.mpp64",
+                        LinearKernel::Simd => "metal.linear.gemm.simd",
+                    });
+                    let compute = encoder.compute_encoder();
+                    set_region(compute, 0, &regions[0]);
+                    set_region(compute, 1, &regions[weight_index]);
+                    set_region(compute, 2, &regions[2]);
+                    // The no-bias mode never reads its typed placeholder.
+                    set_region(compute, 4, &regions[if bias_mode == 0 { 0 } else { 3 }]);
                     compute.set_compute_pipeline_state(pipeline);
                     set_params(
                         compute,
@@ -262,6 +269,7 @@ impl LinearProvider {
                         ),
                         MTLSize::new(128, 1, 1),
                     );
+                    encoder.record_compute_dispatches(1);
                 }
                 Ok(())
             },

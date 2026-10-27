@@ -544,6 +544,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 // These counters describe this acquisition, not the old batch.
                 previous.receipt.completed_executions = 0;
                 previous.receipt.execution_wall_durations_us.clear();
+                previous.receipt.device_timings.clear();
                 previous.receipt.initialization_wall_duration_us = 0;
                 previous.receipt.session_reused = true;
                 previous.receipt.weights_reused = !matches!(
@@ -727,6 +728,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             if let Some(mut active) = self.resident_stages.slot(stage).and_then(Option::take) {
                 active.receipt.completed_executions = 0;
                 active.receipt.execution_wall_durations_us.clear();
+                active.receipt.device_timings.clear();
                 active.receipt.initialization_wall_duration_us = 0;
                 active.receipt.plan.compile_wall_duration_us = 0;
                 active.receipt.session_reused = true;
@@ -773,6 +775,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             {
                 origin.completed_executions = 0;
                 origin.execution_wall_durations_us.clear();
+                origin.device_timings.clear();
                 origin.initialization_wall_duration_us = 0;
                 origin.plan.compile_wall_duration_us = 0;
                 origin.session_reused = false;

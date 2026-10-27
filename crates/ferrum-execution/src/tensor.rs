@@ -13,18 +13,23 @@ mod admission;
 mod admission_control;
 mod request;
 mod serial_actor;
+mod timing;
 mod wave_identity;
 pub use admission_control::{TensorAdmissionCancellation, TensorAdmissionControl};
 pub use ferrum_runtime::TensorRequestStateMapping;
 pub use request::{TensorRequestCloseFailure, TensorRequestSession};
 pub use serial_actor::{TensorSerialActor, TensorSerialActorStreamRequirements};
+pub use timing::{TensorExecutionTiming, TensorTimingNode};
 #[cfg(test)]
 mod output_slices;
 
-/// Bounds physical-backing maintenance, not logical capacity waiting.
+/// Fixed-tensor maintenance bounds and explicit device diagnostics. Logical
+/// capacity waiting remains controlled by the serial actor's admission policy.
 #[derive(Debug, Clone, Copy)]
 pub struct TensorExecutorConfig {
     pub maximum_backing_maintenance_passes: usize,
+    /// Explicit backend observations; Off preserves the ordinary submission path.
+    pub device_timing: DeviceTimingMode,
 }
 
 impl TensorExecutorConfig {
@@ -51,6 +56,7 @@ impl Default for TensorExecutorConfig {
     fn default() -> Self {
         Self {
             maximum_backing_maintenance_passes: 8,
+            device_timing: DeviceTimingMode::Off,
         }
     }
 }
@@ -146,6 +152,7 @@ pub struct TensorExecutionOutput {
     value_id: ProgramValueId,
     tensor: ResolvedTensorSpec,
     bytes: ManagedHostBytes,
+    timing: Option<Arc<TensorExecutionTiming>>,
 }
 
 impl TensorExecutionOutput {
@@ -157,6 +164,10 @@ impl TensorExecutionOutput {
     }
     pub fn bytes(&self) -> &ManagedHostBytes {
         &self.bytes
+    }
+    /// Shared once per execution, not a separate measurement per output.
+    pub fn device_timing(&self) -> Option<&TensorExecutionTiming> {
+        self.timing.as_deref()
     }
 
     /// Select one item of a contiguous leading batch axis, retaining that axis
@@ -194,6 +205,7 @@ impl TensorExecutionOutput {
             value_id: self.value_id.clone(),
             tensor,
             bytes,
+            timing: self.timing.clone(),
         })
     }
 }
@@ -359,6 +371,11 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         );
         let _entered = trace.enter();
         let total_started = trace_enabled.then(Instant::now);
+        let timing_context = self
+            .config
+            .device_timing
+            .completion_enabled()
+            .then(|| (run_id.clone(), request_id.clone()));
         let persistent_request = request_session.is_some();
         let outputs = self
             .outputs
@@ -505,19 +522,21 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         let admission_wave_us =
             initial_admission_us.saturating_add(host_wall_us(admission_started));
         let encode_started = trace_enabled.then(Instant::now);
-        let dispatch = OperationDispatch::encode_and_submit_wave_with_inputs(
+        let dispatch = OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
             self.providers.providers(),
             &self.executable,
             &identity,
             std::iter::once(&active),
-            DeviceTimingMode::Off,
+            self.config.device_timing,
             &uploads,
+            SubmissionExecutionPolicy::adaptive(),
+            &timing::NoHostDispatchTiming,
             wave,
             &lane,
             &self.reaper,
         );
-        let handle = match dispatch {
-            Ok(handle) => handle,
+        let (handle, submission_observation) = match dispatch {
+            Ok(handle) => handle.into_parts(),
             Err(source) => {
                 return Err(TensorExecutionError::Dispatch {
                     source,
@@ -580,6 +599,14 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             });
         }
         let wait_readback_us = host_wall_us(wait_started);
+        let timing = timing_context.map(|(run, request)| {
+            Arc::new(TensorExecutionTiming::from_completion(
+                run,
+                request,
+                &receipt,
+                submission_observation,
+            ))
+        });
         let drop_started = trace_enabled.then(Instant::now);
         drop((handle, active, identity, uploads, batch, lane));
         // This drops execution owners, not a promise that all native owners
@@ -593,6 +620,9 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             });
         }
         let retire_us = host_wall_us(retire_started);
+        if let Some(timing) = &timing {
+            timing.log();
+        }
         if trace_enabled {
             tracing::debug!(
                 admission_wave_us,
@@ -628,6 +658,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                     value_id: port.value_id().clone(),
                     tensor: port.tensor().clone(),
                     bytes,
+                    timing: timing.clone(),
                 })
             })
             .collect()
