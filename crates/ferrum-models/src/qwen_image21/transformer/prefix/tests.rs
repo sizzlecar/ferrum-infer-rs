@@ -2,6 +2,8 @@ use super::*;
 use serde_json::json;
 type F = QwenImage21TransformerFamily;
 
+mod prepared;
+
 fn config() -> QwenImage21TransformerConfig {
     // Two samples share geometry but the second has two invalid prefix keys.
     let transformer = QwenImage21Config::from_hf_json(
