@@ -18,11 +18,21 @@ mod writer;
 
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MANIFEST_FILE: &str = "prepared-fp8.json";
+// File-relative alignment covers the current 16-byte tensor ABI and native
+// 4/16/64KiB pages. Runtime still checks the actual mmap address and native page
+// size; this format does not promise that Metal will accept every no-copy view.
+const STORAGE_ALIGNMENT_BYTES: u64 = 64 * 1024;
+const STORAGE_LAYOUT: &str = "aligned64k.single-shard.v2";
+const PADDING_PREFIX: &str = "__ferrum_prepared_padding_";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedFp8Manifest {
     pub schema_version: u32,
+    pub storage_alignment_bytes: u64,
+    /// Explicit zero-filled U8 tensors, not execution weights. The single shard
+    /// contains exactly these tensors and `components`, without hidden gaps.
+    pub padding: BTreeMap<String, u64>,
     pub numerical_profile: String,
     pub materializer: WeightMaterializerDescriptor,
     pub groups: Vec<Vec<WeightId>>,
@@ -67,6 +77,17 @@ pub struct PreparedFp8ExportReceipt {
     pub source_identity_sha256: String,
     pub payload_bytes: u64,
     pub shard_bytes: u64,
+    /// Publication already succeeded. This reports only the following directory
+    /// sync attempt, not a filesystem/power-loss durability guarantee.
+    pub directory_sync: PreparedFp8DirectorySync,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PreparedFp8DirectorySync {
+    Synced,
+    Failed { message: String },
+    Unsupported,
 }
 
 pub struct PreparedFp8Archive {
@@ -96,6 +117,43 @@ fn portable_file(name: &str) -> bool {
         && !name.chars().any(char::is_control)
 }
 
+fn aligned_storage_end(bytes: u64) -> Result<u64, VNextError> {
+    bytes
+        .checked_add(STORAGE_ALIGNMENT_BYTES - 1)
+        .map(|n| n & !(STORAGE_ALIGNMENT_BYTES - 1))
+        .ok_or_else(|| invalid("prepared storage alignment overflows"))
+}
+
+fn validate_storage_header(whole: &[u8]) -> Result<u64, VNextError> {
+    let prefix: [u8; 8] = whole
+        .get(..8)
+        .ok_or_else(|| invalid("prepared shard header is missing"))?
+        .try_into()
+        .unwrap();
+    let header_bytes = u64::from_le_bytes(prefix);
+    let data_start = header_bytes
+        .checked_add(8)
+        .filter(|n| *n <= whole.len() as u64)
+        .ok_or_else(|| invalid("prepared shard header exceeds its owner"))?;
+    if header_bytes > MAX_MANIFEST_BYTES
+        || !data_start.is_multiple_of(STORAGE_ALIGNMENT_BYTES)
+        || !(whole.len() as u64).is_multiple_of(STORAGE_ALIGNMENT_BYTES)
+    {
+        return Err(invalid("prepared shard header or EOF alignment differs"));
+    }
+    let header: serde_json::Value =
+        serde_json::from_slice(&whole[8..data_start as usize]).map_err(io_error)?;
+    if header.get("__metadata__")
+        != Some(&serde_json::json!({
+            "ferrum.prepared_fp8.layout": STORAGE_LAYOUT,
+            "ferrum.prepared_fp8.alignment_bytes": STORAGE_ALIGNMENT_BYTES.to_string(),
+        }))
+    {
+        return Err(invalid("prepared shard layout metadata differs"));
+    }
+    Ok(data_start)
+}
+
 impl PreparedFp8Archive {
     /// Hashes the selected manifest and every mapped payload once per opened
     /// owner. Files must remain immutable while retained, like raw archives.
@@ -119,11 +177,12 @@ impl PreparedFp8Archive {
             ));
         }
         let manifest: PreparedFp8Manifest = serde_json::from_slice(&bytes).map_err(io_error)?;
-        if manifest.schema_version != 1
+        if manifest.schema_version != 2
+            || manifest.storage_alignment_bytes != STORAGE_ALIGNMENT_BYTES
             || manifest.numerical_profile != BF16_WHOLE_TENSOR_FP8_NUMERICAL_PROFILE
             || manifest.groups.is_empty()
             || manifest.groups.len() > 4096
-            || manifest.shards.is_empty()
+            || manifest.shards.len() != 1
             || manifest.components.is_empty()
             || manifest.materializer.fidelity() != WeightMaterializationFidelity::Approximate
             || manifest.materializer.approximate_quality_contract() != Some(&quality::contract()?)
@@ -173,6 +232,7 @@ impl PreparedFp8Archive {
             .parent()
             .ok_or_else(|| invalid("prepared manifest has no directory"))?;
         let mut shards = BTreeMap::new();
+        let mut data_start = 0;
         for record in &manifest.shards {
             if !portable_file(&record.file)
                 || !record.file.ends_with(".safetensors")
@@ -182,8 +242,12 @@ impl PreparedFp8Archive {
             {
                 return Err(invalid("prepared shard declaration is invalid or repeated"));
             }
-            let archive =
-                SafetensorsArchive::open_single_file(parent, &record.file).map_err(io_error)?;
+            let archive = SafetensorsArchive::open_single_file_with_header_limit(
+                parent,
+                &record.file,
+                NonZeroU64::new(MAX_MANIFEST_BYTES).unwrap(),
+            )
+            .map_err(io_error)?;
             let first = archive
                 .tensor_names()
                 .next()
@@ -195,6 +259,7 @@ impl PreparedFp8Archive {
             if whole.len() as u64 != record.bytes || sha(whole) != record.sha256 {
                 return Err(invalid("prepared shard size or SHA256 mismatch"));
             }
+            data_start = validate_storage_header(whole)?;
             shards.insert(record.file.clone(), archive);
         }
         let specs: BTreeMap<_, _> = manifest
@@ -206,6 +271,7 @@ impl PreparedFp8Archive {
         let mut components = BTreeMap::new();
         let mut storage = BTreeSet::new();
         let mut payload_bytes = 0_u64;
+        let mut ranges = Vec::new();
         for (i, record) in manifest.components.iter().enumerate() {
             let spec = specs
                 .get(&record.component_id)
@@ -213,6 +279,8 @@ impl PreparedFp8Archive {
             if components.insert(record.component_id.clone(), i).is_some()
                 || !storage.insert((record.shard.clone(), record.tensor.clone()))
                 || !canonical_sha(&record.sha256)
+                || record.tensor != record.component_id.as_str()
+                || record.tensor.starts_with(PADDING_PREFIX)
             {
                 return Err(invalid("duplicate or invalid prepared output"));
             }
@@ -231,6 +299,11 @@ impl PreparedFp8Archive {
                     "prepared output shape, encoding, size or SHA256 mismatch",
                 ));
             }
+            let offset = tensor.retained_host_memory().offset_bytes() as u64;
+            if !offset.is_multiple_of(STORAGE_ALIGNMENT_BYTES) {
+                return Err(invalid("prepared component is not storage-aligned"));
+            }
+            ranges.push((offset, record.bytes, false));
             if spec.encoding
                 == WeightEncoding::Quantized(QuantizationSpec::fp8_e4m3fn_whole_tensor_f32())
                 && tensor.bytes().iter().any(|byte| byte & 0x7f == 0x7f)
@@ -253,6 +326,47 @@ impl PreparedFp8Archive {
             payload_bytes = payload_bytes
                 .checked_add(record.bytes)
                 .ok_or_else(|| invalid("prepared payload size overflows"))?;
+        }
+        let shard = &manifest.shards[0];
+        let archive = &shards[&shard.file];
+        for (name, &bytes) in &manifest.padding {
+            let ordinal = name.strip_prefix(PADDING_PREFIX).unwrap_or("");
+            if ordinal.is_empty()
+                || !ordinal.bytes().all(|c| c.is_ascii_digit())
+                || bytes == 0
+                || bytes >= STORAGE_ALIGNMENT_BYTES
+                || !storage.insert((shard.file.clone(), name.clone()))
+            {
+                return Err(invalid("prepared padding declaration differs"));
+            }
+            let tensor = archive.tensor(name).map_err(io_error)?;
+            let offset = tensor.retained_host_memory().offset_bytes() as u64;
+            if tensor.element_type() != Some(ElementType::U8)
+                || tensor.shape() != [bytes]
+                || tensor.bytes().len() as u64 != bytes
+                || tensor.bytes().iter().any(|&byte| byte != 0)
+                || aligned_storage_end(offset)?.checked_sub(offset) != Some(bytes)
+            {
+                return Err(invalid(
+                    "prepared padding shape, range or zero contents differ",
+                ));
+            }
+            ranges.push((offset, bytes, true));
+        }
+        ranges.sort_unstable();
+        let mut end = data_start;
+        for (offset, bytes, _) in ranges {
+            if offset != end {
+                return Err(invalid("prepared tensor ranges leave gaps or overlap"));
+            }
+            end = end
+                .checked_add(bytes)
+                .ok_or_else(|| invalid("prepared tensor range overflows"))?;
+        }
+        if end != shard.bytes {
+            return Err(invalid(
+                "prepared tensors do not cover the complete data section",
+            ));
         }
         let actual_storage: BTreeSet<_> = shards
             .iter()
@@ -278,8 +392,10 @@ impl PreparedFp8Archive {
             payload_bytes,
             shard_count = shards.len(),
             component_count = components.len(),
+            padding_count = manifest.padding.len(),
+            storage_layout = STORAGE_LAYOUT,
             open_verify_wall_us = started.elapsed().as_micros() as u64,
-            verification = "whole_shard_and_component_hashes_plus_finite_fp8_scales",
+            verification = "whole_shard_and_component_hashes_finite_fp8_scales_aligned_zero_padding",
             "verified explicit prepared FP8 physical source"
         );
         Ok(Arc::new(Self {

@@ -21,8 +21,8 @@ mod quality;
 mod source;
 mod timing;
 pub use prepared::{
-    PreparedFp8Archive, PreparedFp8Component, PreparedFp8ExportReceipt, PreparedFp8Manifest,
-    PreparedFp8Shard, PreparedFp8SourceComponent, PreparedFp8TensorArchive,
+    PreparedFp8Archive, PreparedFp8Component, PreparedFp8DirectorySync, PreparedFp8ExportReceipt,
+    PreparedFp8Manifest, PreparedFp8Shard, PreparedFp8SourceComponent, PreparedFp8TensorArchive,
 };
 pub use source::ExactBf16TensorSource;
 /// Backward-compatible spelling; the source now accepts any tensor archive.

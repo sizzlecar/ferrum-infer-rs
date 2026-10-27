@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -118,6 +119,26 @@ impl SafetensorsArchive {
     /// is missing or invalid. As with [`Self::open`], filesystem symlinks are
     /// followed and the mapped file must remain immutable while retained.
     pub fn open_single_file(model_dir: impl AsRef<Path>, basename: &str) -> Result<Self> {
+        Self::open_single_file_inner(model_dir.as_ref(), basename, None)
+    }
+
+    /// Like [`Self::open_single_file`], with a caller-selected metadata bound.
+    /// The 8-byte declared header length is checked on the same retained mmap
+    /// before JSON/Safetensors parsing. No second path open is used to validate
+    /// a different file, and the ordinary raw-source APIs keep their defaults.
+    pub fn open_single_file_with_header_limit(
+        model_dir: impl AsRef<Path>,
+        basename: &str,
+        maximum_header_bytes: NonZeroU64,
+    ) -> Result<Self> {
+        Self::open_single_file_inner(model_dir.as_ref(), basename, Some(maximum_header_bytes))
+    }
+
+    fn open_single_file_inner(
+        model_dir: &Path,
+        basename: &str,
+        maximum_header_bytes: Option<NonZeroU64>,
+    ) -> Result<Self> {
         if basename.len() <= ".safetensors".len()
             || !basename.ends_with(".safetensors")
             || basename.contains(['/', '\\', ':'])
@@ -127,10 +148,10 @@ impl SafetensorsArchive {
                 "safetensors single file must be an explicit .safetensors basename within the model directory",
             ));
         }
-        Self::open_shards(vec![(
-            basename.to_owned(),
-            model_dir.as_ref().join(basename),
-        )])
+        Self::open_shards_with_header_limit(
+            vec![(basename.to_owned(), model_dir.join(basename))],
+            maximum_header_bytes,
+        )
     }
 
     /// Opens an explicitly selected weight-map index in `model_dir`.
@@ -155,6 +176,13 @@ impl SafetensorsArchive {
     }
 
     fn open_shards(shard_paths: Vec<(String, PathBuf)>) -> Result<Self> {
+        Self::open_shards_with_header_limit(shard_paths, None)
+    }
+
+    fn open_shards_with_header_limit(
+        shard_paths: Vec<(String, PathBuf)>,
+        maximum_header_bytes: Option<NonZeroU64>,
+    ) -> Result<Self> {
         let mut shards = Vec::with_capacity(shard_paths.len());
         let mut tensors = BTreeMap::new();
         for (shard_index, (relative_path, path)) in shard_paths.into_iter().enumerate() {
@@ -164,6 +192,32 @@ impl SafetensorsArchive {
                 Mmap::map(&file)
                     .map_err(|error| FerrumError::io(format!("mmap {path:?}: {error}")))?
             };
+            if let Some(limit) = maximum_header_bytes {
+                let prefix: [u8; 8] = mmap
+                    .get(..8)
+                    .ok_or_else(|| {
+                        FerrumError::model(format!(
+                            "safetensors header length is missing in {path:?}"
+                        ))
+                    })?
+                    .try_into()
+                    .unwrap();
+                let declared = u64::from_le_bytes(prefix);
+                if declared > limit.get() {
+                    return Err(FerrumError::model(format!(
+                        "safetensors declared header {declared} exceeds caller limit {} in {path:?}",
+                        limit.get()
+                    )));
+                }
+                if declared
+                    .checked_add(8)
+                    .is_none_or(|end| end > mmap.len() as u64)
+                {
+                    return Err(FerrumError::model(format!(
+                        "safetensors declared header exceeds mapped file in {path:?}"
+                    )));
+                }
+            }
             let parsed = SafeTensors::deserialize(&mmap)
                 .map_err(|error| FerrumError::model(format!("parse {path:?}: {error}")))?;
             for name in parsed.names() {
@@ -829,6 +883,81 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn bounded_single_file_checks_header_before_parse_and_retains_the_checked_mapping() {
+        let directory = tempdir().unwrap();
+        let name = "bounded.safetensors";
+        let bytes = [0x80_u8, 0x3f, 0, 0x80];
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::BF16, vec![2], &bytes).unwrap(),
+            )],
+            &None,
+            &directory.path().join(name),
+        )
+        .unwrap();
+        let written = std::fs::read(directory.path().join(name)).unwrap();
+        let header_bytes = u64::from_le_bytes(written[..8].try_into().unwrap());
+        let rejected = SafetensorsArchive::open_single_file_with_header_limit(
+            directory.path(),
+            name,
+            NonZeroU64::new(header_bytes - 1).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(rejected.to_string().contains("exceeds caller limit"));
+        // Default source opening remains compatible, while the exact bound is
+        // sufficient and retains precisely the mapping on which it was checked.
+        assert!(SafetensorsArchive::open_single_file(directory.path(), name).is_ok());
+        let archive = SafetensorsArchive::open_single_file_with_header_limit(
+            directory.path(),
+            name,
+            NonZeroU64::new(header_bytes).unwrap(),
+        )
+        .unwrap();
+        let tensor = archive.tensor("weight").unwrap();
+        let retained = tensor.retained_host_memory().clone();
+        assert_eq!(retained.owner_bytes(), written);
+        assert!(std::ptr::eq(
+            retained.bytes().as_ptr(),
+            tensor.bytes().as_ptr()
+        ));
+        drop(tensor);
+        drop(archive);
+        assert_eq!(retained.bytes(), bytes);
+    }
+
+    #[test]
+    fn bounded_single_file_rejects_oversized_or_truncated_declarations_without_json_parsing() {
+        let directory = tempdir().unwrap();
+        let name = "invalid.safetensors";
+        let limit = NonZeroU64::new(1024).unwrap();
+        // Invalid JSON and a short file intentionally coexist with an excessive
+        // declaration. The first error must be the caller's pre-parse bound.
+        let mut bytes = 1025_u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"not json");
+        std::fs::write(directory.path().join(name), &bytes).unwrap();
+        let error =
+            SafetensorsArchive::open_single_file_with_header_limit(directory.path(), name, limit)
+                .err()
+                .unwrap();
+        assert!(error.to_string().contains("exceeds caller limit"));
+        bytes[..8].copy_from_slice(&1024_u64.to_le_bytes());
+        std::fs::write(directory.path().join(name), &bytes).unwrap();
+        let error =
+            SafetensorsArchive::open_single_file_with_header_limit(directory.path(), name, limit)
+                .err()
+                .unwrap();
+        assert!(error.to_string().contains("exceeds mapped file"));
+        std::fs::write(directory.path().join(name), [0_u8; 7]).unwrap();
+        let error =
+            SafetensorsArchive::open_single_file_with_header_limit(directory.path(), name, limit)
+                .err()
+                .unwrap();
+        assert!(error.to_string().contains("header length is missing"));
+    }
 
     #[test]
     fn explicit_single_file_selects_bf16_and_retains_only_its_payload() {

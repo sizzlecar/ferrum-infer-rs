@@ -374,3 +374,305 @@ fn export_resolves_once_and_prepared_initialization_never_reads_original_payload
     );
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }
+
+#[test]
+fn aligned_shard_mmap_preserves_exact_payloads_and_native_page_enclosures() {
+    let root = tempfile::tempdir().unwrap();
+    let host = account(24);
+    let (_, _, plan, _, receipt) = exported(root.path(), host.clone());
+    let archive =
+        PreparedFp8Archive::open(&receipt.manifest_path, &receipt.manifest_sha256).unwrap();
+    let manifest = archive.manifest();
+    assert_eq!(manifest.schema_version, 2);
+    assert_eq!(manifest.shards.len(), 1);
+    assert_eq!(manifest.storage_alignment_bytes, STORAGE_ALIGNMENT_BYTES);
+    assert!(receipt.shard_bytes > receipt.payload_bytes);
+    let mut retained = Vec::new();
+    #[cfg(unix)]
+    let native_page = {
+        // This reads the host's page size; no device or Metal API is involved.
+        let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = usize::try_from(value).unwrap();
+        assert!(page.is_power_of_two());
+        page
+    };
+    for spec in &plan.schema.components {
+        let payload = archive.component(spec).unwrap();
+        let memory = payload.retained_host_memory().unwrap();
+        let owner = memory.owner_bytes();
+        let offset = memory.offset_bytes();
+        assert_eq!(offset as u64 % STORAGE_ALIGNMENT_BYTES, 0, "{}", spec.id);
+        assert_eq!(owner.len() as u64 % STORAGE_ALIGNMENT_BYTES, 0);
+        assert_eq!(payload.bytes().as_ptr() as usize % 16, 0, "{}", spec.id);
+        assert_eq!(memory.managed_memory_class(), None);
+        assert!(std::ptr::eq(
+            payload.bytes().as_ptr(),
+            memory.bytes().as_ptr()
+        ));
+        assert_eq!(payload.bytes().len() as u64, spec.physical_bytes().unwrap());
+        // File-relative layout is valid for each supported page granularity.
+        for page in [4096_usize, 16384, 65536] {
+            let begin = offset & !(page - 1);
+            let end = (offset + payload.bytes().len()).div_ceil(page) * page;
+            assert!(
+                begin <= offset && end <= owner.len(),
+                "{} page={page}",
+                spec.id
+            );
+        }
+        #[cfg(unix)]
+        if native_page as u64 <= STORAGE_ALIGNMENT_BYTES {
+            // Also check the actual mmap virtual address for this host. Metal's
+            // native acceptance and any performance effect still require GPU
+            // testing; a larger future page size keeps its copying fallback.
+            let owner_begin = owner.as_ptr() as usize;
+            assert_eq!(owner_begin % native_page, 0);
+            let start = payload.bytes().as_ptr() as usize;
+            let native_begin = start & !(native_page - 1);
+            let native_end = (start + payload.bytes().len()).div_ceil(native_page) * native_page;
+            assert!(native_begin >= owner_begin);
+            assert!(native_end <= owner_begin + owner.len(), "{}", spec.id);
+        }
+        retained.push((memory.clone(), sha(payload.bytes())));
+    }
+    drop(archive);
+    for (memory, expected_sha) in retained {
+        assert_eq!(sha(memory.bytes()), expected_sha);
+    }
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn aligned_stream_releases_each_converted_group_before_resolving_the_next() {
+    let root = tempfile::tempdir().unwrap();
+    let (schema, program, groups) = fixture(DENSE_LINEAR_FP8_BF16_OPERATION_ID);
+    let separate_groups: Vec<_> = groups.into_iter().flatten().map(|id| vec![id]).collect();
+    let source = original(root.path(), &schema);
+    // One 4-byte FP8 vector plus its 4-byte scale fits, two groups do not.
+    let host = account(8);
+    let materializer =
+        Bf16WholeTensorFp8Materializer::new(host.clone(), separate_groups.clone()).unwrap();
+    let plan = plan::prepare_program(&schema, &program, &separate_groups).unwrap();
+    assert_eq!(plan.maximum_group_accounted_bytes(&host).unwrap(), 8);
+    let receipt = materializer
+        .export_plan(
+            &schema,
+            &plan,
+            source.as_ref(),
+            &root.path().join("prepared"),
+        )
+        .unwrap();
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    let archive =
+        PreparedFp8Archive::open(&receipt.manifest_path, &receipt.manifest_sha256).unwrap();
+    assert_eq!(archive.manifest().shards.len(), 1);
+    let originals: BTreeMap<_, _> = schema
+        .components
+        .iter()
+        .map(|spec| (&spec.id, spec))
+        .collect();
+    for output in &plan.schema.components {
+        let inputs: Vec<_> = plan.sources[&output.id]
+            .iter()
+            .map(|id| originals[id])
+            .collect();
+        let reference = materializer
+            .materialize_components(source.as_ref(), &inputs, &[output])
+            .unwrap();
+        assert_eq!(
+            archive.component(output).unwrap().bytes(),
+            reference[0].bytes()
+        );
+    }
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+fn write_rebound_manifest(path: &Path, manifest: &PreparedFp8Manifest) -> String {
+    let bytes = serde_json::to_vec(manifest).unwrap();
+    fs::write(path, &bytes).unwrap();
+    sha(&bytes)
+}
+
+fn replace_header(bytes: &mut [u8], header: &serde_json::Value) {
+    let length = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let encoded = serde_json::to_vec(header).unwrap();
+    assert!(encoded.len() <= length);
+    bytes[8..8 + length].fill(b' ');
+    bytes[8..8 + encoded.len()].copy_from_slice(&encoded);
+}
+
+#[test]
+fn aligned_reader_rejects_rehashed_padding_layout_and_coverage_corruption() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, _, _, _, receipt) = exported(root.path(), account(24));
+    let manifest: PreparedFp8Manifest =
+        serde_json::from_slice(&fs::read(&receipt.manifest_path).unwrap()).unwrap();
+    let shard = receipt
+        .manifest_path
+        .parent()
+        .unwrap()
+        .join(&manifest.shards[0].file);
+    let original = fs::read(&shard).unwrap();
+    let header_length = u64::from_le_bytes(original[..8].try_into().unwrap()) as usize;
+    let header: serde_json::Value =
+        serde_json::from_slice(&original[8..8 + header_length]).unwrap();
+    let (padding, &padding_bytes) = manifest.padding.first_key_value().unwrap();
+    let padding_offset =
+        header[padding]["data_offsets"][0].as_u64().unwrap() as usize + 8 + header_length;
+
+    // Rebind both hashes deliberately: these failures must come from structural
+    // validation, not merely detecting an outdated checksum.
+    let mut changed = original.clone();
+    changed[padding_offset] = 1;
+    fs::write(&shard, &changed).unwrap();
+    let mut altered = manifest.clone();
+    altered.shards[0].sha256 = sha(&changed);
+    let expected = write_rebound_manifest(&receipt.manifest_path, &altered);
+    let error = PreparedFp8Archive::open(&receipt.manifest_path, &expected)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("zero contents"));
+
+    fs::write(&shard, &original).unwrap();
+    let mut altered = manifest.clone();
+    altered.padding.insert(padding.clone(), padding_bytes - 1);
+    let expected = write_rebound_manifest(&receipt.manifest_path, &altered);
+    assert!(PreparedFp8Archive::open(&receipt.manifest_path, &expected).is_err());
+    let mut altered = manifest.clone();
+    altered.padding.remove(padding);
+    let expected = write_rebound_manifest(&receipt.manifest_path, &altered);
+    assert!(PreparedFp8Archive::open(&receipt.manifest_path, &expected).is_err());
+
+    let mut altered_header = header.clone();
+    altered_header["__metadata__"]["ferrum.prepared_fp8.layout"] = "unrecognized".into();
+    let mut changed = original.clone();
+    replace_header(&mut changed, &altered_header);
+    fs::write(&shard, &changed).unwrap();
+    let mut altered = manifest.clone();
+    altered.shards[0].sha256 = sha(&changed);
+    let expected = write_rebound_manifest(&receipt.manifest_path, &altered);
+    let error = PreparedFp8Archive::open(&receipt.manifest_path, &expected)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("layout metadata"));
+
+    // Shift the first real tensor by one byte, adding a declared leading pad
+    // and shrinking its following pad. Safetensors remains fully covered and
+    // every real payload keeps its exact hash, but the native ABI is violated.
+    let first = manifest
+        .components
+        .iter()
+        .find(|record| header[&record.tensor]["data_offsets"][0].as_u64() == Some(0))
+        .unwrap();
+    let after = manifest
+        .padding
+        .keys()
+        .find(|name| header[*name]["data_offsets"][0].as_u64() == Some(first.bytes))
+        .unwrap();
+    let mut altered_header = header.clone();
+    altered_header[&first.tensor]["data_offsets"] = serde_json::json!([1, first.bytes + 1]);
+    altered_header[after]["data_offsets"][0] = (first.bytes + 1).into();
+    altered_header[after]["shape"][0] = (manifest.padding[after] - 1).into();
+    let leading = format!("{PADDING_PREFIX}999999");
+    altered_header[&leading] = serde_json::json!({"dtype":"U8", "shape":[1], "data_offsets":[0,1]});
+    let mut changed = original.clone();
+    let start = 8 + header_length;
+    changed.copy_within(start..start + first.bytes as usize, start + 1);
+    changed[start] = 0;
+    replace_header(&mut changed, &altered_header);
+    fs::write(&shard, &changed).unwrap();
+    let mut altered = manifest.clone();
+    altered.padding.insert(leading, 1);
+    *altered.padding.get_mut(after).unwrap() -= 1;
+    altered.shards[0].sha256 = sha(&changed);
+    let expected = write_rebound_manifest(&receipt.manifest_path, &altered);
+    let error = PreparedFp8Archive::open(&receipt.manifest_path, &expected)
+        .err()
+        .unwrap();
+    assert!(error
+        .to_string()
+        .contains("component is not storage-aligned"));
+
+    // A valid Safetensors file can place its data area 8 bytes earlier. Even
+    // with all payload and file hashes rebound, that layout is not this format.
+    let mut changed = original;
+    changed.drain(8 + header_length - 8..8 + header_length);
+    changed[..8].copy_from_slice(&((header_length - 8) as u64).to_le_bytes());
+    fs::write(&shard, &changed).unwrap();
+    let mut altered = manifest;
+    altered.shards[0].sha256 = sha(&changed);
+    altered.shards[0].bytes = changed.len() as u64;
+    let expected = write_rebound_manifest(&receipt.manifest_path, &altered);
+    let error = PreparedFp8Archive::open(&receipt.manifest_path, &expected)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("header or EOF alignment"));
+}
+
+#[test]
+fn prepared_reader_enforces_its_header_bound_before_safetensors_parsing() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, _, _, _, receipt) = exported(root.path(), account(24));
+    let mut manifest: PreparedFp8Manifest =
+        serde_json::from_slice(&fs::read(&receipt.manifest_path).unwrap()).unwrap();
+    let shard = receipt
+        .manifest_path
+        .parent()
+        .unwrap()
+        .join(&manifest.shards[0].file);
+    // No giant allocation is needed to prove the declaration is checked first.
+    // Rebinding hashes ensures the rejection is the selected reader's bound.
+    let mut bytes = (MAX_MANIFEST_BYTES + 1).to_le_bytes().to_vec();
+    bytes.extend_from_slice(b"not json");
+    fs::write(shard, &bytes).unwrap();
+    manifest.shards[0].bytes = bytes.len() as u64;
+    manifest.shards[0].sha256 = sha(&bytes);
+    let expected = write_rebound_manifest(&receipt.manifest_path, &manifest);
+    let error = PreparedFp8Archive::open(&receipt.manifest_path, &expected)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("exceeds caller limit"));
+}
+
+#[test]
+fn publication_commit_point_preserves_receipt_when_directory_sync_is_unconfirmed() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, _, _, _, mut receipt) = exported(root.path(), account(24));
+    let destination = receipt.manifest_path.parent().unwrap();
+    // The ordinary exporter already attempted real OS sync and reported its
+    // result. This injection tests a post-rename failure, not OS fsync behavior.
+    let original_wire = serde_json::to_value(&receipt).unwrap();
+    assert!(original_wire["directory_sync"]["status"].is_string());
+    let temporary = destination.join("republish.partial");
+    fs::rename(&receipt.manifest_path, &temporary).unwrap();
+    let expected = PreparedFp8DirectorySync::Failed {
+        message: "injected directory-sync failure after actual rename".into(),
+    };
+    receipt.directory_sync =
+        writer::publish_manifest(&temporary, &receipt.manifest_path, destination, |_| {
+            expected.clone()
+        })
+        .unwrap();
+    assert_eq!(receipt.directory_sync, expected);
+    assert!(!temporary.exists());
+    assert!(receipt.manifest_path.exists());
+    let wire = serde_json::to_value(&receipt).unwrap();
+    assert_eq!(wire["directory_sync"]["status"], "failed");
+    let returned: PreparedFp8ExportReceipt = serde_json::from_value(wire).unwrap();
+    assert!(PreparedFp8Archive::open(&returned.manifest_path, &returned.manifest_sha256).is_ok());
+
+    // Failure before the commit point remains an error, does not invoke sync,
+    // and cannot expose the new manifest.
+    let missing = destination.join("missing.partial");
+    let unpublished = destination.join("not-published.json");
+    let invoked = std::cell::Cell::new(false);
+    assert!(
+        writer::publish_manifest(&missing, &unpublished, destination, |_| {
+            invoked.set(true);
+            PreparedFp8DirectorySync::Synced
+        })
+        .is_err()
+    );
+    assert!(!invoked.get());
+    assert!(!unpublished.exists());
+}
