@@ -404,12 +404,33 @@ impl StaticWeightImportSession<MetalDeviceBuffer, MetalDeviceRuntimeError>
                 "Metal static-weight arena is already sealed",
             ));
         }
+        let trace_started = tracing::enabled!(
+            target: "ferrum_kernels::backend::metal::weight_import",
+            tracing::Level::DEBUG
+        )
+        .then(std::time::Instant::now);
         let allocation = metal_static_weight_allocation(
             &self.device,
             payload,
             destination.descriptor.alignment_bytes,
             self.tensor_owner.as_ref(),
         )?;
+        // This records preparation, not publication or GPU execution. Native
+        // view lengths can overlap source pages and are not additive UMA usage.
+        tracing::debug!(
+            target: "ferrum_kernels::backend::metal::weight_import",
+            component = %payload.component_id(),
+            import_kind = if allocation._retained_host_memory.is_some() {
+                "retained_view"
+            } else {
+                "copy"
+            },
+            payload_bytes = length_bytes,
+            native_view_bytes = allocation.base.length(),
+            required_alignment_bytes = destination.descriptor.alignment_bytes,
+            wall_us = trace_started.map_or(0, |started| started.elapsed().as_micros()),
+            "prepared Metal static-weight component"
+        );
         let key = Arc::as_ptr(arena) as usize;
         self.arenas
             .entry(key)
