@@ -525,6 +525,13 @@ pub struct ImageService {
 }
 
 impl ImageService {
+    /// Fixed ownership cost of one production request before prompt, encoded
+    /// reference and preprocessing backing. Queue storage is admitted separately
+    /// because deque slots coexist with requests moved into an executing batch.
+    pub fn minimum_pending_request_bytes() -> usize {
+        std::mem::size_of::<Queued<ImageGenerationOutput>>()
+    }
+
     pub fn new<P: ImageGenerator>(
         generator: P,
         config: ImageServiceConfig,
@@ -1139,7 +1146,7 @@ impl QueuedRequest {
                 Self::Edit(request, _) => request.image.backing_bytes(),
                 Self::Generate(_) => 0,
             })
-            .saturating_add(std::mem::size_of::<Self>())
+            .saturating_add(ImageService::minimum_pending_request_bytes())
     }
 }
 
@@ -1162,6 +1169,8 @@ impl<O> Queued<O> {
 }
 struct State<O> {
     queue: VecDeque<Queued<O>>,
+    // Field order frees the deque before refunding its backing reservation.
+    queue_backing: Option<HostMemoryReservation>,
     accepting: bool,
     closing: bool,
     active: usize,
@@ -1172,6 +1181,74 @@ struct State<O> {
     executed_requests: u64,
     last_batch_size: usize,
     capacity_reductions: u64,
+}
+impl<O> State<O> {
+    fn reserve_queue_slot(
+        &mut self,
+        host: Option<&HostMemoryAccount>,
+        maximum_pending: usize,
+    ) -> Result<(), ImageServiceError> {
+        let full = || {
+            service_error(
+                ImageServiceErrorKind::QueueFull,
+                "cannot grow the image request queue within its Host budget",
+            )
+        };
+        // A prepared candidate can return its tail while newer jobs arrive.
+        // Its slots remain available, so requeue never allocates implicitly.
+        let required = self
+            .queue
+            .len()
+            .checked_add(self.preparing)
+            .and_then(|slots| slots.checked_add(1))
+            .ok_or_else(full)?;
+        if required <= self.queue.capacity() {
+            return Ok(());
+        }
+        let mut capacity = self
+            .queue
+            .capacity()
+            .saturating_mul(2)
+            .max(required)
+            .min(maximum_pending);
+        // Reserve the complete replacement while the old allocation remains
+        // charged. This covers allocation/copy peak, not just the net growth.
+        let reserve = |capacity: usize| {
+            let bytes = capacity
+                .checked_mul(std::mem::size_of::<Queued<O>>())
+                .filter(|bytes| *bytes <= isize::MAX as usize)
+                .ok_or_else(full)?;
+            host.map(|host| host.reserve(HostMemoryClass::InputPreprocess, bytes))
+                .transpose()
+                .map_err(|error| {
+                    service_error(
+                        ImageServiceErrorKind::QueueFull,
+                        format!("image queue backing Host admission failed: {error}"),
+                    )
+                })
+        };
+        let reservation = match reserve(capacity) {
+            Ok(reservation) => reservation,
+            Err(_) if capacity > required => {
+                // Amortized growth is optional: admit the actual next slot if
+                // the geometric spare capacity would exceed the Host budget.
+                capacity = required;
+                reserve(capacity)?
+            }
+            Err(error) => return Err(error),
+        };
+        let mut queue = VecDeque::new();
+        queue.try_reserve_exact(capacity).map_err(|_| full())?;
+        // Keep the charged capacity equal to the retained allocation; never
+        // accept an allocator-provided larger deque on the smaller grant.
+        if queue.capacity() != capacity {
+            return Err(full());
+        }
+        queue.extend(self.queue.drain(..));
+        self.queue = queue;
+        self.queue_backing = reservation;
+        Ok(())
+    }
 }
 struct Shared<O> {
     state: Mutex<State<O>>,
@@ -1241,19 +1318,10 @@ impl<O: Send + 'static> ServiceCore<O> {
         config: ImageServiceConfig,
         host: Option<HostMemoryAccount>,
     ) -> Result<Self, ImageServiceError> {
-        // Reserve queue metadata once, before any request/backend call.
-        let mut queue = VecDeque::new();
-        queue
-            .try_reserve_exact(config.maximum_pending)
-            .map_err(|_| {
-                service_error(
-                    ImageServiceErrorKind::InvalidRequest,
-                    "cannot reserve bounded image request queue",
-                )
-            })?;
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                queue,
+                queue: VecDeque::new(),
+                queue_backing: None,
                 accepting: true,
                 closing: false,
                 active: 0,
@@ -1357,7 +1425,7 @@ impl<O: Send + 'static> ServiceCore<O> {
                         .generation()
                         .prompt
                         .capacity()
-                        .saturating_add(std::mem::size_of::<Queued<O>>()),
+                        .saturating_add(ImageService::minimum_pending_request_bytes()),
                 )
             })
             .transpose()
@@ -1368,6 +1436,13 @@ impl<O: Send + 'static> ServiceCore<O> {
                     format!("image queue Host admission failed: {error}"),
                 )
             })?;
+        if let Err(error) = state.reserve_queue_slot(
+            self.shared.host.as_ref(),
+            self.shared.config.maximum_pending,
+        ) {
+            state.rejected = state.rejected.saturating_add(1);
+            return Err(error);
+        }
         let (response, receiver) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         state.queue.push_back(Queued {
@@ -1460,6 +1535,9 @@ fn reject_pending<O>(state: &mut State<O>, kind: ImageServiceErrorKind) {
             "image service stopped before execution",
         )));
     }
+    // Terminal shutdown releases both the retained allocation and its charge.
+    state.queue = VecDeque::new();
+    state.queue_backing.take();
 }
 
 mod output_budget;

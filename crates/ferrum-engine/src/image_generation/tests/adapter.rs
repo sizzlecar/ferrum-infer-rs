@@ -421,8 +421,8 @@ async fn real_qwen_token_preflight_rejects_job_without_stopping_service_or_submi
     assert!(service.is_accepting());
     assert_eq!(runtime.snapshot().submissions, before.submissions);
     assert_eq!(runtime.snapshot().allocations, before.allocations);
-    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     let retired = service.shutdown().await.unwrap();
     assert!(!retired.has_failure());
     drop(retired);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

@@ -657,6 +657,6 @@ async fn legacy_generator_keeps_single_edit_cap_and_delegates_without_batch_wait
     assert_eq!(error.kind(), ImageServiceErrorKind::Generation);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(service.is_accepting());
-    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     assert!(!service.shutdown().await.unwrap().has_failure());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

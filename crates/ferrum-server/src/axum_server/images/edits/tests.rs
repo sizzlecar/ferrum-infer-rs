@@ -345,8 +345,11 @@ async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
     .await
     .unwrap();
     assert_eq!(images.output_usage().sessions, 0);
-    assert_eq!(host.usage().unwrap().committed_bytes(), output_bytes);
     drop(held_output);
+    // The cancelled input is released; the reusable queue allocation remains
+    // charged while the service is alive. Later requests must return here.
+    let idle_committed = host.usage().unwrap().committed_bytes();
+    assert!(idle_committed < queue_bytes);
     let mut crc = png.clone();
     crc[29] ^= 1;
     let mut pixels = png.clone();
@@ -380,7 +383,7 @@ async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
         );
         drop(response);
         assert!(images.service().is_accepting());
-        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+        assert_eq!(host.usage().unwrap().committed_bytes(), idle_committed);
         assert_eq!(calls.load(Ordering::SeqCst), index + 1);
         assert_eq!(
             *decoded.lock().unwrap(),
@@ -436,8 +439,9 @@ async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert!(images.service().is_accepting());
-        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+        assert_eq!(host.usage().unwrap().committed_bytes(), idle_committed);
     }
     images.shutdown().await.unwrap();
     assert!(!images.take_shutdown().await.unwrap().has_failure());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

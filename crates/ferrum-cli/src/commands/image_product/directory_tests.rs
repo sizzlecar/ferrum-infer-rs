@@ -277,17 +277,23 @@ fn automatic_image_route_rejects_text_controls_and_invalid_product_limits() {
 #[test]
 fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
     let one = DirectoryOptions::from_cli(0.9, None, None, "cuda", None, None).unwrap();
+    let pending = one.host().default_pending_bytes().unwrap().get()
+        / ferrum_engine::image_generation::service::ImageService::minimum_pending_request_bytes();
+    let minimum_output_bytes = ferrum_output::png::encoded_rgba8_png_bytes(
+        ferrum_output::png::PngDimensions::new(1, 1).unwrap(),
+        ferrum_output::png::PngLimits::default(),
+    )
+    .unwrap() as usize;
+    let completed_sessions = one.host().output_bytes / minimum_output_bytes;
     assert_eq!(directory::PRESET_NAME, "bf16_adaptive_v1");
     assert_eq!(one.serving().unwrap().request_batch_max_wait_ms, 0);
     assert_eq!(one.batching, ferrum_types::ImageBatchPolicy::Auto);
-    assert_eq!(
-        one.serving().unwrap().maximum_pending,
-        one.maximum_batch_size * 4
-    );
+    assert_eq!(one.serving().unwrap().maximum_pending, pending);
     assert_eq!(
         one.serving().unwrap().output.max_sessions,
-        one.maximum_batch_size * 5
+        pending + one.maximum_batch_size + completed_sessions
     );
+    ferrum_output::OutputBudget::new(one.serving().unwrap().output).unwrap();
     assert_eq!(
         one.maximum_batch_size,
         ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH
@@ -347,8 +353,11 @@ fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
     }
     let eight = DirectoryOptions::from_cli(0.9, None, Some(8), "cuda", Some("0"), None).unwrap();
     assert_eq!(eight.serving().unwrap().max_num_seqs, 8);
-    assert_eq!(eight.serving().unwrap().maximum_pending, 32);
-    assert_eq!(eight.serving().unwrap().output.max_sessions, 40);
+    assert_eq!(eight.serving().unwrap().maximum_pending, pending);
+    assert_eq!(
+        eight.serving().unwrap().output.max_sessions,
+        pending + eight.maximum_batch_size + completed_sessions
+    );
     assert_eq!(eight.pipeline().maximum_batch_size, 8);
     assert_eq!(eight.serving().unwrap().request_batch_max_wait_ms, 0);
     assert_eq!(
@@ -384,7 +393,10 @@ fn run_has_single_request_capacity_and_metal_keeps_configured_batching() {
             ferrum_engine::image_generation::ImageEditPrefixPolicy::RequestCache
         );
         assert_eq!(run.serving().unwrap().request_batch_max_wait_ms, 0);
-        assert_eq!(run.serving().unwrap().maximum_pending, 4);
+        assert_eq!(
+            run.serving().unwrap().maximum_pending,
+            cuda.serving().unwrap().maximum_pending
+        );
         let metal =
             DirectoryOptions::from_cli(0.9, None, explicit_cap, "metal", None, None).unwrap();
         assert_eq!(metal.batching, ferrum_types::ImageBatchPolicy::Configured);

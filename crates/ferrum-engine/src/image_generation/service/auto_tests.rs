@@ -289,8 +289,24 @@ async fn byte_budget_counts_preparation_and_host_reservation_until_execution_fin
     );
     let service =
         ServiceCore::start_with_host(Box::new(worker), config, Some(host.clone())).unwrap();
+    assert_eq!(service.shared.lock().queue.capacity(), 0);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     let job = service.try_submit(request(1)).unwrap();
     assert_eq!(recv(&c.preparation), [1]);
+    let queue_bytes = {
+        let state = service.shared.lock();
+        assert!(state.queue.is_empty());
+        let bytes = state.queue.capacity() * std::mem::size_of::<Queued<u64>>();
+        assert_eq!(state.queue_backing.as_ref().unwrap().bytes(), bytes);
+        bytes
+    };
+    let request_bytes = host
+        .backing_bytes(ImageService::minimum_pending_request_bytes() + request(1).prompt.capacity())
+        .unwrap();
+    assert_eq!(
+        host.usage().unwrap().committed_bytes(),
+        host.backing_bytes(queue_bytes).unwrap() + request_bytes
+    );
     assert_eq!(
         service.snapshot().pending_bytes,
         config.maximum_pending_bytes
@@ -306,6 +322,68 @@ async fn byte_budget_counts_preparation_and_host_reservation_until_execution_fin
     assert!(host.usage().unwrap().committed_bytes() > 0);
     c.execute_release.send(()).unwrap();
     assert_eq!(job.wait().await.unwrap(), 1);
+    // Empty logical queue retains its allocation and its separate Host charge.
+    // The per-job metadata grant survives preparation/execution, then refunds.
+    assert!(host.usage().unwrap().committed_bytes() >= queue_bytes);
+    assert!(service.shutdown().await.unwrap().failure.is_none());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[tokio::test]
+async fn queue_growth_keeps_prepared_return_slots_and_accounts_relocation_peak() {
+    let (worker, c) = fixture(4);
+    let slot_bytes = std::mem::size_of::<Queued<u64>>();
+    let job_bytes = ImageService::minimum_pending_request_bytes() + request(1).prompt.capacity();
+    // Two job owners plus both the old one-slot and new two-slot allocations.
+    let peak_bytes = 2 * job_bytes + 3 * slot_bytes;
+    let host = HostMemoryAccount::new(
+        ferrum_runtime::HostMemoryLimits::new(
+            peak_bytes,
+            ferrum_runtime::HostMemoryClassLimits {
+                input_preprocess_bytes: peak_bytes,
+                transfer_staging_bytes: 0,
+                output_bytes: 0,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    let pressure = host.reserve(HostMemoryClass::InputPreprocess, 1).unwrap();
+    let service =
+        ServiceCore::start_with_host(Box::new(worker), config(), Some(host.clone())).unwrap();
+    let first = service.try_submit(request(1)).unwrap();
+    assert_eq!(recv(&c.preparation), [1]);
+    let before_growth = host.usage().unwrap().committed_bytes();
+    assert_eq!(
+        service.try_submit(request(2)).err().unwrap().kind(),
+        ImageServiceErrorKind::QueueFull
+    );
+    assert_eq!(host.usage().unwrap().committed_bytes(), before_growth);
+    assert_eq!(service.shared.lock().queue.capacity(), 1);
+    drop(pressure);
+    let second = service.try_submit(request(2)).unwrap();
+    {
+        let state = service.shared.lock();
+        assert_eq!((state.queue.len(), state.preparing), (1, 1));
+        assert_eq!(state.queue.capacity(), 2);
+        assert_eq!(
+            state.queue_backing.as_ref().unwrap().bytes(),
+            2 * slot_bytes
+        );
+    }
+    assert_eq!(
+        host.usage().unwrap().committed_bytes(),
+        2 * job_bytes + 2 * slot_bytes
+    );
+    c.prepare_release.send(()).unwrap();
+    assert_eq!(recv(&c.execution), [1]);
+    c.execute_release.send(()).unwrap();
+    assert_eq!(first.wait().await.unwrap(), 1);
+    assert_eq!(recv(&c.preparation), [2]);
+    c.prepare_release.send(()).unwrap();
+    assert_eq!(recv(&c.execution), [2]);
+    c.execute_release.send(()).unwrap();
+    assert_eq!(second.wait().await.unwrap(), 2);
     assert!(service.shutdown().await.unwrap().failure.is_none());
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

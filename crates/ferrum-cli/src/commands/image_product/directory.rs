@@ -130,20 +130,52 @@ impl DirectoryOptions {
     }
     pub fn serving(&self) -> Result<ServingConfig> {
         self.validate()?;
-        let pending = if self.backend == ImageBackendKind::Cuda
-            && self.batching == ferrum_types::ImageBatchPolicy::Auto
-        {
-            self.maximum_batch_size
-                .checked_mul(4)
-                .context("automatic image pending count overflows")?
-                .max(4)
+        let host = self.host();
+        let pending_bytes = host.default_pending_bytes()?;
+        let automatic_cuda = self.backend == ImageBackendKind::Cuda
+            && self.batching == ferrum_types::ImageBatchPolicy::Auto;
+        let pending = if automatic_cuda {
+            pending_bytes
+                .get()
+                .checked_div(
+                    ferrum_engine::image_generation::service::ImageService::minimum_pending_request_bytes(),
+                )
+                .filter(|count| *count > 0)
+                .context("Host pending budget cannot admit one image request")?
         } else {
             self.maximum_batch_size.max(4)
+        };
+        let active_sessions = pending
+            .checked_add(self.maximum_batch_size)
+            .context("image output session count overflows")?;
+        let max_sessions = if automatic_cuda {
+            use ferrum_output::png::{encoded_rgba8_png_bytes, PngDimensions, PngLimits};
+            // Every successful response owns at least a 1x1 PNG's bytes.
+            // JSON/base64 and physical alignment only increase that cost. This
+            // is a count ceiling, not a reservation or a chosen workload size.
+            let minimum_output_bytes = usize::try_from(encoded_rgba8_png_bytes(
+                PngDimensions::new(1, 1)?,
+                PngLimits::default(),
+            )?)?;
+            let completed_sessions = host.output_bytes / minimum_output_bytes;
+            let sessions = active_sessions
+                .checked_add(completed_sessions)
+                .context("automatic image output session count overflows")?;
+            ensure!(
+                sessions <= tokio::sync::Semaphore::MAX_PERMITS,
+                "automatic image output session count exceeds semaphore capacity"
+            );
+            sessions
+                .checked_mul(ferrum_output::TERMINAL_ERROR_BYTES)
+                .context("automatic image output error allowance exceeds address space")?;
+            sessions
+        } else {
+            active_sessions
         };
         let serving = ServingConfig {
             batching: self.batching,
             maximum_pending: pending,
-            maximum_pending_bytes: Some(self.host().default_pending_bytes()?),
+            maximum_pending_bytes: Some(pending_bytes),
             maximum_prompt_bytes: (1024 * 1024 / self.maximum_batch_size).min(65536),
             max_num_seqs: self.maximum_batch_size,
             request_batch_max_wait_ms: if self.batching == ferrum_types::ImageBatchPolicy::Auto
@@ -158,9 +190,7 @@ impl DirectoryOptions {
             default_seed: 0,
             rgba_scratch_bytes: 16 * 1024,
             output: ferrum_types::OutputConfig {
-                max_sessions: pending
-                    .checked_add(self.maximum_batch_size)
-                    .context("image output session count overflows")?,
+                max_sessions,
                 ..Default::default()
             },
         };

@@ -131,6 +131,7 @@ fn run(fail_preparation: bool) -> (Capture, Arc<Shared<u64>>, Retirement<u64>) {
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
             queue,
+            queue_backing: None,
             accepting: true,
             closing: false,
             active: 0,
