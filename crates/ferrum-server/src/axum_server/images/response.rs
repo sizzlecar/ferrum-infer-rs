@@ -7,7 +7,8 @@ use ferrum_output::{
     OutputBytesLease, OutputSession,
 };
 use ferrum_runtime::{
-    HostMemoryAccount, HostMemoryClass, ManagedHostBuffer, ManagedHostBytes, ResolvedTensorSpec,
+    HostMemoryAccount, HostMemoryClass, HostMemoryScope, ManagedHostBuffer, ManagedHostBytes,
+    ResolvedTensorSpec,
 };
 use std::io::{self, Cursor, Write};
 
@@ -28,35 +29,28 @@ impl AsRef<[u8]> for EncodedImage {
     }
 }
 
-struct PreparedEncoding {
+/// One request's known response bound, reserved before generation submission.
+/// Only small metadata is allocated here. Scratch and JSON consume this credit
+/// later, while other parent consumers see it as unavailable.
+pub(super) struct Admission {
     session: OutputSession,
-    host: HostMemoryAccount,
-    tensor: ResolvedTensorSpec,
-    raw: ManagedHostBytes,
-    scratch: ManagedHostBuffer,
+    scope: HostMemoryScope,
+    lease: OutputBytesLease,
     dimensions: PngDimensions,
     limits: PngLimits,
+    scratch_bytes: usize,
     created: i64,
     count: usize,
 }
 
-impl PreparedEncoding {
-    fn new(
+impl Admission {
+    pub(super) fn new(
         session: OutputSession,
         host: HostMemoryAccount,
-        tensor: ResolvedTensorSpec,
-        raw: ManagedHostBytes,
+        dimensions: PngDimensions,
         limits: PngLimits,
         scratch_bytes: usize,
     ) -> Result<Self, ServerError> {
-        let rgba = QwenImage21RgbaOutput::new(&host, &tensor, &raw).map_err(internal)?;
-        let [batch, _, height, width] = rgba.dimensions();
-        if batch != 1 {
-            return Err(ServerError::InternalError(
-                "image response requires exactly one frame".into(),
-            ));
-        }
-        let dimensions = PngDimensions::new(width as u64, height as u64).map_err(internal)?;
         let png_bytes = encoded_rgba8_png_bytes(dimensions, limits).map_err(internal)?;
         let created = chrono::Utc::now().timestamp();
         let count = response_bytes(png_bytes, created)
@@ -64,34 +58,102 @@ impl PreparedEncoding {
         if count > session.config().max_event_bytes {
             return Err(capacity("encoded image exceeds configured output limit"));
         }
-        let scratch = host
-            .allocate_zeroed(HostMemoryClass::Output, scratch_bytes)
+        let physical = host
+            .backing_bytes(scratch_bytes)
+            .map_err(capacity)?
+            .checked_add(host.backing_bytes(count).map_err(capacity)?)
+            .ok_or_else(|| capacity("encoded image backing exceeds the host address space"))?;
+        let scope = host
+            .reserve_scope(&[(HostMemoryClass::Output, physical)])
             .map_err(capacity)?;
+        // Do not enqueue a second HTTP waiting room. Admission is immediate
+        // and atomic; successful leases survive the response body.
+        let lease = session
+            .try_reserve_encoded(count)
+            .map_err(capacity)?
+            .ok_or_else(|| capacity("encoded output budget is currently full"))?;
         Ok(Self {
             session,
-            host,
-            tensor,
-            raw,
-            scratch,
+            scope,
+            lease,
             dimensions,
             limits,
+            scratch_bytes,
             created,
             count,
         })
     }
 
+    pub(super) fn session(&self) -> OutputSession {
+        self.session.clone()
+    }
+
+    pub(super) async fn encode(
+        self,
+        tensor: ResolvedTensorSpec,
+        raw: ManagedHostBytes,
+    ) -> Result<Bytes, ServerError> {
+        // A cancelled blocking task retains its grant and pixels until the
+        // writer exits, then drops its unpublished encoded owner safely.
+        tokio::task::spawn_blocking(move || PreparedEncoding::new(self, tensor, raw)?.finish())
+            .await
+            .map_err(internal)?
+    }
+}
+
+struct PreparedEncoding {
+    admission: Admission,
+    tensor: ResolvedTensorSpec,
+    raw: ManagedHostBytes,
+    scratch: ManagedHostBuffer,
+}
+
+impl PreparedEncoding {
+    fn new(
+        admission: Admission,
+        tensor: ResolvedTensorSpec,
+        raw: ManagedHostBytes,
+    ) -> Result<Self, ServerError> {
+        let host = admission.scope.account();
+        let rgba = QwenImage21RgbaOutput::new(&host, &tensor, &raw).map_err(internal)?;
+        let [batch, _, height, width] = rgba.dimensions();
+        if batch != 1
+            || width as u64 != u64::from(admission.dimensions.width())
+            || height as u64 != u64::from(admission.dimensions.height())
+        {
+            return Err(ServerError::InternalError(
+                "image response dimensions differ from the admitted single frame".into(),
+            ));
+        }
+        let scratch = host
+            .allocate_zeroed(HostMemoryClass::Output, admission.scratch_bytes)
+            .map_err(internal)?;
+        Ok(Self {
+            admission,
+            tensor,
+            raw,
+            scratch,
+        })
+    }
+
     fn write(&mut self, sink: &mut dyn Write) -> io::Result<()> {
-        let rgba = QwenImage21RgbaOutput::new(&self.host, &self.tensor, &self.raw)
-            .map_err(io::Error::other)?;
+        let rgba =
+            QwenImage21RgbaOutput::new(&self.admission.scope.account(), &self.tensor, &self.raw)
+                .map_err(io::Error::other)?;
         sink.write_all(JSON_PREFIX)?;
-        write!(sink, "{}", self.created)?;
+        write!(sink, "{}", self.admission.created)?;
         sink.write_all(JSON_DATA)?;
         {
             let mut base64 = EncoderWriter::new(&mut *sink, &STANDARD);
-            write_rgba8_png(&mut base64, self.dimensions, self.limits, |stream| {
-                rgba.write_frame_rgba8(0, self.scratch.as_mut(), stream)
-                    .map_err(io::Error::other)
-            })
+            write_rgba8_png(
+                &mut base64,
+                self.admission.dimensions,
+                self.admission.limits,
+                |stream| {
+                    rgba.write_frame_rgba8(0, self.scratch.as_mut(), stream)
+                        .map_err(io::Error::other)
+                },
+            )
             .map_err(io::Error::other)?;
             base64.finish()?;
         }
@@ -99,49 +161,26 @@ impl PreparedEncoding {
         Ok(())
     }
 
-    fn finish(mut self, lease: OutputBytesLease) -> Result<Bytes, ServerError> {
+    fn finish(mut self) -> Result<Bytes, ServerError> {
         let mut output = self
-            .host
-            .allocate_zeroed(HostMemoryClass::Output, self.count)
-            .map_err(capacity)?;
+            .admission
+            .scope
+            .account()
+            .allocate_zeroed(HostMemoryClass::Output, self.admission.count)
+            .map_err(internal)?;
         let mut cursor = Cursor::new(output.as_mut());
         self.write(&mut cursor).map_err(internal)?;
-        if cursor.position() != self.count as u64 {
+        if cursor.position() != self.admission.count as u64 {
             return Err(ServerError::InternalError(
                 "encoded image size differs from the admitted exact length".into(),
             ));
         }
         Ok(Bytes::from_owner(EncodedImage {
             bytes: output.freeze(),
-            _lease: lease,
-            _session: self.session,
+            _lease: self.admission.lease,
+            _session: self.admission.session,
         }))
     }
-}
-
-pub(super) async fn encode(
-    session: OutputSession,
-    host: HostMemoryAccount,
-    tensor: ResolvedTensorSpec,
-    raw: ManagedHostBytes,
-    limits: PngLimits,
-    scratch_bytes: usize,
-) -> Result<Bytes, ServerError> {
-    // Blocking tasks own all backing and admission while encoding. Cancellation
-    // drops the returned owner after the task finishes, not under the writer.
-    let prepared = tokio::task::spawn_blocking(move || {
-        PreparedEncoding::new(session, host, tensor, raw, limits, scratch_bytes)
-    })
-    .await
-    .map_err(internal)??;
-    let lease = prepared
-        .session
-        .reserve_encoded(prepared.count)
-        .await
-        .map_err(capacity)?;
-    tokio::task::spawn_blocking(move || prepared.finish(lease))
-        .await
-        .map_err(internal)?
 }
 
 fn internal(error: impl std::fmt::Display) -> ServerError {

@@ -251,7 +251,19 @@ async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
     let encoded_limit = ImageInputLimits::default().maximum_encoded_bytes();
     let rgba_bytes = 2048 * 2048 * 4;
     let queue_bytes = 4096;
-    let host = account(encoded_limit + rgba_bytes + queue_bytes);
+    let output_bytes = 2 * 1024 * 1024;
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            encoded_limit + rgba_bytes + queue_bytes + output_bytes,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: encoded_limit + rgba_bytes + queue_bytes,
+                output_bytes,
+                transfer_staging_bytes: 0,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
     let calls = Arc::new(AtomicUsize::new(0));
     let decoded = Arc::new(std::sync::Mutex::new(None));
     let service = ImageService::new(
@@ -296,6 +308,30 @@ async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
     .unwrap();
     assert!(png.len() > rgba_bytes);
     assert!(png.len() <= encoded_limit);
+    let held_output = host.reserve(HostMemoryClass::Output, output_bytes).unwrap();
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/edits")
+                .header("content-type", "multipart/form-data; boundary=bound")
+                .body(Body::from(wire(&[
+                    ("model", b"image", false),
+                    ("prompt", b"edit", false),
+                    ("image", &png, true),
+                ])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(images.service().snapshot().pending_requests, 0);
+    assert_eq!(images.output_usage().sessions, 0);
+    assert_eq!(images.output_usage().encoded_bytes, 0);
+    assert_eq!(host.usage().unwrap().committed_bytes(), output_bytes);
+    drop((held_output, response));
     let mut crc = png.clone();
     crc[29] ^= 1;
     let mut pixels = png.clone();

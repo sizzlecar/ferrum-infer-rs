@@ -241,10 +241,37 @@ impl TrustedExecutionWeights {
         family: &PreparedModelFamily,
         source: &'source dyn WeightComponentSource,
         components: &[&WeightComponentSpec],
+        host: Option<&crate::HostMemoryAccount>,
     ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
         self.validate_against_family(family)?;
         self.stored()?
-            .materialize_components(family, source, components)
+            .materialize_components(family, source, components, host)
+    }
+
+    pub(crate) fn additional_host_backing_bytes(
+        &self,
+        family: &PreparedModelFamily,
+        source: Option<&dyn WeightComponentSource>,
+    ) -> Result<usize, VNextError> {
+        self.validate_against_family(family)?;
+        match &self.authority {
+            ExecutionWeightAuthority::None { .. } => Ok(0),
+            ExecutionWeightAuthority::Stored(plan) => {
+                plan.additional_host_backing_bytes(family, source)
+            }
+        }
+    }
+
+    pub(crate) fn prepare_host_backing(
+        &self,
+        family: &PreparedModelFamily,
+        source: Option<&dyn WeightComponentSource>,
+    ) -> Result<crate::HostBackingPreparation, VNextError> {
+        self.validate_against_family(family)?;
+        match &self.authority {
+            ExecutionWeightAuthority::None { .. } => Ok(crate::HostBackingPreparation::new(0)),
+            ExecutionWeightAuthority::Stored(plan) => plan.prepare_host_backing(family, source),
+        }
     }
 
     pub(crate) fn static_weight_transform_for_components(

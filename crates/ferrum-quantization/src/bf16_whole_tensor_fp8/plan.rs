@@ -9,6 +9,16 @@ pub(super) struct Prepared {
     // monotone, and lookup groups all have the same bounded temporary allocation.
     maximum_payload_bytes: [u64; 2],
     pub converted_bytes: u64,
+    pub conversion_groups: Vec<ConversionGroup>,
+}
+
+pub(super) struct ConversionGroup {
+    pub sources: Vec<WeightComponentSpec>,
+    /// The initializer visits execution components in schema order. Cache keys
+    /// include that order, which differs from derive_group's numerical order.
+    pub outputs: Vec<WeightComponentSpec>,
+    pub payload_bytes: usize,
+    pub lookup_bytes: usize,
 }
 
 impl Prepared {
@@ -112,6 +122,7 @@ pub(super) fn prepare_program(
     let mut maximum_group_bytes = 0;
     let mut maximum_payload_bytes = [0_u64; 2];
     let mut converted_bytes = 0_u64;
+    let mut conversion_groups = Vec::with_capacity(groups.len());
     for group in groups {
         let mut source_specs = Vec::with_capacity(group.len());
         for weight in group {
@@ -167,6 +178,14 @@ pub(super) fn prepare_program(
         converted_bytes = converted_bytes
             .checked_add(group_bytes)
             .ok_or_else(|| invalid("converted cache bytes overflow"))?;
+        let mut outputs = derived.clone();
+        outputs.sort_by(|left, right| left.id.cmp(&right.id));
+        conversion_groups.push(ConversionGroup {
+            sources: source_specs.iter().map(|spec| (*spec).clone()).collect(),
+            outputs,
+            payload_bytes: group_bytes as usize,
+            lookup_bytes: lookup_bytes as usize,
+        });
         for (index, weight) in group.iter().enumerate() {
             let tensor = schema
                 .tensors
@@ -213,12 +232,14 @@ pub(super) fn prepare_program(
     schema.layout_id = WeightLayoutId::new(BF16_WHOLE_TENSOR_FP8_LAYOUT_ID)?;
     schema.version = VERSION;
     schema.validate(program.family_id())?;
+    conversion_groups.sort_by(|left, right| left.outputs[0].id.cmp(&right.outputs[0].id));
     Ok(Prepared {
         schema,
         sources: source_map,
         maximum_group_bytes,
         maximum_payload_bytes,
         converted_bytes,
+        conversion_groups,
     })
 }
 

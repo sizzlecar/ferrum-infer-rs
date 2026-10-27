@@ -7,6 +7,8 @@ pub(super) struct PreparedPrefixDecode<R: DeviceRuntime> {
 }
 
 pub(super) struct PreparedRequest<R: DeviceRuntime> {
+    pub host_scope: Option<ferrum_runtime::HostMemoryScope>,
+    pub host_backing: Vec<ferrum_runtime::HostBackingPreparation>,
     pub prompts: QwenImage21T2iPromptBatch,
     pub request_order: BatchOrder,
     pub transformer: QwenImage21TransformerConfig,
@@ -254,7 +256,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             capacity_us,
             "image batch plans prepared"
         );
-        let prepared = PreparedRequest {
+        let mut prepared = PreparedRequest {
+            host_scope: None,
+            host_backing: Vec::new(),
             prompts,
             request_order,
             transformer,
@@ -267,6 +271,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             decode_stage,
             edit,
         };
+        prepared.host_scope = Some(self.reserve_execution_host(&mut prepared)?);
         candidate_cache.commit();
         Ok(prepared)
     }

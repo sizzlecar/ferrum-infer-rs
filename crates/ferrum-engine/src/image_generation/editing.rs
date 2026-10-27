@@ -290,7 +290,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .tensor(Qwen3VLVisionFamily::POSITION_EXTERNAL_NAME)
             .map_err(|e| process(e.into()))?;
         let position_inputs = vision
-            .managed_position_inputs(&self.host, &positions)
+            .managed_position_inputs(self.execution_host(), &positions)
             .map_err(process)?;
         let vision_position_us = trace_elapsed_us(started);
         let batch = inputs.len();
@@ -318,7 +318,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .tensor(Qwen3VLTextEncoderFamily::EMBEDDING_EXTERNAL_NAME)
             .map_err(|e| process(e.into()))?;
         let text_inputs = prompt
-            .managed_text_batch_inputs(&self.host, &self.assets.text, &embedding, vision_outputs)
+            .managed_text_batch_inputs(
+                self.execution_host(),
+                &self.assets.text,
+                &embedding,
+                vision_outputs,
+            )
             .map_err(process)?;
         let text_bridge_us = trace_elapsed_us(started);
         let active = self.start_stage(text_stage, job, stages)?;
@@ -328,7 +333,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let hidden = only_output(outputs, Qwen3VLTextEncoderFamily::OUTPUT_ID).map_err(process)?;
         let text = prompt
             .prompts()
-            .crop_hidden(&self.host, &self.assets.text, &hidden)
+            .crop_hidden(self.execution_host(), &self.assets.text, &hidden)
             .map_err(process)?
             .into_tensor();
         drop(hidden);
@@ -343,7 +348,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         )
         .map_err(process)?;
         let mut references =
-            ReferenceLatentBatch::new(&self.host, batch, shape).map_err(process)?;
+            ReferenceLatentBatch::new(self.execution_host(), batch, shape).map_err(process)?;
         let mut reference_latent_bridge_us = trace_elapsed_us(started);
         let mut active = self.start_stage(encoder_stage, job, stages)?;
         for rgba in rgba_inputs {
@@ -353,7 +358,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let normalize = (|| -> anyhow::Result<()> {
                 let encoded = only_output(outputs, QwenImage21VaeEncoderFamily::OUTPUT_ID)?;
                 let posterior = QwenImage21ManagedLatents::from_output(
-                    &self.host,
+                    self.execution_host(),
                     &encoded,
                     shape,
                     QwenImage21LatentLayout::Nchw,
@@ -362,7 +367,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 // Keep the original staged BF16 subtraction/division unchanged.
                 let reference = posterior
                     .normalize_from_vae(
-                        &self.host,
+                        self.execution_host(),
                         &self.assets.statistics,
                         id(QwenImage21TransformerFamily::REFERENCE_LATENTS_ID)?,
                     )?

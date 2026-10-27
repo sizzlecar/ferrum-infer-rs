@@ -2655,9 +2655,34 @@ impl ExecutionPlan {
         family: &PreparedModelFamily,
         source: &'source dyn WeightComponentSource,
         components: &[&WeightComponentSpec],
+        host: Option<&crate::HostMemoryAccount>,
     ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
         self.trusted_execution_weights
-            .materialize_components(family, source, components)
+            .materialize_components(family, source, components, host)
+    }
+
+    /// Additional physical Host WeightBacking peak for this exact retained
+    /// materializer and source. This is a preparation estimate, not allocation
+    /// authority; an execution-scoped Host reservation authorizes the bytes.
+    pub fn additional_host_backing_bytes(
+        &self,
+        family: &PreparedModelFamily,
+        source: Option<&dyn WeightComponentSource>,
+    ) -> Result<usize, VNextError> {
+        self.trusted_execution_weights
+            .additional_host_backing_bytes(family, source)
+    }
+
+    /// Retain all warm backing assumptions used to reduce the additional Host
+    /// budget. Keep the returned preparation through static initialization;
+    /// dropping it before execution invalidates the corresponding warm bound.
+    pub fn prepare_host_backing(
+        &self,
+        family: &PreparedModelFamily,
+        source: Option<&dyn WeightComponentSource>,
+    ) -> Result<crate::HostBackingPreparation, VNextError> {
+        self.trusted_execution_weights
+            .prepare_host_backing(family, source)
     }
 
     pub(crate) fn static_weight_transform_for_components(

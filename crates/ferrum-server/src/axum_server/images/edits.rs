@@ -47,6 +47,7 @@ pub(in crate::axum_server) async fn edits_handler(
         .service
         .validate_edit_request(&request)
         .map_err(service_error)?;
+    let response = admit_response(images, session, &request.generation)?;
     let started = Instant::now();
     let result = images
         .service
@@ -56,7 +57,7 @@ pub(in crate::axum_server) async fn edits_handler(
         .await
         .map_err(service_error)?;
     let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    encode_result(images, session, result, elapsed).await
+    encode_result(response, result, elapsed).await
 }
 
 async fn parse(

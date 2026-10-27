@@ -229,6 +229,65 @@ fn mappings() -> Vec<TensorRequestStateMapping> {
 }
 
 #[test]
+fn fixed_request_inherits_output_scope_and_can_rebind_after_scope_close() {
+    let c =
+        ReferenceVNextComposition::create_with_capacity(id("device.request.output-scope"), 4096)
+            .unwrap();
+    let host = host();
+    let mut producer = component(&c, &host, true);
+    let mut consumer = component(&c, &host, false);
+    let scope = host
+        .reserve_scope(&[(HostMemoryClass::Output, 16)])
+        .unwrap();
+    producer.set_output_host_account(scope.account()).unwrap();
+    consumer.set_output_host_account(scope.account()).unwrap();
+    let mut request = consumer
+        .begin_request(
+            id("run.scope-request"),
+            id("request.scope-request"),
+            vec![input(&host, [0.; 4])],
+        )
+        .unwrap();
+    // Rebinding the reusable component must not erase the fixed request's
+    // independently retained view of its pre-admitted output credit.
+    consumer.set_output_host_account(host.clone()).unwrap();
+    let before = c.runtime().snapshot();
+    assert!(request
+        .set_output_host_account(HostMemoryAccount::new(host.limits()))
+        .is_err());
+    assert_eq!(c.runtime().snapshot().submissions, before.submissions);
+    let initial = producer
+        .execute_initializing_request(
+            id("run.scope-producer"),
+            id("request.scope-producer"),
+            vec![input(&host, [1., -2., 3., 4.])],
+            &mut request,
+            &mappings(),
+        )
+        .unwrap();
+    let first = request
+        .execute(vec![input(&host, [10., 20., 30., 40.])])
+        .unwrap();
+    assert_eq!(initial[0].bytes().bytes(), bytes(&[3., -6., 9., 12.]));
+    assert_eq!(first[0].bytes().bytes(), bytes(&[12., 16., 36., 48.]));
+    assert_eq!(host.usage().unwrap().allocated_bytes(), 16);
+    drop(scope);
+    producer.set_output_host_account(host.clone()).unwrap();
+    request.set_output_host_account(host.clone()).unwrap();
+    drop(initial);
+    let next = request
+        .execute(vec![input(&host, [-2., 4., -6., -8.])])
+        .unwrap();
+    assert_eq!(next[0].bytes().bytes(), bytes(&[0.; 4]));
+    request.close().unwrap();
+    close(producer);
+    close(consumer);
+    assert_eq!(c.runtime().snapshot().live_allocations, 0);
+    drop((first, next));
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
 fn request_d2d_initialization_rebinds_inputs_without_host_cache_and_retires() {
     let c =
         ReferenceVNextComposition::create_with_capacity(id("device.request.d2d"), 4096).unwrap();

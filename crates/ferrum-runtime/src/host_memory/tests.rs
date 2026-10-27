@@ -179,6 +179,9 @@ fn admitted_copy_is_independent_and_aliases_keep_the_full_initialized_charge() {
     let clone = bytes.clone();
     let slice = clone.slice(2..6).unwrap();
     let empty = slice.slice(4..4).unwrap();
+    for owner in [&bytes, &clone, &slice, &empty] {
+        assert_eq!(owner.backing_bytes(), 8);
+    }
     drop((bytes, clone));
     assert_eq!(slice.bytes(), &expected[2..6]);
     assert_eq!(
@@ -193,9 +196,7 @@ fn admitted_copy_is_independent_and_aliases_keep_the_full_initialized_charge() {
         .is_err());
     drop(slice);
     assert!(empty.is_empty());
-    for owner in [&bytes, &clone, &middle, &nested, &empty] {
-        assert_eq!(owner.backing_bytes(), 8);
-    }
+    assert_eq!(empty.backing_bytes(), 8);
     assert_eq!(account.usage().unwrap().allocated_bytes(), 8);
     drop(empty);
     assert_eq!(account.usage().unwrap().committed_bytes(), 0);

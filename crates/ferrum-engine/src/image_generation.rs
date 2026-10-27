@@ -34,6 +34,7 @@ pub use composition::ImagePipelineLimits;
 pub mod cuda;
 mod decoder;
 mod editing;
+mod host_budget;
 mod host_cache;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
@@ -139,8 +140,9 @@ pub struct ImagePipelineConfig {
     pub maximum_user_tokens: usize,
     pub maximum_width: u32,
     pub maximum_height: u32,
-    /// Admission ceiling for one real request batch. Product configuration
-    /// defaults to one; larger cold batches require explicit opt-in.
+    /// Admission ceiling for one real request batch. CUDA directory serving
+    /// selects the declared operator ceiling; each candidate still requires
+    /// a complete capacity grant. Direct invocation uses a single request.
     pub maximum_batch_size: usize,
     pub decoder_batch_policy: ImageDecoderBatchPolicy,
     pub edit_prefix_policy: ImageEditPrefixPolicy,
@@ -262,6 +264,7 @@ pub struct ImageGenerationOutput {
 pub struct QwenImage21Pipeline<R: DeviceRuntime> {
     runtime: Arc<R>,
     host: HostMemoryAccount,
+    execution_host: Option<HostMemoryAccount>,
     registry: OperationRuntimeRegistry<R>,
     catalog: CapabilityCatalog,
     materializers: WeightMaterializerRegistry,
@@ -322,6 +325,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         Ok(Self {
             runtime,
             host,
+            execution_host: None,
             registry,
             catalog,
             materializers,
@@ -355,6 +359,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
 
     pub fn host_account(&self) -> &HostMemoryAccount {
         &self.host
+    }
+
+    fn execution_host(&self) -> &HostMemoryAccount {
+        self.execution_host.as_ref().unwrap_or(&self.host)
     }
     pub fn is_stopped(&self) -> bool {
         self.stopped
@@ -403,7 +411,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
 
     fn execute_prepared(
         &mut self,
-        prepared: PreparedRequest<R>,
+        mut prepared: PreparedRequest<R>,
         requests: &[ImageGenerationRequest],
     ) -> Result<Vec<ImageGenerationOutput>, ImageGenerationError<R>> {
         let empty_error = |failure| ImageGenerationError {
@@ -419,7 +427,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         })?;
         let mut stages = Vec::with_capacity(4);
         let mut steps = Vec::with_capacity(self.assets.schedule.evaluation_count());
+        let host_scope = prepared.host_scope.take().expect("prepared Host grant");
+        let host_backing = std::mem::take(&mut prepared.host_backing);
+        self.execution_host = Some(host_scope.account());
         let executed = self.run(prepared, &requests, job, &mut stages, &mut steps);
+        self.execution_host = None;
+        // Returned readbacks retain their real parent charge; unused execution
+        // credit is immediately available to HTTP encoders and queued inputs.
+        drop(host_scope);
+        drop(host_backing);
         let native_memory = self.runtime.native_memory_snapshot();
         if let Some(memory) = native_memory {
             tracing::info!(
@@ -505,6 +521,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             prefix_decode,
             decode_stage,
             edit,
+            host_scope: _,
+            host_backing: _,
         } = prepared;
         let process = |source| ImageGenerationFailure::Processing {
             source,
@@ -518,7 +536,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         } else {
             let inputs = prompts
                 .managed_inputs(
-                    &self.host,
+                    self.execution_host(),
                     &self.assets.text,
                     &self
                         .assets
@@ -536,7 +554,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let hidden =
                 only_output(outputs, Qwen3VLTextEncoderFamily::OUTPUT_ID).map_err(process)?;
             let features = prompts
-                .crop_hidden(&self.host, &self.assets.text, &hidden)
+                .crop_hidden(self.execution_host(), &self.assets.text, &hidden)
                 .map_err(process)?;
             drop(hidden);
             (features.into_tensor(), None)
@@ -548,12 +566,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let [_, _, height, width] = latent_shape.nchw_dimensions();
         let item_shape = QwenImage21LatentShape::new(1, height, width).map_err(process)?;
         let mut batch_noise = self
-            .host
+            .execution_host()
             .allocate_zeroed(HostMemoryClass::InputPreprocess, latent_shape.byte_len())
             .map_err(|e| process(e.into()))?;
         let mut noise = self.start_stage(noise_stage, job, stages)?;
         for (index, request) in ordered_requests.enumerate() {
-            let state = match noise_state(&self.host, request.seed) {
+            let state = match noise_state(self.execution_host(), request.seed) {
                 Ok(state) => state,
                 Err(error) => return Err(noise.processing(error)),
             };
@@ -562,7 +580,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let copy = (|| -> anyhow::Result<()> {
                 let output = only_output(outputs, NormalNoiseFamily::OUTPUT_ID)?;
                 let checked = QwenImage21ManagedLatents::from_output(
-                    &self.host,
+                    self.execution_host(),
                     &output,
                     item_shape,
                     QwenImage21LatentLayout::Nchw,
@@ -587,7 +605,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         )
         .map_err(|e| process(e.into()))?;
         let latents = QwenImage21ManagedLatents::new(
-            &self.host,
+            self.execution_host(),
             batch_noise,
             latent_shape,
             QwenImage21LatentLayout::Nchw,
@@ -596,7 +614,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         .map_err(process)?;
         let mut sample = latents
             .repack(
-                &self.host,
+                self.execution_host(),
                 QwenImage21LatentLayout::Packed,
                 id(QwenImage21TransformerFamily::LATENTS_ID).map_err(process)?,
             )
@@ -607,7 +625,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
 
         let rotary_started = std::time::Instant::now();
         let frequencies = transformer
-            .managed_rotary_frequencies(&self.host)
+            .managed_rotary_frequencies(self.execution_host())
             .map_err(process)?;
         tracing::debug!(
             target: "ferrum_engine::image_generation::timing",
@@ -618,7 +636,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         );
         let mut solver = ManagedBf16Euler::new(
             self.assets.schedule.solver().clone(),
-            self.host.clone(),
+            self.execution_host().clone(),
             sample.tensor().clone(),
             self.profiles.euler,
         )
@@ -646,11 +664,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let mut denoiser = self.start_stage(denoise_stage, job, stages)?;
             let mut euler_us = 0_u64;
             while let Some(step) = solver.current_step() {
-                let time =
-                    match transformer.managed_time_features(&self.host, step.timestep().as_f32()) {
-                        Ok(value) => value,
-                        Err(error) => return Err(denoiser.processing(error)),
-                    };
+                let time = match transformer
+                    .managed_time_features(self.execution_host(), step.timestep().as_f32())
+                {
+                    Ok(value) => value,
+                    Err(error) => return Err(denoiser.processing(error)),
+                };
                 let mut inputs = vec![
                     sample.clone(),
                     text_input.clone(),
@@ -691,7 +710,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         drop((text_input, frequencies, solver, reference));
 
         let normalized = QwenImage21ManagedLatents::new(
-            &self.host,
+            self.execution_host(),
             sample,
             latent_shape,
             QwenImage21LatentLayout::Packed,
@@ -699,7 +718,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         )
         .map_err(process)?;
         let input = normalized
-            .denormalize_for_vae(&self.host, &self.assets.statistics)
+            .denormalize_for_vae(self.execution_host(), &self.assets.statistics)
             .map_err(process)?
             .into_input_tensor()
             .map_err(process)?;
@@ -711,10 +730,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
 
     fn execute_stage(
         &mut self,
-        active: ActiveImageStage<R>,
+        mut active: ActiveImageStage<R>,
         job: u64,
         inputs: Vec<ManagedHostTensor>,
     ) -> Result<(ActiveImageStage<R>, Vec<TensorExecutionOutput>), ImageGenerationFailure<R>> {
+        if let Err(error) = active
+            .session
+            .set_output_host_account(self.execution_host().clone())
+        {
+            return Err(active.processing(error.into()));
+        }
         let Some(actor) = self.serial_actor.as_mut() else {
             return Err(active.processing(anyhow::anyhow!("image serial actor is closed")));
         };

@@ -3948,6 +3948,15 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         None
     }
 
+    /// Whether managed static initialization needs TransferStaging quota.
+    /// This side-effect-free query allows preparation to reserve upload credit
+    /// before submitting device work. Returning false promises that managed
+    /// static import is supported without temporary Host staging; an import
+    /// failure must still fail closed rather than fall back to an upload.
+    fn requires_managed_static_staging(&self) -> bool {
+        true
+    }
+
     /// Encode a required source-to-execution static weight transform.
     ///
     /// `None` means this runtime does not implement the exact transform. Core

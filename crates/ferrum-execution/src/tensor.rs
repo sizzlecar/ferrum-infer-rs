@@ -192,6 +192,7 @@ pub struct PreparedTensorExecutor<R: DeviceRuntime> {
     providers: BoundOperationProviderSet<R>,
     resources: Arc<PlanRuntimeResources<R>>,
     binding: TensorExecutionBinding<R>,
+    output_host: HostMemoryAccount,
     outputs: Vec<(CompiledTensorPort, CompletionReadbackRequest)>,
     reaper: Arc<CompletionReaper<R>>,
     config: TensorExecutorConfig,
@@ -207,6 +208,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         config: TensorExecutorConfig,
     ) -> Result<Self, TensorExecutionError<R>> {
         let plan = executable.execution_plan();
+        let output_host = host.clone();
         let binding = resources.bind_tensor_execution(plan, host)?;
         if !binding.supports_managed_io() {
             return Err(invalid("backend does not support managed tensor transfers").into());
@@ -277,6 +279,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             providers,
             resources,
             binding,
+            output_host,
             outputs,
             reaper: CompletionReaper::new(),
             config,
@@ -286,6 +289,22 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
 
     pub fn host_account(&self) -> &HostMemoryAccount {
         self.binding.host_account()
+    }
+
+    /// Select the Host view used to reserve completion readbacks. A scoped
+    /// view may consume an already admitted output grant, but must belong to
+    /// the original parent account. Input bindings retain their original
+    /// account and provenance. Rebind the parent after an execution scope ends
+    /// before reusing a resident executor for an independently admitted job.
+    pub fn set_output_host_account(
+        &mut self,
+        account: HostMemoryAccount,
+    ) -> Result<(), TensorExecutionError<R>> {
+        if !self.host_account().same_parent(&account) {
+            return Err(invalid("output Host account has a different parent").into());
+        }
+        self.output_host = account;
+        Ok(())
     }
 
     /// The same runtime reaper remains available for pending/indeterminate work.
@@ -364,7 +383,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                 Ok((HostMemoryClass::Output, bytes))
             })
             .collect::<Result<Vec<_>, VNextError>>()?;
-        let claims = self.host_account().reserve_many(&demand)?;
+        let claims = self.output_host.reserve_many(&demand)?;
         let readbacks = outputs
             .iter()
             .zip(claims)

@@ -516,6 +516,17 @@ impl<R: DeviceRuntime> TensorComponentSession<R> {
             .expect("live session owns executor")
             .host_account()
     }
+    /// Readbacks consume this same-parent account view while input admission
+    /// remains on the original Host parent. `begin_request` inherits the view.
+    pub fn set_output_host_account(
+        &mut self,
+        account: HostMemoryAccount,
+    ) -> Result<(), TensorExecutionError<R>> {
+        self.executor
+            .as_mut()
+            .expect("live session owns executor")
+            .set_output_host_account(account)
+    }
     pub fn completion_reaper(&self) -> &Arc<CompletionReaper<R>> {
         self.executor
             .as_ref()

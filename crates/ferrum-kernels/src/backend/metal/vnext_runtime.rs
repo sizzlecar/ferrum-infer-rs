@@ -2529,6 +2529,10 @@ impl DeviceRuntime for MetalDeviceRuntime {
         }
     }
 
+    fn requires_managed_static_staging(&self) -> bool {
+        self.tensor_eager.is_none()
+    }
+
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {
         let id = NEXT_STREAM_INSTANCE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {

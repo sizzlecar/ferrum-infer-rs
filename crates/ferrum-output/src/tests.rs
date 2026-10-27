@@ -131,6 +131,30 @@ async fn encoding_uses_a_distinct_pool_and_lease_keeps_session() {
     assert_eq!(budget.usage().sessions, 0);
 }
 
+#[test]
+fn immediate_encoded_admission_is_atomic_and_retains_session_until_release() {
+    let budget = OutputBudget::new(OutputConfig {
+        max_sessions: 1,
+        encoded_bytes_total: 16,
+        max_event_bytes: 16,
+        ..Default::default()
+    })
+    .unwrap();
+    let session = budget.try_open_session().unwrap();
+    let first = session.try_reserve_encoded(12).unwrap().unwrap();
+    assert!(session.try_reserve_encoded(5).unwrap().is_none());
+    assert!(session.try_reserve_encoded(17).is_err());
+    assert_eq!(budget.usage().encoded_bytes, 12);
+    let remainder = session.try_reserve_encoded(4).unwrap().unwrap();
+    assert_eq!(budget.usage().encoded_bytes, 16);
+    drop((session, first));
+    assert_eq!(budget.usage().encoded_bytes, 4);
+    assert!(budget.try_open_session().is_err());
+    drop(remainder);
+    assert_eq!(budget.usage().encoded_bytes, 0);
+    assert_eq!(budget.usage().sessions, 0);
+}
+
 #[tokio::test]
 async fn chunks_reject_incomplete_or_wrong_pool_reservations() {
     let budget = one_session();

@@ -57,7 +57,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let started = Instant::now();
         let decode_frequencies = decode
             .config
-            .managed_rotary_frequencies(&self.host)
+            .managed_rotary_frequencies(self.execution_host())
             .map_err(process)?;
         let decode_rotary_us = elapsed_us(started);
         let mappings = config
@@ -75,12 +75,18 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map_err(process)?;
         let initial_time = decode
             .config
-            .managed_time_features(&self.host, first.timestep().as_f32())
+            .managed_time_features(self.execution_host(), first.timestep().as_f32())
             .map_err(process)?;
         let run = id(format!("run.image.{job}.denoise.prefix")).map_err(process)?;
         let request = id(format!("request.image.{job}.denoise.prefix")).map_err(process)?;
-        let (prefill, weights, temporary_weights) =
+        let (mut prefill, weights, temporary_weights) =
             self.start_prefix_prefill(prefill, job, stages)?;
+        if let Err(error) = prefill
+            .session
+            .set_output_host_account(self.execution_host().clone())
+        {
+            return Err(prefill.processing(error.into()));
+        }
         let mut owners = Owners {
             prefill: Some(prefill),
             decode: None,
@@ -94,7 +100,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 owners.weights.as_ref().unwrap(),
             )?);
             let started = Instant::now();
-            let request_session = owners
+            let mut request_session = owners
                 .decode
                 .as_ref()
                 .unwrap()
@@ -105,13 +111,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     vec![sample.clone(), initial_time, decode_frequencies.clone()],
                 )
                 .map_err(|source| ImageGenerationFailure::RequestExecution { source })?;
+            request_session
+                .set_output_host_account(self.execution_host().clone())
+                .map_err(|source| ImageGenerationFailure::RequestExecution { source })?;
             let request_begin_us = elapsed_us(started);
             owners.request = Some(request_session);
             let initial_inputs = vec![
                 sample.clone(),
                 text,
                 config
-                    .managed_time_features(&self.host, first.timestep().as_f32())
+                    .managed_time_features(self.execution_host(), first.timestep().as_f32())
                     .map_err(process)?,
                 frequencies,
                 reference,
@@ -144,7 +153,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             while let Some(step) = solver.current_step() {
                 let time = decode
                     .config
-                    .managed_time_features(&self.host, step.timestep().as_f32())
+                    .managed_time_features(self.execution_host(), step.timestep().as_f32())
                     .map_err(process)?;
                 let started = Instant::now();
                 let output = owners.request.as_mut().unwrap().execute_on_actor(

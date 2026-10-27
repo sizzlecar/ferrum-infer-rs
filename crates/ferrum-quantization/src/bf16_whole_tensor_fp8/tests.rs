@@ -6,6 +6,8 @@ use safetensors::Dtype;
 
 #[path = "amax_tests.rs"]
 mod amax_tests;
+#[path = "host_budget_tests.rs"]
+mod host_budget_tests;
 #[path = "host_cache_tests.rs"]
 mod host_cache_tests;
 #[path = "lookup_tests.rs"]

@@ -20,6 +20,8 @@ use half::bf16;
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use serde_json::json;
 
+#[path = "vnext_component_session/output_host.rs"]
+mod output_host;
 #[path = "vnext_component_session/request_state.rs"]
 mod request_state;
 #[path = "vnext_component_session/shared_weights.rs"]

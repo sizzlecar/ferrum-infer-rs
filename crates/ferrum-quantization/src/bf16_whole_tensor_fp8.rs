@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
 mod conversion;
+mod host_budget;
 mod host_cache;
 mod lookup;
 mod plan;
@@ -90,6 +91,7 @@ impl Bf16WholeTensorFp8Materializer {
                 include_bytes!("bf16_whole_tensor_fp8.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/plan.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/conversion.rs"),
+                include_bytes!("bf16_whole_tensor_fp8/host_budget.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/lookup.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/timing.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/host_cache.rs"),
@@ -233,16 +235,48 @@ impl WeightMaterializer for Bf16WholeTensorFp8Materializer {
         sources: &[&WeightComponentSpec],
         outputs: &[&WeightComponentSpec],
     ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
-        match &self.host_cache {
-            Some(cache) => conversion::materialize_with_cache(
-                &self.host,
-                source,
-                sources,
-                outputs,
-                Some(cache),
-            ),
-            None => conversion::materialize(&self.host, source, sources, outputs),
+        self.materialize_components_with_host(source, sources, outputs, &self.host)
+    }
+    fn materialize_components_with_host<'source>(
+        &self,
+        source: &'source dyn WeightComponentSource,
+        sources: &[&WeightComponentSpec],
+        outputs: &[&WeightComponentSpec],
+        host: &HostMemoryAccount,
+    ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+        if !self.host.same_parent(host) {
+            return Err(invalid("invocation Host account has a different parent"));
         }
+        match &self.host_cache {
+            Some(cache) => {
+                conversion::materialize_with_cache(host, source, sources, outputs, Some(cache))
+            }
+            None => conversion::materialize(host, source, sources, outputs),
+        }
+    }
+    fn additional_host_backing_bytes(
+        &self,
+        family: &PreparedModelFamily,
+        source: Option<&dyn WeightComponentSource>,
+    ) -> Result<usize, VNextError> {
+        host_budget::additional(
+            &self.host,
+            &plan::prepare(family, &self.groups)?,
+            self.host_cache.as_ref(),
+            source,
+        )
+    }
+    fn prepare_host_backing(
+        &self,
+        family: &PreparedModelFamily,
+        source: Option<&dyn WeightComponentSource>,
+    ) -> Result<HostBackingPreparation, VNextError> {
+        host_budget::prepare(
+            &self.host,
+            &plan::prepare(family, &self.groups)?,
+            self.host_cache.as_ref(),
+            source,
+        )
     }
 }
 

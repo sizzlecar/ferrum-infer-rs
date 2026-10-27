@@ -216,6 +216,22 @@ impl OutputSession {
         self.reserve(BufferKind::Encoded, bytes).await
     }
 
+    /// Admit a known encoded response before producer work, without parking a
+    /// waiter or retaining partial credit when the shared pool is full.
+    pub fn try_reserve_encoded(&self, bytes: usize) -> Result<Option<OutputBytesLease>> {
+        let pool = self.pool(BufferKind::Encoded, bytes)?;
+        match pool.try_acquire_many_owned(bytes as u32) {
+            Ok(permit) => Ok(Some(OutputBytesLease {
+                _session: self.clone(),
+                _permit: Some(permit),
+                bytes,
+                kind: BufferKind::Encoded,
+            })),
+            Err(TryAcquireError::NoPermits) => Ok(None),
+            Err(TryAcquireError::Closed) => Err(exhausted("output encoding budget is closed")),
+        }
+    }
+
     /// One bounded error per session, independent of normal data credit. It
     /// cannot be recycled into an unlimited sequence of control frames.
     pub fn try_reserve_error(&self, bytes: usize) -> Result<OutputBytesLease> {
