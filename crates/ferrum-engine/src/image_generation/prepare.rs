@@ -7,7 +7,9 @@ pub(super) struct PreparedPrefixDecode<R: DeviceRuntime> {
 }
 
 pub(super) struct PreparedRequest<R: DeviceRuntime> {
+    pub plan_cache_candidate: Option<super::plan_cache::PendingCandidatePlanCache<R>>,
     pub host_scope: Option<ferrum_runtime::HostMemoryScope>,
+    pub host_budget: super::host_budget::ExecutionHostBudget,
     pub host_backing: Vec<ferrum_runtime::HostBackingPreparation>,
     pub prompts: QwenImage21T2iPromptBatch,
     pub request_order: BatchOrder,
@@ -84,6 +86,17 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         &self,
         requests: &[ImageGenerationRequest],
         edit: Option<super::editing::EditInputs>,
+    ) -> anyhow::Result<PreparedRequest<R>> {
+        self.prepare_batch_with_host_admission(requests, edit, true)
+    }
+
+    /// Serving retains compiled plans while waiting for independently owned
+    /// output backings. Preparing those plans does not spend execution credit.
+    pub(super) fn prepare_batch_with_host_admission(
+        &self,
+        requests: &[ImageGenerationRequest],
+        edit: Option<super::editing::EditInputs>,
+        reserve_host: bool,
     ) -> anyhow::Result<PreparedRequest<R>> {
         let candidate_cache = self.plan_cache.begin_candidate()?;
         let prepare_started = std::time::Instant::now();
@@ -257,7 +270,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             "image batch plans prepared"
         );
         let mut prepared = PreparedRequest {
+            plan_cache_candidate: None,
             host_scope: None,
+            host_budget: Default::default(),
             host_backing: Vec::new(),
             prompts,
             request_order,
@@ -271,8 +286,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             decode_stage,
             edit,
         };
-        prepared.host_scope = Some(self.reserve_execution_host(&mut prepared)?);
-        candidate_cache.commit();
+        self.prepare_execution_host(&mut prepared)?;
+        if reserve_host {
+            prepared.host_scope = Some(self.reserve_execution_host(&prepared)?);
+        }
+        prepared.plan_cache_candidate = Some(candidate_cache.defer()?);
         Ok(prepared)
     }
 

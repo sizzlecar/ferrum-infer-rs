@@ -1,6 +1,9 @@
 use super::ServerError;
 use axum::body::Bytes;
 use base64::{engine::general_purpose::STANDARD, write::EncoderWriter};
+use ferrum_engine::image_generation::service::{
+    ImageOutputGate, ImageOutputGateError, ImageOutputLease,
+};
 use ferrum_models::qwen_image21::pipeline_adapters::QwenImage21RgbaOutput;
 use ferrum_output::{
     png::{encoded_rgba8_png_bytes, write_rgba8_png, PngDimensions, PngLimits},
@@ -29,9 +32,139 @@ impl AsRef<[u8]> for EncodedImage {
     }
 }
 
-/// One request's known response bound, reserved before generation submission.
-/// Only small metadata is allocated here. Scratch and JSON consume this credit
-/// later, while other parent consumers see it as unavailable.
+/// Queue metadata owns a small session permit, never a full frame reservation.
+/// The scheduler acquires the complete encoding grant only for a selected job.
+pub(super) struct ResponseGate {
+    session: OutputSession,
+    host: HostMemoryAccount,
+    dimensions: PngDimensions,
+    limits: PngLimits,
+    scratch_bytes: usize,
+    created: i64,
+    count: usize,
+    physical_bytes: usize,
+}
+
+impl ResponseGate {
+    pub(super) fn new(
+        session: OutputSession,
+        host: HostMemoryAccount,
+        dimensions: PngDimensions,
+        limits: PngLimits,
+        scratch_bytes: usize,
+    ) -> Result<Self, ServerError> {
+        let png_bytes = encoded_rgba8_png_bytes(dimensions, limits).map_err(internal)?;
+        let created = chrono::Utc::now().timestamp();
+        let count = response_bytes(png_bytes, created)
+            .ok_or_else(|| capacity("encoded image length exceeds the host address space"))?;
+        if count > session.config().max_event_bytes || count > session.config().encoded_bytes_total
+        {
+            return Err(capacity("encoded image exceeds configured output limit"));
+        }
+        let physical = host
+            .backing_bytes(scratch_bytes)
+            .map_err(capacity)?
+            .checked_add(host.backing_bytes(count).map_err(capacity)?)
+            .ok_or_else(|| capacity("encoded image backing exceeds the host address space"))?;
+        host.check_scope_capacity(&[(HostMemoryClass::Output, physical)])
+            .map_err(capacity)?;
+        Ok(Self {
+            session,
+            host,
+            dimensions,
+            limits,
+            scratch_bytes,
+            created,
+            count,
+            physical_bytes: physical,
+        })
+    }
+
+    /// An observed shortage is temporary. The preliminary Host check prevents
+    /// repeated acquire/rollback notifications while one pool remains full;
+    /// only the subsequent actual reservations authorize any encoding bytes.
+    fn try_admit(&self) -> Result<Option<Admission>, ServerError> {
+        if self.session.is_closed() {
+            return Err(internal("output budget is closed"));
+        }
+        let demand = [(HostMemoryClass::Output, self.physical_bytes)];
+        if let Err(error) = self.host.check_scope_admission(&demand) {
+            return if error.is_temporary_capacity() {
+                self.wait_for_external_output(&demand)
+            } else {
+                Err(internal(error))
+            };
+        }
+        let Some(lease) = self
+            .session
+            .try_reserve_encoded(self.count)
+            .map_err(internal)?
+        else {
+            return Ok(None);
+        };
+        let scope = match self.host.reserve_scope(&demand) {
+            Ok(scope) => scope,
+            Err(ferrum_runtime::HostMemoryError::Capacity { .. }) => {
+                return self.wait_for_external_output(&demand)
+            }
+            Err(error) => return Err(internal(error)),
+        };
+        Ok(Some(Admission {
+            session: self.session.clone(),
+            scope,
+            lease,
+            dimensions: self.dimensions,
+            limits: self.limits,
+            scratch_bytes: self.scratch_bytes,
+            created: self.created,
+            count: self.count,
+        }))
+    }
+
+    fn wait_for_external_output(
+        &self,
+        demand: &[(HostMemoryClass, usize)],
+    ) -> Result<Option<Admission>, ServerError> {
+        // No own Host grant exists yet. If releasing every external Output
+        // owner still cannot fit this frame, waiting on output would deadlock
+        // behind queued Input or retained Weight allocations.
+        self.host
+            .check_scope_after_output_release(demand, 0)
+            .map_err(|error| match error {
+                ferrum_runtime::HostMemoryError::Capacity { .. } => capacity(error),
+                other => internal(other),
+            })?;
+        Ok(None)
+    }
+}
+
+impl ImageOutputGate for ResponseGate {
+    fn host_output_bytes(&self, host: &HostMemoryAccount) -> usize {
+        if self.host.same_parent(host) {
+            self.physical_bytes
+        } else {
+            0
+        }
+    }
+
+    fn try_acquire(&self) -> Result<Option<ImageOutputLease>, ImageOutputGateError> {
+        self.try_admit()
+            .map(|admission| admission.map(ImageOutputLease::new))
+            .map_err(|error| match error {
+                ServerError::CapacityExceeded(message) => ImageOutputGateError::Capacity(message),
+                other => ImageOutputGateError::Failed(format!("{other:?}")),
+            })
+    }
+
+    fn subscribe_capacity(&self, waker: std::task::Waker) -> ImageOutputLease {
+        ImageOutputLease::new((
+            self.host.subscribe_capacity(waker.clone()),
+            self.session.subscribe_capacity(waker),
+        ))
+    }
+}
+
+/// This actual execution grant follows the generated output to the HTTP body.
 pub(super) struct Admission {
     session: OutputSession,
     scope: HostMemoryScope,
@@ -44,6 +177,7 @@ pub(super) struct Admission {
 }
 
 impl Admission {
+    #[cfg(test)]
     pub(super) fn new(
         session: OutputSession,
         host: HostMemoryAccount,
@@ -51,37 +185,9 @@ impl Admission {
         limits: PngLimits,
         scratch_bytes: usize,
     ) -> Result<Self, ServerError> {
-        let png_bytes = encoded_rgba8_png_bytes(dimensions, limits).map_err(internal)?;
-        let created = chrono::Utc::now().timestamp();
-        let count = response_bytes(png_bytes, created)
-            .ok_or_else(|| capacity("encoded image length exceeds the host address space"))?;
-        if count > session.config().max_event_bytes {
-            return Err(capacity("encoded image exceeds configured output limit"));
-        }
-        let physical = host
-            .backing_bytes(scratch_bytes)
-            .map_err(capacity)?
-            .checked_add(host.backing_bytes(count).map_err(capacity)?)
-            .ok_or_else(|| capacity("encoded image backing exceeds the host address space"))?;
-        let scope = host
-            .reserve_scope(&[(HostMemoryClass::Output, physical)])
-            .map_err(capacity)?;
-        // Do not enqueue a second HTTP waiting room. Admission is immediate
-        // and atomic; successful leases survive the response body.
-        let lease = session
-            .try_reserve_encoded(count)
-            .map_err(capacity)?
-            .ok_or_else(|| capacity("encoded output budget is currently full"))?;
-        Ok(Self {
-            session,
-            scope,
-            lease,
-            dimensions,
-            limits,
-            scratch_bytes,
-            created,
-            count,
-        })
+        ResponseGate::new(session, host, dimensions, limits, scratch_bytes)?
+            .try_admit()?
+            .ok_or_else(|| capacity("selected test request has no current output grant"))
     }
 
     pub(super) fn session(&self) -> OutputSession {

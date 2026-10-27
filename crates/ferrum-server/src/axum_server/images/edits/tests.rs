@@ -309,9 +309,8 @@ async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
     assert!(png.len() > rgba_bytes);
     assert!(png.len() <= encoded_limit);
     let held_output = host.reserve(HostMemoryClass::Output, output_bytes).unwrap();
-    let response = router
-        .clone()
-        .oneshot(
+    let waiting = tokio::spawn(
+        router.clone().oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/images/edits")
@@ -322,16 +321,32 @@ async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
                     ("image", &png, true),
                 ])))
                 .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        ),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while images.service().snapshot().pending_requests == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(images.service().snapshot().pending_requests, 0);
-    assert_eq!(images.output_usage().sessions, 0);
+    assert!(!waiting.is_finished());
+    assert_eq!(images.output_usage().sessions, 1);
     assert_eq!(images.output_usage().encoded_bytes, 0);
+    // Cancellation removes this cheap pending job even while output stays full.
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while images.service().snapshot().pending_requests != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(images.output_usage().sessions, 0);
     assert_eq!(host.usage().unwrap().committed_bytes(), output_bytes);
-    drop((held_output, response));
+    drop(held_output);
     let mut crc = png.clone();
     crc[29] ^= 1;
     let mut pixels = png.clone();

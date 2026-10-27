@@ -68,6 +68,7 @@ uuid = { workspace = true }
 config = { workspace = true }
 
 [dev-dependencies]
+ferrum-kernels = { workspace = true }
 png = "=0.18.1"
 ferrum-execution = { workspace = true }
 ferrum-testkit = { workspace = true }

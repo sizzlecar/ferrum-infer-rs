@@ -119,6 +119,26 @@ pub struct ImageGeneratorCapabilities {
     pub dimension_multiple: u32,
 }
 
+/// Already-held protocol-independent resources that overlap engine execution.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ImagePreparationResources {
+    pub output_credit_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+pub enum ImageRequestRef<'a> {
+    Generate(&'a ImageGenerationRequest),
+    Edit(&'a ImageEditRequest),
+}
+impl ImageRequestRef<'_> {
+    fn generation(&self) -> &ImageGenerationRequest {
+        match self {
+            Self::Generate(request) => request,
+            Self::Edit(request) => &request.generation,
+        }
+    }
+}
+
 /// Implementations own their runtime and use one Host account for all jobs.
 /// Successful outputs correspond exactly to input order. Fatal errors must
 /// retain their original cleanup/recovery owners; formatting them is not a
@@ -126,6 +146,15 @@ pub struct ImageGeneratorCapabilities {
 /// remains usable and no recovery obligation exists. Compatibility must be deterministic and may
 /// only restrict the common width/height grouping enforced by this service.
 pub trait ImageGenerator: Send + 'static {
+    /// Exact physical Output peak from typed request/model metadata. This runs
+    /// before plan compilation to select a currently affordable FIFO prefix.
+    /// Legacy generators may leave the extra proof unavailable.
+    fn execution_output_bytes(
+        &self,
+        _requests: &[ImageRequestRef<'_>],
+    ) -> Result<Option<usize>, ImageBatchError> {
+        Ok(None)
+    }
     /// Bound the retained preprocessed reference before allocating it. The
     /// queue reserves this many waiting bytes across preparation and requeue.
     fn edit_preparation_bytes(
@@ -153,6 +182,16 @@ pub trait ImageGenerator: Send + 'static {
         _requests: &[(&ImageEditRequest, &ImageEditPreparation)],
     ) -> Result<ImageBatchPreparation, ImageBatchError> {
         Ok(ImageBatchPreparation::default())
+    }
+    /// Obtain execution credit for an already compiled preparation. `false`
+    /// means externally held output capacity can be released; the same token
+    /// remains valid for a later retry, without compiling or decoding again.
+    fn try_admit_prepared(
+        &mut self,
+        _prepared: &mut ImageBatchPreparation,
+        _resources: ImagePreparationResources,
+    ) -> Result<bool, ImageBatchError> {
+        Ok(true)
     }
     fn execute_generation(
         &mut self,
@@ -229,6 +268,21 @@ pub trait ImageGenerator: Send + 'static {
 }
 
 impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
+    fn execution_output_bytes(
+        &self,
+        requests: &[ImageRequestRef<'_>],
+    ) -> Result<Option<usize>, ImageBatchError> {
+        self.service_execution_output_bytes(requests)
+            .map(Some)
+            .map_err(preparation_error)
+    }
+    fn try_admit_prepared(
+        &mut self,
+        prepared: &mut ImageBatchPreparation,
+        resources: ImagePreparationResources,
+    ) -> Result<bool, ImageBatchError> {
+        self.try_admit_service_prepared(prepared, &resources)
+    }
     fn prepare_generation(
         &mut self,
         requests: &[ImageGenerationRequest],
@@ -551,9 +605,40 @@ impl ImageService {
         request: ImageGenerationRequest,
     ) -> Result<ImageJob, ImageServiceError> {
         self.validate_request(&request)?;
+        self.core.try_submit(request).map(|inner| ImageJob {
+            inner,
+            output: None,
+        })
+    }
+
+    /// Queue only the request and gate metadata. Output credit is acquired by
+    /// the worker for the executable FIFO prefix, immediately before prepare.
+    pub fn try_submit_with_output(
+        &self,
+        request: ImageGenerationRequest,
+        gate: Arc<dyn ImageOutputGate>,
+    ) -> Result<ImageJob, ImageServiceError> {
+        self.validate_request(&request)?;
+        self.submit_with_output(QueuedRequest::Generate(request), gate)
+    }
+
+    fn submit_with_output(
+        &self,
+        request: QueuedRequest,
+        gate: Arc<dyn ImageOutputGate>,
+    ) -> Result<ImageJob, ImageServiceError> {
+        let (response, receiver) = oneshot::channel();
+        let output = QueuedOutput {
+            gate,
+            lease: None,
+            response,
+        };
         self.core
-            .try_submit(request)
-            .map(|inner| ImageJob { inner })
+            .try_submit_request_with_output(request, Some(output))
+            .map(|inner| ImageJob {
+                inner,
+                output: Some(receiver),
+            })
     }
 
     pub fn validate_edit_request(
@@ -582,7 +667,19 @@ impl ImageService {
         self.validate_edit_request(&request)?;
         self.core
             .try_submit_request(QueuedRequest::Edit(request, None))
-            .map(|inner| ImageJob { inner })
+            .map(|inner| ImageJob {
+                inner,
+                output: None,
+            })
+    }
+
+    pub fn try_submit_edit_with_output(
+        &self,
+        request: ImageEditRequest,
+        gate: Arc<dyn ImageOutputGate>,
+    ) -> Result<ImageJob, ImageServiceError> {
+        self.validate_edit_request(&request)?;
+        self.submit_with_output(QueuedRequest::Edit(request, None), gate)
     }
 
     /// Stops admission, discards queued requests, lets active work reach its
@@ -598,6 +695,7 @@ impl ImageService {
 
 pub struct ImageJob {
     inner: Job<ImageGenerationOutput>,
+    output: Option<oneshot::Receiver<ImageOutputLease>>,
 }
 impl ImageJob {
     /// Cancellation suppresses delivery, not active backend execution.
@@ -606,6 +704,24 @@ impl ImageJob {
     }
     pub async fn wait(self) -> Result<ImageGenerationOutput, ImageServiceError> {
         self.inner.wait().await
+    }
+    pub async fn wait_with_output(
+        self,
+    ) -> Result<(ImageGenerationOutput, ImageOutputLease), ImageServiceError> {
+        let output = self.inner.wait().await?;
+        let receiver = self.output.ok_or_else(|| {
+            service_error(
+                ImageServiceErrorKind::Generation,
+                "image job has no output admission gate",
+            )
+        })?;
+        let lease = receiver.await.map_err(|_| {
+            service_error(
+                ImageServiceErrorKind::Generation,
+                "image output admission owner was not delivered",
+            )
+        })?;
+        Ok((output, lease))
     }
 }
 
@@ -698,6 +814,12 @@ fn validate_config(
 // outputs; production fixes the output to the managed image artifact above.
 trait BatchWorker: Send + 'static {
     type Output: Send + 'static;
+    fn execution_output_bytes(
+        &self,
+        _requests: &[&QueuedRequest],
+    ) -> Result<Option<usize>, ImageBatchError> {
+        Ok(None)
+    }
     fn preparation_bytes(&self, _request: &QueuedRequest) -> Result<usize, ImageBatchError> {
         Ok(0)
     }
@@ -706,6 +828,13 @@ trait BatchWorker: Send + 'static {
         _requests: &mut [&mut QueuedRequest],
     ) -> Result<ImageBatchPreparation, ImageBatchError> {
         Ok(ImageBatchPreparation::default())
+    }
+    fn try_admit_prepared(
+        &mut self,
+        _prepared: &mut ImageBatchPreparation,
+        _resources: ImagePreparationResources,
+    ) -> Result<bool, ImageBatchError> {
+        Ok(true)
     }
     fn execute(
         &mut self,
@@ -769,6 +898,26 @@ trait BatchWorker: Send + 'static {
 struct GeneratorAdapter<P>(P);
 impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
     type Output = ImageGenerationOutput;
+    fn execution_output_bytes(
+        &self,
+        requests: &[&QueuedRequest],
+    ) -> Result<Option<usize>, ImageBatchError> {
+        let requests: Vec<_> = requests
+            .iter()
+            .map(|request| match request {
+                QueuedRequest::Generate(request) => ImageRequestRef::Generate(request),
+                QueuedRequest::Edit(request, _) => ImageRequestRef::Edit(request),
+            })
+            .collect();
+        self.0.execution_output_bytes(&requests)
+    }
+    fn try_admit_prepared(
+        &mut self,
+        prepared: &mut ImageBatchPreparation,
+        resources: ImagePreparationResources,
+    ) -> Result<bool, ImageBatchError> {
+        self.0.try_admit_prepared(prepared, resources)
+    }
     fn preparation_bytes(&self, request: &QueuedRequest) -> Result<usize, ImageBatchError> {
         match request {
             QueuedRequest::Generate(_) => Ok(0),
@@ -999,6 +1148,7 @@ struct Queued<O> {
     submitted: Instant,
     cancelled: Arc<AtomicBool>,
     response: oneshot::Sender<Result<O, ImageServiceError>>,
+    output: Option<QueuedOutput>,
     _prompt_reservation: Option<HostMemoryReservation>,
     preprocessing_bytes: usize,
     preparation_duration: Duration,
@@ -1026,6 +1176,7 @@ struct State<O> {
 struct Shared<O> {
     state: Mutex<State<O>>,
     changed: Condvar,
+    resources: Arc<ResourceSignal>,
     config: ImageServiceConfig,
     host: Option<HostMemoryAccount>,
 }
@@ -1038,6 +1189,7 @@ impl<O> Shared<O> {
         state.accepting = false;
         state.closing = true;
         self.changed.notify_all();
+        self.resources.notify();
     }
 }
 struct Job<O> {
@@ -1049,6 +1201,7 @@ impl<O> Job<O> {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.shared.changed.notify_all();
+        self.shared.resources.notify();
     }
     async fn wait(mut self) -> Result<O, ImageServiceError> {
         match self.receiver.take() {
@@ -1113,6 +1266,7 @@ impl<O: Send + 'static> ServiceCore<O> {
                 capacity_reductions: 0,
             }),
             changed: Condvar::new(),
+            resources: Arc::new(ResourceSignal::default()),
             config,
             host,
         });
@@ -1160,6 +1314,13 @@ impl<O: Send + 'static> ServiceCore<O> {
         self.try_submit_request(QueuedRequest::Generate(request))
     }
     fn try_submit_request(&self, request: QueuedRequest) -> Result<Job<O>, ImageServiceError> {
+        self.try_submit_request_with_output(request, None)
+    }
+    fn try_submit_request_with_output(
+        &self,
+        request: QueuedRequest,
+        output: Option<QueuedOutput>,
+    ) -> Result<Job<O>, ImageServiceError> {
         let mut state = self.shared.lock();
         prune_cancelled(&mut state.queue);
         if !state.accepting {
@@ -1214,6 +1375,7 @@ impl<O: Send + 'static> ServiceCore<O> {
             submitted: Instant::now(),
             cancelled: cancelled.clone(),
             response,
+            output,
             _prompt_reservation: prompt_reservation,
             preprocessing_bytes: 0,
             preparation_duration: Duration::ZERO,
@@ -1300,7 +1462,11 @@ fn reject_pending<O>(state: &mut State<O>, kind: ImageServiceErrorKind) {
     }
 }
 
+mod output_budget;
+mod output_gate;
 mod preparation;
+pub use output_gate::{ImageOutputGate, ImageOutputGateError, ImageOutputLease};
+use output_gate::{QueuedOutput, ResourceSignal};
 mod scheduler;
 use scheduler::worker_loop;
 
@@ -1310,6 +1476,8 @@ mod auto_tests;
 mod edit_auto_tests;
 #[cfg(test)]
 mod edit_tests;
+#[cfg(test)]
+mod output_gate_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -83,6 +83,15 @@ type GenerationPreparation<R> = BoundPreparation<PreparedRequest<R>, GenerationI
 type EditBatchPreparation<R> = BoundPreparation<PreparedRequest<R>, EditIdentity>;
 type EditInputPreparation = BoundPreparation<QwenImage21ConditionInputs, EditIdentity>;
 
+fn validate_output_budget(expected: usize, actual: usize) -> Result<(), ImageBatchError> {
+    if expected != actual {
+        return Err(ImageBatchError::Rejected(format!(
+            "image output demand differs between metadata and compiled plan: {expected} != {actual}"
+        )));
+    }
+    Ok(())
+}
+
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     fn validate_service_availability(&self) -> Result<(), ImageBatchError> {
         if self.is_stopped() {
@@ -102,7 +111,18 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     ) -> Result<ImageBatchPreparation, ImageBatchError> {
         self.validate_service_availability()?;
         let identities = requests.iter().map(GenerationIdentity::from).collect();
-        let prepared = self.prepare_batch(requests).map_err(preparation_error)?;
+        let output_bytes = self
+            .service_execution_output_bytes(
+                &requests
+                    .iter()
+                    .map(ImageRequestRef::Generate)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(preparation_error)?;
+        let prepared = self
+            .prepare_batch_with_host_admission(requests, None, false)
+            .map_err(preparation_error)?;
+        validate_output_budget(output_bytes, prepared.host_budget.output)?;
         Ok(ImageBatchPreparation::new(BoundPreparation::new(
             &self.service_preparation_identity,
             identities,
@@ -159,6 +179,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         requests: &[(&ImageEditRequest, &ImageEditPreparation)],
     ) -> Result<ImageBatchPreparation, ImageBatchError> {
         self.validate_service_availability()?;
+        let output_bytes = self
+            .service_execution_output_bytes(
+                &requests
+                    .iter()
+                    .map(|(request, _)| ImageRequestRef::Edit(request))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(preparation_error)?;
         let mut identities = Vec::with_capacity(requests.len());
         let mut inputs = Vec::with_capacity(requests.len());
         for (request, input) in requests {
@@ -195,13 +223,72 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map(|(request, _)| request.generation.clone())
             .collect();
         let prepared = self
-            .prepare_preprocessed_edits(&generation, &inputs)
+            .prepare_preprocessed_edits_with_host_admission(&generation, &inputs, false)
             .map_err(preparation_error)?;
+        validate_output_budget(output_bytes, prepared.host_budget.output)?;
         Ok(ImageBatchPreparation::new(BoundPreparation::new(
             &self.service_preparation_identity,
             identities,
             prepared,
         )))
+    }
+
+    /// Retain one validated plan and its immutable weight owners while waiting
+    /// for output backings belonging to earlier executions to be consumed.
+    /// Queue inputs, pinned weights and this candidate's encoding grant cannot
+    /// make progress independently; their combined hard boundary is checked
+    /// before returning a temporary shortage.
+    pub(super) fn try_admit_service_prepared(
+        &mut self,
+        prepared: &mut ImageBatchPreparation,
+        resources: &ImagePreparationResources,
+    ) -> Result<bool, ImageBatchError> {
+        self.validate_service_availability()?;
+        let owner = prepared.0.as_mut().ok_or_else(|| {
+            ImageBatchError::Rejected("image preparation belongs to another generator".into())
+        })?;
+        let payload = if owner.is::<GenerationPreparation<R>>() {
+            let bound = owner.downcast_mut::<GenerationPreparation<R>>().unwrap();
+            if !Arc::ptr_eq(&self.service_preparation_identity, &bound.pipeline) {
+                return Err(ImageBatchError::Rejected(
+                    "image preparation belongs to another pipeline".into(),
+                ));
+            }
+            &mut bound.payload
+        } else if let Some(bound) = owner.downcast_mut::<EditBatchPreparation<R>>() {
+            if !Arc::ptr_eq(&self.service_preparation_identity, &bound.pipeline) {
+                return Err(ImageBatchError::Rejected(
+                    "edit preparation belongs to another pipeline".into(),
+                ));
+            }
+            &mut bound.payload
+        } else {
+            return Err(ImageBatchError::Rejected(
+                "image preparation belongs to another generator".into(),
+            ));
+        };
+        if payload.host_scope.is_some() {
+            return Ok(true);
+        }
+        let claims = payload.host_budget.claims();
+        self.host
+            .check_scope_after_output_release(&claims, resources.output_credit_bytes)
+            .map_err(|error| preparation_error(error.into()))?;
+        match self.host.reserve_scope(&claims) {
+            Ok(scope) => {
+                payload.host_scope = Some(scope);
+                Ok(true)
+            }
+            Err(error) if error.is_temporary_capacity() => {
+                // Queue admission can race the first snapshot. Recheck the
+                // non-releasable owners before parking on output consumption.
+                self.host
+                    .check_scope_after_output_release(&claims, resources.output_credit_bytes)
+                    .map_err(|error| preparation_error(error.into()))?;
+                Ok(false)
+            }
+            Err(error) => Err(preparation_error(error.into())),
+        }
     }
 
     pub(super) fn execute_service_generation(

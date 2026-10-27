@@ -122,6 +122,7 @@ fn run(fail_preparation: bool) -> (Capture, Arc<Shared<u64>>, Retirement<u64>) {
             submitted: Instant::now(),
             cancelled: Arc::new(AtomicBool::new(false)),
             response,
+            output: None,
             _prompt_reservation: None,
             preprocessing_bytes: 0,
             preparation_duration: Duration::ZERO,
@@ -142,6 +143,7 @@ fn run(fail_preparation: bool) -> (Capture, Arc<Shared<u64>>, Retirement<u64>) {
             capacity_reductions: 0,
         }),
         changed: Condvar::new(),
+        resources: Arc::new(ResourceSignal::default()),
         config: ImageServiceConfig {
             batching: ImageBatchPolicy::Auto,
             maximum_pending: 3,

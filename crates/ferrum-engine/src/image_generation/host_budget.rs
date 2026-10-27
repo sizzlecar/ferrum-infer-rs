@@ -25,12 +25,22 @@ impl ExecutionHostBudget {
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
-    pub(super) fn reserve_execution_host(
+    pub(super) fn prepare_execution_host(
         &self,
         prepared: &mut PreparedRequest<R>,
-    ) -> anyhow::Result<HostMemoryScope> {
+    ) -> anyhow::Result<()> {
         let (budget, backing) = self.execution_host_budget(prepared)?;
+        self.host.check_scope_capacity(&budget.claims())?;
+        prepared.host_budget = budget;
         prepared.host_backing = backing;
+        Ok(())
+    }
+
+    pub(super) fn reserve_execution_host(
+        &self,
+        prepared: &PreparedRequest<R>,
+    ) -> anyhow::Result<HostMemoryScope> {
+        let budget = prepared.host_budget;
         tracing::debug!(?budget, "image complete execution Host grant");
         Ok(self.host.reserve_scope(&budget.claims())?)
     }

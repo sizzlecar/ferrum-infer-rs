@@ -114,7 +114,7 @@ HTTP: `POST /v1/images/generations` (JSON) and `POST /v1/images/edits` (multipar
 
 CUDA directory serving uses automatic image batching: an idle GPU starts available work immediately; compatible requests accumulated during execution form the next batch. No batch or gathering-delay option is required. `--max-num-seqs` optionally tightens the model/operator batch ceiling; it does not reserve that many images or select a fixed batch size. Capacity is checked before execution, and oversized candidates are reduced only on an explicit capacity rejection. Scheduling occurs between complete batches, so a large image can delay a later small image.
 
-The CUDA directory preset admits output sizes up to 2048×2048 subject to managed capacity; the Metal preset retains its 1024×1024 bound and configured scheduling. `ferrum run` directly executes one request. Pending requests are bounded by count and Host bytes (one half of the Host input allowance by default); overload returns HTTP 429. The effective policy, limits, rejection count and actual batch counters are exposed in `/health` under `images.scheduler`.
+The CUDA directory preset admits output sizes up to 2048×2048 subject to managed capacity; the Metal preset retains its 1024×1024 bound and configured scheduling. `ferrum run` directly executes one request. Pending requests are bounded by count and Host bytes (one half of the Host input allowance by default); exceeding queue admission limits returns HTTP 429. Queued requests retain small output metadata; complete encoding capacity is acquired only for the next executable batch. Temporary pressure from unread response bodies waits for capacity to return, while a single output exceeding an immutable limit is rejected. The effective policy, limits, rejection count and actual batch counters are exposed in `/health` under `images.scheduler`.
 
 Existing `--image-config` JSON keeps configured batching when `serving.batching` is omitted. Explicit JSON can select `"batching":"auto"` with `"request_batch_max_wait_ms":0`, and optionally set a positive `maximum_pending_bytes`. The historical measurements below used explicit resident service configurations; they do not establish the performance of automatic batching.
 
@@ -130,6 +130,18 @@ ferrum bench-images --endpoint http://127.0.0.1:8000/v1/images/generations \
 ```
 
 Resource monitoring is optional. Each warmup and measured round records its own process identity, physical GPU identity, sampling coverage, errors and observed peaks. Only complete measured windows contribute to aggregate peaks; every sampled peak remains a lower bound on the instantaneous peak. Linux process-tree RSS can count shared pages repeatedly. NVIDIA whole-device used memory includes other processes and driver allocations. Missing observations remain missing and make the command fail after saving the report. Boundary probes are outside request timers; periodic probes compete for CPU and driver resources during requests and can affect latency and throughput. Keep sampling settings identical in comparisons. For multiple sequential endpoints, provide one server PID per endpoint; repeat the GPU flag to sum explicitly selected physical devices.
+
+For local Ferrum lifecycle evidence, build the independent Rust example `probe_image_lifecycle`. It reads the same strict image dataset schema and a fixed prefix of samples; edit samples require `--edit-endpoint`. Keep datasets, reference PNGs and new report files outside the repository:
+
+```sh
+probe_image_lifecycle --endpoint http://127.0.0.1:8000/v1/images/generations \
+  --health-endpoint http://127.0.0.1:8000/health --model qwen-image \
+  --dataset /outside-repo/images-2k.json --output /outside-repo/hold-body.json \
+  --mode hold-body --requests 4 --hold-body-ms 15000 \
+  --observation-ms 60000 --request-timeout-ms 600000
+```
+
+`hold-body` obtains complete headers, waits without polling the body, then validates the PNG. `drop-body` instead drops that unread response after the wait. `cancel` drops the client request future after `--cancel-after-ms`; `observe-shutdown` records an externally controlled stop/restart, with optional `--recovery-delay-ms`. The probe never starts, stops or signals a service. Every mode records bounded `/health` scheduler/output/Host observations and issues normal recovery requests. Reports distinguish observed, not observed and failed findings; a client action alone does not prove server cancellation, disconnect handling or backpressure. Transport buffering can consume bytes while the application holds a body. HTTP 429, expected client actions and observed shutdown transport are counted separately; unexpected protocol, PNG or observation errors produce a failing exit after saving the report. Recovery success must be checked explicitly in the findings.
 
 ### Throughput vs vLLM-Omni
 

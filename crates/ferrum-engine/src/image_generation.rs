@@ -427,8 +427,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         })?;
         let mut stages = Vec::with_capacity(4);
         let mut steps = Vec::with_capacity(self.assets.schedule.evaluation_count());
-        let host_scope = prepared.host_scope.take().expect("prepared Host grant");
+        let host_scope = match prepared.host_scope.take() {
+            Some(scope) => scope,
+            None => self
+                .reserve_execution_host(&prepared)
+                .map_err(|error| empty_error(ImageGenerationFailure::Preflight(error)))?,
+        };
         let host_backing = std::mem::take(&mut prepared.host_backing);
+        if let Some(candidate) = prepared.plan_cache_candidate.take() {
+            candidate.commit();
+        }
         self.execution_host = Some(host_scope.account());
         let executed = self.run(prepared, &requests, job, &mut stages, &mut steps);
         self.execution_host = None;
@@ -522,6 +530,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             decode_stage,
             edit,
             host_scope: _,
+            plan_cache_candidate: _,
+            host_budget: _,
             host_backing: _,
         } = prepared;
         let process = |source| ImageGenerationFailure::Processing {

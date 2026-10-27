@@ -10,7 +10,7 @@ fn request() -> axum::http::Request<Body> {
 }
 
 #[tokio::test]
-async fn response_host_and_encoded_pressure_reject_before_queue_submission() {
+async fn single_output_hard_limit_rejects_but_temporary_encoded_pressure_waits() {
     for encoded_pressure in [false, true] {
         let host = HostMemoryAccount::new(
             HostMemoryLimits::new(
@@ -50,24 +50,63 @@ async fn response_host_and_encoded_pressure_reject_before_queue_submission() {
         )
         .build_router()
         .unwrap();
-        let response = router.oneshot(request()).await.unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        if encoded_pressure {
+            let handler = tokio::spawn(router.oneshot(request()));
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while images.service().snapshot().pending_requests == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!handler.is_finished());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                images.output_usage().encoded_bytes,
+                images.output.config().encoded_bytes_total
+            );
+            drop(encoded_owner.take());
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1); // Intentional fixture failure after wake.
+        } else {
+            let response = router.oneshot(request()).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
         assert_eq!(images.service().snapshot().pending_requests, 0);
         assert_eq!(images.service().snapshot().rejected_requests, 0);
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
         drop(encoded_owner);
         assert_eq!(images.output_usage().sessions, 0);
         assert_eq!(images.output_usage().encoded_bytes, 0);
-        images.shutdown().await.unwrap();
-        assert!(!images.take_shutdown().await.unwrap().has_failure());
+        assert_eq!(images.shutdown().await.is_err(), encoded_pressure);
+        assert_eq!(
+            images.take_shutdown().await.unwrap().has_failure(),
+            encoded_pressure
+        );
     }
 }
 
 #[tokio::test]
-async fn cancelling_handler_during_generation_returns_response_grant_and_credit() {
+async fn cancelling_handler_retains_active_grant_until_generation_is_quiescent() {
     let gate = Arc::new(GenerationGate::default());
     let (images, calls) = image_service_with_gate(Some(gate.clone()));
+    struct ReleaseOnDrop(Arc<GenerationGate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            *self.0.released.lock().unwrap() = true;
+            self.0.changed.notify_all();
+        }
+    }
+    let release = ReleaseOnDrop(gate.clone());
     let host = images.service().host_account().clone();
     let router = super::super::super::AxumServer::from_state(
         AppState::default().with_images(images.clone()),
@@ -92,17 +131,18 @@ async fn cancelling_handler_during_generation_returns_response_grant_and_credit(
     );
     handler.abort();
     assert!(handler.await.unwrap_err().is_cancelled());
-    assert_eq!(images.output_usage().sessions, 0);
-    assert_eq!(images.output_usage().encoded_bytes, 0);
-    assert_eq!(
+    assert_eq!(images.output_usage().sessions, 1);
+    assert!(images.output_usage().encoded_bytes > 0);
+    assert!(
         host.usage()
             .unwrap()
-            .class_committed_bytes(HostMemoryClass::Output),
-        0
+            .class_committed_bytes(HostMemoryClass::Output)
+            > 0
     );
-    *gate.released.lock().unwrap() = true;
-    gate.changed.notify_all();
+    drop(release);
     assert!(images.shutdown().await.is_err());
     drop(images.take_shutdown().await.unwrap());
+    assert_eq!(images.output_usage().sessions, 0);
+    assert_eq!(images.output_usage().encoded_bytes, 0);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

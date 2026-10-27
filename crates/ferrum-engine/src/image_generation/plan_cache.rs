@@ -244,7 +244,7 @@ impl<R: DeviceRuntime> CacheState<R> {
 }
 
 pub(super) struct StagePlanCache<R: DeviceRuntime> {
-    state: Mutex<CacheState<R>>,
+    state: Arc<Mutex<CacheState<R>>>,
     candidate: Mutex<()>,
 }
 
@@ -262,32 +262,75 @@ impl<R: DeviceRuntime> CandidatePlanCache<'_, R> {
     pub(super) fn commit(mut self) {
         self.committed = true;
     }
+
+    /// Finish serialized compilation, retaining rollback ownership until the
+    /// prepared request actually starts. Later candidates use disjoint insertion
+    /// intervals, so cancelling this request cannot remove their new entries.
+    pub(super) fn defer(mut self) -> anyhow::Result<PendingCandidatePlanCache<R>> {
+        let end_insertion = self
+            .cache
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image plan cache poisoned"))?
+            .next_insertion;
+        let pending = PendingCandidatePlanCache {
+            state: self.cache.state.clone(),
+            first_insertion: self.first_insertion,
+            end_insertion,
+            committed: false,
+        };
+        self.committed = true;
+        Ok(pending)
+    }
 }
 impl<R: DeviceRuntime> Drop for CandidatePlanCache<'_, R> {
     fn drop(&mut self) {
         if self.committed {
             return;
         }
-        // Cleanup must also release owners while unwinding. Keep a poisoned
-        // cache poisoned for future callers, but recover its entries here.
-        let mut state = self.cache.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut removed = VecDeque::new();
-        let mut index = 0;
-        while index < state.entries.len() {
-            if state.entries[index].insertion >= self.first_insertion {
-                state.evict(index, &mut removed);
-            } else {
-                index += 1;
-            }
-        }
-        drop(state);
-        drop(removed);
+        release_candidate_entries(&self.cache.state, self.first_insertion, u64::MAX);
     }
+}
+
+pub(super) struct PendingCandidatePlanCache<R: DeviceRuntime> {
+    state: Arc<Mutex<CacheState<R>>>,
+    first_insertion: u64,
+    end_insertion: u64,
+    committed: bool,
+}
+impl<R: DeviceRuntime> PendingCandidatePlanCache<R> {
+    pub(super) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+impl<R: DeviceRuntime> Drop for PendingCandidatePlanCache<R> {
+    fn drop(&mut self) {
+        if !self.committed {
+            release_candidate_entries(&self.state, self.first_insertion, self.end_insertion);
+        }
+    }
+}
+
+fn release_candidate_entries<R: DeviceRuntime>(cache: &Mutex<CacheState<R>>, first: u64, end: u64) {
+    // Cleanup also runs while unwinding. Preserve poison for future callers,
+    // but release cache/native owners outside the accounting lock.
+    let mut state = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut removed = VecDeque::new();
+    let mut index = 0;
+    while index < state.entries.len() {
+        if (first..end).contains(&state.entries[index].insertion) {
+            state.evict(index, &mut removed);
+        } else {
+            index += 1;
+        }
+    }
+    drop(state);
+    drop(removed);
 }
 impl<R: DeviceRuntime> StagePlanCache<R> {
     pub(super) fn new() -> Self {
         Self {
-            state: Mutex::new(CacheState::new(ImagePlanCachePolicy::default())),
+            state: Arc::new(Mutex::new(CacheState::new(ImagePlanCachePolicy::default()))),
             candidate: Mutex::new(()),
         }
     }

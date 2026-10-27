@@ -158,6 +158,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         requests: &[ImageGenerationRequest],
         inputs: &[QwenImage21ConditionInputs],
     ) -> anyhow::Result<PreparedRequest<R>> {
+        self.prepare_preprocessed_edits_with_host_admission(requests, inputs, true)
+    }
+
+    pub(super) fn prepare_preprocessed_edits_with_host_admission(
+        &self,
+        requests: &[ImageGenerationRequest],
+        inputs: &[QwenImage21ConditionInputs],
+        reserve_host: bool,
+    ) -> anyhow::Result<PreparedRequest<R>> {
         ensure!(self.supports_edits(), "editing assets/profiles are missing");
         super::prepare::batch_dimensions(requests, &self.config, self.assets.spatial_scale()?)?;
         for input in inputs {
@@ -198,7 +207,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             edit_layout_and_prompt_us = trace_elapsed_us(started),
             "image edit batch metadata prepared"
         );
-        self.prepare_batch_with_edit(
+        self.prepare_batch_with_host_admission(
             requests,
             Some(EditInputs {
                 prompt,
@@ -206,6 +215,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 vision,
                 encoder,
             }),
+            reserve_host,
         )
     }
 

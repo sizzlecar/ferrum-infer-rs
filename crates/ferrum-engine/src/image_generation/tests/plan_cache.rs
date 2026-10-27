@@ -721,3 +721,35 @@ fn successful_candidate_reuses_exact_compiled_owners_after_commit() {
     assert_eq!(pipeline.runtime.snapshot().allocations, 0);
     assert_eq!(pipeline.runtime.snapshot().submissions, 0);
 }
+
+#[test]
+fn cancelled_host_wait_releases_only_its_candidate_cache_interval() {
+    let (mut pipeline, _directory) = super::adapter::pipeline(2);
+    pipeline.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
+    let first = pipeline.plan_cache.begin_candidate().unwrap();
+    let waiting = cached_projection(&pipeline, ImageStage::Denoiser, 1);
+    let waiting_weak = Arc::downgrade(&waiting.component);
+    let pending = first.defer().unwrap();
+    drop(waiting);
+    assert!(waiting_weak.upgrade().is_some());
+
+    // Preparation no longer holds the serial mutex while waiting. A distinct
+    // later candidate may publish its own plans and must survive this cancel.
+    let second = pipeline.plan_cache.begin_candidate().unwrap();
+    let running = cached_projection(&pipeline, ImageStage::Denoiser, 2);
+    let running_weak = Arc::downgrade(&running.component);
+    second.defer().unwrap().commit();
+    drop(running);
+    drop(pending);
+    assert!(waiting_weak.upgrade().is_none());
+    let retained = cached_projection(&pipeline, ImageStage::Denoiser, 2);
+    assert!(retained.plan.plan_cache_hit);
+    assert!(Arc::ptr_eq(
+        &running_weak.upgrade().unwrap(),
+        &retained.component
+    ));
+    assert_eq!(retained.plan.plan_cache.as_ref().unwrap().entries, 1);
+    assert_eq!(pipeline.runtime.snapshot().allocations, 0);
+    assert_eq!(pipeline.runtime.snapshot().submissions, 0);
+    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+}

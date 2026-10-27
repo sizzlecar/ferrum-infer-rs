@@ -11,8 +11,10 @@ use std::{
     collections::BTreeMap,
     ops::Range,
     sync::{Arc, Mutex},
+    task::Waker,
 };
 
+use ferrum_types::{ResourceChangeNotifier, ResourceChangeSubscription};
 use thiserror::Error;
 
 mod scope;
@@ -124,6 +126,14 @@ pub enum HostMemoryError {
     NestedScope,
 }
 
+impl HostMemoryError {
+    /// Whether releasing existing owners can satisfy this admission failure.
+    /// Every admission checks all hard dimensions before reporting occupancy.
+    pub fn is_temporary_capacity(&self) -> bool {
+        matches!(self, Self::Capacity { requested, limit, .. } if requested <= limit)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Counters {
     total: usize,
@@ -173,6 +183,7 @@ struct AccountInner {
     limits: HostMemoryLimits,
     allocation_alignment: usize,
     state: Mutex<State>,
+    capacity_changed: ResourceChangeNotifier,
 }
 
 /// Clone this authority across engines instead of creating per-engine totals.
@@ -186,6 +197,7 @@ impl HostMemoryAccount {
                 limits,
                 allocation_alignment: 1,
                 state: Mutex::new(State::default()),
+                capacity_changed: ResourceChangeNotifier::default(),
             }),
             None,
         )
@@ -206,6 +218,7 @@ impl HostMemoryAccount {
                 limits,
                 allocation_alignment: alignment,
                 state: Mutex::new(State::default()),
+                capacity_changed: ResourceChangeNotifier::default(),
             }),
             None,
         ))
@@ -232,6 +245,13 @@ impl HostMemoryAccount {
 
     pub fn limits(&self) -> HostMemoryLimits {
         self.0.limits
+    }
+
+    /// Register before probing admission, and retain the subscription while
+    /// waiting. Refunds notify after accounting locks are released. A scheduler
+    /// must also wake its own target for cancellation and shutdown.
+    pub fn subscribe_capacity(&self, waker: Waker) -> ResourceChangeSubscription {
+        self.0.capacity_changed.subscribe(waker)
     }
 
     /// Check provenance against the parent injected by product composition.
@@ -413,6 +433,8 @@ impl Drop for Charge {
             } else {
                 state.fail_closed = true;
             }
+            drop(state);
+            self.account.0.capacity_changed.notify();
             return;
         }
         let committed = state.committed.subtract(amount);
@@ -423,6 +445,8 @@ impl Drop for Charge {
             }
             _ => state.fail_closed = true,
         }
+        drop(state);
+        self.account.0.capacity_changed.notify();
     }
 }
 
@@ -649,5 +673,7 @@ unsafe impl crate::StableHostMemory for ManagedHostBytes {
     }
 }
 
+#[cfg(test)]
+mod capacity_tests;
 #[cfg(test)]
 mod tests;

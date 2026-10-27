@@ -161,10 +161,13 @@ pub(super) fn pipeline(
     let composition = composition("device.image.adapter.batch");
     let host = HostMemoryAccount::new(
         HostMemoryLimits::new(
-            4096,
+            64 * 1024,
             HostMemoryClassLimits {
                 input_preprocess_bytes: 4096,
-                output_bytes: 4096,
+                // A 32-square BF16 RGBA readback is 8 KiB. Leave enough
+                // Output room for these provider/capacity fixtures to reach
+                // their intended native-plan boundary after shape preflight.
+                output_bytes: 32 * 1024,
                 transfer_staging_bytes: 4096,
                 weight_backing_bytes: 0,
             },

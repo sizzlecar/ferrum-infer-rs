@@ -77,14 +77,146 @@ fn take_batch<O: Send + 'static>(
 
 /// Candidate ownership remains charged as waiting until device execution starts.
 /// Requeue uses the original owners and arrival times, ahead of newer arrivals.
-fn return_tail<O>(batch: &mut Vec<Queued<O>>, keep: usize, shared: &Shared<O>) {
+fn return_tail<O>(
+    batch: &mut Vec<Queued<O>>,
+    keep: usize,
+    shared: &Shared<O>,
+    device_capacity: bool,
+) {
     let mut state = shared.lock();
-    for job in batch.drain(keep..).rev() {
+    for mut job in batch.drain(keep..).rev() {
+        // A waiting job must not hold output credit ahead of the FIFO head.
+        if let Some(output) = &mut job.output {
+            output.lease.take();
+        }
         state.preparing -= 1;
         state.preparing_bytes -= job.pending_bytes();
         state.queue.push_front(job);
     }
-    state.capacity_reductions = state.capacity_reductions.saturating_add(1);
+    if device_capacity {
+        state.capacity_reductions = state.capacity_reductions.saturating_add(1);
+    }
+}
+
+/// Acquire only the compatible FIFO prefix that currently has output credit.
+/// A resource-blocked tail cannot stop an already authorized prefix executing.
+fn admit_output_prefix<O: Send + 'static>(
+    worker: &dyn BatchWorker<Output = O>,
+    batch: &mut Vec<Queued<O>>,
+    shared: &Shared<O>,
+) -> Result<bool, ImageWorkerFailure> {
+    'retry: loop {
+        remove_cancelled(batch, &mut shared.lock());
+        if batch.is_empty() {
+            return Ok(false);
+        }
+        for index in 0..batch.len() {
+            if batch[index]
+                .output
+                .as_ref()
+                .is_some_and(|output| output.lease.is_some())
+            {
+                continue;
+            }
+            let gate = batch[index]
+                .output
+                .as_ref()
+                .map(|output| output.gate.clone());
+            let _subscription = gate
+                .as_ref()
+                .map(|gate| gate.subscribe_capacity(shared.resources.waker()));
+            let observed = shared.resources.epoch();
+            // This is initial candidate construction, before any compiled plan.
+            // Current committed bytes already include preceding jobs' grants;
+            // demand adds only the growing engine peak and this next grant.
+            let outcome =
+                output_prefix_available(worker, batch, index, shared).and_then(|available| {
+                    if !available {
+                        return Ok(false);
+                    }
+                    match gate.as_ref().map(|gate| gate.try_acquire()).transpose() {
+                        Ok(Some(Some(lease))) => {
+                            batch[index].output.as_mut().unwrap().lease = Some(lease);
+                            Ok(true)
+                        }
+                        Ok(None) => Ok(true),
+                        Ok(Some(None)) => Ok(false),
+                        Err(ImageOutputGateError::Capacity(message)) => {
+                            Err(ImageBatchError::Overloaded(message))
+                        }
+                        Err(ImageOutputGateError::Failed(message)) => {
+                            Err(ImageBatchError::Rejected(message))
+                        }
+                    }
+                });
+            match outcome {
+                Ok(true) => (),
+                Err(ImageBatchError::Fatal(error)) => {
+                    return Err(ImageWorkerFailure::Generation(error))
+                }
+                Ok(false) | Err(_) if index > 0 => {
+                    return_tail(batch, index, shared, false);
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    return_tail(batch, 1, shared, false);
+                    if shared.lock().closing || batch[0].cancelled.load(Ordering::Acquire) {
+                        continue 'retry;
+                    }
+                    shared.resources.wait(observed);
+                    continue 'retry;
+                }
+                Err(error) => {
+                    return_tail(batch, 1, shared, false);
+                    let (kind, message) = rejection(error)?;
+                    reject_candidate(std::mem::take(batch), shared, kind, &message);
+                    return Ok(false);
+                }
+            }
+        }
+        return Ok(true);
+    }
+}
+
+fn output_prefix_available<O: Send + 'static>(
+    worker: &dyn BatchWorker<Output = O>,
+    batch: &[Queued<O>],
+    index: usize,
+    shared: &Shared<O>,
+) -> Result<bool, ImageBatchError> {
+    let Some(host) = &shared.host else {
+        return Ok(true);
+    };
+    let requests: Vec<_> = batch[..=index].iter().map(|job| &job.request).collect();
+    let Some(engine_bytes) = worker.execution_output_bytes(&requests)? else {
+        return Ok(true);
+    };
+    let held = batch
+        .iter()
+        .filter_map(|job| job.output.as_ref())
+        .filter(|output| output.lease.is_some())
+        .map(|output| output.gate.host_output_bytes(host))
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| ImageBatchError::Overloaded("held output credit overflows".into()))?;
+    let next = batch[index]
+        .output
+        .as_ref()
+        .map_or(0, |output| output.gate.host_output_bytes(host));
+    let demand = engine_bytes
+        .checked_add(next)
+        .ok_or_else(|| ImageBatchError::Overloaded("combined output demand overflows".into()))?;
+    let claims = [(HostMemoryClass::Output, demand)];
+    host.check_scope_after_output_release(&claims, held)
+        .map_err(|error| preparation_error(error.into()))?;
+    match host.check_scope_admission(&claims) {
+        Ok(()) => Ok(true),
+        Err(error) if error.is_temporary_capacity() => {
+            host.check_scope_after_output_release(&claims, held)
+                .map_err(|error| preparation_error(error.into()))?;
+            Ok(false)
+        }
+        Err(error) => Err(preparation_error(error.into())),
+    }
 }
 
 fn remove_cancelled<O>(batch: &mut Vec<Queued<O>>, state: &mut State<O>) -> bool {
@@ -195,12 +327,21 @@ pub(super) fn worker_loop<O: Send + 'static>(
     mut worker: Box<dyn BatchWorker<Output = O>>,
     shared: Arc<Shared<O>>,
 ) -> Retirement<O> {
+    let _host_subscription = shared
+        .host
+        .as_ref()
+        .map(|host| host.subscribe_capacity(shared.resources.waker()));
     let run = catch_unwind(AssertUnwindSafe(|| {
         'batches: while let Some(mut batch) = take_batch(worker.as_ref(), &shared) {
-            let prepared = loop {
+            let prepared = 'prepare: loop {
                 remove_cancelled(&mut batch, &mut shared.lock());
                 if batch.is_empty() {
                     continue 'batches;
+                }
+                match admit_output_prefix(worker.as_ref(), &mut batch, &shared) {
+                    Ok(true) => (),
+                    Ok(false) => continue 'batches,
+                    Err(failure) => break Err(failure),
                 }
                 let preparation_started = Instant::now();
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -216,7 +357,69 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     job.preparation_duration = job.preparation_duration.saturating_add(elapsed);
                 }
                 match outcome {
-                    Ok(Ok(prepared)) => {
+                    Ok(Ok(mut prepared)) => {
+                        loop {
+                            let observed = shared.resources.epoch();
+                            if remove_cancelled(&mut batch, &mut shared.lock()) {
+                                drop(prepared);
+                                continue 'prepare;
+                            }
+                            let output_credit_bytes = batch
+                                .iter()
+                                .filter_map(|job| job.output.as_ref())
+                                .map(|output| {
+                                    shared
+                                        .host
+                                        .as_ref()
+                                        .map_or(0, |host| output.gate.host_output_bytes(host))
+                                })
+                                .try_fold(0usize, |total, bytes| total.checked_add(bytes));
+                            let resources = match output_credit_bytes {
+                                Some(output_credit_bytes) => ImagePreparationResources {
+                                    output_credit_bytes,
+                                },
+                                None => {
+                                    drop(prepared);
+                                    reject_candidate(
+                                        batch,
+                                        &shared,
+                                        ImageServiceErrorKind::QueueFull,
+                                        "combined output grants exceed addressable Host memory",
+                                    );
+                                    continue 'batches;
+                                }
+                            };
+                            let admission = match catch_unwind(AssertUnwindSafe(|| {
+                                worker.try_admit_prepared(&mut prepared, resources)
+                            })) {
+                                Ok(admission) => admission,
+                                Err(panic) => break 'prepare Err(ImageWorkerFailure::Panic(panic)),
+                            };
+                            match admission {
+                                Ok(true) => break,
+                                Ok(false) => {
+                                    // This token has submitted no device work.
+                                    // Keep its plans and edit owners while an
+                                    // independently held output is consumed.
+                                    if shared.lock().closing
+                                        || batch
+                                            .iter()
+                                            .any(|job| job.cancelled.load(Ordering::Acquire))
+                                    {
+                                        continue;
+                                    }
+                                    shared.resources.wait(observed);
+                                }
+                                Err(error) => match rejection(error) {
+                                    Ok((kind, message)) => {
+                                        drop(prepared);
+                                        reject_candidate(batch, &shared, kind, &message);
+                                        continue 'batches;
+                                    }
+                                    Err(failure) => break 'prepare Err(failure),
+                                },
+                            }
+                        }
                         let mut state = shared.lock();
                         // A cancellation invalidates the compiled batch geometry.
                         // Dropping this unused preparation is safe; no work exists.
@@ -245,7 +448,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
                             capacity_bytes = proof.report.capacity_bytes,
                             "image candidate reduced before device execution"
                         );
-                        return_tail(&mut batch, keep, &shared);
+                        return_tail(&mut batch, keep, &shared, true);
                     }
                     Ok(Err(error)) => match rejection(error) {
                         Ok((kind, message)) => {
@@ -286,7 +489,12 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     "image request admitted to execution");
                 }
                 requests.push(job.request);
-                responses.push((job.cancelled, job.response, job._prompt_reservation));
+                responses.push((
+                    job.cancelled,
+                    job.response,
+                    job._prompt_reservation,
+                    job.output,
+                ));
             }
             let outcome = prepared.and_then(|(prepared, _)| {
                 match catch_unwind(AssertUnwindSafe(|| worker.execute(prepared, requests))) {
@@ -309,7 +517,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
                                         state.rejected.saturating_add(responses.len() as u64);
                                 }
                             }
-                            for (cancelled, response, _) in responses.drain(..) {
+                            for (cancelled, response, _, _) in responses.drain(..) {
                                 let kind = if cancelled.load(Ordering::Acquire) {
                                     ImageServiceErrorKind::Cancelled
                                 } else {
@@ -326,13 +534,23 @@ pub(super) fn worker_loop<O: Send + 'static>(
             });
             match outcome {
                 Ok(outputs) => {
-                    for ((cancelled, response, _), output) in responses.into_iter().zip(outputs) {
+                    for ((cancelled, response, _, gate), output) in
+                        responses.into_iter().zip(outputs)
+                    {
                         let result = if cancelled.load(Ordering::Acquire) {
                             Err(service_error(
                                 ImageServiceErrorKind::Cancelled,
                                 "image response cancelled; active execution completed",
                             ))
                         } else {
+                            if let Some(QueuedOutput {
+                                lease: Some(lease),
+                                response,
+                                ..
+                            }) = gate
+                            {
+                                let _ = response.send(lease);
+                            }
                             Ok(output)
                         };
                         let _ = response.send(result);
@@ -352,7 +570,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     state.preparing = 0;
                     state.preparing_bytes = 0;
                     reject_pending(&mut state, ImageServiceErrorKind::Stopped);
-                    for (_, response, _) in responses {
+                    for (_, response, _, _) in responses {
                         let _ = response.send(Err(service_error(kind, &message)));
                     }
                     return Some(failure);

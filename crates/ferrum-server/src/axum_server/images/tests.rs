@@ -12,6 +12,8 @@ use tower::ServiceExt;
 
 #[path = "tests/admission.rs"]
 mod admission;
+#[path = "tests/decoupled_output.rs"]
+mod decoupled_output;
 
 pub(super) fn config() -> ImageHttpConfig {
     ImageHttpConfig {

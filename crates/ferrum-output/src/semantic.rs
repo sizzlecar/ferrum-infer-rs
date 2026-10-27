@@ -17,6 +17,17 @@ pub struct OutputSemanticLease {
     local: Option<OwnedSemaphorePermit>,
 }
 
+impl Drop for OutputSemanticLease {
+    fn drop(&mut self) {
+        let released = self.global.is_some() || self.local.is_some();
+        drop(self.global.take());
+        drop(self.local.take());
+        if released {
+            self.session.0.budget.capacity_changed.notify();
+        }
+    }
+}
+
 impl OutputSession {
     pub fn semantic_usage(&self) -> usize {
         self.config().semantic_bytes_per_session - self.0.semantic.available_permits()
@@ -71,9 +82,9 @@ impl OutputSemanticLease {
         self.bytes()
             .checked_add(additional)
             .ok_or_else(|| exhausted("retained output size overflow"))?;
-        let grant = self.session.try_reserve_semantic(additional)?;
-        merge_permit(&mut self.global, grant.global);
-        merge_permit(&mut self.local, grant.local);
+        let mut grant = self.session.try_reserve_semantic(additional)?;
+        merge_permit(&mut self.global, grant.global.take());
+        merge_permit(&mut self.local, grant.local.take());
         Ok(())
     }
 

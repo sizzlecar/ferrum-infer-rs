@@ -58,9 +58,13 @@ impl HostMemoryScope {
                 Some(committed) => state.committed = committed,
                 None => {
                     state.fail_closed = true;
+                    drop(state);
+                    self.account.0.capacity_changed.notify();
                     return Err(HostMemoryError::Poisoned);
                 }
             }
+            drop(state);
+            self.account.0.capacity_changed.notify();
         }
         Ok(())
     }
@@ -73,6 +77,86 @@ impl Drop for HostMemoryScope {
 }
 
 impl HostMemoryAccount {
+    /// Validate every physical class/total claim against hard account ceilings,
+    /// independently of current occupancy. This does not reserve any capacity.
+    pub fn check_scope_capacity(
+        &self,
+        budgets: &[(HostMemoryClass, usize)],
+    ) -> Result<(), HostMemoryError> {
+        let (demand, _) = self.scope_demand(budgets)?;
+        self.check_hard_capacity(demand, Counters::default())
+    }
+
+    /// Check current scope admission without acquiring or refunding credit.
+    /// A later `reserve_scope` still provides the actual atomic authorization.
+    /// Schedulers can use this before multi-resource admission to avoid a
+    /// rollback repeatedly waking the same unsuccessful admission attempt.
+    pub fn check_scope_admission(
+        &self,
+        budgets: &[(HostMemoryClass, usize)],
+    ) -> Result<(), HostMemoryError> {
+        let (demand, _) = self.scope_demand(budgets)?;
+        let state = self.0.state.lock().map_err(|_| HostMemoryError::Poisoned)?;
+        if state.fail_closed {
+            return Err(HostMemoryError::Poisoned);
+        }
+        self.check_admission(&state, demand).map(|_| ())
+    }
+
+    /// Prove that releasing externally owned Output could make this claim fit.
+    /// Other committed classes form an unreleasable baseline for this check.
+    /// `retained_output_bytes` is the physical Output credit already held by
+    /// the selected execution on this same parent, which cannot be awaited.
+    ///
+    /// This is only a coherent metadata check, not an admission grant. On
+    /// failure, `Capacity.requested` includes the unreleasable baseline and is
+    /// therefore a hard requirement, rather than temporary Output occupancy.
+    pub fn check_scope_after_output_release(
+        &self,
+        budgets: &[(HostMemoryClass, usize)],
+        retained_output_bytes: usize,
+    ) -> Result<(), HostMemoryError> {
+        let (demand, _) = self.scope_demand(budgets)?;
+        let state = self.0.state.lock().map_err(|_| HostMemoryError::Poisoned)?;
+        if state.fail_closed {
+            return Err(HostMemoryError::Poisoned);
+        }
+        let current_output = state.committed.classes[HostMemoryClass::Output.index()];
+        if retained_output_bytes > current_output {
+            return Err(HostMemoryError::InvalidReservation);
+        }
+        let external_output = current_output - retained_output_bytes;
+        let baseline = state
+            .committed
+            .subtract(Counters::single(HostMemoryClass::Output, external_output))
+            .ok_or(HostMemoryError::Poisoned)?;
+        let required = baseline
+            .add(demand)
+            .ok_or(HostMemoryError::ArithmeticOverflow)?;
+        self.check_hard_capacity(required, Counters::default())
+    }
+
+    fn scope_demand(
+        &self,
+        budgets: &[(HostMemoryClass, usize)],
+    ) -> Result<(Counters, [bool; 4]), HostMemoryError> {
+        if self.1.is_some() {
+            return Err(HostMemoryError::NestedScope);
+        }
+        if budgets.is_empty() {
+            return Err(HostMemoryError::InvalidReservation);
+        }
+        let mut demand = Counters::default();
+        let mut classes = [false; 4];
+        for &(class, bytes) in budgets {
+            demand = demand
+                .add(Counters::single(class, bytes))
+                .ok_or(HostMemoryError::ArithmeticOverflow)?;
+            classes[class.index()] = true;
+        }
+        Ok((demand, classes))
+    }
+
     /// Reserve physical backing-byte credit for an execution before device work.
     /// Each supplied class receives a hard scope ceiling; classes absent here
     /// continue to use normal parent admission. Duplicate classes are summed.
@@ -89,20 +173,7 @@ impl HostMemoryAccount {
         &self,
         budgets: &[(HostMemoryClass, usize)],
     ) -> Result<HostMemoryScope, HostMemoryError> {
-        if self.1.is_some() {
-            return Err(HostMemoryError::NestedScope);
-        }
-        if budgets.is_empty() {
-            return Err(HostMemoryError::InvalidReservation);
-        }
-        let mut demand = Counters::default();
-        let mut classes = [false; 4];
-        for &(class, bytes) in budgets {
-            demand = demand
-                .add(Counters::single(class, bytes))
-                .ok_or(HostMemoryError::ArithmeticOverflow)?;
-            classes[class.index()] = true;
-        }
+        let (demand, classes) = self.scope_demand(budgets)?;
         let mut state = self.0.state.lock().map_err(|_| HostMemoryError::Poisoned)?;
         if state.fail_closed {
             return Err(HostMemoryError::Poisoned);
@@ -132,6 +203,7 @@ impl HostMemoryAccount {
         state: &State,
         demand: Counters,
     ) -> Result<Counters, HostMemoryError> {
+        self.check_hard_capacity(demand, state.committed)?;
         let next = state
             .committed
             .add(demand)
@@ -156,6 +228,33 @@ impl HostMemoryAccount {
             }
         }
         Ok(next)
+    }
+
+    fn check_hard_capacity(
+        &self,
+        demand: Counters,
+        committed: Counters,
+    ) -> Result<(), HostMemoryError> {
+        if demand.total > self.0.limits.total_bytes {
+            return Err(HostMemoryError::Capacity {
+                scope: HostMemoryPressureScope::Total,
+                requested: demand.total,
+                committed: committed.total,
+                limit: self.0.limits.total_bytes,
+            });
+        }
+        for class in CLASSES {
+            let index = class.index();
+            if demand.classes[index] > self.0.limits.classes[index] {
+                return Err(HostMemoryError::Capacity {
+                    scope: HostMemoryPressureScope::Class(class),
+                    requested: demand.classes[index],
+                    committed: committed.classes[index],
+                    limit: self.0.limits.classes[index],
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn scoped_demand(
