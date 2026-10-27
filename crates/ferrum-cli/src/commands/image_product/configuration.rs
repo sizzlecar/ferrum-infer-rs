@@ -12,7 +12,7 @@ pub use metal::MetalMemoryConfig;
 pub struct ImageProductConfig {
     /// Public identity only; it does not select a model implementation.
     pub model: String,
-    /// Explicit experimental execution policy, not throughput qualification.
+    /// Explicit execution policy, not throughput qualification.
     pub execution_profile: ImageExecutionProfile,
     pub metadata: MetadataPaths,
     pub weights: WeightPaths,
@@ -24,6 +24,7 @@ pub struct ImageProductConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageExecutionProfile {
+    Adaptive,
     ExperimentalSerialCold,
     ExperimentalBatchedCold,
     ExperimentalResidentV1,
@@ -31,6 +32,7 @@ pub enum ImageExecutionProfile {
 impl ImageExecutionProfile {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Adaptive => "adaptive",
             Self::ExperimentalSerialCold => "experimental_serial_cold",
             Self::ExperimentalBatchedCold => "experimental_batched_cold",
             Self::ExperimentalResidentV1 => "experimental_resident_v1",
@@ -400,6 +402,9 @@ impl ImageProductConfig {
             matches!(
                 (self.execution_profile, pipeline.residency),
                 (
+                    ImageExecutionProfile::Adaptive,
+                    ImageResidencyPolicy::Adaptive
+                ) | (
                     ImageExecutionProfile::ExperimentalResidentV1,
                     ImageResidencyPolicy::DenoiserAndDecoder
                         | ImageResidencyPolicy::AllModelComponents

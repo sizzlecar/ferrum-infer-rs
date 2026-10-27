@@ -229,6 +229,9 @@ impl<R: DeviceRuntime> std::error::Error for ImageGenerationError<R> {}
 pub(super) struct PreparedStage<R: DeviceRuntime> {
     pub(super) component: Arc<CompiledTensorComponent<R>>,
     pub(super) plan: ImageStagePlanReceipt,
+    // Prefix handoff is admitted as one group: the decode request is created
+    // while prefill Step/output storage and the original full weights live.
+    prefix_admission: Option<(u64, u64)>,
 }
 
 enum StageWeightInitialization<'a, R: DeviceRuntime> {
@@ -237,6 +240,43 @@ enum StageWeightInitialization<'a, R: DeviceRuntime> {
     Attach(&'a SharedComponentWeights<R>),
 }
 impl<R: DeviceRuntime> PreparedStage<R> {
+    pub(super) fn bind_prefix_admission(&mut self, decode: &Self) -> anyhow::Result<()> {
+        let prefill = self
+            .component
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory();
+        let memory = decode
+            .component
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory();
+        ensure!(
+            prefill.static_bytes() >= memory.static_bytes(),
+            "prefix decode must use a readonly subset of the prefill installation"
+        );
+        self.prefix_admission = Some((
+            memory
+                .minimum_request_bytes()
+                .checked_add(memory.minimum_sequence_bytes())
+                .context("prefix request capacity overflows")?,
+            memory.minimum_runnable_request_bytes(),
+        ));
+        Ok(())
+    }
+
+    pub(super) fn admission_dynamic_bytes(&self, own_dynamic: u64) -> anyhow::Result<u64> {
+        match self.prefix_admission {
+            Some((request, decode)) => Ok(own_dynamic
+                .checked_add(request)
+                .context("prefix handoff capacity overflows")?
+                .max(decode)),
+            None => Ok(own_dynamic),
+        }
+    }
+
     pub(super) fn compile(
         stage: ImageStage,
         batch_size: usize,
@@ -276,7 +316,11 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             )? {
                 plan.compile_wall_duration_us = elapsed_us(started);
                 plan.plan_cache_hit = true;
-                return Ok(Self { component, plan });
+                return Ok(Self {
+                    component,
+                    plan,
+                    prefix_admission: None,
+                });
             }
         }
         let family_id = family.family_id().clone();
@@ -302,6 +346,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         let minimum_step_bytes = memory.minimum_step_bytes();
         let mut prepared = Self {
             component: Arc::new(component),
+            prefix_admission: None,
             plan: ImageStagePlanReceipt {
                 stage,
                 role,
@@ -371,7 +416,9 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         mode: StageWeightInitialization<'_, R>,
     ) -> Result<(ActiveImageStage<R>, Option<SharedComponentWeights<R>>), ImageGenerationFailure<R>>
     {
-        let Self { component, plan } = self;
+        let Self {
+            component, plan, ..
+        } = self;
         let name = plan.stage.name();
         let config = (|| -> anyhow::Result<_> {
             Ok(ComponentInitializationConfig {

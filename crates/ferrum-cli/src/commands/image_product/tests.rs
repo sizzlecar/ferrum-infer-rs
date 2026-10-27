@@ -600,6 +600,57 @@ fn decoder_batch_policy_is_explicit_independent_and_strict() {
 }
 
 #[test]
+fn adaptive_image_policy_reaches_run_and_serve_without_reinterpreting_legacy_configs() {
+    use ferrum_engine::image_generation::{ImageDynamicResidencyPolicy, ImageResidencyPolicy};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    let mut wire = configuration();
+    let legacy = load(&wire).unwrap();
+    assert_eq!(
+        legacy.backend.pipeline().residency,
+        ImageResidencyPolicy::Cold
+    );
+    wire["execution_profile"] = json!("adaptive");
+    wire["backend"]["pipeline"]["residency"] = json!("adaptive");
+    wire["backend"]["pipeline"]["dynamic_residency"] = json!("adaptive");
+    for serving in [false, true] {
+        wire["serving"] = if serving {
+            json!({"maximum_pending":2,"maximum_prompt_bytes":4096,"max_num_seqs":1,
+                "request_batch_max_wait_ms":0,"default_width":512,"default_height":512,
+                "default_seed":0,"rgba_scratch_bytes":16384,"output":{}})
+        } else {
+            Value::Null
+        };
+        let config = load(&wire).unwrap();
+        assert_eq!(config.execution_profile, ImageExecutionProfile::Adaptive);
+        let ImageBackendConfig::Cuda(cuda) = config.backend else {
+            panic!("expected CUDA configuration")
+        };
+        let resolved = cuda.resolved_pipeline().unwrap();
+        assert_eq!(resolved.residency, ImageResidencyPolicy::Adaptive);
+        assert_eq!(
+            resolved.dynamic_residency,
+            ImageDynamicResidencyPolicy::Adaptive
+        );
+        let limits = cuda.pipeline.resolved_limits().unwrap();
+        assert_eq!(limits.residency, ImageResidencyPolicy::Adaptive);
+        assert_eq!(
+            limits.dynamic_residency,
+            ImageDynamicResidencyPolicy::Adaptive
+        );
+    }
+    wire["backend"]["pipeline"]["residency"] = json!("cold");
+    assert!(load(&wire).is_err());
+    wire["backend"]["pipeline"]["residency"] = json!("adaptive");
+    wire["execution_profile"] = json!("experimental_serial_cold");
+    assert!(load(&wire).is_err());
+}
+
+#[test]
 fn decoder_backing_retention_is_bounded_and_shared_by_run_and_serve() {
     use ferrum_engine::image_generation::ImageDynamicResidencyPolicy;
     let dir = tempfile::tempdir().unwrap();
