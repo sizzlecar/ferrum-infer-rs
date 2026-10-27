@@ -33,7 +33,8 @@ impl AsRef<[u8]> for EncodedImage {
 }
 
 /// Queue metadata owns a small session permit, never a full frame reservation.
-/// The scheduler acquires the complete encoding grant only for a selected job.
+/// The scheduler reserves Host encoding backing only for a selected job.
+/// Encoded transport credit is acquired after inference has released the worker.
 pub(super) struct ResponseGate {
     session: OutputSession,
     host: HostMemoryAccount,
@@ -80,9 +81,9 @@ impl ResponseGate {
         })
     }
 
-    /// An observed shortage is temporary. The preliminary Host check prevents
-    /// repeated acquire/rollback notifications while one pool remains full;
-    /// only the subsequent actual reservations authorize any encoding bytes.
+    /// Only Host capacity and closure constrain the executable prefix. Holding
+    /// Host encoding backing prevents raw outputs from exhausting the bytes
+    /// needed to encode them; transport credit must not constrain GPU batches.
     fn try_admit(&self) -> Result<Option<Admission>, ServerError> {
         if self.session.is_closed() {
             return Err(internal("output budget is closed"));
@@ -95,13 +96,6 @@ impl ResponseGate {
                 Err(internal(error))
             };
         }
-        let Some(lease) = self
-            .session
-            .try_reserve_encoded(self.count)
-            .map_err(internal)?
-        else {
-            return Ok(None);
-        };
         let scope = match self.host.reserve_scope(&demand) {
             Ok(scope) => scope,
             Err(ferrum_runtime::HostMemoryError::Capacity { .. }) => {
@@ -112,7 +106,6 @@ impl ResponseGate {
         Ok(Some(Admission {
             session: self.session.clone(),
             scope,
-            lease,
             dimensions: self.dimensions,
             limits: self.limits,
             scratch_bytes: self.scratch_bytes,
@@ -164,11 +157,10 @@ impl ImageOutputGate for ResponseGate {
     }
 }
 
-/// This actual execution grant follows the generated output to the HTTP body.
+/// This Host grant follows the generated output into response encoding.
 pub(super) struct Admission {
     session: OutputSession,
     scope: HostMemoryScope,
-    lease: OutputBytesLease,
     dimensions: PngDimensions,
     limits: PngLimits,
     scratch_bytes: usize,
@@ -199,16 +191,27 @@ impl Admission {
         tensor: ResolvedTensorSpec,
         raw: ManagedHostBytes,
     ) -> Result<Bytes, ServerError> {
+        // The service worker has already completed. Waiting for unread bodies
+        // to return transport credit retains bounded Host backing and pixels,
+        // but no execution slot. Cancelling this wait drops both owners.
+        let lease = self
+            .session
+            .reserve_encoded(self.count)
+            .await
+            .map_err(internal)?;
         // A cancelled blocking task retains its grant and pixels until the
         // writer exits, then drops its unpublished encoded owner safely.
-        tokio::task::spawn_blocking(move || PreparedEncoding::new(self, tensor, raw)?.finish())
-            .await
-            .map_err(internal)?
+        tokio::task::spawn_blocking(move || {
+            PreparedEncoding::new(self, lease, tensor, raw)?.finish()
+        })
+        .await
+        .map_err(internal)?
     }
 }
 
 struct PreparedEncoding {
     admission: Admission,
+    lease: OutputBytesLease,
     tensor: ResolvedTensorSpec,
     raw: ManagedHostBytes,
     scratch: ManagedHostBuffer,
@@ -217,6 +220,7 @@ struct PreparedEncoding {
 impl PreparedEncoding {
     fn new(
         admission: Admission,
+        lease: OutputBytesLease,
         tensor: ResolvedTensorSpec,
         raw: ManagedHostBytes,
     ) -> Result<Self, ServerError> {
@@ -236,6 +240,7 @@ impl PreparedEncoding {
             .map_err(internal)?;
         Ok(Self {
             admission,
+            lease,
             tensor,
             raw,
             scratch,
@@ -283,7 +288,7 @@ impl PreparedEncoding {
         }
         Ok(Bytes::from_owner(EncodedImage {
             bytes: output.freeze(),
-            _lease: self.admission.lease,
+            _lease: self.lease,
             _session: self.admission.session,
         }))
     }

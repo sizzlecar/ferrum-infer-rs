@@ -159,7 +159,9 @@ fn admit_output_prefix<O: Send + 'static>(
                     return Ok(true);
                 }
                 Ok(false) => {
-                    return_tail(batch, 1, shared, false);
+                    // No prefix has acquired credit yet. Retain the compatible
+                    // candidate so a capacity wake can admit all now-ready jobs,
+                    // rather than permanently reducing this wait to one image.
                     if shared.lock().closing || batch[0].cancelled.load(Ordering::Acquire) {
                         continue 'retry;
                     }

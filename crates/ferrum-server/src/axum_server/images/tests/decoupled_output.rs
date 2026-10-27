@@ -1,5 +1,6 @@
 //! Real Reference VAE execution through HTTP, with a deliberately occupied
-//! Tokio blocking pool. This proves lifecycle separation, not model quality.
+//! encoded-credit pool and Tokio blocking pool. This proves lifecycle
+//! separation, not model quality.
 use super::*;
 use ferrum_engine::image_generation::service::{
     ImageBatchError, ImageGenerator, ImageGeneratorCapabilities, ImageServiceConfig,
@@ -242,7 +243,7 @@ fn request(seed: u64) -> axum::http::Request<Body> {
 }
 
 #[test]
-fn next_inference_runs_while_encoding_is_queued_and_an_earlier_body_is_unread() {
+fn next_inference_runs_while_encoded_credit_is_full_encoding_is_queued_and_body_unread() {
     let host = HostMemoryAccount::new(
         HostMemoryLimits::new(
             8 * 1024 * 1024,
@@ -284,6 +285,14 @@ fn next_inference_runs_while_encoding_is_queued_and_an_earlier_body_is_unread() 
         .build()
         .unwrap();
     runtime.block_on(async {
+        let encoded_session = images.output.try_open_session().unwrap();
+        let mut encoded_owners = Vec::new();
+        let mut remaining = images.output.config().encoded_bytes_total;
+        while remaining > 0 {
+            let bytes = remaining.min(images.output.config().max_event_bytes);
+            encoded_owners.push(encoded_session.reserve_encoded(bytes).await.unwrap());
+            remaining -= bytes;
+        }
         let gate = Arc::new(BlockingPoolGate::default());
         let release = ReleasePool(gate.clone()); // Unblocks the pool even if a test assertion fails.
         let blocked = gate.clone();
@@ -306,13 +315,27 @@ fn next_inference_runs_while_encoding_is_queued_and_an_earlier_body_is_unread() 
         })
         .await
         .unwrap();
-        // Both actual decodes completed on the service worker. HTTP encoding is
-        // still queued in the occupied blocking pool, not running on this reactor.
+        // Both actual decodes completed on the service worker while every
+        // encoded byte was unavailable. HTTP waits retain bounded Host owners.
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(images.service().snapshot().active_requests, 0);
         assert!(!first.is_finished() && !second.is_finished());
-        assert_eq!(images.output_usage().sessions, 2);
-        assert!(images.output_usage().encoded_bytes > 0);
+        assert_eq!(images.output_usage().sessions, 3);
+        assert_eq!(
+            images.output_usage().encoded_bytes,
+            images.output.config().encoded_bytes_total
+        );
+        drop((encoded_owners, encoded_session));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while images.output_usage().encoded_bytes == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Credit is now available, but encoding remains queued in the occupied
+        // blocking pool; no inline codec work has blocked this Tokio reactor.
+        assert!(!first.is_finished() && !second.is_finished());
         drop(release);
         blocker.await.unwrap();
         let first = tokio::time::timeout(Duration::from_secs(30), first)

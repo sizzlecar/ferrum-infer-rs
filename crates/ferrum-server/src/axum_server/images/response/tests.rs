@@ -20,7 +20,7 @@ fn exact_json_length_matches_standard_base64_and_signed_timestamp_boundaries() {
 }
 
 #[test]
-fn four_two_k_queue_gates_are_cheap_and_only_the_available_prefix_takes_frames() {
+fn four_two_k_jobs_reserve_host_without_consuming_encoded_transport_credit() {
     let host = super::super::tests::host_account(256 * 1024 * 1024);
     let budget = OutputBudget::new(OutputConfig {
         max_sessions: 4,
@@ -42,14 +42,17 @@ fn four_two_k_queue_gates_are_cheap_and_only_the_available_prefix_takes_frames()
     assert_eq!(budget.usage().sessions, 4);
     assert_eq!(budget.usage().encoded_bytes, 0);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
-    let first = gates[0].try_admit().unwrap().unwrap();
-    let second = gates[1].try_admit().unwrap().unwrap();
-    assert!(gates[2].try_admit().unwrap().is_none());
-    assert!(gates[3].try_admit().unwrap().is_none());
-    assert_eq!(budget.usage().encoded_bytes, first.count + second.count);
-    drop(first);
-    let third = gates[2].try_admit().unwrap().unwrap();
-    drop((second, third, gates));
+    let admitted = gates
+        .iter()
+        .map(|gate| gate.try_admit().unwrap().unwrap())
+        .collect::<Vec<_>>();
+    assert!(admitted.iter().map(|a| a.count).sum::<usize>() > budget.config().encoded_bytes_total);
+    assert_eq!(budget.usage().encoded_bytes, 0);
+    assert_eq!(
+        host.usage().unwrap().committed_bytes(),
+        gates.iter().map(|gate| gate.physical_bytes).sum::<usize>()
+    );
+    drop((admitted, gates));
     assert_eq!(budget.usage().sessions, 0);
     assert_eq!(budget.usage().encoded_bytes, 0);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
@@ -177,19 +180,21 @@ async fn predicted_length_mismatch_cannot_publish_or_retain_output_credit() {
     .unwrap();
     let budget = OutputBudget::new(OutputConfig::default()).unwrap();
     for delta in [-1_isize, 1] {
-        let mut prepared = PreparedEncoding::new(
-            Admission::new(
-                budget.try_open_session().unwrap(),
-                host.clone(),
-                PngDimensions::new(1, 1).unwrap(),
-                PngLimits::default(),
-                4,
-            )
-            .unwrap(),
-            tensor.clone(),
-            raw.clone(),
+        let admission = Admission::new(
+            budget.try_open_session().unwrap(),
+            host.clone(),
+            PngDimensions::new(1, 1).unwrap(),
+            PngLimits::default(),
+            4,
         )
         .unwrap();
+        let lease = admission
+            .session
+            .reserve_encoded(admission.count)
+            .await
+            .unwrap();
+        let mut prepared =
+            PreparedEncoding::new(admission, lease, tensor.clone(), raw.clone()).unwrap();
         // Model a dependency/profile mismatch, without changing the real writer.
         // Both insufficient backing and excess prediction must fail closed.
         prepared.admission.count = prepared.admission.count.checked_add_signed(delta).unwrap();
@@ -235,7 +240,7 @@ async fn admitted_encoding_survives_full_parent_and_slow_body_blocks_new_admissi
     let count = admitted.count;
     assert_eq!(host.usage().unwrap().committed_bytes(), count + 4);
     assert_eq!(host.usage().unwrap().allocated_bytes(), 0);
-    assert_eq!(budget.usage().encoded_bytes, count);
+    assert_eq!(budget.usage().encoded_bytes, 0);
     // The generator receives only its raw allocation, while unrelated users
     // consume every remaining parent byte before response encoding starts.
     let raw = host
@@ -279,7 +284,7 @@ async fn admitted_encoding_survives_full_parent_and_slow_body_blocks_new_admissi
 }
 
 #[tokio::test]
-async fn unavailable_encoded_credit_does_not_consume_partial_credit_or_host_grant() {
+async fn cancelling_encoding_wait_returns_raw_host_scope_and_partial_transport_credit() {
     let host = super::super::tests::host_account(4096);
     let budget = OutputBudget::new(OutputConfig {
         max_sessions: 2,
@@ -290,18 +295,32 @@ async fn unavailable_encoded_credit_does_not_consume_partial_credit_or_host_gran
     .unwrap();
     let first = budget.try_open_session().unwrap();
     let occupied = first.reserve_encoded(500).await.unwrap();
-    assert!(matches!(
-        Admission::new(
-            budget.try_open_session().unwrap(),
-            host.clone(),
-            PngDimensions::new(1, 1).unwrap(),
-            PngLimits::default(),
-            4,
-        ),
-        Err(ServerError::CapacityExceeded(_))
-    ));
-    // The remaining 12 bytes stay available; no parked waiter or partial lease
-    // survives the rejected response admission.
+    let admitted = Admission::new(
+        budget.try_open_session().unwrap(),
+        host.clone(),
+        PngDimensions::new(1, 1).unwrap(),
+        PngLimits::default(),
+        4,
+    )
+    .unwrap();
+    let count = admitted.count;
+    let raw = host
+        .allocate_zeroed(HostMemoryClass::Output, 8)
+        .unwrap()
+        .freeze();
+    let tensor = ResolvedTensorSpec::new(
+        vec![1, 4, 1, 1],
+        ElementType::Bf16,
+        ResolvedTensorLayout::Contiguous,
+    )
+    .unwrap();
+    let mut encoding = Box::pin(admitted.encode(tensor, raw));
+    assert!(futures::poll!(encoding.as_mut()).is_pending());
+    assert_eq!(host.usage().unwrap().committed_bytes(), count + 4 + 8);
+    assert_eq!(budget.usage().sessions, 2);
+    drop(encoding);
+    // Cancelling the response wait releases its Host grant, raw output and
+    // any partial FIFO semaphore credit; the unrelated owner remains intact.
     assert_eq!(budget.usage().encoded_bytes, 500);
     assert_eq!(budget.usage().sessions, 1);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);

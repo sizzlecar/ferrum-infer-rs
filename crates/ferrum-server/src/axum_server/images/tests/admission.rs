@@ -10,7 +10,7 @@ fn request() -> axum::http::Request<Body> {
 }
 
 #[tokio::test]
-async fn single_output_hard_limit_rejects_but_temporary_encoded_pressure_waits() {
+async fn single_output_hard_limit_rejects_before_inference_but_encoded_pressure_does_not() {
     for encoded_pressure in [false, true] {
         let host = HostMemoryAccount::new(
             HostMemoryLimits::new(
@@ -51,31 +51,22 @@ async fn single_output_hard_limit_rejects_but_temporary_encoded_pressure_waits()
         .build_router()
         .unwrap();
         if encoded_pressure {
-            let handler = tokio::spawn(router.oneshot(request()));
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while images.service().snapshot().pending_requests == 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            assert!(!handler.is_finished());
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            // The intentionally failing generator still executes immediately;
+            // only successful outputs wait for transport credit after inference.
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(5), router.oneshot(request()))
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert_eq!(
                 images.output_usage().encoded_bytes,
                 images.output.config().encoded_bytes_total
             );
-            drop(encoded_owner.take());
-            let response = tokio::time::timeout(std::time::Duration::from_secs(5), handler)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
             assert_eq!(
                 response.status(),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
             );
-            assert_eq!(calls.load(Ordering::SeqCst), 1); // Intentional fixture failure after wake.
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
         } else {
             let response = router.oneshot(request()).await.unwrap();
             assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
@@ -116,7 +107,7 @@ async fn cancelling_handler_retains_active_grant_until_generation_is_quiescent()
     let handler = tokio::spawn(router.oneshot(request()));
     gate.started.notified().await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(images.output_usage().encoded_bytes > 0);
+    assert_eq!(images.output_usage().encoded_bytes, 0);
     assert!(
         host.usage()
             .unwrap()
@@ -132,7 +123,7 @@ async fn cancelling_handler_retains_active_grant_until_generation_is_quiescent()
     handler.abort();
     assert!(handler.await.unwrap_err().is_cancelled());
     assert_eq!(images.output_usage().sessions, 1);
-    assert!(images.output_usage().encoded_bytes > 0);
+    assert_eq!(images.output_usage().encoded_bytes, 0);
     assert!(
         host.usage()
             .unwrap()

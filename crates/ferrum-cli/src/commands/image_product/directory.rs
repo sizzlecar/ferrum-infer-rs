@@ -130,7 +130,16 @@ impl DirectoryOptions {
     }
     pub fn serving(&self) -> Result<ServingConfig> {
         self.validate()?;
-        let pending = self.maximum_batch_size.max(4);
+        let pending = if self.backend == ImageBackendKind::Cuda
+            && self.batching == ferrum_types::ImageBatchPolicy::Auto
+        {
+            self.maximum_batch_size
+                .checked_mul(4)
+                .context("automatic image pending count overflows")?
+                .max(4)
+        } else {
+            self.maximum_batch_size.max(4)
+        };
         let serving = ServingConfig {
             batching: self.batching,
             maximum_pending: pending,
@@ -149,7 +158,9 @@ impl DirectoryOptions {
             default_seed: 0,
             rgba_scratch_bytes: 16 * 1024,
             output: ferrum_types::OutputConfig {
-                max_sessions: pending + self.maximum_batch_size,
+                max_sessions: pending
+                    .checked_add(self.maximum_batch_size)
+                    .context("image output session count overflows")?,
                 ..Default::default()
             },
         };
