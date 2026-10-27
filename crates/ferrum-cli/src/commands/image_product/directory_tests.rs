@@ -111,11 +111,15 @@ fn explicit_image_precision_routes_both_entrypoints_and_rejects_text_or_config_m
         options.precision,
         ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1
     );
-    assert_eq!(options.preset_name(), "experimental_fp8_linear_cold_v1");
+    assert_eq!(options.preset_name(), "fp8_linear_adaptive_v1");
     assert!(options.host().weight_backing_bytes > 0);
     assert_eq!(
         options.pipeline().residency,
-        ferrum_engine::image_generation::ImageResidencyPolicy::Cold
+        ferrum_engine::image_generation::ImageResidencyPolicy::Adaptive
+    );
+    assert_eq!(
+        options.pipeline().dynamic_residency,
+        ferrum_engine::image_generation::ImageDynamicResidencyPolicy::Adaptive
     );
 }
 
@@ -271,15 +275,27 @@ fn automatic_image_route_rejects_text_controls_and_invalid_product_limits() {
 }
 
 #[test]
-fn named_cold_preset_has_one_real_batch_limit_and_finite_host_bounds() {
+fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
     let one = DirectoryOptions::from_cli(0.9, None, None, "auto", None, None).unwrap();
-    assert_eq!(directory::PRESET_NAME, "experimental_bf16_cold_v1");
+    assert_eq!(directory::PRESET_NAME, "bf16_adaptive_v1");
     assert_eq!(one.serving().unwrap().request_batch_max_wait_ms, 0);
     assert_eq!(
         (one.pipeline().maximum_width, one.pipeline().maximum_height),
         (1024, 1024)
     );
     one.host().limits().unwrap();
+    for backend in ["cuda", "metal"] {
+        let options = DirectoryOptions::from_cli(0.9, None, None, backend, None, None).unwrap();
+        let pipeline = options.pipeline();
+        assert_eq!(
+            pipeline.residency,
+            ferrum_engine::image_generation::ImageResidencyPolicy::Adaptive
+        );
+        assert_eq!(
+            pipeline.dynamic_residency,
+            ferrum_engine::image_generation::ImageDynamicResidencyPolicy::Adaptive
+        );
+    }
     let eight = DirectoryOptions::from_cli(0.9, None, Some(8), "cuda", Some("0"), None).unwrap();
     assert_eq!(eight.serving().unwrap().max_num_seqs, 8);
     assert_eq!(eight.pipeline().maximum_batch_size, 8);

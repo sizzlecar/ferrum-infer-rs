@@ -1,4 +1,4 @@
-//! A named, bounded cold-execution preset for standard local pipeline packages.
+//! A bounded, adaptive-residency preset for standard local pipeline packages.
 //! Limits are admission bounds, not measured memory peaks or performance claims.
 use super::configuration::{HostConfig, PipelineConfig, ServingConfig};
 use anyhow::{ensure, Context, Result};
@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const PRESET_NAME: &str = "experimental_bf16_cold_v1";
+pub const PRESET_NAME: &str = "bf16_adaptive_v1";
 const MIB: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,10 +86,10 @@ impl DirectoryOptions {
         match self.precision {
             ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Bf16 => PRESET_NAME,
             ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1 => {
-                "experimental_fp8_linear_cold_v1"
+                "fp8_linear_adaptive_v1"
             }
             ferrum_engine::image_generation::ImageCudaPrecisionPolicy::Components(_) => {
-                "component_precision_cold_v1"
+                "component_precision_adaptive_v1"
             }
         }
     }
@@ -159,9 +159,9 @@ impl DirectoryOptions {
                 ferrum_engine::image_generation::ImageDecoderBatchPolicy::SingleImage,
             edit_prefix_policy: ferrum_engine::image_generation::ImageEditPrefixPolicy::default(),
             plan_cache: ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage,
-            residency: ferrum_engine::image_generation::ImageResidencyPolicy::Cold,
+            residency: ferrum_engine::image_generation::ImageResidencyPolicy::Adaptive,
             dynamic_residency:
-                ferrum_engine::image_generation::ImageDynamicResidencyPolicy::Release,
+                ferrum_engine::image_generation::ImageDynamicResidencyPolicy::Adaptive,
             maximum_staging_bytes: 16 * MIB,
             maximum_initialization_commands: 64,
             maximum_backing_maintenance_passes: 8,

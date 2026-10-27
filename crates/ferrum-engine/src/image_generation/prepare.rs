@@ -211,13 +211,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             &noise.compile_options()?,
             self,
         )?;
-        let denoise_stage = self.prepare_denoiser(&transformer, batch)?;
+        let mut denoise_stage = self.prepare_denoiser(&transformer, batch)?;
         let prefix_decode = prefix_decode_config
             .map(|config| {
                 let stage = self.prepare_denoiser(&config, batch)?;
                 Ok::<_, anyhow::Error>(PreparedPrefixDecode { config, stage })
             })
             .transpose()?;
+        if let Some(prefix) = &prefix_decode {
+            denoise_stage.bind_prefix_admission(&prefix.stage)?;
+        }
         let decode_stage = PreparedStage::compile(
             ImageStage::Decoder,
             decoder_batch,

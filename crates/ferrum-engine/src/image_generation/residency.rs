@@ -5,11 +5,17 @@ use ferrum_quantization::bf16_whole_tensor_fp8::ExactBf16TensorSource;
 use ferrum_quantization::ManagedDenseArchiveSource;
 use std::num::NonZeroU64;
 
+mod adaptive;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImageResidencyPolicy {
     #[default]
     Cold,
+    /// Keep reusable sessions and static weights until a later compiled stage
+    /// needs their capacity. Idle dynamic backing is reclaimed before weights.
+    /// Actual device-account admission remains authoritative.
+    Adaptive,
     /// Retain DiT and VAE static state between batches, releasing idle dynamic
     /// backing after each stage. TE and noise remain cold. Different complete
     /// plans (including masks/profiles) are closed before replacement. A new
@@ -45,6 +51,7 @@ impl ImageResidencyPolicy {
     fn retains(self, stage: ImageStage) -> bool {
         match self {
             Self::Cold => false,
+            Self::Adaptive => true,
             Self::DenoiserAndDecoder => {
                 matches!(stage, ImageStage::Denoiser | ImageStage::Decoder)
             }
@@ -132,6 +139,9 @@ impl ImageStageRetentionBudgets {
 pub enum ImageDynamicResidencyPolicy {
     #[default]
     Release,
+    /// Keep existing idle chunks without reserving additional storage. Requires
+    /// adaptive session residency, which can reclaim these chunks on demand.
+    Adaptive,
     RetainDecoder {
         maximum_bytes: u64,
     },
@@ -147,6 +157,12 @@ pub enum ImageDynamicResidencyPolicy {
 impl ImageDynamicResidencyPolicy {
     pub fn validate(self, residency: ImageResidencyPolicy) -> anyhow::Result<()> {
         residency.validate()?;
+        if self == Self::Adaptive {
+            ensure!(
+                residency == ImageResidencyPolicy::Adaptive,
+                "adaptive dynamic retention requires adaptive session residency"
+            );
+        }
         if let Self::RetainDecoder { maximum_bytes } = self {
             ensure!(
                 maximum_bytes > 0,
@@ -236,6 +252,8 @@ pub(super) struct ResidentStages<R: DeviceRuntime> {
     noise: Option<ActiveImageStage<R>>,
     /// Last successful idle-retention receipts, including older shapes' pools.
     dynamic_bytes: [u64; 6],
+    acquisition_order: [u64; 6],
+    acquisition_clock: u64,
     text_encoder_weights: Option<ResidentWeights<R>>,
     vision_encoder_weights: Option<ResidentWeights<R>>,
     vae_encoder_weights: Option<ResidentWeights<R>>,
@@ -256,6 +274,8 @@ impl<R: DeviceRuntime> ResidentStages<R> {
             decoder: None,
             noise: None,
             dynamic_bytes: [0; 6],
+            acquisition_order: [0; 6],
+            acquisition_clock: 0,
             text_encoder_weights: None,
             vision_encoder_weights: None,
             vae_encoder_weights: None,
@@ -349,7 +369,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         self.config
             .dynamic_residency
             .validate(self.config.residency)?;
+        let adaptive = self.config.residency == ImageResidencyPolicy::Adaptive;
         let retained_dynamic_by_stage = RETAINABLE_STAGES.map(|stage| {
+            if adaptive {
+                return 0;
+            }
             let ceiling = if self.config.residency.retains(stage) {
                 self.config.dynamic_residency.stage_ceiling(stage)
             } else {
@@ -383,7 +407,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 "image resident capacity requires compiled fixed tensor plans"
             );
             let memory = payload.memory();
-            let retained = self.config.residency.retains(stage.plan.stage);
+            let retained = !adaptive && self.config.residency.retains(stage.plan.stage);
             if retained && !counted_static.contains(&stage.plan.stage) {
                 retained_static = retained_static
                     .checked_add(memory.static_bytes())
@@ -395,11 +419,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             // not add the cuDNN workspace limit again or sum all dynamic plans.
             // Prefix lifetimes are handled together below. In particular the
             // decode session is newly attached after the old slot is closed.
-            let dynamic = if prefix.is_some() && stage.plan.stage == ImageStage::Denoiser {
-                memory.minimum_runnable_request_bytes()
-            } else {
-                self.runnable_dynamic_bytes(stage)?
-            };
+            let dynamic =
+                if adaptive || (prefix.is_some() && stage.plan.stage == ImageStage::Denoiser) {
+                    memory.minimum_runnable_request_bytes()
+                } else {
+                    self.runnable_dynamic_bytes(stage)?
+                };
             let active = dynamic
                 .checked_add(if retained { 0 } else { memory.static_bytes() })
                 .and_then(|n| n.checked_add(other_dynamic(stage.plan.stage)))
@@ -407,7 +432,17 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             active_peak = active_peak.max(active);
         }
         if let Some((prefill, decode)) = prefix {
-            let prefill_dynamic = self.runnable_dynamic_bytes(prefill)?;
+            let prefill_dynamic = if adaptive {
+                prefill
+                    .component
+                    .executable()
+                    .execution_plan()
+                    .payload()
+                    .memory()
+                    .minimum_runnable_request_bytes()
+            } else {
+                self.runnable_dynamic_bytes(prefill)?
+            };
             let prefill = prefill
                 .component
                 .executable()
@@ -432,11 +467,13 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .and_then(|n| n.checked_add(decode.minimum_sequence_bytes()))
                 .and_then(|n| n.checked_add(other_dynamic(ImageStage::Denoiser)))
                 .and_then(|n| {
-                    n.checked_add(if self.config.residency.retains(ImageStage::Denoiser) {
-                        0
-                    } else {
-                        prefill.static_bytes()
-                    })
+                    n.checked_add(
+                        if !adaptive && self.config.residency.retains(ImageStage::Denoiser) {
+                            0
+                        } else {
+                            prefill.static_bytes()
+                        },
+                    )
                 })
                 .context("prefix handoff capacity overflows")?;
             active_peak = active_peak.max(transition);
@@ -446,11 +483,13 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .minimum_runnable_request_bytes()
                 .checked_add(other_dynamic(ImageStage::Denoiser))
                 .context("retained pools plus prefix decode capacity overflows")?
-                .checked_add(if self.config.residency.retains(ImageStage::Denoiser) {
-                    0
-                } else {
-                    prefill.static_bytes()
-                })
+                .checked_add(
+                    if !adaptive && self.config.residency.retains(ImageStage::Denoiser) {
+                        0
+                    } else {
+                        prefill.static_bytes()
+                    },
+                )
                 .context("prefix decode capacity overflows")?;
             active_peak = active_peak.max(decode_peak);
         }
@@ -472,7 +511,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             (ImageStage::Denoiser, &self.resident_stages.denoiser_weights),
             (ImageStage::Decoder, &self.resident_stages.decoder_weights),
         ] {
-            if !counted_static.contains(&kind) {
+            if !adaptive && !counted_static.contains(&kind) {
                 if let Some(weights) = weights {
                     retained_static = retained_static
                         .checked_add(weights.origin.plan.static_bytes)
@@ -533,6 +572,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         job: u64,
         stages: &mut Vec<ImageStageReceipt>,
     ) -> Result<ActiveImageStage<R>, ImageGenerationFailure<R>> {
+        if self.config.residency == ImageResidencyPolicy::Adaptive {
+            self.admit_adaptive_stage(&prepared, stages)?;
+        }
         let weightless = matches!(prepared.component.family().weights(), ModelWeights::None);
         if self.config.residency.retains(prepared.plan.stage) {
             if let Some(previous) = self
@@ -642,13 +684,18 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     );
                 }
                 let started = std::time::Instant::now();
-                let ceiling = self
-                    .config
-                    .dynamic_residency
-                    .stage_ceiling(active.receipt.plan.stage);
+                let ceiling =
+                    if self.config.dynamic_residency == ImageDynamicResidencyPolicy::Adaptive {
+                        self.config.device_capacity_bytes
+                    } else {
+                        self.config
+                            .dynamic_residency
+                            .stage_ceiling(active.receipt.plan.stage)
+                    };
                 let retirement = if ceiling > 0 {
                     let outcome = match self.config.dynamic_residency {
-                        ImageDynamicResidencyPolicy::RetainStageBudgets { .. } => active
+                        ImageDynamicResidencyPolicy::RetainStageBudgets { .. }
+                        | ImageDynamicResidencyPolicy::Adaptive => active
                             .session
                             .try_retain_largest_idle_dynamic_chunks(ceiling),
                         _ => active.session.try_retain_idle_dynamic_backing(ceiling),
@@ -700,6 +747,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     .resident_stages
                     .slot(stage)
                     .expect("resident stage slot") = Some(active);
+                self.resident_stages.touch(stage);
                 return Ok(());
             }
         }
