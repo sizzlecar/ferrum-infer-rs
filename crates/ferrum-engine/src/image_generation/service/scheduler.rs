@@ -232,7 +232,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
                         state.executed_requests =
                             state.executed_requests.saturating_add(batch.len() as u64);
                         state.last_batch_size = batch.len();
-                        break Ok(prepared);
+                        break Ok((prepared, state.executed_batches));
                     }
                     Ok(Err(ImageBatchError::Capacity { proof, .. }))
                         if shared.config.batching == ImageBatchPolicy::Auto && batch.len() > 1 =>
@@ -257,11 +257,25 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     Err(panic) => break Err(ImageWorkerFailure::Panic(panic)),
                 }
             };
+            // Scope all request and nested generator/stage events to one actual
+            // dispatch. Failed preparations never receive an execution identity.
+            let dispatch_span = prepared.as_ref().ok().map(|(_, dispatch_id)| {
+                tracing::debug_span!(
+                    target: "ferrum_engine::image_generation::timing",
+                    "image_dispatch",
+                    dispatch_id = *dispatch_id,
+                )
+            });
+            let _dispatch = dispatch_span.as_ref().map(tracing::Span::enter);
             let mut responses = Vec::with_capacity(batch.len());
             let mut requests = Vec::with_capacity(batch.len());
             let now = Instant::now();
-            for job in batch {
-                tracing::debug!(target: "ferrum_engine::image_generation::timing",
+            let batch_size = batch.len();
+            for (batch_index, job) in batch.into_iter().enumerate() {
+                if prepared.is_ok() {
+                    tracing::debug!(target: "ferrum_engine::image_generation::timing",
+                    batch_index,
+                    batch_size,
                     seed = job.request.generation().seed,
                     width = job.request.generation().width,
                     height = job.request.generation().height,
@@ -270,10 +284,11 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     queue_and_prepare_us = u64::try_from(now.duration_since(job.submitted).as_micros()).unwrap_or(u64::MAX),
                     preparation_us = u64::try_from(job.preparation_duration.as_micros()).unwrap_or(u64::MAX),
                     "image request admitted to execution");
+                }
                 requests.push(job.request);
                 responses.push((job.cancelled, job.response, job._prompt_reservation));
             }
-            let outcome = prepared.and_then(|prepared| {
+            let outcome = prepared.and_then(|(prepared, _)| {
                 match catch_unwind(AssertUnwindSafe(|| worker.execute(prepared, requests))) {
                     Ok(Ok(outputs)) if outputs.len() == responses.len() => Ok(outputs),
                     Ok(Ok(_)) => Err(ImageWorkerFailure::Generation(Box::new(service_error(

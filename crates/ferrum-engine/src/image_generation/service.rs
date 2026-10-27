@@ -930,9 +930,12 @@ fn trace_request_timing(
                         target: "ferrum_engine::image_generation::timing",
                         request_kind,
                         job = output.receipt.job,
+                        width = output.receipt.width,
+                        height = output.receipt.height,
                         batch_size,
                         stage_index,
                         stage = ?plan.stage,
+                        role = ?plan.role,
                         stage_batch_size = plan.batch_size,
                         plan_cache_hit = plan.plan_cache_hit,
                         session_reused = execution.session_reused,
@@ -1309,3 +1312,5 @@ mod edit_auto_tests;
 mod edit_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod timing_tests;
