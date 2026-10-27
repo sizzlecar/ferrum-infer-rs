@@ -3,7 +3,8 @@
 use super::configuration::HostConfig;
 use anyhow::{Context, Result};
 use ferrum_engine::image_generation::{
-    ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy, ImageTextEncoderFp8CacheRequirements,
+    ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy, ImageOutputRequirements,
+    ImageTextEncoderFp8CacheRequirements,
 };
 use serde::Serialize;
 use std::num::NonZeroU64;
@@ -17,6 +18,25 @@ pub(super) enum AutoHostCacheDecision {
     TextEncoderNotFp8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AutoOutputDecision {
+    FullOverlap,
+    PartialAvailableMemory,
+    InsufficientAvailableMemory,
+    AvailableMemoryUnknown,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct AutoOutputReceipt {
+    pub decision: AutoOutputDecision,
+    pub pipeline: ImageOutputRequirements,
+    pub response_batch_bytes: usize,
+    pub required_output_bytes: usize,
+    pub effective_output_bytes: usize,
+    pub ownership_scope: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct AutoHostCacheReceipt {
     pub policy: &'static str,
@@ -26,6 +46,8 @@ pub(super) struct AutoHostCacheReceipt {
     pub required_host_total_bytes: Option<usize>,
     pub effective_host_total_bytes: usize,
     pub effective_weight_backing_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_selection: Option<AutoOutputReceipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observation_error: Option<String>,
     pub observation_scope: &'static str,
@@ -37,7 +59,7 @@ pub(super) struct AutoHostCacheSelection {
     pub receipt: AutoHostCacheReceipt,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(super) fn for_directory(
     options: &super::directory::DirectoryOptions,
     assets: &ferrum_engine::image_generation::QwenImage21Assets,
@@ -48,20 +70,40 @@ pub(super) fn for_directory(
         .stage_uses_fp8(ferrum_engine::image_generation::ImageStage::TextEncoder)
         .then(|| assets.text_encoder_fp8_host_cache_requirements(host.limits()?))
         .transpose()?;
-    // Observe after archive mapping/metadata preparation, before creating CUDA
-    // or a managed payload. BF16 needs neither this query nor an expanded pool.
-    let available = if requirements.is_some() {
-        ferrum_kernels::backend::cpu::vnext_runtime::host_memory_available()
-            .map_err(|error| error.to_string())
-    } else {
-        Ok(0)
+    let account = ferrum_runtime::HostMemoryAccount::new(host.limits()?);
+    let output = assets.output_requirements(&options.pipeline().resolved_limits()?, &account)?;
+    let serving = options.serving()?;
+    let http = ferrum_server::ImageHttpConfig {
+        output: serving.output,
+        default_width: serving.default_width,
+        default_height: serving.default_height,
+        default_seed: serving.default_seed,
+        rgba_scratch_bytes: serving.rgba_scratch_bytes,
+        png_limits: ferrum_output::png::PngLimits::default(),
     };
-    select(host, requirements, available)
+    let response_bytes = http.response_backing_bytes(
+        &account,
+        ferrum_output::png::PngDimensions::new(
+            output.maximum_width.into(),
+            output.maximum_height.into(),
+        )?,
+    )?;
+    // One snapshot covers both decisions after archive mapping, before CUDA
+    // construction or managed payload allocation. BF16 also sizes output.
+    let available = ferrum_kernels::backend::cpu::vnext_runtime::host_memory_available()
+        .map_err(|error| error.to_string());
+    select(
+        host,
+        requirements,
+        Some((output, response_bytes)),
+        available,
+    )
 }
 
 fn select(
     mut host: HostConfig,
     requirements: Option<ImageTextEncoderFp8CacheRequirements>,
+    output: Option<(ImageOutputRequirements, usize)>,
     available: Result<u64, String>,
 ) -> Result<AutoHostCacheSelection> {
     let mut receipt = AutoHostCacheReceipt {
@@ -72,6 +114,7 @@ fn select(
         required_host_total_bytes: None,
         effective_host_total_bytes: host.total_bytes,
         effective_weight_backing_bytes: host.weight_backing_bytes,
+        output_selection: None,
         observation_error: None,
         observation_scope: "available physical memory limited by remaining process address space and cgroup headroom; snapshot only, no OS reservation; managed Host allocations remain checked; mmap/page-cache, allocator and native-library memory are outside the Host ledger",
     };
@@ -100,10 +143,10 @@ fn select(
         .max(host.total_bytes);
         receipt.required_cache_bytes = Some(cache_bytes.get());
         receipt.required_host_total_bytes = Some(total);
-        match available {
+        match &available {
             Ok(bytes) => {
-                receipt.observed_available_bytes = Some(bytes);
-                if bytes >= u64::try_from(total)? {
+                receipt.observed_available_bytes = Some(*bytes);
+                if *bytes >= u64::try_from(total)? {
                     host.total_bytes = total;
                     host.weight_backing_bytes = backing;
                     host.limits()?;
@@ -122,10 +165,71 @@ fn select(
             }
             Err(error) => {
                 receipt.decision = AutoHostCacheDecision::AvailableMemoryUnknown;
-                receipt.observation_error = Some(error);
+                receipt.observation_error = Some(error.clone());
             }
         }
     }
+    if let Some((pipeline, response_bytes)) = output {
+        let response_batch_bytes = response_bytes
+            .checked_mul(pipeline.batch_size)
+            .context("HTTP output batch backing overflows")?;
+        // The completed batch can still own raw readbacks and all reserved
+        // encoding backing while the next batch owns its execution scope and
+        // response gates. These are lifecycle owners, not a queue multiplier.
+        let required_output_bytes = [
+            pipeline.raw_batch_bytes,
+            pipeline.execution_output_bytes,
+            response_batch_bytes,
+            response_batch_bytes,
+        ]
+        .into_iter()
+        .try_fold(0usize, |n, bytes| n.checked_add(bytes))
+        .context("overlapping image output backing overflows")?;
+        let decision = match available {
+            Ok(bytes) => {
+                receipt.observed_available_bytes = Some(bytes);
+                let other = [
+                    host.input_preprocess_bytes,
+                    host.transfer_staging_bytes,
+                    host.weight_backing_bytes,
+                ]
+                .into_iter()
+                .try_fold(0usize, |n, bytes| n.checked_add(bytes))
+                .context("non-output Host allowance overflows")?;
+                let remaining = usize::try_from(bytes.saturating_sub(u64::try_from(other)?))
+                    .unwrap_or(usize::MAX);
+                let selected = required_output_bytes.min(remaining).max(host.output_bytes);
+                let decision = if selected >= required_output_bytes {
+                    AutoOutputDecision::FullOverlap
+                } else if selected > host.output_bytes {
+                    AutoOutputDecision::PartialAvailableMemory
+                } else {
+                    AutoOutputDecision::InsufficientAvailableMemory
+                };
+                if selected > host.output_bytes {
+                    host.output_bytes = selected;
+                    host.total_bytes = host.total_bytes.max(
+                        other
+                            .checked_add(selected)
+                            .context("selected Host output total overflows")?,
+                    );
+                }
+                decision
+            }
+            Err(error) => {
+                receipt.observation_error = Some(error);
+                AutoOutputDecision::AvailableMemoryUnknown
+            }
+        };
+        receipt.output_selection = Some(AutoOutputReceipt {
+            decision, pipeline, response_batch_bytes, required_output_bytes,
+            effective_output_bytes: host.output_bytes,
+            ownership_scope: "conservative metadata bound: previous completed batch raw + HTTP backing, next execution readback + HTTP backing; allowance only, no batch preallocation; exact live Host grants remain authoritative",
+        });
+    }
+    host.limits()?;
+    receipt.effective_host_total_bytes = host.total_bytes;
+    receipt.effective_weight_backing_bytes = host.weight_backing_bytes;
     Ok(AutoHostCacheSelection {
         host,
         cache,
@@ -153,7 +257,7 @@ mod tests {
             converted_cache_bytes: 4000,
             maximum_conversion_group_bytes: 100,
         });
-        let enabled = select(host(), requirements, Ok(5200)).unwrap();
+        let enabled = select(host(), requirements, None, Ok(5200)).unwrap();
         assert_eq!(enabled.host.total_bytes, 5200);
         assert_eq!(enabled.host.weight_backing_bytes, 4200);
         assert_eq!(
@@ -167,7 +271,7 @@ mod tests {
             AutoHostCacheDecision::CompleteTextEncoderEnabled
         );
         for observation in [Ok(5199), Err("headroom unavailable".to_owned())] {
-            let selected = select(host(), requirements, observation.clone()).unwrap();
+            let selected = select(host(), requirements, None, observation.clone()).unwrap();
             assert_eq!(selected.cache, ImageFp8HostCachePolicy::Off);
             assert_eq!(selected.host.total_bytes, 1000);
             assert_eq!(selected.host.weight_backing_bytes, 200);
@@ -191,12 +295,13 @@ mod tests {
                 converted_cache_bytes: 4000,
                 maximum_conversion_group_bytes: 500,
             }),
+            None,
             Ok(5500),
         )
         .unwrap();
         assert_eq!(selected.host.total_bytes, 5500);
         assert_eq!(selected.host.weight_backing_bytes, 4500);
-        let unchanged = select(host(), None, Err("must not matter".to_owned())).unwrap();
+        let unchanged = select(host(), None, None, Err("must not matter".to_owned())).unwrap();
         assert_eq!(unchanged.cache, ImageFp8HostCachePolicy::Off);
         assert_eq!(unchanged.host.total_bytes, 1000);
         assert_eq!(
@@ -205,5 +310,55 @@ mod tests {
         );
         assert!(unchanged.receipt.observed_available_bytes.is_none());
         assert!(unchanged.receipt.observation_error.is_none());
+    }
+
+    #[test]
+    fn output_overlap_uses_remaining_shared_headroom_after_complete_cache() {
+        let cache = Some(ImageTextEncoderFp8CacheRequirements {
+            converted_cache_bytes: 4000,
+            maximum_conversion_group_bytes: 100,
+        });
+        let output = Some((
+            ImageOutputRequirements {
+                batch_size: 2,
+                maximum_width: 32,
+                maximum_height: 32,
+                raw_batch_bytes: 400,
+                execution_output_bytes: 600,
+            },
+            50,
+        ));
+        // Other classes with the complete cache cost 4900; the lifecycle
+        // target costs 400 + 600 + 2*100 = 1200, all on the same observation.
+        for (available, expected, decision) in [
+            (Ok(6100), 1200, AutoOutputDecision::FullOverlap),
+            (Ok(5700), 800, AutoOutputDecision::PartialAvailableMemory),
+            (
+                Ok(5200),
+                300,
+                AutoOutputDecision::InsufficientAvailableMemory,
+            ),
+            (
+                Err("unknown".to_owned()),
+                300,
+                AutoOutputDecision::AvailableMemoryUnknown,
+            ),
+        ] {
+            let selected = select(host(), cache, output, available.clone()).unwrap();
+            let receipt = selected.receipt.output_selection.unwrap();
+            assert_eq!(receipt.required_output_bytes, 1200);
+            assert_eq!(receipt.decision, decision);
+            assert_eq!(selected.host.output_bytes, expected);
+            if let Ok(bytes) = available {
+                assert_eq!(selected.host.total_bytes as u64, bytes);
+                assert_eq!(selected.host.weight_backing_bytes, 4200);
+            } else {
+                assert_eq!(selected.cache, ImageFp8HostCachePolicy::Off);
+                assert_eq!(selected.host.total_bytes, 1000);
+            }
+        }
+        let bf16 = select(host(), None, output, Ok(2100)).unwrap();
+        assert_eq!(bf16.host.output_bytes, 1200);
+        assert_eq!(bf16.cache, ImageFp8HostCachePolicy::Off);
     }
 }

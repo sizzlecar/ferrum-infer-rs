@@ -109,6 +109,22 @@ impl QwenImage21T2iTokenizer {
     pub fn drop_prefix_tokens(&self) -> usize {
         self.prefix.len()
     }
+    /// Admission's full hidden sequence bound, including the source template
+    /// and (for editing) expansion of its single visual placeholder.
+    pub fn maximum_sequence_length(
+        &self,
+        maximum_user_tokens: usize,
+        visual_tokens: usize,
+    ) -> Result<usize> {
+        ensure!(
+            (1..=8192).contains(&maximum_user_tokens),
+            "invalid user-token budget"
+        );
+        self.baseline
+            .checked_add(maximum_user_tokens)
+            .and_then(|n| n.checked_add(visual_tokens.saturating_sub(1)))
+            .ok_or_else(|| anyhow::anyhow!("maximum image text sequence overflows"))
+    }
     /// Encode the raw image-conditioned template, checking the user contribution
     /// before expanding the single image placeholder to the merged visual grid.
     pub fn prepare_edit(

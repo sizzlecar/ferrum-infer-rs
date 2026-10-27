@@ -36,6 +36,8 @@ mod decoder;
 mod editing;
 mod host_budget;
 mod host_cache;
+mod output_requirements;
+pub use output_requirements::ImageOutputRequirements;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
 mod metal_attention_policy;

@@ -62,11 +62,7 @@ impl ResponseGate {
         {
             return Err(capacity("encoded image exceeds configured output limit"));
         }
-        let physical = host
-            .backing_bytes(scratch_bytes)
-            .map_err(capacity)?
-            .checked_add(host.backing_bytes(count).map_err(capacity)?)
-            .ok_or_else(|| capacity("encoded image backing exceeds the host address space"))?;
+        let physical = physical_response_bytes(&host, scratch_bytes, count).map_err(capacity)?;
         host.check_scope_capacity(&[(HostMemoryClass::Output, physical)])
             .map_err(capacity)?;
         Ok(Self {
@@ -312,6 +308,32 @@ fn response_bytes(png_bytes: u64, created: i64) -> Option<usize> {
     usize::try_from(bytes)
         .ok()
         .filter(|bytes| *bytes <= isize::MAX as usize)
+}
+
+fn physical_response_bytes(
+    host: &HostMemoryAccount,
+    scratch_bytes: usize,
+    count: usize,
+) -> anyhow::Result<usize> {
+    host.backing_bytes(scratch_bytes)?
+        .checked_add(host.backing_bytes(count)?)
+        .ok_or_else(|| anyhow::anyhow!("encoded image backing exceeds the host address space"))
+}
+
+impl super::ImageHttpConfig {
+    /// Maximum physical scratch + JSON/base64 backing for one response, using
+    /// the actual gate/encoder layout and the longest supported i64 timestamp.
+    /// Pure metadata: neither an OutputSession nor a Host grant is acquired.
+    pub fn response_backing_bytes(
+        &self,
+        host: &HostMemoryAccount,
+        dimensions: PngDimensions,
+    ) -> anyhow::Result<usize> {
+        let png = encoded_rgba8_png_bytes(dimensions, self.png_limits)?;
+        let count = response_bytes(png, i64::MIN)
+            .ok_or_else(|| anyhow::anyhow!("encoded image length exceeds address space"))?;
+        physical_response_bytes(host, self.rgba_scratch_bytes, count)
+    }
 }
 
 #[cfg(test)]

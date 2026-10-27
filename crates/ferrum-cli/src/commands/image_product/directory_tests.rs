@@ -359,6 +359,13 @@ fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
         pending + eight.maximum_batch_size + completed_sessions
     );
     assert_eq!(eight.pipeline().maximum_batch_size, 8);
+    let selected_output = eight.host().output_bytes * 2;
+    let selected = eight.serving_with_output_bytes(selected_output).unwrap();
+    assert_eq!(selected.maximum_pending, pending);
+    assert_eq!(
+        selected.output.max_sessions,
+        pending + eight.maximum_batch_size + selected_output / minimum_output_bytes
+    );
     assert_eq!(eight.serving().unwrap().request_batch_max_wait_ms, 0);
     assert_eq!(
         eight.serving().unwrap().batching,

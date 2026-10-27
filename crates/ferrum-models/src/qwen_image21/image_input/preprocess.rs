@@ -154,6 +154,11 @@ impl QwenImage21ImageProcessor {
     pub fn merge_size(&self) -> usize {
         self.merge
     }
+    /// Metadata ceiling enforced by the same condition-layout validation used
+    /// before preprocessing. This is a bound, not an allocated image buffer.
+    pub fn maximum_condition_pixels(&self) -> usize {
+        self.maximum_pixels
+    }
 
     /// The pinned edit pipeline uses target area 1024² and rounds each axis to
     /// the nearest multiple of 32 (ties to even), independently of output size.

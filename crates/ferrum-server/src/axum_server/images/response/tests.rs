@@ -17,6 +17,34 @@ fn exact_json_length_matches_standard_base64_and_signed_timestamp_boundaries() {
     }
     assert_eq!(response_bytes(u64::MAX, 0), None);
     assert_eq!(response_bytes(isize::MAX as u64, i64::MIN), None);
+    let host = super::super::tests::host_account(256 * 1024 * 1024);
+    let config = super::super::tests::config();
+    let dimensions = PngDimensions::new(2048, 2048).unwrap();
+    let budget = OutputBudget::new(config.output.clone()).unwrap();
+    let gate = ResponseGate::new(
+        budget.try_open_session().unwrap(),
+        host.clone(),
+        dimensions,
+        config.png_limits,
+        config.rgba_scratch_bytes,
+    )
+    .unwrap();
+    let declared = config.response_backing_bytes(&host, dimensions).unwrap();
+    assert!(declared >= gate.physical_bytes);
+    assert_eq!(
+        declared,
+        physical_response_bytes(
+            &host,
+            config.rgba_scratch_bytes,
+            response_bytes(
+                encoded_rgba8_png_bytes(dimensions, config.png_limits).unwrap(),
+                i64::MIN
+            )
+            .unwrap()
+        )
+        .unwrap()
+    );
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }
 
 #[test]

@@ -129,6 +129,9 @@ impl DirectoryOptions {
         Ok(())
     }
     pub fn serving(&self) -> Result<ServingConfig> {
+        self.serving_with_output_bytes(self.host().output_bytes)
+    }
+    pub(super) fn serving_with_output_bytes(&self, output_bytes: usize) -> Result<ServingConfig> {
         self.validate()?;
         let host = self.host();
         let pending_bytes = host.default_pending_bytes()?;
@@ -157,7 +160,7 @@ impl DirectoryOptions {
                 PngDimensions::new(1, 1)?,
                 PngLimits::default(),
             )?)?;
-            let completed_sessions = host.output_bytes / minimum_output_bytes;
+            let completed_sessions = output_bytes / minimum_output_bytes;
             let sessions = active_sessions
                 .checked_add(completed_sessions)
                 .context("automatic image output session count overflows")?;
@@ -411,7 +414,7 @@ impl ImageProductSource {
                 Ok(PreparedProduct {
                     model,
                     profile: options.preset_name(),
-                    serving: Some(options.serving()?),
+                    serving: Some(options.serving_with_output_bytes(backend.host_output_bytes())?),
                     backend,
                     assets,
                 })
