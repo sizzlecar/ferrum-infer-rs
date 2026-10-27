@@ -46,6 +46,7 @@ pub(super) fn dataset(count: usize) -> ImageDataset {
                 width: 1,
                 height: 1,
                 num_inference_steps: None,
+                mode: None,
             })
             .collect(),
     }
@@ -55,10 +56,13 @@ pub(super) fn config(url: String) -> ImageBenchmarkConfig {
     ImageBenchmarkConfig {
         endpoints: vec![ImageBenchmarkEndpoint {
             url,
+            edit_url: None,
             model: "image-model".into(),
             server_config_declaration: "CPU protocol fixture, no model performance evidence".into(),
         }],
         concurrency: 8,
+        arrival: ImageArrivalPolicy::ClosedLoop,
+        maximum_in_flight: None,
         repetitions: 2,
         warmup_repetitions: 0,
         initial_server_state: InitialServerState::Unknown,
@@ -67,6 +71,7 @@ pub(super) fn config(url: String) -> ImageBenchmarkConfig {
         limits: ImageResponseLimits::default(),
         maximum_total_requests: 100,
         maximum_reference_image_bytes: ferrum_models::qwen_image21::image_input::ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES,
+        maximum_total_reference_image_bytes: 128 * 1024 * 1024,
         capture: None,
     }
 }
@@ -186,6 +191,9 @@ async fn protocol_and_streaming_size_errors_are_recorded_without_body_leak_or_su
     let report = run_benchmark(cfg, dataset(4)).await.unwrap();
     let endpoint = &report.endpoints[0];
     assert_eq!(endpoint.measured.errors, 4);
+    assert_eq!(endpoint.measured.rejected, 1);
+    assert_eq!(endpoint.measured.client_not_dispatched, 0);
+    assert_eq!(endpoint.measured.other_errors, 3);
     assert_eq!(
         endpoint.requests[0].failure,
         Some(ImageFailureKind::HttpStatus)
@@ -258,6 +266,131 @@ async fn records_timeout_and_keeps_warmup_out_of_measured_counts() {
         warm.endpoints[0].repetitions[0].metrics.latency_slo_status,
         ImageSloStatus::NotEvaluated
     );
+}
+
+#[tokio::test]
+async fn burst_reports_unsent_arrivals_separately_from_server_rejections() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let received = calls.clone();
+    let (url, _server) = serve(Router::new().route(
+        "/v1/images/generations",
+        post(move || {
+            received.fetch_add(1, Ordering::SeqCst);
+            async { StatusCode::TOO_MANY_REQUESTS }
+        }),
+    ))
+    .await;
+    let mut cfg = config(url);
+    cfg.repetitions = 1;
+    cfg.arrival = ImageArrivalPolicy::Burst;
+    cfg.maximum_in_flight = Some(2);
+    cfg.latency_slo_p99_ms = Some(100_000.0);
+    let report = run_benchmark(cfg, dataset(5)).await.unwrap();
+    let endpoint = &report.endpoints[0];
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(endpoint.measured.attempted, 5);
+    assert_eq!(endpoint.measured.dispatched, 2);
+    assert_eq!(endpoint.measured.rejected, 2);
+    assert_eq!(endpoint.measured.client_not_dispatched, 3);
+    assert_eq!(endpoint.measured.other_errors, 0);
+    assert_eq!(endpoint.measured.errors, 5);
+    assert_eq!(
+        endpoint.measured.latency_slo_status,
+        ImageSloStatus::Violated
+    );
+    assert_eq!(endpoint.arrivals.len(), 5);
+    for (index, arrival) in endpoint.arrivals.iter().enumerate() {
+        assert_eq!(arrival.sample_index, index);
+        assert_eq!(arrival.scheduled_offset_ms, Some(0.0));
+        assert_eq!(arrival.dispatched_offset_ms.is_some(), index < 2);
+        assert_eq!(arrival.dispatch_lag_ms.is_some(), index < 2);
+    }
+    for record in &endpoint.requests[2..] {
+        assert_eq!(record.failure, Some(ImageFailureKind::ClientCapacity));
+        assert_eq!(record.http_status, None);
+    }
+}
+
+#[tokio::test]
+async fn fixed_arrivals_do_not_wait_for_slow_responses_or_retry_unsent_samples() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let received = calls.clone();
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let ready_server = ready.clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_server = release.clone();
+    let body = valid_body();
+    let (url, _server) = serve(Router::new().route(
+        "/v1/images/generations",
+        post(move || {
+            let ready = ready_server.clone();
+            let release = release_server.clone();
+            let received = received.clone();
+            let body = body.clone();
+            async move {
+                let released = release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                if received.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                    ready.notify_one();
+                }
+                released.await;
+                body
+            }
+        }),
+    ))
+    .await;
+    let mut cfg = config(url);
+    cfg.repetitions = 1;
+    cfg.concurrency = 1;
+    cfg.arrival = ImageArrivalPolicy::FixedInterval { interval_ms: 20.0 };
+    cfg.maximum_in_flight = Some(2);
+    let running = tokio::spawn(run_benchmark(cfg, dataset(3)));
+    tokio::time::timeout(Duration::from_secs(2), ready.notified())
+        .await
+        .unwrap();
+    // Both requests stay active beyond the final planned arrival. A closed-loop
+    // implementation would defer the third request and send it after release.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    release.notify_waiters();
+    let report = running.await.unwrap().unwrap();
+    let endpoint = &report.endpoints[0];
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(endpoint.measured.succeeded, 2);
+    assert_eq!(endpoint.measured.client_not_dispatched, 1);
+    assert_eq!(endpoint.measured.rejected, 0);
+    assert_eq!(endpoint.measured.other_errors, 0);
+    assert_eq!(
+        endpoint
+            .arrivals
+            .iter()
+            .map(|record| record.scheduled_offset_ms)
+            .collect::<Vec<_>>(),
+        vec![Some(0.0), Some(20.0), Some(40.0)]
+    );
+    assert_eq!(endpoint.requests[2].sample_id, "image-2");
+    assert_eq!(
+        endpoint.requests[2].failure,
+        Some(ImageFailureKind::ClientCapacity)
+    );
+}
+
+#[test]
+fn arrival_options_are_explicit_and_bounded() {
+    for interval in [f64::NAN, f64::INFINITY, -1.0, 0.0, 1e-20] {
+        assert!(
+            ImageArrivalPolicy::from_cli(ImageArrivalMode::FixedInterval, Some(interval)).is_err()
+        );
+    }
+    assert!(ImageArrivalPolicy::from_cli(ImageArrivalMode::FixedInterval, None).is_err());
+    assert!(ImageArrivalPolicy::from_cli(ImageArrivalMode::ClosedLoop, Some(1.0)).is_err());
+    assert!(ImageArrivalPolicy::from_cli(ImageArrivalMode::Burst, Some(1.0)).is_err());
+    let mut cfg = config("http://127.0.0.1/v1/images/generations".into());
+    cfg.maximum_in_flight = Some(2);
+    assert!(cfg.validate(&dataset(1)).is_err());
+    cfg.arrival = ImageArrivalPolicy::Burst;
+    cfg.maximum_in_flight = Some(0);
+    assert!(cfg.validate(&dataset(1)).is_err());
 }
 
 #[derive(clap::Parser)]

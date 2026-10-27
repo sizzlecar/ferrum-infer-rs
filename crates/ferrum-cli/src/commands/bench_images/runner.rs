@@ -1,5 +1,5 @@
 use super::capture::{capture_validated_png, CaptureSink};
-use super::edit::PreparedReference;
+use super::edit::{PreparedReference, PreparedReferences};
 use super::*;
 use ferrum_bench_core::images::{
     validate_image_response_with_png, ImageFailureKind, ImageHttpRequest, ImageSample,
@@ -15,12 +15,7 @@ pub async fn run_benchmark(
     mut dataset: ImageDataset,
 ) -> anyhow::Result<ImageBenchmarkReport> {
     config.validate(&dataset)?;
-    let reference = PreparedReference::load(&dataset.mode, &config)?;
-    if let (ImageRequestMode::Edit { image }, Some(reference)) = (&mut dataset.mode, &reference) {
-        // The report's dataset fingerprint binds the bytes actually sent, even
-        // when the caller did not predeclare an encoded SHA-256.
-        image.encoded_sha256 = Some(reference.identity.png_sha256.clone());
-    }
+    let references = PreparedReferences::load(&mut dataset, &config)?;
     let capture = config
         .capture
         .as_ref()
@@ -37,6 +32,7 @@ pub async fn run_benchmark(
     let mut endpoint_reports = Vec::new();
     for (endpoint_index, endpoint) in config.endpoints.iter().enumerate() {
         let mut records = Vec::new();
+        let mut arrivals = Vec::new();
         let mut captures = capture.as_ref().map(|_| Vec::new());
         let mut repetitions = Vec::new();
         let mut measured_seconds = 0.0;
@@ -47,7 +43,7 @@ pub async fn run_benchmark(
                 config.repetitions
             };
             for repetition in 0..count {
-                let (run, mut requests, mut artifacts) = run_round(
+                let (run, mut requests, mut artifacts, mut scheduled) = run_round(
                     &client,
                     endpoint_index,
                     endpoint,
@@ -56,7 +52,7 @@ pub async fn run_benchmark(
                     phase,
                     repetition,
                     capture.as_ref(),
-                    reference.as_ref(),
+                    &references,
                 )
                 .await;
                 if phase == ImageRequestPhase::Measured {
@@ -64,6 +60,7 @@ pub async fn run_benchmark(
                 }
                 repetitions.push(run);
                 records.append(&mut requests);
+                arrivals.append(&mut scheduled);
                 if let Some(captures) = &mut captures {
                     captures.append(&mut artifacts);
                 }
@@ -76,11 +73,19 @@ pub async fn run_benchmark(
             .collect();
         let metrics =
             ImageMetrics::from_records(measured_seconds, &measured, config.latency_slo_p99_ms);
+        let measured_workloads = ferrum_bench_core::images::image_workload_metrics(
+            measured_seconds,
+            &measured,
+            &dataset,
+            config.latency_slo_p99_ms,
+        )?;
         endpoint_reports.push(ImageEndpointReport {
             endpoint_index,
             repetitions,
             measured: metrics,
+            measured_workloads,
             requests: records,
+            arrivals,
             captures,
         });
     }
@@ -89,15 +94,32 @@ pub async fn run_benchmark(
     if capture_summary.is_some() {
         evidence.throughput_scope = "successful validated images divided by measured wall time including errors, local validation and PNG capture IO; warmup excluded; capture retains request slots and changes subsequent dispatch pacing";
     }
+    if config.arrival.is_open_loop() {
+        evidence.dispatch_order = "absolute planned arrivals in dataset order; client in-flight saturation produces explicit unsent failures instead of deferred requests; actual dispatch lag is recorded; network/server arrival order is not guaranteed";
+    }
+    let reference_image = (dataset.schema_version < 3 && !dataset.mode.is_generate())
+        .then(|| references.entries[0].identity.clone());
     Ok(ImageBenchmarkReport {
-        schema_version: if dataset.mode.is_generate() { 1 } else { 2 },
+        schema_version: if dataset.schema_version == 3 {
+            3
+        } else if dataset.mode.is_generate() {
+            1
+        } else {
+            2
+        },
         client_version: env!("CARGO_PKG_VERSION").into(),
         started_unix_ms,
         dataset_sha256: dataset.fingerprint()?,
         dataset_file_sha256: None,
         configuration: config,
         dataset,
-        reference_image: reference.map(|reference| reference.identity),
+        reference_image,
+        reference_images: references
+            .entries
+            .iter()
+            .map(|reference| reference.identity.clone())
+            .collect(),
+        sample_reference_indices: references.sample_indices,
         endpoints: endpoint_reports,
         evidence,
         capture: capture_summary,
@@ -113,38 +135,91 @@ async fn run_round(
     phase: ImageRequestPhase,
     repetition: usize,
     capture: Option<&Arc<CaptureSink>>,
-    reference: Option<&PreparedReference>,
+    references: &PreparedReferences,
 ) -> (
     ImageBenchmarkRepetition,
     Vec<ImageRequestRecord>,
     Vec<PngCaptureRecord>,
+    Vec<ImageArrivalRecord>,
 ) {
     let start = Instant::now();
     let mut next = 0usize;
     let mut active = FuturesUnordered::new();
     let mut records = Vec::with_capacity(dataset.samples.len());
     let mut captures = Vec::new();
+    let mut arrivals = Vec::with_capacity(dataset.samples.len());
     let mut http_span = 0.0_f64;
+    let bound = config.maximum_in_flight.unwrap_or(config.concurrency);
     while next < dataset.samples.len() || !active.is_empty() {
-        while next < dataset.samples.len() && active.len() < config.concurrency {
-            active.push(run_request(
-                client,
-                endpoint_index,
-                endpoint,
-                config,
-                &dataset.samples[next],
-                next,
-                phase,
-                repetition,
-                start,
-                capture.cloned(),
-                reference,
-            ));
-            next += 1;
-        }
-        if let Some((record, body_complete_seconds, captured)) = active.next().await {
+        let completed = if config.arrival.is_open_loop() && next < dataset.samples.len() {
+            let due = start
+                + config
+                    .arrival
+                    .offset(next)
+                    .expect("validated arrival clock");
+            tokio::select! {
+                // First release slots whose complete body/validation/capture is
+                // already ready. Never wait for a busy slot past a due arrival.
+                biased;
+                completed = active.next(), if !active.is_empty() => completed,
+                _ = tokio::time::sleep_until(due.into()) => {
+                    let elapsed = start.elapsed();
+                    while next < dataset.samples.len()
+                        && config.arrival.offset(next).unwrap() <= elapsed
+                    {
+                        let offset = config.arrival.offset(next).unwrap();
+                        let sample = &dataset.samples[next];
+                        if active.len() < bound {
+                            active.push(run_request(client, endpoint_index, endpoint, config,
+                                sample, next, phase, repetition, start, Some(offset),
+                                capture.cloned(), references.for_sample(next)));
+                        } else {
+                            let mut record = request_record(sample, next, phase, repetition);
+                            record.failure = Some(ImageFailureKind::ClientCapacity);
+                            record.error = Some("planned arrival not sent: client in-flight limit reached".into());
+                            records.push(record);
+                            arrivals.push(ImageArrivalRecord {
+                                sample_index: next, phase, repetition,
+                                scheduled_offset_ms: Some(offset.as_secs_f64() * 1000.0),
+                                dispatched_offset_ms: None,
+                                dispatch_lag_ms: None,
+                            });
+                            if capture.is_some() {
+                                captures.push(PngCaptureRecord {
+                                    sample_index: next, sample_id: sample.id.clone(), phase, repetition,
+                                    result: PngCaptureResult::NotProduced,
+                                });
+                            }
+                        }
+                        next += 1;
+                    }
+                    None
+                }
+            }
+        } else {
+            while next < dataset.samples.len() && active.len() < config.concurrency {
+                active.push(run_request(
+                    client,
+                    endpoint_index,
+                    endpoint,
+                    config,
+                    &dataset.samples[next],
+                    next,
+                    phase,
+                    repetition,
+                    start,
+                    None,
+                    capture.cloned(),
+                    references.for_sample(next),
+                ));
+                next += 1;
+            }
+            active.next().await
+        };
+        if let Some((record, body_complete_seconds, captured, arrival)) = completed {
             http_span = http_span.max(body_complete_seconds);
             records.push(record);
+            arrivals.push(arrival);
             if let Some(captured) = captured {
                 captures.push(captured);
             }
@@ -153,6 +228,7 @@ async fn run_round(
     let elapsed = start.elapsed().as_secs_f64();
     records.sort_by_key(|record| record.sample_index);
     captures.sort_by_key(|record| record.sample_index);
+    arrivals.sort_by_key(|record| record.sample_index);
     let metrics = ImageMetrics::from_records(
         elapsed,
         &records,
@@ -171,6 +247,7 @@ async fn run_round(
         },
         records,
         captures,
+        arrivals,
     )
 }
 
@@ -184,26 +261,29 @@ async fn run_request(
     phase: ImageRequestPhase,
     repetition: usize,
     round_start: Instant,
+    scheduled_offset: Option<Duration>,
     capture: Option<Arc<CaptureSink>>,
     reference: Option<&PreparedReference>,
-) -> (ImageRequestRecord, f64, Option<PngCaptureRecord>) {
+) -> (
+    ImageRequestRecord,
+    f64,
+    Option<PngCaptureRecord>,
+    ImageArrivalRecord,
+) {
     let capture_enabled = capture.is_some();
     let mut capture_result = PngCaptureResult::NotProduced;
     let start = Instant::now();
-    let mut record = ImageRequestRecord {
+    let dispatched = start.duration_since(round_start);
+    let arrival = ImageArrivalRecord {
         sample_index,
-        sample_id: sample.id.clone(),
         phase,
         repetition,
-        dispatch_index: sample_index,
-        http_status: None,
-        e2e_ms: 0.0,
-        validation_ms: 0.0,
-        response_bytes: 0,
-        image: None,
-        failure: None,
-        error: None,
+        scheduled_offset_ms: scheduled_offset.map(|offset| offset.as_secs_f64() * 1000.0),
+        dispatched_offset_ms: Some(dispatched.as_secs_f64() * 1000.0),
+        dispatch_lag_ms: scheduled_offset
+            .map(|offset| dispatched.saturating_sub(offset).as_secs_f64() * 1000.0),
     };
+    let mut record = request_record(sample, sample_index, phase, repetition);
     let received = receive(
         client,
         endpoint,
@@ -281,7 +361,29 @@ async fn run_request(
         repetition,
         result: capture_result,
     });
-    (record, body_complete_seconds, captured)
+    (record, body_complete_seconds, captured, arrival)
+}
+
+fn request_record(
+    sample: &ImageSample,
+    sample_index: usize,
+    phase: ImageRequestPhase,
+    repetition: usize,
+) -> ImageRequestRecord {
+    ImageRequestRecord {
+        sample_index,
+        sample_id: sample.id.clone(),
+        phase,
+        repetition,
+        dispatch_index: sample_index,
+        http_status: None,
+        e2e_ms: 0.0,
+        validation_ms: 0.0,
+        response_bytes: 0,
+        image: None,
+        failure: None,
+        error: None,
+    }
 }
 
 async fn receive(
@@ -292,7 +394,12 @@ async fn receive(
     record: &mut ImageRequestRecord,
     reference: Option<&PreparedReference>,
 ) -> Result<Vec<u8>, (ImageFailureKind, &'static str)> {
-    let request = client.post(&endpoint.url);
+    let url = if reference.is_some() {
+        endpoint.edit_url.as_deref().unwrap_or(&endpoint.url)
+    } else {
+        &endpoint.url
+    };
+    let request = client.post(url);
     let request = match reference {
         Some(reference) => request.multipart(reference.form(endpoint, sample).map_err(|_| {
             (

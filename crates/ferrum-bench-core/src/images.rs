@@ -14,6 +14,8 @@ pub use png_response::{
 };
 mod request_mode;
 pub use request_mode::{ImageReference, ImageRequestMode};
+mod workload;
+pub use workload::{image_workload_metrics, ImageWorkloadMetrics};
 
 #[cfg(test)]
 mod tests;
@@ -56,23 +58,37 @@ pub struct ImageSample {
     /// A server rejecting this optional field is a recorded protocol failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_inference_steps: Option<u32>,
+    /// Version 3 overrides the dataset default per request, allowing a pinned
+    /// generation/edit mixture and multiple immutable reference PNGs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ImageRequestMode>,
+}
+
+impl ImageSample {
+    pub fn effective_mode<'a>(&'a self, default: &'a ImageRequestMode) -> &'a ImageRequestMode {
+        self.mode.as_ref().unwrap_or(default)
+    }
 }
 
 impl ImageDataset {
     pub fn validate(&self, limits: &ImageResponseLimits) -> Result<(), ImageBenchError> {
         limits.validate()?;
-        if !matches!(self.schema_version, 1 | 2)
+        if !matches!(self.schema_version, 1 | 2 | 3)
             || (self.schema_version == 1 && !self.mode.is_generate())
             || self.samples.is_empty()
             || self.samples.len() > 100_000
         {
             return Err(invalid(
-                "dataset requires version 1 (generate) or 2 and 1..=100000 samples",
+                "dataset requires version 1 (generate), 2 (one mode), or 3 (per-request mode) and 1..=100000 samples",
             ));
         }
         self.mode.validate()?;
         let mut ids = BTreeSet::new();
         for sample in &self.samples {
+            if self.schema_version < 3 && sample.mode.is_some() {
+                return Err(invalid("per-request mode requires dataset version 3"));
+            }
+            sample.effective_mode(&self.mode).validate()?;
             if sample.id.is_empty() || sample.id.len() > 256 || !ids.insert(&sample.id) {
                 return Err(invalid(
                     "sample IDs must be nonempty, unique and at most 256 bytes",
@@ -204,6 +220,9 @@ pub enum ImageFailureKind {
     ResponseLimit,
     InvalidResponse,
     ClientTask,
+    /// A scheduled arrival exceeded the client's declared in-flight bound.
+    /// No HTTP request was sent; this is never a server rejection.
+    ClientCapacity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,14 +259,29 @@ pub enum ImageSloStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMetrics {
+    /// All planned arrivals, including those the bounded client could not send.
     pub attempted: usize,
+    #[serde(default)]
+    pub dispatched: usize,
     pub succeeded: usize,
+    /// All unsuccessful planned requests, preserving the original schema's
+    /// meaning. Includes server rejections and client-capacity drops.
     pub errors: usize,
+    /// HTTP 429 failures; distinct from client-side unsent arrivals.
+    #[serde(default)]
+    pub rejected: usize,
+    #[serde(default)]
+    pub client_not_dispatched: usize,
+    /// Failures other than HTTP 429 or client-capacity drops.
+    #[serde(default)]
+    pub other_errors: usize,
     /// Includes all request failures and local decoding work; excludes warmup.
     pub elapsed_seconds: f64,
     pub images_per_second: Option<f64>,
     /// Percentiles of successful, strictly validated responses only.
     pub e2e_p50_ms: Option<f64>,
+    #[serde(default)]
+    pub e2e_p95_ms: Option<f64>,
     pub e2e_p99_ms: Option<f64>,
     pub latency_slo_p99_ms: Option<f64>,
     /// An explicit threshold is met only with zero errors in the supplied records.
@@ -257,11 +291,12 @@ pub struct ImageMetrics {
 }
 
 impl ImageMetrics {
-    pub fn from_records(
+    pub fn from_records<'a>(
         elapsed_seconds: f64,
-        records: &[ImageRequestRecord],
+        records: impl IntoIterator<Item = &'a ImageRequestRecord>,
         latency_slo_p99_ms: Option<f64>,
     ) -> Self {
+        let records: Vec<_> = records.into_iter().collect();
         let latencies: Vec<_> = records
             .iter()
             .filter(|r| r.succeeded())
@@ -269,7 +304,16 @@ impl ImageMetrics {
             .collect();
         let succeeded = latencies.len();
         let errors = records.len() - succeeded;
+        let rejected = records
+            .iter()
+            .filter(|r| !r.succeeded() && r.http_status == Some(429))
+            .count();
+        let client_not_dispatched = records
+            .iter()
+            .filter(|r| r.failure == Some(ImageFailureKind::ClientCapacity))
+            .count();
         let p50 = (!latencies.is_empty()).then(|| crate::percentile(&latencies, 0.50));
+        let p95 = (!latencies.is_empty()).then(|| crate::percentile(&latencies, 0.95));
         let p99 = (!latencies.is_empty()).then(|| crate::percentile(&latencies, 0.99));
         let status = match latency_slo_p99_ms {
             None => ImageSloStatus::NotEvaluated,
@@ -278,12 +322,17 @@ impl ImageMetrics {
         };
         Self {
             attempted: records.len(),
+            dispatched: records.len() - client_not_dispatched,
             succeeded,
             errors,
+            rejected,
+            client_not_dispatched,
+            other_errors: errors.saturating_sub(rejected + client_not_dispatched),
             elapsed_seconds,
             images_per_second: (elapsed_seconds.is_finite() && elapsed_seconds > 0.0)
                 .then_some(succeeded as f64 / elapsed_seconds),
             e2e_p50_ms: p50,
+            e2e_p95_ms: p95,
             e2e_p99_ms: p99,
             latency_slo_p99_ms,
             latency_slo_status: status,

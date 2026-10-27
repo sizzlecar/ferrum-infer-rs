@@ -10,6 +10,72 @@ use ferrum_bench_core::images::{
 };
 use std::{fs::File, io::Read};
 
+pub(super) struct PreparedReferences {
+    pub(super) entries: Vec<PreparedReference>,
+    pub(super) sample_indices: Vec<Option<usize>>,
+}
+
+impl PreparedReferences {
+    pub(super) fn load(
+        dataset: &mut ferrum_bench_core::images::ImageDataset,
+        config: &ImageBenchmarkConfig,
+    ) -> anyhow::Result<Self> {
+        let mut paths = std::collections::BTreeMap::new();
+        let mut entries: Vec<PreparedReference> = Vec::new();
+        let mut sample_indices = Vec::with_capacity(dataset.samples.len());
+        let mut retained = 0usize;
+        for sample in &mut dataset.samples {
+            let mode = sample.mode.as_mut().unwrap_or(&mut dataset.mode);
+            let ImageRequestMode::Edit { image } = mode else {
+                sample_indices.push(None);
+                continue;
+            };
+            let index = if let Some(&index) = paths.get(&image.path) {
+                index
+            } else {
+                // Enforce the aggregate bound before reading a new backing,
+                // including its transient load before publishing into entries.
+                let mut bounded = config.clone();
+                bounded.maximum_reference_image_bytes = bounded
+                    .maximum_reference_image_bytes
+                    .min(config.maximum_total_reference_image_bytes - retained);
+                let prepared = PreparedReference::load(mode, &bounded)?.expect("edit mode");
+                retained = retained
+                    .checked_add(prepared.png.len())
+                    .context("reference total overflows")?;
+                let index = entries.len();
+                let ImageRequestMode::Edit { image } = mode else {
+                    unreachable!()
+                };
+                paths.insert(image.path.clone(), index);
+                entries.push(prepared);
+                index
+            };
+            let ImageRequestMode::Edit { image } = mode else {
+                unreachable!()
+            };
+            let actual = &entries[index].identity.png_sha256;
+            ensure!(
+                image
+                    .encoded_sha256
+                    .as_ref()
+                    .is_none_or(|expected| expected == actual),
+                "reference PNG SHA-256 differs from the dataset declaration"
+            );
+            image.encoded_sha256 = Some(actual.clone());
+            sample_indices.push(Some(index));
+        }
+        Ok(Self {
+            entries,
+            sample_indices,
+        })
+    }
+
+    pub(super) fn for_sample(&self, index: usize) -> Option<&PreparedReference> {
+        self.sample_indices[index].map(|reference| &self.entries[reference])
+    }
+}
+
 pub(super) struct PreparedReference {
     pub(super) identity: ValidatedImage,
     png: Bytes,
