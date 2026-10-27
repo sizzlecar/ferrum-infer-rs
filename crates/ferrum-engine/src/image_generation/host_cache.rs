@@ -5,6 +5,57 @@ use ferrum_runtime::{HostMemoryClass, HostMemoryLimits};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU64;
 
+/// Metadata-only demand for a complete converted text encoder on the CUDA
+/// composition's byte-aligned Host account. No tensor payload is allocated.
+#[derive(Debug, Clone, Copy)]
+pub struct ImageTextEncoderFp8CacheRequirements {
+    pub converted_cache_bytes: u64,
+    pub maximum_conversion_group_bytes: u64,
+}
+
+impl super::QwenImage21Assets {
+    pub fn text_encoder_fp8_host_cache_requirements(
+        &self,
+        host_limits: HostMemoryLimits,
+    ) -> anyhow::Result<ImageTextEncoderFp8CacheRequirements> {
+        text_encoder_cache_requirements(&self.text, host_limits)
+    }
+}
+
+fn text_encoder_cache_requirements(
+    architecture: &ferrum_models::qwen3_vl_text::Qwen3VLTextArchitecture,
+    host_limits: HostMemoryLimits,
+) -> anyhow::Result<ImageTextEncoderFp8CacheRequirements> {
+    use ferrum_models::qwen3_vl_text::{
+        Qwen3VLTextConfig, Qwen3VLTextEncoderFamily, Qwen3VLTextKeyRun, Qwen3VLTextLayout,
+    };
+    use ferrum_runtime::{
+        HostMemoryAccount, ModelFamilyRegistration, NumericalProfileId, TypedFamilyRegistration,
+    };
+    let text = Qwen3VLTextConfig::new(
+        architecture.clone(),
+        Qwen3VLTextLayout::new(1, vec![vec![Qwen3VLTextKeyRun::new(1, true)]])?,
+    )?;
+    let family = TypedFamilyRegistration::new(Qwen3VLTextEncoderFamily::new()?)
+        .prepare_with_profile(
+            &serde_json::to_value(&text)?,
+            &NumericalProfileId::new(Qwen3VLTextEncoderFamily::CUDA_FP8_PROFILE_ID)
+                .map_err(anyhow::Error::msg)?,
+        )?;
+    // CUDA creates this same byte-aligned account. Conversion metadata is
+    // independent of request batch/text shape and never reads source payloads.
+    let host = HostMemoryAccount::new(host_limits);
+    let materializer = super::precision::materializer(
+        super::precision::TEXT_MATERIALIZER,
+        &host,
+        Qwen3VLTextEncoderFamily::fp8_weight_groups(&text)?,
+    )?;
+    Ok(ImageTextEncoderFp8CacheRequirements {
+        converted_cache_bytes: materializer.converted_cache_bytes(&family)?,
+        maximum_conversion_group_bytes: materializer.maximum_group_accounted_bytes(&family)?,
+    })
+}
+
 /// Only stages with an FP8 weight materializer accept a converted-weight cache.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -132,6 +183,34 @@ impl ImageFp8HostCachePolicy {
 mod tests {
     use super::*;
     use ferrum_runtime::HostMemoryClassLimits;
+
+    #[test]
+    fn text_cache_demand_comes_from_complete_family_metadata_without_payloads() {
+        use ferrum_models::qwen3_vl_text::Qwen3VLTextArchitecture;
+        let architecture = |layers| {
+            Qwen3VLTextArchitecture::from_hf_value(&serde_json::json!({
+                "model_type":"qwen3_vl","architectures":["Qwen3VLForConditionalGeneration"],
+                "text_config":{"model_type":"qwen3_vl_text","dtype":"bfloat16",
+                    "hidden_act":"silu","attention_bias":false,"attention_dropout":0.0,
+                    "num_hidden_layers":layers,"hidden_size":8,"intermediate_size":16,
+                    "num_attention_heads":1,"num_key_value_heads":1,"head_dim":8,
+                    "vocab_size":32,"max_position_embeddings":1024,"rms_norm_eps":0.000001,
+                    "rope_theta":100,"rope_scaling":{"rope_type":"default",
+                        "mrope_interleaved":true,"mrope_section":[2,1,1]}}
+            }))
+            .unwrap()
+        };
+        // Even an account far too small to materialize a group can inspect it.
+        let one = text_encoder_cache_requirements(&architecture(1), host(1024, 1)).unwrap();
+        let two = text_encoder_cache_requirements(&architecture(2), host(1024, 1)).unwrap();
+        assert!(one.converted_cache_bytes > 0);
+        assert_eq!(two.converted_cache_bytes, one.converted_cache_bytes * 2);
+        assert_eq!(
+            two.maximum_conversion_group_bytes,
+            one.maximum_conversion_group_bytes
+        );
+        assert!(one.maximum_conversion_group_bytes > 1);
+    }
 
     fn policy() -> ImageFp8HostCachePolicy {
         ImageFp8HostCachePolicy::StageBudgets {

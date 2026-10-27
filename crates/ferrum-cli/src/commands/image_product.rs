@@ -10,6 +10,8 @@ mod factory;
 #[cfg(all(test, feature = "cuda"))]
 mod gpu_tests;
 #[cfg(any(feature = "cuda", test))]
+mod host_cache;
+#[cfg(any(feature = "cuda", test))]
 mod library;
 mod run;
 mod serve;

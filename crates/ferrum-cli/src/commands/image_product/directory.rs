@@ -394,13 +394,14 @@ impl ImageProductSource {
             }
             Self::LocalDirectory { path, options } => {
                 options.validate()?;
-                let backend = super::factory::PreparedBackend::from_directory(options)?;
+                super::factory::PreparedBackend::ensure_supported(options.backend)?;
                 // Complete metadata and actual archive headers precede any
                 // device context, provider, or native library construction.
                 let assets = ferrum_engine::image_generation::QwenImage21Assets::from_directory(
                     path,
                     PipelineSourceLimits::default(),
                 )?;
+                let backend = super::factory::PreparedBackend::from_directory(options, &assets)?;
                 let model = path
                     .file_name()
                     .and_then(|s| s.to_str())

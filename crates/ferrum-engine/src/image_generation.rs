@@ -51,7 +51,9 @@ mod stage;
 mod stream_requirements;
 pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources};
 pub use attention_policy::ImageCudaAttentionPolicy;
-pub use host_cache::{ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy};
+pub use host_cache::{
+    ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy, ImageTextEncoderFp8CacheRequirements,
+};
 pub use plan_cache::{ImagePlanCachePolicy, ImagePlanCacheReceipt};
 /// Shared component precision contract; keep the original CUDA spelling compatible.
 pub use precision::ImageCudaPrecisionPolicy as ImagePrecisionPolicy;
