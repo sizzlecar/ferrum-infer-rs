@@ -293,9 +293,30 @@ fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
         (2048, 2048)
     );
     one.host().limits().unwrap();
+    #[cfg(feature = "cuda")]
+    {
+        // Resolving a typed preset must not load a native library.
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("libcudnn.so.9");
+        fs::write(&library, b"metadata-only fixture").unwrap();
+        let mut selected = one.clone();
+        selected.cudnn_library = Some(library);
+        assert_eq!(
+            selected.cuda().unwrap().attention_policy,
+            ferrum_engine::image_generation::ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1
+        );
+    }
     for backend in ["cuda", "metal"] {
         let options = DirectoryOptions::from_cli(0.9, None, None, backend, None, None).unwrap();
         let pipeline = options.pipeline();
+        assert_eq!(
+            pipeline.edit_prefix_policy,
+            if backend == "cuda" {
+                ferrum_engine::image_generation::ImageEditPrefixPolicy::RequestCache
+            } else {
+                ferrum_engine::image_generation::ImageEditPrefixPolicy::Recompute
+            }
+        );
         assert_eq!(
             pipeline.residency,
             ferrum_engine::image_generation::ImageResidencyPolicy::Adaptive
@@ -332,11 +353,19 @@ fn run_has_single_request_capacity_and_metal_keeps_configured_batching() {
         let run = cuda.single_request();
         assert_eq!(run.pipeline().maximum_batch_size, 1);
         assert_eq!(run.pipeline().maximum_width, 2048);
+        assert_eq!(
+            run.pipeline().edit_prefix_policy,
+            ferrum_engine::image_generation::ImageEditPrefixPolicy::RequestCache
+        );
         assert_eq!(run.serving().unwrap().request_batch_max_wait_ms, 0);
         let metal =
             DirectoryOptions::from_cli(0.9, None, explicit_cap, "metal", None, None).unwrap();
         assert_eq!(metal.batching, ferrum_types::ImageBatchPolicy::Configured);
         assert_eq!(metal.pipeline().maximum_width, 1024);
+        assert_eq!(
+            metal.pipeline().edit_prefix_policy,
+            ferrum_engine::image_generation::ImageEditPrefixPolicy::Recompute
+        );
         assert_eq!(metal.maximum_batch_size, explicit_cap.unwrap_or(1));
         assert_eq!(
             metal.serving().unwrap().request_batch_max_wait_ms,

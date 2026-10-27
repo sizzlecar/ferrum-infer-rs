@@ -185,7 +185,14 @@ impl DirectoryOptions {
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy:
                 ferrum_engine::image_generation::ImageDecoderBatchPolicy::SingleImage,
-            edit_prefix_policy: ferrum_engine::image_generation::ImageEditPrefixPolicy::default(),
+            edit_prefix_policy: match self.backend {
+                ImageBackendKind::Cuda => {
+                    ferrum_engine::image_generation::ImageEditPrefixPolicy::RequestCache
+                }
+                ImageBackendKind::Metal => {
+                    ferrum_engine::image_generation::ImageEditPrefixPolicy::Recompute
+                }
+            },
             plan_cache: ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage,
             residency: ferrum_engine::image_generation::ImageResidencyPolicy::Adaptive,
             dynamic_residency:
@@ -218,7 +225,8 @@ impl DirectoryOptions {
             maximum_in_flight_per_stream: 1,
             maximum_commands_per_submission: 2048,
             opaque_memory_profile: "experimental-unqualified-runtime-v1".into(),
-            attention_policy: ferrum_engine::image_generation::ImageCudaAttentionPolicy::Sequential,
+            attention_policy:
+                ferrum_engine::image_generation::ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
             precision_policy: self.precision,
             fp8_host_cache: ferrum_engine::image_generation::ImageFp8HostCachePolicy::Off,
             cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
