@@ -20,6 +20,17 @@ fn context() -> (
     OperationRuntimeRegistry<MetalDeviceRuntime>,
     CapabilityCatalog,
 ) {
+    context_with_io_limit(128 << 20)
+}
+
+fn context_with_io_limit(
+    io_bytes: usize,
+) -> (
+    Arc<MetalDeviceRuntime>,
+    HostMemoryAccount,
+    OperationRuntimeRegistry<MetalDeviceRuntime>,
+    CapabilityCatalog,
+) {
     let runtime = Arc::new(
         MetalDeviceRuntime::new_tensor_eager(MetalTensorRuntimeConfig {
             device: metal_tensor_runtime_config(id("device.metal.0")).unwrap(),
@@ -38,8 +49,8 @@ fn context() -> (
             HostMemoryLimits::new(
                 HOST_BYTES,
                 HostMemoryClassLimits {
-                    input_preprocess_bytes: 128 << 20,
-                    output_bytes: 128 << 20,
+                    input_preprocess_bytes: io_bytes,
+                    output_bytes: io_bytes,
                     transfer_staging_bytes: 0,
                     weight_backing_bytes: 2 << 30,
                 },
@@ -103,6 +114,15 @@ fn activation(host: &HostMemoryAccount, shape: &Shape) -> ManagedHostTensor {
 }
 
 fn check_output(shape: &Shape, decoded: &[bf16], bytes: &[u8]) -> Result<(), String> {
+    check_output_at(shape, decoded, bytes, 0)
+}
+
+fn check_output_at(
+    shape: &Shape,
+    decoded: &[bf16],
+    bytes: &[u8],
+    row_base: u64,
+) -> Result<(), String> {
     if bytes.len() as u64 != shape.m * shape.n * 2 {
         return Err("output byte length differs from M*N BF16".into());
     }
@@ -112,13 +132,14 @@ fn check_output(shape: &Shape, decoded: &[bf16], bytes: &[u8]) -> Result<(), Str
     // Odd stride 17 permutes all 4096 K lanes in the full-row cases.
     for (index, word) in bytes.chunks_exact(2).enumerate() {
         let (row, column) = (index as u64 / shape.n, index as u64 % shape.n);
-        let inner = (row * 17 + 3) % shape.k;
-        let scale = [0.25_f64, -0.5, 1.0, -2.0][(row % 4) as usize];
+        let global_row = row_base + row;
+        let inner = (global_row * 17 + 3) % shape.k;
+        let scale = [0.25_f64, -0.5, 1.0, -2.0][(global_row % 4) as usize];
         let expected = f64::from(decoded[(column * shape.k + inner) as usize].to_f32()) * scale;
         let actual = bf16::from_bits(u16::from_le_bytes(word.try_into().unwrap())).to_f32();
         if !actual.is_finite() || f64::from(actual) != expected {
             return Err(format!(
-                "[{row},{column}]: actual={actual} exact decoded-FP64={expected}"
+                "[{global_row},{column}]: actual={actual} exact decoded-FP64={expected}"
             ));
         }
     }
@@ -372,6 +393,391 @@ fn managed_metal_q4k_vs_dense_microbench() {
                 "event":"retirement", "case":case, "host_committed_bytes":host.usage().unwrap().committed_bytes(),
                 "device_capacity_fully_reclaimable":true, "native_before_runtime_drop":native_after_close
             })
+        );
+    }
+}
+
+/// Two views of the same admitted B2 input; no second payload allocation.
+fn split_batch_input(input: &ManagedHostTensor, single: &Shape) -> [ManagedHostTensor; 2] {
+    let sample_bytes = usize::try_from(single.m * single.k * 2).unwrap();
+    assert_eq!(input.bytes().len(), sample_bytes * 2);
+    std::array::from_fn(|sample| {
+        ManagedHostTensor::new(
+            id(X),
+            ResolvedTensorSpec::new(
+                vec![single.m, single.k],
+                ElementType::Bf16,
+                ResolvedTensorLayout::Contiguous,
+            )
+            .unwrap(),
+            input
+                .bytes()
+                .slice(sample * sample_bytes..(sample + 1) * sample_bytes)
+                .unwrap(),
+        )
+        .unwrap()
+    })
+}
+
+#[test]
+fn batch_input_views_and_second_sample_oracle_keep_global_rows() {
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            64 << 10,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: 64 << 10,
+                output_bytes: 0,
+                transfer_staging_bytes: 0,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    let single = Shape {
+        m: 3,
+        n: 2,
+        k: 256,
+        blocks: Format::Q4K.blocks(),
+    };
+    let batch = Shape {
+        m: single.m * 2,
+        ..single.clone()
+    };
+    let input = activation(&host, &batch);
+    let charged = host.usage().unwrap().committed_bytes();
+    let views = split_batch_input(&input, &single);
+    assert_eq!(host.usage().unwrap().committed_bytes(), charged);
+    let half = input.bytes().len() / 2;
+    assert_eq!(views[0].bytes().bytes(), &input.bytes().bytes()[..half]);
+    assert_eq!(views[1].bytes().bytes(), &input.bytes().bytes()[half..]);
+    assert!(input.bytes().slice(half..input.bytes().len() + 1).is_err());
+
+    let decoded: Vec<_> = (0..single.n * single.k)
+        .map(|i| bf16::from_f32((i % single.k + 1) as f32 / 256.0))
+        .collect();
+    // Independently evaluate the actual second input view, rather than using
+    // the row-index formula that the output checker is intended to verify.
+    let mut output = Vec::new();
+    for row in views[1].bytes().bytes().chunks_exact(single.k as usize * 2) {
+        for weights in decoded.chunks_exact(single.k as usize) {
+            let sum: f64 = row
+                .chunks_exact(2)
+                .zip(weights)
+                .map(|(x, w)| {
+                    f64::from(bf16::from_le_bytes(x.try_into().unwrap()).to_f32())
+                        * f64::from(w.to_f32())
+                })
+                .sum();
+            output.extend_from_slice(&bf16::from_f64(sum).to_le_bytes());
+        }
+    }
+    check_output_at(&single, &decoded, &output, single.m).unwrap();
+    assert!(check_output_at(&single, &decoded, &output, 0).is_err());
+    drop(input);
+    assert_eq!(host.usage().unwrap().committed_bytes(), charged);
+    drop(views);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+#[ignore = "paired managed B1/B2 Metal projection timing; requires exclusive GPU access"]
+fn managed_metal_linear_two_b1_vs_b2_microbench() {
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "off,ferrum_execution::tensor=debug,ferrum_kernels::backend::metal::vnext_ops::tensor::linear=debug",
+        ))
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _diagnostics = tracing::subscriber::set_default(subscriber);
+    // 4096 rows represent the image-token projection workload only. Actual DiT
+    // joint text/image sequence lengths and attention masks are not reproduced.
+    // These repetitions bound diagnostic duration; no speed/PASS-ratio gate.
+    let rows_per_image = 4096;
+    let warmup_pairs = 1;
+    let measured_pairs = 3;
+    for (case, (n, k)) in [(4096, 4096), (12288, 4096), (4096, 12288)]
+        .into_iter()
+        .enumerate()
+    {
+        let single = Shape {
+            m: rows_per_image,
+            n,
+            k,
+            blocks: Format::Q4K.blocks(),
+        };
+        let batch = Shape {
+            m: single.m * 2,
+            ..single.clone()
+        };
+        eprintln!(
+            "linear_batch_microbench={}",
+            serde_json::json!({"event":"case_started","case":case,
+                "rows_per_image":rows_per_image,"n":n,"k":k,"status":"preparation_pending"})
+        );
+        // The largest B2 K=12288 input is 192MiB. The overall Host/device
+        // budgets stay the same as the original paired projection diagnostic.
+        let (runtime, host, registry, catalog) = context_with_io_limit(256 << 20);
+        let capacity = DeviceCapacityOwner::open(runtime.descriptor(), DEVICE_BYTES).unwrap();
+        let preparation_bytes = (32 * n * k + (16 << 20)) as usize;
+        let preparation = host
+            .reserve(HostMemoryClass::WeightBacking, preparation_bytes)
+            .unwrap();
+        let fixture = Fixture::new(&single, Format::Q4K);
+        let retained_fixture = host
+            .reserve(
+                HostMemoryClass::WeightBacking,
+                fixture.decoded.len() * 2
+                    + fixture._file.as_file().metadata().unwrap().len() as usize,
+            )
+            .unwrap();
+        let mut decoded = host
+            .allocate_zeroed(HostMemoryClass::WeightBacking, fixture.decoded.len() * 2)
+            .unwrap();
+        for (word, value) in decoded.as_mut().chunks_exact_mut(2).zip(&fixture.decoded) {
+            word.copy_from_slice(&value.to_le_bytes());
+        }
+        let dense = dense::DenseSource(decoded.freeze());
+        drop(preparation);
+        let input = activation(&host, &batch);
+        let single_inputs = split_batch_input(&input, &single);
+        let idle_host_bytes = host.usage().unwrap().committed_bytes();
+        let input_sha = format!("{:x}", Sha256::digest(input.bytes().bytes()));
+        let packed_sha = format!(
+            "{:x}",
+            Sha256::digest(fixture.source.tensor("projection.weight").unwrap().bytes())
+        );
+        let dense_sha = format!("{:x}", Sha256::digest(dense.0.bytes()));
+        let policy = TensorComponentPolicy::new(
+            DEVICE_BYTES,
+            runtime
+                .descriptor()
+                .dynamic_storage_profiles
+                .iter()
+                .copied()
+                .collect(),
+        )
+        .unwrap();
+        let materializers = WeightMaterializerRegistry::identity_only().unwrap();
+        let mut expected_hash: Option<String> = None;
+
+        // Only the two shapes of one precision are resident together. Closing
+        // both before the next precision bounds dynamic pools within 1GiB.
+        for kind in [
+            MetalTensorOperation::DenseLinear,
+            MetalTensorOperation::BlockLinear,
+        ] {
+            let precision = if kind == MetalTensorOperation::DenseLinear {
+                "dense_bf16"
+            } else {
+                "native_q4k"
+            };
+            let components = [&single, &batch].map(|shape| {
+                let prepared = if kind == MetalTensorOperation::DenseLinear {
+                    TypedFamilyRegistration::new(dense::DenseFamily(family::Family {
+                        profile: kind.profile(),
+                    }))
+                    .prepare_with_profile(
+                        &serde_json::to_value(shape).unwrap(),
+                        &id(kind.profile()),
+                    )
+                    .unwrap()
+                } else {
+                    family::prepare_with_profile(shape, kind.profile())
+                };
+                let options = ProgramPlanCompileOptions::new(BTreeMap::from([(
+                    id(X),
+                    tensor(vec![shape.m, k]),
+                )]))
+                .unwrap();
+                CompiledTensorComponent::compile(
+                    prepared,
+                    &registry,
+                    &catalog,
+                    &policy,
+                    &materializers,
+                    &options,
+                )
+                .unwrap()
+            });
+            let plan_memory: Vec<_> = components.iter().map(|c| {
+                let plan = c.executable().execution_plan().payload();
+                serde_json::json!({"static_bytes":plan.memory().static_bytes(),
+                    "minimum_runnable_bytes":plan.memory().minimum_runnable_request_bytes(),
+                    "scratch_bytes":plan.nodes()[0].provider_resources().scratch().and_then(|s|s.fixed_bytes())})
+            }).collect();
+            let mut sessions: Vec<_> = components
+                .iter()
+                .enumerate()
+                .map(|(index, component)| {
+                    let source: &dyn WeightComponentSource =
+                        if kind == MetalTensorOperation::DenseLinear {
+                            &dense
+                        } else {
+                            &fixture.source
+                        };
+                    component
+                        .initialize(
+                            runtime.clone(),
+                            host.clone(),
+                            ComponentWeightSource::Stored(source),
+                            ComponentInitializationConfig {
+                                request_id: id(format!(
+                                    "request.batch-linear.init.{case}.{precision}.{index}"
+                                )),
+                                run_id: id(format!(
+                                    "run.batch-linear.init.{case}.{precision}.{index}"
+                                )),
+                                transaction_id: id(format!(
+                                    "transaction.batch-linear.init.{case}.{precision}.{index}"
+                                )),
+                                static_policy: StaticInitializationPolicy::new(16 << 20, 16)
+                                    .unwrap(),
+                                executor: TensorExecutorConfig::default(),
+                            },
+                        )
+                        .unwrap()
+                })
+                .collect();
+            eprintln!(
+                "linear_batch_microbench={}",
+                serde_json::json!({
+                    "event":"setup","case":case,"precision":precision,"rows_per_image":rows_per_image,
+                    "n":n,"k":k,"batch_shapes":[single,batch],"plan_memory":plan_memory,
+                    "input_sha256":input_sha,"packed_weight_sha256":packed_sha,"dense_weight_sha256":dense_sha,
+                    "device_budget_bytes":DEVICE_BYTES,"host_budget_bytes":HOST_BYTES,"io_class_limit_bytes":256u64<<20,
+                    "runtime_fingerprint":runtime.descriptor().runtime_implementation_fingerprint,
+                    "warmup_pairs":warmup_pairs,"measured_pairs":measured_pairs,
+                    "weight_residency":"two separately initialized shape sessions of this precision; initialization excluded",
+                    "timing_scope":"managed_execute_admission_encode_wait_readback_including_host_tracing; validation and hashing excluded",
+                    "native_memory_scope":"device-handle sampled highwater since this shape runtime creation; not independent per arm/precision or RSS",
+                    "workload_scope":"synthetic image-token projections; not complete DiT, image generation or SLO evidence"
+                })
+            );
+            let mut measured_ms = [Vec::new(), Vec::new()];
+            for pair in 0..warmup_pairs + measured_pairs {
+                let order = if pair % 2 == 0 { [0, 1] } else { [1, 0] };
+                for (position, arm) in order.into_iter().enumerate() {
+                    let batch_size = arm + 1;
+                    let batches = 2 / batch_size;
+                    let calls: Vec<_> = (0..batches)
+                        .map(|sample| {
+                            let suffix = format!("{case}.{precision}.{pair}.{arm}.{sample}");
+                            (
+                                id::<RunId>(format!("run.batch-linear.{suffix}")),
+                                id::<RequestIdentity>(format!("request.batch-linear.{suffix}")),
+                                vec![if arm == 0 {
+                                    single_inputs[sample].clone()
+                                } else {
+                                    input.clone()
+                                }],
+                            )
+                        })
+                        .collect();
+                    let mut outputs = Vec::with_capacity(batches);
+                    let mut execution_ms = Vec::with_capacity(batches);
+                    let started = Instant::now();
+                    for (run, request, inputs) in calls {
+                        let execution_started = Instant::now();
+                        let result = sessions[arm].execute(run, request, inputs);
+                        execution_ms.push(execution_started.elapsed().as_secs_f64() * 1000.0);
+                        match result {
+                            Ok(output) => outputs.push(output),
+                            Err(error) => {
+                                eprintln!(
+                                    "linear_batch_microbench={}",
+                                    serde_json::json!({"event":"sample","case":case,
+                                    "precision":precision,"pair":pair,"arm":arm,"batch_size":batch_size,"position":position,
+                                    "warmup":pair<warmup_pairs,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
+                                    "status":"execution_failed","error":error.to_string()})
+                                );
+                                panic!("managed batch projection failed: {error}");
+                            }
+                        }
+                    }
+                    // Both B1 outputs remain live until both executions finish,
+                    // matching B2's total completion bytes. No validation in between.
+                    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    let mut hash = Sha256::new();
+                    let validation = outputs.iter().enumerate().try_for_each(|(sample, output)| {
+                        if output.len() != 1 {
+                            return Err("output count differs from one projection".into());
+                        }
+                        let bytes = output[0].bytes().bytes();
+                        hash.update(bytes);
+                        check_output_at(
+                            if arm == 0 { &single } else { &batch },
+                            &fixture.decoded,
+                            bytes,
+                            if arm == 0 {
+                                sample as u64 * single.m
+                            } else {
+                                0
+                            },
+                        )
+                    });
+                    let output_sha = format!("{:x}", hash.finalize());
+                    eprintln!(
+                        "linear_batch_microbench={}",
+                        serde_json::json!({
+                            "event":"sample","case":case,"precision":precision,"pair":pair,"position":position,
+                            "arm":if arm==0 {"two_b1"} else {"one_b2"},"batch_size":batch_size,"execution_count":batches,
+                            "images_processed":2,"warmup":pair<warmup_pairs,"elapsed_ms":elapsed_ms,"per_execution_ms":execution_ms,
+                            "per_image_ms":elapsed_ms/2.0,"output_sha256":output_sha,
+                            "status":if validation.is_ok() {"pass"} else {"invalid_output"},"validation_error":validation.as_ref().err(),
+                            "native_memory":runtime.native_memory_snapshot(),"host_committed_bytes":host.usage().unwrap().committed_bytes()
+                        })
+                    );
+                    validation.unwrap();
+                    if let Some(previous) = &expected_hash {
+                        assert_eq!(
+                            &output_sha, previous,
+                            "batching/precision/repetition changed decoded oracle bytes"
+                        );
+                    }
+                    expected_hash = Some(output_sha);
+                    drop(outputs);
+                    assert_eq!(host.usage().unwrap().committed_bytes(), idle_host_bytes);
+                    if pair >= warmup_pairs {
+                        measured_ms[arm].push(elapsed_ms);
+                    }
+                }
+            }
+            eprintln!(
+                "linear_batch_microbench={}",
+                serde_json::json!({"event":"summary","case":case,
+                "precision":precision,"two_b1_measured_ms":measured_ms[0],"one_b2_measured_ms":measured_ms[1],
+                "identical_output_bytes":true,"images_per_sample":2,"slo_status":"not_evaluated",
+                "interpretation":"paired managed wall cost; no kernel-time, full-model or hardware-limit claim"})
+            );
+            for session in sessions {
+                assert!(matches!(
+                    session
+                        .close()
+                        .unwrap_or_else(|e| panic!("close: {:?}", e.failure())),
+                    PlanRuntimeCloseOutcome::Closed(_)
+                ));
+            }
+            drop(components);
+            assert_eq!(host.usage().unwrap().committed_bytes(), idle_host_bytes);
+        }
+        drop((single_inputs, input, dense, fixture, retained_fixture));
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+        drop(registry);
+        drop(metal_tensor_providers(&runtime, &[MetalTensorOperation::DenseLinear]).unwrap());
+        let native_after_close = runtime.native_memory_snapshot();
+        drop(runtime);
+        let all = capacity
+            .reserve(DeviceOpaqueMemoryKind::Bootstrap, DEVICE_BYTES)
+            .unwrap();
+        assert!(capacity.reserve(DeviceOpaqueMemoryKind::Stream, 1).is_err());
+        drop(all);
+        eprintln!(
+            "linear_batch_microbench={}",
+            serde_json::json!({"event":"retirement","case":case,
+            "host_committed_bytes":host.usage().unwrap().committed_bytes(),"device_capacity_fully_reclaimable":true,
+            "native_before_runtime_drop":native_after_close})
         );
     }
 }
