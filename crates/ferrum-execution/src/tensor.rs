@@ -417,26 +417,41 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         };
         let lane_create_us = host_wall_us(lane_started);
         let admission_started = trace_enabled.then(Instant::now);
-        let wave_started = trace_enabled.then(Instant::now);
+        // Accumulate Step/Wave work separately from their capacity waits on
+        // every retry. Initial sequence waiting stays in sequence_admission_us.
+        let mut step_admission_us = 0_u64;
+        let mut wave_prepare_us = 0_u64;
+        let mut admission_wait_us = 0_u64;
         let mut step_maintenance = 0;
         let mut wave_maintenance = 0;
         let mut wave = loop {
             if control.is_some_and(TensorAdmissionControl::is_cancelled) {
                 return Err(scope.cancel_unsubmitted(persistent_request));
             }
-            match self.admit_step(&batch, &lane, &work, &mut step_maintenance)? {
+            let step_started = trace_enabled.then(Instant::now);
+            let step = self.admit_step(&batch, &lane, &work, &mut step_maintenance)?;
+            step_admission_us = step_admission_us.saturating_add(host_wall_us(step_started));
+            match step {
                 admission::AdmissionProgress::Ready(step) => scope.step = Some(step),
                 admission::AdmissionProgress::Deferred(condition) => {
-                    if !self.wait_for_capacity(TensorAdmissionStage::Step, condition, control)? {
+                    let wait_started = trace_enabled.then(Instant::now);
+                    let changed =
+                        self.wait_for_capacity(TensorAdmissionStage::Step, condition, control)?;
+                    admission_wait_us =
+                        admission_wait_us.saturating_add(host_wall_us(wait_started));
+                    if !changed {
                         return Err(scope.cancel_unsubmitted(persistent_request));
                     }
                     continue;
                 }
             }
-            match self.prepare_wave(
+            let wave_started = trace_enabled.then(Instant::now);
+            let prepared = self.prepare_wave(
                 scope.step.as_ref().expect("admitted step"),
                 &mut wave_maintenance,
-            )? {
+            )?;
+            wave_prepare_us = wave_prepare_us.saturating_add(host_wall_us(wave_started));
+            match prepared {
                 admission::AdmissionProgress::Ready(wave) => break wave,
                 admission::AdmissionProgress::Deferred(condition) => {
                     // No wave/participant flight exists. Release the exact
@@ -451,21 +466,26 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                             })
                         }
                     };
-                    if !self.wait_for_capacity(TensorAdmissionStage::Wave, condition, control)? {
+                    let wait_started = trace_enabled.then(Instant::now);
+                    let changed =
+                        self.wait_for_capacity(TensorAdmissionStage::Wave, condition, control)?;
+                    admission_wait_us =
+                        admission_wait_us.saturating_add(host_wall_us(wait_started));
+                    if !changed {
                         return Err(scope.cancel_unsubmitted(persistent_request));
                     }
                 }
             }
         };
-        let step_admission_us = host_wall_us(admission_started);
         if let Some((target, mappings)) = initialize {
+            let initialize_started = trace_enabled.then(Instant::now);
             wave.initialize_tensor_request_state(
                 self.executable.execution_plan(),
                 target,
                 mappings,
             )?;
+            wave_prepare_us = wave_prepare_us.saturating_add(host_wall_us(initialize_started));
         }
-        let wave_prepare_us = host_wall_us(wave_started);
         let identity_started = trace_enabled.then(Instant::now);
         let active = TrustedActiveSequenceBinding::from_session(scope.session()?)?;
         // Admission above still proves the lane's exact runtime and physical
@@ -580,6 +600,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                 sequence_admission_us,
                 step_admission_us,
                 wave_prepare_us,
+                admission_wait_us,
                 identity_bind_us,
                 uploads_prepare_us,
                 lane_create_us,
