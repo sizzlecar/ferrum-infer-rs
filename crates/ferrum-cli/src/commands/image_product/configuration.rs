@@ -3,9 +3,11 @@ use ferrum_runtime::{HostMemoryClassLimits, HostMemoryLimits, StaticInitializati
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 mod metal;
+mod prepared;
 pub use metal::MetalConfig;
 #[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 pub use metal::MetalMemoryConfig;
+pub use prepared::PreparedImageWeights;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +18,9 @@ pub struct ImageProductConfig {
     pub execution_profile: ImageExecutionProfile,
     pub metadata: MetadataPaths,
     pub weights: WeightPaths,
+    /// Explicit, hash-bound physical FP8 artifacts; no automatic cache lookup.
+    #[serde(default)]
+    pub prepared_weights: PreparedImageWeights,
     pub backend: ImageBackendConfig,
     /// Required by serve; run uses the same assets/backend without opening HTTP.
     pub serving: Option<ServingConfig>,
@@ -137,6 +142,13 @@ pub enum ImageBackendConfig {
     Metal(MetalConfig),
 }
 impl ImageBackendConfig {
+    pub fn host_limits(&self) -> Result<HostMemoryLimits> {
+        match self {
+            Self::Cuda(config) => config.host.limits(),
+            Self::Metal(config) => config.host.limits(),
+        }
+    }
+
     pub fn pipeline(&self) -> &PipelineConfig {
         match self {
             Self::Cuda(config) => &config.pipeline,
@@ -351,6 +363,7 @@ impl ImageProductConfig {
             "image configuration must be a JSON object"
         );
         let mut config: Self = serde_json::from_slice(&bytes)?;
+        config.prepared_weights.validate(&config.backend)?;
         ensure!(
             config
                 .metadata
@@ -435,6 +448,7 @@ impl ImageProductConfig {
         Ok(())
     }
     fn resolve_paths(&mut self, base: &Path) {
+        self.prepared_weights.resolve_paths(base);
         for path in [
             &mut self.metadata.model_index,
             &mut self.metadata.text_encoder,

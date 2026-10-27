@@ -505,6 +505,7 @@ impl QwenImage21CudaConfig {
                 _ => unreachable!("only materialized stages are enumerated"),
             };
             let mut materializer = super::precision::materializer(materializer_id, host, groups)?;
+            materializer = assets.bind_prepared_fp8(stage, family, materializer)?;
             super::precision::validate_backing(family, &materializer, host)?;
             maximum_group_bytes =
                 maximum_group_bytes.max(materializer.maximum_group_backing_bytes(family)?);

@@ -3,6 +3,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf};
 
+#[path = "prepared_tests.rs"]
+mod prepared_tests;
+
 fn configuration() -> Value {
     json!({
         "model":"local-picture", "execution_profile":"experimental_serial_cold",

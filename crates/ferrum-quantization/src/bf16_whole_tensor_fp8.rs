@@ -16,9 +16,14 @@ mod conversion;
 mod host_cache;
 mod lookup;
 mod plan;
+mod prepared;
 mod quality;
 mod source;
 mod timing;
+pub use prepared::{
+    PreparedFp8Archive, PreparedFp8Component, PreparedFp8ExportReceipt, PreparedFp8Manifest,
+    PreparedFp8Shard, PreparedFp8SourceComponent, PreparedFp8TensorArchive,
+};
 pub use source::ExactBf16TensorSource;
 /// Backward-compatible spelling; the source now accepts any tensor archive.
 pub type ExactBf16SafetensorsSource<'a> = ExactBf16TensorSource<'a>;
@@ -47,6 +52,7 @@ pub struct Bf16WholeTensorFp8Materializer {
     host: HostMemoryAccount,
     groups: Vec<Vec<WeightId>>,
     host_cache: Option<host_cache::HostCache>,
+    prepared: Option<std::sync::Arc<PreparedFp8Archive>>,
 }
 
 impl Bf16WholeTensorFp8Materializer {
@@ -80,21 +86,10 @@ impl Bf16WholeTensorFp8Materializer {
             }
         }
         groups.sort();
-        let policy = serde_json::to_vec(&groups).map_err(|e| invalid(e.to_string()))?;
         let descriptor = WeightMaterializerDescriptor::new(
             id,
             VERSION,
-            fingerprint(&[
-                BF16_WHOLE_TENSOR_FP8_NUMERICAL_PROFILE.as_bytes(),
-                &policy,
-                include_bytes!("bf16_whole_tensor_fp8.rs"),
-                include_bytes!("bf16_whole_tensor_fp8/plan.rs"),
-                include_bytes!("bf16_whole_tensor_fp8/conversion.rs"),
-                include_bytes!("bf16_whole_tensor_fp8/lookup.rs"),
-                include_bytes!("bf16_whole_tensor_fp8/timing.rs"),
-                include_bytes!("bf16_whole_tensor_fp8/host_cache.rs"),
-                include_bytes!("bf16_whole_tensor_fp8/quality.rs"),
-            ]),
+            recipe_fingerprint(&groups)?,
             WeightMaterializationFidelity::Approximate,
             BTreeSet::new(),
         )?
@@ -104,6 +99,7 @@ impl Bf16WholeTensorFp8Materializer {
             host,
             groups,
             host_cache: None,
+            prepared: None,
         })
     }
 
@@ -112,6 +108,11 @@ impl Bf16WholeTensorFp8Materializer {
     /// eviction. A group larger than this cap converts normally without caching.
     /// Source mappings remain independently retained, immutable mmap owners.
     pub fn with_host_cache(mut self, maximum_bytes: NonZeroU64) -> Result<Self, VNextError> {
+        if self.prepared.is_some() {
+            return Err(invalid(
+                "prepared FP8 sources and conversion Host caching are mutually exclusive",
+            ));
+        }
         if maximum_bytes.get()
             > self
                 .host
@@ -148,6 +149,9 @@ impl Bf16WholeTensorFp8Materializer {
         family: &PreparedModelFamily,
     ) -> Result<WeightMaterializerSelection, VNextError> {
         let prepared = plan::prepare(family, &self.groups)?;
+        if let Some(archive) = &self.prepared {
+            archive.validate_plan(family.stored_weight_schema()?, &prepared)?;
+        }
         WeightMaterializerSelection::numeric_quality_artifact(
             self.descriptor.id().clone(),
             quality::artifact(
@@ -165,7 +169,12 @@ impl Bf16WholeTensorFp8Materializer {
         &self,
         family: &PreparedModelFamily,
     ) -> Result<u64, VNextError> {
-        Ok(plan::prepare(family, &self.groups)?.maximum_group_bytes)
+        let plan = plan::prepare(family, &self.groups)?;
+        if let Some(archive) = &self.prepared {
+            archive.validate_plan(family.stored_weight_schema()?, &plan)?;
+            return Ok(0);
+        }
+        Ok(plan.maximum_group_bytes)
     }
 
     /// Peak charged bytes for a complete conversion group on this materializer's
@@ -176,7 +185,12 @@ impl Bf16WholeTensorFp8Materializer {
         &self,
         family: &PreparedModelFamily,
     ) -> Result<u64, VNextError> {
-        plan::prepare(family, &self.groups)?.maximum_group_accounted_bytes(&self.host)
+        let plan = plan::prepare(family, &self.groups)?;
+        if let Some(archive) = &self.prepared {
+            archive.validate_plan(family.stored_weight_schema()?, &plan)?;
+            return Ok(0);
+        }
+        plan.maximum_group_accounted_bytes(&self.host)
     }
 
     /// Required physical execution payload bytes, including every matrix's
@@ -196,7 +210,11 @@ impl WeightMaterializer for Bf16WholeTensorFp8Materializer {
         family: &PreparedModelFamily,
         _device: &DeviceDescriptor,
     ) -> Result<WeightSchema, VNextError> {
-        Ok(plan::prepare(family, &self.groups)?.schema)
+        let plan = plan::prepare(family, &self.groups)?;
+        if let Some(archive) = &self.prepared {
+            archive.validate_plan(family.stored_weight_schema()?, &plan)?;
+        }
+        Ok(plan.schema)
     }
     fn component_sources(
         &self,
@@ -204,6 +222,9 @@ impl WeightMaterializer for Bf16WholeTensorFp8Materializer {
         schema: &WeightSchema,
     ) -> Result<BTreeMap<WeightId, Vec<WeightId>>, VNextError> {
         let prepared = plan::prepare(family, &self.groups)?;
+        if let Some(archive) = &self.prepared {
+            archive.validate_plan(family.stored_weight_schema()?, &prepared)?;
+        }
         if &prepared.schema != schema {
             return Err(invalid("execution schema differs"));
         }
@@ -233,6 +254,9 @@ impl WeightMaterializer for Bf16WholeTensorFp8Materializer {
         sources: &[&WeightComponentSpec],
         outputs: &[&WeightComponentSpec],
     ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+        if let Some(archive) = &self.prepared {
+            return archive.materialize(source, sources, outputs);
+        }
         match &self.host_cache {
             Some(cache) => conversion::materialize_with_cache(
                 &self.host,
@@ -244,6 +268,21 @@ impl WeightMaterializer for Bf16WholeTensorFp8Materializer {
             None => conversion::materialize(&self.host, source, sources, outputs),
         }
     }
+}
+
+fn recipe_fingerprint(groups: &[Vec<WeightId>]) -> Result<String, VNextError> {
+    let policy = serde_json::to_vec(groups).map_err(|e| invalid(e.to_string()))?;
+    Ok(fingerprint(&[
+        BF16_WHOLE_TENSOR_FP8_NUMERICAL_PROFILE.as_bytes(),
+        &policy,
+        include_bytes!("bf16_whole_tensor_fp8.rs"),
+        include_bytes!("bf16_whole_tensor_fp8/plan.rs"),
+        include_bytes!("bf16_whole_tensor_fp8/conversion.rs"),
+        include_bytes!("bf16_whole_tensor_fp8/lookup.rs"),
+        include_bytes!("bf16_whole_tensor_fp8/timing.rs"),
+        include_bytes!("bf16_whole_tensor_fp8/host_cache.rs"),
+        include_bytes!("bf16_whole_tensor_fp8/quality.rs"),
+    ]))
 }
 
 fn fingerprint(parts: &[&[u8]]) -> String {

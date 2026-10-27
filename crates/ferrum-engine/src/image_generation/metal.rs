@@ -307,6 +307,7 @@ impl QwenImage21MetalConfig {
                 _ => unreachable!("only materialized stages are enumerated"),
             };
             let materializer = precision::materializer(materializer_id, &host, groups)?;
+            let materializer = assets.bind_prepared_fp8(stage, family, materializer)?;
             precision::validate_backing(family, &materializer, &host)?;
             execution_weight_bytes[index] = materializer.execution_weight_bytes(family)?;
             selected.push(Box::new(materializer));

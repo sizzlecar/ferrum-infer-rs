@@ -17,7 +17,7 @@ where
 {
     T::try_from(value.into()).unwrap()
 }
-fn account(bytes: usize) -> HostMemoryAccount {
+pub(super) fn account(bytes: usize) -> HostMemoryAccount {
     HostMemoryAccount::new(
         HostMemoryLimits::new(
             bytes,
@@ -234,7 +234,7 @@ fn unchanged_component_retains_source_without_a_converted_copy() {
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }
 
-fn fixture(operation: &str) -> (WeightSchema, ModelProgram, Vec<Vec<WeightId>>) {
+pub(super) fn fixture(operation: &str) -> (WeightSchema, ModelProgram, Vec<Vec<WeightId>>) {
     let components = vec![
         source_spec("q"),
         source_spec("k"),

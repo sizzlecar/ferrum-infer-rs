@@ -32,7 +32,10 @@ pub mod safetensors_archive;
 pub mod tensor_archive;
 pub mod traits;
 
-pub use bf16_whole_tensor_fp8::Bf16WholeTensorFp8Materializer;
+pub use bf16_whole_tensor_fp8::{
+    Bf16WholeTensorFp8Materializer, PreparedFp8Archive, PreparedFp8ExportReceipt,
+    PreparedFp8Manifest, PreparedFp8TensorArchive,
+};
 pub use block_fp8_safetensors_source::{
     BlockFp8SafetensorsSource, BLOCK_FP8_E4M3_SOURCE_FORMAT_ID,
 };

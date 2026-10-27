@@ -100,9 +100,21 @@ impl ImageProductConfig {
                 vae: self.weights.vae.open()?,
             },
         )?;
-        match processor {
+        let mut assets = match processor {
             Some(processor) => assets.with_image_editing(&text, &vae, &processor),
             None => Ok(assets),
+        }?;
+        for (stage, selected) in self.prepared_weights.entries() {
+            let archive = ferrum_quantization::PreparedFp8Archive::open(
+                &selected.manifest,
+                &selected.sha256,
+            )?;
+            assets = assets.with_prepared_fp8(
+                stage,
+                &self.backend.prepared_fp8_profile(stage)?,
+                archive,
+            )?;
         }
+        Ok(assets)
     }
 }

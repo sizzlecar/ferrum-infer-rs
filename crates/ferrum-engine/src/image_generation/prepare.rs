@@ -191,6 +191,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 &self.host,
                 Qwen3VLTextEncoderFamily::fp8_weight_groups(&text)?,
             )?;
+            let conversion =
+                self.assets
+                    .bind_prepared_fp8(ImageStage::TextEncoder, &text_family, conversion)?;
             precision::select(&text_family, &mut text_options, &conversion, &self.host)?;
         }
         let text_fp8_select_us = trace_elapsed_us(started);
@@ -293,6 +296,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 &self.host,
                 QwenImage21TransformerFamily::fp8_weight_groups(transformer)?,
             )?;
+            let conversion =
+                self.assets
+                    .bind_prepared_fp8(ImageStage::Denoiser, &family, conversion)?;
             precision::select(&family, &mut options, &conversion, &self.host)?;
         }
         tracing::debug!(

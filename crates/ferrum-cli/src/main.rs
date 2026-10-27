@@ -47,6 +47,9 @@ enum Commands {
     /// Benchmark image HTTP endpoints with a fixed prompt/seed/dimension dataset.
     BenchImages(bench_images::BenchImagesCommand),
 
+    /// Prepare image FP8 weights once for reuse by run and serve (CPU only).
+    PrepareImageWeights(prepare_image_weights::PrepareImageWeightsCommand),
+
     /// Validate and replay a request replay bundle without starting HTTP.
     #[command(hide = true)]
     ReplayBundle(replay_bundle::ReplayBundleCommand),
@@ -139,6 +142,12 @@ fn command_future(
         Commands::BenchImages(cmd) => {
             Box::pin(async move { bench_images::execute(cmd).await.map_err(Into::into) })
         }
+        Commands::PrepareImageWeights(cmd) => Box::pin(async move {
+            tokio::task::spawn_blocking(move || prepare_image_weights::execute(cmd))
+                .await
+                .map_err(|error| image_product::ImageProductError::Configuration(error.into()))?
+                .map_err(|error| image_product::ImageProductError::Configuration(error).into())
+        }),
         Commands::ReplayBundle(cmd) => Box::pin(async move {
             replay_bundle::execute(cmd, config)
                 .await
