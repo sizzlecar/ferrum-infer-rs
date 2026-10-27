@@ -155,6 +155,12 @@ fn run(fail_preparation: bool) -> (Capture, Arc<Shared<u64>>, Retirement<u64>) {
         },
         host: None,
     });
+    // tracing-core's single-dispatcher fast path registers a new callsite
+    // against the registering thread's default. A parallel scheduler test with
+    // no subscriber can otherwise cache Interest::never for our shared sites.
+    // Keep two dispatchers alive so registration combines their interests;
+    // neither this no-op dispatcher nor the capture becomes a global default.
+    let _registration_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let capture = Capture::default();
     let retirement = tracing::subscriber::with_default(capture.clone(), || {
         worker_loop(
