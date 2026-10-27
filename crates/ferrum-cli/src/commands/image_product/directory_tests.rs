@@ -318,6 +318,17 @@ fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
             }
         );
         assert_eq!(
+            pipeline.plan_cache,
+            if backend == "cuda" {
+                ferrum_engine::image_generation::ImagePlanCachePolicy::MultiShape {
+                    maximum_entries_per_stage: 16,
+                    maximum_encoded_metadata_bytes: 128 * 1024 * 1024,
+                }
+            } else {
+                ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage
+            }
+        );
+        assert_eq!(
             pipeline.residency,
             ferrum_engine::image_generation::ImageResidencyPolicy::Adaptive
         );
@@ -353,6 +364,7 @@ fn run_has_single_request_capacity_and_metal_keeps_configured_batching() {
         let run = cuda.single_request();
         assert_eq!(run.pipeline().maximum_batch_size, 1);
         assert_eq!(run.pipeline().maximum_width, 2048);
+        assert_eq!(run.pipeline().plan_cache, cuda.pipeline().plan_cache);
         assert_eq!(
             run.pipeline().edit_prefix_policy,
             ferrum_engine::image_generation::ImageEditPrefixPolicy::RequestCache
@@ -362,6 +374,10 @@ fn run_has_single_request_capacity_and_metal_keeps_configured_batching() {
             DirectoryOptions::from_cli(0.9, None, explicit_cap, "metal", None, None).unwrap();
         assert_eq!(metal.batching, ferrum_types::ImageBatchPolicy::Configured);
         assert_eq!(metal.pipeline().maximum_width, 1024);
+        assert_eq!(
+            metal.single_request().pipeline().plan_cache,
+            ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage
+        );
         assert_eq!(
             metal.pipeline().edit_prefix_policy,
             ferrum_engine::image_generation::ImageEditPrefixPolicy::Recompute

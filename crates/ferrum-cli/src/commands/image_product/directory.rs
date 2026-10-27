@@ -193,7 +193,17 @@ impl DirectoryOptions {
                     ferrum_engine::image_generation::ImageEditPrefixPolicy::Recompute
                 }
             },
-            plan_cache: ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage,
+            plan_cache: match self.backend {
+                ImageBackendKind::Cuda => {
+                    ferrum_engine::image_generation::ImagePlanCachePolicy::MultiShape {
+                        maximum_entries_per_stage: 16,
+                        maximum_encoded_metadata_bytes: 128 * MIB as usize,
+                    }
+                }
+                ImageBackendKind::Metal => {
+                    ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage
+                }
+            },
             residency: ferrum_engine::image_generation::ImageResidencyPolicy::Adaptive,
             dynamic_residency:
                 ferrum_engine::image_generation::ImageDynamicResidencyPolicy::Adaptive,
