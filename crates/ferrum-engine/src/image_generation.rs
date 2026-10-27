@@ -1,6 +1,9 @@
 //! Qwen-Image 2.1 request batches on injected runtime owners.
 //!
-//! Cold is the default. Optional DenoiserAndDecoder residency retains two
+//! Residency is selected by typed configuration. Explicit legacy policies keep
+//! their behavior (including the Cold enum default); directory presets select
+//! Adaptive to retain reusable sessions and reclaim idle owners when the next
+//! compiled stage needs capacity. Optional DenoiserAndDecoder residency retains two
 //! exact-plan sessions and immutable weight snapshots across compatible plans,
 //! releasing idle dynamic backing between stages. AllModelComponents also
 //! retains TE; both keep noise cold. AllStages explicitly retains weightless
