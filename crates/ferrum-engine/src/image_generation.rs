@@ -310,7 +310,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .copied()
                 .collect(),
         )?;
-        let serial_actor = TensorSerialActor::new(runtime.clone())?;
+        let mut serial_actor = TensorSerialActor::new(runtime.clone())?;
+        serial_actor.set_admission_control(ferrum_execution::TensorAdmissionControl::new());
         Ok(Self {
             runtime,
             host,
@@ -346,6 +347,20 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
 
     pub fn host_account(&self) -> &HostMemoryAccount {
         &self.host
+    }
+
+    /// Both synchronous CLI calls and the service worker use this admission
+    /// contract. Replace a cancelled control before a new independent batch.
+    pub fn set_admission_control(&mut self, control: ferrum_execution::TensorAdmissionControl) {
+        if let Some(actor) = self.serial_actor.as_mut() {
+            actor.set_admission_control(control);
+        }
+    }
+
+    pub fn admission_control(&self) -> Option<&ferrum_execution::TensorAdmissionControl> {
+        self.serial_actor
+            .as_ref()
+            .and_then(TensorSerialActor::admission_control)
     }
     pub fn is_stopped(&self) -> bool {
         self.stopped
@@ -466,7 +481,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         match result {
             Ok(outputs) => Ok(outputs),
             Err(failure) => {
-                self.stopped = true;
+                let failure = self.retire_failed_execution(failure, &mut stages);
                 Err(ImageGenerationError {
                     failure,
                     completed_stages: stages,
@@ -474,6 +489,25 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 })
             }
         }
+    }
+
+    fn retire_failed_execution(
+        &mut self,
+        failure: ImageGenerationFailure<R>,
+        stages: &mut Vec<ImageStageReceipt>,
+    ) -> ImageGenerationFailure<R> {
+        let failure = match failure {
+            ImageGenerationFailure::Execution {
+                source: TensorExecutionError::CancelledBeforeSubmission(cancellation),
+                active,
+            } => match self.finish_stage(active, stages) {
+                Ok(()) => ImageGenerationFailure::Cancelled(cancellation),
+                Err(failure) => failure,
+            },
+            failure => failure,
+        };
+        self.stopped = !matches!(&failure, ImageGenerationFailure::Cancelled(_));
+        failure
     }
 
     fn run(

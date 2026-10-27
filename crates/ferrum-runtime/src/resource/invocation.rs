@@ -249,10 +249,42 @@ where
         Self::try_finalize(self, StepFrameFinalization::RollbackUnsubmitted)
     }
 
+    /// Roll back a denied, never-prepared wave and retain its exact retry
+    /// condition, discounting only notifications emitted by this rollback.
+    /// External releases racing before/during/after rollback remain visible.
+    pub fn try_rollback_unsubmitted_for_capacity_wait(
+        self: Arc<Self>,
+        condition: &crate::CapacityWaitCondition,
+    ) -> Result<(StepRetirementReceipt, crate::CapacityWaitCondition), StepFinalizationFailure<R>>
+    {
+        Self::try_finalize_with_wait(
+            self,
+            StepFrameFinalization::RollbackUnsubmitted,
+            Some(condition),
+        )
+        .map(|(receipt, condition)| {
+            (
+                receipt,
+                condition.expect("capacity rollback produces its adjusted condition"),
+            )
+        })
+    }
+
     fn try_finalize(
         step: Arc<Self>,
         finalization: StepFrameFinalization,
     ) -> Result<StepRetirementReceipt, StepFinalizationFailure<R>> {
+        Self::try_finalize_with_wait(step, finalization, None).map(|(receipt, _)| receipt)
+    }
+
+    fn try_finalize_with_wait(
+        step: Arc<Self>,
+        finalization: StepFrameFinalization,
+        condition: Option<&crate::CapacityWaitCondition>,
+    ) -> Result<
+        (StepRetirementReceipt, Option<crate::CapacityWaitCondition>),
+        StepFinalizationFailure<R>,
+    > {
         let mut step = match Arc::try_unwrap(step) {
             Ok(step) => step,
             Err(step) => {
@@ -272,6 +304,14 @@ where
                 });
             }
         }
+        if condition.is_some_and(|condition| condition.coordinator_id() != step.coordinator_id()) {
+            return Err(StepFinalizationFailure {
+                step: Arc::new(step),
+                error: invalid_resource(
+                    "capacity rollback condition belongs to another coordinator",
+                ),
+            });
+        }
         let dispositions = match step.finalize_participants(finalization) {
             Ok(dispositions) => dispositions,
             Err(error) => {
@@ -279,6 +319,18 @@ where
                     step: Arc::new(step),
                     error,
                 });
+            }
+        };
+        let condition = match condition
+            .map(|condition| step.claimed_backing.release_for_capacity_wait(condition))
+            .transpose()
+        {
+            Ok(condition) => condition,
+            Err(error) => {
+                return Err(StepFinalizationFailure {
+                    step: Arc::new(step),
+                    error,
+                })
             }
         };
         let participants = step
@@ -294,10 +346,13 @@ where
                 disposition,
             })
             .collect();
-        Ok(StepRetirementReceipt {
-            batch_step_id: step.batch_step_id,
-            participants,
-        })
+        Ok((
+            StepRetirementReceipt {
+                batch_step_id: step.batch_step_id,
+                participants,
+            },
+            condition,
+        ))
     }
 
     fn finalize_participants(
@@ -998,7 +1053,9 @@ where
                         Some(capacity)
                     }
                     BatchCapacityClaimDecision::Deferred(deferred) => {
-                        return Ok(StepSubmissionWaveAdmissionDecision::Deferred(deferred));
+                        return Ok(StepSubmissionWaveAdmissionDecision::Deferred(
+                            prepared_backing.release_for_capacity_wait(deferred)?,
+                        ));
                     }
                     BatchCapacityClaimDecision::PermanentRejected(rejected) => {
                         return Ok(StepSubmissionWaveAdmissionDecision::PermanentRejected(

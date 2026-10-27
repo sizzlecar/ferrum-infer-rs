@@ -110,6 +110,9 @@ pub struct ActiveImageStage<R: DeviceRuntime> {
 
 #[must_use = "pipeline failure may own pending execution or plan cleanup"]
 pub enum ImageGenerationFailure<R: DeviceRuntime> {
+    /// No submitted invocation remains; all checked-out stages and request
+    /// state have completed their normal retirement before this is published.
+    Cancelled(ferrum_execution::TensorAdmissionCancellation),
     Preflight(anyhow::Error),
     Unavailable,
     /// Retains every owner from a two-plan prefix handoff on failure. The inner
@@ -166,6 +169,9 @@ pub struct ImageGenerationError<R: DeviceRuntime> {
 impl<R: DeviceRuntime> fmt::Display for ImageGenerationFailure<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ImageGenerationFailure::Cancelled(_) => f.write_str(
+                "image batch cancelled before its next submission; transient owners retired",
+            ),
             ImageGenerationFailure::Preflight(e) => write!(f, "image preflight: {e:#}"),
             ImageGenerationFailure::Unavailable => f.write_str(
                 "image pipeline stopped; recover any retained failure owners before replacing it",

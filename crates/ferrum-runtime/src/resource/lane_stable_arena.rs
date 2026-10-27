@@ -52,6 +52,20 @@ pub(super) struct PreparedLaneBackingClaim {
 }
 
 impl PreparedLaneBackingClaim {
+    pub(super) fn release_for_capacity_wait(
+        mut self,
+        deferred: crate::AdmissionDeferred,
+    ) -> Result<crate::AdmissionDeferred, VNextError> {
+        let mut releases = Vec::new();
+        if let Some(slot) = self.slot_lease.as_mut() {
+            self.stable.clear();
+            slot.release_recorded(Some(&mut releases))?;
+        } else {
+            super::dynamic_pool::release_owned_slices_recorded(&mut self.stable, &mut releases)?;
+        }
+        deferred.discount_owned_releases(&releases)
+    }
+
     pub(super) fn new(
         stable: Vec<LogicalBackingSliceAuthority>,
         slot_lease: Option<LaneStableArenaSlotLease>,
@@ -344,6 +358,7 @@ impl LaneStableArenaState {
 }
 
 pub(super) struct LaneStableArenaSlotLease {
+    pub(super) released: bool,
     pub(super) arenas: Arc<Mutex<LaneStableArenaState>>,
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) availability_domains: Vec<CapacityDomainId>,
@@ -361,19 +376,24 @@ impl LaneStableArenaSlotLease {
             self.slot_id,
         )
     }
-}
 
-impl Drop for LaneStableArenaSlotLease {
-    fn drop(&mut self) {
+    pub(super) fn release_recorded(
+        &mut self,
+        mut receipts: Option<&mut Vec<crate::admission::OwnedCapacityRelease>>,
+    ) -> Result<(), VNextError> {
+        if self.released {
+            return Ok(());
+        }
+        self.released = true;
         let mut arenas = match self.arenas.lock() {
             Ok(arenas) => arenas,
             Err(poisoned) => {
                 poisoned.into_inner().poisoned = true;
-                return;
+                return Err(invalid_resource("lane slot release mutex is poisoned"));
             }
         };
         if arenas.poisoned {
-            return;
+            return Err(invalid_resource("lane slot release is fail-closed"));
         }
         let now = arenas.tick();
         let released = arenas
@@ -390,24 +410,38 @@ impl Drop for LaneStableArenaSlotLease {
             });
         if !released {
             arenas.poisoned = true;
-            return;
+            return Err(invalid_resource(
+                "lane slot release has no live matching slot",
+            ));
         }
         drop(arenas);
 
-        let mut notification_failed = false;
         for domain in &self.availability_domains {
-            notification_failed |= self
+            match self
                 .logical_admission
-                .notify_domain_availability_changed(*domain)
-                .is_err();
+                .notify_domain_availability_changed_recorded(*domain)
+            {
+                Ok((_, receipt)) => {
+                    if let Some(receipts) = receipts.as_mut() {
+                        receipts.push(receipt);
+                    }
+                }
+                Err(error) => {
+                    self.arenas
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .poisoned = true;
+                    return Err(error);
+                }
+            }
         }
-        if notification_failed {
-            let mut arenas = self
-                .arenas
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            arenas.poisoned = true;
-        }
+        Ok(())
+    }
+}
+
+impl Drop for LaneStableArenaSlotLease {
+    fn drop(&mut self) {
+        let _ = self.release_recorded(None);
     }
 }
 

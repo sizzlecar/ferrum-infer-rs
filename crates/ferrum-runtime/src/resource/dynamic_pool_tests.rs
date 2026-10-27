@@ -32,6 +32,9 @@ mod plan_fit_tests;
 #[path = "submission_wave_projection_tests.rs"]
 mod submission_wave_projection_tests;
 
+#[path = "tensor_capacity_wait_tests.rs"]
+mod tensor_capacity_wait_tests;
+
 #[path = "idle_dynamic_footprint_tests.rs"]
 mod idle_dynamic_footprint_tests;
 

@@ -3,6 +3,7 @@ use ferrum_kernels::backend::reference::ReferenceDeviceRuntime;
 use ferrum_models::qwen_image21::{IMAGE_PROJECTION_INPUT_ID, IMAGE_PROJECTION_OUTPUT_ID};
 use half::bf16;
 
+mod admission;
 mod all_components;
 mod dynamic;
 mod noise;

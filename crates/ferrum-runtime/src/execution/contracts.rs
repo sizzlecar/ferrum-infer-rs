@@ -360,6 +360,14 @@ impl PlanNode {
     }
 
     #[cfg(test)]
+    pub(crate) fn resource_test_with_resources(mut self, resources: Vec<ResourceId>) -> Self {
+        self.resources.extend(resources);
+        self.resources.sort();
+        self.resources.dedup();
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn resource_test_node_with_binding(
         id: NodeId,
         binding_resource: ResourceId,

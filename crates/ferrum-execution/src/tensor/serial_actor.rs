@@ -28,11 +28,12 @@ impl TensorSerialActorStreamRequirements {
 
 /// A serial scheduler retains this owner across components on one runtime.
 /// The original stream and its native capacity grants remain alive together.
-/// Every call needs exclusive access; any error or unwind permanently stops
-/// this actor. Error/completion owners retain their ordinary recovery authority.
+/// Every call needs exclusive access. Errors and unwinds stop this actor except
+/// a proved pre-submission cancellation whose transient owners have retired.
 pub struct TensorSerialActor<R: DeviceRuntime> {
     lane: Arc<ExecutionLane<R>>,
     failed: bool,
+    admission_control: Option<TensorAdmissionControl>,
 }
 
 impl<R: DeviceRuntime> TensorSerialActor<R> {
@@ -40,11 +41,21 @@ impl<R: DeviceRuntime> TensorSerialActor<R> {
         Ok(Self {
             lane: ExecutionLane::create(runtime)?,
             failed: false,
+            admission_control: None,
         })
     }
 
     pub const fn is_failed(&self) -> bool {
         self.failed
+    }
+
+    /// Opt in to capacity waiting. Plain actors retain fail-fast admission.
+    pub fn set_admission_control(&mut self, control: TensorAdmissionControl) {
+        self.admission_control = Some(control);
+    }
+
+    pub fn admission_control(&self) -> Option<&TensorAdmissionControl> {
+        self.admission_control.as_ref()
     }
 
     pub(super) fn execute<T>(
@@ -58,7 +69,10 @@ impl<R: DeviceRuntime> TensorSerialActor<R> {
         // callback to preserve the permanent failure mark.
         self.failed = true;
         let result = execute(&self.lane);
-        if result.is_ok() {
+        if !result
+            .as_ref()
+            .is_err_and(|error| !error.is_cancelled_before_submission())
+        {
             self.failed = false;
         }
         result

@@ -1654,6 +1654,37 @@ fn logical_capacity_matches(
 }
 
 impl ClaimedBackingTransaction {
+    /// Release this exact unsubmitted owner's capacity and record only the
+    /// notifications emitted by those releases. No before/after subtraction.
+    pub(super) fn release_for_capacity_wait(
+        &mut self,
+        condition: &crate::CapacityWaitCondition,
+    ) -> Result<crate::CapacityWaitCondition, VNextError> {
+        let owner = Arc::get_mut(&mut self.owner).ok_or_else(|| {
+            invalid_resource("unsubmitted backing is still retained by another transaction")
+        })?;
+        let mut releases = Vec::new();
+        if owner.lane_slot_lease.is_none() {
+            // Shared projections of one physical claim are internal aliases.
+            // Any other holder prevents explicit release and keeps its owner.
+            super::dynamic_pool::release_owned_slices_recorded(
+                &mut owner.backing_slices,
+                &mut releases,
+            )?;
+        } else {
+            // Cached physical extents remain installed. The checked slot
+            // release below publishes their actual availability notification.
+            owner.backing_slices.clear();
+        }
+        if let Some(logical) = owner.logical_capacity.as_mut() {
+            logical.release_recorded(&mut releases)?;
+        }
+        if let Some(slot) = owner.lane_slot_lease.as_mut() {
+            slot.release_recorded(Some(&mut releases))?;
+        }
+        condition.after_owned_releases(&releases)
+    }
+
     pub(super) fn same_reserved_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.owner, &other.owner)
     }

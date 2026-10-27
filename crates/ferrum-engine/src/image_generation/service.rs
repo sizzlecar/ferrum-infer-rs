@@ -6,6 +6,7 @@
 //! from the generator's shared Host tensor account.
 
 use super::{ImageEditRequest, ImageGenerationOutput, ImageGenerationRequest, QwenImage21Pipeline};
+use ferrum_execution::TensorAdmissionControl;
 use ferrum_models::qwen_image21::image_input::{
     png_dimensions_hint, ImageInputLimits, QwenImage21ImageProcessor,
 };
@@ -34,6 +35,8 @@ type GeneratorError = Box<dyn Error + Send + 'static>;
 /// retain their original owner until explicit service retirement.
 #[derive(Debug)]
 pub enum ImageBatchError {
+    /// The generator proved transient retirement and remains reusable.
+    Cancelled,
     /// Typed request input rejection, with no native work/recovery obligation.
     InvalidInput(String),
     Rejected(String),
@@ -47,6 +50,7 @@ impl From<GeneratorError> for ImageBatchError {
 impl fmt::Display for ImageBatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => f.write_str("image batch cancelled after transient retirement"),
             Self::InvalidInput(message) => f.write_str(message),
             Self::Rejected(message) => f.write_str(message),
             Self::Fatal(error) => fmt::Display::fmt(error, f),
@@ -78,6 +82,9 @@ pub struct ImageGeneratorCapabilities {
 /// remains usable and no recovery obligation exists. Compatibility must be deterministic and may
 /// only restrict the common width/height grouping enforced by this service.
 pub trait ImageGenerator: Send + 'static {
+    /// Called once before each batch. Implementations which wait on capacity
+    /// must use this control so cancellation/shutdown can wake the worker.
+    fn set_admission_control(&mut self, _control: TensorAdmissionControl) {}
     fn host_account(&self) -> &HostMemoryAccount;
     /// Metadata-only validation: this method must not initialize work or create
     /// recovery obligations. Execution failures belong to `generate_batch`.
@@ -129,6 +136,9 @@ pub trait ImageGenerator: Send + 'static {
 }
 
 impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
+    fn set_admission_control(&mut self, control: TensorAdmissionControl) {
+        QwenImage21Pipeline::set_admission_control(self, control);
+    }
     fn supports_edits(&self) -> bool {
         QwenImage21Pipeline::supports_edits(self)
     }
@@ -217,6 +227,9 @@ fn qwen_batch_error<R: DeviceRuntime>(
     stopped: bool,
     error: super::ImageGenerationError<R>,
 ) -> ImageBatchError {
+    if !stopped && matches!(&error.failure, super::ImageGenerationFailure::Cancelled(_)) {
+        return ImageBatchError::Cancelled;
+    }
     // Preflight can also originate inside a stage. The pipeline marks any run
     // failure stopped, even when its variant happens to be Preflight. Only the
     // pre-run, empty-receipt path is safe to discard after returning a message.
@@ -518,6 +531,7 @@ fn validate_config(
 // outputs; production fixes the output to the managed image artifact above.
 trait BatchWorker: Send + 'static {
     type Output: Send + 'static;
+    fn set_admission_control(&mut self, _control: TensorAdmissionControl) {}
     fn compatible(&self, a: &ImageGenerationRequest, b: &ImageGenerationRequest) -> bool;
     fn generate_batch(
         &mut self,
@@ -553,6 +567,9 @@ trait BatchWorker: Send + 'static {
 struct GeneratorAdapter<P>(P);
 impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
     type Output = ImageGenerationOutput;
+    fn set_admission_control(&mut self, control: TensorAdmissionControl) {
+        self.0.set_admission_control(control);
+    }
     fn maximum_edit_batch_size(&self) -> usize {
         self.0.maximum_edit_batch_size()
     }
@@ -641,6 +658,7 @@ fn trace_request_timing(
         }
         Err(error) => {
             let outcome = match error {
+                ImageBatchError::Cancelled => "cancelled",
                 ImageBatchError::InvalidInput(_) => "invalid_input",
                 ImageBatchError::Rejected(_) => "rejected",
                 ImageBatchError::Fatal(_) => "fatal",
@@ -682,6 +700,8 @@ struct State<O> {
     accepting: bool,
     closing: bool,
     active: usize,
+    active_cancellations: Vec<Arc<AtomicBool>>,
+    active_control: Option<TensorAdmissionControl>,
 }
 struct Shared<O> {
     state: Mutex<State<O>>,
@@ -696,6 +716,9 @@ impl<O> Shared<O> {
         let mut state = self.lock();
         state.accepting = false;
         state.closing = true;
+        if let Some(control) = &state.active_control {
+            control.cancel();
+        }
         self.changed.notify_all();
     }
 }
@@ -707,6 +730,18 @@ struct Job<O> {
 impl<O> Job<O> {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        let state = self.shared.lock();
+        if !state.active_cancellations.is_empty()
+            && state
+                .active_cancellations
+                .iter()
+                .all(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            if let Some(control) = &state.active_control {
+                control.cancel();
+            }
+        }
+        drop(state);
         self.shared.changed.notify_all();
     }
     async fn wait(mut self) -> Result<O, ImageServiceError> {
@@ -755,6 +790,8 @@ impl<O: Send + 'static> ServiceCore<O> {
                 accepting: true,
                 closing: false,
                 active: 0,
+                active_cancellations: Vec::new(),
+                active_control: None,
             }),
             changed: Condvar::new(),
             config,
@@ -976,7 +1013,25 @@ fn worker_loop<O: Send + 'static>(
                 requests.push(job.request);
                 responses.push((job.cancelled, job.response));
             }
+            let control = TensorAdmissionControl::new();
+            {
+                let mut state = shared.lock();
+                state.active_cancellations = responses
+                    .iter()
+                    .map(|(cancelled, _)| cancelled.clone())
+                    .collect();
+                if state.closing
+                    || state
+                        .active_cancellations
+                        .iter()
+                        .all(|cancelled| cancelled.load(Ordering::Acquire))
+                {
+                    control.cancel();
+                }
+                state.active_control = Some(control.clone());
+            }
             let outcome = catch_unwind(AssertUnwindSafe(|| {
+                worker.set_admission_control(control);
                 if matches!(requests.first(), Some(QueuedRequest::Edit(_))) {
                     let edits = requests
                         .into_iter()
@@ -1001,6 +1056,11 @@ fn worker_loop<O: Send + 'static>(
                     worker.generate_batch(generated)
                 }
             }));
+            {
+                let mut state = shared.lock();
+                state.active_cancellations.clear();
+                state.active_control = None;
+            }
             let outcome = match outcome {
                 Ok(Ok(outputs)) if outputs.len() == responses.len() => Ok(outputs),
                 Ok(Ok(_)) => Err(ImageWorkerFailure::Generation(Box::new(service_error(
@@ -1008,9 +1068,15 @@ fn worker_loop<O: Send + 'static>(
                     "generator returned a different number of outputs than batch requests",
                 )))),
                 Ok(Err(
-                    error @ (ImageBatchError::Rejected(_) | ImageBatchError::InvalidInput(_)),
+                    error @ (ImageBatchError::Rejected(_)
+                    | ImageBatchError::InvalidInput(_)
+                    | ImageBatchError::Cancelled),
                 )) => {
                     let (message, kind) = match error {
+                        ImageBatchError::Cancelled => (
+                            "image batch cancelled after transient retirement".to_owned(),
+                            ImageServiceErrorKind::Cancelled,
+                        ),
                         ImageBatchError::InvalidInput(message) => {
                             (message, ImageServiceErrorKind::InvalidRequest)
                         }
@@ -1103,6 +1169,8 @@ fn worker_loop<O: Send + 'static>(
     }
 }
 
+#[cfg(test)]
+mod admission_tests;
 #[cfg(test)]
 mod edit_tests;
 #[cfg(test)]

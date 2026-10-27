@@ -16,9 +16,10 @@ pub mod prepared_model;
 pub mod tensor;
 pub mod token_execution;
 pub use tensor::{
-    PreparedTensorExecutor, TensorAdmissionFailure, TensorAdmissionStage, TensorExecutionError,
-    TensorExecutionOutput, TensorExecutionRetirement, TensorExecutorConfig,
-    TensorRequestCloseFailure, TensorRequestSession, TensorRequestStateMapping, TensorSerialActor,
+    PreparedTensorExecutor, TensorAdmissionCancellation, TensorAdmissionControl,
+    TensorAdmissionFailure, TensorAdmissionStage, TensorExecutionError, TensorExecutionOutput,
+    TensorExecutionRetirement, TensorExecutorConfig, TensorRequestCloseFailure,
+    TensorRequestSession, TensorRequestStateMapping, TensorSerialActor,
     TensorSerialActorStreamRequirements,
 };
 

@@ -469,6 +469,19 @@ impl<R: DeviceRuntime> TensorComponentSession<R> {
             .begin_request(run_id, request_id, initial_inputs)
     }
 
+    pub fn begin_request_with_control(
+        &self,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        initial_inputs: Vec<ManagedHostTensor>,
+        control: Option<&crate::TensorAdmissionControl>,
+    ) -> Result<crate::TensorRequestSession<R>, TensorExecutionError<R>> {
+        self.executor
+            .as_ref()
+            .expect("live session owns executor")
+            .begin_request_with_control(run_id, request_id, initial_inputs, control)
+    }
+
     pub fn execute_initializing_request(
         &mut self,
         run_id: RunId,

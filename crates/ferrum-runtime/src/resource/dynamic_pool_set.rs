@@ -1409,6 +1409,7 @@ where
                                 stable,
                                 certificate,
                                 LaneStableArenaSlotLease {
+                                    released: false,
                                     arenas: Arc::clone(&self.lane_stable_arenas),
                                     logical_admission: self.logical_admission.clone(),
                                     availability_domains: slot_domains,
@@ -1456,6 +1457,7 @@ where
                                     stable,
                                     certificate,
                                     LaneStableArenaSlotLease {
+                                        released: false,
                                         arenas: Arc::clone(&self.lane_stable_arenas),
                                         logical_admission: self.logical_admission.clone(),
                                         availability_domains: slot_domains,
@@ -1515,6 +1517,7 @@ where
                             stable,
                             certificate,
                             LaneStableArenaSlotLease {
+                                released: false,
                                 arenas: Arc::clone(&self.lane_stable_arenas),
                                 logical_admission: self.logical_admission.clone(),
                                 availability_domains: availability_domains.clone(),
@@ -1554,6 +1557,7 @@ where
                                     stable,
                                     certificate,
                                     LaneStableArenaSlotLease {
+                                        released: false,
                                         arenas: Arc::clone(&self.lane_stable_arenas),
                                         logical_admission: self.logical_admission.clone(),
                                         availability_domains: slot_domains,

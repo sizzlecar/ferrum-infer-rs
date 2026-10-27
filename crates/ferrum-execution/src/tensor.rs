@@ -2,16 +2,19 @@
 //!
 //! This synchronous first slice has one job per call, owned Host inputs and
 //! outputs, and ordinary submission. It is not a token-generation driver or a
-//! diffusion scheduler. Capacity deferrals return to the caller without waiting.
+//! diffusion scheduler. Capacity deferrals return without waiting unless the
+//! serial scheduler explicitly supplies a cancellable admission control.
 
 use std::{fmt, sync::Arc, time::Instant};
 
 use ferrum_runtime::*;
 
 mod admission;
+mod admission_control;
 mod request;
 mod serial_actor;
 mod wave_identity;
+pub use admission_control::{TensorAdmissionCancellation, TensorAdmissionControl};
 pub use ferrum_runtime::TensorRequestStateMapping;
 pub use request::{TensorRequestCloseFailure, TensorRequestSession};
 pub use serial_actor::{TensorSerialActor, TensorSerialActorStreamRequirements};
@@ -72,6 +75,8 @@ pub enum TensorAdmissionFailure {
 /// permission to reuse memory that has not been proved quiescent.
 #[derive(thiserror::Error)]
 pub enum TensorExecutionError<R: DeviceRuntime> {
+    #[error("tensor execution cancelled before submission after transient retirement")]
+    CancelledBeforeSubmission(TensorAdmissionCancellation),
     #[error(transparent)]
     Runtime(#[from] VNextError),
     #[error(transparent)]
@@ -125,6 +130,12 @@ pub enum TensorExecutionError<R: DeviceRuntime> {
 impl<R: DeviceRuntime> fmt::Debug for TensorExecutionError<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
+    }
+}
+
+impl<R: DeviceRuntime> TensorExecutionError<R> {
+    pub fn is_cancelled_before_submission(&self) -> bool {
+        matches!(self, Self::CancelledBeforeSubmission(_))
     }
 }
 
@@ -300,7 +311,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         inputs: Vec<ManagedHostTensor>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
         let work = self.binding.bind_inputs(inputs)?;
-        self.execute_bound(run_id, request_id, work, None, None, None)
+        self.execute_bound(run_id, request_id, work, None, None, None, None)
     }
 
     /// Execute through a scheduler-owned serial lane. Admission and completion
@@ -312,9 +323,18 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         request_id: RequestIdentity,
         inputs: Vec<ManagedHostTensor>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        let control = actor.admission_control().cloned();
         actor.execute(|lane| {
             let work = self.binding.bind_inputs(inputs)?;
-            self.execute_bound(run_id, request_id, work, None, None, Some(lane))
+            self.execute_bound(
+                run_id,
+                request_id,
+                work,
+                None,
+                None,
+                Some(lane),
+                control.as_ref(),
+            )
         })
     }
 
@@ -326,6 +346,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         request_session: Option<Arc<SequenceSession<R>>>,
         initialize: Option<(&TensorRequestStateTarget<R>, &[TensorRequestStateMapping])>,
         execution_lane: Option<&Arc<ExecutionLane<R>>>,
+        control: Option<&TensorAdmissionControl>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
         // Host wall observations only: native timing, synchronization and the
         // admission/retirement sequence remain unchanged. The span also binds
@@ -376,7 +397,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         let session = match request_session {
             Some(session) => session,
             None => self
-                .admit_sequence(&work, run_id, request_id)?
+                .admit_sequence(&work, run_id, request_id, control)?
                 .open_session()?,
         };
         let mut scope = TensorExecutionRetirement {
@@ -396,11 +417,47 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         };
         let lane_create_us = host_wall_us(lane_started);
         let admission_started = trace_enabled.then(Instant::now);
-        let step = self.admit_step(&batch, &lane, &work)?;
-        scope.step = Some(step.clone());
-        let step_admission_us = host_wall_us(admission_started);
         let wave_started = trace_enabled.then(Instant::now);
-        let mut wave = self.prepare_wave(&step)?;
+        let mut step_maintenance = 0;
+        let mut wave_maintenance = 0;
+        let mut wave = loop {
+            if control.is_some_and(TensorAdmissionControl::is_cancelled) {
+                return Err(scope.cancel_unsubmitted(persistent_request));
+            }
+            match self.admit_step(&batch, &lane, &work, &mut step_maintenance)? {
+                admission::AdmissionProgress::Ready(step) => scope.step = Some(step),
+                admission::AdmissionProgress::Deferred(condition) => {
+                    if !self.wait_for_capacity(TensorAdmissionStage::Step, condition, control)? {
+                        return Err(scope.cancel_unsubmitted(persistent_request));
+                    }
+                    continue;
+                }
+            }
+            match self.prepare_wave(
+                scope.step.as_ref().expect("admitted step"),
+                &mut wave_maintenance,
+            )? {
+                admission::AdmissionProgress::Ready(wave) => break wave,
+                admission::AdmissionProgress::Deferred(condition) => {
+                    // No wave/participant flight exists. Release the exact
+                    // unsubmitted step before subscribing; no scheduler clone
+                    // may keep the frame or its backing live while parked.
+                    let condition = match scope.rollback_for_capacity_wait(&condition) {
+                        Ok(condition) => condition,
+                        Err(source) => {
+                            return Err(TensorExecutionError::Retirement {
+                                source,
+                                retirement: scope,
+                            })
+                        }
+                    };
+                    if !self.wait_for_capacity(TensorAdmissionStage::Wave, condition, control)? {
+                        return Err(scope.cancel_unsubmitted(persistent_request));
+                    }
+                }
+            }
+        };
+        let step_admission_us = host_wall_us(admission_started);
         if let Some((target, mappings)) = initialize {
             wave.initialize_tensor_request_state(
                 self.executable.execution_plan(),
@@ -408,7 +465,6 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                 mappings,
             )?;
         }
-        drop(step);
         let wave_prepare_us = host_wall_us(wave_started);
         let identity_started = trace_enabled.then(Instant::now);
         let active = TrustedActiveSequenceBinding::from_session(scope.session()?)?;
@@ -572,6 +628,60 @@ pub struct TensorExecutionRetirement<R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> TensorExecutionRetirement<R> {
+    fn rollback_for_capacity_wait(
+        &mut self,
+        condition: &CapacityWaitCondition,
+    ) -> Result<CapacityWaitCondition, VNextError> {
+        let step = self
+            .step
+            .take()
+            .ok_or_else(|| invalid("capacity rollback has no step"))?;
+        match step.try_rollback_unsubmitted_for_capacity_wait(condition) {
+            Ok((_, condition)) => Ok(condition),
+            Err(failure) => {
+                let source = invalid(format!(
+                    "tensor capacity rollback failed: {}",
+                    failure.error()
+                ));
+                self.step = Some(failure.into_step());
+                Err(source)
+            }
+        }
+    }
+
+    fn rollback_unsubmitted(&mut self) -> Result<(), VNextError> {
+        if let Some(step) = self.step.take() {
+            if let Err(failure) = step.try_rollback_unsubmitted() {
+                let source = invalid(format!(
+                    "tensor unsubmitted rollback failed: {}",
+                    failure.error()
+                ));
+                self.step = Some(failure.into_step());
+                return Err(source);
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel_unsubmitted(mut self, keep_request: bool) -> TensorExecutionError<R> {
+        let result = self.rollback_unsubmitted().and_then(|()| {
+            if !keep_request {
+                self.session()?.try_abort_if_quiescent()?;
+            }
+            self.session.take();
+            Ok(())
+        });
+        match result {
+            Ok(()) => TensorExecutionError::CancelledBeforeSubmission(
+                TensorAdmissionCancellation::retired(),
+            ),
+            Err(source) => TensorExecutionError::Retirement {
+                source,
+                retirement: self,
+            },
+        }
+    }
+
     /// Failure retains the exact step and session so recovery can be retried.
     /// Success releases this owner's session and input evidence, even when the
     /// caller keeps the retirement value for diagnostics. Other owners, if

@@ -520,6 +520,108 @@ pub struct CapacityWaitCondition {
     observed: Vec<CapacityAvailabilityEpoch>,
 }
 
+/// Emitted by an actual release increment, never inferred from two snapshots.
+/// Kept crate-private: it cannot authorize a caller to suppress arbitrary wakes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OwnedCapacityRelease {
+    coordinator_id: LogicalAdmissionCoordinatorId,
+    source: CapacityAvailabilitySource,
+    increment: u64,
+}
+
+#[cfg(test)]
+mod owned_release_tests {
+    use super::*;
+
+    fn coordinator() -> (LogicalAdmissionCoordinator, CapacityDomainId) {
+        let domain = CapacityDomainId::new(1).unwrap();
+        let coordinator = LogicalAdmissionCoordinator::new(
+            vec![(
+                domain,
+                CapacityDomainSpec::new(CapacityUnits::new(64), CapacityUnits::new(64)).unwrap(),
+            )],
+            1,
+        )
+        .unwrap();
+        (coordinator, domain)
+    }
+
+    #[test]
+    fn release_receipt_suppresses_only_its_own_increment_and_rejects_foreign_or_overflow() {
+        let (coordinator, domain) = coordinator();
+        let observed = coordinator
+            .wait_snapshot_for_domains([domain])
+            .unwrap()
+            .wait_condition()
+            .clone();
+        let (_, owned) = coordinator
+            .notify_domain_availability_changed_recorded(domain)
+            .unwrap();
+        let adjusted = observed.after_owned_releases(&[owned]).unwrap();
+        assert!(!coordinator
+            .register_waiter(adjusted.clone())
+            .unwrap()
+            .recheck()
+            .unwrap()
+            .should_retry());
+        coordinator
+            .notify_domain_availability_changed(domain)
+            .unwrap();
+        assert!(coordinator
+            .register_waiter(adjusted)
+            .unwrap()
+            .recheck()
+            .unwrap()
+            .should_retry());
+        let (foreign, foreign_domain) = self::coordinator();
+        let (_, foreign_release) = foreign
+            .notify_domain_availability_changed_recorded(foreign_domain)
+            .unwrap();
+        assert!(observed.after_owned_releases(&[foreign_release]).is_err());
+        let exhausted = CapacityWaitCondition::new(
+            coordinator.id(),
+            vec![CapacityAvailabilityEpoch::new(
+                CapacityAvailabilitySource::Domain(domain),
+                u64::MAX,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        assert!(exhausted.after_owned_releases(&[owned]).is_err());
+    }
+}
+
+impl CapacityWaitCondition {
+    pub(crate) fn after_owned_releases(
+        &self,
+        releases: &[OwnedCapacityRelease],
+    ) -> Result<Self, VNextError> {
+        let mut adjusted = self.clone();
+        for release in releases {
+            if release.coordinator_id != self.coordinator_id || release.increment == 0 {
+                return Err(invalid_admission(
+                    "owned capacity release belongs to another coordinator or has no increment",
+                ));
+            }
+            if let Ok(index) = adjusted
+                .observed
+                .binary_search_by_key(&release.source, |entry| entry.source)
+            {
+                adjusted.observed[index].epoch = adjusted.observed[index]
+                    .epoch
+                    .checked_add(release.increment)
+                    .ok_or_else(|| {
+                        admission_fault(
+                            DynamicAdmissionFaultKind::EpochExhausted,
+                            "owned capacity release observation overflow",
+                        )
+                    })?;
+            }
+        }
+        Ok(adjusted)
+    }
+}
+
 impl CapacityWaitCondition {
     pub fn from_observation(
         coordinator_id: u64,
@@ -756,6 +858,13 @@ pub struct AdmissionDeferred {
 }
 
 impl AdmissionDeferred {
+    pub(crate) fn discount_owned_releases(
+        mut self,
+        releases: &[OwnedCapacityRelease],
+    ) -> Result<Self, VNextError> {
+        self.wait_condition = self.wait_condition.after_owned_releases(releases)?;
+        Ok(self)
+    }
     pub fn immediate_requested(&self) -> &CapacityVector {
         &self.immediate_requested
     }
@@ -2388,6 +2497,14 @@ impl LogicalAdmissionCoordinator {
         &self,
         domain: CapacityDomainId,
     ) -> Result<CapacityEpochs, VNextError> {
+        self.notify_domain_availability_changed_recorded(domain)
+            .map(|(epochs, _)| epochs)
+    }
+
+    pub(crate) fn notify_domain_availability_changed_recorded(
+        &self,
+        domain: CapacityDomainId,
+    ) -> Result<(CapacityEpochs, OwnedCapacityRelease), VNextError> {
         let mut state = self.inner.lock_mutation()?;
         if state.poisoned {
             return Err(admission_fault(
@@ -2424,7 +2541,14 @@ impl LogicalAdmissionCoordinator {
         let epochs = state.epochs(self.id());
         self.inner.epoch_tx.send_replace(epochs);
         drop(state);
-        Ok(epochs)
+        Ok((
+            epochs,
+            OwnedCapacityRelease {
+                coordinator_id: self.id(),
+                source: CapacityAvailabilitySource::Domain(domain),
+                increment: 1,
+            },
+        ))
     }
 
     pub fn register_waiter(
@@ -2851,6 +2975,16 @@ pub struct LogicalBatchCapacityLease {
 }
 
 impl LogicalBatchCapacityLease {
+    pub(crate) fn release_recorded(
+        &mut self,
+        releases: &mut Vec<OwnedCapacityRelease>,
+    ) -> Result<(), VNextError> {
+        if self.release_inner_recorded(Some(releases)) {
+            Ok(())
+        } else {
+            Err(invalid_admission("batch capacity release failed closed"))
+        }
+    }
     pub fn coordinator_id(&self) -> LogicalAdmissionCoordinatorId {
         self.inner.id
     }
@@ -2864,6 +2998,13 @@ impl LogicalBatchCapacityLease {
     }
 
     fn release_inner(&mut self) -> bool {
+        self.release_inner_recorded(None)
+    }
+
+    fn release_inner_recorded(
+        &mut self,
+        mut releases: Option<&mut Vec<OwnedCapacityRelease>>,
+    ) -> bool {
         if self.released {
             return true;
         }
@@ -2933,6 +3074,13 @@ impl LogicalBatchCapacityLease {
                 .expect("validated child capacity domain remains registered");
             domain.used -= claim.units.get();
             domain.availability_epoch += 1;
+            if let Some(releases) = releases.as_mut() {
+                releases.push(OwnedCapacityRelease {
+                    coordinator_id: self.inner.id,
+                    source: CapacityAvailabilitySource::Domain(claim.domain),
+                    increment: 1,
+                });
+            }
         }
         state.active_child_claims -= 1;
         for parent in &self.parents {

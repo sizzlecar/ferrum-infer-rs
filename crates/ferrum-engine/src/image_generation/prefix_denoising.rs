@@ -22,6 +22,45 @@ struct Owners<R: DeviceRuntime> {
     weights: Option<SharedComponentWeights<R>>,
 }
 impl<R: DeviceRuntime> Owners<R> {
+    fn retire_cancelled(
+        &mut self,
+        pipeline: &mut QwenImage21Pipeline<R>,
+        stages: &mut Vec<ImageStageReceipt>,
+        temporary_weights: bool,
+    ) -> Result<(), ImageGenerationFailure<R>> {
+        if let Some(request) = self.request.take() {
+            request
+                .close()
+                .map_err(|source| ImageGenerationFailure::RequestClose { source })?;
+        }
+        if let Some(prefill) = self.prefill.take() {
+            stages.push(prefill.close()?);
+        }
+        if let Some(decode) = self.decode.take() {
+            pipeline.finish_stage(decode, stages)?;
+        }
+        if let Some(weights) = self.weights.take() {
+            if temporary_weights {
+                match weights.close() {
+                    Ok(SharedComponentWeightsCloseOutcome::Closed(_)) => (),
+                    Ok(outcome) => {
+                        return Err(ImageGenerationFailure::SharedWeightsReferenced {
+                            stage: ImageStage::Denoiser,
+                            outcome,
+                        })
+                    }
+                    Err(source) => {
+                        return Err(ImageGenerationFailure::SharedWeightsClose {
+                            stage: ImageStage::Denoiser,
+                            source,
+                        })
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn fail(self, source: ImageGenerationFailure<R>) -> ImageGenerationFailure<R> {
         ImageGenerationFailure::Prefix {
             source: Box::new(source),
@@ -99,10 +138,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .as_ref()
                 .unwrap()
                 .session
-                .begin_request(
+                .begin_request_with_control(
                     run,
                     request,
                     vec![sample.clone(), initial_time, decode_frequencies.clone()],
+                    self.admission_control(),
                 )
                 .map_err(|source| ImageGenerationFailure::RequestExecution { source })?;
             let request_begin_us = elapsed_us(started);
@@ -217,7 +257,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             }
             Ok(sample)
         })();
-        result.map_err(|source| owners.fail(source))
+        match result {
+            Err(ImageGenerationFailure::RequestExecution {
+                source: TensorExecutionError::CancelledBeforeSubmission(cancellation),
+            }) => match owners.retire_cancelled(self, stages, temporary_weights) {
+                Ok(()) => Err(ImageGenerationFailure::Cancelled(cancellation)),
+                Err(source) => Err(owners.fail(source)),
+            },
+            result => result.map_err(|source| owners.fail(source)),
+        }
     }
 }
 

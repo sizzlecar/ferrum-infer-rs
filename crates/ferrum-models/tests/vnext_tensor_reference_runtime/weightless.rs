@@ -20,6 +20,9 @@ use fault_runtime::{FaultRuntime, FenceMode};
 #[path = "fixed_liveness.rs"]
 mod fixed_liveness;
 
+#[path = "admission_wait.rs"]
+mod admission_wait;
+
 const PROFILE: &str = "reference.tensor.weightless.silu.bf16";
 const BYTE_LEN: usize = 24;
 const INPUT_BITS: [u16; 12] = [

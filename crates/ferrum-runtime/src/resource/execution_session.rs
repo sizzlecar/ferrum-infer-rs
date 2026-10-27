@@ -238,7 +238,9 @@ where
                         StepResourceAdmissionProfilePhase::LogicalCapacityClaim,
                         phase_started,
                     );
-                    return Ok(StepResourceAdmissionDecision::Deferred(deferred));
+                    return Ok(StepResourceAdmissionDecision::Deferred(
+                        prepared.release_for_capacity_wait(deferred)?,
+                    ));
                 }
                 BatchCapacityClaimDecision::PermanentRejected(rejected) => {
                     record_step_admission_profile::<PROFILE, _>(

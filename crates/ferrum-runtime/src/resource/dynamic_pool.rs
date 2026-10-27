@@ -516,7 +516,7 @@ pub(super) trait BackingExtentOwner: Send + Sync {
         claim_identity: &PhysicalBackingClaimIdentity,
         occupancy: DynamicBackingClaimOccupancy,
         segments: &[BackingSegment],
-    );
+    ) -> Result<crate::admission::OwnedCapacityRelease, VNextError>;
 }
 
 pub(super) struct BackingSegmentLease {
@@ -529,6 +529,22 @@ pub(super) struct BackingSegmentLease {
     pub(super) size_bytes: u64,
     pub(super) initialization: Option<Arc<BackingInitializationCell>>,
     pub(super) released: bool,
+}
+
+impl BackingSegmentLease {
+    pub(super) fn release_recorded(
+        &mut self,
+    ) -> Result<Option<crate::admission::OwnedCapacityRelease>, VNextError> {
+        if self.released {
+            return Ok(None);
+        }
+        // A partial allocator failure is fail-closed. Never release the same
+        // physical extent again from Drop after a failed checked attempt.
+        self.released = true;
+        self.owner
+            .release_segments(&self.claim_identity, self.occupancy, &self.segments)
+            .map(Some)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -732,11 +748,7 @@ impl BackingInitializationCell {
 
 impl Drop for BackingSegmentLease {
     fn drop(&mut self) {
-        if !self.released {
-            self.owner
-                .release_segments(&self.claim_identity, self.occupancy, &self.segments);
-            self.released = true;
-        }
+        let _ = self.release_recorded();
     }
 }
 
@@ -753,17 +765,17 @@ where
         claim_identity: &PhysicalBackingClaimIdentity,
         occupancy: DynamicBackingClaimOccupancy,
         segments: &[BackingSegment],
-    ) {
+    ) -> Result<crate::admission::OwnedCapacityRelease, VNextError> {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
                 state.poisoned = true;
-                return;
+                return Err(invalid_resource("backing release pool mutex is poisoned"));
             }
         };
         if state.poisoned {
-            return;
+            return Err(invalid_resource("backing release pool is fail-closed"));
         }
         let segment_count = u64::try_from(segments.len()).ok();
         let physical_bytes = segments.iter().try_fold(0_u64, |total, segment| {
@@ -774,33 +786,39 @@ where
             || Some(occupancy.physical_bytes) != physical_bytes
         {
             state.poisoned = true;
-            return;
+            return Err(invalid_resource(
+                "backing release claim differs from its live occupancy",
+            ));
         }
         let next_occupancy = match state.live_occupancy.checked_without_claim(occupancy) {
             Ok(next) => next,
             Err(_) => {
                 state.poisoned = true;
-                return;
+                return Err(invalid_resource("backing release occupancy underflow"));
             }
         };
         for segment in segments {
             if segment.pool_id() != self.domain.pool_id() {
                 state.poisoned = true;
-                return;
+                return Err(invalid_resource(
+                    "backing release segment belongs to another pool",
+                ));
             }
             let Some(chunk) = state.chunks.get(&segment.chunk_ordinal()) else {
                 state.poisoned = true;
-                return;
+                return Err(invalid_resource("backing release chunk is missing"));
             };
             if chunk.backing.identity != *segment.chunk() || chunk.live_segments == 0 {
                 state.poisoned = true;
-                return;
+                return Err(invalid_resource(
+                    "backing release chunk identity or occupancy differs",
+                ));
             }
         }
         for segment in segments {
             if state.allocator.release(segment).is_err() {
                 state.poisoned = true;
-                return;
+                return Err(invalid_resource("backing allocator release failed"));
             }
             let live_segments = state
                 .chunks
@@ -810,16 +828,18 @@ where
         }
         state.live_occupancy = next_occupancy;
         drop(state);
-        if self
+        match self
             .logical_admission
-            .notify_domain_availability_changed(self.domain.domain_id)
-            .is_err()
+            .notify_domain_availability_changed_recorded(self.domain.domain_id)
         {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.poisoned = true;
+            Ok((_, release)) => Ok(release),
+            Err(error) => {
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .poisoned = true;
+                Err(error)
+            }
         }
     }
 }
@@ -2221,6 +2241,41 @@ pub struct LogicalBackingSliceAuthority {
     pub(in crate::resource) evidence: LogicalBackingSliceEvidence,
     pub(in crate::resource) segment_lease: Arc<BackingSegmentLease>,
     pub(super) reusable_lane: Option<ExecutionLaneId>,
+}
+
+pub(super) fn release_owned_slices_recorded(
+    slices: &mut Vec<LogicalBackingSliceAuthority>,
+    releases: &mut Vec<crate::admission::OwnedCapacityRelease>,
+) -> Result<(), VNextError> {
+    let mut references = std::collections::BTreeMap::<usize, usize>::new();
+    for slice in slices.iter() {
+        *references
+            .entry(Arc::as_ptr(&slice.segment_lease) as usize)
+            .or_default() += 1;
+    }
+    for slice in slices.iter() {
+        if Arc::weak_count(&slice.segment_lease) != 0
+            || Arc::strong_count(&slice.segment_lease)
+                != references[&(Arc::as_ptr(&slice.segment_lease) as usize)]
+        {
+            return Err(invalid_resource(
+                "unsubmitted physical backing has an external owner",
+            ));
+        }
+    }
+    while let Some(mut slice) = slices.pop() {
+        if let Some(lease) = Arc::get_mut(&mut slice.segment_lease) {
+            match lease.release_recorded() {
+                Ok(Some(receipt)) => releases.push(receipt),
+                Ok(None) => (),
+                Err(error) => {
+                    slices.push(slice);
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl LogicalBackingSliceAuthority {

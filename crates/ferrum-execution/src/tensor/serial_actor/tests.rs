@@ -127,6 +127,10 @@ fn successful_calls_keep_one_lane_until_its_last_owner_retires() {
     let runtime = runtime();
     let mut actor = TensorSerialActor::new(runtime.clone()).unwrap();
     assert!(!actor.is_failed());
+    assert!(
+        actor.admission_control().is_none(),
+        "generic actors remain fail-fast by default"
+    );
     let first = actor.execute(|lane| Ok(lane.id())).unwrap();
     let retained = actor.execute(|lane| Ok(lane.clone())).unwrap();
     assert_eq!(first, retained.id());
@@ -137,6 +141,25 @@ fn successful_calls_keep_one_lane_until_its_last_owner_retires() {
     assert_eq!(runtime.streams.dropped.load(Ordering::SeqCst), 0);
     drop(retained);
     assert_eq!(runtime.streams.dropped.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn retired_unsubmitted_cancellation_keeps_the_same_actor_lane_reusable() {
+    let runtime = runtime();
+    let mut actor = TensorSerialActor::new(runtime.clone()).unwrap();
+    actor.set_admission_control(TensorAdmissionControl::new());
+    let first = actor.execute(|lane| Ok(lane.id())).unwrap();
+    let error = actor
+        .execute::<()>(|_| {
+            Err(TensorExecutionError::CancelledBeforeSubmission(
+                TensorAdmissionCancellation::retired(),
+            ))
+        })
+        .unwrap_err();
+    assert!(error.is_cancelled_before_submission());
+    assert!(!actor.is_failed());
+    assert_eq!(actor.execute(|lane| Ok(lane.id())).unwrap(), first);
+    assert_eq!(runtime.streams.created.load(Ordering::SeqCst), 1);
 }
 
 #[test]

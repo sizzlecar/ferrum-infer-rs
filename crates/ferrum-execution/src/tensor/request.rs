@@ -33,6 +33,16 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         request_id: RequestIdentity,
         initial_inputs: Vec<ManagedHostTensor>,
     ) -> Result<TensorRequestSession<R>, TensorExecutionError<R>> {
+        self.begin_request_with_control(run_id, request_id, initial_inputs, None)
+    }
+
+    pub fn begin_request_with_control(
+        &self,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        initial_inputs: Vec<ManagedHostTensor>,
+        control: Option<&TensorAdmissionControl>,
+    ) -> Result<TensorRequestSession<R>, TensorExecutionError<R>> {
         let executor = Self::new(
             self.executable.clone(),
             self.providers.clone(),
@@ -42,7 +52,8 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         )?;
         let inputs = executor.binding.request_input_binding()?;
         let work = inputs.admission_work(initial_inputs)?;
-        let sequence = executor.admit_sequence(&work, run_id.clone(), request_id.clone())?;
+        let sequence =
+            executor.admit_sequence(&work, run_id.clone(), request_id.clone(), control)?;
         let session = sequence.open_session()?;
         let target =
             TensorRequestStateTarget::new(executor.executable.execution_plan(), session.clone())?;
@@ -72,6 +83,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             destination,
             mappings,
             None,
+            None,
         )
     }
 
@@ -84,6 +96,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         destination: &mut TensorRequestSession<R>,
         mappings: &[TensorRequestStateMapping],
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        let control = actor.admission_control().cloned();
         actor.execute(|lane| {
             self.execute_initializing_request_with_lane(
                 run_id,
@@ -92,6 +105,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                 destination,
                 mappings,
                 Some(lane),
+                control.as_ref(),
             )
         })
     }
@@ -104,6 +118,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         destination: &mut TensorRequestSession<R>,
         mappings: &[TensorRequestStateMapping],
         lane: Option<&Arc<ExecutionLane<R>>>,
+        control: Option<&TensorAdmissionControl>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
         if destination.failed || destination.session.is_none() {
             return Err(invalid("cannot initialize a failed or closed tensor request").into());
@@ -116,8 +131,12 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             None,
             Some((&destination.target, mappings)),
             lane,
+            control,
         );
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|error| !error.is_cancelled_before_submission())
+        {
             destination.failed = true;
         }
         result
@@ -129,7 +148,7 @@ impl<R: DeviceRuntime> TensorRequestSession<R> {
         &mut self,
         inputs: Vec<ManagedHostTensor>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
-        self.execute_with_lane(inputs, None)
+        self.execute_with_lane(inputs, None, None)
     }
 
     pub fn execute_on_actor(
@@ -137,13 +156,15 @@ impl<R: DeviceRuntime> TensorRequestSession<R> {
         actor: &mut TensorSerialActor<R>,
         inputs: Vec<ManagedHostTensor>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
-        actor.execute(|lane| self.execute_with_lane(inputs, Some(lane)))
+        let control = actor.admission_control().cloned();
+        actor.execute(|lane| self.execute_with_lane(inputs, Some(lane), control.as_ref()))
     }
 
     fn execute_with_lane(
         &mut self,
         inputs: Vec<ManagedHostTensor>,
         lane: Option<&Arc<ExecutionLane<R>>>,
+        control: Option<&TensorAdmissionControl>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
         if self.failed {
             return Err(invalid("failed fixed request cannot execute again").into());
@@ -162,8 +183,12 @@ impl<R: DeviceRuntime> TensorRequestSession<R> {
             Some(session),
             None,
             lane,
+            control,
         );
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|error| !error.is_cancelled_before_submission())
+        {
             self.failed = true;
         }
         result
