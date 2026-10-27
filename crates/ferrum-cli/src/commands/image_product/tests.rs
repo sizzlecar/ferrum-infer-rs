@@ -42,7 +42,15 @@ fn explicit_image_json_keeps_configured_batching_and_resolves_queue_budget() {
         "request_batch_max_wait_ms":200,"default_width":512,"default_height":512,
         "default_seed":0,"rgba_scratch_bytes":16384,"output":{}
     });
-    let legacy = load(&wire).unwrap().serving.unwrap();
+    let loaded = load(&wire).unwrap();
+    let ImageBackendConfig::Cuda(cuda) = &loaded.backend else {
+        panic!("expected CUDA configuration")
+    };
+    assert_eq!(
+        cuda.cudnn.convolution_workspace,
+        ferrum_engine::image_generation::ImageCudaConvolutionWorkspacePolicy::ConfiguredLimit
+    );
+    let legacy = loaded.serving.unwrap();
     assert_eq!(legacy.batching, ImageBatchPolicy::Configured);
     assert_eq!(legacy.max_num_seqs, 1);
     assert_eq!(legacy.request_batch_max_wait_ms, 200);

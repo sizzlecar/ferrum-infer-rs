@@ -80,17 +80,6 @@ pub(crate) struct CudnnConv2dDescriptor {
     pub groups: i32,
 }
 
-// Pure host metadata, owned by the already admitted cuDNN instance. Saturation
-// falls back to the original query path; it neither rejects a shape nor creates
-// another native handle/descriptor. This is not a Host payload/RSS measurement.
-const CONVOLUTION_MEMO_CAPACITY: usize = 128;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ConvolutionKey {
-    shape: CudnnConv2dDescriptor,
-    workspace_cap: usize,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ConvolutionAlgorithm {
     algo: i32,
@@ -110,56 +99,123 @@ impl ConvolutionAlgorithm {
         }
         Ok(())
     }
-}
 
-struct ConvolutionMemo {
-    entries: [Option<(ConvolutionKey, ConvolutionAlgorithm)>; CONVOLUTION_MEMO_CAPACITY],
-    len: usize,
-}
-impl ConvolutionMemo {
-    fn new() -> Self {
-        Self {
-            entries: [None; CONVOLUTION_MEMO_CAPACITY],
-            len: 0,
+    fn validate_workspace(self, workspace: u64, bytes: u64) -> Result<(), String> {
+        if bytes != self.required_bytes as u64 || (bytes == 0) != (workspace == 0) {
+            return Err("cuDNN workspace differs from prepared actual requirement".into());
         }
-    }
-
-    fn lookup(&self, key: ConvolutionKey) -> Option<ConvolutionAlgorithm> {
-        self.entries[..self.len]
-            .iter()
-            .flatten()
-            .find_map(|(stored, algorithm)| (*stored == key).then_some(*algorithm))
-    }
-
-    /// The callback includes descriptor setup, forward and clearing the handle's
-    /// stream. Failed calls and unwinds preserve the existing quarantine state;
-    /// only a fully successful call may publish a new selection.
-    fn invoke(
-        &mut self,
-        failed: &mut bool,
-        key: ConvolutionKey,
-        operation: impl FnOnce(Option<ConvolutionAlgorithm>) -> Result<ConvolutionAlgorithm, String>,
-    ) -> Result<(), String> {
-        if *failed {
-            return Err("cuDNN owner requires quarantine".into());
-        }
-        *failed = true;
-        let cached = self.lookup(key);
-        if let Some(algorithm) = cached {
-            algorithm.validate(key.workspace_cap)?;
-        }
-        let selected = operation(cached)?;
-        selected.validate(key.workspace_cap)?;
-        if cached.is_some_and(|previous| previous != selected) {
-            return Err("cuDNN cached convolution selection changed during execution".into());
-        }
-        if cached.is_none() && self.len < self.entries.len() {
-            self.entries[self.len] = Some((key, selected));
-            self.len += 1;
-        }
-        *failed = false;
         Ok(())
     }
+}
+
+/// Immutable metadata prepared before resource admission. The compiled plan and
+/// each encoded command retain this exact selection and its native owner.
+/// There is no separate convolution cache or limit on retained shape records.
+pub(crate) struct PreparedConv {
+    owner: Arc<CudaCudnnOwner>,
+    shape: CudnnConv2dDescriptor,
+    selected: ConvolutionAlgorithm,
+    fingerprint: String,
+}
+
+impl PreparedConv {
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(crate) fn workspace_bytes(&self) -> u64 {
+        self.selected.required_bytes as u64
+    }
+
+    pub(crate) fn validate_invocation(
+        &self,
+        owner: &Arc<CudaCudnnOwner>,
+        shape: CudnnConv2dDescriptor,
+        fingerprint: Option<&str>,
+    ) -> Result<(), String> {
+        if !Arc::ptr_eq(&self.owner, owner)
+            || self.shape != shape
+            || fingerprint != Some(self.fingerprint())
+        {
+            return Err("cuDNN convolution owner/shape/prepared identity mismatch".into());
+        }
+        self.selected
+            .validate(self.owner.workspace_limit_bytes as usize)
+    }
+
+    /// Submission only consumes the admitted selection; it never queries an
+    /// algorithm or workspace size. All bindings remain command-owned.
+    pub(crate) fn convolution(
+        &self,
+        stream: &CudaStream,
+        input: u64,
+        filter: u64,
+        output: u64,
+        workspace: u64,
+        workspace_bytes: u64,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        self.selected
+            .validate_workspace(workspace, workspace_bytes)
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        let mut guard = self
+            .owner
+            .inner
+            .lock()
+            .map_err(|_| CudaDeviceRuntimeError::contract("cuDNN owner is poisoned"))?;
+        let native = guard
+            .as_mut()
+            .ok_or_else(|| CudaDeviceRuntimeError::contract("cuDNN owner is closed"))?;
+        if native.failed {
+            return Err(CudaDeviceRuntimeError::contract(
+                "cuDNN owner requires quarantine",
+            ));
+        }
+        native
+            .context
+            .bind_to_thread()
+            .map_err(|e| CudaDeviceRuntimeError::driver("cuDNN execution context bind", e))?;
+        unsafe {
+            native.convolution(
+                stream,
+                self.shape,
+                self.selected,
+                input,
+                filter,
+                output,
+                workspace,
+            )
+        }
+        .map_err(CudaDeviceRuntimeError::contract)
+    }
+}
+
+/// Native errors and unwinds retain quarantine. A fully successful preparation
+/// or forward call is the only path that restores the reusable owner state.
+fn guarded_convolution<T>(
+    failed: &mut bool,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if *failed {
+        return Err("cuDNN owner requires quarantine".into());
+    }
+    *failed = true;
+    let result = operation()?;
+    *failed = false;
+    Ok(result)
+}
+
+/// A successful native query can still have no selection inside the policy
+/// cap. Reject that prepared plan without quarantining the reusable owner.
+/// Native query failures and unwinds remain inside the guarded boundary.
+fn prepare_convolution_selection(
+    failed: &mut bool,
+    workspace_cap: usize,
+    query: impl FnOnce() -> Result<Option<ConvolutionAlgorithm>, String>,
+) -> Result<ConvolutionAlgorithm, String> {
+    let selected = guarded_convolution(failed, query)?
+        .ok_or("no deterministic cuDNN convolution fits configured workspace policy")?;
+    selected.validate(workspace_cap)?;
+    Ok(selected)
 }
 
 pub(crate) struct CudaCudnnOwner {
@@ -175,7 +231,6 @@ struct NativeOwner {
     filter: Descriptor,
     convolution: Descriptor,
     failed: bool,
-    convolution_memo: ConvolutionMemo,
     // Native objects are explicitly destroyed before any of these fields.
     api: Api,
     context: Arc<CudaContext>,
@@ -237,7 +292,6 @@ impl CudaCudnnOwner {
             filter: std::ptr::null_mut(),
             convolution: std::ptr::null_mut(),
             failed: false,
-            convolution_memo: ConvolutionMemo::new(),
             api,
             context,
             _opaque: opaque,
@@ -300,24 +354,13 @@ impl CudaCudnnOwner {
         self.workspace_limit_bytes
     }
 
-    /// Called only inside the runtime submission closure. The command retains
-    /// this owner and all pointers until its fence or quarantine is retired.
-    pub(crate) fn convolution(
-        &self,
-        stream: &CudaStream,
+    /// Query a deterministic algorithm and its actual workspace before the
+    /// provider publishes its resource estimate. No payload or device workspace
+    /// is allocated here, and the selection is not reconstructed during encode.
+    pub(crate) fn prepare_convolution(
+        self: &Arc<Self>,
         shape: CudnnConv2dDescriptor,
-        input: u64,
-        filter: u64,
-        output: u64,
-        workspace: u64,
-        workspace_bytes: u64,
-    ) -> Result<(), CudaDeviceRuntimeError> {
-        if workspace_bytes != self.workspace_limit_bytes || (workspace_bytes != 0 && workspace == 0)
-        {
-            return Err(CudaDeviceRuntimeError::contract(
-                "cuDNN workspace differs from admitted policy",
-            ));
-        }
+    ) -> Result<Arc<PreparedConv>, CudaDeviceRuntimeError> {
         let mut guard = self
             .inner
             .lock()
@@ -333,193 +376,219 @@ impl CudaCudnnOwner {
         native
             .context
             .bind_to_thread()
-            .map_err(|e| CudaDeviceRuntimeError::driver("cuDNN execution context bind", e))?;
-        // Any unwind or native failure leaves a fail-closed owner. A successful
-        // call restores a null stream so the retained handle never references a
-        // stream that may retire before the next invocation.
-        let result = unsafe {
-            native.convolution(
-                stream,
+            .map_err(|e| CudaDeviceRuntimeError::driver("cuDNN preparation context bind", e))?;
+        let selected =
+            unsafe { native.prepare_convolution(shape, self.workspace_limit_bytes() as usize) }
+                .map_err(CudaDeviceRuntimeError::contract)?;
+        Ok(Arc::new(PreparedConv {
+            owner: Arc::clone(self),
+            shape,
+            selected,
+            fingerprint: convolution_fingerprint(
+                self.fingerprint(),
                 shape,
-                input,
-                filter,
-                output,
-                workspace,
-                workspace_bytes as usize,
-            )
-        };
-        result.map_err(CudaDeviceRuntimeError::contract)
+                self.workspace_limit_bytes(),
+                selected,
+            ),
+        }))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ConvolutionDescriptors {
+    input: Descriptor,
+    output: Descriptor,
+    filter: Descriptor,
+    convolution: Descriptor,
+}
+
+impl ConvolutionDescriptors {
+    unsafe fn configure(self, a: &Api, s: CudnnConv2dDescriptor) -> Result<(), String> {
+        check(
+            (a.set_tensor)(
+                self.input,
+                ffi::NCHW,
+                ffi::BF16,
+                s.input[0],
+                s.input[1],
+                s.input[2],
+                s.input[3],
+            ),
+            "set input",
+        )?;
+        check(
+            (a.set_tensor)(
+                self.output,
+                ffi::NCHW,
+                ffi::BF16,
+                s.output[0],
+                s.output[1],
+                s.output[2],
+                s.output[3],
+            ),
+            "set output",
+        )?;
+        check(
+            (a.set_filter)(
+                self.filter,
+                ffi::BF16,
+                ffi::NCHW,
+                s.filter[0],
+                s.filter[1],
+                s.filter[2],
+                s.filter[3],
+            ),
+            "set filter",
+        )?;
+        check(
+            (a.set_convolution)(
+                self.convolution,
+                s.padding[0],
+                s.padding[1],
+                s.stride[0],
+                s.stride[1],
+                s.dilation[0],
+                s.dilation[1],
+                ffi::CROSS_CORRELATION,
+                ffi::FLOAT,
+            ),
+            "set convolution",
+        )?;
+        check((a.set_groups)(self.convolution, s.groups), "set groups")
     }
 }
 
 impl NativeOwner {
+    fn convolution_descriptors(&self) -> ConvolutionDescriptors {
+        ConvolutionDescriptors {
+            input: self.input,
+            output: self.output,
+            filter: self.filter,
+            convolution: self.convolution,
+        }
+    }
+
+    unsafe fn prepare_convolution(
+        &mut self,
+        shape: CudnnConv2dDescriptor,
+        workspace_cap: usize,
+    ) -> Result<ConvolutionAlgorithm, String> {
+        let d = self.convolution_descriptors();
+        let a = &self.api;
+        let handle = self.handle;
+        let started = Instant::now();
+        let selected = prepare_convolution_selection(&mut self.failed, workspace_cap, || unsafe {
+            check(
+                (a.set_stream)(handle, std::ptr::null_mut()),
+                "clear stream for convolution preparation",
+            )?;
+            d.configure(a, shape)?;
+            check(
+                (a.set_math)(d.convolution, ffi::TENSOR_OP_MATH),
+                "set math policy",
+            )?;
+            let mut candidates = [ForwardPerformance::default(); ffi::ALGORITHMS];
+            let mut count = 0;
+            check(
+                (a.algorithms)(
+                    handle,
+                    d.input,
+                    d.filter,
+                    d.convolution,
+                    d.output,
+                    ffi::ALGORITHMS as i32,
+                    &mut count,
+                    candidates.as_mut_ptr(),
+                ),
+                "query convolution algorithms",
+            )?;
+            let count = usize::try_from(count)
+                .ok()
+                .filter(|&n| n > 0 && n <= candidates.len())
+                .ok_or("cuDNN returned an invalid algorithm count")?;
+            let Some(candidate) = choose_algorithm(&candidates[..count], workspace_cap) else {
+                return Ok(None);
+            };
+            check(
+                (a.set_math)(d.convolution, candidate.math_type),
+                "set selected math type",
+            )?;
+            let mut required = 0;
+            check(
+                (a.workspace)(
+                    handle,
+                    d.input,
+                    d.filter,
+                    d.convolution,
+                    d.output,
+                    candidate.algo,
+                    &mut required,
+                ),
+                "query workspace",
+            )?;
+            Ok(Some(ConvolutionAlgorithm {
+                algo: candidate.algo,
+                math_type: candidate.math_type,
+                required_bytes: required,
+            }))
+        })?;
+        tracing::debug!(
+            shape = ?shape,
+            workspace_cap_bytes = workspace_cap,
+            algorithm = selected.algo,
+            math_type = selected.math_type,
+            required_workspace_bytes = selected.required_bytes,
+            selection_query_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "cuDNN convolution prepared selection"
+        );
+        Ok(selected)
+    }
+
     unsafe fn convolution(
         &mut self,
         stream: &CudaStream,
-        s: CudnnConv2dDescriptor,
+        shape: CudnnConv2dDescriptor,
+        selected: ConvolutionAlgorithm,
         input: u64,
         filter: u64,
         output: u64,
         workspace: u64,
-        workspace_bytes: usize,
     ) -> Result<(), String> {
+        let d = self.convolution_descriptors();
         let a = &self.api;
-        self.convolution_memo.invoke(
-            &mut self.failed,
-            ConvolutionKey {
-                shape: s,
-                workspace_cap: workspace_bytes,
-            },
-            |cached| unsafe {
+        let handle = self.handle;
+        guarded_convolution(&mut self.failed, || unsafe {
             check(
-                (a.set_stream)(self.handle, stream.cu_stream() as *mut c_void),
+                (a.set_stream)(handle, stream.cu_stream() as *mut c_void),
                 "set stream",
             )?;
+            d.configure(a, shape)?;
             check(
-                (a.set_tensor)(
-                    self.input,
-                    ffi::NCHW,
-                    ffi::BF16,
-                    s.input[0],
-                    s.input[1],
-                    s.input[2],
-                    s.input[3],
-                ),
-                "set input",
+                (a.set_math)(d.convolution, selected.math_type),
+                "set selected math type",
             )?;
-            check(
-                (a.set_tensor)(
-                    self.output,
-                    ffi::NCHW,
-                    ffi::BF16,
-                    s.output[0],
-                    s.output[1],
-                    s.output[2],
-                    s.output[3],
-                ),
-                "set output",
-            )?;
-            check(
-                (a.set_filter)(
-                    self.filter,
-                    ffi::BF16,
-                    ffi::NCHW,
-                    s.filter[0],
-                    s.filter[1],
-                    s.filter[2],
-                    s.filter[3],
-                ),
-                "set filter",
-            )?;
-            check(
-                (a.set_convolution)(
-                    self.convolution,
-                    s.padding[0],
-                    s.padding[1],
-                    s.stride[0],
-                    s.stride[1],
-                    s.dilation[0],
-                    s.dilation[1],
-                    ffi::CROSS_CORRELATION,
-                    ffi::FLOAT,
-                ),
-                "set convolution",
-            )?;
-            check((a.set_groups)(self.convolution, s.groups), "set groups")?;
-            check(
-                (a.set_math)(self.convolution, ffi::TENSOR_OP_MATH),
-                "set math policy",
-            )?;
-            let selected = if let Some(selected) = cached {
-                check(
-                    (a.set_math)(self.convolution, selected.math_type),
-                    "set selected math type",
-                )?;
-                selected
-            } else {
-                let started = Instant::now();
-                let mut candidates = [ForwardPerformance::default(); ffi::ALGORITHMS];
-                let mut count = 0;
-                check(
-                    (a.algorithms)(
-                        self.handle,
-                        self.input,
-                        self.filter,
-                        self.convolution,
-                        self.output,
-                        ffi::ALGORITHMS as i32,
-                        &mut count,
-                        candidates.as_mut_ptr(),
-                    ),
-                    "query convolution algorithms",
-                )?;
-                let count = usize::try_from(count)
-                    .ok()
-                    .filter(|&n| n > 0 && n <= candidates.len())
-                    .ok_or("cuDNN returned an invalid algorithm count")?;
-                let candidate = choose_algorithm(&candidates[..count], workspace_bytes)
-                    .ok_or("no deterministic cuDNN convolution fits admitted workspace")?;
-                check(
-                    (a.set_math)(self.convolution, candidate.math_type),
-                    "set selected math type",
-                )?;
-                let mut required = 0;
-                check(
-                    (a.workspace)(
-                        self.handle,
-                        self.input,
-                        self.filter,
-                        self.convolution,
-                        self.output,
-                        candidate.algo,
-                        &mut required,
-                    ),
-                    "query workspace",
-                )?;
-                let selected = ConvolutionAlgorithm {
-                    algo: candidate.algo,
-                    math_type: candidate.math_type,
-                    required_bytes: required,
-                };
-                selected.validate(workspace_bytes)?;
-                tracing::debug!(
-                    shape = ?s,
-                    workspace_cap_bytes = workspace_bytes,
-                    algorithm = selected.algo,
-                    math_type = selected.math_type,
-                    required_workspace_bytes = selected.required_bytes,
-                    selection_query_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    "cuDNN convolution algorithm memo miss"
-                );
-                selected
-            };
             let alpha = 1.0_f32;
             let beta = 0.0_f32;
             check(
                 (a.forward)(
-                    self.handle,
+                    handle,
                     (&alpha as *const f32).cast(),
-                    self.input,
+                    d.input,
                     input as *const c_void,
-                    self.filter,
+                    d.filter,
                     filter as *const c_void,
-                    self.convolution,
+                    d.convolution,
                     selected.algo,
                     workspace as *mut c_void,
-                    workspace_bytes,
+                    selected.required_bytes,
                     (&beta as *const f32).cast(),
-                    self.output,
+                    d.output,
                     output as *mut c_void,
                 ),
                 "convolution forward",
             )?;
-            check(
-                (a.set_stream)(self.handle, std::ptr::null_mut()),
-                "clear stream",
-            )?;
-            Ok(selected)
-        },
-        )
+            check((a.set_stream)(handle, std::ptr::null_mut()), "clear stream")
+        })
     }
 
     fn destroy(&mut self) -> bool {
@@ -570,6 +639,33 @@ fn choose_algorithm(candidates: &[ForwardPerformance], cap: usize) -> Option<For
             && (0..ffi::ALGORITHMS as i32).contains(&c.algo)
             && matches!(c.math_type, 0 | ffi::TENSOR_OP_MATH)
     })
+}
+
+fn convolution_fingerprint(
+    owner: &str,
+    shape: CudnnConv2dDescriptor,
+    workspace_cap: u64,
+    selected: ConvolutionAlgorithm,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cuda.cudnn.conv2d.prepared-actual-workspace.v1");
+    digest.update(owner.as_bytes());
+    for dimensions in [shape.input, shape.filter, shape.output] {
+        for value in dimensions {
+            digest.update(value.to_le_bytes());
+        }
+    }
+    for dimensions in [shape.padding, shape.stride, shape.dilation] {
+        for value in dimensions {
+            digest.update(value.to_le_bytes());
+        }
+    }
+    digest.update(shape.groups.to_le_bytes());
+    digest.update(workspace_cap.to_le_bytes());
+    digest.update(selected.algo.to_le_bytes());
+    digest.update(selected.math_type.to_le_bytes());
+    digest.update((selected.required_bytes as u64).to_le_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 fn library_fingerprint(config: &CudaCudnnConfig) -> Result<[u8; 32], CudaDeviceRuntimeError> {

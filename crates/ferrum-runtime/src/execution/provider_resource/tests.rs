@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 #[test]
-fn prepared_implementation_lives_through_compilation_and_cloned_plans_only() {
-    let native = Arc::new(());
+fn prepared_implementation_reads_retain_the_same_owner_across_plan_clones() {
+    let native = Arc::new(String::from("prepared native choice"));
     let weak = Arc::downgrade(&native);
     let estimated = estimate()
         .with_prepared_implementation_fingerprint("1".repeat(64))
@@ -18,12 +18,30 @@ fn prepared_implementation_lives_through_compilation_and_cloned_plans_only() {
     let mut node = crate::PlanNode::resource_test_node(crate::NodeId::new("node.native").unwrap());
     node.provider_resources = plan(estimated);
     let cloned = node.clone();
+    let retained = node
+        .provider_resources()
+        .prepared_implementation::<String>()
+        .unwrap();
+    assert!(Arc::ptr_eq(&retained, &weak.upgrade().unwrap()));
+    assert!(Arc::ptr_eq(
+        &retained,
+        &cloned
+            .provider_resources()
+            .prepared_implementation::<String>()
+            .unwrap()
+    ));
+    assert!(node
+        .provider_resources()
+        .prepared_implementation::<u64>()
+        .is_none());
     let wire = serde_json::to_value(node.provider_resources()).unwrap();
     assert!(wire.get("prepared_implementation_retention").is_none());
     let decoded: UnvalidatedProviderResourcePlan = serde_json::from_value(wire).unwrap();
     drop(node);
     assert!(weak.upgrade().is_some());
     drop(cloned);
+    assert!(weak.upgrade().is_some());
+    drop(retained);
     assert!(weak.upgrade().is_none());
     // An untrusted wire description never retains process-local native state.
     drop(decoded);
@@ -70,6 +88,8 @@ fn prepared_retention_preserves_wire_identity_and_semantic_rebuild() {
             .with_prepared_implementation_retention(Arc::new(()))
             .unwrap(),
     );
+    assert!(plain.prepared_implementation::<()>().is_none());
+    assert!(retained.prepared_implementation::<()>().is_some());
     assert_eq!(retained, rebuilt);
     assert_eq!(
         plain.estimate_fingerprint(),

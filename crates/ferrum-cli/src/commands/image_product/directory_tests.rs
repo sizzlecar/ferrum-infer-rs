@@ -319,6 +319,10 @@ fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
             selected.cuda().unwrap().attention_policy,
             ferrum_engine::image_generation::ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1
         );
+        assert_eq!(
+            selected.cuda().unwrap().convolution_workspace,
+            ferrum_engine::image_generation::ImageCudaConvolutionWorkspacePolicy::Auto
+        );
     }
     for backend in ["cuda", "metal"] {
         let options = DirectoryOptions::from_cli(0.9, None, None, backend, None, None).unwrap();

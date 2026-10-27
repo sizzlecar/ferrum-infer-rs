@@ -15,9 +15,9 @@ use super::composition::{
 use super::ImagePipelineConfig;
 pub use super::ImagePipelineLimits as ImageCudaPipelineLimits;
 use super::{
-    ImageCudaAttentionPolicy, ImageCudaPrecisionPolicy, ImageFp8HostCachePolicy, ImageStreamLimit,
-    ImageStreamPlan, ImageStreamRequirements, QwenImage21Assets, QwenImage21Pipeline,
-    QwenImage21Profiles,
+    ImageCudaAttentionPolicy, ImageCudaConvolutionWorkspacePolicy, ImageCudaPrecisionPolicy,
+    ImageFp8HostCachePolicy, ImageStreamLimit, ImageStreamPlan, ImageStreamRequirements,
+    QwenImage21Assets, QwenImage21Pipeline, QwenImage21Profiles,
 };
 use anyhow::{ensure, Context, Result};
 use ferrum_diffusion::Bf16EulerProfile;
@@ -60,6 +60,9 @@ pub struct ImageCudaCompositionReceipt {
     /// component plans retain the provider's library fingerprint separately.
     pub cudnn_library: std::path::PathBuf,
     pub cudnn_workspace_limit_bytes: u64,
+    pub cudnn_convolution_workspace_policy: ImageCudaConvolutionWorkspacePolicy,
+    /// Algorithm selection ceiling, not a preallocated or per-operation claim.
+    pub cudnn_convolution_workspace_limit_bytes: u64,
     pub attention_policy: ImageCudaAttentionPolicy,
     pub precision_policy: ImageCudaPrecisionPolicy,
     pub fp8_host_cache: ImageFp8HostCachePolicy,
@@ -85,6 +88,7 @@ pub struct QwenImage21CudaConfig {
     pub maximum_commands_per_submission: usize,
     pub opaque_memory_profile: String,
     pub cudnn: CudaCudnnConfig,
+    pub convolution_workspace: ImageCudaConvolutionWorkspacePolicy,
     pub attention_policy: ImageCudaAttentionPolicy,
     pub precision_policy: ImageCudaPrecisionPolicy,
     pub fp8_host_cache: ImageFp8HostCachePolicy,
@@ -273,6 +277,13 @@ impl QwenImage21CudaConfig {
         };
         self.validate_capacity(capacity.get())?;
         self.validate_weight_capacity(&execution_weight_bytes, capacity.get())?;
+        let mut convolution = self.cudnn.clone();
+        convolution.workspace_limit_bytes = self.convolution_workspace.resolve(
+            self.cudnn.workspace_limit_bytes,
+            capacity.get(),
+            self.opaque_bytes()?,
+            execution_weight_bytes.iter().copied().max().unwrap_or(0),
+        )?;
         let receipt = ImageCudaCompositionReceipt {
             stream_plan,
             memory_policy: match self.memory {
@@ -283,6 +294,8 @@ impl QwenImage21CudaConfig {
             observed_memory,
             cudnn_library: self.cudnn.library_path.clone(),
             cudnn_workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
+            cudnn_convolution_workspace_policy: self.convolution_workspace,
+            cudnn_convolution_workspace_limit_bytes: convolution.workspace_limit_bytes,
             attention_policy: self.attention_policy,
             precision_policy: self.precision_policy,
             fp8_host_cache: self.fp8_host_cache,
@@ -296,13 +309,13 @@ impl QwenImage21CudaConfig {
         let mut providers = match self.attention_policy {
             ImageCudaAttentionPolicy::Sequential => cuda_vnext_tensor_providers_with_cudnn(
                 &runtime,
-                &self.cudnn,
+                &convolution,
                 &CudaTensorOperation::ALL,
             )?,
             ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
                 cuda_vnext_tensor_providers_with_cudnn_cross_attention(
                     &runtime,
-                    &self.cudnn,
+                    &convolution,
                     CudnnSdpaPlanPolicy {
                         maximum_plans: 64,
                         maximum_live_bindings: 2048,
@@ -660,6 +673,7 @@ mod tests {
             attention_policy: ImageCudaAttentionPolicy::Sequential,
             precision_policy: ImageCudaPrecisionPolicy::Bf16,
             fp8_host_cache: ImageFp8HostCachePolicy::Off,
+            convolution_workspace: ImageCudaConvolutionWorkspacePolicy::ConfiguredLimit,
             cudnn: CudaCudnnConfig {
                 library_path: "/explicit/libcudnn.so.9".into(),
                 dependency_libraries: Vec::new(),

@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -649,6 +650,8 @@ pub struct OperationInvocation<'a, B, W = TokenInvocationWork<'a>> {
     claimed_backing_fingerprint: &'a str,
     projection_numerics: Option<&'a crate::PreparedProjectionNumerics>,
     prepared_implementation_fingerprint: Option<&'a str>,
+    prepared_implementation_retention:
+        Option<&'a crate::operation::PreparedImplementationRetention>,
 }
 
 /// Checks this fresh wave's common participant authority once. The private
@@ -1248,6 +1251,8 @@ impl<'a, B, W: InvocationWorkProjection<'a>> OperationInvocation<'a, B, W> {
             projection_numerics: provider_resources.projection_numerics(),
             prepared_implementation_fingerprint: provider_resources
                 .prepared_implementation_fingerprint(),
+            prepared_implementation_retention: provider_resources
+                .prepared_implementation_retention(),
         })
     }
 
@@ -1273,6 +1278,12 @@ impl<'a, B, W: InvocationWorkProjection<'a>> OperationInvocation<'a, B, W> {
 
     pub fn prepared_implementation_fingerprint(&self) -> Option<&str> {
         self.prepared_implementation_fingerprint
+    }
+
+    /// Retain the same typed owner selected by this compiled node's estimator.
+    /// Returns `None` when no owner exists or its concrete type differs.
+    pub fn prepared_implementation<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.prepared_implementation_retention?.downcast()
     }
 
     pub fn views(&self) -> &[OperationBufferView<'a, B>] {
@@ -1540,6 +1551,12 @@ impl<'a, B, W: InvocationWorkProjection<'a>> BatchedOperationInvocation<'a, B, W
     /// resource plan. Available to fixed tensor and token providers alike.
     pub fn prepared_implementation_fingerprint(&self) -> Option<&str> {
         self.participants[0].prepared_implementation_fingerprint()
+    }
+
+    /// Read the shared compiled node's retained implementation without
+    /// preparing another native plan or granting buffer admission authority.
+    pub fn prepared_implementation<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.participants[0].prepared_implementation()
     }
 
     pub fn operation(&self) -> &OperationDescriptor {

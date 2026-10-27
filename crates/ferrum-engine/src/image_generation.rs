@@ -30,6 +30,8 @@ mod capacity;
 pub use capacity::{ImageDeviceCapacityExceeded, ImageDeviceCapacityReport};
 mod composition;
 pub use composition::ImagePipelineLimits;
+mod convolution_workspace;
+pub use convolution_workspace::ImageCudaConvolutionWorkspacePolicy;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 mod decoder;

@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -512,7 +513,7 @@ impl OperationResourceEstimate {
     /// any required runtime capacity retention; this is not an allocation grant.
     pub fn with_prepared_implementation_retention(
         mut self,
-        owner: Arc<dyn Send + Sync>,
+        owner: Arc<dyn Any + Send + Sync>,
     ) -> Result<Self, VNextError> {
         let fingerprint = self
             .prepared_implementation_fingerprint
@@ -520,10 +521,8 @@ impl OperationResourceEstimate {
             .ok_or_else(|| {
                 invalid_operation("prepared implementation retention requires its fingerprint")
             })?;
-        self.prepared_implementation_retention = Some(PreparedImplementationRetention {
-            fingerprint,
-            _owner: owner,
-        });
+        self.prepared_implementation_retention =
+            Some(PreparedImplementationRetention { fingerprint, owner });
         Ok(self)
     }
 

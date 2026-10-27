@@ -283,6 +283,8 @@ impl DirectoryOptions {
                 ferrum_engine::image_generation::ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
             precision_policy: self.precision,
             fp8_host_cache: ferrum_engine::image_generation::ImageFp8HostCachePolicy::Off,
+            convolution_workspace:
+                ferrum_engine::image_generation::ImageCudaConvolutionWorkspacePolicy::Auto,
             cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
                 library_path: super::library::resolve(self.cudnn_library.as_deref())?,
                 dependency_libraries: Vec::new(),

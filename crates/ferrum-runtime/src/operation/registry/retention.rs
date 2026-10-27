@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::Arc;
 
 /// Process-local lifetime ownership only. The fingerprint remains the semantic
@@ -6,7 +7,13 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct PreparedImplementationRetention {
     pub(super) fingerprint: String,
-    pub(super) _owner: Arc<dyn Send + Sync>,
+    pub(super) owner: Arc<dyn Any + Send + Sync>,
+}
+
+impl PreparedImplementationRetention {
+    pub(crate) fn downcast<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        Arc::clone(&self.owner).downcast().ok()
+    }
 }
 
 impl std::fmt::Debug for PreparedImplementationRetention {

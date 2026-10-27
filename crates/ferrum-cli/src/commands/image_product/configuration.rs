@@ -199,6 +199,9 @@ pub struct CudnnConfig {
     pub dependency_libraries: Vec<PathBuf>,
     pub opaque_memory_bytes: u64,
     pub workspace_limit_bytes: u64,
+    /// Omission preserves the configured limit; directory entrypoints use Auto.
+    #[serde(default)]
+    pub convolution_workspace: ferrum_engine::image_generation::ImageCudaConvolutionWorkspacePolicy,
     pub opaque_memory_profile: String,
 }
 #[derive(Debug, Deserialize)]
@@ -534,6 +537,7 @@ impl CudaConfig {
                 attention_policy: self.attention_policy,
                 precision_policy: self.precision_policy,
                 fp8_host_cache: self.fp8_host_cache,
+                convolution_workspace: self.cudnn.convolution_workspace,
                 cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
                     library_path: self.cudnn.library_path.clone(),
                     dependency_libraries: self.cudnn.dependency_libraries.clone(),
