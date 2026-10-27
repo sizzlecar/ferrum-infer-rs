@@ -73,6 +73,7 @@ pub(super) fn config(url: String) -> ImageBenchmarkConfig {
         maximum_reference_image_bytes: ferrum_models::qwen_image21::image_input::ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES,
         maximum_total_reference_image_bytes: 128 * 1024 * 1024,
         capture: None,
+        resource_sampling: None,
     }
 }
 
@@ -156,6 +157,13 @@ async fn drives_eight_in_flight_without_mutating_requests_across_endpoints_and_r
     }
     assert!(!serde_json::to_string(&report).unwrap().contains("b64_json"));
     assert_eq!(report.evidence.quality_status, "not_evaluated");
+    let json = serde_json::to_value(&report).unwrap();
+    assert!(json["configuration"].get("resource_sampling").is_none());
+    assert!(json["evidence"].get("resource_sampling_complete").is_none());
+    assert!(json["evidence"].get("resource_peak_scope").is_none());
+    assert!(json["endpoints"][0]["repetitions"][0]
+        .get("resources")
+        .is_none());
 }
 
 async fn failures(Json(request): Json<serde_json::Value>) -> Response {

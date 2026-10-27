@@ -118,6 +118,19 @@ The CUDA directory preset admits output sizes up to 2048×2048 subject to manage
 
 Existing `--image-config` JSON keeps configured batching when `serving.batching` is omitted. Explicit JSON can select `"batching":"auto"` with `"request_batch_max_wait_ms":0`, and optionally set a positive `maximum_pending_bytes`. The historical measurements below used explicit resident service configurations; they do not establish the performance of automatic batching.
 
+`bench-images` can observe either local Ferrum or vLLM-Omni without changing server capacity. Supply an existing workload JSON and the actual server PID; the report path must be new:
+
+```sh
+ferrum bench-images --endpoint http://127.0.0.1:8000/v1/images/generations \
+  --model qwen-image --server-config "fixed service configuration and version" \
+  --dataset image-workload.json --output image-measurement.json \
+  --concurrency 8 --repetitions 3 --warmup-repetitions 1 \
+  --resource-server-pid 12345 --resource-process-scope process-tree \
+  --resource-gpu-index 0 --resource-sample-interval-ms 200
+```
+
+Resource monitoring is optional. Each warmup and measured round records its own process identity, physical GPU identity, sampling coverage, errors and observed peaks. Only complete measured windows contribute to aggregate peaks; every sampled peak remains a lower bound on the instantaneous peak. Linux process-tree RSS can count shared pages repeatedly. NVIDIA whole-device used memory includes other processes and driver allocations. Missing observations remain missing and make the command fail after saving the report. Boundary probes are outside request timers; periodic probes compete for CPU and driver resources during requests and can affect latency and throughput. Keep sampling settings identical in comparisons. For multiple sequential endpoints, provide one server PID per endpoint; repeat the GPU flag to sum explicitly selected physical devices.
+
 ### Throughput vs vLLM-Omni
 
 v0.15.0 candidate measurements · RTX 5090 · Qwen-Image-2.1-Turbo · 8 steps · FP8 text encoder/DiT, BF16 VAE. Four paired pre-release runs per workload, 640 measured requests, zero errors. Mean images/s; C is client concurrency.

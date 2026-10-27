@@ -13,6 +13,7 @@ pub use png_response::{
     ValidatedImage, ValidatedPngResponse,
 };
 mod request_mode;
+pub mod resource_usage;
 pub use request_mode::{ImageReference, ImageRequestMode};
 mod workload;
 pub use workload::{image_workload_metrics, ImageWorkloadMetrics};

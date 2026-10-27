@@ -31,6 +31,10 @@ pub async fn run_benchmark(
         .context("build image benchmark HTTP client")?;
     let mut endpoint_reports = Vec::new();
     for (endpoint_index, endpoint) in config.endpoints.iter().enumerate() {
+        let resource_sampler = config
+            .resource_sampling
+            .as_ref()
+            .map(|config| resources::EndpointSampler::new(config, endpoint_index));
         let mut records = Vec::new();
         let mut arrivals = Vec::new();
         let mut captures = capture.as_ref().map(|_| Vec::new());
@@ -43,7 +47,12 @@ pub async fn run_benchmark(
                 config.repetitions
             };
             for repetition in 0..count {
-                let (run, mut requests, mut artifacts, mut scheduled) = run_round(
+                let resource_window = if let Some(sampler) = &resource_sampler {
+                    Some(resources::RunningResourceWindow::begin(Arc::clone(sampler)).await)
+                } else {
+                    None
+                };
+                let (mut run, mut requests, mut artifacts, mut scheduled) = run_round(
                     &client,
                     endpoint_index,
                     endpoint,
@@ -55,6 +64,9 @@ pub async fn run_benchmark(
                     &references,
                 )
                 .await;
+                if let Some(window) = resource_window {
+                    run.resources = Some(window.finish().await);
+                }
                 if phase == ImageRequestPhase::Measured {
                     measured_seconds += run.metrics.elapsed_seconds;
                 }
@@ -91,6 +103,37 @@ pub async fn run_benchmark(
     }
     let capture_summary = capture.as_ref().map(|sink| sink.summary(&endpoint_reports));
     let mut evidence = ImageEvidenceScope::default();
+    if config.resource_sampling.is_some() {
+        evidence.resource_peak_scope = Some("sampled lower bounds across measured windows only, excludes warmup; aggregate peaks withheld if any measured sampling window is incomplete; per-window observed values and errors remain available; successful sampling never proves an instantaneous true peak");
+        let windows = endpoint_reports
+            .iter()
+            .flat_map(|endpoint| &endpoint.repetitions)
+            .filter(|run| run.phase == ImageRequestPhase::Measured)
+            .filter_map(|run| run.resources.as_ref())
+            .collect::<Vec<_>>();
+        let complete = !windows.is_empty() && windows.iter().all(|window| window.complete);
+        evidence.resource_sampling_complete = Some(complete);
+        if complete {
+            evidence.peak_host_memory_bytes = windows
+                .iter()
+                .filter_map(|window| {
+                    window
+                        .host
+                        .as_ref()
+                        .and_then(|sample| sample.observed_peak_bytes)
+                })
+                .max();
+            evidence.peak_device_memory_bytes = windows
+                .iter()
+                .filter_map(|window| {
+                    window
+                        .device
+                        .as_ref()
+                        .and_then(|sample| sample.observed_peak_bytes)
+                })
+                .max();
+        }
+    }
     if capture_summary.is_some() {
         evidence.throughput_scope = "successful validated images divided by measured wall time including errors, local validation and PNG capture IO; warmup excluded; capture retains request slots and changes subsequent dispatch pacing";
     }
@@ -244,6 +287,7 @@ async fn run_round(
             metrics,
             http_completion_span_seconds: http_span,
             successful_images_per_http_completion_second: rate,
+            resources: None,
         },
         records,
         captures,

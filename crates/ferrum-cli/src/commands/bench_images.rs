@@ -23,7 +23,9 @@ pub use capture::{
     PngCaptureConfig, PngCaptureFailureKind, PngCaptureRecord, PngCaptureResult, PngCaptureSummary,
 };
 mod edit;
+mod resources;
 mod runner;
+pub use resources::{ImageProcessScope, ImageResourceSamplingConfig, ImageResourceWindow};
 pub use runner::run_benchmark;
 #[cfg(test)]
 mod tests;
@@ -92,6 +94,18 @@ pub struct BenchImagesCommand {
     /// Declared state before warmup/measurement; the client never flushes/restarts servers.
     #[arg(long, value_enum, default_value = "unknown")]
     pub initial_server_state: InitialServerState,
+    /// Local Linux server root PID, one per endpoint; samples RSS across every
+    /// warmup/measured repetition. Endpoints must use loopback addresses.
+    #[arg(long)]
+    pub resource_server_pid: Vec<u32>,
+    #[arg(long, value_enum, default_value = "process-tree")]
+    pub resource_process_scope: ImageProcessScope,
+    /// Explicit physical NVIDIA GPU index. Whole-device used memory includes
+    /// other processes and driver baseline; repeat for a sum across devices.
+    #[arg(long)]
+    pub resource_gpu_index: Vec<u32>,
+    #[arg(long, default_value_t = 200)]
+    pub resource_sample_interval_ms: u64,
     #[arg(long, default_value_t = 1800)]
     pub timeout_seconds: u64,
     /// Optional predeclared successful-response E2E P99 threshold. Any error violates it.
@@ -146,6 +160,8 @@ pub struct ImageBenchmarkConfig {
     pub maximum_total_reference_image_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture: Option<PngCaptureConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_sampling: Option<ImageResourceSamplingConfig>,
 }
 
 impl ImageBenchmarkConfig {
@@ -163,6 +179,9 @@ impl ImageBenchmarkConfig {
         );
         if let Some(capture) = &self.capture {
             capture.validate()?;
+        }
+        if let Some(resources) = &self.resource_sampling {
+            resources.validate(&self.endpoints)?;
         }
         ensure!(
             !self.endpoints.is_empty() && self.endpoints.len() <= 16,
@@ -275,6 +294,8 @@ pub struct ImageBenchmarkRepetition {
     /// Not an isolated network-only/server-only throughput measurement.
     pub http_completion_span_seconds: f64,
     pub successful_images_per_http_completion_second: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ImageResourceWindow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -327,6 +348,10 @@ pub struct ImageEvidenceScope {
     pub throughput_target_status: &'static str,
     pub peak_device_memory_bytes: Option<u64>,
     pub peak_host_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_sampling_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_peak_scope: Option<&'static str>,
 }
 
 impl Default for ImageEvidenceScope {
@@ -339,6 +364,8 @@ impl Default for ImageEvidenceScope {
             pixel_validation_scope: "PNG CRC/Adler, full decode and exact dimensions; RGBA8 integer values are finite, pre-encoding floats and prompt quality are not assessed",
             quality_status: "not_evaluated", g3_status: "not_evaluated",
             throughput_target_status: "not_evaluated", peak_device_memory_bytes: None, peak_host_memory_bytes: None,
+            resource_sampling_complete: None,
+            resource_peak_scope: None,
         }
     }
 }
@@ -426,6 +453,15 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
         maximum_reference_image_bytes: command.maximum_reference_image_bytes,
         maximum_total_reference_image_bytes: command.maximum_total_reference_image_bytes,
         capture,
+        resource_sampling: (!command.resource_server_pid.is_empty()
+            || !command.resource_gpu_index.is_empty())
+        .then(|| ImageResourceSamplingConfig {
+            server_pids: command.resource_server_pid,
+            process_scope: command.resource_process_scope,
+            gpu_indices: command.resource_gpu_index,
+            interval_ms: command.resource_sample_interval_ms,
+            ..ImageResourceSamplingConfig::default()
+        }),
         limits: ImageResponseLimits {
             maximum_response_bytes: command.maximum_response_bytes,
             maximum_png_bytes: command.maximum_png_bytes,
@@ -492,6 +528,18 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
             .as_ref()
             .is_none_or(|capture| capture.complete),
         "PNG capture incomplete; report saved to {}",
+        command.output.display()
+    );
+    ensure!(
+        report
+            .endpoints
+            .iter()
+            .flat_map(|endpoint| &endpoint.repetitions)
+            .all(|run| run
+                .resources
+                .as_ref()
+                .is_none_or(|resources| resources.complete)),
+        "resource sampling incomplete (including warmup); report saved to {}",
         command.output.display()
     );
     Ok(())
