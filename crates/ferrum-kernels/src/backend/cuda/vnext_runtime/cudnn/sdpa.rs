@@ -207,7 +207,8 @@ impl CudaCudnnSdpaCache {
             .plans
             .lock()
             .map_err(|_| CudaDeviceRuntimeError::contract("SDPA cache poisoned"))?;
-        plans
+        let before = plans.snapshot();
+        let result = plans
             .get_or_try_insert_with(signature, || {
                 self.owner.prepare_sdpa(
                     signature,
@@ -221,7 +222,27 @@ impl CudaCudnnSdpaCache {
                     "cuDNN SDPA plan cache limit exhausted by retained plans",
                 ),
                 PlanCacheError::Prepare(error) => error,
-            })
+            });
+        let snapshot = plans.snapshot();
+        if result.is_err()
+            || snapshot.entries != before.entries
+            || snapshot.evictions != before.evictions
+        {
+            tracing::debug!(target: "ferrum_kernels::cuda::cudnn_plan_cache",
+                batch = signature.batch, heads = signature.heads,
+                query_length = signature.query_length, key_value_length = signature.key_value_length,
+                head_dim = signature.head_dim, entries = snapshot.entries,
+                maximum_entries = snapshot.maximum,
+                externally_retained_entries = snapshot.externally_retained_entries,
+                evictions = snapshot.evictions, failed_preparations = snapshot.failed_preparations,
+                capacity_rejections = snapshot.capacity_rejections,
+                live_bindings = self.bindings.live.load(Ordering::Acquire),
+                maximum_live_bindings = self.bindings.maximum,
+                opaque_allowance_bytes = self.policy.opaque_memory_bytes,
+                preparation_succeeded = result.is_ok(),
+                "cuDNN SDPA native plan cache ownership observation");
+        }
+        result
     }
 
     /// Encoding never compiles or reselects an engine after scratch admission.

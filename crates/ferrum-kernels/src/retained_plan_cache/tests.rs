@@ -24,6 +24,12 @@ fn live_compiled_and_command_leases_cannot_be_evicted() {
         Err(PlanCacheError::AllPlansRetained)
     ));
     assert_eq!(drops.load(Ordering::SeqCst), 0);
+    let observed = cache.snapshot();
+    assert_eq!(observed.entries, observed.maximum);
+    assert_eq!(observed.externally_retained_entries, 1);
+    assert_eq!(observed.capacity_rejections, 1);
+    assert_eq!(observed.failed_preparations, 0);
+    assert_eq!(observed.evictions, 0);
     assert!(Arc::ptr_eq(&cache.get(&1).unwrap(), &command));
     drop(command);
     let replacement = cache
@@ -32,6 +38,7 @@ fn live_compiled_and_command_leases_cannot_be_evicted() {
             Ok::<_, ()>(Arc::new(Plan(drops.clone())))
         })
         .unwrap();
+    assert_eq!(cache.snapshot().evictions, 1);
     drop(cache);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     drop(replacement);
@@ -60,6 +67,8 @@ fn failed_candidates_and_shape_switching_remain_bounded() {
         Err(PlanCacheError::Prepare("native compilation failed"))
     ));
     assert_eq!(cache.plans.len(), 1);
+    assert_eq!(cache.snapshot().failed_preparations, 1);
+    assert_eq!(cache.snapshot().capacity_rejections, 0);
     assert_eq!(drops.load(Ordering::SeqCst), 63);
     assert!(Arc::ptr_eq(&cache.get(&0).unwrap(), &valid));
 }

@@ -11,6 +11,19 @@ pub(crate) struct RetainedPlanCache<K, V> {
     maximum: usize,
     plans: BTreeMap<K, Arc<V>>,
     recency: VecDeque<K>,
+    evictions: u64,
+    failed_preparations: u64,
+    capacity_rejections: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetainedPlanCacheSnapshot {
+    pub entries: usize,
+    pub maximum: usize,
+    pub externally_retained_entries: usize,
+    pub evictions: u64,
+    pub failed_preparations: u64,
+    pub capacity_rejections: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -25,6 +38,24 @@ impl<K: Ord + Clone, V> RetainedPlanCache<K, V> {
             maximum,
             plans: BTreeMap::new(),
             recency: VecDeque::new(),
+            evictions: 0,
+            failed_preparations: 0,
+            capacity_rejections: 0,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> RetainedPlanCacheSnapshot {
+        RetainedPlanCacheSnapshot {
+            entries: self.plans.len(),
+            maximum: self.maximum,
+            externally_retained_entries: self
+                .plans
+                .values()
+                .filter(|plan| Arc::strong_count(plan) > 1)
+                .count(),
+            evictions: self.evictions,
+            failed_preparations: self.failed_preparations,
+            capacity_rejections: self.capacity_rejections,
         }
     }
 
@@ -52,13 +83,18 @@ impl<K: Ord + Clone, V> RetainedPlanCache<K, V> {
                     .is_some_and(|plan| Arc::strong_count(plan) == 1)
             });
             let Some(index) = reclaimable else {
+                self.capacity_rejections = self.capacity_rejections.saturating_add(1);
                 return Err(PlanCacheError::AllPlansRetained);
             };
             let old = self.recency.remove(index).expect("located cache entry");
             // Drop the old native owner before a replacement can allocate.
             self.plans.remove(&old);
+            self.evictions = self.evictions.saturating_add(1);
         }
-        let plan = prepare().map_err(PlanCacheError::Prepare)?;
+        let plan = prepare().map_err(|error| {
+            self.failed_preparations = self.failed_preparations.saturating_add(1);
+            PlanCacheError::Prepare(error)
+        })?;
         self.plans.insert(key.clone(), Arc::clone(&plan));
         self.recency.push_back(key);
         Ok(plan)
