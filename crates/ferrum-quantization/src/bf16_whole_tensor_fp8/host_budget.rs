@@ -100,7 +100,11 @@ fn missing_bytes(
                 .checked_add(lookup)
                 .ok_or_else(|| invalid("additional uncached backing overflow"))?
         };
-        transient_peak = transient_peak.max(transient);
+        transient_peak = transient_peak.max(
+            transient
+                .checked_add(group.composition_scratch_bytes)
+                .ok_or_else(|| invalid("composition transient backing overflow"))?,
+        );
     }
     new_retained
         .checked_add(transient_peak)

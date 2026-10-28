@@ -33,7 +33,8 @@ fn take_batch<O: Send + 'static>(
             .skip(1)
             .take(maximum_batch.saturating_sub(1))
         {
-            let compatible = job.request.generation().width == first.request.generation().width
+            let compatible = job.adapter == first.adapter
+                && job.request.generation().width == first.request.generation().width
                 && job.request.generation().height == first.request.generation().height
                 && match (&first.request, &job.request) {
                     (QueuedRequest::Generate(a), QueuedRequest::Generate(b)) => {

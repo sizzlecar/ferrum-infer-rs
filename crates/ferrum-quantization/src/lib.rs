@@ -23,6 +23,7 @@ pub mod dense;
 pub mod gguf;
 pub mod gptq;
 pub mod gptq_marlin_source;
+pub mod linear_adapter;
 pub mod loader;
 pub mod lora;
 pub mod mxfp4_safetensors_source;

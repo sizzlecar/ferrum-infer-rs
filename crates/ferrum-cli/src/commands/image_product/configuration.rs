@@ -19,6 +19,15 @@ pub struct ImageProductConfig {
     pub backend: ImageBackendConfig,
     /// Required by serve; run uses the same assets/backend without opening HTTP.
     pub serving: Option<ServingConfig>,
+    #[serde(default)]
+    pub lora: Option<ImageLoraConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageLoraConfig {
+    pub source: ferrum_quantization::linear_adapter::LinearAdapterSource,
+    pub strength: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -474,6 +483,16 @@ impl ImageProductConfig {
         Ok(())
     }
     fn resolve_paths(&mut self, base: &Path) {
+        if let Some(lora) = &mut self.lora {
+            use ferrum_quantization::linear_adapter::LinearAdapterSource;
+            let path = match &mut lora.source {
+                LinearAdapterSource::Peft { directory, .. } => directory,
+                LinearAdapterSource::Diffusers { file, .. } => file,
+            };
+            if path.is_relative() {
+                *path = base.join(&*path);
+            }
+        }
         for path in [
             &mut self.metadata.model_index,
             &mut self.metadata.text_encoder,

@@ -86,6 +86,142 @@ fn materialize_group(
 }
 
 #[test]
+fn lora_requantizes_the_shared_group_and_caches_adapted_bf16_without_preflight_allocations() {
+    use crate::linear_adapter::*;
+    use std::sync::Arc;
+    let (schema, program, groups) = fixture(DENSE_LINEAR_FP8_BF16_OPERATION_ID);
+    let (_base_directory, source) = archive(&schema);
+    let directory = tempfile::tempdir().unwrap();
+    let a = [2_f32; 4]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let b = 1_f32.to_le_bytes();
+    let mut tensors = Vec::new();
+    for module in ["q", "untouched"] {
+        tensors.push((
+            format!("{module}.lora_A.weight"),
+            TensorView::new(Dtype::F32, vec![1, 4], &a).unwrap(),
+        ));
+        tensors.push((
+            format!("{module}.lora_B.weight"),
+            TensorView::new(Dtype::F32, vec![1, 1], &b).unwrap(),
+        ));
+    }
+    let file = directory.path().join("adapter.safetensors");
+    serialize_to_file(tensors, &None, &file).unwrap();
+    let imported = Arc::new(
+        ImportedLinearAdapter::open(&LinearAdapterSource::Diffusers {
+            file,
+            base_model: "fixture/base".into(),
+            scaling: LinearAdapterScaling::Unit,
+        })
+        .unwrap(),
+    );
+    let bindings = ["q", "untouched"]
+        .into_iter()
+        .map(|module| LinearAdapterBinding {
+            module: module.into(),
+            external_weight: format!("{module}.weight"),
+            base_dimensions: [1, 4],
+            adapter_output_rows: 0..1,
+        })
+        .collect();
+    let host = account(1 << 20);
+    let composition = Arc::new(PreparedLinearAdapter::new(imported, bindings, 1.0).unwrap())
+        .manage(&host)
+        .unwrap();
+    let materializer = Bf16WholeTensorFp8Materializer::new_composed_with_id(
+        id("materializer.fixture.lora"),
+        host.clone(),
+        groups.clone(),
+        composition.clone(),
+    )
+    .unwrap()
+    .with_host_cache(NonZeroU64::new(65536).unwrap())
+    .unwrap();
+    let mut prepared = plan::prepare_program(&schema, &program, &groups).unwrap();
+    plan::bind_composition(&mut prepared, composition.prepared(), &host).unwrap();
+    let before = host.usage().unwrap();
+    let lease = host_budget::prepare(
+        &host,
+        &prepared,
+        materializer.host_cache.as_ref(),
+        Some(&source),
+    )
+    .unwrap();
+    assert_eq!(
+        host.usage().unwrap().committed_bytes(),
+        before.committed_bytes()
+    );
+    assert_eq!(host.usage().unwrap().allocated_bytes(), 0);
+    let scope = host
+        .reserve_scope(&[(HostMemoryClass::WeightBacking, lease.additional_bytes())])
+        .unwrap();
+    for group in &prepared.conversion_groups {
+        let outputs = materializer
+            .materialize_components_with_host(
+                &source,
+                &group.sources.iter().collect::<Vec<_>>(),
+                &group.outputs.iter().collect::<Vec<_>>(),
+                &scope.account(),
+            )
+            .unwrap();
+        if group.sources == group.outputs {
+            assert!(outputs[0]
+                .bytes()
+                .chunks_exact(2)
+                .all(|bytes| bytes == 0x4040_u16.to_le_bytes()));
+        } else {
+            for (tensor, expected) in schema.tensors[..3].iter().zip([0x7e_u8, 0x71, 0x71]) {
+                let execution = prepared
+                    .schema
+                    .tensors
+                    .iter()
+                    .find(|candidate| candidate.id == tensor.id)
+                    .unwrap();
+                let PhysicalWeightLayout::QuantizedTensor {
+                    packed_values,
+                    scales,
+                    ..
+                } = &execution.physical_layout
+                else {
+                    panic!("quantized group");
+                };
+                let values = outputs
+                    .iter()
+                    .find(|output| output.component_id() == &packed_values.component_id)
+                    .unwrap();
+                let scale = outputs
+                    .iter()
+                    .find(|output| output.component_id() == &scales.component_id)
+                    .unwrap();
+                assert_eq!(values.bytes(), &[expected; 4]);
+                assert_eq!(
+                    f32::from_le_bytes(scale.bytes().try_into().unwrap()),
+                    3.0 / 448.0
+                );
+            }
+        }
+    }
+    drop(scope);
+    drop(lease);
+    let warm = host_budget::prepare(
+        &host,
+        &prepared,
+        materializer.host_cache.as_ref(),
+        Some(&source),
+    )
+    .unwrap();
+    assert_eq!(warm.additional_bytes(), 0);
+    let committed = host.usage().unwrap().committed_bytes();
+    for group in &prepared.conversion_groups {
+        materialize_group(&materializer, &source, group, &host);
+    }
+    assert_eq!(host.usage().unwrap().committed_bytes(), committed);
+}
+
+#[test]
 fn exact_cache_increment_consumes_scope_and_warm_cache_needs_no_second_claim() {
     let (schema, prepared, groups) = prepared(4);
     let (_directory, source) = archive(&schema);

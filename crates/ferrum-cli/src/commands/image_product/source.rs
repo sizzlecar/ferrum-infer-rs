@@ -100,8 +100,17 @@ impl ImageProductConfig {
                 vae: self.weights.vae.open()?,
             },
         )?;
-        match processor {
-            Some(processor) => assets.with_image_editing(&text, &vae, &processor),
+        let assets = match processor {
+            Some(processor) => assets.with_image_editing(&text, &vae, &processor)?,
+            None => assets,
+        };
+        match &self.lora {
+            Some(lora) => assets.with_lora(
+                Arc::new(
+                    ferrum_quantization::linear_adapter::ImportedLinearAdapter::open(&lora.source)?,
+                ),
+                lora.strength,
+            ),
             None => Ok(assets),
         }
     }

@@ -52,7 +52,7 @@ pub use vae_encoder::{
     QwenImage21VaeEncoderConfig, QwenImage21VaeEncoderFamily, QwenImage21VaeEncoderWeight,
 };
 pub use vae_stem::{QwenImage21VaeStemConfig, QwenImage21VaeStemFamily, QwenImage21VaeStemWeight};
-pub use weights::{ExpectedTensor, ExpectedWeights};
+pub use weights::{ExpectedTensor, ExpectedWeights, LoraTarget, LoraTargetSlice};
 
 use ferrum_types::{FerrumError, Result};
 

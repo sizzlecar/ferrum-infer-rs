@@ -4,10 +4,6 @@ pub(super) struct Prepared {
     pub schema: WeightSchema,
     pub sources: BTreeMap<WeightId, Vec<WeightId>>,
     pub maximum_group_bytes: u64,
-    // Largest payload allocation among scalar groups and lookup groups. Taking
-    // each maximum before Host alignment is exact because backing_bytes is
-    // monotone, and lookup groups all have the same bounded temporary allocation.
-    maximum_payload_bytes: [u64; 2],
     pub converted_bytes: u64,
     pub conversion_groups: Vec<ConversionGroup>,
 }
@@ -19,6 +15,8 @@ pub(super) struct ConversionGroup {
     pub outputs: Vec<WeightComponentSpec>,
     pub payload_bytes: usize,
     pub lookup_bytes: usize,
+    /// Physical temporary composition backing and F32 row workspaces.
+    pub composition_scratch_bytes: usize,
 }
 
 impl Prepared {
@@ -27,23 +25,21 @@ impl Prepared {
         host: &HostMemoryAccount,
     ) -> Result<u64, VNextError> {
         let mut maximum = 0_u64;
-        for (lookup_group, &payload) in self.maximum_payload_bytes.iter().enumerate() {
-            if payload == 0 {
-                continue;
-            }
-            let payload =
-                usize::try_from(payload).map_err(|_| invalid("group payload exceeds usize"))?;
+        for group in &self.conversion_groups {
             let mut charged = host
-                .backing_bytes(payload)
+                .backing_bytes(group.payload_bytes)
                 .map_err(|error| invalid(format!("group backing: {error}")))?;
-            if lookup_group == 1 {
+            if group.lookup_bytes != 0 {
                 charged = charged
                     .checked_add(
-                        host.backing_bytes(lookup::MAGNITUDE_ENTRIES)
+                        host.backing_bytes(group.lookup_bytes)
                             .map_err(|error| invalid(format!("lookup backing: {error}")))?,
                     )
                     .ok_or_else(|| invalid("group accounted bytes overflow"))?;
             }
+            charged = charged
+                .checked_add(group.composition_scratch_bytes)
+                .ok_or_else(|| invalid("composition accounted bytes overflow"))?;
             maximum = maximum.max(charged as u64);
         }
         Ok(maximum)
@@ -120,7 +116,6 @@ pub(super) fn prepare_program(
         .collect();
     let mut used_sources = BTreeSet::new();
     let mut maximum_group_bytes = 0;
-    let mut maximum_payload_bytes = [0_u64; 2];
     let mut converted_bytes = 0_u64;
     let mut conversion_groups = Vec::with_capacity(groups.len());
     for group in groups {
@@ -173,8 +168,6 @@ pub(super) fn prepare_program(
             .checked_add(lookup_bytes)
             .ok_or_else(|| invalid("group temporary bytes overflow"))?;
         maximum_group_bytes = maximum_group_bytes.max(peak_bytes);
-        let kind = usize::from(lookup_bytes != 0);
-        maximum_payload_bytes[kind] = maximum_payload_bytes[kind].max(group_bytes);
         converted_bytes = converted_bytes
             .checked_add(group_bytes)
             .ok_or_else(|| invalid("converted cache bytes overflow"))?;
@@ -185,6 +178,7 @@ pub(super) fn prepare_program(
             outputs,
             payload_bytes: group_bytes as usize,
             lookup_bytes: lookup_bytes as usize,
+            composition_scratch_bytes: 0,
         });
         for (index, weight) in group.iter().enumerate() {
             let tensor = schema
@@ -237,10 +231,76 @@ pub(super) fn prepare_program(
         schema,
         sources: source_map,
         maximum_group_bytes,
-        maximum_payload_bytes,
         converted_bytes,
         conversion_groups,
     })
+}
+
+/// Add composition costs without resolving or reading any payload. Identity
+/// BF16 components also get explicit cached initializer groups when adapted.
+pub(super) fn bind_composition(
+    prepared: &mut Prepared,
+    composition: &crate::linear_adapter::PreparedLinearAdapter,
+    host: &HostMemoryAccount,
+) -> Result<(), VNextError> {
+    let converted_sources = prepared
+        .conversion_groups
+        .iter()
+        .flat_map(|group| group.sources.iter().map(|source| source.id.clone()))
+        .collect::<BTreeSet<_>>();
+    for component in &prepared.schema.components {
+        if composition.affects(component) && !converted_sources.contains(&component.id) {
+            validate_source(component)?;
+            let bytes = usize::try_from(component.physical_bytes()?)
+                .map_err(|_| invalid("composed payload exceeds usize"))?;
+            prepared.conversion_groups.push(ConversionGroup {
+                sources: vec![component.clone()],
+                outputs: vec![component.clone()],
+                payload_bytes: bytes,
+                lookup_bytes: 0,
+                composition_scratch_bytes: 0,
+            });
+            prepared.converted_bytes = prepared
+                .converted_bytes
+                .checked_add(bytes as u64)
+                .ok_or_else(|| invalid("composed cache bytes overflow"))?;
+        }
+    }
+    for group in &mut prepared.conversion_groups {
+        let identity = group.sources == group.outputs;
+        let mut scratch = 0usize;
+        let mut workspace = 0usize;
+        for component in &group.sources {
+            if composition.affects(component) {
+                workspace = workspace.max(
+                    composition
+                        .workspace_bytes(host, component)
+                        .map_err(|error| invalid(error.to_string()))?,
+                );
+                if !identity {
+                    scratch = scratch
+                        .checked_add(
+                            composition
+                                .output_backing_bytes(host, component)
+                                .map_err(|error| invalid(error.to_string()))?,
+                        )
+                        .ok_or_else(|| invalid("composition payload bytes overflow"))?;
+                }
+            }
+        }
+        group.composition_scratch_bytes = scratch
+            .checked_add(workspace)
+            .ok_or_else(|| invalid("composition scratch bytes overflow"))?;
+        let peak = (group.payload_bytes as u64)
+            .checked_add(group.lookup_bytes as u64)
+            .and_then(|bytes| bytes.checked_add(group.composition_scratch_bytes as u64))
+            .ok_or_else(|| invalid("composition group bytes overflow"))?;
+        prepared.maximum_group_bytes = prepared.maximum_group_bytes.max(peak);
+    }
+    prepared
+        .conversion_groups
+        .sort_by(|left, right| left.outputs[0].id.cmp(&right.outputs[0].id));
+    Ok(())
 }
 
 pub(super) fn validate_source(component: &WeightComponentSpec) -> Result<(), VNextError> {

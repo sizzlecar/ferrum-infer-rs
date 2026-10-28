@@ -119,6 +119,15 @@ pub struct ImageGeneratorCapabilities {
     pub dimension_multiple: u32,
 }
 
+/// Immutable startup adapter domain. The effective identity includes adapter
+/// content, target routing and composition semantics; strength stays explicit.
+/// This describes the provider, not a request-level adapter selection API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageAdapterBatchIdentity {
+    pub effective_identity: String,
+    pub strength_bits: u32,
+}
+
 /// Already-held protocol-independent resources that overlap engine execution.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ImagePreparationResources {
@@ -146,6 +155,9 @@ impl ImageRequestRef<'_> {
 /// remains usable and no recovery obligation exists. Compatibility must be deterministic and may
 /// only restrict the common width/height grouping enforced by this service.
 pub trait ImageGenerator: Send + 'static {
+    fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
+        None
+    }
     /// Exact physical Output peak from typed request/model metadata. This runs
     /// before plan compilation to select a currently affordable FIFO prefix.
     /// Legacy generators may leave the extra proof unavailable.
@@ -268,6 +280,16 @@ pub trait ImageGenerator: Send + 'static {
 }
 
 impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
+    fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
+        self.assets
+            .receipt()
+            .lora
+            .as_ref()
+            .map(|lora| ImageAdapterBatchIdentity {
+                effective_identity: lora.identity.clone(),
+                strength_bits: lora.strength.to_bits(),
+            })
+    }
     fn execution_output_bytes(
         &self,
         requests: &[ImageRequestRef<'_>],
@@ -569,6 +591,9 @@ impl ImageService {
     pub fn host_account(&self) -> &HostMemoryAccount {
         &self.host
     }
+    pub fn adapter_batch_identity(&self) -> Option<&ImageAdapterBatchIdentity> {
+        self.core.shared.adapter.as_deref()
+    }
     pub fn capabilities(&self) -> ImageGeneratorCapabilities {
         self.capabilities
     }
@@ -821,6 +846,9 @@ fn validate_config(
 // outputs; production fixes the output to the managed image artifact above.
 trait BatchWorker: Send + 'static {
     type Output: Send + 'static;
+    fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
+        None
+    }
     fn execution_output_bytes(
         &self,
         _requests: &[&QueuedRequest],
@@ -905,6 +933,9 @@ trait BatchWorker: Send + 'static {
 struct GeneratorAdapter<P>(P);
 impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
     type Output = ImageGenerationOutput;
+    fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
+        self.0.adapter_batch_identity()
+    }
     fn execution_output_bytes(
         &self,
         requests: &[&QueuedRequest],
@@ -1152,6 +1183,7 @@ impl QueuedRequest {
 
 struct Queued<O> {
     request: QueuedRequest,
+    adapter: Option<Arc<ImageAdapterBatchIdentity>>,
     submitted: Instant,
     cancelled: Arc<AtomicBool>,
     response: oneshot::Sender<Result<O, ImageServiceError>>,
@@ -1256,6 +1288,7 @@ struct Shared<O> {
     resources: Arc<ResourceSignal>,
     config: ImageServiceConfig,
     host: Option<HostMemoryAccount>,
+    adapter: Option<Arc<ImageAdapterBatchIdentity>>,
 }
 impl<O> Shared<O> {
     fn lock(&self) -> MutexGuard<'_, State<O>> {
@@ -1318,6 +1351,7 @@ impl<O: Send + 'static> ServiceCore<O> {
         config: ImageServiceConfig,
         host: Option<HostMemoryAccount>,
     ) -> Result<Self, ImageServiceError> {
+        let adapter = worker.adapter_batch_identity().map(Arc::new);
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 queue: VecDeque::new(),
@@ -1337,6 +1371,7 @@ impl<O: Send + 'static> ServiceCore<O> {
             resources: Arc::new(ResourceSignal::default()),
             config,
             host,
+            adapter,
         });
         let thread_shared = shared.clone();
         let join = thread::Builder::new()
@@ -1447,6 +1482,7 @@ impl<O: Send + 'static> ServiceCore<O> {
         let cancelled = Arc::new(AtomicBool::new(false));
         state.queue.push_back(Queued {
             request,
+            adapter: self.shared.adapter.clone(),
             submitted: Instant::now(),
             cancelled: cancelled.clone(),
             response,

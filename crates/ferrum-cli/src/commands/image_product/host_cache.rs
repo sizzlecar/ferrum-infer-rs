@@ -3,8 +3,8 @@
 use super::configuration::HostConfig;
 use anyhow::{Context, Result};
 use ferrum_engine::image_generation::{
-    ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy, ImageOutputRequirements,
-    ImageTextEncoderFp8CacheRequirements,
+    ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy, ImageLoraHostRequirements,
+    ImageOutputRequirements, ImageTextEncoderFp8CacheRequirements,
 };
 use serde::Serialize;
 use std::num::NonZeroU64;
@@ -46,6 +46,8 @@ pub(super) struct AutoHostCacheReceipt {
     pub required_host_total_bytes: Option<usize>,
     pub effective_host_total_bytes: usize,
     pub effective_weight_backing_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lora: Option<ImageLoraHostRequirements>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_selection: Option<AutoOutputReceipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,33 +94,72 @@ pub(super) fn for_directory(
     // construction or managed payload allocation. BF16 also sizes output.
     let available = ferrum_kernels::backend::cpu::vnext_runtime::host_memory_available()
         .map_err(|error| error.to_string());
-    select(
+    let lora = assets.lora_host_requirements(options.precision, host.limits()?)?;
+    select_with_lora(
         host,
         requirements,
+        lora,
         Some((output, response_bytes)),
         available,
     )
 }
 
+#[cfg(test)]
 fn select(
-    mut host: HostConfig,
+    host: HostConfig,
     requirements: Option<ImageTextEncoderFp8CacheRequirements>,
     output: Option<(ImageOutputRequirements, usize)>,
     available: Result<u64, String>,
 ) -> Result<AutoHostCacheSelection> {
+    select_with_lora(host, requirements, None, output, available)
+}
+
+fn select_with_lora(
+    mut host: HostConfig,
+    requirements: Option<ImageTextEncoderFp8CacheRequirements>,
+    lora: Option<ImageLoraHostRequirements>,
+    output: Option<(ImageOutputRequirements, usize)>,
+    available: Result<u64, String>,
+) -> Result<AutoHostCacheSelection> {
     let mut receipt = AutoHostCacheReceipt {
-        policy: "auto_complete_text_encoder",
+        policy: if lora.is_some() { "auto_complete_lora_and_text_encoder" } else { "auto_complete_text_encoder" },
         decision: AutoHostCacheDecision::TextEncoderNotFp8,
         observed_available_bytes: None,
         required_cache_bytes: None,
         required_host_total_bytes: None,
         effective_host_total_bytes: host.total_bytes,
         effective_weight_backing_bytes: host.weight_backing_bytes,
+        lora,
         output_selection: None,
         observation_error: None,
         observation_scope: "available physical memory limited by remaining process address space and cgroup headroom; snapshot only, no OS reservation; managed Host allocations remain checked; mmap/page-cache, allocator and native-library memory are outside the Host ledger",
     };
     let mut cache = ImageFp8HostCachePolicy::Off;
+    let mut transient = host.weight_backing_bytes;
+    let mut retained = 0usize;
+    if let Some(lora) = lora {
+        retained = usize::try_from(
+            lora.mapped_backing_bytes
+                .checked_add(lora.cache_backing_bytes)
+                .context("LoRA mapped and cached backing overflows")?,
+        )?;
+        transient = transient.max(usize::try_from(lora.maximum_active_group_bytes)?);
+        let backing = retained
+            .checked_add(transient)
+            .context("LoRA Host backing overflows")?;
+        let total = host_total(&host, backing)?;
+        let observed = available.as_ref().map_err(|error| {
+            anyhow::anyhow!(
+            "cannot admit complete LoRA weight cache: available Host memory is unknown: {error}"
+        )
+        })?;
+        anyhow::ensure!(*observed >= u64::try_from(total)?,
+            "fixed LoRA needs {total} available Host bytes for mapped adapter, complete composed weights, active group and other allowances; observed {observed}");
+        host.weight_backing_bytes = backing;
+        host.total_bytes = total;
+        receipt.observed_available_bytes = Some(*observed);
+        receipt.required_host_total_bytes = Some(total);
+    }
     if let Some(requirements) = requirements {
         let cache_bytes = NonZeroU64::new(requirements.converted_cache_bytes)
             .context("complete text encoder FP8 cache has no converted weights")?;
@@ -127,20 +168,13 @@ fn select(
         // Preserve the existing transient allowance; a larger declared group
         // must also coexist with all retained weights. Never select a partial
         // cache that continually evicts the model it is meant to retain.
-        let backing = host
-            .weight_backing_bytes
+        let backing = transient
             .max(conversion_bytes)
+            .checked_add(retained)
+            .context("retained LoRA Host allowance overflows")?
             .checked_add(usize::try_from(cache_bytes.get())?)
             .context("complete FP8 Host cache allowance overflows")?;
-        let total = [
-            host.input_preprocess_bytes,
-            host.transfer_staging_bytes,
-            host.output_bytes,
-        ]
-        .into_iter()
-        .try_fold(backing, |total, bytes| total.checked_add(bytes))
-        .context("complete FP8 Host coexistence allowance overflows")?
-        .max(host.total_bytes);
+        let total = host_total(&host, backing)?;
         receipt.required_cache_bytes = Some(cache_bytes.get());
         receipt.required_host_total_bytes = Some(total);
         match &available {
@@ -237,6 +271,18 @@ fn select(
     })
 }
 
+fn host_total(host: &HostConfig, backing: usize) -> Result<usize> {
+    [
+        host.input_preprocess_bytes,
+        host.transfer_staging_bytes,
+        host.output_bytes,
+    ]
+    .into_iter()
+    .try_fold(backing, |n, bytes| n.checked_add(bytes))
+    .context("complete Host coexistence allowance overflows")
+    .map(|total| total.max(host.total_bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +295,33 @@ mod tests {
             output_bytes: 300,
             weight_backing_bytes: 200,
         }
+    }
+
+    #[test]
+    fn lora_cache_and_mapped_owner_are_mandatory_and_coexist_with_optional_text_cache() {
+        let lora = Some(ImageLoraHostRequirements {
+            cache_bytes: 2000,
+            cache_backing_bytes: 2000,
+            maximum_active_group_bytes: 500,
+            mapped_backing_bytes: 300,
+        });
+        let mut bf16 = host();
+        bf16.weight_backing_bytes = 0;
+        let selected = select_with_lora(bf16, None, lora, None, Ok(3800)).unwrap();
+        assert_eq!(selected.host.weight_backing_bytes, 2800);
+        assert_eq!(selected.host.total_bytes, 3800);
+        let text = Some(ImageTextEncoderFp8CacheRequirements {
+            converted_cache_bytes: 4000,
+            maximum_conversion_group_bytes: 800,
+        });
+        let selected = select_with_lora(host(), text, lora, None, Ok(8100)).unwrap();
+        assert_eq!(selected.host.weight_backing_bytes, 7100);
+        assert_eq!(selected.host.total_bytes, 8100);
+        let selected = select_with_lora(host(), text, lora, None, Ok(8099)).unwrap();
+        assert_eq!(selected.cache, ImageFp8HostCachePolicy::Off);
+        assert_eq!(selected.host.weight_backing_bytes, 2800);
+        assert!(select_with_lora(host(), None, lora, None, Ok(3799)).is_err());
+        assert!(select_with_lora(host(), None, lora, None, Err("unknown".into())).is_err());
     }
 
     #[test]

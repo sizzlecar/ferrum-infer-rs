@@ -128,6 +128,23 @@ pub(super) fn materializer(
     )
 }
 
+pub(super) fn materializer_with_adapter(
+    id: &str,
+    host: &HostMemoryAccount,
+    groups: Vec<Vec<WeightId>>,
+    adapter: Option<std::sync::Arc<ferrum_quantization::linear_adapter::ManagedLinearAdapter>>,
+) -> Result<Bf16WholeTensorFp8Materializer, VNextError> {
+    match adapter {
+        Some(adapter) => Bf16WholeTensorFp8Materializer::new_composed_with_id(
+            WeightMaterializerId::new(id)?,
+            host.clone(),
+            groups,
+            adapter,
+        ),
+        None => materializer(id, host, groups),
+    }
+}
+
 pub(super) fn select(
     family: &PreparedModelFamily,
     options: &mut ProgramPlanCompileOptions,

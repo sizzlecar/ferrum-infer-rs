@@ -237,6 +237,10 @@ impl QwenImage21MetalConfig {
         QwenImage21Pipeline<MetalDeviceRuntime>,
         ImageMetalCompositionReceipt,
     )> {
+        ensure!(
+            !assets.has_lora(),
+            "image LoRA is currently qualified only for CUDA"
+        );
         self.validate()?;
         let native_block_denoiser = !assets.transformer_encodings.is_empty();
         self.precision_policy

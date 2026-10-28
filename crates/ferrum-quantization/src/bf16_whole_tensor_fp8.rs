@@ -7,10 +7,12 @@
 //! caller's Host account. This does not account for mmap residency or establish
 //! deployment/model quality from the small numerical conversion fixtures.
 
+use crate::linear_adapter::{ManagedLinearAdapter, PreparedLinearAdapter};
 use ferrum_runtime::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 mod conversion;
 mod host_budget;
@@ -48,6 +50,17 @@ pub struct Bf16WholeTensorFp8Materializer {
     host: HostMemoryAccount,
     groups: Vec<Vec<WeightId>>,
     host_cache: Option<host_cache::HostCache>,
+    composition: Option<Arc<ManagedLinearAdapter>>,
+}
+
+/// Metadata-only requirements on the supplied Host account. Cache capacity is
+/// logical payload; retained and temporary backing include allocation padding.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct ComposedWeightHostRequirements {
+    pub cache_bytes: u64,
+    pub cache_backing_bytes: u64,
+    pub maximum_active_group_bytes: u64,
+    pub mapped_backing_bytes: u64,
 }
 
 impl Bf16WholeTensorFp8Materializer {
@@ -64,9 +77,32 @@ impl Bf16WholeTensorFp8Materializer {
     pub fn new_with_id(
         id: WeightMaterializerId,
         host: HostMemoryAccount,
-        mut groups: Vec<Vec<WeightId>>,
+        groups: Vec<Vec<WeightId>>,
     ) -> Result<Self, VNextError> {
-        if groups.is_empty() || groups.len() > 4096 {
+        Self::build(id, host, groups, None)
+    }
+
+    /// Compose a fixed, fully bound ordinary LoRA before quantization. Empty
+    /// FP8 groups explicitly select BF16 composition without quantization.
+    pub fn new_composed_with_id(
+        id: WeightMaterializerId,
+        host: HostMemoryAccount,
+        groups: Vec<Vec<WeightId>>,
+        composition: Arc<ManagedLinearAdapter>,
+    ) -> Result<Self, VNextError> {
+        if !composition.same_host_parent(&host) {
+            return Err(invalid("adapter and materializer Host parents differ"));
+        }
+        Self::build(id, host, groups, Some(composition))
+    }
+
+    fn build(
+        id: WeightMaterializerId,
+        host: HostMemoryAccount,
+        mut groups: Vec<Vec<WeightId>>,
+        composition: Option<Arc<ManagedLinearAdapter>>,
+    ) -> Result<Self, VNextError> {
+        if (groups.is_empty() && composition.is_none()) || groups.len() > 4096 {
             return Err(invalid("requires 1..=4096 explicit conversion groups"));
         }
         let mut seen = BTreeSet::new();
@@ -88,6 +124,10 @@ impl Bf16WholeTensorFp8Materializer {
             fingerprint(&[
                 BF16_WHOLE_TENSOR_FP8_NUMERICAL_PROFILE.as_bytes(),
                 &policy,
+                composition
+                    .as_ref()
+                    .map_or("", |adapter| adapter.identity())
+                    .as_bytes(),
                 include_bytes!("bf16_whole_tensor_fp8.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/plan.rs"),
                 include_bytes!("bf16_whole_tensor_fp8/conversion.rs"),
@@ -106,6 +146,47 @@ impl Bf16WholeTensorFp8Materializer {
             host,
             groups,
             host_cache: None,
+            composition,
+        })
+    }
+
+    fn prepared(&self, family: &PreparedModelFamily) -> Result<plan::Prepared, VNextError> {
+        let mut prepared = plan::prepare(family, &self.groups)?;
+        if let Some(composition) = &self.composition {
+            plan::bind_composition(&mut prepared, composition.prepared(), &self.host)?;
+        }
+        Ok(prepared)
+    }
+
+    /// Forecast fixed adapter composition before authentication or device
+    /// construction. Uses the exact same group planner as materialization.
+    pub fn composed_host_requirements(
+        host: &HostMemoryAccount,
+        family: &PreparedModelFamily,
+        groups: &[Vec<WeightId>],
+        composition: &PreparedLinearAdapter,
+    ) -> Result<ComposedWeightHostRequirements, VNextError> {
+        let mut prepared = plan::prepare(family, groups)?;
+        plan::bind_composition(&mut prepared, composition, host)?;
+        let cache_backing_bytes =
+            prepared
+                .conversion_groups
+                .iter()
+                .try_fold(0u64, |n, group| {
+                    let backing = host
+                        .backing_bytes(group.payload_bytes)
+                        .map_err(|error| invalid(error.to_string()))?;
+                    n.checked_add(backing as u64)
+                        .ok_or_else(|| invalid("cache backing overflows"))
+                })?;
+        Ok(ComposedWeightHostRequirements {
+            cache_bytes: prepared.converted_bytes,
+            cache_backing_bytes,
+            maximum_active_group_bytes: prepared.maximum_group_accounted_bytes(host)?,
+            mapped_backing_bytes: composition
+                .mapped_backing_bytes(host)
+                .map_err(|error| invalid(error.to_string()))?
+                as u64,
         })
     }
 
@@ -140,7 +221,7 @@ impl Bf16WholeTensorFp8Materializer {
     /// components, mmap RSS and concurrent transfer/temporary allocations are
     /// excluded; the composition must separately budget those live owners.
     pub fn converted_cache_bytes(&self, family: &PreparedModelFamily) -> Result<u64, VNextError> {
-        Ok(plan::prepare(family, &self.groups)?.converted_bytes)
+        Ok(self.prepared(family)?.converted_bytes)
     }
 
     /// Small fixed conversion evidence bound to this implementation and the
@@ -149,7 +230,7 @@ impl Bf16WholeTensorFp8Materializer {
         &self,
         family: &PreparedModelFamily,
     ) -> Result<WeightMaterializerSelection, VNextError> {
-        let prepared = plan::prepare(family, &self.groups)?;
+        let prepared = self.prepared(family)?;
         WeightMaterializerSelection::numeric_quality_artifact(
             self.descriptor.id().clone(),
             quality::artifact(
@@ -167,7 +248,7 @@ impl Bf16WholeTensorFp8Materializer {
         &self,
         family: &PreparedModelFamily,
     ) -> Result<u64, VNextError> {
-        Ok(plan::prepare(family, &self.groups)?.maximum_group_bytes)
+        Ok(self.prepared(family)?.maximum_group_bytes)
     }
 
     /// Peak charged bytes for a complete conversion group on this materializer's
@@ -178,14 +259,15 @@ impl Bf16WholeTensorFp8Materializer {
         &self,
         family: &PreparedModelFamily,
     ) -> Result<u64, VNextError> {
-        plan::prepare(family, &self.groups)?.maximum_group_accounted_bytes(&self.host)
+        self.prepared(family)?
+            .maximum_group_accounted_bytes(&self.host)
     }
 
     /// Required physical execution payload bytes, including every matrix's
     /// physical scale scalar. This is a metadata-only lower bound: placement alignment, dynamic
     /// resources and runtime/library reservations are not included.
     pub fn execution_weight_bytes(&self, family: &PreparedModelFamily) -> Result<u64, VNextError> {
-        plan::prepare(family, &self.groups)?.execution_weight_bytes()
+        self.prepared(family)?.execution_weight_bytes()
     }
 }
 
@@ -198,14 +280,14 @@ impl WeightMaterializer for Bf16WholeTensorFp8Materializer {
         family: &PreparedModelFamily,
         _device: &DeviceDescriptor,
     ) -> Result<WeightSchema, VNextError> {
-        Ok(plan::prepare(family, &self.groups)?.schema)
+        Ok(self.prepared(family)?.schema)
     }
     fn component_sources(
         &self,
         family: &PreparedModelFamily,
         schema: &WeightSchema,
     ) -> Result<BTreeMap<WeightId, Vec<WeightId>>, VNextError> {
-        let prepared = plan::prepare(family, &self.groups)?;
+        let prepared = self.prepared(family)?;
         if &prepared.schema != schema {
             return Err(invalid("execution schema differs"));
         }
@@ -247,12 +329,14 @@ impl WeightMaterializer for Bf16WholeTensorFp8Materializer {
         if !self.host.same_parent(host) {
             return Err(invalid("invocation Host account has a different parent"));
         }
-        match &self.host_cache {
-            Some(cache) => {
-                conversion::materialize_with_cache(host, source, sources, outputs, Some(cache))
-            }
-            None => conversion::materialize(host, source, sources, outputs),
-        }
+        conversion::materialize_composed(
+            host,
+            source,
+            sources,
+            outputs,
+            self.host_cache.as_ref(),
+            self.composition.as_deref(),
+        )
     }
     fn additional_host_backing_bytes(
         &self,
@@ -261,7 +345,7 @@ impl WeightMaterializer for Bf16WholeTensorFp8Materializer {
     ) -> Result<usize, VNextError> {
         host_budget::additional(
             &self.host,
-            &plan::prepare(family, &self.groups)?,
+            &self.prepared(family)?,
             self.host_cache.as_ref(),
             source,
         )
@@ -273,7 +357,7 @@ impl WeightMaterializer for Bf16WholeTensorFp8Materializer {
     ) -> Result<HostBackingPreparation, VNextError> {
         host_budget::prepare(
             &self.host,
-            &plan::prepare(family, &self.groups)?,
+            &self.prepared(family)?,
             self.host_cache.as_ref(),
             source,
         )

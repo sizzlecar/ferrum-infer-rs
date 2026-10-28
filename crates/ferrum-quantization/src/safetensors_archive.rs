@@ -248,6 +248,28 @@ impl SafetensorsArchive {
         self.tensors.len()
     }
 
+    /// Explicit header-only metadata query. This neither scans nor copies
+    /// tensor payloads, and preserves each shard's declarations separately.
+    pub fn header_metadata(&self) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+        self.shards
+            .iter()
+            .map(|shard| {
+                let (_, metadata) = SafeTensors::read_metadata(&shard.mmap).map_err(|error| {
+                    FerrumError::model(format!("read safetensors metadata: {error}"))
+                })?;
+                Ok((
+                    shard.relative_path.clone(),
+                    metadata
+                        .metadata()
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect(),
+                ))
+            })
+            .collect()
+    }
+
     pub fn tensor_names(&self) -> impl ExactSizeIterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
     }

@@ -34,6 +34,61 @@ fn config_from(value: &Value) -> Result<QwenImage21Config> {
     )
 }
 
+#[test]
+fn lora_fused_mlp_routes_gate_and_up_rows_in_checkpoint_order() {
+    let expected = ExpectedWeights::from_config(
+        &config_from(&tiny_config()).unwrap(),
+        StructureLimits::default(),
+    )
+    .unwrap();
+    let target = expected
+        .lora_target("transformer_blocks.0.img_mlp.gate_up")
+        .unwrap();
+    assert_eq!(target.dimensions(), [96, 16]);
+    let slices = target.slices();
+    assert_eq!(slices.len(), 2);
+    assert_eq!(
+        slices[0].tensor().external_name(),
+        "transformer_blocks.0.img_mlp.gate_layer.weight"
+    );
+    assert_eq!(slices[0].adapter_output_rows(), 0..48);
+    assert_eq!(
+        slices[1].tensor().external_name(),
+        "transformer_blocks.0.img_mlp.proj.weight"
+    );
+    assert_eq!(slices[1].adapter_output_rows(), 48..96);
+}
+
+#[test]
+fn lora_declares_all_linear_projections_and_rejects_non_linear_or_unknown_targets() {
+    let expected = ExpectedWeights::from_config(
+        &config_from(&tiny_config()).unwrap(),
+        StructureLimits::default(),
+    )
+    .unwrap();
+    for tensor in expected
+        .tensors()
+        .values()
+        .filter(|tensor| tensor.dimensions().len() == 2)
+    {
+        let module = tensor.external_name().strip_suffix(".weight").unwrap();
+        let target = expected.lora_target(module).unwrap();
+        assert_eq!(target.slices()[0].tensor(), tensor);
+        assert_eq!(
+            target.slices()[0].adapter_output_rows(),
+            0..tensor.dimensions()[0]
+        );
+    }
+    for module in [
+        "txt_in.text_norm",
+        "transformer_blocks.0.attn.norm_q",
+        "transformer_blocks.1.img_mlp.gate_up",
+        "transformer_blocks.0.not_a_projection",
+    ] {
+        assert!(expected.lora_target(module).is_err(), "{module}");
+    }
+}
+
 struct ShardFixture {
     name: String,
     header: Value,
