@@ -16,8 +16,7 @@
   "headers": [
     "kernels/abi.h",
     "kernels/gemm.cuh",
-    "kernels/quantize.cuh",
-    "kernels/gemm_sm89.cuh"
+    "kernels/quantize.cuh"
   ],
   "dependency_closures": [
     {
@@ -25,8 +24,7 @@
       "headers": [
         "kernels/abi.h",
         "kernels/gemm.cuh",
-        "kernels/quantize.cuh",
-        "kernels/gemm_sm89.cuh"
+        "kernels/quantize.cuh"
       ]
     }
   ],
