@@ -82,16 +82,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     .context("idle image capacity overflows")?;
             }
         }
-        let reserve = memory
-            .total_bytes
-            .saturating_sub(self.config.device_capacity_bytes);
+        // The configured ceiling already applies utilization and explicit
+        // account limits. Do not subtract total - ceiling from physical free
+        // storage again: native/other owners have already reduced that value.
+        // The report includes the native allowance, so leaving it in this
+        // bound also reserves room for native storage not allocated yet.
         let capacity = memory
             .available_bytes()
             .saturating_add(reclaimable)
-            .saturating_sub(reserve)
-            // The report includes this declared allowance; physical free
-            // storage already excludes native owners that have been allocated.
-            .saturating_add(self.device_opaque_allowance_bytes)
             .min(self.config.device_capacity_bytes);
         tracing::debug!(target: "ferrum_engine::image_generation::timing",
             capacity_bytes = capacity, configured_capacity_bytes = self.config.device_capacity_bytes,
@@ -181,11 +179,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let additional = additional_static
             .checked_add(dynamic.saturating_sub(self.resident_stages.dynamic_bytes(target)))
             .context("adaptive physical demand overflows")?;
-        // Preserve the configured utilization margin for vendor allocations
-        // and driver state, including native storage outside managed pools.
-        let reserve = memory
-            .total_bytes
-            .saturating_sub(self.config.device_capacity_bytes);
+        // The logical check already enforces the configured account ceiling.
+        // Physical free excludes allocated driver/native/other owners; reserve
+        // only the declared native allowance for possible future native growth.
+        let reserve = self.device_opaque_allowance_bytes;
         let available = memory.available_bytes().saturating_sub(reserve);
         tracing::debug!(target: "ferrum_engine::image_generation::timing",
             stage = ?target, additional_bytes = additional, available_bytes = available,
