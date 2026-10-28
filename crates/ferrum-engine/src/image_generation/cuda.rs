@@ -73,6 +73,8 @@ pub struct ImageCudaCompositionReceipt {
     pub attention_opaque_memory_bytes: u64,
     /// These allowances are declared, not measured native memory peaks.
     pub runtime_opaque_profile: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lora: Option<super::assets::ImageLoraReceipt>,
     pub cudnn_opaque_profile: String,
 }
 
@@ -202,7 +204,7 @@ impl QwenImage21CudaConfig {
 
     pub fn create_pipeline_with_receipt(
         self,
-        assets: QwenImage21Assets,
+        mut assets: QwenImage21Assets,
     ) -> Result<(
         QwenImage21Pipeline<CudaDeviceRuntime>,
         ImageCudaCompositionReceipt,
@@ -228,6 +230,7 @@ impl QwenImage21CudaConfig {
         let mut contracts = contracts(self.attention_policy)?;
         // Exactly one Host ledger, also used by CPU weight conversion.
         let host = HostMemoryAccount::new(self.host);
+        assets.prepare_lora(&host, self.precision_policy)?;
         let (materializers, execution_weight_bytes) =
             self.prepare_assets(&assets, &profiles, &host)?;
         let device_id = DeviceId::new(format!("device.cuda.{}", self.ordinal))?;
@@ -302,6 +305,7 @@ impl QwenImage21CudaConfig {
             fp8_opaque_memory_bytes: self.precision_policy.additional_opaque_bytes(),
             attention_opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
             runtime_opaque_profile: self.opaque_memory_profile.clone(),
+            lora: assets.receipt().lora.clone(),
             cudnn_opaque_profile: self.cudnn.opaque_memory_profile.clone(),
         };
         // ALL includes Philox. Do not call the standalone Philox factory:
@@ -491,6 +495,11 @@ impl QwenImage21CudaConfig {
         let mut execution_bytes = assets.receipt().required_weight_bytes;
         let mut selected: Vec<Box<dyn WeightMaterializer>> = Vec::new();
         let mut maximum_group_bytes = 0;
+        let mut composition_retained_bytes = assets
+            .receipt()
+            .lora
+            .as_ref()
+            .map_or(0, |lora| lora.mapped_backing_bytes as u64);
         for (index, stage, family, materializer_id) in [
             (
                 0,
@@ -505,33 +514,55 @@ impl QwenImage21CudaConfig {
                 super::precision::DIT_MATERIALIZER,
             ),
         ] {
-            if !self.precision_policy.stage_uses_fp8(stage) {
+            let fp8 = self.precision_policy.stage_uses_fp8(stage);
+            let adapter = (stage == super::ImageStage::Denoiser)
+                .then(|| assets.lora_materializer.clone())
+                .flatten();
+            let composed = adapter.is_some();
+            if !fp8 && adapter.is_none() {
                 continue;
             }
-            let groups = match stage {
-                super::ImageStage::TextEncoder => {
+            let groups = match (fp8, stage) {
+                (false, _) => Vec::new(),
+                (true, super::ImageStage::TextEncoder) => {
                     Qwen3VLTextEncoderFamily::fp8_weight_groups(&text)?
                 }
-                super::ImageStage::Denoiser => {
+                (true, super::ImageStage::Denoiser) => {
                     QwenImage21TransformerFamily::fp8_weight_groups(&dit)?
                 }
                 _ => unreachable!("only materialized stages are enumerated"),
             };
-            let mut materializer = super::precision::materializer(materializer_id, host, groups)?;
+            let mut materializer = super::precision::materializer_with_adapter(
+                materializer_id,
+                host,
+                groups,
+                adapter,
+            )?;
             super::precision::validate_backing(family, &materializer, host)?;
             maximum_group_bytes =
-                maximum_group_bytes.max(materializer.maximum_group_backing_bytes(family)?);
+                maximum_group_bytes.max(materializer.maximum_group_accounted_bytes(family)?);
             // Schema bytes include scales, but are not a peak/activation estimate.
             execution_bytes[index] = materializer.execution_weight_bytes(family)?;
-            if let Some(capacity) = self.fp8_host_cache.maximum_bytes(stage) {
-                self.fp8_host_cache
-                    .validate_stage(stage, materializer.converted_cache_bytes(family)?)?;
+            let explicit_capacity = self.fp8_host_cache.maximum_bytes(stage);
+            let complete_bytes = materializer.converted_cache_bytes(family)?;
+            if composed && explicit_capacity.is_none() {
+                composition_retained_bytes = composition_retained_bytes
+                    .checked_add(complete_bytes)
+                    .context("LoRA retained cache bytes overflow")?;
+            }
+            if let Some(capacity) = explicit_capacity
+                .or_else(|| composed.then(|| NonZeroU64::new(complete_bytes)).flatten())
+            {
+                self.fp8_host_cache.validate_stage(stage, complete_bytes)?;
                 materializer = materializer.with_host_cache(capacity)?;
             }
             selected.push(Box::new(materializer));
         }
-        self.fp8_host_cache
-            .validate_peak(self.host, maximum_group_bytes)?;
+        self.fp8_host_cache.validate_peak_with_composition(
+            self.host,
+            maximum_group_bytes,
+            composition_retained_bytes,
+        )?;
         let materializers = WeightMaterializerRegistry::new(selected)?;
         if let Some(capacity) = self.declared_maximum() {
             self.validate_weight_capacity(&execution_bytes, capacity.get())?;

@@ -86,6 +86,7 @@ pub(super) fn finite_bf16_amax<'a>(
     Ok(f32::from_bits(u32::from(maximum) << 16))
 }
 
+#[cfg(test)]
 pub(super) fn materialize<'source>(
     host: &HostMemoryAccount,
     source: &'source dyn WeightComponentSource,
@@ -95,6 +96,7 @@ pub(super) fn materialize<'source>(
     materialize_with_cache(host, source, sources, outputs, None)
 }
 
+#[cfg(test)]
 pub(super) fn materialize_with_cache<'source>(
     host: &HostMemoryAccount,
     source: &'source dyn WeightComponentSource,
@@ -102,8 +104,27 @@ pub(super) fn materialize_with_cache<'source>(
     outputs: &[&WeightComponentSpec],
     cache: Option<&host_cache::HostCache>,
 ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+    materialize_composed(host, source, sources, outputs, cache, None)
+}
+
+pub(super) fn materialize_composed<'source>(
+    host: &HostMemoryAccount,
+    source: &'source dyn WeightComponentSource,
+    sources: &[&WeightComponentSpec],
+    outputs: &[&WeightComponentSpec],
+    cache: Option<&host_cache::HostCache>,
+    composition: Option<&ManagedLinearAdapter>,
+) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
     let mut timing = GroupTiming::new();
-    let result = materialize_observed(host, source, sources, outputs, cache, &mut timing);
+    let result = materialize_observed(
+        host,
+        source,
+        sources,
+        outputs,
+        cache,
+        composition,
+        &mut timing,
+    );
     timing.report(sources, outputs, result.is_ok());
     result
 }
@@ -114,6 +135,7 @@ fn materialize_observed<'source>(
     sources: &[&WeightComponentSpec],
     outputs: &[&WeightComponentSpec],
     cache: Option<&host_cache::HostCache>,
+    composition: Option<&ManagedLinearAdapter>,
     timing: &mut GroupTiming,
 ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
     if outputs.is_empty() {
@@ -121,6 +143,16 @@ fn materialize_observed<'source>(
     }
     if let ([original], [output]) = (sources, outputs) {
         if original == output {
+            if let Some(composition) = composition.filter(|adapter| adapter.affects(original)) {
+                return materialize_bf16_composed(
+                    host,
+                    source,
+                    original,
+                    composition,
+                    cache,
+                    timing,
+                );
+            }
             timing.mode = "borrowed";
             return timing.measure(Phase::SourceResolve, || {
                 source.component(original).map(|payload| vec![payload])
@@ -156,7 +188,7 @@ fn materialize_observed<'source>(
     }
     // Retain the exact immutable sources through both passes. This rejects
     // implicit source transcoding into an unaccounted, whole-matrix Vec.
-    let payloads = timing.measure(Phase::SourceResolve, || resolve_sources(source, sources))?;
+    let mut payloads = timing.measure(Phase::SourceResolve, || resolve_sources(source, sources))?;
     let files = payloads
         .iter()
         .map(|payload| payload.source_file().to_owned())
@@ -174,6 +206,33 @@ fn materialize_observed<'source>(
             timing.mode = "cache_hit";
             return payloads_from_backing(outputs, &files, &backing, ranges);
         }
+    }
+    // Cache identity uses the retained base owners plus the materializer's
+    // adapter/content/strength fingerprint. Composition is explicit and occurs
+    // only after a cold miss, never inside source resolution or admission.
+    if let Some(composition) = composition {
+        payloads = timing.measure(Phase::LoraCompose, || {
+            payloads
+                .into_iter()
+                .zip(sources)
+                .map(|(payload, component)| {
+                    if !composition.affects(component) {
+                        return Ok(payload);
+                    }
+                    let backing = composition
+                        .compose(host, component, payload.bytes())
+                        .map_err(|error| invalid(error.to_string()))?;
+                    WeightComponentPayload::from_managed_host(
+                        component,
+                        component.external_names.clone(),
+                        vec![payload.source_file().to_owned()],
+                        component.dimensions.clone(),
+                        ElementType::Bf16,
+                        backing,
+                    )
+                })
+                .collect::<Result<Vec<_>, VNextError>>()
+        })?;
     }
     let maximum = timing.measure(Phase::Amax, || {
         finite_bf16_amax(payloads.iter().map(|payload| payload.bytes()))
@@ -221,6 +280,47 @@ fn materialize_observed<'source>(
         .collect::<Vec<_>>();
     let result = payloads_from_backing(outputs, &files, &backing, ranges.clone())?;
     if let (Some(state), Some(key)) = (state.as_mut(), key.take()) {
+        state.publish(key, backing, ranges)?;
+    }
+    Ok(result)
+}
+
+fn materialize_bf16_composed<'source>(
+    host: &HostMemoryAccount,
+    source: &'source dyn WeightComponentSource,
+    component: &WeightComponentSpec,
+    composition: &ManagedLinearAdapter,
+    cache: Option<&host_cache::HostCache>,
+    timing: &mut GroupTiming,
+) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+    let specs = [component];
+    let payloads = timing.measure(Phase::SourceResolve, || resolve_sources(source, &specs))?;
+    let files = vec![payloads[0].source_file().to_owned()];
+    let bytes = usize::try_from(component.physical_bytes()?)
+        .map_err(|_| invalid("BF16 composition exceeds usize"))?;
+    let cache = cache.filter(|cache| cache.fits(bytes));
+    let key = cache
+        .map(|cache| cache.key(&specs, &specs, &payloads))
+        .transpose()?;
+    let mut state = cache.map(host_cache::HostCache::lock).transpose()?;
+    if let (Some(state), Some(key)) = (state.as_mut(), key.as_ref()) {
+        if let Some((backing, ranges)) = state.get(key)? {
+            timing.mode = "lora_bf16_cache_hit";
+            return payloads_from_backing(&specs, &files, &backing, ranges);
+        }
+    }
+    if let (Some(cache), Some(state)) = (cache, state.as_mut()) {
+        cache.make_room(state, bytes);
+    }
+    timing.mode = "lora_bf16";
+    let backing = timing
+        .measure(Phase::LoraCompose, || {
+            composition.compose(host, component, payloads[0].bytes())
+        })
+        .map_err(|error| invalid(error.to_string()))?;
+    let ranges = vec![0..bytes];
+    let result = payloads_from_backing(&specs, &files, &backing, ranges.clone())?;
+    if let (Some(state), Some(key)) = (state.as_mut(), key) {
         state.publish(key, backing, ranges)?;
     }
     Ok(result)

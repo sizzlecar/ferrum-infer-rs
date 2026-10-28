@@ -29,6 +29,7 @@ pub struct DirectoryOptions {
     pub ordinal: usize,
     pub cudnn_library: Option<PathBuf>,
     pub precision: ferrum_engine::image_generation::ImageCudaPrecisionPolicy,
+    pub lora: Option<super::configuration::ImageLoraConfig>,
 }
 impl DirectoryOptions {
     /// A direct invocation has exactly one image request, regardless of the
@@ -86,6 +87,7 @@ impl DirectoryOptions {
             ordinal,
             cudnn_library,
             precision: Default::default(),
+            lora: None,
         };
         result.validate()?;
         Ok(result)
@@ -109,7 +111,25 @@ impl DirectoryOptions {
             }
         }
     }
+    pub fn with_lora(
+        mut self,
+        lora: Option<super::configuration::ImageLoraConfig>,
+    ) -> Result<Self> {
+        self.lora = lora;
+        self.validate()?;
+        Ok(self)
+    }
     pub fn validate(&self) -> Result<()> {
+        if let Some(lora) = &self.lora {
+            ensure!(
+                self.backend == ImageBackendKind::Cuda,
+                "image LoRA is currently qualified only for CUDA"
+            );
+            ensure!(
+                lora.strength.is_finite(),
+                "image LoRA strength must be finite"
+            );
+        }
         if self.backend == ImageBackendKind::Metal {
             ensure!(
                 self.ordinal == 0 && self.cudnn_library.is_none(),
@@ -402,10 +422,21 @@ impl ImageProductSource {
                 super::factory::PreparedBackend::ensure_supported(options.backend)?;
                 // Complete metadata and actual archive headers precede any
                 // device context, provider, or native library construction.
-                let assets = ferrum_engine::image_generation::QwenImage21Assets::from_directory(
-                    path,
-                    PipelineSourceLimits::default(),
-                )?;
+                let mut assets =
+                    ferrum_engine::image_generation::QwenImage21Assets::from_directory(
+                        path,
+                        PipelineSourceLimits::default(),
+                    )?;
+                if let Some(lora) = &options.lora {
+                    assets = assets.with_lora(
+                        std::sync::Arc::new(
+                            ferrum_quantization::linear_adapter::ImportedLinearAdapter::open(
+                                &lora.source,
+                            )?,
+                        ),
+                        lora.strength,
+                    )?;
+                }
                 let backend = super::factory::PreparedBackend::from_directory(options, &assets)?;
                 let model = path
                     .file_name()

@@ -87,7 +87,7 @@ pub fn execute_run_source_with_image(
         // Opening archives and validating metadata precedes either device runtime.
         let (pipeline, composition) = product.backend.create(product.assets)?;
         let context = RunContext {
-            model: product.model,
+            model: super::composed_model_name(&product.model, &composition)?,
             profile: product.profile,
             composition,
             request: ImageGenerationRequest {

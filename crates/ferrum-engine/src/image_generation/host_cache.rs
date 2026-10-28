@@ -1,6 +1,7 @@
 //! Explicit Host residency for converted weights; independent of device residency.
 use super::{ImageCudaPrecisionPolicy, ImageStage};
 use anyhow::{ensure, Context};
+pub use ferrum_quantization::bf16_whole_tensor_fp8::ComposedWeightHostRequirements as ImageLoraHostRequirements;
 use ferrum_runtime::{HostMemoryClass, HostMemoryLimits};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU64;
@@ -14,6 +15,52 @@ pub struct ImageTextEncoderFp8CacheRequirements {
 }
 
 impl super::QwenImage21Assets {
+    /// Complete fixed-adapter DiT retention, including BF16 projections that
+    /// are not quantized. No payload scan, Host claim or device work occurs.
+    pub fn lora_host_requirements(
+        &self,
+        precision: ImageCudaPrecisionPolicy,
+        host_limits: HostMemoryLimits,
+    ) -> anyhow::Result<Option<ImageLoraHostRequirements>> {
+        use ferrum_models::qwen_image21::{
+            QwenImage21T2iLayout, QwenImage21TransformerConfig, QwenImage21TransformerFamily,
+        };
+        use ferrum_runtime::{
+            HostMemoryAccount, ModelFamilyRegistration, NumericalProfileId, TypedFamilyRegistration,
+        };
+        let Some(adapter) = &self.lora else {
+            return Ok(None);
+        };
+        let fp8 = precision.stage_uses_fp8(ImageStage::Denoiser);
+        let config = QwenImage21TransformerConfig::new(
+            self.transformer.clone(),
+            QwenImage21T2iLayout::new(1, 2, 2, vec![1])?,
+        )?;
+        let profile = if fp8 {
+            QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
+        } else {
+            QwenImage21TransformerFamily::CUDA_PROFILE_ID
+        };
+        let family = TypedFamilyRegistration::new(QwenImage21TransformerFamily::new()?)
+            .prepare_with_profile(
+                &serde_json::to_value(&config)?,
+                &NumericalProfileId::new(profile).map_err(anyhow::Error::msg)?,
+            )?;
+        let groups = if fp8 {
+            QwenImage21TransformerFamily::fp8_weight_groups(&config)?
+        } else {
+            Vec::new()
+        };
+        Ok(Some(
+            ferrum_quantization::Bf16WholeTensorFp8Materializer::composed_host_requirements(
+                &HostMemoryAccount::new(host_limits),
+                &family,
+                &groups,
+                adapter,
+            )?,
+        ))
+    }
+
     pub fn text_encoder_fp8_host_cache_requirements(
         &self,
         host_limits: HostMemoryLimits,
@@ -149,11 +196,24 @@ impl ImageFp8HostCachePolicy {
         host: HostMemoryLimits,
         maximum_active_group_bytes: u64,
     ) -> anyhow::Result<()> {
-        if self == Self::Off {
+        self.validate_peak_with_composition(host, maximum_active_group_bytes, 0)
+    }
+
+    /// LoRA's complete retained cache and mapped files coexist with configured
+    /// FP8 caches; they are mandatory even when the legacy FP8 policy is Off.
+    pub(super) fn validate_peak_with_composition(
+        self,
+        host: HostMemoryLimits,
+        maximum_active_group_bytes: u64,
+        composition_retained_bytes: u64,
+    ) -> anyhow::Result<()> {
+        if self == Self::Off && composition_retained_bytes == 0 {
             return Ok(());
         }
         let backing = self
             .retained_ceiling()?
+            .checked_add(composition_retained_bytes)
+            .context("composed Host retained bytes overflow")?
             .checked_add(maximum_active_group_bytes)
             .context("FP8 Host retained plus active conversion bytes overflow")?;
         ensure!(

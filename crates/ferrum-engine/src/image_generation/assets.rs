@@ -36,6 +36,16 @@ pub struct ImageAssetReceipt {
     pub required_weight_bytes: [u64; 3],
     /// Header/schema agreement is not authentication of checkpoint payloads.
     pub payload_verification: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lora: Option<ImageLoraReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageLoraReceipt {
+    pub identity: String,
+    pub strength: f32,
+    pub mapped_backing_bytes: usize,
+    pub host_requirements: super::ImageLoraHostRequirements,
 }
 
 pub struct QwenImage21Assets {
@@ -48,6 +58,9 @@ pub struct QwenImage21Assets {
     pub(super) statistics: QwenImage21LatentStatistics,
     pub(super) schedule: QwenImage21SamplingSchedule,
     pub(super) editing: Option<EditAssets>,
+    pub(super) lora: Option<Arc<ferrum_quantization::linear_adapter::PreparedLinearAdapter>>,
+    pub(super) lora_materializer:
+        Option<Arc<ferrum_quantization::linear_adapter::ManagedLinearAdapter>>,
     receipt: ImageAssetReceipt,
 }
 
@@ -161,16 +174,62 @@ impl QwenImage21Assets {
             statistics,
             schedule,
             editing: None,
+            lora: None,
+            lora_materializer: None,
             receipt: ImageAssetReceipt {
                 metadata_sha256,
                 required_weight_bytes,
                 payload_verification: "selected headers only; payload not authenticated",
+                lora: None,
             },
         })
     }
 
     pub fn receipt(&self) -> &ImageAssetReceipt {
         &self.receipt
+    }
+
+    /// Bind every ordinary-linear target before any backend is created. Base
+    /// mappings remain immutable; no adapter payload is expanded at this step.
+    pub fn with_lora(
+        mut self,
+        adapter: Arc<ferrum_quantization::linear_adapter::ImportedLinearAdapter>,
+        strength: f32,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            self.lora.is_none(),
+            "only one startup image LoRA is supported"
+        );
+        ensure!(self.transformer_encodings.is_empty(), "image LoRA requires original BF16 transformer sources; native encoded weights are unsupported");
+        let expected = ExpectedWeights::from_config(&self.transformer, StructureLimits::default())?;
+        self.lora = Some(Arc::new(expected.bind_lora(adapter, strength)?));
+        Ok(self)
+    }
+
+    pub fn has_lora(&self) -> bool {
+        self.lora.is_some()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn prepare_lora(
+        &mut self,
+        host: &HostMemoryAccount,
+        precision: super::ImageCudaPrecisionPolicy,
+    ) -> anyhow::Result<()> {
+        if let Some(adapter) = &self.lora {
+            let requirements = self
+                .lora_host_requirements(precision, host.limits())?
+                .context("bound LoRA omitted Host requirements")?;
+            let managed = adapter.manage(host)?;
+            self.receipt.lora = Some(ImageLoraReceipt {
+                identity: managed.identity().to_owned(),
+                strength: managed.strength(),
+                mapped_backing_bytes: managed.mapped_backing_bytes(),
+                host_requirements: requirements,
+            });
+            self.lora_materializer = Some(managed);
+        }
+        Ok(())
     }
 
     pub fn spatial_scale(&self) -> anyhow::Result<u32> {

@@ -112,6 +112,7 @@ fn run(fail_preparation: bool) -> (Capture, Arc<Shared<u64>>, Retirement<u64>) {
     for width in [32, 32, 64] {
         let (response, _) = oneshot::channel();
         queue.push_back(Queued {
+            adapter: None,
             request: QueuedRequest::Generate(ImageGenerationRequest {
                 prompt: "same prompt and seed".into(),
                 width,
@@ -129,6 +130,7 @@ fn run(fail_preparation: bool) -> (Capture, Arc<Shared<u64>>, Retirement<u64>) {
         });
     }
     let shared = Arc::new(Shared {
+        adapter: None,
         state: Mutex::new(State {
             queue,
             queue_backing: None,

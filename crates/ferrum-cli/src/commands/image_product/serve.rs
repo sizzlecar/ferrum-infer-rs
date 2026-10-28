@@ -113,6 +113,7 @@ pub(super) fn prepare_http(
         )
         .into());
     }
+    let explicit_alias = !aliases.is_empty();
     let model = aliases
         .into_iter()
         .next()
@@ -125,6 +126,18 @@ pub(super) fn prepare_http(
     )
     .map_err(anyhow::Error::from)?;
     let (pipeline, composition) = product.backend.create(product.assets)?;
+    let model = if explicit_alias {
+        model
+    } else {
+        super::composed_model_name(&model, &composition)?
+    };
+    ferrum_server::ServedModelRegistry::try_new(
+        model.clone(),
+        ferrum_server::ServedModelKind::ImageGeneration,
+        vec![model.clone()],
+        vec![],
+    )
+    .map_err(anyhow::Error::from)?;
     let service_config = ImageServiceConfig {
         batching: serving.batching,
         maximum_pending: serving.maximum_pending,

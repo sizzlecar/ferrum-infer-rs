@@ -316,11 +316,17 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let mut options = transformer.compile_options()?;
         let compile_options_us = trace_elapsed_us(started);
         let started = std::time::Instant::now();
-        if QwenImage21TransformerFamily::is_fp8_profile(self.profiles.denoiser.as_str()) {
-            let conversion = precision::materializer(
+        let fp8 = QwenImage21TransformerFamily::is_fp8_profile(self.profiles.denoiser.as_str());
+        if fp8 || self.assets.lora_materializer.is_some() {
+            let conversion = precision::materializer_with_adapter(
                 precision::DIT_MATERIALIZER,
                 &self.host,
-                QwenImage21TransformerFamily::fp8_weight_groups(transformer)?,
+                if fp8 {
+                    QwenImage21TransformerFamily::fp8_weight_groups(transformer)?
+                } else {
+                    Vec::new()
+                },
+                self.assets.lora_materializer.clone(),
             )?;
             precision::select(&family, &mut options, &conversion, &self.host)?;
         }

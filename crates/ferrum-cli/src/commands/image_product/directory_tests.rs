@@ -99,6 +99,7 @@ fn explicit_image_precision_routes_both_entrypoints_and_rejects_text_or_config_m
         image_config: None,
         image_cudnn_library: None,
         image_precision: Some(ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1),
+        ..Default::default()
     };
     let ImageProductSource::LocalDirectory { options, .. } = args
         .source(Some(model), 0.9, None, Some(2), "cuda", None)
@@ -167,6 +168,7 @@ fn local_pipeline_routes_both_commands_without_names_or_weight_payloads() {
         image_config: None,
         image_cudnn_library: None,
         image_precision: None,
+        ..Default::default()
     };
     let selected = args
         .source(Some(model), 0.9, None, Some(2), "cuda", Some("1"))

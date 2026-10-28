@@ -12,6 +12,7 @@ pub(super) enum Phase {
     Amax,
     HostAllocateZeroed,
     Encode,
+    LoraCompose,
 }
 
 struct Start {
@@ -54,7 +55,7 @@ impl Measurement {
 
 pub(super) struct GroupTiming {
     started: Option<Start>,
-    phases: [Option<Measurement>; 4],
+    phases: [Option<Measurement>; 5],
     pub(super) mode: &'static str,
 }
 
@@ -66,7 +67,7 @@ impl GroupTiming {
     fn with_enabled(enabled: bool) -> Self {
         Self {
             started: enabled.then(Start::now),
-            phases: [None; 4],
+            phases: [None; 5],
             mode: "converted",
         }
     }
@@ -114,6 +115,8 @@ impl GroupTiming {
             host_allocate_zeroed_thread_cpu_us = ?cpu(Phase::HostAllocateZeroed),
             encode_wall_us = ?wall(Phase::Encode),
             encode_thread_cpu_us = ?cpu(Phase::Encode),
+            lora_compose_wall_us = ?wall(Phase::LoraCompose),
+            lora_compose_caller_thread_cpu_us = ?cpu(Phase::LoraCompose),
             "BF16 whole-tensor FP8 source-group materialization timing"
         );
     }

@@ -30,11 +30,11 @@ pub use serve::execute_serve_source;
 use clap::{parser::ValueSource, ArgMatches, Args};
 use std::{fmt, path::PathBuf};
 
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 pub struct ImageProductArgs {
-    /// Diagnostic image JSON (explicit assets and quotas). A registered local
-    /// MODEL directory instead uses experimental_bf16_cold_v1: BF16, cold
-    /// batches, 512 default / 1024 maximum pixels per axis, single-image decode.
+    /// Diagnostic image JSON with explicit assets and quotas. A registered
+    /// local MODEL directory uses adaptive residency and capability-derived
+    /// defaults, including automatic CUDA batching and single-image decode.
     #[arg(long, value_name = "JSON")]
     pub image_config: Option<PathBuf>,
     /// Override cuDNN 9 discovery for a local image pipeline directory.
@@ -47,9 +47,69 @@ pub struct ImageProductArgs {
     /// config can select denoiser native_source.
     #[arg(long, value_name = "PRESET|JSON")]
     pub image_precision: Option<ferrum_engine::image_generation::ImagePrecisionPolicy>,
+    /// One fixed image adapter: a PEFT directory, or a Diffusers A/B safetensors
+    /// file with explicit --image-lora-base-model. Single files use unit export
+    /// scaling unless --image-lora-alpha declares alpha/r scaling.
+    #[arg(long, value_name = "DIRECTORY|SAFETENSORS")]
+    pub image_lora: Option<PathBuf>,
+    /// Fixed startup strength; finite negative and zero values are supported.
+    #[arg(long, requires = "image_lora", allow_hyphen_values = true)]
+    pub image_lora_strength: Option<f32>,
+    /// Base-model binding for a single file or missing PEFT metadata.
+    #[arg(long, requires = "image_lora")]
+    pub image_lora_base_model: Option<String>,
+    /// Explicit single-file alpha/r scaling; PEFT uses its own configuration.
+    #[arg(long, requires = "image_lora")]
+    pub image_lora_alpha: Option<f32>,
+}
+
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+fn composed_model_name(base: &str, composition: &serde_json::Value) -> anyhow::Result<String> {
+    let Some(adapter) = composition.get("lora") else {
+        return Ok(base.to_owned());
+    };
+    let identity = adapter["identity"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing admitted image LoRA identity"))?;
+    anyhow::ensure!(
+        identity.len() == 64 && identity.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid image LoRA identity"
+    );
+    Ok(format!("{base}:lora:{}", &identity[..16]))
 }
 
 impl ImageProductArgs {
+    fn lora_config(&self) -> anyhow::Result<Option<configuration::ImageLoraConfig>> {
+        use ferrum_quantization::linear_adapter::{LinearAdapterScaling, LinearAdapterSource};
+        let Some(path) = &self.image_lora else {
+            return Ok(None);
+        };
+        let source = if std::fs::metadata(path)?.is_dir() {
+            anyhow::ensure!(
+                self.image_lora_alpha.is_none(),
+                "PEFT image LoRA uses alpha from adapter_config.json"
+            );
+            LinearAdapterSource::Peft {
+                directory: path.clone(),
+                base_model: self.image_lora_base_model.clone(),
+            }
+        } else {
+            LinearAdapterSource::Diffusers {
+                file: path.clone(),
+                base_model: self.image_lora_base_model.clone().ok_or_else(|| {
+                    anyhow::anyhow!("a single-file image LoRA requires --image-lora-base-model")
+                })?,
+                scaling: self
+                    .image_lora_alpha
+                    .map_or(LinearAdapterScaling::Unit, |alpha| {
+                        LinearAdapterScaling::Alpha { alpha }
+                    }),
+            }
+        };
+        let strength = self.image_lora_strength.unwrap_or(1.0);
+        anyhow::ensure!(strength.is_finite(), "image LoRA strength must be finite");
+        Ok(Some(configuration::ImageLoraConfig { source, strength }))
+    }
     pub fn source(
         &self,
         model: Option<&str>,
@@ -61,14 +121,15 @@ impl ImageProductArgs {
     ) -> anyhow::Result<Option<ImageProductSource>> {
         if let Some(path) = &self.image_config {
             anyhow::ensure!(
-                model.is_none() && self.image_cudnn_library.is_none() && self.image_precision.is_none(),
+                model.is_none() && self.image_cudnn_library.is_none() && self.image_precision.is_none()
+                    && self.image_lora.is_none(),
                 "--image-config cannot be combined with MODEL, --image-cudnn-library, or --image-precision; set precision_policy in the JSON backend"
             );
             return Ok(Some(ImageProductSource::ExplicitConfig(path.clone())));
         }
         let Some(path) = directory::discover(model)? else {
             anyhow::ensure!(
-                self.image_cudnn_library.is_none() && self.image_precision.is_none(),
+                self.image_cudnn_library.is_none() && self.image_precision.is_none() && self.image_lora.is_none(),
                 "--image-cudnn-library and --image-precision require a registered image pipeline directory"
             );
             return Ok(None);
@@ -83,7 +144,8 @@ impl ImageProductArgs {
                 gpu_devices,
                 self.image_cudnn_library.clone(),
             )?
-            .with_precision(self.image_precision.unwrap_or_default())?,
+            .with_precision(self.image_precision.unwrap_or_default())?
+            .with_lora(self.lora_config()?)?,
         }))
     }
 }
@@ -138,6 +200,10 @@ pub fn validate_cli_matches(
             "height",
             "image_cudnn_library",
             "image_precision",
+            "image_lora",
+            "image_lora_strength",
+            "image_lora_base_model",
+            "image_lora_alpha",
         ] {
             anyhow::ensure!(
                 !(args.try_contains_id(id).unwrap_or(false)
@@ -177,6 +243,10 @@ pub fn validate_cli_matches(
         "max_num_seqs",
         "image_cudnn_library",
         "image_precision",
+        "image_lora",
+        "image_lora_strength",
+        "image_lora_base_model",
+        "image_lora_alpha",
     ];
     let definition = definition
         .find_subcommand(command)

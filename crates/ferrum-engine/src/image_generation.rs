@@ -53,10 +53,13 @@ mod residency;
 pub mod service;
 mod stage;
 mod stream_requirements;
-pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources};
+pub use assets::{
+    ImageAssetReceipt, ImageLoraReceipt, QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources,
+};
 pub use attention_policy::ImageCudaAttentionPolicy;
 pub use host_cache::{
-    ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy, ImageTextEncoderFp8CacheRequirements,
+    ImageFp8HostCacheBudgets, ImageFp8HostCachePolicy, ImageLoraHostRequirements,
+    ImageTextEncoderFp8CacheRequirements,
 };
 pub use plan_cache::{ImagePlanCachePolicy, ImagePlanCacheReceipt};
 /// Shared component precision contract; keep the original CUDA spelling compatible.
@@ -310,6 +313,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         config: ImagePipelineConfig,
     ) -> anyhow::Result<Self> {
         config.validate()?;
+        ensure!(
+            assets.lora.is_none() || assets.lora_materializer.is_some(),
+            "image LoRA must be admitted and registered by the backend composition root"
+        );
         ensure!(
             config.device_capacity_bytes <= runtime.descriptor().total_memory_bytes,
             "component capacity exceeds physical device descriptor"
