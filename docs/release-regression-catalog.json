@@ -557,7 +557,7 @@
     {
       "path": "README.md",
       "before_sha256": "e22a286a25b8d1b2b54513d2ebfacf52effc907f1e5091305199344c0d80ea73",
-      "after_sha256": "a79571d606783a2cdb21af99647e501c57075821d48057e192beb5fc855def52",
+      "after_sha256": "95df143e981870e6ae0fbf76712778ec013863d4634bb334abbcb36fc917bf8b",
       "areas": [
         "build",
         "backend_submission",
@@ -568,12 +568,12 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the post-v0.16.0 publication README update: the release label identifies Metal Qwen-Image generation and single-PNG editing with GGUF DiT. Metal scope remains 1024x1024 on M4 16 GiB with the documented Q4_K_M DiT, FP8 text encoder and BF16 vision/VAE configuration; no 2K outcome, Metal concurrency, throughput or SLO claim is added. CUDA image throughput values remain unchanged, explicitly labeled as historical v0.15.0 candidate evidence with the original source link; text throughput remains historical 0.13 evidence. Retain all existing distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution or publication result."
+      "rationale": "Reviewed the changes since v0.16.0: the release label and Metal scope describe 1024x1024 generation and single-PNG editing on M4 16 GiB with Q4_K_M DiT, FP8 text encoder and BF16 vision/VAE. CUDA directory defaults document automatic between-batch scheduling, capacity-only candidate reduction, 2K admission, bounded queues/output overlap, Host-aware text caching, retained shape plans and automatic convolution workspace selection; explicit JSON retains configured behavior. The image benchmark and lifecycle probe document resource sampling limits and observed recovery rather than treating client actions or incomplete samples as successful evidence. CUDA throughput remains explicitly historical v0.15.0 candidate evidence; no Auto throughput or SLO claim is added. Retain distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution or publication result."
     },
     {
       "path": "README_zh.md",
       "before_sha256": "fc70122d4610c5d0cb9521fa14034ab947a58709b7afafdb2e346251f0ed32f1",
-      "after_sha256": "5fcdad1b4cf1ec34bf17d73931b4ed315e2f6ee00fed3116980d2c6e002fb218",
+      "after_sha256": "88e4dfce0e881f6d89bafcc9f472a753d3e125f90d41807af2092fec22e4c2cb",
       "areas": [
         "build",
         "backend_submission",
@@ -584,7 +584,7 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the post-v0.16.0 publication README update: the release label identifies Metal Qwen-Image generation and single-PNG editing with GGUF DiT. Metal scope remains 1024x1024 on M4 16 GiB with the documented Q4_K_M DiT, FP8 text encoder and BF16 vision/VAE configuration; no 2K outcome, Metal concurrency, throughput or SLO claim is added. CUDA image throughput values remain unchanged, explicitly labeled as historical v0.15.0 candidate evidence with the original source link; text throughput remains historical 0.13 evidence. Retain all existing distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution or publication result."
+      "rationale": "Reviewed the changes since v0.16.0 in the Chinese README: the release label and Metal scope describe 1024x1024 generation and single-PNG editing on M4 16 GiB with Q4_K_M DiT, FP8 text encoder and BF16 vision/VAE. CUDA directory defaults now document cuDNN SDPA, request-scoped edit-prefix reuse, bounded multi-shape plan caching and capacity-checked 2048x2048 support; Metal retains its configured scheduling and 1024x1024 bound. CUDA throughput remains explicitly historical v0.15.0 candidate evidence; no Auto throughput, Metal concurrency or SLO claim is added. Retain distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution or publication result."
     }
   ],
   "release_profile_ids": [
