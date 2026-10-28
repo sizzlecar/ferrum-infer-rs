@@ -259,10 +259,6 @@ pub(super) struct CandidatePlanCache<'a, R: DeviceRuntime> {
     _serial: MutexGuard<'a, ()>,
 }
 impl<R: DeviceRuntime> CandidatePlanCache<'_, R> {
-    pub(super) fn commit(mut self) {
-        self.committed = true;
-    }
-
     /// Finish serialized compilation, retaining rollback ownership until the
     /// prepared request actually starts. Later candidates use disjoint insertion
     /// intervals, so cancelling this request cannot remove their new entries.

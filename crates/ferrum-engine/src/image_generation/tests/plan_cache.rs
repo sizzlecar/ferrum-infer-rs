@@ -713,7 +713,7 @@ fn successful_candidate_reuses_exact_compiled_owners_after_commit() {
     let candidate = pipeline.plan_cache.begin_candidate().unwrap();
     let prepared = cached_projection(&pipeline, ImageStage::Denoiser, 1);
     let weak = Arc::downgrade(&prepared.component);
-    candidate.commit();
+    candidate.defer().unwrap().commit();
     drop(prepared);
     let cached = cached_projection(&pipeline, ImageStage::Denoiser, 1);
     assert!(cached.plan.plan_cache_hit);
