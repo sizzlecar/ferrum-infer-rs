@@ -57,6 +57,19 @@ fn explicit_padding_and_library_workspace_have_disjoint_checked_layout() {
     );
     assert_eq!((s.elements, s.operations), (144, 7776));
     assert_eq!(s.native.stride, [2, 1]);
+    let actual = s.with_workspace(64).unwrap();
+    assert_eq!(
+        (
+            actual.padding_bytes,
+            actual.workspace_offset,
+            actual.workspace_bytes,
+            actual.scratch_bytes
+        ),
+        (504, 512, 64, 576)
+    );
+    assert_eq!(actual.native, s.native);
+    assert_eq!(s.with_workspace(0).unwrap().scratch_bytes, 512);
+    assert!(s.with_workspace(u64::MAX).is_err());
 }
 
 #[test]

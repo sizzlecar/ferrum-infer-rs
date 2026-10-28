@@ -43,7 +43,14 @@ impl ImageExecutionProfile {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServingConfig {
+    /// Omission preserves legacy explicit-JSON scheduling semantics.
+    #[serde(default)]
+    pub batching: ferrum_types::ImageBatchPolicy,
     pub maximum_pending: usize,
+    /// Queued prompt and encoded edit input bytes. When omitted, reserve a
+    /// half of the backend's Host input budget for queued requests.
+    #[serde(default)]
+    pub maximum_pending_bytes: Option<std::num::NonZeroUsize>,
     pub maximum_prompt_bytes: usize,
     pub max_num_seqs: usize,
     pub request_batch_max_wait_ms: u64,
@@ -54,7 +61,19 @@ pub struct ServingConfig {
     pub output: ferrum_types::OutputConfig,
 }
 impl ServingConfig {
+    pub fn resolve_pending_bytes(&mut self, host: &HostConfig) -> Result<()> {
+        if self.maximum_pending_bytes.is_none() {
+            self.maximum_pending_bytes = Some(host.default_pending_bytes()?);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.batching != ferrum_types::ImageBatchPolicy::Auto
+                || self.request_batch_max_wait_ms == 0,
+            "automatic image batching requires request_batch_max_wait_ms=0"
+        );
         ensure!(
             (1..=ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&self.max_num_seqs),
             "max_num_seqs exceeds supported image batch capacity"
@@ -180,6 +199,9 @@ pub struct CudnnConfig {
     pub dependency_libraries: Vec<PathBuf>,
     pub opaque_memory_bytes: u64,
     pub workspace_limit_bytes: u64,
+    /// Omission preserves the configured limit; directory entrypoints use Auto.
+    #[serde(default)]
+    pub convolution_workspace: ferrum_engine::image_generation::ImageCudaConvolutionWorkspacePolicy,
     pub opaque_memory_profile: String,
 }
 #[derive(Debug, Deserialize)]
@@ -192,6 +214,13 @@ pub struct HostConfig {
     pub weight_backing_bytes: usize,
 }
 impl HostConfig {
+    pub fn default_pending_bytes(&self) -> Result<std::num::NonZeroUsize> {
+        // Queue ownership shares the Host input class with decoding and batch
+        // preparation. Keep half of that allowance available for active work.
+        std::num::NonZeroUsize::new(self.input_preprocess_bytes / 2)
+            .ok_or_else(|| anyhow::anyhow!("Host input budget cannot admit an image queue"))
+    }
+
     pub fn limits(&self) -> Result<HostMemoryLimits> {
         Ok(HostMemoryLimits::new(
             self.total_bytes,
@@ -389,7 +418,12 @@ impl ImageProductConfig {
             }
             ImageBackendConfig::Metal(metal) => metal.validate()?,
         }
-        if let Some(serving) = &config.serving {
+        if let Some(serving) = &mut config.serving {
+            let host = match &config.backend {
+                ImageBackendConfig::Cuda(cuda) => &cuda.host,
+                ImageBackendConfig::Metal(metal) => &metal.host,
+            };
+            serving.resolve_pending_bytes(host)?;
             serving.validate()?;
         }
         config.validate_execution_profile()?;
@@ -503,6 +537,7 @@ impl CudaConfig {
                 attention_policy: self.attention_policy,
                 precision_policy: self.precision_policy,
                 fp8_host_cache: self.fp8_host_cache,
+                convolution_workspace: self.cudnn.convolution_workspace,
                 cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
                     library_path: self.cudnn.library_path.clone(),
                     dependency_libraries: self.cudnn.dependency_libraries.clone(),

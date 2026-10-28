@@ -110,6 +110,55 @@ fn complete_root_uses_declared_roles_and_standard_archives() {
 }
 
 #[test]
+fn output_requirements_follow_decoder_batch_geometry_without_payload_allocation() {
+    let (pipeline, _directory) = super::adapter::pipeline(1);
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            1,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: 0,
+                transfer_staging_bytes: 0,
+                output_bytes: 1,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    let mut limits = ImagePipelineLimits {
+        maximum_user_tokens: 1024,
+        maximum_width: 2048,
+        maximum_height: 2048,
+        maximum_batch_size: STRUCTURED_ATTENTION_BF16_MAX_BATCH,
+        decoder_batch_policy: ImageDecoderBatchPolicy::SingleImage,
+        edit_prefix_policy: ImageEditPrefixPolicy::Recompute,
+        plan_cache: ImagePlanCachePolicy::LastPerStage,
+        residency: ImageResidencyPolicy::Cold,
+        dynamic_residency: ImageDynamicResidencyPolicy::Release,
+        static_initialization: StaticInitializationPolicy::new(256, 8).unwrap(),
+        executor: TensorExecutorConfig::default(),
+    };
+    let batch = pipeline.assets.output_requirements(&limits, &host).unwrap();
+    let decoder = pipeline.assets.decoder_batch(1, 128, 128).unwrap();
+    let frame = decoder
+        .output_tensor()
+        .unwrap()
+        .minimum_storage_bytes()
+        .unwrap() as usize;
+    assert_eq!(batch.raw_batch_bytes, frame * limits.maximum_batch_size);
+    assert!(batch.execution_output_bytes >= batch.raw_batch_bytes);
+    limits.maximum_batch_size = 1;
+    let single = pipeline.assets.output_requirements(&limits, &host).unwrap();
+    assert_eq!(single.raw_batch_bytes, frame);
+    assert_eq!(
+        single.execution_output_bytes,
+        batch.execution_output_bytes / batch.batch_size
+    );
+    limits.maximum_width = 2047;
+    assert!(pipeline.assets.output_requirements(&limits, &host).is_err());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
 fn absent_or_invalid_metadata_fails_before_opening_weight_payloads() {
     let (directory, _) = installation();
     let transformer = directory.path().join("transformer");

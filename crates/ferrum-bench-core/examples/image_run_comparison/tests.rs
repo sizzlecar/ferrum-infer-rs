@@ -16,6 +16,7 @@ fn fixture(repetitions: usize) -> (Workload, BenchInput) {
             width: 1,
             height: 1,
             num_inference_steps: Some(2),
+            mode: None,
         }],
     };
     let arm = || Arm {

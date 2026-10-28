@@ -98,7 +98,9 @@ fn request(seed: u64) -> ImageGenerationRequest {
 }
 fn config(batch: usize, wait: u64, pending: usize) -> ImageServiceConfig {
     ImageServiceConfig {
+        batching: ferrum_types::ImageBatchPolicy::Configured,
         maximum_pending: pending,
+        maximum_pending_bytes: 1024 * 1024,
         maximum_prompt_bytes: 1024,
         max_num_seqs: batch,
         request_batch_max_wait_ms: wait,

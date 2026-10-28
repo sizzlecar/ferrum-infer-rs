@@ -9,7 +9,8 @@ use super::{ImageEditRequest, ImageGenerationOutput, ImageGenerationRequest, Qwe
 use ferrum_models::qwen_image21::image_input::{
     png_dimensions_hint, ImageInputLimits, QwenImage21ImageProcessor,
 };
-use ferrum_runtime::{DeviceRuntime, HostMemoryAccount};
+use ferrum_runtime::{DeviceRuntime, HostMemoryAccount, HostMemoryClass, HostMemoryReservation};
+use ferrum_types::ImageBatchPolicy;
 use serde::Serialize;
 use std::{
     any::Any,
@@ -34,6 +35,13 @@ type GeneratorError = Box<dyn Error + Send + 'static>;
 /// retain their original owner until explicit service retirement.
 #[derive(Debug)]
 pub enum ImageBatchError {
+    /// Only preparation may return this variant. No device work was submitted.
+    Capacity {
+        proof: super::ImageDeviceCapacityExceeded,
+        diagnostic: String,
+    },
+    /// Explicit Host admission pressure; distinct from device capacity search.
+    Overloaded(String),
     /// Typed request input rejection, with no native work/recovery obligation.
     InvalidInput(String),
     Rejected(String),
@@ -47,6 +55,9 @@ impl From<GeneratorError> for ImageBatchError {
 impl fmt::Display for ImageBatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Capacity { diagnostic, .. } | Self::Overloaded(diagnostic) => {
+                f.write_str(diagnostic)
+            }
             Self::InvalidInput(message) => f.write_str(message),
             Self::Rejected(message) => f.write_str(message),
             Self::Fatal(error) => fmt::Display::fmt(error, f),
@@ -57,10 +68,47 @@ impl Error for ImageBatchError {}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ImageServiceConfig {
+    pub batching: ImageBatchPolicy,
     pub maximum_pending: usize,
+    pub maximum_pending_bytes: usize,
     pub maximum_prompt_bytes: usize,
     pub max_num_seqs: usize,
     pub request_batch_max_wait_ms: u64,
+}
+
+/// A single-use, generator-owned preparation. The default empty owner keeps
+/// existing generators usable; capacity-aware generators retain compiled plans.
+#[derive(Default)]
+pub struct ImageBatchPreparation(Option<Box<dyn Any + Send>>);
+impl ImageBatchPreparation {
+    pub fn new<T: Any + Send>(prepared: T) -> Self {
+        Self(Some(Box::new(prepared)))
+    }
+    pub fn into_inner<T: Any + Send>(self) -> Result<T, ImageBatchError> {
+        self.0
+            .and_then(|owner| owner.downcast::<T>().ok())
+            .map(|owner| *owner)
+            .ok_or_else(|| {
+                ImageBatchError::Rejected("image preparation belongs to another generator".into())
+            })
+    }
+}
+
+/// Preprocessed reference backing survives candidate reduction and requeueing.
+#[derive(Default)]
+pub struct ImageEditPreparation(Option<Box<dyn Any + Send>>, usize);
+impl ImageEditPreparation {
+    pub fn new<T: Any + Send>(prepared: T, retained_host_bytes: usize) -> Self {
+        Self(Some(Box::new(prepared)), retained_host_bytes)
+    }
+    pub fn get<T: Any + Send>(&self) -> Result<&T, ImageBatchError> {
+        self.0
+            .as_ref()
+            .and_then(|owner| owner.downcast_ref::<T>())
+            .ok_or_else(|| {
+                ImageBatchError::Rejected("edit preparation belongs to another generator".into())
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -71,6 +119,26 @@ pub struct ImageGeneratorCapabilities {
     pub dimension_multiple: u32,
 }
 
+/// Already-held protocol-independent resources that overlap engine execution.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ImagePreparationResources {
+    pub output_credit_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+pub enum ImageRequestRef<'a> {
+    Generate(&'a ImageGenerationRequest),
+    Edit(&'a ImageEditRequest),
+}
+impl ImageRequestRef<'_> {
+    fn generation(&self) -> &ImageGenerationRequest {
+        match self {
+            Self::Generate(request) => request,
+            Self::Edit(request) => &request.generation,
+        }
+    }
+}
+
 /// Implementations own their runtime and use one Host account for all jobs.
 /// Successful outputs correspond exactly to input order. Fatal errors must
 /// retain their original cleanup/recovery owners; formatting them is not a
@@ -78,6 +146,77 @@ pub struct ImageGeneratorCapabilities {
 /// remains usable and no recovery obligation exists. Compatibility must be deterministic and may
 /// only restrict the common width/height grouping enforced by this service.
 pub trait ImageGenerator: Send + 'static {
+    /// Exact physical Output peak from typed request/model metadata. This runs
+    /// before plan compilation to select a currently affordable FIFO prefix.
+    /// Legacy generators may leave the extra proof unavailable.
+    fn execution_output_bytes(
+        &self,
+        _requests: &[ImageRequestRef<'_>],
+    ) -> Result<Option<usize>, ImageBatchError> {
+        Ok(None)
+    }
+    /// Bound the retained preprocessed reference before allocating it. The
+    /// queue reserves this many waiting bytes across preparation and requeue.
+    fn edit_preparation_bytes(
+        &self,
+        _request: &ImageEditRequest,
+    ) -> Result<usize, ImageBatchError> {
+        Ok(0)
+    }
+    /// Preparation must never submit device work. Only a typed capacity error
+    /// permits the scheduler to reduce a candidate and prepare it again.
+    fn prepare_generation(
+        &mut self,
+        _requests: &[ImageGenerationRequest],
+    ) -> Result<ImageBatchPreparation, ImageBatchError> {
+        Ok(ImageBatchPreparation::default())
+    }
+    fn preprocess_edit(
+        &mut self,
+        _request: &ImageEditRequest,
+    ) -> Result<ImageEditPreparation, ImageBatchError> {
+        Ok(ImageEditPreparation::default())
+    }
+    fn prepare_edits(
+        &mut self,
+        _requests: &[(&ImageEditRequest, &ImageEditPreparation)],
+    ) -> Result<ImageBatchPreparation, ImageBatchError> {
+        Ok(ImageBatchPreparation::default())
+    }
+    /// Obtain execution credit for an already compiled preparation. `false`
+    /// means externally held output capacity can be released; the same token
+    /// remains valid for a later retry, without compiling or decoding again.
+    fn try_admit_prepared(
+        &mut self,
+        _prepared: &mut ImageBatchPreparation,
+        _resources: ImagePreparationResources,
+    ) -> Result<bool, ImageBatchError> {
+        Ok(true)
+    }
+    fn execute_generation(
+        &mut self,
+        prepared: ImageBatchPreparation,
+        requests: Vec<ImageGenerationRequest>,
+    ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError> {
+        if prepared.0.is_some() {
+            return Err(ImageBatchError::Rejected(
+                "generator did not consume its prepared plan".into(),
+            ));
+        }
+        self.generate_batch(requests)
+    }
+    fn execute_edits(
+        &mut self,
+        prepared: ImageBatchPreparation,
+        requests: Vec<ImageEditRequest>,
+    ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError> {
+        if prepared.0.is_some() {
+            return Err(ImageBatchError::Rejected(
+                "generator did not consume its prepared edit plan".into(),
+            ));
+        }
+        self.edit_batch(requests)
+    }
     fn host_account(&self) -> &HostMemoryAccount;
     /// Metadata-only validation: this method must not initialize work or create
     /// recovery obligations. Execution failures belong to `generate_batch`.
@@ -129,6 +268,56 @@ pub trait ImageGenerator: Send + 'static {
 }
 
 impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
+    fn execution_output_bytes(
+        &self,
+        requests: &[ImageRequestRef<'_>],
+    ) -> Result<Option<usize>, ImageBatchError> {
+        self.service_execution_output_bytes(requests)
+            .map(Some)
+            .map_err(preparation_error)
+    }
+    fn try_admit_prepared(
+        &mut self,
+        prepared: &mut ImageBatchPreparation,
+        resources: ImagePreparationResources,
+    ) -> Result<bool, ImageBatchError> {
+        self.try_admit_service_prepared(prepared, &resources)
+    }
+    fn prepare_generation(
+        &mut self,
+        requests: &[ImageGenerationRequest],
+    ) -> Result<ImageBatchPreparation, ImageBatchError> {
+        self.prepare_service_generation(requests)
+    }
+    fn edit_preparation_bytes(&self, request: &ImageEditRequest) -> Result<usize, ImageBatchError> {
+        self.prepare_service_edit_bytes(request)
+    }
+    fn preprocess_edit(
+        &mut self,
+        request: &ImageEditRequest,
+    ) -> Result<ImageEditPreparation, ImageBatchError> {
+        self.preprocess_service_edit(request)
+    }
+    fn prepare_edits(
+        &mut self,
+        requests: &[(&ImageEditRequest, &ImageEditPreparation)],
+    ) -> Result<ImageBatchPreparation, ImageBatchError> {
+        self.prepare_service_edits(requests)
+    }
+    fn execute_generation(
+        &mut self,
+        prepared: ImageBatchPreparation,
+        requests: Vec<ImageGenerationRequest>,
+    ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError> {
+        self.execute_service_generation(prepared, requests)
+    }
+    fn execute_edits(
+        &mut self,
+        prepared: ImageBatchPreparation,
+        requests: Vec<ImageEditRequest>,
+    ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError> {
+        self.execute_service_edits(prepared, requests)
+    }
     fn supports_edits(&self) -> bool {
         QwenImage21Pipeline::supports_edits(self)
     }
@@ -198,6 +387,37 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
             Ok(outputs) => Ok(outputs),
             Err(error) => Err(qwen_batch_error(self.is_stopped(), error)),
         }
+    }
+}
+
+fn preparation_error(error: anyhow::Error) -> ImageBatchError {
+    if let Some(capacity) = error.downcast_ref::<super::ImageDeviceCapacityExceeded>() {
+        return ImageBatchError::Capacity {
+            proof: *capacity,
+            diagnostic: format!("image preflight: {error:#}"),
+        };
+    }
+    use ferrum_models::qwen_image21::image_input::ImageInputError;
+    if error.chain().any(|source| {
+        matches!(
+            source.downcast_ref::<ferrum_runtime::HostMemoryError>(),
+            Some(ferrum_runtime::HostMemoryError::Capacity { .. })
+        )
+    }) {
+        return ImageBatchError::Overloaded(format!("image Host admission: {error:#}"));
+    }
+    if matches!(
+        error.downcast_ref::<ImageInputError>(),
+        Some(
+            ImageInputError::Invalid(_)
+                | ImageInputError::Unsupported(_)
+                | ImageInputError::Limit(_)
+                | ImageInputError::Png(_)
+        )
+    ) {
+        ImageBatchError::InvalidInput(format!("image input: {error:#}"))
+    } else {
+        ImageBatchError::Rejected(format!("image preparation: {error:#}"))
     }
 }
 
@@ -280,6 +500,15 @@ pub struct ImageServiceSnapshot {
     pub accepting: bool,
     pub active_requests: usize,
     pub pending_requests: usize,
+    pub preparing_requests: usize,
+    pub pending_bytes: usize,
+    pub maximum_pending_bytes: usize,
+    pub rejected_requests: u64,
+    pub executed_batches: u64,
+    pub executed_requests: u64,
+    pub last_batch_size: usize,
+    pub capacity_reductions: u64,
+    pub batching: ImageBatchPolicy,
     pub maximum_pending: usize,
     pub max_num_seqs: usize,
 }
@@ -296,6 +525,13 @@ pub struct ImageService {
 }
 
 impl ImageService {
+    /// Fixed ownership cost of one production request before prompt, encoded
+    /// reference and preprocessing backing. Queue storage is admitted separately
+    /// because deque slots coexist with requests moved into an executing batch.
+    pub fn minimum_pending_request_bytes() -> usize {
+        std::mem::size_of::<Queued<ImageGenerationOutput>>()
+    }
+
     pub fn new<P: ImageGenerator>(
         generator: P,
         config: ImageServiceConfig,
@@ -314,7 +550,11 @@ impl ImageService {
             ));
         }
         Ok(Self {
-            core: ServiceCore::start(Box::new(GeneratorAdapter(generator)), config)?,
+            core: ServiceCore::start_with_host(
+                Box::new(GeneratorAdapter(generator)),
+                config,
+                Some(host.clone()),
+            )?,
             host,
             capabilities,
             supports_edits,
@@ -372,9 +612,40 @@ impl ImageService {
         request: ImageGenerationRequest,
     ) -> Result<ImageJob, ImageServiceError> {
         self.validate_request(&request)?;
+        self.core.try_submit(request).map(|inner| ImageJob {
+            inner,
+            output: None,
+        })
+    }
+
+    /// Queue only the request and gate metadata. Output credit is acquired by
+    /// the worker for the executable FIFO prefix, immediately before prepare.
+    pub fn try_submit_with_output(
+        &self,
+        request: ImageGenerationRequest,
+        gate: Arc<dyn ImageOutputGate>,
+    ) -> Result<ImageJob, ImageServiceError> {
+        self.validate_request(&request)?;
+        self.submit_with_output(QueuedRequest::Generate(request), gate)
+    }
+
+    fn submit_with_output(
+        &self,
+        request: QueuedRequest,
+        gate: Arc<dyn ImageOutputGate>,
+    ) -> Result<ImageJob, ImageServiceError> {
+        let (response, receiver) = oneshot::channel();
+        let output = QueuedOutput {
+            gate,
+            lease: None,
+            response,
+        };
         self.core
-            .try_submit(request)
-            .map(|inner| ImageJob { inner })
+            .try_submit_request_with_output(request, Some(output))
+            .map(|inner| ImageJob {
+                inner,
+                output: Some(receiver),
+            })
     }
 
     pub fn validate_edit_request(
@@ -402,8 +673,20 @@ impl ImageService {
     ) -> Result<ImageJob, ImageServiceError> {
         self.validate_edit_request(&request)?;
         self.core
-            .try_submit_request(QueuedRequest::Edit(request))
-            .map(|inner| ImageJob { inner })
+            .try_submit_request(QueuedRequest::Edit(request, None))
+            .map(|inner| ImageJob {
+                inner,
+                output: None,
+            })
+    }
+
+    pub fn try_submit_edit_with_output(
+        &self,
+        request: ImageEditRequest,
+        gate: Arc<dyn ImageOutputGate>,
+    ) -> Result<ImageJob, ImageServiceError> {
+        self.validate_edit_request(&request)?;
+        self.submit_with_output(QueuedRequest::Edit(request, None), gate)
     }
 
     /// Stops admission, discards queued requests, lets active work reach its
@@ -419,6 +702,7 @@ impl ImageService {
 
 pub struct ImageJob {
     inner: Job<ImageGenerationOutput>,
+    output: Option<oneshot::Receiver<ImageOutputLease>>,
 }
 impl ImageJob {
     /// Cancellation suppresses delivery, not active backend execution.
@@ -427,6 +711,24 @@ impl ImageJob {
     }
     pub async fn wait(self) -> Result<ImageGenerationOutput, ImageServiceError> {
         self.inner.wait().await
+    }
+    pub async fn wait_with_output(
+        self,
+    ) -> Result<(ImageGenerationOutput, ImageOutputLease), ImageServiceError> {
+        let output = self.inner.wait().await?;
+        let receiver = self.output.ok_or_else(|| {
+            service_error(
+                ImageServiceErrorKind::Generation,
+                "image job has no output admission gate",
+            )
+        })?;
+        let lease = receiver.await.map_err(|_| {
+            service_error(
+                ImageServiceErrorKind::Generation,
+                "image output admission owner was not delivered",
+            )
+        })?;
+        Ok((output, lease))
     }
 }
 
@@ -488,6 +790,7 @@ fn validate_config(
         )
     };
     if config.maximum_pending == 0
+        || config.maximum_pending_bytes == 0
         || config.maximum_prompt_bytes == 0
         || config.max_num_seqs == 0
         || config.max_num_seqs > caps.maximum_batch_size
@@ -518,6 +821,55 @@ fn validate_config(
 // outputs; production fixes the output to the managed image artifact above.
 trait BatchWorker: Send + 'static {
     type Output: Send + 'static;
+    fn execution_output_bytes(
+        &self,
+        _requests: &[&QueuedRequest],
+    ) -> Result<Option<usize>, ImageBatchError> {
+        Ok(None)
+    }
+    fn preparation_bytes(&self, _request: &QueuedRequest) -> Result<usize, ImageBatchError> {
+        Ok(0)
+    }
+    fn prepare(
+        &mut self,
+        _requests: &mut [&mut QueuedRequest],
+    ) -> Result<ImageBatchPreparation, ImageBatchError> {
+        Ok(ImageBatchPreparation::default())
+    }
+    fn try_admit_prepared(
+        &mut self,
+        _prepared: &mut ImageBatchPreparation,
+        _resources: ImagePreparationResources,
+    ) -> Result<bool, ImageBatchError> {
+        Ok(true)
+    }
+    fn execute(
+        &mut self,
+        _prepared: ImageBatchPreparation,
+        requests: Vec<QueuedRequest>,
+    ) -> Result<Vec<Self::Output>, ImageBatchError> {
+        if matches!(requests.first(), Some(QueuedRequest::Edit(..))) {
+            self.edit_batch(
+                requests
+                    .into_iter()
+                    .map(|request| match request {
+                        QueuedRequest::Edit(request, _) => request,
+                        _ => unreachable!("compatibility was checked before preparation"),
+                    })
+                    .collect(),
+            )
+        } else {
+            self.generate_batch(
+                requests
+                    .into_iter()
+                    .map(|request| match request {
+                        QueuedRequest::Generate(request) => request,
+                        _ => unreachable!("compatibility was checked before preparation"),
+                    })
+                    .collect(),
+            )
+        }
+    }
     fn compatible(&self, a: &ImageGenerationRequest, b: &ImageGenerationRequest) -> bool;
     fn generate_batch(
         &mut self,
@@ -553,6 +905,118 @@ trait BatchWorker: Send + 'static {
 struct GeneratorAdapter<P>(P);
 impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
     type Output = ImageGenerationOutput;
+    fn execution_output_bytes(
+        &self,
+        requests: &[&QueuedRequest],
+    ) -> Result<Option<usize>, ImageBatchError> {
+        let requests: Vec<_> = requests
+            .iter()
+            .map(|request| match request {
+                QueuedRequest::Generate(request) => ImageRequestRef::Generate(request),
+                QueuedRequest::Edit(request, _) => ImageRequestRef::Edit(request),
+            })
+            .collect();
+        self.0.execution_output_bytes(&requests)
+    }
+    fn try_admit_prepared(
+        &mut self,
+        prepared: &mut ImageBatchPreparation,
+        resources: ImagePreparationResources,
+    ) -> Result<bool, ImageBatchError> {
+        self.0.try_admit_prepared(prepared, resources)
+    }
+    fn preparation_bytes(&self, request: &QueuedRequest) -> Result<usize, ImageBatchError> {
+        match request {
+            QueuedRequest::Generate(_) => Ok(0),
+            QueuedRequest::Edit(request, _) => self.0.edit_preparation_bytes(request),
+        }
+    }
+    fn prepare(
+        &mut self,
+        requests: &mut [&mut QueuedRequest],
+    ) -> Result<ImageBatchPreparation, ImageBatchError> {
+        if matches!(requests.first(), Some(QueuedRequest::Edit(..))) {
+            for request in requests.iter_mut() {
+                if let QueuedRequest::Edit(request, input @ None) = &mut **request {
+                    let bound = self.0.edit_preparation_bytes(request)?;
+                    let prepared = self.0.preprocess_edit(request)?;
+                    if prepared.1 > bound {
+                        return Err(ImageBatchError::Rejected(
+                            "edit preprocessing exceeded its declared retained Host bound".into(),
+                        ));
+                    }
+                    *input = Some(prepared);
+                }
+            }
+            let requests = requests
+                .iter()
+                .map(|request| match request {
+                    QueuedRequest::Edit(request, Some(input)) => (request, input),
+                    _ => unreachable!("compatible edit candidate"),
+                })
+                .collect::<Vec<_>>();
+            self.0.prepare_edits(&requests)
+        } else {
+            let prompt_bytes = requests
+                .iter()
+                .map(|request| request.generation().prompt.len())
+                .sum::<usize>();
+            let _prompt_charge = if prompt_bytes > 0 {
+                Some(
+                    self.0
+                        .host_account()
+                        .reserve(HostMemoryClass::InputPreprocess, prompt_bytes)
+                        .map_err(|error| preparation_error(error.into()))?,
+                )
+            } else {
+                None
+            };
+            let requests = requests
+                .iter()
+                .map(|request| request.generation().clone())
+                .collect::<Vec<_>>();
+            self.0.prepare_generation(&requests)
+        }
+    }
+    fn execute(
+        &mut self,
+        prepared: ImageBatchPreparation,
+        requests: Vec<QueuedRequest>,
+    ) -> Result<Vec<Self::Output>, ImageBatchError> {
+        let batch_size = requests.len();
+        let started = Instant::now();
+        let edit = matches!(requests.first(), Some(QueuedRequest::Edit(..)));
+        let outcome = if edit {
+            self.0.execute_edits(
+                prepared,
+                requests
+                    .into_iter()
+                    .map(|request| match request {
+                        QueuedRequest::Edit(request, _) => request,
+                        _ => unreachable!("compatible edit candidate"),
+                    })
+                    .collect(),
+            )
+        } else {
+            self.0.execute_generation(
+                prepared,
+                requests
+                    .into_iter()
+                    .map(|request| match request {
+                        QueuedRequest::Generate(request) => request,
+                        _ => unreachable!("compatible generation candidate"),
+                    })
+                    .collect(),
+            )
+        };
+        trace_request_timing(
+            if edit { "edit" } else { "generate" },
+            batch_size,
+            started,
+            outcome.as_deref(),
+        );
+        outcome
+    }
     fn maximum_edit_batch_size(&self) -> usize {
         self.0.maximum_edit_batch_size()
     }
@@ -622,9 +1086,12 @@ fn trace_request_timing(
                         target: "ferrum_engine::image_generation::timing",
                         request_kind,
                         job = output.receipt.job,
+                        width = output.receipt.width,
+                        height = output.receipt.height,
                         batch_size,
                         stage_index,
                         stage = ?plan.stage,
+                        role = ?plan.role,
                         stage_batch_size = plan.batch_size,
                         plan_cache_hit = plan.plan_cache_hit,
                         session_reused = execution.session_reused,
@@ -641,6 +1108,8 @@ fn trace_request_timing(
         }
         Err(error) => {
             let outcome = match error {
+                ImageBatchError::Capacity { .. } => "capacity",
+                ImageBatchError::Overloaded(_) => "overloaded",
                 ImageBatchError::InvalidInput(_) => "invalid_input",
                 ImageBatchError::Rejected(_) => "rejected",
                 ImageBatchError::Fatal(_) => "fatal",
@@ -659,15 +1128,25 @@ fn trace_request_timing(
 
 enum QueuedRequest {
     Generate(ImageGenerationRequest),
-    Edit(ImageEditRequest),
+    Edit(ImageEditRequest, Option<ImageEditPreparation>),
 }
 
 impl QueuedRequest {
     fn generation(&self) -> &ImageGenerationRequest {
         match self {
             Self::Generate(request) => request,
-            Self::Edit(request) => &request.generation,
+            Self::Edit(request, _) => &request.generation,
         }
+    }
+    fn pending_bytes(&self) -> usize {
+        self.generation()
+            .prompt
+            .capacity()
+            .saturating_add(match self {
+                Self::Edit(request, _) => request.image.backing_bytes(),
+                Self::Generate(_) => 0,
+            })
+            .saturating_add(ImageService::minimum_pending_request_bytes())
     }
 }
 
@@ -676,17 +1155,107 @@ struct Queued<O> {
     submitted: Instant,
     cancelled: Arc<AtomicBool>,
     response: oneshot::Sender<Result<O, ImageServiceError>>,
+    output: Option<QueuedOutput>,
+    _prompt_reservation: Option<HostMemoryReservation>,
+    preprocessing_bytes: usize,
+    preparation_duration: Duration,
+}
+impl<O> Queued<O> {
+    fn pending_bytes(&self) -> usize {
+        self.request
+            .pending_bytes()
+            .saturating_add(self.preprocessing_bytes)
+    }
 }
 struct State<O> {
     queue: VecDeque<Queued<O>>,
+    // Field order frees the deque before refunding its backing reservation.
+    queue_backing: Option<HostMemoryReservation>,
     accepting: bool,
     closing: bool,
     active: usize,
+    preparing: usize,
+    preparing_bytes: usize,
+    rejected: u64,
+    executed_batches: u64,
+    executed_requests: u64,
+    last_batch_size: usize,
+    capacity_reductions: u64,
+}
+impl<O> State<O> {
+    fn reserve_queue_slot(
+        &mut self,
+        host: Option<&HostMemoryAccount>,
+        maximum_pending: usize,
+    ) -> Result<(), ImageServiceError> {
+        let full = || {
+            service_error(
+                ImageServiceErrorKind::QueueFull,
+                "cannot grow the image request queue within its Host budget",
+            )
+        };
+        // A prepared candidate can return its tail while newer jobs arrive.
+        // Its slots remain available, so requeue never allocates implicitly.
+        let required = self
+            .queue
+            .len()
+            .checked_add(self.preparing)
+            .and_then(|slots| slots.checked_add(1))
+            .ok_or_else(full)?;
+        if required <= self.queue.capacity() {
+            return Ok(());
+        }
+        let mut capacity = self
+            .queue
+            .capacity()
+            .saturating_mul(2)
+            .max(required)
+            .min(maximum_pending);
+        // Reserve the complete replacement while the old allocation remains
+        // charged. This covers allocation/copy peak, not just the net growth.
+        let reserve = |capacity: usize| {
+            let bytes = capacity
+                .checked_mul(std::mem::size_of::<Queued<O>>())
+                .filter(|bytes| *bytes <= isize::MAX as usize)
+                .ok_or_else(full)?;
+            host.map(|host| host.reserve(HostMemoryClass::InputPreprocess, bytes))
+                .transpose()
+                .map_err(|error| {
+                    service_error(
+                        ImageServiceErrorKind::QueueFull,
+                        format!("image queue backing Host admission failed: {error}"),
+                    )
+                })
+        };
+        let reservation = match reserve(capacity) {
+            Ok(reservation) => reservation,
+            Err(_) if capacity > required => {
+                // Amortized growth is optional: admit the actual next slot if
+                // the geometric spare capacity would exceed the Host budget.
+                capacity = required;
+                reserve(capacity)?
+            }
+            Err(error) => return Err(error),
+        };
+        let mut queue = VecDeque::new();
+        queue.try_reserve_exact(capacity).map_err(|_| full())?;
+        // Keep the charged capacity equal to the retained allocation; never
+        // accept an allocator-provided larger deque on the smaller grant.
+        if queue.capacity() != capacity {
+            return Err(full());
+        }
+        queue.extend(self.queue.drain(..));
+        self.queue = queue;
+        self.queue_backing = reservation;
+        Ok(())
+    }
 }
 struct Shared<O> {
     state: Mutex<State<O>>,
     changed: Condvar,
+    resources: Arc<ResourceSignal>,
     config: ImageServiceConfig,
+    host: Option<HostMemoryAccount>,
 }
 impl<O> Shared<O> {
     fn lock(&self) -> MutexGuard<'_, State<O>> {
@@ -697,6 +1266,7 @@ impl<O> Shared<O> {
         state.accepting = false;
         state.closing = true;
         self.changed.notify_all();
+        self.resources.notify();
     }
 }
 struct Job<O> {
@@ -708,6 +1278,7 @@ impl<O> Job<O> {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.shared.changed.notify_all();
+        self.shared.resources.notify();
     }
     async fn wait(mut self) -> Result<O, ImageServiceError> {
         match self.receiver.take() {
@@ -735,29 +1306,37 @@ struct ServiceCore<O: Send + 'static> {
     join: Mutex<Option<JoinHandle<Retirement<O>>>>,
 }
 impl<O: Send + 'static> ServiceCore<O> {
+    #[cfg(test)]
     fn start(
         worker: Box<dyn BatchWorker<Output = O>>,
         config: ImageServiceConfig,
     ) -> Result<Self, ImageServiceError> {
-        // Reserve queue metadata once, before any request/backend call.
-        let mut queue = VecDeque::new();
-        queue
-            .try_reserve_exact(config.maximum_pending)
-            .map_err(|_| {
-                service_error(
-                    ImageServiceErrorKind::InvalidRequest,
-                    "cannot reserve bounded image request queue",
-                )
-            })?;
+        Self::start_with_host(worker, config, None)
+    }
+    fn start_with_host(
+        worker: Box<dyn BatchWorker<Output = O>>,
+        config: ImageServiceConfig,
+        host: Option<HostMemoryAccount>,
+    ) -> Result<Self, ImageServiceError> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                queue,
+                queue: VecDeque::new(),
+                queue_backing: None,
                 accepting: true,
                 closing: false,
                 active: 0,
+                preparing: 0,
+                preparing_bytes: 0,
+                rejected: 0,
+                executed_batches: 0,
+                executed_requests: 0,
+                last_batch_size: 0,
+                capacity_reductions: 0,
             }),
             changed: Condvar::new(),
+            resources: Arc::new(ResourceSignal::default()),
             config,
+            host,
         });
         let thread_shared = shared.clone();
         let join = thread::Builder::new()
@@ -780,7 +1359,21 @@ impl<O: Send + 'static> ServiceCore<O> {
         ImageServiceSnapshot {
             accepting: state.accepting,
             active_requests: state.active,
-            pending_requests: state.queue.len(),
+            pending_requests: state.queue.len() + state.preparing,
+            preparing_requests: state.preparing,
+            pending_bytes: state
+                .queue
+                .iter()
+                .map(|job| job.pending_bytes())
+                .sum::<usize>()
+                + state.preparing_bytes,
+            maximum_pending_bytes: self.shared.config.maximum_pending_bytes,
+            rejected_requests: state.rejected,
+            executed_batches: state.executed_batches,
+            executed_requests: state.executed_requests,
+            last_batch_size: state.last_batch_size,
+            capacity_reductions: state.capacity_reductions,
+            batching: self.shared.config.batching,
             maximum_pending: self.shared.config.maximum_pending,
             max_num_seqs: self.shared.config.max_num_seqs,
         }
@@ -789,6 +1382,13 @@ impl<O: Send + 'static> ServiceCore<O> {
         self.try_submit_request(QueuedRequest::Generate(request))
     }
     fn try_submit_request(&self, request: QueuedRequest) -> Result<Job<O>, ImageServiceError> {
+        self.try_submit_request_with_output(request, None)
+    }
+    fn try_submit_request_with_output(
+        &self,
+        request: QueuedRequest,
+        output: Option<QueuedOutput>,
+    ) -> Result<Job<O>, ImageServiceError> {
         let mut state = self.shared.lock();
         prune_cancelled(&mut state.queue);
         if !state.accepting {
@@ -797,11 +1397,51 @@ impl<O: Send + 'static> ServiceCore<O> {
                 "image service is stopped",
             ));
         }
-        if state.queue.len() >= self.shared.config.maximum_pending {
+        let queued_bytes = state
+            .queue
+            .iter()
+            .map(|job| job.pending_bytes())
+            .sum::<usize>();
+        if state.queue.len() + state.preparing >= self.shared.config.maximum_pending
+            || queued_bytes
+                .saturating_add(state.preparing_bytes)
+                .saturating_add(request.pending_bytes())
+                > self.shared.config.maximum_pending_bytes
+        {
+            state.rejected = state.rejected.saturating_add(1);
             return Err(service_error(
                 ImageServiceErrorKind::QueueFull,
-                "image pending queue is full",
+                "image pending queue count or Host byte budget is full",
             ));
+        }
+        let prompt_reservation = self
+            .shared
+            .host
+            .as_ref()
+            .map(|host| {
+                host.reserve(
+                    HostMemoryClass::InputPreprocess,
+                    request
+                        .generation()
+                        .prompt
+                        .capacity()
+                        .saturating_add(ImageService::minimum_pending_request_bytes()),
+                )
+            })
+            .transpose()
+            .map_err(|error| {
+                state.rejected = state.rejected.saturating_add(1);
+                service_error(
+                    ImageServiceErrorKind::QueueFull,
+                    format!("image queue Host admission failed: {error}"),
+                )
+            })?;
+        if let Err(error) = state.reserve_queue_slot(
+            self.shared.host.as_ref(),
+            self.shared.config.maximum_pending,
+        ) {
+            state.rejected = state.rejected.saturating_add(1);
+            return Err(error);
         }
         let (response, receiver) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -810,6 +1450,10 @@ impl<O: Send + 'static> ServiceCore<O> {
             submitted: Instant::now(),
             cancelled: cancelled.clone(),
             response,
+            output,
+            _prompt_reservation: prompt_reservation,
+            preprocessing_bytes: 0,
+            preparation_duration: Duration::ZERO,
         });
         self.shared.changed.notify_one();
         Ok(Job {
@@ -891,219 +1535,28 @@ fn reject_pending<O>(state: &mut State<O>, kind: ImageServiceErrorKind) {
             "image service stopped before execution",
         )));
     }
+    // Terminal shutdown releases both the retained allocation and its charge.
+    state.queue = VecDeque::new();
+    state.queue_backing.take();
 }
 
-fn take_batch<O: Send + 'static>(
-    worker: &dyn BatchWorker<Output = O>,
-    shared: &Shared<O>,
-) -> Option<Vec<Queued<O>>> {
-    let mut state = shared.lock();
-    loop {
-        prune_cancelled(&mut state.queue);
-        if state.closing {
-            reject_pending(&mut state, ImageServiceErrorKind::Shutdown);
-            return None;
-        }
-        let Some(first) = state.queue.front() else {
-            state = shared
-                .changed
-                .wait(state)
-                .unwrap_or_else(|e| e.into_inner());
-            continue;
-        };
-        let maximum_batch = match &first.request {
-            QueuedRequest::Generate(_) => shared.config.max_num_seqs,
-            QueuedRequest::Edit(_) => shared
-                .config
-                .max_num_seqs
-                .min(worker.maximum_edit_batch_size().max(1)),
-        };
-        let mut count = 1;
-        let mut incompatible = false;
-        for job in state
-            .queue
-            .iter()
-            .skip(1)
-            .take(maximum_batch.saturating_sub(1))
-        {
-            let compatible = job.request.generation().width == first.request.generation().width
-                && job.request.generation().height == first.request.generation().height
-                && match (&first.request, &job.request) {
-                    (QueuedRequest::Generate(a), QueuedRequest::Generate(b)) => {
-                        worker.compatible(a, b)
-                    }
-                    (QueuedRequest::Edit(a), QueuedRequest::Edit(b)) => {
-                        worker.compatible_edits(a, b)
-                    }
-                    _ => false,
-                };
-            if !compatible {
-                incompatible = true;
-                break;
-            }
-            count += 1;
-        }
-        let deadline = first.submitted.checked_add(Duration::from_millis(
-            shared.config.request_batch_max_wait_ms,
-        ));
-        let remaining =
-            deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()));
-        if count == maximum_batch
-            || incompatible
-            || remaining.is_none()
-            || remaining == Some(Duration::ZERO)
-        {
-            state.active = count;
-            return Some(state.queue.drain(..count).collect());
-        }
-        state = shared
-            .changed
-            .wait_timeout(state, remaining.unwrap_or(Duration::ZERO))
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
-    }
-}
+mod output_budget;
+mod output_gate;
+mod preparation;
+pub use output_gate::{ImageOutputGate, ImageOutputGateError, ImageOutputLease};
+use output_gate::{QueuedOutput, ResourceSignal};
+mod scheduler;
+use scheduler::worker_loop;
 
-fn worker_loop<O: Send + 'static>(
-    mut worker: Box<dyn BatchWorker<Output = O>>,
-    shared: Arc<Shared<O>>,
-) -> Retirement<O> {
-    let run = catch_unwind(AssertUnwindSafe(|| {
-        while let Some(batch) = take_batch(worker.as_ref(), &shared) {
-            let mut requests = Vec::with_capacity(batch.len());
-            let mut responses = Vec::with_capacity(batch.len());
-            for job in batch {
-                requests.push(job.request);
-                responses.push((job.cancelled, job.response));
-            }
-            let outcome = catch_unwind(AssertUnwindSafe(|| {
-                if matches!(requests.first(), Some(QueuedRequest::Edit(_))) {
-                    let edits = requests
-                        .into_iter()
-                        .map(|request| match request {
-                            QueuedRequest::Edit(request) => Ok(request),
-                            QueuedRequest::Generate(_) => Err(ImageBatchError::Rejected(
-                                "mixed editing batch is unsupported".into(),
-                            )),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    worker.edit_batch(edits)
-                } else {
-                    let generated = requests
-                        .into_iter()
-                        .map(|request| match request {
-                            QueuedRequest::Generate(request) => Ok(request),
-                            QueuedRequest::Edit(_) => Err(ImageBatchError::Rejected(
-                                "mixed editing batch is unsupported".into(),
-                            )),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    worker.generate_batch(generated)
-                }
-            }));
-            let outcome = match outcome {
-                Ok(Ok(outputs)) if outputs.len() == responses.len() => Ok(outputs),
-                Ok(Ok(_)) => Err(ImageWorkerFailure::Generation(Box::new(service_error(
-                    ImageServiceErrorKind::Generation,
-                    "generator returned a different number of outputs than batch requests",
-                )))),
-                Ok(Err(
-                    error @ (ImageBatchError::Rejected(_) | ImageBatchError::InvalidInput(_)),
-                )) => {
-                    let (message, kind) = match error {
-                        ImageBatchError::InvalidInput(message) => {
-                            (message, ImageServiceErrorKind::InvalidRequest)
-                        }
-                        ImageBatchError::Rejected(message) => {
-                            (message, ImageServiceErrorKind::Generation)
-                        }
-                        ImageBatchError::Fatal(_) => unreachable!(),
-                    };
-                    shared.lock().active = 0;
-                    for (cancelled, response) in responses {
-                        let error = if cancelled.load(Ordering::Acquire) {
-                            service_error(
-                                ImageServiceErrorKind::Cancelled,
-                                "image response cancelled; batch preflight rejected",
-                            )
-                        } else {
-                            // A preflight rejection can be a server-side plan
-                            // problem as well as a request problem. Do not turn
-                            // every owner-free rejection into HTTP 400.
-                            service_error(kind, message.clone())
-                        };
-                        let _ = response.send(Err(error));
-                    }
-                    // Do not reopen admission or clear `closing`: shutdown may
-                    // have been requested while this batch was being prepared.
-                    continue;
-                }
-                Ok(Err(ImageBatchError::Fatal(error))) => {
-                    Err(ImageWorkerFailure::Generation(error))
-                }
-                Err(panic) => Err(ImageWorkerFailure::Panic(panic)),
-            };
-            match outcome {
-                Ok(outputs) => {
-                    for ((cancelled, response), output) in responses.into_iter().zip(outputs) {
-                        let result = if cancelled.load(Ordering::Acquire) {
-                            Err(service_error(
-                                ImageServiceErrorKind::Cancelled,
-                                "image response cancelled; active execution completed",
-                            ))
-                        } else {
-                            Ok(output)
-                        };
-                        let _ = response.send(result);
-                    }
-                    shared.lock().active = 0;
-                }
-                Err(failure) => {
-                    let (kind, message) = match &failure {
-                        ImageWorkerFailure::Generation(error) => (ImageServiceErrorKind::Generation,
-                            catch_unwind(AssertUnwindSafe(|| error.to_string()))
-                                .unwrap_or_else(|_| "image generation failed; error formatter panicked, original owner retained".to_owned())),
-                        ImageWorkerFailure::Panic(_) => (ImageServiceErrorKind::WorkerPanic, "image worker panicked; original owners retained".to_owned()),
-                    };
-                    let mut state = shared.lock();
-                    state.accepting = false;
-                    state.closing = true;
-                    state.active = 0;
-                    reject_pending(&mut state, ImageServiceErrorKind::Stopped);
-                    for (_, response) in responses {
-                        let _ = response.send(Err(service_error(kind, message.clone())));
-                    }
-                    return Some(failure);
-                }
-            }
-        }
-        None
-    }));
-    let mut failure = match run {
-        Ok(failure) => failure,
-        Err(panic) => Some(ImageWorkerFailure::Panic(panic)),
-    };
-    if failure.is_none() {
-        failure = match catch_unwind(AssertUnwindSafe(|| worker.shutdown())) {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(ImageWorkerFailure::Generation(error)),
-            Err(panic) => Some(ImageWorkerFailure::Panic(panic)),
-        };
-    }
-    {
-        let mut state = shared.lock();
-        state.accepting = false;
-        state.closing = true;
-        state.active = 0;
-        reject_pending(&mut state, ImageServiceErrorKind::Stopped);
-    }
-    Retirement {
-        worker: Some(worker),
-        failure,
-    }
-}
-
+#[cfg(test)]
+mod auto_tests;
+#[cfg(test)]
+mod edit_auto_tests;
 #[cfg(test)]
 mod edit_tests;
 #[cfg(test)]
+mod output_gate_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod timing_tests;

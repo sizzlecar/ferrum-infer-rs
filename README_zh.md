@@ -116,7 +116,7 @@ ferrum serve --model /path/to/Qwen-Image-2.1-Turbo --served-model-name qwen-imag
 
 HTTP：`POST /v1/images/generations` 接收 JSON，`POST /v1/images/edits` 接收 multipart。编辑支持单张 8 位 RGB/RGBA PNG，返回 PNG 的 `b64_json`；背景和细节可能重绘。
 
-本地目录预设最高支持 1024×1024；2K 及下表的常驻服务配置使用 `--image-config`。
+CUDA 本地目录默认启用 cuDNN SDPA、请求内编辑前缀复用和有界多形状计划缓存：每阶段最多 16 条，序列化编译元数据总计最多 128 MiB。`run` 和 `serve` 均按需填充缓存，不按上限预分配内存。CUDA 目录支持最高 2048×2048，执行前仍须通过容量检查；Metal 保持 1024×1024 和每阶段最近计划缓存。
 
 ### 对比 vLLM-Omni
 

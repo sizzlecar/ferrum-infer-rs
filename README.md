@@ -112,7 +112,46 @@ ferrum serve --model /path/to/Qwen-Image-2.1-Turbo --served-model-name qwen-imag
 
 HTTP: `POST /v1/images/generations` (JSON) and `POST /v1/images/edits` (multipart). Edits accept one 8-bit RGB/RGBA PNG; responses contain PNG as `b64_json`. Editing can redraw background/details.
 
-The local-directory preset supports up to 1024×1024. 2K and the resident service configurations measured below use `--image-config`.
+CUDA directory serving uses automatic image batching: an idle GPU starts available work immediately; compatible requests accumulated during execution form the next batch. No batch or gathering-delay option is required. `--max-num-seqs` optionally tightens the model/operator batch ceiling; it does not reserve that many images or select a fixed batch size. Capacity is checked before execution, and oversized candidates are reduced only on an explicit capacity rejection. Scheduling occurs between complete batches, so a large image can delay a later small image.
+
+CUDA directory defaults enable cuDNN SDPA, request-scoped edit-prefix reuse and a bounded multi-shape plan cache: up to 16 entries per stage and 128 MiB of serialized compilation metadata in total. Both `run` and `serve` grow this cache on demand; these limits do not preallocate memory.
+
+CUDA directory entrypoints also select convolution algorithms automatically. The selection ceiling comes from the device budget after declared opaque allowances and the largest component's execution weights. Compilation records each chosen deterministic algorithm and its actual workspace; full-plan admission still checks weights, activations and scratch together before execution. The ceiling is not preallocated. Attention keeps its separate workspace policy. Existing image JSON preserves `cudnn.workspace_limit_bytes`; setting `cudnn.convolution_workspace` to `"auto"` opts into the same automatic selection. The startup receipt records the resolved policy and selection ceiling.
+
+For a CUDA directory with FP8 text encoding, both entrypoints also retain the complete converted text encoder when observed available Host memory covers its model-derived cache size plus conversion, input, transfer and output allowances. Insufficient or unknown headroom keeps this cache off; no partial cache is selected. The startup composition receipt records the decision, observed headroom and effective Host limits. The availability snapshot accounts for process/cgroup limits but reserves no OS memory; actual allocations still require the shared Host account. Explicit image JSON and Metal keep their configured cache behavior.
+
+The CUDA directory also derives its Host output allowance from the declared image geometry and batch ceiling, including retained results and HTTP encoding backing from the previous batch alongside the next batch's readback and encoding requirements. It uses the same available-memory snapshot as the text encoder cache and limits expansion to the remaining headroom. The receipt distinguishes complete overlap capacity, a partial allowance, and the bounded fallback when headroom is unavailable. This budget does not preallocate image buffers; `ferrum run` derives it for one request, while serving still admits each batch against actual live Host bytes.
+
+The CUDA directory preset admits output sizes up to 2048×2048 subject to managed capacity; the Metal preset retains its 1024×1024 bound and configured scheduling. `ferrum run` directly executes one request. Pending requests are bounded by count and Host bytes (one half of the Host input allowance by default); exceeding queue admission limits returns HTTP 429. Queued requests retain small output metadata; Host encoding backing is reserved only for the next executable batch. Encoded transport credit is acquired after inference completes, so waiting for unread response bodies does not occupy the inference worker. Host capacity still bounds retained outputs, and a single output exceeding an immutable limit is rejected. The effective policy, limits, rejection count and actual batch counters are exposed in `/health` under `images.scheduler`.
+
+CUDA Auto derives its finite pending-request count from the 384 MiB pending-byte budget divided by the minimum queued-request metadata cost, independently of the batch ceiling. Actual metadata, prompt capacity, edit backing and prepared inputs consume the byte budget; queue storage grows on demand. Output session capacity also allows for completed responses still held by clients, using the Host output budget divided by the smallest encoded PNG as a conservative count bound. These counts do not preallocate request or response storage; actual Host and encoded-byte limits determine admission. Higher client concurrency can still reach those resource limits; report admission rejections separately from evidence of GPU saturation.
+
+Existing `--image-config` JSON keeps configured batching when `serving.batching` is omitted. Explicit JSON can select `"batching":"auto"` with `"request_batch_max_wait_ms":0`, and optionally set a positive `maximum_pending_bytes`. The historical measurements below used explicit resident service configurations; they do not establish the performance of automatic batching.
+
+`bench-images` can observe either local Ferrum or vLLM-Omni without changing server capacity. Supply an existing workload JSON and the actual server PID; the report path must be new:
+
+```sh
+ferrum bench-images --endpoint http://127.0.0.1:8000/v1/images/generations \
+  --model qwen-image --server-config "fixed service configuration and version" \
+  --dataset image-workload.json --output image-measurement.json \
+  --concurrency 8 --repetitions 3 --warmup-repetitions 1 \
+  --resource-server-pid 12345 --resource-process-scope process-tree \
+  --resource-gpu-index 0 --resource-sample-interval-ms 200
+```
+
+Resource monitoring is optional. Each warmup and measured round records its own process identity, physical GPU identity, sampling coverage, errors and observed peaks. Only complete measured windows contribute to aggregate peaks; every sampled peak remains a lower bound on the instantaneous peak. Linux process-tree RSS can count shared pages repeatedly. NVIDIA whole-device used memory includes other processes and driver allocations. Missing observations remain missing and make the command fail after saving the report. Boundary probes are outside request timers; periodic probes compete for CPU and driver resources during requests and can affect latency and throughput. Keep sampling settings identical in comparisons. For multiple sequential endpoints, provide one server PID per endpoint; repeat the GPU flag to sum explicitly selected physical devices.
+
+For local Ferrum lifecycle evidence, build the independent Rust example `probe_image_lifecycle`. It reads the same strict image dataset schema and a fixed prefix of samples; edit samples require `--edit-endpoint`. Keep datasets, reference PNGs and new report files outside the repository:
+
+```sh
+probe_image_lifecycle --endpoint http://127.0.0.1:8000/v1/images/generations \
+  --health-endpoint http://127.0.0.1:8000/health --model qwen-image \
+  --dataset /outside-repo/images-2k.json --output /outside-repo/hold-body.json \
+  --mode hold-body --requests 4 --hold-body-ms 15000 \
+  --observation-ms 60000 --request-timeout-ms 600000
+```
+
+`hold-body` obtains complete headers, waits without polling the body, then validates the PNG. `drop-body` instead drops that unread response after the wait. `cancel` drops the client request future after `--cancel-after-ms`; `observe-shutdown` records an externally controlled stop/restart, with optional `--recovery-delay-ms`. The probe never starts, stops or signals a service. Every mode records bounded `/health` scheduler/output/Host observations and issues normal recovery requests. Reports distinguish observed, not observed and failed findings; a client action alone does not prove server cancellation, disconnect handling or backpressure. Transport buffering can consume bytes while the application holds a body. HTTP 429, expected client actions and observed shutdown transport are counted separately; unexpected protocol, PNG or observation errors produce a failing exit after saving the report. Recovery success must be checked explicitly in the findings.
 
 ### Throughput vs vLLM-Omni
 

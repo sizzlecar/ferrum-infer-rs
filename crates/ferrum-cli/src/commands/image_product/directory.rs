@@ -25,11 +25,20 @@ pub struct DirectoryOptions {
     pub utilization: f64,
     pub maximum_memory_bytes: Option<NonZeroU64>,
     pub maximum_batch_size: usize,
+    pub batching: ferrum_types::ImageBatchPolicy,
     pub ordinal: usize,
     pub cudnn_library: Option<PathBuf>,
     pub precision: ferrum_engine::image_generation::ImageCudaPrecisionPolicy,
 }
 impl DirectoryOptions {
+    /// A direct invocation has exactly one image request, regardless of the
+    /// serving capacity ceiling supplied on the command line.
+    pub fn single_request(&self) -> Self {
+        let mut options = self.clone();
+        options.maximum_batch_size = 1;
+        options
+    }
+
     pub fn from_cli(
         utilization: f32,
         maximum: Option<std::num::NonZeroUsize>,
@@ -66,7 +75,14 @@ impl DirectoryOptions {
             maximum_memory_bytes: maximum
                 .map(|v| u64::try_from(v.get()).map(|n| NonZeroU64::new(n).unwrap()))
                 .transpose()?,
-            maximum_batch_size: batch.unwrap_or(1),
+            maximum_batch_size: batch.unwrap_or(match backend {
+                ImageBackendKind::Cuda => ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH,
+                ImageBackendKind::Metal => 1,
+            }),
+            batching: match backend {
+                ImageBackendKind::Cuda => ferrum_types::ImageBatchPolicy::Auto,
+                ImageBackendKind::Metal => ferrum_types::ImageBatchPolicy::Configured,
+            },
             ordinal,
             cudnn_library,
             precision: Default::default(),
@@ -113,19 +129,71 @@ impl DirectoryOptions {
         Ok(())
     }
     pub fn serving(&self) -> Result<ServingConfig> {
+        self.serving_with_output_bytes(self.host().output_bytes)
+    }
+    pub(super) fn serving_with_output_bytes(&self, output_bytes: usize) -> Result<ServingConfig> {
         self.validate()?;
-        let pending = self.maximum_batch_size.max(4);
+        let host = self.host();
+        let pending_bytes = host.default_pending_bytes()?;
+        let automatic_cuda = self.backend == ImageBackendKind::Cuda
+            && self.batching == ferrum_types::ImageBatchPolicy::Auto;
+        let pending = if automatic_cuda {
+            pending_bytes
+                .get()
+                .checked_div(
+                    ferrum_engine::image_generation::service::ImageService::minimum_pending_request_bytes(),
+                )
+                .filter(|count| *count > 0)
+                .context("Host pending budget cannot admit one image request")?
+        } else {
+            self.maximum_batch_size.max(4)
+        };
+        let active_sessions = pending
+            .checked_add(self.maximum_batch_size)
+            .context("image output session count overflows")?;
+        let max_sessions = if automatic_cuda {
+            use ferrum_output::png::{encoded_rgba8_png_bytes, PngDimensions, PngLimits};
+            // Every successful response owns at least a 1x1 PNG's bytes.
+            // JSON/base64 and physical alignment only increase that cost. This
+            // is a count ceiling, not a reservation or a chosen workload size.
+            let minimum_output_bytes = usize::try_from(encoded_rgba8_png_bytes(
+                PngDimensions::new(1, 1)?,
+                PngLimits::default(),
+            )?)?;
+            let completed_sessions = output_bytes / minimum_output_bytes;
+            let sessions = active_sessions
+                .checked_add(completed_sessions)
+                .context("automatic image output session count overflows")?;
+            ensure!(
+                sessions <= tokio::sync::Semaphore::MAX_PERMITS,
+                "automatic image output session count exceeds semaphore capacity"
+            );
+            sessions
+                .checked_mul(ferrum_output::TERMINAL_ERROR_BYTES)
+                .context("automatic image output error allowance exceeds address space")?;
+            sessions
+        } else {
+            active_sessions
+        };
         let serving = ServingConfig {
+            batching: self.batching,
             maximum_pending: pending,
+            maximum_pending_bytes: Some(pending_bytes),
             maximum_prompt_bytes: (1024 * 1024 / self.maximum_batch_size).min(65536),
             max_num_seqs: self.maximum_batch_size,
-            request_batch_max_wait_ms: if self.maximum_batch_size == 1 { 0 } else { 200 },
+            request_batch_max_wait_ms: if self.batching == ferrum_types::ImageBatchPolicy::Auto
+                || self.maximum_batch_size == 1
+            {
+                0
+            } else {
+                200
+            },
             default_width: 512,
             default_height: 512,
             default_seed: 0,
             rgba_scratch_bytes: 16 * 1024,
             output: ferrum_types::OutputConfig {
-                max_sessions: pending + self.maximum_batch_size,
+                max_sessions,
                 ..Default::default()
             },
         };
@@ -150,15 +218,36 @@ impl DirectoryOptions {
         }
     }
     pub fn pipeline(&self) -> PipelineConfig {
+        let maximum_dimension = match self.backend {
+            ImageBackendKind::Cuda => 2048,
+            ImageBackendKind::Metal => 1024,
+        };
         PipelineConfig {
             maximum_user_tokens: 1024,
-            maximum_width: 1024,
-            maximum_height: 1024,
+            maximum_width: maximum_dimension,
+            maximum_height: maximum_dimension,
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy:
                 ferrum_engine::image_generation::ImageDecoderBatchPolicy::SingleImage,
-            edit_prefix_policy: ferrum_engine::image_generation::ImageEditPrefixPolicy::default(),
-            plan_cache: ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage,
+            edit_prefix_policy: match self.backend {
+                ImageBackendKind::Cuda => {
+                    ferrum_engine::image_generation::ImageEditPrefixPolicy::RequestCache
+                }
+                ImageBackendKind::Metal => {
+                    ferrum_engine::image_generation::ImageEditPrefixPolicy::Recompute
+                }
+            },
+            plan_cache: match self.backend {
+                ImageBackendKind::Cuda => {
+                    ferrum_engine::image_generation::ImagePlanCachePolicy::MultiShape {
+                        maximum_entries_per_stage: 16,
+                        maximum_encoded_metadata_bytes: 128 * MIB as usize,
+                    }
+                }
+                ImageBackendKind::Metal => {
+                    ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage
+                }
+            },
             residency: ferrum_engine::image_generation::ImageResidencyPolicy::Adaptive,
             dynamic_residency:
                 ferrum_engine::image_generation::ImageDynamicResidencyPolicy::Adaptive,
@@ -190,9 +279,12 @@ impl DirectoryOptions {
             maximum_in_flight_per_stream: 1,
             maximum_commands_per_submission: 2048,
             opaque_memory_profile: "experimental-unqualified-runtime-v1".into(),
-            attention_policy: ferrum_engine::image_generation::ImageCudaAttentionPolicy::Sequential,
+            attention_policy:
+                ferrum_engine::image_generation::ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
             precision_policy: self.precision,
             fp8_host_cache: ferrum_engine::image_generation::ImageFp8HostCachePolicy::Off,
+            convolution_workspace:
+                ferrum_engine::image_generation::ImageCudaConvolutionWorkspacePolicy::Auto,
             cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
                 library_path: super::library::resolve(self.cudnn_library.as_deref())?,
                 dependency_libraries: Vec::new(),
@@ -276,6 +368,21 @@ pub(super) struct PreparedProduct {
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 impl ImageProductSource {
+    pub(super) fn prepare_for_run(&self) -> Result<PreparedProduct> {
+        match self {
+            Self::LocalDirectory { path, options } => {
+                // `run` has one request. Do not size initialization or resources
+                // for the serving ceiling even when the user supplied one.
+                Self::LocalDirectory {
+                    path: path.clone(),
+                    options: options.single_request(),
+                }
+                .prepare()
+            }
+            Self::ExplicitConfig(_) => self.prepare(),
+        }
+    }
+
     pub(super) fn prepare(&self) -> Result<PreparedProduct> {
         match self {
             Self::ExplicitConfig(path) => {
@@ -292,13 +399,14 @@ impl ImageProductSource {
             }
             Self::LocalDirectory { path, options } => {
                 options.validate()?;
-                let backend = super::factory::PreparedBackend::from_directory(options)?;
+                super::factory::PreparedBackend::ensure_supported(options.backend)?;
                 // Complete metadata and actual archive headers precede any
                 // device context, provider, or native library construction.
                 let assets = ferrum_engine::image_generation::QwenImage21Assets::from_directory(
                     path,
                     PipelineSourceLimits::default(),
                 )?;
+                let backend = super::factory::PreparedBackend::from_directory(options, &assets)?;
                 let model = path
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -308,7 +416,7 @@ impl ImageProductSource {
                 Ok(PreparedProduct {
                     model,
                     profile: options.preset_name(),
-                    serving: Some(options.serving()?),
+                    serving: Some(options.serving_with_output_bytes(backend.host_output_bytes())?),
                     backend,
                     assets,
                 })

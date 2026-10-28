@@ -244,7 +244,7 @@ fn automatic_image_route_rejects_text_controls_and_invalid_product_limits() {
         vec!["--gpu-memory-utilization", "1.01"],
         vec!["--runtime-memory-budget-bytes", "0"],
         vec!["--width", "0"],
-        vec!["--height", "1025"],
+        vec!["--height", "2049"],
     ] {
         let mut arguments = vec![
             "ferrum", "run", model, "--prompt", "cat", "--output", "x.png",
@@ -276,17 +276,76 @@ fn automatic_image_route_rejects_text_controls_and_invalid_product_limits() {
 
 #[test]
 fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
-    let one = DirectoryOptions::from_cli(0.9, None, None, "auto", None, None).unwrap();
+    let one = DirectoryOptions::from_cli(0.9, None, None, "cuda", None, None).unwrap();
+    let pending = one.host().default_pending_bytes().unwrap().get()
+        / ferrum_engine::image_generation::service::ImageService::minimum_pending_request_bytes();
+    let minimum_output_bytes = ferrum_output::png::encoded_rgba8_png_bytes(
+        ferrum_output::png::PngDimensions::new(1, 1).unwrap(),
+        ferrum_output::png::PngLimits::default(),
+    )
+    .unwrap() as usize;
+    let completed_sessions = one.host().output_bytes / minimum_output_bytes;
     assert_eq!(directory::PRESET_NAME, "bf16_adaptive_v1");
     assert_eq!(one.serving().unwrap().request_batch_max_wait_ms, 0);
+    assert_eq!(one.batching, ferrum_types::ImageBatchPolicy::Auto);
+    assert_eq!(one.serving().unwrap().maximum_pending, pending);
+    assert_eq!(
+        one.serving().unwrap().output.max_sessions,
+        pending + one.maximum_batch_size + completed_sessions
+    );
+    ferrum_output::OutputBudget::new(one.serving().unwrap().output).unwrap();
+    assert_eq!(
+        one.maximum_batch_size,
+        ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH
+    );
+    assert_eq!(
+        one.serving().unwrap().maximum_pending_bytes.unwrap().get(),
+        one.host().input_preprocess_bytes / 2
+    );
     assert_eq!(
         (one.pipeline().maximum_width, one.pipeline().maximum_height),
-        (1024, 1024)
+        (2048, 2048)
     );
     one.host().limits().unwrap();
+    #[cfg(feature = "cuda")]
+    {
+        // Resolving a typed preset must not load a native library.
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("libcudnn.so.9");
+        fs::write(&library, b"metadata-only fixture").unwrap();
+        let mut selected = one.clone();
+        selected.cudnn_library = Some(library);
+        assert_eq!(
+            selected.cuda().unwrap().attention_policy,
+            ferrum_engine::image_generation::ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1
+        );
+        assert_eq!(
+            selected.cuda().unwrap().convolution_workspace,
+            ferrum_engine::image_generation::ImageCudaConvolutionWorkspacePolicy::Auto
+        );
+    }
     for backend in ["cuda", "metal"] {
         let options = DirectoryOptions::from_cli(0.9, None, None, backend, None, None).unwrap();
         let pipeline = options.pipeline();
+        assert_eq!(
+            pipeline.edit_prefix_policy,
+            if backend == "cuda" {
+                ferrum_engine::image_generation::ImageEditPrefixPolicy::RequestCache
+            } else {
+                ferrum_engine::image_generation::ImageEditPrefixPolicy::Recompute
+            }
+        );
+        assert_eq!(
+            pipeline.plan_cache,
+            if backend == "cuda" {
+                ferrum_engine::image_generation::ImagePlanCachePolicy::MultiShape {
+                    maximum_entries_per_stage: 16,
+                    maximum_encoded_metadata_bytes: 128 * 1024 * 1024,
+                }
+            } else {
+                ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage
+            }
+        );
         assert_eq!(
             pipeline.residency,
             ferrum_engine::image_generation::ImageResidencyPolicy::Adaptive
@@ -298,9 +357,29 @@ fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
     }
     let eight = DirectoryOptions::from_cli(0.9, None, Some(8), "cuda", Some("0"), None).unwrap();
     assert_eq!(eight.serving().unwrap().max_num_seqs, 8);
+    assert_eq!(eight.serving().unwrap().maximum_pending, pending);
+    assert_eq!(
+        eight.serving().unwrap().output.max_sessions,
+        pending + eight.maximum_batch_size + completed_sessions
+    );
     assert_eq!(eight.pipeline().maximum_batch_size, 8);
-    assert_eq!(eight.serving().unwrap().request_batch_max_wait_ms, 200);
+    let selected_output = eight.host().output_bytes * 2;
+    let selected = eight.serving_with_output_bytes(selected_output).unwrap();
+    assert_eq!(selected.maximum_pending, pending);
+    assert_eq!(
+        selected.output.max_sessions,
+        pending + eight.maximum_batch_size + selected_output / minimum_output_bytes
+    );
+    assert_eq!(eight.serving().unwrap().request_batch_max_wait_ms, 0);
+    assert_eq!(
+        eight.serving().unwrap().batching,
+        ferrum_types::ImageBatchPolicy::Auto
+    );
     assert!(eight.maximum_memory_bytes.is_none());
+    let mut configured = eight.clone();
+    configured.batching = ferrum_types::ImageBatchPolicy::Configured;
+    assert_eq!(configured.serving().unwrap().maximum_pending, 8);
+    assert_eq!(configured.serving().unwrap().output.max_sessions, 16);
     assert!(DirectoryOptions::from_cli(
         1.0,
         None,
@@ -310,6 +389,72 @@ fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
         None
     )
     .is_err());
+}
+
+#[test]
+fn run_has_single_request_capacity_and_metal_keeps_configured_batching() {
+    for explicit_cap in [None, Some(3)] {
+        let cuda = DirectoryOptions::from_cli(0.9, None, explicit_cap, "cuda", None, None).unwrap();
+        let run = cuda.single_request();
+        assert_eq!(run.pipeline().maximum_batch_size, 1);
+        assert_eq!(run.pipeline().maximum_width, 2048);
+        assert_eq!(run.pipeline().plan_cache, cuda.pipeline().plan_cache);
+        assert_eq!(
+            run.pipeline().edit_prefix_policy,
+            ferrum_engine::image_generation::ImageEditPrefixPolicy::RequestCache
+        );
+        assert_eq!(run.serving().unwrap().request_batch_max_wait_ms, 0);
+        assert_eq!(
+            run.serving().unwrap().maximum_pending,
+            cuda.serving().unwrap().maximum_pending
+        );
+        let metal =
+            DirectoryOptions::from_cli(0.9, None, explicit_cap, "metal", None, None).unwrap();
+        assert_eq!(metal.batching, ferrum_types::ImageBatchPolicy::Configured);
+        assert_eq!(
+            metal.serving().unwrap().maximum_pending,
+            metal.maximum_batch_size.max(4)
+        );
+        assert_eq!(metal.pipeline().maximum_width, 1024);
+        assert_eq!(
+            metal.single_request().pipeline().plan_cache,
+            ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage
+        );
+        assert_eq!(
+            metal.pipeline().edit_prefix_policy,
+            ferrum_engine::image_generation::ImageEditPrefixPolicy::Recompute
+        );
+        assert_eq!(metal.maximum_batch_size, explicit_cap.unwrap_or(1));
+        assert_eq!(
+            metal.serving().unwrap().request_batch_max_wait_ms,
+            if explicit_cap.is_some() { 200 } else { 0 }
+        );
+    }
+}
+
+#[test]
+fn cuda_directory_run_admits_2k_geometry_without_changing_metal_bounds() {
+    let root = tempfile::tempdir().unwrap();
+    metadata_fixture(root.path());
+    let model = root.path().to_str().unwrap();
+    for backend in ["cuda", "metal"] {
+        let result = validate(&[
+            "ferrum",
+            "run",
+            model,
+            "--prompt",
+            "cat",
+            "--output",
+            "x.png",
+            "--backend",
+            backend,
+            "--width",
+            "2048",
+            "--height",
+            "2048",
+        ]);
+        assert_eq!(result.is_ok(), backend == "cuda");
+    }
 }
 
 #[cfg(not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))))]

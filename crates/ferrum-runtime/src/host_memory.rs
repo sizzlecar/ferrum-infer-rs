@@ -8,11 +8,18 @@
 
 use std::{
     alloc::Layout,
+    collections::BTreeMap,
     ops::Range,
     sync::{Arc, Mutex},
+    task::Waker,
 };
 
+use ferrum_types::{ResourceChangeNotifier, ResourceChangeSubscription};
 use thiserror::Error;
+
+mod scope;
+pub use scope::HostMemoryScope;
+use scope::{ScopeAuthority, ScopeCredit};
 
 /// A quota dimension; it does not describe allocation or DMA capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +112,26 @@ pub enum HostMemoryError {
     Poisoned,
     #[error("host byte slice is inverted or exceeds its retained owner")]
     InvalidSlice,
+    #[error("host reservation scope is closed")]
+    ScopeClosed,
+    #[error(
+        "host {class:?} scoped capacity exhausted: requested {requested}, available {available}"
+    )]
+    ScopeCapacity {
+        class: HostMemoryClass,
+        requested: usize,
+        available: usize,
+    },
+    #[error("host reservation scopes cannot be nested")]
+    NestedScope,
+}
+
+impl HostMemoryError {
+    /// Whether releasing existing owners can satisfy this admission failure.
+    /// Every admission checks all hard dimensions before reporting occupancy.
+    pub fn is_temporary_capacity(&self) -> bool {
+        matches!(self, Self::Capacity { requested, limit, .. } if requested <= limit)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +174,8 @@ struct State {
     committed: Counters,
     allocated: Counters,
     fail_closed: bool,
+    next_scope: u64,
+    scopes: BTreeMap<u64, ScopeCredit>,
 }
 
 #[derive(Debug)]
@@ -154,19 +183,24 @@ struct AccountInner {
     limits: HostMemoryLimits,
     allocation_alignment: usize,
     state: Mutex<State>,
+    capacity_changed: ResourceChangeNotifier,
 }
 
 /// Clone this authority across engines instead of creating per-engine totals.
 #[derive(Debug, Clone)]
-pub struct HostMemoryAccount(Arc<AccountInner>);
+pub struct HostMemoryAccount(Arc<AccountInner>, Option<Arc<ScopeAuthority>>);
 
 impl HostMemoryAccount {
     pub fn new(limits: HostMemoryLimits) -> Self {
-        Self(Arc::new(AccountInner {
-            limits,
-            allocation_alignment: 1,
-            state: Mutex::new(State::default()),
-        }))
+        Self(
+            Arc::new(AccountInner {
+                limits,
+                allocation_alignment: 1,
+                state: Mutex::new(State::default()),
+                capacity_changed: ResourceChangeNotifier::default(),
+            }),
+            None,
+        )
     }
 
     /// Align payloads and pad their enclosing backing for native no-copy views.
@@ -179,11 +213,15 @@ impl HostMemoryAccount {
         if !alignment.is_power_of_two() || alignment > isize::MAX as usize {
             return Err(HostMemoryError::InvalidReservation);
         }
-        Ok(Self(Arc::new(AccountInner {
-            limits,
-            allocation_alignment: alignment,
-            state: Mutex::new(State::default()),
-        })))
+        Ok(Self(
+            Arc::new(AccountInner {
+                limits,
+                allocation_alignment: alignment,
+                state: Mutex::new(State::default()),
+                capacity_changed: ResourceChangeNotifier::default(),
+            }),
+            None,
+        ))
     }
 
     pub fn allocation_alignment(&self) -> usize {
@@ -209,10 +247,23 @@ impl HostMemoryAccount {
         self.0.limits
     }
 
+    /// Register before probing admission, and retain the subscription while
+    /// waiting. Refunds notify after accounting locks are released. A scheduler
+    /// must also wake its own target for cancellation and shutdown.
+    pub fn subscribe_capacity(&self, waker: Waker) -> ResourceChangeSubscription {
+        self.0.capacity_changed.subscribe(waker)
+    }
+
     /// Check provenance against the parent injected by product composition.
     /// Equal numeric limits do not make independently created accounts equal.
     pub fn owns(&self, bytes: &ManagedHostBytes) -> bool {
         Arc::ptr_eq(&self.0, &bytes.backing.charge.account.0)
+    }
+
+    /// Shared backing-budget and provenance identity, regardless of a view's
+    /// scoped admission credit. Equal numeric limits do not establish ownership.
+    pub fn same_parent(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     pub fn usage(&self) -> Result<HostMemoryUsage, HostMemoryError> {
@@ -266,29 +317,10 @@ impl HostMemoryAccount {
         if state.fail_closed {
             return Err(HostMemoryError::Poisoned);
         }
-        let next = state
-            .committed
-            .add(demand)
-            .ok_or(HostMemoryError::ArithmeticOverflow)?;
-        if next.total > self.0.limits.total_bytes {
-            return Err(HostMemoryError::Capacity {
-                scope: HostMemoryPressureScope::Total,
-                requested: demand.total,
-                committed: state.committed.total,
-                limit: self.0.limits.total_bytes,
-            });
-        }
-        for &(class, _) in requests {
-            let index = class.index();
-            if next.classes[index] > self.0.limits.classes[index] {
-                return Err(HostMemoryError::Capacity {
-                    scope: HostMemoryPressureScope::Class(class),
-                    requested: demand.classes[index],
-                    committed: state.committed.classes[index],
-                    limit: self.0.limits.classes[index],
-                });
-            }
-        }
+        let scoped = self.scoped_demand(&state, demand)?;
+        let unreserved = demand.subtract(scoped).expect("scoped demand is a subset");
+        let next = self.check_admission(&state, unreserved)?;
+        self.consume_scope(&mut state, scoped);
         state.committed = next;
         // Capacity is already allocated, and these operations cannot fail.
         for &(class, bytes) in requests {
@@ -390,12 +422,22 @@ impl Drop for Charge {
             return;
         }
         let amount = Counters::single(self.class, self.bytes);
-        let committed = state.committed.subtract(amount);
         let allocated = if self.allocated {
             state.allocated.subtract(amount)
         } else {
             Some(state.allocated)
         };
+        if self.account.refund_scope(&mut state, amount) {
+            if let Some(allocated) = allocated {
+                state.allocated = allocated;
+            } else {
+                state.fail_closed = true;
+            }
+            drop(state);
+            self.account.0.capacity_changed.notify();
+            return;
+        }
+        let committed = state.committed.subtract(amount);
         match (committed, allocated) {
             (Some(committed), Some(allocated)) => {
                 state.committed = committed;
@@ -403,6 +445,8 @@ impl Drop for Charge {
             }
             _ => state.fail_closed = true,
         }
+        drop(state);
+        self.account.0.capacity_changed.notify();
     }
 }
 
@@ -559,6 +603,12 @@ impl ManagedHostBytes {
     pub fn is_empty(&self) -> bool {
         self.range.is_empty()
     }
+    /// Physical capacity retained by this owner, including alignment padding.
+    /// A clone or slice (even an empty slice) retains the entire allocation's
+    /// charge; its logical `len()` is not the retained memory footprint.
+    pub fn backing_bytes(&self) -> usize {
+        self.backing.charge.bytes
+    }
     pub fn class(&self) -> HostMemoryClass {
         self.backing.charge.class
     }
@@ -623,5 +673,7 @@ unsafe impl crate::StableHostMemory for ManagedHostBytes {
     }
 }
 
+#[cfg(test)]
+mod capacity_tests;
 #[cfg(test)]
 mod tests;

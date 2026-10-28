@@ -2304,6 +2304,13 @@ impl DeviceRuntime for TestRuntime {
         }
     }
 
+    fn requires_managed_static_staging(&self) -> bool {
+        matches!(
+            self.trace.lock().unwrap().managed_static_import,
+            ManagedStaticImportBehavior::Unsupported
+        )
+    }
+
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {
         Ok(TestStream)
     }

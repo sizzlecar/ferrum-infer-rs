@@ -47,16 +47,22 @@ pub(in crate::axum_server) async fn edits_handler(
         .service
         .validate_edit_request(&request)
         .map_err(service_error)?;
+    let response = admit_response(images, session, &request.generation)?;
     let started = Instant::now();
-    let result = images
+    let (result, grant) = images
         .service
-        .try_submit_edit(request)
+        .try_submit_edit_with_output(request, response)
         .map_err(service_error)?
-        .wait()
+        .wait_with_output()
         .await
         .map_err(service_error)?;
     let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    encode_result(images, session, result, elapsed).await
+    let admission = grant.into_inner::<response::Admission>().map_err(|_| {
+        ServerError::InternalError(
+            "image edit response grant belongs to another output gate".into(),
+        )
+    })?;
+    encode_result(admission, result, elapsed).await
 }
 
 async fn parse(

@@ -16,12 +16,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod arrival;
 mod capture;
+pub use arrival::{ImageArrivalMode, ImageArrivalPolicy, ImageArrivalRecord};
 pub use capture::{
     PngCaptureConfig, PngCaptureFailureKind, PngCaptureRecord, PngCaptureResult, PngCaptureSummary,
 };
 mod edit;
+mod resources;
 mod runner;
+pub use resources::{ImageProcessScope, ImageResourceSamplingConfig, ImageResourceWindow};
 pub use runner::run_benchmark;
 #[cfg(test)]
 mod tests;
@@ -40,6 +44,10 @@ pub struct BenchImagesCommand {
     /// Repeat for sequential endpoint comparison; the client never rewrites URLs.
     #[arg(long, required = true)]
     pub endpoint: Vec<String>,
+    /// Explicit /v1/images/edits companion, one per endpoint, for v3 mixed
+    /// generation/edit datasets. URLs are never inferred by rewriting paths.
+    #[arg(long)]
+    pub edit_endpoint: Vec<String>,
     /// One model alias shared by endpoints, or one per endpoint in the same order.
     #[arg(long, required = true)]
     pub model: Vec<String>,
@@ -66,6 +74,17 @@ pub struct BenchImagesCommand {
     pub maximum_capture_bytes: Option<NonZeroU64>,
     #[arg(long, default_value_t = 8)]
     pub concurrency: usize,
+    /// Closed-loop waits for completion; burst and fixed-interval arrivals use
+    /// an absolute clock and explicitly count arrivals the client cannot send.
+    #[arg(long, value_enum, default_value = "closed-loop")]
+    pub arrival_mode: ImageArrivalMode,
+    /// Positive interval between planned arrivals; required for fixed-interval.
+    #[arg(long)]
+    pub arrival_interval_ms: Option<f64>,
+    /// Open-loop client bound, including PNG validation/capture. Defaults to
+    /// --concurrency; reaching it records an unsent arrival, never a server 429.
+    #[arg(long)]
+    pub maximum_in_flight: Option<usize>,
     /// Each repetition submits the complete dataset in its original order.
     #[arg(long, default_value_t = 3)]
     pub repetitions: usize,
@@ -75,6 +94,18 @@ pub struct BenchImagesCommand {
     /// Declared state before warmup/measurement; the client never flushes/restarts servers.
     #[arg(long, value_enum, default_value = "unknown")]
     pub initial_server_state: InitialServerState,
+    /// Local Linux server root PID, one per endpoint; samples RSS across every
+    /// warmup/measured repetition. Endpoints must use loopback addresses.
+    #[arg(long)]
+    pub resource_server_pid: Vec<u32>,
+    #[arg(long, value_enum, default_value = "process-tree")]
+    pub resource_process_scope: ImageProcessScope,
+    /// Explicit physical NVIDIA GPU index. Whole-device used memory includes
+    /// other processes and driver baseline; repeat for a sum across devices.
+    #[arg(long)]
+    pub resource_gpu_index: Vec<u32>,
+    #[arg(long, default_value_t = 200)]
+    pub resource_sample_interval_ms: u64,
     #[arg(long, default_value_t = 1800)]
     pub timeout_seconds: u64,
     /// Optional predeclared successful-response E2E P99 threshold. Any error violates it.
@@ -96,6 +127,9 @@ pub struct BenchImagesCommand {
     /// Decoder dimensions/workspace use the same explicit limits as responses.
     #[arg(long, default_value_t = ferrum_models::qwen_image21::image_input::ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES)]
     pub maximum_reference_image_bytes: usize,
+    /// Total encoded backing retained by all distinct reference files.
+    #[arg(long, default_value_t = 128 * 1024 * 1024)]
+    pub maximum_total_reference_image_bytes: usize,
     #[arg(long, default_value_t = 100_000)]
     pub maximum_total_requests: usize,
 }
@@ -103,6 +137,8 @@ pub struct BenchImagesCommand {
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageBenchmarkEndpoint {
     pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit_url: Option<String>,
     pub model: String,
     pub server_config_declaration: String,
 }
@@ -111,6 +147,8 @@ pub struct ImageBenchmarkEndpoint {
 pub struct ImageBenchmarkConfig {
     pub endpoints: Vec<ImageBenchmarkEndpoint>,
     pub concurrency: usize,
+    pub arrival: ImageArrivalPolicy,
+    pub maximum_in_flight: Option<usize>,
     pub repetitions: usize,
     pub warmup_repetitions: usize,
     pub initial_server_state: InitialServerState,
@@ -119,8 +157,11 @@ pub struct ImageBenchmarkConfig {
     pub limits: ImageResponseLimits,
     pub maximum_total_requests: usize,
     pub maximum_reference_image_bytes: usize,
+    pub maximum_total_reference_image_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture: Option<PngCaptureConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_sampling: Option<ImageResourceSamplingConfig>,
 }
 
 impl ImageBenchmarkConfig {
@@ -131,8 +172,16 @@ impl ImageBenchmarkConfig {
                 && self.maximum_reference_image_bytes < isize::MAX as usize,
             "reference image byte limit must fit the host address space"
         );
+        ensure!(
+            self.maximum_total_reference_image_bytes > 0
+                && self.maximum_total_reference_image_bytes < isize::MAX as usize,
+            "total reference image byte limit must fit the host address space"
+        );
         if let Some(capture) = &self.capture {
             capture.validate()?;
+        }
+        if let Some(resources) = &self.resource_sampling {
+            resources.validate(&self.endpoints)?;
         }
         ensure!(
             !self.endpoints.is_empty() && self.endpoints.len() <= 16,
@@ -142,6 +191,17 @@ impl ImageBenchmarkConfig {
             (1..=1024).contains(&self.concurrency),
             "concurrency must be within 1..=1024"
         );
+        self.arrival.validate(dataset.samples.len())?;
+        if let Some(maximum) = self.maximum_in_flight {
+            ensure!(
+                self.arrival.is_open_loop(),
+                "maximum-in-flight applies only to open-loop arrivals"
+            );
+            ensure!(
+                (1..=1024).contains(&maximum),
+                "maximum-in-flight must be within 1..=1024"
+            );
+        }
         ensure!(self.repetitions > 0, "repetitions must be positive");
         ensure!(
             (1..=86_400).contains(&self.timeout_seconds),
@@ -166,20 +226,34 @@ impl ImageBenchmarkConfig {
                 "latency SLO must be finite and positive"
             );
         }
+        let has_generation = dataset
+            .samples
+            .iter()
+            .any(|sample| sample.effective_mode(&dataset.mode).is_generate());
+        let has_edit = dataset
+            .samples
+            .iter()
+            .any(|sample| !sample.effective_mode(&dataset.mode).is_generate());
         for endpoint in &self.endpoints {
-            let url = reqwest::Url::parse(&endpoint.url).context("invalid endpoint URL")?;
-            ensure!(
-                matches!(url.scheme(), "http" | "https")
-                    && url.host_str().is_some()
-                    && url.username().is_empty()
-                    && url.password().is_none()
-                    && url.query().is_none()
-                    && url.fragment().is_none(),
-                "endpoint requires HTTP(S), host and no credentials/query/fragment"
-            );
-            if !dataset.mode.is_generate() {
+            let url = validate_endpoint_url(&endpoint.url)?;
+            let edit_url = endpoint
+                .edit_url
+                .as_deref()
+                .map(validate_endpoint_url)
+                .transpose()?;
+            if has_generation && has_edit {
                 ensure!(
-                    url.path().ends_with("/v1/images/edits"),
+                    edit_url.is_some() && url.path().ends_with("/v1/images/generations"),
+                    "mixed datasets require explicit generation and edit endpoints"
+                );
+            }
+            if has_edit {
+                ensure!(
+                    edit_url
+                        .as_ref()
+                        .unwrap_or(&url)
+                        .path()
+                        .ends_with("/v1/images/edits"),
                     "edit mode requires an explicit /v1/images/edits endpoint"
                 );
             }
@@ -197,6 +271,20 @@ impl ImageBenchmarkConfig {
     }
 }
 
+fn validate_endpoint_url(value: &str) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value).context("invalid endpoint URL")?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "endpoint requires HTTP(S), host and no credentials/query/fragment"
+    );
+    Ok(url)
+}
+
 #[derive(Debug, Serialize)]
 pub struct ImageBenchmarkRepetition {
     pub phase: ImageRequestPhase,
@@ -206,6 +294,8 @@ pub struct ImageBenchmarkRepetition {
     /// Not an isolated network-only/server-only throughput measurement.
     pub http_completion_span_seconds: f64,
     pub successful_images_per_http_completion_second: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ImageResourceWindow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,7 +303,9 @@ pub struct ImageEndpointReport {
     pub endpoint_index: usize,
     pub repetitions: Vec<ImageBenchmarkRepetition>,
     pub measured: ImageMetrics,
+    pub measured_workloads: Vec<ferrum_bench_core::images::ImageWorkloadMetrics>,
     pub requests: Vec<ImageRequestRecord>,
+    pub arrivals: Vec<ImageArrivalRecord>,
     /// Matched to requests by sample_index, phase and repetition, never by
     /// response completion order. This endpoint supplies the endpoint index.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -233,6 +325,10 @@ pub struct ImageBenchmarkReport {
     /// an assumed equality of noise/model behavior between implementations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference_image: Option<ValidatedImage>,
+    /// Distinct retained references. Per-sample indices identify actual uploads.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reference_images: Vec<ValidatedImage>,
+    pub sample_reference_indices: Vec<Option<usize>>,
     pub endpoints: Vec<ImageEndpointReport>,
     pub evidence: ImageEvidenceScope,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -252,6 +348,10 @@ pub struct ImageEvidenceScope {
     pub throughput_target_status: &'static str,
     pub peak_device_memory_bytes: Option<u64>,
     pub peak_host_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_sampling_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_peak_scope: Option<&'static str>,
 }
 
 impl Default for ImageEvidenceScope {
@@ -264,6 +364,8 @@ impl Default for ImageEvidenceScope {
             pixel_validation_scope: "PNG CRC/Adler, full decode and exact dimensions; RGBA8 integer values are finite, pre-encoding floats and prompt quality are not assessed",
             quality_status: "not_evaluated", g3_status: "not_evaluated",
             throughput_target_status: "not_evaluated", peak_device_memory_bytes: None, peak_host_memory_bytes: None,
+            resource_sampling_complete: None,
+            resource_peak_scope: None,
         }
     }
 }
@@ -290,13 +392,20 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
     );
     let mut dataset: ImageDataset =
         serde_json::from_slice(&bytes).context("invalid image dataset JSON")?;
-    if let ImageRequestMode::Edit { image } = &mut dataset.mode {
-        if image.path.is_relative() {
-            image.path = command
-                .dataset
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(&image.path);
+    for mode in std::iter::once(&mut dataset.mode).chain(
+        dataset
+            .samples
+            .iter_mut()
+            .filter_map(|sample| sample.mode.as_mut()),
+    ) {
+        if let ImageRequestMode::Edit { image } = mode {
+            if image.path.is_relative() {
+                image.path = command
+                    .dataset
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(&image.path);
+            }
         }
     }
     ensure!(
@@ -307,12 +416,17 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
         command.server_config.len() == command.endpoint.len(),
         "provide one server-config declaration per endpoint"
     );
+    ensure!(
+        command.edit_endpoint.is_empty() || command.edit_endpoint.len() == command.endpoint.len(),
+        "provide one edit-endpoint per endpoint for mixed datasets"
+    );
     let endpoints = command
         .endpoint
         .iter()
         .enumerate()
         .map(|(index, url)| ImageBenchmarkEndpoint {
             url: url.clone(),
+            edit_url: command.edit_endpoint.get(index).cloned(),
             model: command.model[if command.model.len() == 1 { 0 } else { index }].clone(),
             server_config_declaration: command.server_config[index].clone(),
         })
@@ -328,6 +442,8 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
     let config = ImageBenchmarkConfig {
         endpoints,
         concurrency: command.concurrency,
+        arrival: ImageArrivalPolicy::from_cli(command.arrival_mode, command.arrival_interval_ms)?,
+        maximum_in_flight: command.maximum_in_flight,
         repetitions: command.repetitions,
         warmup_repetitions: command.warmup_repetitions,
         initial_server_state: command.initial_server_state,
@@ -335,7 +451,17 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
         latency_slo_p99_ms: command.latency_slo_p99_ms,
         maximum_total_requests: command.maximum_total_requests,
         maximum_reference_image_bytes: command.maximum_reference_image_bytes,
+        maximum_total_reference_image_bytes: command.maximum_total_reference_image_bytes,
         capture,
+        resource_sampling: (!command.resource_server_pid.is_empty()
+            || !command.resource_gpu_index.is_empty())
+        .then(|| ImageResourceSamplingConfig {
+            server_pids: command.resource_server_pid,
+            process_scope: command.resource_process_scope,
+            gpu_indices: command.resource_gpu_index,
+            interval_ms: command.resource_sample_interval_ms,
+            ..ImageResourceSamplingConfig::default()
+        }),
         limits: ImageResponseLimits {
             maximum_response_bytes: command.maximum_response_bytes,
             maximum_png_bytes: command.maximum_png_bytes,
@@ -402,6 +528,18 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
             .as_ref()
             .is_none_or(|capture| capture.complete),
         "PNG capture incomplete; report saved to {}",
+        command.output.display()
+    );
+    ensure!(
+        report
+            .endpoints
+            .iter()
+            .flat_map(|endpoint| &endpoint.repetitions)
+            .all(|run| run
+                .resources
+                .as_ref()
+                .is_none_or(|resources| resources.complete)),
+        "resource sampling incomplete (including warmup); report saved to {}",
         command.output.display()
     );
     Ok(())

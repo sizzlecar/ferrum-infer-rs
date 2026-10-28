@@ -271,3 +271,136 @@ async fn edit_cli_resolves_dataset_relative_image_and_records_real_identity() {
     cfg.maximum_reference_image_bytes = usize::MAX;
     assert!(cfg.validate(&data).is_err());
 }
+
+type MixedCalls = Arc<Mutex<Vec<(bool, u64, String, Option<String>)>>>;
+
+fn sized_body(size: &str) -> String {
+    use base64::Engine;
+    use ferrum_output::png::{write_rgba8_png, PngDimensions, PngLimits};
+    let (width, height) = size.split_once('x').unwrap();
+    let dimensions = PngDimensions::new(width.parse().unwrap(), height.parse().unwrap()).unwrap();
+    let mut png = Vec::new();
+    write_rgba8_png(&mut png, dimensions, PngLimits::default(), |sink| {
+        sink.write_all(&vec![128; dimensions.rgba_bytes()])
+    })
+    .unwrap();
+    serde_json::json!({"data":[{"b64_json":base64::engine::general_purpose::STANDARD.encode(png)}]})
+        .to_string()
+}
+
+async fn mixed_generate(
+    State(calls): State<MixedCalls>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> String {
+    let size = body["size"].as_str().unwrap();
+    calls
+        .lock()
+        .unwrap()
+        .push((true, body["seed"].as_u64().unwrap(), size.into(), None));
+    sized_body(size)
+}
+
+async fn mixed_edit(State(calls): State<MixedCalls>, mut multipart: Multipart) -> String {
+    let mut fields = BTreeMap::new();
+    let mut hash = None;
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        let name = field.name().unwrap().to_owned();
+        if name == "image" {
+            hash = Some(sha256(&field.bytes().await.unwrap()));
+        } else {
+            fields.insert(name, field.text().await.unwrap());
+        }
+    }
+    calls.lock().unwrap().push((
+        false,
+        fields["seed"].parse().unwrap(),
+        fields["size"].clone(),
+        hash,
+    ));
+    sized_body(&fields["size"])
+}
+
+#[tokio::test]
+async fn mixed_requests_preserve_modes_geometry_references_and_class_metrics() {
+    let dir = tempfile::tempdir().unwrap();
+    let small = dir.path().join("small.png");
+    let wide = dir.path().join("wide.png");
+    let first = reference_bytes();
+    let second = validate_image_response_with_png(
+        sized_body("2x1").as_bytes(),
+        2,
+        1,
+        &ImageResponseLimits::default(),
+    )
+    .unwrap()
+    .into_parts()
+    .1;
+    std::fs::write(&small, &first).unwrap();
+    std::fs::write(&wide, &second).unwrap();
+    let calls = MixedCalls::default();
+    let (url, _server) = tests::serve(
+        Router::new()
+            .route("/v1/images/generations", post(mixed_generate))
+            .route("/v1/images/edits", post(mixed_edit))
+            .with_state(calls.clone()),
+    )
+    .await;
+    let mut cfg = tests::config(url.clone());
+    cfg.endpoints[0].edit_url = Some(url.replace("/generations", "/edits"));
+    cfg.repetitions = 1;
+    cfg.maximum_total_reference_image_bytes = first.len() + second.len();
+    let mut data = tests::dataset(5);
+    data.schema_version = 3;
+    data.samples[1].mode = Some(edit_mode(small.clone(), None));
+    data.samples[2].width = 2;
+    data.samples[3].width = 2;
+    data.samples[3].mode = Some(edit_mode(wide, None));
+    data.samples[4].mode = Some(edit_mode(small, None));
+    let mut missing_route = cfg.clone();
+    missing_route.endpoints[0].edit_url = None;
+    assert!(missing_route.validate(&data).is_err());
+    let mut short = cfg.clone();
+    short.maximum_total_reference_image_bytes -= 1;
+    assert!(run_benchmark(short, data.clone()).await.is_err());
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "reference preflight must precede HTTP sends"
+    );
+    let report = run_benchmark(cfg, data).await.unwrap();
+    assert_eq!(report.schema_version, 3);
+    assert!(report.reference_image.is_none());
+    assert_eq!(report.reference_images.len(), 2);
+    assert_eq!(
+        report.sample_reference_indices,
+        vec![None, Some(0), None, Some(1), Some(0)]
+    );
+    assert_eq!(report.dataset_sha256, report.dataset.fingerprint().unwrap());
+    let endpoint = &report.endpoints[0];
+    assert_eq!(endpoint.measured.succeeded, 5);
+    assert_eq!(endpoint.measured.errors, 0);
+    assert_eq!(endpoint.measured_workloads.len(), 4);
+    assert_eq!(
+        endpoint
+            .measured_workloads
+            .iter()
+            .map(|group| group.metrics.succeeded)
+            .sum::<usize>(),
+        5
+    );
+    for group in &endpoint.measured_workloads {
+        assert!(group.metrics.e2e_p95_ms.is_some());
+        assert_eq!(
+            group.metrics.elapsed_seconds,
+            endpoint.measured.elapsed_seconds
+        );
+    }
+    let mut calls = calls.lock().unwrap().clone();
+    calls.sort_by_key(|call| call.1);
+    assert_eq!(
+        calls.iter().map(|call| call.0).collect::<Vec<_>>(),
+        vec![true, false, true, false, false]
+    );
+    assert_eq!(calls[1].3, Some(sha256(&first)));
+    assert_eq!(calls[3].3, Some(sha256(&second)));
+    assert_eq!(calls[4].3, Some(sha256(&first)));
+}

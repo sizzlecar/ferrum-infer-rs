@@ -28,6 +28,52 @@ fn configuration() -> Value {
 }
 
 #[test]
+fn explicit_image_json_keeps_configured_batching_and_resolves_queue_budget() {
+    use ferrum_types::ImageBatchPolicy;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    let mut wire = configuration();
+    wire["serving"] = json!({
+        "maximum_pending":2,"maximum_prompt_bytes":4096,"max_num_seqs":1,
+        "request_batch_max_wait_ms":200,"default_width":512,"default_height":512,
+        "default_seed":0,"rgba_scratch_bytes":16384,"output":{}
+    });
+    let loaded = load(&wire).unwrap();
+    let ImageBackendConfig::Cuda(cuda) = &loaded.backend else {
+        panic!("expected CUDA configuration")
+    };
+    assert_eq!(
+        cuda.cudnn.convolution_workspace,
+        ferrum_engine::image_generation::ImageCudaConvolutionWorkspacePolicy::ConfiguredLimit
+    );
+    let legacy = loaded.serving.unwrap();
+    assert_eq!(legacy.batching, ImageBatchPolicy::Configured);
+    assert_eq!(legacy.max_num_seqs, 1);
+    assert_eq!(legacy.request_batch_max_wait_ms, 200);
+    assert_eq!(legacy.maximum_pending_bytes.unwrap().get(), 2048 / 2);
+
+    wire["serving"]["batching"] = json!("auto");
+    assert!(
+        load(&wire).is_err(),
+        "Auto must not wait for future arrivals"
+    );
+    wire["serving"]["request_batch_max_wait_ms"] = json!(0);
+    wire["serving"]["maximum_pending_bytes"] = json!(1024);
+    let automatic = load(&wire).unwrap().serving.unwrap();
+    assert_eq!(automatic.batching, ImageBatchPolicy::Auto);
+    assert_eq!(automatic.maximum_pending_bytes.unwrap().get(), 1024);
+    wire["serving"]["maximum_pending_bytes"] = json!(0);
+    assert!(load(&wire).is_err());
+    wire["serving"]["maximum_pending_bytes"] = json!(1024);
+    wire["serving"]["batching"] = json!("opportunistic");
+    assert!(load(&wire).is_err());
+}
+
+#[test]
 fn stream_capacity_auto_and_explicit_limits_are_shared_by_run_and_serve() {
     use ferrum_engine::image_generation::{ImageStreamLimit, ImageStreamLimitSource};
     let dir = tempfile::tempdir().unwrap();

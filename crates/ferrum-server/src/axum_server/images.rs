@@ -31,7 +31,9 @@ pub(super) use edits::{edits_handler, EDIT_BODY_LIMIT};
 /// budget. `max_event_bytes` bounds the complete JSON/base64 response here.
 /// The same generator Host account must cover raw BF16 RGBA, conversion scratch
 /// and the final encoded response simultaneously. Codec-internal workspace is
-/// separately bounded as documented by `ferrum_output::png`.
+/// separately bounded as documented by `ferrum_output::png`. Known scratch and
+/// encoded bytes are reserved only for selected execution candidates; retained HTTP bodies
+/// keep their backing and output credit until their last byte owner drops.
 #[derive(Debug, Clone)]
 pub struct ImageHttpConfig {
     pub output: OutputConfig,
@@ -307,45 +309,59 @@ pub(super) async fn generations_handler(
         .service
         .validate_request(&request)
         .map_err(service_error)?;
-    // Unread HTTP bodies keep this independent output session after the device
-    // stages close. Capacity failure precedes admission to the generation queue.
+    // This small session permit bounds HTTP lifetimes. The queue holds only
+    // response metadata; the selected candidate later acquires encoded bytes.
     let session = images
         .output
         .try_open_session()
         .map_err(|error| ServerError::CapacityExceeded(error.to_string()))?;
+    let response = admit_response(images, session, &request)?;
     let wait_started = Instant::now();
-    let result = images
+    let (result, grant) = images
         .service
-        .try_submit(request)
+        .try_submit_with_output(request, response)
         .map_err(service_error)?
-        .wait()
+        .wait_with_output()
         .await
         .map_err(service_error)?;
     let queue_and_generation_wait_us =
         u64::try_from(wait_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    encode_result(images, session, result, queue_and_generation_wait_us).await
+    let admission = grant.into_inner::<response::Admission>().map_err(|_| {
+        ServerError::InternalError("image response grant belongs to another output gate".into())
+    })?;
+    encode_result(admission, result, queue_and_generation_wait_us).await
+}
+
+fn admit_response(
+    images: &ImageHttpService,
+    session: ferrum_output::OutputSession,
+    request: &ImageGenerationRequest,
+) -> Result<Arc<response::ResponseGate>, ServerError> {
+    response::ResponseGate::new(
+        session,
+        images.service.host_account().clone(),
+        PngDimensions::new(request.width.into(), request.height.into())
+            .map_err(|error| ServerError::InternalError(error.to_string()))?,
+        images.config.png_limits,
+        images.config.rgba_scratch_bytes,
+    )
+    .map(Arc::new)
 }
 
 async fn encode_result(
-    images: &ImageHttpService,
-    session: ferrum_output::OutputSession,
+    response: response::Admission,
     result: ferrum_engine::image_generation::ImageGenerationOutput,
     queue_and_generation_wait_us: u64,
 ) -> Result<Response, ServerError> {
     let encode_started = Instant::now();
-    let encoded = response::encode(
-        session.clone(),
-        images.service.host_account().clone(),
-        result.rgba.tensor().clone(),
-        result.rgba.bytes().clone(),
-        images.config.png_limits,
-        images.config.rgba_scratch_bytes,
-    )
-    .await;
+    let session = response.session();
+    let encoded = response
+        .encode(result.rgba.tensor().clone(), result.rgba.bytes().clone())
+        .await;
     let response_encode_us =
         u64::try_from(encode_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    // Includes count/encode passes, blocking-pool scheduling and output credit
-    // waits. This stops before the HTTP body is delivered to the client.
+    // Includes encoding and blocking-pool scheduling. This stops before the
+    // HTTP body is delivered to the client; output admission preceded execution.
     tracing::debug!(
         target: "ferrum_server::image_generation::timing",
         job = result.receipt.job,

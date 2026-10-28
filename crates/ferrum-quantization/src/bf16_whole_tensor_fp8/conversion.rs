@@ -156,26 +156,7 @@ fn materialize_observed<'source>(
     }
     // Retain the exact immutable sources through both passes. This rejects
     // implicit source transcoding into an unaccounted, whole-matrix Vec.
-    let payloads = timing.measure(Phase::SourceResolve, || {
-        sources
-            .iter()
-            .map(|spec| {
-                let payload = source.component(spec)?;
-                if payload.component_id() != &spec.id
-                    || payload.dimensions() != spec.dimensions
-                    || payload.element_type() != ElementType::Bf16
-                    || payload.external_names() != spec.external_names
-                    || payload.bytes().len() as u64 != spec.physical_bytes()?
-                    || payload.retained_host_memory().is_none()
-                {
-                    return Err(invalid(
-                        "source must expose its exact retained BF16 backing without transcoding",
-                    ));
-                }
-                Ok(payload)
-            })
-            .collect::<Result<Vec<_>, _>>()
-    })?;
+    let payloads = timing.measure(Phase::SourceResolve, || resolve_sources(source, sources))?;
     let files = payloads
         .iter()
         .map(|payload| payload.source_file().to_owned())
@@ -189,7 +170,7 @@ fn materialize_observed<'source>(
     // and an unwind poisons this owner rather than publishing partial results.
     let mut state = cache.map(host_cache::HostCache::lock).transpose()?;
     if let (Some(state), Some(key)) = (state.as_mut(), key.as_ref()) {
-        if let Some((backing, ranges)) = state.get(key) {
+        if let Some((backing, ranges)) = state.get(key)? {
             timing.mode = "cache_hit";
             return payloads_from_backing(outputs, &files, &backing, ranges);
         }
@@ -240,9 +221,35 @@ fn materialize_observed<'source>(
         .collect::<Vec<_>>();
     let result = payloads_from_backing(outputs, &files, &backing, ranges.clone())?;
     if let (Some(state), Some(key)) = (state.as_mut(), key.take()) {
-        state.publish(key, backing, ranges);
+        state.publish(key, backing, ranges)?;
     }
     Ok(result)
+}
+
+/// Resolve immutable owner identity without scanning, decoding or copying the
+/// source bytes. Both conversion and cache admission use the same validation.
+pub(super) fn resolve_sources<'source>(
+    source: &'source dyn WeightComponentSource,
+    sources: &[&WeightComponentSpec],
+) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+    sources
+        .iter()
+        .map(|spec| {
+            let payload = source.component(spec)?;
+            if payload.component_id() != &spec.id
+                || payload.dimensions() != spec.dimensions
+                || payload.element_type() != ElementType::Bf16
+                || payload.external_names() != spec.external_names
+                || payload.bytes().len() as u64 != spec.physical_bytes()?
+                || payload.retained_host_memory().is_none()
+            {
+                return Err(invalid(
+                    "source must expose its exact retained BF16 backing without transcoding",
+                ));
+            }
+            Ok(payload)
+        })
+        .collect()
 }
 
 fn payloads_from_backing<'source>(

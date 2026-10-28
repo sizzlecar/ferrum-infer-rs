@@ -33,13 +33,16 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         request_id: RequestIdentity,
         initial_inputs: Vec<ManagedHostTensor>,
     ) -> Result<TensorRequestSession<R>, TensorExecutionError<R>> {
-        let executor = Self::new(
+        let mut executor = Self::new(
             self.executable.clone(),
             self.providers.clone(),
             self.resources.clone(),
             self.host_account().clone(),
             self.config,
         )?;
+        // A fixed request owns its executor clone. Preserve the admitted
+        // output view even when the component is rebound for a later request.
+        executor.set_output_host_account(self.output_host.clone())?;
         let inputs = executor.binding.request_input_binding()?;
         let work = inputs.admission_work(initial_inputs)?;
         let sequence = executor.admit_sequence(&work, run_id.clone(), request_id.clone())?;
@@ -125,6 +128,13 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
 }
 
 impl<R: DeviceRuntime> TensorRequestSession<R> {
+    pub fn set_output_host_account(
+        &mut self,
+        account: HostMemoryAccount,
+    ) -> Result<(), TensorExecutionError<R>> {
+        self.executor.set_output_host_account(account)
+    }
+
     pub fn execute(
         &mut self,
         inputs: Vec<ManagedHostTensor>,

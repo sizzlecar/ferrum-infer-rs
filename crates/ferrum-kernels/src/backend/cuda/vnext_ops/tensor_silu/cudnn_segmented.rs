@@ -268,7 +268,8 @@ impl OperationResourceEstimator for Provider {
             Some(scratch),
             None,
         )
-        .with_prepared_implementation_fingerprint(prepared_fingerprint(&stages))
+        .with_prepared_implementation_fingerprint(prepared_fingerprint(&stages))?
+        .with_prepared_implementation_retention(Arc::new(stages))
     }
 }
 impl OperationProvider<CudaDeviceRuntime> for Provider {

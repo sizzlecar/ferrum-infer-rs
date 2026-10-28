@@ -62,6 +62,7 @@ fn provider_resources(provider: &str) -> ProviderResourcePlan {
         persistent: None,
         projection_numerics: None,
         prepared_implementation_fingerprint: None,
+        prepared_implementation_retention: None,
     }
 }
 

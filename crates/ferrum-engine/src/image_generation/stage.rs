@@ -333,6 +333,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             &pipeline.materializers,
             options,
         )
+        .map_err(|source| super::capacity::classify_plan_error(source.into()))
         .with_context(|| {
             format!("image {stage:?} {role:?} plan compilation (batch {batch_size})")
         })?;
@@ -436,7 +437,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             StageWeightInitialization::Cold(source) => component
                 .initialize(
                     pipeline.runtime.clone(),
-                    pipeline.host.clone(),
+                    pipeline.execution_host().clone(),
                     source,
                     config,
                 )
@@ -444,7 +445,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             StageWeightInitialization::Share(source) => component
                 .initialize_shared_weights(
                     pipeline.runtime.clone(),
-                    pipeline.host.clone(),
+                    pipeline.execution_host().clone(),
                     source,
                     config,
                 )
@@ -452,7 +453,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             StageWeightInitialization::Attach(weights) => component
                 .initialize_with_shared_weights(
                     pipeline.runtime.clone(),
-                    pipeline.host.clone(),
+                    pipeline.execution_host().clone(),
                     weights,
                     config,
                 )

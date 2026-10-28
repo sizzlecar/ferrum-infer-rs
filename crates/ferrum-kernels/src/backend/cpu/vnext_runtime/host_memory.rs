@@ -1,7 +1,7 @@
 use super::CpuRuntimeError;
 
 mod available;
-pub(crate) use available::host_memory_available;
+pub use available::host_memory_available;
 
 /// Hardware/process capacity for the existing typed runtime memory policy.
 /// Provider allocations are separately charged against its admitted ceiling.

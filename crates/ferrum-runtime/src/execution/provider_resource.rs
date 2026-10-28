@@ -1,3 +1,6 @@
+use std::any::Any;
+use std::sync::Arc;
+
 use super::{
     canonical_fingerprint, invalid_plan, is_canonical_sha256, ContractVersion,
     OperationProviderDescriptor, OperationResourceEstimate, ProviderId,
@@ -25,6 +28,9 @@ pub struct ProviderResourcePlan {
     pub(super) projection_numerics: Option<crate::PreparedProjectionNumerics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) prepared_implementation_fingerprint: Option<String>,
+    #[serde(skip)]
+    pub(super) prepared_implementation_retention:
+        Option<crate::operation::PreparedImplementationRetention>,
 }
 
 impl ProviderResourcePlan {
@@ -61,6 +67,9 @@ impl ProviderResourcePlan {
             prepared_implementation_fingerprint: estimate
                 .prepared_implementation_fingerprint()
                 .map(str::to_owned),
+            prepared_implementation_retention: estimate
+                .prepared_implementation_retention()
+                .cloned(),
         };
         plan.validate_fields()?;
         plan.estimate_fingerprint = plan.compute_estimate_fingerprint()?;
@@ -206,6 +215,19 @@ impl ProviderResourcePlan {
     /// provider must verify it before encoding a shape-specific native plan.
     pub fn prepared_implementation_fingerprint(&self) -> Option<&str> {
         self.prepared_implementation_fingerprint.as_deref()
+    }
+
+    /// Clone the exact process-local owner retained during estimation. Missing
+    /// retention or a different requested type returns `None`; no native plan
+    /// is reconstructed and this owner grants no resource admission authority.
+    pub fn prepared_implementation<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.prepared_implementation_retention.as_ref()?.downcast()
+    }
+
+    pub(crate) fn prepared_implementation_retention(
+        &self,
+    ) -> Option<&crate::operation::PreparedImplementationRetention> {
+        self.prepared_implementation_retention.as_ref()
     }
 }
 

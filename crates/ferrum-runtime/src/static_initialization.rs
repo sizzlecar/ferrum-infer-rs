@@ -743,6 +743,17 @@ where
         }
     };
     if managed_host.is_some()
+        && !placements.is_empty()
+        && !has_required_weight_transforms
+        && !runtime.requires_managed_static_staging()
+        && weight_import.is_none()
+    {
+        return Err(contract_failure(VNextError::InvalidExecutionPlan {
+            reason: "runtime declared managed static import without staging but declined import"
+                .to_owned(),
+        }));
+    }
+    if managed_host.is_some()
         && (has_required_weight_transforms
             || (weight_import.is_none() && !runtime.supports_managed_tensor_io()))
     {
@@ -946,8 +957,9 @@ where
             // multi-output transforms to read and convert a large source matrix
             // once without retaining converted payloads for the whole model.
             let materialization_started = Instant::now();
-            let uploads = prepare_uploads(family, plan, source, &components, &placements)
-                .map_err(contract_failure)?;
+            let uploads =
+                prepare_uploads(family, plan, source, &components, &placements, managed_host)
+                    .map_err(contract_failure)?;
             let materialization_duration = materialization_started.elapsed();
             source_materialization_duration += materialization_duration;
             if slowest_component_id.is_none()
@@ -1055,8 +1067,11 @@ where
                             Some(reservation) => copy_staged_upload(reservation, source_bytes),
                             None => stage_upload(host, source_bytes),
                         };
-                        if matches!(staged, Err(HostMemoryError::Capacity { .. }))
-                            && pending_staging_bytes != 0
+                        if matches!(
+                            staged,
+                            Err(HostMemoryError::Capacity { .. }
+                                | HostMemoryError::ScopeCapacity { .. })
+                        ) && pending_staging_bytes != 0
                         {
                             submission_wait_duration += submit_pending(
                                 &runtime,
@@ -1485,8 +1500,9 @@ fn prepare_uploads<'source>(
     source: &'source dyn WeightComponentSource,
     components: &[&WeightComponentSpec],
     placements: &BTreeMap<WeightId, WeightPlacement>,
+    host: Option<&HostMemoryAccount>,
 ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
-    let payloads = plan.materialize_weight_components(family, source, components)?;
+    let payloads = plan.materialize_weight_components(family, source, components, host)?;
     for (component, payload) in components.iter().zip(&payloads) {
         let placement =
             placements

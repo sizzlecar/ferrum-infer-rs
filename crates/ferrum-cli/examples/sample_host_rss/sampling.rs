@@ -1,4 +1,7 @@
 use super::Arguments;
+use ferrum_bench_core::images::resource_usage::{
+    proc_memory_bytes as memory_bytes, proc_start_ticks as start_ticks,
+};
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
@@ -47,40 +50,6 @@ pub(super) struct ProcessSample {
     pub lifetime_rss_high_water_bytes: Option<u64>,
 }
 
-fn start_ticks(stat: &str, pid: u32) -> io::Result<u64> {
-    if stat
-        .split_once(' ')
-        .and_then(|(p, _)| p.parse::<u32>().ok())
-        != Some(pid)
-    {
-        return Err(invalid("proc stat PID differs from requested process"));
-    }
-    stat.rsplit_once(") ")
-        .and_then(|(_, tail)| tail.split_whitespace().nth(19))
-        .and_then(|n| n.parse().ok())
-        .ok_or_else(|| invalid("invalid proc stat starttime"))
-}
-fn memory_bytes(status: &str, name: &str) -> io::Result<Option<u64>> {
-    let mut value = None;
-    for line in status.lines().filter(|line| line.starts_with(name)) {
-        if value.is_some() {
-            return Err(invalid("duplicate proc memory field"));
-        }
-        let mut fields = line.split_whitespace();
-        if fields.next() != Some(name) {
-            return Err(invalid("invalid proc memory field"));
-        }
-        let n = fields
-            .next()
-            .and_then(|n| n.parse::<u64>().ok())
-            .and_then(|n| n.checked_mul(1024));
-        if fields.next() != Some("kB") || fields.next().is_some() || n.is_none() {
-            return Err(invalid("invalid proc memory count or unit"));
-        }
-        value = n;
-    }
-    Ok(value)
-}
 fn process(proc_root: &Path, pid: u32, budget: &mut ReadBudget) -> io::Result<ProcessSample> {
     let path = proc_root.join(pid.to_string());
     let before = start_ticks(&budget.read(&path.join("stat"))?, pid)?;

@@ -3,7 +3,9 @@ use super::CpuRuntimeError;
 /// Remaining host memory, including allocations by this and other processes.
 /// Physical availability, address-space headroom and cgroup headroom are
 /// independent ceilings: combine them with min, never subtract usage twice.
-pub(crate) fn host_memory_available() -> Result<u64, CpuRuntimeError> {
+/// This read-only snapshot creates no runtime and reserves no memory. Callers
+/// must still authorize actual allocations against their live resource budget.
+pub fn host_memory_available() -> Result<u64, CpuRuntimeError> {
     let bytes = platform_available()?;
     #[cfg(unix)]
     let bytes = match super::address_space_limit()? {

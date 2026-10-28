@@ -5,8 +5,8 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CanonicalRational, QuantizationFormatId, WeightComponentPayload, WeightComponentSource,
-    WeightComponentSpec, WeightFormatId, WeightLayoutId,
+    CanonicalRational, HostMemoryAccount, QuantizationFormatId, WeightComponentPayload,
+    WeightComponentSource, WeightComponentSpec, WeightFormatId, WeightLayoutId,
 };
 
 use super::{
@@ -18,6 +18,8 @@ use super::{
 
 mod quality_case;
 use quality_case::{ActualEncoding, NumericWeightQualityArtifactCase};
+mod host_backing;
+pub use host_backing::HostBackingPreparation;
 
 pub const IDENTITY_WEIGHT_MATERIALIZER_ID: &str = "weight-materializer.identity";
 const IDENTITY_MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(2, 0);
@@ -1352,6 +1354,36 @@ pub trait WeightMaterializer: Send + Sync {
         device: &DeviceDescriptor,
     ) -> Result<WeightSchema, VNextError>;
 
+    /// Additional peak physical WeightBacking bytes for initialization through
+    /// this retained implementation. Existing managed cache owners remain
+    /// charged to their parent and must not be counted again. Implementations
+    /// with caches must validate actual source identity before subtracting a
+    /// warm entry; absent source evidence requires a conservative cold bound.
+    /// This query may inspect source identity but must not convert weights,
+    /// allocate payloads, evict cache entries, or submit device work.
+    /// The default declares no additional managed Host materialization backing.
+    fn additional_host_backing_bytes(
+        &self,
+        _family: &PreparedModelFamily,
+        _source: Option<&dyn WeightComponentSource>,
+    ) -> Result<usize, VNextError> {
+        Ok(0)
+    }
+
+    /// Prepare a backing bound whose warm cache assumptions remain valid until
+    /// the returned lease is dropped. Caching implementations must atomically
+    /// retain every warm entry subtracted from the bound, and initialization
+    /// must still find those entries if ordinary cache eviction occurs.
+    /// Noncaching implementations can use this default metadata-only bound.
+    fn prepare_host_backing(
+        &self,
+        family: &PreparedModelFamily,
+        source: Option<&dyn WeightComponentSource>,
+    ) -> Result<HostBackingPreparation, VNextError> {
+        self.additional_host_backing_bytes(family, source)
+            .map(HostBackingPreparation::new)
+    }
+
     /// Ordered source-component identities for every execution component.
     ///
     /// The default only permits a same-id mapping. Materializers that create
@@ -1408,6 +1440,21 @@ pub trait WeightMaterializer: Send + Sync {
             .iter()
             .map(|component| self.materialize_component(source, source_components, component))
             .collect()
+    }
+
+    /// Invocation-local managed Host authority for static initialization. The
+    /// default preserves borrowed/unmanaged legacy materializers. Implementations
+    /// using managed backing must explicitly route new allocations through this
+    /// account, while retained cache entries keep their original charge. An
+    /// implementation bound to a parent must reject a different parent account.
+    fn materialize_components_with_host<'source>(
+        &self,
+        source: &'source dyn WeightComponentSource,
+        source_components: &[&WeightComponentSpec],
+        execution_components: &[&WeightComponentSpec],
+        _host: &HostMemoryAccount,
+    ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+        self.materialize_components(source, source_components, execution_components)
     }
 }
 
@@ -1703,6 +1750,29 @@ impl TrustedExecutionWeightPlan {
         &self.plan
     }
 
+    pub(crate) fn additional_host_backing_bytes(
+        &self,
+        family: &PreparedModelFamily,
+        source: Option<&dyn WeightComponentSource>,
+    ) -> Result<usize, VNextError> {
+        self.validate_runtime_authority()?;
+        self.plan
+            .validate_against_materializer(family, &self.descriptor)?;
+        self.materializer
+            .additional_host_backing_bytes(family, source)
+    }
+
+    pub(crate) fn prepare_host_backing(
+        &self,
+        family: &PreparedModelFamily,
+        source: Option<&dyn WeightComponentSource>,
+    ) -> Result<HostBackingPreparation, VNextError> {
+        self.validate_runtime_authority()?;
+        self.plan
+            .validate_against_materializer(family, &self.descriptor)?;
+        self.materializer.prepare_host_backing(family, source)
+    }
+
     pub(crate) fn validate_against_catalog(
         &self,
         family: &PreparedModelFamily,
@@ -1736,6 +1806,7 @@ impl TrustedExecutionWeightPlan {
         family: &PreparedModelFamily,
         source: &'source dyn WeightComponentSource,
         execution_components: &[&WeightComponentSpec],
+        host: Option<&HostMemoryAccount>,
     ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
         self.validate_runtime_authority()?;
         let Some(first_execution_component) = execution_components.first() else {
@@ -1800,11 +1871,19 @@ impl TrustedExecutionWeightPlan {
                 Ok(&family.stored_weight_schema()?.components[source_component_index])
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let payloads = self.materializer.materialize_components(
-            source,
-            &source_components,
-            &planned_components,
-        )?;
+        let payloads = match host {
+            Some(host) => self.materializer.materialize_components_with_host(
+                source,
+                &source_components,
+                &planned_components,
+                host,
+            ),
+            None => self.materializer.materialize_components(
+                source,
+                &source_components,
+                &planned_components,
+            ),
+        }?;
         if payloads.len() != planned_components.len() {
             return Err(invalid_plan(format!(
                 "weight materializer `{}` returned {} payloads for {} execution components",

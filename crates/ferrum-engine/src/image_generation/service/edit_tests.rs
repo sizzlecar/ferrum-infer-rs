@@ -30,14 +30,19 @@ fn edit(host: &HostMemoryAccount, seed: u64) -> QueuedRequest {
         .allocate_zeroed(HostMemoryClass::InputPreprocess, 8)
         .unwrap();
     image.as_mut().copy_from_slice(b"\x89PNG\r\n\x1a\n");
-    QueuedRequest::Edit(ImageEditRequest {
-        generation: request(seed),
-        image: image.freeze(),
-    })
+    QueuedRequest::Edit(
+        ImageEditRequest {
+            generation: request(seed),
+            image: image.freeze(),
+        },
+        None,
+    )
 }
 fn config() -> ImageServiceConfig {
     ImageServiceConfig {
+        batching: ferrum_types::ImageBatchPolicy::Configured,
         maximum_pending: 4,
+        maximum_pending_bytes: 1024 * 1024,
         maximum_prompt_bytes: 1024,
         max_num_seqs: 2,
         request_batch_max_wait_ms: 10,
@@ -419,10 +424,10 @@ async fn edit_batches_preserve_distinct_images_fifo_cancellation_and_queue_quota
     )
     .unwrap();
     let a = service
-        .try_submit_request(QueuedRequest::Edit(png_edit(&host, 11, 17, 2, 2)))
+        .try_submit_request(QueuedRequest::Edit(png_edit(&host, 11, 17, 2, 2), None))
         .unwrap();
     let b = service
-        .try_submit_request(QueuedRequest::Edit(png_edit(&host, 29, 203, 4, 4)))
+        .try_submit_request(QueuedRequest::Edit(png_edit(&host, 29, 203, 4, 4), None))
         .unwrap();
     started.recv_timeout(Duration::from_secs(2)).unwrap();
     let active_bytes = host.usage().unwrap().committed_bytes();
@@ -431,14 +436,14 @@ async fn edit_batches_preserve_distinct_images_fifo_cancellation_and_queue_quota
     assert_eq!(host.usage().unwrap().committed_bytes(), active_bytes);
     let generated = service.try_submit(request(50)).unwrap();
     let pending = service
-        .try_submit_request(QueuedRequest::Edit(png_edit(&host, 99, 5, 2, 2)))
+        .try_submit_request(QueuedRequest::Edit(png_edit(&host, 99, 5, 2, 2), None))
         .unwrap();
     let c = service
-        .try_submit_request(QueuedRequest::Edit(png_edit(&host, 31, 41, 2, 2)))
+        .try_submit_request(QueuedRequest::Edit(png_edit(&host, 31, 41, 2, 2), None))
         .unwrap();
     assert_eq!(
         service
-            .try_submit_request(QueuedRequest::Edit(png_edit(&host, 100, 6, 2, 2)))
+            .try_submit_request(QueuedRequest::Edit(png_edit(&host, 100, 6, 2, 2), None))
             .err()
             .unwrap()
             .kind(),
@@ -447,7 +452,7 @@ async fn edit_batches_preserve_distinct_images_fifo_cancellation_and_queue_quota
     let before_cancel = host.usage().unwrap().committed_bytes();
     pending.cancel();
     let d = service
-        .try_submit_request(QueuedRequest::Edit(png_edit(&host, 32, 42, 2, 2)))
+        .try_submit_request(QueuedRequest::Edit(png_edit(&host, 32, 42, 2, 2), None))
         .unwrap();
     // Pruning returned the cancelled backing before admitting this replacement.
     assert_eq!(host.usage().unwrap().committed_bytes(), before_cancel);
@@ -489,10 +494,10 @@ async fn reference_geometry_and_output_shape_partition_edit_batches() {
             second.generation.width = 64;
         }
         let a = service
-            .try_submit_request(QueuedRequest::Edit(first))
+            .try_submit_request(QueuedRequest::Edit(first, None))
             .unwrap();
         let b = service
-            .try_submit_request(QueuedRequest::Edit(second))
+            .try_submit_request(QueuedRequest::Edit(second, None))
             .unwrap();
         assert_eq!(a.wait().await.unwrap(), (1, 11));
         assert_eq!(b.wait().await.unwrap(), (2, 22));
@@ -529,7 +534,7 @@ fn png_geometry_hint_is_bounded_and_never_substitutes_for_strict_decode() {
     );
     assert!(ManagedRgba8Image::decode_png(&host, &corrupt, ImageInputLimits::default()).is_err());
     let invalid = match edit(&host, 2) {
-        QueuedRequest::Edit(r) => r,
+        QueuedRequest::Edit(r, _) => r,
         _ => unreachable!(),
     };
     assert!(!compatible_edit_geometry(&valid, &invalid));
@@ -557,10 +562,10 @@ async fn batch_edit_fatal_panic_and_wrong_output_count_preserve_worker_retiremen
         )
         .unwrap();
         let a = service
-            .try_submit_request(QueuedRequest::Edit(png_edit(&host, 1, 7, 2, 2)))
+            .try_submit_request(QueuedRequest::Edit(png_edit(&host, 1, 7, 2, 2), None))
             .unwrap();
         let b = service
-            .try_submit_request(QueuedRequest::Edit(png_edit(&host, 2, 8, 2, 2)))
+            .try_submit_request(QueuedRequest::Edit(png_edit(&host, 2, 8, 2, 2), None))
             .unwrap();
         assert!(a.wait().await.is_err());
         assert!(b.wait().await.is_err());
@@ -652,6 +657,6 @@ async fn legacy_generator_keeps_single_edit_cap_and_delegates_without_batch_wait
     assert_eq!(error.kind(), ImageServiceErrorKind::Generation);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(service.is_accepting());
-    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     assert!(!service.shutdown().await.unwrap().has_failure());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

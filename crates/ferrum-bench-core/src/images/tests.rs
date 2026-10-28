@@ -116,6 +116,7 @@ fn workload_identity_is_order_seed_and_geometry_sensitive() {
         width: 2,
         height: 1,
         num_inference_steps: None,
+        mode: None,
     };
     let mut dataset = ImageDataset {
         schema_version: 1,
@@ -164,6 +165,8 @@ fn metrics_do_not_hide_errors_or_invent_missing_slo() {
     };
     let report = ImageMetrics::from_records(2.0, &[record.clone()], None);
     assert_eq!(report.images_per_second, Some(0.5));
+    assert_eq!(report.e2e_p95_ms, Some(10.0));
+    assert_eq!(report.dispatched, 1);
     assert_eq!(report.latency_slo_status, ImageSloStatus::NotEvaluated);
     assert_eq!(
         ImageMetrics::from_records(2.0, &[record.clone()], Some(10.0)).latency_slo_status,
@@ -175,6 +178,45 @@ fn metrics_do_not_hide_errors_or_invent_missing_slo() {
     assert_eq!(failed.errors, 1);
     assert_eq!(failed.e2e_p99_ms, None);
     assert_eq!(failed.latency_slo_status, ImageSloStatus::Violated);
+}
+
+#[test]
+fn rejection_and_unsent_arrivals_remain_failures_without_success_percentiles() {
+    let record = |index, status, failure| ImageRequestRecord {
+        sample_index: index,
+        sample_id: format!("sample-{index}"),
+        phase: ImageRequestPhase::Measured,
+        repetition: 0,
+        dispatch_index: index,
+        http_status: status,
+        e2e_ms: 1.0,
+        validation_ms: 0.0,
+        response_bytes: 0,
+        image: None,
+        failure: Some(failure),
+        error: None,
+    };
+    let records = [
+        record(0, Some(429), ImageFailureKind::HttpStatus),
+        record(1, None, ImageFailureKind::ClientCapacity),
+        record(2, Some(500), ImageFailureKind::HttpStatus),
+    ];
+    let metrics = ImageMetrics::from_records(2.0, &records, Some(10.0));
+    assert_eq!(
+        (metrics.attempted, metrics.dispatched, metrics.errors),
+        (3, 2, 3)
+    );
+    assert_eq!(
+        (
+            metrics.rejected,
+            metrics.client_not_dispatched,
+            metrics.other_errors
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(metrics.images_per_second, Some(0.0));
+    assert_eq!(metrics.e2e_p95_ms, None);
+    assert_eq!(metrics.latency_slo_status, ImageSloStatus::Violated);
 }
 
 #[test]
@@ -214,6 +256,70 @@ fn generation_v1_wire_is_unchanged_and_edit_requires_explicit_v2() {
         }))
         .is_err()
     );
+}
+
+#[test]
+fn mixed_workloads_require_v3_and_partition_failures_by_request_kind_and_size() {
+    let wire = serde_json::json!({"schema_version":3,"samples":[
+        {"id":"generation","prompt":"red kite","seed":1,"width":512,"height":512},
+        {"id":"edit","prompt":"make blue","seed":2,"width":1024,"height":1024,
+         "mode":{"kind":"edit","image":{"path":"reference.png"}}}
+    ]});
+    let mut data: ImageDataset = serde_json::from_value(wire).unwrap();
+    data.validate(&ImageResponseLimits::default()).unwrap();
+    let original = data.fingerprint().unwrap();
+    data.samples[1].mode = Some(ImageRequestMode::Generate);
+    assert_ne!(data.fingerprint().unwrap(), original);
+    data.samples[1].mode = Some(ImageRequestMode::Edit {
+        image: ImageReference {
+            path: "reference.png".into(),
+            encoded_sha256: None,
+        },
+    });
+    data.schema_version = 2;
+    assert!(data.validate(&ImageResponseLimits::default()).is_err());
+    data.schema_version = 3;
+    let records = data
+        .samples
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| ImageRequestRecord {
+            sample_index: index,
+            sample_id: sample.id.clone(),
+            phase: ImageRequestPhase::Measured,
+            repetition: 0,
+            dispatch_index: index,
+            http_status: if index == 0 { Some(429) } else { None },
+            e2e_ms: 0.0,
+            validation_ms: 0.0,
+            response_bytes: 0,
+            image: None,
+            failure: Some(if index == 0 {
+                ImageFailureKind::HttpStatus
+            } else {
+                ImageFailureKind::ClientCapacity
+            }),
+            error: None,
+        })
+        .collect::<Vec<_>>();
+    let groups = image_workload_metrics(2.0, &records, &data, Some(100.0)).unwrap();
+    assert_eq!(groups.len(), 2);
+    let edit = groups
+        .iter()
+        .find(|group| group.request_kind == "edit")
+        .unwrap();
+    assert_eq!((edit.width, edit.height), (1024, 1024));
+    assert_eq!(edit.metrics.client_not_dispatched, 1);
+    assert_eq!(edit.metrics.latency_slo_status, ImageSloStatus::Violated);
+    let generation = groups
+        .iter()
+        .find(|group| group.request_kind == "generate")
+        .unwrap();
+    assert_eq!((generation.width, generation.height), (512, 512));
+    assert_eq!(generation.metrics.rejected, 1);
+    let mut corrupt = records;
+    corrupt[0].sample_id = "wrong-owner".into();
+    assert!(image_workload_metrics(2.0, &corrupt, &data, None).is_err());
 }
 
 #[test]

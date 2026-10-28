@@ -4,7 +4,8 @@
 
 use super::*;
 use crate::backend::cuda::vnext_runtime::{
-    CudaCudnnConfig, CudaCudnnOwner, CudaCudnnSdpaCache, CudnnConv2dDescriptor, CudnnSdpaPlanPolicy,
+    CudaCudnnConfig, CudaCudnnOwner, CudaCudnnSdpaCache, CudnnConv2dDescriptor,
+    CudnnSdpaPlanPolicy, PreparedConv,
 };
 use ferrum_runtime::{
     conv2d_bf16_contract, Conv2dBf16Geometry, Conv2dPaddingMode, DynamicStorageRequirement,
@@ -18,6 +19,7 @@ pub const NUMERICAL_IDENTITY: &str = concat!(
     "NCHW/OIHW-cross-correlation;BF16-input-weight-output;FP32-compute;",
     "padding-mode-is-a-plan-attribute:explicit-materialized-zero-or-implicit-symmetric-cuDNN-descriptor;",
     "implicit-mode-has-no-materialized-padding-scratch;deterministic-v7-heuristic-within-admitted-workspace;",
+    "prepare-selects-algorithm-and-actual-workspace;compiled-plan-retains-selection;",
     "math=DEFAULT-or-TENSOR_OP;no-ALLOW_CONVERSION;no-find-or-unbudgeted-workspace;",
     "B(convolution)-then-B(RN32(output+bias));nonfinite-padding-paths-not-asserted-equivalent;",
     "no-Torch-or-Reference-bitwise-claim;",
@@ -205,12 +207,14 @@ impl OperationResourceEstimator for ConvProvider {
                 "CUDA convolution estimator received another operation",
             ));
         }
-        let s = geometry(
-            request.values(),
-            request.attributes(),
-            self.owner.workspace_limit_bytes(),
-        )
-        .map_err(invalid_plan)?;
+        let s = geometry(request.values(), request.attributes(), 0).map_err(invalid_plan)?;
+        let prepared = self
+            .owner
+            .prepare_convolution(s.native)
+            .map_err(|e| invalid_plan(e.to_string()))?;
+        let s = s
+            .with_workspace(prepared.workspace_bytes())
+            .map_err(invalid_plan)?;
         let scratch = if s.scratch_bytes == 0 {
             None
         } else {
@@ -222,7 +226,7 @@ impl OperationResourceEstimator for ConvProvider {
                 DynamicStorageRequirement::contiguous(),
             )?)
         };
-        Ok(OperationResourceEstimate::new(
+        OperationResourceEstimate::new(
             self.descriptor.resource_estimator_id(),
             self.descriptor.resource_estimator_version(),
             self.descriptor
@@ -231,7 +235,9 @@ impl OperationResourceEstimator for ConvProvider {
             SCRATCH_ALIGNMENT,
             scratch,
             None,
-        ))
+        )
+        .with_prepared_implementation_fingerprint(prepared.fingerprint().to_owned())?
+        .with_prepared_implementation_retention(prepared)
     }
 }
 impl OperationProvider<CudaDeviceRuntime> for ConvProvider {
@@ -276,10 +282,14 @@ impl ConvProvider {
         {
             return Err("CUDA convolution requires its fixed tensor contract".into());
         }
-        let s = geometry(
-            p.bindings(),
-            p.attributes(),
-            self.owner.workspace_limit_bytes(),
+        let prepared = invocation
+            .prepared_implementation::<PreparedConv>()
+            .ok_or("CUDA convolution has no retained prepared implementation")?;
+        let s = geometry(p.bindings(), p.attributes(), prepared.workspace_bytes())?;
+        prepared.validate_invocation(
+            &self.owner,
+            s.native,
+            invocation.prepared_implementation_fingerprint(),
         )?;
         let mut regions = Vec::with_capacity(5);
         for (ordinal, bytes) in [s.input_bytes, s.weight_bytes, s.bias_bytes]
@@ -340,7 +350,6 @@ impl ConvProvider {
         } else if p.scratch_view().is_some() {
             return Err("CUDA convolution received unexpected scratch".into());
         }
-        let owner = Arc::clone(&self.owner);
         let kernels = Arc::clone(&self.kernels);
         CudaDeviceCommand::operation(
             "vnext_conv2d_bf16_cudnn9",
@@ -377,9 +386,8 @@ impl ConvProvider {
                         CudaDeviceRuntimeError::contract("cuDNN scratch address overflows")
                     })?
                 };
-                owner.convolution(
+                prepared.convolution(
                     stream,
-                    s.native,
                     input,
                     regions[1].device_ptr(),
                     regions[3].device_ptr(),
@@ -447,6 +455,14 @@ struct Shape {
     operations: u64,
 }
 impl Shape {
+    fn with_workspace(mut self, actual_bytes: u64) -> Result<Self, String> {
+        let (offset, bytes) = scratch_layout(self.padding_bytes, actual_bytes)?;
+        self.workspace_bytes = actual_bytes;
+        self.workspace_offset = offset;
+        self.scratch_bytes = bytes;
+        Ok(self)
+    }
+
     fn new(g: Conv2dBf16Geometry, workspace_bytes: u64) -> Result<Self, String> {
         let explicit = g.padding_mode() == Conv2dPaddingMode::ExplicitZero;
         let dim = |x: u64| {

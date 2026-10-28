@@ -10,6 +10,11 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tower::ServiceExt;
 
+#[path = "tests/admission.rs"]
+mod admission;
+#[path = "tests/decoupled_output.rs"]
+mod decoupled_output;
+
 pub(super) fn config() -> ImageHttpConfig {
     ImageHttpConfig {
         output: OutputConfig {
@@ -24,7 +29,7 @@ pub(super) fn config() -> ImageHttpConfig {
     }
 }
 
-fn host_account(total: usize) -> HostMemoryAccount {
+pub(super) fn host_account(total: usize) -> HostMemoryAccount {
     HostMemoryAccount::new(
         HostMemoryLimits::new(
             total,
@@ -59,6 +64,25 @@ fn rgba(host: &HostMemoryAccount) -> (ResolvedTensorSpec, ManagedHostBytes) {
         .unwrap(),
         bytes.freeze(),
     )
+}
+
+async fn encode(
+    session: ferrum_output::OutputSession,
+    host: HostMemoryAccount,
+    tensor: ResolvedTensorSpec,
+    raw: ManagedHostBytes,
+    limits: PngLimits,
+    scratch_bytes: usize,
+) -> Result<axum::body::Bytes, ServerError> {
+    response::Admission::new(
+        session,
+        host,
+        PngDimensions::new(2, 2).unwrap(),
+        limits,
+        scratch_bytes,
+    )?
+    .encode(tensor, raw)
+    .await
 }
 
 #[test]
@@ -116,7 +140,7 @@ async fn png_base64_body_retains_host_and_output_credit_until_last_byte_owner() 
     let (tensor, raw) = rgba(&host);
     let budget = OutputBudget::new(config().output).unwrap();
     let session = budget.try_open_session().unwrap();
-    let bytes = response::encode(
+    let bytes = encode(
         session.clone(),
         host.clone(),
         tensor,
@@ -186,7 +210,7 @@ async fn encoding_capacity_failure_returns_all_intermediate_owners() {
     let host = host_account(40);
     let (tensor, raw) = rgba(&host);
     let budget = OutputBudget::new(config().output).unwrap();
-    let result = response::encode(
+    let result = encode(
         budget.try_open_session().unwrap(),
         host.clone(),
         tensor,
@@ -214,7 +238,7 @@ async fn encoded_limit_and_nonfinite_or_foreign_pixels_reject_without_leaking() 
     })
     .unwrap();
     assert!(matches!(
-        response::encode(
+        encode(
             budget.try_open_session().unwrap(),
             host.clone(),
             tensor.clone(),
@@ -227,8 +251,9 @@ async fn encoded_limit_and_nonfinite_or_foreign_pixels_reject_without_leaking() 
     ));
     assert_eq!(host.usage().unwrap().allocated_bytes(), 32);
     assert_eq!(budget.usage().sessions, 0);
+    let budget = OutputBudget::new(config().output).unwrap();
     let foreign = host_account(4096);
-    assert!(response::encode(
+    assert!(encode(
         budget.try_open_session().unwrap(),
         foreign.clone(),
         tensor.clone(),
@@ -241,7 +266,7 @@ async fn encoded_limit_and_nonfinite_or_foreign_pixels_reject_without_leaking() 
     assert_eq!(foreign.usage().unwrap().committed_bytes(), 0);
     let mut invalid = host.allocate_zeroed(HostMemoryClass::Output, 32).unwrap();
     invalid.as_mut()[..2].copy_from_slice(&0x7fc0_u16.to_le_bytes());
-    assert!(response::encode(
+    assert!(encode(
         budget.try_open_session().unwrap(),
         host.clone(),
         tensor,
@@ -383,15 +408,38 @@ fn image_service() -> (ImageHttpService, Arc<AtomicUsize>) {
 fn image_service_with_gate(
     gate: Option<Arc<GenerationGate>>,
 ) -> (ImageHttpService, Arc<AtomicUsize>) {
+    // Queued prompts/metadata and encoded outputs share the injected account.
+    // Keep host_account() output-only for the exact encoder capacity tests.
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            4 * 1024 * 1024,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: 4096,
+                output_bytes: 4 * 1024 * 1024,
+                transfer_staging_bytes: 0,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    image_service_with_host(host, gate)
+}
+
+fn image_service_with_host(
+    host: HostMemoryAccount,
+    gate: Option<Arc<GenerationGate>>,
+) -> (ImageHttpService, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let service = ImageService::new(
         FailingGenerator {
-            host: host_account(4096),
+            host,
             calls: calls.clone(),
             gate,
         },
         ferrum_engine::image_generation::service::ImageServiceConfig {
+            batching: ferrum_types::ImageBatchPolicy::Configured,
             maximum_pending: 2,
+            maximum_pending_bytes: 4096,
             maximum_prompt_bytes: 64,
             max_num_seqs: 1,
             request_batch_max_wait_ms: 0,
@@ -402,6 +450,37 @@ fn image_service_with_gate(
         ImageHttpService::new("image", service, config()).unwrap(),
         calls,
     )
+}
+
+#[tokio::test]
+async fn queue_host_pressure_returns_429_before_generator_execution() {
+    // Output capacity is available, but the separate input class has no room
+    // for the admitted prompt and queue metadata.
+    let host = host_account(4 * 1024 * 1024);
+    let (images, calls) = image_service_with_host(host.clone(), None);
+    let router =
+        super::super::AxumServer::from_state(AppState::default().with_images(images.clone()))
+            .build_router()
+            .unwrap();
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"image","prompt":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(images.service().snapshot().rejected_requests, 1);
+    assert_eq!(images.service().snapshot().pending_requests, 0);
+    assert_eq!(images.output_usage().sessions, 0);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    images.shutdown().await.unwrap();
+    assert!(!images.take_shutdown().await.unwrap().has_failure());
 }
 
 async fn json_get(router: axum::Router, path: &str) -> serde_json::Value {
@@ -435,6 +514,8 @@ async fn image_only_health_models_and_validation_do_not_claim_a_ready_text_engin
     assert_eq!(health["engine"]["text_ready"], false);
     assert_eq!(health["images"]["ready"], true);
     assert_eq!(health["images"]["scheduler"]["max_num_seqs"], 1);
+    assert_eq!(health["images"]["scheduler"]["batching"], "configured");
+    assert_eq!(health["images"]["scheduler"]["maximum_pending_bytes"], 4096);
     assert_eq!(health["images"]["host"]["allocated_bytes"], 0);
     assert_eq!(health["images"]["host"]["committed_bytes"], 0);
     // An image-only service must not present fallback text configuration as

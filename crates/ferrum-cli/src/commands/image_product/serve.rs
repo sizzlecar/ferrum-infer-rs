@@ -45,7 +45,8 @@ pub async fn execute_serve_source(
             ..Default::default()
         };
         tracing::info!(composition=%serde_json::to_string(&prepared.composition).map_err(anyhow::Error::from)?, "image backend composition and device capacity");
-        tracing::warn!(profile=prepared.profile, max_num_seqs=prepared.max_num_seqs,
+        tracing::info!(scheduler=%serde_json::to_string(&prepared.service_config).map_err(anyhow::Error::from)?, "image request scheduling and queue bounds");
+        tracing::warn!(profile=prepared.profile, max_num_seqs=prepared.service_config.max_num_seqs,
             "experimental image HTTP uses its declared residency policy; no G3 throughput qualification");
         let mut task = {
             let server = server.clone();
@@ -89,7 +90,7 @@ pub(super) struct PreparedHttp {
     pub images: ferrum_server::ImageHttpService,
     profile: &'static str,
     composition: serde_json::Value,
-    max_num_seqs: usize,
+    service_config: ferrum_engine::image_generation::service::ImageServiceConfig,
 }
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
@@ -124,13 +125,19 @@ pub(super) fn prepare_http(
     )
     .map_err(anyhow::Error::from)?;
     let (pipeline, composition) = product.backend.create(product.assets)?;
+    let service_config = ImageServiceConfig {
+        batching: serving.batching,
+        maximum_pending: serving.maximum_pending,
+        maximum_pending_bytes: serving
+            .maximum_pending_bytes
+            .ok_or_else(|| anyhow::anyhow!("image queue byte budget was not resolved"))?
+            .get(),
+        maximum_prompt_bytes: serving.maximum_prompt_bytes,
+        max_num_seqs: serving.max_num_seqs,
+        request_batch_max_wait_ms: serving.request_batch_max_wait_ms,
+    };
     let service = pipeline
-        .into_service(ImageServiceConfig {
-            maximum_pending: serving.maximum_pending,
-            maximum_prompt_bytes: serving.maximum_prompt_bytes,
-            max_num_seqs: serving.max_num_seqs,
-            request_batch_max_wait_ms: serving.request_batch_max_wait_ms,
-        })
+        .into_service(service_config)
         .map_err(anyhow::Error::from)?;
     let images = ImageHttpService::new(
         model,
@@ -148,6 +155,6 @@ pub(super) fn prepare_http(
         images,
         profile: product.profile,
         composition,
-        max_num_seqs: serving.max_num_seqs,
+        service_config,
     })
 }

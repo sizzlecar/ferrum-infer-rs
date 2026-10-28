@@ -2,6 +2,9 @@ mod vnext_device_operation_contract;
 
 use vnext_device_operation_contract::*;
 
+#[path = "vnext_static_initialization_contract_tests/host_scope.rs"]
+mod host_scope;
+
 struct ZeroWeightSource;
 
 impl WeightComponentSource for ZeroWeightSource {
@@ -739,9 +742,18 @@ fn derived_component_test_plan() -> (
     Arc<TestRuntime>,
     Arc<Mutex<RuntimeTrace>>,
 ) {
-    let materializers =
-        WeightMaterializerRegistry::new(vec![Box::new(DerivedComponentMaterializer::new())])
-            .unwrap();
+    derived_component_test_plan_with(Box::new(DerivedComponentMaterializer::new()))
+}
+
+fn derived_component_test_plan_with(
+    materializer: Box<dyn WeightMaterializer>,
+) -> (
+    PreparedModelFamily,
+    ExecutionPlan,
+    Arc<TestRuntime>,
+    Arc<Mutex<RuntimeTrace>>,
+) {
+    let materializers = WeightMaterializerRegistry::new(vec![materializer]).unwrap();
     let catalog = materializers.augment_catalog(catalog()).unwrap();
     let registry = operation_registry(
         &catalog,

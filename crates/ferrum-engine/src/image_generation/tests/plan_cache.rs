@@ -622,7 +622,7 @@ fn cache_policy_wire_preserves_strings_and_requires_both_explicit_bounds() {
 }
 
 #[test]
-fn evicted_component_still_initializes_executes_and_retires_with_output_alive() {
+fn failed_candidate_releases_new_cache_owners_and_old_plan_still_executes() {
     use super::residency::{input, numeric_pipeline, prepared};
     use ferrum_models::qwen_image21::IMAGE_PROJECTION_OUTPUT_ID;
     let (mut pipeline, _directory) = numeric_pipeline();
@@ -630,9 +630,24 @@ fn evicted_component_still_initializes_executes_and_retires_with_output_alive() 
     pipeline.config.plan_cache = multi_shape(1, 16 * 1024 * 1024);
     let a = prepared(&pipeline, 1);
     let weak = Arc::downgrade(&a.component);
+    let capacity = pipeline.config.device_capacity_bytes;
+    pipeline.config.device_capacity_bytes = 1;
+    let candidate = pipeline.plan_cache.begin_candidate().unwrap();
     let b = prepared(&pipeline, 2);
+    let rejected = Arc::downgrade(&b.component);
     assert_eq!(b.plan.plan_cache.as_ref().unwrap().evictions, 1);
     assert!(weak.upgrade().is_some()); // A is held solely by this request.
+    let error = pipeline.validate_resident_capacity(&[&b]).unwrap_err();
+    let exceeded = error.downcast_ref::<ImageDeviceCapacityExceeded>().unwrap();
+    assert!(exceeded.report.complete_batch);
+    assert!(!exceeded.report.fits());
+    drop(b);
+    assert!(rejected.upgrade().is_some()); // Candidate cache reference.
+    drop(candidate);
+    assert!(rejected.upgrade().is_none());
+    assert_eq!(pipeline.runtime.snapshot().allocations, 0);
+    assert_eq!(pipeline.runtime.snapshot().submissions, 0);
+    pipeline.config.device_capacity_bytes = capacity;
     let mut stages = Vec::new();
     let active = pipeline
         .start_stage(a, 0, &mut stages)
@@ -658,4 +673,83 @@ fn evicted_component_still_initializes_executes_and_retires_with_output_alive() 
     drop(output);
     assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
     assert!(pipeline.shutdown().unwrap().is_empty());
+}
+
+#[test]
+fn failed_batch_preparation_cleans_partial_stages_without_removing_existing_hits() {
+    let (mut pipeline, _directory) = super::adapter::pipeline(1);
+    pipeline.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
+    let old = cached_projection(&pipeline, ImageStage::Denoiser, 1);
+    let request = ImageGenerationRequest {
+        prompt: "cat".into(),
+        width: 32,
+        height: 32,
+        seed: 9,
+        n: 1,
+    };
+    for _ in 0..3 {
+        let error = pipeline
+            .prepare_batch(std::slice::from_ref(&request))
+            .err()
+            .unwrap();
+        // The real Reference registry rejects Philox after TE was compiled.
+        assert!(format!("{error:#}").contains("philox"));
+        assert!(error
+            .downcast_ref::<ImageDeviceCapacityExceeded>()
+            .is_none());
+        let retained = cached_projection(&pipeline, ImageStage::Denoiser, 1);
+        assert!(Arc::ptr_eq(&old.component, &retained.component));
+        assert!(retained.plan.plan_cache_hit);
+        assert_eq!(retained.plan.plan_cache.as_ref().unwrap().entries, 1);
+    }
+    assert_eq!(pipeline.runtime.snapshot().allocations, 0);
+    assert_eq!(pipeline.runtime.snapshot().submissions, 0);
+    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn successful_candidate_reuses_exact_compiled_owners_after_commit() {
+    let (pipeline, _directory) = super::adapter::pipeline(1);
+    let candidate = pipeline.plan_cache.begin_candidate().unwrap();
+    let prepared = cached_projection(&pipeline, ImageStage::Denoiser, 1);
+    let weak = Arc::downgrade(&prepared.component);
+    candidate.defer().unwrap().commit();
+    drop(prepared);
+    let cached = cached_projection(&pipeline, ImageStage::Denoiser, 1);
+    assert!(cached.plan.plan_cache_hit);
+    assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), &cached.component));
+    assert_eq!(pipeline.runtime.snapshot().allocations, 0);
+    assert_eq!(pipeline.runtime.snapshot().submissions, 0);
+}
+
+#[test]
+fn cancelled_host_wait_releases_only_its_candidate_cache_interval() {
+    let (mut pipeline, _directory) = super::adapter::pipeline(2);
+    pipeline.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
+    let first = pipeline.plan_cache.begin_candidate().unwrap();
+    let waiting = cached_projection(&pipeline, ImageStage::Denoiser, 1);
+    let waiting_weak = Arc::downgrade(&waiting.component);
+    let pending = first.defer().unwrap();
+    drop(waiting);
+    assert!(waiting_weak.upgrade().is_some());
+
+    // Preparation no longer holds the serial mutex while waiting. A distinct
+    // later candidate may publish its own plans and must survive this cancel.
+    let second = pipeline.plan_cache.begin_candidate().unwrap();
+    let running = cached_projection(&pipeline, ImageStage::Denoiser, 2);
+    let running_weak = Arc::downgrade(&running.component);
+    second.defer().unwrap().commit();
+    drop(running);
+    drop(pending);
+    assert!(waiting_weak.upgrade().is_none());
+    let retained = cached_projection(&pipeline, ImageStage::Denoiser, 2);
+    assert!(retained.plan.plan_cache_hit);
+    assert!(Arc::ptr_eq(
+        &running_weak.upgrade().unwrap(),
+        &retained.component
+    ));
+    assert_eq!(retained.plan.plan_cache.as_ref().unwrap().entries, 1);
+    assert_eq!(pipeline.runtime.snapshot().allocations, 0);
+    assert_eq!(pipeline.runtime.snapshot().submissions, 0);
+    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
 }

@@ -4,6 +4,102 @@ use crate::{
     ProviderStorageBindingRequirement, ResolvedValueRole, UnvalidatedProviderResourcePlan,
 };
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
+#[test]
+fn prepared_implementation_reads_retain_the_same_owner_across_plan_clones() {
+    let native = Arc::new(String::from("prepared native choice"));
+    let weak = Arc::downgrade(&native);
+    let estimated = estimate()
+        .with_prepared_implementation_fingerprint("1".repeat(64))
+        .unwrap()
+        .with_prepared_implementation_retention(native)
+        .unwrap();
+    let mut node = crate::PlanNode::resource_test_node(crate::NodeId::new("node.native").unwrap());
+    node.provider_resources = plan(estimated);
+    let cloned = node.clone();
+    let retained = node
+        .provider_resources()
+        .prepared_implementation::<String>()
+        .unwrap();
+    assert!(Arc::ptr_eq(&retained, &weak.upgrade().unwrap()));
+    assert!(Arc::ptr_eq(
+        &retained,
+        &cloned
+            .provider_resources()
+            .prepared_implementation::<String>()
+            .unwrap()
+    ));
+    assert!(node
+        .provider_resources()
+        .prepared_implementation::<u64>()
+        .is_none());
+    let wire = serde_json::to_value(node.provider_resources()).unwrap();
+    assert!(wire.get("prepared_implementation_retention").is_none());
+    let decoded: UnvalidatedProviderResourcePlan = serde_json::from_value(wire).unwrap();
+    drop(node);
+    assert!(weak.upgrade().is_some());
+    drop(cloned);
+    assert!(weak.upgrade().is_some());
+    drop(retained);
+    assert!(weak.upgrade().is_none());
+    // An untrusted wire description never retains process-local native state.
+    drop(decoded);
+}
+
+#[test]
+fn rejected_estimate_releases_prepared_owner_and_identity_cannot_change() {
+    let native = Arc::new(());
+    let weak = Arc::downgrade(&native);
+    let estimated = estimate()
+        .with_prepared_implementation_fingerprint("1".repeat(64))
+        .unwrap()
+        .with_prepared_implementation_retention(native)
+        .unwrap();
+    assert!(estimated
+        .clone()
+        .with_prepared_implementation_fingerprint("2".repeat(64))
+        .is_err());
+    assert!(
+        ProviderResourcePlan::from_provider_output(&descriptor(), "wrong-input", estimated)
+            .is_err()
+    );
+    assert!(weak.upgrade().is_none());
+    assert!(estimate()
+        .with_prepared_implementation_retention(Arc::new(()))
+        .is_err());
+}
+
+#[test]
+fn prepared_retention_preserves_wire_identity_and_semantic_rebuild() {
+    let make = || {
+        estimate()
+            .with_prepared_implementation_fingerprint("1".repeat(64))
+            .unwrap()
+    };
+    let plain = plan(make());
+    let retained = plan(
+        make()
+            .with_prepared_implementation_retention(Arc::new(()))
+            .unwrap(),
+    );
+    let rebuilt = plan(
+        make()
+            .with_prepared_implementation_retention(Arc::new(()))
+            .unwrap(),
+    );
+    assert!(plain.prepared_implementation::<()>().is_none());
+    assert!(retained.prepared_implementation::<()>().is_some());
+    assert_eq!(retained, rebuilt);
+    assert_eq!(
+        plain.estimate_fingerprint(),
+        retained.estimate_fingerprint()
+    );
+    assert_eq!(
+        serde_json::to_value(plain).unwrap(),
+        serde_json::to_value(retained).unwrap()
+    );
+}
 
 fn descriptor() -> OperationProviderDescriptor {
     OperationProviderDescriptor::new(

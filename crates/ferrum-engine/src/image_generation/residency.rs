@@ -48,7 +48,7 @@ impl ImageResidencyPolicy {
         Ok(())
     }
 
-    fn retains(self, stage: ImageStage) -> bool {
+    pub(super) fn retains(self, stage: ImageStage) -> bool {
         match self {
             Self::Cold => false,
             Self::Adaptive => true,
@@ -265,6 +265,17 @@ struct ResidentWeights<R: DeviceRuntime> {
     origin: ImageStageExecutionReceipt,
 }
 impl<R: DeviceRuntime> ResidentStages<R> {
+    pub(super) fn has_weights(&self, stage: ImageStage) -> bool {
+        match stage {
+            ImageStage::TextEncoder => self.text_encoder_weights.is_some(),
+            ImageStage::VisionEncoder => self.vision_encoder_weights.is_some(),
+            ImageStage::VaeEncoder => self.vae_encoder_weights.is_some(),
+            ImageStage::Denoiser => self.denoiser_weights.is_some(),
+            ImageStage::Decoder => self.decoder_weights.is_some(),
+            ImageStage::Noise => false,
+        }
+    }
+
     pub(super) fn new() -> Self {
         Self {
             text_encoder: None,
@@ -366,6 +377,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         stages: &[&PreparedStage<R>],
         prefix: Option<(&PreparedStage<R>, &PreparedStage<R>)>,
     ) -> anyhow::Result<()> {
+        self.capacity_with_prefix(stages, prefix)?.validate()?;
+        Ok(())
+    }
+
+    pub(super) fn capacity_with_prefix(
+        &self,
+        stages: &[&PreparedStage<R>],
+        prefix: Option<(&PreparedStage<R>, &PreparedStage<R>)>,
+    ) -> anyhow::Result<ImageDeviceCapacityReport> {
         self.config
             .dynamic_residency
             .validate(self.config.residency)?;
@@ -523,10 +543,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .checked_add(active_peak)
             .and_then(|n| n.checked_add(self.device_opaque_allowance_bytes))
             .context("resident batch capacity overflows")?;
-        ensure!(required <= self.config.device_capacity_bytes,
-            "resident image batch needs {required} device bytes (retained static {retained_static}, active stage peak {active_peak}, total idle dynamic allowance {retained_dynamic}, native allowance {}), exceeding total ceiling {}",
-            self.device_opaque_allowance_bytes, self.config.device_capacity_bytes);
-        Ok(())
+        Ok(ImageDeviceCapacityReport {
+            complete_batch: true,
+            required_bytes: required,
+            capacity_bytes: self.config.device_capacity_bytes,
+            retained_static_bytes: retained_static,
+            active_stage_peak_bytes: active_peak,
+            retained_dynamic_allowance_bytes: retained_dynamic,
+            native_allowance_bytes: self.device_opaque_allowance_bytes,
+        })
     }
 
     /// The second phase binds this immutable installation while the first
@@ -552,7 +577,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let dit_source = ExactBf16TensorSource::new(self.assets.sources.transformer.as_ref());
             let native_source = ManagedDenseArchiveSource::new(
                 self.assets.sources.transformer.as_ref(),
-                &self.host,
+                self.execution_host(),
             );
             let source =
                 if QwenImage21TransformerFamily::is_fp8_profile(prepared.plan.profile.as_str()) {
@@ -631,8 +656,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         // and stay alive throughout synchronous static initialization.
         let text_source = ExactBf16TensorSource::new(self.assets.sources.text_encoder.as_ref());
         let dit_source = ExactBf16TensorSource::new(self.assets.sources.transformer.as_ref());
-        let native_source =
-            ManagedDenseArchiveSource::new(self.assets.sources.transformer.as_ref(), &self.host);
+        let native_source = ManagedDenseArchiveSource::new(
+            self.assets.sources.transformer.as_ref(),
+            self.execution_host(),
+        );
         let profile = prepared.plan.profile.as_str();
         let source = match prepared.plan.stage {
             ImageStage::TextEncoder if Qwen3VLTextEncoderFamily::is_fp8_profile(profile) => {
@@ -675,6 +702,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         mut active: ActiveImageStage<R>,
         stages: &mut Vec<ImageStageReceipt>,
     ) -> Result<(), ImageGenerationFailure<R>> {
+        // Resident executors must not carry a closed request's scoped view
+        // into the next batch. The root still proves the same Host provenance.
+        if let Err(error) = active.session.set_output_host_account(self.host.clone()) {
+            return Err(active.processing(error.into()));
+        }
         if self.config.residency.retains(active.receipt.plan.stage) {
             if let Some(slot) = self.resident_stages.slot(active.receipt.plan.stage) {
                 if slot.is_some() {

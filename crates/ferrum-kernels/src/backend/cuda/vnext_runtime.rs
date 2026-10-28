@@ -70,7 +70,7 @@ mod tensor_io;
 mod terminal_readback;
 pub use cudnn::CudaCudnnConfig;
 pub use cudnn::CudnnSdpaPlanPolicy;
-pub(crate) use cudnn::{CudaCudnnOwner, CudnnConv2dDescriptor};
+pub(crate) use cudnn::{CudaCudnnOwner, CudnnConv2dDescriptor, PreparedConv};
 pub(crate) use cudnn::{
     CudaCudnnSdpaCache, CudnnSdpaBindings, CudnnSdpaExecution, CudnnSdpaPlan, CudnnSdpaSignature,
 };

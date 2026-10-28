@@ -843,7 +843,7 @@ pub struct RunCommand {
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
 
-    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`; image pipeline batch ceiling.
+    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`; image run always executes one request.
     #[arg(long, value_name = "N")]
     pub max_num_seqs: Option<usize>,
 

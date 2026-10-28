@@ -3,7 +3,10 @@
 //! A completed request can still own unread output. Sessions and byte leases
 //! follow that output, rather than being returned when model resources close.
 
-use ferrum_types::{FerrumError, OutputConfig, Result, StreamChunk};
+use ferrum_types::{
+    FerrumError, OutputConfig, ResourceChangeNotifier, ResourceChangeSubscription, Result,
+    StreamChunk,
+};
 use futures::Stream;
 use std::{
     fmt, io,
@@ -12,7 +15,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
@@ -36,6 +39,7 @@ struct BudgetInner {
     encoded: Arc<Semaphore>,
     semantic: Arc<Semaphore>,
     control_bytes: AtomicUsize,
+    capacity_changed: ResourceChangeNotifier,
 }
 
 /// One instance is shared by an engine and all of its downstream consumers.
@@ -69,6 +73,7 @@ impl OutputBudget {
             encoded: Arc::new(Semaphore::new(config.encoded_bytes_total)),
             semantic: Arc::new(Semaphore::new(config.semantic_bytes_total)),
             control_bytes: AtomicUsize::new(0),
+            capacity_changed: ResourceChangeNotifier::default(),
             config,
         })))
     }
@@ -80,7 +85,7 @@ impl OutputBudget {
         })?;
         Ok(OutputSession(Arc::new(SessionInner {
             budget: self.0.clone(),
-            _permit: permit,
+            permit: Some(permit),
             error_claimed: AtomicBool::new(false),
             semantic: Arc::new(Semaphore::new(self.0.config.semantic_bytes_per_session)),
         })))
@@ -88,6 +93,27 @@ impl OutputBudget {
 
     pub fn config(&self) -> &OutputConfig {
         &self.0.config
+    }
+
+    /// Metadata-only lifecycle check for schedulers probing multiple budgets.
+    pub fn is_closed(&self) -> bool {
+        self.0.sessions.is_closed()
+    }
+
+    /// Subscribe before trying a grant. The wake target should record a
+    /// generation and also support its scheduler's cancellation/shutdown wake.
+    pub fn subscribe_capacity(&self, waker: Waker) -> ResourceChangeSubscription {
+        self.0.capacity_changed.subscribe(waker)
+    }
+
+    /// Stop new sessions/byte grants and wake waiters. Existing content remains
+    /// valid and keeps its charge until its last owner is released.
+    pub fn close(&self) {
+        self.0.sessions.close();
+        self.0.queued.close();
+        self.0.encoded.close();
+        self.0.semantic.close();
+        self.0.capacity_changed.notify();
     }
 
     pub fn usage(&self) -> OutputUsage {
@@ -114,9 +140,16 @@ pub struct OutputUsage {
 #[derive(Debug)]
 struct SessionInner {
     budget: Arc<BudgetInner>,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
     error_claimed: AtomicBool,
     semantic: Arc<Semaphore>,
+}
+
+impl Drop for SessionInner {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.budget.capacity_changed.notify();
+    }
 }
 
 /// Cloning transfers shared ownership of the same session, not a new admission.
@@ -147,6 +180,8 @@ impl OutputBytesLease {
 
 impl Drop for OutputBytesLease {
     fn drop(&mut self) {
+        // A synchronous subscriber may immediately retry admission.
+        drop(self._permit.take());
         if self.kind == BufferKind::TerminalError {
             self._session
                 .0
@@ -154,12 +189,31 @@ impl Drop for OutputBytesLease {
                 .control_bytes
                 .fetch_sub(self.bytes, Ordering::AcqRel);
         }
+        self._session.0.budget.capacity_changed.notify();
+    }
+}
+
+struct CancelledReservationNotification(Option<ResourceChangeNotifier>);
+
+impl Drop for CancelledReservationNotification {
+    fn drop(&mut self) {
+        if let Some(notifier) = &self.0 {
+            notifier.notify();
+        }
     }
 }
 
 impl OutputSession {
     pub fn config(&self) -> &OutputConfig {
         &self.0.budget.config
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.0.budget.sessions.is_closed()
+    }
+
+    pub fn subscribe_capacity(&self, waker: Waker) -> ResourceChangeSubscription {
+        self.0.budget.capacity_changed.subscribe(waker)
     }
 
     fn pool(&self, kind: BufferKind, bytes: usize) -> Result<Arc<Semaphore>> {
@@ -195,11 +249,17 @@ impl OutputSession {
     }
 
     async fn reserve(&self, kind: BufferKind, bytes: usize) -> Result<OutputBytesLease> {
-        let permit = self
-            .pool(kind, bytes)?
-            .acquire_many_owned(bytes as u32)
+        let pool = self.pool(kind, bytes)?;
+        // Locals drop in reverse declaration order: cancellation releases the
+        // semaphore's possibly partial FIFO grant before waking our schedulers.
+        let mut cancellation =
+            CancelledReservationNotification(Some(self.0.budget.capacity_changed.clone()));
+        let acquisition = pool.acquire_many_owned(bytes as u32);
+        tokio::pin!(acquisition);
+        let permit = acquisition
             .await
             .map_err(|_| exhausted("output budget is closed"))?;
+        cancellation.0 = None;
         Ok(OutputBytesLease {
             _session: self.clone(),
             _permit: Some(permit),
@@ -214,6 +274,22 @@ impl OutputSession {
 
     pub async fn reserve_encoded(&self, bytes: usize) -> Result<OutputBytesLease> {
         self.reserve(BufferKind::Encoded, bytes).await
+    }
+
+    /// Admit a known encoded response before producer work, without parking a
+    /// waiter or retaining partial credit when the shared pool is full.
+    pub fn try_reserve_encoded(&self, bytes: usize) -> Result<Option<OutputBytesLease>> {
+        let pool = self.pool(BufferKind::Encoded, bytes)?;
+        match pool.try_acquire_many_owned(bytes as u32) {
+            Ok(permit) => Ok(Some(OutputBytesLease {
+                _session: self.clone(),
+                _permit: Some(permit),
+                bytes,
+                kind: BufferKind::Encoded,
+            })),
+            Err(TryAcquireError::NoPermits) => Ok(None),
+            Err(TryAcquireError::Closed) => Err(exhausted("output encoding budget is closed")),
+        }
     }
 
     /// One bounded error per session, independent of normal data credit. It
@@ -361,5 +437,7 @@ fn exhausted(message: impl Into<String>) -> FerrumError {
     }
 }
 
+#[cfg(test)]
+mod capacity_tests;
 #[cfg(test)]
 mod tests;

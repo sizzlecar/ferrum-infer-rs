@@ -1738,6 +1738,7 @@ dependencies = [
  "ferrum-execution",
  "ferrum-interfaces",
  "ferrum-journal",
+ "ferrum-kernels",
  "ferrum-models",
  "ferrum-output",
  "ferrum-runtime",

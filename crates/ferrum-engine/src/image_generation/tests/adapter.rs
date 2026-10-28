@@ -161,10 +161,13 @@ pub(super) fn pipeline(
     let composition = composition("device.image.adapter.batch");
     let host = HostMemoryAccount::new(
         HostMemoryLimits::new(
-            4096,
+            64 * 1024,
             HostMemoryClassLimits {
                 input_preprocess_bytes: 4096,
-                output_bytes: 4096,
+                // A 32-square BF16 RGBA readback is 8 KiB. Leave enough
+                // Output room for these provider/capacity fixtures to reach
+                // their intended native-plan boundary after shape preflight.
+                output_bytes: 32 * 1024,
                 transfer_staging_bytes: 4096,
                 weight_backing_bytes: 0,
             },
@@ -280,6 +283,12 @@ async fn real_plan_capacity_error_retains_stage_source_and_run_serve_diagnostics
     assert!(*required_bytes > *usable_capacity_bytes);
     assert_eq!(*usable_capacity_bytes, available);
     let required = *required_bytes;
+    let image_capacity = source
+        .downcast_ref::<ImageDeviceCapacityExceeded>()
+        .expect("fresh-plan capacity must be an explicit image shrink signal");
+    assert!(!image_capacity.report.complete_batch);
+    assert_eq!(image_capacity.report.required_bytes, required);
+    assert_eq!(image_capacity.report.capacity_bytes, available);
     // ImageProductError::Generation uses this Display for `ferrum run`.
     let run_message = error.to_string();
     for detail in [
@@ -299,7 +308,9 @@ async fn real_plan_capacity_error_retains_stage_source_and_run_serve_diagnostics
     let service = ImageService::new(
         pipeline,
         ImageServiceConfig {
+            batching: ferrum_types::ImageBatchPolicy::Configured,
             maximum_pending: 2,
+            maximum_pending_bytes: 1024 * 1024,
             maximum_prompt_bytes: 4096,
             max_num_seqs: 1,
             request_batch_max_wait_ms: 0,
@@ -345,7 +356,9 @@ async fn real_qwen_service_rejects_excess_capacity_and_preserves_default_one() {
     assert!(matches!(&error, ImageBatchError::Rejected(_)));
     assert!(error.to_string().contains("maximum_batch_size"));
     let service_config = ImageServiceConfig {
+        batching: ferrum_types::ImageBatchPolicy::Configured,
         maximum_pending: 2,
+        maximum_pending_bytes: 1024 * 1024,
         maximum_prompt_bytes: 4096,
         max_num_seqs: 2,
         request_batch_max_wait_ms: 0,
@@ -368,7 +381,9 @@ async fn real_qwen_token_preflight_rejects_job_without_stopping_service_or_submi
     let service = ImageService::new(
         pipeline,
         ImageServiceConfig {
+            batching: ferrum_types::ImageBatchPolicy::Configured,
             maximum_pending: 2,
+            maximum_pending_bytes: 1024 * 1024,
             maximum_prompt_bytes: 4096,
             max_num_seqs: 1,
             request_batch_max_wait_ms: 0,
@@ -406,8 +421,8 @@ async fn real_qwen_token_preflight_rejects_job_without_stopping_service_or_submi
     assert!(service.is_accepting());
     assert_eq!(runtime.snapshot().submissions, before.submissions);
     assert_eq!(runtime.snapshot().allocations, before.allocations);
-    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     let retired = service.shutdown().await.unwrap();
     assert!(!retired.has_failure());
     drop(retired);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

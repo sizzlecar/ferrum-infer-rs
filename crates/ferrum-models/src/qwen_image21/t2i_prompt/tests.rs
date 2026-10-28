@@ -199,6 +199,8 @@ fn edit_batch_keeps_each_single_reference_span_after_left_padding() {
     let batch = tokenizer.prepare_edit_batch(&texts, 64, 4, 4, 2).unwrap();
     assert_eq!(batch.prompts().batch(), 2);
     let sequence = batch.prompts().sequence_length();
+    assert!(sequence <= tokenizer.maximum_sequence_length(64, 4).unwrap());
+    assert!(tokenizer.maximum_sequence_length(0, 4).is_err());
     let runs = batch.text_config(&architecture_with_layers(3)).unwrap();
     let runs = runs.deepstack().unwrap().runs();
     assert_eq!(runs.len(), 2);

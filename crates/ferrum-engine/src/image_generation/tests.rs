@@ -5,6 +5,7 @@ mod batch_order;
 mod decoder;
 mod directory;
 mod fixture;
+mod host_budget;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal;
 mod ownership;
