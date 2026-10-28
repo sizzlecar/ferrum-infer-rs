@@ -365,6 +365,34 @@ fn unclassified_errors_are_fatal_and_stopped_preflight_is_not_recoverable() {
     ));
 }
 
+#[test]
+fn rolled_back_allocation_rejection_does_not_stop_a_healthy_worker() {
+    use super::super::{ImageGenerationError, ImageGenerationFailure, ImageStage};
+    use ferrum_kernels::backend::reference::ReferenceDeviceRuntime;
+    let failure = || ImageGenerationError::<ReferenceDeviceRuntime> {
+        failure: ImageGenerationFailure::AllocationRejected {
+            stage: ImageStage::TextEncoder,
+            failure: ferrum_runtime::FailureEnvelope::new(
+                ferrum_runtime::FailureDomain::Resource,
+                "device_allocation",
+                "allocation unavailable",
+                true,
+            )
+            .unwrap(),
+        },
+        completed_stages: Vec::new(),
+        completed_steps: Vec::new(),
+    };
+    assert!(matches!(
+        qwen_batch_error(false, failure()),
+        ImageBatchError::Rejected(_)
+    ));
+    assert!(matches!(
+        qwen_batch_error(true, failure()),
+        ImageBatchError::Fatal(_)
+    ));
+}
+
 #[tokio::test]
 async fn pending_capacity_cancel_and_active_cancel_preserve_worker_until_completion() {
     let (entered_tx, entered_rx) = mpsc::channel();

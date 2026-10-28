@@ -717,6 +717,7 @@ pub(crate) enum PostAllocationBehavior {
 pub struct Trace {
     pub(crate) calls: Vec<String>,
     pub(crate) runtime_allocate_calls: u64,
+    pub(crate) allocation_failure: Option<bool>,
     pub(crate) static_fence_indeterminate: bool,
     pub(crate) release_panics: BTreeSet<ResourceId>,
     pub(crate) hook_panics: BTreeSet<String>,
@@ -781,6 +782,13 @@ impl DeviceRuntime for TestRuntime {
         let drift = {
             let mut trace = self.trace.lock().unwrap();
             trace.runtime_allocate_calls += 1;
+            if let Some(retryable) = trace.allocation_failure {
+                return Err(TestRuntimeError(if retryable {
+                    "injected allocation capacity failure"
+                } else {
+                    "injected allocation contract failure"
+                }));
+            }
             trace.drift_on_allocate
         };
         if drift {
@@ -945,7 +953,11 @@ impl DeviceRuntime for TestRuntime {
     }
 
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError> {
-        DeviceErrorReport::new("test_runtime", error.to_string(), false)
+        DeviceErrorReport::new(
+            "test_runtime",
+            error.to_string(),
+            error.0 == "injected allocation capacity failure",
+        )
     }
 }
 
@@ -1632,6 +1644,46 @@ impl StaticInitializationProbe {
         }
         assert_eq!(self.snapshot().buffer_drops, allocations);
         assert_eq!(self.snapshot().late_buffer_drops, 0);
+    }
+}
+
+/// A real production-driver allocation transaction which fails before uploads.
+/// The returned probe observes ownership without keeping the runtime alive.
+pub fn failed_runtime_allocation(
+    retryable: bool,
+) -> (
+    ResourceCommitTransitionError<RuntimeResourceDriver<TestRuntime>>,
+    StaticInitializationProbe,
+) {
+    let (_, plan) = isolated_static_initialization_plan();
+    let runtime = sequence_runtime(&plan);
+    let (_, released) = mpsc::channel();
+    runtime.trace.lock().unwrap().allocation_failure = Some(retryable);
+    let probe = StaticInitializationProbe {
+        trace: Arc::clone(&runtime.trace),
+        runtime: Arc::downgrade(&runtime),
+        released,
+    };
+    let permit = required_static(
+        &plan,
+        Arc::clone(&runtime),
+        id("request.allocation-failure"),
+    )
+    .unwrap();
+    let identity = ResourceTransactionIdentity::for_admission(
+        permit.binding(),
+        id("run.allocation-failure"),
+        id("transaction.allocation-failure"),
+    );
+    let driver = RuntimeResourceDriver::new(runtime).unwrap();
+    let failed = ResourceTransaction::begin(driver, identity, permit)
+        .unwrap()
+        .reserve()
+        .unwrap()
+        .commit();
+    match failed {
+        Err(failure) => (failure, probe),
+        Ok(_) => panic!("allocation injection must fail"),
     }
 }
 

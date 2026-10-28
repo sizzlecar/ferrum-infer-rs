@@ -112,6 +112,12 @@ ferrum serve --model /path/to/Qwen-Image-2.1-Turbo --served-model-name qwen-imag
 
 HTTP: `POST /v1/images/generations` (JSON) and `POST /v1/images/edits` (multipart). Edits accept one 8-bit RGB/RGBA PNG; responses contain PNG as `b64_json`. Editing can redraw background/details.
 
+With adaptive image residency, a recoverable weight-allocation failure rolls
+back before uploads, releases idle dynamic backing, then retires idle weights
+in least-recently-used order as needed to retry. If no reclaimable owner remains,
+the batch fails while the service remains available. Failed recovery or an
+indeterminate execution still stops the pipeline; inference itself is not replayed.
+
 CUDA image LoRA loads one ordinary DiT adapter with a fixed strength at startup.
 Both `run` and `serve` accept `--image-lora /path/to/peft-directory` and
 `--image-lora-strength 0.8`. A PEFT directory must contain

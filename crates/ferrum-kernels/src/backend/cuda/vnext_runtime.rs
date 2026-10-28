@@ -4810,8 +4810,18 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
         let pool_before = trace_enabled.then(|| allocation_pool_snapshot(&self.context));
         let allocation_started = trace_enabled.then(Instant::now);
-        let base = unsafe { self.allocation_stream.alloc::<u8>(allocation_bytes) }
-            .map_err(|error| CudaDeviceRuntimeError::driver("allocation", error))?;
+        let base =
+            unsafe { self.allocation_stream.alloc::<u8>(allocation_bytes) }.map_err(|error| {
+                tracing::error!(
+                    resource_id = %request.resource_id(),
+                    allocation_bytes,
+                    device_memory_free_total = ?self.context.mem_get_info(),
+                    allocator_pool = ?allocation_pool_snapshot(&self.context),
+                    error = ?error,
+                    "CUDA allocation failed; native memory snapshot (not a reservation)"
+                );
+                CudaDeviceRuntimeError::driver("allocation", error)
+            })?;
         let alloc_us = allocation_started.map_or(0, |started| {
             u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
         });

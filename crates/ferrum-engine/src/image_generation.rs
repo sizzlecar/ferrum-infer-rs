@@ -20,7 +20,11 @@
 //! distinct references in caller order. Edits may reuse the timestep-zero prefix
 //! through admitted fixed Request state. Its D2D handoff accounts for both cache
 //! copies; the request retires before decoding. Failures retain recovery owners
-//! and stop this pipeline instance. CFG and video are not implemented.
+//! and stop this pipeline instance, except allocation failures whose transaction
+//! has explicitly compensated and rolled back before any upload/submission.
+//! Adaptive residency reclaims idle backing and retries those allocations;
+//! exhausted clean retries reject that batch without stopping later work.
+//! CFG and video are not implemented.
 //! Host claims cover managed tensor payloads and static transfer staging, not
 //! tokenizer/metadata containers, mapped checkpoints, or total process RSS.
 
@@ -512,7 +516,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         match result {
             Ok(outputs) => Ok(outputs),
             Err(failure) => {
-                self.stopped = true;
+                self.stopped =
+                    !matches!(failure, ImageGenerationFailure::AllocationRejected { .. });
                 Err(ImageGenerationError {
                     failure,
                     completed_stages: stages,

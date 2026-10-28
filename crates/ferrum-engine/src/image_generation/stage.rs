@@ -130,6 +130,16 @@ pub enum ImageGenerationFailure<R: DeviceRuntime> {
         plan: ImageStagePlanReceipt,
         source: ComponentInitializationError<R>,
     },
+    /// Allocation failed before uploads/submission; compensation and rollback
+    /// completed, and no failure-owned device resources remain.
+    AllocationRejected {
+        stage: ImageStage,
+        failure: FailureEnvelope,
+    },
+    InitializationRollback {
+        plan: ImageStagePlanReceipt,
+        source: ResourceRollbackTransitionError<RuntimeResourceDriver<R>>,
+    },
     Execution {
         source: TensorExecutionError<R>,
         active: ActiveImageStage<R>,
@@ -167,6 +177,21 @@ impl<R: DeviceRuntime> fmt::Display for ImageGenerationFailure<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ImageGenerationFailure::Preflight(e) => write!(f, "image preflight: {e:#}"),
+            ImageGenerationFailure::AllocationRejected { stage, failure } => {
+                write!(
+                    f,
+                    "image {stage:?} allocation unavailable after idle reclamation: {}",
+                    failure.message()
+                )
+            }
+            ImageGenerationFailure::InitializationRollback { plan, source } => {
+                write!(
+                    f,
+                    "image {:?} initialization rollback: {:?}",
+                    plan.stage,
+                    source.failure()
+                )
+            }
             ImageGenerationFailure::Unavailable => f.write_str(
                 "image pipeline stopped; recover any retained failure owners before replacing it",
             ),
@@ -232,6 +257,54 @@ pub(super) struct PreparedStage<R: DeviceRuntime> {
     // Prefix handoff is admitted as one group: the decode request is created
     // while prefill Step/output storage and the original full weights live.
     prefix_admission: Option<(u64, u64)>,
+}
+
+impl<R: DeviceRuntime> Clone for PreparedStage<R> {
+    fn clone(&self) -> Self {
+        Self {
+            component: Arc::clone(&self.component),
+            plan: self.plan.clone(),
+            prefix_admission: self.prefix_admission,
+        }
+    }
+}
+
+impl<R: DeviceRuntime> ImageGenerationFailure<R> {
+    pub(super) fn recover_allocation(self) -> Result<(ImageStage, FailureEnvelope), Self> {
+        let Self::Initialization {
+            plan,
+            source:
+                ComponentInitializationError::Commit(ResourceCommitTransitionError::Recoverable(source)),
+        } = self
+        else {
+            return Err(self);
+        };
+        let failure = source.failure().failure();
+        if failure.code() != "device_allocation" || !failure.retryable() {
+            return Err(Self::Initialization {
+                plan,
+                source: ComponentInitializationError::Commit(
+                    ResourceCommitTransitionError::Recoverable(source),
+                ),
+            });
+        }
+        let failure = failure.clone();
+        let transaction = source.recover().map_err(|source| Self::Initialization {
+            plan: plan.clone(),
+            source: ComponentInitializationError::Commit(
+                ResourceCommitTransitionError::Recoverable(source),
+            ),
+        })?;
+        let rolled_back =
+            transaction
+                .rollback()
+                .map_err(|source| Self::InitializationRollback {
+                    plan: plan.clone(),
+                    source,
+                })?;
+        drop(rolled_back);
+        Ok((plan.stage, failure))
+    }
 }
 
 enum StageWeightInitialization<'a, R: DeviceRuntime> {

@@ -126,6 +126,57 @@ fn adaptive_wire_is_explicit_and_fixed_policy_defaults_remain_unchanged() {
 }
 
 #[test]
+fn allocation_pressure_reclaims_dynamic_then_lru_weights_and_stops_when_empty() {
+    let (mut pipeline, _directory) = pipeline();
+    let mut receipts = Vec::new();
+    execute(&mut pipeline, ImageStage::Denoiser, 8, 0, &mut receipts);
+    execute(&mut pipeline, ImageStage::Decoder, 1, 0, &mut receipts);
+    let target = ImageStage::TextEncoder;
+    assert!(pipeline
+        .reclaim_after_allocation_failure(target, &mut receipts)
+        .unwrap_or_else(|error| panic!("{error}")));
+    assert_eq!(pipeline.runtime.snapshot().live_allocations, 2);
+    assert!(pipeline
+        .reclaim_after_allocation_failure(target, &mut receipts)
+        .unwrap_or_else(|error| panic!("{error}")));
+    assert_eq!(pipeline.runtime.snapshot().live_allocations, 1);
+    assert_eq!(
+        receipts.last().unwrap().execution.plan.stage,
+        ImageStage::Denoiser
+    );
+    assert!(pipeline
+        .reclaim_after_allocation_failure(target, &mut receipts)
+        .unwrap_or_else(|error| panic!("{error}")));
+    assert!(!pipeline
+        .reclaim_after_allocation_failure(target, &mut receipts)
+        .unwrap_or_else(|error| panic!("{error}")));
+    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    // Successful later work still produces exact numerical output.
+    execute(&mut pipeline, target, 1, 1, &mut receipts);
+    close(&mut pipeline);
+}
+
+#[test]
+fn allocation_recovery_requires_retryable_failure_and_releases_transaction_owner() {
+    use ferrum_runtime::test_support::resource_support::failed_runtime_allocation;
+    let (pipeline, _directory) = pipeline();
+    let plan = stage(&pipeline, ImageStage::TextEncoder, 1).plan;
+    for retryable in [true, false] {
+        let (source, probe) = failed_runtime_allocation(retryable);
+        let failure = ImageGenerationFailure::Initialization {
+            plan: plan.clone(),
+            source: ComponentInitializationError::Commit(source),
+        };
+        assert!(probe.runtime_alive());
+        let recovered = failure.recover_allocation();
+        assert_eq!(recovered.is_ok(), retryable);
+        assert_eq!(probe.runtime_alive(), !retryable);
+        assert_eq!(probe.snapshot().uploads, 0);
+        assert_eq!(probe.snapshot().submissions, 0);
+    }
+}
+
+#[test]
 fn adaptive_ample_capacity_reuses_weights_across_shapes_and_edit_stage_subsets() {
     let (mut pipeline, _directory) = pipeline();
     let mut receipts = Vec::new();
