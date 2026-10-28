@@ -1,4 +1,4 @@
-//! Allocation-free boundary for one locked SM120 E4M3FN W8A8 kernel.
+//! Allocation-free boundary for locked SM89/SM120 E4M3FN W8A8 kernels.
 //!
 //! These descriptors validate geometry and byte ranges. They confer no device
 //! resource authority. The caller owns every span, the current context, opaque
@@ -15,9 +15,11 @@ pub const CUTLASS_FP8_EXPORTS: [&str; 3] = [
 ];
 pub const CUTLASS_FP8_SCRATCH_ALIGNMENT: u64 = 256;
 pub const CUTLASS_FP8_KERNEL_128: u32 = 1;
+pub const CUTLASS_FP8_KERNEL_SM89: u32 = 2;
 pub const CUTLASS_FP8_NUMERICAL_IDENTITY: &str = concat!(
-    "sm120a;cutlass-cb4247394dd82148787aed73e5dc7cef33cbf862;",
-    "tile128x128x128;cluster1x1x1;persistent-no-stream-k;",
+    "cutlass-cb4247394dd82148787aed73e5dc7cef33cbf862;",
+    "sm120a=tile128x128x128,cluster1x1x1,persistent-no-stream-k;",
+    "sm89=tile128x64x128,warp64x32x128,stages3,no-split-k,f32-scratch-scale;",
     "A=bf16-rowmajor;B=e4m3fn-OI;Y=bf16-rowmajor;",
     "row-amax=fmax(abs(x));scale=max(rn32(amax/448),rn32(1/(448*512)));",
     "quant=E4M3FN-RNE-SATFINITE(fmax(-448,fmin(rn32(x/scale),448)));",
@@ -29,7 +31,7 @@ pub const CUTLASS_FP8_NUMERICAL_IDENTITY: &str = concat!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CutlassFp8Device {
     pub ordinal: u32,
-    /// CUDA major*100 + minor*10; this first kernel requires 1200.
+    /// CUDA major*100 + minor*10; supported values are 890 and 1200.
     pub architecture: u32,
     pub multiprocessors: u32,
     pub maximum_dynamic_shared_bytes: u64,
@@ -88,7 +90,10 @@ impl CutlassFp8RequestV1 {
         {
             return Err(CutlassFp8Error::InvalidArgument);
         }
-        if self.architecture != 1200 || self.inputs % 16 != 0 || self.outputs % 16 != 0 {
+        if !matches!(self.architecture, 890 | 1200)
+            || self.inputs % 16 != 0
+            || self.outputs % 16 != 0
+        {
             return Err(CutlassFp8Error::UnsupportedGeometry);
         }
         self.input_bytes()?;
@@ -144,6 +149,11 @@ impl CutlassFp8PlanV1 {
                 .checked_add(activation_scale_bytes)
                 .ok_or(CutlassFp8Error::Extent)?,
         )?;
+        if request.architecture == 890
+            && gemm_workspace_bytes < align(extent(request.rows, request.outputs, 4)?)?
+        {
+            return Err(CutlassFp8Error::Extent);
+        }
         let scratch_bytes = gemm_workspace_offset
             .checked_add(gemm_workspace_bytes)
             .filter(|n| *n <= isize::MAX as u64)
@@ -152,7 +162,11 @@ impl CutlassFp8PlanV1 {
             request,
             abi: CUTLASS_FP8_ABI,
             size: size_of::<Self>() as u32,
-            kernel_id: CUTLASS_FP8_KERNEL_128,
+            kernel_id: if request.architecture == 890 {
+                CUTLASS_FP8_KERNEL_SM89
+            } else {
+                CUTLASS_FP8_KERNEL_128
+            },
             shared_bytes,
             quantized_activation_bytes,
             activation_scale_offset,

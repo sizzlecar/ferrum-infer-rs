@@ -26,7 +26,7 @@ fn tensor_catalog() -> NativeOperatorProviderCatalog {
     let mut catalog = live_provider_catalog();
     catalog.providers.truncate(1);
     catalog.providers[0].operation_id = "operation.dense_linear_fp8.bf16".into();
-    catalog.providers[0].provider_id = "provider.cuda.dense_linear_fp8.bf16.cutlass.sm120".into();
+    catalog.providers[0].provider_id = "provider.cuda.dense_linear_fp8.bf16.cutlass".into();
     catalog
 }
 

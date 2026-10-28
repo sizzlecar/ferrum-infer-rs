@@ -307,8 +307,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           . './.github/ci/windows-build.ps1'
+          Invoke-FerrumCargo -Stage 'fp8-source-catalog' -CargoArguments @('build', '--locked', '--profile', 'release-tools', '-p', 'ferrum-kernels', '--example', 'cutlass_fp8_catalog_declaration') | Out-Null
           Invoke-FerrumCargo -Stage 'native-operator-builder' -CargoArguments @('build', '--locked', '--profile', 'release-tools', '-p', 'ferrum-native-ops-builder', '--bin', 'ferrum-native-ops-builder', '--timings') | Out-Null
-      - name: Build the four native CUDA operators with MSVC
+      - name: Build native CUDA operators and FP8 with MSVC
         if: inputs.backend == 'cuda'
         id: native_build
         run: |
@@ -338,11 +339,23 @@ jobs:
           if ((Get-FileHash $catalog -Algorithm SHA256).Hash -ne $referenceLock.g03_catalog_sha256) { throw 'Canonical provider catalog hash mismatch' }
           $builder = Join-Path $env:GITHUB_WORKSPACE 'target/release-tools/ferrum-native-ops-builder.exe'
           $builderSha = git rev-parse HEAD
+          $baseCatalog = $catalog
+          $catalog = Join-Path $work 'combined-catalog.json'
+          & './target/release-tools/examples/cutlass_fp8_catalog_declaration.exe' 134217728 512 experimental-release-source-declaration-v1 $catalog $baseCatalog
+          $catalogSha = (Get-FileHash $catalog -Algorithm SHA256).Hash.ToLowerInvariant()
+          $cutlassArchive = Join-Path $work 'cutlass.tar.gz'
+          & './target/release-tools/release_delivery.exe' fetch-verified --url 'https://codeload.github.com/NVIDIA/cutlass/tar.gz/cb4247394dd82148787aed73e5dc7cef33cbf862' --sha256 '7a37329b43a47aaf9ef142be99baff3e71dbeea007b975891350cc0e50bc598b' --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $cutlassArchive
+          $fp8Source = Join-Path $work 'fp8-source'
+          New-Item -ItemType Directory "$fp8Source/cutlass", "$fp8Source/kernels" | Out-Null
+          tar.exe -xzf $cutlassArchive --strip-components=1 -C "$fp8Source/cutlass"
+          foreach ($name in @('abi.h', 'boundary.cu', 'gemm.cuh', 'gemm_sm89.cuh', 'quantize.cuh')) {
+            Copy-Item "crates/ferrum-kernels/native/cutlass-fp8/$name" "$fp8Source/kernels/$name"
+          }
           $receiptArgs = @()
           $failedOperators = @()
           '| Native operator | Cache hits | Compiled units | Build seconds |' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           '| --- | ---: | ---: | ---: |' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          foreach ($operator in @('marlin', 'vllm-marlin', 'vllm-moe-marlin', 'vllm-paged-attention-v2')) {
+          foreach ($operator in @('marlin', 'vllm-marlin', 'vllm-moe-marlin', 'vllm-paged-attention-v2', 'cutlass-fp8')) {
             Write-Host "Starting native operator: $operator"
             $build = Join-Path $work "build/$operator"
             $package = Join-Path $set "packages/$operator"
@@ -379,7 +392,14 @@ jobs:
                 }
               }
               $stage = 'lock-source'
-              & $builder lock-source --definition "native-operators/cuda/source-definitions/$operator.json" --source-root $operatorSource --out $plan
+              if ($operator -eq 'cutlass-fp8') {
+                $operatorSource = $fp8Source
+                $depfile = Join-Path $work 'fp8.d'
+                & "$env:CUDA_PATH/bin/nvcc.exe" -M -MT boundary.obj -MF $depfile -std=c++17 -O3 --expt-relaxed-constexpr --expt-extended-lambda -arch=sm_89 -DFERRUM_CUTLASS_FP8_SM89=1 -ccbin $env:NVCC_CCBIN "-I$fp8Source/cutlass/include" "-I$fp8Source/cutlass/tools/util/include" "-I$fp8Source/kernels" "$fp8Source/kernels/boundary.cu"
+                & $builder lock-source-dependencies --definition 'crates/ferrum-kernels/native/cutlass-fp8/cutlass-fp8-sm89.seed.json' --source-root $operatorSource --depfile $depfile --out-definition "$work/fp8-observed.json" --out-plan $plan
+              } else {
+                & $builder lock-source --definition "native-operators/cuda/source-definitions/$operator.json" --source-root $operatorSource --out $plan
+              }
               $stage = 'source-build'
               & $builder source-build --plan $plan --source-root $operatorSource --out $build --compute-capability sm_89 --builder-sha $builderSha --nvcc "$env:CUDA_PATH/bin/nvcc.exe" --cuda-toolkit-root $env:CUDA_PATH --ccbin $env:NVCC_CCBIN --ar $env:FERRUM_MSVC_LIB --nvcc-threads 4 --object-cache "$env:WINDOWS_OBJECT_CACHE"
               $buildReceipt = Get-Content "$build/source-build.receipt.json" -Raw | ConvertFrom-Json
@@ -389,7 +409,8 @@ jobs:
               Write-Host "$operator completed: $hits object cache hits, $compiled compiled units, $seconds seconds"
               "| $operator | $hits | $compiled | $seconds |" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
               $stage = 'materialize-package-spec'
-              & $builder materialize-package-spec --definition "native-operators/cuda/package-definitions/$operator.json" --g03-catalog $catalog --out $spec
+              $packageDefinition = if ($operator -eq 'cutlass-fp8') { 'native-operators/cuda/package-definitions/cutlass-fp8-sm89.json' } else { "native-operators/cuda/package-definitions/$operator.json" }
+              & $builder materialize-package-spec --definition $packageDefinition --g03-catalog $catalog --out $spec
               $stage = 'package'
               & $builder package --spec $spec --source-root $operatorSource --license-root $env:GITHUB_WORKSPACE --source-build-receipt "$build/source-build.receipt.json" --source-build-plan $plan --g03-catalog $catalog --abi-contract 'native-operators/abi/ferrum-native-abi-v2.json' --cc $env:CC --ar $env:FERRUM_MSVC_LIB --out $package
               $stage = 'package receipt'
@@ -405,7 +426,7 @@ jobs:
             throw ("Native CUDA operator builds failed: {0}" -f ($failedOperators -join ', '))
           }
           $lock = Join-Path $set 'native-operator-set.lock.json'
-          & $builder assemble-set @receiptArgs --g03-catalog-sha256 $referenceLock.g03_catalog_sha256 --compute-capability sm_89 --out $lock
+          & $builder assemble-set @receiptArgs --g03-catalog-sha256 $catalogSha --compute-capability sm_89 --out $lock
           "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
       - name: Save native objects before Rust compilation and packaging
         if: ${{ always() && steps.native_build.outcome == 'success' && steps.windows_native_cache.outputs.cache-primary-key != '' && steps.windows_native_cache.outputs.cache-hit != 'true' }}
@@ -467,8 +488,8 @@ jobs:
             $profile = 'release'
           } else {
             if (-not (Test-Path $env:FERRUM_NATIVE_OPERATOR_SET_LOCK -PathType Leaf)) { throw 'The native operator set is missing' }
-            $dependencies = Invoke-FerrumCargo -Stage 'cuda-dependencies' -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--lib', '--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2', '--timings')
-            $link = Invoke-FerrumCargo -Stage 'cuda-link' -ParallelLink -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--bin', 'ferrum', '--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2', '--timings')
+            $dependencies = Invoke-FerrumCargo -Stage 'cuda-dependencies' -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--lib', '--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8', '--timings')
+            $link = Invoke-FerrumCargo -Stage 'cuda-link' -ParallelLink -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--bin', 'ferrum', '--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8', '--timings')
             $binary = 'target/release-thin/ferrum.exe'
             $profile = 'release-thin'
             & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-elf $binary
@@ -543,7 +564,7 @@ jobs:
               schema_version = 1
               build = @{ version = $env:VERSION; source_commit = $env:RC_SHA; build_id = "github-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" }
               backend = $env:BACKEND; target_triple = 'x86_64-pc-windows-msvc'; cuda_compute_capability = $(if ($env:BACKEND -eq 'cuda') { '89' } else { '' })
-              cargo_features = @(if ($env:BACKEND -eq 'cuda') { 'cuda'; 'vllm-moe-marlin'; 'vllm-paged-attn-v2' }); files = @($files.ToArray())
+              cargo_features = @(if ($env:BACKEND -eq 'cuda') { 'cuda'; 'vllm-moe-marlin'; 'vllm-paged-attn-v2'; 'cuda-cutlass-fp8' }); files = @($files.ToArray())
             }
             sources = $sources
           }

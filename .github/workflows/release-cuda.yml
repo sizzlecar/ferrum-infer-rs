@@ -119,6 +119,11 @@ jobs:
     outputs:
       asset_id: ${{ steps.asset_id.outputs.artifact-id }}
     name: Stage Linux x86_64 CUDA sm89
+    env:
+      NATIVE_REFERENCE_REVISION: 6bfa659ad535caab97019726fe373f8326a233a7
+      LLAMA_NATIVE_REVISION: d81235049384534c167caea52b85a694f6103d14
+      CUTLASS_REVISION: cb4247394dd82148787aed73e5dc7cef33cbf862
+      CUTLASS_ARCHIVE_SHA256: 7a37329b43a47aaf9ef142be99baff3e71dbeea007b975891350cc0e50bc598b
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     container:
@@ -153,7 +158,7 @@ jobs:
       - name: Install system dependencies and Rust
         run: |
           apt-get update
-          apt-get install -y --allow-change-held-packages ca-certificates curl build-essential pkg-config libssl-dev git file python3 zstd libnccl2 libnccl-dev
+          apt-get install -y --allow-change-held-packages ca-certificates curl build-essential pkg-config libssl-dev git file python3 zstd libnccl2 libnccl-dev jq
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain 1.91.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -183,7 +188,7 @@ jobs:
           zstd --decompress --stdout "$archive" | tar -xf - -C "$root"
           lock="$root/inputs/native-operator-set.lock.json"
           test -f "$lock"
-          echo "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" >> "$GITHUB_ENV"
+          echo "SM89_REFERENCE_LOCK=$lock" >> "$GITHUB_ENV"
 
       - uses: actions/cache@v4
         with:
@@ -193,6 +198,88 @@ jobs:
           key: stage-rust1.91.0-linux-x86_64-cuda-sm89-cuda12.4-native-d4cdfe88-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             stage-rust1.91.0-linux-x86_64-cuda-sm89-cuda12.4-native-d4cdfe88-cargo-
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sm89-native-object-cache
+          key: sm89-native-cuda12.4-production-fp8-${{ hashFiles('crates/ferrum-native-ops-builder/**', 'crates/ferrum-native-ops/**', 'native-operators/**') }}
+          restore-keys: |
+            sm89-native-cuda12.4-production-fp8-
+
+      - name: Prepare pinned native sources and source catalog
+        run: |
+          work="$RUNNER_TEMP/sm89-native"
+          mkdir "$work"
+          cargo build --locked --profile release-tools -p ferrum-native-ops-builder --example release_cuda_native --bin ferrum-native-ops-builder
+          cargo build --locked --profile release-tools -p ferrum-kernels --example cutlass_fp8_catalog_declaration
+          ./target/release-tools/examples/release_cuda_native reference --architecture sm89 \
+            --lock "$SM89_REFERENCE_LOCK" --catalog-output "$work/base-catalog.json"
+          # The catalog configuration is explicit source provenance, not a
+          # measured native-memory upper bound or a runtime capacity override.
+          ./target/release-tools/examples/cutlass_fp8_catalog_declaration \
+            134217728 512 experimental-release-source-declaration-v1 \
+            "$work/combined-catalog.json" "$work/base-catalog.json"
+          mkdir "$work/reference-workspace" "$work/source-bundle" "$work/fp8-source"
+          git archive "$NATIVE_REFERENCE_REVISION" | tar -xf - -C "$work/reference-workspace"
+          manifest=native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json
+          source_url=$(jq -er '"https://github.com/" + .distribution.repository + "/releases/download/" + .distribution.tag + "/" + .distribution.asset_name' "$manifest")
+          source_sha=$(jq -er '.archive.sha256' "$manifest")
+          curl --fail --location --retry 5 --retry-all-errors --output "$work/native-sources.tar.gz" "$source_url"
+          printf '%s  %s\n' "$source_sha" "$work/native-sources.tar.gz" | sha256sum --check --strict
+          tar -xzf "$work/native-sources.tar.gz" -C "$work/source-bundle"
+          git init "$work/llama"
+          git -C "$work/llama" remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C "$work/llama" fetch --depth 1 origin "$LLAMA_NATIVE_REVISION"
+          git -C "$work/llama" checkout --detach FETCH_HEAD
+          test "$(git -C "$work/llama" rev-parse HEAD)" = "$LLAMA_NATIVE_REVISION"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "$work/cutlass.tar.gz" "https://codeload.github.com/NVIDIA/cutlass/tar.gz/$CUTLASS_REVISION"
+          printf '%s  %s\n' "$CUTLASS_ARCHIVE_SHA256" "$work/cutlass.tar.gz" | sha256sum --check --strict
+          mkdir "$work/fp8-source/cutlass" "$work/fp8-source/kernels"
+          tar -xzf "$work/cutlass.tar.gz" --strip-components=1 -C "$work/fp8-source/cutlass"
+          for source in abi.h boundary.cu gemm.cuh gemm_sm89.cuh quantize.cuh; do
+            cp "crates/ferrum-kernels/native/cutlass-fp8/$source" "$work/fp8-source/kernels/$source"
+          done
+          /usr/local/cuda/bin/nvcc -M -MT boundary.o -MF "$work/fp8.d" \
+            -std=c++17 -O3 --expt-relaxed-constexpr --expt-extended-lambda \
+            -Xcompiler -fPIC -arch=sm_89 -DFERRUM_CUTLASS_FP8_SM89=1 -ccbin /usr/bin/g++ \
+            -I"$work/fp8-source/cutlass/include" -I"$work/fp8-source/cutlass/tools/util/include" \
+            -I"$work/fp8-source/kernels" "$work/fp8-source/kernels/boundary.cu"
+          ./target/release-tools/ferrum-native-ops-builder lock-source-dependencies \
+            --definition crates/ferrum-kernels/native/cutlass-fp8/cutlass-fp8-sm89.seed.json \
+            --source-root "$work/fp8-source" --depfile "$work/fp8.d" \
+            --out-definition "$work/fp8-observed.json" --out-plan "$work/fp8-plan.json"
+
+      - name: Build and verify complete SM89 production and FP8 native set
+        run: |
+          work="$RUNNER_TEMP/sm89-native"
+          ./target/release-tools/examples/release_cuda_native build --architecture sm89 \
+            --reference-lock "$SM89_REFERENCE_LOCK" --reference-workspace "$work/reference-workspace" \
+            --source-bundle "$work/source-bundle" --llama-source "$work/llama" \
+            --workspace "$GITHUB_WORKSPACE" --catalog "$work/combined-catalog.json" \
+            --fp8-source "$work/fp8-source" --fp8-plan "$work/fp8-plan.json" \
+            --work "$work/builds" --output "$work/operator-set" \
+            --object-cache "$RUNNER_TEMP/sm89-native-object-cache" --builder-sha "$RC_SHA" \
+            --cuda-toolkit-root /usr/local/cuda --nvcc /usr/local/cuda/bin/nvcc \
+            --cc /usr/bin/gcc --cxx /usr/bin/g++ --ar /usr/bin/ar
+          lock="$work/operator-set/native-operator-set.lock.json"
+          ./target/release-tools/examples/release_cuda_native verify --architecture sm89 --lock "$lock"
+          echo "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" >> "$GITHUB_ENV"
+          # Preserve the actual new set and all package/build receipts. No
+          # public release is created here; the staged CLI links these bytes.
+          tar -C "$work/operator-set" -cf - . | zstd -T1 -o "$work/native-operator-set-sm89-production-fp8.tar.zst"
+          (cd "$work" && sha256sum native-operator-set-sm89-production-fp8.tar.zst > native-operator-set-sm89-production-fp8.tar.zst.sha256)
+
+      - name: Preserve staged native operator set
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-sm89-production-fp8-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/sm89-native/native-operator-set-sm89-production-fp8.tar.zst
+            ${{ runner.temp }}/sm89-native/native-operator-set-sm89-production-fp8.tar.zst.sha256
+            ${{ runner.temp }}/sm89-native/fp8-observed.json
 
       - name: Build release metadata tool once
         run: cargo build --release --locked -p ferrum-bench-core --example release_candidate
@@ -212,13 +299,21 @@ jobs:
           export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
           test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
           cargo build --release --locked -p ferrum-cli --bin ferrum \
-            --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
+            --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8
 
       - name: Strip and audit CUDA binary
         run: |
           strip target/release/ferrum
           file target/release/ferrum | tee ferrum-linux-x86_64-cuda-sm89.dependencies.txt
           ldd target/release/ferrum | tee -a ferrum-linux-x86_64-cuda-sm89.dependencies.txt
+
+      - name: Build SM89 FP8 numerical runtime check against the same native set
+        run: |
+          cargo test --release --locked --no-run -p ferrum-models --test vnext_tensor_fp8 \
+            --features cuda-cutlass-fp8 --message-format=json > "$RUNNER_TEMP/fp8-test-build.jsonl"
+          checker=$(jq -sr '[.[] | select(.reason == "compiler-artifact" and .target.name == "vnext_tensor_fp8" and .executable != null) | .executable] | unique | if length == 1 then .[0] else error("missing or ambiguous FP8 checker") end' "$RUNNER_TEMP/fp8-test-build.jsonl")
+          cp "$checker" sm89-fp8-runtime-check
+          sha256sum sm89-fp8-runtime-check > sm89-fp8-runtime-check.sha256
 
       - name: Package staged CUDA asset and adjacent manifests
         run: |
@@ -231,7 +326,7 @@ jobs:
           Ferrum v${VERSION} CUDA release binary
           CUDA toolkit image: nvidia/cuda:12.4.0-devel-ubuntu22.04
           CUDA_COMPUTE_CAP: 89
-          Cargo features: cuda,vllm-moe-marlin,vllm-paged-attn-v2
+          Cargo features: cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8
           NVIDIA driver, compatible CUDA runtime, and NCCL runtime are required.
           EOF
           tar -C dist -czf "$asset" ferrum LICENSE README.md CUDA-BUILD.txt
@@ -244,7 +339,7 @@ jobs:
             --backend cuda --target-triple x86_64-unknown-linux-gnu \
             --asset "$asset" --binary target/release/ferrum \
             --dependencies ferrum-linux-x86_64-cuda-sm89.dependencies.txt \
-            --cargo-features cuda,vllm-moe-marlin,vllm-paged-attn-v2 \
+            --cargo-features cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8 \
             --cuda-compute-capability "$CUDA_COMPUTE_CAP" \
             --cuda-toolkit-image nvidia/cuda:12.4.0-devel-ubuntu22.04
 
@@ -277,6 +372,8 @@ jobs:
             ferrum-linux-x86_64-cuda-sm89.tar.gz.dependency.json
             ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json
             ferrum-linux-x86_64-cuda-sm89.dependencies.txt
+            sm89-fp8-runtime-check
+            sm89-fp8-runtime-check.sha256
 
   linux-x86_64-cuda-sm120:
     if: inputs.platform != 'windows'
@@ -391,9 +488,9 @@ jobs:
         run: |
           work="$RUNNER_TEMP/sm120-native"
           mkdir "$work"
-          cargo build --locked --profile release-tools -p ferrum-native-ops-builder --example release_sm120_native --bin ferrum-native-ops-builder
+          cargo build --locked --profile release-tools -p ferrum-native-ops-builder --example release_cuda_native --bin ferrum-native-ops-builder
           cargo build --locked --profile release-tools -p ferrum-kernels --example cutlass_fp8_catalog_declaration
-          ./target/release-tools/examples/release_sm120_native reference \
+          ./target/release-tools/examples/release_cuda_native reference \
             --lock "$SM120_REFERENCE_LOCK" --catalog-output "$work/base-catalog.json"
           # The catalog configuration is explicit source provenance, not a
           # measured native-memory upper bound or a runtime capacity override.
@@ -418,7 +515,7 @@ jobs:
           printf '%s  %s\n' "$CUTLASS_ARCHIVE_SHA256" "$work/cutlass.tar.gz" | sha256sum --check --strict
           mkdir "$work/fp8-source/cutlass" "$work/fp8-source/kernels"
           tar -xzf "$work/cutlass.tar.gz" --strip-components=1 -C "$work/fp8-source/cutlass"
-          for source in abi.h boundary.cu gemm.cuh quantize.cuh; do
+          for source in abi.h boundary.cu gemm.cuh gemm_sm89.cuh quantize.cuh; do
             cp "crates/ferrum-kernels/native/cutlass-fp8/$source" "$work/fp8-source/kernels/$source"
           done
           /usr/local/cuda/bin/nvcc -M -MT boundary.o -MF "$work/fp8.d" \
@@ -434,7 +531,7 @@ jobs:
       - name: Build and verify complete SM120 production and FP8 native set
         run: |
           work="$RUNNER_TEMP/sm120-native"
-          ./target/release-tools/examples/release_sm120_native build \
+          ./target/release-tools/examples/release_cuda_native build \
             --reference-lock "$SM120_REFERENCE_LOCK" --reference-workspace "$work/reference-workspace" \
             --source-bundle "$work/source-bundle" --llama-source "$work/llama" \
             --workspace "$GITHUB_WORKSPACE" --catalog "$work/combined-catalog.json" \
@@ -444,7 +541,7 @@ jobs:
             --cuda-toolkit-root /usr/local/cuda --nvcc /usr/local/cuda/bin/nvcc \
             --cc /usr/bin/gcc-13 --cxx /usr/bin/g++-13 --ar /usr/bin/ar
           lock="$work/operator-set/native-operator-set.lock.json"
-          ./target/release-tools/examples/release_sm120_native verify --lock "$lock"
+          ./target/release-tools/examples/release_cuda_native verify --lock "$lock"
           echo "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" >> "$GITHUB_ENV"
           # Preserve the actual new set and all package/build receipts. No
           # public release is created here; the staged CLI links these bytes.

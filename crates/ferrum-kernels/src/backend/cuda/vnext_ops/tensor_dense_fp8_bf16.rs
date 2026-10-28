@@ -1,4 +1,4 @@
-//! Explicit SM120 W8A8 dense provider. Device temporaries belong to invocation
+//! Explicit SM89/SM120 W8A8 dense provider. Device temporaries belong to invocation
 //! scratch; the static CUDART fatbin has an independent opaque claim, retained
 //! conservatively until process exit because this bridge has no unload receipt.
 
@@ -34,9 +34,9 @@ pub use probe::{
     QUANTIZATION_PROBE_PROFILE_ID,
 };
 
-pub const NUMERICAL_PROFILE_ID: &str = "cuda.cutlass.sm120.w8a8.bf16.rowwise_e4m3fn.v1";
+pub const NUMERICAL_PROFILE_ID: &str = "cuda.cutlass.w8a8.bf16.rowwise_e4m3fn.v1";
 const PROVIDER: &str = cutlass_fp8::CUTLASS_FP8_PROVIDER_ID;
-const ESTIMATOR: &str = "resource-estimator.cuda.dense_linear_fp8.bf16.cutlass.sm120";
+const ESTIMATOR: &str = "resource-estimator.cuda.dense_linear_fp8.bf16.cutlass";
 
 /// Explicit, unqualified native-memory declaration. It is charged in addition
 /// to context bootstrap and conservatively retained until process exit (native

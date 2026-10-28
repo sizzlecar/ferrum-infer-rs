@@ -37,7 +37,7 @@ const W: &str = "value.fp8.bench.weight";
 #[cfg(feature = "cuda-cutlass-fp8")]
 const Y: &str = "value.fp8.bench.output";
 #[cfg(feature = "cuda-cutlass-fp8")]
-const PROFILE: &str = "cuda.cutlass.sm120.w8a8.bf16.rowwise_e4m3fn.v1";
+const PROFILE: &str = "cuda.cutlass.w8a8.bf16.rowwise_e4m3fn.v1";
 
 #[cfg(any(feature = "cuda-cutlass-fp8", test))]
 fn id<T: TryFrom<String>>(name: impl Into<String>) -> T

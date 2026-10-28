@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// ABI 1, fixed SM120 128x128x128 W8A8 kernel. No CUDA/CUTLASS types cross FFI.
+// ABI 1, architecture-bound SM89/SM120 W8A8 kernels. No CUDA/CUTLASS types cross FFI.
 struct FerrumCutlassFp8RequestV1 {
   uint32_t abi, size, rows, inputs, outputs, device_ordinal, architecture, multiprocessors;
   uint64_t maximum_dynamic_shared_bytes;

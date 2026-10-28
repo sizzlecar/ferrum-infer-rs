@@ -1,0 +1,52 @@
+{
+  "schema_version": 3,
+  "operator": "ferrum.cuda.cutlass_fp8_scaled_mm",
+  "source_package_kind": "ferrum-native-cutlass-fp8",
+  "source_package_revision": "sm89-w8a8-v1+cb4247394dd82148787aed73e5dc7cef33cbf862",
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/NVIDIA/cutlass.git",
+      "revision": "cb4247394dd82148787aed73e5dc7cef33cbf862",
+      "license": "BSD-3-Clause"
+    }
+  ],
+  "translation_units": [
+    "kernels/boundary.cu"
+  ],
+  "headers": [
+    "kernels/abi.h",
+    "kernels/gemm.cuh",
+    "kernels/quantize.cuh",
+    "kernels/gemm_sm89.cuh"
+  ],
+  "dependency_closures": [
+    {
+      "translation_unit": "kernels/boundary.cu",
+      "headers": [
+        "kernels/abi.h",
+        "kernels/gemm.cuh",
+        "kernels/quantize.cuh",
+        "kernels/gemm_sm89.cuh"
+      ]
+    }
+  ],
+  "include_dirs": [
+    "cutlass/include",
+    "cutlass/tools/util/include",
+    "kernels"
+  ],
+  "defines": [
+    "FERRUM_CUTLASS_FP8_SM89=1"
+  ],
+  "nvcc_policy": {
+    "cpp_standard": "cpp17",
+    "optimization": "o3",
+    "use_fast_math": false,
+    "relaxed_constexpr": true,
+    "extended_lambda": true,
+    "host_position_independent_code": true,
+    "host_default_visibility": false
+  },
+  "architecture": "device_compute_capability",
+  "archive_file": "libferrum_cutlass_fp8.a"
+}

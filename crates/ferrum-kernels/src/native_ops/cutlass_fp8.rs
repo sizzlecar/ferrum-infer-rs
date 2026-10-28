@@ -1,4 +1,4 @@
-//! Static-link, allocation-free adapter for the locked SM120 FP8 artifact.
+//! Static-link, allocation-free adapter for the locked SM89/SM120 FP8 artifact.
 //! Native modules may remain loaded until context destruction. The caller must
 //! keep its separately admitted native opaque owner for that full lifetime.
 
