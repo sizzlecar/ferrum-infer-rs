@@ -773,6 +773,15 @@ jobs:
             --tasks "$RUNNER_TEMP/tasks/tasks.json" --ferrum-bin "$RUNNER_TEMP/extracted-cuda/ferrum" \
             --runner "$RUNNER_TEMP/staged-cuda/model_regression" --runner-sha256 "$runner_sha" \
             --report-dir "$RUNNER_TEMP/model-cuda" --task-timeout-secs 1500 --request-timeout-secs 300
+      - name: Execute SM89 FP8 numerical and retirement contracts
+        run: |
+          cd "$RUNNER_TEMP/staged-cuda"
+          sha256sum --check sm89-fp8-runtime-check.sha256
+          chmod +x sm89-fp8-runtime-check
+          set -o pipefail
+          ./sm89-fp8-runtime-check --ignored --exact \
+            managed_fp8_projection_independent_oracle_shapes_and_retirement --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/sm89-fp8-runtime.log"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -781,6 +790,7 @@ jobs:
           path: |
             ${{ runner.temp }}/installation-cuda.json
             ${{ runner.temp }}/model-cuda/
+            ${{ runner.temp }}/sm89-fp8-runtime.log
           if-no-files-found: error
           retention-days: 30
 

@@ -51,7 +51,7 @@ fn catalog_extension_preserves_text_contracts_and_rejects_missing_or_changed_row
         0,
         row(
             "operation.dense_linear_fp8.bf16",
-            "provider.cuda.dense_linear_fp8.bf16.cutlass.sm120",
+            "provider.cuda.dense_linear_fp8.bf16.cutlass",
         ),
     );
     validate_catalog_extension(&original, &combined).unwrap();

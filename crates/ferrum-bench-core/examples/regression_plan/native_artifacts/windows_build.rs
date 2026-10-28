@@ -132,8 +132,8 @@ pub(super) fn verify_executable(script: &str, has_helper: bool) -> Result<(), St
             $profile = 'release'
         } else {
             if (-not (Test-Path $env:FERRUM_NATIVE_OPERATOR_SET_LOCK -PathType Leaf)) { throw 'The native operator set is missing' }
-            $dependencies = Invoke-FerrumCargo -Stage 'cuda-dependencies' -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--lib', '--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2', '--timings')
-            $link = Invoke-FerrumCargo -Stage 'cuda-link' -ParallelLink -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--bin', 'ferrum', '--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2', '--timings')
+            $dependencies = Invoke-FerrumCargo -Stage 'cuda-dependencies' -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--lib', '--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8', '--timings')
+            $link = Invoke-FerrumCargo -Stage 'cuda-link' -ParallelLink -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--bin', 'ferrum', '--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8', '--timings')
             $binary = 'target/release-thin/ferrum.exe'
             $profile = 'release-thin'
         "#,

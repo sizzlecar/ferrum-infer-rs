@@ -11,7 +11,7 @@ use ferrum_types::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const CUTLASS_FP8_PROVIDER_ID: &str = "provider.cuda.dense_linear_fp8.bf16.cutlass.sm120";
+pub const CUTLASS_FP8_PROVIDER_ID: &str = "provider.cuda.dense_linear_fp8.bf16.cutlass";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +59,8 @@ pub fn source_declaration_fingerprint() -> String {
         include_bytes!("../../backend/cuda/vnext_runtime/tensor_eager/cutlass_owner.rs"),
         include_bytes!("../../../native/cutlass-fp8/abi.h"),
         include_bytes!("../../../native/cutlass-fp8/gemm.cuh"),
+        include_bytes!("../../../native/cutlass-fp8/gemm_sm89.cuh"),
+        include_bytes!("../../../native/cutlass-fp8/cutlass-fp8-sm89.seed.json"),
         include_bytes!("../../../native/cutlass-fp8/quantize.cuh"),
         include_bytes!("../../../native/cutlass-fp8/boundary.cu"),
         include_bytes!("../../../native/cutlass-fp8/cutlass-fp8.seed.json"),

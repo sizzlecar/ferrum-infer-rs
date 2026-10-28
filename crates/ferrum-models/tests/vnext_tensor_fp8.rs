@@ -28,7 +28,7 @@ const X: &str = "value.fp8.input";
 const W: &str = "value.fp8.weight";
 const Y: &str = "value.fp8.output";
 const OP: &str = "operation.dense_linear_fp8.bf16";
-const PROFILE: &str = "cuda.cutlass.sm120.w8a8.bf16.rowwise_e4m3fn.v1";
+const PROFILE: &str = "cuda.cutlass.w8a8.bf16.rowwise_e4m3fn.v1";
 const METAL_PROFILE: &str = "metal.simdgroup.f32.w8a8.bf16.rowwise_e4m3fn.v1";
 fn id<T: TryFrom<String>>(name: impl Into<String>) -> T
 where
@@ -170,7 +170,7 @@ fn tiny_weight_source_retains_whole_tensor_encoding_and_independent_scale() {
 
 #[cfg(feature = "cuda-cutlass-fp8")]
 #[test]
-#[ignore = "requires exclusive SM120 CUDA and locked CUTLASS FP8 native artifact"]
+#[ignore = "requires exclusive SM89 or SM120 CUDA and its locked CUTLASS FP8 native artifact"]
 fn managed_fp8_projection_independent_oracle_shapes_and_retirement() {
     runtime::verify();
 }

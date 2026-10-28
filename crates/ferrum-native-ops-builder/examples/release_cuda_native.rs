@@ -38,6 +38,8 @@ struct Arguments {
 enum Command {
     /// Resolve all historical artifacts before exporting their canonical catalog.
     Reference {
+        #[arg(long, value_enum, default_value = "sm120")]
+        architecture: Architecture,
         #[arg(long)]
         lock: PathBuf,
         #[arg(long)]
@@ -47,6 +49,8 @@ enum Command {
     Build(Box<Build>),
     /// Resolve bytes/ABI/evidence and require both production and FP8 coverage.
     Verify {
+        #[arg(long, value_enum, default_value = "sm120")]
+        architecture: Architecture,
         #[arg(long)]
         lock: PathBuf,
     },
@@ -54,6 +58,8 @@ enum Command {
 
 #[derive(clap::Args)]
 struct Build {
+    #[arg(long, value_enum, default_value = "sm120")]
+    architecture: Architecture,
     #[arg(long)]
     reference_lock: PathBuf,
     #[arg(long)]
@@ -90,6 +96,42 @@ struct Build {
     ar: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum Architecture {
+    Sm89,
+    Sm120,
+}
+
+impl Architecture {
+    fn compute_capability(self) -> &'static str {
+        match self {
+            Self::Sm89 => "sm_89",
+            Self::Sm120 => "sm_120",
+        }
+    }
+
+    fn package_definition(self) -> &'static str {
+        match self {
+            Self::Sm89 => "native-operators/cuda/package-definitions/cutlass-fp8-sm89.json",
+            Self::Sm120 => "native-operators/cuda/package-definitions/cutlass-fp8.json",
+        }
+    }
+
+    fn required_units(self) -> &'static [CudaNativeBuildUnit] {
+        match self {
+            Self::Sm89 => SM89_REQUIRED,
+            Self::Sm120 => PRODUCTION,
+        }
+    }
+}
+
+const SM89_REQUIRED: &[CudaNativeBuildUnit] = &[
+    CudaNativeBuildUnit::Marlin,
+    CudaNativeBuildUnit::VllmMarlin,
+    CudaNativeBuildUnit::VllmMoeMarlin,
+    CudaNativeBuildUnit::VllmPagedAttentionV2,
+];
+
 // The Linux production feature closure, including indexed text attention and
 // vllm-moe-marlin's dense vllm-marlin repacking dependency. The addressed and
 // indexed attention units share one artifact; units are not artifact counts.
@@ -107,16 +149,17 @@ const PRODUCTION: &[CudaNativeBuildUnit] = &[
 fn main() -> Result<()> {
     match Arguments::parse().command {
         Command::Reference {
+            architecture,
             lock,
             catalog_output,
         } => {
-            let reference = resolve(&lock, false)?;
+            let reference = resolve(&lock, architecture, false)?;
             let catalog = reference_catalog(&reference)?;
             write_new(&catalog_output, &catalog.canonical_json_bytes()?)?;
         }
         Command::Build(arguments) => build(&arguments)?,
-        Command::Verify { lock } => {
-            let set = resolve(&lock, true)?;
+        Command::Verify { lock, architecture } => {
+            let set = resolve(&lock, architecture, true)?;
             println!(
                 "verified {} native artifacts; production + CUTLASS FP8",
                 set.artifacts.len()
@@ -126,13 +169,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn resolve(path: &Path, fp8: bool) -> Result<ResolvedNativeOperatorArtifactSet> {
+fn resolve(
+    path: &Path,
+    architecture: Architecture,
+    fp8: bool,
+) -> Result<ResolvedNativeOperatorArtifactSet> {
     let set = NativeOperatorArtifactSetLock::load_and_resolve_for_target(
         path,
-        Some("sm_120"),
+        Some(architecture.compute_capability()),
         "x86_64-unknown-linux-gnu",
     )?;
-    let required = PRODUCTION
+    let required = architecture
+        .required_units()
         .iter()
         .copied()
         .chain(fp8.then_some(CudaNativeBuildUnit::CutlassFp8ScaledMm));
@@ -166,7 +214,7 @@ fn validate_catalog_extension(
     if original.schema_version != combined.schema_version || original.backend != combined.backend {
         return Err("catalog schema/backend changed".into());
     }
-    let fp8 = "provider.cuda.dense_linear_fp8.bf16.cutlass.sm120";
+    let fp8 = "provider.cuda.dense_linear_fp8.bf16.cutlass";
     if original.providers.iter().any(|row| row.provider_id == fp8)
         || combined.providers.len() != original.providers.len() + 1
         || original
@@ -188,7 +236,7 @@ fn validate_catalog_extension(
 }
 
 fn build(args: &Build) -> Result<()> {
-    let reference = resolve(&args.reference_lock, false)?;
+    let reference = resolve(&args.reference_lock, args.architecture, false)?;
     let base_catalog = reference_catalog(&reference)?;
     let combined: NativeOperatorProviderCatalog = read_json(&args.catalog)?;
     validate_catalog_extension(&base_catalog, &combined)?;
@@ -225,9 +273,7 @@ fn build(args: &Build) -> Result<()> {
     }
     let spec = args.work.join("cutlass-fp8.package.json");
     materialize_native_operator_package_spec(&NativeOperatorPackageSpecRequest {
-        definition_path: args
-            .workspace
-            .join("native-operators/cuda/package-definitions/cutlass-fp8.json"),
+        definition_path: args.workspace.join(args.architecture.package_definition()),
         g03_catalog_path: args.catalog.clone(),
         output_path: spec.clone(),
     })?;
@@ -259,10 +305,10 @@ fn build(args: &Build) -> Result<()> {
             .collect::<Result<_>>()?,
         receipt_paths: receipts,
         expected_g03_catalog_sha256: catalog_sha,
-        compute_capability: "sm_120".into(),
+        compute_capability: args.architecture.compute_capability().into(),
         output_lock_path: lock.clone(),
     })?;
-    let completed = resolve(&lock, true)?;
+    let completed = resolve(&lock, args.architecture, true)?;
     for old in &reference.artifacts {
         let new = completed
             .artifacts
@@ -302,7 +348,7 @@ fn build_package(
         plan_path: plan.to_owned(),
         source_root: source.to_owned(),
         output_dir: build.clone(),
-        compute_capability: "sm_120".into(),
+        compute_capability: args.architecture.compute_capability().into(),
         builder_sha: args.builder_sha.clone(),
         nvcc_path: args.nvcc.clone(),
         ccbin_path: args.cxx.clone(),
@@ -449,5 +495,5 @@ fn digest_file(path: &Path) -> Result<String> {
 }
 
 #[cfg(test)]
-#[path = "release_sm120_native/tests.rs"]
+#[path = "release_cuda_native/tests.rs"]
 mod tests;

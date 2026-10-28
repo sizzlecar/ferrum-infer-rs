@@ -17,6 +17,22 @@ fn request() -> CutlassFp8RequestV1 {
 fn plan() -> CutlassFp8PlanV1 {
     CutlassFp8PlanV1::checked(request(), 65536, 1024).unwrap()
 }
+
+#[test]
+fn ada_plan_accounts_for_fp32_accumulator_and_has_distinct_kernel_identity() {
+    let mut r = request();
+    r.architecture = 890;
+    r.validate().unwrap();
+    assert!(CutlassFp8PlanV1::checked(r, 73728, 0).is_err());
+    assert!(CutlassFp8PlanV1::checked(r, 73728, 255).is_err());
+    let p = CutlassFp8PlanV1::checked(r, 73728, 256).unwrap();
+    assert_eq!(p.kernel_id, CUTLASS_FP8_KERNEL_SM89);
+    assert_eq!(p.scratch_bytes, p.gemm_workspace_offset + 256);
+    p.validate().unwrap();
+    let mut wrong = p;
+    wrong.kernel_id = CUTLASS_FP8_KERNEL_128;
+    assert!(wrong.validate().is_err());
+}
 fn bindings(p: &CutlassFp8PlanV1) -> CutlassFp8BindingsV1 {
     CutlassFp8BindingsV1 {
         input: CutlassFp8Span {

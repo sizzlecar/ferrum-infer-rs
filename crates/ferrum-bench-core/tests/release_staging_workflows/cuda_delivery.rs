@@ -130,7 +130,7 @@ fn sm120_rebuilds_verified_production_sources_with_fp8_before_linking() {
     let staging = workflow("release-cuda.yml");
     let job = &staging["jobs"]["linux-x86_64-cuda-sm120"];
     let prepare = script(job, "lock-source-dependencies");
-    assert!(prepare.contains("release_sm120_native reference"));
+    assert!(prepare.contains("release_cuda_native reference"));
     assert!(prepare.contains("cutlass_fp8_catalog_declaration"));
     assert!(prepare.contains("\"$work/base-catalog.json\""));
     assert!(
@@ -138,11 +138,11 @@ fn sm120_rebuilds_verified_production_sources_with_fp8_before_linking() {
             < prepare.find("tar -xzf \"$work/cutlass.tar.gz\"").unwrap()
     );
     assert!(prepare.contains("--source-root \"$work/fp8-source\" --depfile \"$work/fp8.d\""));
-    let native = script(job, "release_sm120_native build");
+    let native = script(job, "release_cuda_native build");
     assert!(native.contains("--reference-lock \"$SM120_REFERENCE_LOCK\""));
     assert!(native.contains("--object-cache \"$RUNNER_TEMP/sm120-native-object-cache\""));
     assert!(
-        native.find("release_sm120_native verify").unwrap()
+        native.find("release_cuda_native verify").unwrap()
             < native.find("FERRUM_NATIVE_OPERATOR_SET_LOCK=").unwrap()
     );
     let position = |needle: &str| {
@@ -152,7 +152,7 @@ fn sm120_rebuilds_verified_production_sources_with_fp8_before_linking() {
             .unwrap()
     };
     assert!(
-        position("release_sm120_native build")
+        position("release_cuda_native build")
             < position("cargo build --release --locked -p ferrum-cli")
     );
     // The old archive is provenance, never the feature-expanded link input.
@@ -170,7 +170,7 @@ fn sm120_rebuilds_verified_production_sources_with_fp8_before_linking() {
     }));
     let sm89 = &staging["jobs"]["linux-x86_64-cuda-sm89"];
     assert!(
-        !script(sm89, "cargo build --release --locked -p ferrum-cli").contains("cuda-cutlass-fp8")
+        script(sm89, "cargo build --release --locked -p ferrum-cli").contains("cuda-cutlass-fp8")
     );
 }
 

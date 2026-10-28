@@ -1,4 +1,7 @@
 #pragma once
+#if defined(FERRUM_CUTLASS_FP8_SM89)
+#include "gemm_sm89.cuh"
+#else
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
@@ -61,3 +64,5 @@ inline Kernel::Arguments arguments(const FerrumCutlassFp8RequestV1& r,
   return {cutlass::gemm::GemmUniversalMode::kGemm, shape, main, epi, hardware, {}};
 }
 } // namespace ferrum_fp8
+
+#endif

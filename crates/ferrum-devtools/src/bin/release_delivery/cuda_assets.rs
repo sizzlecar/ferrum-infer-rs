@@ -161,7 +161,10 @@ impl CudaVariant {
             Self::Sm89 => (
                 "89",
                 "nvidia/cuda:12.4.0-devel-ubuntu22.04",
-                &[&["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"]],
+                &[
+                    &["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"],
+                    &["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2", "cuda-cutlass-fp8"],
+                ],
             ),
             Self::Sm120 => (
                 "120",
