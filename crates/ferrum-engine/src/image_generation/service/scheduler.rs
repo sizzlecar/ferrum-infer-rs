@@ -519,12 +519,18 @@ pub(super) fn worker_loop<O: Send + 'static>(
                                         state.rejected.saturating_add(responses.len() as u64);
                                 }
                             }
-                            for (cancelled, response, _, _) in responses.drain(..) {
+                            for (cancelled, response, prompt_reservation, output) in
+                                responses.drain(..)
+                            {
                                 let kind = if cancelled.load(Ordering::Acquire) {
                                     ImageServiceErrorKind::Cancelled
                                 } else {
                                     kind
                                 };
+                                // A terminal rejection makes capacity reusable before
+                                // the waiter can submit its next request.
+                                drop(output);
+                                drop(prompt_reservation);
                                 let _ = response.send(Err(service_error(kind, &message)));
                             }
                             Ok(Vec::new())
