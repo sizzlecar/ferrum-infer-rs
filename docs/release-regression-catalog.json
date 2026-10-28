@@ -556,8 +556,8 @@
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "e22a286a25b8d1b2b54513d2ebfacf52effc907f1e5091305199344c0d80ea73",
-      "after_sha256": "95df143e981870e6ae0fbf76712778ec013863d4634bb334abbcb36fc917bf8b",
+      "before_sha256": "95df143e981870e6ae0fbf76712778ec013863d4634bb334abbcb36fc917bf8b",
+      "after_sha256": "13317db8092feedb53760836700ecda36f8cae45b202c400cc53fd437b192b95",
       "areas": [
         "build",
         "backend_submission",
@@ -568,7 +568,7 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the changes since v0.16.0: the release label and Metal scope describe 1024x1024 generation and single-PNG editing on M4 16 GiB with Q4_K_M DiT, FP8 text encoder and BF16 vision/VAE. CUDA directory defaults document automatic between-batch scheduling, capacity-only candidate reduction, 2K admission, bounded queues/output overlap, Host-aware text caching, retained shape plans and automatic convolution workspace selection; explicit JSON retains configured behavior. The image benchmark and lifecycle probe document resource sampling limits and observed recovery rather than treating client actions or incomplete samples as successful evidence. CUDA throughput remains explicitly historical v0.15.0 candidate evidence; no Auto throughput or SLO claim is added. Retain distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution or publication result."
+      "rationale": "Reviewed the changes since v0.17.0: the CUDA image section documents one ordinary DiT LoRA loaded at startup through run and serve, fixed strength, PEFT or explicitly bound Diffusers A/B imports, complete target and variant validation, immutable BF16 composition before whole-group FP8 quantization, automatically budgeted Host mappings/cache/workspaces, and adapter-specific model and Auto batching identity. It explicitly excludes request switching, multiple adapters, Metal/GGUF adapters and distillation sampling, retains Turbo's eight steps, and distinguishes structural binding from verified Turbo image quality. No throughput or SLO claim is added. Retain distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals; production weight changes independently retain their numerical reach. This content review certifies no execution or publication result."
     },
     {
       "path": "README_zh.md",
