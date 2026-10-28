@@ -4788,11 +4788,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn memory_availability(
         &self,
     ) -> Result<Option<ferrum_runtime::DeviceMemoryAvailability>, Self::Error> {
-        // Retired CudaSlices enqueue frees on this stream. Observe only after
-        // those frees complete; no inference stream or live owner is modified.
-        self.allocation_stream.synchronize().map_err(|error| {
-            CudaDeviceRuntimeError::driver("memory availability synchronization", error)
-        })?;
+        // Observe without synchronizing: a stream sync can trim the CUDA pool
+        // and turn this capacity query into an allocation-policy change.
+        // Retired slices and future allocations share allocation_stream, so
+        // their async frees remain ordered before any subsequent allocation.
+        // Bytes not yet reflected by the counters are conservatively unavailable.
         let (free, total) = self
             .context
             .mem_get_info()
