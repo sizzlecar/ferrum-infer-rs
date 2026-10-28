@@ -13,7 +13,30 @@ pub struct LowRankMatrix {
     pub(super) output: u64,
     pub(super) multiplier: f32,
 }
+
+/// Borrowed encoded storage for explicit interoperability/export. Access does
+/// not scan, convert or copy a payload; consumers must admit retained owners
+/// through the prepared adapter before reading/exporting their values.
+pub struct LinearAdapterMatrixView<'a> {
+    pub element_type: ElementType,
+    pub dimensions: [u64; 2],
+    pub bytes: &'a [u8],
+}
 impl LowRankMatrix {
+    pub fn a(&self) -> LinearAdapterMatrixView<'_> {
+        LinearAdapterMatrixView {
+            element_type: self.a_type,
+            dimensions: [self.rank, self.input],
+            bytes: self.a.bytes(),
+        }
+    }
+    pub fn b(&self) -> LinearAdapterMatrixView<'_> {
+        LinearAdapterMatrixView {
+            element_type: self.b_type,
+            dimensions: [self.output, self.rank],
+            bytes: self.b.bytes(),
+        }
+    }
     pub const fn rank(&self) -> u64 {
         self.rank
     }

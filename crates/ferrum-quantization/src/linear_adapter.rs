@@ -8,7 +8,7 @@ mod import;
 
 pub use compose::{LinearAdapterBinding, ManagedLinearAdapter, PreparedLinearAdapter};
 pub use config::{LinearAdapterScaling, LinearAdapterSource};
-pub use import::{ImportedLinearAdapter, LowRankMatrix};
+pub use import::{ImportedLinearAdapter, LinearAdapterMatrixView, LowRankMatrix};
 
 use ferrum_types::{FerrumError, Result};
 
