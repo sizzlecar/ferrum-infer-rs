@@ -200,6 +200,7 @@ impl ImageGenerator for Decoder {
                 runtime_fingerprint: "actual-reference-vae-lifecycle-fixture".into(),
                 native_memory: None,
                 assets: ImageAssetReceipt {
+                    lora: None,
                     metadata_sha256: BTreeMap::new(),
                     required_weight_bytes: [0; 3],
                     payload_verification: "zero BF16 test weights; no image quality claim",

@@ -112,6 +112,43 @@ ferrum serve --model /path/to/Qwen-Image-2.1-Turbo --served-model-name qwen-imag
 
 HTTP: `POST /v1/images/generations` (JSON) and `POST /v1/images/edits` (multipart). Edits accept one 8-bit RGB/RGBA PNG; responses contain PNG as `b64_json`. Editing can redraw background/details.
 
+CUDA image LoRA loads one ordinary DiT adapter with a fixed strength at startup.
+Both `run` and `serve` accept `--image-lora /path/to/peft-directory` and
+`--image-lora-strength 0.8`. A PEFT directory must contain
+`adapter_config.json` and `adapter_model.safetensors`. A single Diffusers A/B
+file requires an explicit base binding:
+
+```sh
+ferrum serve /path/to/Qwen-Image-2.1-Turbo --backend cuda \
+  --image-precision fp8_linear_experimental_v1 \
+  --image-lora /path/to/style.safetensors \
+  --image-lora-base-model Qwen/Qwen-Image-2.1 --image-lora-strength 0.8 \
+  --served-model-name qwen-style
+```
+
+Single files use unit export scaling unless `--image-lora-alpha` declares
+alpha/r; PEFT uses its config's rank and alpha. Missing PEFT base metadata can
+be supplied with `--image-lora-base-model`, but it cannot override a conflicting
+declaration. Every A/B pair and target is checked; unsupported variants,
+unknown targets, incompatible shapes and nonfinite strengths fail before device
+execution. Ordinary attention, MLP and time/modulation linear targets are
+supported, including fused gate/up exports. Declared structural compatibility
+with Qwen-Image-2.1 does not establish an adapter's image quality on Turbo.
+
+The base remains immutable. Composition produces bounded BF16 tensors before
+whole-group FP8 quantization, including shared Q/K/V scales. CUDA directory
+entrypoints automatically budget the mapped adapter, complete composed DiT
+cache and temporary workspaces; insufficient Host headroom is reported before
+CUDA construction. This retains composed weights across device eviction.
+Explicit JSON uses a top-level `lora` object with `source` and `strength`, and
+must budget these owners in its Host limits. Startup receipts record adapter
+identity, strength and cache requirements. Without an explicit served alias,
+the model name ends in `:lora:<identity-prefix>`; generation and editing use
+that identity. Auto batches share the same fixed adapter and strength.
+Request-level switching, multiple adapters, Metal/GGUF LoRA and special
+distillation sampling contracts are not supported. Turbo keeps its existing
+eight-step schedule.
+
 CUDA directory serving uses automatic image batching: an idle GPU starts available work immediately; compatible requests accumulated during execution form the next batch. No batch or gathering-delay option is required. `--max-num-seqs` optionally tightens the model/operator batch ceiling; it does not reserve that many images or select a fixed batch size. Capacity is checked before execution, and oversized candidates are reduced only on an explicit capacity rejection. Scheduling occurs between complete batches, so a large image can delay a later small image.
 
 CUDA directory defaults enable cuDNN SDPA, request-scoped edit-prefix reuse and a bounded multi-shape plan cache: up to 16 entries per stage and 128 MiB of serialized compilation metadata in total. Both `run` and `serve` grow this cache on demand; these limits do not preallocate memory.
