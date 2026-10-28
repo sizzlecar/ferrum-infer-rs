@@ -271,7 +271,7 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
         ],
     )?;
     require_fragments(
-        step(&windows, "Build the four native CUDA operators with MSVC")?,
+        step(&windows, "Build native CUDA operators and FP8 with MSVC")?,
         &[
             "$ErrorActionPreference = 'Stop'",
             "$PSNativeCommandUseErrorActionPreference = $true",
@@ -558,6 +558,29 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .retain(|name, _| matches!(name.as_str(), LINUX | WINDOWS));
+        // This positive fixture represents an immutable archive consumer,
+        // not today's SM89 source-building route. Keep its two relevant
+        // consumption steps explicit so new source producers cannot enter it.
+        workflow["jobs"][LINUX]["steps"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|step| {
+                matches!(
+                    step["name"].as_str(),
+                    Some(
+                        "Materialize pinned CUDA native operator set"
+                            | "Build release CUDA sm89 binary exactly once"
+                    )
+                )
+            });
+        for step in workflow["jobs"][LINUX]["steps"].as_array_mut().unwrap() {
+            if step["name"] == "Materialize pinned CUDA native operator set" {
+                step["run"] = json!(step["run"].as_str().unwrap().replace(
+                    "SM89_REFERENCE_LOCK=$lock",
+                    "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock"
+                ));
+            }
+        }
         workflow["on"]["workflow_call"]["outputs"]
             .as_object_mut()
             .unwrap()
@@ -742,11 +765,9 @@ mod tests {
             );
             snapshot.consumers.insert(WORKFLOW.into());
         }
-        // Both revisions have the same release topology and immutable SM89
-        // recipe. The additional Linux source consumer itself prevents a
-        // Windows-only refinement; this must not pass merely by comparing the
-        // already-reviewed SM89 job or by ignoring another Linux producer.
-        recipes(&before, &after).unwrap();
+        // Both CUDA architectures now consume native sources. An unchanged
+        // topology cannot turn those source changes into Windows-only impact.
+        assert!(recipes(&before, &after).is_err());
         assert!(consumers(&before, &after).is_err());
         let base = commit(repo.path(), &before);
         let candidate = commit(repo.path(), &after);
@@ -799,7 +820,7 @@ mod tests {
         for (from, to) in [
             (". './.github/ci/windows-build.ps1'", ". $env:BUILD_HELPER"),
             (
-                "'--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2'",
+                "'--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8'",
                 "'--features', 'cuda'",
             ),
             (
@@ -1111,7 +1132,7 @@ mod tests {
             (WINDOWS_WORKFLOW, |v| v["env"]["BACKEND"] = json!("cpu")),
             (WINDOWS_WORKFLOW, |v| {
                 for step in v["jobs"]["build"]["steps"].as_array_mut().unwrap() {
-                    if step["name"] == "Build the four native CUDA operators with MSVC" {
+                    if step["name"] == "Build native CUDA operators and FP8 with MSVC" {
                         step["if"] = json!("inputs.backend != 'cuda'");
                     }
                 }
