@@ -61,6 +61,42 @@ fn idle_receipt(receipt: &mut ImageStageExecutionReceipt) {
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
+    /// A logical capacity estimate cannot guarantee a native allocation. On a
+    /// rolled-back allocation failure, retire actual idle owners before retry.
+    /// Each successful pass removes backing, so retries terminate without a
+    /// configured retry count or reducing the user's batch limit.
+    pub(in crate::image_generation) fn reclaim_after_allocation_failure(
+        &mut self,
+        target: ImageStage,
+        receipts: &mut Vec<ImageStageReceipt>,
+    ) -> Result<bool, ImageGenerationFailure<R>> {
+        let order = self.resident_stages.eviction_order(target);
+        let mut reclaimed = false;
+        for stage in order {
+            if self.resident_stages.stage(stage).is_some()
+                && self.resident_stages.dynamic_bytes(stage) != 0
+            {
+                self.adaptive_release_dynamic(stage, receipts)?;
+                reclaimed = true;
+            }
+        }
+        if reclaimed {
+            return Ok(true);
+        }
+        for stage in order {
+            // A missing session can mean that an active caller checked it out.
+            // Only idle sessions authorize retirement of their shared weights.
+            if self.resident_stages.stage(stage).is_some()
+                && self.resident_stages.weights(stage).is_some()
+            {
+                self.adaptive_close_session(stage, receipts)?;
+                self.adaptive_close_weights(stage, receipts)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn adaptive_required_bytes(&self, prepared: &PreparedStage<R>) -> anyhow::Result<u64> {
         let target = prepared.plan.stage;
         let mut bytes = self.device_opaque_allowance_bytes;

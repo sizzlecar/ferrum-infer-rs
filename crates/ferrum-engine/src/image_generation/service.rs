@@ -459,6 +459,14 @@ fn qwen_batch_error<R: DeviceRuntime>(
     stopped: bool,
     error: super::ImageGenerationError<R>,
 ) -> ImageBatchError {
+    if !stopped
+        && matches!(
+            error.failure,
+            super::ImageGenerationFailure::AllocationRejected { .. }
+        )
+    {
+        return ImageBatchError::Rejected(error.to_string());
+    }
     // Preflight can also originate inside a stage. The pipeline marks any run
     // failure stopped, even when its variant happens to be Preflight. Only the
     // pre-run, empty-receipt path is safe to discard after returning a message.

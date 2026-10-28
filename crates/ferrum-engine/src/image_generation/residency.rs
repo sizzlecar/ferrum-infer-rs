@@ -593,6 +593,34 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
 
     pub(super) fn start_stage(
         &mut self,
+        mut prepared: PreparedStage<R>,
+        job: u64,
+        stages: &mut Vec<ImageStageReceipt>,
+    ) -> Result<ActiveImageStage<R>, ImageGenerationFailure<R>> {
+        if self.config.residency != ImageResidencyPolicy::Adaptive {
+            return self.start_stage_once(prepared, job, stages);
+        }
+        loop {
+            let retry = prepared.clone();
+            match self.start_stage_once(prepared, job, stages) {
+                Ok(active) => return Ok(active),
+                Err(failure) => {
+                    // Only a recoverable allocation transaction qualifies. No
+                    // submitted inference, partial upload, or unknown fence is retried.
+                    let (stage, failure) = failure.recover_allocation()?;
+                    if !self.reclaim_after_allocation_failure(stage, stages)? {
+                        return Err(ImageGenerationFailure::AllocationRejected { stage, failure });
+                    }
+                    tracing::warn!(?stage, job, error = %failure.message(),
+                        "image allocation rolled back; retrying after idle residency reclamation");
+                    prepared = retry;
+                }
+            }
+        }
+    }
+
+    fn start_stage_once(
+        &mut self,
         prepared: PreparedStage<R>,
         job: u64,
         stages: &mut Vec<ImageStageReceipt>,
