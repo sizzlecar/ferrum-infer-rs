@@ -231,15 +231,14 @@ fn edit_batch_keeps_each_single_reference_span_after_left_padding() {
         assert_eq!(explicit_single.spans, single.spans);
     }
     assert!(tokenizer.prepare_edit_batch(&[], 64, 4, 4, 2).is_err());
-    assert!(tokenizer
-        .prepare_edit_batch(
-            &["cat"; STRUCTURED_ATTENTION_BF16_MAX_BATCH + 1],
-            64,
-            4,
-            4,
-            2
-        )
-        .is_err());
+    assert_eq!(
+        tokenizer
+            .prepare_edit_batch(&["cat"; 17], 64, 4, 4, 2)
+            .unwrap()
+            .prompts()
+            .batch(),
+        17
+    );
     assert!(tokenizer
         .prepare_edit_batch(&["cat", "<|image_pad|>"], 64, 4, 4, 2)
         .is_err());
@@ -546,7 +545,9 @@ fn canonical_token_batch_preserves_rows_and_stable_ties_without_weakening_limits
         .prepare_canonical(&["cat", "<|image_pad|>"], 8192)
         .is_err());
     assert!(t.prepare_canonical(&[], 8192).is_err());
-    assert!(t.prepare_canonical(&["cat"; 17], 8192).is_err());
+    let (large, order) = t.prepare_canonical(&["cat"; 17], 8192).unwrap();
+    assert_eq!(large.batch(), 17);
+    assert_eq!(order, (0..17).collect::<Vec<_>>());
 }
 
 #[test]

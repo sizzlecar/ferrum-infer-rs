@@ -160,13 +160,13 @@ fn by_value_mask_preserves_image_boundaries_internal_padding_and_batch_strides()
         (40, 2, 10, 128, 10240)
     );
     assert_eq!(shape.scale, 0.5);
-    assert_eq!(shape.mask.segment_count, 4);
-    assert_eq!(&shape.mask.segment_ends[..4], &[2, 5, 7, 10]);
-    assert_eq!(shape.mask.bidirectional_mask, 0b1110);
-    assert_eq!(&shape.mask.key_run_counts[..2], &[3, 5]);
-    assert_eq!(&shape.mask.key_run_ends[..3], &[3, 4, 10]);
-    assert_eq!(&shape.mask.key_run_ends[32..37], &[3, 4, 8, 9, 10]);
-    assert_eq!(&shape.mask.key_valid_masks[..2], &[0b101, 0b10101]);
+    assert_eq!(shape.masks[0].mask.segment_count, 4);
+    assert_eq!(&shape.masks[0].mask.segment_ends[..4], &[2, 5, 7, 10]);
+    assert_eq!(shape.masks[0].mask.bidirectional_mask, 0b1110);
+    assert_eq!(&shape.masks[0].mask.key_run_counts[..2], &[3, 5]);
+    assert_eq!(&shape.masks[0].mask.key_run_ends[..3], &[3, 4, 10]);
+    assert_eq!(&shape.masks[0].mask.key_run_ends[32..37], &[3, 4, 8, 9, 10]);
+    assert_eq!(&shape.masks[0].mask.key_valid_masks[..2], &[0b101, 0b10101]);
     // Independently count causal OR equal image id, then key validity.
     let image_ids = [-1, -1, 0, 0, 0, 1, 1, 2, 2, 2];
     let mut pairs = 0;
@@ -200,11 +200,11 @@ fn highest_mask_bits_and_final_batch_are_initialized_without_truncation() {
     let tensor = spec(16 * 32, 256);
     let a = attrs(32, 256, &[1; 32], &bidir, &[32; 16], &[1; 512], &valid);
     let shape = validate_specs(&tensor, &tensor, &tensor, &tensor, &a).unwrap();
-    assert_eq!(shape.mask.bidirectional_mask, 0xaaaa_aaaa);
-    assert_eq!(shape.mask.key_valid_masks[15], 0xaaaa_aaaa);
-    assert_eq!(shape.mask.key_run_counts[15], 32);
-    assert_eq!(shape.mask.key_run_ends[511], 32);
-    assert_eq!(shape.mask.segment_ends[31], 32);
+    assert_eq!(shape.masks[0].mask.bidirectional_mask, 0xaaaa_aaaa);
+    assert_eq!(shape.masks[0].mask.key_valid_masks[15], 0xaaaa_aaaa);
+    assert_eq!(shape.masks[0].mask.key_run_counts[15], 32);
+    assert_eq!(shape.masks[0].mask.key_run_ends[511], 32);
+    assert_eq!(shape.masks[0].mask.segment_ends[31], 32);
     let bad = attrs(32, 256, &[1; 32], &bidir, &[32; 17], &[1; 544], &[1; 544]);
     let tensor = spec(17 * 32, 256);
     assert!(validate_specs(&tensor, &tensor, &tensor, &tensor, &bad).is_err());

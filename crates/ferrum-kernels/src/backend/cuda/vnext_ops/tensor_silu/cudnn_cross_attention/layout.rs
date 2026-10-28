@@ -20,7 +20,7 @@ pub(super) struct Stage {
 }
 pub(super) struct Schedule {
     pub geometry: CrossAttentionBf16Geometry,
-    pub mask: attention::NativeMask,
+    pub masks: Vec<attention::NativeMask>,
     pub bytes: u64,
     pub stages: Vec<Stage>,
 }
@@ -34,59 +34,60 @@ impl Schedule {
                 "cuDNN cross attention requires D72/128 and positive i32 query/KV lengths".into(),
             );
         }
-        let batch = geometry.batch() as u32;
-        let base = Stage {
-            first_query: 0,
-            query_count: geometry.query_length() as u32,
-            first_batch: 0,
-            batches: batch,
-            method: Method::Empty,
-        };
-        let lengths = (0..batch)
-            .map(|b| {
-                geometry
-                    .valid_keys(b as usize)
-                    .ok_or("missing cross batch key count")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let stages = if lengths.iter().all(|&n| n != 0) {
-            vec![Stage {
-                method: Method::Sdpa {
-                    packed_rows: *lengths.iter().max().unwrap(),
-                    direct_kv: lengths
-                        .iter()
-                        .all(|&n| u64::from(n) == geometry.key_value_length()),
-                },
-                ..base
-            }]
-        } else if lengths.iter().all(|&n| n == 0) {
-            vec![base]
-        } else {
-            lengths
-                .into_iter()
-                .enumerate()
-                .map(|(b, n)| Stage {
-                    first_batch: b as u32,
-                    batches: 1,
-                    method: if n == 0 {
-                        Method::Empty
-                    } else {
-                        Method::Sdpa {
-                            packed_rows: n,
-                            // Keep mixed-empty scheduling on its original pack
-                            // path, including nonempty samples with no holes.
-                            direct_kv: false,
-                        }
+        let batch = geometry.batch() as usize;
+        let mut stages = Vec::new();
+        let mut masks = Vec::new();
+        for first in (0..batch).step_by(attention::MASK_BATCH_TILE) {
+            let count = attention::MASK_BATCH_TILE.min(batch - first);
+            masks.push(attention::NativeMask::cross_range(&geometry, first, count)?);
+            let base = Stage {
+                first_query: 0,
+                query_count: geometry.query_length() as u32,
+                first_batch: first as u32,
+                batches: count as u32,
+                method: Method::Empty,
+            };
+            let lengths = (first..first + count)
+                .map(|b| {
+                    geometry
+                        .valid_keys(b)
+                        .ok_or("missing cross batch key count")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if lengths.iter().all(|&n| n != 0) {
+                stages.push(Stage {
+                    method: Method::Sdpa {
+                        packed_rows: *lengths.iter().max().unwrap(),
+                        direct_kv: lengths
+                            .iter()
+                            .all(|&n| u64::from(n) == geometry.key_value_length()),
                     },
                     ..base
-                })
-                .collect()
-        };
-        let mask = attention::NativeMask::cross(&geometry)?;
+                });
+            } else if lengths.iter().all(|&n| n == 0) {
+                stages.push(base);
+            } else {
+                for (b, n) in lengths.into_iter().enumerate() {
+                    stages.push(Stage {
+                        first_batch: (first + b) as u32,
+                        batches: 1,
+                        method: if n == 0 {
+                            Method::Empty
+                        } else {
+                            Method::Sdpa {
+                                packed_rows: n,
+                                direct_kv: false,
+                            }
+                        },
+                        ..base
+                    });
+                }
+            }
+        }
         let result = Self {
             bytes: geometry.query_bytes(),
             geometry,
-            mask,
+            masks,
             stages,
         };
         for &s in &result.stages {

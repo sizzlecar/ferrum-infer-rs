@@ -316,8 +316,9 @@ impl QwenImage21T2iTokenizer {
         maximum_user_tokens: usize,
     ) -> Result<Vec<Vec<u32>>> {
         ensure!(
-            !prompts.is_empty() && prompts.len() <= 16,
-            "T2I requires 1..=16 prompts"
+            !prompts.is_empty()
+                && prompts.len() <= ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH,
+            "T2I prompt count exceeds representable batch metadata"
         );
         ensure!(
             (1..=8192).contains(&maximum_user_tokens),

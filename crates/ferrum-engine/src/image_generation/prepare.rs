@@ -36,7 +36,7 @@ impl BatchOrder {
                 && request_indices.len() == batch,
             "canonical batch permutation has an invalid length"
         );
-        let mut seen = [false; STRUCTURED_ATTENTION_BF16_MAX_BATCH];
+        let mut seen = vec![false; batch];
         for &index in &request_indices {
             ensure!(
                 index < batch && !seen[index],

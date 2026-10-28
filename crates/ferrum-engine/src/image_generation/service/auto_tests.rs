@@ -22,7 +22,9 @@ impl BatchWorker for PreparedFixture {
     ) -> Result<ImageBatchPreparation, ImageBatchError> {
         let seeds: Seeds = requests.iter().map(|r| r.generation().seed).collect();
         self.preparation.send(seeds.clone()).unwrap();
-        self.prepare_release.recv().unwrap();
+        self.prepare_release
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
         if self.reject {
             return Err(ImageBatchError::Rejected("unsupported operator".into()));
         }
@@ -45,7 +47,9 @@ impl BatchWorker for PreparedFixture {
                 .collect::<Seeds>()
         );
         self.execution.send(seeds.clone()).unwrap();
-        self.execute_release.recv().unwrap();
+        self.execute_release
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
         if self.fail_execution {
             return Err(capacity_error(requests.len(), 0));
         }
@@ -165,17 +169,18 @@ async fn auto_dispatches_idle_one_and_shrinks_only_before_execution_preserving_f
         ImageServiceErrorKind::QueueFull
     );
     c.prepare_release.send(()).unwrap();
-    assert_eq!(recv(&c.preparation), [1, 2, 3]);
-    {
-        let state = service.shared.lock();
-        assert_eq!(state.queue.front().unwrap().request.generation().seed, 4);
-        assert_eq!(state.queue.front().unwrap().submitted, arrivals[3]);
-    }
+    assert_eq!(recv(&c.preparation), [1, 2]);
     assert_eq!(service.snapshot().pending_requests, 4);
     c.prepare_release.send(()).unwrap();
-    assert_eq!(recv(&c.preparation), [1, 2]);
+    assert_eq!(recv(&c.preparation), [1, 2, 3]);
     c.prepare_release.send(()).unwrap();
     assert_eq!(recv(&c.execution), [1, 2]);
+    {
+        let state = service.shared.lock();
+        assert_eq!(state.queue.front().unwrap().request.generation().seed, 3);
+        assert_eq!(state.queue.front().unwrap().submitted, arrivals[2]);
+        assert_eq!(state.queue.back().unwrap().submitted, arrivals[3]);
+    }
     let snap = service.snapshot();
     assert_eq!(
         (

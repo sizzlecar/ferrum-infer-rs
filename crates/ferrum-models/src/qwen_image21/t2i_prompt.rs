@@ -37,8 +37,9 @@ pub struct QwenImage21T2iPromptBatch {
 impl QwenImage21T2iPromptBatch {
     fn from_encoded(samples: Vec<Vec<u32>>, drop_prefix: usize, pad: u32) -> Result<Self> {
         ensure!(
-            !samples.is_empty() && samples.len() <= 16,
-            "T2I requires 1..=16 prompts"
+            !samples.is_empty()
+                && samples.len() <= ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH,
+            "T2I requires nonempty prompts within the structured-attention bound"
         );
         ensure!(drop_prefix > 0, "system prefix must be nonempty");
         let sequence = samples.iter().map(Vec::len).max().unwrap();

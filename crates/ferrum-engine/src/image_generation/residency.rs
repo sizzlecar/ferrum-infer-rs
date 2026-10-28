@@ -546,7 +546,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         Ok(ImageDeviceCapacityReport {
             complete_batch: true,
             required_bytes: required,
-            capacity_bytes: self.config.device_capacity_bytes,
+            capacity_bytes: if adaptive {
+                self.adaptive_capacity_ceiling()?
+            } else {
+                self.config.device_capacity_bytes
+            },
             retained_static_bytes: retained_static,
             active_stage_peak_bytes: active_peak,
             retained_dynamic_allowance_bytes: retained_dynamic,

@@ -463,6 +463,7 @@ fn qwen_batch_error<R: DeviceRuntime>(
         && matches!(
             error.failure,
             super::ImageGenerationFailure::AllocationRejected { .. }
+                | super::ImageGenerationFailure::CapacityRejected { .. }
         )
     {
         return ImageBatchError::Rejected(error.to_string());

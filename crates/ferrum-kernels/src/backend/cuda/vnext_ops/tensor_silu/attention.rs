@@ -10,7 +10,7 @@ use ferrum_runtime::{
 
 pub const NUMERICAL_PROFILE_ID: &str = "cuda.ieee.structured_attention.bf16.online_exp.v1";
 pub const NUMERICAL_IDENTITY: &str = concat!(
-    "BF16-QKVY[B*S,H*D];power2-D=2..256;B<=16;segments<=32;runs-per-batch<=32;",
+    "BF16-QKVY[B*S,H*D];power2-D=2..256;logical-batch-tiled-at-16;segments<=32;runs-per-batch<=32;",
     "valid-key-and-causal-or-same-bidirectional-segment;key-only-padding;",
     "FP32-separate-mul-adjacent-pairwise-dot-then-scale;sequential-key-online-softmax;",
     "first-visible-key:m=score,l=1,acc=V;later:m=max(m,score);",
@@ -29,6 +29,16 @@ pub const NUMERICAL_IDENTITY: &str = concat!(
 pub(super) const FUNCTION: &str = "ferrum_vnext_structured_attention_bf16";
 const PROVIDER_ID: &str = "provider.cuda.structured_attention.bf16.online_exp";
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.structured_attention.bf16.online_exp";
+
+/// A launch packet bound, independent of the logical tensor batch capacity.
+pub(super) const MASK_BATCH_TILE: usize = 16;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BatchMask {
+    pub first_batch: u64,
+    pub batches: u64,
+    pub mask: NativeMask,
+}
 
 // Exact C ABI mirror of FerrumStructuredAttentionMask in the pinned source.
 // All members are u32, so no padding can contain uninitialized Rust bytes.
@@ -52,16 +62,31 @@ impl NativeMask {
     /// Cross-attention packing only consumes the key runs. Query geometry is
     /// passed independently to the pack/zero kernels and cuDNN signature.
     pub(super) fn cross(mask: &ferrum_runtime::CrossAttentionBf16Geometry) -> Result<Self, String> {
+        Self::cross_range(mask, 0, mask.batch() as usize)
+    }
+
+    pub(super) fn cross_range(
+        mask: &ferrum_runtime::CrossAttentionBf16Geometry,
+        first: usize,
+        count: usize,
+    ) -> Result<Self, String> {
         let mut native = Self::isolated_sequence(
             u32::try_from(mask.key_value_length()).map_err(|_| "cross KV length exceeds u32")?,
         )?;
-        if mask.batch() > 16 {
+        if count == 0
+            || count > MASK_BATCH_TILE
+            || first
+                .checked_add(count)
+                .is_none_or(|end| end > mask.batch() as usize)
+        {
             return Err("cross batch exceeds native mask ABI".into());
         }
-        for batch in 0..mask.batch() as usize {
-            let ends = mask.key_run_ends(batch).ok_or("cross key runs missing")?;
+        for batch in 0..count {
+            let ends = mask
+                .key_run_ends(first + batch)
+                .ok_or("cross key runs missing")?;
             let valid = mask
-                .key_run_valid(batch)
+                .key_run_valid(first + batch)
                 .ok_or("cross key validity missing")?;
             if ends.is_empty() || ends.len() > 32 || ends.len() != valid.len() {
                 return Err("cross key runs exceed native mask ABI".into());
@@ -98,13 +123,38 @@ impl NativeMask {
     }
 
     pub(super) fn new(mask: &StructuredAttentionBf16Mask) -> Result<Self, String> {
+        Self::range(mask, 0, mask.batch())
+    }
+
+    pub(super) fn tiles(mask: &StructuredAttentionBf16Mask) -> Result<Vec<BatchMask>, String> {
+        (0..mask.batch())
+            .step_by(MASK_BATCH_TILE)
+            .map(|first| {
+                let count = MASK_BATCH_TILE.min(mask.batch() - first);
+                Ok(BatchMask {
+                    first_batch: first as u64,
+                    batches: count as u64,
+                    mask: Self::range(mask, first, count)?,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn range(
+        mask: &StructuredAttentionBf16Mask,
+        first: usize,
+        count: usize,
+    ) -> Result<Self, String> {
         let segments = mask.segment_ends();
         let bidirectional = mask.segment_bidirectional();
         if segments.is_empty()
             || segments.len() > 32
             || segments.len() != bidirectional.len()
-            || mask.batch() == 0
-            || mask.batch() > 16
+            || count == 0
+            || count > MASK_BATCH_TILE
+            || first
+                .checked_add(count)
+                .is_none_or(|end| end > mask.batch())
         {
             return Err("CUDA attention mask exceeds its by-value ABI bounds".into());
         }
@@ -120,12 +170,12 @@ impl NativeMask {
         for (i, &enabled) in bidirectional.iter().enumerate() {
             native.bidirectional_mask |= u32::from(enabled) << i;
         }
-        for batch in 0..mask.batch() {
+        for batch in 0..count {
             let ends = mask
-                .key_run_ends(batch)
+                .key_run_ends(first + batch)
                 .ok_or("missing attention key runs")?;
             let valid = mask
-                .key_run_valid(batch)
+                .key_run_valid(first + batch)
                 .ok_or("missing attention key validity")?;
             if ends.is_empty() || ends.len() > 32 || ends.len() != valid.len() {
                 return Err("CUDA attention key runs exceed their by-value ABI bounds".into());
@@ -301,45 +351,50 @@ impl AttentionProvider {
             )?;
         }
         let kernels = Arc::clone(&self.kernels);
+        let work = (shape.elements, shape.operations, shape.masks.len() as u64);
         CudaDeviceCommand::operation(
             FUNCTION,
             vec![query, key, value, output],
             move |stream, regions| {
-                let query = regions[0].device_ptr();
-                let key = regions[1].device_ptr();
-                let value = regions[2].device_ptr();
-                let output = regions[3].device_ptr();
-                let mut builder = stream.launch_builder(kernels.attention_function());
-                builder
-                    .arg(&query)
-                    .arg(&key)
-                    .arg(&value)
-                    .arg(&output)
-                    .arg(&shape.groups)
-                    .arg(&shape.heads)
-                    .arg(&shape.sequence)
-                    .arg(&shape.width)
-                    .arg(&shape.scale)
-                    .arg(&shape.mask);
-                unsafe {
-                    builder.launch(LaunchConfig {
-                        grid_dim: (shape.groups.min(MAX_BLOCKS) as u32, 1, 1),
-                        block_dim: (shape.width, 1, 1),
-                        shared_mem_bytes: shape.width * 4,
-                    })
+                for tile in &shape.masks {
+                    let offset = tile.first_batch * (shape.bytes / shape.batch);
+                    let query = regions[0].device_ptr() + offset;
+                    let key = regions[1].device_ptr() + offset;
+                    let value = regions[2].device_ptr() + offset;
+                    let output = regions[3].device_ptr() + offset;
+                    let groups = (shape.groups / shape.batch) * tile.batches;
+                    let mut builder = stream.launch_builder(kernels.attention_function());
+                    builder
+                        .arg(&query)
+                        .arg(&key)
+                        .arg(&value)
+                        .arg(&output)
+                        .arg(&groups)
+                        .arg(&shape.heads)
+                        .arg(&shape.sequence)
+                        .arg(&shape.width)
+                        .arg(&shape.scale)
+                        .arg(&tile.mask);
+                    unsafe {
+                        builder.launch(LaunchConfig {
+                            grid_dim: (groups.min(MAX_BLOCKS) as u32, 1, 1),
+                            block_dim: (shape.width, 1, 1),
+                            shared_mem_bytes: shape.width * 4,
+                        })
+                    }
+                    .map_err(|error| {
+                        CudaDeviceRuntimeError::driver("BF16 structured attention launch", error)
+                    })?;
                 }
-                .map(|_| ())
-                .map_err(|error| {
-                    CudaDeviceRuntimeError::driver("BF16 structured attention launch", error)
-                })
+                Ok(())
             },
         )
-        .and_then(|command| command.with_tensor_work(shape.elements, shape.operations, 1, 0))
+        .and_then(|command| command.with_tensor_work(work.0, work.1, work.2, 0))
         .map_err(|error| error.to_string())
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Shape {
     groups: u64,
     heads: u64,
@@ -349,7 +404,8 @@ struct Shape {
     elements: u64,
     operations: u64,
     bytes: u64,
-    mask: NativeMask,
+    batch: u64,
+    masks: Vec<BatchMask>,
 }
 
 impl Shape {
@@ -372,7 +428,8 @@ impl Shape {
             elements: checked.element_count(),
             operations: checked.logical_arithmetic_operations(),
             bytes,
-            mask: NativeMask::new(checked.mask())?,
+            batch: checked.batch(),
+            masks: NativeMask::tiles(checked.mask())?,
         })
     }
 }

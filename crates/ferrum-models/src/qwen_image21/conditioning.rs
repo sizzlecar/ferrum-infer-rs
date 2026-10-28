@@ -55,7 +55,7 @@ impl QwenImage21TransformerConfig {
             "timestep batch exceeds checked conditioning capacity"
         );
         // Bounded control values, not a [B,256] feature buffer.
-        let timesteps = [time; STRUCTURED_ATTENTION_BF16_MAX_BATCH];
+        let timesteps = vec![time; batch];
         let adapter = QwenImage21Timestep256::new()?;
         let elements = QwenImage21Timestep256::output_elements(self)?;
         let (id, spec, bytes) =

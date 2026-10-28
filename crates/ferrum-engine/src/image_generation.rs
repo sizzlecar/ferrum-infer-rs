@@ -516,8 +516,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         match result {
             Ok(outputs) => Ok(outputs),
             Err(failure) => {
-                self.stopped =
-                    !matches!(failure, ImageGenerationFailure::AllocationRejected { .. });
+                self.stopped = !matches!(
+                    failure,
+                    ImageGenerationFailure::AllocationRejected { .. }
+                        | ImageGenerationFailure::CapacityRejected { .. }
+                );
                 Err(ImageGenerationError {
                     failure,
                     completed_stages: stages,

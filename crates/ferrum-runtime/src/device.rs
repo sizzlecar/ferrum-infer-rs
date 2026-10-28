@@ -17,7 +17,9 @@ pub use immutable_metadata::{
 mod program_binding_upload;
 pub use program_binding_upload::DeviceProgramBindingUploadSnapshot;
 mod native_memory;
-pub use native_memory::{DeviceNativeMemoryScope, DeviceNativeMemorySnapshot};
+pub use native_memory::{
+    DeviceMemoryAvailability, DeviceNativeMemoryScope, DeviceNativeMemorySnapshot,
+};
 mod resident_program;
 mod tensor_state_copy;
 mod terminal_readback;
@@ -4110,6 +4112,13 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     /// from plan budgets, process RSS and physical device residency.
     fn native_memory_snapshot(&self) -> Option<DeviceNativeMemorySnapshot> {
         None
+    }
+
+    /// Observe physical capacity before starting a new idle-stage allocation.
+    /// Backends may drain their allocation/free stream, but must not release
+    /// live owners. Unsupported backends leave planning to the managed ledger.
+    fn memory_availability(&self) -> Result<Option<DeviceMemoryAvailability>, Self::Error> {
+        Ok(None)
     }
 
     /// Submits one non-empty ordered command batch and returns its exact

@@ -116,7 +116,9 @@ impl StructuredGqaAttentionBf16Geometry {
         let batch =
             usize::try_from(*rows / sequence).map_err(|_| invalid("batch exceeds usize"))?;
         if !(1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&batch) {
-            return Err(invalid("batch must be in 1..=16"));
+            return Err(invalid(
+                "batch exceeds the representable mask metadata extent",
+            ));
         }
         let Some(SemanticValue::Rational(scale)) = attribute(attributes, "scale") else {
             return Err(invalid("scale must be rational"));
