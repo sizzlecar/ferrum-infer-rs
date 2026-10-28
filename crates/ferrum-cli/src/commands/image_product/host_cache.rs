@@ -59,7 +59,7 @@ pub(super) struct AutoHostCacheSelection {
     pub receipt: AutoHostCacheReceipt,
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(feature = "cuda")]
 pub(super) fn for_directory(
     options: &super::directory::DirectoryOptions,
     assets: &ferrum_engine::image_generation::QwenImage21Assets,
