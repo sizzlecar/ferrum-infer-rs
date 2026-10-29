@@ -103,6 +103,13 @@ pub(super) fn verify() {
             n: 16,
             k: 4096,
         },
+        // Seven SM89 N tiles activate Identity8 grouping; both M and N have
+        // tail tiles. Validate every output, including the final partial tile.
+        Shape {
+            m: 129,
+            n: 400,
+            k: 128,
+        },
     ]
     .into_iter()
     .enumerate()
