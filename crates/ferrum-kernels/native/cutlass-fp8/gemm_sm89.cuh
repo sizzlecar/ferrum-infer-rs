@@ -1,49 +1,56 @@
 #pragma once
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
-#include "cutlass/gemm/device/gemm_universal.h"
-#include "cutlass/epilogue/thread/linear_combination.h"
-#include <cuda_bf16.h>
+#include "cutlass/gemm/device/gemm_universal_base.h"
+#include "cutlass/gemm/kernel/default_gemm_universal_with_visitor.h"
+#include "cutlass/epilogue/threadblock/fusion/visitors.hpp"
 
 namespace ferrum_fp8 {
 using Input = cutlass::float_e4m3_t;
 using Output = cutlass::bfloat16_t;
-// Ada has FP8 MMA but no SM120 collective/TMA epilogue. Keep the FP32
-// accumulator in caller-owned scratch, then apply the exact row/scalar scales.
-// No split-K, atomic reduction, hidden allocation or BF16 GEMM fallback.
-// Group nearby N tiles so they can reuse the same activation tile in cache.
-// Identity8 changes CTA placement only; warp geometry, K128 promotion and
-// the separate FP32 scaling epilogue remain unchanged.
-using Gemm = cutlass::gemm::device::GemmUniversal<
-    Input, cutlass::layout::RowMajor, Input, cutlass::layout::ColumnMajor,
-    float, cutlass::layout::RowMajor, float,
-    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
-    cutlass::gemm::GemmShape<128, 64, 128>,
-    cutlass::gemm::GemmShape<64, 32, 128>,
-    cutlass::gemm::GemmShape<16, 8, 32>,
-    cutlass::epilogue::thread::LinearCombination<float, 4, float, float>,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, 3,
-    16, 16, cutlass::arch::OpMultiplyAdd>;
+using Tile = cutlass::gemm::GemmShape<128, 64, 128>;
+using Warp = cutlass::gemm::GemmShape<64, 32, 128>;
+namespace epi = cutlass::epilogue::threadblock;
 
-inline Gemm::Arguments arguments(const FerrumCutlassFp8RequestV1& r,
-    const Input* a, const Input* b, float* accumulator) {
+// Keep Ada's MMA geometry, K128 staged promotion and Identity8 tile placement.
+// The visitor applies weight then row scale in F32, with BF16 RNE only at the
+// final store. No FP32 output scratch, split-K or extra reduction is needed.
+using ThreadMap = epi::OutputTileThreadLayout<Tile, Warp, Output, 8>;
+using RowScale = epi::VisitorColBroadcast<ThreadMap, float,
+    cute::Stride<cute::_1, cute::_0, cute::_0>, false>;
+using WeightScale = epi::VisitorScalarBroadcast<float>;
+using Multiply = epi::VisitorCompute<cutlass::multiplies, float, float,
+    cutlass::FloatRoundStyle::round_to_nearest>;
+using Weighted = epi::Sm80EVT<Multiply, WeightScale, epi::VisitorAccFetch>;
+using Scaled = epi::Sm80EVT<Multiply, Weighted, RowScale>;
+using Store = epi::VisitorAuxStore<ThreadMap, Output,
+    cutlass::FloatRoundStyle::round_to_nearest,
+    cute::Stride<int64_t, cute::_1, cute::_0>>;
+using Epilogue = epi::Sm80EVT<Store, Scaled>;
+using Kernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
+    Input, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 16,
+    Input, cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone, 16,
+    Output, cutlass::layout::RowMajor, 8, float, float,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
+    Tile, Warp, cutlass::gemm::GemmShape<16, 8, 32>, Epilogue,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, 3,
+    cutlass::arch::OpMultiplyAdd>::GemmKernel;
+using Gemm = cutlass::gemm::device::GemmUniversalBase<Kernel>;
+
+inline Kernel::Arguments arguments(const FerrumCutlassFp8RequestV1& r,
+    const Input* activation, const Input* weights, const float* row_scale,
+    const float* weight_scale, Output* output) {
+  WeightScale::Arguments ws{};
+  ws.scalar_ptrs[0] = weight_scale;
+  Weighted::Arguments weighted{ws, {}, {}};
+  RowScale::Arguments rs{row_scale, 0.0f, {}};
+  Scaled::Arguments scaled{weighted, rs, {}};
+  Store::Arguments store{output, {int64_t(r.outputs), cute::_1{}, cute::_0{}}};
+  Epilogue::Arguments epilogue{scaled, store};
   return {cutlass::gemm::GemmUniversalMode::kGemm,
-    {int(r.rows), int(r.outputs), int(r.inputs)}, 1, {1.0f, 0.0f},
-    a, b, accumulator, accumulator,
+    {int(r.rows), int(r.outputs), int(r.inputs)}, 1, epilogue,
+    activation, weights, nullptr, output,
     int64_t(0), int64_t(0), int64_t(0), int64_t(0),
     int64_t(r.inputs), int64_t(r.inputs), int64_t(r.outputs), int64_t(r.outputs)};
-}
-
-inline uint64_t accumulator_bytes(const FerrumCutlassFp8RequestV1& r) {
-  return (uint64_t(r.rows) * r.outputs * sizeof(float) + 255) & ~uint64_t(255);
-}
-
-__global__ void scale_output(const float* accumulator, const float* row_scale,
-    const float* weight_scale, __nv_bfloat16* output, uint64_t elements, uint32_t columns) {
-  for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-       i < elements; i += uint64_t(blockDim.x) * gridDim.x) {
-    const float weighted = __fmul_rn(*weight_scale, accumulator[i]);
-    output[i] = __float2bfloat16_rn(__fmul_rn(weighted, row_scale[i / columns]));
-  }
 }
 } // namespace ferrum_fp8

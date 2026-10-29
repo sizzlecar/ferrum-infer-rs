@@ -400,7 +400,7 @@ impl Provider {
             .map_err(|e| e.to_string())?;
         let transfers = capture
             .as_ref()
-            .map(|capture| capture.transfers(&plan))
+            .map(|capture| capture.transfers())
             .unwrap_or(0);
         let owner = Arc::clone(&self.owner);
         CudaDeviceCommand::operation(

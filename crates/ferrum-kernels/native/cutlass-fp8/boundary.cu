@@ -8,7 +8,7 @@
 namespace {
 constexpr uint32_t ABI = 1;
 #if defined(FERRUM_CUTLASS_FP8_SM89)
-constexpr uint32_t ARCHITECTURE = 890, KERNEL = 2;
+constexpr uint32_t ARCHITECTURE = 890, KERNEL = 3;
 #else
 constexpr uint32_t ARCHITECTURE = 1200, KERNEL = 1;
 #endif
@@ -35,9 +35,6 @@ int request_valid(const FerrumCutlassFp8RequestV1& r) {
   uint64_t ignored;
   if (!extent(r.rows,r.inputs,2,ignored) || !extent(r.outputs,r.inputs,1,ignored) ||
       !extent(r.rows,r.outputs,2,ignored)) return -3;
-#if defined(FERRUM_CUTLASS_FP8_SM89)
-  if (!extent(r.rows,r.outputs,4,ignored)) return -3;
-#endif
   return 0;
 }
 int device_valid(const FerrumCutlassFp8RequestV1& r) {
@@ -54,18 +51,10 @@ int device_valid(const FerrumCutlassFp8RequestV1& r) {
 int derive(const FerrumCutlassFp8RequestV1& r, FerrumCutlassFp8PlanV1& p) {
   int status=request_valid(r); if(status)return status;
   status=device_valid(r); if(status)return status;
-#if defined(FERRUM_CUTLASS_FP8_SM89)
-  constexpr auto shared = sizeof(typename ferrum_fp8::Gemm::GemmKernel::SharedStorage);
-  auto args=ferrum_fp8::arguments(r,nullptr,nullptr,nullptr);
-#else
   constexpr auto shared = sizeof(typename ferrum_fp8::Kernel::SharedStorage);
   auto args=ferrum_fp8::arguments(r,nullptr,nullptr,nullptr,nullptr,nullptr);
-#endif
   if (!shared || shared > r.maximum_dynamic_shared_bytes || shared > UINT32_MAX) return -2;
   uint64_t workspace=ferrum_fp8::Gemm::get_workspace_size(args);
-#if defined(FERRUM_CUTLASS_FP8_SM89)
-  if (!add(workspace,ferrum_fp8::accumulator_bytes(r),workspace)) return -3;
-#endif
   p={}; p.request=r; p.abi=ABI; p.size=sizeof(p); p.kernel_id=KERNEL; p.shared_bytes=uint32_t(shared);
   uint64_t end;
   if (!extent(r.rows,r.inputs,1,p.quantized_activation_bytes) ||
@@ -84,19 +73,12 @@ bool disjoint(FerrumCutlassFp8SpanV1 a, FerrumCutlassFp8SpanV1 b) {
   return a.address >= b.address+b.bytes || b.address >= a.address+a.bytes;
 }
 auto gemm_arguments(const FerrumCutlassFp8PlanV1& p, const FerrumCutlassFp8BindingsV1& b) {
-#if defined(FERRUM_CUTLASS_FP8_SM89)
-  return ferrum_fp8::arguments(p.request,
-      reinterpret_cast<const ferrum_fp8::Input*>(b.scratch.address),
-      reinterpret_cast<const ferrum_fp8::Input*>(b.weight.address),
-      reinterpret_cast<float*>(b.scratch.address+p.gemm_workspace_offset));
-#else
   return ferrum_fp8::arguments(p.request,
       reinterpret_cast<const ferrum_fp8::Input*>(b.scratch.address),
       reinterpret_cast<const ferrum_fp8::Input*>(b.weight.address),
       reinterpret_cast<const float*>(b.scratch.address+p.activation_scale_offset),
       reinterpret_cast<const float*>(b.weight_scale.address),
       reinterpret_cast<ferrum_fp8::Output*>(b.output.address));
-#endif
 }
 int validate(const FerrumCutlassFp8PlanV1& p, const FerrumCutlassFp8BindingsV1& b) {
   FerrumCutlassFp8PlanV1 expected{}; int status=derive(p.request,expected); if(status)return status;
@@ -136,25 +118,13 @@ extern "C" int ferrum_cutlass_fp8_run_v1(const FerrumCutlassFp8PlanV1* plan, con
       reinterpret_cast<float*>(b.scratch.address+p.activation_scale_offset), p.request.inputs);
     error=cudaPeekAtLastError(); if(error!=cudaSuccess)return int(error);
     ferrum_fp8::Gemm gemm;
+    void* workspace=p.gemm_workspace_bytes ? reinterpret_cast<void*>(b.scratch.address+p.gemm_workspace_offset) : nullptr;
 #if defined(FERRUM_CUTLASS_FP8_SM89)
-    void* workspace=reinterpret_cast<void*>(b.scratch.address+p.gemm_workspace_offset+
-        ferrum_fp8::accumulator_bytes(p.request));
     const auto result=gemm(gemm_arguments(p,b),workspace,stream);
 #else
-    void* workspace=p.gemm_workspace_bytes ? reinterpret_cast<void*>(b.scratch.address+p.gemm_workspace_offset) : nullptr;
     const auto result=gemm.run(gemm_arguments(p,b),workspace,stream);
 #endif
     if(result!=cutlass::Status::kSuccess)return -7;
-#if defined(FERRUM_CUTLASS_FP8_SM89)
-    error=cudaPeekAtLastError(); if(error!=cudaSuccess)return int(error);
-    const uint64_t elements=uint64_t(p.request.rows)*p.request.outputs;
-    const unsigned blocks=unsigned((elements+255)/256 > 65535 ? 65535 : (elements+255)/256);
-    ferrum_fp8::scale_output<<<blocks,256,0,stream>>>(
-        reinterpret_cast<const float*>(b.scratch.address+p.gemm_workspace_offset),
-        reinterpret_cast<const float*>(b.scratch.address+p.activation_scale_offset),
-        reinterpret_cast<const float*>(b.weight_scale.address),
-        reinterpret_cast<__nv_bfloat16*>(b.output.address),elements,p.request.outputs);
-#endif
     error=cudaPeekAtLastError(); return error==cudaSuccess ? 0 : int(error);
   } catch(...){return -8;}
 }

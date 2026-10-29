@@ -197,9 +197,7 @@ pub(super) fn verify() {
             );
             // All capture destinations are charged to this same Host parent
             // before any device admission. The ordinary provider has no probe.
-            let ticket = probe
-                .arm_with_accumulator(shape.m as u32, shape.k as u32, shape.n as u32)
-                .unwrap();
+            let ticket = probe.arm(shape.m as u32, shape.k as u32).unwrap();
             let mut bytes = host
                 .allocate_zeroed(HostMemoryClass::InputPreprocess, inputs.len() * 2)
                 .unwrap();
@@ -244,29 +242,6 @@ pub(super) fn verify() {
                 )
                 .unwrap();
             eprintln!("FP8 case{case} repeat{repetition}: actual quantization capture matched {} E4M3FN bytes and {} F32 scale bits; diagnostic={CUDA_FP8_QUANTIZATION_PROBE_PROFILE_ID}", expected.activation_bytes.len(), expected.row_scales.len());
-            if let Some(accumulator) = quantized.accumulator_bytes() {
-                assert!(host.owns(accumulator));
-                expected
-                    .validate_accumulator(
-                        accumulator.bytes(),
-                        payload.scale(),
-                        shape.k as usize,
-                        error_model,
-                    )
-                    .unwrap();
-                let mut worst = (0, 0_f64, 0_f64, 0_f64);
-                for (index, bytes) in accumulator.bytes().chunks_exact(4).enumerate() {
-                    let actual = f64::from(f32::from_le_bytes(bytes.try_into().unwrap()));
-                    let row = index / shape.n as usize;
-                    let expected_raw = expected.quantized_dot[index]
-                        / (f64::from(expected.row_scales[row]) * f64::from(payload.scale()));
-                    let error = (actual - expected_raw).abs();
-                    if error > worst.3 {
-                        worst = (index, actual, expected_raw, error);
-                    }
-                }
-                eprintln!("FP8 case{case} repeat{repetition}: raw F32 accumulator worst index={} actual={} expected={} error={}", worst.0, worst.1, worst.2, worst.3);
-            }
             let bytes = outputs[0].bytes().clone();
             let (gemm_error, quantization_change) = expected
                 .validate(bytes.bytes(), shape.k as usize, error_model)

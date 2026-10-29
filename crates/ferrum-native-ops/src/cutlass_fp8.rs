@@ -15,16 +15,16 @@ pub const CUTLASS_FP8_EXPORTS: [&str; 3] = [
 ];
 pub const CUTLASS_FP8_SCRATCH_ALIGNMENT: u64 = 256;
 pub const CUTLASS_FP8_KERNEL_128: u32 = 1;
-pub const CUTLASS_FP8_KERNEL_SM89: u32 = 2;
+pub const CUTLASS_FP8_KERNEL_SM89: u32 = 3;
 pub const CUTLASS_FP8_NUMERICAL_IDENTITY: &str = concat!(
     "cutlass-cb4247394dd82148787aed73e5dc7cef33cbf862;",
     "sm120a=tile128x128x128,cluster1x1x1,persistent-no-stream-k;",
-    "sm89=tile128x64x128,warp64x32x128,swizzle8,stages3,no-split-k,f32-scratch-scale;",
+    "sm89=tile128x64x128,warp64x32x128,swizzle8,stages3,no-split-k,fused-scale-bf16-store;",
     "A=bf16-rowmajor;B=e4m3fn-OI;Y=bf16-rowmajor;",
     "row-amax=fmax(abs(x));scale=max(rn32(amax/448),rn32(1/(448*512)));",
     "quant=E4M3FN-RNE-SATFINITE(fmax(-448,fmin(rn32(x/scale),448)));",
     "sm89-acc=vendor-fp8-mma,empirical-fp22-local-k128,f32-staged-promotion;",
-    "sm120-acc=f32;epilogue=B(rn32(weight-scale*acc)*row-scale);",
+    "sm120-acc=f32;epilogue=B(rn32(rn32(weight-scale*acc)*row-scale));",
     "weight-scale=f32-positive-finite-scalar;no-bias;",
     "no-fast-math;qualification=not-established;not-deployment-bitwise-parity"
 );
@@ -150,11 +150,6 @@ impl CutlassFp8PlanV1 {
                 .checked_add(activation_scale_bytes)
                 .ok_or(CutlassFp8Error::Extent)?,
         )?;
-        if request.architecture == 890
-            && gemm_workspace_bytes < align(extent(request.rows, request.outputs, 4)?)?
-        {
-            return Err(CutlassFp8Error::Extent);
-        }
         let scratch_bytes = gemm_workspace_offset
             .checked_add(gemm_workspace_bytes)
             .filter(|n| *n <= isize::MAX as u64)
