@@ -121,6 +121,7 @@ jobs:
     name: Stage Linux x86_64 CUDA sm89
     env:
       NATIVE_REFERENCE_REVISION: 6bfa659ad535caab97019726fe373f8326a233a7
+      NATIVE_HISTORICAL_SOURCE_REVISION: 7da9e4ebfb13e996a08bcc91db2a5e194b7b9f8d
       LLAMA_NATIVE_REVISION: d81235049384534c167caea52b85a694f6103d14
       CUTLASS_REVISION: cb4247394dd82148787aed73e5dc7cef33cbf862
       CUTLASS_ARCHIVE_SHA256: 7a37329b43a47aaf9ef142be99baff3e71dbeea007b975891350cc0e50bc598b
@@ -219,8 +220,12 @@ jobs:
           ./target/release-tools/examples/cutlass_fp8_catalog_declaration \
             134217728 512 experimental-release-source-declaration-v1 \
             "$work/combined-catalog.json" "$work/base-catalog.json"
-          mkdir "$work/reference-workspace" "$work/source-bundle" "$work/fp8-source"
+          mkdir "$work/reference-workspace" "$work/source-bundle" "$work/fp8-source" "$work/historical-source"
           git archive "$NATIVE_REFERENCE_REVISION" | tar -xf - -C "$work/reference-workspace"
+          # Recover the exact SM89 inputs from before the native source split.
+          # The builder still requires every byte to match the production plan.
+          git archive "$NATIVE_HISTORICAL_SOURCE_REVISION:crates/ferrum-kernels" \
+            | tar -xf - -C "$work/historical-source"
           manifest=native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json
           source_url=$(jq -er '"https://github.com/" + .distribution.repository + "/releases/download/" + .distribution.tag + "/" + .distribution.asset_name' "$manifest")
           source_sha=$(jq -er '.archive.sha256' "$manifest")
@@ -256,6 +261,7 @@ jobs:
           ./target/release-tools/examples/release_cuda_native build --architecture sm89 \
             --reference-lock "$SM89_REFERENCE_LOCK" --reference-workspace "$work/reference-workspace" \
             --source-bundle "$work/source-bundle" --llama-source "$work/llama" \
+            --historical-source "$work/historical-source" \
             --workspace "$GITHUB_WORKSPACE" --catalog "$work/combined-catalog.json" \
             --fp8-source "$work/fp8-source" --fp8-plan "$work/fp8-plan.json" \
             --work "$work/builds" --output "$work/operator-set" \

@@ -66,6 +66,9 @@ struct Build {
     reference_workspace: PathBuf,
     #[arg(long)]
     source_bundle: PathBuf,
+    /// Additional pinned source tree for historical plans; locked digests still apply.
+    #[arg(long)]
+    historical_source: Option<PathBuf>,
     #[arg(long)]
     llama_source: PathBuf,
     #[arg(long)]
@@ -414,6 +417,9 @@ fn materialize_source(
             (args.reference_workspace.as_path(), repository_file.clone()),
             (args.workspace.as_path(), repository_file),
         ];
+        if let Some(historical) = &args.historical_source {
+            candidates.push((historical.as_path(), relative_path.to_owned()));
+        }
         if let Ok(llama) = relative_path.strip_prefix("llama") {
             candidates.push((args.llama_source.as_path(), llama.to_owned()));
         }
