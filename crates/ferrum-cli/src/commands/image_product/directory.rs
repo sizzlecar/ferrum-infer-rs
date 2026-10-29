@@ -39,6 +39,7 @@ pub struct DirectoryOptions {
     pub lora: Option<super::configuration::ImageLoraConfig>,
 }
 impl DirectoryOptions {
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     fn resolve_automatic_batch(
         &self,
         assets: &ferrum_engine::image_generation::QwenImage21Assets,
@@ -398,6 +399,7 @@ impl DirectoryOptions {
     }
 }
 
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
 pub(super) fn automatic_candidate_limit(
     available_bytes: u64,
     per_request_bytes: usize,
