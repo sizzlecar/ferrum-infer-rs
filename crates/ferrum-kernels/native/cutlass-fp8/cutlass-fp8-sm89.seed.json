@@ -2,7 +2,7 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.cutlass_fp8_scaled_mm",
   "source_package_kind": "ferrum-native-cutlass-fp8",
-  "source_package_revision": "sm89-w8a8-v1+cb4247394dd82148787aed73e5dc7cef33cbf862",
+  "source_package_revision": "sm89-w8a8-swizzle8-v2+cb4247394dd82148787aed73e5dc7cef33cbf862",
   "upstream_sources": [
     {
       "repository": "https://github.com/NVIDIA/cutlass.git",

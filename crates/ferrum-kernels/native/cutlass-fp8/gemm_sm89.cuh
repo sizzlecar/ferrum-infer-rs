@@ -11,6 +11,9 @@ using Output = cutlass::bfloat16_t;
 // Ada has FP8 MMA but no SM120 collective/TMA epilogue. Keep the FP32
 // accumulator in caller-owned scratch, then apply the exact row/scalar scales.
 // No split-K, atomic reduction, hidden allocation or BF16 GEMM fallback.
+// Group nearby N tiles so they can reuse the same activation tile in cache.
+// Identity8 changes CTA placement only; warp geometry, K128 promotion and
+// the separate FP32 scaling epilogue remain unchanged.
 using Gemm = cutlass::gemm::device::GemmUniversal<
     Input, cutlass::layout::RowMajor, Input, cutlass::layout::ColumnMajor,
     float, cutlass::layout::RowMajor, float,
@@ -19,7 +22,7 @@ using Gemm = cutlass::gemm::device::GemmUniversal<
     cutlass::gemm::GemmShape<64, 32, 128>,
     cutlass::gemm::GemmShape<16, 8, 32>,
     cutlass::epilogue::thread::LinearCombination<float, 4, float, float>,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, 3,
     16, 16, cutlass::arch::OpMultiplyAdd>;
 
 inline Gemm::Arguments arguments(const FerrumCutlassFp8RequestV1& r,
