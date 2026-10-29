@@ -163,7 +163,7 @@ pub(super) fn verify() {
                 },
             )
             .unwrap();
-        let mut retained = None;
+        let mut retained: Option<(ManagedHostBytes, oracle::ErrorModel)> = None;
         for repetition in 0..2 {
             // Evict this session's native planning record without retiring the
             // compiled component. Encoding must reconstruct the same admitted
@@ -265,12 +265,13 @@ pub(super) fn verify() {
                 .validate(bytes.bytes(), shape.k as usize, error_model)
                 .unwrap();
             eprintln!("FP8 case{case} repeat{repetition}: decoded-F64 GEMM max error={gemm_error}; activation quantization max dot change={quantization_change}; finite probe only");
-            if let Some(previous) = &retained {
+            if let Some((previous, previous_model)) = &retained {
                 assert_eq!(bytes.bytes(), ManagedHostBytes::bytes(previous));
+                assert_eq!(*previous_model, error_model);
             }
             drop(outputs);
             drop((quantized, ticket));
-            retained = Some(bytes);
+            retained = Some((bytes, error_model));
         }
         assert!(matches!(
             session.try_release_idle_dynamic_backing().unwrap(),
@@ -288,7 +289,10 @@ pub(super) fn verify() {
             }
         }
         drop(compiled);
-        expected.check(retained.as_ref().unwrap().bytes(), shape.k as usize);
+        let (retained_bytes, retained_model) = retained.as_ref().unwrap();
+        expected
+            .validate(retained_bytes.bytes(), shape.k as usize, *retained_model)
+            .unwrap();
         drop(retained);
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     }

@@ -283,6 +283,25 @@ impl Capture {
         }
         let a = scratch.subregion(0, p.quantized_activation_bytes)?;
         let s = scratch.subregion(p.activation_scale_offset, p.activation_scale_bytes)?;
+        // Resolve every requested extent before synchronizing or reading any
+        // payload, so mismatched output geometry cannot partially fill a capture.
+        let accumulator_region = if p.request.architecture == 890 {
+            destination
+                .accumulator
+                .as_ref()
+                .map(|accumulator| {
+                    let bytes = u64::from(p.request.rows) * u64::from(p.request.outputs) * 4;
+                    if accumulator.len() as u64 != bytes || bytes > p.gemm_workspace_bytes {
+                        return Err(error(
+                            "FP8 accumulator capture plan/backing geometry differs",
+                        ));
+                    }
+                    scratch.subregion(p.gemm_workspace_offset, bytes)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         stream
             .synchronize()
             .map_err(|e| CudaDeviceRuntimeError::driver("FP8 diagnostic stream completion", e))?;
@@ -299,15 +318,8 @@ impl Capture {
             cudarc::driver::result::memcpy_dtoh_sync(destination.scales.as_mut(), s.device_ptr())
         }
         .map_err(|e| CudaDeviceRuntimeError::driver("FP8 diagnostic scale readback", e))?;
-        if p.request.architecture == 890 {
+        if let Some(region) = accumulator_region {
             if let Some(accumulator) = &mut destination.accumulator {
-                let bytes = u64::from(p.request.rows) * u64::from(p.request.outputs) * 4;
-                if accumulator.len() as u64 != bytes || bytes > p.gemm_workspace_bytes {
-                    return Err(error(
-                        "FP8 accumulator capture plan/backing geometry differs",
-                    ));
-                }
-                let region = scratch.subregion(p.gemm_workspace_offset, bytes)?;
                 unsafe {
                     cudarc::driver::result::memcpy_dtoh_sync(
                         accumulator.as_mut(),
