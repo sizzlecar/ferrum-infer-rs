@@ -13,7 +13,7 @@ impl ModelFamilyProvider for Family {
         if config.m == 0
             || config.m > 129
             || config.n == 0
-            || config.n > 128
+            || config.n > 512
             || config.k == 0
             || config.k > 4096
             || serde_json::to_value(config).unwrap() != *raw

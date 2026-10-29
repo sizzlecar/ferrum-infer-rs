@@ -19,7 +19,7 @@ pub const CUTLASS_FP8_KERNEL_SM89: u32 = 2;
 pub const CUTLASS_FP8_NUMERICAL_IDENTITY: &str = concat!(
     "cutlass-cb4247394dd82148787aed73e5dc7cef33cbf862;",
     "sm120a=tile128x128x128,cluster1x1x1,persistent-no-stream-k;",
-    "sm89=tile128x64x128,warp64x32x128,stages3,no-split-k,f32-scratch-scale;",
+    "sm89=tile128x64x128,warp64x32x128,swizzle8,stages3,no-split-k,f32-scratch-scale;",
     "A=bf16-rowmajor;B=e4m3fn-OI;Y=bf16-rowmajor;",
     "row-amax=fmax(abs(x));scale=max(rn32(amax/448),rn32(1/(448*512)));",
     "quant=E4M3FN-RNE-SATFINITE(fmax(-448,fmin(rn32(x/scale),448)));",
