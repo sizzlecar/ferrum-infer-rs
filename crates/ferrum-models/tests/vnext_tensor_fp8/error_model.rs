@@ -4,11 +4,12 @@
 //! vendor guarantee of undocumented internals. SageAttention2 §3.4 reports
 //! 13 fraction bits and truncation on Ada/Hopper, including zero-input MMAs:
 //! https://arxiv.org/html/2411.10958v7#S3.SS4
-//! Our unchanged SM89 kernel uses CUTLASS cb4247394dd82148787aed73e5dc7cef33cbf862
+//! The SM89 MMA uses CUTLASS cb4247394dd82148787aed73e5dc7cef33cbf862
 //! GemmShape<128,64,128>, warp K128 and instruction K32, OpMultiplyAdd.
 //! arch::detail::UseStagedAccumulation selects a temporary accumulator;
 //! gemm/threadblock/mma_multistage.h promotes it at warp_mma_k==0 and at the
-//! end. Thus the first segment can be K32, later segments at most K128, with
+//! end. The fused scale/BF16 store does not change this mainloop. Thus the first
+//! segment can be K32, later segments at most K128, with
 //! a tail segment: at most ceil(K/128)+1 F32 promotions. No split-K is used.
 //!
 //! Finite E4M3 products are exact in 14 significant bits. Conservatively allow

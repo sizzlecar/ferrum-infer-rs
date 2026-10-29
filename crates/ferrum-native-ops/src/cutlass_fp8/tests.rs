@@ -19,15 +19,16 @@ fn plan() -> CutlassFp8PlanV1 {
 }
 
 #[test]
-fn ada_plan_accounts_for_fp32_accumulator_and_has_distinct_kernel_identity() {
+fn ada_fused_plan_needs_no_output_scratch_and_has_distinct_kernel_identity() {
     let mut r = request();
     r.architecture = 890;
     r.validate().unwrap();
-    assert!(CutlassFp8PlanV1::checked(r, 73728, 0).is_err());
-    assert!(CutlassFp8PlanV1::checked(r, 73728, 255).is_err());
-    let p = CutlassFp8PlanV1::checked(r, 73728, 256).unwrap();
+    let p = CutlassFp8PlanV1::checked(r, 73728, 0).unwrap();
     assert_eq!(p.kernel_id, CUTLASS_FP8_KERNEL_SM89);
-    assert_eq!(p.scratch_bytes, p.gemm_workspace_offset + 256);
+    assert_eq!(p.scratch_bytes, p.gemm_workspace_offset);
+    let wider =
+        CutlassFp8PlanV1::checked(CutlassFp8RequestV1 { outputs: 4096, ..r }, 73728, 0).unwrap();
+    assert_eq!(p.scratch_bytes, wider.scratch_bytes);
     p.validate().unwrap();
     let mut wrong = p;
     wrong.kernel_id = CUTLASS_FP8_KERNEL_128;

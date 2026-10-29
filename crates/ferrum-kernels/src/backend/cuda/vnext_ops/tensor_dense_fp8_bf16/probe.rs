@@ -1,4 +1,5 @@
-//! Explicit diagnostic capture of actual quantization and GEMM intermediates.
+//! Explicit diagnostic capture of actual quantization and row scales.
+//! Both native architectures fuse the epilogue: no raw accumulator is exposed.
 //! No device allocation or alternate arithmetic path. The caller reserves all
 //! Output backings before admission; the original command synchronously reads
 //! valid scratch extents on its stream and publishes only a complete receipt.
@@ -8,7 +9,7 @@ use cudarc::driver::CudaStream;
 use ferrum_runtime::{HostMemoryAccount, HostMemoryClass, ManagedHostBuffer, ManagedHostBytes};
 
 pub const QUANTIZATION_PROBE_PROFILE_ID: &str =
-    "diagnostic.cuda.cutlass_fp8.quantization_readback.v1";
+    "diagnostic.cuda.cutlass_fp8.quantization_readback.v2";
 
 pub struct CudaCutlassFp8Probe {
     host: HostMemoryAccount,
@@ -33,7 +34,6 @@ enum Slot {
 struct Buffers {
     activations: ManagedHostBuffer,
     scales: ManagedHostBuffer,
-    accumulator: Option<ManagedHostBuffer>,
 }
 
 /// One armed diagnostic invocation. Dropping it before encode cancels its
@@ -50,7 +50,6 @@ pub struct CudaCutlassFp8ProbeReceipt {
     kernel_id: u32,
     activations: ManagedHostBytes,
     scales: ManagedHostBytes,
-    accumulator: Option<ManagedHostBytes>,
 }
 impl CudaCutlassFp8ProbeReceipt {
     /// Actual architecture and selected kernel from the validated native plan.
@@ -73,10 +72,6 @@ impl CudaCutlassFp8ProbeReceipt {
     pub fn row_scale_bytes(&self) -> &ManagedHostBytes {
         &self.scales
     }
-    /// Exact pre-scaling F32 accumulator bits when the native backend exposes them.
-    pub fn accumulator_bytes(&self) -> Option<&ManagedHostBytes> {
-        self.accumulator.as_ref()
-    }
 }
 
 impl CudaCutlassFp8Probe {
@@ -94,29 +89,6 @@ impl CudaCutlassFp8Probe {
         self: &Arc<Self>,
         rows: u32,
         inputs: u32,
-    ) -> Result<CudaCutlassFp8ProbeTicket, CudaDeviceRuntimeError> {
-        self.arm_inner(rows, inputs, None)
-    }
-
-    /// Also capture the SM89 scratch accumulator. SM120 fuses its epilogue and
-    /// has no exposed accumulator, so its receipt retains only quantization.
-    pub fn arm_with_accumulator(
-        self: &Arc<Self>,
-        rows: u32,
-        inputs: u32,
-        outputs: u32,
-    ) -> Result<CudaCutlassFp8ProbeTicket, CudaDeviceRuntimeError> {
-        if outputs == 0 {
-            return Err(error("FP8 probe output geometry must be nonzero"));
-        }
-        self.arm_inner(rows, inputs, Some(outputs))
-    }
-
-    fn arm_inner(
-        self: &Arc<Self>,
-        rows: u32,
-        inputs: u32,
-        outputs: Option<u32>,
     ) -> Result<CudaCutlassFp8ProbeTicket, CudaDeviceRuntimeError> {
         if rows == 0 || inputs == 0 {
             return Err(error("FP8 probe geometry must be nonzero"));
@@ -136,13 +108,10 @@ impl CudaCutlassFp8Probe {
         let next = generation
             .checked_add(1)
             .ok_or_else(|| error("FP8 probe generation exhausted"))?;
-        let mut reservations = vec![
+        let reservations = [
             (HostMemoryClass::Output, bytes(u64::from(inputs))?),
             (HostMemoryClass::Output, bytes(4)?),
         ];
-        if let Some(outputs) = outputs {
-            reservations.push((HostMemoryClass::Output, bytes(u64::from(outputs) * 4)?));
-        }
         let claims = self
             .host
             .reserve_many(&reservations)
@@ -158,11 +127,6 @@ impl CudaCutlassFp8Probe {
             .ok_or_else(|| error("FP8 probe scale claim missing"))?
             .allocate_zeroed()
             .map_err(|e| error(e.to_string()))?;
-        let accumulator = claims
-            .next()
-            .map(|claim| claim.allocate_zeroed())
-            .transpose()
-            .map_err(|e| error(e.to_string()))?;
         inner.next = next;
         inner.slot = Slot::Armed {
             generation,
@@ -171,7 +135,6 @@ impl CudaCutlassFp8Probe {
             buffers: Buffers {
                 activations,
                 scales,
-                accumulator,
             },
         };
         Ok(CudaCutlassFp8ProbeTicket {
@@ -209,7 +172,6 @@ impl CudaCutlassFp8Probe {
             generation,
             rows,
             inputs,
-            capture_accumulator: buffers.accumulator.is_some(),
             buffers: Mutex::new(Some(buffers)),
         }))
     }
@@ -254,12 +216,11 @@ pub(super) struct Capture {
     generation: u64,
     rows: u32,
     inputs: u32,
-    capture_accumulator: bool,
     buffers: Mutex<Option<Buffers>>,
 }
 impl Capture {
-    pub(super) fn transfers(&self, plan: &PreparedCutlassFp8) -> u64 {
-        2 + u64::from(self.capture_accumulator && plan.plan().request.architecture == 890)
+    pub(super) fn transfers(&self) -> u64 {
+        2
     }
     pub(super) fn read(
         &self,
@@ -283,25 +244,6 @@ impl Capture {
         }
         let a = scratch.subregion(0, p.quantized_activation_bytes)?;
         let s = scratch.subregion(p.activation_scale_offset, p.activation_scale_bytes)?;
-        // Resolve every requested extent before synchronizing or reading any
-        // payload, so mismatched output geometry cannot partially fill a capture.
-        let accumulator_region = if p.request.architecture == 890 {
-            destination
-                .accumulator
-                .as_ref()
-                .map(|accumulator| {
-                    let bytes = u64::from(p.request.rows) * u64::from(p.request.outputs) * 4;
-                    if accumulator.len() as u64 != bytes || bytes > p.gemm_workspace_bytes {
-                        return Err(error(
-                            "FP8 accumulator capture plan/backing geometry differs",
-                        ));
-                    }
-                    scratch.subregion(p.gemm_workspace_offset, bytes)
-                })
-                .transpose()?
-        } else {
-            None
-        };
         stream
             .synchronize()
             .map_err(|e| CudaDeviceRuntimeError::driver("FP8 diagnostic stream completion", e))?;
@@ -318,21 +260,6 @@ impl Capture {
             cudarc::driver::result::memcpy_dtoh_sync(destination.scales.as_mut(), s.device_ptr())
         }
         .map_err(|e| CudaDeviceRuntimeError::driver("FP8 diagnostic scale readback", e))?;
-        if let Some(region) = accumulator_region {
-            if let Some(accumulator) = &mut destination.accumulator {
-                unsafe {
-                    cudarc::driver::result::memcpy_dtoh_sync(
-                        accumulator.as_mut(),
-                        region.device_ptr(),
-                    )
-                }
-                .map_err(|e| {
-                    CudaDeviceRuntimeError::driver("FP8 diagnostic accumulator readback", e)
-                })?;
-            }
-        } else {
-            destination.accumulator = None;
-        }
         let mut inner = self
             .probe
             .inner
@@ -353,7 +280,6 @@ impl Capture {
                 kernel_id: p.kernel_id,
                 activations: buffers.activations.freeze(),
                 scales: buffers.scales.freeze(),
-                accumulator: buffers.accumulator.map(ManagedHostBuffer::freeze),
             },
         );
         Ok(())
