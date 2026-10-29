@@ -20,6 +20,27 @@ pub(super) struct Probe {
 }
 
 impl Probe {
+    pub fn batched() -> Self {
+        let batch = 17;
+        let flags: Vec<_> = (0..batch).map(|b| i64::from(b != 15)).collect();
+        Self::new(
+            config(
+                batch as u64 * SEQUENCE as u64,
+                COLUMNS as u64,
+                SEQUENCE as u64,
+                HEAD_DIM as u64,
+                [
+                    vec![2, 3, 2],
+                    vec![0, 1, 1],
+                    vec![1; batch],
+                    vec![7; batch],
+                    flags,
+                ],
+            ),
+            (0..batch).map(|b| [b != 15; SEQUENCE]).collect(),
+        )
+    }
+
     pub fn segmented() -> Self {
         let valid_keys = vec![
             [true, false, true, true, false, true, true],

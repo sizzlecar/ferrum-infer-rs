@@ -296,10 +296,7 @@ fn adaptive_preset_has_one_real_batch_limit_and_finite_host_bounds() {
         pending + one.maximum_batch_size + completed_sessions
     );
     ferrum_output::OutputBudget::new(one.serving().unwrap().output).unwrap();
-    assert_eq!(
-        one.maximum_batch_size,
-        ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH
-    );
+    assert_eq!(one.batch_limit, directory::DirectoryBatchLimit::Auto);
     assert_eq!(
         one.serving().unwrap().maximum_pending_bytes.unwrap().get(),
         one.host().input_preprocess_bytes / 2
@@ -495,4 +492,12 @@ async fn both_product_wrappers_route_local_pipeline_to_explicit_backend_error() 
         result,
         Err(CommandError::Image(ImageProductError::Unsupported(_)))
     ));
+}
+
+#[test]
+fn automatic_batch_candidate_scales_with_available_memory() {
+    assert_eq!(directory::automatic_candidate_limit(100, 10).unwrap(), 10);
+    assert_eq!(directory::automatic_candidate_limit(1000, 10).unwrap(), 100);
+    assert_eq!(directory::automatic_candidate_limit(9, 10).unwrap(), 1);
+    assert!(directory::automatic_candidate_limit(100, 0).is_err());
 }

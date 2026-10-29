@@ -22,9 +22,12 @@ pub fn cross_attention_bf16_contract() -> Result<StandardOperationContract, VNex
         positive_rational_attribute("scale")?,
     ]);
     for (name, maximum) in [
-        ("key_run_counts", 16),
-        ("key_run_lengths", 512),
-        ("key_run_valid", 512),
+        (
+            "key_run_counts",
+            crate::STRUCTURED_ATTENTION_BF16_MAX_BATCH as u32,
+        ),
+        ("key_run_lengths", u32::MAX),
+        ("key_run_valid", u32::MAX),
     ] {
         attributes.insert(
             AttributeId::new(name)?,
@@ -129,7 +132,7 @@ impl CrossAttentionBf16Geometry {
         }
         let batch = unsigned(attrs, "batch")?;
         let d = unsigned(attrs, "head_dim")?;
-        if !(1..=16).contains(&batch)
+        if !(1..=crate::STRUCTURED_ATTENTION_BF16_MAX_BATCH as u64).contains(&batch)
             || *qr == 0
             || *kr == 0
             || *c == 0
@@ -139,7 +142,7 @@ impl CrossAttentionBf16Geometry {
             || !(d.is_power_of_two() || d == 72)
             || c % d != 0
         {
-            return Err(invalid("positive rows divisible by batch 1..16 and columns divisible by head_dim (power2 2..256 or 72) required"));
+            return Err(invalid("positive rows divisible by a representable positive batch and columns divisible by head_dim (power2 2..256 or 72) required"));
         }
         let query_length = qr / batch;
         let key_value_length = kr / batch;

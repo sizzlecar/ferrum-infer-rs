@@ -462,6 +462,15 @@ impl Provider {
                 let key_sequence = schedule.geometry.key_value_length() as u32;
                 for item in &bound {
                     let s = item.stage;
+                    let mask_index = s.first_batch as usize / attention::MASK_BATCH_TILE;
+                    let tile_base = (mask_index * attention::MASK_BATCH_TILE) as u64;
+                    let first_batch = s.first_batch - tile_base as u32;
+                    let mask = &schedule.masks[mask_index];
+                    let output_offset = tile_base * u64::from(sequence) * columns * 2;
+                    let y = y + output_offset;
+                    let key_offset = tile_base * u64::from(key_sequence) * columns * 2;
+                    let k = k + key_offset;
+                    let v = v + key_offset;
                     match s.method {
                         Method::Empty => {
                             let n = u64::from(s.batches) * u64::from(s.query_count) * columns;
@@ -471,7 +480,7 @@ impl Provider {
                                 .arg(&y)
                                 .arg(&columns)
                                 .arg(&sequence)
-                                .arg(&s.first_batch)
+                                .arg(&first_batch)
                                 .arg(&s.batches)
                                 .arg(&s.first_query)
                                 .arg(&s.query_count);
@@ -505,13 +514,13 @@ impl Provider {
                                 .arg(&k_lengths)
                                 .arg(&columns)
                                 .arg(&key_sequence)
-                                .arg(&s.first_batch)
+                                .arg(&first_batch)
                                 .arg(&s.batches)
                                 .arg(&s.query_count)
                                 .arg(&visible_end)
                                 .arg(&packed_rows)
                                 .arg(&copy_payload)
-                                .arg(&schedule.mask);
+                                .arg(mask);
                             unsafe { launch.launch(flat_launch(n)) }.map_err(|e| {
                                 CudaDeviceRuntimeError::driver("attention stable KV packing", e)
                             })?;

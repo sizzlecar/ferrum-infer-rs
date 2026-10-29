@@ -136,6 +136,13 @@ pub enum ImageGenerationFailure<R: DeviceRuntime> {
         stage: ImageStage,
         failure: FailureEnvelope,
     },
+    /// No stage allocation or submission started. All earlier stages retired
+    /// normally, so this capacity observation does not poison the pipeline.
+    CapacityRejected {
+        stage: ImageStage,
+        additional_bytes: u64,
+        available_bytes: u64,
+    },
     InitializationRollback {
         plan: ImageStagePlanReceipt,
         source: ResourceRollbackTransitionError<RuntimeResourceDriver<R>>,
@@ -177,6 +184,13 @@ impl<R: DeviceRuntime> fmt::Display for ImageGenerationFailure<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ImageGenerationFailure::Preflight(e) => write!(f, "image preflight: {e:#}"),
+            ImageGenerationFailure::CapacityRejected {
+                stage,
+                additional_bytes,
+                available_bytes,
+            } => {
+                write!(f, "image {stage:?} needs {additional_bytes} additional device bytes after idle reclamation; {available_bytes} available")
+            }
             ImageGenerationFailure::AllocationRejected { stage, failure } => {
                 write!(
                     f,

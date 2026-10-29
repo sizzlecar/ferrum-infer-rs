@@ -809,10 +809,10 @@ fn geometry_and_conditioning_policy_are_checked_canonical_identity() {
         (3, 2, 2050, vec![1]),
         (3, 2, 2, vec![]),
         (3, 2, 2, vec![4]),
-        (3, 2, 2, vec![1; 17]),
     ] {
         assert!(QwenImage21T2iLayout::new(text, height, width, lengths).is_err());
     }
+    assert!(QwenImage21T2iLayout::new(3, 2, 2, vec![1; 17]).is_ok());
     let config = config(true);
     let encoded = serde_json::to_value(&config).unwrap();
     assert_eq!(

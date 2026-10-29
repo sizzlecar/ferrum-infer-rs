@@ -61,6 +61,43 @@ fn idle_receipt(receipt: &mut ImageStageExecutionReceipt) {
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
+    /// Fresh preparation can count only this pipeline's idle, reclaimable
+    /// allocations in addition to currently available physical storage.
+    pub(super) fn adaptive_capacity_ceiling(&self) -> anyhow::Result<u64> {
+        let Some(memory) = self.runtime.memory_availability()? else {
+            return Ok(self.config.device_capacity_bytes);
+        };
+        let mut reclaimable = 0_u64;
+        for stage in RETAINABLE_STAGES {
+            if self.resident_stages.stage(stage).is_some() {
+                reclaimable = reclaimable
+                    .checked_add(self.resident_stages.dynamic_bytes(stage))
+                    .and_then(|n| {
+                        n.checked_add(
+                            self.resident_stages
+                                .weights(stage)
+                                .map_or(0, |weights| weights.origin.plan.static_bytes),
+                        )
+                    })
+                    .context("idle image capacity overflows")?;
+            }
+        }
+        // The configured ceiling already applies utilization and explicit
+        // account limits. Do not subtract total - ceiling from physical free
+        // storage again: native/other owners have already reduced that value.
+        // The report includes the native allowance, so leaving it in this
+        // bound also reserves room for native storage not allocated yet.
+        let capacity = memory
+            .available_bytes()
+            .saturating_add(reclaimable)
+            .min(self.config.device_capacity_bytes);
+        tracing::debug!(target: "ferrum_engine::image_generation::timing",
+            capacity_bytes = capacity, configured_capacity_bytes = self.config.device_capacity_bytes,
+            reclaimable_bytes = reclaimable, free_bytes = memory.free_bytes,
+            "image preparation physical capacity observed");
+        Ok(capacity)
+    }
+
     /// A logical capacity estimate cannot guarantee a native allocation. On a
     /// rolled-back allocation failure, retire actual idle owners before retry.
     /// Each successful pass removes backing, so retries terminate without a
@@ -125,6 +162,44 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .context("adaptive active capacity overflows")
     }
 
+    fn adaptive_physical_demand(
+        &self,
+        prepared: &PreparedStage<R>,
+    ) -> anyhow::Result<Option<(u64, u64)>> {
+        let Some(memory) = self.runtime.memory_availability()? else {
+            return Ok(None);
+        };
+        let target = prepared.plan.stage;
+        let additional_static = if self.resident_stages.weights(target).is_some() {
+            0
+        } else {
+            prepared.plan.static_bytes
+        };
+        let dynamic = prepared.admission_dynamic_bytes(self.runnable_dynamic_bytes(prepared)?)?;
+        let additional = additional_static
+            .checked_add(dynamic.saturating_sub(self.resident_stages.dynamic_bytes(target)))
+            .context("adaptive physical demand overflows")?;
+        // The logical check already enforces the configured account ceiling.
+        // Physical free excludes allocated driver/native/other owners; reserve
+        // only the declared native allowance for possible future native growth.
+        let reserve = self.device_opaque_allowance_bytes;
+        let available = memory.available_bytes().saturating_sub(reserve);
+        tracing::debug!(target: "ferrum_engine::image_generation::timing",
+            stage = ?target, additional_bytes = additional, available_bytes = available,
+            free_bytes = memory.free_bytes, reusable_pool_bytes = memory.reusable_pool_bytes,
+            reserve_bytes = reserve, "image stage physical capacity observed");
+        Ok(Some((additional, available)))
+    }
+
+    fn adaptive_stage_fits(&self, prepared: &PreparedStage<R>) -> anyhow::Result<bool> {
+        if self.adaptive_required_bytes(prepared)? > self.config.device_capacity_bytes {
+            return Ok(false);
+        }
+        Ok(self
+            .adaptive_physical_demand(prepared)?
+            .is_none_or(|(required, available)| required <= available))
+    }
+
     pub(super) fn admit_adaptive_stage(
         &mut self,
         prepared: &PreparedStage<R>,
@@ -167,9 +242,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         }
         let order = self.resident_stages.eviction_order(target);
         for stage in order {
-            if self.adaptive_required_bytes(prepared).map_err(preflight)?
-                <= self.config.device_capacity_bytes
-            {
+            if self.adaptive_stage_fits(prepared).map_err(preflight)? {
                 return Ok(());
             }
             if self.resident_stages.dynamic_bytes(stage) != 0 {
@@ -177,9 +250,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             }
         }
         for stage in order {
-            if self.adaptive_required_bytes(prepared).map_err(preflight)?
-                <= self.config.device_capacity_bytes
-            {
+            if self.adaptive_stage_fits(prepared).map_err(preflight)? {
                 return Ok(());
             }
             // Only a slot owns an idle session. Never evict a checked-out
@@ -199,6 +270,17 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             return Err(preflight(anyhow::anyhow!(
                 "adaptive image stage still needs {required} bytes after idle reclamation; active owners cannot be evicted"
             )));
+        }
+        if let Some((additional_bytes, available_bytes)) =
+            self.adaptive_physical_demand(prepared).map_err(preflight)?
+        {
+            if additional_bytes > available_bytes {
+                return Err(ImageGenerationFailure::CapacityRejected {
+                    stage: target,
+                    additional_bytes,
+                    available_bytes,
+                });
+            }
         }
         Ok(())
     }

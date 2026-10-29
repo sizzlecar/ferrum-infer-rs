@@ -4785,6 +4785,30 @@ impl DeviceRuntime for CudaDeviceRuntime {
         self.attention_execution_policy
     }
 
+    fn memory_availability(
+        &self,
+    ) -> Result<Option<ferrum_runtime::DeviceMemoryAvailability>, Self::Error> {
+        // Observe without synchronizing: a stream sync can trim the CUDA pool
+        // and turn this capacity query into an allocation-policy change.
+        // Retired slices and future allocations share allocation_stream, so
+        // their async frees remain ordered before any subsequent allocation.
+        // Bytes not yet reflected by the counters are conservatively unavailable.
+        let (free, total) = self
+            .context
+            .mem_get_info()
+            .map_err(|error| CudaDeviceRuntimeError::driver("memory availability", error))?;
+        let reusable_pool_bytes = allocation_pool_snapshot(&self.context)
+            .map_err(|error| CudaDeviceRuntimeError::driver("memory pool availability", error))?
+            .map_or(0, |pool| {
+                pool.reserved_bytes.saturating_sub(pool.used_bytes)
+            });
+        Ok(Some(ferrum_runtime::DeviceMemoryAvailability {
+            total_bytes: total as u64,
+            free_bytes: free as u64,
+            reusable_pool_bytes,
+        }))
+    }
+
     fn allocate(
         &self,
         permit: ferrum_runtime::DeviceAllocationPermit<'_>,

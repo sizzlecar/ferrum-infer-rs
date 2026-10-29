@@ -23,7 +23,7 @@ pub(super) struct Stage {
 #[derive(Debug)]
 pub(super) struct Schedule {
     pub geometry: StructuredAttentionBf16Geometry,
-    pub mask: attention::NativeMask,
+    pub masks: Vec<attention::NativeMask>,
     pub bytes: u64,
     pub stages: Vec<Stage>,
 }
@@ -42,68 +42,67 @@ impl Schedule {
             .checked_mul(2)
             .filter(|&n| n <= isize::MAX as u64)
             .ok_or("cuDNN attention tensor byte extent exceeds address space")?;
-        let mask = attention::NativeMask::new(geometry.mask())?;
+        let tiles = attention::NativeMask::tiles(geometry.mask())?;
         let mut stages = Vec::new();
-        let mut start = 0;
-        for (&end, &bidirectional) in geometry
-            .mask()
-            .segment_ends()
-            .iter()
-            .zip(geometry.mask().segment_bidirectional())
-        {
-            let stage = Stage {
-                first_query: start,
-                query_count: end - start,
-                first_batch: 0,
-                batches: geometry.batch() as u32,
-                method: Method::Causal,
-            };
-            if !bidirectional {
-                stages.push(stage);
-            } else {
-                let mut lengths = [0u32; 16];
-                for (batch, length) in lengths[..geometry.batch() as usize].iter_mut().enumerate() {
-                    *length = valid_prefix(geometry.mask(), batch, end)?;
-                }
-                let lengths = &lengths[..geometry.batch() as usize];
-                if lengths.iter().all(|&n| n != 0) {
-                    // The normal batched path uses one cuDNN launch and exact
-                    // per-batch lengths, even if padding differs by sample.
-                    stages.push(Stage {
-                        method: Method::Sdpa {
-                            packed_rows: *lengths.iter().max().unwrap(),
-                        },
-                        ..stage
-                    });
-                } else if lengths.iter().all(|&n| n == 0) {
-                    stages.push(Stage {
-                        method: Method::Empty,
-                        ..stage
-                    });
+        for tile in &tiles {
+            let mut start = 0;
+            for (&end, &bidirectional) in geometry
+                .mask()
+                .segment_ends()
+                .iter()
+                .zip(geometry.mask().segment_bidirectional())
+            {
+                let stage = Stage {
+                    first_query: start,
+                    query_count: end - start,
+                    first_batch: tile.first_batch as u32,
+                    batches: tile.batches as u32,
+                    method: Method::Causal,
+                };
+                if !bidirectional {
+                    stages.push(stage);
                 } else {
-                    // Empty samples never enter cuDNN and never read Q/K/V.
-                    // This avoids assuming vendor support for seq_len_kv=0.
-                    for (batch, &length) in lengths.iter().enumerate() {
+                    let lengths = (0..tile.batches)
+                        .map(|batch| {
+                            valid_prefix(geometry.mask(), (tile.first_batch + batch) as usize, end)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if lengths.iter().all(|&n| n != 0) {
                         stages.push(Stage {
-                            first_batch: batch as u32,
-                            batches: 1,
-                            method: if length == 0 {
-                                Method::Empty
-                            } else {
-                                Method::Sdpa {
-                                    packed_rows: length,
-                                }
+                            method: Method::Sdpa {
+                                packed_rows: *lengths.iter().max().unwrap(),
                             },
                             ..stage
                         });
+                    } else if lengths.iter().all(|&n| n == 0) {
+                        stages.push(Stage {
+                            method: Method::Empty,
+                            ..stage
+                        });
+                    } else {
+                        for (batch, &length) in lengths.iter().enumerate() {
+                            stages.push(Stage {
+                                first_batch: tile.first_batch as u32 + batch as u32,
+                                batches: 1,
+                                method: if length == 0 {
+                                    Method::Empty
+                                } else {
+                                    Method::Sdpa {
+                                        packed_rows: length,
+                                    }
+                                },
+                                ..stage
+                            });
+                        }
                     }
                 }
+                start = end;
             }
-            start = end;
         }
+        let masks = tiles.into_iter().map(|tile| tile.mask).collect();
         Ok(Self {
             geometry,
-            mask,
+            masks,
             bytes,
             stages,
         })

@@ -59,12 +59,9 @@ fn compatible_request_batches_keep_independent_prompts_and_seeds_and_reject_mixe
     b.width = a.width;
     b.n = 2;
     assert!(prepare::batch_dimensions(&[a.clone(), b], &config, 16).is_err());
-    assert!(prepare::batch_dimensions(
-        &vec![a; STRUCTURED_ATTENTION_BF16_MAX_BATCH + 1],
-        &config,
-        16
-    )
-    .is_err());
+    assert!(
+        prepare::batch_dimensions(&vec![a; config.maximum_batch_size + 1], &config, 16).is_err()
+    );
 }
 
 #[test]
@@ -119,7 +116,7 @@ fn limits_are_explicit_and_pixel_bounds_do_not_authorize_invalid_latent_geometry
     }
     limits.maximum_batch_size = 1;
     assert!(prepare::batch_dimensions(&[request(), request()], &limits, 16).is_err());
-    limits.maximum_batch_size = STRUCTURED_ATTENTION_BF16_MAX_BATCH;
+    limits.maximum_batch_size = 33;
     assert!(
         prepare::batch_dimensions(&vec![request(); limits.maximum_batch_size], &limits, 16).is_ok()
     );

@@ -53,7 +53,7 @@ fn read_bits(bytes: &ManagedHostBytes) -> Vec<u16> {
         .collect()
 }
 
-fn run_case(name: &str, probe: Probe, expected: Expected) {
+fn run_case(name: &str, probe: Probe, expected: Expected, packing_bytes: u64) {
     let (cudnn, sdpa) = cuda_config();
     let elements = probe.inputs[0].len();
     let output_bytes = elements * 2;
@@ -131,11 +131,8 @@ fn run_case(name: &str, probe: Probe, expected: Expected) {
         assert!(node.provider_resources().scratch().is_none());
         assert!(node.scratch_resource().is_none());
     } else {
-        // The final segment packs 3 batches with max 5 valid KV positions.
-        // K and V plus two aligned i32 length arrays must be included before
-        // the separately queried native workspace. Sequential segments share
-        // this one admitted region; no full SxS score tensor is provisioned.
-        let packing_bytes = 2 * 3 * 5 * COLUMNS as u64 * 2 + 2 * 256;
+        // The fixture declares its largest packed K/V shape plus two aligned
+        // length arrays. Sequential segments and batch tiles share this region.
         let scratch = node.provider_resources().scratch().unwrap();
         let bytes = scratch.fixed_bytes().unwrap();
         assert!(bytes >= packing_bytes);
@@ -240,6 +237,21 @@ fn run_case(name: &str, probe: Probe, expected: Expected) {
 
 #[test]
 #[ignore = "requires exclusive CUDA and explicit FERRUM_TEST_CUDNN_LIBRARY_PATH for cuDNN 9.20"]
+fn managed_cuda_fused_attention_batch_tiles_keep_global_offsets() {
+    let probe = Probe::batched();
+    let expected = Expected::prepare(&probe);
+    // The mixed empty sample makes the first tile use independent batches;
+    // the second tile has one sample with seven visible keys.
+    run_case(
+        "batch_tiles",
+        probe,
+        expected,
+        2 * 7 * COLUMNS as u64 * 2 + 2 * 256,
+    );
+}
+
+#[test]
+#[ignore = "requires exclusive CUDA and explicit FERRUM_TEST_CUDNN_LIBRARY_PATH for cuDNN 9.20"]
 fn managed_cuda_fused_attention_independent_reference_masks_scratch_and_retirement() {
     let segmented = Probe::segmented();
     let empty = Probe::empty();
@@ -247,8 +259,13 @@ fn managed_cuda_fused_attention_independent_reference_masks_scratch_and_retireme
     // runtime/provider. Unsupported vendor shapes remain real test failures.
     let expected_segmented = Expected::prepare(&segmented);
     let expected_empty = Expected::prepare(&empty);
-    run_case("segmented", segmented, expected_segmented);
-    run_case("empty", empty, expected_empty);
+    run_case(
+        "segmented",
+        segmented,
+        expected_segmented,
+        2 * 3 * 5 * COLUMNS as u64 * 2 + 2 * 256,
+    );
+    run_case("empty", empty, expected_empty, 0);
     eprintln!("Fused attention: bounded D128 samples checked against independent F64 softmax; no full-domain precision, legacy-profile equivalence, Torch parity or throughput claim");
 }
 

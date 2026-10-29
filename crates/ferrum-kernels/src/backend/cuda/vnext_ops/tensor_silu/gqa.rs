@@ -11,7 +11,7 @@ pub const NUMERICAL_PROFILE_ID: &str = "cuda.ieee.structured_gqa_attention.bf16.
 pub const NUMERICAL_IDENTITY: &str = concat!(
     "BF16-QY[B*S,Hq*D];BF16-KV[B*S,Hkv*D];positive-Hq-divisible-by-Hkv;",
     "kv-head=q-head/(Hq/Hkv);no-KV-repetition;power2-D=2..256;",
-    "B<=16;segments<=32;runs-per-batch<=32;",
+    "logical-batch-tiled-at-16;segments<=32;runs-per-batch<=32;",
     "valid-key-and-causal-or-same-bidirectional-segment;key-only-padding;",
     "FP32-separate-mul-adjacent-pairwise-dot-then-scale;sequential-key-online-softmax;",
     "first-visible-key:m=score,l=1,acc=V;later:m=max(m,score);",
@@ -34,7 +34,7 @@ pub(super) const FUNCTION: &str = "ferrum_vnext_structured_gqa_attention_bf16";
 const PROVIDER_ID: &str = "provider.cuda.structured_gqa_attention.bf16.online_exp";
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.structured_gqa_attention.bf16.online_exp";
 
-use super::attention::NativeMask;
+use super::attention::{BatchMask, NativeMask};
 
 pub(super) fn descriptor(
     device: &DeviceDescriptor,
@@ -201,43 +201,50 @@ impl GqaAttentionProvider {
             )?;
         }
         let kernels = Arc::clone(&self.kernels);
+        let work = (shape.elements, shape.operations, shape.masks.len() as u64);
         CudaDeviceCommand::operation(
             FUNCTION,
             vec![query, key, value, output],
             move |stream, regions| {
-                let query = regions[0].device_ptr();
-                let key = regions[1].device_ptr();
-                let value = regions[2].device_ptr();
-                let output = regions[3].device_ptr();
-                let mut builder = stream.launch_builder(kernels.gqa_attention_function());
-                builder
-                    .arg(&query)
-                    .arg(&key)
-                    .arg(&value)
-                    .arg(&output)
-                    .arg(&shape.groups)
-                    .arg(&shape.query_heads)
-                    .arg(&shape.key_value_heads)
-                    .arg(&shape.sequence)
-                    .arg(&shape.width)
-                    .arg(&shape.scale)
-                    .arg(&shape.mask);
-                unsafe { builder.launch(shape.launch_config()) }
-                    .map(|_| ())
-                    .map_err(|error| {
-                        CudaDeviceRuntimeError::driver(
-                            "BF16 structured GQA attention launch",
-                            error,
-                        )
-                    })
+                for tile in &shape.masks {
+                    let query_offset = tile.first_batch * (shape.query_bytes / shape.batch);
+                    let key_offset = tile.first_batch * (shape.key_value_bytes / shape.batch);
+                    let query = regions[0].device_ptr() + query_offset;
+                    let key = regions[1].device_ptr() + key_offset;
+                    let value = regions[2].device_ptr() + key_offset;
+                    let output = regions[3].device_ptr() + query_offset;
+                    let groups = (shape.groups / shape.batch) * tile.batches;
+                    let mut builder = stream.launch_builder(kernels.gqa_attention_function());
+                    builder
+                        .arg(&query)
+                        .arg(&key)
+                        .arg(&value)
+                        .arg(&output)
+                        .arg(&groups)
+                        .arg(&shape.query_heads)
+                        .arg(&shape.key_value_heads)
+                        .arg(&shape.sequence)
+                        .arg(&shape.width)
+                        .arg(&shape.scale)
+                        .arg(&tile.mask);
+                    unsafe { builder.launch(shape.launch_config_for_groups(groups)) }.map_err(
+                        |error| {
+                            CudaDeviceRuntimeError::driver(
+                                "BF16 structured GQA attention launch",
+                                error,
+                            )
+                        },
+                    )?;
+                }
+                Ok(())
             },
         )
-        .and_then(|command| command.with_tensor_work(shape.elements, shape.operations, 1, 0))
+        .and_then(|command| command.with_tensor_work(work.0, work.1, work.2, 0))
         .map_err(|error| error.to_string())
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Shape {
     groups: u64,
     query_heads: u64,
@@ -249,22 +256,28 @@ struct Shape {
     operations: u64,
     query_bytes: u64,
     key_value_bytes: u64,
-    mask: NativeMask,
+    batch: u64,
+    masks: Vec<BatchMask>,
 }
 
 impl Shape {
+    #[cfg(test)]
     fn launch_config(&self) -> LaunchConfig {
+        self.launch_config_for_groups(self.groups)
+    }
+
+    fn launch_config_for_groups(&self, groups: u64) -> LaunchConfig {
         if self.width == 128 {
             // Four independent groups per CTA. The last CTA and grid-stride
             // tail may leave whole warps idle, never a partial active warp.
             LaunchConfig {
-                grid_dim: (self.groups.div_ceil(4).min(MAX_BLOCKS) as u32, 1, 1),
+                grid_dim: (groups.div_ceil(4).min(MAX_BLOCKS) as u32, 1, 1),
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             }
         } else {
             LaunchConfig {
-                grid_dim: (self.groups.min(MAX_BLOCKS) as u32, 1, 1),
+                grid_dim: (groups.min(MAX_BLOCKS) as u32, 1, 1),
                 block_dim: (self.width, 1, 1),
                 shared_mem_bytes: self.width * 4,
             }
@@ -298,7 +311,8 @@ impl Shape {
             operations: checked.logical_arithmetic_operations(),
             query_bytes,
             key_value_bytes,
-            mask: NativeMask::new(checked.mask())?,
+            batch: checked.batch(),
+            masks: NativeMask::tiles(checked.mask())?,
         })
     }
 }

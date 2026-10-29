@@ -1,5 +1,23 @@
 use serde::Serialize;
 
+/// Physical availability sampled at an idle stage boundary. This is neither
+/// an allocation permit nor a guarantee against concurrent native allocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DeviceMemoryAvailability {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    /// Unused bytes in the allocator pool, already excluded from free_bytes.
+    pub reusable_pool_bytes: u64,
+}
+
+impl DeviceMemoryAvailability {
+    pub fn available_bytes(self) -> u64 {
+        self.free_bytes
+            .saturating_add(self.reusable_pool_bytes)
+            .min(self.total_bytes)
+    }
+}
+
 /// The native counter's attribution boundary, independent of plan ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

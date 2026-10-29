@@ -219,6 +219,9 @@ pub(super) fn geometry(
     if query_bytes > isize::MAX as u64 || key_value_bytes > isize::MAX as u64 {
         return Err("Metal attention byte extent exceeds address space".into());
     }
+    if checked.batch() > 16 {
+        return Err("Metal attention batch exceeds this provider's native packet capacity".into());
+    }
     let shared_bytes = (2048 + 16 * checked.head_dim() + 96) * 4;
     if shared_bytes > shared_limit {
         return Err("Metal attention exceeds device threadgroup storage".into());

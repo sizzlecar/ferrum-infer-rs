@@ -326,6 +326,57 @@ fn reserve_preprocessing<O: Send + 'static>(
     Ok(())
 }
 
+/// Search the already-owned FIFO candidate without publishing or executing a
+/// probe. Only a typed fresh-plan capacity failure permits a smaller prefix.
+fn prepare_capacity_prefix<O: Send + 'static>(
+    worker: &mut dyn BatchWorker<Output = O>,
+    batch: &mut Vec<Queued<O>>,
+    shared: &Shared<O>,
+) -> Result<ImageBatchPreparation, ImageBatchError> {
+    let mut upper = batch.len();
+    let mut candidate = upper;
+    let mut best: Option<(usize, ImageBatchPreparation)> = None;
+    loop {
+        let mut requests = batch[..candidate]
+            .iter_mut()
+            .map(|job| &mut job.request)
+            .collect::<Vec<_>>();
+        let outcome = worker.prepare(&mut requests);
+        match outcome {
+            Ok(prepared) if candidate == upper => {
+                return_tail(batch, candidate, shared, false);
+                return Ok(prepared);
+            }
+            Ok(prepared) => {
+                best = Some((candidate, prepared));
+            }
+            Err(ImageBatchError::Capacity { proof, .. })
+                if shared.config.batching == ImageBatchPolicy::Auto && candidate > 1 =>
+            {
+                upper = candidate - 1;
+                {
+                    let mut state = shared.lock();
+                    state.capacity_reductions = state.capacity_reductions.saturating_add(1);
+                }
+                tracing::debug!(
+                    candidate_batch = candidate,
+                    required_bytes = proof.report.required_bytes,
+                    capacity_bytes = proof.report.capacity_bytes,
+                    "image candidate exceeds compiled capacity; searching a smaller FIFO prefix"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        let lower = best.as_ref().map_or(0, |(count, _)| *count);
+        if lower == upper {
+            let (count, prepared) = best.expect("a positive fitting prefix was retained");
+            return_tail(batch, count, shared, false);
+            return Ok(prepared);
+        }
+        candidate = lower + (upper - lower).div_ceil(2);
+    }
+}
+
 pub(super) fn worker_loop<O: Send + 'static>(
     mut worker: Box<dyn BatchWorker<Output = O>>,
     shared: Arc<Shared<O>>,
@@ -349,11 +400,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
                 let preparation_started = Instant::now();
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
                     reserve_preprocessing(worker.as_ref(), &mut batch, &shared)?;
-                    let mut requests = batch
-                        .iter_mut()
-                        .map(|job| &mut job.request)
-                        .collect::<Vec<_>>();
-                    worker.prepare(&mut requests)
+                    prepare_capacity_prefix(worker.as_mut(), &mut batch, &shared)
                 }));
                 let elapsed = preparation_started.elapsed();
                 for job in &mut batch {
@@ -439,19 +486,6 @@ pub(super) fn worker_loop<O: Send + 'static>(
                             state.executed_requests.saturating_add(batch.len() as u64);
                         state.last_batch_size = batch.len();
                         break Ok((prepared, state.executed_batches));
-                    }
-                    Ok(Err(ImageBatchError::Capacity { proof, .. }))
-                        if shared.config.batching == ImageBatchPolicy::Auto && batch.len() > 1 =>
-                    {
-                        let keep = batch.len() - 1;
-                        tracing::debug!(
-                            candidate_batch = batch.len(),
-                            next_batch = keep,
-                            required_bytes = proof.report.required_bytes,
-                            capacity_bytes = proof.report.capacity_bytes,
-                            "image candidate reduced before device execution"
-                        );
-                        return_tail(&mut batch, keep, &shared, true);
                     }
                     Ok(Err(error)) => match rejection(error) {
                         Ok((kind, message)) => {

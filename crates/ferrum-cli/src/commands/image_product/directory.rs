@@ -19,12 +19,19 @@ pub enum ImageBackendKind {
     Metal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryBatchLimit {
+    Auto,
+    Configured(usize),
+}
+
 #[derive(Debug, Clone)]
 pub struct DirectoryOptions {
     pub backend: ImageBackendKind,
     pub utilization: f64,
     pub maximum_memory_bytes: Option<NonZeroU64>,
     pub maximum_batch_size: usize,
+    pub batch_limit: DirectoryBatchLimit,
     pub batching: ferrum_types::ImageBatchPolicy,
     pub ordinal: usize,
     pub cudnn_library: Option<PathBuf>,
@@ -32,11 +39,56 @@ pub struct DirectoryOptions {
     pub lora: Option<super::configuration::ImageLoraConfig>,
 }
 impl DirectoryOptions {
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    fn resolve_automatic_batch(
+        &self,
+        assets: &ferrum_engine::image_generation::QwenImage21Assets,
+    ) -> Result<Self> {
+        if self.batch_limit != DirectoryBatchLimit::Auto {
+            return Ok(self.clone());
+        }
+        let single = self.single_request();
+        let host = single.host();
+        let account = ferrum_runtime::HostMemoryAccount::new(host.limits()?);
+        let output = assets.output_requirements(&single.pipeline().resolved_limits()?, &account)?;
+        let serving = single.serving()?;
+        let http = ferrum_server::ImageHttpConfig {
+            output: serving.output,
+            default_width: serving.default_width,
+            default_height: serving.default_height,
+            default_seed: serving.default_seed,
+            rgba_scratch_bytes: serving.rgba_scratch_bytes,
+            png_limits: ferrum_output::png::PngLimits::default(),
+        };
+        let response = http.response_backing_bytes(
+            &account,
+            ferrum_output::png::PngDimensions::new(
+                output.maximum_width.into(),
+                output.maximum_height.into(),
+            )?,
+        )?;
+        let per_request = output
+            .execution_output_bytes
+            .checked_add(output.raw_batch_bytes)
+            .and_then(|n| response.checked_mul(2).and_then(|r| n.checked_add(r)))
+            .context("automatic image output extent overflows")?;
+        let observed = ferrum_kernels::backend::cpu::vnext_runtime::host_memory_available()?;
+        let available = observed.saturating_sub((host.total_bytes - host.output_bytes) as u64);
+        let mut resolved = self.clone();
+        resolved.maximum_batch_size = automatic_candidate_limit(available, per_request)?;
+        tracing::info!(observed_host_bytes = observed,
+            candidate_batch_limit = resolved.maximum_batch_size,
+            per_request_host_bound_bytes = per_request,
+            "automatic image candidate bound selected; each request shape is reduced to admitted device capacity");
+        Ok(resolved)
+    }
+
     /// A direct invocation has exactly one image request, regardless of the
     /// serving capacity ceiling supplied on the command line.
     pub fn single_request(&self) -> Self {
         let mut options = self.clone();
         options.maximum_batch_size = 1;
+        options.batch_limit = DirectoryBatchLimit::Configured(1);
         options
     }
 
@@ -76,10 +128,13 @@ impl DirectoryOptions {
             maximum_memory_bytes: maximum
                 .map(|v| u64::try_from(v.get()).map(|n| NonZeroU64::new(n).unwrap()))
                 .transpose()?,
-            maximum_batch_size: batch.unwrap_or(match backend {
-                ImageBackendKind::Cuda => ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH,
-                ImageBackendKind::Metal => 1,
-            }),
+            // Auto is resolved after model metadata and physical Host memory
+            // are available. This placeholder never becomes a serving limit.
+            maximum_batch_size: batch.unwrap_or(1),
+            batch_limit: match (backend, batch) {
+                (ImageBackendKind::Cuda, None) => DirectoryBatchLimit::Auto,
+                (_, count) => DirectoryBatchLimit::Configured(count.unwrap_or(1)),
+            },
             batching: match backend {
                 ImageBackendKind::Cuda => ferrum_types::ImageBatchPolicy::Auto,
                 ImageBackendKind::Metal => ferrum_types::ImageBatchPolicy::Configured,
@@ -199,7 +254,7 @@ impl DirectoryOptions {
             batching: self.batching,
             maximum_pending: pending,
             maximum_pending_bytes: Some(pending_bytes),
-            maximum_prompt_bytes: (1024 * 1024 / self.maximum_batch_size).min(65536),
+            maximum_prompt_bytes: 65536,
             max_num_seqs: self.maximum_batch_size,
             request_batch_max_wait_ms: if self.batching == ferrum_types::ImageBatchPolicy::Auto
                 || self.maximum_batch_size == 1
@@ -344,6 +399,21 @@ impl DirectoryOptions {
     }
 }
 
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
+pub(super) fn automatic_candidate_limit(
+    available_bytes: u64,
+    per_request_bytes: usize,
+) -> Result<usize> {
+    ensure!(
+        per_request_bytes != 0,
+        "image output bound must be positive"
+    );
+    Ok(
+        usize::try_from(available_bytes / u64::try_from(per_request_bytes)?)?
+            .clamp(1, ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH),
+    )
+}
+
 /// No model-name heuristic and no weight reads. A local pipeline declaration
 /// commits to pipeline preflight: malformed or incomplete packages never fall
 /// through to the text loader. A normal text directory keeps its original path.
@@ -437,7 +507,8 @@ impl ImageProductSource {
                         lora.strength,
                     )?;
                 }
-                let backend = super::factory::PreparedBackend::from_directory(options, &assets)?;
+                let options = options.resolve_automatic_batch(&assets)?;
+                let backend = super::factory::PreparedBackend::from_directory(&options, &assets)?;
                 let model = path
                     .file_name()
                     .and_then(|s| s.to_str())

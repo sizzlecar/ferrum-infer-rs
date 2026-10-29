@@ -305,8 +305,17 @@ async fn auto_edit_preprocesses_once_and_keeps_reduced_tail_bytes_and_fifo() {
         ImageServiceErrorKind::QueueFull
     );
     c.prepare_release.send(()).unwrap();
+    assert_eq!(recv(&c.preparing), [1]);
+    assert_eq!(service.snapshot().pending_bytes, waiting_bytes);
+    c.prepare_release.send(()).unwrap();
     assert_eq!(recv(&c.preparing), [1, 2]);
     assert_eq!(service.snapshot().pending_bytes, waiting_bytes);
+    assert_eq!(
+        *c.preprocess_calls.lock().unwrap(),
+        BTreeMap::from([(1, 1), (2, 1), (3, 1)])
+    );
+    c.prepare_release.send(()).unwrap();
+    assert_eq!(recv(&c.executing), [1, 2]);
     {
         let state = service.shared.lock();
         let tail = state.queue.front().unwrap();
@@ -319,8 +328,6 @@ async fn auto_edit_preprocesses_once_and_keeps_reduced_tail_bytes_and_fifo() {
         *c.preprocess_calls.lock().unwrap(),
         BTreeMap::from([(1, 1), (2, 1), (3, 1)])
     );
-    c.prepare_release.send(()).unwrap();
-    assert_eq!(recv(&c.executing), [1, 2]);
     assert_eq!(
         service.snapshot().pending_bytes,
         raw_bytes[2] + PREPROCESSED_BYTES

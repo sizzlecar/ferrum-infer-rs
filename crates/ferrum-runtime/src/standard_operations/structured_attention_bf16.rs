@@ -9,7 +9,10 @@ pub use fused::*;
 pub const STRUCTURED_ATTENTION_BF16_OPERATION_ID: &str = "operation.structured_attention.bf16";
 pub const STRUCTURED_ATTENTION_BF16_CAPABILITY_ID: &str =
     "capability.operation.structured_attention.bf16";
-pub const STRUCTURED_ATTENTION_BF16_MAX_BATCH: usize = 16;
+// Logical metadata bound; providers tile native launch packets independently.
+// Each sample may contribute MAX_KEY_RUNS entries to a u32-sized attribute list.
+pub const STRUCTURED_ATTENTION_BF16_MAX_BATCH: usize =
+    u32::MAX as usize / STRUCTURED_ATTENTION_BF16_MAX_KEY_RUNS;
 pub const STRUCTURED_ATTENTION_BF16_MAX_SEGMENTS: usize = 32;
 pub const STRUCTURED_ATTENTION_BF16_MAX_KEY_RUNS: usize = 32;
 pub const STRUCTURED_ATTENTION_BF16_MAX_HEAD_DIM: u64 = 256;
@@ -30,9 +33,9 @@ pub fn structured_attention_bf16_contract() -> Result<StandardOperationContract,
     for (name, max) in [
         ("segment_lengths", 32),
         ("segment_bidirectional", 32),
-        ("key_run_counts", 16),
-        ("key_run_lengths", 512),
-        ("key_run_valid", 512),
+        ("key_run_counts", STRUCTURED_ATTENTION_BF16_MAX_BATCH as u32),
+        ("key_run_lengths", u32::MAX),
+        ("key_run_valid", u32::MAX),
     ] {
         attributes.insert(
             AttributeId::new(name)?,
@@ -121,7 +124,9 @@ impl StructuredAttentionBf16Geometry {
         let batch =
             usize::try_from(*rows / sequence).map_err(|_| invalid("batch exceeds usize"))?;
         if !(1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&batch) {
-            return Err(invalid("batch must be in 1..=16"));
+            return Err(invalid(
+                "batch exceeds the representable mask metadata extent",
+            ));
         }
         let Some(SemanticValue::Rational(scale)) = attribute(attributes, "scale") else {
             return Err(invalid("scale must be rational"));

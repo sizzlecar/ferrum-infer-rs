@@ -179,6 +179,29 @@ fn run_case(name: &str, config: AttentionConfig, inputs: [Vec<u16>; 3], expected
 }
 
 #[test]
+#[ignore = "requires exclusive CUDA; verifies batch packet boundaries"]
+fn managed_cuda_attention_batch_tiles_keep_sample_masks_independent() {
+    let batch = 17;
+    let mut valid = vec![1; batch];
+    valid[batch - 1] = 0;
+    let shape = config(
+        (batch * 2) as u64,
+        2,
+        2,
+        2,
+        [vec![2], vec![1], vec![1; batch], vec![2; batch], valid],
+    );
+    let q = vec![0; batch * 4];
+    let k = q.clone();
+    let v: Vec<_> = (0..batch)
+        .flat_map(|sample| std::iter::repeat_n(bf16::from_f32((sample + 1) as f32).to_bits(), 4))
+        .collect();
+    let mut expected = v.clone();
+    expected[(batch - 1) * 4..].fill(0);
+    run_case("batch_tiles", shape, [q, k, v], &expected);
+}
+
+#[test]
 #[ignore = "requires exclusive CUDA; managed structured attention analytic probes"]
 fn managed_cuda_structured_attention_masks_online_softmax_and_empty_rows() {
     // Q=K=0 makes each visible softmax probability exactly 1/count. All V
