@@ -23,7 +23,8 @@ pub const CUTLASS_FP8_NUMERICAL_IDENTITY: &str = concat!(
     "A=bf16-rowmajor;B=e4m3fn-OI;Y=bf16-rowmajor;",
     "row-amax=fmax(abs(x));scale=max(rn32(amax/448),rn32(1/(448*512)));",
     "quant=E4M3FN-RNE-SATFINITE(fmax(-448,fmin(rn32(x/scale),448)));",
-    "acc=f32;epilogue=B(rn32(weight-scale*acc)*row-scale);",
+    "sm89-acc=vendor-fp8-mma,empirical-fp22-local-k128,f32-staged-promotion;",
+    "sm120-acc=f32;epilogue=B(rn32(weight-scale*acc)*row-scale);",
     "weight-scale=f32-positive-finite-scalar;no-bias;",
     "no-fast-math;qualification=not-established;not-deployment-bitwise-parity"
 );

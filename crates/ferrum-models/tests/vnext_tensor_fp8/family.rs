@@ -15,7 +15,7 @@ impl ModelFamilyProvider for Family {
             || config.n == 0
             || config.n > 128
             || config.k == 0
-            || config.k > 128
+            || config.k > 4096
             || serde_json::to_value(config).unwrap() != *raw
         {
             return Err(invalid(
@@ -101,7 +101,9 @@ impl ModelFamilyProvider for Family {
                         operation_id: id(OP),
                         version: ContractVersion::new(1, 0),
                         multiplication_type: None,
-                        accumulation_type: Some(ElementType::F32),
+                        // CUDA production fp8_linear::operation declares vendor
+                        // OperationDefined arithmetic, not IEEE F32 intermediates.
+                        accumulation_type: (name == METAL_PROFILE).then_some(ElementType::F32),
                         staged_arithmetic: None,
                         composite_arithmetic: None,
                     }],

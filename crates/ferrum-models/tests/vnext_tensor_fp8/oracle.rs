@@ -3,6 +3,10 @@
 //! E4M3FN representation and chooses nearest-even, then uses F64 dot products.
 use half::bf16;
 
+#[path = "error_model.rs"]
+mod error_model;
+pub use error_model::ErrorModel;
+
 pub fn decode(bits: u8) -> f64 {
     let sign = if bits & 128 == 0 { 1.0 } else { -1.0 };
     let exponent = (bits >> 3) & 15;
@@ -111,33 +115,63 @@ impl Expected {
         }
         Ok(())
     }
-    #[cfg(any(
-        feature = "cuda-cutlass-fp8",
-        all(feature = "metal", target_os = "macos")
-    ))]
     pub fn check(&self, actual: &[u8], k: usize) -> (f64, f64) {
-        assert_eq!(actual.len(), self.quantized_dot.len() * 2);
+        self.validate(actual, k, ErrorModel::IeeeF32).unwrap()
+    }
+
+    pub fn validate(
+        &self,
+        actual: &[u8],
+        k: usize,
+        model: ErrorModel,
+    ) -> Result<(f64, f64), String> {
+        if actual.len() != self.quantized_dot.len() * 2 {
+            return Err("FP8 output extent differs".into());
+        }
         let mut maximum_error = 0_f64;
         let mut quantization_change = 0_f64;
-        // Conservative FP32 accumulate + epilogue rounding and final BF16 RNE.
-        // This excludes quantization approximation; that is reported separately.
-        let u = 2_f64.powi(-24);
-        let gamma = ((2 * k + 8) as f64 * u) / (1.0 - (2 * k + 8) as f64 * u);
         for (i, bytes) in actual.chunks_exact(2).enumerate() {
             let observed =
                 f64::from(bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32());
             let expected = self.quantized_dot[i];
-            let accumulation_bound = gamma * self.absolute_sum[i];
-            let tolerance = accumulation_bound
-                + (expected.abs() + accumulation_bound) / 256.0
-                + 2_f64.powi(-130);
+            let tolerance = model.output_bound(expected, self.absolute_sum[i], k);
             let error = (observed - expected).abs();
-            assert!(observed.is_finite() && error <= tolerance, "index {i}: actual={observed}, quantized F64={expected}, error={error}, tolerance={tolerance}");
+            if !observed.is_finite() || error > tolerance {
+                return Err(format!("{model:?} index {i}: actual={observed}, quantized F64={expected}, error={error}, tolerance={tolerance}"));
+            }
             maximum_error = maximum_error.max(error);
             quantization_change =
                 quantization_change.max((expected - self.unquantized_dot[i]).abs());
         }
-        (maximum_error, quantization_change)
+        Ok((maximum_error, quantization_change))
+    }
+
+    /// Raw F32 storage is checked against the selected intermediate arithmetic,
+    /// independently of epilogue scaling and BF16 rounding.
+    pub fn validate_accumulator(
+        &self,
+        actual: &[u8],
+        weight_scale: f32,
+        k: usize,
+        model: ErrorModel,
+    ) -> Result<f64, String> {
+        if actual.len() != self.quantized_dot.len() * 4 {
+            return Err("FP8 raw accumulator extent differs".into());
+        }
+        let n = self.quantized_dot.len() / self.row_scales.len();
+        let mut maximum_error = 0_f64;
+        for (i, bytes) in actual.chunks_exact(4).enumerate() {
+            let observed = f64::from(f32::from_le_bytes(bytes.try_into().unwrap()));
+            let scale = f64::from(self.row_scales[i / n]) * f64::from(weight_scale);
+            let expected = self.quantized_dot[i] / scale;
+            let tolerance = model.accumulator_bound(self.absolute_sum[i] / scale, k);
+            let error = (observed - expected).abs();
+            if !observed.is_finite() || error > tolerance {
+                return Err(format!("{model:?} raw index {i}: actual={observed}, quantized F64={expected}, error={error}, tolerance={tolerance}"));
+            }
+            maximum_error = maximum_error.max(error);
+        }
+        Ok(maximum_error)
     }
 }
 
@@ -201,4 +235,66 @@ fn quantization_comparison_rejects_independent_activation_and_scale_mutations() 
     assert!(expected
         .check_quantization(&expected.activation_bytes[..3], &scales)
         .is_err());
+}
+
+#[test]
+fn long_reduction_envelope_rejects_corrupt_raw_and_output_values() {
+    use super::{input, Payload, Shape};
+    let shape = Shape {
+        m: 3,
+        n: 16,
+        k: 4096,
+    };
+    let payload = Payload::new(&shape);
+    let expected = expected(&input(&shape), &payload.weights, payload.scale(), 4096, 16);
+    let mut output: Vec<u8> = expected
+        .quantized_dot
+        .iter()
+        .flat_map(|&x| bf16::from_f32(x as f32).to_bits().to_le_bytes())
+        .collect();
+    // The original strict oracle remains usable and unchanged for F32 backends.
+    expected.check(&output, 4096);
+    let model = ErrorModel::Sm89Fp22Block128F32Promotion;
+    expected.validate(&output, 4096, model).unwrap();
+    let mut raw: Vec<u8> = expected
+        .quantized_dot
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &x)| {
+            ((x / (f64::from(expected.row_scales[i / 16]) * f64::from(payload.scale()))) as f32)
+                .to_le_bytes()
+        })
+        .collect();
+    expected
+        .validate_accumulator(&raw, payload.scale(), 4096, model)
+        .unwrap();
+    let i = 16; // first nonzero input row
+    let scale = f64::from(expected.row_scales[1]) * f64::from(payload.scale());
+    let raw_bound = model.accumulator_bound(expected.absolute_sum[i] / scale, 4096);
+    let corrupted = (expected.quantized_dot[i] / scale + 2.0 * raw_bound + 1.0) as f32;
+    raw[i * 4..i * 4 + 4].copy_from_slice(&corrupted.to_le_bytes());
+    assert!(expected
+        .validate_accumulator(&raw, payload.scale(), 4096, model)
+        .is_err());
+    let bound = model.output_bound(expected.quantized_dot[i], expected.absolute_sum[i], 4096);
+    let corrupted = bf16::from_f32((expected.quantized_dot[i] + 2.0 * bound + 1.0) as f32);
+    output[i * 2..i * 2 + 2].copy_from_slice(&corrupted.to_bits().to_le_bytes());
+    assert!(expected.validate(&output, 4096, model).is_err());
+}
+
+#[test]
+fn native_plan_selects_only_the_declared_arithmetic_model() {
+    use ferrum_kernels::native_ops::cutlass_fp8::{
+        CUTLASS_FP8_KERNEL_128, CUTLASS_FP8_KERNEL_SM89,
+    };
+    assert_eq!(
+        ErrorModel::for_cuda(890, CUTLASS_FP8_KERNEL_SM89).unwrap(),
+        ErrorModel::Sm89Fp22Block128F32Promotion
+    );
+    assert_eq!(
+        ErrorModel::for_cuda(1200, CUTLASS_FP8_KERNEL_128).unwrap(),
+        ErrorModel::IeeeF32
+    );
+    assert!(ErrorModel::for_cuda(890, CUTLASS_FP8_KERNEL_128).is_err());
+    assert!(ErrorModel::for_cuda(1200, CUTLASS_FP8_KERNEL_SM89).is_err());
 }
