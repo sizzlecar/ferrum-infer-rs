@@ -97,6 +97,12 @@ pub(super) fn verify() {
             n: 64,
             k: 128,
         },
+        // Long reduction spans many temporary accumulators and F32 promotions.
+        Shape {
+            m: 3,
+            n: 16,
+            k: 4096,
+        },
     ]
     .into_iter()
     .enumerate()
@@ -157,7 +163,7 @@ pub(super) fn verify() {
                 },
             )
             .unwrap();
-        let mut retained = None;
+        let mut retained: Option<(ManagedHostBytes, oracle::ErrorModel)> = None;
         for repetition in 0..2 {
             // Evict this session's native planning record without retiring the
             // compiled component. Encoding must reconstruct the same admitted
@@ -182,9 +188,11 @@ pub(super) fn verify() {
                 )
                 .unwrap(),
             );
-            // Both capture destinations are charged to this same Host parent
+            // All capture destinations are charged to this same Host parent
             // before any device admission. The ordinary provider has no probe.
-            let ticket = probe.arm(shape.m as u32, shape.k as u32).unwrap();
+            let ticket = probe
+                .arm_with_accumulator(shape.m as u32, shape.k as u32, shape.n as u32)
+                .unwrap();
             let mut bytes = host
                 .allocate_zeroed(HostMemoryClass::InputPreprocess, inputs.len() * 2)
                 .unwrap();
@@ -211,6 +219,10 @@ pub(super) fn verify() {
                 .unwrap();
             assert_eq!(outputs.len(), 1);
             let quantized = ticket.take().unwrap();
+            let error_model =
+                oracle::ErrorModel::for_cuda(quantized.architecture(), quantized.kernel_id())
+                    .unwrap();
+            eprintln!("FP8 case{case} repeat{repetition}: error_model={error_model:?} architecture={} kernel_id={} source=validated-native-plan; empirical SM89 model is not an IEEE F32 guarantee", quantized.architecture(), quantized.kernel_id());
             assert_eq!(
                 (quantized.rows(), quantized.inputs()),
                 (shape.m as u32, shape.k as u32)
@@ -225,15 +237,41 @@ pub(super) fn verify() {
                 )
                 .unwrap();
             eprintln!("FP8 case{case} repeat{repetition}: actual quantization capture matched {} E4M3FN bytes and {} F32 scale bits; diagnostic={CUDA_FP8_QUANTIZATION_PROBE_PROFILE_ID}", expected.activation_bytes.len(), expected.row_scales.len());
+            if let Some(accumulator) = quantized.accumulator_bytes() {
+                assert!(host.owns(accumulator));
+                expected
+                    .validate_accumulator(
+                        accumulator.bytes(),
+                        payload.scale(),
+                        shape.k as usize,
+                        error_model,
+                    )
+                    .unwrap();
+                let mut worst = (0, 0_f64, 0_f64, 0_f64);
+                for (index, bytes) in accumulator.bytes().chunks_exact(4).enumerate() {
+                    let actual = f64::from(f32::from_le_bytes(bytes.try_into().unwrap()));
+                    let row = index / shape.n as usize;
+                    let expected_raw = expected.quantized_dot[index]
+                        / (f64::from(expected.row_scales[row]) * f64::from(payload.scale()));
+                    let error = (actual - expected_raw).abs();
+                    if error > worst.3 {
+                        worst = (index, actual, expected_raw, error);
+                    }
+                }
+                eprintln!("FP8 case{case} repeat{repetition}: raw F32 accumulator worst index={} actual={} expected={} error={}", worst.0, worst.1, worst.2, worst.3);
+            }
             let bytes = outputs[0].bytes().clone();
-            let (gemm_error, quantization_change) = expected.check(bytes.bytes(), shape.k as usize);
+            let (gemm_error, quantization_change) = expected
+                .validate(bytes.bytes(), shape.k as usize, error_model)
+                .unwrap();
             eprintln!("FP8 case{case} repeat{repetition}: decoded-F64 GEMM max error={gemm_error}; activation quantization max dot change={quantization_change}; finite probe only");
-            if let Some(previous) = &retained {
+            if let Some((previous, previous_model)) = &retained {
                 assert_eq!(bytes.bytes(), ManagedHostBytes::bytes(previous));
+                assert_eq!(*previous_model, error_model);
             }
             drop(outputs);
             drop((quantized, ticket));
-            retained = Some(bytes);
+            retained = Some((bytes, error_model));
         }
         assert!(matches!(
             session.try_release_idle_dynamic_backing().unwrap(),
@@ -251,7 +289,10 @@ pub(super) fn verify() {
             }
         }
         drop(compiled);
-        expected.check(retained.as_ref().unwrap().bytes(), shape.k as usize);
+        let (retained_bytes, retained_model) = retained.as_ref().unwrap();
+        expected
+            .validate(retained_bytes.bytes(), shape.k as usize, *retained_model)
+            .unwrap();
         drop(retained);
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     }

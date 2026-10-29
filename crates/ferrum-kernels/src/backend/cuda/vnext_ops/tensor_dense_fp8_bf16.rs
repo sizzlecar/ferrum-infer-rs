@@ -398,7 +398,10 @@ impl Provider {
             .map(|probe| probe.claim(plan.plan().request.rows, plan.plan().request.inputs))
             .transpose()
             .map_err(|e| e.to_string())?;
-        let transfers = if capture.is_some() { 2 } else { 0 };
+        let transfers = capture
+            .as_ref()
+            .map(|capture| capture.transfers(&plan))
+            .unwrap_or(0);
         let owner = Arc::clone(&self.owner);
         CudaDeviceCommand::operation(
             cutlass_fp8::CUTLASS_FP8_OPERATOR,

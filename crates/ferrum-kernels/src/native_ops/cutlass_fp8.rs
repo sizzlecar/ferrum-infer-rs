@@ -5,7 +5,8 @@
 pub use ferrum_native_ops::cutlass_fp8::{
     CutlassFp8BindingsV1 as Bindings, CutlassFp8Device as Device, CutlassFp8Error as Error,
     CutlassFp8PlanV1 as Plan, CutlassFp8RequestV1 as Request, CutlassFp8Span as DeviceSpan,
-    CUTLASS_FP8_NUMERICAL_IDENTITY, CUTLASS_FP8_OPERATOR, CUTLASS_FP8_SCRATCH_ALIGNMENT,
+    CUTLASS_FP8_KERNEL_128, CUTLASS_FP8_KERNEL_SM89, CUTLASS_FP8_NUMERICAL_IDENTITY,
+    CUTLASS_FP8_OPERATOR, CUTLASS_FP8_SCRATCH_ALIGNMENT,
 };
 use std::ffi::c_void;
 
