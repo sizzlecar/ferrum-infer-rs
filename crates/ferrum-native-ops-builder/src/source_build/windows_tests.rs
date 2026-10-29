@@ -92,6 +92,7 @@ fn plan_with_source(root: &Path, contents: &str) -> (NativeOperatorSourceBuildPl
             extended_lambda: true,
             host_position_independent_code: true,
             host_default_visibility: true,
+            host_msvc_standard_cplusplus: false,
         },
         architecture: NativeOperatorCudaArchitecture::DeviceComputeCapability,
         archive_file: "libmarlin.a".to_string(),
@@ -1299,4 +1300,38 @@ fn packaged_msvc_source_inputs_survive_relocation_and_reject_missing_or_changed_
         archive_evidence.size_bytes
     );
     assert!(crate::resolve_package_evidence(&relocated, &relocated, archive_evidence).is_err());
+}
+
+#[test]
+fn msvc_standard_cplusplus_policy_is_explicit_and_receipt_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut plan, path) = plan(root.path());
+    let legacy_policy = serde_json::to_value(&plan.nvcc_policy).unwrap();
+    assert!(legacy_policy.get("host_msvc_standard_cplusplus").is_none());
+    let restored: NativeOperatorNvccPolicy = serde_json::from_value(legacy_policy.clone()).unwrap();
+    assert!(!restored.host_msvc_standard_cplusplus);
+    assert_eq!(serde_json::to_value(restored).unwrap(), legacy_policy);
+    let legacy = receipt(&plan, &path);
+    verify_source_build_receipt_against_plan_portable(&legacy, &path).unwrap();
+
+    plan.nvcc_policy.host_msvc_standard_cplusplus = true;
+    write_json(&path, &plan).unwrap();
+    let standard = receipt(&plan, &path);
+    verify_source_build_receipt_against_plan_portable(&standard, &path).unwrap();
+    assert!(standard.commands[0]
+        .argv
+        .windows(2)
+        .any(|args| { args == ["-Xcompiler", "/Zc:__cplusplus"] }));
+    assert_ne!(
+        legacy.commands[0].object_cache_key,
+        standard.commands[0].object_cache_key
+    );
+    assert!(!nvcc_policy_flags_for_host(&plan.nvcc_policy, false)
+        .iter()
+        .any(|arg| arg == "/Zc:__cplusplus"));
+    let mut tampered = standard.clone();
+    tampered.commands[0]
+        .argv
+        .retain(|arg| arg != "/Zc:__cplusplus");
+    assert!(verify_source_build_receipt_against_plan_portable(&tampered, &path).is_err());
 }

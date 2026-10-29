@@ -151,6 +151,10 @@ pub struct NativeOperatorNvccPolicy {
     pub extended_lambda: bool,
     pub host_position_independent_code: bool,
     pub host_default_visibility: bool,
+    /// Report the selected C++ standard to MSVC headers through `__cplusplus`.
+    /// Omitted by legacy plans so their serialized policy and cache identity stay stable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_msvc_standard_cplusplus: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5464,6 +5468,9 @@ fn nvcc_policy_flags_for_host(policy: &NativeOperatorNvccPolicy, msvc: bool) -> 
         // Do not let nvcc replace the SDK/search paths bound by the receipt.
         flags.extend(platform::nvcc_environment_option(msvc).map(str::to_string));
         flags.extend(["-Xcompiler".to_string(), "/MD,/EHsc,/bigobj".to_string()]);
+        if policy.host_msvc_standard_cplusplus {
+            flags.extend(["-Xcompiler".to_string(), "/Zc:__cplusplus".to_string()]);
+        }
     }
     if policy.host_position_independent_code && !msvc {
         flags.extend(["-Xcompiler".to_string(), "-fPIC".to_string()]);
@@ -5840,6 +5847,7 @@ mod tests {
                 extended_lambda: false,
                 host_position_independent_code: true,
                 host_default_visibility: false,
+                host_msvc_standard_cplusplus: false,
             },
             architecture: NativeOperatorCudaArchitecture::Compute80Ptx,
             archive_file: "libmarlin.a".to_string(),
