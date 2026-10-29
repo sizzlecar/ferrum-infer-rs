@@ -395,8 +395,12 @@ jobs:
               if ($operator -eq 'cutlass-fp8') {
                 $operatorSource = $fp8Source
                 $depfile = Join-Path $work 'fp8.d'
-                & "$env:CUDA_PATH/bin/nvcc.exe" -M -MT boundary.obj -MF $depfile -std=c++17 -O3 --expt-relaxed-constexpr --expt-extended-lambda -arch=sm_89 -DFERRUM_CUTLASS_FP8_SM89=1 -ccbin $env:NVCC_CCBIN "-I$fp8Source/cutlass/include" "-I$fp8Source/cutlass/tools/util/include" "-I$fp8Source/kernels" "$fp8Source/kernels/boundary.cu"
-                & $builder lock-source-dependencies --definition 'crates/ferrum-kernels/native/cutlass-fp8/cutlass-fp8-sm89.seed.json' --source-root $operatorSource --depfile $depfile --out-definition "$work/fp8-observed.json" --out-plan $plan
+                # CUDA headers require the real C++ standard macro for constexpr dim3.
+                $fp8Seed = Get-Content 'crates/ferrum-kernels/native/cutlass-fp8/cutlass-fp8-sm89.seed.json' -Raw | ConvertFrom-Json -AsHashtable
+                $fp8Seed.nvcc_policy.host_msvc_standard_cplusplus = $true
+                $fp8Seed | ConvertTo-Json -Depth 20 | Set-Content "$work/fp8-windows.seed.json" -Encoding utf8
+                & "$env:CUDA_PATH/bin/nvcc.exe" -M -MT boundary.obj -MF $depfile -std=c++17 -O3 --expt-relaxed-constexpr --expt-extended-lambda -arch=sm_89 -DFERRUM_CUTLASS_FP8_SM89=1 -ccbin $env:NVCC_CCBIN -Xcompiler /Zc:__cplusplus "-I$fp8Source/cutlass/include" "-I$fp8Source/cutlass/tools/util/include" "-I$fp8Source/kernels" "$fp8Source/kernels/boundary.cu"
+                & $builder lock-source-dependencies --definition "$work/fp8-windows.seed.json" --source-root $operatorSource --depfile $depfile --out-definition "$work/fp8-observed.json" --out-plan $plan
               } else {
                 & $builder lock-source --definition "native-operators/cuda/source-definitions/$operator.json" --source-root $operatorSource --out $plan
               }

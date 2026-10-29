@@ -216,6 +216,7 @@ mod tests {
                 extended_lambda: false,
                 host_position_independent_code: true,
                 host_default_visibility: false,
+                host_msvc_standard_cplusplus: false,
             },
             architecture: NativeOperatorCudaArchitecture::Sm120ArchitectureSpecific,
             archive_file: "libfixture.a".to_owned(),
