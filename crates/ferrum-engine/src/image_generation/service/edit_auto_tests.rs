@@ -350,6 +350,84 @@ async fn auto_edit_preprocesses_once_and_keeps_reduced_tail_bytes_and_fifo() {
 }
 
 #[tokio::test]
+async fn active_edit_preprocessing_uses_input_headroom_beyond_waiting_quota() {
+    let host = account();
+    let (worker, c) = fixture(&host, 8);
+    let request = edit(&host, 1, 16, 16);
+    let service = ServiceCore::start_with_host(
+        Box::new(worker),
+        ImageServiceConfig {
+            maximum_pending_bytes: request.pending_bytes() + PREPROCESSED_BYTES - 1,
+            ..config()
+        },
+        Some(host.clone()),
+    )
+    .unwrap();
+    let job = service.try_submit_request(request).unwrap();
+    assert_eq!(recv(&c.preparing), [1]);
+    c.prepare_release.send(()).unwrap();
+    assert_eq!(recv(&c.executing), [1]);
+    c.execute_release.send(()).unwrap();
+    assert_eq!(job.wait().await.unwrap(), 1);
+    assert_eq!(service.snapshot().rejected_requests, 0);
+    assert!(service.shutdown().await.unwrap().failure.is_none());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[tokio::test]
+async fn edit_host_pressure_executes_fitting_prefix_and_preserves_fifo_tail() {
+    let host = account();
+    let (worker, c) = fixture(&host, 8);
+    let service =
+        ServiceCore::start_with_host(Box::new(worker), config(), Some(host.clone())).unwrap();
+    let first_request = request(0);
+    let first_charge =
+        first_request.prompt.capacity() + ImageService::minimum_pending_request_bytes();
+    let first = service.try_submit(first_request).unwrap();
+    assert_eq!(recv(&c.preparing), [0]);
+    c.prepare_release.send(()).unwrap();
+    assert_eq!(recv(&c.executing), [0]);
+    let jobs = (1..=3)
+        .map(|seed| {
+            service
+                .try_submit_request(edit(&host, seed, 16, 16))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    // After the active request retires, exactly two retained preparations fit.
+    let held_bytes = host.limits().total_bytes()
+        - host.usage().unwrap().committed_bytes()
+        - 2 * PREPROCESSED_BYTES
+        + first_charge;
+    let held = host
+        .reserve(HostMemoryClass::InputPreprocess, held_bytes)
+        .unwrap();
+    c.execute_release.send(()).unwrap();
+    assert_eq!(first.wait().await.unwrap(), 0);
+    assert_eq!(recv(&c.preparing), [1, 2]);
+    assert_eq!(service.snapshot().pending_requests, 3);
+    c.prepare_release.send(()).unwrap();
+    assert_eq!(recv(&c.executing), [1, 2]);
+    assert_eq!(service.snapshot().pending_requests, 1);
+    c.execute_release.send(()).unwrap();
+    assert_eq!(recv(&c.preparing), [3]);
+    c.prepare_release.send(()).unwrap();
+    assert_eq!(recv(&c.executing), [3]);
+    c.execute_release.send(()).unwrap();
+    for (index, job) in jobs.into_iter().enumerate() {
+        assert_eq!(job.wait().await.unwrap(), index as u64 + 1);
+    }
+    assert_eq!(service.snapshot().rejected_requests, 0);
+    assert_eq!(
+        *c.preprocess_calls.lock().unwrap(),
+        BTreeMap::from([(1, 1), (2, 1), (3, 1)])
+    );
+    drop(held);
+    assert!(service.shutdown().await.unwrap().failure.is_none());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[tokio::test]
 async fn waiting_host_budget_rejects_before_preprocessing_without_capacity_retry() {
     let host = account();
     let (worker, c) = fixture(&host, 8);

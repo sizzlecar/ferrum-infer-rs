@@ -1,6 +1,6 @@
 //! Single-image OpenAI multipart adapter. Transport/parser buffers are bounded
-//! by EDIT_BODY_LIMIT, while the retained encoded PNG has one admitted Host
-//! backing. A slice retains that whole allocation and charge through the job.
+//! by EDIT_BODY_LIMIT. Uploaded PNG storage grows under Host admission and is
+//! compacted to its actual encoded length before entering the worker queue.
 
 use super::*;
 use axum::extract::{
@@ -110,26 +110,7 @@ async fn parse(
                     Some("image"),
                 ));
             }
-            let maximum = ImageInputLimits::default().maximum_encoded_bytes();
-            let mut backing = host
-                .allocate_zeroed(HostMemoryClass::InputPreprocess, maximum)
-                .map_err(|error| ServerError::CapacityExceeded(error.to_string()))?;
-            let mut count = 0usize;
-            while let Some(chunk) = field.chunk().await.map_err(invalid)? {
-                let end = count
-                    .checked_add(chunk.len())
-                    .filter(|&n| n <= maximum)
-                    .ok_or_else(|| invalid(format!("encoded image exceeds {maximum} bytes")))?;
-                backing.as_mut()[count..end].copy_from_slice(&chunk);
-                count = end;
-            }
-            if !backing.as_ref()[..count].starts_with(b"\x89PNG\r\n\x1a\n") {
-                return Err(ServerError::unsupported_feature(
-                    "image input is not PNG",
-                    Some("image"),
-                ));
-            }
-            image = Some(backing.freeze().slice(0..count).map_err(invalid)?);
+            image = Some(read_image(&mut field, host).await?);
         } else {
             if field.file_name().is_some() {
                 return Err(invalid("text field cannot be a file"));
@@ -157,6 +138,57 @@ async fn parse(
         },
         image.ok_or_else(|| invalid("missing image"))?,
     ))
+}
+
+async fn read_image(
+    field: &mut Field<'_>,
+    host: &HostMemoryAccount,
+) -> Result<ManagedHostBytes, ServerError> {
+    let maximum = ImageInputLimits::default().maximum_encoded_bytes();
+    let mut backing: Option<ferrum_runtime::ManagedHostBuffer> = None;
+    let mut count = 0usize;
+    while let Some(chunk) = field.chunk().await.map_err(invalid)? {
+        let end = count
+            .checked_add(chunk.len())
+            .filter(|&length| length <= maximum)
+            .ok_or_else(|| invalid(format!("encoded image exceeds {maximum} bytes")))?;
+        let previous_capacity = backing.as_ref().map_or(0, |buffer| buffer.len());
+        if end > previous_capacity {
+            let capacity = previous_capacity
+                .checked_mul(2)
+                .unwrap_or(maximum)
+                .max(end)
+                .min(maximum);
+            // Admit the new allocation while the old one is still charged:
+            // copying, compaction and failures must preserve the real peak.
+            let mut next = host
+                .allocate_zeroed(HostMemoryClass::InputPreprocess, capacity)
+                .map_err(|error| ServerError::CapacityExceeded(error.to_string()))?;
+            if let Some(previous) = &backing {
+                next.as_mut()[..count].copy_from_slice(&previous.as_ref()[..count]);
+            }
+            backing = Some(next);
+        }
+        if let Some(buffer) = &mut backing {
+            buffer.as_mut()[count..end].copy_from_slice(&chunk);
+        }
+        count = end;
+    }
+    let backing = backing.ok_or_else(|| invalid("image input is empty"))?;
+    if !backing.as_ref()[..count].starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(ServerError::unsupported_feature(
+            "image input is not PNG",
+            Some("image"),
+        ));
+    }
+    if count == backing.len() {
+        return Ok(backing.freeze());
+    }
+    let mut exact = host
+        .allocate_zeroed(HostMemoryClass::InputPreprocess, count)
+        .map_err(|error| ServerError::CapacityExceeded(error.to_string()))?;
+    exact.as_mut().copy_from_slice(&backing.as_ref()[..count]);
+    Ok(exact.freeze())
 }
 
 async fn read_text(mut field: Field<'_>, maximum: usize) -> Result<String, ServerError> {

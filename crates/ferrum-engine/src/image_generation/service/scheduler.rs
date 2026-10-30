@@ -287,43 +287,86 @@ fn reject_candidate<O>(
     }
 }
 
-/// Charge the metadata-proven retained input bound before decoding. This is a
-/// waiting-queue quota; the shared Host account still authorizes every actual
-/// backing (including transient decode/resize and execution allocations).
+/// Select a FIFO prefix whose retained preprocessing fits live Host capacity.
+/// The waiting quota bounds queued ownership; preparation can use the separate
+/// input headroom kept for active work. Every real allocation remains admitted
+/// by the shared account, including decode/resize scratch.
 fn reserve_preprocessing<O: Send + 'static>(
     worker: &dyn BatchWorker<Output = O>,
-    batch: &mut [Queued<O>],
+    batch: &mut Vec<Queued<O>>,
     shared: &Shared<O>,
-) -> Result<(), ImageBatchError> {
+) -> Result<bool, ImageBatchError> {
     let bounds = batch
         .iter()
         .map(|job| worker.preparation_bytes(&job.request))
         .collect::<Result<Vec<_>, _>>()?;
-    let extra = bounds
-        .iter()
-        .zip(batch.iter())
-        .try_fold(0_usize, |sum, (&bound, job)| {
-            sum.checked_add(bound.saturating_sub(job.preprocessing_bytes))
-        })
-        .ok_or_else(|| {
-            ImageBatchError::Overloaded("image prepared-input byte bound overflows".into())
-        })?;
     let mut state = shared.lock();
     let queued = state.queue.iter().map(Queued::pending_bytes).sum::<usize>();
-    if queued
-        .saturating_add(state.preparing_bytes)
-        .saturating_add(extra)
-        > shared.config.maximum_pending_bytes
-    {
-        return Err(ImageBatchError::Overloaded(
-            "image prepared inputs exceed waiting Host byte budget".into(),
-        ));
+    let mut extra = 0usize;
+    let mut keep = 0usize;
+    for (job, &bound) in batch.iter().zip(&bounds) {
+        let next = extra
+            .checked_add(bound.saturating_sub(job.preprocessing_bytes))
+            .ok_or_else(|| {
+                ImageBatchError::Overloaded("image prepared-input byte bound overflows".into())
+            })?;
+        let admission = match &shared.host {
+            Some(host) => host
+                .check_scope_admission(&[(HostMemoryClass::InputPreprocess, next)])
+                .map_err(|error| preparation_error(error.into())),
+            None if queued
+                .saturating_add(state.preparing_bytes)
+                .saturating_add(next)
+                <= shared.config.maximum_pending_bytes =>
+            {
+                Ok(())
+            }
+            None => Err(ImageBatchError::Overloaded(
+                "image prepared inputs exceed waiting Host byte budget".into(),
+            )),
+        };
+        if let Err(error) = admission {
+            if keep > 0 {
+                break;
+            }
+            let wait_for_output = if let Some(host) = &shared.host {
+                let held = batch
+                    .iter()
+                    .filter_map(|job| job.output.as_ref())
+                    .filter(|output| output.lease.is_some())
+                    .try_fold(0usize, |total, output| {
+                        total.checked_add(output.gate.host_output_bytes(host))
+                    })
+                    .ok_or_else(|| {
+                        ImageBatchError::Overloaded("held output credit overflows".into())
+                    })?;
+                host.check_scope_after_output_release(
+                    &[(HostMemoryClass::InputPreprocess, next)],
+                    held,
+                )
+                .is_ok()
+            } else {
+                false
+            };
+            drop(state);
+            // A request that cannot fit must not discard later FIFO jobs.
+            return_tail(batch, 1, shared, false);
+            return if wait_for_output {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        extra = next;
+        keep += 1;
     }
-    for (job, bound) in batch.iter_mut().zip(bounds) {
+    for (job, bound) in batch.iter_mut().take(keep).zip(bounds) {
         job.preprocessing_bytes = job.preprocessing_bytes.max(bound);
     }
     state.preparing_bytes += extra;
-    Ok(())
+    drop(state);
+    return_tail(batch, keep, shared, false);
+    Ok(true)
 }
 
 /// Search the already-owned FIFO candidate without publishing or executing a
@@ -398,16 +441,29 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     Err(failure) => break Err(failure),
                 }
                 let preparation_started = Instant::now();
+                let observed = shared.resources.epoch();
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    reserve_preprocessing(worker.as_ref(), &mut batch, &shared)?;
-                    prepare_capacity_prefix(worker.as_mut(), &mut batch, &shared)
+                    if !reserve_preprocessing(worker.as_ref(), &mut batch, &shared)? {
+                        return Ok(None);
+                    }
+                    prepare_capacity_prefix(worker.as_mut(), &mut batch, &shared).map(Some)
                 }));
                 let elapsed = preparation_started.elapsed();
                 for job in &mut batch {
                     job.preparation_duration = job.preparation_duration.saturating_add(elapsed);
                 }
                 match outcome {
-                    Ok(Ok(mut prepared)) => {
+                    Ok(Ok(None)) => {
+                        if !shared.lock().closing
+                            && !batch
+                                .iter()
+                                .any(|job| job.cancelled.load(Ordering::Acquire))
+                        {
+                            shared.resources.wait(observed);
+                        }
+                        continue 'prepare;
+                    }
+                    Ok(Ok(Some(mut prepared))) => {
                         loop {
                             let observed = shared.resources.epoch();
                             if remove_cancelled(&mut batch, &mut shared.lock()) {

@@ -84,6 +84,7 @@ impl PreparedBackend {
                     required_host_total_bytes = ?selected.receipt.required_host_total_bytes,
                     effective_host_total_bytes = selected.receipt.effective_host_total_bytes,
                     output_selection = ?selected.receipt.output_selection,
+                    input_selection = ?selected.receipt.input_selection,
                     observation_error = ?selected.receipt.observation_error,
                     "automatic image Host cache and output allowances selected"
                 );
@@ -110,13 +111,21 @@ impl PreparedBackend {
         }
     }
     pub(super) fn host_output_bytes(&self) -> usize {
+        self.host_limits()
+            .class_bytes(ferrum_runtime::HostMemoryClass::Output)
+    }
+    pub(super) fn host_input_bytes(&self) -> usize {
+        self.host_limits()
+            .class_bytes(ferrum_runtime::HostMemoryClass::InputPreprocess)
+    }
+    fn host_limits(&self) -> ferrum_runtime::HostMemoryLimits {
         let host = match self {
             #[cfg(feature = "cuda")]
             Self::Cuda(config, _) => config.host,
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Self::Metal(config) => config.host,
         };
-        host.class_bytes(ferrum_runtime::HostMemoryClass::Output)
+        host
     }
     pub(super) fn create(
         self,

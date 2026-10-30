@@ -67,7 +67,7 @@ async fn multipart(bytes: Vec<u8>) -> Multipart {
 
 #[tokio::test]
 async fn streaming_fields_preserve_png_owner_and_use_common_image_controls() {
-    let account = account(32 * 1024 * 1024);
+    let account = account(128);
     let png = b"\x89PNG\r\n\x1a\ntransport-fixture";
     let body = wire(&[
         ("image", png, true),
@@ -88,16 +88,8 @@ async fn streaming_fields_preserve_png_owner_and_use_common_image_controls() {
     assert_eq!(image.bytes(), png);
     assert!(account.owns(&image));
     assert_eq!(image.class(), HostMemoryClass::InputPreprocess);
-    // The exact range is exposed; the admitted maximum backing remains charged.
-    assert_eq!(
-        account.usage().unwrap().allocated_bytes(),
-        ImageInputLimits::default().maximum_encoded_bytes()
-    );
-    assert_eq!(
-        image.backing_bytes(),
-        ImageInputLimits::default().maximum_encoded_bytes()
-    );
-    assert!(image.backing_bytes() > image.len());
+    assert_eq!(account.usage().unwrap().allocated_bytes(), png.len());
+    assert_eq!(image.backing_bytes(), png.len());
     drop(image);
     assert_eq!(account.usage().unwrap().committed_bytes(), 0);
 }
@@ -143,9 +135,16 @@ async fn duplicate_files_masks_unknown_controls_and_bad_fields_release_ingress()
 
 #[tokio::test]
 async fn ingress_capacity_and_text_bounds_fail_before_worker_submission() {
-    let small = account(1024);
+    let small = account(64);
+    let mut png = [0u8; 128];
+    png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
     assert!(parse(
-        multipart(wire(&[("image", b"\x89PNG\r\n\x1a\n", true)])).await,
+        multipart(wire(&[
+            ("model", b"image", false),
+            ("prompt", b"edit", false),
+            ("image", &png, true)
+        ]))
+        .await,
         &small
     )
     .await
