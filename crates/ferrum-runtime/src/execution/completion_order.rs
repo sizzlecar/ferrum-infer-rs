@@ -1,4 +1,4 @@
-use super::{invalid_plan, BTreeMap, BTreeSet, NodeId, PlanNode, VNextError};
+use super::{invalid_plan, BTreeMap, NodeId, PlanNode, VNextError};
 
 /// A bounded, single-successor cache for repeated completion-order queries.
 ///
@@ -7,9 +7,11 @@ use super::{invalid_plan, BTreeMap, BTreeSet, NodeId, PlanNode, VNextError};
 /// avoids repeating the dependency traversal without retaining an N-by-N
 /// reachability table. This cache changes no ordering or slot selection rule.
 pub(super) struct CompletionOrderCache<'a> {
-    nodes_by_id: &'a BTreeMap<NodeId, &'a PlanNode>,
-    successor: Option<NodeId>,
-    ancestors: BTreeSet<NodeId>,
+    indices: BTreeMap<&'a NodeId, usize>,
+    dependencies: Vec<Option<Vec<usize>>>,
+    successor: Option<&'a NodeId>,
+    ancestors: Vec<bool>,
+    pending: Vec<usize>,
     missing_dependency: bool,
     #[cfg(test)]
     traversals: usize,
@@ -17,10 +19,34 @@ pub(super) struct CompletionOrderCache<'a> {
 
 impl<'a> CompletionOrderCache<'a> {
     pub(super) fn new(nodes_by_id: &'a BTreeMap<NodeId, &'a PlanNode>) -> Self {
+        let mut indices = nodes_by_id
+            .keys()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect::<BTreeMap<_, _>>();
+        // Missing dependencies also need an identity: DFS encounters their ID
+        // before reporting the missing node, and that prefix remains observable.
+        for node in nodes_by_id.values() {
+            for dependency in &node.dependencies {
+                let next = indices.len();
+                indices.entry(dependency).or_insert(next);
+            }
+        }
+        let mut dependencies = vec![None; indices.len()];
+        for (id, node) in nodes_by_id {
+            dependencies[indices[id]] = Some(
+                node.dependencies
+                    .iter()
+                    .map(|dependency| indices[dependency])
+                    .collect(),
+            );
+        }
         Self {
-            nodes_by_id,
+            ancestors: vec![false; indices.len()],
+            indices,
+            dependencies,
             successor: None,
-            ancestors: BTreeSet::new(),
+            pending: Vec::new(),
             missing_dependency: false,
             #[cfg(test)]
             traversals: 0,
@@ -37,10 +63,14 @@ impl<'a> CompletionOrderCache<'a> {
         if predecessor == successor {
             return Ok(false);
         }
-        if self.successor.as_ref() != Some(successor) {
+        if self.successor != Some(successor) {
             self.fill(successor)?;
         }
-        if self.ancestors.contains(predecessor) {
+        if self
+            .indices
+            .get(predecessor)
+            .is_some_and(|&index| self.ancestors[index])
+        {
             return Ok(true);
         }
         if self.missing_dependency {
@@ -50,22 +80,26 @@ impl<'a> CompletionOrderCache<'a> {
     }
 
     fn fill(&mut self, successor: &NodeId) -> Result<(), VNextError> {
-        let node = self
-            .nodes_by_id
-            .get(successor)
+        let (&id, &index) = self
+            .indices
+            .get_key_value(successor)
             .ok_or_else(|| invalid_plan("completion-order successor node is missing"))?;
-        let mut pending = node.dependencies.clone();
-        self.ancestors.clear();
+        let dependencies = self.dependencies[index]
+            .as_ref()
+            .ok_or_else(|| invalid_plan("completion-order successor node is missing"))?;
+        self.pending.clear();
+        self.pending.extend_from_slice(dependencies);
+        self.ancestors.fill(false);
         self.missing_dependency = false;
         #[cfg(test)]
         {
             self.traversals += 1;
         }
-        while let Some(node_id) = pending.pop() {
-            if !self.ancestors.insert(node_id.clone()) {
+        while let Some(index) = self.pending.pop() {
+            if std::mem::replace(&mut self.ancestors[index], true) {
                 continue;
             }
-            let Some(node) = self.nodes_by_id.get(&node_id) else {
+            let Some(dependencies) = &self.dependencies[index] else {
                 // The original query checks equality before resolving this
                 // dependency. Retain this ID and the exact DFS prefix: a
                 // predecessor already encountered still returns true, while
@@ -73,9 +107,9 @@ impl<'a> CompletionOrderCache<'a> {
                 self.missing_dependency = true;
                 break;
             };
-            pending.extend(node.dependencies.iter().cloned());
+            self.pending.extend_from_slice(dependencies);
         }
-        self.successor = Some(successor.clone());
+        self.successor = Some(id);
         Ok(())
     }
 
@@ -86,6 +120,6 @@ impl<'a> CompletionOrderCache<'a> {
 
     #[cfg(test)]
     pub(super) fn retained_ancestor_count(&self) -> usize {
-        self.ancestors.len()
+        self.ancestors.iter().filter(|&&visited| visited).count()
     }
 }
