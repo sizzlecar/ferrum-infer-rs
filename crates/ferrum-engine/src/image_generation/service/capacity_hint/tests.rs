@@ -5,6 +5,7 @@ struct Worker {
     observed_capacity: usize,
     shape: u8,
     probes: Vec<usize>,
+    report_complete_demand: bool,
 }
 impl BatchWorker for Worker {
     type Output = u64;
@@ -37,12 +38,17 @@ impl BatchWorker for Worker {
                 proof,
             });
         }
-        Ok(ImageBatchPreparation::new(
+        let prepared = ImageBatchPreparation::new(
             requests
                 .iter()
                 .map(|request| request.generation().seed)
                 .collect::<Vec<_>>(),
-        ))
+        );
+        Ok(if self.report_complete_demand {
+            prepared.with_capacity_report(demand(requests.len() as u64, self.capacity as u64))
+        } else {
+            prepared
+        })
     }
     fn compatible(&self, _: &ImageGenerationRequest, _: &ImageGenerationRequest) -> bool {
         true
@@ -153,6 +159,7 @@ fn known_boundary_skips_rejected_shapes_without_turning_short_batches_into_limit
         observed_capacity: 3,
         shape: 0,
         probes: Vec::new(),
+        report_complete_demand: false,
     };
     let mut hint = CapacitySearchHint::default();
     assert_eq!(prepare(&mut worker, &mut hint, 1, None).0.len(), 1);
@@ -176,6 +183,7 @@ fn cached_boundary_still_checks_live_capacity_and_expands_when_capacity_recovers
         observed_capacity: 3,
         shape: 0,
         probes: Vec::new(),
+        report_complete_demand: false,
     };
     let mut hint = CapacitySearchHint::default();
     prepare(&mut worker, &mut hint, 8, None);
@@ -199,6 +207,7 @@ fn changing_capacity_reuses_each_known_failure_bound_without_reprobing_it() {
         observed_capacity: 3,
         shape: 0,
         probes: Vec::new(),
+        report_complete_demand: false,
     };
     let mut hint = CapacitySearchHint::default();
     assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 3);
@@ -236,6 +245,7 @@ fn shape_and_adapter_changes_do_not_reuse_another_capacity_boundary() {
         observed_capacity: 4,
         shape: 0,
         probes: Vec::new(),
+        report_complete_demand: false,
     };
     let mut hint = CapacitySearchHint::default();
     prepare(&mut worker, &mut hint, 8, None);
@@ -248,4 +258,135 @@ fn shape_and_adapter_changes_do_not_reuse_another_capacity_boundary() {
         strength_bits: 1f32.to_bits(),
     };
     assert_eq!(prepare(&mut worker, &mut hint, 8, Some(adapter)).0.len(), 6);
+}
+
+fn demand(
+    required_bytes: u64,
+    capacity_bytes: u64,
+) -> super::super::super::ImageDeviceCapacityReport {
+    super::super::super::ImageDeviceCapacityReport {
+        complete_batch: true,
+        required_bytes,
+        capacity_bytes,
+        retained_static_bytes: 0,
+        active_stage_peak_bytes: required_bytes,
+        retained_dynamic_allowance_bytes: 0,
+        native_allowance_bytes: 0,
+    }
+}
+
+#[test]
+fn complete_demand_skips_distant_probes_but_proves_the_maximum_and_preserves_fifo() {
+    let mut worker = Worker {
+        capacity: 5,
+        observed_capacity: 5,
+        shape: 0,
+        probes: Vec::new(),
+        report_complete_demand: true,
+    };
+    let mut hint = CapacitySearchHint::default();
+    prepare(&mut worker, &mut hint, 1, None);
+    prepare(&mut worker, &mut hint, 4, None);
+    worker.probes.clear();
+    let (selected, tail) = prepare(&mut worker, &mut hint, 15, None);
+    assert_eq!(selected.len(), 5);
+    assert_eq!(tail.len(), 10);
+    assert_eq!(
+        worker.probes,
+        [5, 6],
+        "the estimate is followed by a real boundary probe"
+    );
+
+    worker.capacity = 10;
+    worker.observed_capacity = 10;
+    worker.probes.clear();
+    assert_eq!(prepare(&mut worker, &mut hint, 15, None).0.len(), 10);
+    assert_eq!(
+        worker.probes,
+        [10, 11],
+        "more available memory expands the search"
+    );
+}
+
+#[test]
+fn overestimated_capacity_still_prepares_each_prefix_after_live_capacity_falls() {
+    let mut worker = Worker {
+        capacity: 5,
+        observed_capacity: 5,
+        shape: 0,
+        probes: Vec::new(),
+        report_complete_demand: true,
+    };
+    let mut hint = CapacitySearchHint::default();
+    prepare(&mut worker, &mut hint, 1, None);
+    prepare(&mut worker, &mut hint, 4, None);
+    // Physical storage changes after the metadata observation, before prepare.
+    worker.capacity = 2;
+    worker.probes.clear();
+    assert_eq!(prepare(&mut worker, &mut hint, 15, None).0.len(), 2);
+    assert_eq!(worker.probes.first(), Some(&5));
+    assert_eq!(worker.probes.last(), Some(&2));
+}
+
+#[test]
+fn underestimated_batch_does_not_stop_at_the_first_fitting_batch() {
+    let context = Some(ImageCapacitySearchContext {
+        shape: [0; 32],
+        capacity_bytes: 12,
+    });
+    let mut hint = CapacitySearchHint::default();
+    // A previous workspace choice made the larger shape unusually expensive.
+    hint.observe_demand(context, &None, 1, demand(1, 12), 64);
+    hint.observe_demand(context, &None, 4, demand(8, 12), 64);
+    let mut worker = Worker {
+        capacity: 12,
+        observed_capacity: 12,
+        shape: 0,
+        probes: Vec::new(),
+        report_complete_demand: true,
+    };
+    assert_eq!(prepare(&mut worker, &mut hint, 15, None).0.len(), 12);
+    assert_eq!(worker.probes.first(), Some(&5));
+    assert!(
+        worker.probes.contains(&13),
+        "the fitting estimate is not a capacity bound"
+    );
+}
+
+#[test]
+fn demand_estimates_require_complete_matching_increasing_representable_points() {
+    let context = Some(ImageCapacitySearchContext {
+        shape: [0; 32],
+        capacity_bytes: 9,
+    });
+    let mut hint = CapacitySearchHint::default();
+    hint.observe_demand(context, &None, 1, demand(1, 9), 64);
+    let mut partial = demand(4, 9);
+    partial.complete_batch = false;
+    hint.observe_demand(context, &None, 4, partial, 64);
+    assert_eq!(hint.candidate(context, &None, 1, 16, 16), 16);
+    for required in [1, 0] {
+        hint.observe_demand(context, &None, 4, demand(required, 9), 64);
+        assert_eq!(hint.candidate(context, &None, 1, 16, 16), 16);
+    }
+    hint.observe_demand(context, &None, 4, demand(4, 9), 64);
+    assert_eq!(hint.candidate(context, &None, 1, 16, 16), 9);
+    let other_shape = Some(ImageCapacitySearchContext {
+        shape: [1; 32],
+        capacity_bytes: 9,
+    });
+    let other_adapter = Some(Arc::new(ImageAdapterBatchIdentity {
+        effective_identity: "another adapter".into(),
+        strength_bits: 1f32.to_bits(),
+    }));
+    assert_eq!(hint.candidate(other_shape, &None, 1, 16, 16), 16);
+    assert_eq!(hint.candidate(context, &other_adapter, 1, 16, 16), 16);
+
+    let huge = Some(ImageCapacitySearchContext {
+        shape: [2; 32],
+        capacity_bytes: u64::MAX,
+    });
+    hint.observe_demand(huge, &None, 1, demand(1, u64::MAX), usize::MAX);
+    hint.observe_demand(huge, &None, usize::MAX, demand(2, u64::MAX), usize::MAX);
+    assert_eq!(hint.candidate(huge, &None, 1, 16, 16), 16);
 }

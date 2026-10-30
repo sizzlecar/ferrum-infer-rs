@@ -549,6 +549,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         steps: &mut Vec<ImageDenoiseStepReceipt>,
     ) -> Result<Vec<TensorExecutionOutput>, ImageGenerationFailure<R>> {
         let PreparedRequest {
+            capacity_report: _,
             prompts,
             request_order,
             transformer,

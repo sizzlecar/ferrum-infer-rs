@@ -1,4 +1,4 @@
-//! Metadata-only reuse of a verified capacity search, never an admission grant.
+//! Compiled demand guides search order; only verified failures bound capacity.
 use super::*;
 use sha2::{Digest, Sha256};
 
@@ -21,6 +21,13 @@ struct Boundary {
     shape: [u8; 32],
     adapter: Option<Arc<ImageAdapterBatchIdentity>>,
     rejected: Vec<RejectedBatch>,
+    // At most two distinct complete plans. No plans or native owners survive.
+    demands: Vec<CompleteDemand>,
+}
+
+struct CompleteDemand {
+    batch_size: usize,
+    required_bytes: u64,
 }
 
 struct RejectedBatch {
@@ -29,6 +36,117 @@ struct RejectedBatch {
 }
 
 impl CapacitySearchHint {
+    fn boundary(
+        &mut self,
+        context: ImageCapacitySearchContext,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+    ) -> &mut Boundary {
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|old| old.shape != context.shape || old.adapter != *adapter)
+        {
+            self.0 = Some(Boundary {
+                shape: context.shape,
+                adapter: adapter.clone(),
+                rejected: Vec::new(),
+                demands: Vec::new(),
+            });
+        }
+        self.0.as_mut().unwrap()
+    }
+
+    pub(super) fn observe_demand(
+        &mut self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        count: usize,
+        report: super::super::ImageDeviceCapacityReport,
+        maximum_batch: usize,
+    ) {
+        let Some(context) = context else {
+            return;
+        };
+        // A stage lower bound cannot estimate the complete batch peak.
+        if !report.complete_batch || count == 0 || count > maximum_batch {
+            return;
+        }
+        tracing::debug!(target: "ferrum_engine::image_generation::timing",
+            batch_size = count, required_bytes = report.required_bytes,
+            capacity_bytes = report.capacity_bytes, fits = report.fits(),
+            "image capacity search observes complete compiled demand");
+        let demands = &mut self.boundary(context, adapter).demands;
+        demands.retain(|point| point.batch_size != count);
+        if demands.len() == 2 {
+            demands.remove(0);
+        }
+        demands.push(CompleteDemand {
+            batch_size: count,
+            required_bytes: report.required_bytes,
+        });
+    }
+
+    /// Interpolation only changes the next probe within the unresolved range.
+    /// Stage maxima and native workspaces need not be linear: every candidate
+    /// still compiles, and a fitting estimate does not stop the capacity search.
+    pub(super) fn candidate(
+        &self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        minimum: usize,
+        maximum: usize,
+        fallback: usize,
+    ) -> usize {
+        let estimate = (|| {
+            let context = context?;
+            let boundary = self.0.as_ref()?;
+            if boundary.shape != context.shape || boundary.adapter != *adapter {
+                return None;
+            }
+            let [first, second] = boundary.demands.as_slice() else {
+                return None;
+            };
+            let (small, large) = if first.batch_size < second.batch_size {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            let delta_bytes = large.required_bytes.checked_sub(small.required_bytes)?;
+            if delta_bytes == 0 {
+                return None;
+            }
+            let delta_batch = (large.batch_size - small.batch_size) as u128;
+            let base = small.batch_size as u128;
+            let estimate = if context.capacity_bytes >= small.required_bytes {
+                base.checked_add(
+                    u128::from(context.capacity_bytes - small.required_bytes)
+                        .checked_mul(delta_batch)?
+                        / u128::from(delta_bytes),
+                )?
+            } else {
+                let decrement = u128::from(small.required_bytes - context.capacity_bytes)
+                    .checked_mul(delta_batch)?
+                    .div_ceil(u128::from(delta_bytes));
+                base.saturating_sub(decrement)
+            };
+            usize::try_from(estimate).ok()
+        })();
+        let candidate = estimate.unwrap_or(fallback).clamp(minimum, maximum);
+        if estimate.is_some() {
+            let points = &self.0.as_ref().unwrap().demands;
+            tracing::debug!(target: "ferrum_engine::image_generation::timing",
+                candidate_batch = candidate, fallback_batch = fallback,
+                minimum_batch = minimum, maximum_batch = maximum,
+                observed_batch_a = points[0].batch_size,
+                observed_required_bytes_a = points[0].required_bytes,
+                observed_batch_b = points[1].batch_size,
+                observed_required_bytes_b = points[1].required_bytes,
+                capacity_bytes = context.unwrap().capacity_bytes,
+                "image capacity search uses complete compiled demand estimate");
+        }
+        candidate
+    }
+
     pub(super) fn upper(
         &self,
         context: Option<ImageCapacitySearchContext>,
@@ -72,18 +190,7 @@ impl CapacitySearchHint {
         if count <= 1 || count > maximum_batch || report.required_bytes <= report.capacity_bytes {
             return;
         }
-        if self
-            .0
-            .as_ref()
-            .is_none_or(|old| old.shape != context.shape || old.adapter != *adapter)
-        {
-            self.0 = Some(Boundary {
-                shape: context.shape,
-                adapter: adapter.clone(),
-                rejected: Vec::new(),
-            });
-        }
-        let bounds = &mut self.0.as_mut().unwrap().rejected;
+        let bounds = &mut self.boundary(context, adapter).rejected;
         // A smaller rejected batch with an equal or stronger byte lower bound
         // already excludes every candidate that the new observation excludes.
         if bounds

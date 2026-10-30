@@ -408,7 +408,7 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
         });
         prepared
     };
-    let mut candidate = upper;
+    let mut candidate = hint.candidate(context, &adapter, 1, upper, upper);
     let mut best: Option<(usize, ImageBatchPreparation)> = None;
     loop {
         let mut requests = batch[..candidate]
@@ -416,6 +416,20 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
             .map(|job| &mut job.request)
             .collect::<Vec<_>>();
         let outcome = worker.prepare(&mut requests);
+        let demand = match &outcome {
+            Ok(prepared) => prepared.2,
+            Err(ImageBatchError::Capacity { proof, .. }) => Some(proof.report),
+            _ => None,
+        };
+        if let Some(report) = demand {
+            hint.observe_demand(
+                context,
+                &adapter,
+                candidate,
+                report,
+                shared.config.max_num_seqs,
+            );
+        }
         match outcome {
             Ok(prepared) if candidate == upper => {
                 return_tail(batch, candidate, shared, false);
@@ -454,7 +468,13 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
             return_tail(batch, count, shared, false);
             return Ok(bind_feedback(prepared, count, hint));
         }
-        candidate = lower + (upper - lower).div_ceil(2);
+        candidate = hint.candidate(
+            context,
+            &adapter,
+            lower + 1,
+            upper,
+            lower + (upper - lower).div_ceil(2),
+        );
     }
 }
 

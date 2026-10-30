@@ -82,10 +82,16 @@ pub struct ImageServiceConfig {
 pub struct ImageBatchPreparation(
     Option<Box<dyn Any + Send>>,
     Option<batch_efficiency::ExecutionContext>,
+    Option<super::ImageDeviceCapacityReport>,
 );
 impl ImageBatchPreparation {
     pub fn new<T: Any + Send>(prepared: T) -> Self {
-        Self(Some(Box::new(prepared)), None)
+        Self(Some(Box::new(prepared)), None, None)
+    }
+    /// Compiled demand can guide later searches; it never grants admission.
+    pub fn with_capacity_report(mut self, report: super::ImageDeviceCapacityReport) -> Self {
+        self.2 = Some(report);
+        self
     }
     pub fn into_inner<T: Any + Send>(self) -> Result<T, ImageBatchError> {
         self.0

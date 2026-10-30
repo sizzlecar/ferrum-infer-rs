@@ -123,11 +123,13 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .prepare_batch_with_host_admission(requests, None, false)
             .map_err(preparation_error)?;
         validate_output_budget(output_bytes, prepared.host_budget.output)?;
+        let capacity_report = prepared.capacity_report;
         Ok(ImageBatchPreparation::new(BoundPreparation::new(
             &self.service_preparation_identity,
             identities,
             prepared,
-        )))
+        ))
+        .with_capacity_report(capacity_report))
     }
 
     pub(super) fn prepare_service_edit_bytes(
@@ -226,11 +228,13 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .prepare_preprocessed_edits_with_host_admission(&generation, &inputs, false)
             .map_err(preparation_error)?;
         validate_output_budget(output_bytes, prepared.host_budget.output)?;
+        let capacity_report = prepared.capacity_report;
         Ok(ImageBatchPreparation::new(BoundPreparation::new(
             &self.service_preparation_identity,
             identities,
             prepared,
-        )))
+        ))
+        .with_capacity_report(capacity_report))
     }
 
     /// Retain one validated plan and its immutable weight owners while waiting

@@ -7,6 +7,7 @@ pub(super) struct PreparedPrefixDecode<R: DeviceRuntime> {
 }
 
 pub(super) struct PreparedRequest<R: DeviceRuntime> {
+    pub capacity_report: ImageDeviceCapacityReport,
     pub plan_cache_candidate: Option<super::plan_cache::PendingCandidatePlanCache<R>>,
     pub host_scope: Option<ferrum_runtime::HostMemoryScope>,
     pub host_budget: super::host_budget::ExecutionHostBudget,
@@ -250,12 +251,13 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             all_stages.push(&prefix.stage);
         }
         let started = std::time::Instant::now();
-        self.validate_capacity_with_prefix(
+        let capacity_report = self.capacity_with_prefix(
             &all_stages,
             prefix_decode
                 .as_ref()
                 .map(|prefix| (&denoise_stage, &prefix.stage)),
         )?;
+        capacity_report.validate()?;
         let capacity_us = trace_elapsed_us(started);
         // This total includes family/plan preparation and the listed subspans.
         // It must not be added to those subspans or stage compile receipts.
@@ -270,6 +272,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             "image batch plans prepared"
         );
         let mut prepared = PreparedRequest {
+            capacity_report,
             plan_cache_candidate: None,
             host_scope: None,
             host_budget: Default::default(),
