@@ -13,6 +13,8 @@ mod gpu_tests;
 mod host_cache;
 #[cfg(any(feature = "cuda", test))]
 mod library;
+#[cfg(feature = "cuda")]
+mod profile;
 mod run;
 mod serve;
 mod source;
@@ -21,6 +23,8 @@ mod tests;
 
 pub use configuration::ImageProductConfig;
 pub use directory::{DirectoryOptions, ImageProductSource};
+#[cfg(feature = "cuda")]
+pub use profile::{profile_image_source, ImageProfileWorkload};
 pub use run::execute_run;
 pub use run::execute_run_source;
 pub use run::execute_run_source_with_image;

@@ -128,6 +128,11 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
 }
 
 impl<R: DeviceRuntime> TensorRequestSession<R> {
+    /// Consume diagnostics for the last completed step of this fixed request.
+    pub fn take_execution_profile(&mut self) -> Option<TensorExecutionProfile> {
+        self.executor.take_execution_profile()
+    }
+
     pub fn set_output_host_account(
         &mut self,
         account: HostMemoryAccount,

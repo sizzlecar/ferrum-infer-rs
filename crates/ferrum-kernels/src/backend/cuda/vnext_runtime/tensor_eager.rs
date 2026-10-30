@@ -179,13 +179,22 @@ fn validate_submission_policy(
     timing: DeviceTimingMode,
     facts: ExecutionFactsCapture,
 ) -> Result<(), CudaDeviceRuntimeError> {
+    // Isolated diagnostic opt-in: Kernel uses the existing eager command path
+    // and creates at most two events per command plus submission start/fence.
+    // Commands, live flights and lanes are already bounded before enqueue; the
+    // fence retains its flight/lane (and declared stream opaque allowance) until
+    // its event owners are destroyed. No extra per-event byte claim is invented:
+    // native event storage is within the caller-declared bootstrap/stream opaque
+    // allowances, which remain experimental and unqualified. This diagnostic
+    // allowance is not evidence that the production memory profile is qualified.
+    // Off remains the default; reusable capture and execution facts stay disabled.
     if commands == 0
         || commands > maximum_commands
-        || timing != DeviceTimingMode::Off
+        || !matches!(timing, DeviceTimingMode::Off | DeviceTimingMode::Kernel)
         || facts != ExecutionFactsCapture::Off
     {
         return Err(CudaDeviceRuntimeError::contract(format!(
-            "CUDA tensor eager profile requires timing/facts off and 1..={maximum_commands} total commands"
+            "CUDA tensor eager profile requires timing Off or diagnostic Kernel, facts Off, and 1..={maximum_commands} total commands"
         )));
     }
     Ok(())
@@ -647,6 +656,9 @@ mod tests {
             validate_submission_policy(maximum, count, timing, facts)
         };
         assert!(check(64, 64, DeviceTimingMode::Off, ExecutionFactsCapture::Off).is_ok());
+        assert!(check(64, 64, DeviceTimingMode::Kernel, ExecutionFactsCapture::Off).is_ok());
+        assert!(check(64, 65, DeviceTimingMode::Kernel, ExecutionFactsCapture::Off).is_err());
+        assert!(check(64, 64, DeviceTimingMode::Kernel, ExecutionFactsCapture::On).is_err());
         assert!(check(64, 65, DeviceTimingMode::Off, ExecutionFactsCapture::Off).is_err());
         assert!(check(
             1024,

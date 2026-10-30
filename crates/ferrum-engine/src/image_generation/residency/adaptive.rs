@@ -138,6 +138,7 @@ impl<R: DeviceRuntime> ResidentStages<R> {
 fn idle_receipt(receipt: &mut ImageStageExecutionReceipt) {
     receipt.completed_executions = 0;
     receipt.execution_wall_durations_us.clear();
+    receipt.device_profiles.clear();
     receipt.initialization_wall_duration_us = 0;
     receipt.plan.compile_wall_duration_us = 0;
     receipt.session_reused = true;

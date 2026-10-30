@@ -302,6 +302,16 @@ pub struct QwenImage21Pipeline<R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
+    /// Select diagnostic device observation before any request or session exists.
+    pub fn with_device_timing_mode(mut self, mode: DeviceTimingMode) -> anyhow::Result<Self> {
+        ensure!(
+            self.next_job == 0,
+            "device timing must be selected before requests start"
+        );
+        self.config.executor.device_timing_mode = mode;
+        Ok(self)
+    }
+
     /// The composition root supplies one combined provider registry. In
     /// particular, CUDA noise/DiT/decoder providers share its native module;
     /// creating separate backend runtimes for stages is not supported here.

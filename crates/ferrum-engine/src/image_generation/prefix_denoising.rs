@@ -143,6 +143,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .push(elapsed_us(started));
             let output =
                 output.map_err(|source| ImageGenerationFailure::RequestExecution { source })?;
+            if let Some(profile) = prefill.session.take_execution_profile() {
+                prefill.receipt.device_profiles.push(profile);
+            }
             prefill.receipt.completed_executions += 1;
             let started = Instant::now();
             advance(solver, &mut sample, output, steps).map_err(process)?;
@@ -169,6 +172,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     .push(elapsed_us(started));
                 let output =
                     output.map_err(|source| ImageGenerationFailure::RequestExecution { source })?;
+                if let Some(profile) = owners.request.as_mut().unwrap().take_execution_profile() {
+                    active.receipt.device_profiles.push(profile);
+                }
                 active.receipt.completed_executions += 1;
                 let started = Instant::now();
                 advance(solver, &mut sample, output, steps).map_err(process)?;
@@ -215,6 +221,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 let mut origin = origin;
                 origin.completed_executions = 0;
                 origin.execution_wall_durations_us.clear();
+                origin.device_profiles.clear();
                 origin.initialization_wall_duration_us = 0;
                 origin.plan.compile_wall_duration_us = 0;
                 stages.push(ImageStageReceipt {

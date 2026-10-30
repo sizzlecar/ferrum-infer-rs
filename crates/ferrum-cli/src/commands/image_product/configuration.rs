@@ -304,6 +304,7 @@ impl PipelineConfig {
             )?,
             executor: ferrum_execution::TensorExecutorConfig {
                 maximum_backing_maintenance_passes: self.maximum_backing_maintenance_passes,
+                ..Default::default()
             },
         })
     }
@@ -591,6 +592,7 @@ impl PipelineConfig {
             )?,
             executor: ferrum_execution::TensorExecutorConfig {
                 maximum_backing_maintenance_passes: self.maximum_backing_maintenance_passes,
+                ..Default::default()
             },
         };
         limits.validate()?;
