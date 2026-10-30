@@ -3,14 +3,14 @@ use super::*;
 struct Worker {
     capacity: usize,
     observed_capacity: usize,
-    shape: u8,
+    shape: Option<u8>,
     probes: Vec<usize>,
 }
 impl BatchWorker for Worker {
     type Output = u64;
     fn capacity_search_context(&self, _: &[&QueuedRequest]) -> Option<ImageCapacitySearchContext> {
-        Some(ImageCapacitySearchContext {
-            shape: [self.shape; 32],
+        self.shape.map(|shape| ImageCapacitySearchContext {
+            shape: [shape; 32],
             capacity_bytes: self.observed_capacity as u64,
         })
     }
@@ -118,16 +118,16 @@ fn prepare(
         state.preparing = count;
         state.preparing_bytes = batch.iter().map(Queued::pending_bytes).sum();
     }
-    let prepared = scheduler::prepare_capacity_prefix(
+    let mut prepared = scheduler::prepare_capacity_prefix(
         worker,
         &mut batch,
         &shared,
         hint,
         &mut batch_efficiency::BatchEfficiency::default(),
     )
-    .unwrap()
-    .into_inner::<Vec<u64>>()
     .unwrap();
+    let completed = prepared.1.take();
+    let prepared = prepared.into_inner::<Vec<u64>>().unwrap();
     let selected = batch
         .iter()
         .map(|job| job.request.generation().seed)
@@ -143,109 +143,158 @@ fn prepare(
         selected.iter().chain(&tail).copied().collect::<Vec<_>>(),
         (0..count as u64).collect::<Vec<_>>()
     );
+    // Simulate the worker-loop hook after successful execution. Preparation
+    // alone must not mark a batch completed, including cancelled preparations.
+    if let Some(completed) = completed {
+        hint.completed(
+            completed.context,
+            &completed.adapter,
+            completed.batch_size,
+            shared.config.max_num_seqs,
+        );
+    }
     (selected, tail)
 }
 
-#[test]
-fn known_boundary_skips_rejected_shapes_without_turning_short_batches_into_limits() {
-    let mut worker = Worker {
-        capacity: 3,
-        observed_capacity: 3,
-        shape: 0,
+fn worker(capacity: usize) -> Worker {
+    Worker {
+        capacity,
+        observed_capacity: capacity,
+        shape: Some(0),
         probes: Vec::new(),
-    };
+    }
+}
+
+#[test]
+fn completed_prefix_grows_geometrically_without_becoming_a_capacity_limit() {
+    let mut worker = worker(16);
     let mut hint = CapacitySearchHint::default();
     assert_eq!(prepare(&mut worker, &mut hint, 1, None).0.len(), 1);
-    assert_eq!(prepare(&mut worker, &mut hint, 8, None).0.len(), 3);
-    assert!(worker.probes.contains(&8), "one success is not a ceiling");
-    // A short remaining tail must not erase the proven capacity boundary.
-    assert_eq!(prepare(&mut worker, &mut hint, 1, None).0.len(), 1);
+    for expected in [2, 4, 8, 16] {
+        worker.probes.clear();
+        assert_eq!(prepare(&mut worker, &mut hint, 32, None).0.len(), expected);
+        assert_eq!(worker.probes, [expected]);
+    }
+    let context = worker.capacity_search_context(&[]);
+    assert_eq!(
+        hint.upper(context, &None, 64),
+        64,
+        "a successful batch is not proof that a larger one cannot fit"
+    );
+    prepare(&mut worker, &mut hint, 1, None);
+    assert_eq!(hint.successful(context, &None), Some(16));
+}
+
+#[test]
+fn one_failed_growth_probe_immediately_executes_the_fresh_completed_prefix() {
+    let mut worker = worker(5);
+    let mut hint = CapacitySearchHint::default();
+    prepare(&mut worker, &mut hint, 4, None);
+    // Do not repeat the full 15 -> 7 -> 3 -> 5 -> 6 search in front of
+    // waiting requests. A failed expansion returns to the known FIFO prefix.
     worker.probes.clear();
-    assert_eq!(prepare(&mut worker, &mut hint, 8, None).0.len(), 3);
+    assert_eq!(prepare(&mut worker, &mut hint, 15, None).0.len(), 4);
+    assert_eq!(worker.probes, [8, 4]);
+    // Subsequent real dispatches narrow the bracket, one unknown size each.
+    worker.probes.clear();
+    assert_eq!(prepare(&mut worker, &mut hint, 15, None).0.len(), 4);
+    assert_eq!(worker.probes, [6, 4]);
+    worker.probes.clear();
+    assert_eq!(prepare(&mut worker, &mut hint, 15, None).0.len(), 5);
+    assert_eq!(worker.probes, [5]);
+    worker.probes.clear();
+    assert_eq!(prepare(&mut worker, &mut hint, 15, None).0.len(), 5);
     assert_eq!(
         worker.probes,
-        [3],
-        "one fresh preparation, no failed probes"
+        [5],
+        "the final known prefix is still prepared"
     );
 }
 
 #[test]
-fn cached_boundary_still_checks_live_capacity_and_expands_when_capacity_recovers() {
-    let mut worker = Worker {
-        capacity: 3,
-        observed_capacity: 3,
-        shape: 0,
-        probes: Vec::new(),
-    };
+fn failed_fallback_descends_safely_and_capacity_recovery_allows_growth() {
+    let mut worker = worker(8);
     let mut hint = CapacitySearchHint::default();
-    prepare(&mut worker, &mut hint, 8, None);
-    // The physical state changes after the hint's metadata observation. A
-    // cached batch still receives the real prepare failure and shrinks safely.
-    worker.capacity = 2;
+    prepare(&mut worker, &mut hint, 4, None);
+    // Capacity can fall after the metadata snapshot. Both the growth probe
+    // and the previously successful fallback must receive fresh checks.
+    worker.capacity = 1;
     worker.probes.clear();
-    assert_eq!(prepare(&mut worker, &mut hint, 8, None).0.len(), 2);
-    assert!(worker.probes.contains(&3));
-    worker.capacity = 6;
-    worker.observed_capacity = 6;
+    assert_eq!(prepare(&mut worker, &mut hint, 16, None).0.len(), 1);
+    assert_eq!(worker.probes, [8, 4, 2, 1]);
+
+    worker.capacity = 8;
     worker.probes.clear();
-    assert_eq!(prepare(&mut worker, &mut hint, 8, None).0.len(), 6);
-    assert!(worker.probes.iter().any(|&batch| batch > 3));
+    assert_eq!(prepare(&mut worker, &mut hint, 16, None).0.len(), 8);
+    assert_eq!(worker.probes, [8]);
 }
 
 #[test]
-fn changing_capacity_reuses_each_known_failure_bound_without_reprobing_it() {
-    let mut worker = Worker {
-        capacity: 3,
-        observed_capacity: 3,
-        shape: 0,
-        probes: Vec::new(),
-    };
+fn changing_capacity_reuses_independent_failure_bounds() {
+    let mut worker = worker(3);
     let mut hint = CapacitySearchHint::default();
+    assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 2);
+    assert_eq!(worker.probes, [9, 4, 2]);
     assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 3);
-    assert!(worker.probes.contains(&4));
     worker.capacity = 2;
     worker.observed_capacity = 2;
-    assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 2);
+    prepare(&mut worker, &mut hint, 9, None);
 
-    // Restoring capacity reuses the earlier batch-four failure instead of
-    // forgetting it and searching again from the entire queued candidate.
     worker.capacity = 3;
     worker.observed_capacity = 3;
     worker.probes.clear();
     assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 3);
     assert_eq!(worker.probes, [3]);
+
     worker.capacity = 2;
     worker.observed_capacity = 2;
     worker.probes.clear();
     assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 2);
     assert_eq!(worker.probes, [2]);
 
-    // A more distant failed probe remains useful too; bounds are neither a
-    // fixed two-capacity table nor a permanent cap on a now-larger device.
+    // The old rejection of nine still brackets a recovered larger capacity.
     worker.capacity = 8;
     worker.observed_capacity = 8;
     worker.probes.clear();
-    assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 8);
-    assert_eq!(worker.probes, [8]);
+    assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 6);
+    assert_eq!(worker.probes, [6]);
 }
 
 #[test]
-fn shape_and_adapter_changes_do_not_reuse_another_capacity_boundary() {
-    let mut worker = Worker {
-        capacity: 2,
-        observed_capacity: 4,
-        shape: 0,
-        probes: Vec::new(),
-    };
+fn shape_and_adapter_changes_do_not_reuse_success_or_failure_boundaries() {
+    let mut worker = worker(2);
     let mut hint = CapacitySearchHint::default();
+    prepare(&mut worker, &mut hint, 2, None);
     prepare(&mut worker, &mut hint, 8, None);
-    worker.capacity = 4;
-    worker.shape = 1;
-    assert_eq!(prepare(&mut worker, &mut hint, 8, None).0.len(), 4);
+    worker.capacity = 8;
+    worker.observed_capacity = 8;
+    worker.shape = Some(1);
+    worker.probes.clear();
+    assert_eq!(prepare(&mut worker, &mut hint, 8, None).0.len(), 8);
+    assert_eq!(worker.probes, [8]);
+
     worker.capacity = 6;
+    worker.observed_capacity = 6;
     let adapter = ImageAdapterBatchIdentity {
         effective_identity: "different adapter".into(),
         strength_bits: 1f32.to_bits(),
     };
-    assert_eq!(prepare(&mut worker, &mut hint, 8, Some(adapter)).0.len(), 6);
+    worker.probes.clear();
+    assert_eq!(prepare(&mut worker, &mut hint, 8, Some(adapter)).0.len(), 4);
+    assert_eq!(worker.probes, [8, 4]);
+}
+
+#[test]
+fn first_fitting_context_prefix_executes_but_missing_context_keeps_full_search() {
+    let mut contextual = worker(5);
+    let mut hint = CapacitySearchHint::default();
+    assert_eq!(prepare(&mut contextual, &mut hint, 15, None).0.len(), 3);
+    assert_eq!(contextual.probes, [15, 7, 3]);
+
+    let mut uncached = worker(5);
+    uncached.shape = None;
+    let mut hint = CapacitySearchHint::default();
+    assert_eq!(prepare(&mut uncached, &mut hint, 15, None).0.len(), 5);
+    assert_eq!(uncached.probes, [15, 7, 3, 5, 6]);
+    assert!(hint.0.is_none(), "no incomplete context is retained");
 }

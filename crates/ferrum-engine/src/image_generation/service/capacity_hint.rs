@@ -20,6 +20,8 @@ pub(super) struct CapacitySearchHint(Option<Boundary>);
 struct Boundary {
     shape: [u8; 32],
     adapter: Option<Arc<ImageAdapterBatchIdentity>>,
+    /// Largest completed batch, not a reservation or an upper capacity bound.
+    successful: usize,
     rejected: Vec<RejectedBatch>,
 }
 
@@ -29,6 +31,73 @@ struct RejectedBatch {
 }
 
 impl CapacitySearchHint {
+    pub(super) fn successful(
+        &self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+    ) -> Option<usize> {
+        let context = context?;
+        self.0
+            .as_ref()
+            .filter(|b| b.shape == context.shape && b.adapter == *adapter && b.successful > 0)
+            .map(|b| b.successful)
+    }
+
+    /// Explore at most one larger size per dispatch. Without a failed bound,
+    /// geometric growth reaches larger devices without compiling every size.
+    /// Once a failure brackets the frontier, bisect only the unobserved gap.
+    pub(super) fn candidate(
+        &self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        selected: usize,
+        maximum_batch: usize,
+    ) -> usize {
+        let Some(known) = self.successful(context, adapter).filter(|&n| n < selected) else {
+            return selected;
+        };
+        let upper = self.upper(context, adapter, maximum_batch);
+        if upper < maximum_batch {
+            selected.min(known + (upper - known).div_ceil(2))
+        } else {
+            selected.min(known.saturating_mul(2))
+        }
+    }
+
+    pub(super) fn completed(
+        &mut self,
+        context: ImageCapacitySearchContext,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        count: usize,
+        maximum_batch: usize,
+    ) {
+        if count == 0 || count > maximum_batch {
+            return;
+        }
+        let boundary = self.domain(context, adapter);
+        boundary.successful = boundary.successful.max(count);
+    }
+
+    fn domain(
+        &mut self,
+        context: ImageCapacitySearchContext,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+    ) -> &mut Boundary {
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|old| old.shape != context.shape || old.adapter != *adapter)
+        {
+            self.0 = Some(Boundary {
+                shape: context.shape,
+                adapter: adapter.clone(),
+                successful: 0,
+                rejected: Vec::new(),
+            });
+        }
+        self.0.as_mut().unwrap()
+    }
+
     pub(super) fn upper(
         &self,
         context: Option<ImageCapacitySearchContext>,
@@ -72,18 +141,7 @@ impl CapacitySearchHint {
         if count <= 1 || count > maximum_batch || report.required_bytes <= report.capacity_bytes {
             return;
         }
-        if self
-            .0
-            .as_ref()
-            .is_none_or(|old| old.shape != context.shape || old.adapter != *adapter)
-        {
-            self.0 = Some(Boundary {
-                shape: context.shape,
-                adapter: adapter.clone(),
-                rejected: Vec::new(),
-            });
-        }
-        let bounds = &mut self.0.as_mut().unwrap().rejected;
+        let bounds = &mut self.domain(context, adapter).rejected;
         // A smaller rejected batch with an equal or stronger byte lower bound
         // already excludes every candidate that the new observation excludes.
         if bounds
