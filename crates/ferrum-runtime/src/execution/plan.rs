@@ -2243,22 +2243,30 @@ impl ExecutionPlan {
                 self.payload.sequence_checkpoint_layout.as_ref(),
                 &self.payload.memory.dynamic_descriptors,
             )?;
-        let mut expected_pools = MemoryPlan::derive_dynamic_pools_with_checkpoint(
-            &self.payload.memory.dynamic_descriptors,
-            &self.payload.nodes,
-            dynamic_capacity_bytes,
-            &reusable_workspace_ceilings,
-            &retained_completion_resources,
-            &checkpoint_growth_ceilings,
-        )
-        .map_err(Self::memory_pool_validation_error)?;
-        MemoryPlan::preserve_legacy_invocation_layouts(
-            &mut expected_pools,
-            &self.payload.memory.dynamic_pools,
-            &self.payload.memory.dynamic_descriptors,
-            dynamic_capacity_bytes,
-        )
-        .map_err(Self::memory_pool_validation_error)?;
+        let expected_pools =
+            if reusable_workspace_ceilings.is_empty() && checkpoint_growth_ceilings.is_empty() {
+                // Reuse this validation's independent reconstruction, including
+                // legacy layout handling, rather than trusting the payload pools.
+                base_pools
+            } else {
+                let mut pools = MemoryPlan::derive_dynamic_pools_with_checkpoint(
+                    &self.payload.memory.dynamic_descriptors,
+                    &self.payload.nodes,
+                    dynamic_capacity_bytes,
+                    &reusable_workspace_ceilings,
+                    &retained_completion_resources,
+                    &checkpoint_growth_ceilings,
+                )
+                .map_err(Self::memory_pool_validation_error)?;
+                MemoryPlan::preserve_legacy_invocation_layouts(
+                    &mut pools,
+                    &self.payload.memory.dynamic_pools,
+                    &self.payload.memory.dynamic_descriptors,
+                    dynamic_capacity_bytes,
+                )
+                .map_err(Self::memory_pool_validation_error)?;
+                pools
+            };
         if self.payload.memory.dynamic_pools != expected_pools {
             return Err(invalid_plan(
                 "memory pools or invocation reuse are not derived from plan dependencies",
