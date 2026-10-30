@@ -158,14 +158,20 @@ impl MemoryPlan {
             .map(ReusableExecutionMemoryPlan::pool_workspace_ceilings)
             .transpose()?
             .unwrap_or_default();
-        let dynamic_pools = Self::derive_dynamic_pools_with_reusable(
-            &dynamic_descriptors,
-            nodes,
-            dynamic_capacity_bytes,
-            &reusable_workspace_ceilings,
-            retained_completion_resources,
-        )
-        .map_err(global_capacity_error)?;
+        let dynamic_pools = if reusable_workspace_ceilings.is_empty() {
+            // The base derivation already used these exact inputs with no
+            // additional workspace ceilings; retain its independently built proof.
+            base_dynamic_pools
+        } else {
+            Self::derive_dynamic_pools_with_reusable(
+                &dynamic_descriptors,
+                nodes,
+                dynamic_capacity_bytes,
+                &reusable_workspace_ceilings,
+                retained_completion_resources,
+            )
+            .map_err(global_capacity_error)?
+        };
         let (invocation_liveness_mode, invocation_liveness) =
             Self::summarize_pool_invocation_liveness(&dynamic_pools)?;
         let minimum_request_bytes = dynamic_pools.iter().try_fold(0_u64, |total, pool| {
