@@ -395,7 +395,6 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
     }
     let mut candidate = upper;
     let mut best: Option<(usize, ImageBatchPreparation)> = None;
-    let mut rejected = None;
     loop {
         let mut requests = batch[..candidate]
             .iter_mut()
@@ -404,7 +403,6 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
         let outcome = worker.prepare(&mut requests);
         match outcome {
             Ok(prepared) if candidate == upper => {
-                hint.remember(context, &adapter, candidate, rejected);
                 return_tail(batch, candidate, shared, false);
                 return Ok(prepared);
             }
@@ -415,7 +413,13 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
                 if shared.config.batching == ImageBatchPolicy::Auto && candidate > 1 =>
             {
                 upper = candidate - 1;
-                rejected = Some((candidate, proof.report));
+                hint.remember(
+                    context,
+                    &adapter,
+                    candidate,
+                    proof.report,
+                    shared.config.max_num_seqs,
+                );
                 {
                     let mut state = shared.lock();
                     state.capacity_reductions = state.capacity_reductions.saturating_add(1);
@@ -432,7 +436,6 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
         let lower = best.as_ref().map_or(0, |(count, _)| *count);
         if lower == upper {
             let (count, prepared) = best.expect("a positive fitting prefix was retained");
-            hint.remember(context, &adapter, count, rejected);
             return_tail(batch, count, shared, false);
             return Ok(prepared);
         }

@@ -187,6 +187,43 @@ fn cached_boundary_still_checks_live_capacity_and_expands_when_capacity_recovers
 }
 
 #[test]
+fn changing_capacity_reuses_each_known_failure_bound_without_reprobing_it() {
+    let mut worker = Worker {
+        capacity: 3,
+        observed_capacity: 3,
+        shape: 0,
+        probes: Vec::new(),
+    };
+    let mut hint = CapacitySearchHint::default();
+    assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 3);
+    assert!(worker.probes.contains(&4));
+    worker.capacity = 2;
+    worker.observed_capacity = 2;
+    assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 2);
+
+    // Restoring capacity reuses the earlier batch-four failure instead of
+    // forgetting it and searching again from the entire queued candidate.
+    worker.capacity = 3;
+    worker.observed_capacity = 3;
+    worker.probes.clear();
+    assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 3);
+    assert_eq!(worker.probes, [3]);
+    worker.capacity = 2;
+    worker.observed_capacity = 2;
+    worker.probes.clear();
+    assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 2);
+    assert_eq!(worker.probes, [2]);
+
+    // A more distant failed probe remains useful too; bounds are neither a
+    // fixed two-capacity table nor a permanent cap on a now-larger device.
+    worker.capacity = 8;
+    worker.observed_capacity = 8;
+    worker.probes.clear();
+    assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 8);
+    assert_eq!(worker.probes, [8]);
+}
+
+#[test]
 fn shape_and_adapter_changes_do_not_reuse_another_capacity_boundary() {
     let mut worker = Worker {
         capacity: 2,

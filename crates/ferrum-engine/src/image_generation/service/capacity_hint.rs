@@ -18,10 +18,14 @@ pub struct ImageCapacitySearchContext {
 pub(super) struct CapacitySearchHint(Option<Boundary>);
 
 struct Boundary {
-    context: ImageCapacitySearchContext,
+    shape: [u8; 32],
     adapter: Option<Arc<ImageAdapterBatchIdentity>>,
+    rejected: Vec<RejectedBatch>,
+}
+
+struct RejectedBatch {
     batch_size: usize,
-    next_required_bytes: u64,
+    required_bytes: u64,
 }
 
 impl CapacitySearchHint {
@@ -34,18 +38,21 @@ impl CapacitySearchHint {
         let (Some(context), Some(boundary)) = (context, &self.0) else {
             return queued;
         };
-        if boundary.context.shape != context.shape || boundary.adapter != *adapter {
+        if boundary.shape != context.shape || boundary.adapter != *adapter {
             return queued;
         }
-        // An increased ceiling below the next rejected shape's actual demand
-        // cannot permit growth. Reopen the full search once that demand fits.
-        // Decreases still prepare the previous prefix and shrink it if needed.
-        if context.capacity_bytes > boundary.context.capacity_bytes
-            && context.capacity_bytes >= boundary.next_required_bytes
-        {
-            return queued;
-        }
-        queued.min(boundary.batch_size)
+        // Preserve independent failure bounds when physical capacity changes.
+        // A smaller available ceiling must not erase what a previous larger
+        // ceiling proved. Reaching a bound permits fresh search, never execution.
+        // Prefix exclusion inherits the same-shape monotonicity assumption of
+        // the scheduler's binary search; it does not prove arbitrary native
+        // workspace choices monotonic or establish a globally optimal batch.
+        boundary
+            .rejected
+            .iter()
+            .filter(|bound| bound.required_bytes > context.capacity_bytes)
+            .map(|bound| bound.batch_size - 1)
+            .fold(queued, usize::min)
     }
 
     pub(super) fn remember(
@@ -53,24 +60,44 @@ impl CapacitySearchHint {
         context: Option<ImageCapacitySearchContext>,
         adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
         count: usize,
-        rejected: Option<(usize, super::super::ImageDeviceCapacityReport)>,
+        report: super::super::ImageDeviceCapacityReport,
+        maximum_batch: usize,
     ) {
-        let (Some(mut context), Some((rejected_count, report))) = (context, rejected) else {
+        let Some(context) = context else {
             return;
         };
-        // Only an adjacent failure proves the maximum. A short queue or an
-        // independently constrained Host prefix must not become a device limit.
-        // A single-stage lower bound also proves this candidate cannot fit.
-        // Reaching that lower bound reopens search; it does not authorize it.
-        if rejected_count != count + 1 || report.required_bytes <= report.capacity_bytes {
+        // Only a typed fresh-plan failure reaches this method. A single-stage
+        // lower bound proves failure too. Success, short queues and Host limits
+        // are not device bounds. Distinct counts cannot exceed maximum_batch.
+        if count <= 1 || count > maximum_batch || report.required_bytes <= report.capacity_bytes {
             return;
         }
-        context.capacity_bytes = report.capacity_bytes;
-        self.0 = Some(Boundary {
-            context,
-            adapter: adapter.clone(),
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|old| old.shape != context.shape || old.adapter != *adapter)
+        {
+            self.0 = Some(Boundary {
+                shape: context.shape,
+                adapter: adapter.clone(),
+                rejected: Vec::new(),
+            });
+        }
+        let bounds = &mut self.0.as_mut().unwrap().rejected;
+        // A smaller rejected batch with an equal or stronger byte lower bound
+        // already excludes every candidate that the new observation excludes.
+        if bounds
+            .iter()
+            .any(|old| old.batch_size <= count && old.required_bytes >= report.required_bytes)
+        {
+            return;
+        }
+        bounds.retain(|old| {
+            !(count <= old.batch_size && report.required_bytes >= old.required_bytes)
+        });
+        bounds.push(RejectedBatch {
             batch_size: count,
-            next_required_bytes: report.required_bytes,
+            required_bytes: report.required_bytes,
         });
     }
 }

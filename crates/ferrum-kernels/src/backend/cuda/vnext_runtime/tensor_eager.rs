@@ -49,6 +49,9 @@ pub struct CudaTensorRuntimeAutoConfig {
 }
 
 pub(super) struct TensorEagerState {
+    // Drop the private cache before its capacity/bootstrap owners. Each tensor
+    // buffer retains this state until after its queued allocation-stream free.
+    pub(super) allocation_pool: Option<allocation::TensorAllocationPool>,
     // Bootstrap may retain the provisional owner. Drop its claim before the
     // final lower ceiling, which must govern all native owners until cleanup.
     _bootstrap: DeviceCapacityRetention,
@@ -416,6 +419,15 @@ impl CudaDeviceRuntime {
             hash.update((part.len() as u64).to_le_bytes());
             hash.update(part.as_bytes());
         }
+        // Allocator ownership/recovery is part of the executable runtime
+        // contract, including for explicitly bounded (non-auto) construction.
+        for implementation in [
+            include_bytes!("allocation.rs").as_slice(),
+            include_bytes!("allocation/pool.rs").as_slice(),
+        ] {
+            hash.update((implementation.len() as u64).to_le_bytes());
+            hash.update(implementation);
+        }
         if automatic.is_some() {
             let implementation = include_bytes!("tensor_eager/memory_policy.rs");
             hash.update((implementation.len() as u64).to_le_bytes());
@@ -444,6 +456,7 @@ impl CudaDeviceRuntime {
             )
             .map_err(CudaDeviceRuntimeError::capacity)?;
         let state = Arc::new(TensorEagerState {
+            allocation_pool: None,
             capacity,
             _bootstrap: bootstrap,
             memory_observation: None,
@@ -495,6 +508,39 @@ impl CudaDeviceRuntime {
                     .map_err(CudaDeviceRuntimeError::capacity)?;
             state.capacity = final_capacity;
             state.memory_observation = Some(observation);
+        }
+        if guard.native().context.has_async_alloc() {
+            let stream = Arc::clone(&guard.native().allocation_stream);
+            let state = Arc::get_mut(guard.owner_mut()).ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "CUDA allocator owner escaped before private pool construction",
+                )
+            })?;
+            let release_threshold_bytes = state
+                .memory_observation
+                .as_ref()
+                .map_or(
+                    config.usable_memory_bytes,
+                    CudaTensorMemoryObservation::effective_ceiling_bytes,
+                )
+                .checked_sub(overhead)
+                .filter(|bytes| *bytes > 0)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "CUDA tensor cache ceiling leaves no managed storage",
+                    )
+                })?;
+            state.allocation_pool = Some(
+                allocation::TensorAllocationPool::new(
+                    stream,
+                    release_threshold_bytes,
+                    state._bootstrap.clone(),
+                    state.capacity.clone(),
+                )
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("private tensor allocation pool creation", error)
+                })?,
+            );
         }
         let (mut runtime, state) = guard.into_parts();
         runtime.tensor_eager = Some(state);
@@ -551,10 +597,24 @@ impl CudaDeviceRuntime {
         let owner = self.tensor_eager.as_ref().ok_or_else(|| {
             CudaDeviceRuntimeError::contract("native owner requires bounded tensor runtime")
         })?;
-        owner
+        let retention = owner
             .capacity
             .reserve(DeviceOpaqueMemoryKind::Bootstrap, bytes)
-            .map_err(CudaDeviceRuntimeError::capacity)
+            .map_err(CudaDeviceRuntimeError::capacity)?;
+        // cuDNN/SDPA/CUTLASS allocate outside our managed pool. Return its
+        // idle physical backing before a newly admitted native owner is built;
+        // logical admission alone does not make those cached pages available.
+        // Do not change the threshold: repeated native-owner replacement must
+        // not accumulate historical allowances or disable future cache reuse.
+        if let Some(pool) = owner.allocation_pool.as_ref() {
+            self.allocation_stream.synchronize().map_err(|error| {
+                CudaDeviceRuntimeError::driver("native owner allocation synchronization", error)
+            })?;
+            pool.trim_idle().map_err(|error| {
+                CudaDeviceRuntimeError::driver("native owner allocation pool trim", error)
+            })?;
+        }
+        Ok(retention)
     }
 }
 
@@ -631,6 +691,7 @@ mod tests {
         };
         let capacity = DeviceCapacityOwner::open(&descriptor, 128).unwrap();
         let state = Arc::new(TensorEagerState {
+            allocation_pool: None,
             _bootstrap: capacity
                 .reserve(DeviceOpaqueMemoryKind::Bootstrap, 16)
                 .unwrap(),
