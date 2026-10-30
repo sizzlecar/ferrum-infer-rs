@@ -136,16 +136,34 @@ fn private_tensor_pool_outlives_runtime_and_yields_cache_to_native_owners() {
     let storage_allowance = runtime.reserve_tensor_opaque(8 * MIB as u64).unwrap();
     let mut base = pool.allocate(8 * MIB).unwrap();
     stream.memset_zeros(&mut base).unwrap();
-    let cached = pool.allocate(16 * MIB).unwrap();
+    stream.synchronize().unwrap();
+    // A small idle allocation can share an indivisible driver backing block
+    // with live storage. Expand beyond the observed live backing so this test
+    // exercises releasable blocks without hardcoding CUDA's page granularity.
+    let cached_bytes = pool
+        .snapshot()
+        .unwrap()
+        .reserved_bytes
+        .checked_mul(2)
+        .unwrap();
+    assert!(cached_bytes < threshold);
+    let cached = pool
+        .allocate(usize::try_from(cached_bytes).unwrap())
+        .unwrap();
     stream.synchronize().unwrap();
     drop(cached);
     stream.synchronize().unwrap();
     let before = pool.snapshot().unwrap();
-    assert!(before.reserved_bytes.saturating_sub(before.used_bytes) >= 16 * MIB as u64);
-    for _ in 0..2 {
+    assert!(before.reserved_bytes.saturating_sub(before.used_bytes) >= cached_bytes);
+    for repetition in 0..2 {
         let native = runtime.reserve_tensor_opaque(MIB as u64).unwrap();
-        assert!(pool.snapshot().unwrap().reserved_bytes < before.reserved_bytes);
-        assert_eq!(pool.snapshot().unwrap().release_threshold_bytes, threshold);
+        let after = pool.snapshot().unwrap();
+        eprintln!("native owner trim {repetition}: before={before:?}, after={after:?}");
+        assert!(
+            after.reserved_bytes < before.reserved_bytes,
+            "before={before:?}, after={after:?}"
+        );
+        assert_eq!(after.release_threshold_bytes, threshold);
         drop(native);
     }
     let (aligned_ptr, use_guard) = base.device_ptr(&stream);
