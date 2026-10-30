@@ -79,10 +79,13 @@ pub struct ImageServiceConfig {
 /// A single-use, generator-owned preparation. The default empty owner keeps
 /// existing generators usable; capacity-aware generators retain compiled plans.
 #[derive(Default)]
-pub struct ImageBatchPreparation(Option<Box<dyn Any + Send>>);
+pub struct ImageBatchPreparation(
+    Option<Box<dyn Any + Send>>,
+    Option<batch_efficiency::ExecutionContext>,
+);
 impl ImageBatchPreparation {
     pub fn new<T: Any + Send>(prepared: T) -> Self {
-        Self(Some(Box::new(prepared)))
+        Self(Some(Box::new(prepared)), None)
     }
     pub fn into_inner<T: Any + Send>(self) -> Result<T, ImageBatchError> {
         self.0
@@ -156,6 +159,25 @@ impl ImageRequestRef<'_> {
 /// only restrict the common width/height grouping enforced by this service.
 pub trait ImageGenerator: Send + 'static {
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
+        None
+    }
+    /// Optional metadata for reusing a previous capacity-search boundary. This
+    /// is only a search hint: preparation and execution admission still run.
+    /// A context must describe every row's complete capacity shape and current
+    /// available device ceiling. Return `None` for heterogeneous/unknown shapes.
+    fn capacity_search_context(
+        &self,
+        _requests: &[ImageRequestRef<'_>],
+    ) -> Option<ImageCapacitySearchContext> {
+        None
+    }
+    /// Successful, completed device work only. The service measures execution
+    /// wall time separately; these observations explain cold installations and
+    /// the weights this batch leaves missing for the next invocation.
+    fn batch_execution_feedback(
+        &self,
+        _outputs: &[ImageGenerationOutput],
+    ) -> Option<ImageBatchExecutionFeedback> {
         None
     }
     /// Exact physical Output peak from typed request/model metadata. This runs
@@ -289,6 +311,20 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
                 effective_identity: lora.identity.clone(),
                 strength_bits: lora.strength.to_bits(),
             })
+    }
+    fn capacity_search_context(
+        &self,
+        requests: &[ImageRequestRef<'_>],
+    ) -> Option<ImageCapacitySearchContext> {
+        self.service_capacity_search_context(requests)
+            .ok()
+            .flatten()
+    }
+    fn batch_execution_feedback(
+        &self,
+        outputs: &[ImageGenerationOutput],
+    ) -> Option<ImageBatchExecutionFeedback> {
+        self.service_batch_execution_feedback(outputs)
     }
     fn execution_output_bytes(
         &self,
@@ -858,6 +894,18 @@ trait BatchWorker: Send + 'static {
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
         None
     }
+    fn capacity_search_context(
+        &self,
+        _requests: &[&QueuedRequest],
+    ) -> Option<ImageCapacitySearchContext> {
+        None
+    }
+    fn batch_execution_feedback(
+        &self,
+        _outputs: &[Self::Output],
+    ) -> Option<ImageBatchExecutionFeedback> {
+        None
+    }
     fn execution_output_bytes(
         &self,
         _requests: &[&QueuedRequest],
@@ -944,6 +992,25 @@ impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
     type Output = ImageGenerationOutput;
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
         self.0.adapter_batch_identity()
+    }
+    fn capacity_search_context(
+        &self,
+        requests: &[&QueuedRequest],
+    ) -> Option<ImageCapacitySearchContext> {
+        let requests = requests
+            .iter()
+            .map(|request| match request {
+                QueuedRequest::Generate(request) => ImageRequestRef::Generate(request),
+                QueuedRequest::Edit(request, _) => ImageRequestRef::Edit(request),
+            })
+            .collect::<Vec<_>>();
+        self.0.capacity_search_context(&requests)
+    }
+    fn batch_execution_feedback(
+        &self,
+        outputs: &[Self::Output],
+    ) -> Option<ImageBatchExecutionFeedback> {
+        self.0.batch_execution_feedback(outputs)
     }
     fn execution_output_bytes(
         &self,
@@ -1585,6 +1652,10 @@ fn reject_pending<O>(state: &mut State<O>, kind: ImageServiceErrorKind) {
     state.queue_backing.take();
 }
 
+mod capacity_hint;
+pub use capacity_hint::ImageCapacitySearchContext;
+mod batch_efficiency;
+pub use batch_efficiency::{ImageBatchExecutionFeedback, ImageBatchStageFeedback};
 mod output_budget;
 mod output_gate;
 mod preparation;

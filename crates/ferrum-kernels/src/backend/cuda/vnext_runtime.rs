@@ -222,7 +222,7 @@ struct CudaAllocation {
     _tensor_owner: Option<Arc<tensor_eager::TensorEagerState>>,
 }
 
-/// Read-only observations of the device's current allocator pool. This does
+/// Read-only observations of an allocator pool. This does
 /// not identify a Ferrum capacity owner or certify physical reclamation.
 struct CudaAllocationPoolSnapshot {
     pool_identity: usize,
@@ -246,7 +246,7 @@ impl fmt::Debug for CudaAllocationPoolSnapshot {
 fn allocation_pool_snapshot(
     context: &CudaContext,
 ) -> Result<Option<CudaAllocationPoolSnapshot>, DriverError> {
-    use cudarc::driver::{result, sys::CUmemPool_attribute as Attr};
+    use cudarc::driver::result;
     if !context.has_async_alloc() {
         return Ok(None);
     }
@@ -255,18 +255,26 @@ fn allocation_pool_snapshot(
     // performed, and a diagnostic error never changes allocation behavior.
     unsafe {
         let pool = result::device::get_mem_pool(context.cu_device())?;
-        let read = |attribute| {
-            let mut value = 0_u64;
-            result::mem_pool::get_attribute(pool, attribute, (&mut value as *mut u64).cast())?;
-            Ok::<_, DriverError>(value)
-        };
-        Ok(Some(CudaAllocationPoolSnapshot {
-            pool_identity: pool as usize,
-            release_threshold_bytes: read(Attr::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)?,
-            reserved_bytes: read(Attr::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
-            used_bytes: read(Attr::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
-        }))
+        allocation_pool_snapshot_at(pool).map(Some)
     }
+}
+
+// The caller keeps the pool and its CUDA context alive for the observation.
+unsafe fn allocation_pool_snapshot_at(
+    pool: cudarc::driver::sys::CUmemoryPool,
+) -> Result<CudaAllocationPoolSnapshot, DriverError> {
+    use cudarc::driver::{result, sys::CUmemPool_attribute as Attr};
+    let read = |attribute| {
+        let mut value = 0_u64;
+        result::mem_pool::get_attribute(pool, attribute, (&mut value as *mut u64).cast())?;
+        Ok::<_, DriverError>(value)
+    };
+    Ok(CudaAllocationPoolSnapshot {
+        pool_identity: pool as usize,
+        release_threshold_bytes: read(Attr::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD)?,
+        reserved_bytes: read(Attr::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
+        used_bytes: read(Attr::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+    })
 }
 
 unsafe impl Send for CudaAllocation {}
@@ -4798,7 +4806,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .context
             .mem_get_info()
             .map_err(|error| CudaDeviceRuntimeError::driver("memory availability", error))?;
-        let reusable_pool_bytes = allocation_pool_snapshot(&self.context)
+        let reusable_pool_bytes = self
+            .allocation_pool_snapshot()
             .map_err(|error| CudaDeviceRuntimeError::driver("memory pool availability", error))?
             .map_or(0, |pool| {
                 pool.reserved_bytes.saturating_sub(pool.used_bytes)
@@ -4833,15 +4842,20 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA allocation size overflows"))?;
         let allocation_bytes = checked_usize(allocation_bytes, "CUDA allocation size")?;
         let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
-        let pool_before = trace_enabled.then(|| allocation_pool_snapshot(&self.context));
+        let pool_before = trace_enabled.then(|| self.allocation_pool_snapshot());
         let allocation_started = trace_enabled.then(Instant::now);
-        let base = allocation::allocate(&self.context, &self.allocation_stream, allocation_bytes)
-            .map_err(|error| {
+        let base = allocation::allocate(
+            &self.context,
+            &self.allocation_stream,
+            self.tensor_allocation_pool(),
+            allocation_bytes,
+        )
+        .map_err(|error| {
             tracing::error!(
                 resource_id = %request.resource_id(),
                 allocation_bytes,
                 device_memory_free_total = ?self.context.mem_get_info(),
-                allocator_pool = ?allocation_pool_snapshot(&self.context),
+                allocator_pool = ?self.allocation_pool_snapshot(),
                 error = ?error,
                 "CUDA allocation failed; native memory snapshot (not a reservation)"
             );
@@ -4862,7 +4876,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .checked_add(alignment - 1)
             .map(|pointer| pointer & !(alignment - 1))
             .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA aligned pointer overflows"))?;
-        let pool_before_sync = trace_enabled.then(|| allocation_pool_snapshot(&self.context));
+        let pool_before_sync = trace_enabled.then(|| self.allocation_pool_snapshot());
         let synchronization_started = trace_enabled.then(Instant::now);
         self.allocation_stream
             .synchronize()
@@ -4871,7 +4885,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             let sync_us = synchronization_started.map_or(0, |started| {
                 u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
             });
-            let pool_after_sync = allocation_pool_snapshot(&self.context);
+            let pool_after_sync = self.allocation_pool_snapshot();
             tracing::debug!(
                 runtime_instance = self.runtime_instance,
                 resource_id = %request.resource_id(),

@@ -220,20 +220,21 @@ impl ImageFp8HostCachePolicy {
             backing <= host.class_bytes(HostMemoryClass::WeightBacking) as u64,
             "FP8 Host caching needs {backing} WeightBacking bytes including the active conversion group"
         );
-        let total = [
-            HostMemoryClass::InputPreprocess,
-            HostMemoryClass::TransferStaging,
-            HostMemoryClass::Output,
-        ]
-        .into_iter()
-        .try_fold(backing, |bytes, class| {
-            bytes
-                .checked_add(host.class_bytes(class) as u64)
-                .context("FP8 Host coexistence bytes overflow")
-        })?;
+        // Input and output are ceilings on a shared account, not simultaneous
+        // reservations. Retained weights and conversion staging must leave
+        // room for either class; each live overlap is admitted by that same
+        // account. Summing both maxima would reject adaptive input/output
+        // sharing before any request had allocated a payload.
+        let io = host
+            .class_bytes(HostMemoryClass::InputPreprocess)
+            .max(host.class_bytes(HostMemoryClass::Output));
+        let total = backing
+            .checked_add(host.class_bytes(HostMemoryClass::TransferStaging) as u64)
+            .and_then(|bytes| bytes.checked_add(io as u64))
+            .context("FP8 Host coexistence bytes overflow")?;
         ensure!(
             total <= host.total_bytes() as u64,
-            "FP8 Host caching needs {total} total Host bytes including input, transfer and output allowances"
+            "FP8 Host caching needs {total} total Host bytes for weights, staging and either shared input/output ceiling"
         );
         Ok(())
     }
@@ -342,9 +343,22 @@ mod tests {
         let policy = policy();
         policy.validate_stage(ImageStage::TextEncoder, 400).unwrap();
         assert!(policy.validate_stage(ImageStage::TextEncoder, 401).is_err());
-        policy.validate_peak(host(924, 700), 100).unwrap();
-        assert!(policy.validate_peak(host(924, 699), 100).is_err());
-        assert!(policy.validate_peak(host(923, 700), 100).is_err());
+        policy.validate_peak(host(860, 700), 100).unwrap();
+        assert!(policy.validate_peak(host(860, 699), 100).is_err());
+        assert!(policy.validate_peak(host(859, 700), 100).is_err());
+        let account = ferrum_runtime::HostMemoryAccount::new(host(860, 700));
+        let _weights = account
+            .reserve(HostMemoryClass::WeightBacking, 700)
+            .unwrap();
+        let _staging = account
+            .reserve(HostMemoryClass::TransferStaging, 32)
+            .unwrap();
+        let input = account
+            .reserve(HostMemoryClass::InputPreprocess, 64)
+            .unwrap();
+        assert!(account.reserve(HostMemoryClass::Output, 128).is_err());
+        drop(input);
+        let _output = account.reserve(HostMemoryClass::Output, 128).unwrap();
         assert!(policy.validate_peak(host(1024, 800), u64::MAX).is_err());
         let overflowing = ImageFp8HostCachePolicy::StageBudgets {
             maximum_bytes_by_stage: ImageFp8HostCacheBudgets {

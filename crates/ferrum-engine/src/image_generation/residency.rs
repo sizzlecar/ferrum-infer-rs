@@ -14,6 +14,8 @@ pub enum ImageResidencyPolicy {
     Cold,
     /// Keep reusable sessions and static weights until a later compiled stage
     /// needs their capacity. Idle dynamic backing is reclaimed before weights.
+    /// Prefer a sufficient set of idle weights with the lowest observed reload
+    /// cost; stages without a reload observation use acquisition order.
     /// Actual device-account admission remains authoritative.
     Adaptive,
     /// Retain DiT and VAE static state between batches, releasing idle dynamic
@@ -643,6 +645,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 // These counters describe this acquisition, not the old batch.
                 previous.receipt.completed_executions = 0;
                 previous.receipt.execution_wall_durations_us.clear();
+                previous.receipt.device_profiles.clear();
                 previous.receipt.initialization_wall_duration_us = 0;
                 previous.receipt.session_reused = true;
                 previous.receipt.weights_reused = !matches!(
@@ -839,6 +842,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             if let Some(mut active) = self.resident_stages.slot(stage).and_then(Option::take) {
                 active.receipt.completed_executions = 0;
                 active.receipt.execution_wall_durations_us.clear();
+                active.receipt.device_profiles.clear();
                 active.receipt.initialization_wall_duration_us = 0;
                 active.receipt.plan.compile_wall_duration_us = 0;
                 active.receipt.session_reused = true;
@@ -885,6 +889,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             {
                 origin.completed_executions = 0;
                 origin.execution_wall_durations_us.clear();
+                origin.device_profiles.clear();
                 origin.initialization_wall_duration_us = 0;
                 origin.plan.compile_wall_duration_us = 0;
                 origin.session_reused = false;

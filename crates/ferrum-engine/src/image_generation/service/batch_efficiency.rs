@@ -1,0 +1,304 @@
+//! Online execution efficiency, separate from the authoritative capacity search.
+//! Samples contain no requests, images, compiled plans, or device owners.
+use super::*;
+use crate::image_generation::{ImageResidencyPolicy, ImageStage};
+
+#[derive(Debug, Clone)]
+pub struct ImageBatchStageFeedback {
+    pub stage: ImageStage,
+    /// Actual installation of new physical weights, never session attachment.
+    pub initialization_us: u64,
+    /// Whether the completed batch leaves this required installation resident.
+    pub weights_retained: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ImageBatchExecutionFeedback {
+    pub stages: Vec<ImageBatchStageFeedback>,
+}
+
+pub(super) struct ExecutionContext {
+    pub(super) context: ImageCapacitySearchContext,
+    pub(super) adapter: Option<Arc<ImageAdapterBatchIdentity>>,
+    /// Capacity-proof upper bound independent of a short queue or tail.
+    pub(super) capacity_upper: usize,
+    pub(super) batch_size: usize,
+}
+
+#[derive(Default)]
+pub(super) struct BatchEfficiency(Option<Domain>);
+
+struct Domain {
+    shape: [u8; 32],
+    adapter: Option<Arc<ImageAdapterBatchIdentity>>,
+    capacity_upper: usize,
+    batches: Vec<BatchSample>,
+    stages: Vec<StageSample>,
+    explored_from: Option<usize>,
+    savings_us: u64,
+}
+
+struct StageSample {
+    stage: ImageStage,
+    // The first installation may include disk reads/quantization. Only a later
+    // physical installation is an observed recurring reload cost.
+    reload_us: Option<u64>,
+}
+
+struct BatchSample {
+    count: usize,
+    base_us: u64,
+    last_execution_us: u64,
+    missing: Vec<ImageStage>,
+    eviction_observations: u64,
+}
+
+impl BatchSample {
+    fn cost(&self, stages: &[StageSample]) -> Option<u64> {
+        self.missing.iter().try_fold(self.base_us, |cost, stage| {
+            cost.checked_add(stages.iter().find(|s| s.stage == *stage)?.reload_us?)
+        })
+    }
+}
+
+impl Domain {
+    fn matches(
+        &self,
+        context: ImageCapacitySearchContext,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+    ) -> bool {
+        self.shape == context.shape && self.adapter == *adapter
+    }
+}
+
+impl BatchEfficiency {
+    /// Only shrink the already available FIFO prefix. Unknown costs and sizes
+    /// use the original capacity search; this never waits for more arrivals.
+    pub(super) fn select(
+        &mut self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        queued_upper: usize,
+        capacity_upper: usize,
+    ) -> usize {
+        let Some(context) = context else {
+            return queued_upper;
+        };
+        let Some(domain) = self.0.as_mut().filter(|d| d.matches(context, adapter)) else {
+            return queued_upper;
+        };
+        // Only crossing an actual capacity proof triggers early reassessment.
+        // Physical free-byte jitter and short queues do not reset learning.
+        if capacity_upper > domain.capacity_upper {
+            return queued_upper;
+        }
+        let Some(upper) = domain.batches.iter().find(|b| b.count == queued_upper) else {
+            return queued_upper;
+        };
+        let Some(upper_cost) = upper.cost(&domain.stages) else {
+            return queued_upper;
+        };
+        let largest = domain.batches.iter().map(|b| b.count).max().unwrap_or(1);
+        if queued_upper == largest && domain.savings_us >= upper.last_execution_us {
+            tracing::debug!(target: "ferrum_engine::image_generation::timing",
+                chosen_batch = queued_upper, capacity_upper, saved_us = domain.savings_us,
+                reason = "earned_larger_batch_reassessment",
+                "image batch efficiency selection");
+            return queued_upper;
+        }
+        // One adjacent real-work probe per observed larger size, only after
+        // repeated eviction and a known hot reload. Never walk a ladder of
+        // successively smaller probes, or compile a synthetic probe batch.
+        if queued_upper == largest
+            && queued_upper > 1
+            && upper.eviction_observations >= 2
+            && !upper.missing.is_empty()
+            && domain.explored_from != Some(largest)
+            && !domain.batches.iter().any(|b| b.count == largest - 1)
+        {
+            tracing::debug!(target: "ferrum_engine::image_generation::timing",
+                chosen_batch = largest - 1, observed_max_batch = largest, capacity_upper,
+                upper_base_us = upper.base_us, upper_reload_us = upper_cost - upper.base_us,
+                reason = "observe_adjacent_batch_after_recurring_reload",
+                "image batch efficiency selection");
+            return largest - 1;
+        }
+        let best = domain
+            .batches
+            .iter()
+            .filter(|b| b.count <= queued_upper)
+            .filter_map(|b| b.cost(&domain.stages).map(|cost| (b, cost)))
+            .min_by(|(left, lc), (right, rc)| {
+                (u128::from(*lc) * right.count as u128)
+                    .cmp(&(u128::from(*rc) * left.count as u128))
+                    // Equal per-image cost favors earlier completion.
+                    .then_with(|| left.count.cmp(&right.count))
+            });
+        let Some((best, cost)) = best else {
+            return queued_upper;
+        };
+        if best.count < queued_upper {
+            tracing::debug!(target: "ferrum_engine::image_generation::timing",
+                chosen_batch = best.count, observed_max_batch = largest, capacity_upper,
+                predicted_execution_us = cost, predicted_per_image_us = cost / best.count as u64,
+                predicted_reload_us = cost - best.base_us,
+                upper_predicted_per_image_us = upper_cost / queued_upper as u64,
+                reason = "observed_sustained_cost",
+                "image batch efficiency selection");
+        }
+        best.count
+    }
+
+    pub(super) fn observe(
+        &mut self,
+        execution: ExecutionContext,
+        elapsed: Duration,
+        feedback: ImageBatchExecutionFeedback,
+        maximum_batch: usize,
+    ) {
+        if execution.batch_size == 0
+            || execution.batch_size > maximum_batch
+            || feedback.stages.is_empty()
+        {
+            return;
+        }
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|d| !d.matches(execution.context, &execution.adapter))
+        {
+            self.0 = Some(Domain {
+                shape: execution.context.shape,
+                adapter: execution.adapter,
+                capacity_upper: execution.capacity_upper,
+                batches: Vec::new(),
+                stages: Vec::new(),
+                explored_from: None,
+                savings_us: 0,
+            });
+        }
+        let domain = self.0.as_mut().unwrap();
+        domain.capacity_upper = execution.capacity_upper;
+        let actual_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let mut initialization_us = 0_u64;
+        let mut cold = false;
+        let mut missing = Vec::new();
+        for stage in feedback.stages {
+            initialization_us = initialization_us.saturating_add(stage.initialization_us);
+            match domain.stages.iter_mut().find(|s| s.stage == stage.stage) {
+                Some(previous) if stage.initialization_us > 0 => {
+                    previous.reload_us = Some(stage.initialization_us);
+                }
+                Some(_) => (),
+                None => {
+                    cold |= stage.initialization_us > 0;
+                    domain.stages.push(StageSample {
+                        stage: stage.stage,
+                        reload_us: None,
+                    });
+                }
+            }
+            if !stage.weights_retained && !missing.contains(&stage.stage) {
+                missing.push(stage.stage);
+            }
+        }
+        // Cold initialization can also warm native plans/driver code beyond
+        // the explicit install timer. Do not use that batch to rank sizes.
+        if cold || actual_us <= initialization_us {
+            return;
+        }
+        let base_us = actual_us - initialization_us;
+        let previous_largest = domain.batches.iter().map(|b| b.count).max().unwrap_or(0);
+        if execution.batch_size + 1 == previous_largest {
+            domain.explored_from = Some(previous_largest);
+        }
+        let index = match domain
+            .batches
+            .iter()
+            .position(|b| b.count == execution.batch_size)
+        {
+            Some(index) => index,
+            None => {
+                domain.batches.push(BatchSample {
+                    count: execution.batch_size,
+                    base_us,
+                    last_execution_us: actual_us,
+                    missing: Vec::new(),
+                    eviction_observations: 0,
+                });
+                domain.batches.len() - 1
+            }
+        };
+        let sample = &mut domain.batches[index];
+        // A bounded moving estimate adapts to changed execution conditions.
+        // No old cold/sample-count minimum can permanently pin a chosen size.
+        sample.base_us = ((u128::from(sample.base_us) + u128::from(base_us)) / 2) as u64;
+        sample.last_execution_us = actual_us;
+        sample.eviction_observations = if missing.is_empty() {
+            0
+        } else {
+            sample.eviction_observations.saturating_add(1)
+        };
+        sample.missing = missing;
+        let cost = sample.cost(&domain.stages);
+        let largest = domain.batches.iter().max_by_key(|b| b.count).unwrap();
+        if execution.batch_size >= largest.count {
+            domain.savings_us = 0;
+        } else if let (Some(cost), Some(upper_cost)) = (cost, largest.cost(&domain.stages)) {
+            let counterfactual =
+                u128::from(upper_cost) * execution.batch_size as u128 / largest.count as u128;
+            domain.savings_us = domain.savings_us.saturating_add(
+                u64::try_from(counterfactual.saturating_sub(u128::from(cost))).unwrap_or(u64::MAX),
+            );
+        }
+        tracing::debug!(target: "ferrum_engine::image_generation::timing",
+            batch_size = execution.batch_size, actual_execution_us = actual_us,
+            actual_weight_installation_us = initialization_us, predicted_sustained_us = ?cost,
+            missing_weights = ?domain.batches[index].missing,
+            saved_us = domain.savings_us, "image batch efficiency observation");
+    }
+}
+
+impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
+    pub(super) fn service_batch_execution_feedback(
+        &self,
+        outputs: &[ImageGenerationOutput],
+    ) -> Option<ImageBatchExecutionFeedback> {
+        if self.config.residency != ImageResidencyPolicy::Adaptive {
+            return None;
+        }
+        let receipt = &outputs.first()?.receipt;
+        let mut feedback = ImageBatchExecutionFeedback::default();
+        for stage in &receipt.stages {
+            let execution = &stage.execution;
+            if execution.plan.static_bytes == 0 || execution.completed_executions == 0 {
+                continue;
+            }
+            let initialization_us = if execution.weights_reused {
+                0
+            } else {
+                execution.initialization_wall_duration_us
+            };
+            if let Some(previous) = feedback
+                .stages
+                .iter_mut()
+                .find(|s| s.stage == execution.plan.stage)
+            {
+                previous.initialization_us =
+                    previous.initialization_us.saturating_add(initialization_us);
+            } else {
+                feedback.stages.push(ImageBatchStageFeedback {
+                    stage: execution.plan.stage,
+                    initialization_us,
+                    weights_retained: self.resident_stages.has_weights(execution.plan.stage),
+                });
+            }
+        }
+        Some(feedback)
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests;
+#[cfg(test)]
+mod tests;

@@ -9,10 +9,12 @@ use std::{fmt, sync::Arc, time::Instant};
 use ferrum_runtime::*;
 
 mod admission;
+mod profile;
 mod request;
 mod serial_actor;
 mod wave_identity;
 pub use ferrum_runtime::TensorRequestStateMapping;
+pub use profile::{TensorExecutionProfile, TensorHostWallTimings};
 pub use request::{TensorRequestCloseFailure, TensorRequestSession};
 pub use serial_actor::{TensorSerialActor, TensorSerialActorStreamRequirements};
 #[cfg(test)]
@@ -22,6 +24,8 @@ mod output_slices;
 #[derive(Debug, Clone, Copy)]
 pub struct TensorExecutorConfig {
     pub maximum_backing_maintenance_passes: usize,
+    /// Explicit diagnostic observation; default execution allocates no events.
+    pub device_timing_mode: DeviceTimingMode,
 }
 
 impl TensorExecutorConfig {
@@ -48,6 +52,7 @@ impl Default for TensorExecutorConfig {
     fn default() -> Self {
         Self {
             maximum_backing_maintenance_passes: 8,
+            device_timing_mode: DeviceTimingMode::Off,
         }
     }
 }
@@ -197,6 +202,7 @@ pub struct PreparedTensorExecutor<R: DeviceRuntime> {
     reaper: Arc<CompletionReaper<R>>,
     config: TensorExecutorConfig,
     wave_identity: wave_identity::TensorWaveIdentityCache<R>,
+    last_profile: Option<TensorExecutionProfile>,
 }
 
 impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
@@ -284,6 +290,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             reaper: CompletionReaper::new(),
             config,
             wave_identity: wave_identity::TensorWaveIdentityCache::default(),
+            last_profile: None,
         })
     }
 
@@ -310,6 +317,10 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
     /// The same runtime reaper remains available for pending/indeterminate work.
     pub fn completion_reaper(&self) -> &Arc<CompletionReaper<R>> {
         &self.reaper
+    }
+
+    pub fn take_execution_profile(&mut self) -> Option<TensorExecutionProfile> {
+        self.last_profile.take()
     }
 
     pub fn execute(
@@ -346,10 +357,11 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         initialize: Option<(&TensorRequestStateTarget<R>, &[TensorRequestStateMapping])>,
         execution_lane: Option<&Arc<ExecutionLane<R>>>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
-        // Host wall observations only: native timing, synchronization and the
-        // admission/retirement sequence remain unchanged. The span also binds
-        // nested backend construction observations to this exact execution.
-        let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        // Device timing is explicit and defaults to Off. Host tracing alone
+        // does not enable events or alter the admission/retirement sequence.
+        self.last_profile = None;
+        let profile_enabled = self.config.device_timing_mode != DeviceTimingMode::Off;
+        let trace_enabled = profile_enabled || tracing::enabled!(tracing::Level::DEBUG);
         let trace = tracing::debug_span!(
             "tensor_execution",
             run_id = %run_id,
@@ -448,13 +460,15 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         let admission_wave_us =
             initial_admission_us.saturating_add(host_wall_us(admission_started));
         let encode_started = trace_enabled.then(Instant::now);
-        let dispatch = OperationDispatch::encode_and_submit_wave_with_inputs(
+        let dispatch = OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
             self.providers.providers(),
             &self.executable,
             &identity,
             std::iter::once(&active),
-            DeviceTimingMode::Off,
+            self.config.device_timing_mode,
             &uploads,
+            SubmissionExecutionPolicy::adaptive(),
+            &profile::NoHostDispatchTiming,
             wave,
             &lane,
             &self.reaper,
@@ -469,6 +483,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                 })
             }
         };
+        let (handle, submission_observation) = handle.into_parts();
         let encode_submit_us = host_wall_us(encode_started);
         let wait_started = trace_enabled.then(Instant::now);
         let observed = match handle.wait_with_managed_readbacks(readbacks) {
@@ -536,6 +551,32 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             });
         }
         let retire_us = host_wall_us(retire_started);
+        if profile_enabled {
+            self.last_profile = Some(TensorExecutionProfile {
+                attribution: submission_observation
+                    .into_parts()
+                    .1
+                    .map(|attribution| {
+                        attribution.bind_terminal_timing(receipt.submission_timing().clone())
+                    })
+                    .transpose()?,
+                completion: receipt,
+                host_wall_us: TensorHostWallTimings {
+                    readback_prepare: readback_prepare_us,
+                    sequence_admission: sequence_admission_us,
+                    step_admission: step_admission_us,
+                    wave_prepare: wave_prepare_us,
+                    identity_bind: identity_bind_us,
+                    uploads_prepare: uploads_prepare_us,
+                    lane_create: lane_create_us,
+                    encode_submit: encode_submit_us,
+                    wait_readback: wait_readback_us,
+                    drop_lane: drop_lane_us,
+                    retire: retire_us,
+                    total: host_wall_us(total_started),
+                },
+            });
+        }
         if trace_enabled {
             tracing::debug!(
                 admission_wave_us,

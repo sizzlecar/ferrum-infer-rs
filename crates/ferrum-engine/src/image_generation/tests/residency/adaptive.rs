@@ -240,7 +240,7 @@ fn adaptive_reclaims_only_needed_other_pool_and_keeps_target_reuse() {
 }
 
 #[test]
-fn adaptive_static_eviction_uses_lru_and_reloads_only_reclaimed_weights() {
+fn adaptive_static_eviction_without_reload_observations_uses_lru() {
     let (mut pipeline, _directory) = pipeline();
     pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
     let mut receipts = Vec::new();
@@ -250,6 +250,7 @@ fn adaptive_static_eviction_uses_lru_and_reloads_only_reclaimed_weights() {
         ImageStage::Decoder,
     ] {
         execute(&mut pipeline, kind, 1, 0, &mut receipts);
+        pipeline.resident_stages.set_weight_reload_timing(kind, 0);
     }
     let target = stage(&pipeline, ImageStage::Denoiser, 1);
     pipeline.config.device_capacity_bytes = 3 * target.plan.static_bytes + demand(&target);
@@ -271,6 +272,50 @@ fn adaptive_static_eviction_uses_lru_and_reloads_only_reclaimed_weights() {
     assert!(reused.session_reused && reused.weights_reused);
     let reloaded = execute(&mut pipeline, ImageStage::TextEncoder, 1, 3, &mut receipts);
     assert!(!reloaded.session_reused && !reloaded.weights_reused);
+    close(&mut pipeline);
+}
+
+#[test]
+fn adaptive_static_eviction_minimizes_reload_cost_and_preserves_live_capacity() {
+    let (mut pipeline, _directory) = pipeline();
+    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
+    let mut receipts = Vec::new();
+    for (kind, reload_us) in [
+        (ImageStage::TextEncoder, 90),
+        (ImageStage::VisionEncoder, 10),
+        (ImageStage::Decoder, 20),
+    ] {
+        execute(&mut pipeline, kind, 1, 0, &mut receipts);
+        // Supply deterministic measured costs without a wall-clock assertion.
+        // Static installations and their device-account ownership are real.
+        pipeline
+            .resident_stages
+            .set_weight_reload_timing(kind, reload_us);
+    }
+    let target = stage(&pipeline, ImageStage::Denoiser, 1);
+    let ceiling = 2 * target.plan.static_bytes + demand(&target);
+    pipeline.config.device_capacity_bytes = ceiling;
+    let offset = receipts.len();
+    execute(&mut pipeline, ImageStage::Denoiser, 1, 1, &mut receipts);
+    let evicted: Vec<_> = receipts[offset..]
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.retirement,
+                ImageStageRetirement::SharedWeightsClosed { .. }
+            )
+        })
+        .map(|r| r.execution.plan.stage)
+        .collect();
+    assert_eq!(evicted, [ImageStage::VisionEncoder, ImageStage::Decoder]);
+    let before = pipeline.runtime.snapshot().uploaded_bytes;
+    let reused = execute(&mut pipeline, ImageStage::TextEncoder, 1, 2, &mut receipts);
+    assert!(reused.session_reused && reused.weights_reused);
+    assert_eq!(pipeline.runtime.snapshot().uploaded_bytes - before, 128);
+    // Insufficient capacity still rejects before evicting useful installations.
+    pipeline.config.device_capacity_bytes = target.plan.static_bytes + demand(&target) - 1;
+    assert!(pipeline.start_stage(target, 3, &mut receipts).is_err());
+    pipeline.config.device_capacity_bytes = ceiling;
     close(&mut pipeline);
 }
 

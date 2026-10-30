@@ -345,6 +345,16 @@ impl RuntimePolicy for TensorPolicy {
 #[test]
 #[ignore = "requires exclusive CUDA; actual managed buffers and production BF16 SiLU PTX"]
 fn managed_cuda_silu_upload_execute_readback_and_retirement() {
+    assert_eq!(
+        TensorExecutorConfig::default().device_timing_mode,
+        DeviceTimingMode::Off
+    );
+    for mode in [DeviceTimingMode::Off, DeviceTimingMode::Kernel] {
+        managed_cuda_silu_with_timing(mode);
+    }
+}
+
+fn managed_cuda_silu_with_timing(mode: DeviceTimingMode) {
     // These are explicit conservative smoke-test reservations, not a measured
     // CUDA memory profile or a throughput/capacity qualification claim.
     let runtime = Arc::new(
@@ -406,7 +416,10 @@ fn managed_cuda_silu_upload_execute_readback_and_retirement() {
         registry.bind_plan(executable).unwrap(),
         resources.clone(),
         host.clone(),
-        TensorExecutorConfig::default(),
+        TensorExecutorConfig {
+            device_timing_mode: mode,
+            ..TensorExecutorConfig::default()
+        },
     )
     .unwrap();
     // A second execution exercises retirement and reuse of the one-flight lane.
@@ -419,6 +432,31 @@ fn managed_cuda_silu_upload_execute_readback_and_retirement() {
                 vec![input(&host, &config)],
             )
             .unwrap();
+        let profile = executor.take_execution_profile();
+        if mode == DeviceTimingMode::Off {
+            assert!(profile.is_none());
+        } else {
+            let profile = profile.expect("CUDA profile");
+            let attribution = profile.attribution.expect("CUDA command attribution");
+            let timing = attribution
+                .terminal_timing()
+                .measured()
+                .expect("CUDA event measurement");
+            assert!(!attribution.device().commands().is_empty());
+            assert_eq!(timing.spans().len(), attribution.device().commands().len());
+            for command in attribution.device().commands() {
+                let span = timing
+                    .span_for_command(command.command_index())
+                    .expect("each command has a physical interval");
+                assert_eq!(span.command_count(), 1);
+                assert!(span.measurement().elapsed_ns().is_some());
+            }
+            eprintln!(
+                "CUDA tensor profile preflight: execution={ordinal}, measured_commands={}",
+                timing.spans().len()
+            );
+        }
+        assert!(executor.take_execution_profile().is_none());
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].tensor().dimensions(), [2, 6]);
         assert!(host.owns(outputs[0].bytes()));

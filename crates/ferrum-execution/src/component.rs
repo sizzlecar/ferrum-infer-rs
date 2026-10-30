@@ -457,6 +457,13 @@ pub struct TensorComponentSession<R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> TensorComponentSession<R> {
+    pub fn take_execution_profile(&mut self) -> Option<crate::tensor::TensorExecutionProfile> {
+        self.executor
+            .as_mut()
+            .expect("live session owns executor")
+            .take_execution_profile()
+    }
+
     pub fn begin_request(
         &self,
         run_id: RunId,

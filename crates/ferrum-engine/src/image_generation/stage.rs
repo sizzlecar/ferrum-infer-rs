@@ -74,6 +74,8 @@ pub struct ImageStageExecutionReceipt {
     /// submission, completion wait and readback. A failed final attempt is
     /// retained here; this is not a CUDA event or kernel-only measurement.
     pub execution_wall_durations_us: Vec<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub device_profiles: Vec<ferrum_execution::tensor::TensorExecutionProfile>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -557,6 +559,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                         completed_executions: 0,
                         initialization_wall_duration_us: elapsed_us(started),
                         execution_wall_durations_us: Vec::new(),
+                        device_profiles: Vec::new(),
                     },
                     session,
                 },
@@ -620,6 +623,9 @@ impl<R: DeviceRuntime> ActiveImageStage<R> {
             .push(elapsed_us(started));
         match result {
             Ok(outputs) => {
+                if let Some(profile) = self.session.take_execution_profile() {
+                    self.receipt.device_profiles.push(profile);
+                }
                 self.receipt.completed_executions += 1;
                 Ok((self, outputs))
             }

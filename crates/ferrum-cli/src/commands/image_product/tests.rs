@@ -245,7 +245,7 @@ fn fp8_host_cache_is_explicit_budgeted_and_shared_by_run_and_serve() {
     wire["backend"]["fp8_host_cache"] = cache.clone();
     assert!(load(&wire).is_err()); // BF16 has no converted FP8 payload.
     wire["backend"]["precision_policy"] = json!("fp8_linear_experimental_v1");
-    wire["backend"]["host"] = json!({"total_bytes":5120,"input_preprocess_bytes":1024,
+    wire["backend"]["host"] = json!({"total_bytes":4096,"input_preprocess_bytes":1024,
         "transfer_staging_bytes":1024,"output_bytes":2048,"weight_backing_bytes":1024});
     let expected = ImageFp8HostCachePolicy::StageBudgets {
         maximum_bytes_by_stage: ImageFp8HostCacheBudgets {
@@ -268,9 +268,9 @@ fn fp8_host_cache_is_explicit_budgeted_and_shared_by_run_and_serve() {
         assert_eq!(config.fp8_host_cache, expected);
         #[cfg(feature = "cuda")]
         assert_eq!(config.resolved().unwrap().fp8_host_cache, expected);
-        wire["backend"]["host"]["total_bytes"] = json!(5119);
+        wire["backend"]["host"]["total_bytes"] = json!(4095);
         assert!(load(&wire).is_err());
-        wire["backend"]["host"]["total_bytes"] = json!(5120);
+        wire["backend"]["host"]["total_bytes"] = json!(4096);
         wire["backend"]["host"]["weight_backing_bytes"] = json!(1023);
         assert!(load(&wire).is_err());
         wire["backend"]["host"]["weight_backing_bytes"] = json!(1024);

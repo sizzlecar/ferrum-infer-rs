@@ -207,8 +207,16 @@ impl DirectoryOptions {
         self.serving_with_output_bytes(self.host().output_bytes)
     }
     pub(super) fn serving_with_output_bytes(&self, output_bytes: usize) -> Result<ServingConfig> {
+        self.serving_with_host_bytes(self.host().input_preprocess_bytes, output_bytes)
+    }
+    pub(super) fn serving_with_host_bytes(
+        &self,
+        input_preprocess_bytes: usize,
+        output_bytes: usize,
+    ) -> Result<ServingConfig> {
         self.validate()?;
-        let host = self.host();
+        let mut host = self.host();
+        host.input_preprocess_bytes = input_preprocess_bytes;
         let pending_bytes = host.default_pending_bytes()?;
         let automatic_cuda = self.backend == ImageBackendKind::Cuda
             && self.batching == ferrum_types::ImageBatchPolicy::Auto;
@@ -518,7 +526,10 @@ impl ImageProductSource {
                 Ok(PreparedProduct {
                     model,
                     profile: options.preset_name(),
-                    serving: Some(options.serving_with_output_bytes(backend.host_output_bytes())?),
+                    serving: Some(options.serving_with_host_bytes(
+                        backend.host_input_bytes(),
+                        backend.host_output_bytes(),
+                    )?),
                     backend,
                     assets,
                 })

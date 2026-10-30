@@ -227,7 +227,7 @@ fn execute_pipeline<R: ferrum_runtime::DeviceRuntime>(
 }
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos"), test))]
-fn open_image(path: &Path) -> anyhow::Result<(std::fs::File, usize)> {
+pub(super) fn open_image(path: &Path) -> anyhow::Result<(std::fs::File, usize)> {
     use ferrum_models::qwen_image21::image_input::ImageInputLimits;
     let file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
@@ -242,7 +242,7 @@ fn open_image(path: &Path) -> anyhow::Result<(std::fs::File, usize)> {
 }
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos"), test))]
-fn read_image(
+pub(super) fn read_image(
     host: &ferrum_runtime::HostMemoryAccount,
     mut file: std::fs::File,
     length: usize,

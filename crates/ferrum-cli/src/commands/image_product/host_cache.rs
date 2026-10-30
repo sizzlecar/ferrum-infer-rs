@@ -38,6 +38,16 @@ pub(super) struct AutoOutputReceipt {
 }
 
 #[derive(Debug, Serialize)]
+pub(super) struct AutoInputReceipt {
+    pub policy: &'static str,
+    pub observed_available_bytes: u64,
+    pub reserved_non_input_bytes: usize,
+    pub effective_input_preprocess_bytes: usize,
+    pub maximum_pending_bytes: usize,
+    pub ownership_scope: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 pub(super) struct AutoHostCacheReceipt {
     pub policy: &'static str,
     pub decision: AutoHostCacheDecision,
@@ -50,6 +60,8 @@ pub(super) struct AutoHostCacheReceipt {
     pub lora: Option<ImageLoraHostRequirements>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_selection: Option<AutoOutputReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_selection: Option<AutoInputReceipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observation_error: Option<String>,
     pub observation_scope: &'static str,
@@ -90,18 +102,73 @@ pub(super) fn for_directory(
             output.maximum_height.into(),
         )?,
     )?;
+    let single = assets.output_requirements(
+        &options.single_request().pipeline().resolved_limits()?,
+        &account,
+    )?;
+    let minimum_output_bytes = single
+        .execution_output_bytes
+        .checked_add(single.raw_batch_bytes)
+        .and_then(|bytes| {
+            response_bytes
+                .checked_mul(2)
+                .and_then(|response| bytes.checked_add(response))
+        })
+        .context("single image output headroom overflows")?;
     // One snapshot covers both decisions after archive mapping, before CUDA
     // construction or managed payload allocation. BF16 also sizes output.
     let available = ferrum_kernels::backend::cpu::vnext_runtime::host_memory_available()
         .map_err(|error| error.to_string());
     let lora = assets.lora_host_requirements(options.precision, host.limits()?)?;
-    select_with_lora(
+    let observed = available.clone();
+    let selected = select_with_lora(
         host,
         requirements,
         lora,
         Some((output, response_bytes)),
         available,
-    )
+    )?;
+    share_available_input(selected, observed, minimum_output_bytes)
+}
+
+fn share_available_input(
+    mut selected: AutoHostCacheSelection,
+    available: Result<u64, String>,
+    minimum_output_bytes: usize,
+) -> Result<AutoHostCacheSelection> {
+    let Ok(observed) = available else {
+        return Ok(selected);
+    };
+    let total = usize::try_from(observed)
+        .unwrap_or(isize::MAX as usize)
+        .min(isize::MAX as usize);
+    let host = &mut selected.host;
+    // Keep room for weight installation/cache and one overlapping execution.
+    // Input and larger output maxima share the same authoritative total, so an
+    // unused output allowance does not strand physical memory needed by edits.
+    let reserved = host
+        .weight_backing_bytes
+        .checked_add(host.transfer_staging_bytes)
+        .and_then(|bytes| bytes.checked_add(minimum_output_bytes))
+        .context("image non-input Host headroom overflows")?;
+    let input = total
+        .checked_sub(reserved)
+        .filter(|&bytes| bytes > 1)
+        .context("available Host memory cannot fit image input and execution headroom")?;
+    host.total_bytes = total;
+    host.input_preprocess_bytes = input;
+    host.output_bytes = host.output_bytes.min(total);
+    host.limits()?;
+    selected.receipt.effective_host_total_bytes = total;
+    selected.receipt.input_selection = Some(AutoInputReceipt {
+        policy: "available_memory_with_weight_and_execution_headroom",
+        observed_available_bytes: observed,
+        reserved_non_input_bytes: reserved,
+        effective_input_preprocess_bytes: input,
+        maximum_pending_bytes: host.default_pending_bytes()?.get(),
+        ownership_scope: "input and output class maxima share one live Host total; queue uses half the input ceiling, leaving preparation headroom; no payload preallocation",
+    });
+    Ok(selected)
 }
 
 #[cfg(test)]
@@ -131,6 +198,7 @@ fn select_with_lora(
         effective_weight_backing_bytes: host.weight_backing_bytes,
         lora,
         output_selection: None,
+        input_selection: None,
         observation_error: None,
         observation_scope: "available physical memory limited by remaining process address space and cgroup headroom; snapshot only, no OS reservation; managed Host allocations remain checked; mmap/page-cache, allocator and native-library memory are outside the Host ledger",
     };
@@ -294,6 +362,44 @@ mod tests {
             transfer_staging_bytes: 100,
             output_bytes: 300,
             weight_backing_bytes: 200,
+        }
+    }
+
+    #[test]
+    fn automatic_input_uses_available_memory_and_preserves_execution_headroom() {
+        for available in [2000u64, 8000] {
+            let selected = select(host(), None, None, Ok(available)).unwrap();
+            let selected = share_available_input(selected, Ok(available), 300).unwrap();
+            let expected = available as usize - 200 - 100 - 300;
+            assert_eq!(selected.host.total_bytes, available as usize);
+            assert_eq!(selected.host.input_preprocess_bytes, expected);
+            assert_eq!(
+                selected.host.default_pending_bytes().unwrap().get(),
+                expected / 2
+            );
+            let account = ferrum_runtime::HostMemoryAccount::new(selected.host.limits().unwrap());
+            // Maxima share the parent: input cannot spend the execution reserve.
+            let input = account
+                .reserve(ferrum_runtime::HostMemoryClass::InputPreprocess, expected)
+                .unwrap();
+            let weights = account
+                .reserve(ferrum_runtime::HostMemoryClass::WeightBacking, 200)
+                .unwrap();
+            let staging = account
+                .reserve(ferrum_runtime::HostMemoryClass::TransferStaging, 100)
+                .unwrap();
+            let output = account
+                .reserve(ferrum_runtime::HostMemoryClass::Output, 300)
+                .unwrap();
+            assert!(account
+                .reserve(ferrum_runtime::HostMemoryClass::InputPreprocess, 1)
+                .is_err());
+            assert_eq!(
+                account.usage().unwrap().committed_bytes(),
+                available as usize
+            );
+            drop((input, weights, staging, output));
+            assert_eq!(account.usage().unwrap().committed_bytes(), 0);
         }
     }
 

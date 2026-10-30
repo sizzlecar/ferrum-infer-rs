@@ -76,6 +76,7 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
             completed_executions: 0,
             initialization_wall_duration_us: 0,
             execution_wall_durations_us: Vec::new(),
+            device_profiles: Vec::new(),
         },
         session,
     };

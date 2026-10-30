@@ -287,53 +287,127 @@ fn reject_candidate<O>(
     }
 }
 
-/// Charge the metadata-proven retained input bound before decoding. This is a
-/// waiting-queue quota; the shared Host account still authorizes every actual
-/// backing (including transient decode/resize and execution allocations).
+/// Select a FIFO prefix whose retained preprocessing fits live Host capacity.
+/// The waiting quota bounds queued ownership; preparation can use the separate
+/// input headroom kept for active work. Every real allocation remains admitted
+/// by the shared account, including decode/resize scratch.
 fn reserve_preprocessing<O: Send + 'static>(
     worker: &dyn BatchWorker<Output = O>,
-    batch: &mut [Queued<O>],
+    batch: &mut Vec<Queued<O>>,
     shared: &Shared<O>,
-) -> Result<(), ImageBatchError> {
+) -> Result<bool, ImageBatchError> {
     let bounds = batch
         .iter()
         .map(|job| worker.preparation_bytes(&job.request))
         .collect::<Result<Vec<_>, _>>()?;
-    let extra = bounds
-        .iter()
-        .zip(batch.iter())
-        .try_fold(0_usize, |sum, (&bound, job)| {
-            sum.checked_add(bound.saturating_sub(job.preprocessing_bytes))
-        })
-        .ok_or_else(|| {
-            ImageBatchError::Overloaded("image prepared-input byte bound overflows".into())
-        })?;
     let mut state = shared.lock();
     let queued = state.queue.iter().map(Queued::pending_bytes).sum::<usize>();
-    if queued
-        .saturating_add(state.preparing_bytes)
-        .saturating_add(extra)
-        > shared.config.maximum_pending_bytes
-    {
-        return Err(ImageBatchError::Overloaded(
-            "image prepared inputs exceed waiting Host byte budget".into(),
-        ));
+    let mut extra = 0usize;
+    let mut keep = 0usize;
+    for (job, &bound) in batch.iter().zip(&bounds) {
+        let next = extra
+            .checked_add(bound.saturating_sub(job.preprocessing_bytes))
+            .ok_or_else(|| {
+                ImageBatchError::Overloaded("image prepared-input byte bound overflows".into())
+            })?;
+        let admission = match &shared.host {
+            Some(host) => host
+                .check_scope_admission(&[(HostMemoryClass::InputPreprocess, next)])
+                .map_err(|error| preparation_error(error.into())),
+            None if queued
+                .saturating_add(state.preparing_bytes)
+                .saturating_add(next)
+                <= shared.config.maximum_pending_bytes =>
+            {
+                Ok(())
+            }
+            None => Err(ImageBatchError::Overloaded(
+                "image prepared inputs exceed waiting Host byte budget".into(),
+            )),
+        };
+        if let Err(error) = admission {
+            if keep > 0 {
+                break;
+            }
+            let wait_for_output = if let Some(host) = &shared.host {
+                let held = batch
+                    .iter()
+                    .filter_map(|job| job.output.as_ref())
+                    .filter(|output| output.lease.is_some())
+                    .try_fold(0usize, |total, output| {
+                        total.checked_add(output.gate.host_output_bytes(host))
+                    })
+                    .ok_or_else(|| {
+                        ImageBatchError::Overloaded("held output credit overflows".into())
+                    })?;
+                host.check_scope_after_output_release(
+                    &[(HostMemoryClass::InputPreprocess, next)],
+                    held,
+                )
+                .is_ok()
+            } else {
+                false
+            };
+            drop(state);
+            // A request that cannot fit must not discard later FIFO jobs.
+            return_tail(batch, 1, shared, false);
+            return if wait_for_output {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        extra = next;
+        keep += 1;
     }
-    for (job, bound) in batch.iter_mut().zip(bounds) {
+    for (job, bound) in batch.iter_mut().take(keep).zip(bounds) {
         job.preprocessing_bytes = job.preprocessing_bytes.max(bound);
     }
     state.preparing_bytes += extra;
-    Ok(())
+    drop(state);
+    return_tail(batch, keep, shared, false);
+    Ok(true)
 }
 
-/// Search the already-owned FIFO candidate without publishing or executing a
-/// probe. Only a typed fresh-plan capacity failure permits a smaller prefix.
-fn prepare_capacity_prefix<O: Send + 'static>(
+/// Select an already-owned FIFO prefix using completed execution observations,
+/// then search its capacity without submitting speculative device work. Only
+/// a typed fresh-plan capacity failure permits a smaller capacity-search bound.
+pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
     worker: &mut dyn BatchWorker<Output = O>,
     batch: &mut Vec<Queued<O>>,
     shared: &Shared<O>,
+    hint: &mut capacity_hint::CapacitySearchHint,
+    efficiency: &mut batch_efficiency::BatchEfficiency,
 ) -> Result<ImageBatchPreparation, ImageBatchError> {
-    let mut upper = batch.len();
+    let context = (shared.config.batching == ImageBatchPolicy::Auto)
+        .then(|| {
+            worker
+                .capacity_search_context(&batch.iter().map(|job| &job.request).collect::<Vec<_>>())
+        })
+        .flatten();
+    let adapter = batch[0].adapter.clone();
+    let capacity_upper = hint.upper(context, &adapter, shared.config.max_num_seqs);
+    let mut upper = batch.len().min(capacity_upper);
+    if upper < batch.len() {
+        tracing::debug!(
+            target: "ferrum_engine::image_generation::timing",
+            queued_batch = batch.len(),
+            candidate_batch = upper,
+            "image capacity search reuses a verified shape boundary"
+        );
+    }
+    upper = efficiency.select(context, &adapter, upper, capacity_upper);
+    let bind_feedback = |mut prepared: ImageBatchPreparation,
+                         count: usize,
+                         hint: &capacity_hint::CapacitySearchHint| {
+        prepared.1 = context.map(|context| batch_efficiency::ExecutionContext {
+            context,
+            adapter: adapter.clone(),
+            capacity_upper: hint.upper(Some(context), &adapter, shared.config.max_num_seqs),
+            batch_size: count,
+        });
+        prepared
+    };
     let mut candidate = upper;
     let mut best: Option<(usize, ImageBatchPreparation)> = None;
     loop {
@@ -345,7 +419,7 @@ fn prepare_capacity_prefix<O: Send + 'static>(
         match outcome {
             Ok(prepared) if candidate == upper => {
                 return_tail(batch, candidate, shared, false);
-                return Ok(prepared);
+                return Ok(bind_feedback(prepared, candidate, hint));
             }
             Ok(prepared) => {
                 best = Some((candidate, prepared));
@@ -354,6 +428,13 @@ fn prepare_capacity_prefix<O: Send + 'static>(
                 if shared.config.batching == ImageBatchPolicy::Auto && candidate > 1 =>
             {
                 upper = candidate - 1;
+                hint.remember(
+                    context,
+                    &adapter,
+                    candidate,
+                    proof.report,
+                    shared.config.max_num_seqs,
+                );
                 {
                     let mut state = shared.lock();
                     state.capacity_reductions = state.capacity_reductions.saturating_add(1);
@@ -371,7 +452,7 @@ fn prepare_capacity_prefix<O: Send + 'static>(
         if lower == upper {
             let (count, prepared) = best.expect("a positive fitting prefix was retained");
             return_tail(batch, count, shared, false);
-            return Ok(prepared);
+            return Ok(bind_feedback(prepared, count, hint));
         }
         candidate = lower + (upper - lower).div_ceil(2);
     }
@@ -385,6 +466,8 @@ pub(super) fn worker_loop<O: Send + 'static>(
         .host
         .as_ref()
         .map(|host| host.subscribe_capacity(shared.resources.waker()));
+    let mut capacity_hint = capacity_hint::CapacitySearchHint::default();
+    let mut efficiency = batch_efficiency::BatchEfficiency::default();
     let run = catch_unwind(AssertUnwindSafe(|| {
         'batches: while let Some(mut batch) = take_batch(worker.as_ref(), &shared) {
             let prepared = 'prepare: loop {
@@ -398,16 +481,36 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     Err(failure) => break Err(failure),
                 }
                 let preparation_started = Instant::now();
+                let observed = shared.resources.epoch();
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    reserve_preprocessing(worker.as_ref(), &mut batch, &shared)?;
-                    prepare_capacity_prefix(worker.as_mut(), &mut batch, &shared)
+                    if !reserve_preprocessing(worker.as_ref(), &mut batch, &shared)? {
+                        return Ok(None);
+                    }
+                    prepare_capacity_prefix(
+                        worker.as_mut(),
+                        &mut batch,
+                        &shared,
+                        &mut capacity_hint,
+                        &mut efficiency,
+                    )
+                    .map(Some)
                 }));
                 let elapsed = preparation_started.elapsed();
                 for job in &mut batch {
                     job.preparation_duration = job.preparation_duration.saturating_add(elapsed);
                 }
                 match outcome {
-                    Ok(Ok(mut prepared)) => {
+                    Ok(Ok(None)) => {
+                        if !shared.lock().closing
+                            && !batch
+                                .iter()
+                                .any(|job| job.cancelled.load(Ordering::Acquire))
+                        {
+                            shared.resources.wait(observed);
+                        }
+                        continue 'prepare;
+                    }
+                    Ok(Ok(Some(mut prepared))) => {
                         loop {
                             let observed = shared.resources.epoch();
                             if remove_cancelled(&mut batch, &mut shared.lock()) {
@@ -533,8 +636,28 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     job.output,
                 ));
             }
-            let outcome = prepared.and_then(|(prepared, _)| {
-                match catch_unwind(AssertUnwindSafe(|| worker.execute(prepared, requests))) {
+            let outcome = prepared.and_then(|(mut prepared, _)| {
+                let feedback_context = prepared.1.take();
+                match catch_unwind(AssertUnwindSafe(|| {
+                    let started = Instant::now();
+                    let outcome = worker.execute(prepared, requests);
+                    let elapsed = started.elapsed();
+                    if let Ok(outputs) = &outcome {
+                        if outputs.len() == responses.len() {
+                            if let (Some(context), Some(feedback)) =
+                                (feedback_context, worker.batch_execution_feedback(outputs))
+                            {
+                                efficiency.observe(
+                                    context,
+                                    elapsed,
+                                    feedback,
+                                    shared.config.max_num_seqs,
+                                );
+                            }
+                        }
+                    }
+                    outcome
+                })) {
                     Ok(Ok(outputs)) if outputs.len() == responses.len() => Ok(outputs),
                     Ok(Ok(_)) => Err(ImageWorkerFailure::Generation(Box::new(service_error(
                         ImageServiceErrorKind::Generation,
