@@ -370,9 +370,8 @@ fn reserve_preprocessing<O: Send + 'static>(
 }
 
 /// Select an already-owned FIFO prefix using completed execution observations,
-/// then prepare its current capacity without submitting speculative device work.
-/// Only a typed fresh-plan capacity failure permits shrinking. A complete shape
-/// context executes the first fitting prefix; other generators keep full search.
+/// then search its capacity without submitting speculative device work. Only
+/// a typed fresh-plan capacity failure permits a smaller capacity-search bound.
 pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
     worker: &mut dyn BatchWorker<Output = O>,
     batch: &mut Vec<Queued<O>>,
@@ -418,11 +417,13 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
             .collect::<Vec<_>>();
         let outcome = worker.prepare(&mut requests);
         match outcome {
-            Ok(prepared) if context.is_some() || candidate == upper => {
+            Ok(prepared) if candidate == upper => {
                 return_tail(batch, candidate, shared, false);
                 return Ok(bind_feedback(prepared, candidate, hint));
             }
-            Ok(prepared) => best = Some((candidate, prepared)),
+            Ok(prepared) => {
+                best = Some((candidate, prepared));
+            }
             Err(ImageBatchError::Capacity { proof, .. })
                 if shared.config.batching == ImageBatchPolicy::Auto && candidate > 1 =>
             {
@@ -447,22 +448,13 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
             }
             Err(error) => return Err(error),
         }
-        // Descend only after a fresh capacity failure, then execute the first
-        // fitting prefix. A previous short queue must not force small batches
-        // or make waiting requests pay for an execution-by-execution ramp.
-        if context.is_some() {
-            candidate = upper.div_ceil(2);
-        } else {
-            // Generators without a complete capacity context cannot reuse a
-            // success across dispatches. Preserve their original full search.
-            let lower = best.as_ref().map_or(0, |(count, _)| *count);
-            if lower == upper {
-                let (count, prepared) = best.expect("a fitting prefix was retained");
-                return_tail(batch, count, shared, false);
-                return Ok(bind_feedback(prepared, count, hint));
-            }
-            candidate = lower + (upper - lower).div_ceil(2);
+        let lower = best.as_ref().map_or(0, |(count, _)| *count);
+        if lower == upper {
+            let (count, prepared) = best.expect("a positive fitting prefix was retained");
+            return_tail(batch, count, shared, false);
+            return Ok(bind_feedback(prepared, count, hint));
         }
+        candidate = lower + (upper - lower).div_ceil(2);
     }
 }
 
