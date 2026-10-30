@@ -11,8 +11,15 @@ fn compare_all_queries(nodes: &[PlanNode]) {
         .map(|node| (node.id.clone(), node))
         .collect::<BTreeMap<_, _>>();
     let mut ids = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
+    ids.extend(
+        nodes
+            .iter()
+            .flat_map(|node| node.dependencies.iter().cloned()),
+    );
     ids.push(NodeId::new("node/missing").unwrap());
     ids.push(NodeId::new("node/unrelated").unwrap());
+    ids.sort();
+    ids.dedup();
     let mut cache = CompletionOrderCache::new(&by_id);
     // Exercise reuse within one successor and replacement between successors.
     for successor in ids.iter().chain(ids.iter().rev()) {
@@ -68,6 +75,29 @@ fn cached_completion_order_preserves_missing_dependency_early_return_order() {
     compare_all_queries(&nodes);
     let by_id = nodes.iter().map(|node| (node.id.clone(), node)).collect();
     assert!(CompletionOrderCache::new(&by_id).precedes(&a, &c).unwrap());
+}
+
+#[test]
+fn cached_completion_order_preserves_distinct_missing_ids_and_duplicate_edges() {
+    let mut nodes = vec![
+        plan_node("node/a", &[], &[]),
+        plan_node(
+            "node/b",
+            &[
+                "node/missing-first",
+                "node/a",
+                "node/missing-last",
+                "node/a",
+            ],
+            &[],
+        ),
+        plan_node("node/c", &["node/b", "node/a"], &[]),
+    ];
+    // All referenced IDs are queried as both predecessor and successor,
+    // including absent successors and the missing ID at the DFS stopping point.
+    compare_all_queries(&nodes);
+    nodes[1].dependencies.reverse();
+    compare_all_queries(&nodes);
 }
 
 #[test]
