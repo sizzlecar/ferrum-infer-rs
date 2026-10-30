@@ -118,10 +118,16 @@ fn prepare(
         state.preparing = count;
         state.preparing_bytes = batch.iter().map(Queued::pending_bytes).sum();
     }
-    let prepared = scheduler::prepare_capacity_prefix(worker, &mut batch, &shared, hint)
-        .unwrap()
-        .into_inner::<Vec<u64>>()
-        .unwrap();
+    let prepared = scheduler::prepare_capacity_prefix(
+        worker,
+        &mut batch,
+        &shared,
+        hint,
+        &mut batch_efficiency::BatchEfficiency::default(),
+    )
+    .unwrap()
+    .into_inner::<Vec<u64>>()
+    .unwrap();
     let selected = batch
         .iter()
         .map(|job| job.request.generation().seed)

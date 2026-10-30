@@ -369,22 +369,25 @@ fn reserve_preprocessing<O: Send + 'static>(
     Ok(true)
 }
 
-/// Search the already-owned FIFO candidate without publishing or executing a
-/// probe. Only a typed fresh-plan capacity failure permits a smaller prefix.
+/// Select an already-owned FIFO prefix using completed execution observations,
+/// then search its capacity without submitting speculative device work. Only
+/// a typed fresh-plan capacity failure permits a smaller capacity-search bound.
 pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
     worker: &mut dyn BatchWorker<Output = O>,
     batch: &mut Vec<Queued<O>>,
     shared: &Shared<O>,
     hint: &mut capacity_hint::CapacitySearchHint,
+    efficiency: &mut batch_efficiency::BatchEfficiency,
 ) -> Result<ImageBatchPreparation, ImageBatchError> {
-    let context = (shared.config.batching == ImageBatchPolicy::Auto && batch.len() > 1)
+    let context = (shared.config.batching == ImageBatchPolicy::Auto)
         .then(|| {
             worker
                 .capacity_search_context(&batch.iter().map(|job| &job.request).collect::<Vec<_>>())
         })
         .flatten();
     let adapter = batch[0].adapter.clone();
-    let mut upper = hint.upper(context, &adapter, batch.len());
+    let capacity_upper = hint.upper(context, &adapter, shared.config.max_num_seqs);
+    let mut upper = batch.len().min(capacity_upper);
     if upper < batch.len() {
         tracing::debug!(
             target: "ferrum_engine::image_generation::timing",
@@ -393,6 +396,18 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
             "image capacity search reuses a verified shape boundary"
         );
     }
+    upper = efficiency.select(context, &adapter, upper, capacity_upper);
+    let bind_feedback = |mut prepared: ImageBatchPreparation,
+                         count: usize,
+                         hint: &capacity_hint::CapacitySearchHint| {
+        prepared.1 = context.map(|context| batch_efficiency::ExecutionContext {
+            context,
+            adapter: adapter.clone(),
+            capacity_upper: hint.upper(Some(context), &adapter, shared.config.max_num_seqs),
+            batch_size: count,
+        });
+        prepared
+    };
     let mut candidate = upper;
     let mut best: Option<(usize, ImageBatchPreparation)> = None;
     loop {
@@ -404,7 +419,7 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
         match outcome {
             Ok(prepared) if candidate == upper => {
                 return_tail(batch, candidate, shared, false);
-                return Ok(prepared);
+                return Ok(bind_feedback(prepared, candidate, hint));
             }
             Ok(prepared) => {
                 best = Some((candidate, prepared));
@@ -437,7 +452,7 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
         if lower == upper {
             let (count, prepared) = best.expect("a positive fitting prefix was retained");
             return_tail(batch, count, shared, false);
-            return Ok(prepared);
+            return Ok(bind_feedback(prepared, count, hint));
         }
         candidate = lower + (upper - lower).div_ceil(2);
     }
@@ -452,6 +467,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
         .as_ref()
         .map(|host| host.subscribe_capacity(shared.resources.waker()));
     let mut capacity_hint = capacity_hint::CapacitySearchHint::default();
+    let mut efficiency = batch_efficiency::BatchEfficiency::default();
     let run = catch_unwind(AssertUnwindSafe(|| {
         'batches: while let Some(mut batch) = take_batch(worker.as_ref(), &shared) {
             let prepared = 'prepare: loop {
@@ -475,6 +491,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
                         &mut batch,
                         &shared,
                         &mut capacity_hint,
+                        &mut efficiency,
                     )
                     .map(Some)
                 }));
@@ -619,8 +636,28 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     job.output,
                 ));
             }
-            let outcome = prepared.and_then(|(prepared, _)| {
-                match catch_unwind(AssertUnwindSafe(|| worker.execute(prepared, requests))) {
+            let outcome = prepared.and_then(|(mut prepared, _)| {
+                let feedback_context = prepared.1.take();
+                match catch_unwind(AssertUnwindSafe(|| {
+                    let started = Instant::now();
+                    let outcome = worker.execute(prepared, requests);
+                    let elapsed = started.elapsed();
+                    if let Ok(outputs) = &outcome {
+                        if outputs.len() == responses.len() {
+                            if let (Some(context), Some(feedback)) =
+                                (feedback_context, worker.batch_execution_feedback(outputs))
+                            {
+                                efficiency.observe(
+                                    context,
+                                    elapsed,
+                                    feedback,
+                                    shared.config.max_num_seqs,
+                                );
+                            }
+                        }
+                    }
+                    outcome
+                })) {
                     Ok(Ok(outputs)) if outputs.len() == responses.len() => Ok(outputs),
                     Ok(Ok(_)) => Err(ImageWorkerFailure::Generation(Box::new(service_error(
                         ImageServiceErrorKind::Generation,
