@@ -370,9 +370,9 @@ fn reserve_preprocessing<O: Send + 'static>(
 }
 
 /// Select an already-owned FIFO prefix using completed execution observations,
-/// then prepare at most one larger candidate before falling back to previously
-/// completed work. Only a typed fresh-plan capacity failure permits shrinking;
-/// no speculative device work is submitted and every fallback is prepared anew.
+/// then prepare its current capacity without submitting speculative device work.
+/// Only a typed fresh-plan capacity failure permits shrinking. A complete shape
+/// context executes the first fitting prefix; other generators keep full search.
 pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
     worker: &mut dyn BatchWorker<Output = O>,
     batch: &mut Vec<Queued<O>>,
@@ -397,16 +397,7 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
             "image capacity search reuses a verified shape boundary"
         );
     }
-    let known = hint
-        .successful(context, &adapter)
-        .map(|count| count.min(upper));
-    let selection = efficiency.select(context, &adapter, known.unwrap_or(upper), capacity_upper);
-    let mut candidate = if selection.allow_growth {
-        hint.candidate(context, &adapter, upper, shared.config.max_num_seqs)
-    } else {
-        upper = selection.count;
-        selection.count
-    };
+    upper = efficiency.select(context, &adapter, upper, capacity_upper);
     let bind_feedback = |mut prepared: ImageBatchPreparation,
                          count: usize,
                          hint: &capacity_hint::CapacitySearchHint| {
@@ -418,16 +409,8 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
         });
         prepared
     };
-    let mut fallback = hint
-        .successful(context, &adapter)
-        .filter(|&count| count < candidate);
+    let mut candidate = upper;
     let mut best: Option<(usize, ImageBatchPreparation)> = None;
-    if candidate < upper {
-        tracing::debug!(target: "ferrum_engine::image_generation::timing",
-            queued_batch = batch.len(), candidate_batch = candidate,
-            completed_batch = ?fallback, capacity_upper,
-            "image capacity search grows from a completed prefix");
-    }
     loop {
         let mut requests = batch[..candidate]
             .iter_mut()
@@ -464,13 +447,11 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
             }
             Err(error) => return Err(error),
         }
-        // The previous success is only a starting point. If live preparation
-        // rejects it too, descend until one prefix fits and execute immediately;
-        // do not make waiting requests pay for a subsequent upward search.
+        // Descend only after a fresh capacity failure, then execute the first
+        // fitting prefix. A previous short queue must not force small batches
+        // or make waiting requests pay for an execution-by-execution ramp.
         if context.is_some() {
-            candidate = fallback
-                .take()
-                .map_or_else(|| upper.div_ceil(2), |known| known.min(upper));
+            candidate = upper.div_ceil(2);
         } else {
             // Generators without a complete capacity context cannot reuse a
             // success across dispatches. Preserve their original full search.
@@ -671,21 +652,15 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     let elapsed = started.elapsed();
                     if let Ok(outputs) = &outcome {
                         if outputs.len() == responses.len() {
-                            if let Some(context) = feedback_context {
-                                capacity_hint.completed(
-                                    context.context,
-                                    &context.adapter,
-                                    context.batch_size,
+                            if let (Some(context), Some(feedback)) =
+                                (feedback_context, worker.batch_execution_feedback(outputs))
+                            {
+                                efficiency.observe(
+                                    context,
+                                    elapsed,
+                                    feedback,
                                     shared.config.max_num_seqs,
                                 );
-                                if let Some(feedback) = worker.batch_execution_feedback(outputs) {
-                                    efficiency.observe(
-                                        context,
-                                        elapsed,
-                                        feedback,
-                                        shared.config.max_num_seqs,
-                                    );
-                                }
                             }
                         }
                     }

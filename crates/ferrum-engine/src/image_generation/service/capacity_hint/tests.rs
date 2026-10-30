@@ -118,7 +118,7 @@ fn prepare(
         state.preparing = count;
         state.preparing_bytes = batch.iter().map(Queued::pending_bytes).sum();
     }
-    let mut prepared = scheduler::prepare_capacity_prefix(
+    let prepared = scheduler::prepare_capacity_prefix(
         worker,
         &mut batch,
         &shared,
@@ -126,7 +126,6 @@ fn prepare(
         &mut batch_efficiency::BatchEfficiency::default(),
     )
     .unwrap();
-    let completed = prepared.1.take();
     let prepared = prepared.into_inner::<Vec<u64>>().unwrap();
     let selected = batch
         .iter()
@@ -143,16 +142,6 @@ fn prepare(
         selected.iter().chain(&tail).copied().collect::<Vec<_>>(),
         (0..count as u64).collect::<Vec<_>>()
     );
-    // Simulate the worker-loop hook after successful execution. Preparation
-    // alone must not mark a batch completed, including cancelled preparations.
-    if let Some(completed) = completed {
-        hint.completed(
-            completed.context,
-            &completed.adapter,
-            completed.batch_size,
-            shared.config.max_num_seqs,
-        );
-    }
     (selected, tail)
 }
 
@@ -166,66 +155,52 @@ fn worker(capacity: usize) -> Worker {
 }
 
 #[test]
-fn completed_prefix_grows_geometrically_without_becoming_a_capacity_limit() {
+fn short_successes_do_not_limit_the_next_available_fifo_prefix() {
     let mut worker = worker(16);
     let mut hint = CapacitySearchHint::default();
     assert_eq!(prepare(&mut worker, &mut hint, 1, None).0.len(), 1);
-    for expected in [2, 4, 8, 16] {
-        worker.probes.clear();
-        assert_eq!(prepare(&mut worker, &mut hint, 32, None).0.len(), expected);
-        assert_eq!(worker.probes, [expected]);
-    }
+    worker.probes.clear();
+    assert_eq!(prepare(&mut worker, &mut hint, 16, None).0.len(), 16);
+    assert_eq!(worker.probes, [16]);
     let context = worker.capacity_search_context(&[]);
     assert_eq!(
         hint.upper(context, &None, 64),
         64,
         "a successful batch is not proof that a larger one cannot fit"
     );
-    prepare(&mut worker, &mut hint, 1, None);
-    assert_eq!(hint.successful(context, &None), Some(16));
+    assert!(hint.0.is_none(), "success does not create a capacity bound");
 }
 
 #[test]
-fn one_failed_growth_probe_immediately_executes_the_fresh_completed_prefix() {
+fn failed_candidate_executes_the_first_fitting_prefix_without_a_small_history_fallback() {
     let mut worker = worker(5);
     let mut hint = CapacitySearchHint::default();
-    prepare(&mut worker, &mut hint, 4, None);
-    // Do not repeat the full 15 -> 7 -> 3 -> 5 -> 6 search in front of
-    // waiting requests. A failed expansion returns to the known FIFO prefix.
+    prepare(&mut worker, &mut hint, 1, None);
+    // A short prior queue neither caps the next candidate nor becomes the
+    // preferred fallback. Stop at the first fresh fit without searching up.
     worker.probes.clear();
-    assert_eq!(prepare(&mut worker, &mut hint, 15, None).0.len(), 4);
-    assert_eq!(worker.probes, [8, 4]);
-    // Subsequent real dispatches narrow the bracket, one unknown size each.
-    worker.probes.clear();
-    assert_eq!(prepare(&mut worker, &mut hint, 15, None).0.len(), 4);
-    assert_eq!(worker.probes, [6, 4]);
-    worker.probes.clear();
-    assert_eq!(prepare(&mut worker, &mut hint, 15, None).0.len(), 5);
-    assert_eq!(worker.probes, [5]);
-    worker.probes.clear();
-    assert_eq!(prepare(&mut worker, &mut hint, 15, None).0.len(), 5);
     assert_eq!(
-        worker.probes,
-        [5],
-        "the final known prefix is still prepared"
+        prepare(&mut worker, &mut hint, 7, None),
+        (vec![0, 1, 2], vec![3, 4, 5, 6])
     );
+    assert_eq!(worker.probes, [7, 3]);
 }
 
 #[test]
-fn failed_fallback_descends_safely_and_capacity_recovery_allows_growth() {
+fn live_capacity_drop_descends_safely_and_recovery_reopens_the_candidate() {
     let mut worker = worker(8);
     let mut hint = CapacitySearchHint::default();
     prepare(&mut worker, &mut hint, 4, None);
-    // Capacity can fall after the metadata snapshot. Both the growth probe
-    // and the previously successful fallback must receive fresh checks.
+    // Capacity can fall after the metadata snapshot. All smaller prefixes
+    // must still receive fresh checks, even if they previously fitted.
     worker.capacity = 1;
     worker.probes.clear();
-    assert_eq!(prepare(&mut worker, &mut hint, 16, None).0.len(), 1);
+    assert_eq!(prepare(&mut worker, &mut hint, 8, None).0.len(), 1);
     assert_eq!(worker.probes, [8, 4, 2, 1]);
 
     worker.capacity = 8;
     worker.probes.clear();
-    assert_eq!(prepare(&mut worker, &mut hint, 16, None).0.len(), 8);
+    assert_eq!(prepare(&mut worker, &mut hint, 8, None).0.len(), 8);
     assert_eq!(worker.probes, [8]);
 }
 
@@ -256,25 +231,26 @@ fn changing_capacity_reuses_independent_failure_bounds() {
     worker.capacity = 8;
     worker.observed_capacity = 8;
     worker.probes.clear();
-    assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 6);
-    assert_eq!(worker.probes, [6]);
+    assert_eq!(prepare(&mut worker, &mut hint, 9, None).0.len(), 8);
+    assert_eq!(worker.probes, [8]);
 }
 
 #[test]
-fn shape_and_adapter_changes_do_not_reuse_success_or_failure_boundaries() {
+fn shape_and_adapter_changes_do_not_reuse_failure_boundaries() {
     let mut worker = worker(2);
     let mut hint = CapacitySearchHint::default();
     prepare(&mut worker, &mut hint, 2, None);
     prepare(&mut worker, &mut hint, 8, None);
     worker.capacity = 8;
-    worker.observed_capacity = 8;
+    // Keep the old low snapshot so only the changed identity invalidates
+    // the negative bounds; fresh preparation sees the recovered device.
     worker.shape = Some(1);
     worker.probes.clear();
     assert_eq!(prepare(&mut worker, &mut hint, 8, None).0.len(), 8);
     assert_eq!(worker.probes, [8]);
 
     worker.capacity = 6;
-    worker.observed_capacity = 6;
+    worker.shape = Some(0);
     let adapter = ImageAdapterBatchIdentity {
         effective_identity: "different adapter".into(),
         strength_bits: 1f32.to_bits(),

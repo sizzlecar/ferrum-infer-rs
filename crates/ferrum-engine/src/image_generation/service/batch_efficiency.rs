@@ -28,29 +28,6 @@ pub(super) struct ExecutionContext {
 #[derive(Default)]
 pub(super) struct BatchEfficiency(Option<Domain>);
 
-pub(super) struct BatchSelection {
-    pub(super) count: usize,
-    /// A deliberate smaller probe or earned larger reassessment must execute
-    /// that measured size, rather than silently turning into capacity growth.
-    pub(super) allow_growth: bool,
-}
-
-impl BatchSelection {
-    fn grow(count: usize) -> Self {
-        Self {
-            count,
-            allow_growth: true,
-        }
-    }
-
-    fn exact(count: usize) -> Self {
-        Self {
-            count,
-            allow_growth: false,
-        }
-    }
-}
-
 struct Domain {
     shape: [u8; 32],
     adapter: Option<Arc<ImageAdapterBatchIdentity>>,
@@ -95,33 +72,31 @@ impl Domain {
 }
 
 impl BatchEfficiency {
-    /// Rank the completed capacity frontier before allowing further growth.
-    /// No decision waits for more arrivals or substitutes for live preparation.
+    /// Only shrink the already available FIFO prefix. Unknown costs and sizes
+    /// use the original capacity search; this never waits for more arrivals.
     pub(super) fn select(
         &mut self,
         context: Option<ImageCapacitySearchContext>,
         adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
         queued_upper: usize,
         capacity_upper: usize,
-    ) -> BatchSelection {
+    ) -> usize {
         let Some(context) = context else {
-            return BatchSelection::grow(queued_upper);
+            return queued_upper;
         };
         let Some(domain) = self.0.as_mut().filter(|d| d.matches(context, adapter)) else {
-            return BatchSelection::grow(queued_upper);
+            return queued_upper;
         };
         // Only crossing an actual capacity proof triggers early reassessment.
         // Physical free-byte jitter and short queues do not reset learning.
         if capacity_upper > domain.capacity_upper {
-            return BatchSelection::grow(queued_upper);
+            return queued_upper;
         }
         let Some(upper) = domain.batches.iter().find(|b| b.count == queued_upper) else {
-            return BatchSelection::grow(queued_upper);
+            return queued_upper;
         };
         let Some(upper_cost) = upper.cost(&domain.stages) else {
-            // Repeating a batch which evicted weights obtains its actual hot
-            // reload cost; do not grow past it while that cost is still unknown.
-            return BatchSelection::exact(queued_upper);
+            return queued_upper;
         };
         let largest = domain.batches.iter().map(|b| b.count).max().unwrap_or(1);
         if queued_upper == largest && domain.savings_us >= upper.last_execution_us {
@@ -129,7 +104,7 @@ impl BatchEfficiency {
                 chosen_batch = queued_upper, capacity_upper, saved_us = domain.savings_us,
                 reason = "earned_larger_batch_reassessment",
                 "image batch efficiency selection");
-            return BatchSelection::exact(queued_upper);
+            return queued_upper;
         }
         // One adjacent real-work probe per observed larger size, only after
         // repeated eviction and a known hot reload. Never walk a ladder of
@@ -146,7 +121,7 @@ impl BatchEfficiency {
                 upper_base_us = upper.base_us, upper_reload_us = upper_cost - upper.base_us,
                 reason = "observe_adjacent_batch_after_recurring_reload",
                 "image batch efficiency selection");
-            return BatchSelection::exact(largest - 1);
+            return largest - 1;
         }
         let best = domain
             .batches
@@ -160,7 +135,7 @@ impl BatchEfficiency {
                     .then_with(|| left.count.cmp(&right.count))
             });
         let Some((best, cost)) = best else {
-            return BatchSelection::grow(queued_upper);
+            return queued_upper;
         };
         if best.count < queued_upper {
             tracing::debug!(target: "ferrum_engine::image_generation::timing",
@@ -171,10 +146,7 @@ impl BatchEfficiency {
                 reason = "observed_sustained_cost",
                 "image batch efficiency selection");
         }
-        BatchSelection {
-            count: best.count,
-            allow_growth: best.count == queued_upper,
-        }
+        best.count
     }
 
     pub(super) fn observe(
