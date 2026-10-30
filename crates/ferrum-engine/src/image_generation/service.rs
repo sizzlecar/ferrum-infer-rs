@@ -158,6 +158,16 @@ pub trait ImageGenerator: Send + 'static {
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
         None
     }
+    /// Optional metadata for reusing a previous capacity-search boundary. This
+    /// is only a search hint: preparation and execution admission still run.
+    /// A context must describe every row's complete capacity shape and current
+    /// available device ceiling. Return `None` for heterogeneous/unknown shapes.
+    fn capacity_search_context(
+        &self,
+        _requests: &[ImageRequestRef<'_>],
+    ) -> Option<ImageCapacitySearchContext> {
+        None
+    }
     /// Exact physical Output peak from typed request/model metadata. This runs
     /// before plan compilation to select a currently affordable FIFO prefix.
     /// Legacy generators may leave the extra proof unavailable.
@@ -289,6 +299,14 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
                 effective_identity: lora.identity.clone(),
                 strength_bits: lora.strength.to_bits(),
             })
+    }
+    fn capacity_search_context(
+        &self,
+        requests: &[ImageRequestRef<'_>],
+    ) -> Option<ImageCapacitySearchContext> {
+        self.service_capacity_search_context(requests)
+            .ok()
+            .flatten()
     }
     fn execution_output_bytes(
         &self,
@@ -858,6 +876,12 @@ trait BatchWorker: Send + 'static {
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
         None
     }
+    fn capacity_search_context(
+        &self,
+        _requests: &[&QueuedRequest],
+    ) -> Option<ImageCapacitySearchContext> {
+        None
+    }
     fn execution_output_bytes(
         &self,
         _requests: &[&QueuedRequest],
@@ -944,6 +968,19 @@ impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
     type Output = ImageGenerationOutput;
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
         self.0.adapter_batch_identity()
+    }
+    fn capacity_search_context(
+        &self,
+        requests: &[&QueuedRequest],
+    ) -> Option<ImageCapacitySearchContext> {
+        let requests = requests
+            .iter()
+            .map(|request| match request {
+                QueuedRequest::Generate(request) => ImageRequestRef::Generate(request),
+                QueuedRequest::Edit(request, _) => ImageRequestRef::Edit(request),
+            })
+            .collect::<Vec<_>>();
+        self.0.capacity_search_context(&requests)
     }
     fn execution_output_bytes(
         &self,
@@ -1585,6 +1622,8 @@ fn reject_pending<O>(state: &mut State<O>, kind: ImageServiceErrorKind) {
     state.queue_backing.take();
 }
 
+mod capacity_hint;
+pub use capacity_hint::ImageCapacitySearchContext;
 mod output_budget;
 mod output_gate;
 mod preparation;

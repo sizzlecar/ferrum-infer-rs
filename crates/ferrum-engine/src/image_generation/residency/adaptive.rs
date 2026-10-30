@@ -3,6 +3,20 @@
 use super::*;
 
 impl<R: DeviceRuntime> ResidentStages<R> {
+    #[cfg(test)]
+    pub(in crate::image_generation) fn set_weight_reload_timing(
+        &mut self,
+        stage: ImageStage,
+        duration_us: u64,
+    ) {
+        self.weights_slot(stage)
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .origin
+            .initialization_wall_duration_us = duration_us;
+    }
+
     fn stage(&self, stage: ImageStage) -> Option<&ActiveImageStage<R>> {
         match stage {
             ImageStage::TextEncoder => self.text_encoder.as_ref(),
@@ -50,6 +64,75 @@ impl<R: DeviceRuntime> ResidentStages<R> {
         });
         order
     }
+
+    /// The fixed stage set makes an exact search cheap. Reclaiming several
+    /// small, old installations before a larger one can reload all of them on
+    /// the next batch even when the larger installation alone was sufficient.
+    /// Use actual cold-installation timing; attached-session timing is not a
+    /// weight reload observation. Missing observations retain the LRU fallback.
+    fn minimum_reload_weight_evictions(
+        &self,
+        target: ImageStage,
+        required_bytes: u64,
+    ) -> Option<Vec<ImageStage>> {
+        if required_bytes == 0 {
+            return Some(Vec::new());
+        }
+        let mut candidates = Vec::new();
+        for stage in self.eviction_order(target) {
+            // Checked-out sessions own active execution or prefix state. The
+            // target's installation is needed again immediately, so releasing
+            // it would not satisfy the predicted steady-state capacity deficit.
+            if stage == target || self.stage(stage).is_none() {
+                continue;
+            }
+            let Some(weights) = self.weights(stage) else {
+                continue;
+            };
+            let receipt = &weights.origin;
+            if receipt.weights_reused || receipt.initialization_wall_duration_us == 0 {
+                return None;
+            }
+            candidates.push((
+                stage,
+                receipt.plan.static_bytes,
+                receipt.initialization_wall_duration_us,
+            ));
+        }
+        let mut best = None;
+        for mask in 1_usize..(1 << candidates.len()) {
+            let mut bytes = 0_u128;
+            let mut reload_us = 0_u128;
+            for (index, &(_, size, cost)) in candidates.iter().enumerate() {
+                if mask & (1 << index) != 0 {
+                    bytes += u128::from(size);
+                    reload_us += u128::from(cost);
+                }
+            }
+            if bytes < u128::from(required_bytes) {
+                continue;
+            }
+            // The mask follows LRU order and breaks otherwise identical costs
+            // deterministically. Never evict an extra zero-benefit owner.
+            let score = (
+                reload_us,
+                mask.count_ones(),
+                std::cmp::Reverse(mask.reverse_bits()),
+                mask,
+            );
+            if best.is_none_or(|previous| score < previous) {
+                best = Some(score);
+            }
+        }
+        let (_, _, _, mask) = best?;
+        Some(
+            candidates
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, (stage, _, _))| (mask & (1 << index) != 0).then_some(stage))
+                .collect(),
+        )
+    }
 }
 
 fn idle_receipt(receipt: &mut ImageStageExecutionReceipt) {
@@ -63,7 +146,7 @@ fn idle_receipt(receipt: &mut ImageStageExecutionReceipt) {
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// Fresh preparation can count only this pipeline's idle, reclaimable
     /// allocations in addition to currently available physical storage.
-    pub(super) fn adaptive_capacity_ceiling(&self) -> anyhow::Result<u64> {
+    pub(in crate::image_generation) fn adaptive_capacity_ceiling(&self) -> anyhow::Result<u64> {
         let Some(memory) = self.runtime.memory_availability()? else {
             return Ok(self.config.device_capacity_bytes);
         };
@@ -247,6 +330,36 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             }
             if self.resident_stages.dynamic_bytes(stage) != 0 {
                 self.adaptive_release_dynamic(stage, receipts)?;
+            }
+        }
+
+        let logical_deficit = self
+            .adaptive_required_bytes(prepared)
+            .map_err(preflight)?
+            .saturating_sub(self.config.device_capacity_bytes);
+        let physical_deficit = self
+            .adaptive_physical_demand(prepared)
+            .map_err(preflight)?
+            .map_or(0, |(required, available)| {
+                required.saturating_sub(available)
+            });
+        let required_bytes = logical_deficit.max(physical_deficit);
+        if let Some(evictions) = self
+            .resident_stages
+            .minimum_reload_weight_evictions(target, required_bytes)
+        {
+            tracing::debug!(target: "ferrum_engine::image_generation::timing",
+                stage = ?target, required_bytes, stages = ?evictions,
+                "image idle weight reclamation selected by observed reload cost");
+            for stage in evictions {
+                // This selection is only an estimate. Real free storage and
+                // actual managed ownership remain authoritative after every
+                // release, including when another owner changes capacity.
+                if self.adaptive_stage_fits(prepared).map_err(preflight)? {
+                    return Ok(());
+                }
+                self.adaptive_close_session(stage, receipts)?;
+                self.adaptive_close_weights(stage, receipts)?;
             }
         }
         for stage in order {

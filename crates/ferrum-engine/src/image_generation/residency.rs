@@ -14,6 +14,8 @@ pub enum ImageResidencyPolicy {
     Cold,
     /// Keep reusable sessions and static weights until a later compiled stage
     /// needs their capacity. Idle dynamic backing is reclaimed before weights.
+    /// Prefer a sufficient set of idle weights with the lowest observed reload
+    /// cost; stages without a reload observation use acquisition order.
     /// Actual device-account admission remains authoritative.
     Adaptive,
     /// Retain DiT and VAE static state between batches, releasing idle dynamic

@@ -371,14 +371,31 @@ fn reserve_preprocessing<O: Send + 'static>(
 
 /// Search the already-owned FIFO candidate without publishing or executing a
 /// probe. Only a typed fresh-plan capacity failure permits a smaller prefix.
-fn prepare_capacity_prefix<O: Send + 'static>(
+pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
     worker: &mut dyn BatchWorker<Output = O>,
     batch: &mut Vec<Queued<O>>,
     shared: &Shared<O>,
+    hint: &mut capacity_hint::CapacitySearchHint,
 ) -> Result<ImageBatchPreparation, ImageBatchError> {
-    let mut upper = batch.len();
+    let context = (shared.config.batching == ImageBatchPolicy::Auto && batch.len() > 1)
+        .then(|| {
+            worker
+                .capacity_search_context(&batch.iter().map(|job| &job.request).collect::<Vec<_>>())
+        })
+        .flatten();
+    let adapter = batch[0].adapter.clone();
+    let mut upper = hint.upper(context, &adapter, batch.len());
+    if upper < batch.len() {
+        tracing::debug!(
+            target: "ferrum_engine::image_generation::timing",
+            queued_batch = batch.len(),
+            candidate_batch = upper,
+            "image capacity search reuses a verified shape boundary"
+        );
+    }
     let mut candidate = upper;
     let mut best: Option<(usize, ImageBatchPreparation)> = None;
+    let mut rejected = None;
     loop {
         let mut requests = batch[..candidate]
             .iter_mut()
@@ -387,6 +404,7 @@ fn prepare_capacity_prefix<O: Send + 'static>(
         let outcome = worker.prepare(&mut requests);
         match outcome {
             Ok(prepared) if candidate == upper => {
+                hint.remember(context, &adapter, candidate, rejected);
                 return_tail(batch, candidate, shared, false);
                 return Ok(prepared);
             }
@@ -397,6 +415,7 @@ fn prepare_capacity_prefix<O: Send + 'static>(
                 if shared.config.batching == ImageBatchPolicy::Auto && candidate > 1 =>
             {
                 upper = candidate - 1;
+                rejected = Some((candidate, proof.report));
                 {
                     let mut state = shared.lock();
                     state.capacity_reductions = state.capacity_reductions.saturating_add(1);
@@ -413,6 +432,7 @@ fn prepare_capacity_prefix<O: Send + 'static>(
         let lower = best.as_ref().map_or(0, |(count, _)| *count);
         if lower == upper {
             let (count, prepared) = best.expect("a positive fitting prefix was retained");
+            hint.remember(context, &adapter, count, rejected);
             return_tail(batch, count, shared, false);
             return Ok(prepared);
         }
@@ -428,6 +448,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
         .host
         .as_ref()
         .map(|host| host.subscribe_capacity(shared.resources.waker()));
+    let mut capacity_hint = capacity_hint::CapacitySearchHint::default();
     let run = catch_unwind(AssertUnwindSafe(|| {
         'batches: while let Some(mut batch) = take_batch(worker.as_ref(), &shared) {
             let prepared = 'prepare: loop {
@@ -446,7 +467,13 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     if !reserve_preprocessing(worker.as_ref(), &mut batch, &shared)? {
                         return Ok(None);
                     }
-                    prepare_capacity_prefix(worker.as_mut(), &mut batch, &shared).map(Some)
+                    prepare_capacity_prefix(
+                        worker.as_mut(),
+                        &mut batch,
+                        &shared,
+                        &mut capacity_hint,
+                    )
+                    .map(Some)
                 }));
                 let elapsed = preparation_started.elapsed();
                 for job in &mut batch {
