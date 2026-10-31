@@ -1,5 +1,41 @@
 use super::*;
 
+#[test]
+fn spilling_calibration_has_one_bootstrap_then_needs_earned_execution_savings() {
+    let mut policy = BatchEfficiency::default();
+    observe(&mut policy, 1, 30_000, 20_000, true);
+    observe(&mut policy, 1, 4_000, 0, true);
+    assert!(policy.allow_spilling_candidate(Some(context()), &None, 2, 1));
+    assert!(!policy.allow_spilling_candidate(Some(context()), &None, 3, 1));
+    observe(&mut policy, 2, 5_000, 0, false);
+    assert!(policy.0.as_ref().unwrap().exploration_credit_us < 0);
+    assert!(!policy.allow_spilling_candidate(Some(context()), &None, 3, 1));
+    // Recover known work to price the previously unknown recurring reload.
+    observe(&mut policy, 1, 5_000, 1_000, true);
+    assert!(policy.allow_spilling_candidate(Some(context()), &None, 2, 1));
+    let before = policy.0.as_ref().unwrap().exploration_credit_us;
+    observe(&mut policy, 2, 6_000, 1_000, false);
+    assert!(policy.0.as_ref().unwrap().exploration_credit_us > before);
+    // Two known executions cover three rows, plus the conservative first
+    // installation reserve. Test the cost boundary, not a repetition count.
+    let reserve = 2 * 6_000 + 20_000;
+    policy.0.as_mut().unwrap().exploration_credit_us = reserve - 1;
+    assert!(!policy.allow_spilling_candidate(Some(context()), &None, 3, 1));
+    policy.0.as_mut().unwrap().exploration_credit_us = reserve;
+    assert!(policy.allow_spilling_candidate(Some(context()), &None, 3, 1));
+}
+
+#[test]
+fn a_known_resident_batch_does_not_pay_an_unknown_spilling_probe_when_queue_grows() {
+    let mut policy = BatchEfficiency::default();
+    observe(&mut policy, 2, 12_000, 0, true);
+    observe(&mut policy, 4, 23_500, 0, true);
+    assert!(!policy.allow_spilling_candidate(Some(context()), &None, 5, 4));
+    assert!(!policy.allow_spilling_candidate(Some(context()), &None, 16, 4));
+    assert_eq!(policy.warm_start(Some(context()), &None, 8, 16), Some(4));
+    assert_eq!(policy.warm_start(Some(context()), &None, 16, 16), Some(4));
+}
+
 fn context() -> ImageCapacitySearchContext {
     ImageCapacitySearchContext {
         shape: [1; 32],

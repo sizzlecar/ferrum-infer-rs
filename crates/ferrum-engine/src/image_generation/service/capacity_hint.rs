@@ -22,6 +22,7 @@ struct Boundary {
     adapter: Option<Arc<ImageAdapterBatchIdentity>>,
     rejected: Vec<RejectedBatch>,
     largest_fit: usize,
+    resident_rejected: Vec<RejectedBatch>,
 }
 
 struct RejectedBatch {
@@ -75,6 +76,7 @@ impl CapacitySearchHint {
                 adapter: adapter.clone(),
                 rejected: Vec::new(),
                 largest_fit: 0,
+                resident_rejected: Vec::new(),
             });
         }
         let b = self.0.as_mut().unwrap();
@@ -107,6 +109,56 @@ impl CapacitySearchHint {
             .fold(queued, usize::min)
     }
 
+    /// A soft boundary, distinct from the staged plan's hard capacity proof.
+    /// Zero means even one row needs stage swapping; it must not reject work.
+    pub(super) fn resident_upper(
+        &self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        queued: usize,
+    ) -> usize {
+        let (Some(context), Some(boundary)) = (context, &self.0) else {
+            return queued;
+        };
+        if boundary.shape != context.shape || boundary.adapter != *adapter {
+            return queued;
+        }
+        boundary
+            .resident_rejected
+            .iter()
+            .filter(|b| b.required_bytes > context.capacity_bytes)
+            .map(|b| b.batch_size.saturating_sub(1))
+            .fold(queued, usize::min)
+    }
+
+    pub(super) fn remember_residency(
+        &mut self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        count: usize,
+        report: super::super::ImageDeviceCapacityReport,
+    ) {
+        if !report.complete_batch || report.fits() || count == 0 {
+            return;
+        }
+        self.remember_fit(context, adapter, count);
+        if context.is_none() {
+            return;
+        }
+        let bounds = &mut self.0.as_mut().unwrap().resident_rejected;
+        if bounds
+            .iter()
+            .any(|b| b.batch_size <= count && b.required_bytes >= report.required_bytes)
+        {
+            return;
+        }
+        bounds.retain(|b| !(count <= b.batch_size && report.required_bytes >= b.required_bytes));
+        bounds.push(RejectedBatch {
+            batch_size: count,
+            required_bytes: report.required_bytes,
+        });
+    }
+
     pub(super) fn remember(
         &mut self,
         context: Option<ImageCapacitySearchContext>,
@@ -134,6 +186,7 @@ impl CapacitySearchHint {
                 adapter: adapter.clone(),
                 rejected: Vec::new(),
                 largest_fit: 0,
+                resident_rejected: Vec::new(),
             });
         }
         let bounds = &mut self.0.as_mut().unwrap().rejected;

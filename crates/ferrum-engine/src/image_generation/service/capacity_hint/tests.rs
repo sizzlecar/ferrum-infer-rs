@@ -240,7 +240,7 @@ fn prepare(
 }
 
 fn prepare_with_search(
-    worker: &mut Worker,
+    worker: &mut dyn BatchWorker<Output = u64>,
     hint: &mut CapacitySearchHint,
     count: usize,
     adapter: Option<ImageAdapterBatchIdentity>,
@@ -283,6 +283,109 @@ fn prepare_with_search(
         (0..count as u64).collect::<Vec<_>>()
     );
     (selected, tail)
+}
+
+struct ResidentWorker {
+    inner: Worker,
+    static_bytes: u64,
+    preparation_capacity: Option<u64>,
+}
+
+impl BatchWorker for ResidentWorker {
+    type Output = u64;
+    fn capacity_search_context(
+        &self,
+        requests: &[&QueuedRequest],
+    ) -> Option<ImageCapacitySearchContext> {
+        self.inner.capacity_search_context(requests)
+    }
+    fn compatible(&self, a: &ImageGenerationRequest, b: &ImageGenerationRequest) -> bool {
+        self.inner.compatible(a, b)
+    }
+    fn prepare(
+        &mut self,
+        requests: &mut [&mut QueuedRequest],
+    ) -> Result<ImageBatchPreparation, ImageBatchError> {
+        let count = requests.len() as u64;
+        self.inner.prepare(requests).map(|p| {
+            p.with_resident_capacity(super::super::super::ImageDeviceCapacityReport {
+                complete_batch: true,
+                required_bytes: self.static_bytes + count,
+                capacity_bytes: self
+                    .preparation_capacity
+                    .unwrap_or(self.inner.observed_capacity as u64),
+                retained_static_bytes: self.static_bytes,
+                active_stage_peak_bytes: count,
+                retained_dynamic_allowance_bytes: 0,
+                native_allowance_bytes: 0,
+            })
+        })
+    }
+    fn generate_batch(
+        &mut self,
+        _: Vec<ImageGenerationRequest>,
+    ) -> Result<Vec<u64>, ImageBatchError> {
+        unreachable!("CPU planning fixture")
+    }
+}
+
+#[test]
+fn resident_preference_does_not_become_a_device_limit_or_block_required_swapping() {
+    let mut worker = ResidentWorker {
+        inner: Worker {
+            capacity: 8,
+            observed_capacity: 8,
+            shape: 0,
+            probes: Vec::new(),
+        },
+        static_bytes: 5,
+        preparation_capacity: None,
+    };
+    let mut hint = CapacitySearchHint::default();
+    let selected = prepare_with_search(&mut worker, &mut hint, 8, None, true)
+        .0
+        .len();
+    assert_eq!(selected, 3);
+    assert_eq!(hint.upper(worker.capacity_search_context(&[]), &None, 8), 8);
+    assert_eq!(
+        hint.resident_upper(worker.capacity_search_context(&[]), &None, 8),
+        3
+    );
+    worker.inner.capacity = 16;
+    worker.inner.observed_capacity = 16;
+    assert!(
+        prepare_with_search(&mut worker, &mut hint, 16, None, true)
+            .0
+            .len()
+            > selected
+    );
+    // Required weights exceed the whole device. Staged work remains legal.
+    worker.static_bytes = 17;
+    worker.inner.shape = 1;
+    let mut hint = CapacitySearchHint::default();
+    assert_eq!(
+        prepare_with_search(&mut worker, &mut hint, 8, None, true)
+            .0
+            .len(),
+        8
+    );
+    // The fresh plan may observe less headroom than the preceding context.
+    // A soft residency preference must never shrink a legal singleton to zero.
+    worker.inner.shape = 2;
+    worker.static_bytes = 5;
+    worker.preparation_capacity = Some(4);
+    assert_eq!(
+        prepare_with_search(
+            &mut worker,
+            &mut CapacitySearchHint::default(),
+            1,
+            None,
+            true
+        )
+        .0
+        .len(),
+        1
+    );
 }
 
 #[test]
