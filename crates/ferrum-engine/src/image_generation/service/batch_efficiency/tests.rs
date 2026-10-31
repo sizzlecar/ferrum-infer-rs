@@ -112,3 +112,30 @@ fn an_ineffective_adjacent_observation_does_not_start_a_downward_probe_ladder() 
     observe(&mut policy, 3, 10_000, 1_000, false);
     assert_eq!(select(&mut policy, 3), 3);
 }
+
+#[test]
+fn pipeline_primes_observed_size_but_background_still_explores_unknown_larger_batch() {
+    let mut policy = BatchEfficiency::default();
+    observe(&mut policy, 1, 3_300, 0, true);
+    observe(&mut policy, 3, 8_000, 0, true);
+    assert_eq!(policy.warm_start(Some(context()), &None, 16, 16), Some(3));
+    // Preparing the backlog still probes the larger available shape. A larger
+    // device is not permanently constrained by the first small queue observed.
+    assert_eq!(policy.select(Some(context()), &None, 16, 16), 16);
+    let mut changed = context();
+    changed.shape[0] += 1;
+    assert_eq!(policy.warm_start(Some(changed), &None, 16, 16), None);
+}
+
+#[test]
+fn ready_spilling_batch_is_priced_using_known_work_before_repeating_an_unknown_reload() {
+    let mut policy = BatchEfficiency::default();
+    observe(&mut policy, 2, 5_500, 0, true);
+    // First B3 ran, but left the text encoder missing. Its cold-free reload
+    // time is not known until another actual installation has completed.
+    observe(&mut policy, 3, 8_000, 0, false);
+    assert_eq!(policy.reconsider_ready(context(), &None, 3), Some(2));
+    observe(&mut policy, 2, 7_200, 1_700, true);
+    assert_eq!(policy.reconsider_ready(context(), &None, 3), None);
+    assert_eq!(select(&mut policy, 3), 2);
+}

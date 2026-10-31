@@ -37,18 +37,7 @@ fn take_batch<O: Send + 'static>(
             .skip(1)
             .take(maximum_batch.saturating_sub(1))
         {
-            let compatible = job.adapter == first.adapter
-                && job.request.generation().width == first.request.generation().width
-                && job.request.generation().height == first.request.generation().height
-                && match (&first.request, &job.request) {
-                    (QueuedRequest::Generate(a), QueuedRequest::Generate(b)) => {
-                        worker.compatible(a, b)
-                    }
-                    (QueuedRequest::Edit(a, _), QueuedRequest::Edit(b, _)) => {
-                        worker.compatible_edits(a, b)
-                    }
-                    _ => false,
-                };
+            let compatible = compatible_queued(worker, first, job);
             if !compatible {
                 incompatible = true;
                 break;
@@ -474,6 +463,8 @@ pub(super) fn worker_loop<O: Send + 'static>(
     let mut efficiency = batch_efficiency::BatchEfficiency::default();
     let mut prefetched: Option<Prefetched<O>> = None;
     let run = catch_unwind(AssertUnwindSafe(|| {
+        let overlap_enabled = shared.config.batching == ImageBatchPolicy::Auto
+            && worker.preparation_worker().is_some();
         'batches: while let Some((mut batch, mut prepared_ahead)) = prefetched
             .take()
             .map(|p| (p.batch, Some(p.outcome)))
@@ -494,6 +485,18 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     "image preparation failed; original recovery owners retained",
                 );
                 return failure;
+            }
+            if let Some(Ok(Ok(Some(prepared)))) = &prepared_ahead {
+                if let Some(context) = &prepared.1 {
+                    if let Some(chosen) =
+                        efficiency.reconsider_ready(context.context, &batch[0].adapter, batch.len())
+                    {
+                        prepared_ahead = None;
+                        return_tail(&mut batch, chosen, &shared, false);
+                        tracing::debug!(target: "ferrum_engine::image_generation::timing", batch_size=chosen,
+                            reason="price_unobserved_reload_on_known_batch", "image preparation pipeline reconsidered ready batch");
+                    }
+                }
             }
             let prepared = 'prepare: loop {
                 let changed = remove_cancelled(&mut batch, &mut shared.lock());
@@ -519,6 +522,15 @@ pub(super) fn worker_loop<O: Send + 'static>(
                 }
                 if batch.is_empty() {
                     continue 'batches;
+                }
+                if overlap_enabled && prepared_ahead.is_none() {
+                    start_observed_prefix(
+                        worker.as_ref(),
+                        &mut batch,
+                        &shared,
+                        &capacity_hint,
+                        &efficiency,
+                    );
                 }
                 match admit_output_prefix(worker.as_ref(), &mut batch, &shared) {
                     Ok(true) => (),
@@ -945,4 +957,67 @@ fn deliver_outputs<O>(shared: &Shared<O>, responses: &mut Vec<Response<O>>, outp
         let _ = response.send(result);
     }
     shared.lock().active = 0;
+}
+
+fn compatible_queued<O: Send + 'static>(
+    worker: &dyn BatchWorker<Output = O>,
+    first: &Queued<O>,
+    other: &Queued<O>,
+) -> bool {
+    other.adapter == first.adapter
+        && other.request.generation().width == first.request.generation().width
+        && other.request.generation().height == first.request.generation().height
+        && match (&first.request, &other.request) {
+            (QueuedRequest::Generate(a), QueuedRequest::Generate(b)) => worker.compatible(a, b),
+            (QueuedRequest::Edit(a, _), QueuedRequest::Edit(b, _)) => worker.compatible_edits(a, b),
+            _ => false,
+        }
+}
+
+fn start_observed_prefix<O: Send + 'static>(
+    worker: &dyn BatchWorker<Output = O>,
+    batch: &mut Vec<Queued<O>>,
+    shared: &Shared<O>,
+    hint: &capacity_hint::CapacitySearchHint,
+    efficiency: &batch_efficiency::BatchEfficiency,
+) {
+    let mut state = shared.lock();
+    let maximum = match batch[0].request {
+        QueuedRequest::Generate(_) => shared.config.max_num_seqs,
+        QueuedRequest::Edit(..) => shared
+            .config
+            .max_num_seqs
+            .min(worker.maximum_edit_batch_size().max(1)),
+    };
+    let extra = state
+        .queue
+        .iter()
+        .take(maximum.saturating_sub(batch.len()))
+        .take_while(|job| compatible_queued(worker, &batch[0], job))
+        .count();
+    let requests = batch
+        .iter()
+        .chain(state.queue.iter().take(extra))
+        .map(|job| &job.request)
+        .collect::<Vec<_>>();
+    let context = worker.capacity_search_context(&requests);
+    let upper = hint.upper(context, &batch[0].adapter, maximum);
+    let Some(chosen) = efficiency.warm_start(context, &batch[0].adapter, requests.len(), upper)
+    else {
+        return;
+    };
+    drop(requests);
+    if chosen > batch.len() {
+        let added = state
+            .queue
+            .drain(..chosen - batch.len())
+            .collect::<Vec<_>>();
+        state.preparing += added.len();
+        state.preparing_bytes += added.iter().map(Queued::pending_bytes).sum::<usize>();
+        batch.extend(added);
+    }
+    drop(state);
+    return_tail(batch, chosen, shared, false);
+    tracing::debug!(target: "ferrum_engine::image_generation::timing", batch_size=chosen,
+        reason="observed_shape_primes_execution_lane", "image preparation pipeline warm start");
 }
