@@ -52,7 +52,12 @@ fn metal_config() -> QwenImage21MetalConfig {
 }
 fn assets() -> (QwenImage21Assets, tempfile::TempDir) {
     let (reference, directory) = adapter::pipeline(2);
-    (reference.assets, directory)
+    (
+        Arc::try_unwrap(reference.assets)
+            .ok()
+            .expect("unique fixture assets"),
+        directory,
+    )
 }
 
 #[test]
