@@ -7,7 +7,7 @@ fn spilling_calibration_has_one_bootstrap_then_needs_earned_execution_savings() 
     observe(&mut policy, 1, 4_000, 0, true);
     assert!(policy.allow_spilling_candidate(Some(context()), &None, 2, 1));
     assert!(!policy.allow_spilling_candidate(Some(context()), &None, 3, 1));
-    observe(&mut policy, 2, 5_000, 0, false);
+    observe_event(&mut policy, 2, 5_000, 0, false, true);
     assert!(policy.0.as_ref().unwrap().exploration_credit_us < 0);
     assert!(!policy.allow_spilling_candidate(Some(context()), &None, 3, 1));
     // Recover known work to price the previously unknown recurring reload.
@@ -44,12 +44,24 @@ fn context() -> ImageCapacitySearchContext {
 }
 
 fn observe(policy: &mut BatchEfficiency, count: usize, actual: u64, install: u64, retained: bool) {
+    observe_event(policy, count, actual, install, retained, false);
+}
+
+fn observe_event(
+    policy: &mut BatchEfficiency,
+    count: usize,
+    actual: u64,
+    install: u64,
+    retained: bool,
+    exploration: bool,
+) {
     policy.observe(
         ExecutionContext {
             context: context(),
             adapter: None,
             capacity_upper: 3,
             batch_size: count,
+            exploration,
         },
         Duration::from_micros(actual),
         ImageBatchExecutionFeedback {

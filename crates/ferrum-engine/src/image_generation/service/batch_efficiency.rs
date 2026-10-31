@@ -23,6 +23,7 @@ pub(super) struct ExecutionContext {
     /// Capacity-proof upper bound independent of a short queue or tail.
     pub(super) capacity_upper: usize,
     pub(super) batch_size: usize,
+    pub(super) exploration: bool,
 }
 
 #[derive(Default)]
@@ -320,11 +321,6 @@ impl BatchEfficiency {
             return;
         }
         let base_us = actual_us - initialization_us;
-        let unknown_spill = !missing.is_empty()
-            && !domain
-                .batches
-                .iter()
-                .any(|b| b.count == execution.batch_size);
         if let Some(reference) = domain
             .batches
             .first()
@@ -336,7 +332,7 @@ impl BatchEfficiency {
                 .exploration_credit_us
                 .saturating_add(baseline.saturating_sub(i128::from(actual_us)));
         }
-        if unknown_spill {
+        if execution.exploration {
             domain.exploration_credit_us = domain
                 .exploration_credit_us
                 .saturating_sub(i128::from(actual_us));

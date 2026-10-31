@@ -430,6 +430,7 @@ pub(super) fn prepare_capacity_prefix_using<O: Send + 'static>(
             adapter: adapter.clone(),
             capacity_upper: hint.upper(Some(context), &adapter, shared.config.max_num_seqs),
             batch_size: count,
+            exploration: false,
         });
         prepared
     };
@@ -540,9 +541,10 @@ pub(super) fn prepare_capacity_prefix_using<O: Send + 'static>(
             return Ok(bind_feedback(prepared, count, hint));
         }
         candidate = if progressive && !resident_search {
+            let midpoint = upper.div_ceil(2);
             hint.known_fit(context, &adapter)
                 .filter(|count| *count <= upper)
-                .unwrap_or_else(|| upper.div_ceil(2))
+                .map_or(midpoint, |known| known.max(midpoint))
         } else {
             lower + (upper - lower).div_ceil(2)
         };
@@ -810,7 +812,13 @@ pub(super) fn worker_loop<O: Send + 'static>(
                 ));
             }
             let outcome = prepared.and_then(|(mut prepared, _)| {
-                let feedback_context = prepared.1.take();
+                let feedback_context = prepared.1.take().map(|mut context| {
+                    context.exploration = prepared.2.is_some_and(|r| !r.fits())
+                        && capacity_hint.resident_upper(Some(context.context), &context.adapter, context.capacity_upper) > 0
+                        && efficiency.warm_start(Some(context.context), &context.adapter,
+                            context.batch_size, context.capacity_upper) != Some(context.batch_size);
+                    context
+                });
                 match catch_unwind(AssertUnwindSafe(|| {
                     let started = Instant::now();
                     let preparer = (shared.config.batching == ImageBatchPolicy::Auto)
@@ -1108,7 +1116,12 @@ fn start_observed_prefix<O: Send + 'static>(
         .collect::<Vec<_>>();
     let context = worker.capacity_search_context(&requests);
     let upper = hint.upper(context, &batch[0].adapter, maximum);
-    let Some(chosen) = efficiency.warm_start(context, &batch[0].adapter, requests.len(), upper)
+    let Some(chosen) = efficiency
+        .warm_start(context, &batch[0].adapter, requests.len(), upper)
+        // Start a newly observed shape with its smallest real request while
+        // the preparation lane explores the backlog. An unpriced larger plan
+        // must not delay the first response or occupy the GPU by default.
+        .or_else(|| context.map(|_| 1))
     else {
         return;
     };

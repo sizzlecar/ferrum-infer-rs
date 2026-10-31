@@ -152,6 +152,7 @@ fn efficient_prefix_still_prepares_and_shrinks_on_live_capacity_without_reorderi
                 adapter: None,
                 capacity_upper: 4,
                 batch_size,
+                exploration: false,
             },
             Duration::from_millis(milliseconds),
             ImageBatchExecutionFeedback {
