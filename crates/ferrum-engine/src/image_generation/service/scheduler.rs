@@ -371,6 +371,7 @@ fn reserve_preprocessing<O: Send + 'static>(
 /// Select an already-owned FIFO prefix using completed execution observations,
 /// then search its capacity without submitting speculative device work. Only
 /// a typed fresh-plan capacity failure permits a smaller capacity-search bound.
+#[cfg(test)]
 pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
     worker: &mut dyn BatchWorker<Output = O>,
     batch: &mut Vec<Queued<O>>,
@@ -579,12 +580,13 @@ pub(super) fn worker_loop<O: Send + 'static>(
                         if !reserve_preprocessing(worker.as_ref(), &mut batch, &shared)? {
                             return Ok(None);
                         }
-                        prepare_capacity_prefix(
+                        prepare_capacity_prefix_using(
                             worker.as_mut(),
                             &mut batch,
                             &shared,
                             &mut capacity_hint,
                             &mut efficiency,
+                            overlap_enabled,
                         )
                         .map(Some)
                     }))
