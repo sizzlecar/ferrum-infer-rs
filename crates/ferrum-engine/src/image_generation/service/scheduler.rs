@@ -3,9 +3,13 @@ use super::*;
 fn take_batch<O: Send + 'static>(
     worker: &dyn BatchWorker<Output = O>,
     shared: &Shared<O>,
+    stop: Option<&AtomicBool>,
 ) -> Option<Vec<Queued<O>>> {
     let mut state = shared.lock();
     loop {
+        if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+            return None;
+        }
         prune_cancelled(&mut state.queue);
         if state.closing {
             reject_pending(&mut state, ImageServiceErrorKind::Shutdown);
@@ -468,10 +472,51 @@ pub(super) fn worker_loop<O: Send + 'static>(
         .map(|host| host.subscribe_capacity(shared.resources.waker()));
     let mut capacity_hint = capacity_hint::CapacitySearchHint::default();
     let mut efficiency = batch_efficiency::BatchEfficiency::default();
+    let mut prefetched: Option<Prefetched<O>> = None;
     let run = catch_unwind(AssertUnwindSafe(|| {
-        'batches: while let Some(mut batch) = take_batch(worker.as_ref(), &shared) {
+        'batches: while let Some((mut batch, mut prepared_ahead)) = prefetched
+            .take()
+            .map(|p| (p.batch, Some(p.outcome)))
+            .or_else(|| take_batch(worker.as_ref(), &shared, None).map(|b| (b, None)))
+        {
+            if prepared_ahead.as_ref().is_some_and(|outcome| {
+                matches!(outcome, Err(_) | Ok(Err(ImageBatchError::Fatal(_))))
+            }) {
+                let failure = Prefetched::<O> {
+                    batch: Vec::new(),
+                    outcome: prepared_ahead.take().unwrap(),
+                }
+                .failure();
+                reject_candidate(
+                    batch,
+                    &shared,
+                    ImageServiceErrorKind::Generation,
+                    "image preparation failed; original recovery owners retained",
+                );
+                return failure;
+            }
             let prepared = 'prepare: loop {
-                remove_cancelled(&mut batch, &mut shared.lock());
+                let changed = remove_cancelled(&mut batch, &mut shared.lock());
+                if changed || batch.is_empty() || shared.lock().closing {
+                    if let Some(failure) = prepared_ahead.take().and_then(|outcome| {
+                        Prefetched::<O> {
+                            batch: Vec::new(),
+                            outcome,
+                        }
+                        .failure()
+                    }) {
+                        return Some(failure);
+                    }
+                }
+                if shared.lock().closing {
+                    reject_candidate(
+                        batch,
+                        &shared,
+                        ImageServiceErrorKind::Shutdown,
+                        "image service is shutting down",
+                    );
+                    return None;
+                }
                 if batch.is_empty() {
                     continue 'batches;
                 }
@@ -482,19 +527,21 @@ pub(super) fn worker_loop<O: Send + 'static>(
                 }
                 let preparation_started = Instant::now();
                 let observed = shared.resources.epoch();
-                let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    if !reserve_preprocessing(worker.as_ref(), &mut batch, &shared)? {
-                        return Ok(None);
-                    }
-                    prepare_capacity_prefix(
-                        worker.as_mut(),
-                        &mut batch,
-                        &shared,
-                        &mut capacity_hint,
-                        &mut efficiency,
-                    )
-                    .map(Some)
-                }));
+                let outcome = prepared_ahead.take().unwrap_or_else(|| {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        if !reserve_preprocessing(worker.as_ref(), &mut batch, &shared)? {
+                            return Ok(None);
+                        }
+                        prepare_capacity_prefix(
+                            worker.as_mut(),
+                            &mut batch,
+                            &shared,
+                            &mut capacity_hint,
+                            &mut efficiency,
+                        )
+                        .map(Some)
+                    }))
+                });
                 let elapsed = preparation_started.elapsed();
                 for job in &mut batch {
                     job.preparation_duration = job.preparation_duration.saturating_add(elapsed);
@@ -562,6 +609,18 @@ pub(super) fn worker_loop<O: Send + 'static>(
                                         continue;
                                     }
                                     shared.resources.wait(observed);
+                                }
+                                Err(ImageBatchError::Capacity { proof, .. }) if batch.len() > 1 => {
+                                    let context = prepared.1.as_ref().map(|e| e.context);
+                                    capacity_hint.remember(
+                                        context,
+                                        &batch[0].adapter,
+                                        batch.len(),
+                                        proof.report,
+                                        shared.config.max_num_seqs,
+                                    );
+                                    drop(prepared);
+                                    continue 'prepare;
                                 }
                                 Err(error) => match rejection(error) {
                                     Ok((kind, message)) => {
@@ -640,21 +699,68 @@ pub(super) fn worker_loop<O: Send + 'static>(
                 let feedback_context = prepared.1.take();
                 match catch_unwind(AssertUnwindSafe(|| {
                     let started = Instant::now();
-                    let outcome = worker.execute(prepared, requests);
-                    let elapsed = started.elapsed();
-                    if let Ok(outputs) = &outcome {
-                        if outputs.len() == responses.len() {
-                            if let (Some(context), Some(feedback)) =
-                                (feedback_context, worker.batch_execution_feedback(outputs))
-                            {
-                                efficiency.observe(
-                                    context,
-                                    elapsed,
-                                    feedback,
-                                    shared.config.max_num_seqs,
-                                );
+                    let preparer = (shared.config.batching == ImageBatchPolicy::Auto)
+                        .then(|| worker.preparation_worker())
+                        .flatten();
+                    let stop = AtomicBool::new(false);
+                    let (outcome, elapsed, ahead, feedback) = thread::scope(|scope| {
+                        let handle = preparer.and_then(|mut preparer| {
+                            let hint = &mut capacity_hint;
+                            let efficiency = &mut efficiency;
+                            let shared = &shared;
+                            let stop = &stop;
+                            thread::Builder::new()
+                                .name("ferrum-image-prepare".into())
+                                .spawn_scoped(scope, move || {
+                                    prepare_ahead(preparer.as_mut(), shared, stop, hint, efficiency)
+                                })
+                                .ok()
+                        });
+                        let execution =
+                            catch_unwind(AssertUnwindSafe(|| worker.execute(prepared, requests)));
+                        let elapsed = started.elapsed();
+                        let feedback = match &execution {
+                            Ok(Ok(outputs)) if outputs.len() == responses.len() => {
+                                worker.batch_execution_feedback(outputs)
                             }
+                            _ => None,
+                        };
+                        // Completed outputs must not wait for background compilation.
+                        let execution = match execution {
+                            Ok(Ok(outputs)) if outputs.len() == responses.len() => {
+                                deliver_outputs(&shared, &mut responses, outputs);
+                                Ok(Ok(Vec::new()))
+                            }
+                            other => other,
+                        };
+                        {
+                            let _state = shared.lock();
+                            stop.store(true, Ordering::Release);
+                            shared.changed.notify_all();
                         }
+                        let wait_started = Instant::now();
+                        let ahead = handle.and_then(|handle| match handle.join() {
+                            Ok(prepared) => prepared,
+                            Err(panic) => Some(Prefetched {
+                                batch: Vec::new(),
+                                outcome: Err(panic),
+                            }),
+                        });
+                        if let Some(next) = &ahead {
+                            tracing::debug!(target: "ferrum_engine::image_generation::timing",
+                                next_batch_size = next.batch.len(), execution_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                                preparation_tail_wait_us = u64::try_from(wait_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                                "image preparation pipeline execution completed");
+                        }
+                        (execution, elapsed, ahead, feedback)
+                    });
+                    prefetched = ahead;
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    };
+                    if let (Some(context), Some(feedback)) = (feedback_context, feedback) {
+                        efficiency.observe(context, elapsed, feedback, shared.config.max_num_seqs);
                     }
                     outcome
                 })) {
@@ -700,33 +806,19 @@ pub(super) fn worker_loop<O: Send + 'static>(
             });
             match outcome {
                 Ok(outputs) => {
-                    for ((cancelled, response, _, gate), output) in
-                        responses.into_iter().zip(outputs)
-                    {
-                        let result = if cancelled.load(Ordering::Acquire) {
-                            Err(service_error(
-                                ImageServiceErrorKind::Cancelled,
-                                "image response cancelled; active execution completed",
-                            ))
-                        } else {
-                            if let Some(QueuedOutput {
-                                lease: Some(lease),
-                                response,
-                                ..
-                            }) = gate
-                            {
-                                let _ = response.send(lease);
-                            }
-                            Ok(output)
-                        };
-                        let _ = response.send(result);
-                    }
-                    shared.lock().active = 0;
+                    deliver_outputs(&shared, &mut responses, outputs);
                 }
-                Err(failure) => {
+                Err(mut failure) => {
+                    if let Some(secondary) = prefetched.take().and_then(Prefetched::failure) {
+                        failure = ImageWorkerFailure::Concurrent {
+                            execution: Box::new(failure),
+                            preparation: Box::new(secondary),
+                        };
+                    }
                     let (kind, message) = match &failure {
                         ImageWorkerFailure::Generation(error) => (ImageServiceErrorKind::Generation,
                             catch_unwind(AssertUnwindSafe(|| error.to_string())).unwrap_or_else(|_| "image generation failed; error formatter panicked, original owner retained".to_owned())),
+                        ImageWorkerFailure::Concurrent { .. } => (ImageServiceErrorKind::Generation, "execution and preparation failed; original owners retained".to_owned()),
                         ImageWorkerFailure::Panic(_) => (ImageServiceErrorKind::WorkerPanic, "image worker panicked; original owners retained".to_owned()),
                     };
                     let mut state = shared.lock();
@@ -743,7 +835,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
                 }
             }
         }
-        None
+        prefetched.take().and_then(Prefetched::failure)
     }));
     let mut failure = match run {
         Ok(failure) => failure,
@@ -769,4 +861,88 @@ pub(super) fn worker_loop<O: Send + 'static>(
         worker: Some(worker),
         failure,
     }
+}
+
+// The queue, preprocessing owners and result move together. There is never
+// more than one future batch, and only the execution worker admits it.
+type PreparationAttempt =
+    std::thread::Result<Result<Option<ImageBatchPreparation>, ImageBatchError>>;
+struct Prefetched<O> {
+    batch: Vec<Queued<O>>,
+    outcome: PreparationAttempt,
+}
+impl<O> Prefetched<O> {
+    fn failure(self) -> Option<ImageWorkerFailure> {
+        match self.outcome {
+            Err(panic) => Some(ImageWorkerFailure::Panic(panic)),
+            Ok(Err(ImageBatchError::Fatal(error))) => Some(ImageWorkerFailure::Generation(error)),
+            _ => None,
+        }
+    }
+}
+fn prepare_ahead<O: Send + 'static>(
+    worker: &mut dyn BatchWorker<Output = O>,
+    shared: &Shared<O>,
+    stop: &AtomicBool,
+    hint: &mut capacity_hint::CapacitySearchHint,
+    efficiency: &mut batch_efficiency::BatchEfficiency,
+) -> Option<Prefetched<O>> {
+    let mut batch = take_batch(worker, shared, Some(stop))?;
+    let started = Instant::now();
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let admitted = match admit_output_prefix(worker, &mut batch, shared) {
+            Ok(admitted) => admitted,
+            Err(ImageWorkerFailure::Generation(error)) => {
+                return Err(ImageBatchError::Fatal(error))
+            }
+            Err(ImageWorkerFailure::Panic(panic)) => std::panic::resume_unwind(panic),
+            Err(other) => return Err(ImageBatchError::Fatal(Box::new(other))),
+        };
+        if !admitted || !reserve_preprocessing(worker, &mut batch, shared)? {
+            return Ok(None);
+        }
+        prepare_capacity_prefix(worker, &mut batch, shared, hint, efficiency).map(Some)
+    }));
+    let elapsed = started.elapsed();
+    for job in &mut batch {
+        job.preparation_duration = job.preparation_duration.saturating_add(elapsed);
+    }
+    tracing::debug!(target: "ferrum_engine::image_generation::timing", batch_size = batch.len(), preparation_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX), "image preparation overlapped preceding execution");
+    if matches!(
+        outcome,
+        Ok(Ok(None)) | Ok(Err(ImageBatchError::Overloaded(_)))
+    ) {
+        return_tail(&mut batch, 0, shared, false);
+        return None;
+    }
+    Some(Prefetched { batch, outcome })
+}
+
+type Response<O> = (
+    Arc<AtomicBool>,
+    oneshot::Sender<Result<O, ImageServiceError>>,
+    Option<HostMemoryReservation>,
+    Option<QueuedOutput>,
+);
+fn deliver_outputs<O>(shared: &Shared<O>, responses: &mut Vec<Response<O>>, outputs: Vec<O>) {
+    for ((cancelled, response, _, gate), output) in responses.drain(..).zip(outputs) {
+        let result = if cancelled.load(Ordering::Acquire) {
+            Err(service_error(
+                ImageServiceErrorKind::Cancelled,
+                "image response cancelled; active execution completed",
+            ))
+        } else {
+            if let Some(QueuedOutput {
+                lease: Some(lease),
+                response,
+                ..
+            }) = gate
+            {
+                let _ = response.send(lease);
+            }
+            Ok(output)
+        };
+        let _ = response.send(result);
+    }
+    shared.lock().active = 0;
 }

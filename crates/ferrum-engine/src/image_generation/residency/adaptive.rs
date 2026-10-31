@@ -148,6 +148,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// Fresh preparation can count only this pipeline's idle, reclaimable
     /// allocations in addition to currently available physical storage.
     pub(in crate::image_generation) fn adaptive_capacity_ceiling(&self) -> anyhow::Result<u64> {
+        if self.preparation_only {
+            return Ok(self.config.device_capacity_bytes);
+        }
+
         let Some(memory) = self.runtime.memory_availability()? else {
             return Ok(self.config.device_capacity_bytes);
         };

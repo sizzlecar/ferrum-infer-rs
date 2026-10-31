@@ -34,7 +34,10 @@ pub(super) fn numeric_pipeline() -> (
         &path.join("model.safetensors"),
     )
     .unwrap();
-    pipeline.assets.sources.transformer = Arc::new(SafetensorsArchive::open(&path).unwrap());
+    Arc::get_mut(&mut pipeline.assets)
+        .expect("unique fixture assets")
+        .sources
+        .transformer = Arc::new(SafetensorsArchive::open(&path).unwrap());
     (pipeline, directory)
 }
 

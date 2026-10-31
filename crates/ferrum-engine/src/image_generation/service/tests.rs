@@ -535,3 +535,207 @@ fn explicit_capacity_and_batch_capability_are_checked_before_worker_creation() {
     invalid_caps.dimension_multiple = 0;
     assert!(validate_config(config(1, 0, 1), invalid_caps).is_err());
 }
+
+#[derive(Clone)]
+struct PipelinedFixture {
+    planning: bool,
+    prepared: Arc<(Mutex<usize>, Condvar)>,
+    active: Arc<AtomicUsize>,
+    overlap: Arc<AtomicBool>,
+    entered: mpsc::Sender<()>,
+    release: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+    failures: Option<(Arc<AtomicUsize>, Arc<AtomicUsize>)>,
+}
+impl BatchWorker for PipelinedFixture {
+    type Output = u64;
+    fn preparation_worker(&self) -> Option<Box<dyn BatchWorker<Output = u64>>> {
+        Some(Box::new(Self {
+            planning: true,
+            ..self.clone()
+        }))
+    }
+    fn compatible(&self, _: &ImageGenerationRequest, _: &ImageGenerationRequest) -> bool {
+        true
+    }
+    fn prepare(
+        &mut self,
+        _: &mut [&mut QueuedRequest],
+    ) -> Result<ImageBatchPreparation, ImageBatchError> {
+        let (lock, changed) = &*self.prepared;
+        let mut n = lock.lock().unwrap();
+        *n += 1;
+        if self.planning {
+            self.overlap
+                .store(self.active.load(Ordering::Acquire) == 1, Ordering::Release);
+        }
+        changed.notify_all();
+        drop(n);
+        if self.planning {
+            if let Some(release) = &self.release {
+                let _ = release.lock().unwrap().recv();
+            }
+            if let Some((_, owner)) = &self.failures {
+                return Err(ImageBatchError::Fatal(Box::new(OriginalFailure(
+                    owner.clone(),
+                ))));
+            }
+        }
+        Ok(ImageBatchPreparation::default())
+    }
+    fn try_admit_prepared(
+        &mut self,
+        _: &mut ImageBatchPreparation,
+        _: ImagePreparationResources,
+    ) -> Result<bool, ImageBatchError> {
+        assert!(!self.planning, "preparer cannot admit execution resources");
+        Ok(true)
+    }
+    fn generate_batch(
+        &mut self,
+        requests: Vec<ImageGenerationRequest>,
+    ) -> Result<Vec<u64>, ImageBatchError> {
+        assert!(!self.planning, "preparer cannot execute");
+        assert_eq!(self.active.fetch_add(1, Ordering::AcqRel), 0);
+        if requests[0].seed == 0 {
+            self.entered.send(()).unwrap();
+            let (lock, changed) = &*self.prepared;
+            let (n, _) = changed
+                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(3), |n| *n < 2)
+                .unwrap();
+            assert!(
+                *n >= 2,
+                "next plan was not prepared during active execution"
+            );
+        }
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        if let Some((owner, _)) = &self.failures {
+            return Err(ImageBatchError::Fatal(Box::new(OriginalFailure(
+                owner.clone(),
+            ))));
+        }
+        Ok(requests.iter().map(|r| r.seed).collect())
+    }
+}
+
+#[tokio::test]
+async fn next_plan_overlaps_one_execution_and_does_not_delay_completed_response() {
+    let (entered, rx) = mpsc::channel();
+    let (release, pending) = mpsc::channel();
+    let overlap = Arc::new(AtomicBool::new(false));
+    let service = ServiceCore::start(
+        Box::new(PipelinedFixture {
+            planning: false,
+            prepared: Arc::new((Mutex::new(0), Condvar::new())),
+            active: Arc::new(AtomicUsize::new(0)),
+            overlap: overlap.clone(),
+            entered,
+            release: Some(Arc::new(Mutex::new(pending))),
+            failures: None,
+        }),
+        ImageServiceConfig {
+            batching: ImageBatchPolicy::Auto,
+            ..config(1, 0, 4)
+        },
+    )
+    .unwrap();
+    let first = service.try_submit(request(0)).unwrap();
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let second = service.try_submit(request(1)).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), first.wait())
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert!(overlap.load(Ordering::Acquire));
+    // Compilation of the next batch is still blocked until after this reply.
+    release.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), second.wait())
+            .await
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    let retired = service.shutdown().await.unwrap();
+    assert!(retired.failure.is_none());
+    release_retirement(retired);
+}
+
+#[tokio::test]
+async fn simultaneous_execution_and_preparation_failure_retain_both_original_owners() {
+    let (entered, rx) = mpsc::channel();
+    let execution_owner = Arc::new(AtomicUsize::new(0));
+    let preparation_owner = Arc::new(AtomicUsize::new(0));
+    let service = ServiceCore::start(
+        Box::new(PipelinedFixture {
+            planning: false,
+            prepared: Arc::new((Mutex::new(0), Condvar::new())),
+            active: Arc::new(AtomicUsize::new(0)),
+            overlap: Arc::new(AtomicBool::new(false)),
+            entered,
+            release: None,
+            failures: Some((execution_owner.clone(), preparation_owner.clone())),
+        }),
+        ImageServiceConfig {
+            batching: ImageBatchPolicy::Auto,
+            ..config(1, 0, 4)
+        },
+    )
+    .unwrap();
+    let first = service.try_submit(request(0)).unwrap();
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let second = service.try_submit(request(1)).unwrap();
+    assert!(first.wait().await.is_err());
+    assert!(second.wait().await.is_err());
+    let retired = service.shutdown().await.unwrap();
+    assert!(matches!(
+        retired.failure,
+        Some(ImageWorkerFailure::Concurrent { .. })
+    ));
+    assert_eq!(execution_owner.load(Ordering::Acquire), 0);
+    assert_eq!(preparation_owner.load(Ordering::Acquire), 0);
+    release_retirement(retired);
+    assert_eq!(execution_owner.load(Ordering::Acquire), 1);
+    assert_eq!(preparation_owner.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn cancelling_a_prepared_future_batch_never_executes_it() {
+    let (entered, rx) = mpsc::channel();
+    let (release, pending) = mpsc::channel();
+    let service = ServiceCore::start(
+        Box::new(PipelinedFixture {
+            planning: false,
+            prepared: Arc::new((Mutex::new(0), Condvar::new())),
+            active: Arc::new(AtomicUsize::new(0)),
+            overlap: Arc::new(AtomicBool::new(false)),
+            entered,
+            release: Some(Arc::new(Mutex::new(pending))),
+            failures: None,
+        }),
+        ImageServiceConfig {
+            batching: ImageBatchPolicy::Auto,
+            ..config(1, 0, 4)
+        },
+    )
+    .unwrap();
+    let first = service.try_submit(request(0)).unwrap();
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let second = service.try_submit(request(1)).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), first.wait())
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    second.cancel();
+    release.send(()).unwrap();
+    assert!(second.wait().await.is_err());
+    assert_eq!(service.snapshot().executed_requests, 1);
+    let retired = service.shutdown().await.unwrap();
+    assert!(retired.failure.is_none());
+    release_retirement(retired);
+}
