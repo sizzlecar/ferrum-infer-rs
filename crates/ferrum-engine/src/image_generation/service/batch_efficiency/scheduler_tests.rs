@@ -78,6 +78,7 @@ fn queued(seed: u64) -> Queued<u64> {
         _prompt_reservation: None,
         preprocessing_bytes: 0,
         preparation_duration: Duration::ZERO,
+        preparation_group: None,
     }
 }
 

@@ -1303,6 +1303,8 @@ struct Queued<O> {
     _prompt_reservation: Option<HostMemoryReservation>,
     preprocessing_bytes: usize,
     preparation_duration: Duration,
+    /// A reduced FIFO tail must finish before newer arrivals enlarge its batch.
+    preparation_group: Option<Arc<()>>,
 }
 impl<O> Queued<O> {
     fn pending_bytes(&self) -> usize {
@@ -1602,6 +1604,7 @@ impl<O: Send + 'static> ServiceCore<O> {
             _prompt_reservation: prompt_reservation,
             preprocessing_bytes: 0,
             preparation_duration: Duration::ZERO,
+            preparation_group: None,
         });
         self.shared.changed.notify_one();
         Ok(Job {

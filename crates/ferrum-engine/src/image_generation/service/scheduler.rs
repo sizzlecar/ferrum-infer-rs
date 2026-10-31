@@ -1,6 +1,6 @@
 use super::*;
 
-fn take_batch<O: Send + 'static>(
+pub(super) fn take_batch<O: Send + 'static>(
     worker: &dyn BatchWorker<Output = O>,
     shared: &Shared<O>,
     stop: Option<&AtomicBool>,
@@ -78,7 +78,13 @@ fn return_tail<O>(
     device_capacity: bool,
 ) {
     let mut state = shared.lock();
+    let group =
+        (shared.config.batching == ImageBatchPolicy::Auto && keep > 0 && keep < batch.len())
+            .then(|| Arc::new(()));
     for mut job in batch.drain(keep..).rev() {
+        if job.preparation_group.is_none() {
+            job.preparation_group = group.clone();
+        }
         // A waiting job must not hold output credit ahead of the FIFO head.
         if let Some(output) = &mut job.output {
             output.lease.take();
@@ -372,6 +378,17 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
     hint: &mut capacity_hint::CapacitySearchHint,
     efficiency: &mut batch_efficiency::BatchEfficiency,
 ) -> Result<ImageBatchPreparation, ImageBatchError> {
+    prepare_capacity_prefix_using(worker, batch, shared, hint, efficiency, false)
+}
+
+pub(super) fn prepare_capacity_prefix_using<O: Send + 'static>(
+    worker: &mut dyn BatchWorker<Output = O>,
+    batch: &mut Vec<Queued<O>>,
+    shared: &Shared<O>,
+    hint: &mut capacity_hint::CapacitySearchHint,
+    efficiency: &mut batch_efficiency::BatchEfficiency,
+    progressive: bool,
+) -> Result<ImageBatchPreparation, ImageBatchError> {
     let context = (shared.config.batching == ImageBatchPolicy::Auto)
         .then(|| {
             worker
@@ -401,7 +418,16 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
         });
         prepared
     };
-    let mut candidate = upper;
+    let mut candidate = if progressive {
+        hint.next_probe(context, &adapter, upper)
+    } else {
+        upper
+    };
+    if progressive && candidate < upper {
+        tracing::debug!(target: "ferrum_engine::image_generation::timing",
+            candidate_batch = candidate, queued_batch = batch.len(), expansion_upper = upper,
+            "image preparation probes expansion before starting fitting work");
+    }
     let mut best: Option<(usize, ImageBatchPreparation)> = None;
     loop {
         let mut requests = batch[..candidate]
@@ -410,11 +436,13 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
             .collect::<Vec<_>>();
         let outcome = worker.prepare(&mut requests);
         match outcome {
-            Ok(prepared) if candidate == upper => {
+            Ok(prepared) if candidate == upper || progressive => {
+                hint.remember_fit(context, &adapter, candidate);
                 return_tail(batch, candidate, shared, false);
                 return Ok(bind_feedback(prepared, candidate, hint));
             }
             Ok(prepared) => {
+                hint.remember_fit(context, &adapter, candidate);
                 best = Some((candidate, prepared));
             }
             Err(ImageBatchError::Capacity { proof, .. })
@@ -433,6 +461,7 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
                     state.capacity_reductions = state.capacity_reductions.saturating_add(1);
                 }
                 tracing::debug!(
+                    target: "ferrum_engine::image_generation::timing",
                     candidate_batch = candidate,
                     required_bytes = proof.report.required_bytes,
                     capacity_bytes = proof.report.capacity_bytes,
@@ -447,7 +476,13 @@ pub(super) fn prepare_capacity_prefix<O: Send + 'static>(
             return_tail(batch, count, shared, false);
             return Ok(bind_feedback(prepared, count, hint));
         }
-        candidate = lower + (upper - lower).div_ceil(2);
+        candidate = if progressive {
+            hint.known_fit(context, &adapter)
+                .filter(|count| *count <= upper)
+                .unwrap_or_else(|| upper.div_ceil(2))
+        } else {
+            lower + (upper - lower).div_ceil(2)
+        };
     }
 }
 
@@ -913,7 +948,7 @@ fn prepare_ahead<O: Send + 'static>(
         if !admitted || !reserve_preprocessing(worker, &mut batch, shared)? {
             return Ok(None);
         }
-        prepare_capacity_prefix(worker, &mut batch, shared, hint, efficiency).map(Some)
+        prepare_capacity_prefix_using(worker, &mut batch, shared, hint, efficiency, true).map(Some)
     }));
     let elapsed = started.elapsed();
     for job in &mut batch {
@@ -964,7 +999,11 @@ fn compatible_queued<O: Send + 'static>(
     first: &Queued<O>,
     other: &Queued<O>,
 ) -> bool {
-    other.adapter == first.adapter
+    (match (&first.preparation_group, &other.preparation_group) {
+        (Some(a), Some(b)) if Arc::ptr_eq(a, b) => true,
+        (None, None) => true,
+        _ => false,
+    }) && other.adapter == first.adapter
         && other.request.generation().width == first.request.generation().width
         && other.request.generation().height == first.request.generation().height
         && match (&first.request, &other.request) {
