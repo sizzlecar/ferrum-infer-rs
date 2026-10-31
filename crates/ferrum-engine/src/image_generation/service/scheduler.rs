@@ -524,13 +524,16 @@ pub(super) fn worker_loop<O: Send + 'static>(
             }
             if let Some(Ok(Ok(Some(prepared)))) = &prepared_ahead {
                 if let Some(context) = &prepared.1 {
-                    if let Some(chosen) =
-                        efficiency.reconsider_ready(context.context, &batch[0].adapter, batch.len())
-                    {
+                    if let Some(chosen) = efficiency.reconsider_ready(
+                        context.context,
+                        &batch[0].adapter,
+                        batch.len(),
+                        context.capacity_upper,
+                    ) {
                         prepared_ahead = None;
                         return_tail(&mut batch, chosen, &shared, false);
                         tracing::debug!(target: "ferrum_engine::image_generation::timing", batch_size=chosen,
-                            reason="price_unobserved_reload_on_known_batch", "image preparation pipeline reconsidered ready batch");
+                            reason="completed_execution_feedback", "image preparation pipeline reconsidered ready batch");
                     }
                 }
             }
