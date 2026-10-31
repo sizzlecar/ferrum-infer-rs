@@ -408,6 +408,23 @@ pub(super) fn prepare_capacity_prefix_using<O: Send + 'static>(
         );
     }
     upper = efficiency.select(context, &adapter, upper, capacity_upper);
+    let resident_upper = hint.resident_upper(context, &adapter, upper);
+    if progressive && resident_upper > 0 && resident_upper < upper {
+        let next = resident_upper.saturating_add(1).min(upper);
+        let known = efficiency
+            .warm_start(context, &adapter, upper, capacity_upper)
+            .unwrap_or(1);
+        let proposal = next.max(known).min(upper);
+        upper = if efficiency.allow_spilling_candidate(context, &adapter, proposal, resident_upper)
+        {
+            proposal
+        } else {
+            resident_upper
+        };
+        // The resident preference changed the cohort we can execute. Rank
+        // that fitting prefix too, before compiling a plan to reconsider.
+        upper = efficiency.select(context, &adapter, upper, capacity_upper);
+    }
     let bind_feedback = |mut prepared: ImageBatchPreparation,
                          count: usize,
                          hint: &capacity_hint::CapacitySearchHint| {
@@ -416,6 +433,7 @@ pub(super) fn prepare_capacity_prefix_using<O: Send + 'static>(
             adapter: adapter.clone(),
             capacity_upper: hint.upper(Some(context), &adapter, shared.config.max_num_seqs),
             batch_size: count,
+            exploration: false,
         });
         prepared
     };
@@ -430,14 +448,62 @@ pub(super) fn prepare_capacity_prefix_using<O: Send + 'static>(
             "image preparation probes expansion before starting fitting work");
     }
     let mut best: Option<(usize, ImageBatchPreparation)> = None;
+    let mut resident_search = false;
+    let mut staged_fallback: Option<(usize, ImageBatchPreparation)> = None;
     loop {
         let mut requests = batch[..candidate]
             .iter_mut()
             .map(|job| &mut job.request)
             .collect::<Vec<_>>();
         let outcome = worker.prepare(&mut requests);
+        let outcome = match outcome {
+            Ok(prepared) if progressive && prepared.2.is_some_and(|r| !r.fits()) => {
+                let report = prepared.2.unwrap();
+                hint.remember_residency(context, &adapter, candidate, report);
+                let resident_upper = hint.resident_upper(context, &adapter, capacity_upper);
+                if resident_upper == 0 || candidate == 1 {
+                    // This hardware cannot keep even a singleton's required
+                    // weights together. The staged plan remains legal, and a
+                    // larger already-prepared batch amortizes required swaps.
+                    let (count, prepared) = staged_fallback.take().unwrap_or((candidate, prepared));
+                    hint.remember_fit(context, &adapter, count);
+                    return_tail(batch, count, shared, false);
+                    return Ok(bind_feedback(prepared, count, hint));
+                }
+                if !efficiency.allow_spilling_candidate(
+                    context,
+                    &adapter,
+                    candidate,
+                    resident_upper,
+                ) {
+                    tracing::debug!(target: "ferrum_engine::image_generation::timing",
+                        candidate_batch=candidate, resident_required_bytes=report.required_bytes,
+                        capacity_bytes=report.capacity_bytes,
+                        "image execution defers an unfunded weight-swapping candidate");
+                    if staged_fallback
+                        .as_ref()
+                        .is_none_or(|(count, _)| candidate > *count)
+                    {
+                        staged_fallback = Some((candidate, prepared));
+                    }
+                    upper = candidate - 1;
+                    resident_search = true;
+                    let lower = best.as_ref().map_or(0, |(count, _)| *count);
+                    if lower == upper {
+                        let (count, prepared) =
+                            best.take().expect("resident fitting prefix retained");
+                        return_tail(batch, count, shared, false);
+                        return Ok(bind_feedback(prepared, count, hint));
+                    }
+                    candidate = lower + (upper - lower).div_ceil(2);
+                    continue;
+                }
+                Ok(prepared)
+            }
+            outcome => outcome,
+        };
         match outcome {
-            Ok(prepared) if candidate == upper || progressive => {
+            Ok(prepared) if candidate == upper || (progressive && !resident_search) => {
                 hint.remember_fit(context, &adapter, candidate);
                 return_tail(batch, candidate, shared, false);
                 return Ok(bind_feedback(prepared, candidate, hint));
@@ -477,10 +543,11 @@ pub(super) fn prepare_capacity_prefix_using<O: Send + 'static>(
             return_tail(batch, count, shared, false);
             return Ok(bind_feedback(prepared, count, hint));
         }
-        candidate = if progressive {
+        candidate = if progressive && !resident_search {
+            let midpoint = upper.div_ceil(2);
             hint.known_fit(context, &adapter)
                 .filter(|count| *count <= upper)
-                .unwrap_or_else(|| upper.div_ceil(2))
+                .map_or(midpoint, |known| known.max(midpoint))
         } else {
             lower + (upper - lower).div_ceil(2)
         };
@@ -748,7 +815,13 @@ pub(super) fn worker_loop<O: Send + 'static>(
                 ));
             }
             let outcome = prepared.and_then(|(mut prepared, _)| {
-                let feedback_context = prepared.1.take();
+                let feedback_context = prepared.1.take().map(|mut context| {
+                    context.exploration = prepared.2.is_some_and(|r| !r.fits())
+                        && capacity_hint.resident_upper(Some(context.context), &context.adapter, context.capacity_upper) > 0
+                        && efficiency.warm_start(Some(context.context), &context.adapter,
+                            context.batch_size, context.capacity_upper) != Some(context.batch_size);
+                    context
+                });
                 match catch_unwind(AssertUnwindSafe(|| {
                     let started = Instant::now();
                     let preparer = (shared.config.batching == ImageBatchPolicy::Auto)
@@ -1046,7 +1119,12 @@ fn start_observed_prefix<O: Send + 'static>(
         .collect::<Vec<_>>();
     let context = worker.capacity_search_context(&requests);
     let upper = hint.upper(context, &batch[0].adapter, maximum);
-    let Some(chosen) = efficiency.warm_start(context, &batch[0].adapter, requests.len(), upper)
+    let Some(chosen) = efficiency
+        .warm_start(context, &batch[0].adapter, requests.len(), upper)
+        // Start a newly observed shape with its smallest real request while
+        // the preparation lane explores the backlog. An unpriced larger plan
+        // must not delay the first response or occupy the GPU by default.
+        .or_else(|| context.map(|_| 1))
     else {
         return;
     };
