@@ -1,5 +1,128 @@
 use super::*;
 
+#[test]
+fn progressive_preparation_runs_fitting_work_then_continues_expansion() {
+    let mut worker = Worker {
+        capacity: 16,
+        observed_capacity: 16,
+        shape: 0,
+        probes: Vec::new(),
+    };
+    let mut hint = CapacitySearchHint::default();
+    prepare(&mut worker, &mut hint, 1, None);
+    worker.probes.clear();
+    assert_eq!(
+        prepare_with_search(&mut worker, &mut hint, 7, None, true)
+            .0
+            .len(),
+        4
+    );
+    assert_eq!(worker.probes, [4]);
+    worker.probes.clear();
+    assert_eq!(
+        prepare_with_search(&mut worker, &mut hint, 15, None, true)
+            .0
+            .len(),
+        9
+    );
+    assert_eq!(
+        worker.probes,
+        [9],
+        "a successful small prefix is never a capacity ceiling"
+    );
+}
+
+#[test]
+fn progressive_capacity_failure_prepares_known_work_and_retains_fresh_checks() {
+    let mut worker = Worker {
+        capacity: 5,
+        observed_capacity: 5,
+        shape: 0,
+        probes: Vec::new(),
+    };
+    let mut hint = CapacitySearchHint::default();
+    prepare(&mut worker, &mut hint, 4, None);
+    for (selected, probes) in [(4, vec![9, 4]), (4, vec![6, 4]), (5, vec![5])] {
+        worker.probes.clear();
+        assert_eq!(
+            prepare_with_search(&mut worker, &mut hint, 15, None, true)
+                .0
+                .len(),
+            selected
+        );
+        assert_eq!(worker.probes, probes);
+    }
+    worker.capacity = 2;
+    worker.observed_capacity = 2;
+    worker.probes.clear();
+    assert_eq!(
+        prepare_with_search(&mut worker, &mut hint, 15, None, true)
+            .0
+            .len(),
+        2
+    );
+    assert_eq!(
+        worker.probes,
+        [5, 2],
+        "the old fit does not grant physical capacity"
+    );
+}
+
+#[test]
+fn reduced_fifo_tail_does_not_wait_for_newer_requests_in_its_execution_batch() {
+    let mut worker = Worker {
+        capacity: 4,
+        observed_capacity: 4,
+        shape: 0,
+        probes: Vec::new(),
+    };
+    let mut hint = CapacitySearchHint::default();
+    prepare(&mut worker, &mut hint, 1, None);
+    let shared = shared();
+    let mut batch = (0..7).map(|seed| queued(seed, None)).collect::<Vec<_>>();
+    {
+        let mut state = shared.lock();
+        state.preparing = batch.len();
+        state.preparing_bytes = batch.iter().map(Queued::pending_bytes).sum();
+    }
+    scheduler::prepare_capacity_prefix_using(
+        &mut worker,
+        &mut batch,
+        &shared,
+        &mut hint,
+        &mut batch_efficiency::BatchEfficiency::default(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(batch.len(), 4);
+    {
+        let mut state = shared.lock();
+        state.preparing = 0;
+        state.preparing_bytes = 0;
+        // Cancellation must not remove the surviving tail's boundary.
+        state.queue[1].cancelled.store(true, Ordering::Release);
+        state.queue.extend((7..11).map(|seed| queued(seed, None)));
+    }
+    let tail = scheduler::take_batch(&worker, &shared, None).unwrap();
+    assert_eq!(
+        tail.iter()
+            .map(|j| j.request.generation().seed)
+            .collect::<Vec<_>>(),
+        [4, 6]
+    );
+    assert_eq!(
+        shared.lock().preparing_bytes,
+        tail.iter().map(Queued::pending_bytes).sum::<usize>()
+    );
+    let new = scheduler::take_batch(&worker, &shared, None).unwrap();
+    assert_eq!(
+        new.iter()
+            .map(|j| j.request.generation().seed)
+            .collect::<Vec<_>>(),
+        [7, 8, 9, 10]
+    );
+}
+
 struct Worker {
     capacity: usize,
     observed_capacity: usize,
@@ -86,44 +209,60 @@ fn shared() -> Shared<u64> {
     }
 }
 
+fn queued(seed: u64, adapter: Option<Arc<ImageAdapterBatchIdentity>>) -> Queued<u64> {
+    Queued {
+        request: QueuedRequest::Generate(ImageGenerationRequest {
+            prompt: "a".into(),
+            width: 32,
+            height: 32,
+            seed,
+            n: 1,
+        }),
+        adapter,
+        submitted: Instant::now(),
+        cancelled: Arc::new(AtomicBool::new(false)),
+        response: oneshot::channel().0,
+        output: None,
+        _prompt_reservation: None,
+        preprocessing_bytes: 0,
+        preparation_duration: Duration::ZERO,
+        preparation_group: None,
+    }
+}
+
 fn prepare(
     worker: &mut Worker,
     hint: &mut CapacitySearchHint,
     count: usize,
     adapter: Option<ImageAdapterBatchIdentity>,
 ) -> (Vec<u64>, Vec<u64>) {
+    prepare_with_search(worker, hint, count, adapter, false)
+}
+
+fn prepare_with_search(
+    worker: &mut Worker,
+    hint: &mut CapacitySearchHint,
+    count: usize,
+    adapter: Option<ImageAdapterBatchIdentity>,
+    progressive: bool,
+) -> (Vec<u64>, Vec<u64>) {
     let shared = shared();
     let adapter = adapter.map(Arc::new);
     let mut batch = (0..count)
-        .map(|seed| Queued {
-            request: QueuedRequest::Generate(ImageGenerationRequest {
-                prompt: "a".into(),
-                width: 32,
-                height: 32,
-                seed: seed as u64,
-                n: 1,
-            }),
-            adapter: adapter.clone(),
-            submitted: Instant::now(),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            response: oneshot::channel().0,
-            output: None,
-            _prompt_reservation: None,
-            preprocessing_bytes: 0,
-            preparation_duration: Duration::ZERO,
-        })
+        .map(|seed| queued(seed as u64, adapter.clone()))
         .collect::<Vec<_>>();
     {
         let mut state = shared.lock();
         state.preparing = count;
         state.preparing_bytes = batch.iter().map(Queued::pending_bytes).sum();
     }
-    let prepared = scheduler::prepare_capacity_prefix(
+    let prepared = scheduler::prepare_capacity_prefix_using(
         worker,
         &mut batch,
         &shared,
         hint,
         &mut batch_efficiency::BatchEfficiency::default(),
+        progressive,
     )
     .unwrap()
     .into_inner::<Vec<u64>>()

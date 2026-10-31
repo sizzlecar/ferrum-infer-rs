@@ -127,6 +127,7 @@ fn run(fail_preparation: bool) -> (Capture, Arc<Shared<u64>>, Retirement<u64>) {
             _prompt_reservation: None,
             preprocessing_bytes: 0,
             preparation_duration: Duration::ZERO,
+            preparation_group: None,
         });
     }
     let shared = Arc::new(Shared {

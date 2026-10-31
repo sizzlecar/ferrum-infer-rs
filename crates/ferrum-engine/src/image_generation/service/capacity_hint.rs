@@ -21,6 +21,7 @@ struct Boundary {
     shape: [u8; 32],
     adapter: Option<Arc<ImageAdapterBatchIdentity>>,
     rejected: Vec<RejectedBatch>,
+    largest_fit: usize,
 }
 
 struct RejectedBatch {
@@ -29,6 +30,57 @@ struct RejectedBatch {
 }
 
 impl CapacitySearchHint {
+    pub(super) fn known_fit(
+        &self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+    ) -> Option<usize> {
+        let context = context?;
+        self.0
+            .as_ref()
+            .filter(|b| b.shape == context.shape && b.adapter == *adapter)
+            .map(|b| b.largest_fit)
+            .filter(|count| *count > 0)
+    }
+
+    /// One expansion between the known fitting prefix and the available queue.
+    /// A first fitting plan starts real work; later execution windows continue
+    /// exploration. This is a probe choice, never a physical admission grant.
+    pub(super) fn next_probe(
+        &self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        upper: usize,
+    ) -> usize {
+        match self.known_fit(context, adapter) {
+            Some(fit) if fit < upper => fit + ((upper - fit) / 2).max(1),
+            _ => upper,
+        }
+    }
+
+    pub(super) fn remember_fit(
+        &mut self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        count: usize,
+    ) {
+        let Some(context) = context else { return };
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|b| b.shape != context.shape || b.adapter != *adapter)
+        {
+            self.0 = Some(Boundary {
+                shape: context.shape,
+                adapter: adapter.clone(),
+                rejected: Vec::new(),
+                largest_fit: 0,
+            });
+        }
+        let b = self.0.as_mut().unwrap();
+        b.largest_fit = b.largest_fit.max(count);
+    }
+
     pub(super) fn upper(
         &self,
         context: Option<ImageCapacitySearchContext>,
@@ -81,6 +133,7 @@ impl CapacitySearchHint {
                 shape: context.shape,
                 adapter: adapter.clone(),
                 rejected: Vec::new(),
+                largest_fit: 0,
             });
         }
         let bounds = &mut self.0.as_mut().unwrap().rejected;

@@ -134,8 +134,11 @@ fn ready_spilling_batch_is_priced_using_known_work_before_repeating_an_unknown_r
     // First B3 ran, but left the text encoder missing. Its cold-free reload
     // time is not known until another actual installation has completed.
     observe(&mut policy, 3, 8_000, 0, false);
-    assert_eq!(policy.reconsider_ready(context(), &None, 3), Some(2));
+    assert_eq!(policy.reconsider_ready(context(), &None, 3, 3), Some(2));
     observe(&mut policy, 2, 7_200, 1_700, true);
-    assert_eq!(policy.reconsider_ready(context(), &None, 3), None);
+    // The background plan may already be ready when this execution prices
+    // the reload. It must use that feedback too, not execute a known loser.
+    assert_eq!(policy.reconsider_ready(context(), &None, 3, 3), Some(2));
+    assert_eq!(policy.reconsider_ready(context(), &None, 3, 4), None);
     assert_eq!(select(&mut policy, 3), 2);
 }

@@ -174,19 +174,21 @@ impl BatchEfficiency {
             .map(|(b, _)| b.count)
     }
 
-    /// A just-observed eviction has an unpriced recurring reload. A known
-    /// alternative pays that first hot installation once, allowing the normal
-    /// cost model to price both sizes without blindly repeating the eviction.
+    /// Recheck a prepared batch after the preceding execution supplies feedback.
+    /// Price a just-observed eviction using known work once, then apply the
+    /// normal cost model before committing a plan prepared from older samples.
     pub(super) fn reconsider_ready(
-        &self,
+        &mut self,
         context: ImageCapacitySearchContext,
         adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
         ready: usize,
+        capacity_upper: usize,
     ) -> Option<usize> {
         let domain = self.0.as_ref().filter(|d| d.matches(context, adapter))?;
         let sample = domain.batches.iter().find(|b| b.count == ready)?;
-        if sample.missing.is_empty() || sample.cost(&domain.stages).is_some() {
-            return None;
+        if sample.cost(&domain.stages).is_some() {
+            let chosen = self.select(Some(context), adapter, ready, capacity_upper);
+            return (chosen < ready).then_some(chosen);
         }
         self.warm_start(Some(context), adapter, ready, ready)
             .filter(|chosen| *chosen < ready)
