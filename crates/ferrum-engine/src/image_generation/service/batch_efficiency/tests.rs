@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn cohort_cost_prices_fragmented_tails_instead_of_only_per_image_execution() {
+    let mut policy = BatchEfficiency::default();
+    for (count, cost) in [(1, 7_000), (3, 17_000), (4, 23_000)] {
+        observe(&mut policy, count, cost, 0, true);
+    }
+    // Three rows look cheaper per image, but 3+1 costs more than four.
+    assert_eq!(policy.warm_start(Some(context()), &None, 4, 16), Some(4));
+    assert_eq!(policy.warm_start(Some(context()), &None, 8, 16), Some(4));
+    // A different cohort still benefits from 3+3: no fixed batch preference.
+    assert_eq!(policy.warm_start(Some(context()), &None, 6, 16), Some(3));
+    let domain = policy.0.as_mut().unwrap();
+    domain.capacity_upper = 16;
+    assert_eq!(policy.select(Some(context()), &None, 4, 16), 4);
+}
+
+#[test]
 fn spilling_calibration_has_one_bootstrap_then_needs_earned_execution_savings() {
     let mut policy = BatchEfficiency::default();
     observe(&mut policy, 1, 30_000, 20_000, true);
@@ -178,6 +194,7 @@ fn pipeline_primes_observed_size_but_background_still_explores_unknown_larger_ba
 #[test]
 fn ready_spilling_batch_is_priced_using_known_work_before_repeating_an_unknown_reload() {
     let mut policy = BatchEfficiency::default();
+    observe(&mut policy, 1, 3_300, 0, true);
     observe(&mut policy, 2, 5_500, 0, true);
     // First B3 ran, but left the text encoder missing. Its cold-free reload
     // time is not known until another actual installation has completed.

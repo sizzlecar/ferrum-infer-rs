@@ -421,6 +421,9 @@ pub(super) fn prepare_capacity_prefix_using<O: Send + 'static>(
         } else {
             resident_upper
         };
+        // The resident preference changed the cohort we can execute. Rank
+        // that fitting prefix too, before compiling a plan to reconsider.
+        upper = efficiency.select(context, &adapter, upper, capacity_upper);
     }
     let bind_feedback = |mut prepared: ImageBatchPreparation,
                          count: usize,
