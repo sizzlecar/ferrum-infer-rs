@@ -158,6 +158,11 @@ impl ImageRequestRef<'_> {
 /// remains usable and no recovery obligation exists. Compatibility must be deterministic and may
 /// only restrict the common width/height grouping enforced by this service.
 pub trait ImageGenerator: Send + 'static {
+    /// Optional plan-only worker sharing model/provider identity and Host account.
+    /// It must never submit device execution or admit execution resources.
+    fn preparation_worker(&self) -> Option<Box<dyn ImageGenerator>> {
+        None
+    }
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
         None
     }
@@ -302,6 +307,10 @@ pub trait ImageGenerator: Send + 'static {
 }
 
 impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
+    fn preparation_worker(&self) -> Option<Box<dyn ImageGenerator>> {
+        self.preparation_fork()
+            .map(|p| Box::new(p) as Box<dyn ImageGenerator>)
+    }
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
         self.assets
             .receipt()
@@ -618,7 +627,7 @@ impl ImageService {
         }
         Ok(Self {
             core: ServiceCore::start_with_host(
-                Box::new(GeneratorAdapter(generator)),
+                Box::new(GeneratorAdapter(Box::new(generator))),
                 config,
                 Some(host.clone()),
             )?,
@@ -807,15 +816,34 @@ impl ImageJob {
 pub enum ImageWorkerFailure {
     Generation(GeneratorError),
     Panic(Box<dyn Any + Send + 'static>),
+    Concurrent {
+        execution: Box<ImageWorkerFailure>,
+        preparation: Box<ImageWorkerFailure>,
+    },
 }
 impl fmt::Debug for ImageWorkerFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Generation(error) => f.debug_tuple("Generation").field(error).finish(),
+            Self::Concurrent {
+                execution,
+                preparation,
+            } => f
+                .debug_struct("Concurrent")
+                .field("execution", execution)
+                .field("preparation", preparation)
+                .finish(),
             Self::Panic(_) => f.write_str("Panic(original payload retained)"),
         }
     }
 }
+
+impl fmt::Display for ImageWorkerFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+impl std::error::Error for ImageWorkerFailure {}
 
 /// Keep this opaque generator owner alive while recovering the original error.
 /// It contains the original runtime, provider registry, assets and Host parent.
@@ -890,6 +918,9 @@ fn validate_config(
 // Generic only inside this module so scheduler tests can use small scalar
 // outputs; production fixes the output to the managed image artifact above.
 trait BatchWorker: Send + 'static {
+    fn preparation_worker(&self) -> Option<Box<dyn BatchWorker<Output = Self::Output>>> {
+        None
+    }
     type Output: Send + 'static;
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
         None
@@ -987,8 +1018,13 @@ trait BatchWorker: Send + 'static {
         Ok(())
     }
 }
-struct GeneratorAdapter<P>(P);
-impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
+struct GeneratorAdapter(Box<dyn ImageGenerator>);
+impl BatchWorker for GeneratorAdapter {
+    fn preparation_worker(&self) -> Option<Box<dyn BatchWorker<Output = Self::Output>>> {
+        self.0
+            .preparation_worker()
+            .map(|p| Box::new(GeneratorAdapter(p)) as Box<dyn BatchWorker<Output = Self::Output>>)
+    }
     type Output = ImageGenerationOutput;
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
         self.0.adapter_batch_identity()

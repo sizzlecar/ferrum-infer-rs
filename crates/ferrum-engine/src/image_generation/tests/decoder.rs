@@ -180,7 +180,10 @@ fn real_reference_decoder_microbatch_reuses_initialization_and_matches_full_batc
     pipeline.host = host(65536);
     pipeline.config.static_initialization = StaticInitializationPolicy::new(65536, 64).unwrap();
     let config = pipeline.assets.decoder_batch(1, 2, 2).unwrap();
-    pipeline.assets.sources.vae = decoder_source(&directory.path().join("numeric-vae"), &config);
+    Arc::get_mut(&mut pipeline.assets)
+        .expect("unique fixture assets")
+        .sources
+        .vae = decoder_source(&directory.path().join("numeric-vae"), &config);
     let weights = config.expected_weights().unwrap();
     let weight_bytes: u64 = weights.iter().map(|w| w.bytes()).sum();
     let source = input(&pipeline.host);
@@ -271,8 +274,10 @@ fn cached_decoder_plan_reinitializes_without_retaining_device_or_host_payloads()
     pipeline.host = host(65536);
     pipeline.config.static_initialization = StaticInitializationPolicy::new(65536, 64).unwrap();
     let config = pipeline.assets.decoder_batch(1, 2, 2).unwrap();
-    pipeline.assets.sources.vae =
-        decoder_source(&directory.path().join("cached-numeric-vae"), &config);
+    Arc::get_mut(&mut pipeline.assets)
+        .expect("unique fixture assets")
+        .sources
+        .vae = decoder_source(&directory.path().join("cached-numeric-vae"), &config);
     let source = input(&pipeline.host);
     let mut previous = None;
     let mut previous_plan = None;
@@ -325,8 +330,10 @@ fn resident_real_decoder_reuses_one_initialization_and_shutdown_preserves_host_i
     pipeline.config.residency = ImageResidencyPolicy::DenoiserAndDecoder;
     pipeline.config.static_initialization = StaticInitializationPolicy::new(65536, 64).unwrap();
     let config = pipeline.assets.decoder_batch(1, 2, 2).unwrap();
-    pipeline.assets.sources.vae =
-        decoder_source(&directory.path().join("resident-numeric-vae"), &config);
+    Arc::get_mut(&mut pipeline.assets)
+        .expect("unique fixture assets")
+        .sources
+        .vae = decoder_source(&directory.path().join("resident-numeric-vae"), &config);
     let source = input(&pipeline.host);
     let mut outputs = Vec::new();
     let mut uploaded = 0;

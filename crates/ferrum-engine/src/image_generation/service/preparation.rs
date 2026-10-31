@@ -94,7 +94,7 @@ fn validate_output_budget(expected: usize, actual: usize) -> Result<(), ImageBat
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     fn validate_service_availability(&self) -> Result<(), ImageBatchError> {
-        if self.is_stopped() {
+        if self.stopped || (!self.preparation_only && self.is_stopped()) {
             return Err(ImageBatchError::Fatal(Box::new(
                 ImageGenerationError::<R> {
                     failure: ImageGenerationFailure::Unavailable,
@@ -243,6 +243,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         prepared: &mut ImageBatchPreparation,
         resources: &ImagePreparationResources,
     ) -> Result<bool, ImageBatchError> {
+        if self.preparation_only {
+            return Err(ImageBatchError::Rejected(
+                "plan-only worker cannot execute or admit resources".into(),
+            ));
+        }
         self.validate_service_availability()?;
         let owner = prepared.0.as_mut().ok_or_else(|| {
             ImageBatchError::Rejected("image preparation belongs to another generator".into())
@@ -267,6 +272,26 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 "image preparation belongs to another generator".into(),
             ));
         };
+        let mut stages = vec![
+            &payload.text_stage,
+            &payload.noise_stage,
+            &payload.denoise_stage,
+            &payload.decode_stage,
+        ];
+        if let Some(edit) = &payload.edit {
+            stages.extend([&edit.vision_stage, &edit.encoder_stage]);
+        }
+        if let Some(prefix) = &payload.prefix_decode {
+            stages.push(&prefix.stage);
+        }
+        self.validate_capacity_with_prefix(
+            &stages,
+            payload
+                .prefix_decode
+                .as_ref()
+                .map(|p| (&payload.denoise_stage, &p.stage)),
+        )
+        .map_err(preparation_error)?;
         if payload.host_scope.is_some() {
             return Ok(true);
         }
@@ -296,6 +321,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         prepared: ImageBatchPreparation,
         requests: Vec<ImageGenerationRequest>,
     ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError> {
+        if self.preparation_only {
+            return Err(ImageBatchError::Rejected(
+                "plan-only worker cannot execute or admit resources".into(),
+            ));
+        }
         self.validate_service_availability()?;
         let identities: Vec<_> = requests.iter().map(GenerationIdentity::from).collect();
         let prepared = prepared
@@ -310,6 +340,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         prepared: ImageBatchPreparation,
         requests: Vec<ImageEditRequest>,
     ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError> {
+        if self.preparation_only {
+            return Err(ImageBatchError::Rejected(
+                "plan-only worker cannot execute or admit resources".into(),
+            ));
+        }
         self.validate_service_availability()?;
         let identities: Vec<_> = requests.iter().map(EditIdentity::from).collect();
         let prepared = prepared

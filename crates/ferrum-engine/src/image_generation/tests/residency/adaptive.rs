@@ -21,13 +21,21 @@ fn pipeline() -> (
         reference_vnext_operation_registry(composition.runtime()).unwrap(),
         composition.catalog().clone(),
         WeightMaterializerRegistry::identity_only().unwrap(),
-        original.assets,
+        Arc::try_unwrap(original.assets)
+            .ok()
+            .expect("unique fixture assets"),
         original.profiles,
         original.config,
     )
     .unwrap();
-    pipeline.assets.sources.text_encoder = pipeline.assets.sources.transformer.clone();
-    pipeline.assets.sources.vae = pipeline.assets.sources.transformer.clone();
+    Arc::get_mut(&mut pipeline.assets)
+        .expect("unique fixture assets")
+        .sources
+        .text_encoder = pipeline.assets.sources.transformer.clone();
+    Arc::get_mut(&mut pipeline.assets)
+        .expect("unique fixture assets")
+        .sources
+        .vae = pipeline.assets.sources.transformer.clone();
     pipeline.config.residency = ImageResidencyPolicy::Adaptive;
     pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::Adaptive;
     (pipeline, directory)
@@ -459,8 +467,10 @@ fn adaptive_active_request_cannot_be_stored_as_an_idle_reusable_pool() {
     let mut receipts = Vec::new();
     // Reuse the adapter's complete tiny transformer archive. A projection has
     // no readonly Request state and cannot exercise this lifetime boundary.
-    pipeline.assets.sources.transformer =
-        Arc::new(SafetensorsArchive::open(directory.path().join("dit")).unwrap());
+    Arc::get_mut(&mut pipeline.assets)
+        .expect("unique fixture assets")
+        .sources
+        .transformer = Arc::new(SafetensorsArchive::open(directory.path().join("dit")).unwrap());
     let config = QwenImage21TransformerConfig::new(
         transformer(),
         QwenImage21T2iLayout::new(1, 2, 2, vec![1]).unwrap(),

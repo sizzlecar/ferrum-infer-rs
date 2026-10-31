@@ -278,10 +278,10 @@ pub struct QwenImage21Pipeline<R: DeviceRuntime> {
     runtime: Arc<R>,
     host: HostMemoryAccount,
     execution_host: Option<HostMemoryAccount>,
-    registry: OperationRuntimeRegistry<R>,
+    registry: Arc<OperationRuntimeRegistry<R>>,
     catalog: CapabilityCatalog,
-    materializers: WeightMaterializerRegistry,
-    assets: QwenImage21Assets,
+    materializers: Arc<WeightMaterializerRegistry>,
+    assets: Arc<QwenImage21Assets>,
     profiles: QwenImage21Profiles,
     editing_profiles: Option<QwenImage21EditProfiles>,
     config: ImagePipelineConfig,
@@ -291,7 +291,8 @@ pub struct QwenImage21Pipeline<R: DeviceRuntime> {
     // Prepared service owners may move between threads, but can only be
     // consumed by this exact pipeline instance, even with a shared runtime.
     service_preparation_identity: Arc<()>,
-    plan_cache: plan_cache::StagePlanCache<R>,
+    plan_cache: Arc<plan_cache::StagePlanCache<R>>,
+    preparation_only: bool,
     resident_stages: residency::ResidentStages<R>,
     // Composition-supplied planning allowance. Actual native owners still
     // reserve through the existing device account; this never claims bytes.
@@ -353,10 +354,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             runtime,
             host,
             execution_host: None,
-            registry,
+            registry: Arc::new(registry),
             catalog,
-            materializers,
-            assets,
+            materializers: Arc::new(materializers),
+            assets: Arc::new(assets),
             profiles,
             editing_profiles: None,
             config,
@@ -364,7 +365,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             next_job: 0,
             stopped: false,
             service_preparation_identity: Arc::new(()),
-            plan_cache: plan_cache::StagePlanCache::new(),
+            plan_cache: Arc::new(plan_cache::StagePlanCache::new()),
+            preparation_only: false,
             resident_stages: residency::ResidentStages::new(),
             device_opaque_allowance_bytes: 0,
             serial_actor: Some(serial_actor),
@@ -382,6 +384,40 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         );
         self.device_opaque_allowance_bytes = bytes;
         Ok(self)
+    }
+
+    // Shares immutable model/provider owners, but owns no device session or
+    // serial actor. The returned worker can only prepare future requests.
+    fn preparation_fork(&self) -> Option<Self> {
+        if self.config.residency != ImageResidencyPolicy::Adaptive || self.is_stopped() {
+            return None;
+        }
+        Some(Self {
+            runtime: self.runtime.clone(),
+            host: self.host.clone(),
+            execution_host: self.execution_host.clone(),
+            registry: self.registry.clone(),
+            catalog: self.catalog.clone(),
+            materializers: self.materializers.clone(),
+            assets: self.assets.clone(),
+            profiles: self.profiles.clone(),
+            editing_profiles: self.editing_profiles.clone(),
+            // Observe before current device work starts, so its temporary
+            // allocations are not mistaken for permanent future pressure.
+            config: ImagePipelineConfig {
+                device_capacity_bytes: self.adaptive_capacity_ceiling().ok()?,
+                ..self.config.clone()
+            },
+            policy: self.policy.clone(),
+            next_job: self.next_job.saturating_add(1),
+            stopped: false,
+            service_preparation_identity: self.service_preparation_identity.clone(),
+            plan_cache: self.plan_cache.clone(),
+            preparation_only: true,
+            resident_stages: residency::ResidentStages::new(),
+            device_opaque_allowance_bytes: self.device_opaque_allowance_bytes,
+            serial_actor: None,
+        })
     }
 
     pub fn host_account(&self) -> &HostMemoryAccount {

@@ -20,13 +20,21 @@ fn pipeline() -> (
         reference_vnext_operation_registry(composition.runtime()).unwrap(),
         composition.catalog().clone(),
         WeightMaterializerRegistry::identity_only().unwrap(),
-        original.assets,
+        Arc::try_unwrap(original.assets)
+            .ok()
+            .expect("unique fixture assets"),
         original.profiles,
         original.config,
     )
     .unwrap();
-    pipeline.assets.sources.text_encoder = pipeline.assets.sources.transformer.clone();
-    pipeline.assets.sources.vae = pipeline.assets.sources.transformer.clone();
+    Arc::get_mut(&mut pipeline.assets)
+        .expect("unique fixture assets")
+        .sources
+        .text_encoder = pipeline.assets.sources.transformer.clone();
+    Arc::get_mut(&mut pipeline.assets)
+        .expect("unique fixture assets")
+        .sources
+        .vae = pipeline.assets.sources.transformer.clone();
     pipeline.config.residency = ImageResidencyPolicy::SelectedStages {
         stages: ImageResidentStageSet {
             vision_encoder: true,

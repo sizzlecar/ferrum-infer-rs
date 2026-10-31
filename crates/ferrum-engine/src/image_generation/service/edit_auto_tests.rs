@@ -88,7 +88,7 @@ impl ImageGenerator for Generator {
 /// Use the production GeneratorAdapter for preprocessing and reuse; only the
 /// device execution/output is replaced with scalar seeds and deterministic gates.
 struct Worker {
-    adapter: GeneratorAdapter<Generator>,
+    adapter: GeneratorAdapter,
     capacity: usize,
     preparing: mpsc::Sender<Seeds>,
     prepare_release: mpsc::Receiver<()>,
@@ -183,10 +183,10 @@ fn fixture(host: &HostMemoryAccount, capacity: usize) -> (Worker, Controls) {
     let preprocess_calls = Arc::new(Mutex::new(BTreeMap::new()));
     (
         Worker {
-            adapter: GeneratorAdapter(Generator {
+            adapter: GeneratorAdapter(Box::new(Generator {
                 host: host.clone(),
                 preprocess_calls: preprocess_calls.clone(),
-            }),
+            })),
             capacity,
             preparing,
             prepare_release,

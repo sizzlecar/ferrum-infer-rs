@@ -20,13 +20,18 @@ fn pipeline() -> (
         reference_vnext_operation_registry(composition.runtime()).unwrap(),
         composition.catalog().clone(),
         WeightMaterializerRegistry::identity_only().unwrap(),
-        original.assets,
+        Arc::try_unwrap(original.assets)
+            .ok()
+            .expect("unique fixture assets"),
         original.profiles,
         original.config,
     )
     .unwrap();
     // The same small numerical projection exercises a decoder-lifetime owner.
-    pipeline.assets.sources.vae = pipeline.assets.sources.transformer.clone();
+    Arc::get_mut(&mut pipeline.assets)
+        .expect("unique fixture assets")
+        .sources
+        .vae = pipeline.assets.sources.transformer.clone();
     pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainDecoder {
         maximum_bytes: DEVICE_BYTES / 2,
     };
@@ -313,7 +318,10 @@ fn small_pipeline(
     tempfile::TempDir,
 ) {
     let (mut pipeline, directory) = pipeline();
-    pipeline.assets.sources.text_encoder = pipeline.assets.sources.transformer.clone();
+    Arc::get_mut(&mut pipeline.assets)
+        .expect("unique fixture assets")
+        .sources
+        .text_encoder = pipeline.assets.sources.transformer.clone();
     pipeline.config.residency = ImageResidencyPolicy::AllModelComponents;
     pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainSmallStages {
         maximum_bytes_per_stage,

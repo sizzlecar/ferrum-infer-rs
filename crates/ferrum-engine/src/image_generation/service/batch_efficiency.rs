@@ -149,6 +149,49 @@ impl BatchEfficiency {
         best.count
     }
 
+    /// Prime an idle execution lane with an observed efficient shape. The
+    /// preparation lane still performs the normal search of the remaining
+    /// backlog, so this neither caps capacity nor suppresses larger probes.
+    pub(super) fn warm_start(
+        &self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        queued: usize,
+        capacity_upper: usize,
+    ) -> Option<usize> {
+        let context = context?;
+        let domain = self.0.as_ref().filter(|d| d.matches(context, adapter))?;
+        domain
+            .batches
+            .iter()
+            .filter(|b| b.count <= queued.min(capacity_upper))
+            .filter_map(|b| b.cost(&domain.stages).map(|cost| (b, cost)))
+            .min_by(|(a, ac), (b, bc)| {
+                (u128::from(*ac) * b.count as u128)
+                    .cmp(&(u128::from(*bc) * a.count as u128))
+                    .then_with(|| a.count.cmp(&b.count))
+            })
+            .map(|(b, _)| b.count)
+    }
+
+    /// A just-observed eviction has an unpriced recurring reload. A known
+    /// alternative pays that first hot installation once, allowing the normal
+    /// cost model to price both sizes without blindly repeating the eviction.
+    pub(super) fn reconsider_ready(
+        &self,
+        context: ImageCapacitySearchContext,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        ready: usize,
+    ) -> Option<usize> {
+        let domain = self.0.as_ref().filter(|d| d.matches(context, adapter))?;
+        let sample = domain.batches.iter().find(|b| b.count == ready)?;
+        if sample.missing.is_empty() || sample.cost(&domain.stages).is_some() {
+            return None;
+        }
+        self.warm_start(Some(context), adapter, ready, ready)
+            .filter(|chosen| *chosen < ready)
+    }
+
     pub(super) fn observe(
         &mut self,
         execution: ExecutionContext,
