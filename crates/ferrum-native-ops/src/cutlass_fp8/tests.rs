@@ -149,3 +149,65 @@ fn prepared_facts_reject_forgery_and_identify_workspace_and_device() {
     assert_ne!(p.fingerprint_material(), q.fingerprint_material());
     assert_eq!(p.fingerprint_material()[0..4], 1u32.to_le_bytes());
 }
+
+fn group_bindings(p: &CutlassFp8PlanV1) -> [CutlassFp8BindingsV1; 3] {
+    std::array::from_fn(|index| {
+        let mut b = bindings(p);
+        let branch_offset = index as u64 * 0x100000;
+        b.weight.address += branch_offset;
+        b.weight_scale.address += branch_offset;
+        b.output.address += branch_offset;
+        b
+    })
+}
+
+#[test]
+fn shared_quantization_requires_exact_input_and_scratch_extents() {
+    let p = plan();
+    let group = group_bindings(&p);
+    CutlassFp8BindingsV1::validate_group(&p, &group[..2]).unwrap();
+    CutlassFp8BindingsV1::validate_group(&p, &group).unwrap();
+    for unsupported in [Vec::new(), group[..1].to_vec(), vec![group[0]; 4]] {
+        assert_eq!(
+            CutlassFp8BindingsV1::validate_group(&p, &unsupported),
+            Err(CutlassFp8Error::InvalidArgument)
+        );
+    }
+    let mut different_input = group;
+    different_input[1].input.address += 16;
+    different_input[1].validate(&p).unwrap();
+    assert!(CutlassFp8BindingsV1::validate_group(&p, &different_input).is_err());
+    let mut different_scratch = group;
+    different_scratch[1].scratch.address += 0x10000;
+    different_scratch[1].validate(&p).unwrap();
+    assert!(CutlassFp8BindingsV1::validate_group(&p, &different_scratch).is_err());
+    let mut incomplete_span = group;
+    incomplete_span[1].weight.bytes -= 1;
+    assert!(CutlassFp8BindingsV1::validate_group(&p, &incomplete_span).is_err());
+}
+
+#[test]
+fn grouped_writes_cannot_clobber_another_branchs_reads_or_outputs() {
+    let p = plan();
+    let group = group_bindings(&p);
+    for destination in [
+        group[0].weight.address,
+        group[0].weight_scale.address,
+        group[0].output.address,
+    ] {
+        let mut overlapping = group;
+        overlapping[1].output.address = destination;
+        // Per-branch validation cannot see this hazard. Whole-group validation
+        // must reject it before quantization or any GEMM can be submitted.
+        overlapping[1].validate(&p).unwrap();
+        assert!(CutlassFp8BindingsV1::validate_group(&p, &overlapping).is_err());
+    }
+    let mut later_read = group;
+    later_read[2].weight_scale.address = group[0].output.address;
+    later_read[2].validate(&p).unwrap();
+    assert!(CutlassFp8BindingsV1::validate_group(&p, &later_read).is_err());
+    let mut shared_read = group;
+    shared_read[1].weight = group[0].weight;
+    shared_read[1].weight_scale = group[0].weight_scale;
+    CutlassFp8BindingsV1::validate_group(&p, &shared_read).unwrap();
+}

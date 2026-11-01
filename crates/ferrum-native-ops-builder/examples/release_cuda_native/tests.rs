@@ -47,19 +47,29 @@ fn catalog_extension_preserves_text_contracts_and_rejects_missing_or_changed_row
         providers: vec![row("operation.text", "provider.cuda.text")],
     };
     let mut combined = original.clone();
-    combined.providers.insert(
-        0,
-        row(
-            "operation.dense_linear_fp8.bf16",
-            "provider.cuda.dense_linear_fp8.bf16.cutlass",
-        ),
-    );
+    for suffix in ["", "_pair", "_triple"] {
+        combined.providers.push(row(
+            &format!("operation.dense_linear_fp8{suffix}.bf16"),
+            &format!("provider.cuda.dense_linear_fp8{suffix}.bf16.cutlass"),
+        ));
+    }
+    combined
+        .providers
+        .sort_by(|a, b| (&a.operation_id, &a.provider_id).cmp(&(&b.operation_id, &b.provider_id)));
     validate_catalog_extension(&original, &combined).unwrap();
     assert!(validate_catalog_extension(&original, &original).is_err());
     let mut missing_text = combined.clone();
     missing_text.providers.pop();
     assert!(validate_catalog_extension(&original, &missing_text).is_err());
-    combined.providers[1].provider_implementation_fingerprint = "c".repeat(64);
+    let mut missing_group = combined.clone();
+    missing_group.providers.remove(1);
+    assert!(validate_catalog_extension(&original, &missing_group).is_err());
+    combined
+        .providers
+        .iter_mut()
+        .find(|row| row.operation_id == "operation.text")
+        .unwrap()
+        .provider_implementation_fingerprint = "c".repeat(64);
     assert!(validate_catalog_extension(&original, &combined).is_err());
 }
 

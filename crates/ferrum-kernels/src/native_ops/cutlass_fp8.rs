@@ -14,8 +14,9 @@ use std::ffi::c_void;
 pub(crate) mod cache;
 mod catalog;
 pub use catalog::{
-    provider_catalog_declaration, source_declaration_fingerprint, CutlassFp8CatalogConfig,
-    CUTLASS_FP8_PROVIDER_ID,
+    group_provider_id, provider_catalog_declaration, source_declaration_fingerprint,
+    CutlassFp8CatalogConfig, CUTLASS_FP8_PAIR_PROVIDER_ID, CUTLASS_FP8_PROVIDER_ID,
+    CUTLASS_FP8_TRIPLE_PROVIDER_ID,
 };
 
 #[derive(Debug, Clone)]
@@ -74,6 +75,27 @@ impl PreparedCutlassFp8 {
         }
     }
 
+    /// Validate all branches before enqueue. The same input and scratch spans
+    /// feed two or three independent, equal-shape projections. This does not
+    /// read payloads or acquire device memory.
+    pub fn validate_group(&self, bindings: &[Bindings]) -> Result<(), Error> {
+        Bindings::validate_group(&self.plan, bindings)?;
+        #[cfg(feature = "cuda-cutlass-fp8")]
+        {
+            status(unsafe {
+                ferrum_cutlass_fp8_validate_group_v1(
+                    &self.plan,
+                    bindings.as_ptr(),
+                    bindings.len() as u32,
+                )
+            })
+        }
+        #[cfg(not(feature = "cuda-cutlass-fp8"))]
+        {
+            Err(Error::Unavailable)
+        }
+    }
+
     /// Enqueue quantization followed by the prepared GEMM on one explicit stream.
     ///
     /// # Safety
@@ -90,6 +112,85 @@ impl PreparedCutlassFp8 {
         #[cfg(feature = "cuda-cutlass-fp8")]
         {
             status(unsafe { ferrum_cutlass_fp8_run_v1(&self.plan, bindings, stream) })
+        }
+        #[cfg(not(feature = "cuda-cutlass-fp8"))]
+        {
+            Err(Error::Unavailable)
+        }
+    }
+
+    /// Quantize one shared input, then enqueue every independent GEMM in order.
+    /// Native validation of the whole group completes before the first enqueue.
+    ///
+    /// # Safety
+    /// The same ownership/context/completion rules as [`Self::run`] apply to
+    /// every branch. Input and scratch must remain live and immutable to other
+    /// work until all branches complete. Scratch may not be concurrently reused.
+    /// An error may follow partial enqueue and never proves NotSubmitted.
+    pub unsafe fn run_group(
+        &self,
+        bindings: &[Bindings],
+        stream: *mut c_void,
+    ) -> Result<(), Error> {
+        Bindings::validate_group(&self.plan, bindings)?;
+        if stream.is_null() {
+            return Err(Error::InvalidArgument);
+        }
+        #[cfg(feature = "cuda-cutlass-fp8")]
+        {
+            status(unsafe {
+                ferrum_cutlass_fp8_run_group_v1(
+                    &self.plan,
+                    bindings.as_ptr(),
+                    bindings.len() as u32,
+                    stream,
+                )
+            })
+        }
+        #[cfg(not(feature = "cuda-cutlass-fp8"))]
+        {
+            Err(Error::Unavailable)
+        }
+    }
+
+    /// Opt-in command-event diagnostic: records before quantization, after it,
+    /// and after all GEMMs. No event creation, synchronization or device payload
+    /// allocation occurs. Intervals may include host enqueue gaps; they are not
+    /// kernel-active cycles. Ordinary [`Self::run_group`] has no event calls.
+    ///
+    /// # Safety
+    /// All [`Self::run_group`] requirements apply. `events` must contain three
+    /// distinct, live timing-enabled CUDA events on the same bound context.
+    /// The caller retains the events and every payload through completion,
+    /// including partial errors, and reads timing only after completion.
+    pub unsafe fn run_group_profiled(
+        &self,
+        bindings: &[Bindings],
+        stream: *mut c_void,
+        events: [*mut c_void; 3],
+    ) -> Result<(), Error> {
+        Bindings::validate_group(&self.plan, bindings)?;
+        if stream.is_null()
+            || events.iter().any(|event| event.is_null())
+            || events[0] == events[1]
+            || events[0] == events[2]
+            || events[1] == events[2]
+        {
+            return Err(Error::InvalidArgument);
+        }
+        #[cfg(feature = "cuda-cutlass-fp8")]
+        {
+            status(unsafe {
+                ferrum_cutlass_fp8_run_group_profiled_v1(
+                    &self.plan,
+                    bindings.as_ptr(),
+                    bindings.len() as u32,
+                    stream,
+                    events[0],
+                    events[1],
+                    events[2],
+                )
+            })
         }
         #[cfg(not(feature = "cuda-cutlass-fp8"))]
         {
@@ -130,5 +231,25 @@ unsafe extern "C" {
         plan: *const Plan,
         bindings: *const Bindings,
         stream: *mut c_void,
+    ) -> i32;
+    fn ferrum_cutlass_fp8_validate_group_v1(
+        plan: *const Plan,
+        bindings: *const Bindings,
+        count: u32,
+    ) -> i32;
+    fn ferrum_cutlass_fp8_run_group_v1(
+        plan: *const Plan,
+        bindings: *const Bindings,
+        count: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn ferrum_cutlass_fp8_run_group_profiled_v1(
+        plan: *const Plan,
+        bindings: *const Bindings,
+        count: u32,
+        stream: *mut c_void,
+        start: *mut c_void,
+        after_quant: *mut c_void,
+        after_gemm: *mut c_void,
     ) -> i32;
 }

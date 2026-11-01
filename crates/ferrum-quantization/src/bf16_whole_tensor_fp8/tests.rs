@@ -381,6 +381,59 @@ fn schema_preserves_three_dense_nodes_with_distinct_scales_and_untouched_bf16() 
 }
 
 #[test]
+fn shared_activation_groups_keep_each_weights_original_conversion_and_scale() {
+    let (source, scalar, groups) = fixture(DENSE_LINEAR_FP8_BF16_OPERATION_ID);
+    let expected = plan::prepare_program(&source, &scalar, &groups).unwrap();
+    for (branches, operation) in [
+        (2, DENSE_LINEAR_FP8_PAIR_BF16_OPERATION_ID),
+        (3, DENSE_LINEAR_FP8_TRIPLE_BF16_OPERATION_ID),
+    ] {
+        let mut blocks = scalar.blocks().to_vec();
+        let originals = &blocks[0].nodes;
+        let mut fused = originals[0].clone();
+        fused.operation_id = id(operation);
+        fused.inputs.truncate(1);
+        fused.inputs.extend(
+            originals[..branches]
+                .iter()
+                .map(|node| node.inputs[1].clone()),
+        );
+        fused.outputs = originals[..branches]
+            .iter()
+            .map(|node| node.outputs[0].clone())
+            .collect();
+        blocks[0].nodes = std::iter::once(fused)
+            .chain(originals[branches..].iter().cloned())
+            .collect();
+        let build = |blocks| {
+            ModelProgram::new(
+                scalar.family_id().clone(),
+                scalar.inputs().to_vec(),
+                blocks,
+                scalar.states().to_vec(),
+                scalar.weights().to_vec(),
+                scalar.outputs().to_vec(),
+            )
+            .unwrap()
+        };
+        let grouped = build(blocks.clone());
+        let actual = plan::prepare_program(&source, &grouped, &groups).unwrap();
+        assert_eq!(actual.schema, expected.schema);
+        assert_eq!(actual.sources, expected.sources);
+        assert_eq!(actual.converted_bytes, expected.converted_bytes);
+        assert_eq!(actual.maximum_group_bytes, expected.maximum_group_bytes);
+
+        let mut omitted = groups.clone();
+        omitted[0].pop();
+        assert!(plan::prepare_program(&source, &grouped, &omitted).is_err());
+        // Being a group input is not sufficient: activation port zero is not
+        // a quantized weight port, even when it names a selected static weight.
+        blocks[0].nodes[0].inputs.swap(0, 1);
+        assert!(plan::prepare_program(&source, &build(blocks), &groups).is_err());
+    }
+}
+
+#[test]
 fn lookup_preflight_charges_each_aligned_allocation_without_changing_weight_bytes() {
     let (mut original, program, groups) = fixture(DENSE_LINEAR_FP8_BF16_OPERATION_ID);
     let columns = lookup::MINIMUM_PACKED_ELEMENTS / 3;

@@ -28,3 +28,16 @@ static_assert(sizeof(FerrumCutlassFp8BindingsV1) == 80, "bindings ABI drift");
 extern "C" int ferrum_cutlass_fp8_plan_v1(const FerrumCutlassFp8RequestV1*, FerrumCutlassFp8PlanV1*) noexcept;
 extern "C" int ferrum_cutlass_fp8_validate_v1(const FerrumCutlassFp8PlanV1*, const FerrumCutlassFp8BindingsV1*) noexcept;
 extern "C" int ferrum_cutlass_fp8_run_v1(const FerrumCutlassFp8PlanV1*, const FerrumCutlassFp8BindingsV1*, void* stream) noexcept;
+
+// Two or three equal-shape projections share exact input/scratch spans. All
+// outputs are disjoint from every read and from one another. Validation of the
+// entire group precedes enqueue. One row quantization feeds independent GEMMs.
+extern "C" int ferrum_cutlass_fp8_validate_group_v1(const FerrumCutlassFp8PlanV1*, const FerrumCutlassFp8BindingsV1*, uint32_t count) noexcept;
+extern "C" int ferrum_cutlass_fp8_run_group_v1(const FerrumCutlassFp8PlanV1*, const FerrumCutlassFp8BindingsV1*, uint32_t count, void* stream) noexcept;
+
+// Opt-in diagnostic only. The caller creates and retains three distinct timing
+// events on the same context through completion. Records start, after quant,
+// and after all GEMMs; never creates events, synchronizes or allocates payloads.
+// Recorded intervals include any host enqueue gaps. Normal run_group has no
+// event calls. Errors may follow partial enqueue, including event recording.
+extern "C" int ferrum_cutlass_fp8_run_group_profiled_v1(const FerrumCutlassFp8PlanV1*, const FerrumCutlassFp8BindingsV1*, uint32_t count, void* stream, void* start, void* after_quant, void* after_gemm) noexcept;

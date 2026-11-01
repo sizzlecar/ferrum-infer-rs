@@ -68,4 +68,9 @@ pub mod cuda;
 #[path = "cuda/vnext_runtime/tensor_eager/memory_policy.rs"]
 mod cuda_tensor_memory_policy;
 
+// Configuration checks must run in CPU tests as well as CUDA constructors.
+#[cfg(any(feature = "cuda", test))]
+#[path = "cuda/vnext_runtime/tensor_eager/capability_policy.rs"]
+mod cuda_tensor_capability_policy;
+
 pub mod timer;
