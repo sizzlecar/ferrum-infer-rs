@@ -190,7 +190,17 @@ fn consumes(job: &Value, dependency: &str, artifact: &str) -> Result<(), String>
     }
     let mut found = false;
     for step in mandatory_steps(job)? {
-        if step["uses"] == "actions/download-artifact@v4"
+        let download = step["uses"]
+            .as_str()
+            .and_then(|action| action.strip_prefix("actions/download-artifact@"))
+            .is_some_and(|revision| {
+                // Retain the historical v4 workflow and recognize immutable
+                // official-action pins without binding the graph to one update.
+                revision == "v4"
+                    || (revision.len() == 40
+                        && revision.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            });
+        if download
             && step["with"]["artifact-ids"]
                 .as_str()
                 .is_some_and(|ids| ids.split(',').any(|id| id == artifact))
@@ -206,6 +216,61 @@ fn consumes(job: &Value, dependency: &str, artifact: &str) -> Result<(), String>
         return Err(format!("missing required artifact input {artifact}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn consumer(action: &str) -> Value {
+        json!({
+            "needs": ["producer"],
+            "steps": [{"uses": action, "with": {"artifact-ids": "${{ needs.producer.outputs.asset }}"}}]
+        })
+    }
+
+    #[test]
+    fn artifact_inputs_recognize_official_pins_without_accepting_mutable_or_other_actions() {
+        let artifact = "${{ needs.producer.outputs.asset }}";
+        for revision in [
+            "v4".into(),
+            "a".repeat(40),
+            "0123456789abcdef".repeat(2) + "01234567",
+        ] {
+            assert!(consumes(
+                &consumer(&format!("actions/download-artifact@{revision}")),
+                "producer",
+                artifact
+            )
+            .is_ok());
+        }
+        for action in [
+            "actions/download-artifact@main".into(),
+            "actions/download-artifact@v8".into(),
+            format!("actions/download-artifact@{}", "a".repeat(39)),
+            format!("actions/download-artifact@{}", "g".repeat(40)),
+            format!("other/download-artifact@{}", "a".repeat(40)),
+            format!("actions/upload-artifact@{}", "a".repeat(40)),
+        ] {
+            assert!(
+                consumes(&consumer(&action), "producer", artifact).is_err(),
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_artifact_inputs_still_require_mandatory_download_and_producer() {
+        let job = consumer(&format!("actions/download-artifact@{}", "a".repeat(40)));
+        let artifact = "${{ needs.producer.outputs.asset }}";
+        assert!(consumes(&job, "missing", artifact).is_err());
+        assert!(consumes(&job, "producer", "${{ needs.producer.outputs.other }}").is_err());
+        for (field, value) in [("if", json!("false")), ("continue-on-error", json!(true))] {
+            let mut changed = job.clone();
+            changed["steps"][0][field] = value;
+            assert!(consumes(&changed, "producer", artifact).is_err(), "{field}");
+        }
+    }
 }
 
 pub(super) fn producer_jobs(
