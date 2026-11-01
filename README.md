@@ -12,6 +12,22 @@ Text and image inference in one Rust binary, with CLI and OpenAI-compatible APIs
 
 The goal: maximize output throughput while meeting latency SLOs for time to first token (TTFT), time per output token (TPOT) and inter-token latency (ITL).
 
+Fix hardware, model and output policy; optimize execution policy $\pi\in\Pi$:
+
+$$
+\begin{gathered}
+\max_{\pi\in\Pi}\;\frac{N_{\mathrm{out}}(\pi;W,T)}{T} \\
+\text{s.t.} \\
+Q_{p_k}\!\left(L_k(\pi;W,T)\right)\le S_k \\
+\forall k\in\{\mathrm{TTFT},\mathrm{TPOT},\mathrm{ITL}\} \\
+C(\pi;W,T)\ge\rho
+\end{gathered}
+$$
+
+- $W$: fixed requests and arrival schedule; $T>0$: fixed window and common cutoff. $N_{\mathrm{out}}$: valid output tokens from requests successfully completed by that cutoff.
+- $L_k$: latency samples; $Q_{p_k}$: quantile; $S_k$: SLO limit. TTFT includes queueing; missing latency evidence does not establish compliance.
+- $C$: fraction of $W$ successfully completed by the cutoff; rejected, failed, timed-out and unfinished requests remain in the denominator. Declare $p_k$, $S_k$ and minimum completion rate $0<\rho\le1$ before measuring. [Sampling rules](docs/performance-popular-models-p0.zh.md).
+
 ## Install
 
 macOS Apple Silicon / Linux x86_64:

@@ -12,6 +12,22 @@ Rust 文本与图像推理引擎，一个二进制提供 CLI 和 OpenAI 兼容 A
 
 目标：满足首 token 延迟（TTFT）、单 token 耗时（TPOT）和输出间隔（ITL）要求，最大化输出吞吐。
 
+固定硬件、模型和输出策略，优化执行策略 $\pi\in\Pi$：
+
+$$
+\begin{gathered}
+\max_{\pi\in\Pi}\;\frac{N_{\mathrm{out}}(\pi;W,T)}{T} \\
+\text{s.t.} \\
+Q_{p_k}\!\left(L_k(\pi;W,T)\right)\le S_k \\
+\forall k\in\{\mathrm{TTFT},\mathrm{TPOT},\mathrm{ITL}\} \\
+C(\pi;W,T)\ge\rho
+\end{gathered}
+$$
+
+- $W$：固定请求集与到达时序；$T>0$：固定窗口，结束即共同截止点。$N_{\mathrm{out}}$：截止前成功完成请求的有效输出 token 数。
+- $L_k$：延迟样本；$Q_{p_k}$：分位数；$S_k$：SLO 上限。TTFT 包含排队时间，缺失延迟证据不算达标。
+- $C$：$W$ 中截止前成功完成的比例，分母包含拒绝、失败、超时和未完成请求。测量前确定 $p_k$、$S_k$ 和最低完成率 $0<\rho\le1$。[采样口径](docs/performance-popular-models-p0.zh.md)。
+
 ## 安装
 
 macOS Apple Silicon / Linux x86_64：
