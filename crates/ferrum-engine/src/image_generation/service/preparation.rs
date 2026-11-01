@@ -93,6 +93,36 @@ fn validate_output_budget(expected: usize, actual: usize) -> Result<(), ImageBat
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
+    fn service_resident_preference(
+        &self,
+        prepared: &PreparedRequest<R>,
+    ) -> Result<Option<super::super::ImageDeviceCapacityReport>, ImageBatchError> {
+        if self.config.residency != super::super::ImageResidencyPolicy::Adaptive {
+            return Ok(None);
+        }
+        let mut stages = vec![
+            &prepared.text_stage,
+            &prepared.noise_stage,
+            &prepared.denoise_stage,
+            &prepared.decode_stage,
+        ];
+        if let Some(edit) = &prepared.edit {
+            stages.extend([&edit.vision_stage, &edit.encoder_stage]);
+        }
+        if let Some(prefix) = &prepared.prefix_decode {
+            stages.push(&prefix.stage);
+        }
+        self.resident_preference_with_prefix(
+            &stages,
+            prepared
+                .prefix_decode
+                .as_ref()
+                .map(|p| (&prepared.denoise_stage, &p.stage)),
+        )
+        .map(Some)
+        .map_err(preparation_error)
+    }
+
     fn validate_service_availability(&self) -> Result<(), ImageBatchError> {
         if self.stopped || (!self.preparation_only && self.is_stopped()) {
             return Err(ImageBatchError::Fatal(Box::new(
@@ -123,11 +153,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .prepare_batch_with_host_admission(requests, None, false)
             .map_err(preparation_error)?;
         validate_output_budget(output_bytes, prepared.host_budget.output)?;
-        Ok(ImageBatchPreparation::new(BoundPreparation::new(
+        let resident = self.service_resident_preference(&prepared)?;
+        let mut preparation = ImageBatchPreparation::new(BoundPreparation::new(
             &self.service_preparation_identity,
             identities,
             prepared,
-        )))
+        ));
+        if let Some(report) = resident {
+            preparation = preparation.with_resident_capacity(report);
+        }
+        Ok(preparation)
     }
 
     pub(super) fn prepare_service_edit_bytes(
@@ -226,11 +261,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .prepare_preprocessed_edits_with_host_admission(&generation, &inputs, false)
             .map_err(preparation_error)?;
         validate_output_budget(output_bytes, prepared.host_budget.output)?;
-        Ok(ImageBatchPreparation::new(BoundPreparation::new(
+        let resident = self.service_resident_preference(&prepared)?;
+        let mut preparation = ImageBatchPreparation::new(BoundPreparation::new(
             &self.service_preparation_identity,
             identities,
             prepared,
-        )))
+        ));
+        if let Some(report) = resident {
+            preparation = preparation.with_resident_capacity(report);
+        }
+        Ok(preparation)
     }
 
     /// Retain one validated plan and its immutable weight owners while waiting

@@ -10,8 +10,9 @@ pub enum ImageBatchPolicy {
     /// Preserve an explicitly configured batch ceiling and gathering window.
     #[default]
     Configured,
-    /// Dispatch available work immediately. At the next idle boundary, combine
-    /// compatible backlog and reduce it only on a typed preparation-capacity
-    /// rejection. No future arrivals are awaited to fill a batch.
+    /// Dispatch available work immediately. Adapt compatible backlog using
+    /// compiled capacity/residency demand and measured execution costs. Unknown
+    /// weight-swapping probes spend earned execution savings; fresh capacity
+    /// admission remains authoritative. Never wait for future arrivals.
     Auto,
 }

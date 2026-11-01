@@ -5,6 +5,35 @@ use ferrum_kernels::backend::reference::reference_vnext_operation_registry;
 use ferrum_models::qwen_image21::QwenImage21TransformerPhase;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[test]
+fn resident_preference_counts_required_weights_without_tightening_staged_admission() {
+    let (mut pipeline, _directory) = pipeline();
+    let text = stage(&pipeline, ImageStage::TextEncoder, 1);
+    let denoiser = stage(&pipeline, ImageStage::Denoiser, 2);
+    let stages = [&text, &denoiser];
+    let staged = pipeline.capacity_with_prefix(&stages, None).unwrap();
+    let resident = pipeline
+        .resident_preference_with_prefix(&stages, None)
+        .unwrap();
+    assert_eq!(
+        resident.retained_static_bytes,
+        text.plan.static_bytes + denoiser.plan.static_bytes
+    );
+    assert!(resident.required_bytes > staged.required_bytes);
+    pipeline.config.device_capacity_bytes = resident.required_bytes - 1;
+    assert!(pipeline.capacity_with_prefix(&stages, None).unwrap().fits());
+    assert!(!pipeline
+        .resident_preference_with_prefix(&stages, None)
+        .unwrap()
+        .fits());
+    pipeline.config.device_capacity_bytes = resident.required_bytes;
+    assert!(pipeline
+        .resident_preference_with_prefix(&stages, None)
+        .unwrap()
+        .fits());
+    close(&mut pipeline);
+}
+
 fn pipeline() -> (
     QwenImage21Pipeline<ReferenceDeviceRuntime>,
     tempfile::TempDir,

@@ -388,6 +388,26 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         stages: &[&PreparedStage<R>],
         prefix: Option<(&PreparedStage<R>, &PreparedStage<R>)>,
     ) -> anyhow::Result<ImageDeviceCapacityReport> {
+        self.capacity_with_prefix_retention(stages, prefix, false)
+    }
+
+    /// Advisory steady-state demand if all weights required by this workload
+    /// remain installed. Idle dynamic pools can still be retired. This is a
+    /// scheduling preference, not the staged execution's admission boundary.
+    pub(super) fn resident_preference_with_prefix(
+        &self,
+        stages: &[&PreparedStage<R>],
+        prefix: Option<(&PreparedStage<R>, &PreparedStage<R>)>,
+    ) -> anyhow::Result<ImageDeviceCapacityReport> {
+        self.capacity_with_prefix_retention(stages, prefix, true)
+    }
+
+    fn capacity_with_prefix_retention(
+        &self,
+        stages: &[&PreparedStage<R>],
+        prefix: Option<(&PreparedStage<R>, &PreparedStage<R>)>,
+        retain_required_weights: bool,
+    ) -> anyhow::Result<ImageDeviceCapacityReport> {
         self.config
             .dynamic_residency
             .validate(self.config.residency)?;
@@ -429,7 +449,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 "image resident capacity requires compiled fixed tensor plans"
             );
             let memory = payload.memory();
-            let retained = !adaptive && self.config.residency.retains(stage.plan.stage);
+            let retained = retain_required_weights
+                || (!adaptive && self.config.residency.retains(stage.plan.stage));
             if retained && !counted_static.contains(&stage.plan.stage) {
                 retained_static = retained_static
                     .checked_add(memory.static_bytes())
@@ -490,7 +511,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .and_then(|n| n.checked_add(other_dynamic(ImageStage::Denoiser)))
                 .and_then(|n| {
                     n.checked_add(
-                        if !adaptive && self.config.residency.retains(ImageStage::Denoiser) {
+                        if retain_required_weights
+                            || (!adaptive && self.config.residency.retains(ImageStage::Denoiser))
+                        {
                             0
                         } else {
                             prefill.static_bytes()
@@ -506,7 +529,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .checked_add(other_dynamic(ImageStage::Denoiser))
                 .context("retained pools plus prefix decode capacity overflows")?
                 .checked_add(
-                    if !adaptive && self.config.residency.retains(ImageStage::Denoiser) {
+                    if retain_required_weights
+                        || (!adaptive && self.config.residency.retains(ImageStage::Denoiser))
+                    {
                         0
                     } else {
                         prefill.static_bytes()

@@ -23,6 +23,7 @@ pub(super) struct ExecutionContext {
     /// Capacity-proof upper bound independent of a short queue or tail.
     pub(super) capacity_upper: usize,
     pub(super) batch_size: usize,
+    pub(super) exploration: bool,
 }
 
 #[derive(Default)]
@@ -36,6 +37,10 @@ struct Domain {
     stages: Vec<StageSample>,
     explored_from: Option<usize>,
     savings_us: u64,
+    /// Real execution savings against the first warm observed batch. Unknown
+    /// spilling probes spend a whole execution; subsequent reloads are charged
+    /// by their actual execution too. Bootstrap debt must be repaid first.
+    exploration_credit_us: i128,
 }
 
 struct StageSample {
@@ -43,6 +48,8 @@ struct StageSample {
     // The first installation may include disk reads/quantization. Only a later
     // physical installation is an observed recurring reload cost.
     reload_us: Option<u64>,
+    /// Conservative probe reserve only, never a recurring cost estimate.
+    installation_ceiling_us: u64,
 }
 
 struct BatchSample {
@@ -62,6 +69,41 @@ impl BatchSample {
 }
 
 impl Domain {
+    /// Price completion of the owned FIFO cohort, including its short tail.
+    /// Per-row ranking alone can split a fitting batch into a cheaper-looking
+    /// prefix and an expensive singleton. Unknown tail shapes conservatively
+    /// use a whole observed execution as their estimate, never as admission.
+    fn cohort_first(&self, queued: usize, maximum: usize) -> Option<&BatchSample> {
+        let costs: Vec<_> = self
+            .batches
+            .iter()
+            .filter(|b| b.count <= queued.min(maximum))
+            .filter_map(|b| b.cost(&self.stages).map(|cost| (b, u128::from(cost))))
+            .collect();
+        if costs.is_empty() {
+            return None;
+        }
+        // (finish time, summed image completion times, first batch). Finish
+        // time preserves throughput; ties minimize waiting across the cohort.
+        let mut plans = vec![(0_u128, 0_u128, 0_usize); queued + 1];
+        for remaining in 1..=queued {
+            plans[remaining] = costs
+                .iter()
+                .map(|(batch, cost)| {
+                    let tail = plans[remaining.saturating_sub(batch.count)];
+                    (
+                        cost.saturating_add(tail.0),
+                        cost.saturating_mul(remaining as u128)
+                            .saturating_add(tail.1),
+                        batch.count,
+                    )
+                })
+                .min()
+                .expect("observed costs retained");
+        }
+        self.batches.iter().find(|b| b.count == plans[queued].2)
+    }
+
     fn matches(
         &self,
         context: ImageCapacitySearchContext,
@@ -72,6 +114,62 @@ impl Domain {
 }
 
 impl BatchEfficiency {
+    pub(super) fn allow_spilling_candidate(
+        &self,
+        context: Option<ImageCapacitySearchContext>,
+        adapter: &Option<Arc<ImageAdapterBatchIdentity>>,
+        candidate: usize,
+        resident_upper: usize,
+    ) -> bool {
+        if resident_upper == 0 {
+            return true;
+        }
+        let Some(context) = context else {
+            return true;
+        };
+        let Some(domain) = self.0.as_ref().filter(|d| d.matches(context, adapter)) else {
+            return false;
+        };
+        let best = domain
+            .batches
+            .iter()
+            .filter(|b| b.count <= candidate)
+            .filter_map(|b| b.cost(&domain.stages).map(|cost| (b, cost)))
+            .min_by(|(a, ac), (b, bc)| {
+                (u128::from(*ac) * b.count as u128)
+                    .cmp(&(u128::from(*bc) * a.count as u128))
+                    .then_with(|| a.count.cmp(&b.count))
+            });
+        let Some((best, _)) = best else {
+            return false;
+        };
+        if let Some(sample) = domain.batches.iter().find(|b| b.count == candidate) {
+            if sample.cost(&domain.stages).is_none() {
+                return false;
+            }
+            if best.count == candidate {
+                return true;
+            }
+        }
+        // When only a singleton fits without swapping, permit one adjacent
+        // real-work calibration. Its full cost becomes debt below. There is
+        // no machine-specific batch cap and no repeated free calibration.
+        if candidate == 2 && resident_upper == 1 && domain.batches.iter().all(|b| b.count == 1) {
+            return true;
+        }
+        let executions = candidate.div_ceil(best.count) as u128;
+        let reserve = u128::from(best.last_execution_us)
+            .saturating_mul(executions)
+            .saturating_add(
+                domain
+                    .stages
+                    .iter()
+                    .map(|s| u128::from(s.installation_ceiling_us))
+                    .sum::<u128>(),
+            );
+        domain.exploration_credit_us >= 0 && domain.exploration_credit_us as u128 >= reserve
+    }
+
     /// Only shrink the already available FIFO prefix. Unknown costs and sizes
     /// use the original capacity search; this never waits for more arrivals.
     pub(super) fn select(
@@ -123,20 +221,10 @@ impl BatchEfficiency {
                 "image batch efficiency selection");
             return largest - 1;
         }
-        let best = domain
-            .batches
-            .iter()
-            .filter(|b| b.count <= queued_upper)
-            .filter_map(|b| b.cost(&domain.stages).map(|cost| (b, cost)))
-            .min_by(|(left, lc), (right, rc)| {
-                (u128::from(*lc) * right.count as u128)
-                    .cmp(&(u128::from(*rc) * left.count as u128))
-                    // Equal per-image cost favors earlier completion.
-                    .then_with(|| left.count.cmp(&right.count))
-            });
-        let Some((best, cost)) = best else {
+        let Some(best) = domain.cohort_first(queued_upper, capacity_upper) else {
             return queued_upper;
         };
+        let cost = best.cost(&domain.stages).expect("priced cohort batch");
         if best.count < queued_upper {
             tracing::debug!(target: "ferrum_engine::image_generation::timing",
                 chosen_batch = best.count, observed_max_batch = largest, capacity_upper,
@@ -161,17 +249,7 @@ impl BatchEfficiency {
     ) -> Option<usize> {
         let context = context?;
         let domain = self.0.as_ref().filter(|d| d.matches(context, adapter))?;
-        domain
-            .batches
-            .iter()
-            .filter(|b| b.count <= queued.min(capacity_upper))
-            .filter_map(|b| b.cost(&domain.stages).map(|cost| (b, cost)))
-            .min_by(|(a, ac), (b, bc)| {
-                (u128::from(*ac) * b.count as u128)
-                    .cmp(&(u128::from(*bc) * a.count as u128))
-                    .then_with(|| a.count.cmp(&b.count))
-            })
-            .map(|(b, _)| b.count)
+        domain.cohort_first(queued, capacity_upper).map(|b| b.count)
     }
 
     /// Recheck a prepared batch after the preceding execution supplies feedback.
@@ -220,6 +298,7 @@ impl BatchEfficiency {
                 stages: Vec::new(),
                 explored_from: None,
                 savings_us: 0,
+                exploration_credit_us: 0,
             });
         }
         let domain = self.0.as_mut().unwrap();
@@ -233,6 +312,9 @@ impl BatchEfficiency {
             match domain.stages.iter_mut().find(|s| s.stage == stage.stage) {
                 Some(previous) if stage.initialization_us > 0 => {
                     previous.reload_us = Some(stage.initialization_us);
+                    previous.installation_ceiling_us = previous
+                        .installation_ceiling_us
+                        .max(stage.initialization_us);
                 }
                 Some(_) => (),
                 None => {
@@ -240,6 +322,7 @@ impl BatchEfficiency {
                     domain.stages.push(StageSample {
                         stage: stage.stage,
                         reload_us: None,
+                        installation_ceiling_us: stage.initialization_us,
                     });
                 }
             }
@@ -253,6 +336,22 @@ impl BatchEfficiency {
             return;
         }
         let base_us = actual_us - initialization_us;
+        if let Some(reference) = domain
+            .batches
+            .first()
+            .and_then(|b| b.cost(&domain.stages).map(|cost| (b.count, cost)))
+        {
+            let baseline =
+                i128::from(reference.1) * execution.batch_size as i128 / reference.0 as i128;
+            domain.exploration_credit_us = domain
+                .exploration_credit_us
+                .saturating_add(baseline.saturating_sub(i128::from(actual_us)));
+        }
+        if execution.exploration {
+            domain.exploration_credit_us = domain
+                .exploration_credit_us
+                .saturating_sub(i128::from(actual_us));
+        }
         let previous_largest = domain.batches.iter().map(|b| b.count).max().unwrap_or(0);
         if execution.batch_size + 1 == previous_largest {
             domain.explored_from = Some(previous_largest);
