@@ -86,9 +86,22 @@ ferrum serve /path/to/Qwen-Image-2.1-Turbo --backend cuda \
 
 CLI 示例、Metal 配置和 CUDA LoRA 见[图像使用指南](docs/image-generation.md)。
 
-## 模型与文档
+## 支持范围
 
-文本架构包括 Llama、Mistral、Qwen2、Qwen3 dense/MoE、Qwen3.5 dense/MoE 和 Gemma 3。支持 GGUF、SafeTensors，量化与模型支持范围取决于后端，已验证组合见[回归目录](docs/release-regression-catalog.md)。
+| 范围 | 模型、格式与后端限制 |
+|---|---|
+| 文本架构 | Llama、Mistral、Qwen2、Qwen3 dense/MoE、Qwen3.5 hybrid dense/MoE、Gemma 3 文本 |
+| 权重格式 | GGUF，含 Q4_K/Q5_K/Q6_K/Q8_0；SafeTensors |
+| CUDA 量化 | 部分模型路径支持 GPTQ INT4、compressed-tensors INT4、block-FP8 |
+| CUDA 专用模型 | Gemma 4 compressed-tensors W4A16；GPT-OSS MXFP4 |
+| PQ2_0 | Metal 已验证完整模型；CUDA 仅有算子覆盖 |
+| 图像 | Qwen-Image-2.1-Turbo 生图与单张 PNG 编辑；Linux CUDA SM89/SM120、Metal。M4 Metal 已验证 1024×1024 |
+
+支持范围取决于架构、格式和后端组合；文本支持不代表视觉支持。CPU 为兼容后端。已验证组合与覆盖范围见[回归目录](docs/release-regression-catalog.md)。
+
+Embedding、ASR、TTS 入口和旧执行 API 已退役，见[迁移说明](https://github.com/sizzlecar/ferrum-infer-rs/pull/441)。
+
+## 文档
 
 - [API 兼容说明](docs/openai-api-compatibility.md) · [Agent 服务](docs/agent-serving.md)
 - [数值执行策略](docs/numerical-execution.zh.md) · [缓存说明](docs/cache-product.md)
