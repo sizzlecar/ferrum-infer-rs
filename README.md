@@ -86,9 +86,22 @@ Both return PNG in `b64_json`. CUDA batches compatible requests automatically wi
 
 See the [image guide](docs/image-generation.md) for CLI examples, Metal setup and CUDA LoRA.
 
-## Models and documentation
+## Supported scope
 
-Text architectures include Llama, Mistral, Qwen2, Qwen3 dense/MoE, Qwen3.5 dense/MoE and Gemma 3. Supports GGUF and SafeTensors; quantization and model support vary by backend. See the [validation catalog](docs/release-regression-catalog.md) for tested combinations.
+| Scope | Models, formats and backend limits |
+|---|---|
+| Text architectures | Llama, Mistral, Qwen2, Qwen3 dense/MoE, Qwen3.5 hybrid dense/MoE, Gemma 3 text |
+| Weights | GGUF, including Q4_K/Q5_K/Q6_K/Q8_0; SafeTensors |
+| CUDA quantization | Selected model paths: GPTQ INT4, compressed-tensors INT4, block-FP8 |
+| Specific CUDA models | Gemma 4 compressed-tensors W4A16; GPT-OSS MXFP4 |
+| PQ2_0 | Complete-model validation on Metal; CUDA operator coverage only |
+| Images | Qwen-Image-2.1-Turbo generation and single-PNG editing; Linux CUDA SM89/SM120 and Metal. Validated at 1024×1024 on M4 Metal |
+
+Support depends on the architecture, format and backend combination; text support does not imply vision support. CPU is a compatibility backend. See the [validation catalog](docs/release-regression-catalog.md) for tested combinations and coverage.
+
+Embedding, ASR, TTS and legacy execution APIs are retired. See [migration notes](https://github.com/sizzlecar/ferrum-infer-rs/pull/441).
+
+## Documentation
 
 - [API compatibility](docs/openai-api-compatibility.md) · [Agent serving](docs/agent-serving.md)
 - [Numerical profiles](docs/numerical-execution.zh.md) · [Caching](docs/cache-product.md)
