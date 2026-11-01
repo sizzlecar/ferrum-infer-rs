@@ -467,14 +467,7 @@ pub fn cuda_tensor_runtime_config_with_cutlass_fp8_grouped(
     device_id: DeviceId,
 ) -> Result<CudaDeviceRuntimeConfig, VNextError> {
     let mut config = cuda_tensor_runtime_config_with_cutlass_fp8(ordinal, device_id)?;
-    for group in [
-        ferrum_runtime::DenseLinearFp8Group::Pair,
-        ferrum_runtime::DenseLinearFp8Group::Triple,
-    ] {
-        config
-            .capabilities
-            .insert(CapabilityId::new(group.capability_id())?);
-    }
+    crate::backend::cuda_tensor_capability_policy::add_grouped_fp8(&mut config.capabilities)?;
     config.runtime_implementation_fingerprint = implementation_fingerprint(&[
         config.runtime_implementation_fingerprint.as_bytes(),
         b"cuda.tensor.cutlass-fp8.shared-quant.v1",
