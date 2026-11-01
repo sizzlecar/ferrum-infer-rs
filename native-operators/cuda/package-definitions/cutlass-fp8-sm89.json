@@ -19,7 +19,10 @@
   ],
   "required_exports": [
     "ferrum_cutlass_fp8_plan_v1",
+    "ferrum_cutlass_fp8_run_group_profiled_v1",
+    "ferrum_cutlass_fp8_run_group_v1",
     "ferrum_cutlass_fp8_run_v1",
+    "ferrum_cutlass_fp8_validate_group_v1",
     "ferrum_cutlass_fp8_validate_v1"
   ],
   "license_files": [

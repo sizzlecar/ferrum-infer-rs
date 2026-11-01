@@ -8,9 +8,12 @@ use std::mem::{offset_of, size_of};
 
 pub const CUTLASS_FP8_ABI: u32 = 1;
 pub const CUTLASS_FP8_OPERATOR: &str = "ferrum.cuda.cutlass_fp8_scaled_mm";
-pub const CUTLASS_FP8_EXPORTS: [&str; 3] = [
+pub const CUTLASS_FP8_EXPORTS: [&str; 6] = [
     "ferrum_cutlass_fp8_plan_v1",
+    "ferrum_cutlass_fp8_run_group_profiled_v1",
+    "ferrum_cutlass_fp8_run_group_v1",
     "ferrum_cutlass_fp8_run_v1",
+    "ferrum_cutlass_fp8_validate_group_v1",
     "ferrum_cutlass_fp8_validate_v1",
 ];
 pub const CUTLASS_FP8_SCRATCH_ALIGNMENT: u64 = 256;
@@ -265,6 +268,36 @@ impl CutlassFp8BindingsV1 {
             }
         }
         disjoint(self.output, self.scratch)
+    }
+
+    /// Two or three same-shape projections may share the exact input and
+    /// invocation scratch. Every output remains separate from all reads and
+    /// all other outputs, including branches executed later in the group.
+    /// These checks describe extents only; they grant no resource authority.
+    pub fn validate_group(
+        plan: &CutlassFp8PlanV1,
+        bindings: &[Self],
+    ) -> Result<(), CutlassFp8Error> {
+        if !matches!(bindings.len(), 2 | 3) {
+            return Err(CutlassFp8Error::InvalidArgument);
+        }
+        for binding in bindings {
+            binding.validate(plan)?;
+            if binding.input != bindings[0].input || binding.scratch != bindings[0].scratch {
+                return Err(CutlassFp8Error::Span);
+            }
+        }
+        for (index, binding) in bindings.iter().enumerate() {
+            for other in bindings {
+                for read in [other.input, other.weight, other.weight_scale] {
+                    disjoint(binding.output, read)?;
+                }
+            }
+            for other in &bindings[index + 1..] {
+                disjoint(binding.output, other.output)?;
+            }
+        }
+        Ok(())
     }
 }
 fn disjoint(a: CutlassFp8Span, b: CutlassFp8Span) -> Result<(), CutlassFp8Error> {
