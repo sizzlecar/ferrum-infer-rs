@@ -217,23 +217,39 @@ fn validate_catalog_extension(
     if original.schema_version != combined.schema_version || original.backend != combined.backend {
         return Err("catalog schema/backend changed".into());
     }
-    let fp8 = "provider.cuda.dense_linear_fp8.bf16.cutlass";
-    if original.providers.iter().any(|row| row.provider_id == fp8)
-        || combined.providers.len() != original.providers.len() + 1
+    let fp8 = [
+        (
+            "operation.dense_linear_fp8.bf16",
+            "provider.cuda.dense_linear_fp8.bf16.cutlass",
+        ),
+        (
+            "operation.dense_linear_fp8_pair.bf16",
+            "provider.cuda.dense_linear_fp8_pair.bf16.cutlass",
+        ),
+        (
+            "operation.dense_linear_fp8_triple.bf16",
+            "provider.cuda.dense_linear_fp8_triple.bf16.cutlass",
+        ),
+    ];
+    if original
+        .providers
+        .iter()
+        .any(|row| fp8.iter().any(|(_, provider)| row.provider_id == *provider))
+        || combined.providers.len() != original.providers.len() + fp8.len()
         || original
             .providers
             .iter()
             .any(|row| !combined.providers.contains(row))
-        || combined
-            .providers
-            .iter()
-            .filter(|row| {
-                row.provider_id == fp8 && row.operation_id == "operation.dense_linear_fp8.bf16"
-            })
-            .count()
-            != 1
+        || fp8.iter().any(|(operation, provider)| {
+            combined
+                .providers
+                .iter()
+                .filter(|row| row.provider_id == *provider && row.operation_id == *operation)
+                .count()
+                != 1
+        })
     {
-        return Err("combined catalog must preserve every production row and add only FP8".into());
+        return Err("combined catalog must preserve every production row and add the scalar/pair/triple FP8 bundle".into());
     }
     Ok(())
 }

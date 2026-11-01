@@ -3,7 +3,10 @@
 //! that an artifact is installed, executable or numerically qualified. The
 //! executable provider additionally binds the actual compiled artifact identity.
 
-use ferrum_runtime::{dense_linear_fp8_bf16_contract, OperationContract};
+use ferrum_runtime::{
+    dense_linear_fp8_bf16_contract, dense_linear_fp8_group_bf16_contract, DenseLinearFp8Group,
+    OperationContract,
+};
 use ferrum_types::{
     NativeOperatorBackend, NativeOperatorContractVersion, NativeOperatorProviderCatalog,
     NativeOperatorProviderCatalogRow, NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
@@ -12,6 +15,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CUTLASS_FP8_PROVIDER_ID: &str = "provider.cuda.dense_linear_fp8.bf16.cutlass";
+pub const CUTLASS_FP8_PAIR_PROVIDER_ID: &str = "provider.cuda.dense_linear_fp8_pair.bf16.cutlass";
+pub const CUTLASS_FP8_TRIPLE_PROVIDER_ID: &str =
+    "provider.cuda.dense_linear_fp8_triple.bf16.cutlass";
+
+pub const fn group_provider_id(group: DenseLinearFp8Group) -> &'static str {
+    match group {
+        DenseLinearFp8Group::Pair => CUTLASS_FP8_PAIR_PROVIDER_ID,
+        DenseLinearFp8Group::Triple => CUTLASS_FP8_TRIPLE_PROVIDER_ID,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +69,7 @@ pub fn source_declaration_fingerprint() -> String {
         include_bytes!("../cutlass_fp8.rs"),
         include_bytes!("../../backend/cuda/vnext_ops/tensor_dense_fp8_bf16.rs"),
         include_bytes!("../../backend/cuda/vnext_ops/tensor_dense_fp8_bf16/weights.rs"),
+        include_bytes!("../../backend/cuda/vnext_ops/tensor_dense_fp8_bf16/grouped.rs"),
         include_bytes!("../../backend/cuda/vnext_runtime/tensor_eager/cutlass_owner.rs"),
         include_bytes!("../../../native/cutlass-fp8/abi.h"),
         include_bytes!("../../../native/cutlass-fp8/gemm.cuh"),
@@ -77,7 +91,7 @@ pub fn provider_catalog_declaration(
     let contract = dense_linear_fp8_bf16_contract().map_err(|error| error.to_string())?;
     let operation = contract.descriptor();
     let config_bytes = serde_json::to_vec(config).map_err(|error| error.to_string())?;
-    let catalog = NativeOperatorProviderCatalog {
+    let mut catalog = NativeOperatorProviderCatalog {
         schema_version: NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
         backend: NativeOperatorBackend::Cuda,
         providers: vec![NativeOperatorProviderCatalogRow {
@@ -96,6 +110,29 @@ pub fn provider_catalog_declaration(
             ]),
         }],
     };
+    for group in [DenseLinearFp8Group::Pair, DenseLinearFp8Group::Triple] {
+        let contract = dense_linear_fp8_group_bf16_contract(group).map_err(|e| e.to_string())?;
+        let operation = contract.descriptor();
+        catalog.providers.push(NativeOperatorProviderCatalogRow {
+            operation_id: operation.id.to_string(),
+            operation_contract_version: NativeOperatorContractVersion::new(
+                operation.version.major,
+                operation.version.minor,
+            ),
+            operation_fingerprint: operation.fingerprint().map_err(|e| e.to_string())?,
+            provider_id: group_provider_id(group).into(),
+            provider_version: NativeOperatorContractVersion::new(1, 0),
+            provider_implementation_fingerprint: digest(&[
+                b"ferrum.cutlass-fp8.grouped-provider-source-declaration.v1",
+                source_declaration_fingerprint().as_bytes(),
+                group.operation_id().as_bytes(),
+                &config_bytes,
+            ]),
+        });
+    }
+    catalog
+        .providers
+        .sort_by(|a, b| (&a.operation_id, &a.provider_id).cmp(&(&b.operation_id, &b.provider_id)));
     catalog.validate()?;
     Ok(catalog)
 }
@@ -120,6 +157,7 @@ mod tests {
             opaque_memory_profile: "experimental-test-v1".into(),
         };
         let first = provider_catalog_declaration(&config).unwrap();
+        assert_eq!(first.providers.len(), 3);
         assert_eq!(
             first.providers[0].operation_fingerprint,
             dense_linear_fp8_bf16_contract()

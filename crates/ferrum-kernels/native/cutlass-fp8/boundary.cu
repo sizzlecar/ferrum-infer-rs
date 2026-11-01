@@ -80,9 +80,7 @@ auto gemm_arguments(const FerrumCutlassFp8PlanV1& p, const FerrumCutlassFp8Bindi
       reinterpret_cast<const float*>(b.weight_scale.address),
       reinterpret_cast<ferrum_fp8::Output*>(b.output.address));
 }
-int validate(const FerrumCutlassFp8PlanV1& p, const FerrumCutlassFp8BindingsV1& b) {
-  FerrumCutlassFp8PlanV1 expected{}; int status=derive(p.request,expected); if(status)return status;
-  if (std::memcmp(&p,&expected,sizeof(p))) return -5;
+int validate_bindings(const FerrumCutlassFp8PlanV1& p, const FerrumCutlassFp8BindingsV1& b) {
   uint64_t in=0,w=0,out=0;
   extent(p.request.rows,p.request.inputs,2,in); extent(p.request.outputs,p.request.inputs,1,w);
   extent(p.request.rows,p.request.outputs,2,out);
@@ -92,6 +90,68 @@ int validate(const FerrumCutlassFp8PlanV1& p, const FerrumCutlassFp8BindingsV1& 
   for (const auto& read:reads) if(!disjoint(b.output,read)||!disjoint(b.scratch,read))return -4;
   if(!disjoint(b.output,b.scratch))return -4;
   return ferrum_fp8::Gemm::can_implement(gemm_arguments(p,b)) == cutlass::Status::kSuccess ? 0 : -6;
+}
+int validate(const FerrumCutlassFp8PlanV1& p, const FerrumCutlassFp8BindingsV1& b) {
+  FerrumCutlassFp8PlanV1 expected{}; int status=derive(p.request,expected); if(status)return status;
+  if (std::memcmp(&p,&expected,sizeof(p))) return -5;
+  return validate_bindings(p,b);
+}
+bool same_span(FerrumCutlassFp8SpanV1 a, FerrumCutlassFp8SpanV1 b) {
+  return a.address == b.address && a.bytes == b.bytes;
+}
+int validate_group(const FerrumCutlassFp8PlanV1& p, const FerrumCutlassFp8BindingsV1* b, uint32_t count) {
+  if (!b || (count != 2 && count != 3)) return -1;
+  FerrumCutlassFp8PlanV1 expected{}; int status=derive(p.request,expected); if(status)return status;
+  if (std::memcmp(&p,&expected,sizeof(p))) return -5;
+  for (uint32_t i=0;i<count;i++) {
+    status=validate_bindings(p,b[i]); if(status)return status;
+    if (!same_span(b[0].input,b[i].input) || !same_span(b[0].scratch,b[i].scratch)) return -4;
+  }
+  // A previous GEMM must never overwrite a later branch's reads or output.
+  // Read-only spans may alias; the shared scratch is checked against every
+  // branch by validate_bindings above. All checks precede the first enqueue.
+  for (uint32_t i=0;i<count;i++) {
+    for (uint32_t j=0;j<count;j++) {
+      const FerrumCutlassFp8SpanV1 reads[]={b[j].input,b[j].weight,b[j].weight_scale};
+      for (const auto& read:reads) if(!disjoint(b[i].output,read))return -4;
+      if(i<j && !disjoint(b[i].output,b[j].output))return -4;
+    }
+  }
+  return 0;
+}
+int enqueue_quantization(const FerrumCutlassFp8PlanV1& p, const FerrumCutlassFp8BindingsV1& b, cudaStream_t stream) {
+  ferrum_fp8::quantize_rows<<<p.request.rows,256,0,stream>>>(
+    reinterpret_cast<const __nv_bfloat16*>(b.input.address), reinterpret_cast<uint8_t*>(b.scratch.address),
+    reinterpret_cast<float*>(b.scratch.address+p.activation_scale_offset), p.request.inputs);
+  const auto error=cudaPeekAtLastError(); return error==cudaSuccess ? 0 : int(error);
+}
+int enqueue_gemm(const FerrumCutlassFp8PlanV1& p, const FerrumCutlassFp8BindingsV1& b, cudaStream_t stream) {
+  ferrum_fp8::Gemm gemm;
+  void* workspace=p.gemm_workspace_bytes ? reinterpret_cast<void*>(b.scratch.address+p.gemm_workspace_offset) : nullptr;
+#if defined(FERRUM_CUTLASS_FP8_SM89)
+  const auto result=gemm(gemm_arguments(p,b),workspace,stream);
+#else
+  const auto result=gemm.run(gemm_arguments(p,b),workspace,stream);
+#endif
+  if(result!=cutlass::Status::kSuccess)return -7;
+  const auto error=cudaPeekAtLastError(); return error==cudaSuccess ? 0 : int(error);
+}
+int run(const FerrumCutlassFp8PlanV1& p, const FerrumCutlassFp8BindingsV1* b,
+    uint32_t count, void* raw_stream, const cudaEvent_t* events) {
+  if (!b || !raw_stream) return -1;
+  int status=count==1 ? validate(p,b[0]) : validate_group(p,b,count); if(status)return status;
+  const auto stream=reinterpret_cast<cudaStream_t>(raw_stream);
+  cudaStreamCaptureStatus capture;
+  auto error=cudaStreamIsCapturing(stream,&capture); if(error!=cudaSuccess)return int(error);
+  if(capture!=cudaStreamCaptureStatusNone)return -2;
+  if(events) { error=cudaEventRecord(events[0],stream); if(error!=cudaSuccess)return int(error); }
+  status=enqueue_quantization(p,b[0],stream); if(status)return status;
+  if(events) { error=cudaEventRecord(events[1],stream); if(error!=cudaSuccess)return int(error); }
+  for (uint32_t i=0;i<count;i++) {
+    status=enqueue_gemm(p,b[i],stream); if(status)return status;
+  }
+  if(events) { error=cudaEventRecord(events[2],stream); if(error!=cudaSuccess)return int(error); }
+  return 0;
 }
 }
 
@@ -106,25 +166,20 @@ extern "C" int ferrum_cutlass_fp8_validate_v1(const FerrumCutlassFp8PlanV1* plan
 }
 extern "C" int ferrum_cutlass_fp8_run_v1(const FerrumCutlassFp8PlanV1* plan, const FerrumCutlassFp8BindingsV1* bindings, void* raw_stream) noexcept {
   if(!plan||!bindings||!raw_stream)return -1;
-  try {
-    const auto& p=*plan; const auto& b=*bindings;
-    int status=validate(p,b); if(status)return status;
-    auto stream=reinterpret_cast<cudaStream_t>(raw_stream);
-    cudaStreamCaptureStatus capture;
-    auto error=cudaStreamIsCapturing(stream,&capture); if(error!=cudaSuccess)return int(error);
-    if(capture!=cudaStreamCaptureStatusNone)return -2;
-    ferrum_fp8::quantize_rows<<<p.request.rows,256,0,stream>>>(
-      reinterpret_cast<const __nv_bfloat16*>(b.input.address), reinterpret_cast<uint8_t*>(b.scratch.address),
-      reinterpret_cast<float*>(b.scratch.address+p.activation_scale_offset), p.request.inputs);
-    error=cudaPeekAtLastError(); if(error!=cudaSuccess)return int(error);
-    ferrum_fp8::Gemm gemm;
-    void* workspace=p.gemm_workspace_bytes ? reinterpret_cast<void*>(b.scratch.address+p.gemm_workspace_offset) : nullptr;
-#if defined(FERRUM_CUTLASS_FP8_SM89)
-    const auto result=gemm(gemm_arguments(p,b),workspace,stream);
-#else
-    const auto result=gemm.run(gemm_arguments(p,b),workspace,stream);
-#endif
-    if(result!=cutlass::Status::kSuccess)return -7;
-    error=cudaPeekAtLastError(); return error==cudaSuccess ? 0 : int(error);
-  } catch(...){return -8;}
+  try { return run(*plan,bindings,1,raw_stream,nullptr); } catch(...){return -8;}
+}
+extern "C" int ferrum_cutlass_fp8_validate_group_v1(const FerrumCutlassFp8PlanV1* plan, const FerrumCutlassFp8BindingsV1* bindings, uint32_t count) noexcept {
+  if(!plan)return -1;
+  try { return validate_group(*plan,bindings,count); } catch(...){return -8;}
+}
+extern "C" int ferrum_cutlass_fp8_run_group_v1(const FerrumCutlassFp8PlanV1* plan, const FerrumCutlassFp8BindingsV1* bindings, uint32_t count, void* raw_stream) noexcept {
+  if(!plan||(count!=2&&count!=3))return -1;
+  try { return run(*plan,bindings,count,raw_stream,nullptr); } catch(...){return -8;}
+}
+extern "C" int ferrum_cutlass_fp8_run_group_profiled_v1(const FerrumCutlassFp8PlanV1* plan, const FerrumCutlassFp8BindingsV1* bindings, uint32_t count, void* raw_stream, void* start, void* after_quant, void* after_gemm) noexcept {
+  if(!plan||(count!=2&&count!=3)||!start||!after_quant||!after_gemm||
+      start==after_quant||start==after_gemm||after_quant==after_gemm)return -1;
+  const cudaEvent_t events[]={reinterpret_cast<cudaEvent_t>(start),
+      reinterpret_cast<cudaEvent_t>(after_quant),reinterpret_cast<cudaEvent_t>(after_gemm)};
+  try { return run(*plan,bindings,count,raw_stream,events); } catch(...){return -8;}
 }

@@ -329,55 +329,8 @@ impl CudaDeviceRuntime {
         {
             return Err(CudaDeviceRuntimeError::contract("CUDA tensor budgets require finite positive limits and a versioned profile identity"));
         }
-        if config.device.capabilities.is_empty()
-            || !config.device.capabilities.iter().all(|capability| {
-                matches!(
-                    capability.as_str(),
-                    ferrum_runtime::SILU_BF16_CAPABILITY_ID
-                        | ferrum_runtime::PHILOX_NORMAL_BF16_CAPABILITY_ID
-                        | ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID
-                        | ferrum_runtime::DENSE_LINEAR_BLOCK_BF16_CAPABILITY_ID
-                        | ferrum_runtime::DENSE_LINEAR_FP8_BF16_CAPABILITY_ID
-                        | ferrum_runtime::SILU_MUL_BF16_CAPABILITY_ID
-                        | ferrum_runtime::TANH_BF16_CAPABILITY_ID
-                        | ferrum_runtime::MODULATION_SCALE_BF16_CAPABILITY_ID
-                        | ferrum_runtime::GATED_RESIDUAL_BF16_CAPABILITY_ID
-                        | ferrum_runtime::LAYER_NORM_BF16_CAPABILITY_ID
-                        | ferrum_runtime::HEAD_RMS_NORM_BF16_CAPABILITY_ID
-                        | ferrum_runtime::ADJACENT_ROPE_BF16_CAPABILITY_ID
-                        | ferrum_runtime::STRUCTURED_ATTENTION_BF16_CAPABILITY_ID
-                        | ferrum_runtime::STRUCTURED_ATTENTION_FUSED_BF16_CAPABILITY_ID
-                        | ferrum_runtime::CROSS_ATTENTION_FUSED_BF16_CAPABILITY_ID
-                        | ferrum_runtime::ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID
-                        | ferrum_runtime::GELU_TANH_BF16_CAPABILITY_ID
-                        | ferrum_runtime::ROW_GATHER_BF16_CAPABILITY_ID
-                        | ferrum_runtime::BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID
-                        | ferrum_runtime::PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID
-                        | ferrum_runtime::HALF_SPLIT_ROPE_BF16_CAPABILITY_ID
-                        | ferrum_runtime::STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID
-                        | ferrum_runtime::CONV2D_BF16_CAPABILITY_ID
-                        | ferrum_runtime::CHANNEL_L2_NORM_BF16_CAPABILITY_ID
-                        | ferrum_runtime::CHANNEL_L2_NORM_IMAGE_BF16_CAPABILITY_ID
-                        | ferrum_runtime::SPATIAL_ATTENTION_BF16_CAPABILITY_ID
-                        | ferrum_runtime::SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID
-                        | ferrum_runtime::SPATIAL_GROUP_MEAN_BF16_CAPABILITY_ID
-                        | ferrum_runtime::AFFINE_LINEAR_BF16_CAPABILITY_ID
-                        | ferrum_runtime::PATCH_PROJECTION_BF16_CAPABILITY_ID
-                        | ferrum_runtime::AFFINE_LAYER_NORM_BF16_CAPABILITY_ID
-                        | ferrum_runtime::GELU_ERF_BF16_CAPABILITY_ID
-                        | ferrum_runtime::HALF_ROTARY_BF16_CAPABILITY_ID
-                        | ferrum_runtime::ROW_SCATTER_ADD_BF16_CAPABILITY_ID
-                        | ferrum_runtime::RESHAPE_COPY_BF16_CAPABILITY_ID
-                        | ferrum_runtime::SEGMENTED_ATTENTION_BF16_CAPABILITY_ID
-                        | ferrum_runtime::SILU_NCHW_BF16_CAPABILITY_ID
-                        | ferrum_runtime::PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID
-                )
-            })
-        {
-            return Err(CudaDeviceRuntimeError::contract(
-                "this CUDA tensor eager profile admits only its fixed BF16 pointwise, normalization, rotary and Dense providers",
-            ));
-        }
+        crate::backend::cuda_tensor_capability_policy::validate(&config.device.capabilities)
+            .map_err(CudaDeviceRuntimeError::contract)?;
         let streams = u64::try_from(config.maximum_streams)
             .map_err(|_| CudaDeviceRuntimeError::contract("CUDA stream limit exceeds u64"))?;
         let overhead = config

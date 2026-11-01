@@ -73,6 +73,8 @@ fn prefix_phases_preserve_default_wire_and_share_exact_weight_schema() {
             F::CUDA_PROFILE_ID,
             F::CUDA_FUSED_PROFILE_ID,
             F::CUDA_FP8_FUSED_PROFILE_ID,
+            F::CUDA_FP8_SHARED_QUANT_PROFILE_ID,
+            F::CUDA_FP8_SHARED_QUANT_FUSED_PROFILE_ID,
         ] {
             let program = graph(&c, name);
             assert_eq!(

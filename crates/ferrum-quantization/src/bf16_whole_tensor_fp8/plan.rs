@@ -88,9 +88,20 @@ pub(super) fn prepare_program(
             let Some(weight) = weights.get(input) else {
                 continue;
             };
-            let fp8_weight_port = node.operation_id.as_str() == DENSE_LINEAR_FP8_BF16_OPERATION_ID
-                && node.required_version == VERSION
-                && ordinal == 1;
+            let branches = match node.operation_id.as_str() {
+                DENSE_LINEAR_FP8_PAIR_BF16_OPERATION_ID => Some(2),
+                DENSE_LINEAR_FP8_TRIPLE_BF16_OPERATION_ID => Some(3),
+                _ => None,
+            };
+            let fp8_weight_port = node.required_version == VERSION
+                && ((node.operation_id.as_str() == DENSE_LINEAR_FP8_BF16_OPERATION_ID
+                    && ordinal == 1)
+                    || branches.is_some_and(|branches| {
+                        node.work == ProgramNodeWorkSpec::Fixed
+                            && node.inputs.len() == branches + 1
+                            && node.outputs.len() == branches
+                            && (1..=branches).contains(&ordinal)
+                    }));
             if selected.contains(*weight) {
                 if !fp8_weight_port {
                     return Err(invalid(format!(
