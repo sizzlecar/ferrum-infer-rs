@@ -59,6 +59,12 @@ impl QwenImage21TransformerFamily {
         "qwen_image21.transformer.t2i.cuda.fp8_linear.experimental.v1";
     pub const CUDA_FP8_FUSED_PROFILE_ID: &'static str =
         "qwen_image21.transformer.t2i.cuda.fp8_linear.fused_attention.experimental.v1";
+    /// Equal-shape projections of one activation share its row quantization.
+    /// The original scalar profiles remain available with unchanged graphs.
+    pub const CUDA_FP8_SHARED_QUANT_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.cuda.fp8_linear.shared_quant.experimental.v1";
+    pub const CUDA_FP8_SHARED_QUANT_FUSED_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.cuda.fp8_linear.shared_quant.fused_attention.experimental.v1";
     pub const CUDA_NATIVE_BLOCK_PROFILE_ID: &'static str =
         "qwen_image21.transformer.t2i.cuda.native_block.bf16_f32.v1";
     pub const CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID: &'static str =
@@ -241,6 +247,11 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
                 let op = crate::fp8_linear::operation()?;
                 operations.insert(op.operation_id.clone(), op);
             }
+            if is_shared_quantization(name) {
+                for op in crate::fp8_linear::shared_quantization_operations()? {
+                    operations.insert(op.operation_id.clone(), op);
+                }
+            }
             if is_native_block(name) {
                 let operation = crate::block_quantized_linear::operation()?;
                 operations.insert(operation.operation_id.clone(), operation);
@@ -318,7 +329,12 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
             .ok_or_else(|| invalid("profile", "unknown transformer profile"))?;
         let program = program::build(self, config, source)?;
         if is_fp8(profile.id.as_str()) {
-            crate::fp8_linear::select(program, &Self::fp8_weight_groups(config)?)
+            let selected = crate::fp8_linear::select(program, &Self::fp8_weight_groups(config)?)?;
+            if is_shared_quantization(profile.id.as_str()) {
+                crate::fp8_linear::share_input_quantization(selected)
+            } else {
+                Ok(selected)
+            }
         } else if is_native_block(profile.id.as_str()) {
             crate::block_quantized_linear::select(program, &config.native_block_weight_ids()?)
         } else {
@@ -335,8 +351,17 @@ fn is_fp8(name: &str) -> bool {
         name,
         QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
             | QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
+            | QwenImage21TransformerFamily::CUDA_FP8_SHARED_QUANT_PROFILE_ID
+            | QwenImage21TransformerFamily::CUDA_FP8_SHARED_QUANT_FUSED_PROFILE_ID
             | QwenImage21TransformerFamily::METAL_FP8_PROFILE_ID
             | QwenImage21TransformerFamily::METAL_FP8_FUSED_PROFILE_ID
+    )
+}
+fn is_shared_quantization(name: &str) -> bool {
+    matches!(
+        name,
+        QwenImage21TransformerFamily::CUDA_FP8_SHARED_QUANT_PROFILE_ID
+            | QwenImage21TransformerFamily::CUDA_FP8_SHARED_QUANT_FUSED_PROFILE_ID
     )
 }
 fn is_native_block(name: &str) -> bool {
@@ -348,7 +373,7 @@ fn is_native_block(name: &str) -> bool {
             | QwenImage21TransformerFamily::METAL_NATIVE_BLOCK_FUSED_PROFILE_ID
     )
 }
-fn profile_sources() -> [(&'static str, &'static str); 13] {
+fn profile_sources() -> [(&'static str, &'static str); 15] {
     [
         (
             QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_PROFILE_ID,
@@ -376,6 +401,14 @@ fn profile_sources() -> [(&'static str, &'static str); 13] {
         ),
         (
             QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID,
+            Block::CUDA_FUSED_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::CUDA_FP8_SHARED_QUANT_PROFILE_ID,
+            Block::CUDA_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::CUDA_FP8_SHARED_QUANT_FUSED_PROFILE_ID,
             Block::CUDA_FUSED_PROFILE_ID,
         ),
         (

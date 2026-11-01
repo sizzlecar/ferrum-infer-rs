@@ -14,8 +14,9 @@ use std::ffi::c_void;
 pub(crate) mod cache;
 mod catalog;
 pub use catalog::{
-    provider_catalog_declaration, source_declaration_fingerprint, CutlassFp8CatalogConfig,
-    CUTLASS_FP8_PROVIDER_ID,
+    group_provider_id, provider_catalog_declaration, source_declaration_fingerprint,
+    CutlassFp8CatalogConfig, CUTLASS_FP8_PAIR_PROVIDER_ID, CUTLASS_FP8_PROVIDER_ID,
+    CUTLASS_FP8_TRIPLE_PROVIDER_ID,
 };
 
 #[derive(Debug, Clone)]

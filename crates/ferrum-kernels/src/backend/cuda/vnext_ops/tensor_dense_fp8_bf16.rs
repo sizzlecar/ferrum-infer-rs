@@ -25,7 +25,9 @@ use ferrum_runtime::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+mod grouped;
 mod probe;
+pub(super) use grouped::providers as grouped_providers;
 #[cfg(test)]
 mod tests;
 mod weights;
@@ -96,16 +98,18 @@ pub(super) fn source_fingerprint() -> Result<String, String> {
         &identity,
         include_bytes!("tensor_dense_fp8_bf16.rs"),
         include_bytes!("tensor_dense_fp8_bf16/weights.rs"),
+        include_bytes!("tensor_dense_fp8_bf16/grouped.rs"),
         include_bytes!("../../../native_ops/cutlass_fp8.rs"),
         include_bytes!("../../../native_ops/cutlass_fp8/cache.rs"),
         include_bytes!("../vnext_runtime/tensor_eager/cutlass_owner.rs"),
     ]))
 }
 
+#[derive(Clone)]
 pub(super) struct Provider {
     descriptor: OperationProviderDescriptor,
     device: Device,
-    plans: Mutex<PreparedPlanCache>,
+    plans: Arc<Mutex<PreparedPlanCache>>,
     probe: Option<Arc<CudaCutlassFp8Probe>>,
     // Retained after all plan records. Commands also keep this owner alive.
     owner: Arc<CudaTensorCutlassRetention>,
@@ -212,10 +216,10 @@ impl Provider {
         Ok(Self {
             descriptor,
             device,
-            plans: Mutex::new(
+            plans: Arc::new(Mutex::new(
                 PreparedPlanCache::new(config.maximum_plans)
                     .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?,
-            ),
+            )),
             probe,
             owner,
         })

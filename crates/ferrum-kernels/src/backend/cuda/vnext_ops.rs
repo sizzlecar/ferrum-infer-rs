@@ -460,6 +460,37 @@ pub fn cuda_vnext_dense_linear_fp8_bf16_provider(
     )?))
 }
 
+/// Same native module, with typed pair/triple projections sharing activation
+/// quantization. Scalar callers may keep the original configuration/factory.
+pub fn cuda_tensor_runtime_config_with_cutlass_fp8_grouped(
+    ordinal: usize,
+    device_id: DeviceId,
+) -> Result<CudaDeviceRuntimeConfig, VNextError> {
+    let mut config = cuda_tensor_runtime_config_with_cutlass_fp8(ordinal, device_id)?;
+    for group in [
+        ferrum_runtime::DenseLinearFp8Group::Pair,
+        ferrum_runtime::DenseLinearFp8Group::Triple,
+    ] {
+        config
+            .capabilities
+            .insert(CapabilityId::new(group.capability_id())?);
+    }
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        b"cuda.tensor.cutlass-fp8.shared-quant.v1",
+    ]);
+    Ok(config)
+}
+
+/// Scalar/pair/triple providers share exactly one bounded plan cache and one
+/// process-retained native module allowance. No additional weight copies.
+pub fn cuda_vnext_dense_linear_fp8_bf16_grouped_providers(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCutlassFp8Config,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_dense_fp8_bf16::grouped_providers(runtime, config)
+}
+
 /// Diagnostic-only synchronous scratch capture. Caller arms the probe's
 /// accounted Output destinations before each invocation. The ordinary FP8
 /// factory performs no capture or extra synchronization/transfer.

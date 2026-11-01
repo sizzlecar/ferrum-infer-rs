@@ -236,7 +236,9 @@ impl QwenImage21CudaConfig {
         let device_id = DeviceId::new(format!("device.cuda.{}", self.ordinal))?;
         let device = if self.precision_policy.uses_fp8() {
             contracts.push(Box::new(dense_linear_fp8_bf16_contract()?));
-            cuda_tensor_runtime_config_with_cutlass_fp8(self.ordinal, device_id)?
+            contracts.push(Box::new(dense_linear_fp8_pair_bf16_contract()?));
+            contracts.push(Box::new(dense_linear_fp8_triple_bf16_contract()?));
+            cuda_tensor_runtime_config_with_cutlass_fp8_grouped(self.ordinal, device_id)?
         } else {
             cuda_tensor_runtime_config(self.ordinal, device_id)?
         };
@@ -332,7 +334,7 @@ impl QwenImage21CudaConfig {
         };
         providers.push(cuda_vnext_dense_bf16_provider(&runtime)?);
         if self.precision_policy.uses_fp8() {
-            providers.push(cuda_vnext_dense_linear_fp8_bf16_provider(
+            providers.extend(cuda_vnext_dense_linear_fp8_bf16_grouped_providers(
                 &runtime,
                 &CudaCutlassFp8Config {
                     opaque_memory_bytes: self.precision_policy.additional_opaque_bytes(),
@@ -628,12 +630,12 @@ fn cuda_profiles_with_precision(
                 QwenImage21TransformerFamily::CUDA_FUSED_PROFILE_ID
             }
             (ImageCudaAttentionPolicy::Sequential, Denoiser::Fp8LinearExperimentalV1) => {
-                QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
+                QwenImage21TransformerFamily::CUDA_FP8_SHARED_QUANT_PROFILE_ID
             }
             (
                 ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
                 Denoiser::Fp8LinearExperimentalV1,
-            ) => QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID,
+            ) => QwenImage21TransformerFamily::CUDA_FP8_SHARED_QUANT_FUSED_PROFILE_ID,
             (ImageCudaAttentionPolicy::Sequential, Denoiser::NativeSource) => {
                 QwenImage21TransformerFamily::CUDA_NATIVE_BLOCK_PROFILE_ID
             }
@@ -981,10 +983,10 @@ mod tests {
                 fp8.denoiser.as_str(),
                 match attention {
                     ImageCudaAttentionPolicy::Sequential => {
-                        QwenImage21TransformerFamily::CUDA_FP8_PROFILE_ID
+                        QwenImage21TransformerFamily::CUDA_FP8_SHARED_QUANT_PROFILE_ID
                     }
                     ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
-                        QwenImage21TransformerFamily::CUDA_FP8_FUSED_PROFILE_ID
+                        QwenImage21TransformerFamily::CUDA_FP8_SHARED_QUANT_FUSED_PROFILE_ID
                     }
                 }
             );

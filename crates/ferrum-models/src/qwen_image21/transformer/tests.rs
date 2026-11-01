@@ -291,6 +291,78 @@ fn fp8_transformer_scope_groups_qkv_but_keeps_all_boundary_projections_bf16() {
 }
 
 #[test]
+fn shared_quantization_preserves_each_projection_and_every_bf16_boundary() {
+    let config = QwenImage21TransformerConfig::new(
+        transformer(2, true, true),
+        QwenImage21T2iLayout::new(3, 2, 2, vec![3, 1]).unwrap(),
+    )
+    .unwrap();
+    let family = F::new().unwrap();
+    let profiles = family.numerical_profiles(&config).unwrap();
+    for (scalar_name, shared_name) in [
+        (F::CUDA_FP8_PROFILE_ID, F::CUDA_FP8_SHARED_QUANT_PROFILE_ID),
+        (
+            F::CUDA_FP8_FUSED_PROFILE_ID,
+            F::CUDA_FP8_SHARED_QUANT_FUSED_PROFILE_ID,
+        ),
+    ] {
+        let scalar_profile = profiles.resolve(&profile_id(scalar_name).unwrap()).unwrap();
+        let shared_profile = profiles.resolve(&profile_id(shared_name).unwrap()).unwrap();
+        let scalar = family.semantic_program(&config, scalar_profile).unwrap();
+        let shared = family.semantic_program(&config, shared_profile).unwrap();
+        shared_profile.validate_program(&shared).unwrap();
+        assert!(scalar_profile.validate_program(&shared).is_err());
+        assert_eq!(scalar_profile.boundaries, shared_profile.boundaries);
+        assert_eq!(scalar.weights(), shared.weights());
+        assert_eq!(scalar.inputs(), shared.inputs());
+        assert_eq!(scalar.outputs(), shared.outputs());
+        let scalar_outputs: BTreeMap<_, _> = scalar
+            .blocks()
+            .iter()
+            .flat_map(|b| &b.nodes)
+            .flat_map(|node| node.outputs.iter().map(move |output| (output, node)))
+            .collect();
+        let mut paired = false;
+        let mut tripled = false;
+        for node in shared.blocks().iter().flat_map(|b| &b.nodes) {
+            let branches = match node.operation_id.as_str() {
+                DENSE_LINEAR_FP8_PAIR_BF16_OPERATION_ID => {
+                    paired = true;
+                    2
+                }
+                DENSE_LINEAR_FP8_TRIPLE_BF16_OPERATION_ID => {
+                    tripled = true;
+                    3
+                }
+                _ => {
+                    assert_eq!(node, scalar_outputs[&node.outputs[0]]);
+                    continue;
+                }
+            };
+            assert_eq!(node.outputs.len(), branches);
+            assert_eq!(node.inputs.len(), branches + 1);
+            for (branch, output) in node.outputs.iter().enumerate() {
+                let original = scalar_outputs[output];
+                assert_eq!(
+                    original.operation_id.as_str(),
+                    DENSE_LINEAR_FP8_BF16_OPERATION_ID
+                );
+                assert_eq!(
+                    original.inputs,
+                    [node.inputs[0].clone(), node.inputs[branch + 1].clone()]
+                );
+                assert_eq!(original.attributes, node.attributes);
+                assert_eq!(original.work, node.work);
+            }
+        }
+        assert!(
+            paired && tripled,
+            "both MLP and QKV share the activation conversion"
+        );
+    }
+}
+
+#[test]
 fn fused_transformer_profile_selects_every_dit_attention_without_changing_transport() {
     let config = QwenImage21TransformerConfig::new(
         transformer(2, true, true),
@@ -607,7 +679,28 @@ fn full_graph_reuses_two_distinct_layers_and_only_retains_target_velocity() {
         assert!(graph.states().is_empty());
         assert_eq!(graph.weights().len(), 27);
         let nodes = &graph.blocks()[0].nodes;
-        assert_eq!(profile.boundaries.len(), nodes.len());
+        assert_eq!(
+            profile.boundaries.len(),
+            nodes.iter().map(|node| node.outputs.len()).sum::<usize>()
+        );
+        // Shared-input profiles preserve every boundary while representing
+        // multiple projections as one node. Their branch mapping is checked
+        // above; compare the common layer template through its scalar graph.
+        let scalar = if is_shared_quantization(profile.id.as_str()) {
+            let scalar_name = if profile.id.as_str() == F::CUDA_FP8_SHARED_QUANT_FUSED_PROFILE_ID {
+                F::CUDA_FP8_FUSED_PROFILE_ID
+            } else {
+                F::CUDA_FP8_PROFILE_ID
+            };
+            family
+                .semantic_program(
+                    &config,
+                    profiles.resolve(&profile_id(scalar_name).unwrap()).unwrap(),
+                )
+                .unwrap()
+        } else {
+            graph.clone()
+        };
         assert_shared_gates(&graph, config.transformer().layers());
         let target = nodes
             .iter()
@@ -634,7 +727,8 @@ fn full_graph_reuses_two_distinct_layers_and_only_retains_target_velocity() {
         let mut previous = id(program::JOINT);
         for layer in 0..config.transformer().layers() {
             let prefix = format!("node.qwen_image21.transformer.layer{layer}.");
-            let layer_nodes = nodes
+            let layer_nodes = scalar.blocks()[0]
+                .nodes
                 .iter()
                 .filter(|node| node.id.as_str().starts_with(&prefix))
                 .collect::<Vec<_>>();
@@ -661,6 +755,7 @@ fn full_graph_reuses_two_distinct_layers_and_only_retains_target_velocity() {
                         | F::METAL_NATIVE_BLOCK_FUSED_PROFILE_ID
                         | F::CUDA_FUSED_PROFILE_ID
                         | F::CUDA_FP8_FUSED_PROFILE_ID
+                        | F::CUDA_FP8_SHARED_QUANT_FUSED_PROFILE_ID
                         | F::CUDA_NATIVE_BLOCK_FUSED_PROFILE_ID
                 ) && original.operation_id.as_str()
                     == STRUCTURED_ATTENTION_BF16_OPERATION_ID
