@@ -153,6 +153,37 @@ pub(super) fn project_device_command_timing<'a>(
 }
 
 impl VNextProfileExecutionEventSink {
+    fn enqueue_execution_facts_event(
+        &self,
+        event: FerrumProfileEvent,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let limit = self
+            .journals
+            .iter()
+            .map(SchedulerTraceJournal::maximum_record_bytes)
+            .min()
+            .expect("execution profile sink has a journal");
+        let events = execution_facts::bounded_records(event, limit)?;
+        // Every indexed fragment obtains an ordinary bounded queue/payload
+        // grant. Keep trying healthy destinations after a fanout error; missing
+        // fragments remain detectable and never become complete evidence.
+        let mut first_error = None;
+        for event in events {
+            if let Err(error) = self.enqueue_profile_batch(vec![event]) {
+                if first_error
+                    .as_ref()
+                    .is_none_or(|first: &ExecutionEventSinkError| {
+                        first.kind() == ferrum_runtime::ExecutionEventSinkErrorKind::Transport
+                            && error.kind() == ferrum_runtime::ExecutionEventSinkErrorKind::Contract
+                    })
+                {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     #[cfg(test)]
     pub(super) fn new(
         journal: SchedulerTraceJournal,
@@ -1592,7 +1623,7 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         let event = self
             .context
             .execution_facts_event(facts, chrono::Utc::now())?;
-        self.enqueue_profile_batch(vec![event])
+        self.enqueue_execution_facts_event(event)
     }
 
     fn capture_policy_for_request(

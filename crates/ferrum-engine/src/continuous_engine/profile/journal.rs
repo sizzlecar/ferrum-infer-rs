@@ -25,6 +25,11 @@ pub(in crate::continuous_engine) struct SchedulerTraceJournal {
 }
 
 impl SchedulerTraceJournal {
+    pub(super) fn maximum_record_bytes(&self) -> usize {
+        let config = self.inner.config();
+        config.max_record_bytes.min(config.max_batch_bytes)
+    }
+
     pub(in crate::continuous_engine) fn from_producer(
         inner: JsonlJournal<SchedulerTraceRecord>,
     ) -> Self {
