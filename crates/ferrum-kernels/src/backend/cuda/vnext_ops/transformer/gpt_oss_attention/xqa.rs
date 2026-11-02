@@ -194,6 +194,10 @@ pub(super) struct XqaDecode {
 }
 
 impl XqaDecode {
+    pub(super) fn transfer_count(&self) -> u64 {
+        u64::from(self.prepared.plan().subsequences > 1)
+    }
+
     pub(super) fn fingerprint_material(&self) -> Vec<u8> {
         let mut result = self.prepared.fingerprint_material();
         for value in [

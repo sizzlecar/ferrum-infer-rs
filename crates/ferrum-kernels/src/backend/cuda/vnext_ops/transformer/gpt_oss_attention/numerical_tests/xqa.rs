@@ -4,6 +4,8 @@ use crate::native_ops::flashinfer_xqa::{
     Bindings, DeviceSpan, PreparedXqa, Request, FLASHINFER_XQA_ABI,
 };
 use cudarc::driver::sys::CUdevice_attribute::*;
+use cudarc::driver::sys::CUevent_flags;
+use std::time::Instant;
 
 // Reuse the same explicit capture/upload/drop lifecycle as other native tests.
 #[path = "../../../native_blocks/tests/captured.rs"]
@@ -60,7 +62,8 @@ impl Fixture {
             83.0,
         );
         let output = Guarded::new(stream, &vec![f16::ZERO; elements], f16::from_f32(84.0));
-        // Nonzero initial semaphores make omission of the per-run reset observable.
+        // Nonzero initial semaphores make a missing multi-split reset observable;
+        // single-split execution must leave them untouched.
         let semaphores = Guarded::new(
             stream,
             &vec![0xBAD0_u32; prepared.plan().semaphore_bytes as usize / 4],
@@ -156,12 +159,136 @@ fn xqa_gpt_oss_decode_preserves_sinks_pages_windows_and_graph_replay_on_cuda() {
             let fixture = Fixture::new(&stream, &positions, window);
             fixture.launch(&stream);
             fixture.check(&stream, &positions, window);
+            if fixture.prepared.plan().subsequences == 1 {
+                fixture.semaphores.assert_unchanged(&stream);
+            }
             let graph = captured::Captured::new(&stream, || fixture.launch(&stream));
             for _ in 0..3 {
                 graph.launch();
                 fixture.check(&stream, &positions, window);
+                if fixture.prepared.plan().subsequences == 1 {
+                    fixture.semaphores.assert_unchanged(&stream);
+                }
             }
         }
+    }
+}
+
+#[test]
+#[ignore = "requires SM120 and its locked XQA artifact; isolates single-split graph reset cost"]
+fn xqa_gpt_oss_single_split_graph_reset_microbench() {
+    let context = CudaContext::new(0).unwrap();
+    let stream = context.new_stream().unwrap();
+    let module = context
+        .load_module(Ptx::from_src(crate::ptx::SANDWICH_NORM.to_owned()))
+        .unwrap();
+    let cast_sinks = module.load_function("cast_f16_to_f32_slice").unwrap();
+    const BATCH: usize = 16;
+    const LAYERS: usize = 24;
+    const ITERATIONS: usize = 32;
+    let positions = vec![593; BATCH];
+    let fixtures = [
+        Fixture::new(&stream, &positions, 128),
+        Fixture::new(&stream, &positions, 0),
+    ];
+    for fixture in &fixtures {
+        assert_eq!(
+            fixture.prepared.plan().subsequences,
+            1,
+            "paired reset diagnostic requires single-split geometry"
+        );
+    }
+    let sources = fixtures
+        .each_ref()
+        .map(|fixture| fixture.sinks.pointer(&stream));
+    // Both arms include identical sink casts and native attention. The second
+    // reinstates precisely the old single-split semaphore reset per layer.
+    let graphs = [false, true].map(|extra_reset| {
+        captured::Captured::new(&stream, || {
+            for layer in 0..LAYERS {
+                let index = layer % fixtures.len();
+                let fixture = &fixtures[index];
+                let source = sources[index];
+                let destination = fixture.bindings.sinks_f32.address;
+                let zero = 0_i32;
+                let count = 64_i32;
+                let mut launch = stream.launch_builder(&cast_sinks);
+                launch
+                    .arg(&source)
+                    .arg(&destination)
+                    .arg(&zero)
+                    .arg(&zero)
+                    .arg(&count);
+                // All buffers remain retained through both graph lifetimes.
+                unsafe { launch.launch(LaunchConfig::for_num_elems(64)) }.unwrap();
+                if extra_reset {
+                    unsafe {
+                        cudarc::driver::result::memset_d8_async(
+                            fixture.bindings.semaphores.address,
+                            0,
+                            fixture.prepared.plan().semaphore_bytes as usize,
+                            stream.cu_stream(),
+                        )
+                    }
+                    .unwrap();
+                }
+                fixture.launch(&stream);
+            }
+        })
+    });
+    // Upload happened during Captured::new; warm both paths before timing.
+    for _ in 0..3 {
+        for graph in &graphs {
+            graph.launch();
+            stream.synchronize().unwrap();
+        }
+    }
+    for graph in &graphs {
+        graph.launch();
+        for (fixture, window) in fixtures.iter().zip([128, 0]) {
+            fixture.check(&stream, &positions, window);
+        }
+    }
+    let start = context
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .unwrap();
+    let end = context
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .unwrap();
+    for round in 0..5 {
+        for (order, index) in [0, 1, 1, 0].into_iter().enumerate() {
+            let mut host_ns = 0_u128;
+            let mut gpu_ms = 0.0_f64;
+            for _ in 0..ITERATIONS {
+                // Avoid enqueue backpressure. Events, synchronization and
+                // numerical inspection are outside cuGraphLaunch wall timing.
+                stream.synchronize().unwrap();
+                start.record(&stream).unwrap();
+                let begin = Instant::now();
+                graphs[index].launch();
+                host_ns += begin.elapsed().as_nanos();
+                end.record(&stream).unwrap();
+                end.synchronize().unwrap();
+                gpu_ms += f64::from(start.elapsed_ms(&end).unwrap());
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "benchmark": "gpt_oss_xqa_single_split_graph_reset",
+                    "arm": if index == 0 { "native_no_reset" } else { "external_reset_then_native" },
+                    "participants": BATCH, "context_tokens": 594,
+                    "alternating_full_local_layers": LAYERS, "subsequences": 1,
+                    "graph_nodes": graphs[index].node_count,
+                    "round": round, "abba_index": order, "iterations": ITERATIONS,
+                    "graph_launch_host_us": host_ns as f64 / 1000.0 / ITERATIONS as f64,
+                    "cuda_event_interval_us": gpu_ms * 1000.0 / ITERATIONS as f64,
+                    "scope": "paired resident attention graph; host timing wraps only graph launch; CUDA event interval may include host enqueue gaps, not device busy time; not serving performance",
+                })
+            );
+        }
+    }
+    for (fixture, window) in fixtures.iter().zip([128, 0]) {
+        fixture.check(&stream, &positions, window);
     }
 }
 

@@ -90,10 +90,13 @@ extern "C" int ferrum_flashinfer_xqa_run_v1(FerrumXqaPlanV1 const* p,FerrumXqaBi
   int error=ferrum_flashinfer_xqa_validate_v1(p,b); if(error) return error;
   if(!raw_stream) return 1;
   auto stream=reinterpret_cast<cudaStream_t>(raw_stream);
-  // Reset on the same stream every invocation, also recorded inside CUDA graphs.
+  // Only multi-block execution reads/increments semaphores. Single-split
+  // execution never accesses them and needs no reset node in CUDA graphs.
+  // Multi-block reset remains on the same stream for every invocation.
   // A failure after this point may leave pending work; caller retains ownership.
-  if((error=cuda_status(cudaMemsetAsync(reinterpret_cast<void*>(b->semaphores.address),0,
-                                        p->semaphore_bytes,stream)))) return error;
+  if(p->subsequences>1 &&
+     (error=cuda_status(cudaMemsetAsync(reinterpret_cast<void*>(b->semaphores.address),0,
+                                       p->semaphore_bytes,stream)))) return error;
   auto const& r=p->request;
   uint32_t const max_seq=r.max_pages_per_sequence*32;
   try {

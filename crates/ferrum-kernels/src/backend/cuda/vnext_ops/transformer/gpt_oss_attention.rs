@@ -1149,10 +1149,12 @@ fn encode_attention(
         .map_err(|error| error.to_string())?;
 
     let packed_enabled = packed.is_some();
-    let xqa_enabled = xqa_decode.is_some();
+    let xqa_transfers = xqa_decode
+        .as_ref()
+        .map_or(0, xqa::XqaDecode::transfer_count);
     let dispatch_count = if xqa_decode.is_some() {
         // Replace one R5 attention kernel with sink cast + one vendor kernel.
-        // Split reduction stays in that launch; semaphore memset is a transfer.
+        // Split reduction stays in that launch; multi-split semaphore reset is a transfer.
         9
     } else if packed_decode.is_some() {
         8
@@ -1236,7 +1238,7 @@ fn encode_attention(
             participant_count,
             total_tokens,
             dispatch_count,
-            u64::from(xqa_enabled),
+            xqa_transfers,
         )
     })
     .map_err(|error| error.to_string())?;
