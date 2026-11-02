@@ -461,15 +461,26 @@ fn resolve_reusable_execution_policy(
                 .map_err(|error| FerrumError::config(error.to_string()))?,
         );
     }
-    let program_policy = if on_demand {
-        ReusableExecutionProgramPolicy::exact_on_demand(program_specs)
-    } else {
-        ReusableExecutionProgramPolicy::exact_startup_sealed(
-            REUSABLE_EXECUTION_WARMUP_PASSES,
-            REUSABLE_EXECUTION_CAPTURE_PASSES,
-            REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES,
-            program_specs,
-        )
+    let program_policy = match capture_config.preparation {
+        ReusableExecutionPreparationMode::OnDemand => {
+            ReusableExecutionProgramPolicy::exact_on_demand(program_specs)
+        }
+        ReusableExecutionPreparationMode::StartupAndOnDemand => {
+            ReusableExecutionProgramPolicy::exact_startup_and_on_demand(
+                REUSABLE_EXECUTION_WARMUP_PASSES,
+                REUSABLE_EXECUTION_CAPTURE_PASSES,
+                REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES,
+                program_specs,
+            )
+        }
+        ReusableExecutionPreparationMode::Auto | ReusableExecutionPreparationMode::Startup => {
+            ReusableExecutionProgramPolicy::exact_startup_sealed(
+                REUSABLE_EXECUTION_WARMUP_PASSES,
+                REUSABLE_EXECUTION_CAPTURE_PASSES,
+                REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES,
+                program_specs,
+            )
+        }
     }
     .map_err(|error| FerrumError::config(error.to_string()))?;
     policy = policy
@@ -604,9 +615,10 @@ impl ProgramExecutorConfig {
                     ReusableExecutionPreparationMode::Startup;
             }
             ReusableExecutionPreparationMode::Startup => {}
-            ReusableExecutionPreparationMode::OnDemand => {
+            ReusableExecutionPreparationMode::OnDemand
+            | ReusableExecutionPreparationMode::StartupAndOnDemand => {
                 return Err(FerrumError::config(
-                    "fixed determinism collection requires startup reusable execution preparation",
+                    "fixed determinism collection requires startup-sealed reusable execution preparation",
                 ))
             }
         }
@@ -1011,9 +1023,7 @@ impl VNextReusableExecutionStartupPlan {
             .checked_add(capture_passes)
             .and_then(|passes| passes.checked_add(replay_validation_passes))
             .ok_or_else(|| FerrumError::config("vNext reusable startup passes overflow usize"))?;
-        let maximum_decode_sequence_tokens = if program_policy.catalog_lifetime()
-            == ReusableExecutionCatalogLifetime::OnDemandBounded
-        {
+        let maximum_decode_sequence_tokens = if !program_policy.prepares_before_readiness() {
             0
         } else {
             decode_widths
@@ -1192,6 +1202,8 @@ struct VNextReusableExecutionStartupReport {
     prepared_prefill_token_counts: Vec<usize>,
     requested_prefill_chunks: Vec<PrefillChunk>,
     prepared_prefill_chunks: Vec<PrefillChunk>,
+    /// Concurrent decode cohort width, not the cumulative number of synthetic
+    /// incarnations or the separately admitted prefill requests.
     synthetic_sequences: usize,
     eager_warmup_waves: usize,
     capture_waves: usize,
@@ -5451,9 +5463,13 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         let requested_decode_widths = plan.decode_widths();
         let requested_prefill_chunks = plan.prefill_chunks();
         let requested_prefill_token_counts = plan.prefill_token_counts();
-        if plan.device_plan.catalog_lifetime() == ReusableExecutionCatalogLifetime::OnDemandBounded
-        {
-            return self.prepare_on_demand_reusable_execution(&plan, started);
+        let bounded = plan.device_plan.catalog_lifetime()
+            == ReusableExecutionCatalogLifetime::OnDemandBounded;
+        if bounded {
+            let initial = self.prepare_on_demand_reusable_execution(&plan, started)?;
+            if !plan.program_policy.prepares_before_readiness() {
+                return Ok(initial);
+            }
         }
         for _ in 0..plan.warmup_passes {
             for chunk in requested_prefill_chunks.iter().copied() {
@@ -5507,15 +5523,22 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             }
         }
 
-        let configured = self
-            .lane
-            .configure_reusable_executables(plan.device_plan)
-            .map_err(|error| {
-                FerrumError::device(format!(
-                    "vNext reusable execution configuration failed: {error}"
-                ))
-            })?;
-        if configured.state() != DeviceReusableExecutionPreparationState::Preparing {
+        let configured = if bounded {
+            self.lane.reusable_executable_preparation()
+        } else {
+            self.lane.configure_reusable_executables(plan.device_plan)
+        }
+        .map_err(|error| {
+            FerrumError::device(format!(
+                "vNext reusable execution configuration failed: {error}"
+            ))
+        })?;
+        let preparation_state = if bounded {
+            DeviceReusableExecutionPreparationState::Ready
+        } else {
+            DeviceReusableExecutionPreparationState::Preparing
+        };
+        if configured.state() != preparation_state {
             return Err(FerrumError::internal(format!(
                 "vNext reusable execution capability configured as {:?}",
                 configured.state()
@@ -5536,13 +5559,33 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     "vNext reusable execution capture inspection failed: {error}"
                 ))
             })?;
-        if captured.state() != DeviceReusableExecutionPreparationState::Preparing
+        if captured.state() != preparation_state
             || captured.captured_executables() != captured.uploaded_executables()
             || captured.uploaded_executables() != captured.resident_executables()
         {
             return Err(FerrumError::device(format!(
                 "vNext reusable execution capture receipt is incomplete: {captured:?}"
             )));
+        }
+        // Validate bounded startup graphs with new request incarnations. Only
+        // the lane/plan executable survives; KV and per-request authority do not.
+        if bounded {
+            resources.complete()?;
+            resources = VNextStartupSequenceGuard::new(self);
+            for _ in 0..requested_sequences {
+                if !self
+                    .admit_startup_sequence(
+                        &mut resources,
+                        Arc::clone(&input_tokens),
+                        plan.maximum_decode_sequence_tokens,
+                    )
+                    .await?
+                {
+                    return Err(FerrumError::resource_exhausted(
+                        "vNext fresh-request startup replay could not admit its resolved width",
+                    ));
+                }
+            }
         }
         for _ in 0..plan.replay_validation_passes {
             for width in prepared_decode_widths.iter().copied() {
@@ -5563,7 +5606,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     "vNext reusable execution replay inspection failed: {error}"
                 ))
             })?;
-        if replayed.state() != DeviceReusableExecutionPreparationState::Preparing
+        if replayed.state() != preparation_state
             || !reusable_executable_inventory_matches(captured, replayed)
         {
             return Err(FerrumError::device(format!(
@@ -5588,7 +5631,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                                 chunk.range()
                             ))
                         })?;
-                if prefill_captured.state() != DeviceReusableExecutionPreparationState::Preparing
+                if prefill_captured.state() != preparation_state
                     || prefill_captured.captured_executables()
                         != prefill_captured.uploaded_executables()
                     || prefill_captured.uploaded_executables()
@@ -5617,7 +5660,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                             chunk.range()
                         ))
                         })?;
-                if prefill_replayed.state() != DeviceReusableExecutionPreparationState::Preparing
+                if prefill_replayed.state() != preparation_state
                     || !reusable_executable_inventory_matches(captured, prefill_replayed)
                 {
                     return Err(FerrumError::device(format!(
@@ -5628,7 +5671,12 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             }
         }
 
-        let device_preparation = self.lane.seal_reusable_executables().map_err(|error| {
+        let device_preparation = if bounded {
+            self.lane.reusable_executable_preparation()
+        } else {
+            self.lane.seal_reusable_executables()
+        }
+        .map_err(|error| {
             FerrumError::device(format!("vNext reusable execution sealing failed: {error}"))
         })?;
         if device_preparation.state() != DeviceReusableExecutionPreparationState::Ready
@@ -5784,10 +5832,17 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         prepared_prefill_token_counts.sort_unstable_by(|left, right| right.cmp(left));
         prepared_prefill_token_counts.dedup();
         let incomplete_capture_cases = prepared_descriptors.len() != requested_descriptors.len();
-        self.install_reusable_execution_catalog(VNextReusableExecutionCatalog {
+        let catalog = VNextReusableExecutionCatalog {
             lane_epoch: catalog_epoch,
             programs: catalog_by_id,
-        })?;
+        };
+        if bounded {
+            *self.reusable_execution_catalog.write() = Some(Arc::new(catalog));
+            self.reusable_execution_catalog_refresh_needed
+                .store(false, Ordering::Release);
+        } else {
+            self.install_reusable_execution_catalog(catalog)?;
+        }
         let requested_wave_shapes = prepared_decode_widths.len() + plan.prefill_wave_shapes();
         Ok(VNextReusableExecutionStartupReport {
             enabled: true,
@@ -7414,7 +7469,12 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         if cold_wave.is_some() {
                             diagnostic_program_id = Some(program_id.clone());
                         }
-                        if catalog.is_none() {
+                        if catalog.is_none()
+                            || participants.iter().all(|participant| {
+                                participant.sequence.request_origin
+                                    == ExecutorRequestOrigin::Startup
+                            })
+                        {
                             self.record_startup_reusable_program(participants, kind, &program_id);
                         }
                         match catalog {
@@ -10011,6 +10071,23 @@ mod tests {
             &ReusableExecutionCaptureConfig::default()
         )
         .is_err());
+
+        let hybrid = ReusableExecutionCaptureConfig {
+            preparation: ferrum_types::ReusableExecutionPreparationMode::StartupAndOnDemand,
+            ..Default::default()
+        };
+        assert!(resolve_test_reusable_startup_plan(32, 32, 2, &[], 7, &hybrid).is_err());
+        let hybrid_plan = resolve_test_reusable_startup_plan(32, 32, 128, &[], 7, &hybrid).unwrap();
+        assert!(hybrid_plan.program_policy.prepares_before_readiness());
+        assert_eq!(hybrid_plan.maximum_decode_sequence_tokens, 97);
+        assert_eq!(
+            hybrid_plan.device_plan.catalog_lifetime(),
+            plan.device_plan.catalog_lifetime()
+        );
+        assert_eq!(
+            hybrid_plan.device_plan.maximum_executables(),
+            plan.device_plan.maximum_executables()
+        );
     }
 
     #[test]

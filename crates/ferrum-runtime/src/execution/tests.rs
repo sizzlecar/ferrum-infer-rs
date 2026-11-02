@@ -1020,6 +1020,10 @@ fn startup_memory_sealed_catalog_retains_captured_arenas_beside_eager_workspace(
     let sealed = make_plan(
         ReusableExecutionProgramPolicy::exact_startup_sealed(1, 1, 1, programs.clone()).unwrap(),
     );
+    let hybrid = make_plan(
+        ReusableExecutionProgramPolicy::exact_startup_and_on_demand(1, 1, 1, programs.clone())
+            .unwrap(),
+    );
     let on_demand = make_plan(ReusableExecutionProgramPolicy::exact_on_demand(programs).unwrap());
     assert_eq!(
         sealed.startup_peak_bytes(100, 1, 1).unwrap(),
@@ -1030,6 +1034,14 @@ fn startup_memory_sealed_catalog_retains_captured_arenas_beside_eager_workspace(
         2 * (64 + 128) + 256
     );
     assert_eq!(on_demand.startup_peak_bytes(100, 1, 1).unwrap(), 64);
+    assert_eq!(
+        hybrid.startup_peak_bytes(100, 1, 1).unwrap(),
+        sealed.startup_peak_bytes(100, 1, 1).unwrap()
+    );
+    assert_eq!(
+        hybrid.startup_peak_bytes(100, 1, 9).unwrap(),
+        sealed.startup_peak_bytes(100, 1, 9).unwrap()
+    );
     let budget_for_only_largest_captured_bucket = 2 * 128 + 64;
     assert!(
         sealed.startup_peak_bytes(100, 1, 1).unwrap() > budget_for_only_largest_captured_bucket

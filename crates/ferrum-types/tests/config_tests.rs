@@ -514,14 +514,19 @@ fn reusable_execution_capture_explicit_policy_round_trips() {
 
 #[test]
 fn reusable_execution_preparation_resolves_declared_capabilities() {
-    use ReusableExecutionPreparationMode::{Auto, OnDemand, Startup};
-    assert_eq!(Auto.resolve(true).unwrap(), OnDemand);
+    use ReusableExecutionPreparationMode::{Auto, OnDemand, Startup, StartupAndOnDemand};
+    assert_eq!(Auto.resolve(true).unwrap(), StartupAndOnDemand);
     assert_eq!(Auto.resolve(false).unwrap(), Startup);
     assert_eq!(Startup.resolve(true).unwrap(), Startup);
     assert_eq!(Startup.resolve(false).unwrap(), Startup);
     assert_eq!(OnDemand.resolve(true).unwrap(), OnDemand);
     assert!(OnDemand.resolve(false).is_err());
-    for mode in [Auto, Startup, OnDemand] {
+    assert_eq!(
+        StartupAndOnDemand.resolve(true).unwrap(),
+        StartupAndOnDemand
+    );
+    assert!(StartupAndOnDemand.resolve(false).is_err());
+    for mode in [Auto, Startup, StartupAndOnDemand, OnDemand] {
         let mut config = EngineConfig::default();
         let snapshot = RuntimeConfigSnapshot::from_entries(vec![RuntimeConfigEntry::new(
             "FERRUM_REUSABLE_EXECUTION_PREPARATION",
@@ -530,6 +535,12 @@ fn reusable_execution_preparation_resolves_declared_capabilities() {
         )]);
         config.apply_runtime_config_snapshot(&snapshot).unwrap();
         assert_eq!(config.backend.reusable_execution_capture.preparation, mode);
+        assert_eq!(
+            mode.as_runtime_value()
+                .parse::<ReusableExecutionPreparationMode>()
+                .unwrap(),
+            mode
+        );
     }
     assert!("sometimes"
         .parse::<ReusableExecutionPreparationMode>()
