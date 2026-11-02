@@ -26,7 +26,7 @@ $$
 
 - $W$: fixed requests and arrival schedule; $T>0$: fixed window and common cutoff. $N_{\mathrm{out}}$: valid output tokens from requests successfully completed by that cutoff.
 - $L_k$: latency samples; $Q_{p_k}$: quantile; $S_k$: SLO limit. TTFT includes queueing; missing latency evidence does not establish compliance.
-- $C$: fraction of $W$ successfully completed by the cutoff; rejected, failed, timed-out and unfinished requests remain in the denominator. Declare $p_k$, $S_k$ and minimum completion rate $0<\rho\le1$ before measuring. [Sampling rules](docs/performance-evaluation.md).
+- $C$: fraction of $W$ successfully completed by the cutoff; rejected, failed, timed-out and unfinished requests remain in the denominator. Declare $p_k$, $S_k$ and minimum completion rate $0<\rho\le1$ before measuring. [Sampling rules](docs/performance-rtx5090-gpt-oss-20261102.md).
 
 ## Install
 
