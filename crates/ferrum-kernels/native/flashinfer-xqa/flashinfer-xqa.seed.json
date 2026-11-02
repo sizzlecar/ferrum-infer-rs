@@ -53,8 +53,8 @@
     }
   ],
   "include_dirs": [
-    "xqa",
-    "kernels"
+    "kernels",
+    "xqa"
   ],
   "defines": [
     "BEAM_WIDTH=1",
