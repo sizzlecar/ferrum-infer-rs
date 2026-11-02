@@ -1692,6 +1692,10 @@ fn cuda_text_native_build_units() -> Vec<crate::native_ops::CudaNativeBuildUnit>
             cfg!(feature = "cuda-indexed-causal-attention"),
             CudaNativeBuildUnit::VllmIndexedPagedAttentionV2,
         ),
+        (
+            crate::native_ops::flashinfer_xqa::compiled(),
+            CudaNativeBuildUnit::FlashinferXqa,
+        ),
     ]
     .into_iter()
     .filter_map(|(enabled, unit)| enabled.then_some(unit))

@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/flashinfer-ai/flashinfer.git",
+  "revision": "946200de1ae94fc93fdd0926f0a13afd1fa7f0f1",
+  "installed_version": "0.7.0.post1",
+  "members": [
+    {
+      "path": "xqa/barriers.cuh",
+      "sha256": "1891ddd0923b67145c9261b3e4d02d00a10b8d2b6924672efab2d4e756b5d11f"
+    },
+    {
+      "path": "xqa/cuda_hint.cuh",
+      "sha256": "68277000d4ed517a22ba05d8ed2891e9ab425d8969c449d729347b6f9b340871"
+    },
+    {
+      "path": "xqa/defines.h",
+      "sha256": "722dd1cba129d23ba532bdab69c15c7255d6870af52d0d3e1d5667734e752973"
+    },
+    {
+      "path": "xqa/hostUtils.h",
+      "sha256": "48336384eae56886654e39be726f37ccebc06ce3586d781151e692017d6a0682"
+    },
+    {
+      "path": "xqa/ldgsts.cuh",
+      "sha256": "08f2531efd9f8f4fcd1d66c8fd00e18e92743e0e1c4497c0d4d73cb8de7afb75"
+    },
+    {
+      "path": "xqa/mha.cu",
+      "sha256": "fac9c9a116be125b800257c455ee3abe2a2a620b2816a3c254792d3a5033ace4"
+    },
+    {
+      "path": "xqa/mha.h",
+      "sha256": "e23d3741868ec09c3aa2cb08ffea298db21737362b7ba89bb9d6f9c6533746fa"
+    },
+    {
+      "path": "xqa/mhaUtils.cuh",
+      "sha256": "9a62daf9bc47e03d68eb4ea8e650d4f72b29ad50538a07404f3a0793d5a1ade8"
+    },
+    {
+      "path": "xqa/mha_components.cuh",
+      "sha256": "6a549616e31ede5413ea7b5e89328f69906a0504ea35324c38941b77d31ad6c4"
+    },
+    {
+      "path": "xqa/mha_stdheaders.cuh",
+      "sha256": "54799afa4a1f605efa4b0be5963b0cbfab4bb567d70b1d600c2f852f80000e39"
+    },
+    {
+      "path": "xqa/mma.cuh",
+      "sha256": "a4a8ffbd9ecb0329864f21943916640d805e92137387b7f23e0fbc06c6dfe4d2"
+    },
+    {
+      "path": "xqa/platform.h",
+      "sha256": "e8e6e0a29992bce8cfcdc435a281730d6bc9ddaf8b8cfb647de5aad85d2c9b88"
+    },
+    {
+      "path": "xqa/utils.cuh",
+      "sha256": "04f996f1951d8534aec7fc10e0303e10bd13b53de7eda22bc7f4a629cd627eab"
+    },
+    {
+      "path": "xqa/utils.h",
+      "sha256": "cbbcd6f7ddd2ab310f4edd3660f3535c5500071f4f359f9f49b7517f4c63c6ed"
+    }
+  ]
+}

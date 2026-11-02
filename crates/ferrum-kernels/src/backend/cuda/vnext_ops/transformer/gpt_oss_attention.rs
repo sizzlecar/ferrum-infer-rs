@@ -29,6 +29,8 @@ use ferrum_runtime::{
 };
 use sha2::{Digest, Sha256};
 
+mod xqa;
+
 use super::{attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16};
 use crate::backend::cuda::vnext_ops::{
     binding, contiguous_token_region, contract_error, implementation_fingerprint,
@@ -41,7 +43,7 @@ use crate::backend::cuda::vnext_runtime::{
 };
 
 pub(in crate::backend::cuda::vnext_ops) const GPT_OSS_ATTENTION_PROVIDER_ID: &str =
-    "provider.cuda.gpt_oss.causal_paged_attention.f16";
+    crate::native_ops::flashinfer_xqa::GPT_OSS_ATTENTION_PROVIDER_ID;
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.gpt_oss.causal_paged_attention.f16";
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
 const PREPARE_FUNCTION: &str = "gpt_oss_prepare_qkv_yarn_f16";
@@ -73,6 +75,7 @@ const GPT_OSS_SLIDING_WINDOW: u64 = 128;
 pub(in crate::backend::cuda::vnext_ops) struct CudaGptOssCausalPagedAttentionProvider {
     descriptor: OperationProviderDescriptor,
     functions: GptOssAttentionFunctions,
+    xqa: Option<xqa::XqaSupport>,
 }
 
 #[derive(Clone)]
@@ -98,15 +101,19 @@ impl CudaGptOssCausalPagedAttentionProvider {
             ));
         }
 
+        let xqa = xqa::XqaSupport::discover(runtime)?;
+        let xqa_identity = xqa
+            .as_ref()
+            .map(xqa::XqaSupport::fingerprint_material)
+            .unwrap_or_default();
         let source = include_str!("gpt_oss_attention.rs");
-        let provider_fingerprint = implementation_fingerprint(&[
+        let provider_fingerprint = crate::native_ops::flashinfer_xqa::provider_source_fingerprint();
+        let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
-            crate::ptx::RMS_NORM.as_bytes(),
-            crate::ptx::GPT_OSS_ATTENTION.as_bytes(),
-            GPT_OSS_ATTENTION_PROVIDER_ID.as_bytes(),
+            include_bytes!("gpt_oss_attention/xqa.rs"),
+            &xqa_identity,
+            ESTIMATOR_ID.as_bytes(),
         ]);
-        let estimator_fingerprint =
-            implementation_fingerprint(&[source.as_bytes(), ESTIMATOR_ID.as_bytes()]);
         let descriptor = OperationProviderDescriptor::new(
             ProviderId::new(GPT_OSS_ATTENTION_PROVIDER_ID).map_err(contract_error)?,
             contract.descriptor().id.clone(),
@@ -167,6 +174,7 @@ impl CudaGptOssCausalPagedAttentionProvider {
         Ok(Self {
             descriptor,
             functions,
+            xqa,
         })
     }
 }
@@ -226,13 +234,19 @@ impl OperationResourceEstimator for CudaGptOssCausalPagedAttentionProvider {
         )?;
         let shape =
             GptOssAttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
+        let (fixed, per_sequence, alignment) = self
+            .xqa
+            .as_ref()
+            .filter(|_| xqa::XqaSupport::eligible(shape))
+            .map(xqa::XqaSupport::workspace_formula)
+            .unwrap_or((0, 0, SCRATCH_ALIGNMENT));
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
-                0,
-                0,
+                fixed,
+                per_sequence,
                 shape.scratch_bytes_per_token().map_err(invalid_plan)?,
             )?,
-            SCRATCH_ALIGNMENT,
+            alignment,
             ProviderWorkspaceScope::Invocation,
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
@@ -302,6 +316,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGptOssCausalPagedAttentionProv
         let identity = invocation.participants()[0].identity().clone();
         encode_attention(
             &self.functions,
+            self.xqa.as_ref(),
             self.descriptor.provider_implementation_fingerprint(),
             invocation,
         )
@@ -835,6 +850,7 @@ fn bind_shape_replay_key(
 
 fn encode_attention(
     functions: &GptOssAttentionFunctions,
+    xqa_support: Option<&xqa::XqaSupport>,
     provider_fingerprint: &str,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
@@ -855,6 +871,13 @@ fn encode_attention(
 
     let total_tokens = invocation.work_shape().immediate_tokens();
     let layout = ScratchLayout::new(shape, total_tokens)?;
+    let xqa_support = xqa_support.filter(|_| xqa::XqaSupport::eligible(shape));
+    let required_scratch = xqa_support
+        .map(|support| {
+            support.workspace_bytes(layout.required_bytes, invocation.participants().len())
+        })
+        .transpose()?
+        .unwrap_or(layout.required_bytes);
     let binding_layout = BindingLayout::new(shape, invocation.participants().len())?;
     let cuda = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
@@ -878,10 +901,7 @@ fn encode_attention(
         sinks: push_shared_weight(&mut compute_regions, &invocation, 10)?,
         scratch: {
             let index = compute_regions.len();
-            compute_regions.push(super::shared_scratch_region(
-                &invocation,
-                layout.required_bytes,
-            )?);
+            compute_regions.push(super::shared_scratch_region(&invocation, required_scratch)?);
             index
         },
         binding: {
@@ -1064,6 +1084,14 @@ fn encode_attention(
         .map(|packed| packed_decode_launch(packed, &launches, binding_layout))
         .transpose()?
         .flatten();
+    let xqa_decode = if packed_decode.is_some() {
+        xqa_support
+            .map(|support| support.prepare(shape, layout, binding_layout, launches.len()))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
 
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "CUDA GPT-OSS attention participant count exceeds u32".to_owned())?;
@@ -1121,7 +1149,12 @@ fn encode_attention(
         .map_err(|error| error.to_string())?;
 
     let packed_enabled = packed.is_some();
-    let dispatch_count = if packed_decode.is_some() {
+    let xqa_enabled = xqa_decode.is_some();
+    let dispatch_count = if xqa_decode.is_some() {
+        // Replace one R5 attention kernel with sink cast + one vendor kernel.
+        // Split reduction stays in that launch; semaphore memset is a transfer.
+        9
+    } else if packed_decode.is_some() {
         8
     } else if packed_enabled {
         6_u64.saturating_add((launches.len() as u64).saturating_mul(2))
@@ -1135,7 +1168,14 @@ fn encode_attention(
     .u64(total_tokens)
     .boolean(packed_enabled)
     .boolean(packed_decode.is_some())
-    .u64(layout.required_bytes)
+    .boolean(xqa_decode.is_some())
+    .bytes(
+        &xqa_decode
+            .as_ref()
+            .map(xqa::XqaDecode::fingerprint_material)
+            .unwrap_or_default(),
+    )
+    .u64(required_scratch)
     .u64(layout.normalized)
     .u64(layout.query_raw)
     .u64(layout.key_raw)
@@ -1164,6 +1204,7 @@ fn encode_attention(
                     shared,
                     packed,
                     packed_decode,
+                    xqa_decode.as_ref(),
                     &launches,
                     regions,
                 )?;
@@ -1195,7 +1236,7 @@ fn encode_attention(
             participant_count,
             total_tokens,
             dispatch_count,
-            0,
+            u64::from(xqa_enabled),
         )
     })
     .map_err(|error| error.to_string())?;
@@ -1381,6 +1422,7 @@ fn enqueue_packed_attention(
     shared: SharedRegions,
     packed: PackedLaunch,
     packed_decode: Option<PackedDecodeLaunch>,
+    xqa_decode: Option<&xqa::XqaDecode>,
     launches: &[AttentionLaunch],
     regions: &[CudaBufferRegion],
 ) -> Result<(), CudaDeviceRuntimeError> {
@@ -1454,16 +1496,20 @@ fn enqueue_packed_attention(
             decode,
             cuda,
         )?;
-        launch_packed_decode_attention(
-            stream,
-            &functions.attention_packed_decode,
-            scratch_base,
-            binding.device_ptr(),
-            regions[shared.sinks].device_ptr(),
-            layout,
-            decode,
-            cuda,
-        )?;
+        if let Some(xqa) = xqa_decode {
+            xqa.enqueue(stream, scratch, binding, &regions[shared.sinks], layout)?;
+        } else {
+            launch_packed_decode_attention(
+                stream,
+                &functions.attention_packed_decode,
+                scratch_base,
+                binding.device_ptr(),
+                regions[shared.sinks].device_ptr(),
+                layout,
+                decode,
+                cuda,
+            )?;
+        }
     } else {
         for launch in launches {
             launch_prepare(

@@ -414,6 +414,9 @@ fn materialize_source(
         CudaNativeBuildUnit::CutlassFp8ScaledMm => {
             return Err("FP8 uses its observed source closure".into())
         }
+        CudaNativeBuildUnit::FlashinferXqa => {
+            return Err("XQA uses its observed source closure".into())
+        }
     };
     let mut files = BTreeMap::new();
     for file in plan.translation_units.iter().chain(&plan.headers) {

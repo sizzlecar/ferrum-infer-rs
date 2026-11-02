@@ -6,6 +6,8 @@ use half::f16;
 
 mod microbench;
 mod prefill;
+#[cfg(ferrum_native_flashinfer_xqa)]
+mod xqa;
 
 fn attention_shape(sliding_window_tokens: u64) -> GptOssAttentionShape {
     GptOssAttentionShape {

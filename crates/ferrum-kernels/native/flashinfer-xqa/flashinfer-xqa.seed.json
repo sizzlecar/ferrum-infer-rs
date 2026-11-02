@@ -1,0 +1,87 @@
+{
+  "schema_version": 3,
+  "operator": "ferrum.cuda.flashinfer_xqa_decode",
+  "source_package_kind": "ferrum-native-flashinfer-xqa",
+  "source_package_revision": "f16-h64-gqa8-pointer-pages-v1+946200de1ae94fc93fdd0926f0a13afd1fa7f0f1",
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/flashinfer-ai/flashinfer.git",
+      "revision": "946200de1ae94fc93fdd0926f0a13afd1fa7f0f1",
+      "license": "Apache-2.0"
+    }
+  ],
+  "translation_units": [
+    "kernels/boundary.cu"
+  ],
+  "headers": [
+    "kernels/abi.h",
+    "xqa/barriers.cuh",
+    "xqa/cuda_hint.cuh",
+    "xqa/defines.h",
+    "xqa/hostUtils.h",
+    "xqa/ldgsts.cuh",
+    "xqa/mha.cu",
+    "xqa/mha.h",
+    "xqa/mhaUtils.cuh",
+    "xqa/mha_components.cuh",
+    "xqa/mha_stdheaders.cuh",
+    "xqa/mma.cuh",
+    "xqa/platform.h",
+    "xqa/utils.cuh",
+    "xqa/utils.h"
+  ],
+  "dependency_closures": [
+    {
+      "translation_unit": "kernels/boundary.cu",
+      "headers": [
+        "kernels/abi.h",
+        "xqa/barriers.cuh",
+        "xqa/cuda_hint.cuh",
+        "xqa/defines.h",
+        "xqa/hostUtils.h",
+        "xqa/ldgsts.cuh",
+        "xqa/mha.cu",
+        "xqa/mha.h",
+        "xqa/mhaUtils.cuh",
+        "xqa/mha_components.cuh",
+        "xqa/mha_stdheaders.cuh",
+        "xqa/mma.cuh",
+        "xqa/platform.h",
+        "xqa/utils.cuh",
+        "xqa/utils.h"
+      ]
+    }
+  ],
+  "include_dirs": [
+    "xqa",
+    "kernels"
+  ],
+  "defines": [
+    "BEAM_WIDTH=1",
+    "CACHE_ELEM_ENUM=0",
+    "DTYPE=__half",
+    "HEAD_ELEMS=64",
+    "HEAD_GRP_SIZE=8",
+    "INPUT_FP16=1",
+    "LOW_PREC_OUTPUT=0",
+    "MLA_WRAPPER=0",
+    "NDEBUG=1",
+    "SLIDING_WINDOW=1",
+    "SPEC_DEC=0",
+    "TOKENS_PER_PAGE=32",
+    "USE_CUSTOM_BARRIER=1",
+    "USE_INPUT_KV=0",
+    "USE_SM90_MHA=0"
+  ],
+  "nvcc_policy": {
+    "cpp_standard": "cpp17",
+    "optimization": "o3",
+    "use_fast_math": false,
+    "relaxed_constexpr": true,
+    "extended_lambda": true,
+    "host_position_independent_code": true,
+    "host_default_visibility": false
+  },
+  "architecture": "device_compute_capability",
+  "archive_file": "libferrum_flashinfer_xqa.a"
+}
