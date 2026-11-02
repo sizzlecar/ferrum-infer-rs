@@ -140,6 +140,7 @@ fn attention(
     stream: &Arc<CudaStream>,
     function: &CudaFunction,
     packed: bool,
+    block_threads: u32,
     shape: CudaGptOssAttentionShape,
     query: &Guarded<f16>,
     sinks: &Guarded<f16>,
@@ -185,7 +186,7 @@ fn attention(
                 shape.query_heads as u32,
                 1,
             ),
-            block_dim: (32, 1, 1),
+            block_dim: (block_threads, 1, 1),
             shared_mem_bytes: 0,
         })
     }
@@ -252,6 +253,9 @@ fn packed_gpt_oss_decode_preserves_yarn_sink_windows_and_independent_pages_on_cu
     let packed_attention = module
         .load_function("gpt_oss_paged_attention_sink_packed_decode_f16")
         .unwrap();
+    let multiwarp_attention = module
+        .load_function("gpt_oss_paged_attention_sink_packed_decode_multiwarp_f16")
+        .unwrap();
     for sliding_window_tokens in [0, 128] {
         let shape = GptOssAttentionShape {
             hidden_size: 2880,
@@ -261,7 +265,7 @@ fn packed_gpt_oss_decode_preserves_yarn_sink_windows_and_independent_pages_on_cu
             query_features: 4096,
             kv_features: 512,
             rope_dim: 64,
-            maximum_context_tokens: 512,
+            maximum_context_tokens: 4096,
             rope_theta: 150_000.0,
             yarn_factor: 32.0,
             yarn_original_context_tokens: 4096,
@@ -273,8 +277,9 @@ fn packed_gpt_oss_decode_preserves_yarn_sink_windows_and_independent_pages_on_cu
         };
         let cuda = shape.cuda_shape().unwrap();
         for participants in [1, 3, 17] {
+            let context_positions = [0, 1, 2, 3, 31, 32, 127, 128, 257, 1023, 4095];
             let positions = (0..participants)
-                .map(|i| [0, 31, 32, 127, 128, 257][i % 6])
+                .map(|i| context_positions[i % context_positions.len()])
                 .collect::<Vec<_>>();
             let scalar_kv = KvFixture::new(&stream, &positions, shape);
             let packed_kv = KvFixture::new(&stream, &positions, shape);
@@ -314,6 +319,7 @@ fn packed_gpt_oss_decode_preserves_yarn_sink_windows_and_independent_pages_on_cu
             let packed_q = Guarded::new(&stream, &blank, f16::from_f32(86.0));
             let scalar_output = Guarded::new(&stream, &blank, f16::from_f32(87.0));
             let packed_output = Guarded::new(&stream, &blank, f16::from_f32(88.0));
+            let multiwarp_output = Guarded::new(&stream, &blank, f16::from_f32(89.0));
             for p in 0..participants {
                 prepare(
                     &stream,
@@ -331,6 +337,7 @@ fn packed_gpt_oss_decode_preserves_yarn_sink_windows_and_independent_pages_on_cu
                     &stream,
                     &scalar_attention,
                     false,
+                    32,
                     cuda,
                     &scalar_q,
                     &sinks,
@@ -356,6 +363,7 @@ fn packed_gpt_oss_decode_preserves_yarn_sink_windows_and_independent_pages_on_cu
                 &stream,
                 &packed_attention,
                 true,
+                32,
                 cuda,
                 &packed_q,
                 &sinks,
@@ -364,8 +372,22 @@ fn packed_gpt_oss_decode_preserves_yarn_sink_windows_and_independent_pages_on_cu
                 0,
                 participants,
             );
+            attention(
+                &stream,
+                &multiwarp_attention,
+                true,
+                128,
+                cuda,
+                &packed_q,
+                &sinks,
+                &multiwarp_output,
+                &packed_kv,
+                0,
+                participants,
+            );
             let queries = packed_q.read(&stream);
             let values = packed_output.read(&stream);
+            let multiwarp_values = multiwarp_output.read(&stream);
             let kv = packed_kv.read(&stream);
             assert_eq!(
                 queries,
@@ -390,12 +412,21 @@ fn packed_gpt_oss_decode_preserves_yarn_sink_windows_and_independent_pages_on_cu
                 let end = start + shape.query_features as usize;
                 let expected =
                     reference(&queries[start..end], &kv[p], &sinks_host, position, shape);
-                for (i, (actual, expected)) in values[start..end].iter().zip(expected).enumerate() {
-                    let bound = 0.001 * expected.abs().max(1.0);
-                    assert!(
-                        actual.is_finite() && (actual.to_f64() - expected).abs() <= bound,
-                        "F64 attention p={p} element={i}: {actual:?} vs {expected}"
-                    );
+                // Parallel reduction changes addition order. Both kernels must satisfy
+                // the independent reference; only the original packed path is bitwise.
+                for (kernel, actual_values) in
+                    [("packed", &values), ("multiwarp", &multiwarp_values)]
+                {
+                    for (i, (actual, expected)) in
+                        actual_values[start..end].iter().zip(&expected).enumerate()
+                    {
+                        let bound = 0.001 * expected.abs().max(1.0);
+                        assert!(
+                            actual.is_finite() && (actual.to_f64() - expected).abs() <= bound,
+                            "F64 {kernel} attention p={p} context={} window={sliding_window_tokens} element={i}: {actual:?} vs {expected}",
+                            position + 1,
+                        );
+                    }
                 }
             }
             for input in raw.iter().chain(&bias).chain(std::iter::once(&sinks)) {

@@ -47,7 +47,8 @@ const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
 const PREPARE_FUNCTION: &str = "gpt_oss_prepare_qkv_yarn_f16";
 const ATTENTION_FUNCTION: &str = "gpt_oss_paged_attention_sink_f16";
 const PREPARE_PACKED_DECODE_FUNCTION: &str = "gpt_oss_prepare_qkv_yarn_packed_decode_f16";
-const ATTENTION_PACKED_DECODE_FUNCTION: &str = "gpt_oss_paged_attention_sink_packed_decode_f16";
+const ATTENTION_PACKED_DECODE_FUNCTION: &str =
+    "gpt_oss_paged_attention_sink_packed_decode_multiwarp_f16";
 const RESIDUAL_BIAS_FUNCTION: &str = "gpt_oss_residual_output_bias_f16";
 const COMPUTE_OPERATION: &str = "vnext.gpt_oss.causal_paged_attention.f16";
 const BINDING_OPERATION: &str = "vnext_gpt_oss_causal_paged_attention_bindings";
@@ -57,6 +58,7 @@ const POINTER_BYTES: u64 = std::mem::size_of::<u64>() as u64;
 const BINDING_CONTROL_WORDS: usize = 4;
 const BINDING_CONTROL_BYTES: u64 = (BINDING_CONTROL_WORDS * std::mem::size_of::<i32>()) as u64;
 const WARP_THREADS: u32 = 32;
+const PACKED_DECODE_ATTENTION_WARPS: u32 = 4;
 
 const GPT_OSS_HEAD_DIM: u64 = 64;
 const GPT_OSS_ROPE_DIM: u64 = 64;
@@ -1708,7 +1710,7 @@ fn launch_packed_decode_attention(
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (decode.participants as u32, shape.query_heads as u32, 1),
-            block_dim: (WARP_THREADS, 1, 1),
+            block_dim: (WARP_THREADS * PACKED_DECODE_ATTENTION_WARPS, 1, 1),
             shared_mem_bytes: 0,
         })
     }
