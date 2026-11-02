@@ -5,7 +5,7 @@
 use super::*;
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
-use ferrum_runtime::{BufferUsage, ResourceId};
+use ferrum_runtime::{BufferUsage, DisabledDeviceSubmissionTimingSink, ResourceId};
 use serde_json::json;
 use std::sync::Weak;
 
@@ -347,7 +347,11 @@ impl Fixture {
                             .map(|command| (DeviceCommandPhase::DynamicBinding, None, command))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let entries = input_upload_packet::coalesce(runtime, entries)?;
+                let entries = input_upload_packet::coalesce(
+                    runtime,
+                    entries,
+                    &DisabledDeviceSubmissionTimingSink,
+                )?;
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].2.compute_dispatch_count, 1);
                 assert_eq!(entries[0].2.transfer_command_count, 1);
@@ -689,7 +693,9 @@ fn input_upload_product_preserves_bytes_lifetimes_and_fallbacks() {
     }
     let original = entries();
     let expected = snapshot(&original);
-    let fallback = input_upload_packet::coalesce(&runtime, original).unwrap();
+    let fallback =
+        input_upload_packet::coalesce(&runtime, original, &DisabledDeviceSubmissionTimingSink)
+            .unwrap();
     assert_eq!(snapshot(&fallback), expected);
     drop((fallback, held));
     assert_eq!(runtime.input_upload_scatter.live_bytes_for_test(), 0);
@@ -711,7 +717,9 @@ fn input_upload_product_preserves_bytes_lifetimes_and_fallbacks() {
             .unwrap(),
     ));
     let expected = snapshot(&original);
-    let fallback = input_upload_packet::coalesce(&runtime, original).unwrap();
+    let fallback =
+        input_upload_packet::coalesce(&runtime, original, &DisabledDeviceSubmissionTimingSink)
+            .unwrap();
     assert_eq!(snapshot(&fallback), expected);
     assert_eq!(runtime.input_upload_scatter.live_bytes_for_test(), 0);
     drop(fallback);
@@ -719,7 +727,9 @@ fn input_upload_product_preserves_bytes_lifetimes_and_fallbacks() {
     // A node-attributed command is a boundary even if it is also a host copy.
     let mut original = entries();
     original[8].1 = Some(17);
-    let grouped = input_upload_packet::coalesce(&runtime, original).unwrap();
+    let grouped =
+        input_upload_packet::coalesce(&runtime, original, &DisabledDeviceSubmissionTimingSink)
+            .unwrap();
     assert_eq!(grouped.len(), 9); // eight merged; boundary and seven direct
     assert_eq!(grouped[0].2.compute_dispatch_count, 1);
     assert_eq!(grouped[1].1, Some(17));
@@ -749,6 +759,9 @@ fn input_upload_product_preserves_bytes_lifetimes_and_fallbacks() {
         .is_err());
     let mut foreign = entries();
     foreign[0].2.runtime_instance = runtime.runtime_instance + 1;
-    assert!(input_upload_packet::coalesce(&runtime, foreign).is_err());
+    assert!(
+        input_upload_packet::coalesce(&runtime, foreign, &DisabledDeviceSubmissionTimingSink)
+            .is_err()
+    );
     println!("product input packet: byte-exact fresh independent allocations, same-stream successor, caller-owner release, shared capacity/overlap fallback, attributed boundary and typed rejection verified");
 }

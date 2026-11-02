@@ -923,6 +923,13 @@ impl DeviceCommandLogicalWork {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceSubmissionStage {
     ValidateAndPrepare,
+    /// Nested host intervals within `ValidateAndPrepare`, not additive stages.
+    InputPacketAllocate,
+    InputPacketAllocationSync,
+    ReusableCaptureRecord,
+    ReusableCaptureTopology,
+    ReusableGraphInstantiate,
+    ReusableGraphUpload,
     BeginTiming,
     EnqueueCommands,
     RecordFenceAndAccount,

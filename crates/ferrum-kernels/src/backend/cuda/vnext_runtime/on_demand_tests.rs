@@ -146,6 +146,7 @@ impl CaptureHarness {
                 &candidates,
                 quiescent,
                 capture,
+                &ferrum_runtime::DisabledDeviceSubmissionTimingSink,
             )
             .unwrap();
         // Capture and graph upload must not execute the stateful operation.
@@ -354,6 +355,7 @@ fn on_demand_logical_catalog_is_bounded_and_stale_references_miss_before_launch(
                 &candidates,
                 true,
                 ExecutionFactsCapture::Off,
+                &ferrum_runtime::DisabledDeviceSubmissionTimingSink,
             )
             .unwrap();
         h.cache
@@ -432,6 +434,7 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
             &candidates,
             true,
             ExecutionFactsCapture::Off,
+            &sink,
         )
         .unwrap();
     h.cache
@@ -482,6 +485,7 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
             &[],
             true,
             ExecutionFactsCapture::Off,
+            &sink,
         )
         .unwrap();
     assert_eq!(eager_preparation, CudaExecutablePreparation::default());

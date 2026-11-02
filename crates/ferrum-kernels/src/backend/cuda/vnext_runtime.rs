@@ -93,7 +93,7 @@ use tensor_io::validate_tensor_command;
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
-struct CudaSubmissionStageTimer<'sink, S>
+pub(super) struct CudaSubmissionStageTimer<'sink, S>
 where
     S: DeviceSubmissionTimingSink,
 {
@@ -107,7 +107,7 @@ where
     S: DeviceSubmissionTimingSink,
 {
     #[inline(always)]
-    fn start(sink: &'sink S, stage: DeviceSubmissionStage) -> Self {
+    pub(super) fn start(sink: &'sink S, stage: DeviceSubmissionStage) -> Self {
         Self {
             sink,
             stage,
@@ -5747,8 +5747,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
         });
         // Compact only fresh eager uploads, before physical command indices,
         // timing spans, or replay candidates are derived from these entries.
-        let entries =
-            input_upload_packet::coalesce(self, entries).map_err(DefinitelyNotSubmitted::new)?;
+        let entries = input_upload_packet::coalesce(self, entries, timing_sink)
+            .map_err(DefinitelyNotSubmitted::new)?;
         if let Some(facts) = execution_facts.as_mut() {
             facts.after_upload_coalescing(&entries);
         }
@@ -5955,6 +5955,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             &executable_candidates,
             capture_allowed,
             facts_capture,
+            timing_sink,
         ) {
             Ok(preparation) => preparation,
             Err(error) => {

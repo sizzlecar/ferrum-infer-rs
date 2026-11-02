@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ferrum_runtime::StaticInitializationReceipt;
+use ferrum_runtime::{DeviceSubmissionStage, StaticInitializationReceipt};
+use serde::Serialize;
 
 pub(super) struct StartupPhaseTimer {
     phase: &'static str,
@@ -104,6 +105,83 @@ impl AtomicDurationMetrics {
             },
             "max_us": max_ns as f64 / 1_000.0,
         })
+    }
+
+    fn observed_total_ns(&self) -> Option<u64> {
+        (self.samples.load(Ordering::Relaxed) != 0).then(|| self.total_ns.load(Ordering::Relaxed))
+    }
+}
+
+/// Fixed-size preparation observations shared by aggregate metrics and the
+/// bounded same-attempt ledger. Recording reads no clock and allocates nothing.
+#[derive(Default)]
+pub(super) struct DevicePreparationTimingMetrics {
+    input_packet_allocate: AtomicDurationMetrics,
+    input_packet_allocation_sync: AtomicDurationMetrics,
+    reusable_capture_record: AtomicDurationMetrics,
+    reusable_capture_topology: AtomicDurationMetrics,
+    reusable_graph_instantiate: AtomicDurationMetrics,
+    reusable_graph_upload: AtomicDurationMetrics,
+}
+
+#[derive(Serialize)]
+pub(super) struct DevicePreparationIntervals {
+    input_packet_allocate: Option<u64>,
+    input_packet_allocation_sync: Option<u64>,
+    reusable_capture_record: Option<u64>,
+    reusable_capture_topology: Option<u64>,
+    reusable_graph_instantiate: Option<u64>,
+    reusable_graph_upload: Option<u64>,
+}
+
+impl DevicePreparationTimingMetrics {
+    pub(super) fn record(&self, stage: DeviceSubmissionStage, duration: Duration) {
+        let metric = match stage {
+            DeviceSubmissionStage::InputPacketAllocate => &self.input_packet_allocate,
+            DeviceSubmissionStage::InputPacketAllocationSync => &self.input_packet_allocation_sync,
+            DeviceSubmissionStage::ReusableCaptureRecord => &self.reusable_capture_record,
+            DeviceSubmissionStage::ReusableCaptureTopology => &self.reusable_capture_topology,
+            DeviceSubmissionStage::ReusableGraphInstantiate => &self.reusable_graph_instantiate,
+            DeviceSubmissionStage::ReusableGraphUpload => &self.reusable_graph_upload,
+            _ => return,
+        };
+        metric.record(duration);
+    }
+
+    pub(super) fn totals(&self) -> DevicePreparationIntervals {
+        DevicePreparationIntervals {
+            input_packet_allocate: self.input_packet_allocate.observed_total_ns(),
+            input_packet_allocation_sync: self.input_packet_allocation_sync.observed_total_ns(),
+            reusable_capture_record: self.reusable_capture_record.observed_total_ns(),
+            reusable_capture_topology: self.reusable_capture_topology.observed_total_ns(),
+            reusable_graph_instantiate: self.reusable_graph_instantiate.observed_total_ns(),
+            reusable_graph_upload: self.reusable_graph_upload.observed_total_ns(),
+        }
+    }
+
+    pub(super) fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "scope": "per_call_nested_in_validate_and_prepare",
+            "input_packet_allocate": self.input_packet_allocate.snapshot(),
+            "input_packet_allocation_sync": self.input_packet_allocation_sync.snapshot(),
+            "reusable_capture_record": self.reusable_capture_record.snapshot(),
+            "reusable_capture_topology": self.reusable_capture_topology.snapshot(),
+            "reusable_graph_instantiate": self.reusable_graph_instantiate.snapshot(),
+            "reusable_graph_upload": self.reusable_graph_upload.snapshot(),
+        })
+    }
+
+    pub(super) fn reset(&self) {
+        for metric in [
+            &self.input_packet_allocate,
+            &self.input_packet_allocation_sync,
+            &self.reusable_capture_record,
+            &self.reusable_capture_topology,
+            &self.reusable_graph_instantiate,
+            &self.reusable_graph_upload,
+        ] {
+            metric.reset();
+        }
     }
 }
 

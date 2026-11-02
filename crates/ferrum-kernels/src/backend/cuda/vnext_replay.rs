@@ -24,8 +24,8 @@ use ferrum_runtime::{
     DeviceReusableExecutionPreparation, DeviceReusableExecutionPreparationState,
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGap,
     DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionProgramId,
-    DeviceReusableExecutionSegment, DeviceSubmissionTimingSink, DeviceTimingMode, ElementType,
-    ExecutionFactsCapture, ProjectionInvocationTemplate,
+    DeviceReusableExecutionSegment, DeviceSubmissionStage, DeviceSubmissionTimingSink,
+    DeviceTimingMode, ElementType, ExecutionFactsCapture, ProjectionInvocationTemplate,
 };
 use sha2::{Digest, Sha256};
 
@@ -34,7 +34,9 @@ use crate::backend::reusable_execution::{
     ReusableExecutionPreparationTracker,
 };
 
-use super::vnext_runtime::{CudaCommandExecutable, CudaDeviceCommand, CudaDeviceRuntimeError};
+use super::vnext_runtime::{
+    CudaCommandExecutable, CudaDeviceCommand, CudaDeviceRuntimeError, CudaSubmissionStageTimer,
+};
 use super::vnext_tool_correlation::correlate_replay_launch;
 use crate::backend::enqueue_timing;
 
@@ -643,7 +645,7 @@ mod graph_attribution_tests {
 }
 
 impl CudaExecutableSegment {
-    fn capture(
+    fn capture<S: DeviceSubmissionTimingSink>(
         key: CudaExecutableSegmentKey,
         context: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
@@ -651,7 +653,12 @@ impl CudaExecutableSegment {
         commands: &[CudaDeviceCommand],
         facts_capture: ExecutionFactsCapture,
         last_used: u64,
+        timing_sink: &S,
     ) -> Result<Self, CudaReplayError> {
+        let record_stage = CudaSubmissionStageTimer::start(
+            timing_sink,
+            DeviceSubmissionStage::ReusableCaptureRecord,
+        );
         let capture_status = unsafe {
             sys::cuStreamBeginCapture_v2(
                 stream.cu_stream(),
@@ -730,18 +737,28 @@ impl CudaExecutableSegment {
                 capture_terminated,
             ));
         }
+        drop(record_stage);
         let command_graph_node_counts = command_frontiers
             .filter(|frontiers| frontiers.len() == commands.len())
             .filter(|_| capture_graph == Some(graph))
             .and_then(|frontiers| {
+                let _topology_stage = CudaSubmissionStageTimer::start(
+                    timing_sink,
+                    DeviceSubmissionStage::ReusableCaptureTopology,
+                );
                 let (nodes, edges) = captured_graph_topology(graph)?;
                 command_graph_node_counts_from_topology(&nodes, &edges, &frontiers)
             })
             .map(Arc::<[u32]>::from);
 
         let mut executable: sys::CUgraphExec = std::ptr::null_mut();
+        let instantiate_stage = CudaSubmissionStageTimer::start(
+            timing_sink,
+            DeviceSubmissionStage::ReusableGraphInstantiate,
+        );
         let instantiate_status =
             unsafe { sys::cuGraphInstantiateWithFlags(&mut executable, graph, 0) };
+        drop(instantiate_stage);
         if instantiate_status != sys::CUresult::CUDA_SUCCESS || executable.is_null() {
             unsafe {
                 sys::cuGraphDestroy(graph);
@@ -773,7 +790,15 @@ impl CudaExecutableSegment {
         })
     }
 
-    fn upload(&mut self, stream: &CudaStream) -> Result<(), CudaReplayError> {
+    fn upload<S: DeviceSubmissionTimingSink>(
+        &mut self,
+        stream: &CudaStream,
+        timing_sink: &S,
+    ) -> Result<(), CudaReplayError> {
+        let _upload_stage = CudaSubmissionStageTimer::start(
+            timing_sink,
+            DeviceSubmissionStage::ReusableGraphUpload,
+        );
         let status = unsafe { sys::cuGraphUpload(self.executable, stream.cu_stream()) };
         if status != sys::CUresult::CUDA_SUCCESS {
             return Err(CudaReplayError::cuda(
@@ -1203,7 +1228,7 @@ impl CudaExecutableCache {
         Ok(true)
     }
 
-    pub(crate) fn prepare_all(
+    pub(crate) fn prepare_all<S: DeviceSubmissionTimingSink>(
         &mut self,
         context: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
@@ -1212,6 +1237,7 @@ impl CudaExecutableCache {
         candidates: &[CudaExecutableCandidate],
         capture_allowed: bool,
         facts_capture: ExecutionFactsCapture,
+        timing_sink: &S,
     ) -> Result<CudaExecutablePreparation, CudaReplayError> {
         let mut report = CudaExecutablePreparation::default();
         for candidate in candidates {
@@ -1347,6 +1373,7 @@ impl CudaExecutableCache {
                 candidate.commands(commands),
                 facts_capture,
                 now,
+                timing_sink,
             ) {
                 Ok(entry) => captured.push((key, entry)),
                 Err(error) if error.eager_fallback_safe() => {
@@ -1392,7 +1419,7 @@ impl CudaExecutableCache {
             self.entries
                 .get_mut(&key)
                 .expect("captured CUDA executable was committed before upload")
-                .upload(stream)?;
+                .upload(stream, timing_sink)?;
             report.uploaded_segments += 1;
         }
         if candidates.iter().any(|candidate| {

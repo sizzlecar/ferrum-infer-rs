@@ -473,6 +473,114 @@ fn reusable_cold_path_callbacks_forward_unchanged_and_repeats_remain_visible() {
 }
 
 #[test]
+fn reusable_cold_path_preparation_children_preserve_attempt_phase_and_reset() {
+    let metrics = VNextExecutorMetrics::default();
+    let ledger = Ledger::default();
+    let timing = VNextWaveTimingSink {
+        aggregate: &metrics.wave_timing,
+        phase: &metrics.prefill_wave_timing,
+    };
+    let mut wave = ledger.begin(true, VNextExecutionWaveKind::Prefill).unwrap();
+    let observer = AttemptObservation::new(&timing, None, 1, None, None);
+    let children = [
+        (
+            DeviceSubmissionStage::InputPacketAllocate,
+            "input_packet_allocate",
+            3,
+        ),
+        (
+            DeviceSubmissionStage::InputPacketAllocationSync,
+            "input_packet_allocation_sync",
+            0,
+        ),
+        (
+            DeviceSubmissionStage::ReusableCaptureRecord,
+            "reusable_capture_record",
+            5,
+        ),
+        (
+            DeviceSubmissionStage::ReusableCaptureTopology,
+            "reusable_capture_topology",
+            7,
+        ),
+        (
+            DeviceSubmissionStage::ReusableGraphInstantiate,
+            "reusable_graph_instantiate",
+            11,
+        ),
+        (
+            DeviceSubmissionStage::ReusableGraphUpload,
+            "reusable_graph_upload",
+            13,
+        ),
+    ];
+    for (stage, _, ns) in children {
+        observer.record_device_submission(stage, Duration::from_nanos(ns));
+    }
+    // Multiple segments aggregate without becoming duplicate callbacks.
+    observer.record_device_submission(
+        DeviceSubmissionStage::ReusableGraphInstantiate,
+        Duration::from_nanos(17),
+    );
+    observer.record_device_submission(
+        DeviceSubmissionStage::ValidateAndPrepare,
+        Duration::from_nanos(100),
+    );
+    wave.record_attempt(observer, no_resident(), Outcome::ProviderError, None);
+    wave.record_attempt(
+        AttemptObservation::new(&timing, None, 1, None, None),
+        no_resident(),
+        Outcome::Submitted,
+        None,
+    );
+    wave.finish(None, Outcome::Submitted);
+    let snapshot = ledger.snapshot();
+    let attempts = &snapshot["records"][0]["attempts"];
+    assert_eq!(attempts[0]["repeated_callback"], false);
+    for (_, field, ns) in children {
+        let total_ns = if field == "reusable_graph_instantiate" {
+            28
+        } else {
+            ns
+        };
+        assert_eq!(
+            attempts[0]["validate_and_prepare_children_ns"][field],
+            total_ns
+        );
+        assert!(attempts[1]["validate_and_prepare_children_ns"][field].is_null());
+        for aggregate in [&metrics.wave_timing, &metrics.prefill_wave_timing] {
+            let snapshot = aggregate.snapshot();
+            let submit = &snapshot["host_encode_submit_breakdown"]
+                ["provider_encode_submit_breakdown"]["lane_reserve_submit_arm_breakdown"]
+                ["device_runtime_submit_breakdown"];
+            let child = &submit["validate_and_prepare_breakdown"][field];
+            assert_eq!(child["total_ns"], total_ns);
+            assert_eq!(
+                child["samples"],
+                if field == "reusable_graph_instantiate" {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert_eq!(submit["validate_and_prepare"]["total_ns"], 100);
+            assert_eq!(snapshot["submitted_wave_total"]["samples"], 0);
+        }
+    }
+    assert_eq!(
+        metrics.decode_wave_timing.snapshot(),
+        VNextWaveTimingMetrics::default().snapshot()
+    );
+    for aggregate in [&metrics.wave_timing, &metrics.prefill_wave_timing] {
+        aggregate.reset();
+        assert_eq!(
+            aggregate.snapshot(),
+            VNextWaveTimingMetrics::default().snapshot()
+        );
+    }
+}
+
+#[test]
 fn reusable_cold_path_capacity_drop_and_reset_never_invent_completed_history() {
     let ledger = Ledger::with_capacity(2);
     let sink = CaptureSink::default();

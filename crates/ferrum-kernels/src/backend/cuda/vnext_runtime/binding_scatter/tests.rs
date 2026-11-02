@@ -309,7 +309,12 @@ fn partial_upload_quarantine_retains_budget(addressed: bool) {
     small_budget(&mut scatter, bytes, bytes);
     let prepare = || {
         if addressed {
-            scatter.prepare_addressed(&runtime.allocation_stream, bytes, 1)
+            scatter.prepare_addressed(
+                &runtime.allocation_stream,
+                bytes,
+                1,
+                &DisabledDeviceSubmissionTimingSink,
+            )
         } else {
             scatter.prepare_encoded(&runtime.allocation_stream, bytes, input.len() as u32)
         }

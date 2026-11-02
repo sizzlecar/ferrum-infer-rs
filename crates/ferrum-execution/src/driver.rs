@@ -59,7 +59,10 @@ use self::{
         VNextCheckpointSelection, VNextTeacherForcedDecision,
     },
     completion_worker::{VNextCompletionTaskKind, VNextCompletionWorker},
-    timing::{log_static_initialization_receipt, AtomicDurationMetrics, StartupPhaseTimer},
+    timing::{
+        log_static_initialization_receipt, AtomicDurationMetrics, DevicePreparationTimingMetrics,
+        StartupPhaseTimer,
+    },
 };
 
 mod backing_maintenance;
@@ -2251,6 +2254,7 @@ struct VNextWaveTimingMetrics {
     lane_reserve: AtomicDurationMetrics,
     device_runtime_submit: AtomicDurationMetrics,
     device_submit_validate_prepare: AtomicDurationMetrics,
+    device_prepare_breakdown: DevicePreparationTimingMetrics,
     device_submit_begin_timing: AtomicDurationMetrics,
     device_submit_enqueue_commands: AtomicDurationMetrics,
     device_enqueue_graph_launch: VNextEnqueueCallMetrics,
@@ -2371,6 +2375,7 @@ impl VNextWaveTimingMetrics {
                         "device_runtime_submit": self.device_runtime_submit.snapshot(),
                         "device_runtime_submit_breakdown": {
                             "validate_and_prepare": self.device_submit_validate_prepare.snapshot(),
+                            "validate_and_prepare_breakdown": self.device_prepare_breakdown.snapshot(),
                             "begin_timing": self.device_submit_begin_timing.snapshot(),
                             "enqueue_commands": self.device_submit_enqueue_commands.snapshot(),
                             "enqueue_commands_breakdown": self.enqueue_commands_breakdown(),
@@ -2401,6 +2406,7 @@ impl VNextWaveTimingMetrics {
                 "binding_validate_coalesce includes per-node binding validation and the final exact-layout coverage and backend coalescing pass; child timers include elapsed work before an error but skip unwinding",
                 "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
                 "device_runtime_submit breakdown isolates backend validation/preparation, timing start, ordered command enqueue, and fence/accounting for runtimes that implement typed attribution",
+                "validate_and_prepare children are per-call nested host intervals, not GPU execution or additional wave time; allocation synchronization can include prior allocation-stream work; graph recording, topology attribution, instantiation and upload are separate entered stages and may have different sample counts",
                 "enqueue_commands children are nested per-call host intervals, not additional wave time; optional thread_cpu and its paired wall use only calls with valid CPU samples; unavailable includes clocks not collected; these clocks are not additive, and their difference cannot identify driver waits or GPU idle; snapshots are not atomic",
                 "completion_round_trip includes async queue wait, device fence wait, and readback",
                 "these host intervals are not kernel or device-busy time"
@@ -2487,6 +2493,7 @@ impl VNextWaveTimingMetrics {
             metrics.reset();
         }
         self.resource_step_admission_breakdown.reset();
+        self.device_prepare_breakdown.reset();
         self.device_enqueue_graph_launch.reset();
         self.device_enqueue_eager_command.reset();
         self.device_enqueue_deferred_snapshot_readback.reset();
@@ -2612,6 +2619,14 @@ impl DeviceSubmissionTimingSink for VNextWaveTimingMetrics {
         match stage {
             DeviceSubmissionStage::ValidateAndPrepare => {
                 self.device_submit_validate_prepare.record(elapsed)
+            }
+            DeviceSubmissionStage::InputPacketAllocate
+            | DeviceSubmissionStage::InputPacketAllocationSync
+            | DeviceSubmissionStage::ReusableCaptureRecord
+            | DeviceSubmissionStage::ReusableCaptureTopology
+            | DeviceSubmissionStage::ReusableGraphInstantiate
+            | DeviceSubmissionStage::ReusableGraphUpload => {
+                self.device_prepare_breakdown.record(stage, elapsed)
             }
             DeviceSubmissionStage::BeginTiming => self.device_submit_begin_timing.record(elapsed),
             DeviceSubmissionStage::EnqueueCommands => {

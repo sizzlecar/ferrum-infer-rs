@@ -3,7 +3,7 @@
 
 use super::{
     CudaDeviceCommand, CudaDeviceRuntime, CudaDeviceRuntimeError, CudaWorkDeclaration,
-    DeviceCommandPhase, HOST_UPLOAD_NATIVE_OPERATION_ID,
+    DeviceCommandPhase, DeviceSubmissionTimingSink, HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 
 type Result<T> = std::result::Result<T, CudaDeviceRuntimeError>;
@@ -14,7 +14,11 @@ const HEADER_BYTES: usize = 24;
 const MIN_UPLOADS: usize = 8;
 const MAX_UPLOAD_BYTES: usize = 256;
 
-pub(super) fn coalesce(runtime: &CudaDeviceRuntime, entries: Vec<Entry>) -> Result<Vec<Entry>> {
+pub(super) fn coalesce<S: DeviceSubmissionTimingSink>(
+    runtime: &CudaDeviceRuntime,
+    entries: Vec<Entry>,
+    timing_sink: &S,
+) -> Result<Vec<Entry>> {
     if entries
         .iter()
         .any(|(_, _, command)| command.runtime_instance != runtime.runtime_instance)
@@ -35,7 +39,7 @@ pub(super) fn coalesce(runtime: &CudaDeviceRuntime, entries: Vec<Entry>) -> Resu
             run.push(entries.next().expect("peeked CUDA input upload"));
         }
         if run.len() >= MIN_UPLOADS {
-            if let Some(command) = compact(runtime, &run)? {
+            if let Some(command) = compact(runtime, &run, timing_sink)? {
                 output.push((DeviceCommandPhase::DynamicBinding, None, command));
                 continue;
             }
@@ -85,7 +89,11 @@ fn eligible((phase, node_index, command): &Entry) -> bool {
         && region.length_bytes == bytes.len() as u64
 }
 
-fn compact(runtime: &CudaDeviceRuntime, run: &[Entry]) -> Result<Option<CudaDeviceCommand>> {
+fn compact<S: DeviceSubmissionTimingSink>(
+    runtime: &CudaDeviceRuntime,
+    run: &[Entry],
+    timing_sink: &S,
+) -> Result<Option<CudaDeviceCommand>> {
     let writes = run
         .iter()
         .map(|(_, _, command)| {
@@ -104,6 +112,7 @@ fn compact(runtime: &CudaDeviceRuntime, run: &[Entry]) -> Result<Option<CudaDevi
         &runtime.allocation_stream,
         packet.bytes.len(),
         packet.count,
+        timing_sink,
     )?
     else {
         return Ok(None);
