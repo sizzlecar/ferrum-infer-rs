@@ -1,6 +1,11 @@
 use super::*;
 
-fn run_projection_case(resources: ReusableBindingResources, reusable: bool, drift: bool) {
+fn run_projection_case(
+    resources: ReusableBindingResources,
+    reusable: bool,
+    drift: bool,
+    segment_support: Option<SegmentBindingDeclarationSupport>,
+) {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_hybrid_state_and_provider_behavior(ProviderBehavior::ProgramBinding),
     );
@@ -9,18 +14,40 @@ fn run_projection_case(resources: ReusableBindingResources, reusable: bool, drif
         .lock()
         .unwrap()
         .reusable_binding_resources = resources;
+    if let Some(support) = segment_support {
+        fixture
+            .provider_trace
+            .lock()
+            .unwrap()
+            .segment_binding_declaration_support = support;
+        fixture.runtime_trace.lock().unwrap().segment_entry =
+            Some(DeviceReusableExecutionEntryIdentity::new());
+    }
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active = wave_active_bindings(&wave, &session);
     let lane = Arc::clone(step.execution_lane());
     let reaper = CompletionReaper::new();
     let providers = fixture.registry.bind_plan(&fixture.resolved).unwrap();
-    let identity = OperationDispatch::bind_submission_wave_identity(
-        &fixture.resolved,
-        active.iter(),
-        &wave,
-        &lane,
-    )
-    .unwrap();
+    let identity = if segment_support.is_some() {
+        let topology =
+            OperationDispatch::compile_submission_wave_identity(&fixture.resolved, &lane).unwrap();
+        OperationDispatch::bind_compiled_submission_wave_identity_with_preparation(
+            &topology,
+            active.iter(),
+            &wave,
+            &lane,
+            ferrum_types::InvocationPreparationStrategy::ResidentDecodeProgram,
+        )
+        .unwrap()
+    } else {
+        OperationDispatch::bind_submission_wave_identity(
+            &fixture.resolved,
+            active.iter(),
+            &wave,
+            &lane,
+        )
+        .unwrap()
+    };
     let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
         providers.providers(),
         &fixture.resolved,
@@ -99,7 +126,12 @@ fn run_projection_case(resources: ReusableBindingResources, reusable: bool, drif
             CompletionObservation::Terminal(_)
         ));
         let trace = fixture.provider_trace.lock().unwrap();
-        if reusable {
+        if reusable && segment_support != Some(SegmentBindingDeclarationSupport::Probe) {
+            assert_eq!(trace.encode_calls, 0);
+            assert_eq!(
+                trace.reusable_binding_encode_calls as usize,
+                providers.len()
+            );
             assert_eq!(trace.reusable_views.len(), providers.len());
             for (node_id, actual_views, actual_values) in &trace.reusable_views {
                 let node = fixture
@@ -158,8 +190,9 @@ fn reusable_binding_projection_preserves_live_paged_and_recurrent_state_and_all_
         ReusableBindingResources::RequestStateAndBinding,
         true,
         false,
+        None,
     );
-    run_projection_case(ReusableBindingResources::All, true, false);
+    run_projection_case(ReusableBindingResources::All, true, false, None);
 }
 
 #[test]
@@ -168,10 +201,46 @@ fn reusable_binding_opt_in_does_not_filter_eager_views() {
         ReusableBindingResources::RequestStateAndBinding,
         false,
         false,
+        None,
     );
 }
 
 #[test]
 fn reusable_binding_projection_rejects_live_descriptor_drift_before_encoding() {
-    run_projection_case(ReusableBindingResources::RequestStateAndBinding, true, true);
+    run_projection_case(
+        ReusableBindingResources::RequestStateAndBinding,
+        true,
+        true,
+        None,
+    );
+}
+
+#[test]
+fn unsupported_segment_declaration_uses_checked_compact_replay_bindings() {
+    run_projection_case(
+        ReusableBindingResources::RequestStateAndBinding,
+        true,
+        false,
+        Some(SegmentBindingDeclarationSupport::Unsupported),
+    );
+}
+
+#[test]
+fn default_segment_declaration_probe_preserves_cold_encoding_when_none() {
+    run_projection_case(
+        ReusableBindingResources::RequestStateAndBinding,
+        true,
+        false,
+        Some(SegmentBindingDeclarationSupport::default()),
+    );
+}
+
+#[test]
+fn unsupported_segment_replay_rejects_live_descriptor_drift_before_encoding() {
+    run_projection_case(
+        ReusableBindingResources::RequestStateAndBinding,
+        true,
+        true,
+        Some(SegmentBindingDeclarationSupport::Unsupported),
+    );
 }

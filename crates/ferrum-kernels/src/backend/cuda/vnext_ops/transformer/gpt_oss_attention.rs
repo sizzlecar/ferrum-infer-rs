@@ -45,10 +45,10 @@ pub(in crate::backend::cuda::vnext_ops) const GPT_OSS_ATTENTION_PROVIDER_ID: &st
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.gpt_oss.causal_paged_attention.f16";
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
 const PREPARE_FUNCTION: &str = "gpt_oss_prepare_qkv_yarn_f16";
-const ATTENTION_FUNCTION: &str = "gpt_oss_paged_attention_sink_f16";
+const ATTENTION_FUNCTION: &str = "gpt_oss_paged_attention_sink_paged_f16";
 const PREPARE_PACKED_DECODE_FUNCTION: &str = "gpt_oss_prepare_qkv_yarn_packed_decode_f16";
 const ATTENTION_PACKED_DECODE_FUNCTION: &str =
-    "gpt_oss_paged_attention_sink_packed_decode_multiwarp_f16";
+    "gpt_oss_paged_attention_sink_packed_decode_multiwarp_paged_f16";
 const RESIDUAL_BIAS_FUNCTION: &str = "gpt_oss_residual_output_bias_f16";
 const COMPUTE_OPERATION: &str = "vnext.gpt_oss.causal_paged_attention.f16";
 const BINDING_OPERATION: &str = "vnext_gpt_oss_causal_paged_attention_bindings";
@@ -254,6 +254,19 @@ impl OperationResourceEstimator for CudaGptOssCausalPagedAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaGptOssCausalPagedAttentionProvider {
+    fn segment_binding_declaration_support(
+        &self,
+    ) -> ferrum_runtime::SegmentBindingDeclarationSupport {
+        ferrum_runtime::SegmentBindingDeclarationSupport::Unsupported
+    }
+
+    fn reusable_binding_resources(&self) -> ferrum_runtime::ReusableBindingResources {
+        // Replay only refreshes current KV pages and the binding workspace.
+        // Semantic signature metadata remains complete; captured weights and
+        // scratch are retained and validated by the resident executable.
+        ferrum_runtime::ReusableBindingResources::RequestStateAndBinding
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,

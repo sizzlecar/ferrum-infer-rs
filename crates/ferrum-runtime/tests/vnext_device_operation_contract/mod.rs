@@ -781,6 +781,7 @@ pub(crate) struct ProviderTrace {
     pub(crate) facts_capture_at_encode: Vec<ExecutionFactsCapture>,
     pub(crate) segment_regions_by_node: BTreeMap<NodeId, Vec<SegmentBindingRegionRequest>>,
     pub(crate) reusable_binding_resources: ReusableBindingResources,
+    pub(crate) segment_binding_declaration_support: SegmentBindingDeclarationSupport,
     pub(crate) reusable_views: Vec<(NodeId, BTreeSet<ResourceId>, BTreeSet<ProgramValueId>)>,
     pub(crate) reusable_topology_calls: u64,
     pub(crate) reusable_topology_packed_input_coordinates: Vec<bool>,
@@ -866,6 +867,13 @@ impl OperationResourceEstimator for TestProvider {
 }
 
 impl OperationProvider<TestRuntime> for TestProvider {
+    fn segment_binding_declaration_support(&self) -> SegmentBindingDeclarationSupport {
+        self.trace
+            .lock()
+            .unwrap()
+            .segment_binding_declaration_support
+    }
+
     fn reusable_binding_resources(&self) -> ReusableBindingResources {
         self.trace.lock().unwrap().reusable_binding_resources
     }
