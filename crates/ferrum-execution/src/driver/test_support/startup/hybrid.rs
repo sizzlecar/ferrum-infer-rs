@@ -67,6 +67,28 @@ async fn select_only<R: DeviceRuntime>(
     completion.next_frontier().clone()
 }
 
+async fn prefill<R: DeviceRuntime>(
+    executor: &ProgramExecutor<R>,
+    frontier: &ExecutionFrontier,
+    chunk: PrefillChunk,
+) -> ExecutionFrontier {
+    // The public product contract always returns FullLogits for final prefill;
+    // device-selected Greedy tokens are a decode-only readback optimization.
+    let completion =
+        token_execution::execute_one(executor, frontier, TokenWork::Prefill(chunk)).await;
+    let policy = LogitsReturnPolicy::FullLogits;
+    let input = ExecutionWork::new(frontier, TokenWork::Prefill(chunk), &policy).unwrap();
+    completion
+        .validate_for(0, &input, executor.info.vocab_size)
+        .unwrap();
+    let ExecutorSamplingOutput::FullLogits(logits) = sampling::sampling(&completion) else {
+        panic!("final prefill must preserve the full-logits contract");
+    };
+    assert_eq!(logits.len(), executor.info.vocab_size);
+    assert!(logits.iter().all(|value| value.is_finite()));
+    completion.next_frontier().clone()
+}
+
 pub async fn assert_startup_on_demand_product_reuse<R: DeviceRuntime>(
     executor: &ProgramExecutor<R>,
 ) {
@@ -90,8 +112,8 @@ pub async fn assert_startup_on_demand_product_reuse<R: DeviceRuntime>(
     settle(executor).await;
     assert_eq!(executor.metrics.submitted_waves.load(Ordering::Relaxed), 0);
 
-    // Startup used FullLogits. A new Product owner must reuse those graphs
-    // while selecting Greedy tokens, and a later mask must replace this one.
+    // A new Product owner must reuse startup graphs. Final prefill keeps its
+    // FullLogits contract; subsequent decode uses Greedy with changing masks.
     let mut frontier = admit_product(
         executor,
         &[TokenId::new(0)],
@@ -100,13 +122,7 @@ pub async fn assert_startup_on_demand_product_reuse<R: DeviceRuntime>(
     .await;
     let replay = &executor.metrics.wave_timing.reusable_execution;
     let before = replay.replayed_segments.load(Ordering::Relaxed);
-    frontier = select_only(
-        executor,
-        &frontier,
-        TokenWork::Prefill(PrefillChunk::new(0, 1, 1).unwrap()),
-        TokenId::new(1),
-    )
-    .await;
+    frontier = prefill(executor, &frontier, PrefillChunk::new(0, 1, 1).unwrap()).await;
     assert!(replay.replayed_segments.load(Ordering::Relaxed) > before);
     for allowed in [TokenId::new(2), TokenId::new(3)] {
         let before = replay.replayed_segments.load(Ordering::Relaxed);
@@ -149,13 +165,7 @@ pub async fn assert_startup_on_demand_product_reuse<R: DeviceRuntime>(
     for phase in ["warm", "capture", "replay"] {
         let initial = admit_product(executor, &tokens, plan.maximum_decode_sequence_tokens).await;
         let before = replay.replayed_segments.load(Ordering::Relaxed);
-        let done = select_only(
-            executor,
-            &initial,
-            TokenWork::Prefill(chunk),
-            TokenId::new(1),
-        )
-        .await;
+        let done = prefill(executor, &initial, chunk).await;
         if phase == "replay" {
             assert!(replay.replayed_segments.load(Ordering::Relaxed) > before);
         }
