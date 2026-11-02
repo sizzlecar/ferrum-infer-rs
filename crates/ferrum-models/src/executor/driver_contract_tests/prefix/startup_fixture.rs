@@ -2,8 +2,10 @@
 //! The shared fixture retains its original CUDA Int8-KV weights and policies.
 use crate::test_support::stateful_program;
 use ferrum_execution::test_support::{
-    assert_executor_closed, startup::assert_startup_capture_replay,
+    assert_executor_closed,
+    startup::{assert_startup_capture_replay, assert_startup_on_demand_product_reuse},
 };
+use ferrum_runtime::ReusableExecutionOnDemandAdmission;
 
 #[tokio::test]
 #[ignore = "requires actual CUDA device and native attention kernels"]
@@ -14,6 +16,40 @@ async fn native_startup_cuda_attention_capture_replay_preserves_exact_descriptor
         ..
     } = stateful_program::cuda_startup();
     assert_startup_capture_replay(&executor).await;
+    let _runtime = assert_executor_closed(executor);
+    drop(directory);
+}
+
+#[tokio::test]
+#[ignore = "requires actual CUDA device and native attention kernels"]
+async fn native_startup_cuda_auto_reuses_fresh_greedy_requests_and_serves_new_shapes() {
+    let stateful_program::Fixture {
+        directory,
+        executor,
+        ..
+    } = stateful_program::cuda_auto_startup();
+    assert_startup_on_demand_product_reuse(
+        &executor,
+        ReusableExecutionOnDemandAdmission::AmortizedHostCostV1,
+    )
+    .await;
+    let _runtime = assert_executor_closed(executor);
+    drop(directory);
+}
+
+#[tokio::test]
+#[ignore = "requires actual CUDA device and native attention kernels"]
+async fn native_startup_cuda_explicit_hybrid_keeps_on_demand_learning() {
+    let stateful_program::Fixture {
+        directory,
+        executor,
+        ..
+    } = stateful_program::cuda_after_warmup_startup();
+    assert_startup_on_demand_product_reuse(
+        &executor,
+        ReusableExecutionOnDemandAdmission::AfterWarmup,
+    )
+    .await;
     let _runtime = assert_executor_closed(executor);
     drop(directory);
 }

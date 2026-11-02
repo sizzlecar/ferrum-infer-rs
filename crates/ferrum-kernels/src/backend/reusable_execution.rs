@@ -8,10 +8,13 @@
 use std::ops::Range;
 
 #[cfg(any(feature = "cuda", test))]
+pub(crate) mod capture_cost;
+#[cfg(any(feature = "cuda", test))]
 pub(crate) mod warmup;
 
 use ferrum_runtime::{
     DeviceCommandPhase, DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
+    ReusableExecutionOnDemandAdmission, ReusableExecutionProgramPreparation,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,11 +155,30 @@ pub(crate) struct ReusableExecutionPreparationTracker {
 impl ReusableExecutionPreparationTracker {
     pub(crate) const fn is_on_demand(&self) -> bool {
         match self.lifecycle {
-            ReusableExecutionPreparationLifecycle::Ready(plan) => {
+            ReusableExecutionPreparationLifecycle::Preparing(plan)
+            | ReusableExecutionPreparationLifecycle::Ready(plan) => {
                 !plan.catalog_lifetime().is_startup_sealed()
             }
             _ => false,
         }
+    }
+
+    pub(crate) const fn measures_capture_cost(&self) -> bool {
+        match self.lifecycle {
+            ReusableExecutionPreparationLifecycle::Preparing(plan)
+            | ReusableExecutionPreparationLifecycle::Ready(plan) => matches!(
+                plan.on_demand_admission(),
+                ReusableExecutionOnDemandAdmission::AmortizedHostCostV1
+            ),
+            ReusableExecutionPreparationLifecycle::Unconfigured => false,
+        }
+    }
+
+    pub(crate) const fn requires_amortization(&self) -> bool {
+        matches!(
+            self.lifecycle,
+            ReusableExecutionPreparationLifecycle::Ready(_)
+        ) && self.measures_capture_cost()
     }
 
     pub(crate) fn configure(
@@ -173,7 +195,7 @@ impl ReusableExecutionPreparationTracker {
                 "reusable execution preparation requires an empty executable cache".to_owned(),
             );
         }
-        if plan.catalog_lifetime().is_startup_sealed() {
+        if plan.preparation() == ReusableExecutionProgramPreparation::BeforeReadiness {
             self.lifecycle = ReusableExecutionPreparationLifecycle::Preparing(plan);
             Ok(DeviceReusableExecutionPreparation::preparing(plan))
         } else {
@@ -285,12 +307,31 @@ impl ReusableExecutionPreparationTracker {
 
 #[cfg(test)]
 mod tests {
-    use ferrum_runtime::DeviceCommandPhase;
+    use ferrum_runtime::{DeviceCommandPhase, ReusableExecutionOnDemandAdmission};
 
     use super::{
         discover_reusable_segments, plan_bounded_reusable_execution,
         ReusableExecutionPreparationTracker,
     };
+
+    #[test]
+    fn bounded_startup_calibrates_before_live_cost_admission() {
+        let plan = DeviceReusableExecutionPlan::startup_and_on_demand(4)
+            .unwrap()
+            .with_on_demand_admission(ReusableExecutionOnDemandAdmission::AmortizedHostCostV1)
+            .unwrap();
+        let mut tracker = ReusableExecutionPreparationTracker::default();
+        tracker.configure(plan, 0, 0).unwrap();
+        assert!(tracker.is_on_demand());
+        assert!(tracker.capture_is_open());
+        assert!(tracker.measures_capture_cost());
+        assert!(!tracker.requires_amortization());
+        tracker.seal(0, 0).unwrap();
+        assert!(tracker.is_on_demand());
+        assert!(tracker.capture_is_open());
+        assert!(tracker.measures_capture_cost());
+        assert!(tracker.requires_amortization());
+    }
     use ferrum_runtime::{DeviceReusableExecutionPlan, DeviceReusableExecutionPreparationState};
 
     #[test]

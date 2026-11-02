@@ -430,14 +430,47 @@ pub enum ReusableExecutionCatalogMissPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum ReusableExecutionCatalogLifetime {
     StartupSealed,
-    /// Publish only programs encountered by real work, within the resolved
-    /// executable capacity. A miss remains eligible for ordinary execution.
+    /// Learn programs from checked token work within the resolved executable
+    /// capacity, including startup work when requested. A miss remains eligible
+    /// for ordinary execution.
     OnDemandBounded,
 }
 
 impl ReusableExecutionCatalogLifetime {
     pub const fn is_startup_sealed(&self) -> bool {
         matches!(self, Self::StartupSealed)
+    }
+}
+
+/// Preparation timing is independent of whether the catalog remains mutable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReusableExecutionProgramPreparation {
+    OnDemand,
+    BeforeReadiness,
+}
+
+/// Admission of optional captures after readiness. Safety warmup, exact replay
+/// identity and executable capacity remain mandatory under either policy.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReusableExecutionOnDemandAdmission {
+    #[default]
+    AfterWarmup,
+    /// Recent completed eager submissions earn their measured host-submit time
+    /// minus the stream's largest observed replay cost. The first eager sample
+    /// is safety warmup and earns no credit. Capture requires enough credit for
+    /// the largest observed graph preparation cost; missing cost data defers it.
+    /// Evidence is bounded by executable capacity and ages with eager/replay
+    /// submissions over that capacity-derived horizon. Startup preparation may
+    /// collect costs without this live gate. This estimates future reuse; it
+    /// does not bound an unseen graph's first driver instantiation latency.
+    AmortizedHostCostV1,
+}
+
+impl ReusableExecutionOnDemandAdmission {
+    pub const fn is_after_warmup(&self) -> bool {
+        matches!(self, Self::AfterWarmup)
     }
 }
 
@@ -454,6 +487,9 @@ pub struct ReusableExecutionProgramPolicy {
     shape_semantics: ReusableExecutionProgramShapeSemantics,
     catalog_miss_policy: ReusableExecutionCatalogMissPolicy,
     catalog_lifetime: ReusableExecutionCatalogLifetime,
+    preparation: ReusableExecutionProgramPreparation,
+    #[serde(skip_serializing_if = "ReusableExecutionOnDemandAdmission::is_after_warmup")]
+    on_demand_admission: ReusableExecutionOnDemandAdmission,
     warmup_passes: u32,
     capture_passes: u32,
     replay_validation_passes: u32,
@@ -466,6 +502,10 @@ struct ReusableExecutionProgramPolicyWire {
     shape_semantics: ReusableExecutionProgramShapeSemantics,
     catalog_miss_policy: ReusableExecutionCatalogMissPolicy,
     catalog_lifetime: ReusableExecutionCatalogLifetime,
+    #[serde(default)]
+    preparation: Option<ReusableExecutionProgramPreparation>,
+    #[serde(default)]
+    on_demand_admission: ReusableExecutionOnDemandAdmission,
     warmup_passes: u32,
     capture_passes: u32,
     replay_validation_passes: u32,
@@ -473,6 +513,15 @@ struct ReusableExecutionProgramPolicyWire {
 }
 
 impl ReusableExecutionProgramPolicy {
+    pub fn with_on_demand_admission(
+        mut self,
+        admission: ReusableExecutionOnDemandAdmission,
+    ) -> Result<Self, VNextError> {
+        self.on_demand_admission = admission;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Keep the same exact shape and workspace contract without executing its
     /// cases before readiness. Warmup and capture consume successive real
     /// submissions; validation must never replay a user's state transition.
@@ -481,7 +530,26 @@ impl ReusableExecutionProgramPolicy {
     ) -> Result<Self, VNextError> {
         let mut policy = Self::exact_startup_sealed(1, 1, 1, programs)?;
         policy.catalog_lifetime = ReusableExecutionCatalogLifetime::OnDemandBounded;
+        policy.preparation = ReusableExecutionProgramPreparation::OnDemand;
         policy.replay_validation_passes = 0;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Seed the bounded cache with real startup work, without sealing it.
+    pub fn exact_startup_and_on_demand(
+        warmup_passes: u32,
+        capture_passes: u32,
+        replay_validation_passes: u32,
+        programs: Vec<ReusableExecutionProgramSpec>,
+    ) -> Result<Self, VNextError> {
+        let mut policy = Self::exact_startup_sealed(
+            warmup_passes,
+            capture_passes,
+            replay_validation_passes,
+            programs,
+        )?;
+        policy.catalog_lifetime = ReusableExecutionCatalogLifetime::OnDemandBounded;
         policy.validate()?;
         Ok(policy)
     }
@@ -517,6 +585,8 @@ impl ReusableExecutionProgramPolicy {
             shape_semantics: ReusableExecutionProgramShapeSemantics::Exact,
             catalog_miss_policy: ReusableExecutionCatalogMissPolicy::EagerFallback,
             catalog_lifetime: ReusableExecutionCatalogLifetime::StartupSealed,
+            preparation: ReusableExecutionProgramPreparation::BeforeReadiness,
+            on_demand_admission: ReusableExecutionOnDemandAdmission::AfterWarmup,
             warmup_passes,
             capture_passes,
             replay_validation_passes,
@@ -531,12 +601,15 @@ impl ReusableExecutionProgramPolicy {
             || self.catalog_miss_policy != ReusableExecutionCatalogMissPolicy::EagerFallback
             || self.warmup_passes == 0
             || self.capture_passes == 0
-            || match self.catalog_lifetime {
-                ReusableExecutionCatalogLifetime::StartupSealed => {
+            || (self.catalog_lifetime.is_startup_sealed()
+                && !self.on_demand_admission.is_after_warmup())
+            || match self.preparation {
+                ReusableExecutionProgramPreparation::BeforeReadiness => {
                     self.replay_validation_passes == 0
                 }
-                ReusableExecutionCatalogLifetime::OnDemandBounded => {
-                    self.warmup_passes != 1
+                ReusableExecutionProgramPreparation::OnDemand => {
+                    self.catalog_lifetime != ReusableExecutionCatalogLifetime::OnDemandBounded
+                        || self.warmup_passes != 1
                         || self.capture_passes != 1
                         || self.replay_validation_passes != 0
                 }
@@ -601,6 +674,21 @@ impl ReusableExecutionProgramPolicy {
         self.catalog_lifetime
     }
 
+    pub const fn preparation(&self) -> ReusableExecutionProgramPreparation {
+        self.preparation
+    }
+
+    pub const fn on_demand_admission(&self) -> ReusableExecutionOnDemandAdmission {
+        self.on_demand_admission
+    }
+
+    pub const fn prepares_before_readiness(&self) -> bool {
+        matches!(
+            self.preparation,
+            ReusableExecutionProgramPreparation::BeforeReadiness
+        )
+    }
+
     pub const fn warmup_passes(&self) -> u32 {
         self.warmup_passes
     }
@@ -628,6 +716,15 @@ impl<'de> Deserialize<'de> for ReusableExecutionProgramPolicy {
             shape_semantics: wire.shape_semantics,
             catalog_miss_policy: wire.catalog_miss_policy,
             catalog_lifetime: wire.catalog_lifetime,
+            preparation: wire.preparation.unwrap_or(match wire.catalog_lifetime {
+                ReusableExecutionCatalogLifetime::StartupSealed => {
+                    ReusableExecutionProgramPreparation::BeforeReadiness
+                }
+                ReusableExecutionCatalogLifetime::OnDemandBounded => {
+                    ReusableExecutionProgramPreparation::OnDemand
+                }
+            }),
+            on_demand_admission: wire.on_demand_admission,
             warmup_passes: wire.warmup_passes,
             capture_passes: wire.capture_passes,
             replay_validation_passes: wire.replay_validation_passes,
@@ -1076,12 +1173,12 @@ impl ReusableExecutionMemoryPlan {
     /// Arenas retained by the declared startup capture inventory. Multiple
     /// programs using one bucket share its lane arena; unreferenced buckets
     /// remain permissions rather than resident startup allocations.
-    pub(crate) fn startup_sealed_pool_workspace_bytes(
+    pub(crate) fn startup_prepared_pool_workspace_bytes(
         &self,
     ) -> Result<BTreeMap<DynamicBackingPoolId, u64>, VNextError> {
         let Some(policy) = self
             .program_policy()
-            .filter(|policy| policy.catalog_lifetime().is_startup_sealed())
+            .filter(|policy| policy.prepares_before_readiness())
         else {
             return Ok(BTreeMap::new());
         };
@@ -1104,11 +1201,13 @@ impl ReusableExecutionMemoryPlan {
                 let bytes = budget
                     .total_bytes()?
                     .checked_mul(u64::from(self.maximum_reusable_lanes))
-                    .ok_or_else(|| invalid_plan("sealed reusable lane workspace overflows u64"))?;
+                    .ok_or_else(|| {
+                        invalid_plan("prepared reusable lane workspace overflows u64")
+                    })?;
                 let total = totals.entry(budget.pool_id().clone()).or_insert(0_u64);
-                *total = total
-                    .checked_add(bytes)
-                    .ok_or_else(|| invalid_plan("sealed reusable pool workspace overflows u64"))?;
+                *total = total.checked_add(bytes).ok_or_else(|| {
+                    invalid_plan("prepared reusable pool workspace overflows u64")
+                })?;
             }
         }
         Ok(totals)
@@ -1231,6 +1330,63 @@ mod tests {
     }
 
     #[test]
+    fn on_demand_admission_preserves_legacy_wire_and_changes_cost_policy_identity() {
+        use super::ReusableExecutionOnDemandAdmission::{AfterWarmup, AmortizedHostCostV1};
+        use crate::{DeviceReusableExecutionPlan, ReusableExecutionProgramPreparation};
+        let shapes = vec![program(
+            "uniform-query",
+            ReusableExecutionProgramShape::uniform_decode(3, 1).unwrap(),
+        )];
+        let legacy =
+            ReusableExecutionProgramPolicy::exact_startup_and_on_demand(1, 1, 1, shapes.clone())
+                .unwrap();
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(wire.get("on_demand_admission").is_none());
+        let decoded: ReusableExecutionProgramPolicy = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.on_demand_admission(), AfterWarmup);
+        let measured = legacy
+            .clone()
+            .with_on_demand_admission(AmortizedHostCostV1)
+            .unwrap();
+        assert_ne!(
+            super::canonical_fingerprint(&legacy, "legacy policy").unwrap(),
+            super::canonical_fingerprint(&measured, "measured policy").unwrap(),
+        );
+        assert_eq!(
+            serde_json::from_value::<ReusableExecutionProgramPolicy>(
+                serde_json::to_value(&measured).unwrap()
+            )
+            .unwrap(),
+            measured,
+        );
+        assert!(
+            ReusableExecutionProgramPolicy::exact_startup_sealed(1, 1, 1, shapes)
+                .unwrap()
+                .with_on_demand_admission(AmortizedHostCostV1)
+                .is_err()
+        );
+        assert!(DeviceReusableExecutionPlan::new(3)
+            .unwrap()
+            .with_on_demand_admission(AmortizedHostCostV1)
+            .is_err());
+        let plan = DeviceReusableExecutionPlan::startup_and_on_demand(3)
+            .unwrap()
+            .with_on_demand_admission(AmortizedHostCostV1)
+            .unwrap();
+        assert_eq!(
+            plan.preparation(),
+            ReusableExecutionProgramPreparation::BeforeReadiness
+        );
+        assert_eq!(plan.on_demand_admission(), AmortizedHostCostV1);
+        let lazy = DeviceReusableExecutionPlan::on_demand(3).unwrap();
+        assert_eq!(
+            lazy.preparation(),
+            ReusableExecutionProgramPreparation::OnDemand
+        );
+        assert_eq!(lazy.on_demand_admission(), AfterWarmup);
+    }
+
+    #[test]
     fn on_demand_policy_preserves_exact_shapes_without_replaying_user_transitions() {
         let shapes = vec![program(
             "uniform-query",
@@ -1238,8 +1394,32 @@ mod tests {
         )];
         let startup =
             ReusableExecutionProgramPolicy::exact_startup_sealed(1, 1, 1, shapes.clone()).unwrap();
+        let hybrid =
+            ReusableExecutionProgramPolicy::exact_startup_and_on_demand(1, 1, 1, shapes.clone())
+                .unwrap();
         let demand = ReusableExecutionProgramPolicy::exact_on_demand(shapes).unwrap();
         assert_eq!(startup.programs(), demand.programs());
+        assert_eq!(hybrid.programs(), demand.programs());
+        assert_eq!(hybrid.catalog_lifetime(), demand.catalog_lifetime());
+        assert!(hybrid.prepares_before_readiness());
+        assert!(!demand.prepares_before_readiness());
+        for policy in [&startup, &hybrid, &demand] {
+            let value = serde_json::to_value(policy).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ReusableExecutionProgramPolicy>(value).unwrap(),
+                *policy
+            );
+        }
+        // Older documents did not spell out preparation timing. Preserve
+        // their original sealed/lazy semantics, not the new Auto default.
+        for policy in [&startup, &demand] {
+            let mut legacy = serde_json::to_value(policy).unwrap();
+            legacy.as_object_mut().unwrap().remove("preparation");
+            assert_eq!(
+                serde_json::from_value::<ReusableExecutionProgramPolicy>(legacy).unwrap(),
+                *policy
+            );
+        }
         let value = serde_json::to_value(&demand).unwrap();
         assert_ne!(serde_json::to_value(&startup).unwrap(), value);
         assert_eq!(
@@ -1255,6 +1435,9 @@ mod tests {
             invalid[field] = serde_json::json!(2);
             assert!(serde_json::from_value::<ReusableExecutionProgramPolicy>(invalid).is_err());
         }
+        let mut invalid = serde_json::to_value(&startup).unwrap();
+        invalid["preparation"] = serde_json::json!("on_demand");
+        assert!(serde_json::from_value::<ReusableExecutionProgramPolicy>(invalid).is_err());
     }
 
     #[test]

@@ -2,6 +2,9 @@
 
 use super::*;
 
+mod hybrid;
+pub use hybrid::assert_startup_on_demand_product_reuse;
+
 #[derive(Default)]
 struct StartupEvents(Mutex<Vec<ExecutionEvent>>, DeviceTimingMode);
 

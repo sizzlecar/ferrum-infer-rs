@@ -97,6 +97,23 @@ pub(super) async fn open_chat_events(
     let buffer_structured_api_stream =
         ferrum_types::chat_api_may_emit_tool_or_function_call(&stream_api_request);
     let model_output_protocol = inference_request.sampling_params.model_output_protocol;
+    // Harmony owns its channel/recipient framing. Plain automatic responses can
+    // stream proven text prefixes; hard content/tool contracts stay buffered.
+    let mut harmony_projection = (model_output_protocol == ModelOutputProtocol::HarmonyGptOss
+        && stream_api_request
+            .response_format
+            .as_ref()
+            .is_none_or(|format| format.format_type == "text")
+        && stream_api_request
+            .tool_choice
+            .as_ref()
+            .is_none_or(|choice| {
+                matches!(choice, ferrum_types::ApiToolChoice::Mode(mode)
+                if mode.eq_ignore_ascii_case("auto"))
+            })
+        && stream_api_request.legacy_functions.is_empty()
+        && stream_api_request.legacy_function_call.is_none())
+    .then(ferrum_types::HarmonyStreamProjection::default);
     let buffer_stream_output = buffer_json_object_stream
         || buffer_strict_json_schema_stream
         || buffer_structured_api_stream
@@ -222,6 +239,7 @@ pub(super) async fn open_chat_events(
                         }
 
                         if native_projector.is_some()
+                            || harmony_projection.is_some()
                             || (!buffer_stream_output
                                 && !should_defer_model_reasoning_stream_delta(
                                     model_output_protocol,
@@ -229,16 +247,18 @@ pub(super) async fn open_chat_events(
                                 ))
                         {
                             let parsed_result = if let Some(projector) = native_projector.as_ref() {
-                                Ok(ParsedReasoningResponse {
+                                Ok(Some(ParsedReasoningResponse {
                                     content: projector.visible_prefix().to_owned(),
                                     reasoning: projector.reasoning_prefix().map(str::to_owned),
-                                })
+                                }))
+                            } else if let Some(projector) = harmony_projection.as_mut() {
+                                projector.advance(&current_text).map(|()| None)
                             } else {
                                 parse_model_reasoning_response(
                                     model_output_protocol,
                                     &current_text,
                                     started_in_think,
-                                )
+                                ).map(Some)
                             };
                             let parsed = match parsed_result {
                                 Ok(parsed) => parsed,
@@ -252,13 +272,22 @@ pub(super) async fn open_chat_events(
                                     break;
                                 }
                             };
-                            // This parsed copy lives across yield; it is a distinct retained owner.
-                            let _parsed_lease = event_session.try_reserve_semantic(ferrum_output::semantic_cost(&(&parsed.content, &parsed.reasoning))?)?;
-                            let full_reasoning = parsed.reasoning.as_deref().unwrap_or("");
+                            // Other parsers retain a distinct parsed copy across yield.
+                            // Harmony borrows the already charged raw history; only its
+                            // newly emitted deltas are copied, never the full prefix.
+                            let _parsed_lease = parsed.as_ref().map(|parsed| {
+                                event_session.try_reserve_semantic(ferrum_output::semantic_cost(&(&parsed.content, &parsed.reasoning))?)
+                            }).transpose()?;
+                            let (full_content, full_reasoning) = if let Some(parsed) = parsed.as_ref() {
+                                (parsed.content.as_str(), parsed.reasoning.as_deref().unwrap_or(""))
+                            } else {
+                                let projector = harmony_projection.as_ref().expect("borrowed Harmony projection");
+                                (projector.content(&current_text), projector.reasoning(&current_text).unwrap_or(""))
+                            };
                             let reasoning_delta =
                                 stream_text_delta(full_reasoning, &mut sent_reasoning_len);
                             let content_delta =
-                                stream_text_delta(&parsed.content, &mut sent_content_len);
+                                stream_text_delta(full_content, &mut sent_content_len);
                             if !reasoning_delta.is_empty() || !content_delta.is_empty() {
                                 // Create streaming response chunk
                                 let response_chunk = ChatCompletionsResponse {
@@ -467,14 +496,14 @@ pub(super) async fn open_chat_events(
 
                         if let Some(chat_response) = structured_chat_response.as_ref() {
                             let mut delta = openai_chat_delta_from_api(&chat_response.message);
-                            if has_native_projection {
+                            if has_native_projection || harmony_projection.is_some() {
                                 delta.content =
                                     stream_text_delta(&delta.content, &mut sent_content_len);
                             }
                             if delta.reasoning.is_none() {
                                 delta.reasoning = parsed_final.reasoning.clone();
                             }
-                            if has_native_projection {
+                            if has_native_projection || harmony_projection.is_some() {
                                 let reasoning = stream_text_delta(
                                     delta.reasoning.as_deref().unwrap_or(""),
                                     &mut sent_reasoning_len,

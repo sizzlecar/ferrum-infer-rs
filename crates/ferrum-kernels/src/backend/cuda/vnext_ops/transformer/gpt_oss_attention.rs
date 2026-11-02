@@ -29,6 +29,8 @@ use ferrum_runtime::{
 };
 use sha2::{Digest, Sha256};
 
+mod xqa;
+
 use super::{attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16};
 use crate::backend::cuda::vnext_ops::{
     binding, contiguous_token_region, contract_error, implementation_fingerprint,
@@ -41,11 +43,14 @@ use crate::backend::cuda::vnext_runtime::{
 };
 
 pub(in crate::backend::cuda::vnext_ops) const GPT_OSS_ATTENTION_PROVIDER_ID: &str =
-    "provider.cuda.gpt_oss.causal_paged_attention.f16";
+    crate::native_ops::flashinfer_xqa::GPT_OSS_ATTENTION_PROVIDER_ID;
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.gpt_oss.causal_paged_attention.f16";
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
 const PREPARE_FUNCTION: &str = "gpt_oss_prepare_qkv_yarn_f16";
-const ATTENTION_FUNCTION: &str = "gpt_oss_paged_attention_sink_f16";
+const ATTENTION_FUNCTION: &str = "gpt_oss_paged_attention_sink_multiwarp_paged_f16";
+const PREPARE_PACKED_DECODE_FUNCTION: &str = "gpt_oss_prepare_qkv_yarn_packed_decode_f16";
+const ATTENTION_PACKED_DECODE_FUNCTION: &str =
+    "gpt_oss_paged_attention_sink_packed_decode_multiwarp_paged_f16";
 const RESIDUAL_BIAS_FUNCTION: &str = "gpt_oss_residual_output_bias_f16";
 const COMPUTE_OPERATION: &str = "vnext.gpt_oss.causal_paged_attention.f16";
 const BINDING_OPERATION: &str = "vnext_gpt_oss_causal_paged_attention_bindings";
@@ -55,6 +60,7 @@ const POINTER_BYTES: u64 = std::mem::size_of::<u64>() as u64;
 const BINDING_CONTROL_WORDS: usize = 4;
 const BINDING_CONTROL_BYTES: u64 = (BINDING_CONTROL_WORDS * std::mem::size_of::<i32>()) as u64;
 const WARP_THREADS: u32 = 32;
+const ATTENTION_WARPS: u32 = 4;
 
 const GPT_OSS_HEAD_DIM: u64 = 64;
 const GPT_OSS_ROPE_DIM: u64 = 64;
@@ -69,6 +75,7 @@ const GPT_OSS_SLIDING_WINDOW: u64 = 128;
 pub(in crate::backend::cuda::vnext_ops) struct CudaGptOssCausalPagedAttentionProvider {
     descriptor: OperationProviderDescriptor,
     functions: GptOssAttentionFunctions,
+    xqa: Option<xqa::XqaSupport>,
 }
 
 #[derive(Clone)]
@@ -76,6 +83,8 @@ struct GptOssAttentionFunctions {
     rms_norm: CudaFunction,
     prepare: CudaFunction,
     attention: CudaFunction,
+    prepare_packed_decode: CudaFunction,
+    attention_packed_decode: CudaFunction,
     residual_bias: CudaFunction,
 }
 
@@ -92,15 +101,19 @@ impl CudaGptOssCausalPagedAttentionProvider {
             ));
         }
 
+        let xqa = xqa::XqaSupport::discover(runtime)?;
+        let xqa_identity = xqa
+            .as_ref()
+            .map(xqa::XqaSupport::fingerprint_material)
+            .unwrap_or_default();
         let source = include_str!("gpt_oss_attention.rs");
-        let provider_fingerprint = implementation_fingerprint(&[
+        let provider_fingerprint = crate::native_ops::flashinfer_xqa::provider_source_fingerprint();
+        let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
-            crate::ptx::RMS_NORM.as_bytes(),
-            crate::ptx::GPT_OSS_ATTENTION.as_bytes(),
-            GPT_OSS_ATTENTION_PROVIDER_ID.as_bytes(),
+            include_bytes!("gpt_oss_attention/xqa.rs"),
+            &xqa_identity,
+            ESTIMATOR_ID.as_bytes(),
         ]);
-        let estimator_fingerprint =
-            implementation_fingerprint(&[source.as_bytes(), ESTIMATOR_ID.as_bytes()]);
         let descriptor = OperationProviderDescriptor::new(
             ProviderId::new(GPT_OSS_ATTENTION_PROVIDER_ID).map_err(contract_error)?,
             contract.descriptor().id.clone(),
@@ -142,6 +155,16 @@ impl CudaGptOssCausalPagedAttentionProvider {
                 "GPT-OSS attention prepare",
             )?,
             attention: load_function(&attention_module, ATTENTION_FUNCTION, "GPT-OSS attention")?,
+            prepare_packed_decode: load_function(
+                &attention_module,
+                PREPARE_PACKED_DECODE_FUNCTION,
+                "GPT-OSS packed decode prepare",
+            )?,
+            attention_packed_decode: load_function(
+                &attention_module,
+                ATTENTION_PACKED_DECODE_FUNCTION,
+                "GPT-OSS packed decode attention",
+            )?,
             residual_bias: load_function(
                 &attention_module,
                 RESIDUAL_BIAS_FUNCTION,
@@ -151,6 +174,7 @@ impl CudaGptOssCausalPagedAttentionProvider {
         Ok(Self {
             descriptor,
             functions,
+            xqa,
         })
     }
 }
@@ -210,13 +234,19 @@ impl OperationResourceEstimator for CudaGptOssCausalPagedAttentionProvider {
         )?;
         let shape =
             GptOssAttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
+        let (fixed, per_sequence, alignment) = self
+            .xqa
+            .as_ref()
+            .filter(|_| xqa::XqaSupport::eligible(shape))
+            .map(xqa::XqaSupport::workspace_formula)
+            .unwrap_or((0, 0, SCRATCH_ALIGNMENT));
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
-                0,
-                0,
+                fixed,
+                per_sequence,
                 shape.scratch_bytes_per_token().map_err(invalid_plan)?,
             )?,
-            SCRATCH_ALIGNMENT,
+            alignment,
             ProviderWorkspaceScope::Invocation,
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
@@ -238,6 +268,19 @@ impl OperationResourceEstimator for CudaGptOssCausalPagedAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaGptOssCausalPagedAttentionProvider {
+    fn segment_binding_declaration_support(
+        &self,
+    ) -> ferrum_runtime::SegmentBindingDeclarationSupport {
+        ferrum_runtime::SegmentBindingDeclarationSupport::Unsupported
+    }
+
+    fn reusable_binding_resources(&self) -> ferrum_runtime::ReusableBindingResources {
+        // Replay only refreshes current KV pages and the binding workspace.
+        // Semantic signature metadata remains complete; captured weights and
+        // scratch are retained and validated by the resident executable.
+        ferrum_runtime::ReusableBindingResources::RequestStateAndBinding
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
@@ -273,6 +316,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGptOssCausalPagedAttentionProv
         let identity = invocation.participants()[0].identity().clone();
         encode_attention(
             &self.functions,
+            self.xqa.as_ref(),
             self.descriptor.provider_implementation_fingerprint(),
             invocation,
         )
@@ -649,6 +693,38 @@ struct PackedLaunch {
     tokens_i32: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackedDecodeLaunch {
+    participants: i32,
+    binding_stride_bytes: u64,
+}
+
+fn packed_decode_launch(
+    packed: PackedLaunch,
+    launches: &[AttentionLaunch],
+    bindings: BindingLayout,
+) -> Result<Option<PackedDecodeLaunch>, String> {
+    if launches.len() < 2 || launches.iter().any(|launch| launch.tokens != 1) {
+        return Ok(None);
+    }
+    let participants = u64::try_from(launches.len())
+        .map_err(|_| "GPT-OSS packed decode participant count exceeds u64".to_owned())?;
+    if packed.tokens != participants {
+        return Err("GPT-OSS packed decode requires one token per participant".to_owned());
+    }
+    for (index, launch) in launches.iter().enumerate() {
+        if launch.packed_token_start != index as u64
+            || launch.binding_offset != bindings.binding_offset(index)?
+        {
+            return Err("GPT-OSS packed decode token/binding offsets are not canonical".to_owned());
+        }
+    }
+    Ok(Some(PackedDecodeLaunch {
+        participants: checked_i32(participants, "GPT-OSS packed decode participants")?,
+        binding_stride_bytes: bindings.slot_bytes,
+    }))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AttentionBinding {
     first_page_region: usize,
@@ -774,6 +850,7 @@ fn bind_shape_replay_key(
 
 fn encode_attention(
     functions: &GptOssAttentionFunctions,
+    xqa_support: Option<&xqa::XqaSupport>,
     provider_fingerprint: &str,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
@@ -794,6 +871,13 @@ fn encode_attention(
 
     let total_tokens = invocation.work_shape().immediate_tokens();
     let layout = ScratchLayout::new(shape, total_tokens)?;
+    let xqa_support = xqa_support.filter(|_| xqa::XqaSupport::eligible(shape));
+    let required_scratch = xqa_support
+        .map(|support| {
+            support.workspace_bytes(layout.required_bytes, invocation.participants().len())
+        })
+        .transpose()?
+        .unwrap_or(layout.required_bytes);
     let binding_layout = BindingLayout::new(shape, invocation.participants().len())?;
     let cuda = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
@@ -817,10 +901,7 @@ fn encode_attention(
         sinks: push_shared_weight(&mut compute_regions, &invocation, 10)?,
         scratch: {
             let index = compute_regions.len();
-            compute_regions.push(super::shared_scratch_region(
-                &invocation,
-                layout.required_bytes,
-            )?);
+            compute_regions.push(super::shared_scratch_region(&invocation, required_scratch)?);
             index
         },
         binding: {
@@ -999,6 +1080,18 @@ fn encode_attention(
             total_tokens,
         )?;
     }
+    let packed_decode = packed
+        .map(|packed| packed_decode_launch(packed, &launches, binding_layout))
+        .transpose()?
+        .flatten();
+    let xqa_decode = if packed_decode.is_some() {
+        xqa_support
+            .map(|support| support.prepare(shape, layout, binding_layout, launches.len()))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
 
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "CUDA GPT-OSS attention participant count exceeds u32".to_owned())?;
@@ -1056,7 +1149,16 @@ fn encode_attention(
         .map_err(|error| error.to_string())?;
 
     let packed_enabled = packed.is_some();
-    let dispatch_count = if packed_enabled {
+    let xqa_transfers = xqa_decode
+        .as_ref()
+        .map_or(0, xqa::XqaDecode::transfer_count);
+    let dispatch_count = if xqa_decode.is_some() {
+        // Replace one R5 attention kernel with sink cast + one vendor kernel.
+        // Split reduction stays in that launch; multi-split semaphore reset is a transfer.
+        9
+    } else if packed_decode.is_some() {
+        8
+    } else if packed_enabled {
         6_u64.saturating_add((launches.len() as u64).saturating_mul(2))
     } else {
         (launches.len() as u64).saturating_mul(8)
@@ -1067,7 +1169,15 @@ fn encode_attention(
     )
     .u64(total_tokens)
     .boolean(packed_enabled)
-    .u64(layout.required_bytes)
+    .boolean(packed_decode.is_some())
+    .boolean(xqa_decode.is_some())
+    .bytes(
+        &xqa_decode
+            .as_ref()
+            .map(xqa::XqaDecode::fingerprint_material)
+            .unwrap_or_default(),
+    )
+    .u64(required_scratch)
     .u64(layout.normalized)
     .u64(layout.query_raw)
     .u64(layout.key_raw)
@@ -1083,22 +1193,32 @@ fn encode_attention(
     }
     let replay_key = replay_key.finish();
     let functions = functions.clone();
-    let enqueue_compute = move |stream: &CudaStream,
-                                blas: &CudaBlas,
-                                regions: &[CudaBufferRegion]| {
-        if let Some(packed) = packed {
-            enqueue_packed_attention(
-                stream, blas, &functions, shape, cuda, layout, shared, packed, &launches, regions,
-            )?;
-        } else {
-            for launch in &launches {
-                enqueue_attention(
-                    stream, blas, &functions, shape, cuda, layout, shared, *launch, regions,
+    let enqueue_compute =
+        move |stream: &CudaStream, blas: &CudaBlas, regions: &[CudaBufferRegion]| {
+            if let Some(packed) = packed {
+                enqueue_packed_attention(
+                    stream,
+                    blas,
+                    &functions,
+                    shape,
+                    cuda,
+                    layout,
+                    shared,
+                    packed,
+                    packed_decode,
+                    xqa_decode.as_ref(),
+                    &launches,
+                    regions,
                 )?;
+            } else {
+                for launch in &launches {
+                    enqueue_attention(
+                        stream, blas, &functions, shape, cuda, layout, shared, *launch, regions,
+                    )?;
+                }
             }
-        }
-        Ok(())
-    };
+            Ok(())
+        };
     let compute_command = CudaDeviceCommand::replayable_operation_with_blas_and_fence_dependencies(
         COMPUTE_OPERATION,
         compute_regions,
@@ -1118,7 +1238,7 @@ fn encode_attention(
             participant_count,
             total_tokens,
             dispatch_count,
-            0,
+            xqa_transfers,
         )
     })
     .map_err(|error| error.to_string())?;
@@ -1303,6 +1423,8 @@ fn enqueue_packed_attention(
     layout: ScratchLayout,
     shared: SharedRegions,
     packed: PackedLaunch,
+    packed_decode: Option<PackedDecodeLaunch>,
+    xqa_decode: Option<&xqa::XqaDecode>,
     launches: &[AttentionLaunch],
     regions: &[CudaBufferRegion],
 ) -> Result<(), CudaDeviceRuntimeError> {
@@ -1364,26 +1486,54 @@ fn enqueue_packed_attention(
             operation,
         )?;
     }
-    for launch in launches {
-        launch_prepare(
+    if let Some(decode) = packed_decode {
+        launch_packed_decode_prepare(
             stream,
-            &functions.prepare,
+            &functions.prepare_packed_decode,
             scratch_base,
             binding.device_ptr(),
             regions,
             shared,
-            *launch,
+            layout,
+            decode,
             cuda,
         )?;
-        launch_attention(
-            stream,
-            &functions.attention,
-            scratch_base,
-            binding.device_ptr(),
-            regions[shared.sinks].device_ptr(),
-            *launch,
-            cuda,
-        )?;
+        if let Some(xqa) = xqa_decode {
+            xqa.enqueue(stream, scratch, binding, &regions[shared.sinks], layout)?;
+        } else {
+            launch_packed_decode_attention(
+                stream,
+                &functions.attention_packed_decode,
+                scratch_base,
+                binding.device_ptr(),
+                regions[shared.sinks].device_ptr(),
+                layout,
+                decode,
+                cuda,
+            )?;
+        }
+    } else {
+        for launch in launches {
+            launch_prepare(
+                stream,
+                &functions.prepare,
+                scratch_base,
+                binding.device_ptr(),
+                regions,
+                shared,
+                *launch,
+                cuda,
+            )?;
+            launch_attention(
+                stream,
+                &functions.attention,
+                scratch_base,
+                binding.device_ptr(),
+                regions[shared.sinks].device_ptr(),
+                *launch,
+                cuda,
+            )?;
+        }
     }
     launch_gemm_f16(
         blas,
@@ -1518,6 +1668,120 @@ fn enqueue_attention(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn launch_packed_decode_prepare(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    scratch_base: u64,
+    binding_base: u64,
+    regions: &[CudaBufferRegion],
+    shared: SharedRegions,
+    layout: ScratchLayout,
+    decode: PackedDecodeLaunch,
+    shape: CudaGptOssAttentionShape,
+) -> Result<(), CudaDeviceRuntimeError> {
+    let pointers = [
+        scratch_pointer(scratch_base, layout.query_raw)?,
+        scratch_pointer(scratch_base, layout.key_raw)?,
+        scratch_pointer(scratch_base, layout.value_raw)?,
+        regions[shared.query_bias].device_ptr(),
+        regions[shared.key_bias].device_ptr(),
+        regions[shared.value_bias].device_ptr(),
+        scratch_pointer(scratch_base, layout.query)?,
+        binding_base,
+    ];
+    let dimensions = [
+        decode.participants,
+        checked_i32_runtime(
+            VNEXT_KV_PAGE_BYTES / ElementType::F16.size_bytes(),
+            "GPT-OSS packed decode page elements",
+        )?,
+        shape.query_heads,
+        shape.kv_heads,
+        shape.head_dim,
+        shape.rope_dim,
+        shape.query_features,
+        shape.kv_features,
+    ];
+    let parameters = [
+        shape.rope_theta,
+        shape.yarn_factor,
+        shape.yarn_original_context_tokens as f32,
+        shape.yarn_beta_fast,
+        shape.yarn_beta_slow,
+    ];
+    let mut builder = stream.launch_builder(function);
+    for pointer in &pointers {
+        builder.arg(pointer);
+    }
+    builder.arg(&decode.binding_stride_bytes);
+    for dimension in &dimensions {
+        builder.arg(dimension);
+    }
+    for parameter in &parameters {
+        builder.arg(parameter);
+    }
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (
+                decode.participants as u32,
+                (shape.query_heads + 2 * shape.kv_heads) as u32,
+                1,
+            ),
+            block_dim: (WARP_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|error| CudaDeviceRuntimeError::driver("GPT-OSS packed decode prepare launch", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_packed_decode_attention(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    scratch_base: u64,
+    binding_base: u64,
+    sinks: u64,
+    layout: ScratchLayout,
+    decode: PackedDecodeLaunch,
+    shape: CudaGptOssAttentionShape,
+) -> Result<(), CudaDeviceRuntimeError> {
+    let query = scratch_pointer(scratch_base, layout.query)?;
+    let output = scratch_pointer(scratch_base, layout.context)?;
+    let dimensions = [
+        checked_i32_runtime(
+            VNEXT_KV_PAGE_BYTES / ElementType::F16.size_bytes(),
+            "GPT-OSS packed decode page elements",
+        )?,
+        shape.query_heads,
+        shape.kv_heads,
+        shape.head_dim,
+        shape.sliding_window_tokens,
+    ];
+    let mut builder = stream.launch_builder(function);
+    builder.arg(&query);
+    builder.arg(&sinks);
+    builder.arg(&binding_base);
+    builder.arg(&decode.binding_stride_bytes);
+    builder.arg(&decode.participants);
+    builder.arg(&output);
+    for dimension in &dimensions {
+        builder.arg(dimension);
+    }
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (decode.participants as u32, shape.query_heads as u32, 1),
+            block_dim: (WARP_THREADS * ATTENTION_WARPS, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|error| {
+        CudaDeviceRuntimeError::driver("GPT-OSS packed decode attention launch", error)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn launch_prepare(
     stream: &CudaStream,
     function: &CudaFunction,
@@ -1646,7 +1910,7 @@ fn launch_attention(
                 })?,
                 1,
             ),
-            block_dim: (WARP_THREADS, 1, 1),
+            block_dim: (WARP_THREADS * ATTENTION_WARPS, 1, 1),
             shared_mem_bytes: 0,
         })
     }
@@ -2003,6 +2267,9 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 }
 
 #[cfg(test)]
+mod numerical_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ferrum_runtime::CanonicalRational;
@@ -2163,6 +2430,59 @@ mod tests {
         assert!((payload.len() as u64) <= shape.binding_slot_bytes().unwrap());
         assert!(binding_payload_from_addresses(10, 2, 13, &pages).is_err());
         assert!(binding_payload_from_addresses(0, 1, 1, &[]).is_err());
+    }
+
+    #[test]
+    fn packed_decode_requires_one_canonical_row_per_participant() {
+        let shape = GptOssAttentionShape::from_attributes(&attributes(128)).unwrap();
+        let bindings = BindingLayout::new(shape, 17).unwrap();
+        let packed = PackedLaunch {
+            input_region: 0,
+            output_region: 1,
+            tokens: 17,
+            tokens_i32: 17,
+        };
+        let mut launches = (0..17)
+            .map(|index| AttentionLaunch {
+                input_region: 0,
+                output_region: 1,
+                binding_offset: bindings.binding_offset(index).unwrap(),
+                packed_token_start: index as u64,
+                normalized_offset: 0,
+                query_raw_offset: 0,
+                key_raw_offset: 0,
+                value_raw_offset: 0,
+                query_offset: 0,
+                context_offset: 0,
+                projected_offset: 0,
+                tokens: 1,
+                tokens_i32: 1,
+                position_start: index as u64 * 31,
+                sequence_tokens: index as u64 * 31 + 1,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            packed_decode_launch(packed, &launches, bindings).unwrap(),
+            Some(PackedDecodeLaunch {
+                participants: 17,
+                binding_stride_bytes: bindings.slot_bytes,
+            })
+        );
+        assert_eq!(
+            packed_decode_launch(packed, &launches[..1], bindings).unwrap(),
+            None
+        );
+        launches[3].tokens = 2;
+        assert_eq!(
+            packed_decode_launch(packed, &launches, bindings).unwrap(),
+            None
+        );
+        launches[3].tokens = 1;
+        launches[3].binding_offset = 0;
+        assert!(packed_decode_launch(packed, &launches, bindings).is_err());
+        launches[3].binding_offset = bindings.binding_offset(3).unwrap();
+        launches[3].packed_token_start = 2;
+        assert!(packed_decode_launch(packed, &launches, bindings).is_err());
     }
 
     #[test]

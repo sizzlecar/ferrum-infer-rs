@@ -486,23 +486,31 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/sm120-native-object-cache
-          key: sm120-native-cuda12.8.1-gcc13-production-fp8-${{ hashFiles('crates/ferrum-native-ops-builder/**', 'crates/ferrum-native-ops/**', 'native-operators/**') }}
+          key: sm120-native-cuda12.8.1-gcc13-production-fp8-${{ hashFiles('crates/ferrum-native-ops-builder/**', 'crates/ferrum-native-ops/**', 'crates/ferrum-kernels/native/**', 'native-operators/**') }}
           restore-keys: |
             sm120-native-cuda12.8.1-gcc13-production-fp8-
+
+      - name: Restore pinned XQA source cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/flashinfer-xqa-source-cache
+          key: flashinfer-xqa-source-${{ hashFiles('crates/ferrum-kernels/native/flashinfer-xqa/upstream-source-manifest.json') }}
 
       - name: Prepare pinned native sources and source catalog
         run: |
           work="$RUNNER_TEMP/sm120-native"
           mkdir "$work"
           cargo build --locked --profile release-tools -p ferrum-native-ops-builder --example release_cuda_native --bin ferrum-native-ops-builder
-          cargo build --locked --profile release-tools -p ferrum-kernels --example cutlass_fp8_catalog_declaration
+          cargo build --locked --profile release-tools -p ferrum-kernels --example cutlass_fp8_catalog_declaration --example flashinfer_xqa_catalog_declaration
           ./target/release-tools/examples/release_cuda_native reference \
             --lock "$SM120_REFERENCE_LOCK" --catalog-output "$work/base-catalog.json"
+          ./target/release-tools/examples/flashinfer_xqa_catalog_declaration \
+            "$work/base-catalog.json" "$work/gpt-oss-source-catalog.json"
           # The catalog configuration is explicit source provenance, not a
           # measured native-memory upper bound or a runtime capacity override.
           ./target/release-tools/examples/cutlass_fp8_catalog_declaration \
             134217728 512 experimental-release-source-declaration-v1 \
-            "$work/combined-catalog.json" "$work/base-catalog.json"
+            "$work/combined-catalog.json" "$work/gpt-oss-source-catalog.json"
           mkdir "$work/reference-workspace" "$work/source-bundle" "$work/fp8-source"
           git archive "$NATIVE_REFERENCE_REVISION" | tar -xf - -C "$work/reference-workspace"
           manifest=native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json
@@ -511,6 +519,25 @@ jobs:
           curl --fail --location --retry 5 --retry-all-errors --output "$work/native-sources.tar.gz" "$source_url"
           printf '%s  %s\n' "$source_sha" "$work/native-sources.tar.gz" | sha256sum --check --strict
           tar -xzf "$work/native-sources.tar.gz" -C "$work/source-bundle"
+          # Only these pinned members are fetched. Rust materialize-source
+          # revalidates every member and applies the source-bound overlay.
+          xqa_manifest=crates/ferrum-kernels/native/flashinfer-xqa/upstream-source-manifest.json
+          test "$(jq -er '.repository' "$xqa_manifest")" = https://github.com/flashinfer-ai/flashinfer.git
+          xqa_revision=$(jq -er '.revision | select(test("^[0-9a-f]{40}$"))' "$xqa_manifest")
+          xqa_cache="$RUNNER_TEMP/flashinfer-xqa-source-cache/$xqa_revision"
+          mkdir -p "$xqa_cache/xqa" "$work/source-bundle/xqa"
+          while IFS=$'\t' read -r relative expected; do
+            [[ "$relative" =~ ^xqa/[A-Za-z0-9_.-]+$ ]]
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+            cached="$xqa_cache/$relative"
+            if ! { test -f "$cached" && printf '%s  %s\n' "$expected" "$cached" | sha256sum --check --strict --status; }; then
+              curl --fail --location --retry 5 --retry-all-errors \
+                --output "$cached.partial" "https://raw.githubusercontent.com/flashinfer-ai/flashinfer/$xqa_revision/csrc/$relative"
+              printf '%s  %s\n' "$expected" "$cached.partial" | sha256sum --check --strict
+              mv "$cached.partial" "$cached"
+            fi
+            cp "$cached" "$work/source-bundle/$relative"
+          done < <(jq -er '.members[] | [.path, .sha256] | @tsv' "$xqa_manifest")
           git init "$work/llama"
           git -C "$work/llama" remote add origin https://github.com/ggml-org/llama.cpp.git
           git -C "$work/llama" fetch --depth 1 origin "$LLAMA_NATIVE_REVISION"
@@ -534,13 +561,14 @@ jobs:
             --source-root "$work/fp8-source" --depfile "$work/fp8.d" \
             --out-definition "$work/fp8-observed.json" --out-plan "$work/fp8-plan.json"
 
-      - name: Build and verify complete SM120 production and FP8 native set
+      - name: Build and verify complete SM120 production, FP8 and XQA native set
         run: |
           work="$RUNNER_TEMP/sm120-native"
           ./target/release-tools/examples/release_cuda_native build \
             --reference-lock "$SM120_REFERENCE_LOCK" --reference-workspace "$work/reference-workspace" \
             --source-bundle "$work/source-bundle" --llama-source "$work/llama" \
             --workspace "$GITHUB_WORKSPACE" --catalog "$work/combined-catalog.json" \
+            --gpt-oss-source-catalog "$work/gpt-oss-source-catalog.json" \
             --fp8-source "$work/fp8-source" --fp8-plan "$work/fp8-plan.json" \
             --work "$work/builds" --output "$work/operator-set" \
             --object-cache "$RUNNER_TEMP/sm120-native-object-cache" --builder-sha "$RC_SHA" \

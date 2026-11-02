@@ -660,9 +660,26 @@ pub enum ReusableBindingResources {
     RequestStateAndBinding,
 }
 
+/// Whether cold encoding may provide a complete segment binding declaration.
+/// This is provider capability metadata, not permission to reuse live resources.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SegmentBindingDeclarationSupport {
+    /// Preserve probing for providers whose declaration can depend on the
+    /// current shape. An absent declaration must not be negatively cached.
+    #[default]
+    Probe,
+    /// This provider never supplies a declaration. Resident execution still
+    /// uses the ordinary, freshly validated reusable-binding invocation.
+    Unsupported,
+}
+
 /// A compile-time provider contract for one concrete runtime buffer type. The
 /// kernel method consumes only a dispatch-created invocation.
 pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
+    fn segment_binding_declaration_support(&self) -> SegmentBindingDeclarationSupport {
+        SegmentBindingDeclarationSupport::Probe
+    }
+
     /// Opts a binding-only encoder into a smaller physical view projection.
     /// The default preserves the full invocation, including for providers
     /// whose binding encoder delegates to `encode_selected`.

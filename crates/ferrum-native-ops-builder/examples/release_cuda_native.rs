@@ -17,7 +17,8 @@ use ferrum_native_ops::{
     ResolvedNativeOperatorArtifactSet,
 };
 use ferrum_native_ops_builder::{
-    assemble_native_operator_set, materialize_native_operator_package_spec,
+    assemble_native_operator_set, lock_native_operator_source_definition,
+    materialize_native_operator_package_spec, materialize_native_operator_source_overlay,
     package_native_operator, run_native_operator_source_build, NativeOperatorPackageRequest,
     NativeOperatorPackageSpecRequest, NativeOperatorSetRequest, NativeOperatorSourceBuildPlan,
     NativeOperatorSourceBuildRequest,
@@ -45,9 +46,9 @@ enum Command {
         #[arg(long)]
         catalog_output: PathBuf,
     },
-    /// Rebuild the complete historical set and add the explicitly locked FP8 unit.
+    /// Rebuild the historical set plus locked FP8 and architecture-specific XQA.
     Build(Box<Build>),
-    /// Resolve bytes/ABI/evidence and require both production and FP8 coverage.
+    /// Resolve bytes/ABI/evidence and require complete architecture-specific coverage.
     Verify {
         #[arg(long, value_enum, default_value = "sm120")]
         architecture: Architecture,
@@ -75,6 +76,9 @@ struct Build {
     workspace: PathBuf,
     #[arg(long)]
     catalog: PathBuf,
+    /// CPU source declaration generated from this workspace, required for SM120.
+    #[arg(long)]
+    gpt_oss_source_catalog: Option<PathBuf>,
     #[arg(long)]
     fp8_source: PathBuf,
     #[arg(long)]
@@ -164,7 +168,7 @@ fn main() -> Result<()> {
         Command::Verify { lock, architecture } => {
             let set = resolve(&lock, architecture, true)?;
             println!(
-                "verified {} native artifacts; production + CUTLASS FP8",
+                "verified {} native artifacts; complete architecture-specific release coverage",
                 set.artifacts.len()
             );
         }
@@ -182,13 +186,23 @@ fn resolve(
         Some(architecture.compute_capability()),
         "x86_64-unknown-linux-gnu",
     )?;
-    let required = architecture
+    ResolvedCudaNativeBuildCoverage::resolve(&set, required_units_for_set(architecture, fp8))?;
+    Ok(set)
+}
+
+fn required_units_for_set(
+    architecture: Architecture,
+    final_set: bool,
+) -> impl Iterator<Item = CudaNativeBuildUnit> {
+    architecture
         .required_units()
         .iter()
         .copied()
-        .chain(fp8.then_some(CudaNativeBuildUnit::CutlassFp8ScaledMm));
-    ResolvedCudaNativeBuildCoverage::resolve(&set, required)?;
-    Ok(set)
+        .chain(final_set.then_some(CudaNativeBuildUnit::CutlassFp8ScaledMm))
+        .chain(
+            (final_set && matches!(architecture, Architecture::Sm120))
+                .then_some(CudaNativeBuildUnit::FlashinferXqa),
+        )
 }
 
 fn reference_catalog(
@@ -211,11 +225,50 @@ fn reference_catalog(
 fn validate_catalog_extension(
     original: &NativeOperatorProviderCatalog,
     combined: &NativeOperatorProviderCatalog,
+    gpt_source: Option<&NativeOperatorProviderCatalog>,
 ) -> Result<()> {
     original.validate()?;
     combined.validate()?;
     if original.schema_version != combined.schema_version || original.backend != combined.backend {
         return Err("catalog schema/backend changed".into());
+    }
+    let mut expected = original.clone();
+    if let Some(source) = gpt_source {
+        source.validate()?;
+        if source.schema_version != original.schema_version
+            || source.backend != original.backend
+            || source.providers.len() != original.providers.len()
+        {
+            return Err(
+                "GPT-OSS source declaration must preserve the reference catalog shape".into(),
+            );
+        }
+        let key = (
+            "operation.gpt_oss.causal_paged_attention",
+            "provider.cuda.gpt_oss.causal_paged_attention.f16",
+        );
+        let mut replacements = 0;
+        for (old, declared) in expected.providers.iter_mut().zip(&source.providers) {
+            if (old.operation_id.as_str(), old.provider_id.as_str()) == key {
+                if old.operation_id != declared.operation_id
+                    || old.provider_id != declared.provider_id
+                    || old.operation_contract_version != declared.operation_contract_version
+                    || old.operation_fingerprint != declared.operation_fingerprint
+                    || old.provider_version != declared.provider_version
+                {
+                    return Err("GPT-OSS source declaration changed a versioned contract".into());
+                }
+                *old = declared.clone();
+                replacements += 1;
+            } else if old != declared {
+                return Err("GPT-OSS source declaration changed an unrelated provider".into());
+            }
+        }
+        if replacements != 1 {
+            return Err(
+                "GPT-OSS source declaration must contain its one exact provider row".into(),
+            );
+        }
     }
     let fp8 = [
         (
@@ -236,7 +289,7 @@ fn validate_catalog_extension(
         .iter()
         .any(|row| fp8.iter().any(|(_, provider)| row.provider_id == *provider))
         || combined.providers.len() != original.providers.len() + fp8.len()
-        || original
+        || expected
             .providers
             .iter()
             .any(|row| !combined.providers.contains(row))
@@ -249,7 +302,7 @@ fn validate_catalog_extension(
                 != 1
         })
     {
-        return Err("combined catalog must preserve every production row and add the scalar/pair/triple FP8 bundle".into());
+        return Err("combined catalog must preserve production rows (or the exact GPT-OSS source declaration) and add the scalar/pair/triple FP8 bundle".into());
     }
     Ok(())
 }
@@ -258,7 +311,20 @@ fn build(args: &Build) -> Result<()> {
     let reference = resolve(&args.reference_lock, args.architecture, false)?;
     let base_catalog = reference_catalog(&reference)?;
     let combined: NativeOperatorProviderCatalog = read_json(&args.catalog)?;
-    validate_catalog_extension(&base_catalog, &combined)?;
+    let gpt_source = match args.architecture {
+        Architecture::Sm120 => Some(read_json::<NativeOperatorProviderCatalog>(
+            args.gpt_oss_source_catalog
+                .as_deref()
+                .ok_or("SM120 release requires the CPU-generated GPT-OSS source catalog")?,
+        )?),
+        Architecture::Sm89 => {
+            if args.gpt_oss_source_catalog.is_some() {
+                return Err("SM89 release does not consume the SM120 XQA declaration".into());
+            }
+            None
+        }
+    };
+    validate_catalog_extension(&base_catalog, &combined, gpt_source.as_ref())?;
     let catalog_sha = combined.canonical_sha256()?;
     if digest_file(&args.catalog)? != catalog_sha {
         return Err("combined catalog must use canonical bytes".into());
@@ -296,6 +362,11 @@ fn build(args: &Build) -> Result<()> {
         g03_catalog_path: args.catalog.clone(),
         output_path: spec.clone(),
     })?;
+    let xqa = if matches!(args.architecture, Architecture::Sm120) {
+        Some(prepare_xqa(args)?)
+    } else {
+        None
+    };
     // Reject a missing historical source before spending time on any compiler.
     let mut receipts = Vec::new();
     for (unit, source, plan, spec) in prepared {
@@ -316,6 +387,16 @@ fn build(args: &Build) -> Result<()> {
         &spec,
         &args.workspace,
     )?);
+    if let Some((source, plan, spec)) = xqa {
+        receipts.push(build_package(
+            args,
+            "flashinfer-xqa",
+            &source,
+            &plan,
+            &spec,
+            &args.workspace,
+        )?);
+    }
     let lock = args.output.join("native-operator-set.lock.json");
     assemble_native_operator_set(&NativeOperatorSetRequest {
         expected_receipt_sha256: receipts
@@ -352,6 +433,41 @@ fn build(args: &Build) -> Result<()> {
         digest_file(&lock)?
     );
     Ok(())
+}
+
+fn prepare_xqa(args: &Build) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let native = args
+        .workspace
+        .join("crates/ferrum-kernels/native/flashinfer-xqa");
+    let source = args.work.join("flashinfer-xqa-source");
+    materialize_native_operator_source_overlay(
+        &native.join("source-overlay.json"),
+        &args.source_bundle,
+        &args.workspace,
+        &source,
+    )?;
+    fs::create_dir(source.join("kernels"))?;
+    for name in ["abi.h", "boundary.cu"] {
+        write_new(
+            &source.join("kernels").join(name),
+            &fs::read(native.join(name))?,
+        )?;
+    }
+    let plan = args.work.join("flashinfer-xqa.plan.json");
+    lock_native_operator_source_definition(
+        &native.join("flashinfer-xqa.seed.json"),
+        &source,
+        &plan,
+    )?;
+    let spec = args.work.join("flashinfer-xqa.package.json");
+    materialize_native_operator_package_spec(&NativeOperatorPackageSpecRequest {
+        definition_path: args
+            .workspace
+            .join("native-operators/cuda/package-definitions/flashinfer-xqa.json"),
+        g03_catalog_path: args.catalog.clone(),
+        output_path: spec.clone(),
+    })?;
+    Ok((source, plan, spec))
 }
 
 fn build_package(
@@ -413,6 +529,9 @@ fn materialize_source(
         CudaNativeBuildUnit::UpstreamQ6F32Linear => "upstream-q6-f32-linear",
         CudaNativeBuildUnit::CutlassFp8ScaledMm => {
             return Err("FP8 uses its observed source closure".into())
+        }
+        CudaNativeBuildUnit::FlashinferXqa => {
+            return Err("XQA uses its observed source closure".into())
         }
     };
     let mut files = BTreeMap::new();

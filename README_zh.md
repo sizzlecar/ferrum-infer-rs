@@ -4,7 +4,7 @@
   </a>
 </p>
 
-[English](README.md) · [发布版本](https://github.com/sizzlecar/ferrum-infer-rs/releases) · [性能对比](docs/performance-rtx5090-popular-models-20261101.zh.md) · [MIT](LICENSE)
+[English](README.md) · [发布版本](https://github.com/sizzlecar/ferrum-infer-rs/releases) · [性能对比](docs/performance-rtx5090-popular-models-20261101.zh.md) · [GPT-OSS 更新](docs/performance-rtx5090-gpt-oss-20261102.zh.md) · [MIT](LICENSE)
 
 # Ferrum
 

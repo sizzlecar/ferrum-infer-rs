@@ -611,7 +611,7 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
     let start = Instant::now();
     let feature_enabled = env::var_os(NATIVE_OP_ARTIFACT_FEATURE_ENV).is_some();
     println!("cargo:rerun-if-env-changed={NATIVE_OP_ARTIFACT_FEATURE_ENV}");
-    let required_build_units = required_cuda_native_build_units();
+    let mut required_build_units = required_cuda_native_build_units();
     let lock_path = optional_non_empty_env(NATIVE_OPERATOR_SET_LOCK_ENV);
     let Some(lock_path) = lock_path else {
         if !required_build_units.is_empty() {
@@ -660,11 +660,23 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
             lock_path.display()
         )
     });
+    // XQA is an additive capability of the selected, locked artifact set.
+    // Existing CUDA locks remain valid without it; a present package must
+    // satisfy the full ABI before any Rust extern references are enabled.
+    if resolved_set.artifacts.iter().any(|artifact| {
+        artifact.resolved.manifest.operator
+            == CudaNativeBuildUnit::FlashinferXqa.artifact_operator()
+    }) {
+        required_build_units.push(CudaNativeBuildUnit::FlashinferXqa);
+    }
     let build_coverage =
         match ResolvedCudaNativeBuildCoverage::resolve(&resolved_set, required_build_units) {
             Ok(coverage) => coverage,
             Err(error) => reject_incomplete_native_artifact_set(&lock_path, &error),
         };
+    if build_coverage.contains(CudaNativeBuildUnit::FlashinferXqa) {
+        println!("cargo:rustc-cfg=ferrum_native_flashinfer_xqa");
+    }
 
     let cuda_root = cuda_root_from_env();
     if let Some(cuda_root) = cuda_root.as_ref() {
@@ -811,6 +823,7 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
 fn emit_native_artifact_build_unit(unit: CudaNativeBuildUnit) {
     let summary_artifact = match unit {
         CudaNativeBuildUnit::CutlassFp8ScaledMm => "cutlass_fp8_scaled_mm",
+        CudaNativeBuildUnit::FlashinferXqa => "flashinfer_xqa",
         CudaNativeBuildUnit::Marlin => "marlin",
         CudaNativeBuildUnit::VllmMarlin => "vllm_marlin",
         CudaNativeBuildUnit::VllmMoeMarlin => "vllm_moe_marlin",
@@ -1231,6 +1244,7 @@ sha256={} import_dir={}",
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(ferrum_native_mmvq_pdl)");
+    println!("cargo:rustc-check-cfg=cfg(ferrum_native_flashinfer_xqa)");
     initialize_cuda_build_summary_receipt();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_support/host.rs");
@@ -1280,6 +1294,9 @@ fn main() {
             unit.as_str()
         );
         emit_native_artifact_build_unit(unit);
+    }
+    if native_artifact_coverage.contains(CudaNativeBuildUnit::FlashinferXqa) {
+        emit_native_artifact_build_unit(CudaNativeBuildUnit::FlashinferXqa);
     }
 
     // Legacy compatibility switch. The source-linked FA2 path has moved out of

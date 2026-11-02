@@ -39,7 +39,7 @@ use super::{
     translate_step_participant_upload_range, BatchOperationIdentity, BatchOperationNodeIdentity,
     BatchOperationParticipantIdentity, BatchedOperationInvocation, BoundOperationProvider,
     OperationInvocation, ProviderReplayEquivalence, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, TensorAccess,
+    ReusableExecutionTopologyRequest, SegmentBindingDeclarationSupport, TensorAccess,
 };
 
 /// The only public path from a resolved plan to an operation kernel.
@@ -1754,7 +1754,29 @@ impl OperationDispatch {
         let use_compiled_segment = batch_identity
             .preparation_strategy()
             .uses_decode_segment_program();
-        let use_segment = batch_identity.preparation_strategy().uses_decode_segment()
+        // A complete recipe cannot exist when a required binding provider
+        // explicitly declines declarations. Avoid rebuilding its full compute
+        // encoding on every replay just to rediscover that fact. Unknown or
+        // shape-dependent providers keep the existing cold probing behavior.
+        let declarations_supported = reusable_program.is_none_or(|program| {
+            program
+                .per_wave_binding_node_indices()
+                .iter()
+                .filter(|index| {
+                    program
+                        .segments()
+                        .iter()
+                        .any(|segment| segment.contains_node(**index))
+                })
+                .all(|index| {
+                    providers[*index as usize]
+                        .provider()
+                        .segment_binding_declaration_support()
+                        != SegmentBindingDeclarationSupport::Unsupported
+                })
+        });
+        let use_segment = declarations_supported
+            && batch_identity.preparation_strategy().uses_decode_segment()
             && determinism_restore.is_none()
             && completion
                 .wave()

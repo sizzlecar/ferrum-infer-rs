@@ -93,7 +93,7 @@ use tensor_io::validate_tensor_command;
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
-struct CudaSubmissionStageTimer<'sink, S>
+pub(super) struct CudaSubmissionStageTimer<'sink, S>
 where
     S: DeviceSubmissionTimingSink,
 {
@@ -107,7 +107,7 @@ where
     S: DeviceSubmissionTimingSink,
 {
     #[inline(always)]
-    fn start(sink: &'sink S, stage: DeviceSubmissionStage) -> Self {
+    pub(super) fn start(sink: &'sink S, stage: DeviceSubmissionStage) -> Self {
         Self {
             sink,
             stage,
@@ -5747,8 +5747,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
         });
         // Compact only fresh eager uploads, before physical command indices,
         // timing spans, or replay candidates are derived from these entries.
-        let entries =
-            input_upload_packet::coalesce(self, entries).map_err(DefinitelyNotSubmitted::new)?;
+        let entries = input_upload_packet::coalesce(self, entries, timing_sink)
+            .map_err(DefinitelyNotSubmitted::new)?;
         if let Some(facts) = execution_facts.as_mut() {
             facts.after_upload_coalescing(&entries);
         }
@@ -5955,6 +5955,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             &executable_candidates,
             capture_allowed,
             facts_capture,
+            timing_sink,
         ) {
             Ok(preparation) => preparation,
             Err(error) => {
@@ -5986,6 +5987,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
             }
             for _ in 0..preparation.warmup_required_segments() {
                 replay_observation.observe_warmup_required_segment();
+            }
+            for _ in 0..preparation.amortization_deferred_segments() {
+                replay_observation.observe_amortization_deferred_segment();
             }
             for _ in 0..preparation.capacity_deferred_segments() {
                 replay_observation.observe_capacity_deferred_segment();
@@ -6063,6 +6067,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let mut observed_dependencies = native_attribution.then(|| vec![None; commands.len()]);
         let mut index = 0;
         let mut executable_candidate_index = 0;
+        let mut eager_capture_cost: Option<super::vnext_replay::CudaEagerCaptureCost> = None;
         while index < commands.len() {
             if let Some(invocation) = commands[index].reusable_execution_invocation() {
                 let start = command_spans.as_ref().and_then(|_| {
@@ -6288,6 +6293,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
                 None => {}
             }
+            if let Some(candidate) = replay_candidate {
+                debug_assert!(eager_capture_cost.is_none());
+                eager_capture_cost = stream.executable_cache.begin_eager_cost(candidate);
+            }
             let command_start = command_spans.as_ref().and_then(|_| {
                 stream
                     .stream
@@ -6352,6 +6361,14 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 replay_observation.observe_eager_command();
             }
             index += 1;
+            if eager_capture_cost
+                .as_ref()
+                .is_some_and(|observation| observation.end() == index)
+            {
+                stream
+                    .executable_cache
+                    .finish_eager_cost(eager_capture_cost.take().expect("observed segment end"));
+            }
         }
         // Snapshot non-aliasing typed binding statuses after all eager or
         // replayed computation and before the fence. The prelude commands own

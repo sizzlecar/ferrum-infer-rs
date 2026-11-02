@@ -56,21 +56,85 @@ fn catalog_extension_preserves_text_contracts_and_rejects_missing_or_changed_row
     combined
         .providers
         .sort_by(|a, b| (&a.operation_id, &a.provider_id).cmp(&(&b.operation_id, &b.provider_id)));
-    validate_catalog_extension(&original, &combined).unwrap();
-    assert!(validate_catalog_extension(&original, &original).is_err());
+    validate_catalog_extension(&original, &combined, None).unwrap();
+    assert!(validate_catalog_extension(&original, &original, None).is_err());
     let mut missing_text = combined.clone();
     missing_text.providers.pop();
-    assert!(validate_catalog_extension(&original, &missing_text).is_err());
+    assert!(validate_catalog_extension(&original, &missing_text, None).is_err());
     let mut missing_group = combined.clone();
     missing_group.providers.remove(1);
-    assert!(validate_catalog_extension(&original, &missing_group).is_err());
+    assert!(validate_catalog_extension(&original, &missing_group, None).is_err());
     combined
         .providers
         .iter_mut()
         .find(|row| row.operation_id == "operation.text")
         .unwrap()
         .provider_implementation_fingerprint = "c".repeat(64);
-    assert!(validate_catalog_extension(&original, &combined).is_err());
+    assert!(validate_catalog_extension(&original, &combined, None).is_err());
+}
+
+#[test]
+fn sm120_final_coverage_requires_xqa_but_historical_and_sm89_sets_do_not() {
+    let set = ResolvedNativeOperatorArtifactSet {
+        lock_path: PathBuf::from("fixture.lock.json"),
+        g03_catalog_sha256: "a".repeat(64),
+        artifacts: Vec::new(),
+    };
+    let xqa = |architecture, final_set| {
+        required_units_for_set(architecture, final_set)
+            .filter(|unit| *unit == CudaNativeBuildUnit::FlashinferXqa)
+    };
+    assert!(
+        ResolvedCudaNativeBuildCoverage::resolve(&set, xqa(Architecture::Sm120, false)).is_ok()
+    );
+    assert!(ResolvedCudaNativeBuildCoverage::resolve(&set, xqa(Architecture::Sm89, true)).is_ok());
+    assert_eq!(
+        ResolvedCudaNativeBuildCoverage::resolve(&set, xqa(Architecture::Sm120, true)).unwrap_err(),
+        ferrum_native_ops::CudaNativeBuildCoverageError::MissingArtifact {
+            unit: "flashinfer_xqa",
+            operator: "ferrum.cuda.flashinfer_xqa_decode",
+        }
+    );
+}
+
+#[test]
+fn gpt_catalog_refresh_requires_exact_source_row_and_preserves_contracts() {
+    let original = NativeOperatorProviderCatalog {
+        schema_version: NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
+        backend: NativeOperatorBackend::Cuda,
+        providers: vec![
+            row(
+                "operation.gpt_oss.causal_paged_attention",
+                "provider.cuda.gpt_oss.causal_paged_attention.f16",
+            ),
+            row("operation.text", "provider.cuda.text"),
+        ],
+    };
+    let mut source = original.clone();
+    source.providers[0].provider_implementation_fingerprint = "c".repeat(64);
+    let mut combined = source.clone();
+    for suffix in ["", "_pair", "_triple"] {
+        combined.providers.push(row(
+            &format!("operation.dense_linear_fp8{suffix}.bf16"),
+            &format!("provider.cuda.dense_linear_fp8{suffix}.bf16.cutlass"),
+        ));
+    }
+    combined.providers.sort();
+    validate_catalog_extension(&original, &combined, Some(&source)).unwrap();
+    assert!(validate_catalog_extension(&original, &combined, None).is_err());
+    let mut wrong = combined.clone();
+    wrong
+        .providers
+        .iter_mut()
+        .find(|r| r.operation_id == "operation.gpt_oss.causal_paged_attention")
+        .unwrap()
+        .provider_implementation_fingerprint = "d".repeat(64);
+    assert!(validate_catalog_extension(&original, &wrong, Some(&source)).is_err());
+    source.providers[0].operation_fingerprint = "e".repeat(64);
+    assert!(validate_catalog_extension(&original, &combined, Some(&source)).is_err());
+    source = original.clone();
+    source.providers[1].provider_implementation_fingerprint = "f".repeat(64);
+    assert!(validate_catalog_extension(&original, &combined, Some(&source)).is_err());
 }
 
 #[test]

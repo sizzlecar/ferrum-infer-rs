@@ -57,10 +57,10 @@ impl MemoryPlan {
             .iter()
             .map(|descriptor| (descriptor.base_resource_id.clone(), descriptor))
             .collect::<BTreeMap<_, _>>();
-        let sealed_workspace = self
+        let prepared_workspace = self
             .reusable_execution
             .as_ref()
-            .map(|reusable| reusable.startup_sealed_pool_workspace_bytes())
+            .map(|reusable| reusable.startup_prepared_pool_workspace_bytes())
             .transpose()?
             .unwrap_or_default();
 
@@ -120,7 +120,7 @@ impl MemoryPlan {
                     // even an eager miss can need a rounded, uncaptured arena.
                     // Sealed captured arenas cannot be trimmed to make room.
                     wave_bytes = wave_bytes
-                        .checked_add(sealed_workspace.get(pool.pool_id()).copied().unwrap_or(0))
+                        .checked_add(prepared_workspace.get(pool.pool_id()).copied().unwrap_or(0))
                         .ok_or_else(|| invalid_plan("sealed startup workspace overflows u64"))?;
                 }
                 let required = sequence_bytes

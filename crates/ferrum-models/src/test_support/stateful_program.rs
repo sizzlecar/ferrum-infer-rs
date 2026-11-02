@@ -599,14 +599,34 @@ pub fn metal() -> Fixture<ferrum_kernels::backend::metal::vnext_runtime::MetalDe
 /// Preserve the original CUDA startup-capture scenario and all its policies.
 #[cfg(feature = "cuda")]
 pub fn cuda_startup() -> Fixture<ferrum_kernels::backend::cuda::vnext_runtime::CudaDeviceRuntime> {
+    cuda_with_preparation(ferrum_types::ReusableExecutionPreparationMode::Startup)
+}
+
+/// Exercise the product default: prepare before readiness, then keep learning.
+#[cfg(feature = "cuda")]
+pub fn cuda_auto_startup(
+) -> Fixture<ferrum_kernels::backend::cuda::vnext_runtime::CudaDeviceRuntime> {
+    cuda_with_preparation(ferrum_types::ReusableExecutionPreparationMode::Auto)
+}
+
+/// Explicit hybrid preparation retains the original after-warmup admission.
+#[cfg(feature = "cuda")]
+pub fn cuda_after_warmup_startup(
+) -> Fixture<ferrum_kernels::backend::cuda::vnext_runtime::CudaDeviceRuntime> {
+    cuda_with_preparation(ferrum_types::ReusableExecutionPreparationMode::StartupAndOnDemand)
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_with_preparation(
+    preparation: ferrum_types::ReusableExecutionPreparationMode,
+) -> Fixture<ferrum_kernels::backend::cuda::vnext_runtime::CudaDeviceRuntime> {
     use ferrum_kernels::backend::cuda::vnext_ops::{
         cuda_weight_materializer_selection, CudaVNextComposition,
     };
     let directory = tempfile::tempdir().unwrap();
     let mut engine_config = configuration();
     engine_config.backend.enable_reusable_execution = true;
-    engine_config.backend.reusable_execution_capture.preparation =
-        ferrum_types::ReusableExecutionPreparationMode::Startup;
+    engine_config.backend.reusable_execution_capture.preparation = preparation;
     let (executor, runtime) = build_executor(
         directory.path(),
         AttentionKind::CausalInt8,

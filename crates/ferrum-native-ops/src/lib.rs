@@ -10,6 +10,7 @@ pub mod build_cache;
 pub mod build_unit;
 pub mod coff;
 pub mod cutlass_fp8;
+pub mod flashinfer_xqa;
 pub mod manifest;
 pub mod registry;
 pub mod resolver;

@@ -182,8 +182,12 @@ async fn assert_rejected(output: &str, finish_reason: FinishReason, stop: Option
                 .expect("invalid Harmony must emit an SSE error");
             assert_eq!(error["error"]["type"], "internal_server_error");
             assert_eq!(error["error"]["param"], "model_output");
-            assert!(delta_text(&events, "content").is_empty());
-            assert!(delta_text(&events, "reasoning").is_empty());
+            // A later terminal failure cannot retract already published safe
+            // text. It must never expose a control marker or publish success.
+            for field in ["content", "reasoning"] {
+                let visible = delta_text(&events, field);
+                assert!(!visible.contains("<|") && !visible.contains("|>"), "{body}");
+            }
             assert!(
                 events.iter().all(|event| {
                     event["choices"][0]["delta"].get("tool_calls").is_none()
@@ -230,5 +234,137 @@ async fn harmony_user_stop_keeps_incomplete_tools_and_unknown_controls_fail_clos
         "<|channel|>final<|message|>private payload<|",
     ] {
         assert_rejected(output, FinishReason::Stop, Some("STOP")).await;
+    }
+}
+
+fn projected_delta(events: &[Value], responses: bool, field: &str) -> String {
+    events
+        .iter()
+        .filter_map(|event| {
+            if responses {
+                let event_type = match field {
+                    "content" => "response.output_text.delta",
+                    "reasoning" => "response.reasoning_text.delta",
+                    "arguments" => "response.function_call_arguments.delta",
+                    _ => unreachable!(),
+                };
+                (event["type"] == event_type)
+                    .then(|| event["delta"].as_str())
+                    .flatten()
+            } else if field == "arguments" {
+                event["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            } else {
+                event["choices"][0]["delta"][field].as_str()
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn harmony_text_and_reasoning_arrive_before_engine_finish_on_both_apis() {
+    for (first, rest, early_content, final_content, arguments) in [
+        (
+            "<|channel|>analysis<|message|>Reason early<",
+            "|end|><|start|>assistant<|channel|>final<|message|>答案<|return|>",
+            "", "答案", "",
+        ),
+        (
+            "<|channel|>analysis<|message|>Reason early<|end|><|start|>assistant<|channel|>final<|message|>答案<",
+            "|return|>",
+            "答案", "答案", "",
+        ),
+        (
+            "<|channel|>analysis<|message|>Reason early<",
+            "|end|><|start|>assistant to=functions.weather<|channel|>commentary<|constrain|>json<|message|>{\"city\":\"Paris\"}<|call|>",
+            "", "", "{\"city\":\"Paris\"}",
+        ),
+    ] {
+        for responses in [false, true] {
+            let gate = Arc::new(StreamGate::default());
+            let engine = StubLlm {
+                stream_after_first_gate: Some(gate.clone()),
+                ..StubLlm::with_separate_final_stream_chunk(&[first, rest])
+            };
+            let app = AxumServer::from_llm(Arc::new(engine))
+                .with_prompt_template(Some(harmony_json_template()))
+                .build_router().unwrap();
+            let function = json!({"name": "weather", "parameters": {
+                "type": "object", "properties": {"city": {"type": "string"}}
+            }});
+            let (path, wire) = if responses {
+                ("/v1/responses", json!({
+                    "model": "stub-model", "input": "Continue.", "stream": true,
+                    "tools": [{"type": "function", "name": "weather", "parameters": function["parameters"]}],
+                    "tool_choice": "auto"
+                }))
+            } else {
+                let mut wire = request(true, None);
+                wire["tools"] = json!([{"type": "function", "function": function}]);
+                wire["tool_choice"] = json!("auto");
+                ("/v1/chat/completions", wire)
+            };
+            let response = post_json(app, path, wire).await;
+            assert_eq!(response.status(), AxumStatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            let mut text = String::new();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = gate.entered.notified() => break,
+                        frame = body.next() => {
+                            let frame = frame.expect("engine gate precedes HTTP EOF").unwrap();
+                            text.push_str(std::str::from_utf8(&frame).unwrap());
+                        }
+                    }
+                }
+            }).await.expect("first chunk must be consumed before engine can finish");
+            let events = responses_sse_json_events(&text);
+            assert_eq!(projected_delta(&events, responses, "reasoning"), "Reason early", "{text}");
+            assert_eq!(projected_delta(&events, responses, "content"), early_content, "{text}");
+            assert!(projected_delta(&events, responses, "arguments").is_empty());
+            assert!(!text.contains("[DONE]") && !text.contains("response.completed"));
+            gate.resume.notify_one();
+            while let Some(frame) = body.next().await {
+                text.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+            }
+            let events = responses_sse_json_events(&text);
+            assert_eq!(projected_delta(&events, responses, "reasoning"), "Reason early", "{text}");
+            assert_eq!(projected_delta(&events, responses, "content"), final_content, "{text}");
+            assert_eq!(projected_delta(&events, responses, "arguments"), arguments, "{text}");
+            assert!(events.iter().all(|event| event["error"].is_null()), "{text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn harmony_malformed_chunk_is_atomic_and_later_failure_never_finishes_successfully() {
+    for (chunks, expected) in [
+        (vec!["<|channel|>final<|message|>private<|bogus|>"], ""),
+        (
+            vec!["<|channel|>final<|message|>Visible", "<|bogus|>"],
+            "Visible",
+        ),
+    ] {
+        let response = post_json(
+            router(&chunks, FinishReason::EOS, true),
+            "/v1/chat/completions",
+            request(true, None),
+        )
+        .await;
+        let body = response_text(response).await;
+        let events = responses_sse_json_events(&body);
+        assert_eq!(delta_text(&events, "content"), expected);
+        assert!(
+            events.iter().any(|event| event["error"].is_object()),
+            "{body}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event["choices"][0]["finish_reason"].is_null()
+                    && event["usage"].is_null()),
+            "{body}"
+        );
     }
 }

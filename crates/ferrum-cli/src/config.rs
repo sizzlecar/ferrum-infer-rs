@@ -336,7 +336,7 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub reusable_execution: Option<bool>,
 
-    /// vNext preparation lifecycle: auto, startup, or on_demand.
+    /// vNext preparation: auto, startup, startup_and_on_demand, or on_demand.
     #[serde(default)]
     pub reusable_execution_preparation: Option<ferrum_types::ReusableExecutionPreparationMode>,
 

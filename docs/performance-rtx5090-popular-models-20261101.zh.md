@@ -1,6 +1,10 @@
 # RTX 5090 热门文本模型并发对比（2026-11-01–02，UTC+8）
 
+[English](performance-rtx5090-popular-models-20261101.md)
+
 本轮使用正式版 Ferrum 0.18.3，对比同一张 RTX 5090 上的 llama.cpp 和 vLLM。7 组对照已全部完成：6 组每端各 256/256 个正式请求成功，GPT-OSS 自然 EOS 短测每端各 64/64 成功，但 Ferrum 未满足流式延迟 SLO。只比较同源权重、相同负载的配对结果，不跨模型或量化格式混排。
+
+GPT-OSS 的后续流式修复、CUDA 优化与复测见[修复验证报告](performance-rtx5090-gpt-oss-20261102.zh.md)。本页保留 0.18.3 的原始结果。
 
 目标是满足 TTFT、TPOT 和可见文本 ITL 的延迟 SLO 后提高输出吞吐。超出任一必需 SLO 的结果会保留，但不计为达标优化。[27B 历史结果](performance-popular-models-p0.zh.md)单独保留，本轮不重复测试，也不将旧版本数字混入新表。
 

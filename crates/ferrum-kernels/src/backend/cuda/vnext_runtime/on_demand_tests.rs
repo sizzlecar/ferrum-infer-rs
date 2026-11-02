@@ -39,18 +39,27 @@ struct CaptureHarness {
 
 impl CaptureHarness {
     fn new(capacity: usize) -> Self {
+        Self::with_plan(DeviceReusableExecutionPlan::on_demand(capacity).unwrap())
+    }
+
+    fn with_plan(plan: DeviceReusableExecutionPlan) -> Self {
         let context = CudaContext::new(0).expect("CUDA capture tests require a configured GPU");
         let stream = context.new_stream().unwrap();
         let blas = Arc::new(CudaBlas::new(Arc::clone(&stream)).unwrap());
         let counter = Arc::new(stream.clone_htod(&[0_u32]).unwrap());
         stream.synchronize().unwrap();
         let mut cache = CudaExecutableCache::new();
-        let receipt = cache
-            .configure(DeviceReusableExecutionPlan::on_demand(capacity).unwrap())
-            .unwrap();
+        let receipt = cache.configure(plan).unwrap();
         assert_eq!(
             receipt.state(),
-            DeviceReusableExecutionPreparationState::Ready
+            match plan.preparation() {
+                ferrum_runtime::ReusableExecutionProgramPreparation::BeforeReadiness => {
+                    DeviceReusableExecutionPreparationState::Preparing
+                }
+                ferrum_runtime::ReusableExecutionProgramPreparation::OnDemand => {
+                    DeviceReusableExecutionPreparationState::Ready
+                }
+            }
         );
         assert_eq!(receipt.captured_executables(), 0);
         Self {
@@ -146,6 +155,7 @@ impl CaptureHarness {
                 &candidates,
                 quiescent,
                 capture,
+                &ferrum_runtime::DisabledDeviceSubmissionTimingSink,
             )
             .unwrap();
         // Capture and graph upload must not execute the stateful operation.
@@ -165,7 +175,11 @@ impl CaptureHarness {
             )
             .unwrap();
         if launched.is_none() {
+            let cost = self.cache.begin_eager_cost(&candidates[0]);
             commands[0].enqueue(&self.stream, &self.blas).unwrap();
+            if let Some(cost) = cost {
+                self.cache.finish_eager_cost(cost);
+            }
         }
         self.stream.synchronize().unwrap();
         assert_eq!(
@@ -178,6 +192,40 @@ impl CaptureHarness {
         );
         (report, launched)
     }
+}
+
+#[test]
+#[ignore = "requires a configured CUDA device"]
+fn cost_admission_preserves_startup_graphs_and_defers_unearned_live_capture() {
+    let plan = DeviceReusableExecutionPlan::startup_and_on_demand(4)
+        .unwrap()
+        .with_on_demand_admission(
+            ferrum_runtime::ReusableExecutionOnDemandAdmission::AmortizedHostCostV1,
+        )
+        .unwrap();
+    let mut h = CaptureHarness::with_plan(plan);
+    assert!(h.cache.catalog().unwrap().is_empty());
+    let warmup = h.execute(h.command(1, false), true, 1);
+    assert_eq!(warmup.warmup_required_segments(), 1);
+    let prepared = h.execute(h.command(1, false), true, 2);
+    assert_eq!(prepared.captured_segments(), 1);
+    assert_eq!(prepared.amortization_deferred_segments(), 0);
+    let ready = h.cache.seal().unwrap();
+    assert_eq!(ready.resident_executables(), 1);
+    let resident = h.execute(h.command(1, false), true, 3);
+    assert_eq!(resident.cache_hit_segments(), 1);
+
+    // A different state transition remains fully correct under ordinary
+    // execution. Its first cold execution cannot buy a graph, regardless of
+    // wall-clock speed; deterministic controller tests cover later promotion.
+    let first = h.execute(h.command(2, false), true, 5);
+    assert_eq!(first.warmup_required_segments(), 1);
+    let deferred = h.execute(h.command(2, false), true, 7);
+    assert_eq!(deferred.amortization_deferred_segments(), 1);
+    assert_eq!(deferred.captured_segments(), 0);
+    assert_eq!(deferred.cached_rejected_segments(), 0);
+    assert_eq!(deferred.capture_rejected_segments(), 0);
+    assert_eq!(h.cache.preparation().unwrap().resident_executables(), 1);
 }
 
 #[test]
@@ -354,6 +402,7 @@ fn on_demand_logical_catalog_is_bounded_and_stale_references_miss_before_launch(
                 &candidates,
                 true,
                 ExecutionFactsCapture::Off,
+                &ferrum_runtime::DisabledDeviceSubmissionTimingSink,
             )
             .unwrap();
         h.cache
@@ -432,6 +481,7 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
             &candidates,
             true,
             ExecutionFactsCapture::Off,
+            &sink,
         )
         .unwrap();
     h.cache
@@ -482,6 +532,7 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
             &[],
             true,
             ExecutionFactsCapture::Off,
+            &sink,
         )
         .unwrap();
     assert_eq!(eager_preparation, CudaExecutablePreparation::default());

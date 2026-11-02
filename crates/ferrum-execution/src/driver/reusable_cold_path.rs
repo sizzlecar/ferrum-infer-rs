@@ -2,11 +2,12 @@
 
 use std::sync::OnceLock;
 
+use super::timing::DevicePreparationIntervals;
 use super::*;
 
 const MAXIMUM_WAVES: usize = 4_096;
 const MAXIMUM_ATTEMPTS: usize = MAX_DEFINITELY_NOT_SUBMITTED_RETRIES as usize + 1;
-const GAP_REASONS: [DeviceReusableExecutionProgramGapReason; 11] = [
+const GAP_REASONS: [DeviceReusableExecutionProgramGapReason; 12] = [
     DeviceReusableExecutionProgramGapReason::MissingComputeCommand,
     DeviceReusableExecutionProgramGapReason::ProviderReplayKeyMissing,
     DeviceReusableExecutionProgramGapReason::ReusableAddressScopeMissing,
@@ -18,6 +19,7 @@ const GAP_REASONS: [DeviceReusableExecutionProgramGapReason; 11] = [
     DeviceReusableExecutionProgramGapReason::CapacityDeferred,
     DeviceReusableExecutionProgramGapReason::Evicted,
     DeviceReusableExecutionProgramGapReason::OutsidePreparation,
+    DeviceReusableExecutionProgramGapReason::AmortizationDeferred,
 ];
 
 fn gap_index(reason: DeviceReusableExecutionProgramGapReason) -> usize {
@@ -33,6 +35,7 @@ fn gap_index(reason: DeviceReusableExecutionProgramGapReason) -> usize {
         DeviceReusableExecutionProgramGapReason::CapacityDeferred => 8,
         DeviceReusableExecutionProgramGapReason::Evicted => 9,
         DeviceReusableExecutionProgramGapReason::OutsidePreparation => 10,
+        DeviceReusableExecutionProgramGapReason::AmortizationDeferred => 11,
     }
 }
 
@@ -119,6 +122,7 @@ struct AttemptRecord {
     provider_encode_submit_ns: Option<u64>,
     provider_node_encode_ns: Option<u64>,
     enqueue_commands_ns: Option<u64>,
+    validate_and_prepare_children_ns: DevicePreparationIntervals,
     backend_preparation: Option<BackendPreparation>,
     program_gaps: Option<ProgramGaps>,
     backend_submission_observation: Option<DeviceReusableExecutionObservation>,
@@ -214,6 +218,7 @@ impl Ledger {
                 "submitted means dispatch returned a handle, not terminal device success",
                 "each wave owns one host_encode_submit interval including all retries; attempt intervals are nested and must not be added to it",
                 "provider_encode_submit includes core dispatch; provider_node_encode and enqueue_commands reuse their original stage scopes",
+                "validate_and_prepare_children_ns sums entered child calls in this attempt; null means unobserved and these nested intervals must not be added to the parent",
                 "missing callback or interval is null, not zero; prepare and final submission observations are separate boundaries",
                 "program_gaps counts actual node gaps by reason before on-demand tombstone removal; segment counters have a different denominator",
                 "program_id retains every field; exact backend identity comparison is diagnostic and never changes dispatch",
@@ -350,6 +355,7 @@ pub(super) struct AttemptObservation<'a, T> {
     catalog_miss: Option<VNextReusableExecutionCatalogMissReason>,
     provider_ns: ObservationCell<u64>,
     enqueue_ns: ObservationCell<u64>,
+    prepare_timing: DevicePreparationTimingMetrics,
     preparation: ObservationCell<BackendPreparation>,
     gaps: ObservationCell<ProgramGaps>,
     submission: ObservationCell<DeviceReusableExecutionObservation>,
@@ -372,6 +378,7 @@ impl<'a, T> AttemptObservation<'a, T> {
             catalog_miss,
             provider_ns: ObservationCell::new(),
             enqueue_ns: ObservationCell::new(),
+            prepare_timing: DevicePreparationTimingMetrics::default(),
             preparation: ObservationCell::new(),
             gaps: ObservationCell::new(),
             submission: ObservationCell::new(),
@@ -405,6 +412,7 @@ impl<'a, T> AttemptObservation<'a, T> {
             provider_encode_submit_ns: provider_encode_submit.map(duration_ns),
             provider_node_encode_ns: self.provider_ns.into_inner(),
             enqueue_commands_ns: self.enqueue_ns.into_inner(),
+            validate_and_prepare_children_ns: self.prepare_timing.totals(),
             backend_preparation: self.preparation.into_inner(),
             program_gaps: self.gaps.into_inner(),
             backend_submission_observation: self.submission.into_inner(),
@@ -427,8 +435,11 @@ impl<T: DeviceSubmissionTimingSink> DeviceSubmissionTimingSink for AttemptObserv
 
     fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration) {
         self.timing.record_device_submission(stage, elapsed);
-        if T::ENABLED && stage == DeviceSubmissionStage::EnqueueCommands {
-            self.set(&self.enqueue_ns, duration_ns(elapsed));
+        if T::ENABLED {
+            self.prepare_timing.record(stage, elapsed);
+            if stage == DeviceSubmissionStage::EnqueueCommands {
+                self.set(&self.enqueue_ns, duration_ns(elapsed));
+            }
         }
     }
 

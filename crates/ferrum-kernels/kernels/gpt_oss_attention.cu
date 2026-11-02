@@ -16,6 +16,7 @@
 #define GPT_OSS_WARP_SIZE 32
 #define GPT_OSS_HEAD_DIM 64
 #define GPT_OSS_HEAD_CHUNKS 2
+#define GPT_OSS_DECODE_WARPS 4
 
 __device__ __forceinline__ __half* gpt_oss_paged_element(
     const unsigned long long* __restrict__ page_pointers,
@@ -73,6 +74,38 @@ __device__ __forceinline__ float gpt_oss_load_kv(
   return source == nullptr ? 0.0f : __half2float(*source);
 }
 
+// Preserve the original general page mapping as the fallback. The fast path
+// depends only on page geometry; it does not specialize a model or GPU.
+__device__ __forceinline__ float gpt_oss_load_kv_paged(
+    const unsigned long long* __restrict__ page_pointers,
+    const int page_count,
+    const int page_elements,
+    const int page_shift,
+    const unsigned page_mask,
+    const int token,
+    const int kind,
+    const int head,
+    const int dim,
+    const int kv_heads,
+    const int head_dim) {
+  const long long logical_element =
+      gpt_oss_kv_element_index(token, kind, head, dim, kv_heads, head_dim);
+  if (page_shift < 0 || logical_element < 0) {
+    return gpt_oss_load_kv(page_pointers, page_count, page_elements, token,
+                           kind, head, dim, kv_heads, head_dim);
+  }
+  const unsigned long long logical =
+      static_cast<unsigned long long>(logical_element);
+  const unsigned long long page = logical >> page_shift;
+  if (page_count <= 0 || page >= static_cast<unsigned long long>(page_count))
+    return 0.0f;
+  const unsigned long long offset = logical & page_mask;
+  const __half* source = reinterpret_cast<const __half*>(
+                            static_cast<uintptr_t>(page_pointers[page])) +
+                        offset;
+  return source == nullptr ? 0.0f : __half2float(*source);
+}
+
 // OpenAI's reference computes YaRN with an NTK-by-parts ramp:
 //   low  = d/2 * log(original / (beta_fast * 2pi)) / log(theta)
 //   high = d/2 * log(original / (beta_slow * 2pi)) / log(theta)
@@ -102,7 +135,7 @@ __device__ __forceinline__ float gpt_oss_yarn_inv_frequency(
          extrapolation * extrapolation_weight;
 }
 
-extern "C" __global__ void gpt_oss_prepare_qkv_yarn_f16(
+__device__ __forceinline__ void gpt_oss_prepare_qkv_yarn_token_f16(
     const __half* __restrict__ query_raw,
     const __half* __restrict__ key_raw,
     const __half* __restrict__ value_raw,
@@ -123,13 +156,13 @@ extern "C" __global__ void gpt_oss_prepare_qkv_yarn_f16(
     const float yarn_factor,
     const float yarn_original_context,
     const float yarn_beta_fast,
-    const float yarn_beta_slow) {
+    const float yarn_beta_slow,
+    const int token,
+    const int combined_head,
+    const int lane) {
   const int page_count = control[0];
   const int position_start = control[1];
   const int tokens = control[2];
-  const int token = blockIdx.x;
-  const int combined_head = blockIdx.y;
-  const int lane = threadIdx.x;
   const int total_heads = query_heads + 2 * kv_heads;
   if (token >= tokens || combined_head >= total_heads ||
       lane >= GPT_OSS_WARP_SIZE)
@@ -214,7 +247,82 @@ extern "C" __global__ void gpt_oss_prepare_qkv_yarn_f16(
   }
 }
 
-extern "C" __global__ void gpt_oss_paged_attention_sink_f16(
+extern "C" __global__ void gpt_oss_prepare_qkv_yarn_f16(
+    const __half* __restrict__ query_raw,
+    const __half* __restrict__ key_raw,
+    const __half* __restrict__ value_raw,
+    const __half* __restrict__ query_bias,
+    const __half* __restrict__ key_bias,
+    const __half* __restrict__ value_bias,
+    __half* __restrict__ query,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int rope_dim,
+    const int query_features,
+    const int kv_features,
+    const float rope_theta,
+    const float yarn_factor,
+    const float yarn_original_context,
+    const float yarn_beta_fast,
+    const float yarn_beta_slow) {
+  gpt_oss_prepare_qkv_yarn_token_f16(
+      query_raw, key_raw, value_raw, query_bias, key_bias, value_bias,
+      query, control, page_pointers, page_elements, query_heads, kv_heads,
+      head_dim, rope_dim, query_features, kv_features, rope_theta, yarn_factor,
+      yarn_original_context, yarn_beta_fast, yarn_beta_slow,
+      blockIdx.x, blockIdx.y, threadIdx.x);
+}
+
+// Each participant contributes one packed token. Retain the scalar warp's
+// arithmetic and key order while allowing different requests to occupy the
+// device concurrently. The host validates this exact decode geometry.
+extern "C" __global__ void gpt_oss_prepare_qkv_yarn_packed_decode_f16(
+    const __half* __restrict__ query_raw,
+    const __half* __restrict__ key_raw,
+    const __half* __restrict__ value_raw,
+    const __half* __restrict__ query_bias,
+    const __half* __restrict__ key_bias,
+    const __half* __restrict__ value_bias,
+    __half* __restrict__ query,
+    const unsigned char* __restrict__ bindings,
+    const unsigned long long binding_stride_bytes,
+    const int participants,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int rope_dim,
+    const int query_features,
+    const int kv_features,
+    const float rope_theta,
+    const float yarn_factor,
+    const float yarn_original_context,
+    const float yarn_beta_fast,
+    const float yarn_beta_slow) {
+  const int participant = blockIdx.x;
+  if (participant >= participants) return;
+  const int* control = reinterpret_cast<const int*>(
+      bindings + (unsigned long long)participant * binding_stride_bytes);
+  const unsigned long long* page_pointers =
+      reinterpret_cast<const unsigned long long*>(control + 4);
+  gpt_oss_prepare_qkv_yarn_token_f16(
+      query_raw + (long long)participant * query_features,
+      key_raw + (long long)participant * kv_features,
+      value_raw + (long long)participant * kv_features,
+      query_bias, key_bias, value_bias,
+      query + (long long)participant * query_features,
+      control, page_pointers, page_elements, query_heads, kv_heads,
+      head_dim, rope_dim, query_features, kv_features, rope_theta, yarn_factor,
+      yarn_original_context, yarn_beta_fast, yarn_beta_slow,
+      0, blockIdx.y, threadIdx.x);
+}
+
+template <bool UsePageShift>
+__device__ __forceinline__ void gpt_oss_paged_attention_sink_token_f16(
     const __half* __restrict__ query,
     const __half* __restrict__ sinks,
     const int* __restrict__ control,
@@ -224,13 +332,18 @@ extern "C" __global__ void gpt_oss_paged_attention_sink_f16(
     const int query_heads,
     const int kv_heads,
     const int head_dim,
-    const int sliding_window) {
+    const int sliding_window,
+    const int token,
+    const int query_head,
+    const int lane) {
   const int page_count = control[0];
+  const unsigned page_mask = static_cast<unsigned>(page_elements) - 1U;
+  const bool power_of_two_page =
+      UsePageShift && page_elements > 0 &&
+      (static_cast<unsigned>(page_elements) & page_mask) == 0;
+  const int page_shift = power_of_two_page ? __ffs(page_elements) - 1 : -1;
   const int position_start = control[1];
   const int tokens = control[2];
-  const int token = blockIdx.x;
-  const int query_head = blockIdx.y;
-  const int lane = threadIdx.x;
   if (token >= tokens || query_head >= query_heads ||
       lane >= GPT_OSS_WARP_SIZE)
     return;
@@ -270,6 +383,163 @@ extern "C" __global__ void gpt_oss_paged_attention_sink_f16(
       if (dim < head_dim) {
         partial_dot +=
             query_values[chunk] *
+            gpt_oss_load_kv_paged(
+                page_pointers, page_count, page_elements, page_shift, page_mask,
+                key_position, 0, kv_head, dim, kv_heads, head_dim);
+      }
+    }
+    const float score = warp_reduce_sum(partial_dot) * attention_scale;
+    const float next_max = fmaxf(running_max, score);
+    const float previous_scale = expf(running_max - next_max);
+    const float value_scale = expf(score - next_max);
+    running_sum = running_sum * previous_scale + value_scale;
+#pragma unroll
+    for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+      const int dim = lane + chunk * GPT_OSS_WARP_SIZE;
+      if (dim < head_dim) {
+        const float value =
+            gpt_oss_load_kv_paged(
+                page_pointers, page_count, page_elements, page_shift, page_mask,
+                key_position, 1, kv_head, dim, kv_heads, head_dim);
+        accumulated[chunk] =
+            accumulated[chunk] * previous_scale + value * value_scale;
+      }
+    }
+    running_max = next_max;
+  }
+
+  const float inverse_sum = 1.0f / running_sum;
+#pragma unroll
+  for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+    const int dim = lane + chunk * GPT_OSS_WARP_SIZE;
+    if (dim < head_dim) {
+      output[((long long)token * query_heads + query_head) * head_dim + dim] =
+          __float2half(accumulated[chunk] * inverse_sum);
+    }
+  }
+}
+
+extern "C" __global__ void gpt_oss_paged_attention_sink_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ sinks,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int sliding_window) {
+  gpt_oss_paged_attention_sink_token_f16<false>(
+      query, sinks, control, page_pointers, output, page_elements,
+      query_heads, kv_heads, head_dim, sliding_window,
+      blockIdx.x, blockIdx.y, threadIdx.x);
+}
+
+// Preserve scalar/prefill arithmetic while reusing the address-only fast path.
+extern "C" __global__ void gpt_oss_paged_attention_sink_paged_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ sinks,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int sliding_window) {
+  gpt_oss_paged_attention_sink_token_f16<true>(
+      query, sinks, control, page_pointers, output, page_elements,
+      query_heads, kv_heads, head_dim, sliding_window,
+      blockIdx.x, blockIdx.y, threadIdx.x);
+}
+
+extern "C" __global__ void gpt_oss_paged_attention_sink_packed_decode_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ sinks,
+    const unsigned char* __restrict__ bindings,
+    const unsigned long long binding_stride_bytes,
+    const int participants,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int sliding_window) {
+  const int participant = blockIdx.x;
+  if (participant >= participants) return;
+  const int* control = reinterpret_cast<const int*>(
+      bindings + (unsigned long long)participant * binding_stride_bytes);
+  const unsigned long long* page_pointers =
+      reinterpret_cast<const unsigned long long*>(control + 4);
+  const long long row = (long long)participant * query_heads * head_dim;
+  gpt_oss_paged_attention_sink_token_f16<false>(
+      query + row, sinks, control, page_pointers, output + row, page_elements,
+      query_heads, kv_heads, head_dim, sliding_window,
+      0, blockIdx.y, threadIdx.x);
+}
+
+// Split a head's key range across warps, retaining the paged addressing and
+// per-key dot product. This changes the softmax summation order relative to the
+// scalar oracle above. Only the final merge includes the learned zero-valued
+// sink, so neither the numerator nor denominator duplicates it across warps.
+extern "C" __global__ void
+gpt_oss_paged_attention_sink_packed_decode_multiwarp_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ sinks,
+    const unsigned char* __restrict__ bindings,
+    const unsigned long long binding_stride_bytes,
+    const int participants,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int sliding_window) {
+  const int participant = blockIdx.x;
+  const int query_head = blockIdx.y;
+  if (participant >= participants || query_head >= query_heads ||
+      blockDim.x != GPT_OSS_DECODE_WARPS * GPT_OSS_WARP_SIZE)
+    return;
+
+  const int* control = reinterpret_cast<const int*>(
+      bindings + (unsigned long long)participant * binding_stride_bytes);
+  if (control[2] < 1) return;
+  const unsigned long long* page_pointers =
+      reinterpret_cast<const unsigned long long*>(control + 4);
+  const int page_count = control[0];
+  const int absolute_position = control[1];
+  const int first_key = sliding_window == 0
+                            ? 0
+                            : max(0, absolute_position - sliding_window + 1);
+  const int kv_head = query_head / (query_heads / kv_heads);
+  const int lane = threadIdx.x % GPT_OSS_WARP_SIZE;
+  const int warp = threadIdx.x / GPT_OSS_WARP_SIZE;
+  const long long row =
+      ((long long)participant * query_heads + query_head) * head_dim;
+  float query_values[GPT_OSS_HEAD_CHUNKS];
+  float accumulated[GPT_OSS_HEAD_CHUNKS];
+#pragma unroll
+  for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+    const int dim = lane + chunk * GPT_OSS_WARP_SIZE;
+    query_values[chunk] =
+        dim < head_dim ? __half2float(query[row + dim]) : 0.0f;
+    accumulated[chunk] = 0.0f;
+  }
+
+  float running_max = -CUDART_INF_F;
+  float running_sum = 0.0f;
+  const float attention_scale = rsqrtf((float)head_dim);
+  for (int key_position = first_key + warp;
+       key_position <= absolute_position;
+       key_position += GPT_OSS_DECODE_WARPS) {
+    float partial_dot = 0.0f;
+#pragma unroll
+    for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+      const int dim = lane + chunk * GPT_OSS_WARP_SIZE;
+      if (dim < head_dim) {
+        partial_dot +=
+            query_values[chunk] *
             gpt_oss_load_kv(page_pointers, page_count, page_elements,
                             key_position, 0, kv_head, dim, kv_heads, head_dim);
       }
@@ -293,15 +563,229 @@ extern "C" __global__ void gpt_oss_paged_attention_sink_f16(
     running_max = next_max;
   }
 
-  const float inverse_sum = 1.0f / running_sum;
+  __shared__ float partial_max[GPT_OSS_DECODE_WARPS];
+  __shared__ float partial_sum[GPT_OSS_DECODE_WARPS];
+  __shared__ float partial_output[GPT_OSS_DECODE_WARPS][GPT_OSS_HEAD_DIM];
+  if (lane == 0) {
+    partial_max[warp] = running_max;
+    partial_sum[warp] = running_sum;
+  }
+#pragma unroll
+  for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+    partial_output[warp][lane + chunk * GPT_OSS_WARP_SIZE] = accumulated[chunk];
+  }
+  __syncthreads();
+  if (warp != 0) return;
+
+  const float sink = __half2float(sinks[query_head]);
+  float maximum = sink;
+#pragma unroll
+  for (int partition = 0; partition < GPT_OSS_DECODE_WARPS; ++partition) {
+    if (partial_sum[partition] > 0.0f)
+      maximum = fmaxf(maximum, partial_max[partition]);
+  }
+  float denominator = expf(sink - maximum);
+#pragma unroll
+  for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+    accumulated[chunk] = 0.0f;
+  }
+#pragma unroll
+  for (int partition = 0; partition < GPT_OSS_DECODE_WARPS; ++partition) {
+    // Fewer keys than warps leave empty partitions. Skip them before the
+    // exponential rather than subtracting two negative infinities.
+    if (partial_sum[partition] > 0.0f) {
+      const float scale = expf(partial_max[partition] - maximum);
+      denominator += partial_sum[partition] * scale;
+#pragma unroll
+      for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+        accumulated[chunk] +=
+            partial_output[partition][lane + chunk * GPT_OSS_WARP_SIZE] * scale;
+      }
+    }
+  }
+  const float inverse_sum = 1.0f / denominator;
 #pragma unroll
   for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
     const int dim = lane + chunk * GPT_OSS_WARP_SIZE;
-    if (dim < head_dim) {
-      output[((long long)token * query_heads + query_head) * head_dim + dim] =
-          __float2half(accumulated[chunk] * inverse_sum);
+    if (dim < head_dim)
+      output[row + dim] = __float2half(accumulated[chunk] * inverse_sum);
+  }
+}
+
+// Shared decode/prefill core. Query rows remain independent and causal; four
+// warps split each row's keys with the same arithmetic as packed decode.
+__device__ __forceinline__ void
+gpt_oss_paged_attention_sink_multiwarp_token_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ sinks,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int sliding_window,
+    const int token,
+    const int query_head) {
+  if (token >= control[2] || query_head >= query_heads ||
+      blockDim.x != GPT_OSS_DECODE_WARPS * GPT_OSS_WARP_SIZE)
+    return;
+  const int page_count = control[0];
+  const unsigned page_mask = static_cast<unsigned>(page_elements) - 1U;
+  const bool power_of_two_page =
+      page_elements > 0 &&
+      (static_cast<unsigned>(page_elements) & page_mask) == 0;
+  const int page_shift = power_of_two_page ? __ffs(page_elements) - 1 : -1;
+  const int absolute_position = control[1] + token;
+  const int first_key = sliding_window == 0
+                            ? 0
+                            : max(0, absolute_position - sliding_window + 1);
+  const int kv_head = query_head / (query_heads / kv_heads);
+  const int lane = threadIdx.x % GPT_OSS_WARP_SIZE;
+  const int warp = threadIdx.x / GPT_OSS_WARP_SIZE;
+  const long long row =
+      ((long long)token * query_heads + query_head) * head_dim;
+  float query_values[GPT_OSS_HEAD_CHUNKS];
+  float accumulated[GPT_OSS_HEAD_CHUNKS];
+#pragma unroll
+  for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+    const int dim = lane + chunk * GPT_OSS_WARP_SIZE;
+    query_values[chunk] =
+        dim < head_dim ? __half2float(query[row + dim]) : 0.0f;
+    accumulated[chunk] = 0.0f;
+  }
+
+  float running_max = -CUDART_INF_F;
+  float running_sum = 0.0f;
+  const float attention_scale = rsqrtf((float)head_dim);
+  for (int key_position = first_key + warp;
+       key_position <= absolute_position;
+       key_position += GPT_OSS_DECODE_WARPS) {
+    float partial_dot = 0.0f;
+#pragma unroll
+    for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+      const int dim = lane + chunk * GPT_OSS_WARP_SIZE;
+      if (dim < head_dim) {
+        partial_dot +=
+            query_values[chunk] *
+            gpt_oss_load_kv_paged(
+                page_pointers, page_count, page_elements, page_shift, page_mask,
+                key_position, 0, kv_head, dim, kv_heads, head_dim);
+      }
+    }
+    const float score = warp_reduce_sum(partial_dot) * attention_scale;
+    const float next_max = fmaxf(running_max, score);
+    const float previous_scale = expf(running_max - next_max);
+    const float value_scale = expf(score - next_max);
+    running_sum = running_sum * previous_scale + value_scale;
+#pragma unroll
+    for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+      const int dim = lane + chunk * GPT_OSS_WARP_SIZE;
+      if (dim < head_dim) {
+        const float value =
+            gpt_oss_load_kv_paged(
+                page_pointers, page_count, page_elements, page_shift, page_mask,
+                key_position, 1, kv_head, dim, kv_heads, head_dim);
+        accumulated[chunk] =
+            accumulated[chunk] * previous_scale + value * value_scale;
+      }
+    }
+    running_max = next_max;
+  }
+
+  __shared__ float partial_max[GPT_OSS_DECODE_WARPS];
+  __shared__ float partial_sum[GPT_OSS_DECODE_WARPS];
+  __shared__ float partial_output[GPT_OSS_DECODE_WARPS][GPT_OSS_HEAD_DIM];
+  if (lane == 0) {
+    partial_max[warp] = running_max;
+    partial_sum[warp] = running_sum;
+  }
+#pragma unroll
+  for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+    partial_output[warp][lane + chunk * GPT_OSS_WARP_SIZE] = accumulated[chunk];
+  }
+  __syncthreads();
+  if (warp != 0) return;
+
+  const float sink = __half2float(sinks[query_head]);
+  float maximum = sink;
+#pragma unroll
+  for (int partition = 0; partition < GPT_OSS_DECODE_WARPS; ++partition) {
+    if (partial_sum[partition] > 0.0f)
+      maximum = fmaxf(maximum, partial_max[partition]);
+  }
+  float denominator = expf(sink - maximum);
+#pragma unroll
+  for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+    accumulated[chunk] = 0.0f;
+  }
+#pragma unroll
+  for (int partition = 0; partition < GPT_OSS_DECODE_WARPS; ++partition) {
+    // Fewer keys than warps leave empty partitions. Skip them before the
+    // exponential rather than subtracting two negative infinities.
+    if (partial_sum[partition] > 0.0f) {
+      const float scale = expf(partial_max[partition] - maximum);
+      denominator += partial_sum[partition] * scale;
+#pragma unroll
+      for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+        accumulated[chunk] +=
+            partial_output[partition][lane + chunk * GPT_OSS_WARP_SIZE] * scale;
+      }
     }
   }
+  const float inverse_sum = 1.0f / denominator;
+#pragma unroll
+  for (int chunk = 0; chunk < GPT_OSS_HEAD_CHUNKS; ++chunk) {
+    const int dim = lane + chunk * GPT_OSS_WARP_SIZE;
+    if (dim < head_dim)
+      output[row + dim] = __float2half(accumulated[chunk] * inverse_sum);
+  }
+}
+
+// Identical arithmetic to the original packed multiwarp entrypoint, with
+// power-of-two page shift/mask reused by every KV access.
+extern "C" __global__ void
+gpt_oss_paged_attention_sink_packed_decode_multiwarp_paged_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ sinks,
+    const unsigned char* __restrict__ bindings,
+    const unsigned long long binding_stride_bytes,
+    const int participants,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int sliding_window) {
+  const int participant = blockIdx.x;
+  if (participant >= participants) return;
+  const int* control = reinterpret_cast<const int*>(
+      bindings + (unsigned long long)participant * binding_stride_bytes);
+  const unsigned long long* page_pointers =
+      reinterpret_cast<const unsigned long long*>(control + 4);
+  const long long offset = (long long)participant * query_heads * head_dim;
+  gpt_oss_paged_attention_sink_multiwarp_token_f16(
+      query + offset, sinks, control, page_pointers, output + offset,
+      page_elements, query_heads, kv_heads, head_dim, sliding_window,
+      0, blockIdx.y);
+}
+
+extern "C" __global__ void gpt_oss_paged_attention_sink_multiwarp_paged_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ sinks,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int sliding_window) {
+  gpt_oss_paged_attention_sink_multiwarp_token_f16(
+      query, sinks, control, page_pointers, output,
+      page_elements, query_heads, kv_heads, head_dim, sliding_window,
+      blockIdx.x, blockIdx.y);
 }
 
 extern "C" __global__ void gpt_oss_residual_output_bias_f16(

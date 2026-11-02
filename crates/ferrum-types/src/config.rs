@@ -1671,11 +1671,16 @@ pub const DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH: usize =
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReusableExecutionPreparationMode {
-    /// Select on-demand preparation when declared by the runtime, otherwise startup.
+    /// Prepare before readiness and retain bounded, measured-cost learning when
+    /// supported; otherwise prepare the startup-sealed catalog. Explicit modes
+    /// retain their after-warmup capture behavior.
     #[default]
     Auto,
     /// Prepare and validate the configured matrix before accepting requests.
     Startup,
+    /// Prepare the resolved shapes before readiness, then learn new shapes
+    /// within the same bounded catalog while serving.
+    StartupAndOnDemand,
     /// Warm up with ordinary requests, then capture recurring shapes within the budget.
     OnDemand,
 }
@@ -1685,16 +1690,17 @@ impl ReusableExecutionPreparationMode {
         match self {
             Self::Auto => "auto",
             Self::Startup => "startup",
+            Self::StartupAndOnDemand => "startup_and_on_demand",
             Self::OnDemand => "on_demand",
         }
     }
 
     pub fn resolve(self, on_demand_supported: bool) -> Result<Self, String> {
         match (self, on_demand_supported) {
-            (Self::Auto, true) => Ok(Self::OnDemand),
+            (Self::Auto, true) => Ok(Self::StartupAndOnDemand),
             (Self::Auto, false) => Ok(Self::Startup),
-            (Self::OnDemand, false) => Err(
-                "runtime.reusable_execution_preparation=on_demand requires a runtime declaring on-demand reusable execution support".to_owned(),
+            (Self::OnDemand | Self::StartupAndOnDemand, false) => Err(
+                "on-demand reusable execution preparation requires a runtime declaring on-demand reusable execution support".to_owned(),
             ),
             (mode, _) => Ok(mode),
         }
@@ -1708,9 +1714,10 @@ impl std::str::FromStr for ReusableExecutionPreparationMode {
         match value.trim() {
             "auto" => Ok(Self::Auto),
             "startup" => Ok(Self::Startup),
+            "startup_and_on_demand" => Ok(Self::StartupAndOnDemand),
             "on_demand" => Ok(Self::OnDemand),
             _ => {
-                Err("reusable execution preparation must be auto, startup, or on_demand".to_owned())
+                Err("reusable execution preparation must be auto, startup, startup_and_on_demand, or on_demand".to_owned())
             }
         }
     }

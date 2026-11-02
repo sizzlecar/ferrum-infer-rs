@@ -130,6 +130,7 @@ pub use registry::{
     OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
     ReusableBindingResources, ReusableExecutionTopology, ReusableExecutionTopologyRequest,
     ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress,
+    SegmentBindingDeclarationSupport,
 };
 pub use resolved_value::{
     ProviderStorageBindingRequirement, ResolvedStorageComponent, ResolvedValueBinding,

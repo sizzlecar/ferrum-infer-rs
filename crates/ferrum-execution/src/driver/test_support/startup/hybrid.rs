@@ -1,0 +1,193 @@
+//! Before-readiness preparation must remain useful after synthetic owners end.
+
+use super::*;
+use crate::model_executor::TokenSelectionMask;
+use ferrum_runtime::ReusableExecutionOnDemandAdmission;
+
+async fn admit_product<R: DeviceRuntime>(
+    executor: &ProgramExecutor<R>,
+    tokens: &[TokenId],
+    maximum_tokens: usize,
+) -> ExecutionFrontier {
+    let request = RequestId::new();
+    let admission = ExecutionAdmission {
+        context: ExecutorPrefillAdmission::for_product_request(
+            &request,
+            tokens,
+            maximum_tokens,
+            tokens.len(),
+            0,
+        )
+        .unwrap(),
+        adapter: None,
+    };
+    loop {
+        match executor.admit_tokens(admission).await.unwrap() {
+            TokenAdmissionOutcome::Admitted(frontier) => return frontier,
+            TokenAdmissionOutcome::MaintenanceDeferred(_) => {
+                assert!(matches!(
+                    executor.maintain_prefill_backing(&request).unwrap(),
+                    ExecutorPrefillMaintenanceOutcome::Maintained { .. }
+                        | ExecutorPrefillMaintenanceOutcome::RetryAdmission { .. }
+                ));
+            }
+            other => panic!("fresh product admission failed: {other:?}"),
+        }
+    }
+}
+
+async fn select_only<R: DeviceRuntime>(
+    executor: &ProgramExecutor<R>,
+    frontier: &ExecutionFrontier,
+    work: TokenWork,
+    allowed: TokenId,
+) -> ExecutionFrontier {
+    let mut mask = vec![0; executor.info.vocab_size];
+    mask[allowed.get() as usize] = 1;
+    let policy = LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(TokenSelectionMask::new(mask)),
+        repetition_penalty: None,
+    };
+    let input = ExecutionWork::new(frontier, work, &policy).unwrap();
+    let mut completions = sampling::completed(
+        executor
+            .execute_tokens(std::slice::from_ref(&input))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(completions.len(), 1);
+    let completion = completions.pop().unwrap();
+    completion
+        .validate_for(0, &input, executor.info.vocab_size)
+        .unwrap();
+    assert_eq!(
+        sampling::sampling(&completion),
+        &ExecutorSamplingOutput::GreedyToken(allowed),
+        "replayed work must consume this request's current mask"
+    );
+    completion.next_frontier().clone()
+}
+
+async fn prefill<R: DeviceRuntime>(
+    executor: &ProgramExecutor<R>,
+    frontier: &ExecutionFrontier,
+    chunk: PrefillChunk,
+) -> ExecutionFrontier {
+    // The public product contract always returns FullLogits for final prefill;
+    // device-selected Greedy tokens are a decode-only readback optimization.
+    let completion =
+        token_execution::execute_one(executor, frontier, TokenWork::Prefill(chunk)).await;
+    let policy = LogitsReturnPolicy::FullLogits;
+    let input = ExecutionWork::new(frontier, TokenWork::Prefill(chunk), &policy).unwrap();
+    completion
+        .validate_for(0, &input, executor.info.vocab_size)
+        .unwrap();
+    let ExecutorSamplingOutput::FullLogits(logits) = sampling::sampling(&completion) else {
+        panic!("final prefill must preserve the full-logits contract");
+    };
+    assert_eq!(logits.len(), executor.info.vocab_size);
+    assert!(logits.iter().all(|value| value.is_finite()));
+    completion.next_frontier().clone()
+}
+
+pub async fn assert_startup_on_demand_product_reuse<R: DeviceRuntime>(
+    executor: &ProgramExecutor<R>,
+    expected_admission: ReusableExecutionOnDemandAdmission,
+) {
+    executor.attach_execution_event_sink(Arc::new(StartupEvents(
+        Mutex::new(Vec::new()),
+        DeviceTimingMode::Replay,
+    )));
+    executor.prepare_startup().await.unwrap();
+    let plan = executor.reusable_execution_startup_plan.as_ref().unwrap();
+    assert!(plan.program_policy.prepares_before_readiness());
+    assert_eq!(
+        plan.program_policy.on_demand_admission(),
+        expected_admission
+    );
+    assert_eq!(
+        plan.program_policy.catalog_lifetime(),
+        ReusableExecutionCatalogLifetime::OnDemandBounded
+    );
+    let inventory = executor.lane.reusable_executable_preparation().unwrap();
+    assert!(inventory.resident_executables() > 0);
+    assert_eq!(
+        inventory.state(),
+        DeviceReusableExecutionPreparationState::Ready
+    );
+    settle(executor).await;
+    assert_eq!(executor.metrics.submitted_waves.load(Ordering::Relaxed), 0);
+
+    // A new Product owner must reuse startup graphs. Final prefill keeps its
+    // FullLogits contract; subsequent decode uses Greedy with changing masks.
+    let mut frontier = admit_product(
+        executor,
+        &[TokenId::new(0)],
+        plan.maximum_decode_sequence_tokens,
+    )
+    .await;
+    let replay = &executor.metrics.wave_timing.reusable_execution;
+    let before = replay.replayed_segments.load(Ordering::Relaxed);
+    frontier = prefill(executor, &frontier, PrefillChunk::new(0, 1, 1).unwrap()).await;
+    assert!(replay.replayed_segments.load(Ordering::Relaxed) > before);
+    for allowed in [TokenId::new(2), TokenId::new(3)] {
+        let before = replay.replayed_segments.load(Ordering::Relaxed);
+        frontier = select_only(
+            executor,
+            &frontier,
+            TokenWork::Decode {
+                token: TokenId::new(0),
+                position: frontier.consumed_tokens(),
+            },
+            allowed,
+        )
+        .await;
+        assert!(replay.replayed_segments.load(Ordering::Relaxed) > before);
+    }
+    sampling::close(executor, frontier.sequence()).await;
+    settle(executor).await;
+    assert!(reusable_executable_inventory_matches(
+        inventory,
+        executor.lane.reusable_executable_preparation().unwrap()
+    ));
+
+    // Unseeded work must remain valid with fresh owners and the same budget.
+    // The explicit AfterWarmup policy still promises capture after warmup;
+    // Auto may defer it when the measured saving does not justify capture.
+    // Cost-credit transitions use deterministic samples in backend tests,
+    // not a fixed repetition count or a wall-clock threshold on this GPU.
+    let maximum_chunk = plan
+        .prefill_chunks()
+        .into_iter()
+        .map(PrefillChunk::tokens_to_process)
+        .max()
+        .unwrap();
+    let chunk = (2..=maximum_chunk)
+        .map(|tokens| PrefillChunk::new(0, tokens, tokens).unwrap())
+        .find(|chunk| {
+            !plan
+                .descriptors
+                .contains(&VNextReusableExecutionDescriptor::prefill(*chunk))
+        })
+        .expect("fixture needs an admitted shape outside the startup seeds");
+    let tokens = vec![TokenId::new(0); chunk.total_prompt_tokens()];
+    for phase in ["first", "recurrence", "subsequent"] {
+        let initial = admit_product(executor, &tokens, plan.maximum_decode_sequence_tokens).await;
+        let before = replay.replayed_segments.load(Ordering::Relaxed);
+        let done = prefill(executor, &initial, chunk).await;
+        if phase == "subsequent"
+            && expected_admission == ReusableExecutionOnDemandAdmission::AfterWarmup
+        {
+            assert!(replay.replayed_segments.load(Ordering::Relaxed) > before);
+        }
+        sampling::close(executor, done.sequence()).await;
+        settle(executor).await;
+    }
+    let after = executor.lane.reusable_executable_preparation().unwrap();
+    if expected_admission == ReusableExecutionOnDemandAdmission::AfterWarmup {
+        assert!(after.captured_executables() > inventory.captured_executables());
+    }
+    assert_eq!(after.maximum_executables(), inventory.maximum_executables());
+    assert!(after.resident_executables() <= after.maximum_executables());
+    assert!(executor.on_demand_reusable_execution_enabled());
+}

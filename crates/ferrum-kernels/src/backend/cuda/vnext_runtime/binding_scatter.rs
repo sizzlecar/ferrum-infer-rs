@@ -1,11 +1,14 @@
 //! Compact transport after fresh Core and typed-arena validation. Scratch is
 //! runtime-owned, never a forged Core allocation or a reusable compute resource.
 
-use super::{CudaDeviceRuntimeError, CudaProgramBindingTransfer};
+use super::{CudaDeviceRuntimeError, CudaProgramBindingTransfer, CudaSubmissionStageTimer};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
+use ferrum_runtime::{
+    DeviceSubmissionStage, DeviceSubmissionTimingSink, DisabledDeviceSubmissionTimingSink,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -149,17 +152,24 @@ impl BindingScatter {
                 "encoded binding packet has no payload",
             ));
         }
-        self.prepare_storage(allocation_stream, bytes, count, &self.function)
+        self.prepare_storage(
+            allocation_stream,
+            bytes,
+            count,
+            &self.function,
+            &DisabledDeviceSubmissionTimingSink,
+        )
     }
 
     /// Independent destinations use their own descriptor ABI; they are never
     /// treated as offsets in an invented common arena. Budget is shared with
     /// program-binding packets and remains charged through the same fence.
-    pub(super) fn prepare_addressed(
+    pub(super) fn prepare_addressed<S: DeviceSubmissionTimingSink>(
         &self,
         allocation_stream: &Arc<CudaStream>,
         bytes: usize,
         count: u32,
+        timing_sink: &S,
     ) -> Result<Option<ScatterOwner>> {
         if count == 0
             || (count as usize)
@@ -170,7 +180,13 @@ impl BindingScatter {
                 "addressed input packet has no payload",
             ));
         }
-        self.prepare_storage(allocation_stream, bytes, count, &self.addressed_function)
+        self.prepare_storage(
+            allocation_stream,
+            bytes,
+            count,
+            &self.addressed_function,
+            timing_sink,
+        )
     }
 
     pub(super) fn packet_limit(&self) -> usize {
@@ -187,19 +203,26 @@ impl BindingScatter {
         self.budget.reserve(self.budget.limits.packet_bytes)
     }
 
-    fn prepare_storage(
+    fn prepare_storage<S: DeviceSubmissionTimingSink>(
         &self,
         allocation_stream: &Arc<CudaStream>,
         bytes: usize,
         count: u32,
         function: &CudaFunction,
+        timing_sink: &S,
     ) -> Result<Option<ScatterOwner>> {
         let Some(reservation) = self.budget.reserve(bytes) else {
             return Ok(None);
         };
         // No H2D or destination writes occur during preparation. Allocation
         // failure can still safely choose the original sparse-copy prelude.
-        let device = match unsafe { allocation_stream.alloc::<u8>(bytes) } {
+        let allocation_stage = CudaSubmissionStageTimer::start(
+            timing_sink,
+            DeviceSubmissionStage::InputPacketAllocate,
+        );
+        let allocated = unsafe { allocation_stream.alloc::<u8>(bytes) };
+        drop(allocation_stage);
+        let device = match allocated {
             Ok(device) => device,
             Err(error) if error.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY => {
                 return Ok(None);
@@ -220,7 +243,13 @@ impl BindingScatter {
         };
         // Event tracking is disabled by this runtime. Establish allocation
         // readiness explicitly before another stream can use its raw address.
-        if let Err(error) = allocation_stream.synchronize() {
+        let sync_stage = CudaSubmissionStageTimer::start(
+            timing_sink,
+            DeviceSubmissionStage::InputPacketAllocationSync,
+        );
+        let synchronized = allocation_stream.synchronize();
+        drop(sync_stage);
+        if let Err(error) = synchronized {
             // Unknown allocation completion is not a healthy fallback. Keep
             // both its allocation and budget charged instead of freeing it.
             std::mem::forget(owner);
