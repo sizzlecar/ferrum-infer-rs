@@ -4,7 +4,7 @@
   </a>
 </p>
 
-[中文](README_zh.md) · [Releases](https://github.com/sizzlecar/ferrum-infer-rs/releases) · [Performance](docs/performance-rtx5090-popular-models-20261101.md) · [GPT-OSS update](docs/performance-rtx5090-gpt-oss-20261102.md) · [MIT](LICENSE)
+[中文](README_zh.md) · [Releases](https://github.com/sizzlecar/ferrum-infer-rs/releases) · [Performance](#performance) · [MIT](LICENSE)
 
 # Ferrum
 
@@ -26,7 +26,7 @@ $$
 
 - $W$: fixed requests and arrival schedule; $T>0$: fixed window and common cutoff. $N_{\mathrm{out}}$: valid output tokens from requests successfully completed by that cutoff.
 - $L_k$: latency samples; $Q_{p_k}$: quantile; $S_k$: SLO limit. TTFT includes queueing; missing latency evidence does not establish compliance.
-- $C$: fraction of $W$ successfully completed by the cutoff; rejected, failed, timed-out and unfinished requests remain in the denominator. Declare $p_k$, $S_k$ and minimum completion rate $0<\rho\le1$ before measuring. [Sampling rules](docs/performance-popular-models-p0.zh.md).
+- $C$: fraction of $W$ successfully completed by the cutoff; rejected, failed, timed-out and unfinished requests remain in the denominator. Declare $p_k$, $S_k$ and minimum completion rate $0<\rho\le1$ before measuring. [Sampling rules](docs/performance-evaluation.md).
 
 ## Install
 
@@ -101,11 +101,31 @@ Support depends on the architecture, format and backend combination; text suppor
 
 Embedding, ASR, TTS and legacy execution APIs are retired. See [migration notes](https://github.com/sizzlecar/ferrum-infer-rs/pull/441).
 
+## Performance
+
+**RTX 5090 · GPT-OSS 20B · MXFP4:** the optimization shipped in **0.18.4** reaches **108.7–108.9% of vLLM throughput at C8** and **96.8–96.9% at C16**, meeting the predefined latency SLOs. Measurements use its R11 candidate, not a fresh benchmark of the final release archive.
+
+Same GPU, source weights and pinned ShareGPT samples; natural EOS, at most 512 output tokens. Ferrum uses F16 outer activations/KV and BF16 experts; vLLM uses BF16 activations/KV. Latencies are **P50 / P99, milliseconds**; ITL measures non-empty visible SSE text events.
+
+| Concurrency | Engine / fresh process | Output tok/s | TTFT | TPOT | SSE ITL |
+|---:|---|---:|---:|---:|---:|
+| 8 | Ferrum R11 #1 | 890.93 | 155.70 / 227.27 | 8.17 / 8.62 | 8.00 / 14.38 |
+| 8 | Ferrum R11 #2 | 892.30 | 157.81 / 226.31 | 8.21 / 8.61 | 7.95 / 13.02 |
+| 8 | vLLM 0.31.0 | 819.77 | 94.75 / 387.13 | 8.71 / 8.96 | 8.16 / 33.00 |
+| 16 | Ferrum R11 #1 | 1383.53 | 346.93 / 462.27 | 10.00 / 10.29 | 9.88 / 11.73 |
+| 16 | Ferrum R11 #2 | 1385.86 | 340.35 / 444.62 | 10.10 / 10.39 | 9.89 / 12.27 |
+| 16 | vLLM 0.31.0 | 1429.75 | 174.08 / 183.29 | 10.14 / 10.38 | 9.47 / 34.24 |
+
+All rows meet P99 TTFT ≤2000 ms, TPOT ≤50 ms and SSE ITL ≤100 ms, with 32/32 successful requests and zero errors/rejections per cell. Ferrum ran two fresh processes, one C8→C16 sweep each (128/128 requests); the vLLM baseline was retained. C16 first-text latency remains higher than vLLM.
+
+Whole-sweep peak device VRAM / window process RSS: Ferrum #1 **15.978 / 1.177 GiB**, #2 **16.165 / 1.192 GiB**; vLLM **29.937 / 3.145 GiB**. These are not per-concurrency peaks; vLLM preallocates KV, and its RSS covers EngineCore only, so these figures do not establish a memory-efficiency ratio.
+
+[Workload, commands, output validity and full evidence](docs/performance-rtx5090-gpt-oss-20261102.md). These measurements cover this model and configuration only.
+
 ## Documentation
 
 - [API compatibility](docs/openai-api-compatibility.md) · [Agent serving](docs/agent-serving.md)
 - [Numerical profiles](docs/numerical-execution.zh.md) · [Caching](docs/cache-product.md)
-- Historical measurements: [text, v0.13 candidate](docs/performance-popular-models-p0.zh.md) · [images, v0.15 candidate](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.15.0#qwen-image-performance). Each records its workload, latency and memory; results are specific to those versions and configurations.
 
 ## Project
 

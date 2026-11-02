@@ -4,7 +4,7 @@
   </a>
 </p>
 
-[English](README.md) · [发布版本](https://github.com/sizzlecar/ferrum-infer-rs/releases) · [性能对比](docs/performance-rtx5090-popular-models-20261101.zh.md) · [GPT-OSS 更新](docs/performance-rtx5090-gpt-oss-20261102.zh.md) · [MIT](LICENSE)
+[English](README.md) · [发布版本](https://github.com/sizzlecar/ferrum-infer-rs/releases) · [性能对比](#性能) · [MIT](LICENSE)
 
 # Ferrum
 
@@ -101,11 +101,31 @@ CLI 示例、Metal 配置和 CUDA LoRA 见[图像使用指南](docs/image-genera
 
 Embedding、ASR、TTS 入口和旧执行 API 已退役，见[迁移说明](https://github.com/sizzlecar/ferrum-infer-rs/pull/441)。
 
+## 性能
+
+**RTX 5090 · GPT-OSS 20B · MXFP4：** **0.18.4** 合入的优化在 C8 达到 vLLM 吞吐的 **108.7–108.9%**，C16 达到 **96.8–96.9%**，均满足预设延迟 SLO。数据来自该优化的 R11 候选版本，未对最终发布包重新压测。
+
+同 GPU、源权重与固定 ShareGPT 样本；自然 EOS，最多输出 512 token。Ferrum 使用 F16 外层激活/KV、BF16 专家路径，vLLM 使用 BF16 激活/KV。延迟为 **P50 / P99，单位毫秒**；ITL 按客户端非空可见 SSE 文本事件计算。
+
+| 并发 | 引擎 / 独立进程 | 输出 tok/s | TTFT | TPOT | SSE ITL |
+|---:|---|---:|---:|---:|---:|
+| 8 | Ferrum R11 #1 | 890.93 | 155.70 / 227.27 | 8.17 / 8.62 | 8.00 / 14.38 |
+| 8 | Ferrum R11 #2 | 892.30 | 157.81 / 226.31 | 8.21 / 8.61 | 7.95 / 13.02 |
+| 8 | vLLM 0.31.0 | 819.77 | 94.75 / 387.13 | 8.71 / 8.96 | 8.16 / 33.00 |
+| 16 | Ferrum R11 #1 | 1383.53 | 346.93 / 462.27 | 10.00 / 10.29 | 9.88 / 11.73 |
+| 16 | Ferrum R11 #2 | 1385.86 | 340.35 / 444.62 | 10.10 / 10.39 | 9.89 / 12.27 |
+| 16 | vLLM 0.31.0 | 1429.75 | 174.08 / 183.29 | 10.14 / 10.38 | 9.47 / 34.24 |
+
+所有行均满足 P99 TTFT ≤2000 ms、TPOT ≤50 ms、SSE ITL ≤100 ms；每格成功 32/32，错误和拒绝均为 0。Ferrum 用两个独立进程各跑一轮 C8→C16，共成功 128/128；vLLM 复用既有基线。C16 首字延迟仍高于 vLLM。
+
+整轮峰值设备显存 / 窗口进程 RSS：Ferrum #1 为 **15.978 / 1.177 GiB**，#2 为 **16.165 / 1.192 GiB**；vLLM 为 **29.937 / 3.145 GiB**。不是逐并发峰值；vLLM 预分配 KV，且其 RSS 仅统计 EngineCore，不能据此推导内存效率倍数。
+
+[负载、命令、输出有效性与完整证据](docs/performance-rtx5090-gpt-oss-20261102.zh.md)。结论仅覆盖该模型与配置。
+
 ## 文档
 
 - [API 兼容说明](docs/openai-api-compatibility.md) · [Agent 服务](docs/agent-serving.md)
 - [数值执行策略](docs/numerical-execution.zh.md) · [缓存说明](docs/cache-product.md)
-- 历史实测：[文本，v0.13 候选](docs/performance-popular-models-p0.zh.md) · [图像，v0.15 候选](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.15.0#qwen-image-performance)。包含负载、延迟和内存数据，仅代表对应版本与配置。
 
 ## 项目
 
