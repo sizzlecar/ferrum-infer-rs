@@ -7,7 +7,7 @@ use super::*;
 
 const MAXIMUM_WAVES: usize = 4_096;
 const MAXIMUM_ATTEMPTS: usize = MAX_DEFINITELY_NOT_SUBMITTED_RETRIES as usize + 1;
-const GAP_REASONS: [DeviceReusableExecutionProgramGapReason; 11] = [
+const GAP_REASONS: [DeviceReusableExecutionProgramGapReason; 12] = [
     DeviceReusableExecutionProgramGapReason::MissingComputeCommand,
     DeviceReusableExecutionProgramGapReason::ProviderReplayKeyMissing,
     DeviceReusableExecutionProgramGapReason::ReusableAddressScopeMissing,
@@ -19,6 +19,7 @@ const GAP_REASONS: [DeviceReusableExecutionProgramGapReason; 11] = [
     DeviceReusableExecutionProgramGapReason::CapacityDeferred,
     DeviceReusableExecutionProgramGapReason::Evicted,
     DeviceReusableExecutionProgramGapReason::OutsidePreparation,
+    DeviceReusableExecutionProgramGapReason::AmortizationDeferred,
 ];
 
 fn gap_index(reason: DeviceReusableExecutionProgramGapReason) -> usize {
@@ -34,6 +35,7 @@ fn gap_index(reason: DeviceReusableExecutionProgramGapReason) -> usize {
         DeviceReusableExecutionProgramGapReason::CapacityDeferred => 8,
         DeviceReusableExecutionProgramGapReason::Evicted => 9,
         DeviceReusableExecutionProgramGapReason::OutsidePreparation => 10,
+        DeviceReusableExecutionProgramGapReason::AmortizationDeferred => 11,
     }
 }
 

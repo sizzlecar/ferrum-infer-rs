@@ -35,7 +35,8 @@ use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
     EncodedRetainedPlanDependency, ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope,
     IdentifiedFailure, PlanHash, RetainedPlanDependencyIdentity, ReusableExecutionBucketId,
-    ReusableExecutionCatalogLifetime, StaticWeightTransformPlan, VNextError,
+    ReusableExecutionCatalogLifetime, ReusableExecutionOnDemandAdmission,
+    ReusableExecutionProgramPreparation, StaticWeightTransformPlan, VNextError,
     WeightComponentPayload, WeightComponentSegments, WeightComponentSpec,
 };
 
@@ -958,6 +959,7 @@ pub struct DeviceReusableExecutionObservation {
     cached_rejected_segments: u64,
     capture_rejected_segments: u64,
     warmup_required_segments: u64,
+    amortization_deferred_segments: u64,
     quiescence_deferred_segments: u64,
     capacity_deferred_segments: u64,
     outside_preparation_segments: u64,
@@ -998,6 +1000,10 @@ impl DeviceReusableExecutionObservation {
 
     pub fn observe_warmup_required_segment(&mut self) {
         self.warmup_required_segments = self.warmup_required_segments.saturating_add(1);
+    }
+
+    pub fn observe_amortization_deferred_segment(&mut self) {
+        self.amortization_deferred_segments = self.amortization_deferred_segments.saturating_add(1);
     }
 
     pub fn observe_capacity_deferred_segment(&mut self) {
@@ -1055,6 +1061,10 @@ impl DeviceReusableExecutionObservation {
         self.warmup_required_segments
     }
 
+    pub const fn amortization_deferred_segments(self) -> u64 {
+        self.amortization_deferred_segments
+    }
+
     pub const fn capacity_deferred_segments(self) -> u64 {
         self.capacity_deferred_segments
     }
@@ -1099,6 +1109,9 @@ pub struct DeviceReusableExecutionPlan {
     maximum_executables: usize,
     #[serde(skip_serializing_if = "ReusableExecutionCatalogLifetime::is_startup_sealed")]
     catalog_lifetime: ReusableExecutionCatalogLifetime,
+    preparation: ReusableExecutionProgramPreparation,
+    #[serde(skip_serializing_if = "ReusableExecutionOnDemandAdmission::is_after_warmup")]
+    on_demand_admission: ReusableExecutionOnDemandAdmission,
 }
 
 impl DeviceReusableExecutionPlan {
@@ -1111,13 +1124,45 @@ impl DeviceReusableExecutionPlan {
         Ok(Self {
             maximum_executables,
             catalog_lifetime: ReusableExecutionCatalogLifetime::StartupSealed,
+            preparation: ReusableExecutionProgramPreparation::BeforeReadiness,
+            on_demand_admission: ReusableExecutionOnDemandAdmission::AfterWarmup,
         })
     }
 
     pub fn on_demand(maximum_executables: usize) -> Result<Self, super::VNextError> {
         let mut plan = Self::new(maximum_executables)?;
         plan.catalog_lifetime = ReusableExecutionCatalogLifetime::OnDemandBounded;
+        plan.preparation = ReusableExecutionProgramPreparation::OnDemand;
         Ok(plan)
+    }
+
+    /// Prepare real startup work before readiness, then retain bounded learning.
+    pub fn startup_and_on_demand(maximum_executables: usize) -> Result<Self, super::VNextError> {
+        let mut plan = Self::on_demand(maximum_executables)?;
+        plan.preparation = ReusableExecutionProgramPreparation::BeforeReadiness;
+        Ok(plan)
+    }
+
+    pub fn with_on_demand_admission(
+        mut self,
+        admission: ReusableExecutionOnDemandAdmission,
+    ) -> Result<Self, super::VNextError> {
+        if self.catalog_lifetime.is_startup_sealed() && !admission.is_after_warmup() {
+            return Err(super::VNextError::InvalidExecutionPlan {
+                reason: "on-demand capture admission requires a bounded on-demand catalog"
+                    .to_owned(),
+            });
+        }
+        self.on_demand_admission = admission;
+        Ok(self)
+    }
+
+    pub const fn preparation(self) -> ReusableExecutionProgramPreparation {
+        self.preparation
+    }
+
+    pub const fn on_demand_admission(self) -> ReusableExecutionOnDemandAdmission {
+        self.on_demand_admission
     }
 
     pub const fn catalog_lifetime(self) -> ReusableExecutionCatalogLifetime {
@@ -1395,6 +1440,7 @@ pub enum DeviceReusableExecutionProgramGapReason {
     CaptureRejected,
     CachedCaptureRejected,
     WarmupRequired,
+    AmortizationDeferred,
     QuiescenceDeferred,
     CapacityDeferred,
     Evicted,
@@ -1411,6 +1457,7 @@ impl DeviceReusableExecutionProgramGapReason {
             Self::CaptureRejected => "capture_rejected",
             Self::CachedCaptureRejected => "cached_capture_rejected",
             Self::WarmupRequired => "warmup_required",
+            Self::AmortizationDeferred => "amortization_deferred",
             Self::QuiescenceDeferred => "quiescence_deferred",
             Self::CapacityDeferred => "capacity_deferred",
             Self::Evicted => "evicted",
@@ -1740,7 +1787,8 @@ pub enum DeviceReusableExecutionPreparationState {
 
 /// Backend receipt for the configured preparation lifecycle.
 ///
-/// Startup preparation transitions through `Preparing` to sealed `Ready`.
+/// Startup preparation transitions through `Preparing` to `Ready`; the declared
+/// catalog lifetime determines whether later capture remains possible.
 /// On-demand preparation starts `Ready` with an empty bounded cache and may
 /// prepare recurring real work after its warmup completes. The device plan
 /// declares which lifecycle applies; readiness alone does not authorize capture.
@@ -3993,9 +4041,9 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         Ok(DeviceReusableExecutionPreparation::unsupported())
     }
 
-    /// Permanently closes the preparation window for this stream. A sealed
-    /// stream may replay or fall back to eager execution but cannot capture on
-    /// a later product request.
+    /// Completes the before-readiness preparation scope. StartupSealed plans
+    /// permanently close capture; bounded plans retain their declared live
+    /// admission policy. Readiness does not relax warmup or resource authority.
     fn seal_reusable_executables(
         &self,
         _stream: &mut Self::Stream,
@@ -4013,7 +4061,9 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         Ok(DeviceReusableExecutionPreparation::unsupported())
     }
 
-    /// Returns the immutable direct-submit catalog after preparation is sealed.
+    /// Returns a quiescent immutable direct-submit catalog snapshot. A bounded
+    /// catalog may publish during before-readiness preparation as well as live
+    /// operation; a startup-sealed catalog publishes after preparation ends.
     ///
     /// Backends without direct reusable execution return an empty catalog.
     fn reusable_execution_catalog(

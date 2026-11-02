@@ -450,6 +450,30 @@ pub enum ReusableExecutionProgramPreparation {
     BeforeReadiness,
 }
 
+/// Admission of optional captures after readiness. Safety warmup, exact replay
+/// identity and executable capacity remain mandatory under either policy.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReusableExecutionOnDemandAdmission {
+    #[default]
+    AfterWarmup,
+    /// Recent completed eager submissions earn their measured host-submit time
+    /// minus the stream's largest observed replay cost. The first eager sample
+    /// is safety warmup and earns no credit. Capture requires enough credit for
+    /// the largest observed graph preparation cost; missing cost data defers it.
+    /// Evidence is bounded by executable capacity and ages with eager/replay
+    /// submissions over that capacity-derived horizon. Startup preparation may
+    /// collect costs without this live gate. This estimates future reuse; it
+    /// does not bound an unseen graph's first driver instantiation latency.
+    AmortizedHostCostV1,
+}
+
+impl ReusableExecutionOnDemandAdmission {
+    pub const fn is_after_warmup(&self) -> bool {
+        matches!(self, Self::AfterWarmup)
+    }
+}
+
 /// Fully resolved, fingerprinted logical capture contract.
 ///
 /// Physical catalog receipts remain authoritative for what was actually made
@@ -464,6 +488,8 @@ pub struct ReusableExecutionProgramPolicy {
     catalog_miss_policy: ReusableExecutionCatalogMissPolicy,
     catalog_lifetime: ReusableExecutionCatalogLifetime,
     preparation: ReusableExecutionProgramPreparation,
+    #[serde(skip_serializing_if = "ReusableExecutionOnDemandAdmission::is_after_warmup")]
+    on_demand_admission: ReusableExecutionOnDemandAdmission,
     warmup_passes: u32,
     capture_passes: u32,
     replay_validation_passes: u32,
@@ -478,6 +504,8 @@ struct ReusableExecutionProgramPolicyWire {
     catalog_lifetime: ReusableExecutionCatalogLifetime,
     #[serde(default)]
     preparation: Option<ReusableExecutionProgramPreparation>,
+    #[serde(default)]
+    on_demand_admission: ReusableExecutionOnDemandAdmission,
     warmup_passes: u32,
     capture_passes: u32,
     replay_validation_passes: u32,
@@ -485,6 +513,15 @@ struct ReusableExecutionProgramPolicyWire {
 }
 
 impl ReusableExecutionProgramPolicy {
+    pub fn with_on_demand_admission(
+        mut self,
+        admission: ReusableExecutionOnDemandAdmission,
+    ) -> Result<Self, VNextError> {
+        self.on_demand_admission = admission;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Keep the same exact shape and workspace contract without executing its
     /// cases before readiness. Warmup and capture consume successive real
     /// submissions; validation must never replay a user's state transition.
@@ -549,6 +586,7 @@ impl ReusableExecutionProgramPolicy {
             catalog_miss_policy: ReusableExecutionCatalogMissPolicy::EagerFallback,
             catalog_lifetime: ReusableExecutionCatalogLifetime::StartupSealed,
             preparation: ReusableExecutionProgramPreparation::BeforeReadiness,
+            on_demand_admission: ReusableExecutionOnDemandAdmission::AfterWarmup,
             warmup_passes,
             capture_passes,
             replay_validation_passes,
@@ -563,6 +601,8 @@ impl ReusableExecutionProgramPolicy {
             || self.catalog_miss_policy != ReusableExecutionCatalogMissPolicy::EagerFallback
             || self.warmup_passes == 0
             || self.capture_passes == 0
+            || (self.catalog_lifetime.is_startup_sealed()
+                && !self.on_demand_admission.is_after_warmup())
             || match self.preparation {
                 ReusableExecutionProgramPreparation::BeforeReadiness => {
                     self.replay_validation_passes == 0
@@ -638,6 +678,10 @@ impl ReusableExecutionProgramPolicy {
         self.preparation
     }
 
+    pub const fn on_demand_admission(&self) -> ReusableExecutionOnDemandAdmission {
+        self.on_demand_admission
+    }
+
     pub const fn prepares_before_readiness(&self) -> bool {
         matches!(
             self.preparation,
@@ -680,6 +724,7 @@ impl<'de> Deserialize<'de> for ReusableExecutionProgramPolicy {
                     ReusableExecutionProgramPreparation::OnDemand
                 }
             }),
+            on_demand_admission: wire.on_demand_admission,
             warmup_passes: wire.warmup_passes,
             capture_passes: wire.capture_passes,
             replay_validation_passes: wire.replay_validation_passes,
@@ -1282,6 +1327,63 @@ mod tests {
             program_policy.programs(),
             &[prerequisite, final_prefill, decode_1, decode_4]
         );
+    }
+
+    #[test]
+    fn on_demand_admission_preserves_legacy_wire_and_changes_cost_policy_identity() {
+        use super::ReusableExecutionOnDemandAdmission::{AfterWarmup, AmortizedHostCostV1};
+        use crate::{DeviceReusableExecutionPlan, ReusableExecutionProgramPreparation};
+        let shapes = vec![program(
+            "uniform-query",
+            ReusableExecutionProgramShape::uniform_decode(3, 1).unwrap(),
+        )];
+        let legacy =
+            ReusableExecutionProgramPolicy::exact_startup_and_on_demand(1, 1, 1, shapes.clone())
+                .unwrap();
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(wire.get("on_demand_admission").is_none());
+        let decoded: ReusableExecutionProgramPolicy = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.on_demand_admission(), AfterWarmup);
+        let measured = legacy
+            .clone()
+            .with_on_demand_admission(AmortizedHostCostV1)
+            .unwrap();
+        assert_ne!(
+            super::canonical_fingerprint(&legacy, "legacy policy").unwrap(),
+            super::canonical_fingerprint(&measured, "measured policy").unwrap(),
+        );
+        assert_eq!(
+            serde_json::from_value::<ReusableExecutionProgramPolicy>(
+                serde_json::to_value(&measured).unwrap()
+            )
+            .unwrap(),
+            measured,
+        );
+        assert!(
+            ReusableExecutionProgramPolicy::exact_startup_sealed(1, 1, 1, shapes)
+                .unwrap()
+                .with_on_demand_admission(AmortizedHostCostV1)
+                .is_err()
+        );
+        assert!(DeviceReusableExecutionPlan::new(3)
+            .unwrap()
+            .with_on_demand_admission(AmortizedHostCostV1)
+            .is_err());
+        let plan = DeviceReusableExecutionPlan::startup_and_on_demand(3)
+            .unwrap()
+            .with_on_demand_admission(AmortizedHostCostV1)
+            .unwrap();
+        assert_eq!(
+            plan.preparation(),
+            ReusableExecutionProgramPreparation::BeforeReadiness
+        );
+        assert_eq!(plan.on_demand_admission(), AmortizedHostCostV1);
+        let lazy = DeviceReusableExecutionPlan::on_demand(3).unwrap();
+        assert_eq!(
+            lazy.preparation(),
+            ReusableExecutionProgramPreparation::OnDemand
+        );
+        assert_eq!(lazy.on_demand_admission(), AfterWarmup);
     }
 
     #[test]

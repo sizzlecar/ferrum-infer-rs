@@ -11,6 +11,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         serde_json::json!({
             "state": "installed",
             "catalog_lifetime": self.reusable_execution_startup_plan.as_ref().map(|plan| plan.device_plan.catalog_lifetime()),
+            "on_demand_admission": self.reusable_execution_startup_plan.as_ref().map(|plan| plan.device_plan.on_demand_admission()),
             "lane_epoch": catalog.lane_epoch,
             "current_lane_epoch": self.lane.reusable_execution_epoch(),
             "refresh_pending": self.reusable_execution_catalog_refresh_needed.load(Ordering::Acquire),
@@ -55,7 +56,12 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             .map_err(|error| {
                 FerrumError::device(format!("vNext on-demand configuration failed: {error}"))
             })?;
-        if device_preparation.state() != DeviceReusableExecutionPreparationState::Ready
+        let expected_state = if plan.program_policy.prepares_before_readiness() {
+            DeviceReusableExecutionPreparationState::Preparing
+        } else {
+            DeviceReusableExecutionPreparationState::Ready
+        };
+        if device_preparation.state() != expected_state
             || device_preparation.resident_executables() != 0
             || device_preparation.captured_executables() != 0
             || device_preparation.maximum_executables()

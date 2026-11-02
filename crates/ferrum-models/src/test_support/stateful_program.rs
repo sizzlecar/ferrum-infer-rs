@@ -609,6 +609,13 @@ pub fn cuda_auto_startup(
     cuda_with_preparation(ferrum_types::ReusableExecutionPreparationMode::Auto)
 }
 
+/// Explicit hybrid preparation retains the original after-warmup admission.
+#[cfg(feature = "cuda")]
+pub fn cuda_after_warmup_startup(
+) -> Fixture<ferrum_kernels::backend::cuda::vnext_runtime::CudaDeviceRuntime> {
+    cuda_with_preparation(ferrum_types::ReusableExecutionPreparationMode::StartupAndOnDemand)
+}
+
 #[cfg(feature = "cuda")]
 fn cuda_with_preparation(
     preparation: ferrum_types::ReusableExecutionPreparationMode,

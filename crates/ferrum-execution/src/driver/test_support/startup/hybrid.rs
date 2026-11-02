@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::model_executor::TokenSelectionMask;
+use ferrum_runtime::ReusableExecutionOnDemandAdmission;
 
 async fn admit_product<R: DeviceRuntime>(
     executor: &ProgramExecutor<R>,
@@ -91,6 +92,7 @@ async fn prefill<R: DeviceRuntime>(
 
 pub async fn assert_startup_on_demand_product_reuse<R: DeviceRuntime>(
     executor: &ProgramExecutor<R>,
+    expected_admission: ReusableExecutionOnDemandAdmission,
 ) {
     executor.attach_execution_event_sink(Arc::new(StartupEvents(
         Mutex::new(Vec::new()),
@@ -99,6 +101,10 @@ pub async fn assert_startup_on_demand_product_reuse<R: DeviceRuntime>(
     executor.prepare_startup().await.unwrap();
     let plan = executor.reusable_execution_startup_plan.as_ref().unwrap();
     assert!(plan.program_policy.prepares_before_readiness());
+    assert_eq!(
+        plan.program_policy.on_demand_admission(),
+        expected_admission
+    );
     assert_eq!(
         plan.program_policy.catalog_lifetime(),
         ReusableExecutionCatalogLifetime::OnDemandBounded
@@ -145,8 +151,11 @@ pub async fn assert_startup_on_demand_product_reuse<R: DeviceRuntime>(
         executor.lane.reusable_executable_preparation().unwrap()
     ));
 
-    // Exercise a legal prefill shape that was not seeded. It must still warm,
-    // capture, then replay with another fresh owner, within the same budget.
+    // Unseeded work must remain valid with fresh owners and the same budget.
+    // The explicit AfterWarmup policy still promises capture after warmup;
+    // Auto may defer it when the measured saving does not justify capture.
+    // Cost-credit transitions use deterministic samples in backend tests,
+    // not a fixed repetition count or a wall-clock threshold on this GPU.
     let maximum_chunk = plan
         .prefill_chunks()
         .into_iter()
@@ -162,18 +171,22 @@ pub async fn assert_startup_on_demand_product_reuse<R: DeviceRuntime>(
         })
         .expect("fixture needs an admitted shape outside the startup seeds");
     let tokens = vec![TokenId::new(0); chunk.total_prompt_tokens()];
-    for phase in ["warm", "capture", "replay"] {
+    for phase in ["first", "recurrence", "subsequent"] {
         let initial = admit_product(executor, &tokens, plan.maximum_decode_sequence_tokens).await;
         let before = replay.replayed_segments.load(Ordering::Relaxed);
         let done = prefill(executor, &initial, chunk).await;
-        if phase == "replay" {
+        if phase == "subsequent"
+            && expected_admission == ReusableExecutionOnDemandAdmission::AfterWarmup
+        {
             assert!(replay.replayed_segments.load(Ordering::Relaxed) > before);
         }
         sampling::close(executor, done.sequence()).await;
         settle(executor).await;
     }
     let after = executor.lane.reusable_executable_preparation().unwrap();
-    assert!(after.captured_executables() > inventory.captured_executables());
+    if expected_admission == ReusableExecutionOnDemandAdmission::AfterWarmup {
+        assert!(after.captured_executables() > inventory.captured_executables());
+    }
     assert_eq!(after.maximum_executables(), inventory.maximum_executables());
     assert!(after.resident_executables() <= after.maximum_executables());
     assert!(executor.on_demand_reusable_execution_enabled());
