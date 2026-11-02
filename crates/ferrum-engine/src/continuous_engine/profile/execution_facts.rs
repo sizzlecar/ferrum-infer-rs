@@ -4,6 +4,9 @@
 use super::*;
 use ferrum_runtime::{OperationCompletionDisposition, TerminalExecutionFacts};
 
+mod chunks;
+pub(super) use chunks::bounded_records;
+
 impl VNextProfileEventContext {
     pub(super) fn execution_facts_event(
         &self,
