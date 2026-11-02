@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{FerrumError, FinishReason, Result};
 
+mod stream;
+pub use stream::HarmonyStreamProjection;
+
 const START: &str = "<|start|>";
 const END: &str = "<|end|>";
 const MESSAGE: &str = "<|message|>";

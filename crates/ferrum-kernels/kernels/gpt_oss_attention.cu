@@ -102,7 +102,7 @@ __device__ __forceinline__ float gpt_oss_yarn_inv_frequency(
          extrapolation * extrapolation_weight;
 }
 
-extern "C" __global__ void gpt_oss_prepare_qkv_yarn_f16(
+__device__ __forceinline__ void gpt_oss_prepare_qkv_yarn_token_f16(
     const __half* __restrict__ query_raw,
     const __half* __restrict__ key_raw,
     const __half* __restrict__ value_raw,
@@ -123,13 +123,13 @@ extern "C" __global__ void gpt_oss_prepare_qkv_yarn_f16(
     const float yarn_factor,
     const float yarn_original_context,
     const float yarn_beta_fast,
-    const float yarn_beta_slow) {
+    const float yarn_beta_slow,
+    const int token,
+    const int combined_head,
+    const int lane) {
   const int page_count = control[0];
   const int position_start = control[1];
   const int tokens = control[2];
-  const int token = blockIdx.x;
-  const int combined_head = blockIdx.y;
-  const int lane = threadIdx.x;
   const int total_heads = query_heads + 2 * kv_heads;
   if (token >= tokens || combined_head >= total_heads ||
       lane >= GPT_OSS_WARP_SIZE)
@@ -214,7 +214,81 @@ extern "C" __global__ void gpt_oss_prepare_qkv_yarn_f16(
   }
 }
 
-extern "C" __global__ void gpt_oss_paged_attention_sink_f16(
+extern "C" __global__ void gpt_oss_prepare_qkv_yarn_f16(
+    const __half* __restrict__ query_raw,
+    const __half* __restrict__ key_raw,
+    const __half* __restrict__ value_raw,
+    const __half* __restrict__ query_bias,
+    const __half* __restrict__ key_bias,
+    const __half* __restrict__ value_bias,
+    __half* __restrict__ query,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int rope_dim,
+    const int query_features,
+    const int kv_features,
+    const float rope_theta,
+    const float yarn_factor,
+    const float yarn_original_context,
+    const float yarn_beta_fast,
+    const float yarn_beta_slow) {
+  gpt_oss_prepare_qkv_yarn_token_f16(
+      query_raw, key_raw, value_raw, query_bias, key_bias, value_bias,
+      query, control, page_pointers, page_elements, query_heads, kv_heads,
+      head_dim, rope_dim, query_features, kv_features, rope_theta, yarn_factor,
+      yarn_original_context, yarn_beta_fast, yarn_beta_slow,
+      blockIdx.x, blockIdx.y, threadIdx.x);
+}
+
+// Each participant contributes one packed token. Retain the scalar warp's
+// arithmetic and key order while allowing different requests to occupy the
+// device concurrently. The host validates this exact decode geometry.
+extern "C" __global__ void gpt_oss_prepare_qkv_yarn_packed_decode_f16(
+    const __half* __restrict__ query_raw,
+    const __half* __restrict__ key_raw,
+    const __half* __restrict__ value_raw,
+    const __half* __restrict__ query_bias,
+    const __half* __restrict__ key_bias,
+    const __half* __restrict__ value_bias,
+    __half* __restrict__ query,
+    const unsigned char* __restrict__ bindings,
+    const unsigned long long binding_stride_bytes,
+    const int participants,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int rope_dim,
+    const int query_features,
+    const int kv_features,
+    const float rope_theta,
+    const float yarn_factor,
+    const float yarn_original_context,
+    const float yarn_beta_fast,
+    const float yarn_beta_slow) {
+  const int participant = blockIdx.x;
+  if (participant >= participants) return;
+  const int* control = reinterpret_cast<const int*>(
+      bindings + (unsigned long long)participant * binding_stride_bytes);
+  const unsigned long long* page_pointers =
+      reinterpret_cast<const unsigned long long*>(control + 4);
+  gpt_oss_prepare_qkv_yarn_token_f16(
+      query_raw + (long long)participant * query_features,
+      key_raw + (long long)participant * kv_features,
+      value_raw + (long long)participant * kv_features,
+      query_bias, key_bias, value_bias,
+      query + (long long)participant * query_features,
+      control, page_pointers, page_elements, query_heads, kv_heads,
+      head_dim, rope_dim, query_features, kv_features, rope_theta, yarn_factor,
+      yarn_original_context, yarn_beta_fast, yarn_beta_slow,
+      0, blockIdx.y, threadIdx.x);
+}
+
+__device__ __forceinline__ void gpt_oss_paged_attention_sink_token_f16(
     const __half* __restrict__ query,
     const __half* __restrict__ sinks,
     const int* __restrict__ control,
@@ -224,13 +298,13 @@ extern "C" __global__ void gpt_oss_paged_attention_sink_f16(
     const int query_heads,
     const int kv_heads,
     const int head_dim,
-    const int sliding_window) {
+    const int sliding_window,
+    const int token,
+    const int query_head,
+    const int lane) {
   const int page_count = control[0];
   const int position_start = control[1];
   const int tokens = control[2];
-  const int token = blockIdx.x;
-  const int query_head = blockIdx.y;
-  const int lane = threadIdx.x;
   if (token >= tokens || query_head >= query_heads ||
       lane >= GPT_OSS_WARP_SIZE)
     return;
@@ -302,6 +376,48 @@ extern "C" __global__ void gpt_oss_paged_attention_sink_f16(
           __float2half(accumulated[chunk] * inverse_sum);
     }
   }
+}
+
+extern "C" __global__ void gpt_oss_paged_attention_sink_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ sinks,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int sliding_window) {
+  gpt_oss_paged_attention_sink_token_f16(
+      query, sinks, control, page_pointers, output, page_elements,
+      query_heads, kv_heads, head_dim, sliding_window,
+      blockIdx.x, blockIdx.y, threadIdx.x);
+}
+
+extern "C" __global__ void gpt_oss_paged_attention_sink_packed_decode_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ sinks,
+    const unsigned char* __restrict__ bindings,
+    const unsigned long long binding_stride_bytes,
+    const int participants,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int sliding_window) {
+  const int participant = blockIdx.x;
+  if (participant >= participants) return;
+  const int* control = reinterpret_cast<const int*>(
+      bindings + (unsigned long long)participant * binding_stride_bytes);
+  const unsigned long long* page_pointers =
+      reinterpret_cast<const unsigned long long*>(control + 4);
+  const long long row = (long long)participant * query_heads * head_dim;
+  gpt_oss_paged_attention_sink_token_f16(
+      query + row, sinks, control, page_pointers, output + row, page_elements,
+      query_heads, kv_heads, head_dim, sliding_window,
+      0, blockIdx.y, threadIdx.x);
 }
 
 extern "C" __global__ void gpt_oss_residual_output_bias_f16(

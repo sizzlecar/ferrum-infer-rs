@@ -377,6 +377,8 @@ struct RunStreamOutput {
     prompt_opened_thinking: bool,
     emitted_content: String,
     semantic: Option<OutputSemanticLease>,
+    harmony: ferrum_types::HarmonyStreamProjection,
+    harmony_content_sent: usize,
 }
 
 impl RunStreamOutput {
@@ -386,6 +388,8 @@ impl RunStreamOutput {
             prompt_opened_thinking,
             emitted_content: String::new(),
             semantic: None,
+            harmony: Default::default(),
+            harmony_content_sent: 0,
         }
     }
 
@@ -394,10 +398,16 @@ impl RunStreamOutput {
         Ok(self)
     }
 
-    fn delta<'a>(&'a mut self, raw_text: &str, raw_delta: &'a str) -> Result<Option<&'a str>> {
+    fn delta<'a>(&'a mut self, raw_text: &'a str, raw_delta: &'a str) -> Result<Option<&'a str>> {
         match self.protocol {
             ModelOutputProtocol::Text => Ok(Some(raw_delta)),
-            ModelOutputProtocol::HarmonyGptOss => Ok(None),
+            ModelOutputProtocol::HarmonyGptOss => {
+                self.harmony.advance(raw_text)?;
+                let content = self.harmony.content(raw_text);
+                let delta = &content[self.harmony_content_sent..];
+                self.harmony_content_sent = content.len();
+                Ok((!delta.is_empty()).then_some(delta))
+            }
             ModelOutputProtocol::GemmaThought => {
                 if should_defer_model_reasoning_stream_delta(self.protocol, raw_text) {
                     return Ok(None);
@@ -407,11 +417,32 @@ impl RunStreamOutput {
         }
     }
 
-    fn finish(&mut self, raw_text: &str) -> Result<Option<&str>> {
+    fn finish(
+        &mut self,
+        raw_text: &str,
+        finish_reason: Option<FinishReason>,
+    ) -> Result<Option<&str>> {
         match self.protocol {
-            // Ordinary text has already streamed; Harmony is validated and
-            // displayed as a complete message by the caller.
-            ModelOutputProtocol::Text | ModelOutputProtocol::HarmonyGptOss => Ok(None),
+            ModelOutputProtocol::Text => Ok(None),
+            ModelOutputProtocol::HarmonyGptOss => {
+                let parsed = self.harmony.finish(raw_text, finish_reason)?;
+                if parsed.tool_call.is_some() {
+                    return Err(FerrumError::invalid_format(
+                        "GPT-OSS emitted a Harmony tool call for `ferrum run`, which has no tool executor",
+                    ));
+                }
+                let tail = &parsed.content[self.harmony_content_sent..];
+                self.semantic
+                    .as_mut()
+                    .ok_or_else(|| {
+                        FerrumError::internal("run stream output has no output session")
+                    })?
+                    .try_grow(tail.len())?;
+                let previous_len = self.emitted_content.len();
+                self.emitted_content.push_str(tail);
+                self.harmony_content_sent = parsed.content.len();
+                Ok((!tail.is_empty()).then_some(&self.emitted_content[previous_len..]))
+            }
             // A last chunk may contain visible text followed by an incomplete
             // channel marker. Flush its safe visible prefix without the marker.
             ModelOutputProtocol::GemmaThought => self.parsed_content_delta(raw_text),
@@ -635,7 +666,7 @@ async fn collect_run_text_stream(
     }
     clear_first_token_indicator(first_token_indicator);
     require_run_terminal_reason(finish_reason)?;
-    if let Some(delta) = output.finish(&raw_text)? {
+    if let Some(delta) = output.finish(&raw_text, finish_reason)? {
         print!("{delta}");
         io::stdout().flush().ok();
     }
@@ -1996,13 +2027,6 @@ pub async fn execute(
                         parsed,
                     )?)
                 };
-
-                if format == OutputFormat::Text
-                    && model_output_protocol == ModelOutputProtocol::HarmonyGptOss
-                {
-                    print!("{clean_response}");
-                    io::stdout().flush().ok();
-                }
 
                 let elapsed = start.elapsed();
                 let elapsed_s = elapsed.as_secs_f64();
@@ -4592,6 +4616,44 @@ mod tests {
     }
 
     #[test]
+    fn harmony_run_stream_exposes_only_final_payload_before_terminal() {
+        for (raw, reason, expected) in [
+            ("<|channel|>analysis<|message|>Private.<|end|><|start|>assistant<|channel|>final<|message|>答案🙂<|return|>", FinishReason::EOS, "答案🙂"),
+            ("<|channel|>final<|message|>答案<", FinishReason::Length, "答案<"),
+        ] {
+            let mut output = RunStreamOutput::new(ModelOutputProtocol::HarmonyGptOss, false)
+                .bind_session(&test_output_session()).unwrap();
+            let mut visible = String::new();
+            let mut last_end = 0;
+            for end in raw.char_indices().map(|(offset, ch)| offset + ch.len_utf8()) {
+                if let Some(delta) = output.delta(&raw[..end], &raw[last_end..end]).unwrap() {
+                    visible.push_str(delta);
+                }
+                assert!(expected.starts_with(&visible));
+                last_end = end;
+            }
+            assert!(visible.starts_with("答案"), "payload must arrive before finish");
+            if let Some(tail) = output.finish(raw, Some(reason)).unwrap() {
+                visible.push_str(tail);
+            }
+            assert_eq!(visible, expected);
+            assert!(output.finish(raw, Some(reason)).unwrap().is_none());
+            assert_eq!(parse_run_model_output(ModelOutputProtocol::HarmonyGptOss, raw, false, Some(reason)).unwrap().content, visible);
+        }
+        let mut output = RunStreamOutput::new(ModelOutputProtocol::HarmonyGptOss, false)
+            .bind_session(&test_output_session())
+            .unwrap();
+        let tool =
+            "<|channel|>commentary to=functions.weather<|message|>{\"city\":\"Paris\"}<|call|>";
+        assert!(output.delta(tool, tool).unwrap().is_none());
+        assert!(output
+            .finish(tool, Some(FinishReason::EOS))
+            .unwrap_err()
+            .to_string()
+            .contains("no tool executor"));
+    }
+
+    #[test]
     fn gemma_run_stream_splits_never_expose_thought_frames_or_reasoning() {
         for (raw, opened, expected) in [
             ("<|channel>thought\n<channel|>579", false, "579"),
@@ -4622,11 +4684,17 @@ mod tests {
                     }
                     assert!(expected.starts_with(&visible));
                 }
-                if let Some(delta) = output.finish(&cumulative).unwrap() {
+                if let Some(delta) = output
+                    .finish(&cumulative, Some(FinishReason::Length))
+                    .unwrap()
+                {
                     visible.push_str(&delta);
                 }
                 assert_eq!(visible, expected, "split at {split}");
-                assert!(output.finish(&cumulative).unwrap().is_none());
+                assert!(output
+                    .finish(&cumulative, Some(FinishReason::Length))
+                    .unwrap()
+                    .is_none());
                 let parsed = parse_run_model_output(
                     ModelOutputProtocol::GemmaThought,
                     &cumulative,
@@ -4806,7 +4874,7 @@ mod tests {
                 collect_run_text_stream(
                     stream,
                     false,
-                    RunStreamOutput::new(ModelOutputProtocol::HarmonyGptOss, false)
+                    RunStreamOutput::new(ModelOutputProtocol::Text, false)
                         .bind_session(&test_output_session())
                         .unwrap(),
                     0,

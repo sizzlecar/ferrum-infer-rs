@@ -422,7 +422,12 @@ async fn natural_eos_cannot_impersonate_a_matched_wire_stop() {
                     .expect("malformed natural EOS must produce an SSE error");
                 assert_eq!(error["error"]["type"], "internal_server_error");
                 assert_eq!(error["error"]["param"], "model_output");
-                for field in ["content", "reasoning", "reasoning_content"] {
+                let content: String = events
+                    .iter()
+                    .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                    .collect();
+                assert_eq!(content, "answer ", "safe text precedes the malformed EOS");
+                for field in ["reasoning", "reasoning_content"] {
                     assert!(
                         events
                             .iter()
@@ -430,7 +435,7 @@ async fn natural_eos_cannot_impersonate_a_matched_wire_stop() {
                                 .as_str()
                                 .unwrap_or("")
                                 .is_empty()),
-                        "malformed Harmony must not leak buffered {field}"
+                        "malformed Harmony must not invent {field}"
                     );
                 }
                 assert!(
