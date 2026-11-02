@@ -24,12 +24,12 @@
   ],
   "license_files": [
     {
-      "source_path": "native-operators/licenses/Apache-2.0.txt",
-      "output_path": "licenses/FlashInfer-Apache-2.0.txt"
-    },
-    {
       "source_path": "LICENSE",
       "output_path": "licenses/Ferrum-MIT.txt"
+    },
+    {
+      "source_path": "native-operators/licenses/Apache-2.0.txt",
+      "output_path": "licenses/FlashInfer-Apache-2.0.txt"
     }
   ],
   "cuda_toolkit": "12.8",
