@@ -556,8 +556,8 @@
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "95df143e981870e6ae0fbf76712778ec013863d4634bb334abbcb36fc917bf8b",
-      "after_sha256": "13317db8092feedb53760836700ecda36f8cae45b202c400cc53fd437b192b95",
+      "before_sha256": "13317db8092feedb53760836700ecda36f8cae45b202c400cc53fd437b192b95",
+      "after_sha256": "b824ae97bbfd9d0321393dae12e037a006194772fe34783e616a05be261a380b",
       "areas": [
         "build",
         "backend_submission",
@@ -568,12 +568,12 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the changes since v0.17.0: the CUDA image section documents one ordinary DiT LoRA loaded at startup through run and serve, fixed strength, PEFT or explicitly bound Diffusers A/B imports, complete target and variant validation, immutable BF16 composition before whole-group FP8 quantization, automatically budgeted Host mappings/cache/workspaces, and adapter-specific model and Auto batching identity. It explicitly excludes request switching, multiple adapters, Metal/GGUF adapters and distillation sampling, retains Turbo's eight steps, and distinguishes structural binding from verified Turbo image quality. No throughput or SLO claim is added. Retain distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals; production weight changes independently retain their numerical reach. This content review certifies no execution or publication result."
+      "rationale": "Reviewed the English README changes since v0.18.3: the shorter bilingual overview retains the throughput objective constrained by TTFT, TPOT, ITL and completion requirements, the model/backend combination limits, installation URLs, and text run/serve CLI entrypoints. Detailed image CLI, Metal and CUDA LoRA instructions move to the linked image guide. The image section states the validated Linux CUDA SM89/SM120 scope and distinguishes JSON text generation from editing with one 8-bit RGB/RGBA PNG; the Metal 1024x1024 qualification remains explicit. Performance links now lead to the English reports with Chinese counterparts and version-scoped measurements, including the GPT-OSS update, without extending those results to other models or releases. Retain all distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution, numerical correctness, throughput, SLO compliance or publication result."
     },
     {
       "path": "README_zh.md",
-      "before_sha256": "fc70122d4610c5d0cb9521fa14034ab947a58709b7afafdb2e346251f0ed32f1",
-      "after_sha256": "88e4dfce0e881f6d89bafcc9f472a753d3e125f90d41807af2092fec22e4c2cb",
+      "before_sha256": "88e4dfce0e881f6d89bafcc9f472a753d3e125f90d41807af2092fec22e4c2cb",
+      "after_sha256": "b6356d62286391a07962a9a07fb97bc0b358133b92d0590fea94e63c405baa1f",
       "areas": [
         "build",
         "backend_submission",
@@ -584,7 +584,7 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the changes since v0.16.0 in the Chinese README: the release label and Metal scope describe 1024x1024 generation and single-PNG editing on M4 16 GiB with Q4_K_M DiT, FP8 text encoder and BF16 vision/VAE. CUDA directory defaults now document cuDNN SDPA, request-scoped edit-prefix reuse, bounded multi-shape plan caching and capacity-checked 2048x2048 support; Metal retains its configured scheduling and 1024x1024 bound. CUDA throughput remains explicitly historical v0.15.0 candidate evidence; no Auto throughput, Metal concurrency or SLO claim is added. Retain distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution or publication result."
+      "rationale": "Reviewed the Chinese README changes since v0.18.3: the shorter bilingual overview retains the throughput objective constrained by TTFT, TPOT, ITL and completion requirements, the model/backend combination limits, installation URLs, and text run/serve CLI entrypoints. Detailed image CLI, Metal and CUDA LoRA instructions move to the linked image guide. The image section states the validated Linux CUDA SM89/SM120 scope and distinguishes JSON text generation from editing with one 8-bit RGB/RGBA PNG; the Metal 1024x1024 qualification remains explicit. Performance links lead to the Chinese reports paired with the default English editions and version-scoped measurements, including the GPT-OSS update, without extending those results to other models or releases. Retain all distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution, numerical correctness, throughput, SLO compliance or publication result."
     }
   ],
   "release_profile_ids": [
