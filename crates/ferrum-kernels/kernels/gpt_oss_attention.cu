@@ -612,39 +612,32 @@ gpt_oss_paged_attention_sink_packed_decode_multiwarp_f16(
   }
 }
 
-// Identical arithmetic to the multiwarp entrypoint, with power-of-two page
-// shift/mask calculated once and reused by every KV access in this invocation.
-extern "C" __global__ void
-gpt_oss_paged_attention_sink_packed_decode_multiwarp_paged_f16(
+// Shared decode/prefill core. Query rows remain independent and causal; four
+// warps split each row's keys with the same arithmetic as packed decode.
+__device__ __forceinline__ void
+gpt_oss_paged_attention_sink_multiwarp_token_f16(
     const __half* __restrict__ query,
     const __half* __restrict__ sinks,
-    const unsigned char* __restrict__ bindings,
-    const unsigned long long binding_stride_bytes,
-    const int participants,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
     __half* __restrict__ output,
     const int page_elements,
     const int query_heads,
     const int kv_heads,
     const int head_dim,
-    const int sliding_window) {
-  const int participant = blockIdx.x;
-  const int query_head = blockIdx.y;
-  if (participant >= participants || query_head >= query_heads ||
+    const int sliding_window,
+    const int token,
+    const int query_head) {
+  if (token >= control[2] || query_head >= query_heads ||
       blockDim.x != GPT_OSS_DECODE_WARPS * GPT_OSS_WARP_SIZE)
     return;
-
-  const int* control = reinterpret_cast<const int*>(
-      bindings + (unsigned long long)participant * binding_stride_bytes);
-  if (control[2] < 1) return;
-  const unsigned long long* page_pointers =
-      reinterpret_cast<const unsigned long long*>(control + 4);
   const int page_count = control[0];
   const unsigned page_mask = static_cast<unsigned>(page_elements) - 1U;
   const bool power_of_two_page =
       page_elements > 0 &&
       (static_cast<unsigned>(page_elements) & page_mask) == 0;
   const int page_shift = power_of_two_page ? __ffs(page_elements) - 1 : -1;
-  const int absolute_position = control[1];
+  const int absolute_position = control[1] + token;
   const int first_key = sliding_window == 0
                             ? 0
                             : max(0, absolute_position - sliding_window + 1);
@@ -652,7 +645,7 @@ gpt_oss_paged_attention_sink_packed_decode_multiwarp_paged_f16(
   const int lane = threadIdx.x % GPT_OSS_WARP_SIZE;
   const int warp = threadIdx.x / GPT_OSS_WARP_SIZE;
   const long long row =
-      ((long long)participant * query_heads + query_head) * head_dim;
+      ((long long)token * query_heads + query_head) * head_dim;
   float query_values[GPT_OSS_HEAD_CHUNKS];
   float accumulated[GPT_OSS_HEAD_CHUNKS];
 #pragma unroll
@@ -748,6 +741,51 @@ gpt_oss_paged_attention_sink_packed_decode_multiwarp_paged_f16(
     if (dim < head_dim)
       output[row + dim] = __float2half(accumulated[chunk] * inverse_sum);
   }
+}
+
+// Identical arithmetic to the original packed multiwarp entrypoint, with
+// power-of-two page shift/mask reused by every KV access.
+extern "C" __global__ void
+gpt_oss_paged_attention_sink_packed_decode_multiwarp_paged_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ sinks,
+    const unsigned char* __restrict__ bindings,
+    const unsigned long long binding_stride_bytes,
+    const int participants,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int sliding_window) {
+  const int participant = blockIdx.x;
+  if (participant >= participants) return;
+  const int* control = reinterpret_cast<const int*>(
+      bindings + (unsigned long long)participant * binding_stride_bytes);
+  const unsigned long long* page_pointers =
+      reinterpret_cast<const unsigned long long*>(control + 4);
+  const long long offset = (long long)participant * query_heads * head_dim;
+  gpt_oss_paged_attention_sink_multiwarp_token_f16(
+      query + offset, sinks, control, page_pointers, output + offset,
+      page_elements, query_heads, kv_heads, head_dim, sliding_window,
+      0, blockIdx.y);
+}
+
+extern "C" __global__ void gpt_oss_paged_attention_sink_multiwarp_paged_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ sinks,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int sliding_window) {
+  gpt_oss_paged_attention_sink_multiwarp_token_f16(
+      query, sinks, control, page_pointers, output,
+      page_elements, query_heads, kv_heads, head_dim, sliding_window,
+      blockIdx.x, blockIdx.y);
 }
 
 extern "C" __global__ void gpt_oss_residual_output_bias_f16(
