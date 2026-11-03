@@ -103,6 +103,29 @@ Embedding, ASR, TTS and legacy execution APIs are retired. See [migration notes]
 
 ## Performance
 
+**RTX 5090: latest recorded results for all benchmarked popular models.** Throughput is tok/s, shown as **Ferrum / reference**. C8/C16 are client concurrency; each row identifies the measured Ferrum version.
+
+| Model / source weights | Measured version | Reference | C8 tok/s | C16 tok/s | SLO: C8 / C16 |
+|---|---|---|---:|---:|---|
+| Qwen3.5-4B · Q4_K_M | 0.18.3 | llama.cpp | 960.8 / 634.7 | 1294.8 / 729.4 | pass / Ferrum ITL fail |
+| Qwen3.5-9B · Q4_K_M | 0.18.3 | llama.cpp | 731.6 / 550.5 | 942.0 / 654.7 | pass / Ferrum ITL fail |
+| Qwen3.5-4B · BF16 | 0.18.3 | vLLM | 840.0 / 684.6 | 1306.8 / 1153.9 | pass / pass |
+| Qwen3.5-9B · BF16 | 0.18.3 | vLLM | 563.4 / 508.2 | 875.0 / 864.3 | pass / pass |
+| Qwen3-30B-A3B · GPTQ INT4 | 0.18.3 | vLLM | 630.5 / 824.0 | 848.8 / 1263.7 | pass / pass |
+| Qwen3.5-35B-A3B · GPTQ INT4 | 0.18.3 | vLLM | 717.6 / 625.6 | 978.3 / 947.4 | pass / vLLM ITL fail |
+| GPT-OSS-20B · MXFP4 | 0.18.4 R11 | vLLM | 890.9–892.3 / 819.8 | 1383.5–1385.9 / 1429.8 | pass / pass |
+| Qwen3.8-27B · UD-Q4_K_M | 0.13 candidate | llama.cpp | 356.42 / 291.60 | 535.51 / 377.41 | both fail / both fail |
+| Qwen3.8-27B · CT INT4 | 0.13 candidate | vLLM | 374.32 / 447.06 | 654.04 / 733.86 | Ferrum fails / both fail |
+
+“Pass” means both engines pass both repetitions; the noted ITL failure occurs in repetition 1. The 4B/9B/30B/35B cells contain 64 requests × 2 repetitions per engine, all successful with zero errors/rejections. GPT-OSS uses 32 requests × 2 fresh Ferrum processes and one retained reference run. The 27B cells use 200 requests × 2 repetitions, zero errors, and separate stricter SLOs; do not rank across workloads.
+
+For 4B/9B/30B/35B/GPT-OSS, P99 limits are TTFT 2000 ms, TPOT 50 ms and visible SSE ITL 100 ms. Each pair uses the same source weights and workload. In BF16-source and 35B comparisons, Ferrum uses F16 activations/KV, while vLLM uses BF16. The 30B gap remains; small pooled leads for 9B BF16 and 35B reverse between repetitions and do not establish a stable advantage.
+
+Full TTFT/TPOT/ITL P50/P99, peak VRAM/RSS, commands and sampling: [4B / 9B / 30B / 35B](docs/performance-rtx5090-popular-models-20261101.md) · [GPT-OSS](docs/performance-rtx5090-gpt-oss-20261102.md) · [27B](docs/performance-popular-models-p0.zh.md).
+
+<details>
+<summary>Latest GPT-OSS optimization: latency and resource details</summary>
+
 **RTX 5090 · GPT-OSS 20B · MXFP4:** the optimization shipped in **0.18.4** reaches **108.7–108.9% of vLLM throughput at C8** and **96.8–96.9% at C16**, meeting the predefined latency SLOs. Measurements use its R11 candidate, not a fresh benchmark of the final release archive.
 
 Same GPU, source weights and pinned ShareGPT samples; natural EOS, at most 512 output tokens. Ferrum uses F16 outer activations/KV and BF16 experts; vLLM uses BF16 activations/KV. Latencies are **P50 / P99, milliseconds**; ITL measures non-empty visible SSE text events.
@@ -121,6 +144,8 @@ All rows meet P99 TTFT ≤2000 ms, TPOT ≤50 ms and SSE ITL ≤100 ms, with 32/
 Whole-sweep peak device VRAM / window process RSS: Ferrum #1 **15.978 / 1.177 GiB**, #2 **16.165 / 1.192 GiB**; vLLM **29.937 / 3.145 GiB**. These are not per-concurrency peaks; vLLM preallocates KV, and its RSS covers EngineCore only, so these figures do not establish a memory-efficiency ratio.
 
 [Workload, commands, output validity and full evidence](docs/performance-rtx5090-gpt-oss-20261102.md). These measurements cover this model and configuration only.
+
+</details>
 
 ## Documentation
 
