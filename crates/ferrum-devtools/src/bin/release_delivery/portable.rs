@@ -130,20 +130,18 @@ pub(super) fn verify_staged(
         Backend::Cuda => "ferrum-windows-x86_64-cuda-sm89.zip",
         _ => return Err("Windows portable backend is unsupported".into()),
     };
+    let has_feature = |name: &str| receipt.manifest.cargo_features.iter().any(|f| f == name);
+    // The production bundle enables both operators transitively in ferrum-cli.
+    // Keep historical packages with explicit operator features inspectable.
+    let has_cuda_operators = has_feature("cuda-production")
+        || (has_feature("vllm-moe-marlin") && has_feature("vllm-paged-attn-v2"));
     if receipt.archive_name != expected_archive
         || receipt.manifest.build.version != version
         || receipt.manifest.build.source_commit != candidate
         || (receipt.manifest.backend == Backend::Cuda
             && (receipt.manifest.cuda_compute_capability != "89"
-                || ["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"]
-                    .iter()
-                    .any(|required| {
-                        !receipt
-                            .manifest
-                            .cargo_features
-                            .iter()
-                            .any(|f| f == required)
-                    })))
+                || !has_feature("cuda")
+                || !has_cuda_operators))
     {
         return Err("Windows portable identity differs from the formal candidate".into());
     }
