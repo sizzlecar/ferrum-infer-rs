@@ -596,9 +596,13 @@ fn auto_numerical_profile_rejection(
             .map_err(|error| format!("Q6 F16 Auto device qualification unavailable: {error}"))?;
         // This is the currently validated architecture scope, not a GPU-name
         // or build-toolchain guess. Other architectures retain strict Auto.
-        if actual.compute_capability_major != 12
-            || actual.compute_capability_minor != 0
-            || actual.multiprocessor_count == 0
+        if !matches!(
+            (
+                actual.compute_capability_major,
+                actual.compute_capability_minor
+            ),
+            (8, 9) | (12, 0)
+        ) || actual.multiprocessor_count == 0
         {
             return Err(format!(
                 "Q6 F16 Auto is not qualified for CUDA compute capability {}.{} with {} multiprocessors",
@@ -1600,18 +1604,24 @@ mod tests {
     fn q6_auto_requires_all_native_capabilities_and_selected_device_attributes() {
         let profile = q6_auto_profile();
         let capabilities = q6_auto_capabilities();
-        assert!(auto_numerical_profile_rejection(
-            &ferrum_types::NumericalExecutionPolicy::Auto,
-            &profile,
-            &ferrum_types::Device::CUDA(3),
-            3,
-            &capabilities,
-            |ordinal| {
-                assert_eq!(ordinal, 3);
-                Ok(qualified_q6_device())
-            },
-        )
-        .is_none());
+        for (major, minor) in [(8, 9), (12, 0)] {
+            assert!(auto_numerical_profile_rejection(
+                &ferrum_types::NumericalExecutionPolicy::Auto,
+                &profile,
+                &ferrum_types::Device::CUDA(3),
+                3,
+                &capabilities,
+                |ordinal| {
+                    assert_eq!(ordinal, 3);
+                    Ok(ferrum_kernels::backend::CudaDeviceAttributes {
+                        compute_capability_major: major,
+                        compute_capability_minor: minor,
+                        multiprocessor_count: 20,
+                    })
+                },
+            )
+            .is_none());
+        }
         assert!(auto_numerical_profile_rejection(
             &ferrum_types::NumericalExecutionPolicy::Auto,
             &profile,
@@ -1651,7 +1661,7 @@ mod tests {
     fn q6_auto_rejects_unknown_unqualified_or_non_cuda_devices() {
         let profile = q6_auto_profile();
         let capabilities = q6_auto_capabilities();
-        for (major, minor, count) in [(8, 9, 32), (12, 1, 32), (12, 0, 0)] {
+        for (major, minor, count) in [(8, 6, 32), (12, 1, 32), (8, 9, 0), (12, 0, 0)] {
             assert!(auto_numerical_profile_rejection(
                 &ferrum_types::NumericalExecutionPolicy::Auto,
                 &profile,

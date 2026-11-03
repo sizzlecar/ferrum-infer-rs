@@ -820,7 +820,7 @@ mod tests {
         for (from, to) in [
             (". './.github/ci/windows-build.ps1'", ". $env:BUILD_HELPER"),
             (
-                "'--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8'",
+                "'--features', 'cuda,cuda-production,cuda-cutlass-fp8'",
                 "'--features', 'cuda'",
             ),
             (
