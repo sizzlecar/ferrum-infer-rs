@@ -303,6 +303,36 @@ fn accept_staged(
 }
 
 #[test]
+fn cuda_staged_package_accepts_production_bundle_and_rejects_missing_operators() {
+    let cases: &[(&[&str], bool)] = &[
+        (&["cuda", "cuda-production", "cuda-cutlass-fp8"], true),
+        (&["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"], true),
+        (&["cuda", "cuda-cutlass-fp8"], false),
+        (&["cuda", "vllm-moe-marlin"], false),
+        (&["cuda", "vllm-paged-attn-v2"], false),
+    ];
+    for (features, accepted) in cases {
+        let mut fixture = staged_fixture();
+        fixture.spec.manifest.cargo_features = features.iter().map(|f| (*f).into()).collect();
+        fs::remove_file(&fixture.archive).unwrap();
+        fs::remove_file(&fixture.receipt).unwrap();
+        let receipt = fixture.pack();
+        let inspection_path = fixture.root.path().join("portable.staging-inspection.json");
+        let mut inspection: Inspection = read(&inspection_path).unwrap();
+        inspection.receipt = receipt;
+        fs::write(&inspection_path, serde_json::to_vec(&inspection).unwrap()).unwrap();
+        let result = verify_staged(
+            &fixture.archive,
+            &fixture.receipt,
+            &inspection_path,
+            "2.3.4",
+            &"a".repeat(40),
+        );
+        assert_eq!(result.is_ok(), *accepted, "features: {features:?}");
+    }
+}
+
+#[test]
 fn windows_release_requires_cpu_startup_and_the_shared_stable_launcher() {
     let cuda = staged_fixture();
     let accept = || {
