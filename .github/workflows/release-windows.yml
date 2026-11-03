@@ -330,10 +330,12 @@ jobs:
           # Windows packages separately pin their actual source plan and MSVC tools;
           # runtime compatibility checks the live provider contracts. No Linux code is linked.
           $referenceArchive = Join-Path $work 'reference.tar.zst'
-          & './target/release-tools/release_delivery.exe' fetch-verified --url 'https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst' --sha256 'd4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e' --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $referenceArchive | Tee-Object -FilePath (Join-Path $work 'reference-download.json')
-          if ((Get-FileHash $referenceArchive -Algorithm SHA256).Hash -ne 'd4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e') { throw 'Reference archive hash mismatch' }
+          # Reuse the complete production provider contracts, including Q4/Q5/Q6.
+          # Only the catalog is read; all linked archives are rebuilt for Windows SM89.
+          & './target/release-tools/release_delivery.exe' fetch-verified --url 'https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.8-sm120-v4/native-operator-set-cuda12.8-sm120-v4.tar.zst' --sha256 '5283c1fcdcabdcd1aab7058f8c1f2676c48d8b99b50f8b116f737816199e88ec' --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $referenceArchive | Tee-Object -FilePath (Join-Path $work 'reference-download.json')
+          if ((Get-FileHash $referenceArchive -Algorithm SHA256).Hash -ne '5283c1fcdcabdcd1aab7058f8c1f2676c48d8b99b50f8b116f737816199e88ec') { throw 'Reference archive hash mismatch' }
           tar.exe -xf $referenceArchive -C $reference
-          $referenceLockPath = Join-Path $reference 'inputs/native-operator-set.lock.json'
+          $referenceLockPath = Join-Path $reference 'native-operator-set.lock.json'
           $referenceLock = Get-Content $referenceLockPath -Raw | ConvertFrom-Json
           $catalog = Join-Path (Split-Path $referenceLockPath) $referenceLock.artifacts[0].g03_catalog.path
           if ((Get-FileHash $catalog -Algorithm SHA256).Hash -ne $referenceLock.g03_catalog_sha256) { throw 'Canonical provider catalog hash mismatch' }
@@ -343,6 +345,14 @@ jobs:
           $catalog = Join-Path $work 'combined-catalog.json'
           & './target/release-tools/examples/cutlass_fp8_catalog_declaration.exe' 134217728 512 experimental-release-source-declaration-v1 $catalog $baseCatalog
           $catalogSha = (Get-FileHash $catalog -Algorithm SHA256).Hash.ToLowerInvariant()
+          . './.github/ci/windows-production-native.ps1'
+          $llamaSource = Join-Path $work 'llama'
+          $llamaRevision = 'd81235049384534c167caea52b85a694f6103d14'
+          git init $llamaSource
+          git -C $llamaSource remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C $llamaSource fetch --depth 1 origin $llamaRevision
+          git -C $llamaSource checkout --detach FETCH_HEAD
+          if ((git -C $llamaSource rev-parse HEAD) -ne $llamaRevision) { throw 'Upstream projection source revision mismatch' }
           $cutlassArchive = Join-Path $work 'cutlass.tar.gz'
           & './target/release-tools/release_delivery.exe' fetch-verified --url 'https://codeload.github.com/NVIDIA/cutlass/tar.gz/cb4247394dd82148787aed73e5dc7cef33cbf862' --sha256 '7a37329b43a47aaf9ef142be99baff3e71dbeea007b975891350cc0e50bc598b' --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $cutlassArchive
           $fp8Source = Join-Path $work 'fp8-source'
@@ -355,7 +365,7 @@ jobs:
           $failedOperators = @()
           '| Native operator | Cache hits | Compiled units | Build seconds |' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           '| --- | ---: | ---: | ---: |' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          foreach ($operator in @('marlin', 'vllm-marlin', 'vllm-moe-marlin', 'vllm-paged-attention-v2', 'cutlass-fp8')) {
+          foreach ($operator in @('marlin', 'vllm-marlin', 'vllm-moe-marlin', 'vllm-paged-attention-v2', 'upstream-linear', 'upstream-extra-linear', 'upstream-q6-f32-linear', 'cutlass-fp8')) {
             Write-Host "Starting native operator: $operator"
             $build = Join-Path $work "build/$operator"
             $package = Join-Path $set "packages/$operator"
@@ -364,6 +374,11 @@ jobs:
             $operatorSource = $source
             $stage = 'lock-source'
             try {
+              if ($operator.StartsWith('upstream-')) {
+                $stage = 'materialize-source'
+                $operatorSource = Join-Path $work "$operator-source"
+                Initialize-FerrumUpstreamNativeSource -Workspace $env:GITHUB_WORKSPACE -LlamaSource $llamaSource -Operator $operator -Output $operatorSource
+              }
               if ($operator -eq 'marlin') {
                 $stage = 'materialize-source'
                 $operatorSource = Join-Path $work 'marlin-instance-policy-source'
@@ -414,6 +429,11 @@ jobs:
               "| $operator | $hits | $compiled | $seconds |" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
               $stage = 'materialize-package-spec'
               $packageDefinition = if ($operator -eq 'cutlass-fp8') { 'native-operators/cuda/package-definitions/cutlass-fp8-sm89.json' } else { "native-operators/cuda/package-definitions/$operator.json" }
+              if ($operator.StartsWith('upstream-')) {
+                $windowsDefinition = Join-Path $work "$operator.windows.package.json"
+                Write-FerrumWindowsNativePackageDefinition -Definition $packageDefinition -Output $windowsDefinition
+                $packageDefinition = $windowsDefinition
+              }
               & $builder materialize-package-spec --definition $packageDefinition --g03-catalog $catalog --out $spec
               $stage = 'package'
               & $builder package --spec $spec --source-root $operatorSource --license-root $env:GITHUB_WORKSPACE --source-build-receipt "$build/source-build.receipt.json" --source-build-plan $plan --g03-catalog $catalog --abi-contract 'native-operators/abi/ferrum-native-abi-v2.json' --cc $env:CC --ar $env:FERRUM_MSVC_LIB --out $package
@@ -492,8 +512,8 @@ jobs:
             $profile = 'release'
           } else {
             if (-not (Test-Path $env:FERRUM_NATIVE_OPERATOR_SET_LOCK -PathType Leaf)) { throw 'The native operator set is missing' }
-            $dependencies = Invoke-FerrumCargo -Stage 'cuda-dependencies' -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--lib', '--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8', '--timings')
-            $link = Invoke-FerrumCargo -Stage 'cuda-link' -ParallelLink -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--bin', 'ferrum', '--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8', '--timings')
+            $dependencies = Invoke-FerrumCargo -Stage 'cuda-dependencies' -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--lib', '--features', 'cuda,cuda-production,cuda-cutlass-fp8', '--timings')
+            $link = Invoke-FerrumCargo -Stage 'cuda-link' -ParallelLink -CargoArguments @('build', '--profile', 'release-thin', '--locked', '-p', 'ferrum-cli', '--bin', 'ferrum', '--features', 'cuda,cuda-production,cuda-cutlass-fp8', '--timings')
             $binary = 'target/release-thin/ferrum.exe'
             $profile = 'release-thin'
             & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-elf $binary
@@ -568,7 +588,7 @@ jobs:
               schema_version = 1
               build = @{ version = $env:VERSION; source_commit = $env:RC_SHA; build_id = "github-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" }
               backend = $env:BACKEND; target_triple = 'x86_64-pc-windows-msvc'; cuda_compute_capability = $(if ($env:BACKEND -eq 'cuda') { '89' } else { '' })
-              cargo_features = @(if ($env:BACKEND -eq 'cuda') { 'cuda'; 'vllm-moe-marlin'; 'vllm-paged-attn-v2'; 'cuda-cutlass-fp8' }); files = @($files.ToArray())
+              cargo_features = @(if ($env:BACKEND -eq 'cuda') { 'cuda'; 'cuda-production'; 'cuda-cutlass-fp8' }); files = @($files.ToArray())
             }
             sources = $sources
           }
