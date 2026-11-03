@@ -103,6 +103,29 @@ Embedding、ASR、TTS 入口和旧执行 API 已退役，见[迁移说明](https
 
 ## 性能
 
+**RTX 5090：所有已测热门模型的最新记录。** 吞吐单位 tok/s，每格为 **Ferrum / 对照**；C8、C16 表示客户端并发。版本逐行标注，未将旧版本数据冒充新版复测。
+
+| 模型 / 源权重 | 实测版本 | 对照 | C8 tok/s | C16 tok/s | SLO：C8 / C16 |
+|---|---|---|---:|---:|---|
+| Qwen3.5-4B · Q4_K_M | 0.18.3 | llama.cpp | 960.8 / 634.7 | 1294.8 / 729.4 | 通过 / Ferrum ITL 超限 |
+| Qwen3.5-9B · Q4_K_M | 0.18.3 | llama.cpp | 731.6 / 550.5 | 942.0 / 654.7 | 通过 / Ferrum ITL 超限 |
+| Qwen3.5-4B · BF16 | 0.18.3 | vLLM | 840.0 / 684.6 | 1306.8 / 1153.9 | 通过 / 通过 |
+| Qwen3.5-9B · BF16 | 0.18.3 | vLLM | 563.4 / 508.2 | 875.0 / 864.3 | 通过 / 通过 |
+| Qwen3-30B-A3B · GPTQ INT4 | 0.18.3 | vLLM | 630.5 / 824.0 | 848.8 / 1263.7 | 通过 / 通过 |
+| Qwen3.5-35B-A3B · GPTQ INT4 | 0.18.3 | vLLM | 717.6 / 625.6 | 978.3 / 947.4 | 通过 / vLLM ITL 超限 |
+| GPT-OSS-20B · MXFP4 | 0.18.4 R11 | vLLM | 890.9–892.3 / 819.8 | 1383.5–1385.9 / 1429.8 | 通过 / 通过 |
+| Qwen3.8-27B · UD-Q4_K_M | 0.13 候选 | llama.cpp | 356.42 / 291.60 | 535.51 / 377.41 | 双方未达标 / 双方未达标 |
+| Qwen3.8-27B · CT INT4 | 0.13 候选 | vLLM | 374.32 / 447.06 | 654.04 / 733.86 | Ferrum 未达标 / 双方未达标 |
+
+“通过”表示双方两轮均达标；ITL 超限发生在该档第一轮。4B/9B/30B/35B 每引擎每档 64 请求×2 轮，全部成功、零错误/拒绝；GPT-OSS 为 32 请求×2 独立进程，对照保留一轮。27B 为 200 请求×2 轮、零错误，使用更严格的独立 SLO，不能与其他行直接排名。
+
+4B/9B/30B/35B/GPT-OSS 的 P99 上限为 TTFT 2000 ms、TPOT 50 ms、可见 SSE ITL 100 ms。同一行使用同源权重和相同负载；BF16 源权重组及 35B 的 Ferrum 激活/KV 为 F16，vLLM 为 BF16。30B 仍明显落后；9B BF16 和 35B 的小幅吞吐领先在不同轮次中会反转，不宣称稳定优势。
+
+完整 TTFT/TPOT/ITL P50/P99、显存/RSS、命令与采样口径：[4B / 9B / 30B / 35B](docs/performance-rtx5090-popular-models-20261101.zh.md) · [GPT-OSS](docs/performance-rtx5090-gpt-oss-20261102.zh.md) · [27B](docs/performance-popular-models-p0.zh.md)。
+
+<details>
+<summary>GPT-OSS 最新优化：延迟和资源明细</summary>
+
 **RTX 5090 · GPT-OSS 20B · MXFP4：** **0.18.4** 合入的优化在 C8 达到 vLLM 吞吐的 **108.7–108.9%**，C16 达到 **96.8–96.9%**，均满足预设延迟 SLO。数据来自该优化的 R11 候选版本，未对最终发布包重新压测。
 
 同 GPU、源权重与固定 ShareGPT 样本；自然 EOS，最多输出 512 token。Ferrum 使用 F16 外层激活/KV、BF16 专家路径，vLLM 使用 BF16 激活/KV。延迟为 **P50 / P99，单位毫秒**；ITL 按客户端非空可见 SSE 文本事件计算。
@@ -121,6 +144,8 @@ Embedding、ASR、TTS 入口和旧执行 API 已退役，见[迁移说明](https
 整轮峰值设备显存 / 窗口进程 RSS：Ferrum #1 为 **15.978 / 1.177 GiB**，#2 为 **16.165 / 1.192 GiB**；vLLM 为 **29.937 / 3.145 GiB**。不是逐并发峰值；vLLM 预分配 KV，且其 RSS 仅统计 EngineCore，不能据此推导内存效率倍数。
 
 [负载、命令、输出有效性与完整证据](docs/performance-rtx5090-gpt-oss-20261102.zh.md)。结论仅覆盖该模型与配置。
+
+</details>
 
 ## 文档
 
