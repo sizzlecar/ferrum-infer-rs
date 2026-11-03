@@ -556,8 +556,8 @@
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "13317db8092feedb53760836700ecda36f8cae45b202c400cc53fd437b192b95",
-      "after_sha256": "b824ae97bbfd9d0321393dae12e037a006194772fe34783e616a05be261a380b",
+      "before_sha256": "b824ae97bbfd9d0321393dae12e037a006194772fe34783e616a05be261a380b",
+      "after_sha256": "7a2504e4a4234e5c444ca999a55da23565014ca9aaed1f1b1aec6cedc21424ca",
       "areas": [
         "build",
         "backend_submission",
@@ -568,12 +568,12 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the English README changes since v0.18.3: the shorter bilingual overview retains the throughput objective constrained by TTFT, TPOT, ITL and completion requirements, the model/backend combination limits, installation URLs, and text run/serve CLI entrypoints. Detailed image CLI, Metal and CUDA LoRA instructions move to the linked image guide. The image section states the validated Linux CUDA SM89/SM120 scope and distinguishes JSON text generation from editing with one 8-bit RGB/RGBA PNG; the Metal 1024x1024 qualification remains explicit. Performance links now lead to the English reports with Chinese counterparts and version-scoped measurements, including the GPT-OSS update, without extending those results to other models or releases. Retain all distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution, numerical correctness, throughput, SLO compliance or publication result."
+      "rationale": "Reviewed the README changes since v0.18.4: existing version-scoped 5090 measurements are summarized in the bilingual performance tables, including all benchmarked popular models and the GPT-OSS R11 details. The text retains workload, precision, repetition, latency SLO failure and memory-accounting qualifications; historical results are not described as measurements of 0.18.5. Navigation links now point to those tables and their existing detailed reports. Installation commands, run/serve entrypoints, model/backend support limits and API behavior are unchanged. Retain all distribution, device, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This review certifies content scope only, not execution, performance or publication."
     },
     {
       "path": "README_zh.md",
-      "before_sha256": "88e4dfce0e881f6d89bafcc9f472a753d3e125f90d41807af2092fec22e4c2cb",
-      "after_sha256": "b6356d62286391a07962a9a07fb97bc0b358133b92d0590fea94e63c405baa1f",
+      "before_sha256": "b6356d62286391a07962a9a07fb97bc0b358133b92d0590fea94e63c405baa1f",
+      "after_sha256": "1c1ec4799a80fea9e6a92f8eb9925bdd8acced46322739766eddf9f9cd55f206",
       "areas": [
         "build",
         "backend_submission",
@@ -584,7 +584,7 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the Chinese README changes since v0.18.3: the shorter bilingual overview retains the throughput objective constrained by TTFT, TPOT, ITL and completion requirements, the model/backend combination limits, installation URLs, and text run/serve CLI entrypoints. Detailed image CLI, Metal and CUDA LoRA instructions move to the linked image guide. The image section states the validated Linux CUDA SM89/SM120 scope and distinguishes JSON text generation from editing with one 8-bit RGB/RGBA PNG; the Metal 1024x1024 qualification remains explicit. Performance links lead to the Chinese reports paired with the default English editions and version-scoped measurements, including the GPT-OSS update, without extending those results to other models or releases. Retain all distribution, device submission, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This content review certifies no execution, numerical correctness, throughput, SLO compliance or publication result."
+      "rationale": "Reviewed the README changes since v0.18.4: existing version-scoped 5090 measurements are summarized in the bilingual performance tables, including all benchmarked popular models and the GPT-OSS R11 details. The text retains workload, precision, repetition, latency SLO failure and memory-accounting qualifications; historical results are not described as measurements of 0.18.5. Navigation links now point to those tables and their existing detailed reports. Installation commands, run/serve entrypoints, model/backend support limits and API behavior are unchanged. Retain all distribution, device, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This review certifies content scope only, not execution, performance or publication."
     }
   ],
   "release_profile_ids": [
