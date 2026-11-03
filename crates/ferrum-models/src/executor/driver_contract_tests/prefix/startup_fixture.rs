@@ -30,7 +30,7 @@ async fn native_startup_cuda_auto_reuses_fresh_greedy_requests_and_serves_new_sh
     } = stateful_program::cuda_auto_startup();
     assert_startup_on_demand_product_reuse(
         &executor,
-        ReusableExecutionOnDemandAdmission::AmortizedHostCostV1,
+        ReusableExecutionOnDemandAdmission::AfterWarmup,
     )
     .await;
     let _runtime = assert_executor_closed(executor);

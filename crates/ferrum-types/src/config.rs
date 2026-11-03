@@ -1671,9 +1671,9 @@ pub const DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH: usize =
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReusableExecutionPreparationMode {
-    /// Prepare before readiness and retain bounded, measured-cost learning when
-    /// supported; otherwise prepare the startup-sealed catalog. Explicit modes
-    /// retain their after-warmup capture behavior.
+    /// Prepare before readiness and capture recurring shapes after safety warmup
+    /// within the bounded catalog when supported; otherwise prepare only the
+    /// startup-sealed catalog.
     #[default]
     Auto,
     /// Prepare and validate the configured matrix before accepting requests.

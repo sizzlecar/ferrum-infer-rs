@@ -257,19 +257,6 @@ fn reusable_execution_maximum_decode_sequence_tokens(decode_width_count: usize) 
         .ok_or_else(|| FerrumError::config("vNext reusable startup token ceiling overflowed"))
 }
 
-fn resolve_reusable_capture_admission(
-    requested: ReusableExecutionPreparationMode,
-    resolved: ReusableExecutionPreparationMode,
-) -> ReusableExecutionOnDemandAdmission {
-    if requested == ReusableExecutionPreparationMode::Auto
-        && resolved == ReusableExecutionPreparationMode::StartupAndOnDemand
-    {
-        ReusableExecutionOnDemandAdmission::AmortizedHostCostV1
-    } else {
-        ReusableExecutionOnDemandAdmission::AfterWarmup
-    }
-}
-
 fn resolve_reusable_execution_policy(
     maximum_active_sequences: u32,
     maximum_scheduled_tokens: u64,
@@ -722,7 +709,6 @@ impl ProgramExecutorConfig {
         let prepare_device_programs =
             engine.backend.enable_reusable_execution && device_reusable_execution_supported;
         let mut capture_config = engine.backend.reusable_execution_capture.clone();
-        let requested_preparation = capture_config.preparation;
         if engine.backend.enable_reusable_execution {
             capture_config.preparation = capture_config
                 .preparation
@@ -779,7 +765,11 @@ impl ProgramExecutorConfig {
             maximum_model_tokens,
             &reusable_execution_prefill_chunks,
             &capture_config,
-            resolve_reusable_capture_admission(requested_preparation, capture_config.preparation),
+            // Recurring shapes may capture after safety warmup within the fixed
+            // executable budget. Waiting to amortize the largest previously
+            // observed capture cost can keep a new concurrency width eager
+            // throughout its first request wave.
+            ReusableExecutionOnDemandAdmission::AfterWarmup,
             prepare_device_programs,
         )?;
         let reusable_execution_policy = Some(reusable_execution_resolution.policy);
@@ -10092,7 +10082,7 @@ mod tests {
     }
 
     #[test]
-    fn reusable_execution_auto_cost_admission_preserves_explicit_modes_and_startup_scope() {
+    fn reusable_execution_modes_preserve_after_warmup_admission_and_startup_scope() {
         use ferrum_runtime::{
             ReusableExecutionOnDemandAdmission as Admission, ReusableExecutionProgramPreparation,
         };
@@ -10104,15 +10094,7 @@ mod tests {
             Mode::OnDemand,
         ] {
             let resolved = mode.resolve(true).unwrap();
-            let admission = super::resolve_reusable_capture_admission(mode, resolved);
-            assert_eq!(
-                admission,
-                if mode == Mode::Auto {
-                    Admission::AmortizedHostCostV1
-                } else {
-                    Admission::AfterWarmup
-                }
-            );
+            let admission = Admission::AfterWarmup;
             let config = ReusableExecutionCaptureConfig {
                 preparation: resolved,
                 ..Default::default()
@@ -10139,13 +10121,6 @@ mod tests {
                 }
             );
         }
-        assert_eq!(
-            super::resolve_reusable_capture_admission(
-                Mode::Auto,
-                Mode::Auto.resolve(false).unwrap()
-            ),
-            Admission::AfterWarmup
-        );
     }
 
     #[test]
