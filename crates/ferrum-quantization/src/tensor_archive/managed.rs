@@ -5,6 +5,7 @@ use ferrum_runtime::{
     WeightComponentSpec,
 };
 use half::{bf16, f16};
+mod bf16_to_f16;
 
 /// Native blocks remain borrowed and unchanged. Dense floating-point values
 /// may be rounded to the requested component type, with output reserved before
@@ -247,6 +248,19 @@ fn floating(ty: ElementType) -> bool {
 }
 
 fn convert_floating(
+    source: ElementType,
+    target: ElementType,
+    input: &[u8],
+    output: &mut [u8],
+    affine: Option<(CanonicalRational, CanonicalRational)>,
+) -> std::result::Result<(), &'static str> {
+    if source == ElementType::Bf16 && target == ElementType::F16 && affine.is_none() {
+        return bf16_to_f16::convert(input, output);
+    }
+    convert_floating_scalar(source, target, input, output, affine)
+}
+
+fn convert_floating_scalar(
     source: ElementType,
     target: ElementType,
     input: &[u8],

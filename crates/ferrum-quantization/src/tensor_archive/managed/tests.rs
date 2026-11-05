@@ -4,6 +4,7 @@ use ferrum_runtime::{HostMemoryClassLimits, HostMemoryLimits, WeightComponentRol
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 mod affine;
+mod bf16_simd;
 
 struct Tensor {
     name: &'static str,
