@@ -58,7 +58,8 @@ pub use quant_linear::QuantLinear;
 pub use safetensors_archive::{SafetensorsArchive, SafetensorsReadAheadPolicy, SafetensorsTensor};
 pub use tensor_archive::{
     ArchiveTensor, Bf16ToF16BlockCounts, DenseArchiveMaterializationReport,
-    DenseArchivePhaseTiming, DenseArchiveSourceTouch, ManagedDenseArchiveSource, TensorArchive,
+    DenseArchivePhaseTiming, DenseArchiveSourceTouch, ManagedDenseArchiveInstallation,
+    ManagedDenseArchiveSource, TensorArchive,
 };
 pub use traits::Linear;
 

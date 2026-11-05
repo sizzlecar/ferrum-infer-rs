@@ -7,10 +7,13 @@ use ferrum_runtime::{
 use half::{bf16, f16};
 mod bf16_to_f16;
 mod diagnostics;
+mod reuse;
 pub use diagnostics::{
     Bf16ToF16BlockCounts, DenseArchiveMaterializationReport, DenseArchivePhaseTiming,
     DenseArchiveSourceTouch,
 };
+pub use reuse::ManagedDenseArchiveInstallation;
+use reuse::{BackingLease, ReusableBacking};
 
 /// Native blocks remain borrowed and unchanged. Dense floating-point values
 /// may be rounded to the requested component type, with output reserved before
@@ -28,6 +31,19 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
         Self { archive, host }
     }
 
+    /// Explicit single-installation reuse, bounded by the caller's selected
+    /// maximum converted component extent. Allocates and charges the original
+    /// Host account once, including alignment padding. This does not validate
+    /// native placements or overlapping materialization groups; callers must
+    /// consume components sequentially and release every payload before reuse.
+    /// Ordinary `component` calls on this source continue to allocate fresh.
+    pub fn reusable_installation(
+        &self,
+        maximum_component_bytes: std::num::NonZeroUsize,
+    ) -> std::result::Result<ManagedDenseArchiveInstallation<'archive>, VNextError> {
+        ManagedDenseArchiveInstallation::new(self.archive, self.host, maximum_component_bytes)
+    }
+
     /// Run the same conversion with explicit CPU diagnostics. The report is
     /// reset per call and retained on error. No GPU or execution precision is
     /// changed. Touching mmap pages is optional and changes source residency.
@@ -37,9 +53,19 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
         source_touch: DenseArchiveSourceTouch,
         report: &mut DenseArchiveMaterializationReport,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+        self.component_diagnostic(component, source_touch, report, None)
+    }
+
+    fn component_diagnostic<'source>(
+        &'source self,
+        component: &WeightComponentSpec,
+        source_touch: DenseArchiveSourceTouch,
+        report: &mut DenseArchiveMaterializationReport,
+        reuse: Option<&ReusableBacking>,
+    ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
         *report = DenseArchiveMaterializationReport::default();
         let started = std::time::Instant::now();
-        let result = self.component_inner::<true>(component, source_touch, report);
+        let result = self.component_inner::<true>(component, source_touch, report, reuse);
         report.total_wall_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         report.completed = result.is_ok();
         result
@@ -50,6 +76,7 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
         component: &WeightComponentSpec,
         source_touch: DenseArchiveSourceTouch,
         report: &mut DenseArchiveMaterializationReport,
+        reuse: Option<&ReusableBacking>,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
         let metadata_started = diagnostics::start::<DIAGNOSTICS>();
         let invalid = |reason: &str| VNextError::InvalidExecutionPlan {
@@ -155,14 +182,12 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
         for tensor in &tensors {
             diagnostics::touch::<DIAGNOSTICS>(tensor.bytes(), source_touch, report);
         }
-        // Every source is an immutable archive view. The only payload-sized
-        // allocation is this one exact destination on the caller's Host view.
+        // Every source is an immutable archive view. Conversion writes the
+        // exact logical destination on the caller's Host view; an explicitly
+        // reused slot may retain a larger, fully charged physical allocation.
         let allocation_started = diagnostics::start::<DIAGNOSTICS>();
-        let backing = self
-            .host
-            .reserve(HostMemoryClass::WeightBacking, bytes)
-            .and_then(|reservation| reservation.allocate_zeroed())
-            .map_err(|e| invalid(&e.to_string()));
+        let backing =
+            BackingLease::allocate(self.host, bytes, reuse).map_err(|error| invalid(&error));
         diagnostics::finish(allocation_started, &mut report.reserve_allocate_zeroed);
         let mut backing = backing?;
         let mut offset = 0usize;
@@ -193,7 +218,7 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
             files,
             component.dimensions.clone(),
             *target,
-            backing.freeze(),
+            backing.freeze()?,
         );
         diagnostics::finish(assembly_started, &mut report.payload_assembly);
         payload
@@ -204,12 +229,13 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
         component: &WeightComponentSpec,
         source_touch: DenseArchiveSourceTouch,
         report: &mut DenseArchiveMaterializationReport,
+        reuse: Option<&ReusableBacking>,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
         let invalid = |reason: &str| VNextError::InvalidExecutionPlan {
             reason: format!("managed archive component `{}`: {reason}", component.id),
         };
         let [name] = component.external_names.as_slice() else {
-            return self.composite::<DIAGNOSTICS>(component, source_touch, report);
+            return self.composite::<DIAGNOSTICS>(component, source_touch, report, reuse);
         };
         let metadata_started = diagnostics::start::<DIAGNOSTICS>();
         let tensor = self
@@ -289,11 +315,8 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
         diagnostics::finish(metadata_started, &mut report.metadata_validation);
         diagnostics::touch::<DIAGNOSTICS>(tensor.bytes(), source_touch, report);
         let allocation_started = diagnostics::start::<DIAGNOSTICS>();
-        let backing = self
-            .host
-            .reserve(HostMemoryClass::WeightBacking, bytes)
-            .and_then(|reservation| reservation.allocate_zeroed())
-            .map_err(|e| invalid(&e.to_string()));
+        let backing =
+            BackingLease::allocate(self.host, bytes, reuse).map_err(|error| invalid(&error));
         diagnostics::finish(allocation_started, &mut report.reserve_allocate_zeroed);
         let mut backing = backing?;
         let conversion_started = diagnostics::start::<DIAGNOSTICS>();
@@ -317,7 +340,7 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
             vec![tensor.source_file().to_owned()],
             component.dimensions.clone(),
             target,
-            backing.freeze(),
+            backing.freeze()?,
         );
         diagnostics::finish(assembly_started, &mut report.payload_assembly);
         payload
@@ -347,6 +370,7 @@ impl WeightComponentSource for ManagedDenseArchiveSource<'_> {
             component,
             DenseArchiveSourceTouch::AsMapped,
             &mut DenseArchiveMaterializationReport::default(),
+            None,
         )
     }
 }
