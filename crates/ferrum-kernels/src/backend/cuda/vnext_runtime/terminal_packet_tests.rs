@@ -331,7 +331,7 @@ impl Fixture {
             .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
             .map_err(|e| CudaDeviceRuntimeError::driver("test start event", e))?;
         for command in &pending.commands {
-            command.enqueue(&pending.stream.stream, &pending.stream.blas)?;
+            pending.stream.enqueue_command(command)?;
         }
         let event = pending
             .stream
@@ -348,7 +348,7 @@ impl Fixture {
             stream_state: Arc::clone(&pending.stream.state),
             terminal_accounted: AtomicBool::new(false),
             _stream: Arc::clone(&pending.stream.stream),
-            _blas: Arc::clone(&pending.stream.blas),
+            _blas: pending.stream.blas.clone(),
             _commands: std::mem::take(&mut pending.commands),
         });
         let enqueued_ns = started.elapsed().as_nanos();

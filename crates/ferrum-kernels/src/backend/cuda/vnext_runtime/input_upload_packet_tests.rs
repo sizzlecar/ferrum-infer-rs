@@ -402,7 +402,7 @@ impl Fixture {
             .map_err(|e| CudaDeviceRuntimeError::driver("input upload start event", e))?;
         let enqueue = Instant::now();
         for command in &pending.commands {
-            command.enqueue(&pending.stream.stream, &pending.stream.blas)?;
+            pending.stream.enqueue_command(command)?;
         }
         let enqueue_ns = enqueue.elapsed().as_nanos();
         let event = pending
@@ -420,7 +420,7 @@ impl Fixture {
             stream_state: Arc::clone(&pending.stream.state),
             terminal_accounted: AtomicBool::new(false),
             _stream: Arc::clone(&pending.stream.stream),
-            _blas: Arc::clone(&pending.stream.blas),
+            _blas: pending.stream.blas.clone(),
             _commands: std::mem::take(&mut pending.commands),
         });
         let fence = pending.fence.as_ref().unwrap();

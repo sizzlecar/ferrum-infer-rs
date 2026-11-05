@@ -223,6 +223,7 @@ pub fn cuda_vnext_runtime_config(
     let q6_head_fingerprint = q6_head::fingerprint();
     let fingerprint_parts: Vec<&[u8]> = vec![
         include_str!("vnext_runtime.rs").as_bytes(),
+        include_bytes!("vnext_runtime/blas.rs"),
         q6_head_fingerprint.as_bytes(),
         include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
         include_str!("vnext_runtime/binding_scatter.rs").as_bytes(),
@@ -1883,6 +1884,7 @@ impl CudaVNextComposition {
             implementation_fingerprint(&[
                 include_str!("vnext_ops.rs").as_bytes(),
                 include_str!("vnext_runtime.rs").as_bytes(),
+                include_bytes!("vnext_runtime/blas.rs"),
                 q6_head::fingerprint().as_bytes(),
                 include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
                 include_str!("vnext_runtime/segment_oracle.rs").as_bytes(),

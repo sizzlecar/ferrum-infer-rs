@@ -55,6 +55,7 @@ use crate::backend::program_binding_upload::ProgramBindingUploadCounters;
 mod allocation;
 mod binding_scatter;
 mod binding_transfers;
+mod blas;
 #[cfg(test)]
 mod compact_upload_scatter_tests;
 mod cudnn;
@@ -2891,7 +2892,7 @@ pub struct CudaDeviceStream {
     id: u64,
     runtime_instance: u64,
     stream: Arc<CudaStream>,
-    blas: Arc<CudaBlas>,
+    blas: Option<Arc<CudaBlas>>,
     state: Arc<CudaStreamState>,
     executable_cache: CudaExecutableCache,
     terminal_readback_pool: Arc<terminal_readback::Pool>,
@@ -3009,7 +3010,7 @@ pub struct CudaDeviceFence {
     stream_state: Arc<CudaStreamState>,
     terminal_accounted: AtomicBool,
     _stream: Arc<CudaStream>,
-    _blas: Arc<CudaBlas>,
+    _blas: Option<Arc<CudaBlas>>,
     _commands: Vec<CudaDeviceCommand>,
 }
 
@@ -3028,7 +3029,7 @@ impl Drop for CudaDeviceFence {
             // the native owners and their quotas conservatively.
             self.stream_state.fail();
             std::mem::forget(Arc::clone(&self._stream));
-            std::mem::forget(Arc::clone(&self._blas));
+            std::mem::forget(self._blas.clone());
             std::mem::forget(std::mem::take(&mut self._commands));
         }
     }
@@ -3281,7 +3282,7 @@ fn cuda_event_elapsed_ns(start: &CudaEvent, end: &CudaEvent) -> Option<u64> {
 struct QuarantinedSubmission {
     stream_id: u64,
     _stream: Arc<CudaStream>,
-    _blas: Arc<CudaBlas>,
+    _blas: Option<Arc<CudaBlas>>,
     _commands: Vec<CudaDeviceCommand>,
 }
 
@@ -3792,7 +3793,7 @@ impl CudaDeviceRuntime {
         self.quarantined().push(QuarantinedSubmission {
             stream_id: stream.id,
             _stream: Arc::clone(&stream.stream),
-            _blas: Arc::clone(&stream.blas),
+            _blas: stream.blas.clone(),
             _commands: commands,
         });
     }
@@ -4990,16 +4991,20 @@ impl DeviceRuntime for CudaDeviceRuntime {
             let stream_create_us = stream_started.map_or(0, |started| {
                 u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
             });
-            let blas_started = trace_enabled.then(Instant::now);
-            let blas =
-                Arc::new(CudaBlas::new(Arc::clone(&stream)).map_err(|error| {
-                    CudaDeviceRuntimeError::blas("cuBLAS handle creation", error)
-                })?);
+            let blas_started = (trace_enabled && self.tensor_eager.is_none()).then(Instant::now);
+            let blas = if self.tensor_eager.is_some() {
+                None
+            } else {
+                Some(Arc::new(CudaBlas::new(Arc::clone(&stream)).map_err(
+                    |error| CudaDeviceRuntimeError::blas("cuBLAS handle creation", error),
+                )?))
+            };
             if trace_enabled {
                 tracing::debug!(
                     stream_id = id,
                     runtime_instance = self.runtime_instance,
                     stream_create_us,
+                    blas_created = blas.is_some(),
                     blas_create_us = blas_started.map_or(0, |started| {
                         u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
                     }),
@@ -5924,6 +5929,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 error,
             )));
         }
+        // Typed transfers do not use cuBLAS. Any other command (including a
+        // legacy terminal tail) establishes the dependency before a submission
+        // is armed or any work can enqueue on this original stream.
+        let requires_blas =
+            blas::submission_requires_blas(commands.iter().chain(terminal_readback.iter()));
+        self.ensure_submission_blas(stream, requires_blas)
+            .map_err(DefinitelyNotSubmitted::new)?;
         if let Some(lane) = &stream.tensor_lane {
             let flight = lane.reserve_flight().map_err(DefinitelyNotSubmitted::new)?;
             commands[0].tensor_flight = Some(flight);
@@ -5992,7 +6004,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let preparation = match stream.executable_cache.prepare_all(
             &self.context,
             &stream.stream,
-            &stream.blas,
+            stream.blas.as_ref(),
             &commands,
             &executable_candidates,
             capture_allowed,
@@ -6351,7 +6363,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 false,
                 || {
                     catch_unwind(AssertUnwindSafe(|| {
-                        commands[index].enqueue(&stream.stream, &stream.blas)
+                        stream.enqueue_command(&commands[index])
                     }))
                 },
             ) {
@@ -6438,7 +6450,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         // segment and its logical attribution. Keep all tail owners through
         // the original fence, or through quarantine after any partial enqueue.
         if let Some(tail) = terminal_readback.as_ref() {
-            if let Err(error) = tail.enqueue(&stream.stream, &stream.blas) {
+            if let Err(error) = stream.enqueue_command(tail) {
                 commands.push(terminal_readback.take().expect("present terminal tail"));
                 stream.state.fail();
                 self.quarantine(stream, commands.take());
@@ -6534,7 +6546,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             stream_state: Arc::clone(&stream.state),
             terminal_accounted: AtomicBool::new(false),
             _stream: Arc::clone(&stream.stream),
-            _blas: Arc::clone(&stream.blas),
+            _blas: stream.blas.clone(),
             _commands: commands.take(),
         };
         drop(fence_stage);
@@ -6824,7 +6836,7 @@ mod tests {
             .with_numerical_status(region.clone(), vec![0], 1 << 31, false)
             .unwrap();
             stream.state.begin_submission().unwrap();
-            command.enqueue(&stream.stream, &stream.blas).unwrap();
+            stream.enqueue_command(&command).unwrap();
             // A following operation overwrites the entire scratch word. Its
             // value must not erase the earlier operation's failure snapshot.
             unsafe {

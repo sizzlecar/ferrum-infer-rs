@@ -1281,7 +1281,7 @@ impl CudaExecutableCache {
         &mut self,
         context: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
-        blas: &Arc<CudaBlas>,
+        blas: Option<&Arc<CudaBlas>>,
         commands: &[CudaDeviceCommand],
         candidates: &[CudaExecutableCandidate],
         capture_allowed: bool,
@@ -1316,6 +1316,11 @@ impl CudaExecutableCache {
         if candidates.is_empty() {
             return Ok(report);
         }
+        let blas = blas.ok_or_else(|| CudaReplayError {
+            stage: "prepare reusable executable dependencies",
+            detail: "CUDA reusable candidates require an initialized cuBLAS handle".to_owned(),
+            eager_fallback_safe: false,
+        })?;
         if !self.preparation.capture_is_open() {
             report.outside_preparation_segments = candidates
                 .len()

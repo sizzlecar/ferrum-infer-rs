@@ -10,7 +10,7 @@ pub(super) struct SubmissionGuard<'a> {
     runtime: &'a CudaDeviceRuntime,
     stream_id: u64,
     stream: Arc<CudaStream>,
-    blas: Arc<CudaBlas>,
+    blas: Option<Arc<CudaBlas>>,
     state: Arc<CudaStreamState>,
     commands: Vec<CudaDeviceCommand>,
     armed: bool,
@@ -26,7 +26,7 @@ impl<'a> SubmissionGuard<'a> {
             runtime,
             stream_id: stream.id,
             stream: Arc::clone(&stream.stream),
-            blas: Arc::clone(&stream.blas),
+            blas: stream.blas.clone(),
             state: Arc::clone(&stream.state),
             commands,
             armed: false,
@@ -59,7 +59,7 @@ impl Drop for SubmissionGuard<'_> {
             self.runtime.quarantined().push(QuarantinedSubmission {
                 stream_id: self.stream_id,
                 _stream: Arc::clone(&self.stream),
-                _blas: Arc::clone(&self.blas),
+                _blas: self.blas.clone(),
                 _commands: std::mem::take(&mut self.commands),
             });
         }

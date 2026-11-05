@@ -150,7 +150,7 @@ impl CaptureHarness {
             .prepare_all(
                 &self.context,
                 &self.stream,
-                &self.blas,
+                Some(&self.blas),
                 &commands,
                 &candidates,
                 quiescent,
@@ -397,7 +397,7 @@ fn on_demand_logical_catalog_is_bounded_and_stale_references_miss_before_launch(
             .prepare_all(
                 &h.context,
                 &h.stream,
-                &h.blas,
+                Some(&h.blas),
                 &commands,
                 &candidates,
                 true,
@@ -476,7 +476,7 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
         .prepare_all(
             &h.context,
             &h.stream,
-            &h.blas,
+            Some(&h.blas),
             &commands,
             &candidates,
             true,
@@ -527,7 +527,7 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
         .prepare_all(
             &h.context,
             &h.stream,
-            &h.blas,
+            Some(&h.blas),
             &eager_commands,
             &[],
             true,
