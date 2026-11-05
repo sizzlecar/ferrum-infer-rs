@@ -61,11 +61,13 @@ use uuid::Uuid;
 
 mod chat_stream;
 mod images;
+mod listener;
 mod output;
 mod profile_delivery;
 mod responses;
 
 pub use images::{ImageHttpConfig, ImageHttpService};
+pub use listener::BoundHttpListener;
 
 use profile_delivery::HttpProfileDelivery;
 pub use profile_delivery::{
@@ -149,7 +151,6 @@ pub fn init_prometheus_recorder() {
 /// engine. Text handlers return 503 when no engine is loaded.
 pub struct AxumServer {
     state: AppState,
-    config: ServerConfig,
     lifecycle: Arc<AxumServerLifecycle>,
 }
 
@@ -157,6 +158,7 @@ pub struct AxumServer {
 struct AxumServerLifecycle {
     shutdown_requested: AtomicBool,
     running: AtomicBool,
+    bound_address: Mutex<Option<std::net::SocketAddr>>,
     engines_stopped: AtomicBool,
     shutdown_notify: Notify,
     stopped_notify: Notify,
@@ -209,6 +211,11 @@ struct AxumServerRunGuard {
 
 impl Drop for AxumServerRunGuard {
     fn drop(&mut self) {
+        *self
+            .lifecycle
+            .bound_address
+            .lock()
+            .expect("HTTP bound address") = None;
         self.lifecycle.running.store(false, Ordering::Release);
         self.lifecycle.stopped_notify.notify_waiters();
     }
@@ -225,7 +232,6 @@ impl AxumServer {
     pub fn from_state(state: AppState) -> Self {
         Self {
             state,
-            config: ServerConfig::default(),
             lifecycle: Arc::new(AxumServerLifecycle::default()),
         }
     }
@@ -1130,61 +1136,7 @@ fn trim_messages_to_token_budget(messages: &mut Vec<SessionMessage>, max_tokens:
 #[async_trait]
 impl HttpServer for AxumServer {
     async fn start(&self, config: &ServerConfig) -> ferrum_types::Result<()> {
-        // Publish start before stop can decide HTTP is drained. The guard is
-        // released before profile assembly, bind, and serving: shutdown never
-        // waits for a running task that needs this same lock to make progress.
-        let start_guard = self.lifecycle.stop_lock.lock().await;
-        if self.lifecycle.shutdown_requested.load(Ordering::Acquire) {
-            return Err(Error::internal(
-                "cannot start Axum server after shutdown was requested",
-            ));
-        }
-        if self.lifecycle.running.load(Ordering::Acquire) {
-            return Err(Error::internal("Axum server is already running"));
-        }
-        *self
-            .lifecycle
-            .profile_detail
-            .lock()
-            .expect("HTTP selected profile detail") = Some(config.profile_detail);
-        self.state.validate_lora_execution_support(
-            self.state.served_model_registry.adapter_count() > 0,
-        )?;
-        self.state.validate_image_configuration()?;
-        self.lifecycle
-            .running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Error::internal("Axum server is already running"))?;
-        let _run_guard = AxumServerRunGuard {
-            lifecycle: Arc::clone(&self.lifecycle),
-        };
-        drop(start_guard);
-        let addr = format!("{}:{}", config.host, config.port);
-        info!("Starting Axum server on {}", addr);
-
-        let state = self.prepare_profile_state(
-            self.state
-                .clone()
-                .with_request_dump_dir(config.request_dump_dir.clone())
-                .with_profile_jsonl(config.profile_jsonl.clone())
-                .with_profile_detail(config.profile_detail)
-                .with_profile_journal(config.profile_journal.clone())
-                .with_memory_profile_jsonl(config.memory_profile_jsonl.clone()),
-        )?;
-        let app = self.build_router_with_state(state);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| Error::internal(format!("Failed to bind to {}: {}", addr, e)))?;
-
-        info!("Server listening on {}", addr);
-
-        let lifecycle = Arc::clone(&self.lifecycle);
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { lifecycle.wait_for_shutdown().await })
-            .await
-            .map_err(|e| Error::internal(format!("Server error: {}", e)))?;
-
-        Ok(())
+        self.start_inner(config, None, |_| {}).await
     }
 
     async fn stop(&self, timeout: std::time::Duration) -> ferrum_types::Result<()> {
@@ -1196,10 +1148,11 @@ impl HttpServer for AxumServer {
     }
 
     fn address(&self) -> Option<std::net::SocketAddr> {
-        // For MVP, return configured address
-        format!("{}:{}", self.config.host, self.config.port)
-            .parse()
-            .ok()
+        *self
+            .lifecycle
+            .bound_address
+            .lock()
+            .expect("HTTP bound address")
     }
 
     fn register_handler(
