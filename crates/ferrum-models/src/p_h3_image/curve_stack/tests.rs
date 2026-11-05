@@ -566,6 +566,7 @@ fn checkpoint_metadata_builds_a_real_w4_then_w8_stack_without_expanding_weights(
     )
     .unwrap();
     assert_eq!(discovered, s.config);
+    assert!(PH3ImageBlockProjectionStorage::from_checkpoint(&files.source, 2).is_err());
     let checkpoint =
         PH3ImageCurveStackCheckpoint::new(&discovered, &files.source, limits()).unwrap();
     let c = compose::build(&discovered, limits()).unwrap();

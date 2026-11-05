@@ -1,9 +1,7 @@
 //! Per-projection physical storage declared by the original checkpoint.
 //! No layer number or model name selects a quantization format.
-use anyhow::{bail, Result};
-use ferrum_quantization::comfy_convrot::{
-    ComfyCanonicalWeightSource, ComfyQuantizationMetadata, ComfyQuantizedMatrix,
-};
+use anyhow::{bail, Context, Result};
+use ferrum_quantization::comfy_convrot::{ComfyCanonicalWeightSource, ComfyQuantizationMetadata};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -60,11 +58,15 @@ impl PH3ImageBlockProjectionStorage {
     }
     pub fn from_checkpoint(source: &ComfyCanonicalWeightSource, block_index: u64) -> Result<Self> {
         let get = |module: &str| -> Result<PH3ImageProjectionStorage> {
-            let matrix = ComfyQuantizedMatrix::from_archive(
-                source.archive(),
-                &format!("blocks.{block_index}.{module}"),
-            )?;
-            PH3ImageProjectionStorage::from_metadata(matrix.metadata())
+            let name = format!("blocks.{block_index}.{module}");
+            // The immutable canonical source already validated every physical
+            // scale and codebook on construction. Request geometry only needs
+            // its declared storage, not another scan of the weight payloads.
+            let metadata = source
+                .modules()
+                .get(&name)
+                .with_context(|| format!("missing validated H3 projection {name}"))?;
+            PH3ImageProjectionStorage::from_metadata(metadata)
         };
         Ok(Self::new(
             get("attn.qkv_proj")?,
