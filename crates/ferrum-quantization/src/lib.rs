@@ -28,6 +28,7 @@ pub mod loader;
 pub mod lora;
 pub mod mxfp4_safetensors_source;
 pub mod native_safetensors;
+pub mod process_mapped_dense;
 pub mod quant_linear;
 pub mod safetensors_archive;
 pub mod tensor_archive;
@@ -49,6 +50,9 @@ pub use loader::{PrefixedLoader, WeightLoader};
 pub use lora::LoraLinearRef;
 pub use mxfp4_safetensors_source::{Mxfp4SafetensorsSource, MXFP4_E2M1_E8M0_SOURCE_FORMAT_ID};
 pub use native_safetensors::{NativeSafetensorsLoadOptions, NativeSafetensorsLoader};
+pub use process_mapped_dense::{
+    ProcessMappedDenseLimits, ProcessMappedDenseRequirements, ProcessMappedDenseWeights,
+};
 pub use quant_linear::QuantLinear;
 pub use safetensors_archive::{SafetensorsArchive, SafetensorsReadAheadPolicy, SafetensorsTensor};
 pub use tensor_archive::{ArchiveTensor, ManagedDenseArchiveSource, TensorArchive};
