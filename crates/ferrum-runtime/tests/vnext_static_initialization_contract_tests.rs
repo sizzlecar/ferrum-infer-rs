@@ -5,6 +5,9 @@ use vnext_device_operation_contract::*;
 #[path = "vnext_static_initialization_contract_tests/host_scope.rs"]
 mod host_scope;
 
+#[path = "vnext_static_initialization_contract_tests/managed_weight_upload.rs"]
+mod managed_weight_upload;
+
 struct ZeroWeightSource;
 
 impl WeightComponentSource for ZeroWeightSource {

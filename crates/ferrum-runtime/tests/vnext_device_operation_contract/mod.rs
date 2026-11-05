@@ -1436,7 +1436,7 @@ pub(crate) struct TestBuffer {
 #[derive(Debug, Default)]
 pub(crate) struct TestStream;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TestCommand {
     Provider,
     ScratchProvider,
@@ -1448,8 +1448,22 @@ pub(crate) enum TestCommand {
     ResultBinding,
     Copy,
     Upload(u8, BufferUsage),
+    ManagedUpload(TestManagedUpload),
     Zero,
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct TestManagedUpload {
+    source: ManagedHostBytes,
+    usage: BufferUsage,
+}
+
+impl PartialEq for TestManagedUpload {
+    fn eq(&self, other: &Self) -> bool {
+        self.usage == other.usage && self.source.same_region(&other.source)
+    }
+}
+impl Eq for TestManagedUpload {}
 
 #[derive(Debug, Clone)]
 pub(crate) struct TestFence(
@@ -1458,6 +1472,7 @@ pub(crate) struct TestFence(
     Option<DeviceSubmissionAttribution>,
     Option<Arc<TestTerminalPacket>>,
     Option<DeviceSubmissionExecutionFacts>,
+    Arc<Vec<ManagedHostBytes>>,
 );
 
 pub(crate) struct TestTerminalPacket {
@@ -1635,6 +1650,15 @@ pub(crate) struct RuntimeTrace {
     pub(crate) submitted_compute_path_requirements: Vec<DeviceComputePathRequirement>,
     pub(crate) submitted_attribution_requirements: Vec<DeviceSubmissionAttributionRequirement>,
     pub(crate) uploaded_payloads: Vec<Vec<u8>>,
+    /// Observations own copied test diagnostics, never the actual upload owner.
+    pub(crate) uploaded_ranges: Vec<(bool, u64, Vec<u8>)>,
+    pub(crate) managed_uploads_enabled: bool,
+    pub(crate) managed_static_uploads_enabled: bool,
+    pub(crate) managed_static_weight_sources_enabled: bool,
+    pub(crate) managed_upload_classes: Vec<HostMemoryClass>,
+    pub(crate) managed_upload_backing_bytes: Vec<usize>,
+    pub(crate) fail_managed_upload_at: Option<usize>,
+    pub(crate) managed_upload_encode_calls: usize,
     pub(crate) submitted_reusable_captures: Vec<Option<DeviceReusableExecutionCapture>>,
     pending_reusable_invocations: Vec<DeviceReusableExecutionInvocation>,
     pub(crate) scratch_bytes: BTreeMap<u32, u8>,
@@ -1732,7 +1756,9 @@ fn test_submission_attribution(
                     ("test_result_binding", DeviceExecutionPath::Eager, 0, 1)
                 }
                 TestCommand::Copy => ("test_copy", DeviceExecutionPath::Eager, 0, 1),
-                TestCommand::Upload(_, _) => ("test_upload", DeviceExecutionPath::Eager, 0, 1),
+                TestCommand::Upload(_, _) | TestCommand::ManagedUpload(_) => {
+                    ("test_upload", DeviceExecutionPath::Eager, 0, 1)
+                }
                 TestCommand::Zero => ("test_zero", DeviceExecutionPath::Eager, 0, 1),
             };
         let logical_work = entry.logical_work();
@@ -2319,6 +2345,17 @@ impl DeviceRuntime for TestRuntime {
         )
     }
 
+    fn supports_managed_tensor_io(&self) -> bool {
+        self.trace.lock().unwrap().managed_static_uploads_enabled
+    }
+
+    fn supports_managed_static_weight_sources(&self) -> bool {
+        self.trace
+            .lock()
+            .unwrap()
+            .managed_static_weight_sources_enabled
+    }
+
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {
         Ok(TestStream)
     }
@@ -2350,17 +2387,68 @@ impl DeviceRuntime for TestRuntime {
         source: &[u8],
         _source_layout: HostTransferLayout,
         destination: &Self::Buffer,
-        _destination_offset_bytes: u64,
+        destination_offset_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
-        self.trace
-            .lock()
-            .unwrap()
-            .uploaded_payloads
-            .push(source.to_vec());
+        let mut trace = self.trace.lock().unwrap();
+        trace.uploaded_payloads.push(source.to_vec());
+        trace
+            .uploaded_ranges
+            .push((false, destination_offset_bytes, source.to_vec()));
         Ok(TestCommand::Upload(
             source.first().copied().unwrap_or(0),
             destination.descriptor.usage,
         ))
+    }
+
+    fn encode_managed_upload(
+        &self,
+        source: ManagedHostBytes,
+        source_layout: HostTransferLayout,
+        destination: &Self::Buffer,
+        destination_offset_bytes: u64,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        let mut trace = self.trace.lock().unwrap();
+        let static_upload = trace.managed_static_uploads_enabled
+            && destination.descriptor.usage == BufferUsage::Weights;
+        if !trace.managed_uploads_enabled && !static_upload {
+            return Ok(None);
+        }
+        source_layout
+            .validate_bytes(source.len())
+            .map_err(|_| TestRuntimeError("managed upload layout differs"))?;
+        let dynamic_source = trace.managed_uploads_enabled
+            && source.class() == HostMemoryClass::InputPreprocess
+            && destination.descriptor.usage == BufferUsage::Activations;
+        let static_source = static_upload
+            && (source.class() == HostMemoryClass::TransferStaging
+                || (trace.managed_static_weight_sources_enabled
+                    && source.class() == HostMemoryClass::WeightBacking));
+        if (!dynamic_source && !static_source)
+            || destination.descriptor.element_type != source_layout.element_type()
+            || destination_offset_bytes
+                .checked_add(source.len() as u64)
+                .is_none_or(|end| end > destination.descriptor.size_bytes)
+        {
+            return Err(TestRuntimeError(
+                "managed upload owner or destination differs",
+            ));
+        }
+        let call = trace.managed_upload_encode_calls;
+        trace.managed_upload_encode_calls += 1;
+        if trace.fail_managed_upload_at == Some(call) {
+            return Err(TestRuntimeError("injected managed upload encode failure"));
+        }
+        trace
+            .uploaded_ranges
+            .push((true, destination_offset_bytes, source.bytes().to_vec()));
+        trace.managed_upload_classes.push(source.class());
+        trace
+            .managed_upload_backing_bytes
+            .push(source.backing_bytes());
+        Ok(Some(TestCommand::ManagedUpload(TestManagedUpload {
+            source,
+            usage: destination.descriptor.usage,
+        })))
     }
 
     fn encode_zero(
@@ -2532,6 +2620,27 @@ impl DeviceRuntime for TestRuntime {
             .map(|(_, _, _, command)| command)
             .collect::<Vec<_>>();
         let command_count = commands.len();
+        let managed_uploads = Arc::new(
+            commands
+                .iter()
+                .filter_map(|command| match command {
+                    TestCommand::ManagedUpload(upload) => Some(upload.source.clone()),
+                    _ => None,
+                })
+                .collect(),
+        );
+        // Test traces must not keep an upload alive after its real fence is
+        // retired. Snapshot only the same small command tag as legacy upload.
+        let command_snapshots = commands
+            .iter()
+            .map(|command| match command {
+                TestCommand::ManagedUpload(upload) => TestCommand::Upload(
+                    upload.source.bytes().first().copied().unwrap_or(0),
+                    upload.usage,
+                ),
+                _ => command.clone(),
+            })
+            .collect();
         let (drift, behavior, fence) = {
             let mut trace = self.trace.lock().unwrap();
             trace.submit_calls += 1;
@@ -2540,7 +2649,7 @@ impl DeviceRuntime for TestRuntime {
             trace
                 .submitted_command_node_indices
                 .push(command_node_indices);
-            trace.submitted_commands.push(commands);
+            trace.submitted_commands.push(command_snapshots);
             trace
                 .submitted_compute_path_requirements
                 .push(compute_path_requirement);
@@ -2567,6 +2676,7 @@ impl DeviceRuntime for TestRuntime {
                     attribution,
                     terminal_packet,
                     device_facts,
+                    managed_uploads,
                 ),
             )
         };

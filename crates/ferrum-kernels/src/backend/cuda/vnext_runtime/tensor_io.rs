@@ -70,6 +70,7 @@ impl Drop for SubmissionGuard<'_> {
 pub(super) enum UploadPurpose {
     Input,
     StaticWeight,
+    StaticWeightBacking,
 }
 
 impl UploadPurpose {
@@ -80,6 +81,7 @@ impl UploadPurpose {
         match (class, usage) {
             (HostMemoryClass::InputPreprocess, BufferUsage::Activations) => Ok(Self::Input),
             (HostMemoryClass::TransferStaging, BufferUsage::Weights) => Ok(Self::StaticWeight),
+            (HostMemoryClass::WeightBacking, BufferUsage::Weights) => Ok(Self::StaticWeightBacking),
             _ => Err(CudaDeviceRuntimeError::contract(
                 "managed CUDA upload class differs from destination usage",
             )),
@@ -89,7 +91,7 @@ impl UploadPurpose {
     fn phase(self) -> DeviceCommandPhase {
         match self {
             Self::Input => DeviceCommandPhase::DynamicBinding,
-            Self::StaticWeight => DeviceCommandPhase::Initialization,
+            Self::StaticWeight | Self::StaticWeightBacking => DeviceCommandPhase::Initialization,
         }
     }
 
@@ -97,6 +99,7 @@ impl UploadPurpose {
         match self {
             Self::Input => HostMemoryClass::InputPreprocess,
             Self::StaticWeight => HostMemoryClass::TransferStaging,
+            Self::StaticWeightBacking => HostMemoryClass::WeightBacking,
         }
     }
 }
@@ -257,11 +260,16 @@ mod tests {
         let weights =
             UploadPurpose::new(HostMemoryClass::TransferStaging, BufferUsage::Weights).unwrap();
         assert_eq!(weights.phase(), DeviceCommandPhase::Initialization);
+        let backing =
+            UploadPurpose::new(HostMemoryClass::WeightBacking, BufferUsage::Weights).unwrap();
+        assert_eq!(backing.phase(), DeviceCommandPhase::Initialization);
+        assert_eq!(backing.host_class(), HostMemoryClass::WeightBacking);
         for (class, usage) in [
             (HostMemoryClass::InputPreprocess, BufferUsage::Weights),
             (HostMemoryClass::TransferStaging, BufferUsage::Activations),
             (HostMemoryClass::Output, BufferUsage::Weights),
-            (HostMemoryClass::WeightBacking, BufferUsage::Weights),
+            (HostMemoryClass::WeightBacking, BufferUsage::Activations),
+            (HostMemoryClass::WeightBacking, BufferUsage::Persistent),
             (HostMemoryClass::TransferStaging, BufferUsage::Persistent),
         ] {
             assert!(UploadPurpose::new(class, usage).is_err());

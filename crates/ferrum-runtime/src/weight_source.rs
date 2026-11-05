@@ -346,7 +346,8 @@ impl<'source> WeightComponentPayload<'source> {
     /// Own a converted component without copying it into an unaccounted Vec.
     /// The materializer must allocate this backing from the composition's Host
     /// account. Slices retain the entire original allocation and its one claim;
-    /// the initializer's separate TransferStaging copies remain separately charged.
+    /// any separate TransferStaging copies remain separately charged. A capable
+    /// runtime can retain this original backing for static uploads instead.
     pub fn from_managed_host(
         component: &WeightComponentSpec,
         external_names: Vec<String>,
@@ -432,6 +433,15 @@ impl<'source> WeightComponentPayload<'source> {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Only the concrete managed allocation qualifies for direct static upload;
+    /// a generic stable owner or a claimed memory class is insufficient.
+    pub(crate) fn managed_host_bytes(&self) -> Option<&ManagedHostBytes> {
+        match &self.bytes {
+            WeightPayloadBytes::Managed(bytes) => Some(bytes),
+            WeightPayloadBytes::Ordinary(_) => None,
+        }
     }
 
     pub fn retained_host_memory(&self) -> Option<&RetainedHostMemoryRegion> {

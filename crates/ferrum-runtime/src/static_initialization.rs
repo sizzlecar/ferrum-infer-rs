@@ -119,6 +119,7 @@ pub struct StaticInitializationReceipt {
     initialized_resource_count: usize,
     uploaded_component_count: usize,
     uploaded_bytes: u64,
+    retained_source_upload_bytes: u64,
     imported_component_count: usize,
     imported_bytes: u64,
     transformed_component_count: usize,
@@ -129,6 +130,7 @@ pub struct StaticInitializationReceipt {
     total_duration_us: u64,
     setup_duration_us: u64,
     source_materialization_duration_us: u64,
+    staging_copy_duration_us: u64,
     device_encode_duration_us: u64,
     device_import_duration_us: u64,
     device_transform_encode_duration_us: u64,
@@ -150,6 +152,12 @@ impl StaticInitializationReceipt {
 
     pub const fn uploaded_bytes(&self) -> u64 {
         self.uploaded_bytes
+    }
+
+    /// Uploaded bytes borrowed from the original accounted WeightBacking,
+    /// without allocating a second TransferStaging payload.
+    pub const fn retained_source_upload_bytes(&self) -> u64 {
+        self.retained_source_upload_bytes
     }
 
     pub const fn imported_component_count(&self) -> usize {
@@ -190,6 +198,10 @@ impl StaticInitializationReceipt {
 
     pub const fn source_materialization_duration_us(&self) -> u64 {
         self.source_materialization_duration_us
+    }
+
+    pub const fn staging_copy_duration_us(&self) -> u64 {
+        self.staging_copy_duration_us
     }
 
     pub const fn device_encode_duration_us(&self) -> u64 {
@@ -615,10 +627,12 @@ where
 
     /// Initializes weights through bounded staging or an explicit managed import.
     ///
-    /// Each chunk is admitted as [`HostMemoryClass::TransferStaging`] before
-    /// allocating or copying bytes. The backend must retain that exact owner
-    /// until its upload is quiescent; unsupported managed uploads never fall
-    /// back to a raw-byte upload. A backend may instead provide a managed
+    /// Copied chunks are admitted as [`HostMemoryClass::TransferStaging`] before
+    /// allocation. Capable backends may upload an existing WeightBacking from
+    /// the exact invocation scope without copying it; those transfers finish
+    /// before the next source group is materialized. The original owner and
+    /// charge remain live until quiescence. Unsupported managed uploads never
+    /// fall back to a raw-byte upload. A backend may instead provide a managed
     /// import transaction with no temporary host staging. The ordinary import
     /// hook and device transforms are not used. Existing source/materializer
     /// backing, including mmap pages or format conversion allocations, is outside
@@ -815,12 +829,14 @@ where
     let mut upload_command_count = 0_usize;
     let mut uploaded_component_count = 0_usize;
     let mut uploaded_bytes = 0_u64;
+    let mut retained_source_upload_bytes = 0_u64;
     let mut imported_component_count = 0_usize;
     let mut imported_bytes = 0_u64;
     let mut transformed_component_count = 0_usize;
     let mut transformed_bytes = 0_u64;
     let mut transform_command_count = 0_usize;
     let mut source_materialization_duration = Duration::ZERO;
+    let mut staging_copy_duration = Duration::ZERO;
     let mut device_encode_duration = Duration::ZERO;
     let mut device_import_duration = Duration::ZERO;
     let mut device_transform_encode_duration = Duration::ZERO;
@@ -968,6 +984,7 @@ where
                 slowest_component_materialization_duration = materialization_duration;
                 slowest_component_id = Some(components[0].id.clone());
             }
+            let mut retained_group_source = false;
             for (component, upload) in components.into_iter().zip(uploads) {
                 let placement = placements
                     .get(&component.id)
@@ -1009,6 +1026,22 @@ where
                     }));
                 }
                 let bytes = upload.bytes();
+                let direct_source = managed_host
+                    .filter(|_| runtime.supports_managed_static_weight_sources())
+                    .and_then(|host| {
+                        upload
+                            .managed_host_bytes()
+                            .filter(|source| host.owns_in_scope(source))
+                    });
+                if direct_source.is_some() {
+                    // The original source allocation has already consumed the
+                    // exact invocation's WeightBacking allowance. Keep that
+                    // claim through every upload fence, never reclassify it as
+                    // staging or assign its unused first-chunk reservation to a
+                    // differently sized later component.
+                    drop(first_staging.take());
+                    retained_group_source = true;
+                }
                 let mut source_offset = 0_usize;
                 while source_offset < bytes.len() {
                     let remaining = bytes.len() - source_offset;
@@ -1061,12 +1094,21 @@ where
                     // that bounded batch once before retrying admission. Never
                     // wait while retaining the very staging capacity needed
                     // by this chunk, and never bypass a genuine capacity error.
-                    let managed_bytes = if let Some(host) = managed_host {
+                    let managed_bytes = if let Some(source) = direct_source {
+                        Some(source.slice(source_offset..source_end).map_err(|error| {
+                            InitializationStepFailure::Quiescent(resource_failure(
+                                "static_source_slice",
+                                error,
+                            ))
+                        })?)
+                    } else if let Some(host) = managed_host {
                         let source_bytes = &bytes[source_offset..source_end];
+                        let copy_started = Instant::now();
                         let mut staged = match first_staging.take() {
                             Some(reservation) => copy_staged_upload(reservation, source_bytes),
                             None => stage_upload(host, source_bytes),
                         };
+                        staging_copy_duration += copy_started.elapsed();
                         if matches!(
                             staged,
                             Err(HostMemoryError::Capacity { .. }
@@ -1080,7 +1122,9 @@ where
                                 &mut pending_staging_bytes,
                             )?;
                             submission_batch_count += 1;
+                            let copy_started = Instant::now();
                             staged = stage_upload(host, source_bytes);
+                            staging_copy_duration += copy_started.elapsed();
                         }
                         Some(staged.map_err(|error| {
                             InitializationStepFailure::Quiescent(resource_failure(
@@ -1134,6 +1178,29 @@ where
                             reason: "static initialization uploaded bytes overflow u64".to_owned(),
                         })
                     })?;
+                if direct_source.is_some() {
+                    retained_source_upload_bytes = retained_source_upload_bytes
+                        .checked_add(placement.length_bytes)
+                        .ok_or_else(|| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
+                                reason: "retained static source bytes overflow u64".to_owned(),
+                            })
+                        })?;
+                }
+            }
+            if retained_group_source && !pending.is_empty() {
+                // Source admission is bounded by the largest materialization
+                // group, not the sum of adjacent groups. A slice retains its
+                // entire allocation. Therefore finish this group's original
+                // transfers before the next group can allocate source backing.
+                // Indeterminate completion keeps the original recovery owners.
+                submission_wait_duration += submit_pending(
+                    &runtime,
+                    &mut stream,
+                    &mut pending,
+                    &mut pending_staging_bytes,
+                )?;
+                submission_batch_count += 1;
             }
         }
     }
@@ -1162,6 +1229,7 @@ where
         initialized_resource_count: plan.payload().memory().static_allocations().len(),
         uploaded_component_count,
         uploaded_bytes,
+        retained_source_upload_bytes,
         imported_component_count,
         imported_bytes,
         transformed_component_count,
@@ -1172,6 +1240,7 @@ where
         total_duration_us: duration_us(initialization_started.elapsed()),
         setup_duration_us: duration_us(setup_duration),
         source_materialization_duration_us: duration_us(source_materialization_duration),
+        staging_copy_duration_us: duration_us(staging_copy_duration),
         device_encode_duration_us: duration_us(device_encode_duration),
         device_import_duration_us: duration_us(device_import_duration),
         device_transform_encode_duration_us: duration_us(device_transform_encode_duration),

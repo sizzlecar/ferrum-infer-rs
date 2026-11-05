@@ -4125,6 +4125,15 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         false
     }
 
+    /// Whether managed uploads also accept WeightBacking into static Weights.
+    /// The backend retains the same immutable allocation through completion,
+    /// including indeterminate submission recovery, without a private copy.
+    /// Core drains each materialization group before preparing the next, so
+    /// retaining a chunk cannot extend one group's source peak into another.
+    fn supports_managed_static_weight_sources(&self) -> bool {
+        false
+    }
+
     /// Retains the immutable, accounted backing through the completion fence.
     /// `None` declines before submission; no unaccounted staging copy is allowed.
     fn encode_managed_upload(

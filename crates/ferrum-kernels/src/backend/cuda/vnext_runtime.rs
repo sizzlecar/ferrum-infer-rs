@@ -5525,6 +5525,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
         self.tensor_eager.is_some()
     }
 
+    fn supports_managed_static_weight_sources(&self) -> bool {
+        self.tensor_eager.is_some()
+    }
+
     fn encode_managed_upload(
         &self,
         source: ManagedHostBytes,

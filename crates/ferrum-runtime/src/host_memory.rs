@@ -265,6 +265,18 @@ impl HostMemoryAccount {
         Arc::ptr_eq(&self.0, &bytes.backing.charge.account.0)
     }
 
+    /// Exact admission provenance for borrowing an allocation in an operation
+    /// whose peak was reserved from this view. Parent identity alone cannot
+    /// authorize spending a sibling phase's backing allowance.
+    pub(crate) fn owns_in_scope(&self, bytes: &ManagedHostBytes) -> bool {
+        self.owns(bytes)
+            && match (&self.1, &bytes.backing.charge.account.1) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+
     /// Shared backing-budget and provenance identity, regardless of a view's
     /// scoped admission credit. Equal numeric limits do not establish ownership.
     pub fn same_parent(&self, other: &Self) -> bool {
