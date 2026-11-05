@@ -9,7 +9,10 @@ use ferrum_runtime::{
 };
 use ferrum_types::{FerrumError, Result};
 mod managed;
-pub use managed::ManagedDenseArchiveSource;
+pub use managed::{
+    Bf16ToF16BlockCounts, DenseArchiveMaterializationReport, DenseArchivePhaseTiming,
+    DenseArchiveSourceTouch, ManagedDenseArchiveSource,
+};
 
 /// An indexed archive whose payloads can also satisfy an explicit runtime
 /// component schema. Implementations retain immutable storage; inspecting a

@@ -56,7 +56,10 @@ pub use process_mapped_dense::{
 };
 pub use quant_linear::QuantLinear;
 pub use safetensors_archive::{SafetensorsArchive, SafetensorsReadAheadPolicy, SafetensorsTensor};
-pub use tensor_archive::{ArchiveTensor, ManagedDenseArchiveSource, TensorArchive};
+pub use tensor_archive::{
+    ArchiveTensor, Bf16ToF16BlockCounts, DenseArchiveMaterializationReport,
+    DenseArchivePhaseTiming, DenseArchiveSourceTouch, ManagedDenseArchiveSource, TensorArchive,
+};
 pub use traits::Linear;
 
 // Quant config types — populated from safetensors metadata or GGUF header.

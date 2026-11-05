@@ -5,6 +5,7 @@ use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 mod affine;
 mod bf16_simd;
+mod diagnostics;
 
 struct Tensor {
     name: &'static str,

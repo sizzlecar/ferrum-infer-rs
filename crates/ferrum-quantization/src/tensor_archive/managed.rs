@@ -6,6 +6,11 @@ use ferrum_runtime::{
 };
 use half::{bf16, f16};
 mod bf16_to_f16;
+mod diagnostics;
+pub use diagnostics::{
+    Bf16ToF16BlockCounts, DenseArchiveMaterializationReport, DenseArchivePhaseTiming,
+    DenseArchiveSourceTouch,
+};
 
 /// Native blocks remain borrowed and unchanged. Dense floating-point values
 /// may be rounded to the requested component type, with output reserved before
@@ -23,10 +28,30 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
         Self { archive, host }
     }
 
-    fn composite<'source>(
+    /// Run the same conversion with explicit CPU diagnostics. The report is
+    /// reset per call and retained on error. No GPU or execution precision is
+    /// changed. Touching mmap pages is optional and changes source residency.
+    pub fn component_with_diagnostics<'source>(
         &'source self,
         component: &WeightComponentSpec,
+        source_touch: DenseArchiveSourceTouch,
+        report: &mut DenseArchiveMaterializationReport,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+        *report = DenseArchiveMaterializationReport::default();
+        let started = std::time::Instant::now();
+        let result = self.component_inner::<true>(component, source_touch, report);
+        report.total_wall_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        report.completed = result.is_ok();
+        result
+    }
+
+    fn composite<'source, const DIAGNOSTICS: bool>(
+        &'source self,
+        component: &WeightComponentSpec,
+        source_touch: DenseArchiveSourceTouch,
+        report: &mut DenseArchiveMaterializationReport,
+    ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+        let metadata_started = diagnostics::start::<DIAGNOSTICS>();
         let invalid = |reason: &str| VNextError::InvalidExecutionPlan {
             reason: format!("managed archive component `{}`: {reason}", component.id),
         };
@@ -120,53 +145,82 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
                 "combined source bytes differ from the exact target extent",
             ));
         }
+        if DIAGNOSTICS {
+            report.composite = true;
+            report.source_parts = tensors.len();
+            report.source_bytes = tensors.iter().map(|t| t.bytes().len() as u64).sum();
+            report.destination_bytes = bytes as u64;
+        }
+        diagnostics::finish(metadata_started, &mut report.metadata_validation);
+        for tensor in &tensors {
+            diagnostics::touch::<DIAGNOSTICS>(tensor.bytes(), source_touch, report);
+        }
         // Every source is an immutable archive view. The only payload-sized
         // allocation is this one exact destination on the caller's Host view.
-        let mut backing = self
+        let allocation_started = diagnostics::start::<DIAGNOSTICS>();
+        let backing = self
             .host
             .reserve(HostMemoryClass::WeightBacking, bytes)
             .and_then(|reservation| reservation.allocate_zeroed())
-            .map_err(|e| invalid(&e.to_string()))?;
+            .map_err(|e| invalid(&e.to_string()));
+        diagnostics::finish(allocation_started, &mut report.reserve_allocate_zeroed);
+        let mut backing = backing?;
         let mut offset = 0usize;
         let mut files = Vec::with_capacity(tensors.len());
         for ((tensor, source), extent) in tensors.iter().zip(source_types).zip(part_bytes) {
             let end = offset + extent; // checked above as part of the exact total
-            convert_floating(
+            let conversion_started = diagnostics::start::<DIAGNOSTICS>();
+            let converted = convert_floating_counted::<DIAGNOSTICS>(
                 source,
                 *target,
                 tensor.bytes(),
                 &mut backing.as_mut()[offset..end],
                 None,
-            )
-            .map_err(invalid)?;
+                &mut report.bf16_to_f16,
+            );
+            diagnostics::finish(
+                conversion_started,
+                &mut report.conversion_and_direct_packing,
+            );
+            converted.map_err(invalid)?;
             offset = end;
             files.push(tensor.source_file().to_owned());
         }
-        WeightComponentPayload::from_managed_host(
+        let assembly_started = diagnostics::start::<DIAGNOSTICS>();
+        let payload = WeightComponentPayload::from_managed_host(
             component,
             component.external_names.clone(),
             files,
             component.dimensions.clone(),
             *target,
             backing.freeze(),
-        )
+        );
+        diagnostics::finish(assembly_started, &mut report.payload_assembly);
+        payload
     }
-}
-impl WeightComponentSource for ManagedDenseArchiveSource<'_> {
-    fn component<'source>(
+
+    fn component_inner<'source, const DIAGNOSTICS: bool>(
         &'source self,
         component: &WeightComponentSpec,
+        source_touch: DenseArchiveSourceTouch,
+        report: &mut DenseArchiveMaterializationReport,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
         let invalid = |reason: &str| VNextError::InvalidExecutionPlan {
             reason: format!("managed archive component `{}`: {reason}", component.id),
         };
         let [name] = component.external_names.as_slice() else {
-            return self.composite(component);
+            return self.composite::<DIAGNOSTICS>(component, source_touch, report);
         };
+        let metadata_started = diagnostics::start::<DIAGNOSTICS>();
         let tensor = self
             .archive
             .tensor(name)
             .map_err(|e| invalid(&e.to_string()))?;
+        if DIAGNOSTICS {
+            report.source_parts = 1;
+            report.source_bytes = tensor.bytes().len() as u64;
+            report.destination_bytes = component.physical_bytes()?;
+        }
         let (source, target, affine) = match (tensor.encoding(), &component.encoding) {
             (
                 WeightEncoding::Dense {
@@ -190,14 +244,18 @@ impl WeightComponentSource for ManagedDenseArchiveSource<'_> {
                 if tensor.encoding() != &component.encoding {
                     return Err(invalid("stored encoding differs from the bound component"));
                 }
-                return self.archive.component(component);
+                diagnostics::finish(metadata_started, &mut report.metadata_validation);
+                diagnostics::touch::<DIAGNOSTICS>(tensor.bytes(), source_touch, report);
+                return self.borrowed::<DIAGNOSTICS>(component, report);
             }
         };
         if tensor.shape() != component.dimensions {
             return Err(invalid("stored dimensions differ from the bound component"));
         }
         if source == target && affine.is_none() {
-            return self.archive.component(component);
+            diagnostics::finish(metadata_started, &mut report.metadata_validation);
+            diagnostics::touch::<DIAGNOSTICS>(tensor.bytes(), source_touch, report);
+            return self.borrowed::<DIAGNOSTICS>(component, report);
         }
         if !floating(source) || !floating(target) {
             return Err(invalid(
@@ -225,20 +283,70 @@ impl WeightComponentSource for ManagedDenseArchiveSource<'_> {
                 "target payload extent differs from its declared shape",
             ));
         }
-        let mut backing = self
+        if DIAGNOSTICS {
+            report.affine = affine.is_some();
+        }
+        diagnostics::finish(metadata_started, &mut report.metadata_validation);
+        diagnostics::touch::<DIAGNOSTICS>(tensor.bytes(), source_touch, report);
+        let allocation_started = diagnostics::start::<DIAGNOSTICS>();
+        let backing = self
             .host
             .reserve(HostMemoryClass::WeightBacking, bytes)
             .and_then(|reservation| reservation.allocate_zeroed())
-            .map_err(|e| invalid(&e.to_string()))?;
-        convert_floating(source, target, tensor.bytes(), backing.as_mut(), affine)
-            .map_err(invalid)?;
-        WeightComponentPayload::from_managed_host(
+            .map_err(|e| invalid(&e.to_string()));
+        diagnostics::finish(allocation_started, &mut report.reserve_allocate_zeroed);
+        let mut backing = backing?;
+        let conversion_started = diagnostics::start::<DIAGNOSTICS>();
+        let converted = convert_floating_counted::<DIAGNOSTICS>(
+            source,
+            target,
+            tensor.bytes(),
+            backing.as_mut(),
+            affine,
+            &mut report.bf16_to_f16,
+        );
+        diagnostics::finish(
+            conversion_started,
+            &mut report.conversion_and_direct_packing,
+        );
+        converted.map_err(invalid)?;
+        let assembly_started = diagnostics::start::<DIAGNOSTICS>();
+        let payload = WeightComponentPayload::from_managed_host(
             component,
             vec![name.clone()],
             vec![tensor.source_file().to_owned()],
             component.dimensions.clone(),
             target,
             backing.freeze(),
+        );
+        diagnostics::finish(assembly_started, &mut report.payload_assembly);
+        payload
+    }
+
+    fn borrowed<'source, const DIAGNOSTICS: bool>(
+        &'source self,
+        component: &WeightComponentSpec,
+        report: &mut DenseArchiveMaterializationReport,
+    ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+        let started = diagnostics::start::<DIAGNOSTICS>();
+        let payload = self.archive.component(component);
+        diagnostics::finish(started, &mut report.payload_assembly);
+        if DIAGNOSTICS {
+            report.borrowed = true;
+        }
+        payload
+    }
+}
+
+impl WeightComponentSource for ManagedDenseArchiveSource<'_> {
+    fn component<'source>(
+        &'source self,
+        component: &WeightComponentSpec,
+    ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+        self.component_inner::<false>(
+            component,
+            DenseArchiveSourceTouch::AsMapped,
+            &mut DenseArchiveMaterializationReport::default(),
         )
     }
 }
@@ -247,6 +355,7 @@ fn floating(ty: ElementType) -> bool {
     matches!(ty, ElementType::F32 | ElementType::F16 | ElementType::Bf16)
 }
 
+#[cfg(test)]
 fn convert_floating(
     source: ElementType,
     target: ElementType,
@@ -254,8 +363,30 @@ fn convert_floating(
     output: &mut [u8],
     affine: Option<(CanonicalRational, CanonicalRational)>,
 ) -> std::result::Result<(), &'static str> {
+    convert_floating_counted::<false>(
+        source,
+        target,
+        input,
+        output,
+        affine,
+        &mut Bf16ToF16BlockCounts::default(),
+    )
+}
+
+fn convert_floating_counted<const COUNT: bool>(
+    source: ElementType,
+    target: ElementType,
+    input: &[u8],
+    output: &mut [u8],
+    affine: Option<(CanonicalRational, CanonicalRational)>,
+    counts: &mut Bf16ToF16BlockCounts,
+) -> std::result::Result<(), &'static str> {
     if source == ElementType::Bf16 && target == ElementType::F16 && affine.is_none() {
-        return bf16_to_f16::convert(input, output);
+        return if COUNT {
+            bf16_to_f16::convert_counted::<true>(input, output, counts)
+        } else {
+            bf16_to_f16::convert(input, output)
+        };
     }
     convert_floating_scalar(source, target, input, output, affine)
 }

@@ -27,6 +27,26 @@ fn bf16_to_f16_simd_exhaustive_bit_patterns_preserve_scalar_bits_and_errors() {
             "bits {word:#06x}"
         );
         assert_eq!(actual, expected, "bits {word:#06x}");
+        let mut observed = [0x55; BLOCK_BYTES];
+        let mut counts = Bf16ToF16BlockCounts::default();
+        assert_eq!(
+            convert_counted::<true>(&source, &mut observed, &mut counts),
+            oracle(&source, &mut expected),
+            "counted bits {word:#06x}"
+        );
+        assert_eq!(observed, actual, "counted bits {word:#06x}");
+        if cfg!(all(
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )) {
+            let magnitude = word & 0x7fff;
+            let normal = magnitude == 0 || (0x3880..=0x477f).contains(&magnitude);
+            assert_eq!(counts.simd_blocks_attempted, 1);
+            assert_eq!(counts.simd_blocks_converted, u64::from(normal));
+            assert_eq!(counts.scalar_fallback_blocks, u64::from(!normal));
+        } else {
+            assert_eq!(counts.portable_scalar_elements, 8);
+        }
     }
 }
 

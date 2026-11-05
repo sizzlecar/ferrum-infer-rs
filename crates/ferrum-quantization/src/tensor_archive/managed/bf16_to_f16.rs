@@ -1,11 +1,20 @@
 //! Exact bit conversion for normal/zero BF16 blocks. No float scratch, extra
 //! payload or new rounding boundary is introduced. Exceptional blocks delegate
 //! to the existing scalar converter, including its finite-overflow rejection.
+use super::diagnostics::Bf16ToF16BlockCounts;
 use ferrum_runtime::ElementType;
 
 const BLOCK_BYTES: usize = 16;
 
 pub(super) fn convert(input: &[u8], output: &mut [u8]) -> Result<(), &'static str> {
+    convert_counted::<false>(input, output, &mut Bf16ToF16BlockCounts::default())
+}
+
+pub(super) fn convert_counted<const COUNT: bool>(
+    input: &[u8],
+    output: &mut [u8],
+    counts: &mut Bf16ToF16BlockCounts,
+) -> Result<(), &'static str> {
     if input.len() != output.len() || !input.len().is_multiple_of(2) {
         return Err("source and target floating element counts differ");
     }
@@ -23,9 +32,20 @@ pub(super) fn convert(input: &[u8], output: &mut [u8]) -> Result<(), &'static st
             // loads/stores explicitly permit unaligned addresses. SSE2 is an
             // x86_64 baseline; Advanced SIMD is an AArch64 baseline. Each
             // implementation checks every lane before writing anything.
-            if !unsafe { normal_block(source.as_ptr(), destination.as_mut_ptr()) } {
-                scalar(source, destination)?;
+            if COUNT {
+                counts.simd_blocks_attempted += 1;
             }
+            if !unsafe { normal_block(source.as_ptr(), destination.as_mut_ptr()) } {
+                if COUNT {
+                    counts.scalar_fallback_blocks += 1;
+                }
+                scalar(source, destination)?;
+            } else if COUNT {
+                counts.simd_blocks_converted += 1;
+            }
+        }
+        if COUNT {
+            counts.scalar_tail_elements += ((input.len() - complete) / 2) as u64;
         }
         scalar(&input[complete..], &mut output[complete..])
     }
@@ -33,7 +53,12 @@ pub(super) fn convert(input: &[u8], output: &mut [u8]) -> Result<(), &'static st
         target_endian = "little",
         any(target_arch = "x86_64", target_arch = "aarch64")
     )))]
-    scalar(input, output)
+    {
+        if COUNT {
+            counts.portable_scalar_elements += (input.len() / 2) as u64;
+        }
+        scalar(input, output)
+    }
 }
 
 fn scalar(input: &[u8], output: &mut [u8]) -> Result<(), &'static str> {
