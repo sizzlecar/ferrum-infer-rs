@@ -1,0 +1,13 @@
+The unmodified chat_template.jinja fixture comes from:
+https://huggingface.co/PrunaAI/P-H3-Image/blob/7f98acef503cf2bcfba821a78cb1cf1a9928b2df/prompt_upsampler_processor/chat_template.jinja
+
+Relevant upstream attribution (P-H3-Image NOTICE):
+
+p-h3-image
+Copyright 2026 Pruna AI
+
+The files in this repository were modified by Pruna AI.
+
+prompt_upsampler/
+    The p-h3-image prompt upsampler, based on Qwen3.5-9B by the Qwen team (https://huggingface.co/Qwen/Qwen3.5-9B),
+    under the Apache License 2.0, see LICENSE-APACHE.
