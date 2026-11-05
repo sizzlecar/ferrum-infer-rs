@@ -737,6 +737,14 @@ where
     } else {
         BTreeMap::new()
     };
+    // The complete family/source-schema proof belongs to setup, before native
+    // import, stream creation or any zero/upload can write device storage.
+    // Keep immutable borrows for all CPU-materialized groups; required device
+    // transforms retain their original validation and submission path.
+    let materialization = stored
+        .map(|_| plan.weight_materialization_session(family))
+        .transpose()
+        .map_err(contract_failure)?;
     let runtime = Arc::clone(transaction.lease().runtime());
     let has_required_weight_transforms = !plan
         .payload()
@@ -981,9 +989,16 @@ where
             // multi-output transforms to read and convert a large source matrix
             // once without retaining converted payloads for the whole model.
             let materialization_started = Instant::now();
-            let uploads =
-                prepare_uploads(family, plan, source, &components, &placements, managed_host)
-                    .map_err(contract_failure)?;
+            let uploads = prepare_uploads(
+                materialization
+                    .as_ref()
+                    .expect("stored initialization retains its validated materialization view"),
+                source,
+                &components,
+                &placements,
+                managed_host,
+            )
+            .map_err(contract_failure)?;
             let materialization_duration = materialization_started.elapsed();
             source_materialization_duration += materialization_duration;
             if slowest_component_id.is_none()
@@ -1613,14 +1628,13 @@ fn weight_placements(
 }
 
 fn prepare_uploads<'source>(
-    family: &PreparedModelFamily,
-    plan: &ExecutionPlan,
+    materialization: &crate::ValidatedWeightMaterialization<'_>,
     source: &'source dyn WeightComponentSource,
     components: &[&WeightComponentSpec],
     placements: &BTreeMap<WeightId, WeightPlacement>,
     host: Option<&HostMemoryAccount>,
 ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
-    let payloads = plan.materialize_weight_components(family, source, components, host)?;
+    let payloads = materialization.materialize_components(source, components, host)?;
     for (component, payload) in components.iter().zip(&payloads) {
         let placement =
             placements

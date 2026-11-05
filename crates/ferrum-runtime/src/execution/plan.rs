@@ -26,7 +26,7 @@ use super::{
 use super::{resolve_retained_completion_values, CompletionRetentionSpec, RetainedCompletionValue};
 use crate::{
     CompletionReadbackRequest, ExecutionDeterminismRequirement, HostTransferLayout,
-    ResourceWorkShape, WeightComponentPayload, WeightComponentSource, WeightComponentSpec,
+    ResourceWorkShape, WeightComponentSource, WeightComponentSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2670,15 +2670,14 @@ impl ExecutionPlan {
         &self.operation_registry_authority
     }
 
-    pub(crate) fn materialize_weight_components<'source>(
-        &self,
-        family: &PreparedModelFamily,
-        source: &'source dyn WeightComponentSource,
-        components: &[&WeightComponentSpec],
-        host: Option<&crate::HostMemoryAccount>,
-    ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+    /// Validate the complete immutable family/weight-plan relation before any
+    /// initialization write, then retain that proof for this installation.
+    pub(crate) fn weight_materialization_session<'a>(
+        &'a self,
+        family: &'a PreparedModelFamily,
+    ) -> Result<super::ValidatedWeightMaterialization<'a>, VNextError> {
         self.trusted_execution_weights
-            .materialize_components(family, source, components, host)
+            .materialization_session(family)
     }
 
     /// Additional physical Host WeightBacking peak for this exact retained
