@@ -191,7 +191,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     let mut distributions = BTreeMap::new();
     let mut names = BTreeSet::new();
     for path in &args.abi {
-        let distribution = distribution(path, &args.version, &candidate).await?;
+        let distribution = distribution(path, &args.version, &candidate, &cuda_capability).await?;
         for asset in &distribution.assets {
             if !names.insert(asset.name.clone()) {
                 return Err("duplicate declared distribution asset".into());
@@ -456,7 +456,12 @@ fn verify_performance_policy(plan: &Plan, catalog: &Value) -> Result<(), String>
     Ok(())
 }
 
-async fn distribution(path: &Path, version: &str, candidate: &str) -> Result<Distribution, String> {
+async fn distribution(
+    path: &Path,
+    version: &str,
+    candidate: &str,
+    cuda_capability: &cuda_assets::CudaDeliveryCapability,
+) -> Result<Distribution, String> {
     let abi: Value = read(path)?;
     let name = text(&abi, "asset_name")?;
     if !file_name(&name)
@@ -502,7 +507,7 @@ async fn distribution(path: &Path, version: &str, candidate: &str) -> Result<Dis
             })
             .transpose()?,
     };
-    let cuda_variant = CudaVariant::from_abi(&name, &abi_input)?;
+    let cuda_variant = cuda_capability.validate_asset(&name, &abi_input)?;
     let audit_name = text(&dependencies, "audit_file")?;
     if !file_name(&audit_name) {
         return Err("dependency audit must be an adjacent declared filename".into());

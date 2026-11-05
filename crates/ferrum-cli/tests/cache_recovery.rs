@@ -16,15 +16,22 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Output, Stdio},
     time::Duration,
 };
-use tokio::{net::TcpListener, process::Command, time::Instant};
+use tokio::{process::Command, time::Instant};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Entrypoint {
+    Run,
+    Serve,
+}
 
 struct Flow {
     arguments: Vec<String>,
-    server_url: Option<String>,
+    entrypoint: Entrypoint,
     expect_execution_feedback: bool,
 }
 
@@ -59,15 +66,12 @@ impl Flow {
         .collect();
         Self {
             arguments,
-            server_url: None,
+            entrypoint: Entrypoint::Run,
             expect_execution_feedback: false,
         }
     }
 
     async fn serve(model: &str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let port = address.port().to_string();
         let arguments = [
             "serve",
             "--model",
@@ -77,7 +81,7 @@ impl Flow {
             "--host",
             "127.0.0.1",
             "--port",
-            &port,
+            "0",
             "--served-model-name",
             "recovery",
             "--disable-thinking",
@@ -95,7 +99,7 @@ impl Flow {
         .collect();
         Self {
             arguments,
-            server_url: Some(format!("http://{address}")),
+            entrypoint: Entrypoint::Serve,
             expect_execution_feedback: false,
         }
     }
@@ -112,10 +116,10 @@ impl Flow {
     }
 
     async fn successful_with_shutdown(&self, hub: &Hub, cache: &Path, shutdown: Shutdown) {
-        let Some(url) = &self.server_url else {
+        if self.entrypoint == Entrypoint::Run {
             assert_run_success(output(self.command(hub, cache)).await);
             return;
-        };
+        }
         let stdout = cache.join("server.stdout");
         let stderr = cache.join("server.stderr");
         let mut child = self
@@ -130,27 +134,37 @@ impl Flow {
             .build()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(45);
-        loop {
+        let url = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 panic!(
-                    "serve exited {status}: {}",
+                    "serve exited {status}\nstdout: {}\nstderr: {}",
+                    fs::read_to_string(&stdout).unwrap(),
                     fs::read_to_string(&stderr).unwrap()
                 );
             }
-            if let Ok(response) = client.get(format!("{url}/health")).send().await {
-                if response.status().is_success() {
-                    let health: Value = response.json().await.unwrap();
-                    assert_eq!(health["status"], "healthy", "{health}");
-                    break;
+            // The child owns the OS-selected socket continuously. Discover it
+            // only from the actual ready announcement, never from a dropped
+            // parent listener or a guessed port. Files retain all diagnostics.
+            if let Some(address) = announced_server_address(&fs::read(&stdout).unwrap())
+                .expect("valid completed serve readiness announcement")
+            {
+                let url = format!("http://{address}");
+                if let Ok(response) = client.get(format!("{url}/health")).send().await {
+                    if response.status().is_success() {
+                        let health: Value = response.json().await.unwrap();
+                        assert_eq!(health["status"], "healthy", "{health}");
+                        break url;
+                    }
                 }
             }
             assert!(
                 Instant::now() < deadline,
-                "serve did not become ready: {}",
+                "serve did not become ready\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&fs::read(&stdout).unwrap()),
                 fs::read_to_string(&stderr).unwrap()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        };
         let response = client
             .post(format!("{url}/v1/chat/completions"))
             .json(&json!({
@@ -169,7 +183,7 @@ impl Flow {
         );
         assert_eq!(body["usage"]["completion_tokens"], 1, "{body}");
         if self.expect_execution_feedback {
-            execution_feedback::assert_worker_observed_execution(&client, url).await;
+            execution_feedback::assert_worker_observed_execution(&client, &url).await;
         }
         match shutdown {
             Shutdown::Kill => child.start_kill().unwrap(),
@@ -196,6 +210,64 @@ impl Flow {
         #[cfg(not(unix))]
         let _ = status;
     }
+}
+
+/// Read only complete stdout lines: a concurrent file read can split either a
+/// UTF-8 character or the port digits. The public ready banner uses the actual
+/// bound SocketAddr; a zero port or non-loopback URL is not usable by this fixture.
+fn announced_server_address(stdout: &[u8]) -> Result<Option<SocketAddr>, String> {
+    let mut address = None;
+    for line in stdout.split_inclusive(|byte| *byte == b'\n') {
+        let Some(line) = line.strip_suffix(b"\n") else {
+            continue;
+        };
+        let line = String::from_utf8_lossy(line);
+        let Some(value) = line
+            .trim_end_matches('\r')
+            .strip_prefix("🚀 Server running at http://")
+        else {
+            continue;
+        };
+        let parsed: SocketAddr = value
+            .parse()
+            .map_err(|error| format!("invalid ready address {value:?}: {error}"))?;
+        if !parsed.ip().is_loopback() || parsed.port() == 0 {
+            return Err(format!(
+                "ready address must be an assigned loopback socket: {parsed}"
+            ));
+        }
+        if address.replace(parsed).is_some() {
+            return Err("serve announced readiness more than once".into());
+        }
+    }
+    Ok(address)
+}
+
+#[test]
+fn readiness_requires_a_complete_bound_address_not_a_partial_stdout_write() {
+    let prefix = "Loading model...\n🚀 Server running at http://127.0.0.1:43210";
+    for end in 0..prefix.len() {
+        assert_eq!(
+            announced_server_address(&prefix.as_bytes()[..end]).unwrap(),
+            None
+        );
+    }
+    assert_eq!(announced_server_address(prefix.as_bytes()).unwrap(), None);
+    assert_eq!(
+        announced_server_address(format!("{prefix}\nEndpoints:\n").as_bytes()).unwrap(),
+        Some("127.0.0.1:43210".parse().unwrap())
+    );
+    assert_eq!(
+        announced_server_address("🚀 Server running at http://[::1]:43210\r\n".as_bytes()).unwrap(),
+        Some("[::1]:43210".parse().unwrap())
+    );
+    for address in ["127.0.0.1:0", "0.0.0.0:43210", "127.0.0.1:invalid"] {
+        assert!(announced_server_address(
+            format!("🚀 Server running at http://{address}\n").as_bytes()
+        )
+        .is_err());
+    }
+    assert!(announced_server_address(format!("{prefix}\n{prefix}\n").as_bytes()).is_err());
 }
 
 fn command(hub: &Hub, cache: &Path) -> Command {
@@ -313,10 +385,15 @@ async fn recover_files(flow: Flow, missing: &str, pinned: bool, files: BTreeMap<
         "failure was not the fixture HTTP failure: {}",
         String::from_utf8_lossy(&failed.stderr)
     );
-    if flow.server_url.is_none() {
+    if flow.entrypoint == Entrypoint::Run {
         assert!(!jsonl(&failed)
             .iter()
             .any(|record| record["event"] == "assistant"));
+    } else {
+        assert!(
+            announced_server_address(&failed.stdout).unwrap().is_none(),
+            "a bound socket must not announce readiness after model download fails"
+        );
     }
     let snapshot = snapshot(cache.path());
     for name in [INDEX, FIRST_SHARD, LAST_SHARD]

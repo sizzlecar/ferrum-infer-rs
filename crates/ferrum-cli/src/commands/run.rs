@@ -772,9 +772,9 @@ pub struct RunCommand {
     #[arg(long)]
     pub no_context_shift: bool,
 
-    /// Sampling temperature (0.0–2.0). 0.0 = greedy / argmax (deterministic,
-    /// what you want for benchmarks). >0 = softmax sample with `--top-k`
-    /// and `--top-p` filtering applied.
+    /// Sampling temperature (0.0–2.0). 0.0 = greedy / argmax for the computed
+    /// logits; identical text across batch sizes or devices is not guaranteed.
+    /// >0 = softmax sample with `--top-k` and `--top-p` filtering applied.
     #[arg(long, default_value = "0.0")]
     pub temperature: f32,
 
@@ -783,7 +783,11 @@ pub struct RunCommand {
     pub backend: String,
 
     /// Numerical execution profile: auto or an exact family profile ID.
-    #[arg(long, value_name = "PROFILE")]
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        long_help = crate::commands::NUMERICAL_PROFILE_LONG_HELP
+    )]
     pub numerical_profile: Option<ferrum_types::NumericalExecutionPolicy>,
 
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
