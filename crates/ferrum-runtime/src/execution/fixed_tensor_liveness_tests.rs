@@ -89,6 +89,175 @@ fn pools(nodes: &[PlanNode], retained: &[&str]) -> Vec<DynamicBackingPoolSpec> {
     .unwrap()
 }
 
+fn token_chain() -> Vec<PlanNode> {
+    let mut nodes = chain();
+    for node in &mut nodes {
+        let mut input_ordinal = 0;
+        let mut output_ordinal = 0;
+        for value in &mut node.values {
+            let ordinal = if value.role() == ResolvedValueRole::Input {
+                &mut input_ordinal
+            } else {
+                &mut output_ordinal
+            };
+            *value = with_ordinal(value, *ordinal);
+            *ordinal += 1;
+        }
+        let projections = node.values.iter().map(token_projection).collect::<Vec<_>>();
+        node.work = NodeWorkContract::Tokens {
+            source: projections[0].clone(),
+            projections,
+        };
+    }
+    nodes
+}
+
+fn with_ordinal(value: &ResolvedValueBinding, ordinal: u32) -> ResolvedValueBinding {
+    ResolvedValueBinding::new(
+        value.value_id().clone(),
+        value.role(),
+        ordinal,
+        value.tensor().clone(),
+        value.access(),
+        value.alias().clone(),
+        value.usage(),
+        value.weight().cloned(),
+        value.storage().clone(),
+    )
+    .unwrap()
+}
+
+fn token_projection(value: &ResolvedValueBinding) -> NodeTokenBindingProjection {
+    NodeTokenBindingProjection {
+        value_id: value.value_id().clone(),
+        role: value.role(),
+        ordinal: value.ordinal(),
+        axis: 0,
+        rank: 2,
+        canonical_extent: 8,
+    }
+}
+
+fn token_descriptors() -> Vec<DynamicResourceDescriptor> {
+    ["x", "late", "a", "b", "c", "out"]
+        .map(|name| {
+            let mut descriptor = descriptor(&format!("resource/{name}"));
+            // Match the actual [8, 4] F16 binding: eight bytes per token,
+            // independently aligned in the real dynamic pool.
+            descriptor.demand = DynamicResourceDemand::tokens(8, 8).unwrap();
+            descriptor
+        })
+        .to_vec()
+}
+
+#[test]
+fn token_scaled_late_uploaded_inputs_are_dedicated_while_internal_values_still_reuse() {
+    let nodes = token_chain();
+    let descriptors = token_descriptors();
+    let retained = BTreeSet::from([ResourceId::new("resource/out").unwrap()]);
+    let pools = MemoryPlan::derive_dynamic_pools_with_completion_retention(
+        &descriptors,
+        &nodes,
+        1 << 20,
+        &retained,
+    )
+    .unwrap();
+    assert_eq!(pools.len(), 1);
+    let pool = &pools[0];
+    assert_eq!(pool.minimum_step_bytes(), 5 * 16);
+    let shared = pool
+        .step_resource_slots()
+        .iter()
+        .filter(|slot| slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave)
+        .collect::<Vec<_>>();
+    assert_eq!(shared.len(), 1);
+    assert_eq!(
+        shared[0].resource_ids(),
+        &[
+            ResourceId::new("resource/a").unwrap(),
+            ResourceId::new("resource/c").unwrap()
+        ]
+    );
+    // Every input is already uploaded when node/a starts. In particular late
+    // must not occupy b's slot before node/out reads its original bytes.
+    for name in ["resource/x", "resource/late", "resource/out"] {
+        let resource = ResourceId::new(name).unwrap();
+        let slot = pool
+            .step_resource_slots()
+            .iter()
+            .find(|slot| slot.resource_ids().contains(&resource))
+            .unwrap();
+        assert_eq!(slot.kind(), StepResourceSlotKind::Dedicated);
+        assert_eq!(slot.resource_ids(), &[resource]);
+    }
+    let exact = MemoryPlan::from_core_with_completion_retention(
+        80,
+        80,
+        0,
+        1,
+        vec![],
+        descriptors.clone(),
+        &nodes,
+        None,
+        &retained,
+    )
+    .unwrap();
+    assert_eq!(exact.minimum_runnable_request_bytes(), 80);
+    assert!(matches!(
+        MemoryPlan::from_core_with_completion_retention(
+            79,
+            79,
+            0,
+            1,
+            vec![],
+            descriptors,
+            &nodes,
+            None,
+            &retained,
+        ),
+        Err(VNextError::PlanCapacityExceeded {
+            required_bytes: 80,
+            usable_capacity_bytes: 79
+        })
+    ));
+}
+
+#[test]
+fn token_scaled_external_alias_cannot_use_an_internal_producer_lifetime() {
+    let mut nodes = token_chain();
+    let alias = with_ordinal(
+        &token_binding(
+            "value/external-alias",
+            ResolvedValueRole::Input,
+            TensorAccess::Read,
+            "resource/a",
+        ),
+        1,
+    );
+    if let NodeWorkContract::Tokens { projections, .. } = &mut nodes[0].work {
+        projections.push(token_projection(&alias));
+    }
+    nodes[0].values.push(alias);
+    let pools = MemoryPlan::derive_dynamic_pools_with_completion_retention(
+        &token_descriptors(),
+        &nodes,
+        1 << 20,
+        &BTreeSet::from([ResourceId::new("resource/out").unwrap()]),
+    )
+    .unwrap();
+    assert_eq!(pools[0].minimum_step_bytes(), 6 * 16);
+    for resource in ["resource/a", "resource/late"] {
+        let resource = ResourceId::new(resource).unwrap();
+        let slot = pools[0]
+            .step_resource_slots()
+            .iter()
+            .find(|slot| slot.resource_ids().contains(&resource))
+            .unwrap();
+        assert_eq!(slot.kind(), StepResourceSlotKind::Dedicated);
+        assert_eq!(slot.resource_ids(), &[resource]);
+    }
+}
+
 #[test]
 fn fixed_internal_liveness_reuses_slots_but_late_uploaded_inputs_stay_dedicated() {
     let pools = pools(&chain(), &["resource/out"]);

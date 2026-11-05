@@ -752,7 +752,7 @@ impl MemoryPlan {
             reusable: bool,
         }
 
-        // Fixed tensor inputs are uploaded before the whole submission wave,
+        // External tensor inputs are uploaded before the whole submission wave,
         // even when their first consumer is much later. Only node-produced
         // values may therefore use the first/last-user liveness intervals.
         // Semantic plan validation guarantees SSA producer-before-consumer
@@ -812,6 +812,7 @@ impl MemoryPlan {
                     // Completion diagnostics read after the terminal fence, so
                     // a retained activation cannot share a liveness slot.
                     reusable: Self::is_reusable_step_activation(descriptor)
+                        && !external_resources.contains(&descriptor.base_resource_id)
                         && (!matches!(descriptor.demand, DynamicResourceDemand::Fixed { .. })
                             || internal_fixed_resources.contains(&descriptor.base_resource_id))
                         && !retained_completion_resources.contains(&descriptor.base_resource_id),
