@@ -36,6 +36,7 @@ pub(super) fn log_static_initialization_receipt(receipt: &StaticInitializationRe
         uploaded_component_count = receipt.uploaded_component_count(),
         uploaded_bytes = receipt.uploaded_bytes(),
         retained_source_upload_bytes = receipt.retained_source_upload_bytes(),
+        mapped_source_upload_bytes = receipt.mapped_source_upload_bytes(),
         transformed_component_count = receipt.transformed_component_count(),
         transformed_bytes = receipt.transformed_bytes(),
         imported_component_count = receipt.imported_component_count(),

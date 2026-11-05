@@ -41,9 +41,9 @@ use ferrum_runtime::{
     DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
     ElementType, ExecutionFactsCapture, FenceIndeterminate, FenceQuery, HostTransferLayout,
     ManagedHostBuffer, ManagedHostBytes, ProgramBindingNodeBinding, ProjectionInvocationTemplate,
-    RetainedHostMemoryRegion, StaticWeightTransformPlan, StaticWeightTransformRequest, StreamState,
-    VNextError, DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
-    HOST_UPLOAD_NATIVE_OPERATION_ID,
+    ReadOnlyMappedHostMemoryRegion, RetainedHostMemoryRegion, StaticWeightTransformPlan,
+    StaticWeightTransformRequest, StreamState, VNextError, DEVICE_COPY_NATIVE_OPERATION_ID,
+    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use ferrum_types::{AttentionExecutionPolicy, ProgramBindingUploadStrategy};
 
@@ -5527,6 +5527,44 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn supports_managed_static_weight_sources(&self) -> bool {
         self.tensor_eager.is_some()
+    }
+
+    fn supports_readonly_mapped_static_weight_sources(&self) -> bool {
+        self.tensor_eager.is_some()
+    }
+
+    fn encode_readonly_mapped_static_weight_upload(
+        &self,
+        source: ReadOnlyMappedHostMemoryRegion,
+        layout: HostTransferLayout,
+        destination: &Self::Buffer,
+        destination_offset_bytes: u64,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        if self.tensor_eager.is_none() {
+            return Ok(None);
+        }
+        self.validate_buffer(destination)?;
+        tensor_io::validate_mapped_weight_layout(
+            layout,
+            source.length_bytes(),
+            destination.descriptor.usage,
+            destination.descriptor.element_type,
+        )?;
+        let region = CopyRegion::new(0, destination_offset_bytes, source.length_bytes() as u64)
+            .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+        let (_, range) = tensor_io::transfer_range(
+            layout,
+            source.length_bytes() as u64,
+            destination.descriptor.size_bytes,
+            region,
+        )?;
+        CudaDeviceCommand::mapped_weight_upload(
+            self.runtime_instance,
+            source,
+            destination.region(range.start as u64..range.end as u64)?,
+            layout,
+        )
+        .map(Some)
     }
 
     fn encode_managed_upload(

@@ -418,6 +418,7 @@ fn initialize_resources<R: DeviceRuntime>(
         uploaded_component_count = static_receipt.uploaded_component_count(),
         uploaded_bytes = static_receipt.uploaded_bytes(),
         retained_source_upload_bytes = static_receipt.retained_source_upload_bytes(),
+        mapped_source_upload_bytes = static_receipt.mapped_source_upload_bytes(),
         upload_command_count = static_receipt.upload_command_count(),
         transform_command_count = static_receipt.transform_command_count(),
         submission_batch_count = static_receipt.submission_batch_count(),

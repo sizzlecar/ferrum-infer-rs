@@ -145,10 +145,73 @@ impl ManagedUpload {
     }
 }
 
+/// The typed source proves read-only file mapping provenance, separately from
+/// accounted ManagedHostBytes. The submission and quarantine retain that exact
+/// mapping; neither this command nor its encode path creates a payload copy.
+pub(super) struct MappedWeightUpload {
+    source: ReadOnlyMappedHostMemoryRegion,
+    destination: CudaBufferRegion,
+    layout: HostTransferLayout,
+}
+
+impl MappedWeightUpload {
+    fn enqueue(&self, stream: &CudaStream) -> Result<(), CudaDeviceRuntimeError> {
+        // File-backed pages may be pageable. CUDA can stage or synchronize the
+        // copy internally; this does not imply pinned DMA or zero Host RSS.
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                self.destination.device_ptr,
+                self.source.bytes(),
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|error| CudaDeviceRuntimeError::driver("mapped static weight upload", error))
+    }
+
+    fn validate(&self, runtime_instance: u64) -> Result<(), CudaDeviceRuntimeError> {
+        validate_mapped_weight_layout(
+            self.layout,
+            self.source.length_bytes(),
+            BufferUsage::Weights,
+            self.destination.element_type,
+        )?;
+        if self.destination.runtime_instance != runtime_instance
+            || self.destination.length_bytes != self.source.length_bytes() as u64
+            || self.destination.backing_byte_offset() % self.layout.element_type().size_bytes() != 0
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "invalid mapped CUDA static weight upload region",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn validate_mapped_weight_layout(
+    layout: HostTransferLayout,
+    source_bytes: usize,
+    destination_usage: BufferUsage,
+    destination_type: ElementType,
+) -> Result<(), CudaDeviceRuntimeError> {
+    layout
+        .validate_bytes(source_bytes)
+        .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+    if source_bytes == 0
+        || destination_usage != BufferUsage::Weights
+        || layout.element_type() != destination_type
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "mapped CUDA upload requires matching static weight layout",
+        ));
+    }
+    Ok(())
+}
+
 /// Typed eager transfers never enter the legacy executable/upload packet.
 /// A static zero has no host payload and is admitted only in Initialization.
 pub(super) enum TensorTransfer {
     Upload(ManagedUpload),
+    MappedWeightUpload(MappedWeightUpload),
     StaticZero(CudaBufferRegion),
     StateCopy {
         source: CudaBufferRegion,
@@ -160,6 +223,7 @@ impl TensorTransfer {
     pub(super) fn enqueue(&self, stream: &CudaStream) -> Result<(), CudaDeviceRuntimeError> {
         match self {
             Self::Upload(upload) => upload.enqueue(stream),
+            Self::MappedWeightUpload(upload) => upload.enqueue(stream),
             Self::StateCopy {
                 source,
                 destination,
@@ -193,6 +257,7 @@ impl TensorTransfer {
     fn validate(&self, runtime_instance: u64) -> Result<(), CudaDeviceRuntimeError> {
         match self {
             Self::Upload(upload) => upload.validate(runtime_instance),
+            Self::MappedWeightUpload(upload) => upload.validate(runtime_instance),
             Self::StateCopy {
                 source,
                 destination,
@@ -234,6 +299,7 @@ impl TensorTransfer {
     fn phase(&self) -> DeviceCommandPhase {
         match self {
             Self::Upload(upload) => upload.purpose.phase(),
+            Self::MappedWeightUpload(_) => DeviceCommandPhase::Initialization,
             Self::StaticZero(_) => DeviceCommandPhase::Initialization,
             Self::StateCopy { .. } => DeviceCommandPhase::ResultBinding,
         }
@@ -241,7 +307,9 @@ impl TensorTransfer {
 
     fn operation(&self) -> &'static str {
         match self {
-            Self::Upload(_) => HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(),
+            Self::Upload(_) | Self::MappedWeightUpload(_) => {
+                HOST_UPLOAD_NATIVE_OPERATION_ID.as_str()
+            }
             Self::StaticZero(_) => DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(),
             Self::StateCopy { .. } => DEVICE_COPY_NATIVE_OPERATION_ID.as_str(),
         }
@@ -251,6 +319,27 @@ impl TensorTransfer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapped_weight_upload_rejects_request_buffers_and_layout_mismatches() {
+        let layout = HostTransferLayout::new(ElementType::Bf16, 3).unwrap();
+        validate_mapped_weight_layout(layout, 6, BufferUsage::Weights, ElementType::Bf16).unwrap();
+        for usage in [BufferUsage::Activations, BufferUsage::Persistent] {
+            assert!(validate_mapped_weight_layout(layout, 6, usage, ElementType::Bf16).is_err());
+        }
+        assert!(
+            validate_mapped_weight_layout(layout, 5, BufferUsage::Weights, ElementType::Bf16)
+                .is_err()
+        );
+        assert!(
+            validate_mapped_weight_layout(layout, 6, BufferUsage::Weights, ElementType::F16)
+                .is_err()
+        );
+        assert!(
+            validate_mapped_weight_layout(layout, 0, BufferUsage::Weights, ElementType::Bf16)
+                .is_err()
+        );
+    }
 
     #[test]
     fn managed_upload_roles_do_not_turn_weights_into_request_inputs() {
@@ -384,6 +473,22 @@ pub(super) fn validate_tensor_command(
 }
 
 impl CudaDeviceCommand {
+    pub(super) fn mapped_weight_upload(
+        runtime_instance: u64,
+        source: ReadOnlyMappedHostMemoryRegion,
+        destination: CudaBufferRegion,
+        layout: HostTransferLayout,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::tensor_transfer_command(
+            runtime_instance,
+            TensorTransfer::MappedWeightUpload(MappedWeightUpload {
+                source,
+                destination,
+                layout,
+            }),
+        )
+    }
+
     pub(super) fn managed_upload(
         runtime_instance: u64,
         source: ManagedHostBytes,
