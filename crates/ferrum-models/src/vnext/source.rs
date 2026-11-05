@@ -4,6 +4,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ferrum_quantization::SafetensorsArchive;
 use ferrum_runtime::{
     ExternalModelMetadataId, FileFingerprint, ModelArtifactSourceRole, ModelSourceKind,
     OriginalModelSource, OriginalModelSources, ProductModelArtifactBinding,
@@ -25,6 +26,9 @@ const TOKENIZER_OPTIONAL_FILES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductionWeightArtifact {
     SafetensorsDirectory(PathBuf),
+    /// Exactly one selected archive; sibling shards, indices, and configs are
+    /// not part of this source. Semantic and tokenizer roles stay explicit.
+    SafetensorsFile(PathBuf),
     GgufFile(PathBuf),
 }
 
@@ -39,13 +43,43 @@ impl ProductionWeightArtifact {
         Self::SafetensorsDirectory(path.into())
     }
 
+    pub fn safetensors_file(path: impl Into<PathBuf>) -> Self {
+        Self::SafetensorsFile(path.into())
+    }
+
     pub fn gguf_file(path: impl Into<PathBuf>) -> Self {
         Self::GgufFile(path.into())
     }
 
     pub fn path(&self) -> &Path {
         match self {
-            Self::SafetensorsDirectory(path) | Self::GgufFile(path) => path,
+            Self::SafetensorsDirectory(path)
+            | Self::SafetensorsFile(path)
+            | Self::GgufFile(path) => path,
+        }
+    }
+
+    /// Maps only the explicitly selected physical safetensors artifact. This
+    /// keeps production inventory and payload access on the same file set as
+    /// the source fingerprint; a single-file source never discovers siblings.
+    pub fn open_safetensors_archive(&self) -> Result<SafetensorsArchive> {
+        match self {
+            Self::SafetensorsDirectory(root) => SafetensorsArchive::open(root),
+            Self::SafetensorsFile(path) => {
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| FerrumError::model("safetensors source has no parent"))?;
+                let basename =
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| {
+                            FerrumError::model("safetensors source basename is not UTF-8")
+                        })?;
+                SafetensorsArchive::open_single_file(parent, basename)
+            }
+            Self::GgufFile(_) => Err(FerrumError::model(
+                "a GGUF artifact cannot be opened as safetensors",
+            )),
         }
     }
 
@@ -153,7 +187,8 @@ impl ProductionModelSourceBundle {
             ProductionWeightArtifact::SafetensorsDirectory(root) => {
                 read_optional_file(&root.join("config.json"))?
             }
-            ProductionWeightArtifact::GgufFile(_) => None,
+            ProductionWeightArtifact::SafetensorsFile(_)
+            | ProductionWeightArtifact::GgufFile(_) => None,
         };
         if let Some(raw) = weight_config_json.as_deref() {
             if let Some(physical_architecture) = declared_architecture(raw, "weight config.json")? {
@@ -403,25 +438,57 @@ fn normalize_weight_artifact(
                 canonical_directory(&path, "safetensors weight source")?,
             ))
         }
-        ProductionWeightArtifact::GgufFile(path) => {
-            if !path.is_file() {
-                return Err(FerrumError::model(format!(
-                    "GGUF weight source is not a file: {}",
-                    path.display()
-                )));
+        ProductionWeightArtifact::SafetensorsFile(path) => {
+            let basename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| FerrumError::model("safetensors source basename is not UTF-8"))?;
+            if basename.len() <= ".safetensors".len()
+                || !basename.ends_with(".safetensors")
+                || basename.contains(['/', '\\', ':'])
+                || basename.chars().any(char::is_control)
+            {
+                return Err(FerrumError::model(
+                    "safetensors single-file source must select a portable .safetensors basename",
+                ));
             }
-            let file_name = path.file_name().ok_or_else(|| {
-                FerrumError::model(format!("GGUF source has no file name: {}", path.display()))
-            })?;
-            let parent = path.parent().ok_or_else(|| {
-                FerrumError::model(format!("GGUF source has no parent: {}", path.display()))
-            })?;
-            let parent = parent.canonicalize().map_err(|error| {
-                FerrumError::model(format!("canonicalize {}: {error}", parent.display()))
-            })?;
-            Ok(ProductionWeightArtifact::GgufFile(parent.join(file_name)))
+            Ok(ProductionWeightArtifact::SafetensorsFile(
+                normalize_weight_file(&path, "safetensors")?,
+            ))
         }
+        ProductionWeightArtifact::GgufFile(path) => Ok(ProductionWeightArtifact::GgufFile(
+            normalize_weight_file(&path, "GGUF")?,
+        )),
     }
+}
+
+fn normalize_weight_file(path: &Path, format: &str) -> Result<PathBuf> {
+    if !path.is_file() {
+        return Err(FerrumError::model(format!(
+            "{format} weight source is not a file: {}",
+            path.display()
+        )));
+    }
+    let file_name = path.file_name().ok_or_else(|| {
+        FerrumError::model(format!(
+            "{format} source has no file name: {}",
+            path.display()
+        ))
+    })?;
+    let parent = path.parent().ok_or_else(|| {
+        FerrumError::model(format!("{format} source has no parent: {}", path.display()))
+    })?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let parent = parent.canonicalize().map_err(|error| {
+        FerrumError::model(format!("canonicalize {}: {error}", parent.display()))
+    })?;
+    // Preserve an LFS symlink's snapshot-relative name instead of resolving
+    // the selected file into blobs/ and losing its declared repository role.
+    Ok(parent.join(file_name))
 }
 
 fn fingerprint_named_files(
@@ -447,10 +514,11 @@ fn fingerprint_weight_artifact(
     retained_config: Option<&[u8]>,
 ) -> Result<Vec<FileFingerprint>> {
     match artifact {
-        ProductionWeightArtifact::GgufFile(path) => {
+        ProductionWeightArtifact::SafetensorsFile(path)
+        | ProductionWeightArtifact::GgufFile(path) => {
             let parent = path
                 .parent()
-                .ok_or_else(|| FerrumError::model("GGUF source has no parent"))?;
+                .ok_or_else(|| FerrumError::model("weight file source has no parent"))?;
             // Repository evidence must distinguish subdirectories containing
             // the same basename. Preserve the snapshot path before LFS resolution.
             let root = if huggingface_snapshot_identity(path).is_some() {
@@ -461,11 +529,13 @@ fn fingerprint_weight_artifact(
                 parent
             };
             let relative = path.strip_prefix(root).map_err(|error| {
-                FerrumError::model(format!("GGUF artifact is outside its source root: {error}"))
+                FerrumError::model(format!(
+                    "weight file artifact is outside its source root: {error}"
+                ))
             })?;
             let name = relative
                 .to_str()
-                .ok_or_else(|| FerrumError::model("GGUF source file name is not UTF-8"))?
+                .ok_or_else(|| FerrumError::model("weight source file name is not UTF-8"))?
                 .replace(std::path::MAIN_SEPARATOR, "/");
             fingerprint_file(root, &name).map(|file| vec![file])
         }
@@ -714,6 +784,10 @@ fn portable_relative_path(path: &str) -> bool {
 #[cfg(test)]
 #[path = "source_identity_tests.rs"]
 mod identity_tests;
+
+#[cfg(test)]
+#[path = "source_single_file_tests.rs"]
+mod single_file_tests;
 
 #[cfg(test)]
 mod tests {

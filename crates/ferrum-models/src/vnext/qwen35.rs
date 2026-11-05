@@ -2919,8 +2919,9 @@ pub(super) fn define_from_sources(
 ) -> ferrum_types::Result<DefinedProductionModel> {
     preflight_semantic_config(sources.config_json()).map_err(ferrum_types::FerrumError::model)?;
     match sources.weights() {
-        ProductionWeightArtifact::SafetensorsDirectory(weight_root) => {
-            let weights = SafetensorsArchive::open(weight_root)?;
+        ProductionWeightArtifact::SafetensorsDirectory(_)
+        | ProductionWeightArtifact::SafetensorsFile(_) => {
+            let weights = sources.weights().open_safetensors_archive()?;
             let config = load_safetensors_family_config(&sources, &weights)
                 .map_err(ferrum_types::FerrumError::model)?;
             match config.weight_format {

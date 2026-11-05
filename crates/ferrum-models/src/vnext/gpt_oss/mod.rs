@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrum_quantization::{Mxfp4SafetensorsSource, SafetensorsArchive};
+use ferrum_quantization::Mxfp4SafetensorsSource;
 use ferrum_runtime::{
     CausalLanguageMetadata, ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId,
     ModelFamilyProvider, ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata,
@@ -202,15 +202,17 @@ pub(super) fn define_from_sources(
     .map_err(ferrum_types::FerrumError::model)?;
     let (semantic, quantization) = GptOssSemanticConfig::parse(sources.config_json())
         .map_err(ferrum_types::FerrumError::model)?;
-    let weight_root = match sources.weights() {
-        ProductionWeightArtifact::SafetensorsDirectory(weight_root) => weight_root,
+    let archive = match sources.weights() {
+        ProductionWeightArtifact::SafetensorsDirectory(_)
+        | ProductionWeightArtifact::SafetensorsFile(_) => {
+            sources.weights().open_safetensors_archive()?
+        }
         ProductionWeightArtifact::GgufFile(_) => {
             return Err(ferrum_types::FerrumError::model(
                 "GPT-OSS accepts only the locked native MXFP4 safetensors source",
             ))
         }
     };
-    let archive = SafetensorsArchive::open(weight_root)?;
     let weights = GptOssWeightManifest::load(&archive, &semantic, &quantization)
         .map_err(ferrum_types::FerrumError::model)?;
     finish_preparation(
