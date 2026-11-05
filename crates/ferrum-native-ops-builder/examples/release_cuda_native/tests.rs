@@ -1,7 +1,7 @@
 use super::*;
 use ferrum_types::{
-    NativeOperatorBackend, NativeOperatorContractVersion, NativeOperatorProviderCatalogRow,
-    NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
+    NativeOperatorBackend, NativeOperatorBinding, NativeOperatorContractVersion,
+    NativeOperatorProviderCatalogRow, NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
 };
 
 #[test]
@@ -25,6 +25,102 @@ fn production_moe_closure_rejects_missing_dense_repacking_artifact() {
             unit: "vllm_marlin",
             operator: "ferrum.cuda.vllm_marlin",
         }
+    );
+}
+
+#[test]
+fn both_release_architectures_require_quantized_projection_and_indexed_attention() {
+    let set = ResolvedNativeOperatorArtifactSet {
+        lock_path: PathBuf::from("fixture.lock.json"),
+        g03_catalog_sha256: "a".repeat(64),
+        artifacts: Vec::new(),
+    };
+    for architecture in [Architecture::Sm89, Architecture::Sm120] {
+        for final_set in [false, true] {
+            for required in [
+                CudaNativeBuildUnit::UpstreamLinear,
+                CudaNativeBuildUnit::UpstreamExtraLinear,
+                CudaNativeBuildUnit::UpstreamQ6F32Linear,
+                CudaNativeBuildUnit::VllmIndexedPagedAttentionV2,
+            ] {
+                let units = required_units_for_set(architecture, final_set)
+                    .filter(|unit| *unit == required);
+                assert_eq!(
+                    ResolvedCudaNativeBuildCoverage::resolve(&set, units).unwrap_err(),
+                    ferrum_native_ops::CudaNativeBuildCoverageError::MissingArtifact {
+                        unit: required.as_str(),
+                        operator: required.artifact_operator(),
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn f32_only_q6_package_cannot_satisfy_the_production_f16_boundary() {
+    let f32 = CudaNativeBuildUnit::UpstreamQ6F32Linear
+        .required_exports()
+        .iter()
+        .map(|export| (*export).to_owned())
+        .collect::<Vec<_>>();
+    assert!(require_q6_f16_exports(&f32).is_err());
+    let f16 = ferrum_native_ops::upstream_q6_f16_linear::UPSTREAM_Q6_F16_LINEAR_EXPORTS;
+    let complete = f32
+        .into_iter()
+        .chain(f16.iter().map(|export| (*export).to_owned()))
+        .collect::<Vec<_>>();
+    require_q6_f16_exports(&complete).unwrap();
+    for missing in f16 {
+        let incomplete = complete
+            .iter()
+            .filter(|export| *export != missing)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(require_q6_f16_exports(&incomplete)
+            .unwrap_err()
+            .to_string()
+            .contains(missing));
+    }
+}
+
+#[test]
+fn cross_architecture_package_keeps_provider_contract_and_uses_the_build_target() {
+    let exports = vec!["ferrum_upstream_q6_f16_dot_v1".to_owned()];
+    let reference = NativeOperatorPackageSpec {
+        schema_version: ferrum_native_ops_builder::NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION,
+        operator: CudaNativeBuildUnit::UpstreamQ6F32Linear
+            .artifact_operator()
+            .to_owned(),
+        operator_abi_version: "1".to_owned(),
+        backend: NativeOperatorBackend::Cuda,
+        compute_capabilities: vec!["sm_120".to_owned()],
+        operation_bindings: vec![NativeOperatorBinding {
+            operation_id: "operation.dense_swiglu.upstream-q6-f16-marker-v1".to_owned(),
+            operation_contract_version: NativeOperatorContractVersion::new(1, 0),
+            provider_id: "provider.cuda.dense_swiglu.upstream-q6-f16-marker-v1".to_owned(),
+            provider_version: NativeOperatorContractVersion::new(1, 0),
+            provider_implementation_fingerprint: "b".repeat(64),
+            entrypoints: exports.clone(),
+        }],
+        required_exports: exports,
+        license_files: vec![ferrum_native_ops_builder::NativeOperatorLicenseInput {
+            source_path: "LICENSE".to_owned(),
+            output_path: "licenses/Ferrum-MIT.txt".to_owned(),
+        }],
+        cuda_toolkit: Some("12.8".to_owned()),
+        cuda_runtime_min: Some("12.8".to_owned()),
+        system_libraries: vec![ferrum_native_ops::NativeOperatorSystemLibrary::CudaRuntime],
+    };
+    let rebuilt = package_spec_for_target(reference.clone(), Architecture::Sm89);
+    assert_eq!(rebuilt.compute_capabilities, ["sm_89"]);
+    assert_eq!(rebuilt.cuda_toolkit.as_deref(), Some("12.4"));
+    assert_eq!(rebuilt.cuda_runtime_min.as_deref(), Some("12.4"));
+    // Returning the target metadata to the reference architecture must recover
+    // the entire original provider, ABI, license and linker contract.
+    assert_eq!(
+        package_spec_for_target(rebuilt, Architecture::Sm120),
+        reference
     );
 }
 

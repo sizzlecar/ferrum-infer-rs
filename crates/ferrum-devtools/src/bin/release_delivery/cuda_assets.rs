@@ -22,8 +22,39 @@ impl Sm120RuntimePolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct CudaDeliveryCapability {
+    pub(super) sm89_feature_policy: CudaFeaturePolicy,
     pub(super) sm120_asset_required: bool,
     pub(super) sm120_runtime: Sm120RuntimePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum CudaFeaturePolicy {
+    /// Historical package inspection does not establish production capabilities.
+    #[default]
+    Compatible,
+    Production,
+}
+
+impl CudaDeliveryCapability {
+    /// Enforce the candidate's declared build contract. Runtime operator
+    /// availability still requires execution of the extracted staged binary.
+    pub(super) fn validate_asset(
+        &self,
+        name: &str,
+        abi: &AbiInput,
+    ) -> Result<Option<CudaVariant>, String> {
+        let variant = CudaVariant::from_abi(name, abi)?;
+        if variant == Some(CudaVariant::Sm89)
+            && self.sm89_feature_policy == CudaFeaturePolicy::Production
+            && !abi
+                .cargo_features
+                .iter()
+                .any(|feature| feature == "cuda-production")
+        {
+            return Err("candidate requires the SM89 cuda-production feature bundle; historical CUDA operator features do not satisfy it".into());
+        }
+        Ok(variant)
+    }
 }
 
 /// Read the immutable candidate blob, never the tool's checkout or available assets.
@@ -109,13 +140,31 @@ pub(super) fn workflow_delivery_capability(bytes: &[u8]) -> Result<CudaDeliveryC
         return Ok(CudaDeliveryCapability::default());
     };
     let outputs = mapping(outputs, "outputs")?;
+    let sm89_feature_policy = match literal(outputs, "cuda_sm89_feature_policy")? {
+        None => CudaFeaturePolicy::Compatible,
+        Some("production") => {
+            let declaration = get(outputs, "cuda_asset_id")
+                .ok_or("SM89 feature policy requires the SM89 asset declaration")?;
+            if get(mapping(declaration, "cuda_asset_id")?, "value")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err("SM89 output requires a nonempty scalar value".into());
+            }
+            CudaFeaturePolicy::Production
+        }
+        Some(_) => return Err("invalid SM89 feature policy; expected production".into()),
+    };
     let policy = literal(outputs, "cuda_sm120_runtime_policy")?;
     let reason = literal(outputs, "cuda_sm120_runtime_reason")?;
     let Some(declaration) = get(outputs, "cuda_sm120_asset_id") else {
         if policy.is_some() || reason.is_some() {
             return Err("SM120 runtime policy requires the SM120 asset declaration".into());
         }
-        return Ok(CudaDeliveryCapability::default());
+        return Ok(CudaDeliveryCapability {
+            sm89_feature_policy,
+            ..CudaDeliveryCapability::default()
+        });
     };
     let value = get(mapping(declaration, "cuda_sm120_asset_id")?, "value")
         .and_then(Value::as_str)
@@ -133,6 +182,7 @@ pub(super) fn workflow_delivery_capability(bytes: &[u8]) -> Result<CudaDeliveryC
         _ => return Err("invalid SM120 runtime policy or missing/contradictory reason".into()),
     };
     Ok(CudaDeliveryCapability {
+        sm89_feature_policy,
         sm120_asset_required: true,
         sm120_runtime,
     })
@@ -162,8 +212,12 @@ impl CudaVariant {
                 "89",
                 "nvidia/cuda:12.4.0-devel-ubuntu22.04",
                 &[
+                    // Inspection preserves the historical package contract;
+                    // the candidate's explicit policy gates new production assets.
                     &["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"],
                     &["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2", "cuda-cutlass-fp8"],
+                    &["cuda", "cuda-production"],
+                    &["cuda", "cuda-production", "cuda-cutlass-fp8"],
                 ],
             ),
             Self::Sm120 => (
@@ -186,7 +240,7 @@ impl CudaVariant {
             || actual.len() != abi.cargo_features.len()
         {
             return Err(
-                "CUDA asset name, target, capability, toolkit and production features disagree"
+                "CUDA asset name, target, capability, toolkit and declared features disagree"
                     .into(),
             );
         }
@@ -199,6 +253,105 @@ mod tests {
     use super::*;
 
     const DECLARED: &str = "on:\n  workflow_call:\n    outputs:\n      cuda_sm120_asset_id:\n        value: '${{ jobs.sm120.outputs.asset_id }}'\n";
+
+    fn sm89_workflow(policy: Option<&str>, asset: Option<&str>) -> Vec<u8> {
+        let mut outputs = serde_json::Map::new();
+        for (key, value) in [
+            ("cuda_sm89_feature_policy", policy),
+            ("cuda_asset_id", asset),
+        ] {
+            if let Some(value) = value {
+                outputs.insert(key.into(), serde_json::json!({"value": value}));
+            }
+        }
+        serde_yaml::to_string(&serde_json::json!({
+            "on": {"workflow_call": {"outputs": outputs}}
+        }))
+        .unwrap()
+        .into_bytes()
+    }
+
+    #[test]
+    fn sm89_feature_policy_requires_an_explicit_literal_and_declared_asset() {
+        let legacy = workflow_delivery_capability(&sm89_workflow(None, Some("asset"))).unwrap();
+        assert_eq!(legacy.sm89_feature_policy, CudaFeaturePolicy::Compatible);
+        let production = workflow_delivery_capability(&sm89_workflow(
+            Some("production"),
+            Some("${{ jobs.cuda.outputs.asset_id }}"),
+        ))
+        .unwrap();
+        assert_eq!(
+            production.sm89_feature_policy,
+            CudaFeaturePolicy::Production
+        );
+        assert!(!production.sm120_asset_required);
+        let combined = workflow_delivery_capability(
+            b"on: {workflow_call: {outputs: {cuda_asset_id: {value: sm89}, cuda_sm89_feature_policy: {value: production}, cuda_sm120_asset_id: {value: sm120}}}}",
+        )
+        .unwrap();
+        assert_eq!(combined.sm89_feature_policy, CudaFeaturePolicy::Production);
+        assert!(combined.sm120_asset_required);
+        assert_eq!(combined.sm120_runtime, Sm120RuntimePolicy::Required);
+        for policy in [
+            "",
+            "legacy",
+            " production",
+            "production\n",
+            "${{ inputs.policy }}",
+        ] {
+            assert!(
+                workflow_delivery_capability(&sm89_workflow(Some(policy), Some("asset"))).is_err()
+            );
+        }
+        for asset in [None, Some(""), Some("  ")] {
+            assert!(
+                workflow_delivery_capability(&sm89_workflow(Some("production"), asset)).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn historical_features_remain_inspectable_but_do_not_satisfy_production_policy() {
+        let compatible = CudaDeliveryCapability::default();
+        let production =
+            workflow_delivery_capability(&sm89_workflow(Some("production"), Some("asset")))
+                .unwrap();
+        let name = "ferrum-linux-x86_64-cuda-sm89.tar.gz";
+        for (features, is_production) in [
+            (vec!["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"], false),
+            (
+                vec![
+                    "cuda",
+                    "vllm-moe-marlin",
+                    "vllm-paged-attn-v2",
+                    "cuda-cutlass-fp8",
+                ],
+                false,
+            ),
+            (vec!["cuda", "cuda-production"], true),
+            (vec!["cuda", "cuda-production", "cuda-cutlass-fp8"], true),
+        ] {
+            let abi = AbiInput {
+                backend: Backend::Cuda,
+                target_triple: "x86_64-unknown-linux-gnu".into(),
+                cargo_features: features.into_iter().map(str::to_owned).collect(),
+                cuda_compute_capability: Some("89".into()),
+                cuda_toolkit_image: Some("nvidia/cuda:12.4.0-devel-ubuntu22.04".into()),
+            };
+            assert_eq!(
+                compatible.validate_asset(name, &abi).unwrap(),
+                Some(CudaVariant::Sm89)
+            );
+            let result = production.validate_asset(name, &abi);
+            if is_production {
+                assert_eq!(result.unwrap(), Some(CudaVariant::Sm89));
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .contains("cuda-production feature bundle"));
+            }
+        }
+    }
 
     #[test]
     fn candidate_workflow_declaration_is_parsed_not_inferred_from_text() {
@@ -277,6 +430,7 @@ mod tests {
             ))
             .unwrap(),
             CudaDeliveryCapability {
+                sm89_feature_policy: CudaFeaturePolicy::Compatible,
                 sm120_asset_required: true,
                 sm120_runtime: Sm120RuntimePolicy::NotRunHardwareUnavailable {
                     reason: "No approved SM120 executor.".into()

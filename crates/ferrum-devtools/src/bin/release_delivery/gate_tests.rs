@@ -493,6 +493,10 @@ fn cuda_asset_identity_binds_architecture_toolkit_and_feature_set() {
          "nvidia/cuda:12.4.0-devel-ubuntu22.04", vec!["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"]),
         (CudaVariant::Sm89, "ferrum-linux-x86_64-cuda-sm89.tar.gz", "89",
          "nvidia/cuda:12.4.0-devel-ubuntu22.04", vec!["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2", "cuda-cutlass-fp8"]),
+        (CudaVariant::Sm89, "ferrum-linux-x86_64-cuda-sm89.tar.gz", "89",
+         "nvidia/cuda:12.4.0-devel-ubuntu22.04", vec!["cuda", "cuda-production"]),
+        (CudaVariant::Sm89, "ferrum-linux-x86_64-cuda-sm89.tar.gz", "89",
+         "nvidia/cuda:12.4.0-devel-ubuntu22.04", vec!["cuda", "cuda-production", "cuda-cutlass-fp8"]),
         (CudaVariant::Sm120, "ferrum-linux-x86_64-cuda-sm120.tar.gz", "120",
          "nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66", vec!["cuda", "cuda-production"]),
         (CudaVariant::Sm120, "ferrum-linux-x86_64-cuda-sm120.tar.gz", "120",
@@ -1754,7 +1758,8 @@ async fn distribution_rehashes_embedded_binary_and_reaudits_raw_dependencies() {
     )
     .unwrap();
     fs::write(directory.path().join("native.dependencies.txt"), audit).unwrap();
-    let accepted = distribution(&abi_path, "2.3.4", &"a".repeat(40))
+    let capability = cuda_assets::CudaDeliveryCapability::default();
+    let accepted = distribution(&abi_path, "2.3.4", &"a".repeat(40), &capability)
         .await
         .unwrap();
     assert!(accepted
@@ -1765,10 +1770,12 @@ async fn distribution_rehashes_embedded_binary_and_reaudits_raw_dependencies() {
     let mut altered = generated.abi.clone();
     altered["binary_sha256"] = json!("d".repeat(64));
     fs::write(&abi_path, serde_json::to_vec(&altered).unwrap()).unwrap();
-    assert!(distribution(&abi_path, "2.3.4", &"a".repeat(40))
-        .await
-        .unwrap_err()
-        .contains("actual archive/binary"));
+    assert!(
+        distribution(&abi_path, "2.3.4", &"a".repeat(40), &capability)
+            .await
+            .unwrap_err()
+            .contains("actual archive/binary")
+    );
     fs::write(&abi_path, serde_json::to_vec(&generated.abi).unwrap()).unwrap();
     fs::write(
         directory.path().join("native.dependencies.txt"),
@@ -1776,7 +1783,7 @@ async fn distribution_rehashes_embedded_binary_and_reaudits_raw_dependencies() {
     )
     .unwrap();
     assert!(
-        distribution(&abi_path, "2.3.4", &"a".repeat(40))
+        distribution(&abi_path, "2.3.4", &"a".repeat(40), &capability)
             .await
             .is_err(),
         "a false forbidden-runtime summary must not bypass raw dependency audit"

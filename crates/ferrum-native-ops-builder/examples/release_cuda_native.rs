@@ -20,8 +20,8 @@ use ferrum_native_ops_builder::{
     assemble_native_operator_set, lock_native_operator_source_definition,
     materialize_native_operator_package_spec, materialize_native_operator_source_overlay,
     package_native_operator, run_native_operator_source_build, NativeOperatorPackageRequest,
-    NativeOperatorPackageSpecRequest, NativeOperatorSetRequest, NativeOperatorSourceBuildPlan,
-    NativeOperatorSourceBuildRequest,
+    NativeOperatorPackageSpec, NativeOperatorPackageSpecRequest, NativeOperatorSetRequest,
+    NativeOperatorSourceBuildPlan, NativeOperatorSourceBuildRequest,
 };
 use ferrum_types::NativeOperatorProviderCatalog;
 use serde::de::DeserializeOwned;
@@ -61,6 +61,9 @@ enum Command {
 struct Build {
     #[arg(long, value_enum, default_value = "sm120")]
     architecture: Architecture,
+    /// Architecture of the source-plan reference; every archive is rebuilt for the target.
+    #[arg(long, value_enum)]
+    reference_architecture: Option<Architecture>,
     #[arg(long)]
     reference_lock: PathBuf,
     #[arg(long)]
@@ -124,20 +127,13 @@ impl Architecture {
         }
     }
 
-    fn required_units(self) -> &'static [CudaNativeBuildUnit] {
+    fn cuda_toolkit(self) -> &'static str {
         match self {
-            Self::Sm89 => SM89_REQUIRED,
-            Self::Sm120 => PRODUCTION,
+            Self::Sm89 => "12.4",
+            Self::Sm120 => "12.8",
         }
     }
 }
-
-const SM89_REQUIRED: &[CudaNativeBuildUnit] = &[
-    CudaNativeBuildUnit::Marlin,
-    CudaNativeBuildUnit::VllmMarlin,
-    CudaNativeBuildUnit::VllmMoeMarlin,
-    CudaNativeBuildUnit::VllmPagedAttentionV2,
-];
 
 // The Linux production feature closure, including indexed text attention and
 // vllm-moe-marlin's dense vllm-marlin repacking dependency. The addressed and
@@ -187,15 +183,31 @@ fn resolve(
         "x86_64-unknown-linux-gnu",
     )?;
     ResolvedCudaNativeBuildCoverage::resolve(&set, required_units_for_set(architecture, fp8))?;
+    let q6 = set
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.lock.operator == CudaNativeBuildUnit::UpstreamQ6F32Linear.artifact_operator()
+        })
+        .ok_or("production set is missing the Q6 projection artifact")?;
+    require_q6_f16_exports(&q6.lock.required_exports)?;
     Ok(set)
+}
+
+fn require_q6_f16_exports(exports: &[String]) -> Result<()> {
+    for required in ferrum_native_ops::upstream_q6_f16_linear::UPSTREAM_Q6_F16_LINEAR_EXPORTS {
+        if !exports.iter().any(|export| export == required) {
+            return Err(format!("production Q6 artifact is missing F16 export {required}").into());
+        }
+    }
+    Ok(())
 }
 
 fn required_units_for_set(
     architecture: Architecture,
     final_set: bool,
 ) -> impl Iterator<Item = CudaNativeBuildUnit> {
-    architecture
-        .required_units()
+    PRODUCTION
         .iter()
         .copied()
         .chain(final_set.then_some(CudaNativeBuildUnit::CutlassFp8ScaledMm))
@@ -308,7 +320,11 @@ fn validate_catalog_extension(
 }
 
 fn build(args: &Build) -> Result<()> {
-    let reference = resolve(&args.reference_lock, args.architecture, false)?;
+    let reference = resolve(
+        &args.reference_lock,
+        args.reference_architecture.unwrap_or(args.architecture),
+        false,
+    )?;
     let base_catalog = reference_catalog(&reference)?;
     let combined: NativeOperatorProviderCatalog = read_json(&args.catalog)?;
     let gpt_source = match args.architecture {
@@ -349,7 +365,21 @@ fn build(args: &Build) -> Result<()> {
         }
         let source = args.work.join(format!("{}-source", unit.as_str()));
         materialize_source(&plan, unit, args, &source)?;
-        let spec = reference_root.join(&artifact.lock.package_spec.path);
+        // Only source plans and provider contracts cross architectures. The
+        // archive is always freshly compiled below, and packaging verifies the
+        // target/toolkit declaration against that actual source-build receipt.
+        let reference_spec: NativeOperatorPackageSpec =
+            read_json(&reference_root.join(&artifact.lock.package_spec.path))?;
+        let spec = args
+            .work
+            .join(format!("{}-target.package.json", unit.as_str()));
+        write_new(
+            &spec,
+            &serde_json::to_vec_pretty(&package_spec_for_target(
+                reference_spec,
+                args.architecture,
+            ))?,
+        )?;
         prepared.push((unit, source, plan_path, spec));
     }
     let fp8: NativeOperatorSourceBuildPlan = read_json(&args.fp8_plan)?;
@@ -433,6 +463,16 @@ fn build(args: &Build) -> Result<()> {
         digest_file(&lock)?
     );
     Ok(())
+}
+
+fn package_spec_for_target(
+    mut spec: NativeOperatorPackageSpec,
+    architecture: Architecture,
+) -> NativeOperatorPackageSpec {
+    spec.compute_capabilities = vec![architecture.compute_capability().to_owned()];
+    spec.cuda_toolkit = Some(architecture.cuda_toolkit().to_owned());
+    spec.cuda_runtime_min = Some(architecture.cuda_toolkit().to_owned());
+    spec
 }
 
 fn prepare_xqa(args: &Build) -> Result<(PathBuf, PathBuf, PathBuf)> {

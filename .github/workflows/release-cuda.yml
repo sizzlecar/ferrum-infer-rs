@@ -41,6 +41,9 @@ on:
       cuda_asset_id:
         description: Immutable uploaded artifact ID
         value: ${{ jobs.linux-x86_64-cuda-sm89.outputs.asset_id }}
+      cuda_sm89_feature_policy:
+        description: Required operator capabilities in the Linux SM89 distribution
+        value: production
       cuda_sm120_asset_id:
         description: Immutable Linux SM120 production artifact ID
         value: ${{ jobs.linux-x86_64-cuda-sm120.outputs.asset_id }}
@@ -108,10 +111,10 @@ env:
   CUDA_HOME: /usr/local/cuda
   CUDA_ROOT: /usr/local/cuda
   CUDA_COMPUTE_CAP: 89
-  # Build-time, content-addressed component. The staged ferrum binary links
-  # these operators statically and performs no runtime download.
-  NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v8/native-operator-set-cuda12.4-sm89-v8.tar.zst
-  NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 977538d1f33e02adfef43e6648cf0749f07b15b238e0b240ad1e3bd338c37d60
+  # Complete production source-plan/catalog baseline, including Q4/Q5/Q6.
+  # Every linked archive is rebuilt for the destination architecture/toolkit.
+  NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.8-sm120-v4/native-operator-set-cuda12.8-sm120-v4.tar.zst
+  NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 5283c1fcdcabdcd1aab7058f8c1f2676c48d8b99b50f8b116f737816199e88ec
 
 jobs:
   linux-x86_64-cuda-sm89:
@@ -120,13 +123,12 @@ jobs:
       asset_id: ${{ steps.asset_id.outputs.artifact-id }}
     name: Stage Linux x86_64 CUDA sm89
     env:
-      NATIVE_REFERENCE_REVISION: 6bfa659ad535caab97019726fe373f8326a233a7
-      NATIVE_HISTORICAL_SOURCE_REVISION: 7da9e4ebfb13e996a08bcc91db2a5e194b7b9f8d
+      NATIVE_REFERENCE_REVISION: 37617964f3ed9fd1c191a51a14c94721c7ff4f58
       LLAMA_NATIVE_REVISION: d81235049384534c167caea52b85a694f6103d14
       CUTLASS_REVISION: cb4247394dd82148787aed73e5dc7cef33cbf862
       CUTLASS_ARCHIVE_SHA256: 7a37329b43a47aaf9ef142be99baff3e71dbeea007b975891350cc0e50bc598b
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 240
     container:
       image: nvidia/cuda:12.4.0-devel-ubuntu22.04
     steps:
@@ -179,7 +181,7 @@ jobs:
 
       - name: Materialize pinned CUDA native operator set
         run: |
-          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v8.tar.zst"
+          archive="$RUNNER_TEMP/native-production-reference.tar.zst"
           root="$RUNNER_TEMP/ferrum-native-operator-set"
           curl --fail --location --retry 5 --retry-all-errors \
             --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
@@ -187,7 +189,7 @@ jobs:
             | sha256sum --check --strict
           mkdir -p "$root"
           zstd --decompress --stdout "$archive" | tar -xf - -C "$root"
-          lock="$root/inputs/native-operator-set.lock.json"
+          lock="$root/native-operator-set.lock.json"
           test -f "$lock"
           echo "SM89_REFERENCE_LOCK=$lock" >> "$GITHUB_ENV"
 
@@ -213,19 +215,15 @@ jobs:
           mkdir "$work"
           cargo build --locked --profile release-tools -p ferrum-native-ops-builder --example release_cuda_native --bin ferrum-native-ops-builder
           cargo build --locked --profile release-tools -p ferrum-kernels --example cutlass_fp8_catalog_declaration
-          ./target/release-tools/examples/release_cuda_native reference --architecture sm89 \
+          ./target/release-tools/examples/release_cuda_native reference --architecture sm120 \
             --lock "$SM89_REFERENCE_LOCK" --catalog-output "$work/base-catalog.json"
           # The catalog configuration is explicit source provenance, not a
           # measured native-memory upper bound or a runtime capacity override.
           ./target/release-tools/examples/cutlass_fp8_catalog_declaration \
             134217728 512 experimental-release-source-declaration-v1 \
             "$work/combined-catalog.json" "$work/base-catalog.json"
-          mkdir "$work/reference-workspace" "$work/source-bundle" "$work/fp8-source" "$work/historical-source"
+          mkdir "$work/reference-workspace" "$work/source-bundle" "$work/fp8-source"
           git archive "$NATIVE_REFERENCE_REVISION" | tar -xf - -C "$work/reference-workspace"
-          # Recover the exact SM89 inputs from before the native source split.
-          # The builder still requires every byte to match the production plan.
-          git archive "$NATIVE_HISTORICAL_SOURCE_REVISION:crates/ferrum-kernels" \
-            | tar -xf - -C "$work/historical-source"
           manifest=native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json
           source_url=$(jq -er '"https://github.com/" + .distribution.repository + "/releases/download/" + .distribution.tag + "/" + .distribution.asset_name' "$manifest")
           source_sha=$(jq -er '.archive.sha256' "$manifest")
@@ -259,9 +257,9 @@ jobs:
         run: |
           work="$RUNNER_TEMP/sm89-native"
           ./target/release-tools/examples/release_cuda_native build --architecture sm89 \
+            --reference-architecture sm120 \
             --reference-lock "$SM89_REFERENCE_LOCK" --reference-workspace "$work/reference-workspace" \
             --source-bundle "$work/source-bundle" --llama-source "$work/llama" \
-            --historical-source "$work/historical-source" \
             --workspace "$GITHUB_WORKSPACE" --catalog "$work/combined-catalog.json" \
             --fp8-source "$work/fp8-source" --fp8-plan "$work/fp8-plan.json" \
             --work "$work/builds" --output "$work/operator-set" \
@@ -305,7 +303,7 @@ jobs:
           export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
           test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
           cargo build --release --locked -p ferrum-cli --bin ferrum \
-            --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8
+            --features cuda,cuda-production,cuda-cutlass-fp8
 
       - name: Strip and audit CUDA binary
         run: |
@@ -321,19 +319,36 @@ jobs:
           cp "$checker" sm89-fp8-runtime-check
           sha256sum sm89-fp8-runtime-check > sm89-fp8-runtime-check.sha256
 
+      - name: Assemble SM89 distribution licenses from the pinned native packages
+        run: |
+          mkdir -p dist
+          cat LICENSE crates/ferrum-kernels/src/gguf_blocks/LICENSE.ggml > dist/LICENSE
+          native_set_root=$(dirname "$FERRUM_NATIVE_OPERATOR_SET_LOCK")
+          for native_license in "$native_set_root"/packages/*/licenses/*.txt; do
+            test -f "$native_license"
+            printf '\n--- %s ---\n' "${native_license#"$native_set_root/"}" >> dist/LICENSE
+            cat "$native_license" >> dist/LICENSE
+          done
+
       - name: Package staged CUDA asset and adjacent manifests
         run: |
           asset="ferrum-linux-x86_64-cuda-sm89.tar.gz"
+          runtime_dependencies=$(readelf -d target/release/ferrum | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p')
+          test -n "$runtime_dependencies"
           mkdir -p dist
           cp target/release/ferrum dist/ferrum
-          cat LICENSE crates/ferrum-kernels/src/gguf_blocks/LICENSE.ggml > dist/LICENSE
           cp README.md dist/README.md
           cat > dist/CUDA-BUILD.txt <<EOF
           Ferrum v${VERSION} CUDA release binary
           CUDA toolkit image: nvidia/cuda:12.4.0-devel-ubuntu22.04
           CUDA_COMPUTE_CAP: 89
-          Cargo features: cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8
-          NVIDIA driver, compatible CUDA runtime, and NCCL runtime are required.
+          Cargo features: cuda,cuda-production,cuda-cutlass-fp8
+          Native operator set: rebuilt from locked production source plans plus pinned CUTLASS FP8
+          Native operator lock SHA256: $(sha256sum "$FERRUM_NATIVE_OPERATOR_SET_LOCK" | cut -d ' ' -f 1)
+          CUDA runtime libraries are not bundled. Install the NVIDIA driver and CUDA 12.4 or a compatible newer CUDA 12 runtime, and satisfy the shared-library list below.
+          Direct dynamic dependencies (the driver provides libcuda.so.1):
+          ${runtime_dependencies}
+          Use ldd ./ferrum to check for missing libraries before starting the server.
           EOF
           tar -C dist -czf "$asset" ferrum LICENSE README.md CUDA-BUILD.txt
           ./target/release/examples/release_candidate manifest \
@@ -345,7 +360,7 @@ jobs:
             --backend cuda --target-triple x86_64-unknown-linux-gnu \
             --asset "$asset" --binary target/release/ferrum \
             --dependencies ferrum-linux-x86_64-cuda-sm89.dependencies.txt \
-            --cargo-features cuda,vllm-moe-marlin,vllm-paged-attn-v2,cuda-cutlass-fp8 \
+            --cargo-features cuda,cuda-production,cuda-cutlass-fp8 \
             --cuda-compute-capability "$CUDA_COMPUTE_CAP" \
             --cuda-toolkit-image nvidia/cuda:12.4.0-devel-ubuntu22.04
 
@@ -633,6 +648,8 @@ jobs:
       - name: Package staged CUDA asset and adjacent manifests
         run: |
           asset="ferrum-linux-x86_64-cuda-sm120.tar.gz"
+          runtime_dependencies=$(readelf -d target/release/ferrum | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p')
+          test -n "$runtime_dependencies"
           mkdir -p dist
           cp target/release/ferrum dist/ferrum
           cp README.md dist/README.md
@@ -648,7 +665,10 @@ jobs:
           CUTLASS revision: ${CUTLASS_REVISION}
           CUTLASS source archive SHA256: ${CUTLASS_ARCHIVE_SHA256}
           Native operator lock SHA256: $(sha256sum "$FERRUM_NATIVE_OPERATOR_SET_LOCK" | cut -d ' ' -f 1)
-          NVIDIA driver, compatible CUDA 12.8 runtime, and NCCL runtime are required.
+          CUDA runtime libraries are not bundled. Install the NVIDIA driver and CUDA 12.8 or a compatible newer CUDA 12 runtime, and satisfy the shared-library list below.
+          Direct dynamic dependencies (the driver provides libcuda.so.1):
+          ${runtime_dependencies}
+          Use ldd ./ferrum to check for missing libraries before starting the server.
           EOF
           tar -C dist -czf "$asset" ferrum LICENSE README.md CUDA-BUILD.txt
           ./target/release/examples/release_candidate manifest \

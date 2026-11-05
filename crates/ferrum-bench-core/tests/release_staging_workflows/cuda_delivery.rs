@@ -82,17 +82,14 @@ fn cuda_staging_keeps_architecture_inputs_and_package_metadata_separate() {
     let staging = workflow("release-cuda.yml");
     let old = &staging["jobs"]["linux-x86_64-cuda-sm89"];
     let production = &staging["jobs"]["linux-x86_64-cuda-sm120"];
-    assert!(script(old, "cargo build --release --locked -p ferrum-cli")
-        .contains("--features cuda,vllm-moe-marlin,vllm-paged-attn-v2"));
-    assert!(
-        script(production, "cargo build --release --locked -p ferrum-cli")
-            .contains("--features cuda,cuda-production,cuda-cutlass-fp8")
-    );
+    for job in [old, production] {
+        assert_cuda_production_features(job);
+    }
     assert_ne!(old["container"]["image"], production["container"]["image"]);
-    assert_ne!(
-        staging["env"]["NATIVE_OPERATOR_SET_ARCHIVE_URL"],
-        production["env"]["NATIVE_OPERATOR_SET_ARCHIVE_URL"]
-    );
+    // Source plans may share a complete reference baseline. The destination
+    // architecture is explicit, and every linked native archive is rebuilt.
+    let rebuild = script(old, "release_cuda_native build --architecture sm89");
+    assert!(rebuild.contains("--reference-architecture sm120"));
     let image = production["container"]["image"].as_str().unwrap();
     let (_, digest) = image.split_once("@sha256:").expect("pinned build image");
     assert!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -123,6 +120,58 @@ fn cuda_staging_keeps_architecture_inputs_and_package_metadata_separate() {
         "unverified native bytes must not be extracted"
     );
     assert!(staging["jobs"]["windows-x86_64-cuda-sm89"]["uses"].is_string());
+}
+
+// Resolve the actual CLI feature graph: a release may spell the production
+// bundle explicitly or expand it, but must not omit its quantized operators.
+fn assert_cuda_production_features(job: &Value) {
+    use std::collections::BTreeSet;
+    let manifest =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../ferrum-cli/Cargo.toml"))
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+    let expand = |roots: Vec<String>| {
+        let mut pending = roots;
+        let mut found = BTreeSet::new();
+        while let Some(feature) = pending.pop() {
+            if !found.insert(feature.clone()) {
+                continue;
+            }
+            if let Some(children) = manifest["features"]
+                .get(&feature)
+                .and_then(toml_edit::Item::as_array)
+            {
+                pending.extend(children.iter().map(|v| v.as_str().unwrap().to_owned()));
+            }
+        }
+        found
+    };
+    let argument = |text: &str, flag: &str| -> Vec<String> {
+        let mut words = text.split_whitespace();
+        words.find(|word| *word == flag).expect("feature argument");
+        words
+            .next()
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect()
+    };
+    let build = argument(
+        script(job, "cargo build --release --locked -p ferrum-cli"),
+        "--features",
+    );
+    let package = argument(
+        script(job, "release_candidate manifest"),
+        "--cargo-features",
+    );
+    assert_eq!(expand(build.clone()), expand(package));
+    let mut required = expand(vec!["cuda".into(), "cuda-production".into()]);
+    required.remove("cuda-production");
+    assert!(
+        required.is_subset(&expand(build)),
+        "CUDA releases must include the production operator feature closure"
+    );
 }
 
 #[test]
@@ -860,66 +909,100 @@ fn resume_manual_archive_preserves_raw_bytes_and_rejects_bad_hash_links_and_miss
 
 #[cfg(unix)]
 #[test]
-fn sm120_distribution_preserves_project_and_native_package_license_texts() {
+fn cuda_packaging_rejects_failed_or_empty_dynamic_dependency_inspection() {
+    let staging = workflow("release-cuda.yml");
+    for job in ["linux-x86_64-cuda-sm89", "linux-x86_64-cuda-sm120"] {
+        let package = script(&staging["jobs"][job], "release_candidate manifest");
+        for status in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            // Simulate an ELF inspection tool that fails, or succeeds without
+            // finding any shared libraries. Neither may produce an archive.
+            let command = format!("readelf() {{ return {status}; }}\n{package}");
+            let result = std::process::Command::new("bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-e",
+                    "-o",
+                    "pipefail",
+                    "-c",
+                    &command,
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(!result.status.success());
+            assert!(!dir.path().join("dist").exists());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cuda_distributions_preserve_project_and_native_package_license_texts() {
     use std::process::Command;
     let staging = workflow("release-cuda.yml");
-    let production = &staging["jobs"]["linux-x86_64-cuda-sm120"];
-    let collect = script(production, "for native_license in");
-    let dir = tempfile::tempdir().unwrap();
-    let ggml = dir.path().join("crates/ferrum-kernels/src/gguf_blocks");
-    fs::create_dir_all(&ggml).unwrap();
-    fs::write(dir.path().join("LICENSE"), "project MIT fixture\n").unwrap();
-    fs::write(ggml.join("LICENSE.ggml"), "GGML copyright fixture\n").unwrap();
-    let native = dir.path().join("portable native set");
-    let licenses = native.join("packages/marlin/licenses");
-    fs::create_dir_all(&licenses).unwrap();
-    let third_party = [
-        ("Apache-2.0.txt", "Apache native distribution fixture\n"),
-        ("llama-MIT.txt", "llama copyright fixture\n"),
-        ("Ferrum-MIT.txt", "native Ferrum MIT fixture\n"),
-    ];
-    for (name, text) in third_party {
-        fs::write(licenses.join(name), text).unwrap();
-    }
-    let run = || {
-        Command::new("bash")
-            .args([
-                "--noprofile",
-                "--norc",
-                "-e",
-                "-o",
-                "pipefail",
-                "-c",
-                collect,
-            ])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env(
-                "FERRUM_NATIVE_OPERATOR_SET_LOCK",
-                native.join("native-operator-set.lock.json"),
-            )
-            .current_dir(dir.path())
-            .output()
-            .unwrap()
-    };
-    let result = run();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let combined = fs::read_to_string(dir.path().join("dist/LICENSE")).unwrap();
-    assert!(combined.starts_with("project MIT fixture\nGGML copyright fixture\n"));
-    for (name, text) in third_party {
-        assert!(combined.contains(&format!("packages/marlin/licenses/{name}")));
+    for job in ["linux-x86_64-cuda-sm89", "linux-x86_64-cuda-sm120"] {
+        let production = &staging["jobs"][job];
+        let collect = script(production, "for native_license in");
+        let dir = tempfile::tempdir().unwrap();
+        let ggml = dir.path().join("crates/ferrum-kernels/src/gguf_blocks");
+        fs::create_dir_all(&ggml).unwrap();
+        fs::write(dir.path().join("LICENSE"), "project MIT fixture\n").unwrap();
+        fs::write(ggml.join("LICENSE.ggml"), "GGML copyright fixture\n").unwrap();
+        let native = dir.path().join("portable native set");
+        let licenses = native.join("packages/marlin/licenses");
+        fs::create_dir_all(&licenses).unwrap();
+        let third_party = [
+            ("Apache-2.0.txt", "Apache native distribution fixture\n"),
+            ("llama-MIT.txt", "llama copyright fixture\n"),
+            ("Ferrum-MIT.txt", "native Ferrum MIT fixture\n"),
+        ];
+        for (name, text) in third_party {
+            fs::write(licenses.join(name), text).unwrap();
+        }
+        let run = || {
+            Command::new("bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-e",
+                    "-o",
+                    "pipefail",
+                    "-c",
+                    collect,
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(
+                    "FERRUM_NATIVE_OPERATOR_SET_LOCK",
+                    native.join("native-operator-set.lock.json"),
+                )
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+        };
+        let result = run();
         assert!(
-            combined.contains(text),
-            "native license content must be preserved"
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let combined = fs::read_to_string(dir.path().join("dist/LICENSE")).unwrap();
+        assert!(combined.starts_with("project MIT fixture\nGGML copyright fixture\n"));
+        for (name, text) in third_party {
+            assert!(combined.contains(&format!("packages/marlin/licenses/{name}")));
+            assert!(
+                combined.contains(text),
+                "native license content must be preserved"
+            );
+        }
+        fs::remove_dir_all(licenses).unwrap();
+        assert!(
+            !run().status.success(),
+            "missing native license inputs must not silently pass packaging"
         );
     }
-    fs::remove_dir_all(licenses).unwrap();
-    assert!(
-        !run().status.success(),
-        "missing native license inputs must not silently pass packaging"
-    );
 }
