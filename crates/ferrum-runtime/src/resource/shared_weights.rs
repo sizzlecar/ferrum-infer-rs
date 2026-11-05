@@ -277,6 +277,7 @@ impl<R: DeviceRuntime> SharedComponentWeights<R> {
             },
             runtime: base.runtime,
             deferred_cleanup_domain: new_deferred_device_cleanup_domain(),
+            retained_until_closed: Mutex::default(),
         });
         drop(gate);
         Ok(resources)

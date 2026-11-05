@@ -436,7 +436,10 @@ where
     pub(super) static_resources: PlanRuntimeStatic<R>,
     pub(super) runtime: Arc<R>,
     pub(super) deferred_cleanup_domain: DeferredDeviceCleanupDomainId,
+    pub(super) retained_until_closed: Mutex<close_custody::PlanRuntimeCloseCustody>,
 }
+
+pub(super) mod close_custody;
 
 /// Sealed owning proof that one exact plan, runtime instance, provisioning
 /// outcome, and admission coordinator belong together. Every durable child
@@ -698,6 +701,7 @@ where
     failure: FailureEnvelope,
     evidence: TrustedPlanRuntimeEvidence,
     static_resources: Option<PlanStaticResources<R>>,
+    retained_until_closed: Mutex<close_custody::PlanRuntimeCloseCustody>,
 }
 
 impl<R> PlanRuntimeCloseFailure<R>
@@ -717,6 +721,10 @@ where
         match static_resources.release_all() {
             Ok(_) => {
                 self.static_resources.take();
+                self.retained_until_closed
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .release();
                 Ok(PlanRuntimeCloseReceipt {
                     evidence: self.evidence,
                     released_static_resources: total_static_resources,
@@ -829,6 +837,7 @@ where
             static_resources: PlanRuntimeStatic::NoStatic { binding },
             runtime,
             deferred_cleanup_domain: new_deferred_device_cleanup_domain(),
+            retained_until_closed: Mutex::default(),
         })
     }
 }
@@ -837,6 +846,19 @@ impl<R> PlanRuntimeResources<R>
 where
     R: DeviceRuntime,
 {
+    /// Retain an original caller-owned resource until this exact plan's checked
+    /// close succeeds. Referenced/failed close keeps it on the original root or
+    /// failure owner. Unchecked drop or quarantine retains it fail-closed.
+    /// The returned evidence binds a caller's typed handback to the real close
+    /// receipt, rather than an independent completion flag.
+    pub fn retain_until_closed(&self, resource: impl Send + 'static) -> TrustedPlanRuntimeEvidence {
+        self.retained_until_closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(resource);
+        self.evidence()
+    }
+
     pub(super) fn plan_static_view(
         &self,
         slot_index: usize,
@@ -1118,7 +1140,11 @@ where
             static_resources,
             runtime,
             deferred_cleanup_domain,
+            retained_until_closed,
         } = resources;
+        let retained_until_closed = retained_until_closed
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         debug_assert!(retire_deferred_device_cleanup_domain(
             deferred_cleanup_domain
         ));
@@ -1128,6 +1154,7 @@ where
         match static_resources {
             PlanRuntimeStatic::NoStatic { .. } => {
                 drop(runtime);
+                retained_until_closed.release();
                 Ok(PlanRuntimeCloseOutcome::Closed(PlanRuntimeCloseReceipt {
                     evidence,
                     released_static_resources: 0,
@@ -1139,6 +1166,7 @@ where
                 match static_resources.release_all() {
                     Ok(_) => {
                         drop(static_resources);
+                        retained_until_closed.release();
                         Ok(PlanRuntimeCloseOutcome::Closed(PlanRuntimeCloseReceipt {
                             evidence,
                             released_static_resources: total_static_resources,
@@ -1148,6 +1176,7 @@ where
                         failure: failure.into_failure(),
                         evidence,
                         static_resources: Some(static_resources),
+                        retained_until_closed: Mutex::new(retained_until_closed),
                     }),
                 }
             }
@@ -1155,6 +1184,7 @@ where
                 drop(runtime);
                 match weights.release_attachment() {
                     Ok(released_static_resources) => {
+                        retained_until_closed.release();
                         Ok(PlanRuntimeCloseOutcome::Closed(PlanRuntimeCloseReceipt {
                             evidence,
                             released_static_resources,
@@ -1164,6 +1194,7 @@ where
                         failure: failure.failure,
                         evidence,
                         static_resources: Some(failure.resources),
+                        retained_until_closed: Mutex::new(retained_until_closed),
                     }),
                 }
             }
