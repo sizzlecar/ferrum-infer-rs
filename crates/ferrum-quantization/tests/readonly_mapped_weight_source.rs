@@ -47,8 +47,8 @@ fn readonly_mapped_safetensors_payload_keeps_exact_bytes_after_archive_drop() {
     assert!(mapped.offset_bytes() > 0); // The safetensors header precedes data.
     let tail = mapped.slice(4..8).unwrap();
     assert_eq!(tail.offset_bytes(), mapped.offset_bytes() + 4);
-    for range in [0..0, 7..9, 9..8, 0..usize::MAX] {
-        assert!(mapped.slice(range).is_err());
+    for (start, end) in [(0, 0), (7, 9), (9, 8), (0, usize::MAX)] {
+        assert!(mapped.slice(start..end).is_err());
     }
     drop(payload);
     drop(archive);
