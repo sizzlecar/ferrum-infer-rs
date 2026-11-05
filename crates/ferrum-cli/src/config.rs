@@ -946,7 +946,7 @@ impl Default for DevConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::{Parser, Subcommand};
+    use clap::{CommandFactory, Parser, Subcommand};
 
     #[tokio::test]
     async fn output_and_tokenizer_cache_config_reaches_shared_engine_settings() {
@@ -1269,6 +1269,36 @@ mod tests {
                 "invalid profile",
             ])
             .is_err());
+        }
+    }
+
+    #[test]
+    fn numerical_profile_long_help_explains_reproducibility_in_every_model_entrypoint() {
+        let mut cli = NumericalCli::command();
+        for entrypoint in ["run", "serve", "bench"] {
+            let command = cli.find_subcommand_mut(entrypoint).unwrap();
+            let help = command
+                .render_long_help()
+                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            for explanation in [
+                "Temperature 0 selects greedily",
+                "does not guarantee",
+                "batch sizes",
+                "devices",
+                "qwen3_5.f32-master",
+                "qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1",
+                "mixed-precision reference",
+                "global determinism",
+                "unsupported selections fail",
+            ] {
+                assert!(
+                    help.contains(explanation),
+                    "{entrypoint}: missing {explanation}"
+                );
+            }
         }
     }
 

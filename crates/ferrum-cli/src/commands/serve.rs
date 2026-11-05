@@ -79,7 +79,11 @@ pub struct ServeCommand {
     pub backend: String,
 
     /// Numerical execution profile: auto or an exact family profile ID.
-    #[arg(long, value_name = "PROFILE")]
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        long_help = crate::commands::NUMERICAL_PROFILE_LONG_HELP
+    )]
     pub numerical_profile: Option<ferrum_types::NumericalExecutionPolicy>,
 
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
