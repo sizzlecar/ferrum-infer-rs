@@ -244,6 +244,13 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
     {
         return Err("Linux native archive is not pinned by URL and SHA256".into());
     }
+    let linux_text = serde_json::to_string(&linux).unwrap();
+    if NEEDLES.iter().any(|needle| linux_text.contains(needle))
+        || linux_text.contains("source-build")
+        || linux_text.contains("ferrum-native-ops-builder")
+    {
+        return Err("Linux artifact now consumes native source inputs".into());
+    }
     let materialize = step(&linux, "Materialize pinned CUDA native operator set")?;
     require_fragments(
         materialize,
@@ -255,13 +262,6 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
             "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock",
         ],
     )?;
-    let linux_text = serde_json::to_string(&linux).unwrap();
-    if NEEDLES.iter().any(|needle| linux_text.contains(needle))
-        || linux_text.contains("source-build")
-        || linux_text.contains("ferrum-native-ops-builder")
-    {
-        return Err("Linux artifact now consumes native source inputs".into());
-    }
     require_fragments(
         step(&linux, "Build release CUDA sm89 binary exactly once")?,
         &[
@@ -545,9 +545,9 @@ mod tests {
     use std::fs;
 
     fn fixture(windows: bool, source: &[u8]) -> Snapshot {
-        // Model the reviewed immutable SM89 artifact route explicitly. Reuse
-        // its actual commands and Windows bridge, but do not silently pull new
-        // source-building Linux jobs into this positive compatibility fixture.
+        // Model the historical immutable SM89 artifact route explicitly. The
+        // current Windows bridge and delivery topology remain under test, but
+        // today's reference archive is source-plan input, not an SM89 library.
         // The complete current workflow is checked separately below and must
         // retain kernel scope when it consumes native source inputs.
         let mut workflow = yaml(include_str!(
@@ -558,29 +558,37 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .retain(|name, _| matches!(name.as_str(), LINUX | WINDOWS));
-        // This positive fixture represents an immutable archive consumer,
-        // not today's SM89 source-building route. Keep its two relevant
-        // consumption steps explicit so new source producers cannot enter it.
-        workflow["jobs"][LINUX]["steps"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|step| {
-                matches!(
-                    step["name"].as_str(),
-                    Some(
-                        "Materialize pinned CUDA native operator set"
-                            | "Build release CUDA sm89 binary exactly once"
-                    )
-                )
-            });
-        for step in workflow["jobs"][LINUX]["steps"].as_array_mut().unwrap() {
-            if step["name"] == "Materialize pinned CUDA native operator set" {
-                step["run"] = json!(step["run"].as_str().unwrap().replace(
-                    "SM89_REFERENCE_LOCK=$lock",
-                    "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock"
-                ));
+        // Preserve the reviewed archive, its layout and its actual link
+        // feature contract together. Transforming current reference/build
+        // steps into a direct consumer would invent an invalid package route.
+        workflow["env"]["NATIVE_OPERATOR_SET_ARCHIVE_URL"] = json!(
+            "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v8/native-operator-set-cuda12.4-sm89-v8.tar.zst"
+        );
+        workflow["env"]["NATIVE_OPERATOR_SET_ARCHIVE_SHA256"] =
+            json!("977538d1f33e02adfef43e6648cf0749f07b15b238e0b240ad1e3bd338c37d60");
+        workflow["jobs"][LINUX]["steps"] = json!([
+            {
+                "name": "Materialize pinned CUDA native operator set",
+                "run": r#"archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v8.tar.zst"
+root="$RUNNER_TEMP/ferrum-native-operator-set"
+curl --fail --location --retry 5 --retry-all-errors --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
+printf '%s  %s\n' "$NATIVE_OPERATOR_SET_ARCHIVE_SHA256" "$archive" | sha256sum --check --strict
+mkdir -p "$root"
+zstd --decompress --stdout "$archive" | tar -xf - -C "$root"
+lock="$root/inputs/native-operator-set.lock.json"
+test -f "$lock"
+echo "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" >> "$GITHUB_ENV"
+"#
+            },
+            {
+                "name": "Build release CUDA sm89 binary exactly once",
+                "run": r#"export PATH="$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
+cargo build --release --locked -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
+"#
             }
-        }
+        ]);
         workflow["on"]["workflow_call"]["outputs"]
             .as_object_mut()
             .unwrap()
@@ -767,7 +775,10 @@ mod tests {
         }
         // Both CUDA architectures now consume native sources. An unchanged
         // topology cannot turn those source changes into Windows-only impact.
-        assert!(recipes(&before, &after).is_err());
+        assert_eq!(
+            recipes(&before, &after).unwrap_err(),
+            "Linux artifact now consumes native source inputs"
+        );
         assert!(consumers(&before, &after).is_err());
         let base = commit(repo.path(), &before);
         let candidate = commit(repo.path(), &after);

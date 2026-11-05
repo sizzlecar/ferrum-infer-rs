@@ -31,9 +31,12 @@ pub async fn execute_serve_source(
     }
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     {
-        use ferrum_server::{axum_server::AppState, AxumServer, HttpServer, ServerConfig};
+        use ferrum_server::{axum_server::AppState, AxumServer, BoundHttpListener, ServerConfig};
         use std::sync::Arc;
 
+        let listener = BoundHttpListener::bind(&host, port)
+            .await
+            .map_err(anyhow::Error::from)?;
         let prepared = prepare_http(source, aliases)?;
         let images = prepared.images;
         let server = Arc::new(AxumServer::from_state(
@@ -50,7 +53,11 @@ pub async fn execute_serve_source(
             "experimental image HTTP uses its declared residency policy; no G3 throughput qualification");
         let mut task = {
             let server = server.clone();
-            tokio::spawn(async move { server.start(&server_config).await })
+            tokio::spawn(async move {
+                server
+                    .start_with_listener(&server_config, listener, |_| {})
+                    .await
+            })
         };
         let joined = tokio::select! {
             joined = &mut task => Some(joined),

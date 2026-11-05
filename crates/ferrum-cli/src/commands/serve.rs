@@ -5,6 +5,9 @@ mod lifecycle;
 #[path = "serve/lifecycle_tests.rs"]
 mod lifecycle_tests;
 #[cfg(test)]
+#[path = "serve/listener_tests.rs"]
+mod listener_tests;
+#[cfg(test)]
 #[path = "serve/profile_metadata_tests.rs"]
 mod profile_metadata_tests;
 
@@ -13,7 +16,9 @@ use crate::runtime_env::runtime_snapshot_value;
 use clap::Args;
 use colored::*;
 use ferrum_models::source::ModelFormat;
-use ferrum_server::{AxumServer, HttpServer, ServedModelKind, ServedModelRegistry, ServerConfig};
+use ferrum_server::{
+    AxumServer, BoundHttpListener, ServedModelKind, ServedModelRegistry, ServerConfig,
+};
 use ferrum_types::{
     CompiledKernelFeatures, CompiledNativeOperatorArtifact, FerrumError, HardwareCapabilities,
     ModelCapabilities, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
@@ -79,7 +84,11 @@ pub struct ServeCommand {
     pub backend: String,
 
     /// Numerical execution profile: auto or an exact family profile ID.
-    #[arg(long, value_name = "PROFILE")]
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        long_help = crate::commands::NUMERICAL_PROFILE_LONG_HELP
+    )]
     pub numerical_profile: Option<ferrum_types::NumericalExecutionPolicy>,
 
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
@@ -678,6 +687,13 @@ async fn run_serve_lifecycle(
         backend_initialized_sample.clone(),
     );
 
+    // Keep the actual socket throughout model resolution and initialization.
+    // This follows local configuration/backend checks and artifact-only exits;
+    // a failed port must not trigger downloads, model loading or a ready banner.
+    let host = host.unwrap_or_else(|| config.server.host.clone());
+    let port = port.unwrap_or(config.server.port);
+    let listener = BoundHttpListener::bind(&host, port).await?;
+
     // Print banner
     print_banner();
 
@@ -792,8 +808,6 @@ async fn run_serve_lifecycle(
         );
     }
 
-    let host = host.unwrap_or_else(|| config.server.host.clone());
-    let port = port.unwrap_or(config.server.port);
     let engine_model_path = source.local_path.to_string_lossy().to_string();
 
     println!("{} {:?}", "Device:".dimmed(), device);
@@ -1284,23 +1298,6 @@ async fn run_serve_lifecycle(
         ..Default::default()
     };
 
-    println!();
-    println!(
-        "{} {} {}",
-        "🚀".green(),
-        "Server running at".green().bold(),
-        format!("http://{}:{}", host, port).cyan().bold()
-    );
-    println!();
-    println!("Endpoints:");
-    println!("  POST /v1/chat/completions      - OpenAI-compatible chat");
-    println!("  POST /v1/responses             - OpenAI Responses API");
-    println!("  GET  /v1/models                - List models");
-    println!("  GET  /health                   - Health check");
-    println!();
-    println!("{}", "Press Ctrl+C to stop.".dimmed());
-    println!();
-
     // Write PID file for stop command
     let pid_file = std::env::temp_dir().join("ferrum.pid");
     std::fs::write(&pid_file, std::process::id().to_string()).ok();
@@ -1310,7 +1307,7 @@ async fn run_serve_lifecycle(
     let mut server_task = {
         let server = Arc::clone(&server);
         let server_config = server_config.clone();
-        tokio::spawn(async move { server.start(&server_config).await })
+        tokio::spawn(async move { server.start_with_listener(&server_config, listener, print_listening_banner).await })
     };
     let already_joined = tokio::select! {
         joined = &mut server_task => Some(joined),
@@ -1380,6 +1377,25 @@ async fn run_serve_lifecycle(
         tracing::warn!(%error, "serve final cleanup incomplete");
     }
     shutdown.finish(execution_result.and(cleanup_result).map_err(Into::into))
+}
+
+fn print_listening_banner(address: std::net::SocketAddr) {
+    println!();
+    println!(
+        "{} {} {}",
+        "🚀".green(),
+        "Server running at".green().bold(),
+        format!("http://{address}").cyan().bold()
+    );
+    println!();
+    println!("Endpoints:");
+    println!("  POST /v1/chat/completions      - OpenAI-compatible chat");
+    println!("  POST /v1/responses             - OpenAI Responses API");
+    println!("  GET  /v1/models                - List models");
+    println!("  GET  /health                   - Health check");
+    println!();
+    println!("{}", "Press Ctrl+C to stop.".dimmed());
+    println!();
 }
 
 pub(super) async fn serve_shutdown_signal() {

@@ -2,6 +2,18 @@
 
 use clap::ValueEnum;
 
+pub const NUMERICAL_PROFILE_LONG_HELP: &str = concat!(
+    "Numerical execution profile: auto or an exact family profile ID.\n\n",
+    "Temperature 0 selects greedily from the computed logits; it does not guarantee ",
+    "identical text across batch sizes, request layouts, devices, or numerical profiles.\n\n",
+    "Qwen3.5 examples (availability depends on the model source and backend):\n",
+    "  qwen3_5.f32-master\n",
+    "  qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1\n\n",
+    "F32-master is a mixed-precision reference for comparison, not a guarantee of ",
+    "global determinism. Explicit profiles require complete backend support; ",
+    "unsupported selections fail instead of silently falling back."
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PrefillDecodeExecutionArg {
     Split,
