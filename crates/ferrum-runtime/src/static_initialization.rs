@@ -120,6 +120,7 @@ pub struct StaticInitializationReceipt {
     uploaded_component_count: usize,
     uploaded_bytes: u64,
     retained_source_upload_bytes: u64,
+    mapped_source_upload_bytes: u64,
     imported_component_count: usize,
     imported_bytes: u64,
     transformed_component_count: usize,
@@ -158,6 +159,12 @@ impl StaticInitializationReceipt {
     /// without allocating a second TransferStaging payload.
     pub const fn retained_source_upload_bytes(&self) -> u64 {
         self.retained_source_upload_bytes
+    }
+
+    /// Uploaded bytes borrowed from explicitly proven read-only file mappings,
+    /// without a second TransferStaging payload. This is not mapping RSS.
+    pub const fn mapped_source_upload_bytes(&self) -> u64 {
+        self.mapped_source_upload_bytes
     }
 
     pub const fn imported_component_count(&self) -> usize {
@@ -830,6 +837,7 @@ where
     let mut uploaded_component_count = 0_usize;
     let mut uploaded_bytes = 0_u64;
     let mut retained_source_upload_bytes = 0_u64;
+    let mut mapped_source_upload_bytes = 0_u64;
     let mut imported_component_count = 0_usize;
     let mut imported_bytes = 0_u64;
     let mut transformed_component_count = 0_usize;
@@ -1033,12 +1041,21 @@ where
                             .managed_host_bytes()
                             .filter(|source| host.owns_in_scope(source))
                     });
-                if direct_source.is_some() {
-                    // The original source allocation has already consumed the
-                    // exact invocation's WeightBacking allowance. Keep that
-                    // claim through every upload fence, never reclassify it as
-                    // staging or assign its unused first-chunk reservation to a
-                    // differently sized later component.
+                let mapped_source = if managed_host.is_some()
+                    && direct_source.is_none()
+                    && runtime.supports_readonly_mapped_static_weight_sources()
+                {
+                    upload
+                        .retained_host_memory()
+                        .and_then(|source| source.readonly_file_mapping())
+                } else {
+                    None
+                };
+                if direct_source.is_some() || mapped_source.is_some() {
+                    // Accounted sources keep their exact invocation claim;
+                    // mapping sources keep their explicit immutable owner.
+                    // Neither route may reclassify a generic stable owner or
+                    // reuse this reservation for a differently sized fallback.
                     drop(first_staging.take());
                     retained_group_source = true;
                 }
@@ -1094,7 +1111,14 @@ where
                     // that bounded batch once before retrying admission. Never
                     // wait while retaining the very staging capacity needed
                     // by this chunk, and never bypass a genuine capacity error.
-                    let managed_bytes = if let Some(source) = direct_source {
+                    let mapped_chunk = mapped_source
+                        .as_ref()
+                        .map(|source| source.slice(source_offset..source_end))
+                        .transpose()
+                        .map_err(contract_failure)?;
+                    let managed_bytes = if mapped_chunk.is_some() {
+                        None
+                    } else if let Some(source) = direct_source {
                         Some(source.slice(source_offset..source_end).map_err(|error| {
                             InitializationStepFailure::Quiescent(resource_failure(
                                 "static_source_slice",
@@ -1136,7 +1160,22 @@ where
                         None
                     };
                     let encode_started = Instant::now();
-                    let command = if let Some(managed_bytes) = managed_bytes {
+                    let command = if let Some(mapped_chunk) = mapped_chunk {
+                        with_static_buffer(transaction, &placement.resource_id, |buffer| {
+                            runtime.encode_readonly_mapped_static_weight_upload(
+                                mapped_chunk,
+                                layout,
+                                buffer,
+                                destination_offset,
+                            )
+                        })
+                        .map_err(|error| {
+                            runtime_or_contract_failure(&runtime, error, "static_mapped_upload_encode")
+                        })?
+                        .ok_or_else(|| contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: "runtime declined declared read-only mapped static upload; raw fallback is forbidden".to_owned(),
+                        }))?
+                    } else if let Some(managed_bytes) = managed_bytes {
                         with_static_buffer(transaction, &placement.resource_id, |buffer| {
                             runtime.encode_managed_upload(
                                 managed_bytes,
@@ -1187,6 +1226,15 @@ where
                             })
                         })?;
                 }
+                if mapped_source.is_some() {
+                    mapped_source_upload_bytes = mapped_source_upload_bytes
+                        .checked_add(placement.length_bytes)
+                        .ok_or_else(|| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
+                                reason: "mapped static source bytes overflow u64".to_owned(),
+                            })
+                        })?;
+                }
             }
             if retained_group_source && !pending.is_empty() {
                 // Source admission is bounded by the largest materialization
@@ -1230,6 +1278,7 @@ where
         uploaded_component_count,
         uploaded_bytes,
         retained_source_upload_bytes,
+        mapped_source_upload_bytes,
         imported_component_count,
         imported_bytes,
         transformed_component_count,

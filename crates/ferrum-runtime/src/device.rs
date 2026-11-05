@@ -4134,6 +4134,28 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         false
     }
 
+    /// Accepts an explicitly proven immutable file mapping for static Weights.
+    /// This is independent of accounted Managed uploads: an arbitrary stable
+    /// owner, unaccounted Vec or claimed Host class does not provide this proof.
+    /// Original chunk/batch bounds and source-group quiescence still apply.
+    fn supports_readonly_mapped_static_weight_sources(&self) -> bool {
+        false
+    }
+
+    /// Retains the exact mapping through the original completion/recovery
+    /// owner. This does not imply pinned DMA, no driver staging or bounded RSS.
+    /// `None` declines before submission; unsupported backends use core's
+    /// existing accounted staging path without invoking this hook.
+    fn encode_readonly_mapped_static_weight_upload(
+        &self,
+        _source: crate::ReadOnlyMappedHostMemoryRegion,
+        _source_layout: HostTransferLayout,
+        _destination: &Self::Buffer,
+        _destination_offset_bytes: u64,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        Ok(None)
+    }
+
     /// Retains the immutable, accounted backing through the completion fence.
     /// `None` declines before submission; no unaccounted staging copy is allowed.
     fn encode_managed_upload(

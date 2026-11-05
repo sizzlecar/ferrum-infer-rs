@@ -18,6 +18,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+memmap2 = "0.9"
 trybuild = "1.0"
 syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = "1"

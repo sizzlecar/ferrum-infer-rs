@@ -1449,6 +1449,7 @@ pub(crate) enum TestCommand {
     Copy,
     Upload(u8, BufferUsage),
     ManagedUpload(TestManagedUpload),
+    MappedUpload(TestMappedUpload),
     Zero,
 }
 
@@ -1466,6 +1467,17 @@ impl PartialEq for TestManagedUpload {
 impl Eq for TestManagedUpload {}
 
 #[derive(Debug, Clone)]
+pub(crate) struct TestMappedUpload {
+    source: ReadOnlyMappedHostMemoryRegion,
+}
+impl PartialEq for TestMappedUpload {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.source.bytes(), other.source.bytes())
+    }
+}
+impl Eq for TestMappedUpload {}
+
+#[derive(Debug, Clone)]
 pub(crate) struct TestFence(
     u64,
     DeviceTimingMode,
@@ -1473,6 +1485,7 @@ pub(crate) struct TestFence(
     Option<Arc<TestTerminalPacket>>,
     Option<DeviceSubmissionExecutionFacts>,
     Arc<Vec<ManagedHostBytes>>,
+    Arc<Vec<ReadOnlyMappedHostMemoryRegion>>,
 );
 
 pub(crate) struct TestTerminalPacket {
@@ -1655,6 +1668,10 @@ pub(crate) struct RuntimeTrace {
     pub(crate) managed_uploads_enabled: bool,
     pub(crate) managed_static_uploads_enabled: bool,
     pub(crate) managed_static_weight_sources_enabled: bool,
+    pub(crate) readonly_mapped_static_uploads_enabled: bool,
+    pub(crate) decline_readonly_mapped_upload: bool,
+    pub(crate) mapped_upload_encode_calls: usize,
+    pub(crate) mapped_upload_ranges: Vec<(usize, u64, Vec<u8>)>,
     pub(crate) managed_upload_classes: Vec<HostMemoryClass>,
     pub(crate) managed_upload_backing_bytes: Vec<usize>,
     pub(crate) fail_managed_upload_at: Option<usize>,
@@ -1756,9 +1773,9 @@ fn test_submission_attribution(
                     ("test_result_binding", DeviceExecutionPath::Eager, 0, 1)
                 }
                 TestCommand::Copy => ("test_copy", DeviceExecutionPath::Eager, 0, 1),
-                TestCommand::Upload(_, _) | TestCommand::ManagedUpload(_) => {
-                    ("test_upload", DeviceExecutionPath::Eager, 0, 1)
-                }
+                TestCommand::Upload(_, _)
+                | TestCommand::ManagedUpload(_)
+                | TestCommand::MappedUpload(_) => ("test_upload", DeviceExecutionPath::Eager, 0, 1),
                 TestCommand::Zero => ("test_zero", DeviceExecutionPath::Eager, 0, 1),
             };
         let logical_work = entry.logical_work();
@@ -2356,6 +2373,44 @@ impl DeviceRuntime for TestRuntime {
             .managed_static_weight_sources_enabled
     }
 
+    fn supports_readonly_mapped_static_weight_sources(&self) -> bool {
+        self.trace
+            .lock()
+            .unwrap()
+            .readonly_mapped_static_uploads_enabled
+    }
+
+    fn encode_readonly_mapped_static_weight_upload(
+        &self,
+        source: ReadOnlyMappedHostMemoryRegion,
+        source_layout: HostTransferLayout,
+        destination: &Self::Buffer,
+        destination_offset_bytes: u64,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        let mut trace = self.trace.lock().unwrap();
+        if !trace.readonly_mapped_static_uploads_enabled || trace.decline_readonly_mapped_upload {
+            return Ok(None);
+        }
+        source_layout
+            .validate_bytes(source.length_bytes())
+            .map_err(|_| TestRuntimeError("mapped upload layout differs"))?;
+        if destination.descriptor.usage != BufferUsage::Weights
+            || destination.descriptor.element_type != source_layout.element_type()
+            || destination_offset_bytes
+                .checked_add(source.length_bytes() as u64)
+                .is_none_or(|end| end > destination.descriptor.size_bytes)
+        {
+            return Err(TestRuntimeError("mapped upload destination differs"));
+        }
+        trace.mapped_upload_encode_calls += 1;
+        trace.mapped_upload_ranges.push((
+            source.offset_bytes(),
+            destination_offset_bytes,
+            source.bytes().to_vec(),
+        ));
+        Ok(Some(TestCommand::MappedUpload(TestMappedUpload { source })))
+    }
+
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {
         Ok(TestStream)
     }
@@ -2629,6 +2684,15 @@ impl DeviceRuntime for TestRuntime {
                 })
                 .collect(),
         );
+        let mapped_uploads = Arc::new(
+            commands
+                .iter()
+                .filter_map(|command| match command {
+                    TestCommand::MappedUpload(upload) => Some(upload.source.clone()),
+                    _ => None,
+                })
+                .collect(),
+        );
         // Test traces must not keep an upload alive after its real fence is
         // retired. Snapshot only the same small command tag as legacy upload.
         let command_snapshots = commands
@@ -2637,6 +2701,10 @@ impl DeviceRuntime for TestRuntime {
                 TestCommand::ManagedUpload(upload) => TestCommand::Upload(
                     upload.source.bytes().first().copied().unwrap_or(0),
                     upload.usage,
+                ),
+                TestCommand::MappedUpload(upload) => TestCommand::Upload(
+                    upload.source.bytes().first().copied().unwrap_or(0),
+                    BufferUsage::Weights,
                 ),
                 _ => command.clone(),
             })
@@ -2677,6 +2745,7 @@ impl DeviceRuntime for TestRuntime {
                     terminal_packet,
                     device_facts,
                     managed_uploads,
+                    mapped_uploads,
                 ),
             )
         };

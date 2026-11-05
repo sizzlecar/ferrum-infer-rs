@@ -41,12 +41,25 @@ pub unsafe trait StableHostMemory: Send + Sync + 'static {
     }
 }
 
+/// A stable owner of an immutable, read-only, file-backed memory mapping.
+///
+/// # Safety
+///
+/// The bytes must actually reside in a retained read-only file mapping, not a
+/// heap allocation or anonymous mapping. The owner must retain that mapping
+/// until its last reference drops, and uphold [`StableHostMemory`] even after
+/// the archive or source object drops. The mapped file must not be modified or
+/// truncated while a region exists. Implementations must not use this marker
+/// to reclassify an accounted Host allocation as unaccounted checkpoint data.
+pub unsafe trait ImmutableFileMappedHostMemory: StableHostMemory {}
+
 /// An owned, bounds-checked subregion of stable host memory.
 #[derive(Clone)]
 pub struct RetainedHostMemoryRegion {
     owner: Arc<dyn StableHostMemory>,
     offset_bytes: usize,
     length_bytes: usize,
+    readonly_file_mapping: bool,
 }
 
 impl RetainedHostMemoryRegion {
@@ -72,7 +85,33 @@ impl RetainedHostMemoryRegion {
             owner,
             offset_bytes,
             length_bytes,
+            readonly_file_mapping: false,
         })
+    }
+
+    /// Construct the explicit mapping proof from a loader's typed owner.
+    /// Ordinary stable owners remain unclassified, even when their Host class
+    /// is `None`; that alone does not distinguish a mapping from an owned Vec.
+    pub fn new_readonly_file_mapping<T: ImmutableFileMappedHostMemory>(
+        owner: Arc<T>,
+        offset_bytes: usize,
+        length_bytes: usize,
+    ) -> Result<Self, VNextError> {
+        if owner.managed_memory_class().is_some() {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "accounted Host memory cannot become an unaccounted file mapping".into(),
+            });
+        }
+        let mut region = Self::new(owner, offset_bytes, length_bytes)?;
+        region.readonly_file_mapping = true;
+        Ok(region)
+    }
+
+    pub fn readonly_file_mapping(&self) -> Option<ReadOnlyMappedHostMemoryRegion> {
+        self.readonly_file_mapping
+            .then(|| ReadOnlyMappedHostMemoryRegion {
+                region: self.clone(),
+            })
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -106,7 +145,53 @@ impl fmt::Debug for RetainedHostMemoryRegion {
             .debug_struct("RetainedHostMemoryRegion")
             .field("offset_bytes", &self.offset_bytes)
             .field("length_bytes", &self.length_bytes)
+            .field("readonly_file_mapping", &self.readonly_file_mapping)
             .finish_non_exhaustive()
+    }
+}
+
+/// An owned file-mapping region admitted only to the typed static upload hook.
+/// Its provenance can only originate from [`ImmutableFileMappedHostMemory`].
+/// This proves source lifetime, not pinned DMA or a bound on mapping RSS.
+#[derive(Clone, Debug)]
+pub struct ReadOnlyMappedHostMemoryRegion {
+    region: RetainedHostMemoryRegion,
+}
+
+impl ReadOnlyMappedHostMemoryRegion {
+    pub fn bytes(&self) -> &[u8] {
+        self.region.bytes()
+    }
+    pub fn owner_bytes(&self) -> &[u8] {
+        self.region.owner_bytes()
+    }
+    pub const fn offset_bytes(&self) -> usize {
+        self.region.offset_bytes
+    }
+    pub const fn length_bytes(&self) -> usize {
+        self.region.length_bytes
+    }
+    /// Retain the same mapping while exposing only this exact nonempty chunk.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Result<Self, VNextError> {
+        if range.start >= range.end || range.end > self.length_bytes() {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "read-only mapped slice is empty or outside its source region".into(),
+            });
+        }
+        let offset_bytes = self
+            .offset_bytes()
+            .checked_add(range.start)
+            .ok_or_else(|| VNextError::InvalidExecutionPlan {
+                reason: "read-only mapped slice offset overflows".into(),
+            })?;
+        Ok(Self {
+            region: RetainedHostMemoryRegion {
+                owner: Arc::clone(&self.region.owner),
+                offset_bytes,
+                length_bytes: range.end - range.start,
+                readonly_file_mapping: true,
+            },
+        })
     }
 }
 

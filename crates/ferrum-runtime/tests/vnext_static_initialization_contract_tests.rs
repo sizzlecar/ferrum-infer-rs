@@ -8,6 +8,9 @@ mod host_scope;
 #[path = "vnext_static_initialization_contract_tests/managed_weight_upload.rs"]
 mod managed_weight_upload;
 
+#[path = "vnext_static_initialization_contract_tests/readonly_mapped_weight_upload.rs"]
+mod readonly_mapped_weight_upload;
+
 struct ZeroWeightSource;
 
 impl WeightComponentSource for ZeroWeightSource {
