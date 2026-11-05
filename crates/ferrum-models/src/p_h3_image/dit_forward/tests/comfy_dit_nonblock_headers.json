@@ -1,0 +1,313 @@
+{
+  "adaln_t_table": {
+    "dtype": "F32",
+    "shape": [
+      4097,
+      16
+    ]
+  },
+  "audio_patch_proj.bias": {
+    "dtype": "F32",
+    "shape": [
+      5376
+    ]
+  },
+  "audio_patch_proj.weight": {
+    "dtype": "F32",
+    "shape": [
+      5376,
+      32
+    ]
+  },
+  "condition_proj.bias": {
+    "dtype": "BF16",
+    "shape": [
+      5376
+    ]
+  },
+  "condition_proj.weight": {
+    "dtype": "BF16",
+    "shape": [
+      5376,
+      5120
+    ]
+  },
+  "final_layer.adaln_proj.linear.bias": {
+    "dtype": "F32",
+    "shape": [
+      10752
+    ]
+  },
+  "final_layer.adaln_proj.linear.weight": {
+    "dtype": "F32",
+    "shape": [
+      10752,
+      16
+    ]
+  },
+  "final_layer.audio_out.bias": {
+    "dtype": "F32",
+    "shape": [
+      32
+    ]
+  },
+  "final_layer.audio_out.weight": {
+    "dtype": "F32",
+    "shape": [
+      32,
+      5376
+    ]
+  },
+  "final_layer.norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      5376
+    ]
+  },
+  "final_layer.video_out.bias": {
+    "dtype": "F32",
+    "shape": [
+      96
+    ]
+  },
+  "final_layer.video_out.weight": {
+    "dtype": "F32",
+    "shape": [
+      96,
+      5376
+    ]
+  },
+  "rope.inv_freq": {
+    "dtype": "F32",
+    "shape": [
+      16
+    ]
+  },
+  "token_refiner.blocks.0.attn.k_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "token_refiner.blocks.0.attn.out_proj.comfy_quant": {
+    "dtype": "U8",
+    "shape": [
+      72
+    ]
+  },
+  "token_refiner.blocks.0.attn.out_proj.weight": {
+    "dtype": "I8",
+    "shape": [
+      5376,
+      7168
+    ]
+  },
+  "token_refiner.blocks.0.attn.out_proj.weight_scale": {
+    "dtype": "F32",
+    "shape": [
+      5376,
+      1
+    ]
+  },
+  "token_refiner.blocks.0.attn.q_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "token_refiner.blocks.0.attn.qkv_proj.comfy_quant": {
+    "dtype": "U8",
+    "shape": [
+      72
+    ]
+  },
+  "token_refiner.blocks.0.attn.qkv_proj.weight": {
+    "dtype": "I8",
+    "shape": [
+      21504,
+      5376
+    ]
+  },
+  "token_refiner.blocks.0.attn.qkv_proj.weight_scale": {
+    "dtype": "F32",
+    "shape": [
+      21504,
+      1
+    ]
+  },
+  "token_refiner.blocks.0.mlp.fc1.comfy_quant": {
+    "dtype": "U8",
+    "shape": [
+      72
+    ]
+  },
+  "token_refiner.blocks.0.mlp.fc1.weight": {
+    "dtype": "I8",
+    "shape": [
+      28672,
+      5376
+    ]
+  },
+  "token_refiner.blocks.0.mlp.fc1.weight_scale": {
+    "dtype": "F32",
+    "shape": [
+      28672,
+      1
+    ]
+  },
+  "token_refiner.blocks.0.mlp.fc2.comfy_quant": {
+    "dtype": "U8",
+    "shape": [
+      72
+    ]
+  },
+  "token_refiner.blocks.0.mlp.fc2.weight": {
+    "dtype": "I8",
+    "shape": [
+      5376,
+      14336
+    ]
+  },
+  "token_refiner.blocks.0.mlp.fc2.weight_scale": {
+    "dtype": "F32",
+    "shape": [
+      5376,
+      1
+    ]
+  },
+  "token_refiner.blocks.0.norm1.weight": {
+    "dtype": "BF16",
+    "shape": [
+      5376
+    ]
+  },
+  "token_refiner.blocks.0.norm2.weight": {
+    "dtype": "BF16",
+    "shape": [
+      5376
+    ]
+  },
+  "token_refiner.blocks.1.attn.k_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "token_refiner.blocks.1.attn.out_proj.comfy_quant": {
+    "dtype": "U8",
+    "shape": [
+      72
+    ]
+  },
+  "token_refiner.blocks.1.attn.out_proj.weight": {
+    "dtype": "I8",
+    "shape": [
+      5376,
+      7168
+    ]
+  },
+  "token_refiner.blocks.1.attn.out_proj.weight_scale": {
+    "dtype": "F32",
+    "shape": [
+      5376,
+      1
+    ]
+  },
+  "token_refiner.blocks.1.attn.q_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      128
+    ]
+  },
+  "token_refiner.blocks.1.attn.qkv_proj.comfy_quant": {
+    "dtype": "U8",
+    "shape": [
+      72
+    ]
+  },
+  "token_refiner.blocks.1.attn.qkv_proj.weight": {
+    "dtype": "I8",
+    "shape": [
+      21504,
+      5376
+    ]
+  },
+  "token_refiner.blocks.1.attn.qkv_proj.weight_scale": {
+    "dtype": "F32",
+    "shape": [
+      21504,
+      1
+    ]
+  },
+  "token_refiner.blocks.1.mlp.fc1.comfy_quant": {
+    "dtype": "U8",
+    "shape": [
+      72
+    ]
+  },
+  "token_refiner.blocks.1.mlp.fc1.weight": {
+    "dtype": "I8",
+    "shape": [
+      28672,
+      5376
+    ]
+  },
+  "token_refiner.blocks.1.mlp.fc1.weight_scale": {
+    "dtype": "F32",
+    "shape": [
+      28672,
+      1
+    ]
+  },
+  "token_refiner.blocks.1.mlp.fc2.comfy_quant": {
+    "dtype": "U8",
+    "shape": [
+      72
+    ]
+  },
+  "token_refiner.blocks.1.mlp.fc2.weight": {
+    "dtype": "I8",
+    "shape": [
+      5376,
+      14336
+    ]
+  },
+  "token_refiner.blocks.1.mlp.fc2.weight_scale": {
+    "dtype": "F32",
+    "shape": [
+      5376,
+      1
+    ]
+  },
+  "token_refiner.blocks.1.norm1.weight": {
+    "dtype": "BF16",
+    "shape": [
+      5376
+    ]
+  },
+  "token_refiner.blocks.1.norm2.weight": {
+    "dtype": "BF16",
+    "shape": [
+      5376
+    ]
+  },
+  "token_refiner.final_norm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      5376
+    ]
+  },
+  "video_patch_proj.bias": {
+    "dtype": "F32",
+    "shape": [
+      5376
+    ]
+  },
+  "video_patch_proj.weight": {
+    "dtype": "F32",
+    "shape": [
+      5376,
+      96
+    ]
+  }
+}
