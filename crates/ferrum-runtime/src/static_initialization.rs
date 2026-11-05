@@ -713,6 +713,13 @@ where
 {
     let initialization_started = Instant::now();
     let setup_started = Instant::now();
+    let trace_setup = tracing::enabled!(
+        target: "ferrum_runtime::static_initialization",
+        tracing::Level::DEBUG
+    );
+    let trace_elapsed_us =
+        |started: Option<Instant>| started.map_or(0, |started| duration_us(started.elapsed()));
+    let mut phase_started = trace_setup.then(Instant::now);
     preflight_transaction(transaction, family, plan).map_err(contract_failure)?;
     let (stored, managed_host) = match (input, family.weights(), plan.payload().execution_weights())
     {
@@ -732,11 +739,15 @@ where
             }))
         }
     };
+    let preflight_us = trace_elapsed_us(phase_started);
+    phase_started = trace_setup.then(Instant::now);
     let placements = if stored.is_some() {
         weight_placements(family, plan).map_err(contract_failure)?
     } else {
         BTreeMap::new()
     };
+    let placements_us = trace_elapsed_us(phase_started);
+    phase_started = trace_setup.then(Instant::now);
     // The complete family/source-schema proof belongs to setup, before native
     // import, stream creation or any zero/upload can write device storage.
     // Keep immutable borrows for all CPU-materialized groups; required device
@@ -745,6 +756,8 @@ where
         .map(|_| plan.weight_materialization_session(family))
         .transpose()
         .map_err(contract_failure)?;
+    let materialization_proof_us = trace_elapsed_us(phase_started);
+    phase_started = trace_setup.then(Instant::now);
     let runtime = Arc::clone(transaction.lease().runtime());
     let has_required_weight_transforms = !plan
         .payload()
@@ -829,6 +842,8 @@ where
         }
         _ => None,
     };
+    let import_and_staging_reserve_us = trace_elapsed_us(phase_started);
+    phase_started = trace_setup.then(Instant::now);
     let created_stream = runtime.create_stream().map_err(|error| {
         InitializationStepFailure::Quiescent(device_failure(
             &runtime,
@@ -838,6 +853,24 @@ where
     })?;
     let mut stream = Some(created_stream);
     let setup_duration = setup_started.elapsed();
+    if trace_setup {
+        let stream_creation_us = trace_elapsed_us(phase_started);
+        tracing::debug!(
+            target: "ferrum_runtime::static_initialization",
+            family_id = %family.family_id(),
+            plan_id = %plan.payload().plan_id(),
+            plan_hash = %plan.plan_hash(),
+            run_id = %transaction.identity().run_id(),
+            request_id = %transaction.identity().request_id(),
+            preflight_us,
+            placements_us,
+            materialization_proof_us,
+            import_and_staging_reserve_us,
+            stream_creation_us,
+            setup_duration_us = duration_us(setup_duration),
+            "static initialization setup host timing"
+        );
+    }
     let mut pending = Vec::<<D::Runtime as DeviceRuntime>::Command>::new();
     let mut pending_staging_bytes = 0_u64;
     let mut submission_batch_count = 0_usize;
