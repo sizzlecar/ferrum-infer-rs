@@ -601,6 +601,23 @@ pub struct ManagedHostBytes {
 }
 
 impl ManagedHostBytes {
+    /// Recover the original writable buffer only when this view covers its
+    /// complete logical range and no other owner retains the allocation.
+    /// Clones, slices and retained native regions prevent recovery while live.
+    /// Failure returns this immutable view unchanged.
+    ///
+    /// This neither copies nor reallocates bytes and preserves the allocation's
+    /// physical charge, class and original Host scope. Existing contents remain
+    /// initialized; they are not reset to zero. Closing a scope does not revoke
+    /// its outstanding allocation, and recovery grants no new scoped capacity.
+    pub fn try_thaw(self) -> Result<ManagedHostBuffer, Self> {
+        if self.range != self.backing.range {
+            return Err(self);
+        }
+        let Self { backing, range } = self;
+        Arc::try_unwrap(backing).map_err(|backing| Self { backing, range })
+    }
+
     /// Retains the full initialized backing, including accounted padding, while
     /// exposing only this logical slice as the payload. A backend must still
     /// validate its own native page and alignment requirements.
@@ -650,8 +667,9 @@ impl ManagedHostBytes {
 
 struct FrozenHostAllocation(Arc<ManagedHostBuffer>);
 
-// SAFETY: constructed only after freeze. The Arc is private, never converted
-// back into a writable buffer, and retains the full allocation and its charge.
+// SAFETY: constructed only after freeze. This private Arc retains the full
+// allocation and its charge. While this owner lives, try_thaw cannot obtain
+// unique ownership, so the bytes remain immutable for its entire lifetime.
 unsafe impl crate::StableHostMemory for FrozenHostAllocation {
     fn stable_bytes(&self) -> &[u8] {
         &self.0.bytes
@@ -680,6 +698,8 @@ impl AsRef<[u8]> for ManagedHostBytes {
 
 // SAFETY: freeze removes the sole mutable owner. Arc retains the byte allocation
 // and its charge, and a view's private range never changes during its lifetime.
+// try_thaw consumes the sole full-range owner; any other view or retained region
+// prevents recovery, so no live immutable owner can observe writable storage.
 unsafe impl crate::StableHostMemory for ManagedHostBytes {
     fn stable_bytes(&self) -> &[u8] {
         self.bytes()
@@ -694,3 +714,5 @@ unsafe impl crate::StableHostMemory for ManagedHostBytes {
 mod capacity_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod thaw_tests;
