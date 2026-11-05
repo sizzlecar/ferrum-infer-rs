@@ -14,6 +14,9 @@ mod completion_order_cache;
 #[path = "invocation_chain_tests.rs"]
 mod invocation_chain;
 
+#[path = "unused_weight_tests.rs"]
+mod unused_weights;
+
 #[test]
 fn execution_plan_wire_limit_is_symmetric() {
     super::validation::validate_execution_plan_wire_size(
