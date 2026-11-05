@@ -20,6 +20,10 @@ use thiserror::Error;
 mod scope;
 pub use scope::HostMemoryScope;
 use scope::{ScopeAuthority, ScopeCredit};
+mod scope_exchange;
+pub use scope_exchange::HostMemoryScopeExchangeFailure;
+use scope_exchange::ScopeRefund;
+mod scope_shrink;
 
 /// A quota dimension; it does not describe allocation or DMA capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +180,7 @@ struct State {
     fail_closed: bool,
     next_scope: u64,
     scopes: BTreeMap<u64, ScopeCredit>,
+    scope_refunds: BTreeMap<u64, ScopeRefund>,
 }
 
 #[derive(Debug)]
