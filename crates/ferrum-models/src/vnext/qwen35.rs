@@ -59,7 +59,10 @@ use crate::qwen35_weights::{
 };
 
 use super::{
-    hf_metadata::{is_hf_template_source, parse_hf_model_semantic_metadata},
+    hf_metadata::{
+        is_hf_template_source, parse_hf_model_semantic_metadata,
+        parse_hf_model_semantic_metadata_with_tokenizer,
+    },
     weight_layout::{contiguous_or_reshaped_binding, dense_or_reshaped_layout},
     CausalLanguageModelDescriptor, DefinedProductionModel, ProductionModelSourceBundle,
     ProductionWeightArtifact,
@@ -3053,9 +3056,10 @@ fn load_safetensors_family_config(
     let tokenizer_config_bytes = sources
         .tokenizer_config_json()
         .ok_or_else(|| "tokenizer source missing tokenizer_config.json".to_owned())?;
-    let metadata = parse_hf_model_semantic_metadata(
+    let metadata = parse_hf_model_semantic_metadata_with_tokenizer(
         &hf_config,
-        &tokenizer_config_bytes,
+        tokenizer_config_bytes,
+        sources.tokenizer_json(),
         sources.chat_template_jinja(),
         sources.chat_template_json(),
     )?;
@@ -3199,9 +3203,10 @@ fn load_gguf_family_config(
     let tokenizer_config_bytes = sources
         .tokenizer_config_json()
         .ok_or_else(|| "tokenizer source missing tokenizer_config.json".to_owned())?;
-    let metadata = parse_hf_model_semantic_metadata(
+    let metadata = parse_hf_model_semantic_metadata_with_tokenizer(
         &hf_config,
         tokenizer_config_bytes,
+        sources.tokenizer_json(),
         sources.chat_template_jinja(),
         sources.chat_template_json(),
     )?;
