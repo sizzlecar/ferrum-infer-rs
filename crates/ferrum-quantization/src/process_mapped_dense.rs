@@ -19,6 +19,17 @@ use layout::Layout;
 #[cfg(test)]
 mod tests;
 
+/// Upload authorization for the same immutable process-owned representation.
+/// Staged retains the mapping as ordinary stable memory, so a runtime must use
+/// its existing accounted staging path rather than the mapped-upload hook.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessMappedDenseUploadPolicy {
+    #[default]
+    ReadOnlyMapping,
+    Staged,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessMappedDenseLimits {
@@ -192,12 +203,13 @@ impl ProcessMappedDenseWeights {
                 .zip(components)
                 .all(|(entry, spec)| &entry.spec == spec)
     }
-}
-
-impl WeightComponentSource for ProcessMappedDenseWeights {
-    fn component<'a>(
+    /// Return the exact same bytes and mapping owner with an explicit upload
+    /// authorization. This does not reserve staging or create a managed owner;
+    /// staging remains the caller runtime's existing Host-account obligation.
+    pub fn component_with_upload_policy<'a>(
         &'a self,
         spec: &WeightComponentSpec,
+        policy: ProcessMappedDenseUploadPolicy,
     ) -> Result<WeightComponentPayload<'a>, VNextError> {
         let position = self
             .layout
@@ -212,11 +224,18 @@ impl WeightComponentSource for ProcessMappedDenseWeights {
             ));
         }
         let range = self.layout.data_range(entry)?;
-        let retained = RetainedHostMemoryRegion::new_readonly_file_mapping(
-            Arc::clone(&self.mapping),
-            range.start,
-            range.len(),
-        )?;
+        let retained = match policy {
+            ProcessMappedDenseUploadPolicy::ReadOnlyMapping => {
+                RetainedHostMemoryRegion::new_readonly_file_mapping(
+                    Arc::clone(&self.mapping),
+                    range.start,
+                    range.len(),
+                )?
+            }
+            ProcessMappedDenseUploadPolicy::Staged => {
+                RetainedHostMemoryRegion::new(Arc::clone(&self.mapping), range.start, range.len())?
+            }
+        };
         WeightComponentPayload::from_ordered_sources(
             spec,
             spec.external_names.clone(),
@@ -226,6 +245,15 @@ impl WeightComponentSource for ProcessMappedDenseWeights {
             &self.mapping.bytes[range],
         )?
         .with_retained_host_memory(retained)
+    }
+}
+
+impl WeightComponentSource for ProcessMappedDenseWeights {
+    fn component<'a>(
+        &'a self,
+        spec: &WeightComponentSpec,
+    ) -> Result<WeightComponentPayload<'a>, VNextError> {
+        self.component_with_upload_policy(spec, ProcessMappedDenseUploadPolicy::ReadOnlyMapping)
     }
 }
 

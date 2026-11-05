@@ -181,6 +181,26 @@ fn exact_normalization_preserves_composites_affine_once_f32_and_original_lineage
             actual.bytes().as_ptr(),
             retained.bytes().as_ptr()
         ));
+        let staged = cached
+            .component_with_upload_policy(spec, ProcessMappedDenseUploadPolicy::Staged)
+            .unwrap();
+        assert_eq!(staged.bytes(), actual.bytes());
+        assert_eq!(staged.component_id(), actual.component_id());
+        assert_eq!(staged.external_names(), actual.external_names());
+        assert_eq!(staged.source_files(), actual.source_files());
+        assert_eq!(staged.dimensions(), actual.dimensions());
+        assert_eq!(staged.element_type(), actual.element_type());
+        assert!(std::ptr::eq(
+            staged.bytes().as_ptr(),
+            actual.bytes().as_ptr()
+        ));
+        let staged_owner = staged.retained_host_memory().unwrap();
+        assert!(staged_owner.readonly_file_mapping().is_none());
+        assert_eq!(staged_owner.managed_memory_class(), None);
+        assert!(std::ptr::eq(
+            staged_owner.owner_bytes().as_ptr(),
+            retained.owner_bytes().as_ptr()
+        ));
     }
     let norm = cached.component(&specs[3]).unwrap();
     assert_eq!(
@@ -389,6 +409,9 @@ fn source_contract_mismatch_and_invalid_layouts_fail_without_new_host_allocation
         }
         assert!(!cached.matches_components(std::slice::from_ref(&changed)));
         assert!(cached.component(&changed).is_err());
+        assert!(cached
+            .component_with_upload_policy(&changed, ProcessMappedDenseUploadPolicy::Staged)
+            .is_err());
         changed = spec.clone();
     }
     for invalid_spec in [
@@ -437,4 +460,77 @@ fn malformed_source_shape_and_missing_component_do_not_leave_a_partial_artifact(
         assert_eq!(h.usage().unwrap().committed_bytes(), 0);
     }
     assert!(std::fs::read_dir(output.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn upload_policy_defaults_preserve_mapping_authority_and_staged_owner_outlives_source() {
+    assert_eq!(
+        ProcessMappedDenseUploadPolicy::default(),
+        ProcessMappedDenseUploadPolicy::ReadOnlyMapping
+    );
+    for (wire, policy) in [
+        (
+            "read_only_mapping",
+            ProcessMappedDenseUploadPolicy::ReadOnlyMapping,
+        ),
+        ("staged", ProcessMappedDenseUploadPolicy::Staged),
+    ] {
+        assert_eq!(serde_json::to_value(policy).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<ProcessMappedDenseUploadPolicy>(serde_json::json!(wire))
+                .unwrap(),
+            policy
+        );
+    }
+    assert!(
+        serde_json::from_value::<ProcessMappedDenseUploadPolicy>(serde_json::json!(
+            "implicit_pinned"
+        ))
+        .is_err()
+    );
+    let (original_directory, original) = archive(&[bf("a", &[1, 2], &[1.125, -0.])]);
+    let spec = component("component.a", &["a"], &[1, 2], ElementType::F16);
+    let output = tempfile::tempdir().unwrap();
+    let h = host();
+    let cached = ProcessMappedDenseWeights::build(
+        &original,
+        std::slice::from_ref(&spec),
+        &h,
+        output.path(),
+        limits(),
+    )
+    .unwrap();
+    let weak = Arc::downgrade(&cached.mapping);
+    let mapped = cached.component(&spec).unwrap();
+    let staged = cached
+        .component_with_upload_policy(&spec, ProcessMappedDenseUploadPolicy::Staged)
+        .unwrap();
+    let mapped_owner = mapped.retained_host_memory().unwrap().clone();
+    let staged_owner = staged.retained_host_memory().unwrap().clone();
+    assert!(mapped_owner.readonly_file_mapping().is_some());
+    assert!(staged_owner.readonly_file_mapping().is_none());
+    assert_eq!(staged_owner.managed_memory_class(), None);
+    assert!(std::ptr::eq(
+        mapped_owner.owner_bytes().as_ptr(),
+        staged_owner.owner_bytes().as_ptr()
+    ));
+    drop(mapped);
+    drop(staged);
+    drop(cached);
+    drop(original);
+    original_directory.close().unwrap();
+    output.close().unwrap();
+    drop(mapped_owner);
+    assert!(weak.upgrade().is_some());
+    assert_eq!(
+        staged_owner.bytes(),
+        [0x3c80u16, 0x8000]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(h.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(h.usage().unwrap().allocated_bytes(), 0);
+    drop(staged_owner);
+    assert!(weak.upgrade().is_none());
 }

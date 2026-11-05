@@ -51,7 +51,8 @@ pub use lora::LoraLinearRef;
 pub use mxfp4_safetensors_source::{Mxfp4SafetensorsSource, MXFP4_E2M1_E8M0_SOURCE_FORMAT_ID};
 pub use native_safetensors::{NativeSafetensorsLoadOptions, NativeSafetensorsLoader};
 pub use process_mapped_dense::{
-    ProcessMappedDenseLimits, ProcessMappedDenseRequirements, ProcessMappedDenseWeights,
+    ProcessMappedDenseLimits, ProcessMappedDenseRequirements, ProcessMappedDenseUploadPolicy,
+    ProcessMappedDenseWeights,
 };
 pub use quant_linear::QuantLinear;
 pub use safetensors_archive::{SafetensorsArchive, SafetensorsReadAheadPolicy, SafetensorsTensor};
