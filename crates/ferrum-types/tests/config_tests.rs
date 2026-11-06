@@ -554,3 +554,19 @@ fn sampling_presets_contains_expected() {
     assert!(presets.presets.get("creative").is_some());
     assert!(presets.presets.get("precise").is_some());
 }
+
+#[test]
+fn reusable_execution_capture_scope_defaults_all_and_round_trips_decode_only() {
+    use ferrum_types::ReusableExecutionCaptureScope;
+    let old: ReusableExecutionCaptureConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(old.scope, ReusableExecutionCaptureScope::All);
+    let explicit: ReusableExecutionCaptureConfig =
+        serde_json::from_str(r#"{"scope":"decode_only","preparation":"on_demand"}"#).unwrap();
+    assert_eq!(explicit.scope, ReusableExecutionCaptureScope::DecodeOnly);
+    let parsed: ReusableExecutionCaptureConfig =
+        serde_json::from_value(serde_json::to_value(&explicit).unwrap()).unwrap();
+    assert_eq!(parsed, explicit);
+    assert!(
+        serde_json::from_str::<ReusableExecutionCaptureConfig>(r#"{"scope":"unknown"}"#).is_err()
+    );
+}

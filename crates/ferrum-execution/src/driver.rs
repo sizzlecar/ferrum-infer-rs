@@ -128,6 +128,21 @@ const fn submission_execution_policy_for_timing(
     }
 }
 
+const fn submission_execution_policy_for_wave(
+    timing_mode: DeviceTimingMode,
+    decode_only: bool,
+    kind: VNextExecutionWaveKind,
+) -> SubmissionExecutionPolicy {
+    if decode_only
+        && !matches!(kind, VNextExecutionWaveKind::Decode)
+        && !matches!(timing_mode, DeviceTimingMode::Verification)
+    {
+        SubmissionExecutionPolicy::eager()
+    } else {
+        submission_execution_policy_for_timing(timing_mode)
+    }
+}
+
 const fn reusable_catalog_lookup_allowed(
     has_startup_plan: bool,
     direct_reusable_execution_allowed: bool,
@@ -596,6 +611,7 @@ pub struct ProgramExecutorConfig {
     pub completion_readback_policy: ferrum_types::CompletionReadbackPolicy,
     pub sampling_readback_mode: SamplingReadbackMode,
     pub device_reusable_execution_enabled: bool,
+    pub device_reusable_execution_decode_only: bool,
     pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
     reusable_execution_capture_resolution: Option<VNextReusableExecutionCaptureResolution>,
     pub diagnostic_fault: Option<VNextDiagnosticFault>,
@@ -731,6 +747,16 @@ impl ProgramExecutorConfig {
                 }))
                 .map_err(FerrumError::config)?;
         }
+        let decode_only =
+            capture_config.scope == ferrum_types::ReusableExecutionCaptureScope::DecodeOnly;
+        if prepare_device_programs
+            && decode_only
+            && capture_config.preparation != ReusableExecutionPreparationMode::OnDemand
+        {
+            return Err(FerrumError::config(
+                "decode-only reusable execution requires on-demand preparation",
+            ));
+        }
         let mut reusable_execution_prefill_chunks = [
             engine.scheduler.prefill_step_chunk,
             engine.scheduler.active_decode_prefill_chunk,
@@ -746,12 +772,15 @@ impl ProgramExecutorConfig {
         .map(|token_count| PrefillChunk::new(0, token_count, token_count))
         .collect::<Result<Vec<_>>>()?;
         reusable_execution_prefill_chunks.extend_from_slice(additional_prefill_chunks);
+        if decode_only {
+            reusable_execution_prefill_chunks.clear();
+        }
         // Decode startup admission executes this exact prefill before the
         // synthetic sequence can participate in capture. Budget it in the
         // immutable program policy instead of observing an unplanned case.
         budget_reusable_decode_seed_prefill(
             &mut reusable_execution_prefill_chunks,
-            prepare_device_programs,
+            prepare_device_programs && !decode_only,
         )?;
         if reusable_execution_prefill_chunks.iter().any(|chunk| {
             !chunk.is_final()
@@ -862,6 +891,8 @@ impl ProgramExecutorConfig {
             completion_readback_policy: engine.runtime.completion_readback_policy,
             sampling_readback_mode: engine.runtime.sampling_readback_mode,
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
+            device_reusable_execution_decode_only: capture_config.scope
+                == ferrum_types::ReusableExecutionCaptureScope::DecodeOnly,
             reusable_execution_prefill_chunks,
             reusable_execution_capture_resolution,
             diagnostic_fault,
@@ -4583,6 +4614,7 @@ pub struct ProgramExecutor<R: DeviceRuntime> {
     static_bytes: u64,
     sequence_state_memory: TypedSequenceStateMemory,
     device_reusable_execution_enabled: bool,
+    device_reusable_execution_decode_only: bool,
     reusable_execution_supported: bool,
     reusable_execution_startup_plan: Option<VNextReusableExecutionStartupPlan>,
     reusable_execution_catalog: RwLock<Option<Arc<VNextReusableExecutionCatalog>>>,
@@ -5184,6 +5216,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             static_bytes,
             sequence_state_memory,
             device_reusable_execution_enabled: config.device_reusable_execution_enabled,
+            device_reusable_execution_decode_only: config.device_reusable_execution_decode_only,
             reusable_execution_supported,
             reusable_execution_startup_plan,
             reusable_execution_catalog: RwLock::new(None),
@@ -7473,17 +7506,24 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 phase: phase_timing,
             };
             let device_timing_mode = self.device_timing_mode();
-            let execution_policy = submission_execution_policy_for_timing(device_timing_mode);
+            let replay_wave = !self.device_reusable_execution_decode_only
+                || matches!(kind, VNextExecutionWaveKind::Decode);
+            let execution_policy = submission_execution_policy_for_wave(
+                device_timing_mode,
+                self.device_reusable_execution_decode_only,
+                kind,
+            );
             let mut reusable_catalog_miss = None;
             let catalog_snapshot = self.reusable_execution_catalog.read().clone();
             let catalog = catalog_snapshot.as_deref();
             let mut diagnostic_program_id = None;
-            let reusable_program = if !reusable_program_identity_required(
-                self.reusable_execution_startup_plan.is_some(),
-                catalog.is_some(),
-                device_timing_mode.direct_reusable_execution_allowed(),
-                reusable_direct_attempted,
-            ) {
+            let reusable_program = if !replay_wave
+                || !reusable_program_identity_required(
+                    self.reusable_execution_startup_plan.is_some(),
+                    catalog.is_some(),
+                    device_timing_mode.direct_reusable_execution_allowed(),
+                    reusable_direct_attempted,
+                ) {
                 None
             } else {
                 let program_id = match OperationDispatch::reusable_execution_program_id_for_wave(
@@ -11199,5 +11239,54 @@ mod tests {
         assert!(
             validate_sequence_completion_accounting(&request_id, 2, 1, &other_request).is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_decode_replay_policy_tests {
+    use super::*;
+    use ferrum_runtime::SubmissionScratchInitialization;
+
+    #[test]
+    fn decode_replay_keeps_prefill_eager_without_diagnostic_fill() {
+        for timing in [
+            DeviceTimingMode::Off,
+            DeviceTimingMode::Completion,
+            DeviceTimingMode::Replay,
+            DeviceTimingMode::Kernel,
+        ] {
+            for kind in [
+                VNextExecutionWaveKind::Prefill,
+                VNextExecutionWaveKind::Mixed,
+            ] {
+                let policy = submission_execution_policy_for_wave(timing, true, kind);
+                assert_eq!(
+                    policy.compute_path(),
+                    ferrum_runtime::DeviceComputePathRequirement::EagerOnly
+                );
+                assert_eq!(
+                    policy.scratch_initialization(),
+                    SubmissionScratchInitialization::ProviderContract
+                );
+                assert_eq!(
+                    submission_execution_policy_for_wave(timing, false, kind),
+                    SubmissionExecutionPolicy::adaptive()
+                );
+            }
+            assert_eq!(
+                submission_execution_policy_for_wave(timing, true, VNextExecutionWaveKind::Decode),
+                SubmissionExecutionPolicy::adaptive()
+            );
+        }
+        for kind in [
+            VNextExecutionWaveKind::Prefill,
+            VNextExecutionWaveKind::Mixed,
+            VNextExecutionWaveKind::Decode,
+        ] {
+            assert_eq!(
+                submission_execution_policy_for_wave(DeviceTimingMode::Verification, true, kind),
+                SubmissionExecutionPolicy::determinism_eager(0)
+            );
+        }
     }
 }

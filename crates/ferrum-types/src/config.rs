@@ -1723,6 +1723,16 @@ impl std::str::FromStr for ReusableExecutionPreparationMode {
     }
 }
 
+/// Execution waves eligible for reusable capture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReusableExecutionCaptureScope {
+    #[default]
+    All,
+    /// Learn only actual uniform decode waves. Prefill and mixed waves remain eager.
+    DecodeOnly,
+}
+
 /// Product policy for bounded reusable-execution capture.
 ///
 /// `None` requests an automatically resolved exact-width matrix. Explicit
@@ -1735,6 +1745,7 @@ impl std::str::FromStr for ReusableExecutionPreparationMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReusableExecutionCaptureConfig {
+    pub scope: ReusableExecutionCaptureScope,
     /// Preparation lifecycle, resolved from declared device capabilities.
     pub preparation: ReusableExecutionPreparationMode,
     /// Exact concurrent decode widths to prepare. `None` selects automatic
@@ -1748,6 +1759,7 @@ pub struct ReusableExecutionCaptureConfig {
 impl Default for ReusableExecutionCaptureConfig {
     fn default() -> Self {
         Self {
+            scope: ReusableExecutionCaptureScope::All,
             preparation: ReusableExecutionPreparationMode::default(),
             exact_decode_widths: None,
             maximum_automatic_exact_decode_width: DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH,

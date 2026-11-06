@@ -617,6 +617,15 @@ impl SubmissionExecutionPolicy {
         }
     }
 
+    /// Execute original providers without recording or launching reusable work.
+    /// Scratch remains governed by each provider's production contract.
+    pub const fn eager() -> Self {
+        Self {
+            compute_path: DeviceComputePathRequirement::EagerOnly,
+            scratch_initialization: SubmissionScratchInitialization::ProviderContract,
+        }
+    }
+
     pub const fn determinism_eager(scratch_fill: u8) -> Self {
         Self {
             compute_path: DeviceComputePathRequirement::EagerOnly,
