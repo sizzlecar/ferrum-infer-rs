@@ -176,7 +176,8 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
                 tensor(vec![1], ElementType::F32),
             ),
         ]))
-        .map_err(|error| FerrumError::model(format!("vNext compile input: {error}")))?;
+        .map_err(|error| FerrumError::model(format!("vNext compile input: {error}")))?
+        .with_weight_arena_packing(config.weight_arena_packing);
         config.plan_observation.apply(family, &mut options)?;
         if let Some(selection) = &checkpoint_selection {
             selection.retain_in(&mut options);

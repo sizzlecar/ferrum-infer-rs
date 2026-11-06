@@ -619,6 +619,7 @@ fn budget_reusable_decode_seed_prefill(
 #[derive(Debug, Clone)]
 pub struct ProgramExecutorConfig {
     pub maximum_model_tokens: usize,
+    pub weight_arena_packing: ferrum_runtime::WeightArenaPacking,
     pub startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
@@ -899,6 +900,10 @@ impl ProgramExecutorConfig {
 
         Ok(Self {
             maximum_model_tokens,
+            weight_arena_packing: engine.memory.weight_arena_target_bytes.map_or(
+                ferrum_runtime::WeightArenaPacking::ByElementType,
+                |target_bytes| ferrum_runtime::WeightArenaPacking::Bounded { target_bytes },
+            ),
             startup_memory_plan: engine.runtime.startup_memory_plan.clone(),
             static_initialization,
             runtime_policy,

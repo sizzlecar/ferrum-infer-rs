@@ -1562,6 +1562,11 @@ pub struct MemoryConfig {
     /// device or pool capacity.
     #[serde(default)]
     pub usable_capacity_bytes: Option<usize>,
+    /// Optional target for each compiled weight arena. Individual tensors stay
+    /// contiguous; a tensor larger than the target receives its own arena.
+    /// This changes allocation layout, not the device-wide memory budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_arena_target_bytes: Option<std::num::NonZeroU64>,
     /// Enable memory pooling
     pub enable_pooling: bool,
     /// Memory alignment in bytes
@@ -1638,6 +1643,7 @@ impl Default for MemoryConfig {
         Self {
             pool_size: None,
             usable_capacity_bytes: None,
+            weight_arena_target_bytes: None,
             enable_pooling: true,
             alignment: 256,
             enable_defragmentation: false,
@@ -2059,6 +2065,29 @@ impl Default for BatchConfig {
 mod tests {
     use super::*;
     use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+
+    #[test]
+    fn weight_arena_target_is_explicit_positive_and_default_wire_compatible() {
+        let mut wire = serde_json::to_value(EngineConfig::default()).unwrap();
+        assert!(wire["memory"].get("weight_arena_target_bytes").is_none());
+        let default: EngineConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert!(default.memory.weight_arena_target_bytes.is_none());
+        wire["memory"]["weight_arena_target_bytes"] = serde_json::json!(536_870_912_u64);
+        let configured: EngineConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            configured.memory.weight_arena_target_bytes.unwrap().get(),
+            536_870_912
+        );
+        assert_eq!(serde_json::to_value(configured).unwrap(), wire);
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            wire["memory"]["weight_arena_target_bytes"] = invalid;
+            assert!(serde_json::from_value::<EngineConfig>(wire.clone()).is_err());
+        }
+    }
 
     #[test]
     fn retired_native_overrides_reject_before_mutating_engine_config() {
