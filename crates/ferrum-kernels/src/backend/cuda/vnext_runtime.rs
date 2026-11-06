@@ -5534,6 +5534,17 @@ impl DeviceRuntime for CudaDeviceRuntime {
         self.tensor_eager.is_some()
     }
 
+    fn static_weight_source_retention(&self) -> ferrum_runtime::StaticWeightSourceRetention {
+        if self.tensor_eager.is_some() {
+            // Typed uploads copy into device-owned storage. Their original
+            // Host owners remain with the fence or quarantine until proven
+            // quiescent and dropped; they never enter a plan/replay cache.
+            ferrum_runtime::StaticWeightSourceRetention::FencedCopy
+        } else {
+            ferrum_runtime::StaticWeightSourceRetention::UnknownOrPlanRetained
+        }
+    }
+
     fn supports_readonly_mapped_static_weight_sources(&self) -> bool {
         self.tensor_eager.is_some()
     }

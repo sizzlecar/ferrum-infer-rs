@@ -196,6 +196,12 @@ fn upload(
 #[ignore = "requires an exclusive CUDA window; real transfer and cuBLAS execution"]
 fn typed_transfers_do_not_create_blas_and_first_compute_initializes_once() {
     let runtime = tensor_runtime();
+    assert_eq!(
+        runtime.static_weight_source_retention(),
+        ferrum_runtime::StaticWeightSourceRetention::FencedCopy
+    );
+    assert!(runtime.supports_managed_static_weight_sources());
+    assert!(runtime.begin_managed_static_weight_import().is_none());
     let mut stream = runtime.create_stream().unwrap();
     assert!(stream.blas.is_none());
     let (buffer, quota) = buffer(&runtime, &stream);
@@ -307,6 +313,10 @@ fn typed_transfers_do_not_create_blas_and_first_compute_initializes_once() {
 #[ignore = "requires an exclusive CUDA window; original transfer quarantine and Host ownership"]
 fn transfer_only_unwind_retains_owners_without_blas_until_real_synchronization() {
     let runtime = tensor_runtime();
+    assert_eq!(
+        runtime.static_weight_source_retention(),
+        ferrum_runtime::StaticWeightSourceRetention::FencedCopy
+    );
     let mut stream = runtime.create_stream().unwrap();
     let (buffer, quota) = buffer(&runtime, &stream);
     let host = host();
@@ -354,6 +364,11 @@ fn legacy_streams_keep_eager_blas_and_empty_replay_preparation_accepts_no_handle
         .unwrap(),
     )
     .unwrap();
+    assert_eq!(
+        runtime.static_weight_source_retention(),
+        ferrum_runtime::StaticWeightSourceRetention::UnknownOrPlanRetained
+    );
+    assert!(!runtime.supports_managed_static_weight_sources());
     let stream = runtime.create_stream().unwrap();
     assert!(stream.blas.is_some());
     let report = CudaExecutableCache::new()
