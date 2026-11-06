@@ -6,6 +6,8 @@ mod dense_linear_fp8_bf16;
 pub use dense_linear_fp8_bf16::*;
 mod dense_linear_fp8_group_bf16;
 pub use dense_linear_fp8_group_bf16::*;
+mod affine_linear_f32;
+pub use affine_linear_f32::*;
 mod dense_linear_block_bf16;
 pub use dense_linear_block_bf16::*;
 mod channel_l2_norm_image_bf16;
