@@ -1431,8 +1431,13 @@ struct Job<O> {
 impl<O> Job<O> {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
-        self.shared.changed.notify_all();
+        // Resource callbacks never acquire the queue mutex. Publish their
+        // wake before synchronizing with the declared collection wait.
         self.shared.resources.notify();
+        // Pair with the waiter's predicate check and atomic unlock/wait.
+        // Atomic cancellation alone cannot prevent a lost Condvar wake.
+        let _state = self.shared.lock();
+        self.shared.changed.notify_all();
     }
     async fn wait(mut self) -> Result<O, ImageServiceError> {
         match self.receiver.take() {
