@@ -44,6 +44,8 @@ mod half_split_rope;
 pub(crate) use half_split_rope::{ReferenceHalfSplitRopeLaunch, ReferenceHalfSplitRopeShape};
 mod structured_gqa_attention;
 pub(crate) use structured_gqa_attention::ReferenceStructuredGqaAttentionLaunch;
+mod structured_gqa_attention_f32;
+pub(crate) use structured_gqa_attention_f32::ReferenceStructuredGqaAttentionF32Launch;
 mod structured_attention;
 pub(crate) use structured_attention::ReferenceStructuredAttentionLaunch;
 mod cross_attention;
@@ -389,6 +391,9 @@ enum ReferenceCommandKind {
     StructuredGqaAttention {
         launch: ReferenceStructuredGqaAttentionLaunch,
     },
+    StructuredGqaAttentionF32 {
+        launch: ReferenceStructuredGqaAttentionF32Launch,
+    },
     StructuredAttention {
         launch: ReferenceStructuredAttentionLaunch,
     },
@@ -442,6 +447,9 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::PlainResidualAdd { .. } => "plain_residual_add",
             ReferenceCommandKind::HalfSplitRope { .. } => "half_split_rope",
             ReferenceCommandKind::StructuredGqaAttention { .. } => "structured_gqa_attention",
+            ReferenceCommandKind::StructuredGqaAttentionF32 { .. } => {
+                "structured_gqa_attention_f32"
+            }
             ReferenceCommandKind::StructuredAttention { .. } => "structured_attention",
             ReferenceCommandKind::CrossAttention { .. } => "cross_attention",
             ReferenceCommandKind::AdjacentRope { .. } => "adjacent_rope",
@@ -571,6 +579,19 @@ impl ReferenceDeviceCommand {
             compute_dispatch_count: 1,
             transfer_command_count: 0,
             kind: ReferenceCommandKind::StructuredGqaAttention { launch },
+        })
+    }
+
+    pub(crate) fn structured_gqa_attention_f32_tensor(
+        launch: ReferenceStructuredGqaAttentionF32Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_structured_gqa_attention_f32",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::StructuredGqaAttentionF32 { launch },
         })
     }
 
@@ -917,6 +938,9 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::StructuredGqaAttention { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::StructuredGqaAttentionF32 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::StructuredAttention { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
@@ -1051,6 +1075,12 @@ impl ReferenceDeviceCommand {
                     .structured_gqa_attention_launches
                     .fetch_add(1, Ordering::Relaxed);
             }
+            ReferenceCommandKind::StructuredGqaAttentionF32 { launch } => {
+                structured_gqa_attention_f32::execute(launch);
+                counters
+                    .structured_gqa_attention_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             ReferenceCommandKind::StructuredAttention { launch } => {
                 structured_attention::execute(launch);
                 counters
@@ -1179,6 +1209,12 @@ impl<'a, const N: usize> AllocationLocks<'a, N> {
         let bytes = self.guards[self.slots[role]].as_mut().unwrap();
         let offset = self.offsets[role] + index * 2;
         bytes[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+    }
+
+    fn write_f32(&mut self, role: usize, index: usize, value: f32) {
+        let bytes = self.guards[self.slots[role]].as_mut().unwrap();
+        let offset = self.offsets[role] + index * 4;
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 }
 

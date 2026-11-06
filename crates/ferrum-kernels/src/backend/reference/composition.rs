@@ -82,6 +82,7 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
         CapabilityId::new(PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID)?,
         CapabilityId::new(HALF_SPLIT_ROPE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::STRUCTURED_GQA_ATTENTION_F32_CAPABILITY_ID)?,
         CapabilityId::new(DENSE_LINEAR_F16_CAPABILITY_ID)?,
         CapabilityId::new(DENSE_LINEAR_BF16_CAPABILITY_ID)?,
         CapabilityId::new(LAYER_NORM_BF16_CAPABILITY_ID)?,
@@ -144,6 +145,8 @@ fn reference_vnext_runtime_config_with_capacity(
             include_str!("runtime/half_split_rope.rs").as_bytes(),
             include_str!("structured_gqa_attention.rs").as_bytes(),
             include_str!("runtime/structured_gqa_attention.rs").as_bytes(),
+            include_str!("structured_gqa_attention_f32.rs").as_bytes(),
+            include_str!("runtime/structured_gqa_attention_f32.rs").as_bytes(),
             include_str!("dense_linear.rs").as_bytes(),
             include_str!("layer_norm.rs").as_bytes(),
             include_str!("runtime/layer_norm.rs").as_bytes(),
@@ -192,6 +195,7 @@ pub fn reference_vnext_operation_registry(
         Box::new(plain_residual_add_bf16_contract().map_err(contract_error)?),
         Box::new(half_split_rope_bf16_contract().map_err(contract_error)?),
         Box::new(structured_gqa_attention_bf16_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::structured_gqa_attention_f32_contract().map_err(contract_error)?),
         Box::new(dense_linear_contract().map_err(contract_error)?),
         Box::new(dense_linear_bf16_contract().map_err(contract_error)?),
         Box::new(layer_norm_bf16_contract().map_err(contract_error)?),
@@ -224,6 +228,7 @@ pub fn reference_vnext_operation_registry(
         reference_vnext_plain_residual_add_bf16_provider(runtime)?,
         reference_vnext_half_split_rope_bf16_provider(runtime)?,
         reference_vnext_structured_gqa_attention_bf16_provider(runtime)?,
+        reference_vnext_structured_gqa_attention_f32_provider(runtime)?,
         reference_vnext_dense_linear_provider(runtime)?,
         reference_vnext_dense_linear_bf16_provider(runtime)?,
         reference_vnext_layer_norm_bf16_provider(runtime)?,
@@ -630,4 +635,14 @@ pub fn reference_vnext_tensor_primitive_bf16_provider(
     Ok(Box::new(ReferenceTensorPrimitiveProvider::new(
         runtime, kind,
     )?))
+}
+
+pub fn reference_vnext_structured_gqa_attention_f32_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(
+        super::structured_gqa_attention_f32::ReferenceStructuredGqaAttentionF32Provider::new(
+            runtime,
+        )?,
+    ))
 }
