@@ -1,5 +1,7 @@
 mod philox_normal_bf16;
 pub use philox_normal_bf16::*;
+mod philox_normal_f32;
+pub use philox_normal_f32::*;
 mod dense_linear_fp8_bf16;
 pub use dense_linear_fp8_bf16::*;
 mod dense_linear_fp8_group_bf16;
