@@ -71,6 +71,24 @@ fn validated_materialization_session_consumes_distinct_original_source_groups() 
 }
 
 #[test]
+fn range_authority_requires_the_original_live_identity_schema() {
+    let family = stored_family(false);
+    let authority = TrustedExecutionWeights::for_family(&family).unwrap();
+    let session = authority.materialization_session(&family).unwrap();
+    for component in &family.stored_weight_schema().unwrap().components {
+        session
+            .validate_identity_range_component(component)
+            .unwrap();
+        let mut changed = component.clone();
+        changed.dimensions[0] += 1;
+        assert!(session.validate_identity_range_component(&changed).is_err());
+        changed = component.clone();
+        changed.external_names.reverse();
+        assert!(session.validate_identity_range_component(&changed).is_err());
+    }
+}
+
+#[test]
 fn validated_materialization_session_rejects_foreign_family_and_absent_weights() {
     let original = stored_family(false);
     let other = stored_family(true);

@@ -6,6 +6,9 @@ use super::{
     ElementType, HostMemoryClass, ManagedHostBytes, VNextError, WeightComponentSpec, WeightId,
 };
 
+mod streaming;
+pub use streaming::{WeightComponentRange, WeightComponentRangeRequest, WeightComponentStreamSpec};
+
 enum WeightPayloadBytes<'source> {
     Ordinary(Cow<'source, [u8]>),
     Managed(ManagedHostBytes),
@@ -553,6 +556,8 @@ pub struct StaticWeightSourceContext<'a> {
     plan: &'a crate::ExecutionPlan,
     host: Option<&'a crate::HostMemoryAccount>,
     retention: StaticWeightSourceRetention,
+    maximum_source_chunk_bytes: u64,
+    supports_managed_source_upload: bool,
 }
 
 impl<'a> StaticWeightSourceContext<'a> {
@@ -561,12 +566,16 @@ impl<'a> StaticWeightSourceContext<'a> {
         plan: &'a crate::ExecutionPlan,
         host: Option<&'a crate::HostMemoryAccount>,
         retention: StaticWeightSourceRetention,
+        maximum_source_chunk_bytes: u64,
+        supports_managed_source_upload: bool,
     ) -> Self {
         Self {
             family,
             plan,
             host,
             retention,
+            maximum_source_chunk_bytes,
+            supports_managed_source_upload,
         }
     }
 
@@ -582,6 +591,14 @@ impl<'a> StaticWeightSourceContext<'a> {
         self.retention
     }
 
+    pub const fn maximum_source_chunk_bytes(&self) -> u64 {
+        self.maximum_source_chunk_bytes
+    }
+
+    pub const fn supports_managed_source_upload(&self) -> bool {
+        self.supports_managed_source_upload
+    }
+
     /// Exact parent and admission-scope authority; legal clones match, while
     /// parent-only and sibling views cannot spend this installation's credit.
     pub fn matches_host_account(&self, host: &crate::HostMemoryAccount) -> bool {
@@ -595,6 +612,30 @@ impl<'a> StaticWeightSourceContext<'a> {
 /// any repacking or quantization before resource initialization performs
 /// placement and device submission.
 pub trait WeightComponentSource: Send + Sync {
+    /// Metadata-only declaration, frozen before initialization starts. `Some`
+    /// selects the range route exclusively; a later failure cannot fall back
+    /// to allocating a complete payload. Existing sources use the full route.
+    fn streaming_component(
+        &self,
+        _component: &WeightComponentSpec,
+    ) -> Result<Option<WeightComponentStreamSpec>, VNextError> {
+        Ok(None)
+    }
+
+    /// Produce precisely the requested range using the installation's original
+    /// accounted Host owner. Core waits the previous range's terminal fence
+    /// before calling again. Implementations must still require unique mutable
+    /// ownership before reusing backing; terminal completion alone is not an
+    /// alias proof.
+    fn component_range(
+        &self,
+        _request: &WeightComponentRangeRequest,
+    ) -> Result<WeightComponentRange, VNextError> {
+        Err(VNextError::InvalidExecutionPlan {
+            reason: "weight source does not support component ranges".into(),
+        })
+    }
+
     /// Validate or prepare invocation-local source backing after core has
     /// checked this exact plan and selected its native import/copy route.
     /// This runs before initialization zero/upload/import commands. Any new
@@ -650,7 +691,7 @@ mod tests {
     use super::*;
     use crate::{BlockQuantizationSpec, WeightComponentRole, WeightEncoding};
 
-    fn managed_account(total: usize) -> crate::HostMemoryAccount {
+    pub(super) fn managed_account(total: usize) -> crate::HostMemoryAccount {
         crate::HostMemoryAccount::new(
             crate::HostMemoryLimits::new(
                 total,
@@ -776,7 +817,7 @@ mod tests {
         }
     }
 
-    fn packed_component() -> WeightComponentSpec {
+    pub(super) fn packed_component() -> WeightComponentSpec {
         WeightComponentSpec {
             id: WeightId::new("component.test.gate_up").unwrap(),
             role: WeightComponentRole::Values,

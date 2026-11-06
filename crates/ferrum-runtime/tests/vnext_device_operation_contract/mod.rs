@@ -1456,7 +1456,13 @@ pub(crate) struct TestBuffer {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct TestStream;
+pub(crate) struct TestStream {
+    // Honor the advertised managed/mapped upload capability even when submit
+    // cannot return its fence. Only this original stream's successful recovery
+    // may release its indeterminate source owners.
+    managed_submission_custody: Vec<Arc<Vec<ManagedHostBytes>>>,
+    mapped_submission_custody: Vec<Arc<Vec<ReadOnlyMappedHostMemoryRegion>>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TestCommand {
@@ -2439,7 +2445,7 @@ impl DeviceRuntime for TestRuntime {
     }
 
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {
-        Ok(TestStream)
+        Ok(TestStream::default())
     }
 
     fn stream_state(&self, _stream: &Self::Stream) -> StreamState {
@@ -2581,7 +2587,7 @@ impl DeviceRuntime for TestRuntime {
 
     fn submit(
         &self,
-        _stream: &mut Self::Stream,
+        stream: &mut Self::Stream,
         mut commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
@@ -2782,7 +2788,11 @@ impl DeviceRuntime for TestRuntime {
                     "definitely-not-submitted",
                 )));
             }
-            SubmitBehavior::Panic => panic!("injected submit panic"),
+            SubmitBehavior::Panic => {
+                stream.managed_submission_custody.push(fence.5);
+                stream.mapped_submission_custody.push(fence.6);
+                panic!("injected submit panic");
+            }
             SubmitBehavior::Success => {}
         }
         if drift {
@@ -2872,12 +2882,14 @@ impl DeviceRuntime for TestRuntime {
         }
     }
 
-    fn synchronize(&self, _stream: &mut Self::Stream) -> Result<(), Self::Error> {
+    fn synchronize(&self, stream: &mut Self::Stream) -> Result<(), Self::Error> {
         let mut trace = self.trace.lock().unwrap();
         trace.synchronize_calls += 1;
         if trace.synchronize_fails {
             Err(TestRuntimeError("synchronize-failed"))
         } else {
+            stream.managed_submission_custody.clear();
+            stream.mapped_submission_custody.clear();
             Ok(())
         }
     }

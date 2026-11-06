@@ -18,8 +18,8 @@ use super::{
 use super::{
     DeviceCommandBatch, DeviceTerminal, HostTransferLayout, PreparedModelFamily,
     StaticWeightTransformDestination, StaticWeightTransformPlan, StaticWeightTransformRequest,
-    WeightComponentPayload, WeightComponentSegments, WeightComponentSource, WeightComponentSpec,
-    WeightId,
+    WeightComponentPayload, WeightComponentRangeRequest, WeightComponentSegments,
+    WeightComponentSource, WeightComponentSpec, WeightId,
 };
 
 static STATIC_INITIALIZATION_CLEANUP_DOMAIN: OnceLock<DeferredDeviceCleanupDomainId> =
@@ -326,6 +326,10 @@ where
 {
     stream: R::Stream,
     fence: Option<R::Fence>,
+    // A submit panic may drop the command before returning its fence. Keep the
+    // current streamed source's original charge until this same stream is
+    // proven quiescent, independently of backend command retention.
+    source_backing: Option<ManagedHostBytes>,
 }
 
 /// Failure owner for initialization. A quiescent failure can return the
@@ -518,6 +522,7 @@ where
         match synchronized {
             Ok(Ok(())) => {
                 drop(recovery.fence.take());
+                drop(recovery.source_backing.take());
                 Ok(self
                     .transaction
                     .take()
@@ -759,6 +764,44 @@ where
     let materialization_proof_us = trace_elapsed_us(phase_started);
     phase_started = trace_setup.then(Instant::now);
     let runtime = Arc::clone(transaction.lease().runtime());
+    // Freeze every range/full route before source allocation or native work.
+    // A source declaration is not permission to bypass materialization: only
+    // the original live canonical identity implementation supplies that proof.
+    let mut streaming_components = BTreeMap::new();
+    if let Some((source, weights)) = stored {
+        for component in &weights.schema().components {
+            if !placements.contains_key(&component.id) {
+                continue;
+            }
+            if let Some(spec) = source
+                .streaming_component(component)
+                .map_err(contract_failure)?
+            {
+                if spec.component() != component {
+                    return Err(contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "streamed source metadata differs from the placed component".into(),
+                    }));
+                }
+                materialization
+                    .as_ref()
+                    .expect("stored materialization view")
+                    .validate_identity_range_component(component)
+                    .map_err(contract_failure)?;
+                if managed_host.is_none()
+                    || !runtime.supports_managed_static_weight_sources()
+                    || runtime.static_weight_source_retention()
+                        != super::StaticWeightSourceRetention::FencedCopy
+                    || policy.maximum_staging_bytes()
+                        < component.physical_element_type().size_bytes()
+                {
+                    return Err(contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "streamed weights require admitted managed direct upload with FencedCopy retention and an element-sized chunk".into(),
+                    }));
+                }
+                streaming_components.insert(component.id.clone(), spec);
+            }
+        }
+    }
     let has_required_weight_transforms = !plan
         .payload()
         .execution_weights()
@@ -784,6 +827,11 @@ where
             }
         }
     };
+    if !streaming_components.is_empty() && weight_import.is_some() {
+        return Err(contract_failure(VNextError::InvalidExecutionPlan {
+            reason: "streamed weights cannot use a plan-retained import route".into(),
+        }));
+    }
     if managed_host.is_some()
         && !placements.is_empty()
         && !has_required_weight_transforms
@@ -854,6 +902,8 @@ where
                 plan,
                 managed_host,
                 retention,
+                policy.maximum_staging_bytes(),
+                weight_import.is_none() && runtime.supports_managed_static_weight_sources(),
             ))
             .map_err(contract_failure)?;
     }
@@ -1031,6 +1081,143 @@ where
                     )?;
                     submission_batch_count += 1;
                 }
+                continue;
+            }
+            if let Some(spec) = streaming_components.get(&components[0].id) {
+                // Identity proof above establishes exactly one source and one
+                // output. Complete earlier work before the sole mutable slot
+                // can be acquired, then retire every range before requesting
+                // another. Existing submit/wait recovery retains unknown work.
+                if components.len() != 1 {
+                    return Err(contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "streamed identity component cannot share a materialization group"
+                            .into(),
+                    }));
+                }
+                if !pending.is_empty() {
+                    submission_wait_duration += submit_pending(
+                        &runtime,
+                        &mut stream,
+                        &mut pending,
+                        &mut pending_staging_bytes,
+                    )?;
+                    submission_batch_count += 1;
+                }
+                drop(first_staging.take());
+                let component = components[0];
+                let placement = placements
+                    .get(&component.id)
+                    .expect("placed streamed component");
+                let host = managed_host.expect("streamed source was admitted with Host authority");
+                let element_bytes = component.physical_element_type().size_bytes();
+                let maximum = policy
+                    .maximum_staging_bytes()
+                    .min(spec.maximum_range_bytes() as u64);
+                let maximum = maximum - maximum % element_bytes;
+                let maximum = usize::try_from(maximum).map_err(|_| {
+                    contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "streamed chunk exceeds address space".into(),
+                    })
+                })?;
+                let full_bytes = usize::try_from(placement.length_bytes).map_err(|_| {
+                    contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "streamed component exceeds address space".into(),
+                    })
+                })?;
+                source_files.extend(spec.source_files().iter().cloned());
+                let mut offset = 0;
+                let mut materialization_duration = Duration::ZERO;
+                while offset < full_bytes {
+                    let length = maximum.min(full_bytes - offset);
+                    let request = WeightComponentRangeRequest::new(spec, offset, length)
+                        .map_err(contract_failure)?;
+                    let started = Instant::now();
+                    let bytes = source
+                        .component_range(&request)
+                        .map_err(contract_failure)?
+                        .validate_and_take(&request, host)
+                        .map_err(contract_failure)?;
+                    // Zero-copy custody across encode/submit unwinding. Only
+                    // one range is in flight; success drops this alias before
+                    // the source can uniquely reclaim its slot for the next.
+                    let mut source_backing = Some(bytes.clone());
+                    materialization_duration += started.elapsed();
+                    let layout = HostTransferLayout::new(
+                        component.physical_element_type(),
+                        length as u64 / element_bytes,
+                    )
+                    .map_err(contract_failure)?;
+                    let destination_offset = placement
+                        .offset_bytes
+                        .checked_add(offset as u64)
+                        .ok_or_else(|| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
+                                reason: "streamed destination offset overflows".into(),
+                            })
+                        })?;
+                    let started = Instant::now();
+                    let command =
+                        with_static_buffer(transaction, &placement.resource_id, |buffer| {
+                            runtime.encode_managed_upload(bytes, layout, buffer, destination_offset)
+                        })
+                        .map_err(|error| {
+                            runtime_or_contract_failure(
+                                &runtime,
+                                error,
+                                "static_streamed_upload_encode",
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
+                            reason:
+                                "runtime declined streamed managed upload; fallback is forbidden"
+                                    .into(),
+                        })
+                        })?;
+                    device_encode_duration += started.elapsed();
+                    pending.push(command);
+                    pending_staging_bytes = length as u64;
+                    upload_command_count += 1;
+                    submission_wait_duration += submit_pending(
+                        &runtime,
+                        &mut stream,
+                        &mut pending,
+                        &mut pending_staging_bytes,
+                    )
+                    .map_err(|mut failure| {
+                        if let InitializationStepFailure::Indeterminate { recovery, .. } =
+                            &mut failure
+                        {
+                            recovery.source_backing = source_backing.take();
+                        }
+                        failure
+                    })?;
+                    drop(source_backing);
+                    submission_batch_count += 1;
+                    offset += length;
+                }
+                source_materialization_duration += materialization_duration;
+                if slowest_component_id.is_none()
+                    || materialization_duration > slowest_component_materialization_duration
+                {
+                    slowest_component_materialization_duration = materialization_duration;
+                    slowest_component_id = Some(component.id.clone());
+                }
+                uploaded_component_count += 1;
+                uploaded_bytes = uploaded_bytes
+                    .checked_add(placement.length_bytes)
+                    .ok_or_else(|| {
+                        contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: "streamed uploaded bytes overflow".into(),
+                        })
+                    })?;
+                retained_source_upload_bytes = retained_source_upload_bytes
+                    .checked_add(placement.length_bytes)
+                    .ok_or_else(|| {
+                        contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: "streamed retained source bytes overflow".into(),
+                        })
+                    })?;
                 continue;
             }
             // Retain only outputs derived from one exact source set. This permits
@@ -1434,6 +1621,7 @@ where
                         .take()
                         .expect("static initialization owns its stream"),
                     fence: None,
+                    source_backing: None,
                 },
             })
         }
@@ -1453,6 +1641,7 @@ where
                     .take()
                     .expect("static initialization owns its stream"),
                 fence: Some(fence),
+                source_backing: None,
             },
         }),
         Err(payload) => Err(InitializationStepFailure::Indeterminate {
@@ -1467,6 +1656,7 @@ where
                     .take()
                     .expect("static initialization owns its stream"),
                 fence: Some(fence),
+                source_backing: None,
             },
         }),
     }

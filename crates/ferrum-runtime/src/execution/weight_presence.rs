@@ -171,6 +171,14 @@ pub(crate) struct ValidatedWeightMaterialization<'a> {
 }
 
 impl ValidatedWeightMaterialization<'_> {
+    pub(crate) fn validate_identity_range_component(
+        &self,
+        component: &WeightComponentSpec,
+    ) -> Result<(), VNextError> {
+        self.plan
+            .validate_identity_range_component(self.family, component)
+    }
+
     pub(crate) fn materialize_components<'source>(
         &self,
         source: &'source dyn WeightComponentSource,
