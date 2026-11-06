@@ -60,6 +60,7 @@ mod blas;
 mod compact_upload_scatter_tests;
 mod cudnn;
 mod execution_facts;
+mod idle_lanes;
 mod input_upload_packet;
 #[cfg(test)]
 mod input_upload_packet_tests;
@@ -68,6 +69,7 @@ mod segment_oracle;
 mod segment_owners;
 mod sequence_physical;
 mod tensor_eager;
+pub use idle_lanes::CudaNativeLaneReuse;
 mod tensor_io;
 mod terminal_readback;
 pub use cudnn::CudaCudnnConfig;
@@ -2897,6 +2899,7 @@ pub struct CudaDeviceStream {
     executable_cache: CudaExecutableCache,
     terminal_readback_pool: Arc<terminal_readback::Pool>,
     tensor_lane: Option<Arc<tensor_eager::TensorLaneRetention>>,
+    idle_native_lanes: std::sync::Weak<idle_lanes::IdleNativeLanes>,
 }
 
 impl fmt::Debug for CudaDeviceStream {
@@ -2917,7 +2920,10 @@ impl Drop for CudaDeviceStream {
             // Normal executor shutdown reaches quiescence and destroys every
             // graph without a device-wide synchronization.
             self.executable_cache.leak_if_in_flight();
+            self.return_retired_native_lane();
+            return;
         }
+        self.return_retired_native_lane();
     }
 }
 
@@ -3355,6 +3361,7 @@ pub struct CudaDeviceRuntime {
     #[cfg(feature = "vllm-marlin")]
     mxfp4_marlin_prepare: Mxfp4MarlinPrepareFunctions,
     quarantined: Mutex<Vec<QuarantinedSubmission>>,
+    idle_native_lanes: Option<Arc<idle_lanes::IdleNativeLanes>>,
     tensor_eager: Option<Arc<tensor_eager::TensorEagerState>>,
 }
 
@@ -3593,6 +3600,7 @@ impl CudaDeviceRuntime {
             #[cfg(feature = "vllm-marlin")]
             mxfp4_marlin_prepare,
             quarantined: Mutex::new(Vec::new()),
+            idle_native_lanes: None,
             tensor_eager: None,
         })
     }
@@ -5013,7 +5021,31 @@ impl DeviceRuntime for CudaDeviceRuntime {
             }
             Ok((stream, blas))
         };
-        let ((stream, blas), tensor_lane) = if let Some(owner) = &self.tensor_eager {
+        let reused = self
+            .idle_native_lanes
+            .as_ref()
+            .map(|cache| cache.take())
+            .transpose()?
+            .flatten();
+        let ((stream, blas), tensor_lane) = if let Some(cached) = reused {
+            let (native, lane) = cached.into_parts();
+            tracing::debug!(
+                stream_id = id,
+                previous_stream_id = native.previous_stream_id,
+                runtime_instance = self.runtime_instance,
+                native_lane_reused = true,
+                "CUDA native lane acquisition"
+            );
+            ((native.stream, Some(native.blas)), Some(lane))
+        } else if let Some(owner) = &self.tensor_eager {
+            if self.idle_native_lanes.is_some() {
+                tracing::debug!(
+                    stream_id = id,
+                    runtime_instance = self.runtime_instance,
+                    native_lane_reused = false,
+                    "CUDA native lane acquisition"
+                );
+            }
             let lane = owner.reserve_lane()?;
             let (native, lane) = tensor_eager::create_native(lane, create)?;
             (native, Some(lane))
@@ -5029,6 +5061,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
             executable_cache: CudaExecutableCache::new(),
             terminal_readback_pool: Arc::new(terminal_readback::Pool::new()),
             tensor_lane,
+            idle_native_lanes: self
+                .idle_native_lanes
+                .as_ref()
+                .map_or_else(std::sync::Weak::new, Arc::downgrade),
         })
     }
 

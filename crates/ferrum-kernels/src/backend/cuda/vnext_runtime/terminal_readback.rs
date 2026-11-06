@@ -22,6 +22,12 @@ impl Pool {
         }
     }
 
+    pub(super) fn retired(&self) -> bool {
+        self.storage
+            .lock()
+            .is_ok_and(|storage| !matches!(*storage, Storage::CheckedOut))
+    }
+
     fn take(
         &self,
         context: &Arc<CudaContext>,

@@ -269,7 +269,7 @@ impl CudaDeviceRuntime {
     pub fn new_tensor_eager(
         config: CudaTensorRuntimeConfig,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        Self::new_tensor_eager_with_observation(config, None)
+        Self::new_tensor_eager_with_native_lane_reuse(config, CudaNativeLaneReuse::Off)
     }
 
     /// Creates one runtime/context and queries free memory on that context.
@@ -279,6 +279,22 @@ impl CudaDeviceRuntime {
     pub fn new_tensor_eager_auto(
         config: CudaTensorRuntimeAutoConfig,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_tensor_eager_auto_with_native_lane_reuse(config, CudaNativeLaneReuse::Off)
+    }
+
+    /// Retain only fully retired native lanes within the original stream quota.
+    pub fn new_tensor_eager_with_native_lane_reuse(
+        config: CudaTensorRuntimeConfig,
+        reuse: CudaNativeLaneReuse,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_tensor_eager_with_observation(config, None, reuse)
+    }
+
+    pub fn new_tensor_eager_auto_with_native_lane_reuse(
+        config: CudaTensorRuntimeAutoConfig,
+        reuse: CudaNativeLaneReuse,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        reuse.validate(config.maximum_streams)?;
         let policy = AutoMemoryPolicy::new(config.utilization, config.maximum_memory_bytes)
             .map_err(CudaDeviceRuntimeError::contract)?;
         let total = query_device_total(config.device.ordinal)?;
@@ -297,6 +313,7 @@ impl CudaDeviceRuntime {
                 opaque_memory_profile: config.opaque_memory_profile,
             },
             Some((policy, total)),
+            reuse,
         )
     }
 
@@ -309,7 +326,9 @@ impl CudaDeviceRuntime {
     fn new_tensor_eager_with_observation(
         mut config: CudaTensorRuntimeConfig,
         automatic: Option<(AutoMemoryPolicy, u64)>,
+        reuse: CudaNativeLaneReuse,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        reuse.validate(config.maximum_streams)?;
         if config.device.device_id.as_str() != format!("device.cuda.{}", config.device.ordinal) {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA tensor runtime requires the canonical physical device identity",
@@ -380,6 +399,11 @@ impl CudaDeviceRuntime {
         ] {
             hash.update((part.len() as u64).to_le_bytes());
             hash.update(part.as_bytes());
+        }
+        if let CudaNativeLaneReuse::Bounded { maximum_idle_lanes } = reuse {
+            hash.update(b"retired-native-lanes-v1");
+            hash.update((maximum_idle_lanes.get() as u64).to_le_bytes());
+            hash.update(include_bytes!("idle_lanes.rs"));
         }
         // Allocator ownership/recovery is part of the executable runtime
         // contract, including for explicitly bounded (non-auto) construction.
@@ -506,6 +530,7 @@ impl CudaDeviceRuntime {
         }
         let (mut runtime, state) = guard.into_parts();
         runtime.tensor_eager = Some(state);
+        runtime.idle_native_lanes = idle_lanes::IdleNativeLanes::new(reuse);
         Ok(runtime)
     }
 
