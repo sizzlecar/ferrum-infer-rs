@@ -4005,6 +4005,13 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         None
     }
 
+    /// Source lifetime on a static copy route. This is not allocation or reuse
+    /// authority: core overrides it for actual imports, and the source must
+    /// still prove unique ownership before modifying any bytes.
+    fn static_weight_source_retention(&self) -> crate::StaticWeightSourceRetention {
+        crate::StaticWeightSourceRetention::UnknownOrPlanRetained
+    }
+
     /// Whether managed static initialization needs TransferStaging quota.
     /// This side-effect-free query allows preparation to reserve upload credit
     /// before submitting device work. Returning false promises that managed

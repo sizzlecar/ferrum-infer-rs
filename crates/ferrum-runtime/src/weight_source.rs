@@ -534,12 +534,78 @@ impl<'source> WeightComponentPayload<'source> {
     }
 }
 
+/// Retention of original Host sources on the selected static copy route.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StaticWeightSourceRetention {
+    /// An import or backend may keep a source for the plan lifetime.
+    #[default]
+    UnknownOrPlanRetained,
+    /// The backend copies the bytes. After the corresponding terminal fence
+    /// and command owners drop, it retains no source for future execution.
+    /// Other aliases must still be checked before mutable reuse.
+    FencedCopy,
+}
+
+/// Core-validated context for one static source installation. Only core can
+/// construct it, after plan/family validation and actual import-route choice.
+pub struct StaticWeightSourceContext<'a> {
+    family: &'a crate::PreparedModelFamily,
+    plan: &'a crate::ExecutionPlan,
+    host: Option<&'a crate::HostMemoryAccount>,
+    retention: StaticWeightSourceRetention,
+}
+
+impl<'a> StaticWeightSourceContext<'a> {
+    pub(crate) fn new(
+        family: &'a crate::PreparedModelFamily,
+        plan: &'a crate::ExecutionPlan,
+        host: Option<&'a crate::HostMemoryAccount>,
+        retention: StaticWeightSourceRetention,
+    ) -> Self {
+        Self {
+            family,
+            plan,
+            host,
+            retention,
+        }
+    }
+
+    pub fn family(&self) -> &'a crate::PreparedModelFamily {
+        self.family
+    }
+
+    pub fn plan(&self) -> &'a crate::ExecutionPlan {
+        self.plan
+    }
+
+    pub fn source_retention(&self) -> StaticWeightSourceRetention {
+        self.retention
+    }
+
+    /// Exact parent and admission-scope authority; legal clones match, while
+    /// parent-only and sibling views cannot spend this installation's credit.
+    pub fn matches_host_account(&self, host: &crate::HostMemoryAccount) -> bool {
+        self.host.is_some_and(|actual| actual.same_scope_view(host))
+    }
+}
+
 /// Backend-neutral source of schema-addressed physical weight components.
 /// Implementations own checkpoint file-format discovery and source-payload
 /// validation. The execution plan's trusted [`super::WeightMaterializer`] owns
 /// any repacking or quantization before resource initialization performs
 /// placement and device submission.
 pub trait WeightComponentSource: Send + Sync {
+    /// Validate or prepare invocation-local source backing after core has
+    /// checked this exact plan and selected its native import/copy route.
+    /// This runs before initialization zero/upload/import commands. Any new
+    /// backing must use the original admitted Host view; no grant is created.
+    fn validate_static_initialization(
+        &self,
+        _context: &StaticWeightSourceContext<'_>,
+    ) -> Result<(), VNextError> {
+        Ok(())
+    }
+
     fn component<'source>(
         &'source self,
         component: &WeightComponentSpec,

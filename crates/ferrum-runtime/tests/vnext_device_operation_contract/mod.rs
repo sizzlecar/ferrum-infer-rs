@@ -1668,6 +1668,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) managed_uploads_enabled: bool,
     pub(crate) managed_static_uploads_enabled: bool,
     pub(crate) managed_static_weight_sources_enabled: bool,
+    pub(crate) static_source_retention: StaticWeightSourceRetention,
     pub(crate) readonly_mapped_static_uploads_enabled: bool,
     pub(crate) decline_readonly_mapped_upload: bool,
     pub(crate) mapped_upload_encode_calls: usize,
@@ -2371,6 +2372,10 @@ impl DeviceRuntime for TestRuntime {
             .lock()
             .unwrap()
             .managed_static_weight_sources_enabled
+    }
+
+    fn static_weight_source_retention(&self) -> StaticWeightSourceRetention {
+        self.trace.lock().unwrap().static_source_retention
     }
 
     fn supports_readonly_mapped_static_weight_sources(&self) -> bool {

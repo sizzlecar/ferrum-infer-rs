@@ -283,6 +283,15 @@ impl HostMemoryAccount {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    pub(crate) fn same_scope_view(&self, other: &Self) -> bool {
+        self.same_parent(other)
+            && match (&self.1, &other.1) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+
     pub fn usage(&self) -> Result<HostMemoryUsage, HostMemoryError> {
         let state = self.0.state.lock().map_err(|_| HostMemoryError::Poisoned)?;
         if state.fail_closed {

@@ -11,6 +11,9 @@ mod managed_weight_upload;
 #[path = "vnext_static_initialization_contract_tests/readonly_mapped_weight_upload.rs"]
 mod readonly_mapped_weight_upload;
 
+#[path = "vnext_static_initialization_contract_tests/source_preparation.rs"]
+mod source_preparation;
+
 struct ZeroWeightSource;
 
 impl WeightComponentSource for ZeroWeightSource {

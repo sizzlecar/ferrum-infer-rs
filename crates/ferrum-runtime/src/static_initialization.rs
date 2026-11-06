@@ -842,6 +842,21 @@ where
         }
         _ => None,
     };
+    if let Some((source, _)) = stored {
+        let retention = if weight_import.is_some() {
+            super::StaticWeightSourceRetention::UnknownOrPlanRetained
+        } else {
+            runtime.static_weight_source_retention()
+        };
+        source
+            .validate_static_initialization(&super::StaticWeightSourceContext::new(
+                family,
+                plan,
+                managed_host,
+                retention,
+            ))
+            .map_err(contract_failure)?;
+    }
     let import_and_staging_reserve_us = trace_elapsed_us(phase_started);
     phase_started = trace_setup.then(Instant::now);
     let created_stream = runtime.create_stream().map_err(|error| {
