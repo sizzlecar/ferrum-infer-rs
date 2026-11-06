@@ -279,7 +279,7 @@ impl CudaDeviceRuntime {
     pub fn new_tensor_eager_auto(
         config: CudaTensorRuntimeAutoConfig,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        Self::new_tensor_eager_auto_with_native_lane_reuse(config, CudaNativeLaneReuse::Off)
+        Self::new_tensor_eager_auto_with_options(config, CudaTensorRuntimeOptions::default())
     }
 
     /// Retain only fully retired native lanes within the original stream quota.
@@ -287,14 +287,41 @@ impl CudaDeviceRuntime {
         config: CudaTensorRuntimeConfig,
         reuse: CudaNativeLaneReuse,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        Self::new_tensor_eager_with_observation(config, None, reuse)
+        Self::new_tensor_eager_with_options(
+            config,
+            CudaTensorRuntimeOptions {
+                native_lane_reuse: reuse,
+                ..Default::default()
+            },
+        )
     }
 
     pub fn new_tensor_eager_auto_with_native_lane_reuse(
         config: CudaTensorRuntimeAutoConfig,
         reuse: CudaNativeLaneReuse,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        reuse.validate(config.maximum_streams)?;
+        Self::new_tensor_eager_auto_with_options(
+            config,
+            CudaTensorRuntimeOptions {
+                native_lane_reuse: reuse,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn new_tensor_eager_with_options(
+        config: CudaTensorRuntimeConfig,
+        options: CudaTensorRuntimeOptions,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_tensor_eager_with_observation(config, None, options)
+    }
+
+    pub fn new_tensor_eager_auto_with_options(
+        config: CudaTensorRuntimeAutoConfig,
+        options: CudaTensorRuntimeOptions,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        options.native_lane_reuse.validate(config.maximum_streams)?;
+        options.native_allocation_reuse.validate()?;
         let policy = AutoMemoryPolicy::new(config.utilization, config.maximum_memory_bytes)
             .map_err(CudaDeviceRuntimeError::contract)?;
         let total = query_device_total(config.device.ordinal)?;
@@ -313,7 +340,7 @@ impl CudaDeviceRuntime {
                 opaque_memory_profile: config.opaque_memory_profile,
             },
             Some((policy, total)),
-            reuse,
+            options,
         )
     }
 
@@ -326,9 +353,10 @@ impl CudaDeviceRuntime {
     fn new_tensor_eager_with_observation(
         mut config: CudaTensorRuntimeConfig,
         automatic: Option<(AutoMemoryPolicy, u64)>,
-        reuse: CudaNativeLaneReuse,
+        options: CudaTensorRuntimeOptions,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        reuse.validate(config.maximum_streams)?;
+        options.native_lane_reuse.validate(config.maximum_streams)?;
+        options.native_allocation_reuse.validate()?;
         if config.device.device_id.as_str() != format!("device.cuda.{}", config.device.ordinal) {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA tensor runtime requires the canonical physical device identity",
@@ -358,6 +386,11 @@ impl CudaDeviceRuntime {
             .and_then(|bytes| bytes.checked_add(config.bootstrap_memory_bytes))
             .ok_or_else(|| {
                 CudaDeviceRuntimeError::contract("CUDA tensor opaque budget overflows")
+            })?;
+        let overhead = overhead
+            .checked_add(options.native_allocation_reuse.maximum_idle_bytes())
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("native allocation cache allowance overflows")
             })?;
         if overhead >= config.usable_memory_bytes {
             return Err(CudaDeviceRuntimeError::contract(
@@ -400,10 +433,22 @@ impl CudaDeviceRuntime {
             hash.update((part.len() as u64).to_le_bytes());
             hash.update(part.as_bytes());
         }
-        if let CudaNativeLaneReuse::Bounded { maximum_idle_lanes } = reuse {
+        if let CudaNativeLaneReuse::Bounded { maximum_idle_lanes } = options.native_lane_reuse {
             hash.update(b"retired-native-lanes-v1");
             hash.update((maximum_idle_lanes.get() as u64).to_le_bytes());
             hash.update(include_bytes!("idle_lanes.rs"));
+        }
+        if let CudaNativeAllocationReuse::Bounded {
+            maximum_idle_bytes,
+            maximum_entry_bytes,
+            maximum_entries,
+        } = options.native_allocation_reuse
+        {
+            hash.update(b"retired-native-allocations-largest-exact-v1");
+            hash.update(maximum_idle_bytes.get().to_le_bytes());
+            hash.update(maximum_entry_bytes.get().to_le_bytes());
+            hash.update((maximum_entries.get() as u64).to_le_bytes());
+            hash.update(include_bytes!("idle_allocations.rs"));
         }
         // Allocator ownership/recovery is part of the executable runtime
         // contract, including for explicitly bounded (non-auto) construction.
@@ -441,6 +486,19 @@ impl CudaDeviceRuntime {
                 config.bootstrap_memory_bytes,
             )
             .map_err(CudaDeviceRuntimeError::capacity)?;
+        let allocation_cache_capacity = if options.native_allocation_reuse.maximum_idle_bytes() == 0
+        {
+            None
+        } else {
+            Some(
+                capacity
+                    .reserve(
+                        DeviceOpaqueMemoryKind::Bootstrap,
+                        options.native_allocation_reuse.maximum_idle_bytes(),
+                    )
+                    .map_err(CudaDeviceRuntimeError::capacity)?,
+            )
+        };
         let state = Arc::new(TensorEagerState {
             allocation_pool: None,
             capacity,
@@ -530,7 +588,12 @@ impl CudaDeviceRuntime {
         }
         let (mut runtime, state) = guard.into_parts();
         runtime.tensor_eager = Some(state);
-        runtime.idle_native_lanes = idle_lanes::IdleNativeLanes::new(reuse);
+        runtime.idle_native_lanes = idle_lanes::IdleNativeLanes::new(options.native_lane_reuse);
+        runtime.idle_native_allocations = idle_allocations::IdleAllocations::new(
+            options.native_allocation_reuse,
+            &runtime,
+            allocation_cache_capacity,
+        )?;
         Ok(runtime)
     }
 

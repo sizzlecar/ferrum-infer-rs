@@ -60,7 +60,9 @@ mod blas;
 mod compact_upload_scatter_tests;
 mod cudnn;
 mod execution_facts;
+mod idle_allocations;
 mod idle_lanes;
+pub use idle_allocations::{CudaNativeAllocationReuse, CudaTensorRuntimeOptions};
 mod input_upload_packet;
 #[cfg(test)]
 mod input_upload_packet_tests;
@@ -219,7 +221,8 @@ impl Error for CudaDeviceRuntimeError {
 }
 
 struct CudaAllocation {
-    _base: CudaSlice<u8>,
+    _base: Option<CudaSlice<u8>>,
+    idle_allocation_return: Option<idle_allocations::AllocationReturn>,
     aligned_ptr: cudarc::driver::sys::CUdeviceptr,
     requested_bytes: u64,
     _tensor_owner: Option<Arc<tensor_eager::TensorEagerState>>,
@@ -375,7 +378,11 @@ impl CudaBufferRegion {
         self.runtime_instance
     }
     pub(crate) fn context(&self) -> &Arc<CudaContext> {
-        self._allocation._base.context()
+        self._allocation
+            ._base
+            .as_ref()
+            .expect("live allocation owns native backing")
+            .context()
     }
     /// Physical offset in the retained allocation, including nested slices.
     /// This is shape/range evidence only; it does not confer Plan ownership.
@@ -1018,8 +1025,6 @@ impl CudaBindingProgramSink {
             if let Some((offsets, failure_mask)) = &node.numerical_status {
                 let mut host = unsafe {
                     node.destination
-                        ._allocation
-                        ._base
                         .context()
                         .alloc_pinned::<u32>(offsets.len())
                 }
@@ -1344,16 +1349,10 @@ impl CudaDeviceCommand {
                 "numerical status differs from its owned CUDA binding",
             ));
         }
-        let mut host = unsafe {
-            source
-                ._allocation
-                ._base
-                .context()
-                .alloc_pinned::<u32>(offsets.len())
-        }
-        .map_err(|error| {
-            CudaDeviceRuntimeError::driver("numerical status host allocation", error)
-        })?;
+        let mut host =
+            unsafe { source.context().alloc_pinned::<u32>(offsets.len()) }.map_err(|error| {
+                CudaDeviceRuntimeError::driver("numerical status host allocation", error)
+            })?;
         host.as_mut_slice()
             .map_err(|error| {
                 CudaDeviceRuntimeError::driver("numerical status initialization", error)
@@ -3362,6 +3361,7 @@ pub struct CudaDeviceRuntime {
     mxfp4_marlin_prepare: Mxfp4MarlinPrepareFunctions,
     quarantined: Mutex<Vec<QuarantinedSubmission>>,
     idle_native_lanes: Option<Arc<idle_lanes::IdleNativeLanes>>,
+    idle_native_allocations: Option<Arc<idle_allocations::IdleAllocations>>,
     tensor_eager: Option<Arc<tensor_eager::TensorEagerState>>,
 }
 
@@ -3601,6 +3601,7 @@ impl CudaDeviceRuntime {
             mxfp4_marlin_prepare,
             quarantined: Mutex::new(Vec::new()),
             idle_native_lanes: None,
+            idle_native_allocations: None,
             tensor_eager: None,
         })
     }
@@ -4853,12 +4854,22 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
         let pool_before = trace_enabled.then(|| self.allocation_pool_snapshot());
         let allocation_started = trace_enabled.then(Instant::now);
-        let base = allocation::allocate(
-            &self.context,
-            &self.allocation_stream,
-            self.tensor_allocation_pool(),
-            allocation_bytes,
-        )
+        let reused = self
+            .idle_native_allocations
+            .as_ref()
+            .map(|cache| cache.take(allocation_bytes, request.alignment_bytes()))
+            .transpose()?
+            .flatten();
+        let native_allocation_reused = reused.is_some();
+        let base = match reused {
+            Some(base) => Ok(base),
+            None => allocation::allocate(
+                &self.context,
+                &self.allocation_stream,
+                self.tensor_allocation_pool(),
+                allocation_bytes,
+            ),
+        }
         .map_err(|error| {
             tracing::error!(
                 resource_id = %request.resource_id(),
@@ -4902,6 +4913,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 alloc_us,
                 sync_us,
                 async_allocator = self.context.has_async_alloc(),
+                native_allocation_reused,
                 ?pool_before,
                 ?pool_before_sync,
                 ?pool_after_sync,
@@ -4919,7 +4931,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
             descriptor,
             runtime_instance: self.runtime_instance,
             allocation: Arc::new(CudaAllocation {
-                _base: base,
+                _base: Some(base),
+                idle_allocation_return: self.idle_native_allocations.as_ref().map(|cache| {
+                    idle_allocations::AllocationReturn {
+                        cache: Arc::downgrade(cache),
+                        alignment: request.alignment_bytes(),
+                    }
+                }),
                 aligned_ptr,
                 requested_bytes: request.size_bytes(),
                 _tensor_owner: self.tensor_eager.clone(),
@@ -6851,7 +6869,8 @@ mod tests {
         let pointer = base.device_ptr(&stream.stream).0;
         let region = CudaBufferRegion {
             _allocation: Arc::new(CudaAllocation {
-                _base: base,
+                _base: Some(base),
+                idle_allocation_return: None,
                 aligned_ptr: pointer,
                 requested_bytes: 4,
                 _tensor_owner: None,

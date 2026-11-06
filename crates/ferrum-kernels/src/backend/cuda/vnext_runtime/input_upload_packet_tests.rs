@@ -78,7 +78,8 @@ fn buffer(
         },
         runtime_instance: runtime.runtime_instance,
         allocation: Arc::new(CudaAllocation {
-            _base: base,
+            _base: Some(base),
+            idle_allocation_return: None,
             aligned_ptr: ptr,
             requested_bytes: BYTES as u64,
             _tensor_owner: None,

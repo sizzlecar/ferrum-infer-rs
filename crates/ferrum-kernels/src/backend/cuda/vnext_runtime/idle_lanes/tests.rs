@@ -231,7 +231,8 @@ fn retired_native_lane_rejects_unretired_owners_and_late_returns() {
     runtime.allocation_stream.synchronize().unwrap();
     let region = CudaBufferRegion {
         _allocation: Arc::new(CudaAllocation {
-            _base: base,
+            _base: Some(base),
+            idle_allocation_return: None,
             aligned_ptr: pointer,
             requested_bytes: 4,
             _tensor_owner: runtime.tensor_eager.clone(),

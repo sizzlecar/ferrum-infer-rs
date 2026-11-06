@@ -160,7 +160,8 @@ fn buffer(
             },
             runtime_instance: runtime.runtime_instance,
             allocation: Arc::new(CudaAllocation {
-                _base: base,
+                _base: Some(base),
+                idle_allocation_return: None,
                 aligned_ptr: pointer,
                 requested_bytes: 12,
                 _tensor_owner: runtime.tensor_eager.clone(),
@@ -248,7 +249,10 @@ fn typed_transfers_do_not_create_blas_and_first_compute_initializes_once() {
     assert!(fence._blas.is_none());
     drop(fence);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
-    let values = stream.stream.clone_dtoh(&buffer.allocation._base).unwrap();
+    let values = stream
+        .stream
+        .clone_dtoh(buffer.allocation._base.as_ref().unwrap())
+        .unwrap();
     assert_eq!(f32::from_le_bytes(values[0..4].try_into().unwrap()), 2.0);
     assert_eq!(f32::from_le_bytes(values[4..8].try_into().unwrap()), 3.0);
 
@@ -302,7 +306,10 @@ fn typed_transfers_do_not_create_blas_and_first_compute_initializes_once() {
         stream.enqueue_command(&clear_output).unwrap();
         stream.enqueue_command(&compute).unwrap();
         runtime.synchronize(&mut stream).unwrap();
-        let values = stream.stream.clone_dtoh(&buffer.allocation._base).unwrap();
+        let values = stream
+            .stream
+            .clone_dtoh(buffer.allocation._base.as_ref().unwrap())
+            .unwrap();
         assert_eq!(f32::from_le_bytes(values[8..12].try_into().unwrap()), 6.0);
     }
     drop((compute, clear_output, buffer, first, stream));
