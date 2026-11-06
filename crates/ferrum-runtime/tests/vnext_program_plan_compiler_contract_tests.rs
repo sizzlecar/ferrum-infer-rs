@@ -1225,3 +1225,158 @@ fn weight_arena_reaches_provider_alignment_fixed_point() {
         .iter()
         .all(|component| component.offset_bytes() % 64 == 0));
 }
+
+#[test]
+fn explicit_default_weight_arena_packing_preserves_the_complete_plan() {
+    let family = TestRegistry::new().prepare();
+    let catalog = catalog();
+    let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
+    let planning = registry.planning();
+    let options = compile_options();
+    assert_eq!(
+        options.weight_arena_packing(),
+        WeightArenaPacking::ByElementType
+    );
+    let old = ProgramPlanCompiler::compile(&family, &catalog, &policy(4096), &planning, &options)
+        .unwrap();
+    let explicit = ProgramPlanCompiler::compile(
+        &family,
+        &catalog,
+        &policy(4096),
+        &planning,
+        &options.with_weight_arena_packing(WeightArenaPacking::ByElementType),
+    )
+    .unwrap();
+    assert_eq!(old, explicit);
+}
+
+#[test]
+fn bounded_weight_arena_uses_original_plan_accounting_and_alignment_fixed_point() {
+    let family = TestRegistry::new().prepare();
+    let catalog = catalog();
+    let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::ArenaAlignment64);
+    let planning = registry.planning();
+    // The 16-byte tensor exceeds this target and must remain one contiguous
+    // allocation. Target bytes never override original plan admission.
+    let options = compile_options().with_weight_arena_packing(WeightArenaPacking::Bounded {
+        target_bytes: std::num::NonZeroU64::new(8).unwrap(),
+    });
+    let compilation =
+        ProgramPlanCompiler::compile(&family, &catalog, &policy(4096), &planning, &options)
+            .unwrap();
+    let plan = compilation.executable().execution_plan();
+    let weight = plan.payload().nodes()[0]
+        .values()
+        .iter()
+        .find(|v| v.usage() == BufferUsage::Weights)
+        .unwrap();
+    assert_eq!(weight.storage().components().len(), 1);
+    let location = &weight.storage().components()[0];
+    assert_eq!((location.offset_bytes(), location.length_bytes()), (0, 16));
+    assert_eq!(
+        plan.payload().nodes()[0]
+            .provider_resources()
+            .value_alignment_bytes(),
+        64
+    );
+    let allocation = plan
+        .payload()
+        .memory()
+        .static_allocations()
+        .iter()
+        .find(|a| a.resource_id() == location.resource_id())
+        .unwrap();
+    assert_eq!(allocation.size_bytes(), 64); // Original whole-resource alignment padding.
+    assert_eq!(allocation.alignment_bytes(), 64);
+    let default = ProgramPlanCompiler::compile(
+        &family,
+        &catalog,
+        &policy(4096),
+        &planning,
+        &compile_options(),
+    )
+    .unwrap();
+    assert_ne!(plan, default.executable().execution_plan());
+    assert_eq!(
+        plan.payload().memory().static_bytes(),
+        default
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory()
+            .static_bytes()
+    );
+    assert!(matches!(
+        ProgramPlanCompiler::compile(
+            &family,
+            &catalog,
+            &policy_with(63, 0, 1).unwrap(),
+            &planning,
+            &options
+        ),
+        Err(VNextError::PlanCapacityExceeded {
+            required_bytes: 96,
+            usable_capacity_bytes: 63,
+        })
+    ));
+}
+
+#[test]
+fn bounded_weight_components_reach_distinct_static_resource_permits() {
+    let original = TestRegistry::new().prepare();
+    let mut schema = original.stored_weight_schema().unwrap().clone();
+    let template = schema.components[0].clone();
+    schema.components = ["left", "right"]
+        .into_iter()
+        .map(|name| {
+            let mut component = template.clone();
+            component.id = id(format!("weight.{name}"));
+            component.external_names = vec![format!("{name}.bin")];
+            component.dimensions = vec![2];
+            component
+        })
+        .collect();
+    schema.tensors[0].physical_layout = PhysicalWeightLayout::Composite {
+        parts: schema
+            .components
+            .iter()
+            .enumerate()
+            .map(|(index, component)| CompositeWeightPart {
+                layout: Box::new(PhysicalWeightLayout::Dense {
+                    component_id: component.id.clone(),
+                }),
+                logical_offsets: vec![index as u64 * 2],
+                extents: vec![2],
+            })
+            .collect(),
+    };
+    let family = prepared_with_weight_schema(schema);
+    let catalog = catalog();
+    let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::ArenaAlignment64);
+    let planning = registry.planning();
+    let options = compile_options().with_weight_arena_packing(WeightArenaPacking::Bounded {
+        target_bytes: std::num::NonZeroU64::new(8).unwrap(),
+    });
+    let compilation =
+        ProgramPlanCompiler::compile(&family, &catalog, &policy(4096), &planning, &options)
+            .unwrap();
+    let plan = compilation.executable().execution_plan();
+    let weight = plan.payload().nodes()[0]
+        .values()
+        .iter()
+        .find(|v| v.usage() == BufferUsage::Weights)
+        .unwrap();
+    let locations = weight.storage().components();
+    assert_eq!(locations.len(), 2);
+    assert_ne!(locations[0].resource_id(), locations[1].resource_id());
+    let requests = plan.payload().memory().static_buffer_requests().unwrap();
+    for location in locations {
+        assert_eq!((location.offset_bytes(), location.length_bytes()), (0, 8));
+        let request = requests
+            .iter()
+            .find(|r| r.resource_id() == location.resource_id())
+            .unwrap();
+        assert_eq!((request.size_bytes(), request.alignment_bytes()), (64, 64));
+    }
+    assert_eq!(plan.payload().memory().static_bytes(), 160); // Two 64-byte weight resources plus the existing 32-byte persistent workspace.
+}
