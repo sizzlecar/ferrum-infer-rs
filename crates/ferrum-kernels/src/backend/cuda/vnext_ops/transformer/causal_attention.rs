@@ -4872,6 +4872,21 @@ fn launch_fallback_attention(
     builder.arg(&binding_slot_bytes);
     let token_grid = packed.map_or(launch.tokens, |packed| packed.token_grid);
     let participant_grid = packed.map_or(1, |packed| packed.participant_grid);
+    // Decode's small head grid benefits from parallel KV scans within each CTA.
+    // The kernel keeps its serial path below 256 live keys, including sliding
+    // windows. F32 partials use only CTA shared memory, with no device allocation
+    // or change to the original page-table/fence owners and captured ABI.
+    let parallel_warps =
+        if !shape.int8_kv && token_grid == 1 && matches!(shape.head_dim, 64 | 128 | 256) {
+            16
+        } else {
+            1
+        };
+    let shared_mem_bytes = if parallel_warps > 1 {
+        parallel_warps * (shape.head_dim as u32 + 2) * 4
+    } else {
+        0
+    };
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (
@@ -4881,8 +4896,8 @@ fn launch_fallback_attention(
                 })?,
                 participant_grid,
             ),
-            block_dim: (WARP_THREADS, 1, 1),
-            shared_mem_bytes: 0,
+            block_dim: (parallel_warps * WARP_THREADS, 1, 1),
+            shared_mem_bytes,
         })
     }
     .map(|_| ())

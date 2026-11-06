@@ -510,12 +510,26 @@ extern "C" __global__ void vnext_causal_attention_f16(
   const int token = blockIdx.x;
   const int packed_token = packed_token_start + token;
   const int query_head = blockIdx.y;
-  const int lane = threadIdx.x;
-  if (token >= tokens || query_head >= query_heads || lane >= VNEXT_WARP_SIZE)
+  const int lane = threadIdx.x % VNEXT_WARP_SIZE;
+  const int warp = threadIdx.x / VNEXT_WARP_SIZE;
+  if (token >= tokens || query_head >= query_heads)
     return;
 
   const int kv_head = query_head / (query_heads / kv_heads);
   const int absolute_position = position_start + token;
+  const int key_start =
+      sliding_window > 0
+          ? max(0, absolute_position - sliding_window + 1)
+          : 0;
+  // Single-token launches may use 16 warps to scan independent KV positions.
+  // Short contexts retain the original one-warp arithmetic. Each partial and
+  // the final softmax/PV merge remain F32; only the final output is F16.
+  const int warps = blockDim.x == 16 * VNEXT_WARP_SIZE &&
+                            (head_dim == 64 || head_dim == 128 || head_dim == 256) &&
+                            (long long)absolute_position - key_start + 1 >= 256
+                        ? 16
+                        : 1;
+  if (warp >= warps) return;
   float query_values[VNEXT_MAX_HEAD_CHUNKS];
   float accumulated[VNEXT_MAX_HEAD_CHUNKS];
 
@@ -534,12 +548,8 @@ extern "C" __global__ void vnext_causal_attention_f16(
 
   float running_max = -CUDART_INF_F;
   float running_sum = 0.0f;
-  const int key_start =
-      sliding_window > 0
-          ? max(0, absolute_position - sliding_window + 1)
-          : 0;
-  for (int key_position = key_start; key_position <= absolute_position;
-       ++key_position) {
+  for (long long key_position = (long long)key_start + warp;
+       key_position <= absolute_position; key_position += warps) {
     float partial_dot = 0.0f;
 #pragma unroll
     for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
@@ -577,6 +587,45 @@ extern "C" __global__ void vnext_causal_attention_f16(
       }
     }
     running_max = next_max;
+  }
+
+  if (warps > 1) {
+    // One CTA-local row per warp: [max, sum, unnormalized PV...]. The launcher
+    // reserves exactly warps * (head_dim + 2) * sizeof(float) shared bytes.
+    extern __shared__ float partials[];
+    const int stride = head_dim + 2;
+    float* partial = partials + warp * stride;
+    if (lane == 0) {
+      partial[0] = running_max;
+      partial[1] = running_sum;
+    }
+#pragma unroll
+    for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+      const int dim = lane + chunk * VNEXT_WARP_SIZE;
+      if (dim < head_dim) partial[2 + dim] = accumulated[chunk];
+    }
+    __syncthreads();
+    if (warp != 0) return;
+    running_max = -CUDART_INF_F;
+    for (int part = 0; part < warps; ++part) {
+      if (partials[part * stride + 1] != 0.0f)
+        running_max = fmaxf(running_max, partials[part * stride]);
+    }
+    running_sum = 0.0f;
+#pragma unroll
+    for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk)
+      accumulated[chunk] = 0.0f;
+    for (int part = 0; part < warps; ++part) {
+      const float* row = partials + part * stride;
+      if (row[1] == 0.0f) continue;
+      const float scale = expf(row[0] - running_max);
+      running_sum += row[1] * scale;
+#pragma unroll
+      for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+        const int dim = lane + chunk * VNEXT_WARP_SIZE;
+        if (dim < head_dim) accumulated[chunk] += row[2 + dim] * scale;
+      }
+    }
   }
 
   const float inverse_sum = 1.0f / running_sum;
