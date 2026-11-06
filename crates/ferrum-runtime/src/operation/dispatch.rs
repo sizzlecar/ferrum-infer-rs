@@ -768,6 +768,14 @@ impl OperationDispatch {
             digest.update(topology_len.to_le_bytes());
             digest.update(topology_bytes);
         }
+        // A reusable workspace binds stable storage, even on an eager-only
+        // device. It is not permission to capture a device executable. Keep
+        // all lane, claim and provider-topology validation above this boundary.
+        if !lane.descriptor().capabilities.iter().any(|capability| {
+            capability.as_str() == super::super::DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID
+        }) {
+            return Ok(None);
+        }
         Ok(Some(ReusableExecutionWaveAuthority {
             program_id: program_id.with_topology_fingerprint(
                 DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),

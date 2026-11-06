@@ -1061,6 +1061,23 @@ pub(crate) fn fixture_with_token_scaled_paged_state_and_bucket(
     )
 }
 
+pub(crate) fn fixture_with_reusable_workspace_device_capture(device_capture: bool) -> Fixture {
+    fixture_with_configured_runtime_bucket_and_device_capture(
+        // Packed token inputs use the provider's complete program-binding
+        // path, including sequence state. A fixed-sequence fixture would
+        // instead declare captured state without lane-stable address authority.
+        TestStateProfile::token_scaled_sequence(),
+        ProviderBehavior::ProgramBinding,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        false,
+        ContractVersion::new(1, 0),
+        |_| {},
+        None,
+        device_capture,
+    )
+}
+
 pub(crate) fn fixture_with_hybrid_state_and_provider_behavior(
     behavior: ProviderBehavior,
 ) -> Fixture {
@@ -1183,6 +1200,30 @@ fn fixture_with_configured_runtime_and_bucket(
     configure: impl FnOnce(&mut TestRuntime),
     bucket_override: Option<ReusableExecutionBucketSpec>,
 ) -> Fixture {
+    fixture_with_configured_runtime_bucket_and_device_capture(
+        state_profile,
+        behavior,
+        execution_semantics,
+        execution_determinism,
+        retain_determinism_outputs,
+        operation_version,
+        configure,
+        bucket_override,
+        true,
+    )
+}
+
+fn fixture_with_configured_runtime_bucket_and_device_capture(
+    state_profile: TestStateProfile,
+    behavior: ProviderBehavior,
+    execution_semantics: ProviderExecutionSemantics,
+    execution_determinism: ExecutionDeterminismRequirement,
+    retain_determinism_outputs: bool,
+    operation_version: ContractVersion,
+    configure: impl FnOnce(&mut TestRuntime),
+    bucket_override: Option<ReusableExecutionBucketSpec>,
+    device_capture: bool,
+) -> Fixture {
     let scratch = if matches!(
         behavior,
         ProviderBehavior::ProgramBindingWithScratchTail
@@ -1193,11 +1234,12 @@ fn fixture_with_configured_runtime_and_bucket(
     } else {
         ResourcePresenceRequirement::Forbidden
     };
-    let catalog = catalog_with_resource_options_execution_semantics_storage_and_operation_version(
+    let catalog = catalog_with_resource_options_execution_semantics_storage_operation_version_and_device_capture(
         state_profile,
         scratch,
         execution_semantics,
         operation_version,
+        device_capture,
     );
     let (runtime_policy, reusable_execution_bucket) = if behavior.uses_program_binding() {
         let bucket = bucket_override.unwrap_or_else(|| reusable_policy().1);

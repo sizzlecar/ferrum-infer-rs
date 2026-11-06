@@ -675,11 +675,33 @@ fn catalog_with_resource_options_execution_semantics_storage_and_operation_versi
     execution_semantics: ProviderExecutionSemantics,
     operation_version: ContractVersion,
 ) -> CapabilityCatalog {
+    catalog_with_resource_options_execution_semantics_storage_operation_version_and_device_capture(
+        state_profile,
+        scratch,
+        execution_semantics,
+        operation_version,
+        true,
+    )
+}
+
+fn catalog_with_resource_options_execution_semantics_storage_operation_version_and_device_capture(
+    state_profile: TestStateProfile,
+    scratch: ResourcePresenceRequirement,
+    execution_semantics: ProviderExecutionSemantics,
+    operation_version: ContractVersion,
+    device_capture: bool,
+) -> CapabilityCatalog {
     let mut operation = operation_with_resource_profile(state_profile, scratch);
     operation.version = operation_version;
     operation.validate().unwrap();
     let device_id: DeviceId = id("device.device-operation.0");
     let capabilities = BTreeSet::from([id("capability.compute")]);
+    // This contract runtime actually accepts and records reusable capture.
+    // Its device declaration is independent of provider compute requirements.
+    let mut device_capabilities = capabilities.clone();
+    if device_capture {
+        device_capabilities.insert(id(DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID));
+    }
     let provider = OperationProviderDescriptor::new(
         id("provider.operation.device-operation"),
         operation.id.clone(),
@@ -704,7 +726,7 @@ fn catalog_with_resource_options_execution_semantics_storage_and_operation_versi
             ordinal: 0,
             total_memory_bytes: 1 << 20,
             runtime_implementation_fingerprint: sha('d'),
-            capabilities: capabilities.clone(),
+            capabilities: device_capabilities,
             dynamic_storage_profiles: if state_profile.token_scaled_state {
                 BTreeSet::from([contiguous_storage_profile(), paged_storage_profile()])
             } else {
