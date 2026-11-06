@@ -20,20 +20,9 @@ impl<'archive> ManagedDenseArchiveInstallation<'archive> {
         host: &'archive HostMemoryAccount,
         maximum_component_bytes: NonZeroUsize,
     ) -> std::result::Result<Self, VNextError> {
-        let buffer = host
-            .allocate_zeroed(
-                HostMemoryClass::WeightBacking,
-                maximum_component_bytes.get(),
-            )
-            .map_err(|error| invalid(error.to_string()))?;
-        let full = buffer.freeze();
         Ok(Self {
             source: ManagedDenseArchiveSource::new(archive, host),
-            backing: ReusableBacking {
-                logical_bytes: maximum_component_bytes.get(),
-                physical_bytes: full.backing_bytes(),
-                state: Mutex::new(SlotState::Ready(full)),
-            },
+            backing: ReusableBacking::new(host, maximum_component_bytes)?,
         })
     }
 
@@ -90,6 +79,29 @@ pub(super) struct ReusableBacking {
 }
 
 impl ReusableBacking {
+    pub(super) fn new(
+        host: &HostMemoryAccount,
+        logical_bytes: NonZeroUsize,
+    ) -> std::result::Result<Self, VNextError> {
+        let full = host
+            .allocate_zeroed(HostMemoryClass::WeightBacking, logical_bytes.get())
+            .map_err(|error| invalid(error.to_string()))?
+            .freeze();
+        Ok(Self {
+            logical_bytes: logical_bytes.get(),
+            physical_bytes: full.backing_bytes(),
+            state: Mutex::new(SlotState::Ready(full)),
+        })
+    }
+
+    pub(super) fn logical_bytes(&self) -> usize {
+        self.logical_bytes
+    }
+
+    pub(super) fn physical_bytes(&self) -> usize {
+        self.physical_bytes
+    }
+
     fn checkout(&self, bytes: usize) -> std::result::Result<ReuseLease<'_>, VNextError> {
         if bytes == 0 || bytes > self.logical_bytes {
             return Err(invalid(

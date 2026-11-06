@@ -7,6 +7,7 @@ mod affine;
 mod bf16_simd;
 mod diagnostics;
 mod reuse;
+mod streaming;
 
 struct Tensor {
     name: &'static str,

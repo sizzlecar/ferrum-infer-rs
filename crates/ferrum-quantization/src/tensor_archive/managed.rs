@@ -8,12 +8,14 @@ use half::{bf16, f16};
 mod bf16_to_f16;
 mod diagnostics;
 mod reuse;
+mod streaming;
 pub use diagnostics::{
     Bf16ToF16BlockCounts, DenseArchiveMaterializationReport, DenseArchivePhaseTiming,
     DenseArchiveSourceTouch,
 };
 pub use reuse::ManagedDenseArchiveInstallation;
 use reuse::{BackingLease, ReusableBacking};
+pub use streaming::{ManagedDenseArchiveStreamingSlot, PreparedBf16F16Component};
 
 /// Native blocks remain borrowed and unchanged. Dense floating-point values
 /// may be rounded to the requested component type, with output reserved before
