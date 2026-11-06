@@ -4,11 +4,20 @@ use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser)]
+#[command(group(
+    clap::ArgGroup::new("source")
+        .required(true)
+        .args(["model", "image_config"])
+))]
 struct Arguments {
     #[arg(long)]
     run: bool,
+    /// Local Qwen Image directory using the existing FP8 diagnostic preset.
     #[arg(long)]
-    model: PathBuf,
+    model: Option<PathBuf>,
+    /// Explicit image configuration; preserves its architecture and numerical preset.
+    #[arg(long, value_name = "JSON")]
+    image_config: Option<PathBuf>,
     #[arg(long)]
     output: PathBuf,
     #[arg(long)]
@@ -30,10 +39,39 @@ struct Arguments {
     width: u32,
     #[arg(long, default_value_t = 1024)]
     height: u32,
-    #[arg(long, default_value_t = 0.9)]
-    gpu_memory_utilization: f32,
-    #[arg(long)]
+    /// Directory memory utilization (default: 0.9); explicit configs own their quota.
+    #[arg(long, requires = "model", conflicts_with = "image_config")]
+    gpu_memory_utilization: Option<f32>,
+    #[arg(long, requires = "model", conflicts_with = "image_config")]
     cudnn_library: Option<PathBuf>,
+}
+
+impl Arguments {
+    /// Resolve metadata only; neither source loads assets or starts a device here.
+    fn source(&self) -> Result<ferrum_cli::commands::image_product::ImageProductSource> {
+        use ferrum_cli::commands::image_product::{DirectoryOptions, ImageProductSource};
+        use ferrum_engine::image_generation::ImageCudaPrecisionPolicy;
+
+        match (&self.model, &self.image_config) {
+            (None, Some(path)) => Ok(ImageProductSource::ExplicitConfig(path.clone())),
+            (Some(path), None) => {
+                let options = DirectoryOptions::from_cli(
+                    self.gpu_memory_utilization.unwrap_or(0.9),
+                    None,
+                    self.batch.iter().copied().max(),
+                    "cuda",
+                    None,
+                    self.cudnn_library.clone(),
+                )?
+                .with_precision(ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1)?;
+                Ok(ImageProductSource::LocalDirectory {
+                    path: path.clone(),
+                    options,
+                })
+            }
+            _ => anyhow::bail!("select exactly one of --model or --image-config"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -64,19 +102,9 @@ fn main() -> Result<()> {
     anyhow::bail!("build with cuda-cutlass-fp8 and the matching locked native set");
     #[cfg(feature = "cuda-cutlass-fp8")]
     {
-        use ferrum_cli::commands::image_product::{
-            profile_image_source, DirectoryOptions, ImageProductSource, ImageProfileWorkload,
-        };
-        use ferrum_engine::image_generation::{ImageCudaPrecisionPolicy, ImageGenerationRequest};
-        let options = DirectoryOptions::from_cli(
-            args.gpu_memory_utilization,
-            None,
-            args.batch.iter().copied().max(),
-            "cuda",
-            None,
-            args.cudnn_library,
-        )?
-        .with_precision(ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1)?;
+        use ferrum_cli::commands::image_product::{profile_image_source, ImageProfileWorkload};
+        use ferrum_engine::image_generation::ImageGenerationRequest;
+        let source = args.source()?;
         let request = ImageGenerationRequest {
             prompt: args.prompt,
             width: args.width,
@@ -89,10 +117,7 @@ fn main() -> Result<()> {
             .write(true)
             .open(args.output)?;
         profile_image_source(
-            ImageProductSource::LocalDirectory {
-                path: args.model,
-                options,
-            },
+            source,
             ImageProfileWorkload {
                 request,
                 image: args.image,
@@ -107,3 +132,7 @@ fn main() -> Result<()> {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "profile_image_pipeline/tests.rs"]
+mod tests;
