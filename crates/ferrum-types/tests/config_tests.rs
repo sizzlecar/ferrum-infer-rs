@@ -570,3 +570,28 @@ fn reusable_execution_capture_scope_defaults_all_and_round_trips_decode_only() {
         serde_json::from_str::<ReusableExecutionCaptureConfig>(r#"{"scope":"unknown"}"#).is_err()
     );
 }
+
+#[test]
+fn reusable_execution_lane_cap_is_optional_and_round_trips() {
+    let default: ReusableExecutionCaptureConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(default.maximum_executables_per_lane, None);
+    assert!(serde_json::to_value(&default)
+        .unwrap()
+        .get("maximum_executables_per_lane")
+        .is_none());
+    let explicit: ReusableExecutionCaptureConfig =
+        serde_json::from_str(r#"{"preparation":"on_demand","maximum_executables_per_lane":64}"#)
+            .unwrap();
+    assert_eq!(explicit.maximum_executables_per_lane, Some(64));
+    assert_eq!(
+        serde_json::from_value::<ReusableExecutionCaptureConfig>(
+            serde_json::to_value(&explicit).unwrap()
+        )
+        .unwrap(),
+        explicit
+    );
+    assert!(serde_json::from_str::<ReusableExecutionCaptureConfig>(
+        r#"{"maximum_executables_per_lane":-1}"#,
+    )
+    .is_err());
+}

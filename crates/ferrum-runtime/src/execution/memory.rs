@@ -612,9 +612,14 @@ impl MemoryPlan {
             .map_err(|_| {
                 invalid_plan("reusable execution startup capture case count exceeds u64")
             })?;
-        let maximum_device_executables = node_count
+        let per_lane_universe = node_count
             .checked_mul(startup_capture_case_count)
-            .and_then(|count| count.checked_mul(u64::from(policy.maximum_reusable_lanes())))
+            .ok_or_else(|| invalid_plan("reusable device executable count overflows u64"))?;
+        let per_lane_executables = policy
+            .maximum_executables_per_lane()
+            .map_or(per_lane_universe, |maximum| per_lane_universe.min(maximum));
+        let maximum_device_executables = per_lane_executables
+            .checked_mul(u64::from(policy.maximum_reusable_lanes()))
             .ok_or_else(|| invalid_plan("reusable device executable count overflows u64"))?;
         let descriptors = dynamic_descriptors
             .iter()
@@ -651,6 +656,7 @@ impl MemoryPlan {
             maximum_device_executables,
             buckets,
             policy.program_policy().cloned(),
+            policy.maximum_executables_per_lane(),
         )
     }
 

@@ -294,6 +294,16 @@ fn resolve_reusable_execution_policy(
     on_demand_admission: ReusableExecutionOnDemandAdmission,
     prepare_device_programs: bool,
 ) -> Result<VNextReusableExecutionPolicyResolution> {
+    if let Some(maximum) = capture_config.maximum_executables_per_lane {
+        if maximum == 0
+            || !prepare_device_programs
+            || capture_config.preparation != ReusableExecutionPreparationMode::OnDemand
+        {
+            return Err(FerrumError::config(
+                "a per-lane executable cap requires enabled pure on-demand reusable execution",
+            ));
+        }
+    }
     let maximum_active_sequences = usize::try_from(maximum_active_sequences)
         .map_err(|_| FerrumError::config("vNext active sequence limit exceeds usize"))?;
     let maximum_scheduled_tokens = usize::try_from(maximum_scheduled_tokens)
@@ -519,6 +529,11 @@ fn resolve_reusable_execution_policy(
     policy = policy
         .with_program_policy(program_policy)
         .map_err(|error| FerrumError::config(error.to_string()))?;
+    if let Some(maximum) = capture_config.maximum_executables_per_lane {
+        policy = policy
+            .with_maximum_executables_per_lane(maximum)
+            .map_err(|error| FerrumError::config(error.to_string()))?;
+    }
     Ok(VNextReusableExecutionPolicyResolution {
         policy,
         capture: Some(VNextReusableExecutionCaptureResolution {
@@ -5048,7 +5063,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     capture_resolution,
                     config.maximum_model_tokens,
                     &config.reusable_execution_prefill_chunks,
-                    reusable_memory.maximum_device_executables(),
+                    reusable_memory
+                        .capped_device_executables_per_lane()
+                        .unwrap_or_else(|| reusable_memory.maximum_device_executables()),
                 )?)
             } else {
                 None
@@ -10228,6 +10245,51 @@ mod tests {
         assert_eq!(
             hybrid_plan.device_plan.maximum_executables(),
             plan.device_plan.maximum_executables()
+        );
+    }
+
+    #[test]
+    fn reusable_execution_lane_cap_requires_enabled_on_demand_and_reaches_policy() {
+        use ferrum_types::ReusableExecutionPreparationMode as Mode;
+        let resolve = |config: &ReusableExecutionCaptureConfig, enabled| {
+            resolve_reusable_execution_policy(
+                2,
+                64,
+                128,
+                &[],
+                config,
+                ferrum_runtime::ReusableExecutionOnDemandAdmission::AfterWarmup,
+                enabled,
+            )
+        };
+        let mut config = ReusableExecutionCaptureConfig {
+            preparation: Mode::OnDemand,
+            maximum_executables_per_lane: Some(64),
+            ..Default::default()
+        };
+        let resolved = resolve(&config, true).unwrap();
+        assert_eq!(resolved.policy.maximum_executables_per_lane(), Some(64));
+        assert_eq!(resolved.policy.maximum_reusable_lanes(), 1);
+        assert!(!resolved
+            .policy
+            .program_policy()
+            .unwrap()
+            .prepares_before_readiness());
+        assert!(resolve(&config, false).is_err());
+        for mode in [Mode::Startup, Mode::StartupAndOnDemand, Mode::Auto] {
+            config.preparation = mode;
+            assert!(resolve(&config, true).is_err());
+        }
+        config.preparation = Mode::OnDemand;
+        config.maximum_executables_per_lane = Some(0);
+        assert!(resolve(&config, true).is_err());
+        config.maximum_executables_per_lane = None;
+        assert_eq!(
+            resolve(&config, true)
+                .unwrap()
+                .policy
+                .maximum_executables_per_lane(),
+            None
         );
     }
 

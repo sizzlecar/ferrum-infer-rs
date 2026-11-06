@@ -1748,6 +1748,10 @@ pub struct ReusableExecutionCaptureConfig {
     pub scope: ReusableExecutionCaptureScope,
     /// Preparation lifecycle, resolved from declared device capabilities.
     pub preparation: ReusableExecutionPreparationMode,
+    /// Optional executable-cache ceiling for each reusable lane. Only pure
+    /// on-demand preparation may reduce the derived program universe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_executables_per_lane: Option<u64>,
     /// Exact concurrent decode widths to prepare. `None` selects automatic
     /// resolution from the admitted runtime capacity.
     pub exact_decode_widths: Option<Vec<usize>>,
@@ -1761,6 +1765,7 @@ impl Default for ReusableExecutionCaptureConfig {
         Self {
             scope: ReusableExecutionCaptureScope::All,
             preparation: ReusableExecutionPreparationMode::default(),
+            maximum_executables_per_lane: None,
             exact_decode_widths: None,
             maximum_automatic_exact_decode_width: DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH,
         }
