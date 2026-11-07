@@ -140,6 +140,15 @@ fn resident_facts_with_device(post_submit_panic: bool, capture_device: bool) {
 }
 
 fn resident_facts_with_extra(post_submit_panic: bool, capture_device: bool, extra_readback: bool) {
+    resident_facts_with_inputs(post_submit_panic, capture_device, extra_readback, false);
+}
+
+fn resident_facts_with_inputs(
+    post_submit_panic: bool,
+    capture_device: bool,
+    extra_readback: bool,
+    managed_inputs: bool,
+) {
     let bucket = ReusableExecutionBucketSpec::new(
         ReusableExecutionClassId::new("execution.resident-work-facts").unwrap(),
         ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
@@ -151,6 +160,7 @@ fn resident_facts_with_extra(post_submit_panic: bool, capture_device: bool, extr
         trace.segment_metadata_enabled = true;
         trace.segment_encoder_enabled = true;
         trace.resident_enabled = true;
+        trace.managed_uploads_enabled = managed_inputs;
         trace.segment_entry = Some(DeviceReusableExecutionEntryIdentity::new());
         if capture_device {
             trace.device_facts_templates =
@@ -271,11 +281,37 @@ fn resident_facts_with_extra(post_submit_panic: bool, capture_device: bool, extr
             .lock()
             .unwrap()
             .submission_attribution_panics = panic_now;
+        let host = super::managed_input_upload_tests::host();
+        let physical = host.backing_bytes(4).unwrap();
+        let input_scope = host
+            .reserve_scope(&[(HostMemoryClass::InputPreprocess, physical)])
+            .unwrap();
+        let uploads = if managed_inputs {
+            let bytes = super::managed_input_upload_tests::source(
+                &input_scope.account(),
+                &[start as u8; 4],
+            );
+            // This token-scaled input has four bytes per source token. The
+            // current resident row lives at source `start`, then projects into
+            // its admitted packed row. Readback-local offsets do not apply.
+            vec![SubmissionWaveInputUpload::managed_range(
+                id("node.main"),
+                0,
+                0,
+                start as u64 * 4,
+                HostTransferLayout::new(ElementType::F32, 1).unwrap(),
+                bytes,
+            )
+            .unwrap()]
+        } else {
+            vec![]
+        };
+        let uploaded_before = fixture.runtime_trace.lock().unwrap().uploaded_ranges.len();
         let submitted = OperationDispatch::encode_and_submit_resident_decode_with_inputs_and_facts(
             &program,
             &fixture.resolved,
             &identity,
-            &[],
+            &uploads,
             use_,
             &lane,
             &reaper,
@@ -283,6 +319,8 @@ fn resident_facts_with_extra(post_submit_panic: bool, capture_device: bool, extr
             capture,
             &DisabledSubmissionWaveDispatchTimingSink,
         );
+        drop(uploads);
+        input_scope.close().unwrap();
         let (handle, observation) = if panic_now {
             match submitted {
                 Err(ResidentDecodeDispatchError::PostSubmitContract {
@@ -297,6 +335,18 @@ fn resident_facts_with_extra(post_submit_panic: bool, capture_device: bool, extr
         } else {
             submitted.unwrap().into_parts()
         };
+        if managed_inputs {
+            assert_eq!(host.usage().unwrap().allocated_bytes(), physical);
+            let trace = fixture.runtime_trace.lock().unwrap();
+            let records = &trace.uploaded_ranges[uploaded_before..];
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|(managed, _, bytes)| (*managed, bytes.clone()))
+                    .collect::<Vec<_>>(),
+                vec![(true, vec![start as u8; 4])]
+            );
+        }
         assert!(!handle.receipt().has_materialized_participant_receipts());
         let preparation = identity.preparation_snapshot();
         assert_eq!(preparation.parts_materialized, 0);
@@ -457,6 +507,7 @@ fn resident_facts_with_extra(post_submit_panic: bool, capture_device: bool, extr
             .submission()
             .has_materialized_participant_receipts());
         drop(handle);
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
         retirement.try_retire_normal().unwrap();
         assert!(reservation.is_idle());
         assert_eq!(reaper.retained_count(), 0);
@@ -514,6 +565,11 @@ fn resident_facts_with_extra(post_submit_panic: bool, capture_device: bool, extr
         3,
         "facts remain readable after actual resource closure"
     );
+}
+
+#[test]
+fn managed_input_uploads_direct_resident_keep_original_slices_until_fenced() {
+    resident_facts_with_inputs(false, false, false, true);
 }
 
 #[test]

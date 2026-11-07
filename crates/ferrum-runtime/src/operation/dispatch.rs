@@ -3035,8 +3035,12 @@ where
         let mut validated_cursor = 0_usize;
         while validated_cursor < validated.len() {
             let mut contiguous_end = validated_cursor + 1;
-            if participant_packed {
+            // Only legacy bytes may use the legacy Vec aggregate. A managed
+            // slice retains its original accounted backing independently, even
+            // when adjacent legacy or managed slices share a packed allocation.
+            if participant_packed && validated[validated_cursor].upload.managed_bytes().is_none() {
                 while contiguous_end < validated.len()
+                    && validated[contiguous_end].upload.managed_bytes().is_none()
                     && validated[contiguous_end - 1].destination.end
                         == validated[contiguous_end].destination.start
                 {
@@ -3052,11 +3056,6 @@ where
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
             if let Some(managed) = first.upload.managed_bytes() {
-                if contiguous_end != validated_cursor + 1 {
-                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "managed tensor input aggregation requires an explicit accounted backing",
-                    )));
-                }
                 encode_submission_wave_managed_backing_upload(
                     runtime,
                     &first.identity,
