@@ -72,6 +72,8 @@ fn real_files_preserve_reference_dtype_payload_hash_and_combined_limit() {
                 shape: vec![2, 2],
             },
             group_axis: None,
+            left_axis0_range: None,
+            reference_axis0_range: None,
             reference,
             tensor: "features".into(),
             maximum_input_bytes: left.len() + file.len(),
@@ -205,6 +207,8 @@ fn two_safetensors_select_distinct_names_and_group_original_coordinates() {
         tensor: "hidden_states".into(),
         maximum_input_bytes: left_file.len() + right_file.len(),
         group_axis: Some(1),
+        left_axis0_range: None,
+        reference_axis0_range: None,
     };
     let result = run(&args).unwrap();
     assert_eq!(result["left"]["tensor"], "connector_input");
@@ -326,6 +330,8 @@ fn half_safetensors_keep_each_dtype_and_group_stride_without_changing_metrics() 
                 tensor: "left".into(),
             },
             group_axis: Some(1),
+            left_axis0_range: None,
+            reference_axis0_range: None,
             reference: reference_path.clone(),
             tensor: "right".into(),
             maximum_input_bytes: left_file.len() + reference_file.len(),
@@ -407,4 +413,190 @@ fn safetensors_left_cli_requires_its_own_name_and_rejects_raw_shape_combinations
     let mut empty = base;
     empty[3] = "";
     assert!(Arguments::parse(empty.map(OsString::from)).is_err());
+}
+
+#[test]
+fn axis0_ranges_compare_actual_bf16_prefix_and_f32_tail_without_copy_or_reshape() {
+    let root = tempfile::tempdir().unwrap();
+    let left_path = root.path().join("left.safetensors");
+    let reference_path = root.path().join("reference.safetensors");
+    let left: Vec<u8> = [91.0_f32, 92.0, 1.0, 2.0, 3.0, 4.0, 31.0, 32.0]
+        .iter()
+        .flat_map(|v| bf16::from_f32(*v).to_bits().to_le_bytes())
+        .collect();
+    let reference = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 101.0, 102.0, 111.0, 112.0]);
+    serialize_to_file(
+        [(
+            "native",
+            TensorView::new(Dtype::BF16, vec![4, 1, 2], &left).unwrap(),
+        )],
+        &None,
+        &left_path,
+    )
+    .unwrap();
+    serialize_to_file(
+        [(
+            "official",
+            TensorView::new(Dtype::F32, vec![4, 1, 2], &reference).unwrap(),
+        )],
+        &None,
+        &reference_path,
+    )
+    .unwrap();
+    let budget = std::fs::metadata(&left_path).unwrap().len() as usize
+        + std::fs::metadata(&reference_path).unwrap().len() as usize;
+    let mut args = Arguments {
+        left: LeftInput::Safetensors {
+            path: left_path,
+            tensor: "native".into(),
+        },
+        reference: reference_path,
+        tensor: "official".into(),
+        maximum_input_bytes: budget,
+        group_axis: Some(0),
+        left_axis0_range: None,
+        reference_axis0_range: None,
+    };
+    let full = run(&args).unwrap();
+    assert_eq!(full["metrics"]["max_abs"], 98.0);
+    assert!(full.get("coordinate_space").is_none());
+    assert!(full["left"].get("original_shape").is_none());
+    assert_eq!(full["left"]["payload_sha256"], sha256(&left));
+    args.left_axis0_range = Some(Axis0Range { start: 1, end: 3 });
+    args.reference_axis0_range = Some(Axis0Range { start: 0, end: 2 });
+    let selected = run(&args).unwrap();
+    assert_eq!(selected["metrics"]["max_abs"], 0.0);
+    assert_eq!(selected["metrics"]["rmse"], 0.0);
+    assert_eq!(
+        selected["left"]["original_shape"],
+        serde_json::json!([4, 1, 2])
+    );
+    assert_eq!(
+        selected["left"]["selected_shape"],
+        serde_json::json!([2, 1, 2])
+    );
+    assert_eq!(
+        selected["reference"]["selected_shape"],
+        serde_json::json!([2, 1, 2])
+    );
+    assert_eq!(
+        selected["left"]["axis0_range"],
+        serde_json::json!({"start":1,"end":3})
+    );
+    assert_eq!(
+        selected["reference"]["axis0_range"],
+        serde_json::json!({"start":0,"end":2})
+    );
+    assert_eq!(
+        selected["left"]["selected_payload_sha256"],
+        sha256(&left[4..12])
+    );
+    assert_eq!(
+        selected["reference"]["selected_payload_sha256"],
+        sha256(&reference[..16])
+    );
+    assert_eq!(
+        selected["left"]["payload_sha256"],
+        full["left"]["payload_sha256"]
+    );
+    assert_eq!(selected["left"]["file_bytes"], full["left"]["file_bytes"]);
+    assert_eq!(selected["groups"].as_array().unwrap().len(), 2);
+    let (borrowed, shape) =
+        select_axis0(&left, Dtype::BF16, &[4, 1, 2], args.left_axis0_range).unwrap();
+    assert_eq!(borrowed.as_ptr(), left[4..].as_ptr());
+    assert_eq!(shape, [2, 1, 2]);
+    args.reference_axis0_range = Some(Axis0Range { start: 2, end: 4 });
+    let tail = run(&args).unwrap();
+    assert_eq!(tail["metrics"]["max_abs"], 108.0);
+    assert_eq!(
+        tail["metrics"]["worst"]["coordinate"],
+        serde_json::json!([1, 0, 0])
+    );
+    assert_eq!(tail["metrics"]["worst"]["flat_index"], 2);
+    args.maximum_input_bytes -= 1;
+    assert!(
+        run(&args).is_err(),
+        "selection must not evade complete-file budget"
+    );
+    args.maximum_input_bytes += 1;
+    let raw = root.path().join("small.raw");
+    std::fs::write(&raw, f32_bytes(&[1.0, 2.0, 3.0, 4.0])).unwrap();
+    args.left = LeftInput::Raw {
+        path: raw,
+        shape: vec![2, 1, 2],
+    };
+    args.left_axis0_range = None;
+    args.reference_axis0_range = Some(Axis0Range { start: 0, end: 2 });
+    let independent = run(&args).unwrap();
+    assert_eq!(independent["metrics"]["max_abs"], 0.0);
+    assert!(independent["left"]["axis0_range"].is_null());
+    assert_eq!(
+        independent["left"]["selected_shape"],
+        serde_json::json!([2, 1, 2])
+    );
+}
+
+#[test]
+fn axis0_ranges_reject_empty_reversed_overflowing_and_out_of_bounds_intervals() {
+    let payload = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
+    for range in [
+        Axis0Range { start: 0, end: 0 },
+        Axis0Range { start: 2, end: 1 },
+        Axis0Range { start: 0, end: 3 },
+        Axis0Range {
+            start: usize::MAX - 1,
+            end: usize::MAX,
+        },
+    ] {
+        assert!(select_axis0(&payload, Dtype::F32, &[2, 2], Some(range)).is_err());
+    }
+    assert!(select_axis0(&payload, Dtype::F32, &[usize::MAX, 2], None).is_err());
+    assert!(select_axis0(&payload[..15], Dtype::F32, &[2, 2], None).is_err());
+    let base = [
+        "--left-raw",
+        "native.raw",
+        "--left-shape",
+        "2,2",
+        "--reference-safetensors",
+        "ref.safetensors",
+        "--tensor",
+        "ref",
+        "--maximum-input-bytes",
+        "4096",
+    ];
+    for value in [
+        "",
+        "0",
+        "0:",
+        ":1",
+        "1:1",
+        "2:1",
+        "-1:2",
+        "+0:2",
+        "0:1.5",
+        "0:1:2",
+        "0:184467440737095516160",
+    ] {
+        for flag in ["--left-axis0-range", "--reference-axis0-range"] {
+            assert!(
+                Arguments::parse(base.into_iter().chain([flag, value]).map(OsString::from))
+                    .is_err()
+            );
+        }
+    }
+    let args = Arguments::parse(
+        base.into_iter()
+            .chain(["--left-axis0-range", "0:1"])
+            .map(OsString::from),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(args.left_axis0_range, Some(Axis0Range { start: 0, end: 1 }));
+    assert_eq!(args.reference_axis0_range, None);
+    assert!(Arguments::parse(
+        base.into_iter()
+            .chain(["--left-axis0-range", "0:1", "--left-axis0-range", "0:2"])
+            .map(OsString::from)
+    )
+    .is_err());
 }

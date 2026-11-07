@@ -14,7 +14,36 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const USAGE: &str = "compare_tensor_payloads (--left-raw F32_LE_FILE --left-shape D0,D1,... | --left-safetensors FILE --left-tensor NAME) --reference-safetensors FILE --tensor NAME --maximum-input-bytes TOTAL_BYTES [--group-axis AXIS]\nSafetensors on either side supports F32, F16 or BF16; raw left remains F32. The byte limit covers both complete input files combined. Shapes must match exactly. Zero reference norm makes relative_l2 null; either zero norm makes cosine null. No quality threshold is applied.";
+const USAGE: &str = "compare_tensor_payloads (--left-raw F32_LE_FILE --left-shape D0,D1,... | --left-safetensors FILE --left-tensor NAME) --reference-safetensors FILE --tensor NAME --maximum-input-bytes TOTAL_BYTES [--group-axis AXIS] [--left-axis0-range START:END] [--reference-axis0-range START:END]\nSafetensors on either side supports F32, F16 or BF16; raw left remains F32. The byte limit covers both complete input files combined, including unselected rows. Optional nonempty half-open axis-0 ranges are independent and preserve rank. Selected shapes must match exactly; reported coordinates/group indices are relative to the selected tensors. Zero reference norm makes relative_l2 null; either zero norm makes cosine null. No quality threshold is applied.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct Axis0Range {
+    start: usize,
+    end: usize,
+}
+impl Axis0Range {
+    fn parse(value: &str) -> Result<Self> {
+        let (start, end) = value
+            .split_once(':')
+            .context("axis-0 range requires START:END")?;
+        ensure!(
+            !start.is_empty()
+                && !end.is_empty()
+                && start.bytes().all(|v| v.is_ascii_digit())
+                && end.bytes().all(|v| v.is_ascii_digit()),
+            "axis-0 range endpoints require unsigned decimal integers"
+        );
+        let result = Self {
+            start: start.parse()?,
+            end: end.parse()?,
+        };
+        ensure!(
+            result.start < result.end,
+            "axis-0 range must be nonempty and increasing"
+        );
+        Ok(result)
+    }
+}
 
 enum LeftInput {
     Raw { path: PathBuf, shape: Vec<usize> },
@@ -30,6 +59,8 @@ impl LeftInput {
 struct Arguments {
     left: LeftInput,
     group_axis: Option<usize>,
+    left_axis0_range: Option<Axis0Range>,
+    reference_axis0_range: Option<Axis0Range>,
     reference: PathBuf,
     tensor: String,
     maximum_input_bytes: usize,
@@ -56,6 +87,8 @@ impl Arguments {
                         | "--left-safetensors"
                         | "--left-tensor"
                         | "--group-axis"
+                        | "--left-axis0-range"
+                        | "--reference-axis0-range"
                         | "--reference-safetensors"
                         | "--tensor"
                         | "--maximum-input-bytes"
@@ -75,6 +108,8 @@ impl Arguments {
         let safe = values.remove("--left-safetensors");
         let left_tensor = values.remove("--left-tensor");
         let group = values.remove("--group-axis");
+        let left_range = values.remove("--left-axis0-range");
+        let reference_range = values.remove("--reference-axis0-range");
         let mut take = |name: &str| {
             values
                 .remove(name)
@@ -102,6 +137,9 @@ impl Arguments {
         let group_axis = group
             .map(|value| -> Result<usize> { Ok(text(value)?.parse()?) })
             .transpose()?;
+        let parse_range = |value: OsString| Axis0Range::parse(&text(value)?);
+        let left_axis0_range = left_range.map(parse_range).transpose()?;
+        let reference_axis0_range = reference_range.map(parse_range).transpose()?;
         let tensor = text(take("--tensor")?)?;
         ensure!(!tensor.is_empty(), "tensor name must not be empty");
         let maximum_input_bytes = text(take("--maximum-input-bytes")?)?.parse::<usize>()?;
@@ -120,6 +158,8 @@ impl Arguments {
         Ok(Some(Self {
             left,
             group_axis,
+            left_axis0_range,
+            reference_axis0_range,
             reference,
             tensor,
             maximum_input_bytes,
@@ -209,6 +249,54 @@ fn dtype_width(dtype: Dtype) -> Result<usize> {
         Dtype::F16 | Dtype::BF16 => Ok(2),
         other => bail!("unsupported tensor dtype {other:?}; expected F32, F16 or BF16"),
     }
+}
+
+/// Axis 0 is contiguous in the captured tensor; this only borrows its byte
+/// interval. Full-file bounds have already been enforced before selection.
+fn select_axis0<'a>(
+    payload: &'a [u8],
+    dtype: Dtype,
+    shape: &[usize],
+    range: Option<Axis0Range>,
+) -> Result<(&'a [u8], Vec<usize>)> {
+    let count = elements(shape)?;
+    let width = dtype_width(dtype)?;
+    ensure!(
+        count.checked_mul(width) == Some(payload.len()),
+        "original payload extent differs from its exact shape"
+    );
+    let mut selected_shape = shape.to_vec();
+    let Some(range) = range else {
+        return Ok((payload, selected_shape));
+    };
+    ensure!(
+        range.start < range.end && range.end <= shape[0],
+        "axis-0 range {}:{} exceeds original extent {} or is empty/reversed",
+        range.start,
+        range.end,
+        shape[0]
+    );
+    let row_bytes = (count / shape[0])
+        .checked_mul(width)
+        .context("axis-0 row extent overflows")?;
+    let start = range
+        .start
+        .checked_mul(row_bytes)
+        .context("axis-0 start offset overflows")?;
+    let end = range
+        .end
+        .checked_mul(row_bytes)
+        .context("axis-0 end offset overflows")?;
+    selected_shape[0] = range
+        .end
+        .checked_sub(range.start)
+        .context("axis-0 selected extent underflows")?;
+    Ok((
+        payload
+            .get(start..end)
+            .context("axis-0 interval exceeds payload")?,
+        selected_shape,
+    ))
 }
 
 fn scalar(bytes: &[u8], dtype: Dtype) -> f64 {
@@ -358,7 +446,7 @@ fn run(args: &Arguments) -> Result<serde_json::Value> {
         }
         _ => None,
     };
-    let (payload, shape, encoding, left_dtype) = match (&args.left, &left_tensor) {
+    let (payload, original_shape, encoding, left_dtype) = match (&args.left, &left_tensor) {
         (LeftInput::Raw { shape, .. }, None) => {
             (left.as_slice(), shape.as_slice(), "raw_f32_le", Dtype::F32)
         }
@@ -367,12 +455,23 @@ fn run(args: &Arguments) -> Result<serde_json::Value> {
         }
         _ => unreachable!("left source and borrowed tensor agree"),
     };
+    let (selected_payload, shape) =
+        select_axis0(payload, left_dtype, original_shape, args.left_axis0_range)
+            .context("select left axis-0 range")?;
+    let (reference_payload, reference_shape) = select_axis0(
+        tensor.data(),
+        tensor.dtype(),
+        tensor.shape(),
+        args.reference_axis0_range,
+    )
+    .context("select reference axis-0 range")?;
     ensure!(
-        tensor.shape() == shape,
+        reference_shape == shape,
         "shape mismatch: left {:?}, reference {:?}; reshape/squeeze is not permitted",
         shape,
-        tensor.shape()
+        reference_shape
     );
+    let shape = shape.as_slice();
     let count = elements(shape)?;
     if let Some(axis) = args.group_axis {
         ensure!(
@@ -381,7 +480,13 @@ fn run(args: &Arguments) -> Result<serde_json::Value> {
             shape.len()
         );
     }
-    let metrics = compare(payload, tensor.data(), left_dtype, tensor.dtype(), shape)?;
+    let metrics = compare(
+        selected_payload,
+        reference_payload,
+        left_dtype,
+        tensor.dtype(),
+        shape,
+    )?;
     let mut left_metadata = serde_json::json!({
         "path":left_path, "encoding":encoding, "dtype":format!("{left_dtype:?}"), "shape":shape,
         "elements":count, "file_bytes":left.len(), "payload_bytes":payload.len(),
@@ -395,11 +500,34 @@ fn run(args: &Arguments) -> Result<serde_json::Value> {
         "normalization":"reference_l2",
         "left":left_metadata,
         "reference":{"path":reference_path, "encoding":"safetensors", "tensor":args.tensor,
-            "dtype":format!("{:?}",tensor.dtype()), "shape":tensor.shape(), "elements":count,
+            "dtype":format!("{:?}",tensor.dtype()), "shape":reference_shape, "elements":count,
             "file_bytes":reference.len(), "payload_bytes":tensor.data().len(),
             "file_sha256":sha256(&reference), "payload_sha256":sha256(tensor.data())},
         "metrics":metrics,
     });
+    if args.left_axis0_range.is_some() || args.reference_axis0_range.is_some() {
+        report["coordinate_space"] = serde_json::json!("worst coordinates and group indices are relative to the selected tensors; add each side's axis0_range.start (or 0 for null) to recover its original first-axis coordinate");
+        for (side, original, range, selected) in [
+            (
+                "left",
+                original_shape,
+                args.left_axis0_range,
+                selected_payload,
+            ),
+            (
+                "reference",
+                tensor.shape(),
+                args.reference_axis0_range,
+                reference_payload,
+            ),
+        ] {
+            report[side]["original_shape"] = serde_json::json!(original);
+            report[side]["axis0_range"] = serde_json::json!(range);
+            report[side]["selected_shape"] = serde_json::json!(shape);
+            report[side]["selected_payload_bytes"] = serde_json::json!(selected.len());
+            report[side]["selected_payload_sha256"] = serde_json::json!(sha256(selected));
+        }
+    }
     if let Some(axis) = args.group_axis {
         let groups = shape[axis];
         // All products are subsets of the already checked positive full shape.
@@ -412,8 +540,8 @@ fn run(args: &Arguments) -> Result<serde_json::Value> {
                 start..start + stride
             });
             let metrics = compare_indices(
-                payload,
-                tensor.data(),
+                selected_payload,
+                reference_payload,
                 left_dtype,
                 tensor.dtype(),
                 shape,
