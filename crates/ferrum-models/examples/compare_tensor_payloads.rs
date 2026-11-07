@@ -1,5 +1,6 @@
-//! Bounded, untransformed comparison of a native F32 capture (raw or
-//! safetensors) and one reference safetensors tensor. Metrics are observations, never a quality acceptance gate.
+//! Bounded, untransformed comparison of a raw F32 or floating safetensors
+//! capture and one reference safetensors tensor. Metrics are observations,
+//! never a quality acceptance gate.
 use anyhow::{bail, ensure, Context, Result};
 use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors};
@@ -13,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const USAGE: &str = "compare_tensor_payloads (--left-raw F32_LE_FILE --left-shape D0,D1,... | --left-safetensors FILE --left-tensor NAME) --reference-safetensors FILE --tensor NAME --maximum-input-bytes TOTAL_BYTES [--group-axis AXIS]\nThe byte limit covers both complete input files combined. Shapes must match exactly. Zero reference norm makes relative_l2 null; either zero norm makes cosine null. No quality threshold is applied.";
+const USAGE: &str = "compare_tensor_payloads (--left-raw F32_LE_FILE --left-shape D0,D1,... | --left-safetensors FILE --left-tensor NAME) --reference-safetensors FILE --tensor NAME --maximum-input-bytes TOTAL_BYTES [--group-axis AXIS]\nSafetensors on either side supports F32, F16 or BF16; raw left remains F32. The byte limit covers both complete input files combined. Shapes must match exactly. Zero reference norm makes relative_l2 null; either zero norm makes cosine null. No quality threshold is applied.";
 
 enum LeftInput {
     Raw { path: PathBuf, shape: Vec<usize> },
@@ -202,31 +203,59 @@ struct Metrics {
     worst: WorstDifference,
 }
 
-fn compare(left: &[u8], reference: &[u8], dtype: Dtype, shape: &[usize]) -> Result<Metrics> {
+fn dtype_width(dtype: Dtype) -> Result<usize> {
+    match dtype {
+        Dtype::F32 => Ok(4),
+        Dtype::F16 | Dtype::BF16 => Ok(2),
+        other => bail!("unsupported tensor dtype {other:?}; expected F32, F16 or BF16"),
+    }
+}
+
+fn scalar(bytes: &[u8], dtype: Dtype) -> f64 {
+    f64::from(match dtype {
+        Dtype::F32 => f32::from_le_bytes(bytes.try_into().unwrap()),
+        Dtype::F16 => f16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap())).to_f32(),
+        Dtype::BF16 => bf16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap())).to_f32(),
+        _ => unreachable!("dtype and exact element width were checked"),
+    })
+}
+
+fn compare(
+    left: &[u8],
+    reference: &[u8],
+    left_dtype: Dtype,
+    reference_dtype: Dtype,
+    shape: &[usize],
+) -> Result<Metrics> {
     let count = elements(shape)?;
-    compare_indices(left, reference, dtype, shape, 0..count)
+    compare_indices(
+        left,
+        reference,
+        left_dtype,
+        reference_dtype,
+        shape,
+        0..count,
+    )
 }
 
 fn compare_indices(
     left: &[u8],
     reference: &[u8],
-    dtype: Dtype,
+    left_dtype: Dtype,
+    reference_dtype: Dtype,
     shape: &[usize],
     indices: impl Iterator<Item = usize>,
 ) -> Result<Metrics> {
     let count = elements(shape)?;
-    let width = match dtype {
-        Dtype::F32 => 4,
-        Dtype::F16 | Dtype::BF16 => 2,
-        other => bail!("unsupported reference dtype {other:?}; expected F32, F16 or BF16"),
-    };
+    let left_width = dtype_width(left_dtype)?;
+    let reference_width = dtype_width(reference_dtype)?;
     ensure!(
-        left.len() % 4 == 0 && reference.len() % width == 0,
+        left.len() % left_width == 0 && reference.len() % reference_width == 0,
         "payload length is not divisible by its dtype width"
     );
     ensure!(
-        count.checked_mul(4) == Some(left.len())
-            && count.checked_mul(width) == Some(reference.len()),
+        count.checked_mul(left_width) == Some(left.len())
+            && count.checked_mul(reference_width) == Some(reference.len()),
         "payload lengths do not match the exact declared shape"
     );
     let (mut squared_error, mut left_squared, mut reference_squared, mut dot) =
@@ -244,16 +273,11 @@ fn compare_indices(
             index < count,
             "comparison index is outside the declared shape"
         );
-        let a = &left[index * 4..(index + 1) * 4];
-        let b = &reference[index * width..(index + 1) * width];
+        let a = &left[index * left_width..(index + 1) * left_width];
+        let b = &reference[index * reference_width..(index + 1) * reference_width];
         compared += 1;
-        let a = f64::from(f32::from_le_bytes(a.try_into().unwrap()));
-        let b = f64::from(match dtype {
-            Dtype::F32 => f32::from_le_bytes(b.try_into().unwrap()),
-            Dtype::F16 => f16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f32(),
-            Dtype::BF16 => bf16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f32(),
-            _ => unreachable!(),
-        });
+        let a = scalar(a, left_dtype);
+        let b = scalar(b, reference_dtype);
         ensure!(
             a.is_finite() && b.is_finite(),
             "non-finite value at index {index}, coordinate {:?}: left={a}, reference={b}",
@@ -329,18 +353,17 @@ fn run(args: &Arguments) -> Result<serde_json::Value> {
     let left_tensor = match (&args.left, &left_archive) {
         (LeftInput::Safetensors { tensor, .. }, Some(archive)) => {
             let tensor = archive.tensor(tensor).context("select exact left tensor")?;
-            ensure!(
-                tensor.dtype() == Dtype::F32,
-                "left safetensors tensor must be native F32"
-            );
+            dtype_width(tensor.dtype()).context("left safetensors dtype")?;
             Some(tensor)
         }
         _ => None,
     };
-    let (payload, shape, encoding) = match (&args.left, &left_tensor) {
-        (LeftInput::Raw { shape, .. }, None) => (left.as_slice(), shape.as_slice(), "raw_f32_le"),
+    let (payload, shape, encoding, left_dtype) = match (&args.left, &left_tensor) {
+        (LeftInput::Raw { shape, .. }, None) => {
+            (left.as_slice(), shape.as_slice(), "raw_f32_le", Dtype::F32)
+        }
         (LeftInput::Safetensors { .. }, Some(tensor)) => {
-            (tensor.data(), tensor.shape(), "safetensors")
+            (tensor.data(), tensor.shape(), "safetensors", tensor.dtype())
         }
         _ => unreachable!("left source and borrowed tensor agree"),
     };
@@ -358,9 +381,9 @@ fn run(args: &Arguments) -> Result<serde_json::Value> {
             shape.len()
         );
     }
-    let metrics = compare(payload, tensor.data(), tensor.dtype(), shape)?;
+    let metrics = compare(payload, tensor.data(), left_dtype, tensor.dtype(), shape)?;
     let mut left_metadata = serde_json::json!({
-        "path":left_path, "encoding":encoding, "dtype":"F32", "shape":shape,
+        "path":left_path, "encoding":encoding, "dtype":format!("{left_dtype:?}"), "shape":shape,
         "elements":count, "file_bytes":left.len(), "payload_bytes":payload.len(),
         "file_sha256":sha256(&left), "payload_sha256":sha256(payload),
     });
@@ -369,6 +392,7 @@ fn run(args: &Arguments) -> Result<serde_json::Value> {
     }
     let mut report = serde_json::json!({
         "schema_version":1, "maximum_input_bytes":args.maximum_input_bytes,
+        "normalization":"reference_l2",
         "left":left_metadata,
         "reference":{"path":reference_path, "encoding":"safetensors", "tensor":args.tensor,
             "dtype":format!("{:?}",tensor.dtype()), "shape":tensor.shape(), "elements":count,
@@ -387,7 +411,14 @@ fn run(args: &Arguments) -> Result<serde_json::Value> {
                 let start = (outer * groups + group) * stride;
                 start..start + stride
             });
-            let metrics = compare_indices(payload, tensor.data(), tensor.dtype(), shape, indices)?;
+            let metrics = compare_indices(
+                payload,
+                tensor.data(),
+                left_dtype,
+                tensor.dtype(),
+                shape,
+                indices,
+            )?;
             grouped.push(
                 serde_json::json!({"index":group, "elements":count/groups, "metrics":metrics}),
             );

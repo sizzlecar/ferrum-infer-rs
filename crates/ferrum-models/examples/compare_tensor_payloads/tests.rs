@@ -9,7 +9,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 fn metrics_use_reference_norm_and_report_exact_worst_coordinate() {
     let left = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
     let reference = f32_bytes(&[1.0, 2.0, 3.0, 3.0]);
-    let m = compare(&left, &reference, Dtype::F32, &[2, 2]).unwrap();
+    let m = compare(&left, &reference, Dtype::F32, Dtype::F32, &[2, 2]).unwrap();
     assert!(m.finite);
     assert_eq!(m.max_abs, 1.0);
     assert_eq!(m.rmse, 0.5);
@@ -20,11 +20,18 @@ fn metrics_use_reference_norm_and_report_exact_worst_coordinate() {
     assert_eq!(m.worst.left, 4.0);
     assert_eq!(m.worst.reference, 3.0);
     let zeros = f32_bytes(&[0.0, -0.0]);
-    let m = compare(&zeros, &zeros, Dtype::F32, &[2]).unwrap();
+    let m = compare(&zeros, &zeros, Dtype::F32, Dtype::F32, &[2]).unwrap();
     assert_eq!(m.max_abs, 0.0);
     assert_eq!(m.rmse, 0.0);
     assert!(m.relative_l2.is_none() && m.cosine.is_none());
-    let m = compare(&f32_bytes(&[1.0, 0.0]), &zeros, Dtype::F32, &[2]).unwrap();
+    let m = compare(
+        &f32_bytes(&[1.0, 0.0]),
+        &zeros,
+        Dtype::F32,
+        Dtype::F32,
+        &[2],
+    )
+    .unwrap();
     assert!(m.relative_l2.is_none() && m.cosine.is_none());
 }
 
@@ -108,18 +115,24 @@ fn invalid_lengths_shapes_dtypes_and_nonfinite_values_are_rejected() {
     assert!(elements(&[2, 0]).is_err());
     assert!(elements(&[usize::MAX, 2]).is_err());
     let finite = f32_bytes(&[1.0]);
-    assert!(compare(&finite[..3], &finite, Dtype::F32, &[1]).is_err());
-    assert!(compare(&finite, &[0], Dtype::F16, &[1]).is_err());
-    assert!(compare(&finite, &finite, Dtype::F32, &[2]).is_err());
-    assert!(compare(&finite, &[0], Dtype::U8, &[1]).is_err());
+    assert!(compare(&finite[..3], &finite, Dtype::F32, Dtype::F32, &[1]).is_err());
+    assert!(compare(&finite, &[0], Dtype::F32, Dtype::F16, &[1]).is_err());
+    assert!(compare(&finite, &finite, Dtype::F32, Dtype::F32, &[2]).is_err());
+    assert!(compare(&finite, &[0], Dtype::F32, Dtype::U8, &[1]).is_err());
+    assert!(compare(&[0], &finite, Dtype::U8, Dtype::F32, &[1]).is_err());
+    for dtype in [Dtype::BF16, Dtype::F16] {
+        assert!(compare(&[0], &finite, dtype, Dtype::F32, &[1]).is_err());
+        assert!(compare(&[0; 2], &finite, dtype, Dtype::F32, &[2]).is_err());
+    }
     for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        assert!(compare(&f32_bytes(&[value]), &finite, Dtype::F32, &[1]).is_err());
-        assert!(compare(&finite, &f32_bytes(&[value]), Dtype::F32, &[1]).is_err());
+        assert!(compare(&f32_bytes(&[value]), &finite, Dtype::F32, Dtype::F32, &[1]).is_err());
+        assert!(compare(&finite, &f32_bytes(&[value]), Dtype::F32, Dtype::F32, &[1]).is_err());
         for (dtype, bits) in [
             (Dtype::F16, f16::from_f32(value).to_bits()),
             (Dtype::BF16, bf16::from_f32(value).to_bits()),
         ] {
-            assert!(compare(&finite, &bits.to_le_bytes(), dtype, &[1]).is_err());
+            assert!(compare(&finite, &bits.to_le_bytes(), Dtype::F32, dtype, &[1]).is_err());
+            assert!(compare(&bits.to_le_bytes(), &finite, dtype, Dtype::F32, &[1]).is_err());
         }
     }
 }
@@ -252,13 +265,107 @@ fn two_safetensors_select_distinct_names_and_group_original_coordinates() {
     serialize_to_file(
         [(
             "connector_input",
-            TensorView::new(Dtype::F16, vec![2, 3, 2], &half).unwrap(),
+            TensorView::new(Dtype::U16, vec![2, 3, 2], &half).unwrap(),
         )],
         &None,
         &left_path,
     )
     .unwrap();
-    assert!(run(&args).unwrap_err().to_string().contains("native F32"));
+    assert!(format!("{:#}", run(&args).unwrap_err()).contains("unsupported tensor dtype U16"));
+}
+
+#[test]
+fn half_safetensors_keep_each_dtype_and_group_stride_without_changing_metrics() {
+    let root = tempfile::tempdir().unwrap();
+    let left_path = root.path().join("left.safetensors");
+    let reference_path = root.path().join("reference.safetensors");
+    let encode = |values: &[f32], dtype| -> Vec<u8> {
+        match dtype {
+            Dtype::F32 => f32_bytes(values),
+            Dtype::BF16 => values
+                .iter()
+                .flat_map(|&v| bf16::from_f32(v).to_bits().to_le_bytes())
+                .collect(),
+            Dtype::F16 => values
+                .iter()
+                .flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes())
+                .collect(),
+            _ => unreachable!(),
+        }
+    };
+    for (left_dtype, reference_dtype) in [
+        (Dtype::BF16, Dtype::F16),
+        (Dtype::BF16, Dtype::BF16),
+        (Dtype::F16, Dtype::F32),
+    ] {
+        let left = encode(&[1.0, -2.0, 3.0, 4.0], left_dtype);
+        let reference = encode(&[1.0, -2.0, 3.0, 3.5], reference_dtype);
+        serialize_to_file(
+            [(
+                "left",
+                TensorView::new(left_dtype, vec![2, 2], &left).unwrap(),
+            )],
+            &None,
+            &left_path,
+        )
+        .unwrap();
+        serialize_to_file(
+            [(
+                "right",
+                TensorView::new(reference_dtype, vec![2, 2], &reference).unwrap(),
+            )],
+            &None,
+            &reference_path,
+        )
+        .unwrap();
+        let left_file = std::fs::read(&left_path).unwrap();
+        let reference_file = std::fs::read(&reference_path).unwrap();
+        let report = run(&Arguments {
+            left: LeftInput::Safetensors {
+                path: left_path.clone(),
+                tensor: "left".into(),
+            },
+            group_axis: Some(1),
+            reference: reference_path.clone(),
+            tensor: "right".into(),
+            maximum_input_bytes: left_file.len() + reference_file.len(),
+        })
+        .unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["normalization"], "reference_l2");
+        assert_eq!(report["left"]["dtype"], format!("{left_dtype:?}"));
+        assert_eq!(report["reference"]["dtype"], format!("{reference_dtype:?}"));
+        assert_eq!(report["left"]["payload_sha256"], sha256(&left));
+        assert_eq!(report["left"]["file_sha256"], sha256(&left_file));
+        assert_eq!(report["reference"]["payload_sha256"], sha256(&reference));
+        assert_eq!(report["reference"]["file_sha256"], sha256(&reference_file));
+        assert_eq!(report["metrics"]["max_abs"], 0.5);
+        assert_eq!(report["metrics"]["rmse"], 0.25);
+        assert!(
+            (report["metrics"]["relative_l2"].as_f64().unwrap() - 0.5 / 26.25_f64.sqrt()).abs()
+                < 1e-15
+        );
+        assert!(
+            (report["metrics"]["cosine"].as_f64().unwrap()
+                - 28.0 / (30.0_f64.sqrt() * 26.25_f64.sqrt()))
+            .abs()
+                < 1e-15
+        );
+        assert_eq!(report["groups"][0]["metrics"]["max_abs"], 0.0);
+        assert_eq!(report["groups"][1]["metrics"]["max_abs"], 0.5);
+        assert_eq!(
+            report["groups"][1]["metrics"]["worst"]["coordinate"],
+            serde_json::json!([1, 1])
+        );
+        assert!(
+            (report["groups"][1]["metrics"]["relative_l2"]
+                .as_f64()
+                .unwrap()
+                - 0.5 / 16.25_f64.sqrt())
+            .abs()
+                < 1e-15
+        );
+    }
 }
 
 #[test]
