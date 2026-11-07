@@ -237,3 +237,233 @@ fn late_overflow_returns_no_range_and_reuses_only_after_every_alias_is_gone() {
     // Core aborts the failed installation; this local conversion test does not
     // authorize retrying an indeterminate native submission.
 }
+
+fn parallel_host(bytes: usize) -> HostMemoryAccount {
+    // The backing rounds payload size before adding allocation alignment slack.
+    let limit = bytes.next_multiple_of(64) + 63;
+    HostMemoryAccount::with_allocation_alignment(
+        HostMemoryLimits::new(
+            limit,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: 0,
+                output_bytes: 0,
+                transfer_staging_bytes: 0,
+                weight_backing_bytes: limit,
+            },
+        )
+        .unwrap(),
+        64,
+    )
+    .unwrap()
+}
+
+fn valid_bf16_bytes(bytes: usize) -> Vec<u8> {
+    (0..bytes / 2)
+        .flat_map(|index| {
+            let mut bits = index as u16;
+            let value = bf16::from_bits(bits).to_f32();
+            if value.is_finite() && !f16::from_f32(value).is_finite() {
+                bits = 0;
+            }
+            bits.to_le_bytes()
+        })
+        .collect()
+}
+
+#[test]
+fn parallel_ranges_match_serial_bits_across_large_parts_tail_and_retained_alias() {
+    let part_bytes = 4 * Bf16F16ConversionPolicy::MINIMUM_BYTES_PER_WORKER + 10;
+    let small_bytes = 2 * Bf16F16ConversionPolicy::MINIMUM_BYTES_PER_WORKER + 6;
+    let (_directory, archive) = archive(&[
+        Tensor {
+            name: "large",
+            shape: vec![part_bytes / 2],
+            dtype: Dtype::BF16,
+            bytes: valid_bf16_bytes(part_bytes),
+        },
+        Tensor {
+            name: "prefix",
+            shape: vec![small_bytes / 2],
+            dtype: Dtype::BF16,
+            bytes: valid_bf16_bytes(small_bytes),
+        },
+    ]);
+    let total = part_bytes + small_bytes;
+    let owner = parallel_host(total);
+    let source = ManagedDenseArchiveSource::new(&archive, &owner);
+    let slot = source.bounded_streaming_slot(capacity(total)).unwrap();
+    let policy = Bf16F16ConversionPolicy::new(capacity(4)).unwrap();
+    assert_eq!(
+        Bf16F16ConversionPolicy::default().maximum_workers().get(),
+        1
+    );
+    assert!(Bf16F16ConversionPolicy::new(capacity(17)).is_err());
+
+    let single = source
+        .prepare_bf16_f16_stream(&component(
+            &["large"],
+            &[(part_bytes / 2) as u64],
+            ElementType::F16,
+        ))
+        .unwrap()
+        .unwrap();
+    let serial = single
+        .materialize_range(&slot, 0, part_bytes)
+        .unwrap()
+        .bytes()
+        .to_vec();
+    let parallel = single
+        .materialize_range_with_policy(&slot, 0, part_bytes, policy)
+        .unwrap();
+    assert_eq!(parallel.bytes(), serial);
+    let alias = parallel.slice(2..8).unwrap();
+    drop(parallel);
+    assert!(single
+        .materialize_range_with_policy(&slot, 0, part_bytes, policy)
+        .is_err());
+    assert_eq!(alias.bytes(), &serial[2..8]);
+    drop(alias);
+
+    let combined = source
+        .prepare_bf16_f16_stream(&component(
+            &["prefix", "large"],
+            &[(total / 2) as u64],
+            ElementType::F16,
+        ))
+        .unwrap()
+        .unwrap();
+    // Cross the component boundary with an unaligned-to-SIMD, whole-element
+    // offset and a tail. Each large continuous part uses the original kernel.
+    let serial = combined
+        .materialize_range(&slot, 2, total - 8)
+        .unwrap()
+        .bytes()
+        .to_vec();
+    let parallel = combined
+        .materialize_range_with_policy(&slot, 2, total - 8, policy)
+        .unwrap();
+    assert_eq!(parallel.bytes(), serial);
+    assert_eq!(
+        owner.usage().unwrap().committed_bytes(),
+        slot.backing_bytes()
+    );
+    drop(parallel);
+    drop(slot);
+    assert_eq!(owner.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn parallel_overflow_publishes_nothing_and_original_slot_can_be_rewritten() {
+    let bytes = 4 * Bf16F16ConversionPolicy::MINIMUM_BYTES_PER_WORKER + 14;
+    let mut input = valid_bf16_bytes(bytes);
+    input[bytes - 2..].copy_from_slice(&bf16::from_f32(65536.).to_le_bytes());
+    let (_directory, archive) = archive(&[Tensor {
+        name: "overflow",
+        shape: vec![bytes / 2],
+        dtype: Dtype::BF16,
+        bytes: input,
+    }]);
+    let owner = parallel_host(bytes);
+    let source = ManagedDenseArchiveSource::new(&archive, &owner);
+    let prepared = source
+        .prepare_bf16_f16_stream(&component(
+            &["overflow"],
+            &[(bytes / 2) as u64],
+            ElementType::F16,
+        ))
+        .unwrap()
+        .unwrap();
+    let slot = source.bounded_streaming_slot(capacity(bytes)).unwrap();
+    let policy = Bf16F16ConversionPolicy::new(capacity(4)).unwrap();
+    assert!(prepared
+        .materialize_range_with_policy(&slot, 0, bytes, policy)
+        .is_err());
+    assert_eq!(
+        owner.usage().unwrap().committed_bytes(),
+        slot.backing_bytes()
+    );
+    let expected = prepared
+        .materialize_range(&slot, 0, bytes - 2)
+        .unwrap()
+        .bytes()
+        .to_vec();
+    let recovered = prepared
+        .materialize_range_with_policy(&slot, 0, bytes - 2, policy)
+        .unwrap();
+    assert_eq!(recovered.bytes(), expected);
+    drop(recovered);
+    drop(slot);
+    assert_eq!(owner.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn failed_launch_and_panics_join_started_workers_before_slot_reuse() {
+    use super::super::streaming::convert_part_with;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let bytes = 2 * Bf16F16ConversionPolicy::MINIMUM_BYTES_PER_WORKER;
+    let input = valid_bf16_bytes(bytes);
+    let owner = parallel_host(bytes);
+    let backing = ReusableBacking::new(&owner, capacity(bytes)).unwrap();
+    let policy = Bf16F16ConversionPolicy::new(capacity(2)).unwrap();
+    #[derive(Clone, Copy)]
+    enum Failure {
+        Spawn,
+        WorkerPanic,
+        LaunchPanic,
+    }
+    for failure in [Failure::Spawn, Failure::WorkerPanic, Failure::LaunchPanic] {
+        let completed = AtomicUsize::new(0);
+        let result = (|| {
+            let mut destination = BackingLease::allocate(&owner, bytes, Some(&backing))
+                .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+            convert_part_with(
+                &input,
+                destination.as_mut(),
+                policy,
+                |worker, input, output| {
+                    if matches!(failure, Failure::WorkerPanic) && worker == 0 {
+                        panic!("injected converter panic");
+                    }
+                    super::super::bf16_to_f16::convert(input, output)?;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |worker| {
+                    if worker == 1 {
+                        match failure {
+                            Failure::Spawn => {
+                                return Err(std::io::Error::other("injected launch failure"))
+                            }
+                            Failure::LaunchPanic => panic!("injected launch panic"),
+                            Failure::WorkerPanic => {}
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+            destination.freeze()
+        })();
+        assert!(result.is_err());
+        // In all three cases one successful worker must have finished before
+        // an error returns and a new mutable lease of the same slot is allowed.
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            owner.usage().unwrap().committed_bytes(),
+            backing.physical_bytes()
+        );
+        let mut destination = BackingLease::allocate(&owner, bytes, Some(&backing)).unwrap();
+        convert_part_with(
+            &input,
+            destination.as_mut(),
+            policy,
+            |_, input, output| super::super::bf16_to_f16::convert(input, output),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let recovered = destination.freeze().unwrap();
+        assert_eq!(recovered.len(), bytes);
+        drop(recovered);
+    }
+    drop(backing);
+    assert_eq!(owner.usage().unwrap().committed_bytes(), 0);
+}

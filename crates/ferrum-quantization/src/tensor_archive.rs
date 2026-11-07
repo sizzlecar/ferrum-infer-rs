@@ -10,8 +10,9 @@ use ferrum_runtime::{
 use ferrum_types::{FerrumError, Result};
 mod managed;
 pub use managed::{
-    Bf16ToF16BlockCounts, DenseArchiveMaterializationReport, DenseArchivePhaseTiming,
-    DenseArchiveSourceTouch, ManagedDenseArchiveInstallation, ManagedDenseArchiveSource,
+    Bf16F16ConversionPolicy, Bf16ToF16BlockCounts, DenseArchiveMaterializationReport,
+    DenseArchivePhaseTiming, DenseArchiveSourceTouch, ManagedDenseArchiveInstallation,
+    ManagedDenseArchiveSource, ManagedDenseArchiveStreamingSlot, PreparedBf16F16Component,
 };
 
 /// An indexed archive whose payloads can also satisfy an explicit runtime

@@ -2,6 +2,48 @@
 use super::*;
 use std::num::NonZeroUsize;
 
+/// Explicit CPU parallelism within one existing, charged conversion slot.
+/// This changes neither conversion arithmetic nor the number of payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bf16F16ConversionPolicy {
+    maximum_workers: NonZeroUsize,
+}
+
+impl Bf16F16ConversionPolicy {
+    pub const MAXIMUM_WORKERS: usize = 16;
+    /// Small continuous source parts stay serial. Each worker handles at
+    /// least approximately this many bytes; composite parts are not coalesced.
+    pub const MINIMUM_BYTES_PER_WORKER: usize = 1024 * 1024;
+
+    pub fn new(maximum_workers: NonZeroUsize) -> std::result::Result<Self, VNextError> {
+        if maximum_workers.get() > Self::MAXIMUM_WORKERS {
+            return Err(invalid(
+                "conversion worker count exceeds the bounded maximum",
+            ));
+        }
+        Ok(Self { maximum_workers })
+    }
+
+    pub const fn maximum_workers(self) -> NonZeroUsize {
+        self.maximum_workers
+    }
+
+    fn workers_for(self, bytes: usize) -> usize {
+        self.maximum_workers
+            .get()
+            .min(bytes / Self::MINIMUM_BYTES_PER_WORKER)
+            .max(1)
+    }
+}
+
+impl Default for Bf16F16ConversionPolicy {
+    fn default() -> Self {
+        Self {
+            maximum_workers: NonZeroUsize::MIN,
+        }
+    }
+}
+
 /// Complete source metadata bound to the original archive. Preparing this
 /// descriptor reads no tensor values and allocates no converted payload.
 /// Execution-plan identity and placement remain the caller's responsibility.
@@ -174,6 +216,25 @@ impl PreparedBf16F16Component<'_> {
         offset_bytes: usize,
         length_bytes: usize,
     ) -> std::result::Result<ferrum_runtime::ManagedHostBytes, VNextError> {
+        self.materialize_range_with_policy(
+            slot,
+            offset_bytes,
+            length_bytes,
+            Bf16F16ConversionPolicy::default(),
+        )
+    }
+
+    /// Convert disjoint, element-aligned portions of each sufficiently large
+    /// contiguous source part. Every started worker is joined before returning
+    /// success or failure; only complete success freezes the original slot.
+    /// No second payload, global thread pool, or upload overlap is introduced.
+    pub fn materialize_range_with_policy(
+        &self,
+        slot: &ManagedDenseArchiveStreamingSlot<'_>,
+        offset_bytes: usize,
+        length_bytes: usize,
+        policy: Bf16F16ConversionPolicy,
+    ) -> std::result::Result<ferrum_runtime::ManagedHostBytes, VNextError> {
         let end = offset_bytes
             .checked_add(length_bytes)
             .filter(|&end| end <= self.full_bytes)
@@ -197,11 +258,13 @@ impl PreparedBf16F16Component<'_> {
             let stop = end.min(part_end);
             if start < stop {
                 let bytes = stop - start;
-                bf16_to_f16::convert(
+                convert_part_with(
                     &part.bytes()[start - part_start..stop - part_start],
                     &mut destination.as_mut()[written..written + bytes],
-                )
-                .map_err(invalid)?;
+                    policy,
+                    |_, input, output| bf16_to_f16::convert(input, output),
+                    |_| Ok(()),
+                )?;
                 written += bytes;
             }
             part_start = part_end;
@@ -216,6 +279,75 @@ impl PreparedBf16F16Component<'_> {
         }
         destination.freeze()
     }
+}
+
+// The narrow callbacks let lifecycle tests inject a converter panic or a
+// failed launch while using real scoped workers and the original Host slot.
+// Production always uses the unchanged converter and an infallible prelaunch.
+pub(super) fn convert_part_with(
+    input: &[u8],
+    output: &mut [u8],
+    policy: Bf16F16ConversionPolicy,
+    convert: impl Fn(usize, &[u8], &mut [u8]) -> std::result::Result<(), &'static str> + Sync,
+    mut before_spawn: impl FnMut(usize) -> std::io::Result<()>,
+) -> std::result::Result<(), VNextError> {
+    if input.len() != output.len() || !input.len().is_multiple_of(2) {
+        return Err(invalid(
+            "parallel conversion requires equal whole-element extents",
+        ));
+    }
+    let workers = policy.workers_for(input.len());
+    if workers == 1 {
+        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            convert(0, input, output).map_err(invalid)
+        }))
+        .unwrap_or_else(|_| Err(invalid("serial conversion panicked")));
+    }
+    let chunk_bytes = (input.len() / 2).div_ceil(workers) * 2;
+    // Even a panic in launch/bookkeeping waits for the scope's workers before
+    // becoming an ordinary error. It cannot unwind through the slot's mutex
+    // guard and poison an otherwise recoverable CPU conversion allocation.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            let mut error = None;
+            for (worker, (source, destination)) in input
+                .chunks(chunk_bytes)
+                .zip(output.chunks_mut(chunk_bytes))
+                .enumerate()
+            {
+                let convert = &convert;
+                let launched = before_spawn(worker).and_then(|()| {
+                    std::thread::Builder::new()
+                        .name(format!("bf16-f16-range-{worker}"))
+                        .spawn_scoped(scope, move || convert(worker, source, destination))
+                });
+                match launched {
+                    Ok(handle) => handles.push((worker, handle)),
+                    Err(cause) => {
+                        error = Some(invalid(format!(
+                            "conversion worker {worker} could not start: {cause}"
+                        )));
+                        break;
+                    }
+                }
+            }
+            // Do not use early-return `?`: all successful launches must join
+            // even if another worker failed conversion or panicked.
+            for (worker, handle) in handles {
+                let failure = match handle.join() {
+                    Ok(Ok(())) => None,
+                    Ok(Err(cause)) => Some(invalid(format!("conversion worker {worker}: {cause}"))),
+                    Err(_) => Some(invalid(format!("conversion worker {worker} panicked"))),
+                };
+                if error.is_none() {
+                    error = failure;
+                }
+            }
+            error.map_or(Ok(()), Err)
+        })
+    }));
+    result.unwrap_or_else(|_| Err(invalid("conversion scope panicked after worker retirement")))
 }
 
 fn valid_source_file(file: &str) -> bool {

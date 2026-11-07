@@ -58,9 +58,10 @@ pub use process_mapped_dense::{
 pub use quant_linear::QuantLinear;
 pub use safetensors_archive::{SafetensorsArchive, SafetensorsReadAheadPolicy, SafetensorsTensor};
 pub use tensor_archive::{
-    ArchiveTensor, Bf16ToF16BlockCounts, DenseArchiveMaterializationReport,
-    DenseArchivePhaseTiming, DenseArchiveSourceTouch, ManagedDenseArchiveInstallation,
-    ManagedDenseArchiveSource, TensorArchive,
+    ArchiveTensor, Bf16F16ConversionPolicy, Bf16ToF16BlockCounts,
+    DenseArchiveMaterializationReport, DenseArchivePhaseTiming, DenseArchiveSourceTouch,
+    ManagedDenseArchiveInstallation, ManagedDenseArchiveSource, ManagedDenseArchiveStreamingSlot,
+    PreparedBf16F16Component, TensorArchive,
 };
 pub use traits::Linear;
 
