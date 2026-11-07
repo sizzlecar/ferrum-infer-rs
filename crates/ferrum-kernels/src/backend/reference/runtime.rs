@@ -16,6 +16,9 @@ use ferrum_runtime::{
 };
 use half::{bf16, f16};
 
+mod cast_f32_to_bf16;
+pub(crate) use cast_f32_to_bf16::ReferenceCastF32ToBf16Launch;
+
 mod row_transport;
 pub(crate) use row_transport::{
     checked_concat_bytes, checked_gather_bytes, ReferenceBatchedRowConcatLaunch,
@@ -361,6 +364,9 @@ enum ReferenceCommandKind {
     DenseLinear {
         launches: Box<[ReferenceDenseLinearLaunch]>,
     },
+    CastF32ToBf16 {
+        launch: ReferenceCastF32ToBf16Launch,
+    },
     LayerNorm {
         launch: ReferenceLayerNormLaunch,
     },
@@ -437,6 +443,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::ManagedUpload { .. } => "managed_upload",
             ReferenceCommandKind::Zero { .. } => "zero",
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
+            ReferenceCommandKind::CastF32ToBf16 { .. } => "cast_f32_to_bf16",
             ReferenceCommandKind::LayerNorm { .. } => "layer_norm",
             ReferenceCommandKind::ZeroCenteredRmsNorm { .. } => "zero_centered_rms_norm",
             ReferenceCommandKind::RowGather { .. } => "row_gather",
@@ -540,6 +547,25 @@ impl ReferenceDeviceCommand {
             kind: ReferenceCommandKind::DenseLinear {
                 launches: vec![launch].into_boxed_slice(),
             },
+        })
+    }
+
+    pub(crate) fn cast_f32_to_bf16_tensor(
+        launch: ReferenceCastF32ToBf16Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_cast_f32_to_bf16",
+            logical_work: Some(
+                DeviceCommandLogicalWork::tensor(
+                    launch.geometry.elements(),
+                    launch.geometry.elements(),
+                )
+                .map_err(|e| ReferenceDeviceRuntimeError::contract(e.to_string()))?,
+            ),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::CastF32ToBf16 { launch },
         })
     }
 
@@ -906,6 +932,9 @@ impl ReferenceDeviceCommand {
                 }
                 Ok(())
             }
+            ReferenceCommandKind::CastF32ToBf16 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::ZeroCenteredRmsNorm { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
@@ -1005,6 +1034,7 @@ impl ReferenceDeviceCommand {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
+            ReferenceCommandKind::CastF32ToBf16 { launch } => cast_f32_to_bf16::execute(launch),
             ReferenceCommandKind::LayerNorm { launch } => {
                 layer_norm::execute(launch);
                 counters.layer_norm_launches.fetch_add(1, Ordering::Relaxed);

@@ -25,6 +25,7 @@ use ferrum_runtime::{
 };
 
 use super::adjacent_rope::ReferenceAdjacentRopeProvider;
+use super::cast_f32_to_bf16::reference_vnext_cast_f32_to_bf16_provider;
 use super::cross_attention::ReferenceCrossAttentionProvider;
 use super::dense_linear::{implementation_fingerprint, ReferenceDenseLinearProvider};
 use super::gelu_tanh::ReferenceGeluTanhProvider;
@@ -85,6 +86,7 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
         CapabilityId::new(ferrum_runtime::STRUCTURED_GQA_ATTENTION_F32_CAPABILITY_ID)?,
         CapabilityId::new(DENSE_LINEAR_F16_CAPABILITY_ID)?,
         CapabilityId::new(DENSE_LINEAR_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CAST_F32_TO_BF16_CAPABILITY_ID)?,
         CapabilityId::new(LAYER_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ROW_GATHER_BF16_CAPABILITY_ID)?,
@@ -148,6 +150,8 @@ fn reference_vnext_runtime_config_with_capacity(
             include_str!("structured_gqa_attention_f32.rs").as_bytes(),
             include_str!("runtime/structured_gqa_attention_f32.rs").as_bytes(),
             include_str!("dense_linear.rs").as_bytes(),
+            include_str!("cast_f32_to_bf16.rs").as_bytes(),
+            include_str!("runtime/cast_f32_to_bf16.rs").as_bytes(),
             include_str!("layer_norm.rs").as_bytes(),
             include_str!("runtime/layer_norm.rs").as_bytes(),
             include_str!("zero_centered_rms_norm.rs").as_bytes(),
@@ -198,6 +202,7 @@ pub fn reference_vnext_operation_registry(
         Box::new(ferrum_runtime::structured_gqa_attention_f32_contract().map_err(contract_error)?),
         Box::new(dense_linear_contract().map_err(contract_error)?),
         Box::new(dense_linear_bf16_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::cast_f32_to_bf16_contract().map_err(contract_error)?),
         Box::new(layer_norm_bf16_contract().map_err(contract_error)?),
         Box::new(head_rms_norm_bf16_contract().map_err(contract_error)?),
         Box::new(row_gather_bf16_contract().map_err(contract_error)?),
@@ -231,6 +236,7 @@ pub fn reference_vnext_operation_registry(
         reference_vnext_structured_gqa_attention_f32_provider(runtime)?,
         reference_vnext_dense_linear_provider(runtime)?,
         reference_vnext_dense_linear_bf16_provider(runtime)?,
+        reference_vnext_cast_f32_to_bf16_provider(runtime)?,
         reference_vnext_layer_norm_bf16_provider(runtime)?,
         reference_vnext_head_rms_norm_bf16_provider(runtime)?,
         reference_vnext_row_gather_bf16_provider(runtime)?,

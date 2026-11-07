@@ -42,6 +42,10 @@ mod structured_gqa_attention_f32;
 pub use composition::reference_vnext_structured_gqa_attention_f32_provider;
 pub use structured_gqa_attention_f32::REFERENCE_STRUCTURED_GQA_ATTENTION_F32_NUMERICAL_PROFILE_ID;
 mod adjacent_rope;
+mod cast_f32_to_bf16;
+pub use cast_f32_to_bf16::{
+    reference_vnext_cast_f32_to_bf16_provider, REFERENCE_CAST_F32_TO_BF16_NUMERICAL_PROFILE_ID,
+};
 mod composition;
 mod cross_attention;
 mod dense_linear;
