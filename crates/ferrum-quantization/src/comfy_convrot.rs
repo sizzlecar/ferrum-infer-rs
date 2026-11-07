@@ -9,9 +9,9 @@
 //! `44a0fb73f299da1bb715bdb5ff59ce3fd3c6f543` (DiT metadata and codebook).
 //!
 //! This module preserves borrowed checkpoint bytes, supplies a validating
-//! component source, and provides an F32 dequantization reference. Device
-//! execution belongs to the separately versioned runtime operations; this
-//! reference does not establish CUDA numerical parity.
+//! component source, and provides F32 dequantization and BF16/F32 A8 scalar CPU
+//! references. Device execution belongs to the separately versioned runtime
+//! operations; these references do not establish CUDA numerical parity.
 
 use ferrum_types::{FerrumError, Result};
 use safetensors::Dtype;
@@ -22,6 +22,8 @@ use crate::{SafetensorsArchive, SafetensorsTensor};
 mod reference;
 mod source;
 pub use source::{ComfyCanonicalWeightSource, COMFY_CONVROT_CANONICAL_WEIGHT_FORMAT_ID};
+mod a8_reference;
+pub use a8_reference::{ComfyA8Bf16Reference, ComfyA8F32Reference};
 #[cfg(test)]
 mod tests;
 
