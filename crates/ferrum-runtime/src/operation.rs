@@ -158,3 +158,6 @@ pub use weight_contract::{
     WeightComponentRole, WeightEncoding, FP8_E4M3FN_WHOLE_TENSOR_F32_FORMAT_ID,
     MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH, MAX_PHYSICAL_WEIGHT_LAYOUT_NODES, RN_F16_FRAGMENT_ABI_V1,
 };
+
+mod candidate_state;
+pub use candidate_state::*;

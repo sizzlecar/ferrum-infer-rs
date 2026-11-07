@@ -826,6 +826,7 @@ pub(super) struct ActiveSequenceSessionState {
     pub(super) submission_wave_flight: Option<ParticipantFlightPhase>,
     pub(super) state_transfer: SequenceStateTransferSlot,
     pub(super) completed_boundary: SequenceCompletedFrontier,
+    pub(super) conditioning_inputs: Option<Arc<super::SequenceConditioningInputs>>,
     pub(super) retired_frames: u64,
 }
 
@@ -2383,6 +2384,7 @@ where
             submission_wave_flight: None,
             state_transfer: SequenceStateTransferSlot::default(),
             completed_boundary: SequenceCompletedFrontier::default(),
+            conditioning_inputs: None,
             retired_frames: 0,
         });
         *authority_source = SequenceExecutionAuthoritySource::SequenceSession;

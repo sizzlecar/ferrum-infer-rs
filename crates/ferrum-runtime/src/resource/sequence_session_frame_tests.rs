@@ -43,6 +43,7 @@ fn active_candidate(next_frame: u64, fingerprint: &str) -> SequenceFrameCandidat
                     submission_wave_flight: None,
                     state_transfer: SequenceStateTransferSlot::default(),
                     completed_boundary: SequenceCompletedFrontier::default(),
+                    conditioning_inputs: None,
                     retired_frames: next_frame - 1,
                 },
             )),

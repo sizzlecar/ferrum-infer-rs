@@ -235,6 +235,8 @@ impl ExecutionDeterminismRequirement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperationProviderDescriptor {
+    #[serde(skip_serializing_if = "crate::ProviderCandidateStateEffects::is_unsupported")]
+    candidate_state: crate::ProviderCandidateStateEffects,
     provider_id: ProviderId,
     operation_id: OperationId,
     operation_fingerprint: String,
@@ -258,6 +260,8 @@ pub struct OperationProviderDescriptor {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OperationProviderDescriptorWire {
+    #[serde(default)]
+    candidate_state: crate::ProviderCandidateStateEffects,
     provider_id: ProviderId,
     operation_id: OperationId,
     operation_fingerprint: String,
@@ -302,6 +306,7 @@ impl<'de> Deserialize<'de> for OperationProviderDescriptor {
             wire.resource_estimator_implementation_fingerprint,
         )
         .map_err(serde::de::Error::custom)?
+        .with_candidate_state_effects(wire.candidate_state)
         .with_checkpoint_capability(wire.checkpoint)
         .with_fixed_tensor_work(wire.fixed_tensor_work);
         if descriptor.dynamic_storage_bindings != original_bindings {
@@ -314,6 +319,17 @@ impl<'de> Deserialize<'de> for OperationProviderDescriptor {
 }
 
 impl OperationProviderDescriptor {
+    pub fn with_candidate_state_effects(
+        mut self,
+        effects: crate::ProviderCandidateStateEffects,
+    ) -> Self {
+        self.candidate_state = effects;
+        self
+    }
+    pub fn candidate_state_effects(&self) -> &crate::ProviderCandidateStateEffects {
+        &self.candidate_state
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider_id: ProviderId,
@@ -364,6 +380,7 @@ impl OperationProviderDescriptor {
             execution_semantics,
             fixed_tensor_work: false,
             checkpoint: ProviderCheckpointCapability::Unsupported,
+            candidate_state: crate::ProviderCandidateStateEffects::Unsupported,
             version,
             device_id,
             capabilities,

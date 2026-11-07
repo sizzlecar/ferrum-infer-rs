@@ -81,6 +81,7 @@ where
     pub(in crate::resource) pools: BTreeMap<DynamicBackingPoolId, Arc<DynamicBackingPool<R>>>,
     pub(in crate::resource) domains: Vec<DynamicPoolDomainSpec>,
     pub(in crate::resource) nodes: Arc<[PlanNode]>,
+    pub(in crate::resource) candidate_state_layout: Option<crate::CandidateStateLayout>,
     pub(in crate::resource) step_resource_slot_layouts: Vec<Vec<StepResourceSlotLayout>>,
     pub(in crate::resource) submission_wave_layouts: Vec<Option<SubmissionWaveDomainLayout>>,
     pub(in crate::resource) submission_wave_reusable_capacity_layouts:
@@ -163,6 +164,7 @@ where
         logical_admission: LogicalAdmissionCoordinator,
         domains: Vec<DynamicPoolDomainSpec>,
         nodes: Arc<[PlanNode]>,
+        candidate_state_layout: Option<crate::CandidateStateLayout>,
         reusable_execution: Option<ReusableExecutionMemoryPlan>,
     ) -> Result<Self, VNextError> {
         let request_state_hazards = RequestStateHazardCoordinator::compile(&nodes)?;
@@ -229,6 +231,7 @@ where
             domains,
             pools,
             nodes,
+            candidate_state_layout,
             step_resource_slot_layouts,
             submission_wave_layouts,
             submission_wave_reusable_capacity_layouts,

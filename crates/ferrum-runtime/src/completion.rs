@@ -1506,6 +1506,7 @@ impl CompletionSweepReceipt {
 }
 
 enum CompletionResourceLease<R: DeviceRuntime> {
+    Selected(crate::PreparedSelectedStateCommit<R>),
     Invocation(InvocationResourceLease<R>),
     Wave(PreparedStepSubmissionWave<R>),
     Resident(ResidentDecodeUse<R>),
@@ -1514,6 +1515,7 @@ enum CompletionResourceLease<R: DeviceRuntime> {
 impl<R: DeviceRuntime> CompletionResourceLease<R> {
     fn runtime(&self) -> &Arc<R> {
         match self {
+            Self::Selected(selected) => selected.runtime(),
             Self::Invocation(invocation) => invocation.runtime(),
             Self::Wave(wave) => wave.runtime(),
             Self::Resident(use_) => use_.runtime(),
@@ -1522,6 +1524,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
 
     fn deferred_cleanup_domain(&self) -> DeferredDeviceCleanupDomainId {
         match self {
+            Self::Selected(selected) => selected.cleanup_domain(),
             Self::Invocation(invocation) => invocation.deferred_cleanup_domain(),
             Self::Wave(wave) => wave.deferred_cleanup_domain(),
             Self::Resident(use_) => use_.deferred_cleanup_domain(),
@@ -1530,6 +1533,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
 
     fn mark_submission_fence_installed(&mut self) -> Result<(), VNextError> {
         match self {
+            Self::Selected(_) => Ok(()),
             Self::Invocation(invocation) => invocation.mark_submission_fence_installed(),
             Self::Wave(wave) => wave.mark_submission_fence_installed(),
             Self::Resident(use_) => use_.mark_submission_fence_installed(),
@@ -1542,6 +1546,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
         commands: &mut DeviceCommandBatch<R::Command>,
     ) -> Result<usize, BackingInitializationEncodeError<R::Error>> {
         match self {
+            Self::Selected(_) => Ok(0),
             Self::Invocation(invocation) => {
                 invocation.encode_backing_initializations(runtime, commands)
             }
@@ -1552,6 +1557,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
 
     fn mark_submission_indeterminate(&mut self) {
         match self {
+            Self::Selected(_) => (),
             Self::Invocation(invocation) => invocation.mark_submission_indeterminate(),
             Self::Wave(wave) => wave.mark_submission_indeterminate(),
             Self::Resident(use_) => use_.mark_submission_indeterminate(),
@@ -1560,6 +1566,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
 
     fn finish_backing_initializations(&mut self, succeeded: bool) -> Result<(), VNextError> {
         match self {
+            Self::Selected(_) => Ok(()),
             Self::Invocation(invocation) => invocation.finish_backing_initializations(succeeded),
             Self::Wave(wave) => wave.finish_backing_initializations(succeeded),
             Self::Resident(use_) => use_.finish_backing_initializations(succeeded),
@@ -1571,6 +1578,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
         disposition: RequestStateHazardTerminalDisposition,
     ) -> Result<(), VNextError> {
         match self {
+            Self::Selected(_) => Ok(()),
             Self::Invocation(invocation) => invocation.finish_request_state_hazards(disposition),
             Self::Wave(wave) => wave.finish_request_state_hazards(disposition),
             Self::Resident(use_) => use_.finish_request_state_hazards(disposition),
@@ -1587,6 +1595,9 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
             invalid_completion("completion readback participant index exceeds host address space")
         })?;
         match self {
+            Self::Selected(_) => Err(invalid_completion(
+                "selected-copy completion has no public readback authority",
+            )),
             Self::Resident(use_) => use_.backing_view(node_id, participant_index, resource_id),
             Self::Invocation(invocation) => {
                 if invocation.node_id() != node_id {
@@ -1665,6 +1676,9 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
             invalid_completion("completion readback participant index exceeds host address space")
         })?;
         let (step, work_shape) = match self {
+            Self::Selected(_) => {
+                return Err(invalid_completion("selected copy has no readback range"))
+            }
             Self::Resident(use_) => {
                 return use_.readback_range(node_id, participant_index, resource_id, semantic_range)
             }
@@ -2642,7 +2656,12 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                     if wave.purpose() == super::SubmissionWavePurpose::FullPlan {
                         let seal =
                             SuccessfulWaveCompletionSeal::from_terminal_identity(&batch_identity);
-                        if let Err(error) = wave.record_full_plan_success(&seal) {
+                        let recorded = if wave.step_resources().candidate_layout().is_some() {
+                            wave.record_candidate_success(&seal, &batch_identity)
+                        } else {
+                            wave.record_full_plan_success(&seal)
+                        };
+                        if let Err(error) = recorded {
                             disposition =
                                 OperationCompletionDisposition::ContractFailedButQuiescent(
                                     QuiescentCompletionContractFailure::new(format!(
@@ -2651,6 +2670,16 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                                 );
                         }
                     }
+                }
+            }
+            if let CompletionResourceLease::Selected(selected) = &mut resources {
+                if let Err(error) = selected.finish(matches!(
+                    disposition,
+                    OperationCompletionDisposition::Succeeded
+                )) {
+                    disposition = OperationCompletionDisposition::ContractFailedButQuiescent(
+                        QuiescentCompletionContractFailure::new(error.to_string()),
+                    );
                 }
             }
             if let CompletionResourceLease::Wave(wave) = &mut resources {
@@ -3908,7 +3937,9 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             .expect("live completion reservation owns submission resources")
         {
             CompletionResourceLease::Invocation(invocation) => invocation,
-            CompletionResourceLease::Wave(_) | CompletionResourceLease::Resident(_) => {
+            CompletionResourceLease::Selected(_)
+            | CompletionResourceLease::Wave(_)
+            | CompletionResourceLease::Resident(_) => {
                 unreachable!("single-operation reservation cannot own batch resources")
             }
         }
@@ -3921,7 +3952,9 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             .expect("live completion reservation owns submission resources")
         {
             CompletionResourceLease::Wave(wave) => wave,
-            CompletionResourceLease::Invocation(_) | CompletionResourceLease::Resident(_) => {
+            CompletionResourceLease::Selected(_)
+            | CompletionResourceLease::Invocation(_)
+            | CompletionResourceLease::Resident(_) => {
                 unreachable!("wave reservation cannot own other resource kinds")
             }
         }
@@ -3932,6 +3965,9 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         resource_id: &ResourceId,
     ) -> Result<&super::DynamicResourceDescriptor, VNextError> {
         match self.resources.as_ref().expect("reservation resources") {
+            CompletionResourceLease::Selected(_) => {
+                Err(invalid_completion("selected copy has no input uploads"))
+            }
             CompletionResourceLease::Wave(wave) => {
                 wave.step_resources().dynamic_descriptor(resource_id)
             }
@@ -3958,6 +3994,18 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
                 Ok(invocation.work_shape())
             }
             _ => Err(invalid_completion("input node absent from invocation")),
+        }
+    }
+
+    pub(crate) fn validate_candidate_inputs(
+        &self,
+        uploads: &[crate::SubmissionWaveInputUpload],
+    ) -> Result<(), VNextError> {
+        match self.resources.as_ref().expect("reservation resources") {
+            CompletionResourceLease::Wave(wave) => {
+                wave.step_resources().validate_candidate_inputs(uploads)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -4263,3 +4311,6 @@ mod fingerprint_tests {
         );
     }
 }
+
+mod selected_state;
+pub use selected_state::SelectedStateSubmission;

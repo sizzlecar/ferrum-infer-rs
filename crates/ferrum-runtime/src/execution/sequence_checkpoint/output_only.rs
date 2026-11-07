@@ -11,7 +11,7 @@ use crate::{
 /// been validated. Unknown operations cannot reach this point. Provider
 /// checkpoint declarations and hidden persistent workspace are checked by the
 /// enclosing derivation, independently of this value-dependency proof.
-pub(super) fn state_dependencies(
+pub(in crate::execution) fn state_dependencies(
     inputs: &ProgramCheckpointInputs,
     nodes: &[PlanNode],
 ) -> Result<Vec<SequenceCheckpointUnsupportedReason>, VNextError> {

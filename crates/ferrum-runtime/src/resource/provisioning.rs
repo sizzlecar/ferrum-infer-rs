@@ -381,6 +381,7 @@ impl ExecutionPlan {
             logical_admission,
             domains,
             nodes,
+            self.candidate_state_layout().cloned(),
             payload.memory().reusable_execution().cloned(),
         )?);
         validate_runtime_descriptor_for_admission(

@@ -233,11 +233,11 @@ where
     pub fn try_retire_normal(
         self: Arc<Self>,
     ) -> Result<StepRetirementReceipt, StepFinalizationFailure<R>> {
-        Self::try_finalize(self, StepFrameFinalization::Commit)
+        Self::try_finalize(self, StepFrameFinalization::Commit, false)
     }
 
     pub fn try_abort(self: Arc<Self>) -> Result<StepRetirementReceipt, StepFinalizationFailure<R>> {
-        Self::try_finalize(self, StepFrameFinalization::Abort)
+        Self::try_finalize(self, StepFrameFinalization::Abort, false)
     }
 
     /// Releases a capacity-deferred step before any invocation was prepared or
@@ -246,13 +246,31 @@ where
     pub fn try_rollback_unsubmitted(
         self: Arc<Self>,
     ) -> Result<StepRetirementReceipt, StepFinalizationFailure<R>> {
-        Self::try_finalize(self, StepFrameFinalization::RollbackUnsubmitted)
+        Self::try_finalize(self, StepFrameFinalization::RollbackUnsubmitted, false)
+    }
+
+    pub fn try_retire_selected(
+        self: Arc<Self>,
+    ) -> Result<StepRetirementReceipt, StepFinalizationFailure<R>> {
+        Self::try_finalize(self, StepFrameFinalization::Commit, true)
     }
 
     fn try_finalize(
         step: Arc<Self>,
         finalization: StepFrameFinalization,
+        selected: bool,
     ) -> Result<StepRetirementReceipt, StepFinalizationFailure<R>> {
+        if finalization == StepFrameFinalization::Commit {
+            let is_candidate = step.candidate_layout().is_some();
+            let ready = step
+                .completed_boundary
+                .lock()
+                .map(|s| matches!(*s, super::StepCompletedBoundarySlot::CopySucceeded(_)))
+                .unwrap_or(false);
+            if is_candidate != selected || (selected && !ready) {
+                return Err(StepFinalizationFailure { step, error: invalid_resource("candidate frames require a successful selected-copy fence and selected retirement") });
+            }
+        }
         let mut step = match Arc::try_unwrap(step) {
             Ok(step) => step,
             Err(step) => {
@@ -599,6 +617,11 @@ where
         self: &Arc<Self>,
         request: InvocationResourceAdmissionRequest,
     ) -> Result<InvocationResourceAdmissionDecision<R>, VNextError> {
+        if self.candidate_layout().is_some() {
+            return Err(invalid_resource(
+                "candidate plans require full-plan wave execution",
+            ));
+        }
         let _lifecycle = self.participants[0]
             .session
             .resources()
@@ -854,6 +877,38 @@ where
         purpose: SubmissionWavePurpose,
         reserved: Option<&ClaimedSubmissionWaveBacking>,
     ) -> Result<StepSubmissionWaveAdmissionDecision<R>, VNextError> {
+        if self.candidate_layout().is_some()
+            && (purpose != SubmissionWavePurpose::FullPlan
+                || work_shape.as_ref() != self.work_shape()
+                || reserved.is_some())
+        {
+            return Err(invalid_resource("candidate settlement requires exact admitted full-plan work without resident replay"));
+        }
+        if self.candidate_layout().is_some()
+            && work_shape
+                .participant_work()?
+                .iter()
+                .zip(self.work_shape().participant_work()?)
+                .any(|(requested, admitted)| {
+                    requested
+                        .token_span()
+                        .checkpoint_tokens()
+                        .is_some_and(|tokens| {
+                            Some(tokens) != admitted.token_span().checkpoint_tokens()
+                        })
+                })
+        {
+            return Err(invalid_resource(
+                "candidate invocation replaced admitted exact token evidence",
+            ));
+        }
+        // Work equality intentionally omits process-local token owners. Always
+        // execute the admitted evidence, including on the first candidate frame.
+        let work_shape = if self.candidate_layout().is_some() {
+            Arc::clone(self.claimed_backing.work_shape_arc())
+        } else {
+            work_shape
+        };
         let _lifecycle = self.participants[0]
             .session
             .resources()
@@ -2010,6 +2065,14 @@ where
 
     pub(crate) const fn purpose(&self) -> SubmissionWavePurpose {
         self.purpose
+    }
+
+    pub(crate) fn record_candidate_success(
+        &self,
+        seal: &crate::SuccessfulWaveCompletionSeal,
+        identity: &crate::BatchOperationIdentity,
+    ) -> Result<(), VNextError> {
+        super::sequence::record_candidate_wave(self, seal, identity)
     }
 
     pub(crate) fn record_full_plan_success(

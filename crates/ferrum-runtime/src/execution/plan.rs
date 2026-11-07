@@ -31,6 +31,8 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionPlan {
+    #[serde(skip)]
+    pub(super) candidate_state_layout: Option<super::CandidateStateLayout>,
     pub(super) payload: ExecutionPlanPayload,
     pub(super) plan_hash: PlanHash,
     #[serde(skip)]
@@ -234,6 +236,14 @@ impl ExecutionPlan {
         } else {
             None
         };
+        let candidate_state_layout =
+            super::candidate_state::derive_candidate_state(program, &nodes, request.capabilities)?;
+        if candidate_state_layout.is_some() && request.policy.reusable_execution_policy().is_some()
+        {
+            return Err(invalid_plan(
+                "candidate settlement currently requires eager full-plan execution",
+            ));
+        }
         let retention = if work_limits.is_tensor() {
             CompletionRetentionSpec::new(
                 request
@@ -247,6 +257,18 @@ impl ExecutionPlan {
         } else {
             request.completion_retention.clone()
         };
+        let retention = CompletionRetentionSpec::new(
+            retention
+                .values()
+                .iter()
+                .cloned()
+                .chain(
+                    candidate_state_layout
+                        .iter()
+                        .flat_map(|layout| layout.retained_values().cloned()),
+                )
+                .collect(),
+        );
         let retained_completion_values = resolve_retained_completion_values(&nodes, &retention)?;
         let terminal_output_resources = nodes
             .iter()
@@ -276,6 +298,9 @@ impl ExecutionPlan {
             &retained_completion_resources,
         )?;
 
+        if let Some(layout) = &candidate_state_layout {
+            layout.validate_memory(&memory)?;
+        }
         let (sequence_checkpoint_layout, checkpoint_unsupported_reasons) =
             super::sequence_checkpoint::derive_sequence_checkpoint(
                 program,
@@ -317,6 +342,7 @@ impl ExecutionPlan {
         )?)?;
         payload.plan_id = Self::plan_id_for_hash(&plan_hash)?;
         let plan = Self {
+            candidate_state_layout,
             payload,
             plan_hash,
             operation_registry_authority,

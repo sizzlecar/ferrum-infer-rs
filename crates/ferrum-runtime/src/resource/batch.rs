@@ -1007,10 +1007,24 @@ where
             let SequenceSessionSlotState::Active(active) = &**state else {
                 unreachable!("all session frame candidates were validated");
             };
-            active.completed_boundary.validate_imported_work(
-                work.token_span(),
-                candidate.resources.request.plan.plan_hash(),
-            )?;
+            if candidate
+                .resources
+                .request
+                .plan
+                .dynamic_pools()
+                .candidate_state_layout
+                .is_some()
+            {
+                active.completed_boundary.validate_candidate_work(
+                    work.token_span(),
+                    candidate.resources.request.plan.plan_hash(),
+                )?;
+            } else {
+                active.completed_boundary.validate_imported_work(
+                    work.token_span(),
+                    candidate.resources.request.plan.plan_hash(),
+                )?;
+            }
         }
     }
     // Frame capture and extension publication use the same slot -> backing

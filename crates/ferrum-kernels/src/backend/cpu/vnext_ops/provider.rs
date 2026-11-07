@@ -209,7 +209,33 @@ impl CpuOperationProvider {
                 format!("resource-estimator.cpu.{identity}"),
                 ContractVersion::new(1, 0),
                 implementation_fingerprint(),
-            )?,
+            )?
+            .with_candidate_state_effects(
+                if matches!(operation, CpuOperation::GatedDeltaCandidateScan(_)) {
+                    ferrum_runtime::ProviderCandidateStateEffects::PrefixCausal {
+                        ports: vec![
+                            ferrum_runtime::ProviderCandidateStatePort::TailTwo {
+                                input_ordinal: 8,
+                                output_ordinal: 1,
+                                storage_profile: ferrum_runtime::DynamicStorageProfile::new(
+                                    ferrum_runtime::DynamicStorageAllocator::LinearArena,
+                                    ferrum_runtime::DynamicStorageView::Contiguous,
+                                )?,
+                            },
+                            ferrum_runtime::ProviderCandidateStatePort::TailTwo {
+                                input_ordinal: 9,
+                                output_ordinal: 2,
+                                storage_profile: ferrum_runtime::DynamicStorageProfile::new(
+                                    ferrum_runtime::DynamicStorageAllocator::LinearArena,
+                                    ferrum_runtime::DynamicStorageView::Contiguous,
+                                )?,
+                            },
+                        ],
+                    }
+                } else {
+                    ferrum_runtime::ProviderCandidateStateEffects::Unsupported
+                },
+            ),
         })
     }
 }

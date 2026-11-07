@@ -104,3 +104,6 @@ pub use determinism_coverage::*;
 #[cfg(test)]
 #[path = "execution/tests.rs"]
 mod tests;
+
+mod candidate_state;
+pub use candidate_state::CandidateStateLayout;

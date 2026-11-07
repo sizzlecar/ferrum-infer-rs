@@ -1691,6 +1691,9 @@ impl OperationDispatch {
         if determinism_restore.is_some() {
             commands.require_logical_execution_path_attribution();
         }
+        completion
+            .validate_candidate_inputs(input_uploads)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
         let backing_initialization_command_count = completion
             .encode_backing_initializations(runtime, &mut commands)
             .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
