@@ -19,6 +19,7 @@ pub(super) enum CpuOperation {
     LastTokenLinear(CpuFloat),
     SwiGlu,
     Argmax(CpuFloat),
+    TailTwoGreedy,
     GatedDelta(CpuFloat),
     GatedDeltaCandidateScan(CpuFloat),
     CausalAttention(CpuFloat),
@@ -48,6 +49,7 @@ impl CpuOperation {
         Self::SwiGlu,
         Self::Argmax(CpuFloat::F16),
         Self::Argmax(CpuFloat::F32),
+        Self::TailTwoGreedy,
         Self::GatedDelta(CpuFloat::F16),
         Self::GatedDelta(CpuFloat::F32),
         Self::GatedDeltaCandidateScan(CpuFloat::F16),
@@ -81,6 +83,7 @@ impl CpuOperation {
             Self::SwiGlu => dense_swiglu_contract(),
             Self::Argmax(CpuFloat::F16) => last_token_masked_argmax_contract(),
             Self::Argmax(CpuFloat::F32) => last_token_masked_argmax_f32_contract(),
+            Self::TailTwoGreedy => tail_two_greedy_f16_contract(),
             Self::GatedDelta(CpuFloat::F16) => gated_delta_recurrent_attention_contract(),
             Self::GatedDelta(CpuFloat::F32) => {
                 gated_delta_recurrent_attention_f32_master_contract()
@@ -105,6 +108,7 @@ impl CpuOperation {
             Self::LastTokenLinear(_) => "cpu.last_token_dense_linear",
             Self::SwiGlu => "cpu.dense_swiglu",
             Self::Argmax(_) => "cpu.last_token_masked_argmax",
+            Self::TailTwoGreedy => "cpu.tail_two_greedy.f16",
             Self::GatedDelta(_) => "cpu.gated_delta_recurrent_attention",
             Self::GatedDeltaCandidateScan(_) => "cpu.gated_delta_candidate_scan",
             Self::CausalAttention(_) => "cpu.causal_attention",
@@ -141,7 +145,9 @@ impl CpuOperationProvider {
                 | CpuOperation::CausalAttention(_)
         );
         let has_weights = has_matrix || matches!(operation, CpuOperation::RmsNorm { .. });
-        let weight_formats = if has_weights {
+        let weight_formats = if matches!(operation, CpuOperation::TailTwoGreedy) {
+            BTreeSet::from([WeightFormatId::new("weight-format.safetensors.dense")?])
+        } else if has_weights {
             [
                 "weight-format.safetensors.dense",
                 "weight-format.gguf.native-block",
@@ -232,6 +238,8 @@ impl CpuOperationProvider {
                             },
                         ],
                     }
+                } else if matches!(operation, CpuOperation::TailTwoGreedy) {
+                    ferrum_runtime::ProviderCandidateStateEffects::TerminalOnly
                 } else {
                     ferrum_runtime::ProviderCandidateStateEffects::Unsupported
                 },
@@ -268,6 +276,19 @@ impl OperationResourceEstimator for CpuOperationProvider {
             CpuOperation::Argmax(_) => Some(ProviderWorkspaceSizeFormula::actual_sequences(
                 unsigned(request.attributes(), "vocab_size")?,
             )?),
+            CpuOperation::TailTwoGreedy => {
+                let vocabulary = unsigned(request.attributes(), "vocab_size")?;
+                if vocabulary == 0 || vocabulary > u32::MAX as u64 {
+                    return Err(invalid_plan(
+                        "CPU tail head vocabulary exceeds U32 decision ABI",
+                    ));
+                }
+                Some(ProviderWorkspaceSizeFormula::actual_sequences(
+                    vocabulary
+                        .checked_mul(2)
+                        .ok_or_else(|| invalid_plan("CPU tail head scratch overflows"))?,
+                )?)
+            }
             CpuOperation::GatedDelta(_) | CpuOperation::GatedDeltaCandidateScan(_) => {
                 let shape =
                     super::gated_delta::GatedDeltaShape::from_attributes(request.attributes())

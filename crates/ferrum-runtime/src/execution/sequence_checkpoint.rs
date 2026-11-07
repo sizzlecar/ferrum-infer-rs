@@ -19,6 +19,7 @@ mod derive;
 mod output_only;
 pub(super) use derive::derive_sequence_checkpoint;
 pub(super) use output_only::state_dependencies as output_only_state_dependencies;
+pub(super) use output_only::state_dependencies_from_values;
 mod ranges;
 pub use ranges::{
     SequenceCheckpointBytePlan, SequenceCheckpointCopyRange, SequenceCheckpointResourceRanges,

@@ -1,5 +1,7 @@
 mod gated_delta_candidate_scan;
 pub use gated_delta_candidate_scan::*;
+mod tail_two_greedy_f16;
+pub use tail_two_greedy_f16::*;
 mod philox_normal_bf16;
 pub use philox_normal_bf16::*;
 mod philox_normal_f32;

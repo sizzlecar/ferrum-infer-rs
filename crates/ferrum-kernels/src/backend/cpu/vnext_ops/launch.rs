@@ -18,6 +18,7 @@ pub(super) enum ResidualStorage {
 }
 
 pub(super) enum CpuAction {
+    TailTwoGreedy(Box<super::tail_two_greedy::CpuTailTwoGreedyLaunch>),
     GatedDelta(Box<super::gated_delta_launch::CpuGatedDeltaLaunch>),
     CausalAttention(Box<super::causal_attention_launch::CpuCausalLaunch>),
     CausalBinding {
@@ -104,6 +105,7 @@ impl CpuKernelLaunch for CpuOperatorLaunch {
 impl CpuAction {
     fn execute(&self, views: &mut CpuRegionSet<'_>) -> Result<(), CpuRuntimeError> {
         match *self {
+            Self::TailTwoGreedy(ref launch) => launch.execute(views),
             Self::GatedDelta(ref launch) => launch.execute(views),
             Self::CausalAttention(ref launch) => launch.execute(views),
             Self::CausalBinding {

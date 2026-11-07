@@ -83,6 +83,22 @@ pub(super) fn encode(
         };
         use ResolvedValueRole::{Input, Output};
         match operation {
+            CpuOperation::TailTwoGreedy => {
+                let launch = super::tail_two_greedy::prepare(
+                    invocation,
+                    index,
+                    rows,
+                    workspace_offset,
+                    &mut regions,
+                )?;
+                let bytes = attribute("vocab_size")?
+                    .checked_mul(2)
+                    .ok_or_else(|| CpuRuntimeError::new("CPU tail head scratch overflows"))?;
+                workspace_offset = workspace_offset
+                    .checked_add(bytes)
+                    .ok_or_else(|| CpuRuntimeError::new("CPU tail head batch scratch overflows"))?;
+                actions.push(CpuAction::TailTwoGreedy(Box::new(launch)));
+            }
             CpuOperation::CausalAttention(dtype) => {
                 let (launch, preparation) = super::causal_attention_launch::prepare(
                     invocation,

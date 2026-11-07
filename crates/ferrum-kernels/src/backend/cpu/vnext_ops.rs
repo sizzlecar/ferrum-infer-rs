@@ -14,6 +14,7 @@ mod lowering;
 mod matrix;
 mod provider;
 mod scalar;
+mod tail_two_greedy;
 mod weights;
 
 pub use composition::CpuVNextComposition;

@@ -434,6 +434,24 @@ fn selected_prefix_output_only_input_is_allowed_only_after_all_state_dependencie
 }
 
 #[test]
+fn selected_prefix_terminal_only_outputs_cannot_feed_state() {
+    // Actual selected providers, Stored weights and full candidate effects.
+    // A terminal node after the state graph is legal. Moving it before the
+    // state node and consuming its output is acyclic but not prefix-safe.
+    let f = Fixture::with_terminal(false).unwrap();
+    f.close(vec![]);
+    let Err(error) = Fixture::with_terminal(true) else {
+        panic!("terminal output affecting recurrent/KV state must be rejected");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("terminal candidate output affects persistent state"),
+        "{error}"
+    );
+}
+
+#[test]
 fn selected_prefix_proof_cannot_be_borrowed_from_another_step_or_partial_state_contract() {
     assert!(
         Fixture::with_effects(false).is_err(),

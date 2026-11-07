@@ -201,10 +201,15 @@ pub(super) fn masked_argmax(
                 value = half::f16::from_f32(value).to_f32();
             }
         }
-        if value.is_finite() && (best == u32::MAX || value.total_cmp(&maximum).is_gt()) {
-            maximum = value;
-            best = token as u32;
-        }
+        select_finite_max(&mut best, &mut maximum, token as u32, value);
     }
     Ok(best)
+}
+
+/// Tokens are visited in ascending order, so equal logits retain the lowest id.
+pub(super) fn select_finite_max(best: &mut u32, maximum: &mut f32, token: u32, value: f32) {
+    if value.is_finite() && (*best == u32::MAX || value.total_cmp(maximum).is_gt()) {
+        *maximum = value;
+        *best = token;
+    }
 }

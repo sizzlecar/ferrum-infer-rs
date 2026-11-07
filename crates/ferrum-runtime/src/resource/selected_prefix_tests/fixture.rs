@@ -454,6 +454,7 @@ fn states() -> Vec<StateSpec> {
 struct Family {
     visual: bool,
     output_only: Option<bool>,
+    terminal: bool,
 }
 impl ModelFamilyProvider for Family {
     type Config = TestConfig;
@@ -525,7 +526,7 @@ impl ModelFamilyProvider for Family {
             external_inputs.push(id(SELECTOR));
         }
         if self.output_only == Some(true) {
-            node_inputs.push(id(SELECTOR));
+            node_inputs.push(id(if self.terminal { FINAL } else { SELECTOR }));
         }
         let mut nodes = vec![ProgramNode {
             id: id(NODE),
@@ -537,15 +538,36 @@ impl ModelFamilyProvider for Family {
             attributes: BTreeMap::new(),
         }];
         if self.output_only.is_some() {
-            nodes.push(ProgramNode {
+            let node = ProgramNode {
                 id: id("node.output"),
                 operation_id: id(OUTPUT_OP),
                 required_version: ContractVersion::new(1, 0),
-                work: ProgramNodeWorkSpec::tokens(id(Y), 0),
-                inputs: vec![id(Y), id(SELECTOR)],
+                work: ProgramNodeWorkSpec::tokens(
+                    id(if self.terminal && self.output_only == Some(true) {
+                        SELECTOR
+                    } else {
+                        Y
+                    }),
+                    0,
+                ),
+                inputs: if self.terminal && self.output_only == Some(true) {
+                    vec![id(SELECTOR)]
+                } else {
+                    vec![id(Y), id(SELECTOR)]
+                },
                 outputs: vec![id(FINAL)],
                 attributes: BTreeMap::new(),
-            });
+            };
+            if self.terminal && self.output_only == Some(true) {
+                // Legal acyclic dataflow, but a terminal reduction is used by
+                // the persistent-state node. The effects proof must reject it.
+                nodes.insert(0, node);
+            } else {
+                nodes.push(node);
+            }
+        }
+        if self.terminal {
+            conditioning.insert(id(SELECTOR));
         }
         ModelProgram::new(
             self.family_id().clone(),
@@ -564,7 +586,7 @@ impl ModelFamilyProvider for Family {
         )?
         .with_checkpoint_inputs(
             ProgramCheckpointInputs::new(id(X), conditioning)?.with_output_only_inputs(
-                if self.output_only.is_some() {
+                if self.output_only.is_some() && !self.terminal {
                     BTreeSet::from([id(SELECTOR)])
                 } else {
                     BTreeSet::new()
@@ -886,18 +908,22 @@ impl Fixture {
         Self::with_effects(true).unwrap()
     }
     pub fn with_effects(include_kv: bool) -> Result<Self, VNextError> {
-        Self::build(include_kv, false, None)
+        Self::build(include_kv, false, None, false)
     }
     pub fn visual() -> Self {
-        Self::build(true, true, None).unwrap()
+        Self::build(true, true, None, false).unwrap()
     }
     pub fn with_output_only(state_dependency: bool) -> Result<Self, VNextError> {
-        Self::build(true, false, Some(state_dependency))
+        Self::build(true, false, Some(state_dependency), false)
+    }
+    pub fn with_terminal(state_dependency: bool) -> Result<Self, VNextError> {
+        Self::build(true, false, Some(state_dependency), true)
     }
     fn build(
         include_kv: bool,
         visual: bool,
         output_only: Option<bool>,
+        terminal: bool,
     ) -> Result<Self, VNextError> {
         let runtime = Runtime::new();
         let mut operation = contract(visual);
@@ -964,6 +990,9 @@ impl Fixture {
                 token_float(TensorAccess::Read),
                 token_float(TensorAccess::Read),
             ];
+            if terminal && output_only == Some(true) {
+                output.inputs.truncate(1);
+            }
             output.outputs = vec![token_float(TensorAccess::Write)];
             let descriptor = OperationProviderDescriptor::new(
                 id("provider.selected.output.fixture"),
@@ -981,9 +1010,11 @@ impl Fixture {
                 ContractVersion::new(1, 0),
                 sha('f'),
             )?
-            .with_candidate_state_effects(
-                ProviderCandidateStateEffects::PrefixCausal { ports: vec![] },
-            );
+            .with_candidate_state_effects(if terminal {
+                ProviderCandidateStateEffects::TerminalOnly
+            } else {
+                ProviderCandidateStateEffects::PrefixCausal { ports: vec![] }
+            });
             contracts.push(Box::new(Contract(output)));
             providers.push(Box::new(Provider {
                 descriptor,
@@ -1006,6 +1037,7 @@ impl Fixture {
         let family = TypedFamilyRegistration::new(Family {
             visual,
             output_only,
+            terminal,
         })
         .prepare_fixture(&json!({"width":4}))?;
         let policy = ResolvedRuntimePolicy::new(

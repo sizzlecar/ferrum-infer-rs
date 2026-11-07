@@ -15,18 +15,24 @@ pub(in crate::execution) fn state_dependencies(
     inputs: &ProgramCheckpointInputs,
     nodes: &[PlanNode],
 ) -> Result<Vec<SequenceCheckpointUnsupportedReason>, VNextError> {
-    if inputs.output_only_inputs().is_empty() {
+    state_dependencies_from_values(inputs.output_only_inputs().iter().cloned(), nodes)
+}
+
+/// The same conservative dependency proof also applies to terminal provider
+/// outputs. Aliases and work-shape dependencies participate in the closure.
+pub(in crate::execution) fn state_dependencies_from_values(
+    values: impl IntoIterator<Item = ProgramValueId>,
+    nodes: &[PlanNode],
+) -> Result<Vec<SequenceCheckpointUnsupportedReason>, VNextError> {
+    let mut affected: BTreeMap<ProgramValueId, ProgramValueId> =
+        values.into_iter().map(|id| (id.clone(), id)).collect();
+    if affected.is_empty() {
         return Ok(Vec::new());
     }
     let aliases = ExecutionPlan::alias_classes(nodes)?;
     // Keep the original input as diagnostic evidence through intermediate
     // values. Every input may affect every output; no operation-name whitelist
     // or numerical assumption is used to discard a dependency.
-    let mut affected: BTreeMap<ProgramValueId, ProgramValueId> = inputs
-        .output_only_inputs()
-        .iter()
-        .map(|id| (id.clone(), id.clone()))
-        .collect();
     loop {
         let before = affected.len();
         let affected_classes: BTreeMap<_, _> = affected

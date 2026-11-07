@@ -192,16 +192,29 @@ pub(super) fn derive_candidate_state(
     let mut covered = BTreeSet::new();
     let mut profiles = BTreeMap::new();
     for (node, provider) in nodes.iter().zip(providers) {
-        let Effects::PrefixCausal { ports } = provider.candidate_state_effects() else {
-            return Err(invalid_plan(
-                "every selected node must promise prefix-causal effects",
-            ));
-        };
         if node.provider_resources().persistent().is_some() {
             return Err(invalid_plan(
                 "candidate plan has hidden persistent workspace",
             ));
         }
+        let ports = match provider.candidate_state_effects() {
+            Effects::PrefixCausal { ports } => ports,
+            Effects::TerminalOnly => {
+                let values = node.values().iter().filter(|v| {
+                    v.role() == ResolvedValueRole::Output
+                        || matches!(v.access(), TensorAccess::Write | TensorAccess::ReadWrite)
+                }).map(|v| v.value_id().clone());
+                if !node.state_effects().is_empty()
+                    || !super::sequence_checkpoint::state_dependencies_from_values(values, nodes)?.is_empty()
+                {
+                    return Err(invalid_plan("terminal candidate output affects persistent state"));
+                }
+                continue;
+            }
+            Effects::Unsupported => return Err(invalid_plan(
+                "every selected node must promise prefix-causal effects or prove terminal-only outputs",
+            )),
+        };
         let mut declared = BTreeSet::new();
         for port in ports {
             let (role, ordinal, profile) = match port {
