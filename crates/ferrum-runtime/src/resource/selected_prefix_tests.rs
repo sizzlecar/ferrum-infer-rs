@@ -8,6 +8,26 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[test]
+fn selected_prefix_eager_execution_preserves_workspace_capacity_policy() {
+    let fixture = Fixture::with_workspace_policy().unwrap();
+    let session = fixture.session("workspace");
+    let wave = fixture
+        .try_step(&[session.clone()], &[&[3, 5]], &[0])
+        .unwrap();
+    fixture.compute(&wave, &[&[3, 5]]);
+    fixture.select(wave, vec![SelectedPrefix::One]);
+    let continued = fixture
+        .try_step(&[session.clone()], &[&[3, 7]], &[1])
+        .unwrap();
+    fixture.compute(&continued, &[&[3, 7]]);
+    fixture.select(continued, vec![SelectedPrefix::All]);
+    let actual = fixture.runtime.probes();
+    assert_eq!(actual[0][0].values(), [6., 14.]);
+    assert_eq!(actual[0][1].values(), [10., 20., 33.]);
+    fixture.close(vec![session]);
+}
+
+#[test]
 fn selected_prefix_one_copies_both_states_and_rejects_discarded_or_changed_prefix() {
     let f = Fixture::new();
     let session = f.session("one");

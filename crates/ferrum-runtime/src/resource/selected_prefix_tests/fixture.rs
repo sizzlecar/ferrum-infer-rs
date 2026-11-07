@@ -908,22 +908,33 @@ impl Fixture {
         Self::with_effects(true).unwrap()
     }
     pub fn with_effects(include_kv: bool) -> Result<Self, VNextError> {
-        Self::build(include_kv, false, None, false)
+        Self::build(include_kv, false, None, false, None)
     }
     pub fn visual() -> Self {
-        Self::build(true, true, None, false).unwrap()
+        Self::build(true, true, None, false, None).unwrap()
     }
     pub fn with_output_only(state_dependency: bool) -> Result<Self, VNextError> {
-        Self::build(true, false, Some(state_dependency), false)
+        Self::build(true, false, Some(state_dependency), false, None)
     }
     pub fn with_terminal(state_dependency: bool) -> Result<Self, VNextError> {
-        Self::build(true, false, Some(state_dependency), true)
+        Self::build(true, false, Some(state_dependency), true, None)
+    }
+    pub fn with_workspace_policy() -> Result<Self, VNextError> {
+        let workspace = ReusableExecutionPolicy::new(
+            1,
+            vec![ReusableExecutionBucketSpec::new(
+                ReusableExecutionClassId::new("workspace.selected.eager")?,
+                ReusableExecutionCapacity::new(2, 32, 32)?,
+            )?],
+        )?;
+        Self::build(true, false, None, false, Some(workspace))
     }
     fn build(
         include_kv: bool,
         visual: bool,
         output_only: Option<bool>,
         terminal: bool,
+        workspace: Option<ReusableExecutionPolicy>,
     ) -> Result<Self, VNextError> {
         let runtime = Runtime::new();
         let mut operation = contract(visual);
@@ -1061,7 +1072,7 @@ impl Fixture {
             },
             ferrum_types::AttentionExecutionPolicy::Portable,
             ExecutionDeterminismRequirement::BitwiseSameRuntime,
-            None,
+            workspace,
         )?;
         let mut options = ProgramPlanCompileOptions::new(BTreeMap::from([(
             id(X),
