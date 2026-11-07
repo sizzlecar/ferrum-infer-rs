@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Caller-owned scalar CPU initial noise; independent of the device component.
+pub mod cpu_mt19937;
+
 /// The generator writes this precision directly. F32 never means a promoted
 /// BF16 draw. The default retains existing Qwen configuration and sequence.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
