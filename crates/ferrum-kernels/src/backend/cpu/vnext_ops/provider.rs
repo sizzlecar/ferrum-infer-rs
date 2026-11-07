@@ -20,6 +20,7 @@ pub(super) enum CpuOperation {
     SwiGlu,
     Argmax(CpuFloat),
     GatedDelta(CpuFloat),
+    GatedDeltaCandidateScan(CpuFloat),
     CausalAttention(CpuFloat),
 }
 
@@ -49,6 +50,8 @@ impl CpuOperation {
         Self::Argmax(CpuFloat::F32),
         Self::GatedDelta(CpuFloat::F16),
         Self::GatedDelta(CpuFloat::F32),
+        Self::GatedDeltaCandidateScan(CpuFloat::F16),
+        Self::GatedDeltaCandidateScan(CpuFloat::F32),
         Self::CausalAttention(CpuFloat::F16),
         Self::CausalAttention(CpuFloat::F32),
     ];
@@ -82,6 +85,12 @@ impl CpuOperation {
             Self::GatedDelta(CpuFloat::F32) => {
                 gated_delta_recurrent_attention_f32_master_contract()
             }
+            Self::GatedDeltaCandidateScan(CpuFloat::F16) => {
+                gated_delta_candidate_scan_f16_contract()
+            }
+            Self::GatedDeltaCandidateScan(CpuFloat::F32) => {
+                gated_delta_candidate_scan_f32_master_contract()
+            }
             Self::CausalAttention(CpuFloat::F16) => causal_paged_attention_contract(),
             Self::CausalAttention(CpuFloat::F32) => causal_paged_attention_f32_master_contract(),
         }
@@ -97,6 +106,7 @@ impl CpuOperation {
             Self::SwiGlu => "cpu.dense_swiglu",
             Self::Argmax(_) => "cpu.last_token_masked_argmax",
             Self::GatedDelta(_) => "cpu.gated_delta_recurrent_attention",
+            Self::GatedDeltaCandidateScan(_) => "cpu.gated_delta_candidate_scan",
             Self::CausalAttention(_) => "cpu.causal_attention",
         }
     }
@@ -127,6 +137,7 @@ impl CpuOperationProvider {
                 | CpuOperation::LastTokenLinear(_)
                 | CpuOperation::SwiGlu
                 | CpuOperation::GatedDelta(_)
+                | CpuOperation::GatedDeltaCandidateScan(_)
                 | CpuOperation::CausalAttention(_)
         );
         let has_weights = has_matrix || matches!(operation, CpuOperation::RmsNorm { .. });
@@ -172,11 +183,13 @@ impl CpuOperationProvider {
                     },
                 )
             })
-            .chain(std::iter::once(ProviderStorageBindingRequirement::new(
-                ResolvedValueRole::Output,
-                0,
-                DynamicStorageRequirement::contiguous(),
-            )))
+            .chain((0..descriptor.outputs.len() as u32).map(|ordinal| {
+                ProviderStorageBindingRequirement::new(
+                    ResolvedValueRole::Output,
+                    ordinal,
+                    DynamicStorageRequirement::contiguous(),
+                )
+            }))
             .collect();
         let identity = descriptor.id.as_str();
         Ok(Self {
@@ -229,7 +242,7 @@ impl OperationResourceEstimator for CpuOperationProvider {
             CpuOperation::Argmax(_) => Some(ProviderWorkspaceSizeFormula::actual_sequences(
                 unsigned(request.attributes(), "vocab_size")?,
             )?),
-            CpuOperation::GatedDelta(_) => {
+            CpuOperation::GatedDelta(_) | CpuOperation::GatedDeltaCandidateScan(_) => {
                 let shape =
                     super::gated_delta::GatedDeltaShape::from_attributes(request.attributes())
                         .map_err(|error| invalid_plan(error.to_string()))?;

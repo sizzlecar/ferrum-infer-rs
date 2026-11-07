@@ -1,3 +1,5 @@
+mod gated_delta_candidate_scan;
+pub use gated_delta_candidate_scan::*;
 mod philox_normal_bf16;
 pub use philox_normal_bf16::*;
 mod philox_normal_f32;

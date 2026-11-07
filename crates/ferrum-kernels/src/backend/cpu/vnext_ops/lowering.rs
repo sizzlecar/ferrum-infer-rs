@@ -103,8 +103,13 @@ pub(super) fn encode(
                 actions.push(CpuAction::CausalAttention(Box::new(launch)));
                 bindings.push(Box::new(preparation));
             }
-            CpuOperation::GatedDelta(dtype) => {
-                let launch = super::gated_delta_launch::prepare(
+            CpuOperation::GatedDelta(dtype) | CpuOperation::GatedDeltaCandidateScan(dtype) => {
+                let prepare = if matches!(operation, CpuOperation::GatedDeltaCandidateScan(_)) {
+                    super::gated_delta_launch::prepare_candidate_scan
+                } else {
+                    super::gated_delta_launch::prepare
+                };
+                let launch = prepare(
                     invocation,
                     index,
                     rows,
