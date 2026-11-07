@@ -8,6 +8,8 @@ use ferrum_runtime::{
 
 use super::*;
 
+mod managed_io;
+
 fn runtime(capacity: u64) -> CpuDeviceRuntime {
     CpuDeviceRuntime::new(DeviceDescriptor {
         id: DeviceId::new("device.cpu.runtime-test").unwrap(),

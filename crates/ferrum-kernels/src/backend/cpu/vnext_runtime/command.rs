@@ -22,6 +22,10 @@ pub(super) enum CommandKind {
         source: Storage,
         destination: CpuBufferRegion,
     },
+    ManagedUpload {
+        source: ferrum_runtime::ManagedHostBytes,
+        destination: CpuBufferRegion,
+    },
     Zero {
         destination: CpuBufferRegion,
     },
@@ -132,9 +136,9 @@ impl CpuDeviceCommand {
                 source.validate_runtime(instance)?;
                 destination.validate_runtime(instance)
             }
-            CommandKind::Upload { destination, .. } | CommandKind::Zero { destination } => {
-                destination.validate_runtime(instance)
-            }
+            CommandKind::Upload { destination, .. }
+            | CommandKind::ManagedUpload { destination, .. }
+            | CommandKind::Zero { destination } => destination.validate_runtime(instance),
             CommandKind::Compute { launches } => {
                 for launch in launches {
                     launch.validate_runtime(instance)?;
@@ -151,6 +155,10 @@ impl CpuDeviceCommand {
                 destination,
             } => source.copy_to(destination),
             CommandKind::Upload {
+                source,
+                destination,
+            } => destination.write(source.bytes()),
+            CommandKind::ManagedUpload {
                 source,
                 destination,
             } => destination.write(source.bytes()),
