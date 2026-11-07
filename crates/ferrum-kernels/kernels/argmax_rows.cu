@@ -217,7 +217,7 @@ __device__ __forceinline__ bool vnext_argmax_better(
         (order == selected_order && index < selected));
 }
 
-template<typename Logit, bool Partitioned = false>
+template<typename Logit, bool Partitioned = false, bool Greedy = false>
 __device__ void vnext_masked_argmax_preserving_logits(
     const Logit* __restrict__ logits,
     Logit* __restrict__ scratch,
@@ -232,9 +232,9 @@ __device__ void vnext_masked_argmax_preserving_logits(
 ) {
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
-    unsigned int repetition_start = min(repetition_offsets[0], (unsigned int)repetition_capacity);
-    unsigned int repetition_end = min(repetition_offsets[1], (unsigned int)repetition_capacity);
-    const float penalty = repetition_penalty[0];
+    unsigned int repetition_start = Greedy ? 0 : min(repetition_offsets[0], (unsigned int)repetition_capacity);
+    unsigned int repetition_end = Greedy ? 0 : min(repetition_offsets[1], (unsigned int)repetition_capacity);
+    const float penalty = Greedy ? 1.0f : repetition_penalty[0];
     const bool apply_penalty = penalty != 1.0f && repetition_start < repetition_end;
     if (Partitioned && apply_penalty && blockIdx.x != 0) {
         return;
@@ -269,7 +269,7 @@ __device__ void vnext_masked_argmax_preserving_logits(
     const int first = tid + (partition ? int(blockIdx.x) * block_size : 0);
     const int stride = block_size * (partition ? VNEXT_ARGMAX_PARTITIONS : 1);
     for (int token = first; token < n; token += stride) {
-        if (token >= mask_len || valid[token] == 0) {
+        if (!Greedy && (token >= mask_len || valid[token] == 0)) {
             continue;
         }
         const float value = static_cast<float>(selection_logits[token]);
@@ -323,6 +323,15 @@ __device__ void vnext_masked_argmax_preserving_logits(
             }
         }
     }
+}
+
+// Same finite/IEEE-total-order/lowest-id reduction, without policy inputs.
+// Logits have already been rounded to F16 by the ordinary dense head GEMM.
+extern "C" __global__ void tail_two_greedy_argmax_f16(
+    const __half* __restrict__ logits, int n, int* __restrict__ output
+) {
+    vnext_masked_argmax_preserving_logits<__half, false, true>(
+        logits, nullptr, n, nullptr, n, nullptr, nullptr, nullptr, 0, output);
 }
 
 extern "C" __global__ void last_token_masked_argmax_preserving_logits_f16(

@@ -66,6 +66,7 @@ mod native_io;
 mod q6_head;
 pub use q6_head::CudaQ6MmqF32LastTokenProvider;
 mod selection;
+mod tail_two_greedy;
 mod tensor_dense_bf16;
 mod tensor_dense_fp8_bf16;
 mod tensor_storage;
@@ -1070,6 +1071,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
         LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
         LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
+        ferrum_runtime::TAIL_TWO_GREEDY_F16_CAPABILITY_ID,
         LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
         RMS_NORM_F16_CAPABILITY_ID,
         RMS_NORM_F32_TO_F16_CAPABILITY_ID,
@@ -1333,6 +1335,7 @@ fn cuda_operation_contracts(
         Box::new(last_token_dense_linear_contract().map_err(contract_error)?),
         Box::new(last_token_dense_linear_f32_contract().map_err(contract_error)?),
         Box::new(last_token_masked_argmax_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::tail_two_greedy_f16_contract().map_err(contract_error)?),
         Box::new(last_token_masked_argmax_f32_contract().map_err(contract_error)?),
         Box::new(rms_norm_contract().map_err(contract_error)?),
         Box::new(rms_norm_f32_to_f16_contract().map_err(contract_error)?),
@@ -1395,6 +1398,7 @@ pub fn cuda_vnext_operation_registry(
         Box::new(CudaLastTokenDenseLinearProvider::new(runtime)?),
         Box::new(CudaLastTokenDenseLinearProvider::new_f32(runtime)?),
         Box::new(CudaLastTokenMaskedArgmaxProvider::new(runtime)?),
+        Box::new(tail_two_greedy::CudaTailTwoGreedyProvider::new(runtime)?),
         Box::new(CudaLastTokenMaskedArgmaxProvider::new_f32(runtime)?),
         Box::new(transformer::CudaRmsNormProvider::new(runtime)?),
         Box::new(transformer::CudaRmsNormProvider::new_f32_to_f16(runtime)?),
