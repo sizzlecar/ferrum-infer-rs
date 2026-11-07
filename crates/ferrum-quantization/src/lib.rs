@@ -18,6 +18,7 @@
 
 pub mod bf16_whole_tensor_fp8;
 pub mod block_fp8_safetensors_source;
+pub mod comfy_convrot;
 pub mod compressed_tensors_marlin_source;
 pub mod dense;
 pub mod gguf;
