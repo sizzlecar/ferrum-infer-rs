@@ -71,7 +71,11 @@ mod determinism;
 mod input_uploads;
 mod invocation_preparation;
 mod resident_decode;
-pub use composition::{CompiledProgram, ProgramCompilationError, RuntimeComposition};
+use composition::StaticInstallation;
+pub use composition::{
+    CompiledProgram, ProgramCompilationError, ProgramSharedWeightsReceipt, RuntimeComposition,
+    SharedProgramWeights, SharedProgramWeightsCloseOutcome,
+};
 use resident_decode::{
     PreparedDispatch, PreparedDispatchResult, PreparedRetirement, ResidentCache, ResidentMetrics,
 };
@@ -4629,6 +4633,7 @@ pub struct ProgramExecutor<R: DeviceRuntime> {
     family_fingerprint: String,
     program_fingerprint: String,
     static_provider_attribution: Option<StaticProviderAttributionWitness>,
+    shared_weights_receipt: Option<ProgramSharedWeightsReceipt>,
     checkpoint_capture: Option<VNextCheckpointCapture>,
     retained_output_capture: Option<Arc<RetainedOutputCapture>>,
     static_bytes: u64,
@@ -4946,8 +4951,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
 
     fn from_compiled_model<F>(
         compiled: CompiledProgram<'_, R>,
+        static_installation: StaticInstallation<'_, R>,
         resolve_plan: F,
-    ) -> crate::ExecutorBuildResult<Self>
+    ) -> crate::ExecutorBuildResult<(Self, Option<SharedProgramWeights<R>>)>
     where
         F: FnOnce(
             &ResolvedRuntimePolicy,
@@ -4979,6 +4985,22 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             .into());
         }
         prepared.validate_resolved_plan(&resolved_plan)?;
+        // Reject an incompatible/closing installation before creating a lane,
+        // worker or native buffer. bind_plan repeats the check under its gate.
+        match &static_installation {
+            StaticInstallation::Private => {}
+            StaticInstallation::PublishShared => {
+                SharedComponentWeights::<R>::validate_plan(resolved_plan.execution_plan())
+                    .map_err(|e| FerrumError::model(format!("shared static publication: {e}")))?;
+            }
+            StaticInstallation::AttachShared(weights) => {
+                weights.validate_for(
+                    resolved_plan.execution_plan(),
+                    &runtime,
+                    &prepared.resolved_sources().weights,
+                )?;
+            }
+        }
         let sequence_state_memory = state_memory::logical_sequence_state_memory(
             &family.numerical_profile().states,
             &family.numerical_profile().kv_storage,
@@ -5097,84 +5119,112 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         let provision_request = RequestIdentity::new(format!("request.vnext.provision.{run_id}"))
             .map_err(|error| FerrumError::internal(error.to_string()))?;
         let provision_phase = StartupPhaseTimer::start("static_provision");
-        let provisioned = resolved_plan
-            .execution_plan()
-            .provision_static(Arc::clone(&runtime), provision_request)
-            .map_err(|error| FerrumError::device(format!("vNext static provision: {error}")))?;
-        provision_phase.finish();
-        let (plan_resources, static_provider_attribution) = match provisioned.into_provisioning() {
-            StaticProvisioning::NoStatic(no_static) => (no_static.into_plan_runtime(), None),
-            StaticProvisioning::Required(permit) => {
-                let identity = ResourceTransactionIdentity::for_admission(
-                    permit.binding(),
-                    run_id.clone(),
-                    TransactionId::new(format!("transaction.vnext.provision.{run_id}"))
-                        .map_err(|error| FerrumError::internal(error.to_string()))?,
-                );
-                let driver = RuntimeResourceDriver::new(Arc::clone(&runtime))
-                    .map_err(|error| FerrumError::device(error.to_string()))?;
-                let transaction_begin_phase =
-                    StartupPhaseTimer::start("resource_transaction_begin");
-                let transaction = ResourceTransaction::<VNextDriver<R>, TransactionNew>::begin(
-                    driver, identity, permit,
-                )
-                .map_err(|error| FerrumError::device(error.to_string()))?;
-                transaction_begin_phase.finish();
-                let reserve_phase = StartupPhaseTimer::start("resource_reserve");
-                let reserved = match transaction.reserve() {
-                    Ok(reserved) => reserved,
-                    Err(error) => {
-                        let cause = FerrumError::device(format!(
-                            "vNext static reserve failed: {:?}",
-                            error.failure()
-                        ));
-                        let original =
-                            ferrum_runtime::ResourcePreparationRetirement::from_reserve(error);
-                        return Err(shutdown::preparation_error(original, cause));
+        let mut published_weights = None;
+        let mut shared_weights_receipt = None;
+        let (plan_resources, static_provider_attribution) =
+            if let StaticInstallation::AttachShared(weights) = &static_installation {
+                let resources = weights
+                    .weights
+                    .bind_plan(
+                        resolved_plan.execution_plan(),
+                        Arc::clone(&runtime),
+                        provision_request,
+                    )
+                    .map_err(|e| FerrumError::device(format!("shared static attachment: {e}")))?;
+                provision_phase.finish();
+                shared_weights_receipt = Some(ProgramSharedWeightsReceipt::Attached {
+                    evidence: weights.evidence().clone(),
+                    source: weights.source.clone(),
+                });
+                (resources, None)
+            } else {
+                let provisioned = resolved_plan
+                    .execution_plan()
+                    .provision_static(Arc::clone(&runtime), provision_request)
+                    .map_err(|error| {
+                        FerrumError::device(format!("vNext static provision: {error}"))
+                    })?;
+                provision_phase.finish();
+                match provisioned.into_provisioning() {
+                    StaticProvisioning::NoStatic(no_static) => {
+                        (no_static.into_plan_runtime(), None)
                     }
-                };
-                reserve_phase.finish();
-                let commit_phase = StartupPhaseTimer::start("resource_commit");
-                let committed = match reserved.commit() {
-                    Ok(committed) => committed,
-                    Err(error) => {
-                        let cause = match &error {
-                            ResourceCommitTransitionError::Recoverable(error) => {
-                                FerrumError::device(format!(
-                                    "vNext static commit failed: {:?}",
+                    StaticProvisioning::Required(permit) => {
+                        let identity = ResourceTransactionIdentity::for_admission(
+                            permit.binding(),
+                            run_id.clone(),
+                            TransactionId::new(format!("transaction.vnext.provision.{run_id}"))
+                                .map_err(|error| FerrumError::internal(error.to_string()))?,
+                        );
+                        let driver = RuntimeResourceDriver::new(Arc::clone(&runtime))
+                            .map_err(|error| FerrumError::device(error.to_string()))?;
+                        let transaction_begin_phase =
+                            StartupPhaseTimer::start("resource_transaction_begin");
+                        let transaction =
+                            ResourceTransaction::<VNextDriver<R>, TransactionNew>::begin(
+                                driver, identity, permit,
+                            )
+                            .map_err(|error| FerrumError::device(error.to_string()))?;
+                        transaction_begin_phase.finish();
+                        let reserve_phase = StartupPhaseTimer::start("resource_reserve");
+                        let reserved = match transaction.reserve() {
+                            Ok(reserved) => reserved,
+                            Err(error) => {
+                                let cause = FerrumError::device(format!(
+                                    "vNext static reserve failed: {:?}",
                                     error.failure()
-                                ))
-                            }
-                            ResourceCommitTransitionError::Poisoned(error) => {
-                                FerrumError::device(format!(
-                                    "vNext static commit was indeterminate: {:?}",
-                                    error.failure()
-                                ))
+                                ));
+                                let original =
+                                    ferrum_runtime::ResourcePreparationRetirement::from_reserve(
+                                        error,
+                                    );
+                                return Err(shutdown::preparation_error(original, cause));
                             }
                         };
-                        let original =
-                            ferrum_runtime::ResourcePreparationRetirement::from_commit(error);
-                        return Err(shutdown::preparation_error(original, cause));
-                    }
-                };
-                commit_phase.finish();
-                let initialized = match committed.initialize_static(
-                    family,
-                    resolved_plan.execution_plan(),
-                    prepared.weights(),
-                    config.static_initialization,
-                ) {
-                    Ok(initialized) => initialized,
-                    Err(failure) => {
-                        let cause = FerrumError::device(format!(
-                            "vNext static initialization failed: {}",
-                            failure.failure().message()
-                        ));
-                        return Err(shutdown::initialization_error(failure, cause));
-                    }
-                };
-                log_static_initialization_receipt(initialized.receipt());
-                let provider_attribution =
+                        reserve_phase.finish();
+                        let commit_phase = StartupPhaseTimer::start("resource_commit");
+                        let committed = match reserved.commit() {
+                            Ok(committed) => committed,
+                            Err(error) => {
+                                let cause = match &error {
+                                    ResourceCommitTransitionError::Recoverable(error) => {
+                                        FerrumError::device(format!(
+                                            "vNext static commit failed: {:?}",
+                                            error.failure()
+                                        ))
+                                    }
+                                    ResourceCommitTransitionError::Poisoned(error) => {
+                                        FerrumError::device(format!(
+                                            "vNext static commit was indeterminate: {:?}",
+                                            error.failure()
+                                        ))
+                                    }
+                                };
+                                let original =
+                                    ferrum_runtime::ResourcePreparationRetirement::from_commit(
+                                        error,
+                                    );
+                                return Err(shutdown::preparation_error(original, cause));
+                            }
+                        };
+                        commit_phase.finish();
+                        let initialized = match committed.initialize_static(
+                            family,
+                            resolved_plan.execution_plan(),
+                            prepared.weights(),
+                            config.static_initialization,
+                        ) {
+                            Ok(initialized) => initialized,
+                            Err(failure) => {
+                                let cause = FerrumError::device(format!(
+                                    "vNext static initialization failed: {}",
+                                    failure.failure().message()
+                                ));
+                                return Err(shutdown::initialization_error(failure, cause));
+                            }
+                        };
+                        log_static_initialization_receipt(initialized.receipt());
+                        let provider_attribution =
                     match StaticProviderAttributionWitness::from_completed_static_initialization(
                         &resolved_plan,
                         initialized.receipt(),
@@ -5188,73 +5238,101 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                             return Err(shutdown::initialization_error(original, cause));
                         }
                     };
-                let handoff_phase = StartupPhaseTimer::start("runtime_handoff");
-                match initialized.into_plan_runtime() {
-                    Ok(resources) => {
-                        handoff_phase.finish();
-                        (resources, provider_attribution)
-                    }
-                    Err(original) => {
-                        let cause = FerrumError::device(format!(
-                            "vNext runtime handoff failed: {}",
-                            original.failure().message()
-                        ));
-                        return Err(shutdown::initialization_error(original, cause));
+                        let handoff_phase = StartupPhaseTimer::start("runtime_handoff");
+                        let handoff =
+                            if matches!(static_installation, StaticInstallation::PublishShared) {
+                                initialized
+                                    .into_shared_plan_runtime(resolved_plan.execution_plan())
+                                    .map(|(resources, weights)| {
+                                        shared_weights_receipt =
+                                            Some(ProgramSharedWeightsReceipt::Published {
+                                                evidence: weights.evidence().clone(),
+                                                source: prepared.resolved_sources().weights.clone(),
+                                            });
+                                        published_weights = Some(SharedProgramWeights {
+                                            weights,
+                                            source: prepared.resolved_sources().weights.clone(),
+                                        });
+                                        resources
+                                    })
+                            } else {
+                                initialized.into_plan_runtime()
+                            };
+                        match handoff {
+                            Ok(resources) => {
+                                handoff_phase.finish();
+                                (resources, provider_attribution)
+                            }
+                            Err(original) => {
+                                let cause = FerrumError::device(format!(
+                                    "vNext runtime handoff failed: {}",
+                                    original.failure().message()
+                                ));
+                                return Err(shutdown::initialization_error(original, cause));
+                            }
+                        }
                     }
                 }
-            }
-        };
+            };
         executor_startup.finish();
         metrics
             .program_binding_upload
             .reset_baseline(runtime.program_binding_upload_snapshot());
-        Ok(Self {
-            info,
-            token_issuer: ExecutorSequenceIssuer::new(),
-            resolved_plan,
-            capability_catalog: catalog,
-            runtime,
-            providers,
-            policy: config.runtime_policy,
-            invocation_preparation_strategy: config.invocation_preparation_strategy,
-            resident_decode: Mutex::new(None),
-            resident_metrics: ResidentMetrics::default(),
-            completion_readback_policy: config.completion_readback_policy,
-            sampling_readback_mode: config.sampling_readback_mode,
-            plan_resources,
-            lane,
-            submission_wave_identity,
-            completion_worker,
-            reaper,
-            io,
-            maximum_model_tokens: config.maximum_model_tokens,
-            startup_memory_plan: config.startup_memory_plan,
-            run_id,
-            family_fingerprint,
-            program_fingerprint,
-            static_provider_attribution,
-            checkpoint_capture,
-            retained_output_capture,
-            static_bytes,
-            sequence_state_memory,
-            device_reusable_execution_enabled: config.device_reusable_execution_enabled,
-            device_reusable_execution_decode_only: config.device_reusable_execution_decode_only,
-            reusable_execution_supported,
-            reusable_execution_startup_plan,
-            reusable_execution_catalog: RwLock::new(None),
-            reusable_execution_catalog_refresh_needed: AtomicBool::new(false),
-            startup_reusable_programs: Mutex::new(BTreeMap::new()),
-            startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
-            sequences,
-            prefix_cache: Mutex::new(prefix_cache::PrefixIndex::default()),
-            prefix_capture_identity: Arc::new(()),
-            product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
-            event_sink: RwLock::new(None),
-            device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
-            diagnostic_fault: config.diagnostic_fault,
-            diagnostic_fault_armed: AtomicBool::new(config.diagnostic_fault.is_some()),
-            metrics,
-        })
+        Ok((
+            Self {
+                info,
+                token_issuer: ExecutorSequenceIssuer::new(),
+                resolved_plan,
+                capability_catalog: catalog,
+                runtime,
+                providers,
+                policy: config.runtime_policy,
+                invocation_preparation_strategy: config.invocation_preparation_strategy,
+                resident_decode: Mutex::new(None),
+                resident_metrics: ResidentMetrics::default(),
+                completion_readback_policy: config.completion_readback_policy,
+                sampling_readback_mode: config.sampling_readback_mode,
+                plan_resources,
+                lane,
+                submission_wave_identity,
+                completion_worker,
+                reaper,
+                io,
+                maximum_model_tokens: config.maximum_model_tokens,
+                startup_memory_plan: config.startup_memory_plan,
+                run_id,
+                family_fingerprint,
+                program_fingerprint,
+                static_provider_attribution,
+                shared_weights_receipt,
+                checkpoint_capture,
+                retained_output_capture,
+                static_bytes,
+                sequence_state_memory,
+                device_reusable_execution_enabled: config.device_reusable_execution_enabled,
+                device_reusable_execution_decode_only: config.device_reusable_execution_decode_only,
+                reusable_execution_supported,
+                reusable_execution_startup_plan,
+                reusable_execution_catalog: RwLock::new(None),
+                reusable_execution_catalog_refresh_needed: AtomicBool::new(false),
+                startup_reusable_programs: Mutex::new(BTreeMap::new()),
+                startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
+                sequences,
+                prefix_cache: Mutex::new(prefix_cache::PrefixIndex::default()),
+                prefix_capture_identity: Arc::new(()),
+                product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
+                event_sink: RwLock::new(None),
+                device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
+                diagnostic_fault: config.diagnostic_fault,
+                diagnostic_fault_armed: AtomicBool::new(config.diagnostic_fault.is_some()),
+                metrics,
+            },
+            published_weights,
+        ))
+    }
+
+    pub fn shared_weights_receipt(&self) -> Option<&ProgramSharedWeightsReceipt> {
+        self.shared_weights_receipt.as_ref()
     }
 
     pub fn resolved_plan(&self) -> &ResolvedModelPlan {
@@ -9669,6 +9747,11 @@ impl<R: DeviceRuntime> ModelExecutor for ProgramExecutor<R> {
     }
 
     fn execution_attribution_snapshot(&self) -> Option<serde_json::Value> {
+        if let Some(receipt @ ProgramSharedWeightsReceipt::Attached { .. }) =
+            &self.shared_weights_receipt
+        {
+            return serde_json::to_value(receipt).ok();
+        }
         self.static_provider_attribution
             .as_ref()
             .and_then(|witness| serde_json::to_value(witness).ok())

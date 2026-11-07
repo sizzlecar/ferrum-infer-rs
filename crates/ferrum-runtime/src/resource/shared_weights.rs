@@ -18,10 +18,15 @@ pub(crate) struct SharedWeightContract {
 impl SharedWeightContract {
     pub(crate) fn from_plan(plan: &ExecutionPlan) -> Result<Self, VNextError> {
         let payload = plan.payload();
+        // Token plans share only immutable plan-static weights. Their sequence
+        // state, workspaces, admission and completion owners remain per-plan.
+        match payload.work_limits() {
+            RuntimeWorkLimits::FixedTensor => {}
+            limits @ RuntimeWorkLimits::Tokens { .. } => limits.validate()?,
+        }
         let weights = payload.execution_weights().stored()?;
         let allocations = payload.memory().static_allocations();
-        if payload.work_limits() != RuntimeWorkLimits::FixedTensor
-            || allocations.is_empty()
+        if allocations.is_empty()
             || !weights.static_weight_transforms().is_empty()
             || allocations.iter().any(|allocation| {
                 allocation.usage() != BufferUsage::Weights
@@ -29,7 +34,7 @@ impl SharedWeightContract {
                     || !matches!(allocation.kind(), AllocationKind::Value)
             })
         {
-            return Err(invalid_resource("shared component weights require fixed-tensor, readonly Stored allocations without static transforms or mutable static state"));
+            return Err(invalid_resource("shared component weights require readonly Stored allocations without static transforms or mutable static state"));
         }
         let static_ids = allocations
             .iter()

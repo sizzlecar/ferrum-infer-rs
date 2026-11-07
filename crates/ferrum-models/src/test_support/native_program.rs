@@ -17,6 +17,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+#[cfg(test)]
+#[path = "native_program/shared_weights.rs"]
+mod shared_weights;
+
 pub const VOCAB: usize = 4;
 const MAX_TOKENS: usize = 16;
 const TOKENIZER_CONFIG: &[u8] = br#"{"chat_template":"{{ messages }}"}"#;
@@ -354,6 +358,62 @@ impl<R: DeviceRuntime> Fixture<R> {
         options: FixtureOptions,
         configure: impl FnOnce(&mut EngineConfig),
     ) -> ferrum_execution::ExecutorBuildResult<Self> {
+        let (directory, executor) = Self::with_prepared(
+            mode,
+            device,
+            options,
+            configure,
+            |prepared, info, engine, family_registry, definition| {
+                ProgramExecutor::from_runtime_composition(
+                    prepared.execution_input().unwrap(),
+                    info,
+                    engine,
+                    runtime,
+                    registry,
+                    materializers,
+                    WeightMaterializerSelection::exact(id(IDENTITY_WEIGHT_MATERIALIZER_ID)),
+                    catalog,
+                    |policy, catalog, compilation| {
+                        resolve_plan(
+                            prepared,
+                            policy,
+                            catalog,
+                            compilation,
+                            family_registry,
+                            definition,
+                            ferrum_types::KvStorageFormat::F16,
+                            StopPolicy {
+                                maximum_output_tokens: 8,
+                                token_ids: BTreeSet::from([2]),
+                                strings: vec![],
+                                collision_policy: StopTokenCollisionPolicy::require_distinct(),
+                            },
+                        )
+                    },
+                )
+            },
+        )?;
+        Ok(Self {
+            _directory: directory,
+            executor,
+        })
+    }
+
+    /// Reuse the real family, archive and typed model resolution while allowing
+    /// lifecycle tests to initialize more than one compiled token executor.
+    fn with_prepared<T>(
+        mode: SamplingReadbackMode,
+        device: ferrum_types::Device,
+        options: FixtureOptions,
+        configure: impl FnOnce(&mut EngineConfig),
+        initialize: impl FnOnce(
+            &PreparedProductionModel,
+            ferrum_types::ModelInfo,
+            &EngineConfig,
+            &FamilyRegistry,
+            &ModelFamilyDefinition,
+        ) -> ferrum_execution::ExecutorBuildResult<T>,
+    ) -> ferrum_execution::ExecutorBuildResult<(tempfile::TempDir, T)> {
         assert!(matches!(
             options.logits_type,
             ElementType::F16 | ElementType::F32
@@ -501,37 +561,8 @@ impl<R: DeviceRuntime> Fixture<R> {
                 ReusableExecutionPreparationMode::Startup;
         }
         configure(&mut engine);
-        let executor = ProgramExecutor::from_runtime_composition(
-            prepared.execution_input().unwrap(),
-            info,
-            &engine,
-            runtime,
-            registry,
-            materializers,
-            WeightMaterializerSelection::exact(id(IDENTITY_WEIGHT_MATERIALIZER_ID)),
-            catalog,
-            |policy, catalog, compilation| {
-                resolve_plan(
-                    &prepared,
-                    policy,
-                    catalog,
-                    compilation,
-                    &family_registry,
-                    &definition,
-                    ferrum_types::KvStorageFormat::F16,
-                    StopPolicy {
-                        maximum_output_tokens: 8,
-                        token_ids: BTreeSet::from([2]),
-                        strings: vec![],
-                        collision_policy: StopTokenCollisionPolicy::require_distinct(),
-                    },
-                )
-            },
-        )?;
-        Ok(Self {
-            _directory: directory,
-            executor,
-        })
+        let result = initialize(&prepared, info, &engine, &family_registry, &definition)?;
+        Ok((directory, result))
     }
 }
 

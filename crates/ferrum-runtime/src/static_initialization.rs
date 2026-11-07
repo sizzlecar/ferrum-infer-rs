@@ -279,7 +279,7 @@ where
     }
 
     /// Publish exactly this successfully initialized installation for immutable
-    /// reuse by compatible fixed-tensor plans. Original allocation, transaction,
+    /// reuse by compatible tensor or token plans. Original allocation, transaction,
     /// generation and capacity ownership remain intact.
     pub fn into_shared_plan_runtime(
         self,

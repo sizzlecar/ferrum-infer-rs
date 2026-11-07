@@ -4,6 +4,108 @@
 
 use super::*;
 
+/// This executor either published the original completed installation or
+/// attached to it without reading, materializing or uploading static weights.
+/// Evidence identifies the original physical owner, not a second initialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProgramSharedWeightsReceipt {
+    Published {
+        evidence: SharedComponentWeightsEvidence,
+        source: ResolvedModelSource,
+    },
+    Attached {
+        evidence: SharedComponentWeightsEvidence,
+        source: ResolvedModelSource,
+    },
+}
+
+impl ProgramSharedWeightsReceipt {
+    pub fn evidence(&self) -> &SharedComponentWeightsEvidence {
+        match self {
+            Self::Published { evidence, .. } | Self::Attached { evidence, .. } => evidence,
+        }
+    }
+}
+
+/// Sealed token-program installation and the frozen weight artifact identity
+/// consumed by its successful cold initialization. Core's snapshot deliberately
+/// does not authenticate files; this product handle also binds those sources.
+/// There is no public constructor or Deserialize path.
+#[must_use = "shared program weights retain the original physical installation"]
+pub struct SharedProgramWeights<R: DeviceRuntime> {
+    pub(super) weights: SharedComponentWeights<R>,
+    pub(super) source: ResolvedModelSource,
+}
+
+impl<R: DeviceRuntime> Clone for SharedProgramWeights<R> {
+    fn clone(&self) -> Self {
+        Self {
+            weights: self.weights.clone(),
+            source: self.source.clone(),
+        }
+    }
+}
+
+impl<R: DeviceRuntime> SharedProgramWeights<R> {
+    pub fn evidence(&self) -> &SharedComponentWeightsEvidence {
+        self.weights.evidence()
+    }
+    pub fn source(&self) -> &ResolvedModelSource {
+        &self.source
+    }
+    pub(super) fn validate_for(
+        &self,
+        plan: &ExecutionPlan,
+        runtime: &Arc<R>,
+        source: &ResolvedModelSource,
+    ) -> Result<()> {
+        if source != &self.source {
+            return Err(FerrumError::model(
+                "shared program weights differ from the frozen weight artifact source",
+            ));
+        }
+        self.weights
+            .validate_for(plan, runtime)
+            .map_err(|e| FerrumError::model(format!("shared static attachment: {e}")))
+    }
+    /// Delegate retirement to the original Core owner. A referenced result
+    /// retains the sealed source binding; failed retirement preserves Core's
+    /// original failure owner and retry API without authorizing another attach.
+    pub fn close(
+        self,
+    ) -> std::result::Result<
+        SharedProgramWeightsCloseOutcome<R>,
+        SharedComponentWeightsCloseFailure<R>,
+    > {
+        match self.weights.close()? {
+            SharedComponentWeightsCloseOutcome::Closed(receipt) => {
+                Ok(SharedProgramWeightsCloseOutcome::Closed(receipt))
+            }
+            SharedComponentWeightsCloseOutcome::Referenced { weights } => {
+                Ok(SharedProgramWeightsCloseOutcome::Referenced {
+                    weights: Self {
+                        weights,
+                        source: self.source,
+                    },
+                })
+            }
+        }
+    }
+}
+
+#[must_use = "referenced program weights retain the original physical claim"]
+pub enum SharedProgramWeightsCloseOutcome<R: DeviceRuntime> {
+    Closed(SharedComponentWeightsCloseReceipt),
+    Referenced { weights: SharedProgramWeights<R> },
+}
+
+pub(super) enum StaticInstallation<'a, R: DeviceRuntime> {
+    Private,
+    PublishShared,
+    AttachShared(&'a SharedProgramWeights<R>),
+}
+
 /// Preserve only fresh static-planning capacity failures across the model
 /// boundary. Contract errors and all initialization failures remain terminal.
 #[derive(Debug, thiserror::Error)]
@@ -285,6 +387,55 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
             &ProgramPlanCompilation,
         ) -> Result<ResolvedModelPlan>,
     {
-        ProgramExecutor::from_compiled_model(self, resolve_plan)
+        ProgramExecutor::from_compiled_model(self, StaticInstallation::Private, resolve_plan)
+            .map(|(executor, _)| executor)
+    }
+
+    /// Initialize once and publish that exact readonly physical installation.
+    /// The returned executor and handle share the original capacity claim;
+    /// sequence state and dynamic pools are never part of the shared owner.
+    pub fn initialize_shared_weights<F>(
+        self,
+        resolve_plan: F,
+    ) -> crate::ExecutorBuildResult<(ProgramExecutor<R>, SharedProgramWeights<R>)>
+    where
+        F: FnOnce(
+            &ResolvedRuntimePolicy,
+            &CapabilityCatalog,
+            &ProgramPlanCompilation,
+        ) -> Result<ResolvedModelPlan>,
+    {
+        ProgramExecutor::from_compiled_model(self, StaticInstallation::PublishShared, resolve_plan)
+            .map(|(executor, weights)| {
+                (
+                    executor,
+                    weights.expect("shared publication returns its original owner"),
+                )
+            })
+    }
+
+    /// Attach an independently compiled token executor to a compatible original
+    /// installation. Complete weight identity, physical placement, runtime and
+    /// capacity ceilings must agree; equal weight names alone are insufficient.
+    /// The prepared source is not read on this path. All ordinary executor
+    /// preflight, admission, completion and shutdown rules remain in effect.
+    pub fn initialize_with_shared_weights<F>(
+        self,
+        weights: &SharedProgramWeights<R>,
+        resolve_plan: F,
+    ) -> crate::ExecutorBuildResult<ProgramExecutor<R>>
+    where
+        F: FnOnce(
+            &ResolvedRuntimePolicy,
+            &CapabilityCatalog,
+            &ProgramPlanCompilation,
+        ) -> Result<ResolvedModelPlan>,
+    {
+        ProgramExecutor::from_compiled_model(
+            self,
+            StaticInstallation::AttachShared(weights),
+            resolve_plan,
+        )
+        .map(|(executor, _)| executor)
     }
 }
