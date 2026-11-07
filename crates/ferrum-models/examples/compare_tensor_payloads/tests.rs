@@ -60,8 +60,11 @@ fn real_files_preserve_reference_dtype_payload_hash_and_combined_limit() {
         .unwrap();
         let file = std::fs::read(&reference).unwrap();
         let mut args = Arguments {
-            left_raw: left_path.clone(),
-            left_shape: vec![2, 2],
+            left: LeftInput::Raw {
+                path: left_path.clone(),
+                shape: vec![2, 2],
+            },
+            group_axis: None,
             reference,
             tensor: "features".into(),
             maximum_input_bytes: left.len() + file.len(),
@@ -71,18 +74,26 @@ fn real_files_preserve_reference_dtype_payload_hash_and_combined_limit() {
         assert_eq!(report["reference"]["payload_sha256"], sha256(&payload));
         assert_eq!(report["reference"]["file_sha256"], sha256(&file));
         assert_eq!(report["left"]["payload_sha256"], sha256(&left));
+        assert!(report.get("groups").is_none());
+        assert!(report["left"].get("tensor").is_none());
         assert_eq!(report["metrics"]["max_abs"], 0.0);
         assert_eq!(report["metrics"]["rmse"], 0.0);
         assert!((report["metrics"]["cosine"].as_f64().unwrap() - 1.0).abs() < 1e-15);
         args.maximum_input_bytes -= 1;
         assert!(run(&args).is_err());
         args.maximum_input_bytes += 1;
-        args.left_shape = vec![4];
+        args.left = LeftInput::Raw {
+            path: left_path.clone(),
+            shape: vec![4],
+        };
         assert!(run(&args)
             .unwrap_err()
             .to_string()
             .contains("shape mismatch"));
-        args.left_shape = vec![2, 2];
+        args.left = LeftInput::Raw {
+            path: left_path.clone(),
+            shape: vec![2, 2],
+        };
         args.tensor = "missing".into();
         assert!(run(&args).is_err());
     }
@@ -139,4 +150,154 @@ fn cli_requires_explicit_shape_bound_and_rejects_duplicate_options() {
         args[position] = value.into();
         assert!(Arguments::parse(args).is_err());
     }
+}
+
+#[test]
+fn two_safetensors_select_distinct_names_and_group_original_coordinates() {
+    let root = tempfile::tempdir().unwrap();
+    let left_path = root.path().join("left.safetensors");
+    let reference_path = root.path().join("reference.safetensors");
+    let reference = f32_bytes(&[1.0; 12]);
+    let mut values = [1.0; 12];
+    values[2] += 2.0;
+    values[8] += 4.0;
+    values[6] += 3.0;
+    let left = f32_bytes(&values);
+    serialize_to_file(
+        [(
+            "connector_input",
+            TensorView::new(Dtype::F32, vec![2, 3, 2], &left).unwrap(),
+        )],
+        &None,
+        &left_path,
+    )
+    .unwrap();
+    serialize_to_file(
+        [(
+            "hidden_states",
+            TensorView::new(Dtype::F32, vec![2, 3, 2], &reference).unwrap(),
+        )],
+        &None,
+        &reference_path,
+    )
+    .unwrap();
+    let left_file = std::fs::read(&left_path).unwrap();
+    let right_file = std::fs::read(&reference_path).unwrap();
+    let mut args = Arguments {
+        left: LeftInput::Safetensors {
+            path: left_path.clone(),
+            tensor: "connector_input".into(),
+        },
+        reference: reference_path.clone(),
+        tensor: "hidden_states".into(),
+        maximum_input_bytes: left_file.len() + right_file.len(),
+        group_axis: Some(1),
+    };
+    let result = run(&args).unwrap();
+    assert_eq!(result["left"]["tensor"], "connector_input");
+    assert_eq!(result["reference"]["tensor"], "hidden_states");
+    assert_eq!(result["left"]["payload_sha256"], sha256(&left));
+    assert_eq!(result["left"]["file_sha256"], sha256(&left_file));
+    assert_eq!(result["groups"].as_array().unwrap().len(), 3);
+    assert_eq!(result["groups"][0]["metrics"]["rmse"], 1.5);
+    assert!(
+        (result["groups"][1]["metrics"]["rmse"].as_f64().unwrap() - 5.0_f64.sqrt()).abs() < 1e-15
+    );
+    assert_eq!(result["groups"][1]["metrics"]["worst"]["flat_index"], 8);
+    assert_eq!(
+        result["groups"][1]["metrics"]["worst"]["coordinate"],
+        serde_json::json!([1, 1, 0])
+    );
+    assert_eq!(result["groups"][2]["metrics"]["max_abs"], 0.0);
+    assert!((result["metrics"]["rmse"].as_f64().unwrap() - (29.0_f64 / 12.0).sqrt()).abs() < 1e-15);
+    args.group_axis = Some(0);
+    let first = run(&args).unwrap();
+    assert_eq!(first["groups"].as_array().unwrap().len(), 2);
+    assert_eq!(first["groups"][0]["elements"], 6);
+    assert_eq!(first["groups"][0]["metrics"]["max_abs"], 2.0);
+    assert_eq!(first["groups"][1]["metrics"]["max_abs"], 4.0);
+    args.group_axis = Some(2);
+    let last = run(&args).unwrap();
+    assert_eq!(last["groups"][0]["metrics"]["max_abs"], 4.0);
+    assert_eq!(last["groups"][1]["metrics"]["max_abs"], 0.0);
+    args.group_axis = Some(3);
+    assert!(run(&args).unwrap_err().to_string().contains("group axis"));
+    args.group_axis = Some(1);
+    args.maximum_input_bytes -= 1;
+    assert!(run(&args).is_err());
+    args.maximum_input_bytes += 1;
+    args.left = LeftInput::Safetensors {
+        path: left_path.clone(),
+        tensor: "missing".into(),
+    };
+    assert!(run(&args).is_err());
+    args.left = LeftInput::Safetensors {
+        path: left_path.clone(),
+        tensor: "connector_input".into(),
+    };
+    serialize_to_file(
+        [(
+            "hidden_states",
+            TensorView::new(Dtype::F32, vec![2, 6], &reference).unwrap(),
+        )],
+        &None,
+        &reference_path,
+    )
+    .unwrap();
+    assert!(run(&args)
+        .unwrap_err()
+        .to_string()
+        .contains("shape mismatch"));
+    let half = [0u8; 24];
+    serialize_to_file(
+        [(
+            "connector_input",
+            TensorView::new(Dtype::F16, vec![2, 3, 2], &half).unwrap(),
+        )],
+        &None,
+        &left_path,
+    )
+    .unwrap();
+    assert!(run(&args).unwrap_err().to_string().contains("native F32"));
+}
+
+#[test]
+fn safetensors_left_cli_requires_its_own_name_and_rejects_raw_shape_combinations() {
+    let base = [
+        "--left-safetensors",
+        "native.safetensors",
+        "--left-tensor",
+        "connector_input",
+        "--reference-safetensors",
+        "reference.safetensors",
+        "--tensor",
+        "hidden_states",
+        "--maximum-input-bytes",
+        "134217728",
+        "--group-axis",
+        "1",
+    ];
+    let args = Arguments::parse(base.map(OsString::from)).unwrap().unwrap();
+    assert_eq!(args.group_axis, Some(1));
+    assert!(matches!(&args.left,LeftInput::Safetensors { tensor,.. } if tensor=="connector_input"));
+    for extra in [
+        ["--left-raw", "native.raw"],
+        ["--left-shape", "1,5,1180,2560"],
+    ] {
+        let all = base.into_iter().chain(extra).map(OsString::from);
+        assert!(Arguments::parse(all).is_err());
+    }
+    let missing_name = base[..2]
+        .iter()
+        .chain(base[4..].iter())
+        .map(|value| OsString::from(*value));
+    assert!(Arguments::parse(missing_name).is_err());
+    for value in ["-1", "1.5", "invalid"] {
+        let mut args = base;
+        args[11] = value;
+        assert!(Arguments::parse(args.map(OsString::from)).is_err());
+    }
+    let mut empty = base;
+    empty[3] = "";
+    assert!(Arguments::parse(empty.map(OsString::from)).is_err());
 }

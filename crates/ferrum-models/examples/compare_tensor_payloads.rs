@@ -1,5 +1,5 @@
-//! Bounded, untransformed comparison of a native F32-LE capture and one
-//! safetensors tensor. Metrics are observations, never a quality acceptance gate.
+//! Bounded, untransformed comparison of a native F32 capture (raw or
+//! safetensors) and one reference safetensors tensor. Metrics are observations, never a quality acceptance gate.
 use anyhow::{bail, ensure, Context, Result};
 use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors};
@@ -13,11 +13,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const USAGE: &str = "compare_tensor_payloads --left-raw F32_LE_FILE --left-shape D0,D1,... --reference-safetensors FILE --tensor NAME --maximum-input-bytes TOTAL_BYTES\nThe byte limit covers both complete input files combined. Shapes must match exactly. Zero reference norm makes relative_l2 null; either zero norm makes cosine null. No quality threshold is applied.";
+const USAGE: &str = "compare_tensor_payloads (--left-raw F32_LE_FILE --left-shape D0,D1,... | --left-safetensors FILE --left-tensor NAME) --reference-safetensors FILE --tensor NAME --maximum-input-bytes TOTAL_BYTES [--group-axis AXIS]\nThe byte limit covers both complete input files combined. Shapes must match exactly. Zero reference norm makes relative_l2 null; either zero norm makes cosine null. No quality threshold is applied.";
 
+enum LeftInput {
+    Raw { path: PathBuf, shape: Vec<usize> },
+    Safetensors { path: PathBuf, tensor: String },
+}
+impl LeftInput {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Raw { path, .. } | Self::Safetensors { path, .. } => path,
+        }
+    }
+}
 struct Arguments {
-    left_raw: PathBuf,
-    left_shape: Vec<usize>,
+    left: LeftInput,
+    group_axis: Option<usize>,
     reference: PathBuf,
     tensor: String,
     maximum_input_bytes: usize,
@@ -41,6 +52,9 @@ impl Arguments {
                     flag.as_str(),
                     "--left-raw"
                         | "--left-shape"
+                        | "--left-safetensors"
+                        | "--left-tensor"
+                        | "--group-axis"
                         | "--reference-safetensors"
                         | "--tensor"
                         | "--maximum-input-bytes"
@@ -55,22 +69,38 @@ impl Arguments {
                 "duplicate option {flag}"
             );
         }
+        let raw = values.remove("--left-raw");
+        let shape = values.remove("--left-shape");
+        let safe = values.remove("--left-safetensors");
+        let left_tensor = values.remove("--left-tensor");
+        let group = values.remove("--group-axis");
         let mut take = |name: &str| {
             values
                 .remove(name)
                 .with_context(|| format!("required option {name}"))
         };
-        let left_raw = PathBuf::from(take("--left-raw")?);
         let reference = PathBuf::from(take("--reference-safetensors")?);
         let text = |value: OsString| {
             value
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("numeric options and tensor name require UTF-8"))
         };
-        let left_shape = text(take("--left-shape")?)?
-            .split(',')
-            .map(str::parse)
-            .collect::<std::result::Result<Vec<usize>, _>>()?;
+        let left = match (raw, shape, safe, left_tensor) {
+            (Some(path), Some(shape), None, None) => LeftInput::Raw {
+                path: path.into(),
+                shape: text(shape)?.split(',').map(str::parse)
+                    .collect::<std::result::Result<Vec<usize>, _>>()?,
+            },
+            (None, None, Some(path), Some(tensor)) => {
+                let tensor = text(tensor)?;
+                ensure!(!tensor.is_empty(), "left tensor name must not be empty");
+                LeftInput::Safetensors { path: path.into(), tensor }
+            }
+            _ => bail!("select either --left-raw with --left-shape or --left-safetensors with --left-tensor"),
+        };
+        let group_axis = group
+            .map(|value| -> Result<usize> { Ok(text(value)?.parse()?) })
+            .transpose()?;
         let tensor = text(take("--tensor")?)?;
         ensure!(!tensor.is_empty(), "tensor name must not be empty");
         let maximum_input_bytes = text(take("--maximum-input-bytes")?)?.parse::<usize>()?;
@@ -78,16 +108,17 @@ impl Arguments {
             maximum_input_bytes > 0 && maximum_input_bytes <= isize::MAX as usize,
             "input byte limit must be positive and addressable"
         );
-        let elements = elements(&left_shape)?;
-        ensure!(
-            elements
-                .checked_mul(4)
-                .is_some_and(|n| n <= maximum_input_bytes),
-            "left shape exceeds input byte limit"
-        );
+        if let LeftInput::Raw { shape, .. } = &left {
+            ensure!(
+                elements(shape)?
+                    .checked_mul(4)
+                    .is_some_and(|n| n <= maximum_input_bytes),
+                "left shape exceeds input byte limit"
+            );
+        }
         Ok(Some(Self {
-            left_raw,
-            left_shape,
+            left,
+            group_axis,
             reference,
             tensor,
             maximum_input_bytes,
@@ -173,6 +204,17 @@ struct Metrics {
 
 fn compare(left: &[u8], reference: &[u8], dtype: Dtype, shape: &[usize]) -> Result<Metrics> {
     let count = elements(shape)?;
+    compare_indices(left, reference, dtype, shape, 0..count)
+}
+
+fn compare_indices(
+    left: &[u8],
+    reference: &[u8],
+    dtype: Dtype,
+    shape: &[usize],
+    indices: impl Iterator<Item = usize>,
+) -> Result<Metrics> {
+    let count = elements(shape)?;
     let width = match dtype {
         Dtype::F32 => 4,
         Dtype::F16 | Dtype::BF16 => 2,
@@ -196,11 +238,15 @@ fn compare(left: &[u8], reference: &[u8], dtype: Dtype, shape: &[usize]) -> Resu
         left: 0.0,
         reference: 0.0,
     };
-    for (index, (a, b)) in left
-        .chunks_exact(4)
-        .zip(reference.chunks_exact(width))
-        .enumerate()
-    {
+    let mut compared = 0usize;
+    for index in indices {
+        ensure!(
+            index < count,
+            "comparison index is outside the declared shape"
+        );
+        let a = &left[index * 4..(index + 1) * 4];
+        let b = &reference[index * width..(index + 1) * width];
+        compared += 1;
         let a = f64::from(f32::from_le_bytes(a.try_into().unwrap()));
         let b = f64::from(match dtype {
             Dtype::F32 => f32::from_le_bytes(b.try_into().unwrap()),
@@ -228,11 +274,12 @@ fn compare(left: &[u8], reference: &[u8], dtype: Dtype, shape: &[usize]) -> Resu
             };
         }
     }
+    ensure!(compared > 0, "comparison group is empty");
     worst.coordinate = coordinate(worst.flat_index, shape);
     Ok(Metrics {
         finite: true,
         max_abs,
-        rmse: (squared_error / count as f64).sqrt(),
+        rmse: (squared_error / compared as f64).sqrt(),
         relative_l2: (reference_squared != 0.0)
             .then(|| squared_error.sqrt() / reference_squared.sqrt()),
         cosine: (left_squared != 0.0 && reference_squared != 0.0)
@@ -247,16 +294,23 @@ fn sha256(bytes: &[u8]) -> String {
 
 fn run(args: &Arguments) -> Result<serde_json::Value> {
     let left_path = args
-        .left_raw
+        .left
+        .path()
         .to_str()
         .context("JSON input path requires UTF-8")?;
     let reference_path = args
         .reference
         .to_str()
         .context("JSON input path requires UTF-8")?;
-    let count = elements(&args.left_shape)?;
-    let raw_bytes = count.checked_mul(4).context("F32 extent overflows")?;
-    let left = read_bounded(&args.left_raw, args.maximum_input_bytes, Some(raw_bytes))?;
+    let expected = match &args.left {
+        LeftInput::Raw { shape, .. } => Some(
+            elements(shape)?
+                .checked_mul(4)
+                .context("F32 extent overflows")?,
+        ),
+        LeftInput::Safetensors { .. } => None,
+    };
+    let left = read_bounded(args.left.path(), args.maximum_input_bytes, expected)?;
     let remaining = args
         .maximum_input_bytes
         .checked_sub(left.len())
@@ -266,21 +320,82 @@ fn run(args: &Arguments) -> Result<serde_json::Value> {
     let tensor = archive
         .tensor(&args.tensor)
         .context("select exact reference tensor")?;
+    let left_archive = match &args.left {
+        LeftInput::Raw { .. } => None,
+        LeftInput::Safetensors { .. } => {
+            Some(SafeTensors::deserialize(&left).context("validate left safetensors")?)
+        }
+    };
+    let left_tensor = match (&args.left, &left_archive) {
+        (LeftInput::Safetensors { tensor, .. }, Some(archive)) => {
+            let tensor = archive.tensor(tensor).context("select exact left tensor")?;
+            ensure!(
+                tensor.dtype() == Dtype::F32,
+                "left safetensors tensor must be native F32"
+            );
+            Some(tensor)
+        }
+        _ => None,
+    };
+    let (payload, shape, encoding) = match (&args.left, &left_tensor) {
+        (LeftInput::Raw { shape, .. }, None) => (left.as_slice(), shape.as_slice(), "raw_f32_le"),
+        (LeftInput::Safetensors { .. }, Some(tensor)) => {
+            (tensor.data(), tensor.shape(), "safetensors")
+        }
+        _ => unreachable!("left source and borrowed tensor agree"),
+    };
     ensure!(
-        tensor.shape() == args.left_shape.as_slice(),
+        tensor.shape() == shape,
         "shape mismatch: left {:?}, reference {:?}; reshape/squeeze is not permitted",
-        args.left_shape,
+        shape,
         tensor.shape()
     );
-    let metrics = compare(&left, tensor.data(), tensor.dtype(), &args.left_shape)?;
-    let left_sha256 = sha256(&left);
-    Ok(serde_json::json!({
-        "schema_version": 1,
-        "maximum_input_bytes": args.maximum_input_bytes,
-        "left": {"path": left_path, "encoding": "raw_f32_le", "dtype": "F32", "shape": args.left_shape, "elements": count, "file_bytes": left.len(), "payload_bytes": left.len(), "file_sha256": left_sha256, "payload_sha256": left_sha256},
-        "reference": {"path": reference_path, "encoding": "safetensors", "tensor": args.tensor, "dtype": format!("{:?}", tensor.dtype()), "shape": tensor.shape(), "elements": count, "file_bytes": reference.len(), "payload_bytes": tensor.data().len(), "file_sha256": sha256(&reference), "payload_sha256": sha256(tensor.data())},
-        "metrics": metrics
-    }))
+    let count = elements(shape)?;
+    if let Some(axis) = args.group_axis {
+        ensure!(
+            axis < shape.len(),
+            "group axis {axis} exceeds tensor rank {}",
+            shape.len()
+        );
+    }
+    let metrics = compare(payload, tensor.data(), tensor.dtype(), shape)?;
+    let mut left_metadata = serde_json::json!({
+        "path":left_path, "encoding":encoding, "dtype":"F32", "shape":shape,
+        "elements":count, "file_bytes":left.len(), "payload_bytes":payload.len(),
+        "file_sha256":sha256(&left), "payload_sha256":sha256(payload),
+    });
+    if let LeftInput::Safetensors { tensor, .. } = &args.left {
+        left_metadata["tensor"] = serde_json::json!(tensor);
+    }
+    let mut report = serde_json::json!({
+        "schema_version":1, "maximum_input_bytes":args.maximum_input_bytes,
+        "left":left_metadata,
+        "reference":{"path":reference_path, "encoding":"safetensors", "tensor":args.tensor,
+            "dtype":format!("{:?}",tensor.dtype()), "shape":tensor.shape(), "elements":count,
+            "file_bytes":reference.len(), "payload_bytes":tensor.data().len(),
+            "file_sha256":sha256(&reference), "payload_sha256":sha256(tensor.data())},
+        "metrics":metrics,
+    });
+    if let Some(axis) = args.group_axis {
+        let groups = shape[axis];
+        // All products are subsets of the already checked positive full shape.
+        let stride: usize = shape[axis + 1..].iter().product();
+        let outer = count / (groups * stride);
+        let mut grouped = Vec::new();
+        for group in 0..groups {
+            let indices = (0..outer).flat_map(|outer| {
+                let start = (outer * groups + group) * stride;
+                start..start + stride
+            });
+            let metrics = compare_indices(payload, tensor.data(), tensor.dtype(), shape, indices)?;
+            grouped.push(
+                serde_json::json!({"index":group, "elements":count/groups, "metrics":metrics}),
+            );
+        }
+        report["group_axis"] = serde_json::json!(axis);
+        report["groups"] = serde_json::json!(grouped);
+    }
+    Ok(report)
 }
 
 fn main() -> Result<()> {
