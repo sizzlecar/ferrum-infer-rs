@@ -14,6 +14,8 @@ mod affine_linear_f32;
 pub use affine_linear_f32::*;
 mod cast_f32_to_bf16;
 pub use cast_f32_to_bf16::*;
+mod gelu_f32;
+pub use gelu_f32::*;
 mod dense_linear_block_bf16;
 pub use dense_linear_block_bf16::*;
 mod channel_l2_norm_image_bf16;
