@@ -3,6 +3,7 @@
 use super::*;
 use ferrum_runtime::{HostMemoryScope, ManagedHostBuffer};
 use std::task::Waker;
+mod ready_capacity;
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -20,6 +21,7 @@ enum Mode {
     PreparationRejected,
     BeginRejected,
     BlockedDownstream,
+    ReadyCapacity,
 }
 struct FormatterPanic;
 impl fmt::Display for FormatterPanic {
@@ -52,6 +54,9 @@ struct State {
     drops: usize,
     phase_bytes: usize,
     wake: Option<Waker>,
+    initialized: Vec<(u64, usize)>,
+    cancelled_initializations: Vec<(u64, usize)>,
+    native_pressure: Option<native_pressure::NativePressure>,
 }
 #[derive(Default)]
 struct Control {
@@ -254,6 +259,12 @@ impl ImageDenoisingGenerator for Cohorted {
     ) -> Result<ImageInitializationProgress, ImageBatchError> {
         let seed = *owner.get::<u64>()?;
         if cancelled {
+            self.control
+                .state
+                .lock()
+                .unwrap()
+                .cancelled_initializations
+                .push((seed, self.inner.trace.lock().unwrap().len()));
             return Ok(ImageInitializationProgress::Cancelled);
         }
         let ImageRequestRef::Generate(request) = request else {
@@ -284,6 +295,12 @@ impl ImageDenoisingGenerator for Cohorted {
         let ready = self
             .inner
             .start_request(ImageBatchPreparation::new(seed), request)?;
+        self.control
+            .state
+            .lock()
+            .unwrap()
+            .initialized
+            .push((seed, self.inner.trace.lock().unwrap().len()));
         if matches!(self.mode, Mode::BlockedDownstream) && seed == 1 {
             let pressure = self
                 .host_account()
@@ -358,6 +375,12 @@ impl ImageDenoisingGenerator for Cohorted {
         r: &mut ImageDenoisingRequest,
         b: &mut ImageDenoisingBatch,
     ) -> Result<ImageGenerationOutput, ImageBatchError> {
+        // This fixture's independently owned native pressure retires only
+        // after an actual solver completes, before its larger decoder starts.
+        let pressure = self.control.state.lock().unwrap().native_pressure.take();
+        if let Some(pressure) = pressure {
+            pressure.close();
+        }
         self.inner.finish_request(r, b)
     }
 }
@@ -368,7 +391,13 @@ impl ImageInitializationCohortGenerator for Cohorted {
     ) -> Result<usize, ImageBatchError> {
         self.control.state.lock().unwrap().maximum_probed = true;
         self.control.changed.notify_one();
-        Ok(if *p.get_mut::<u64>()? == 0 { 0 } else { 2 })
+        Ok(if *p.get_mut::<u64>()? == 0 {
+            0
+        } else if matches!(self.mode, Mode::ReadyCapacity) {
+            self.inner.pipeline.execution.config.maximum_batch_size
+        } else {
+            2
+        })
     }
     fn initialization_cohort_compatible(
         &mut self,
@@ -540,6 +569,7 @@ impl ImageInitializationCohortGenerator for Cohorted {
                     | Mode::AuxiliaryTail
                     | Mode::AuxiliaryUnknownProgress
                     | Mode::BlockedDownstream
+                    | Mode::ReadyCapacity
             ) {
                 ImageInitializationCohortOutcome::Pending(ImageRequestInitialization::new(
                     request.seed,
@@ -619,6 +649,14 @@ fn start_cohort_with_policy(
     Arc<Control>,
 ) {
     let (mut pipeline, source) = fixture_pipeline();
+    let native_pressure = if matches!(mode, Mode::ReadyCapacity) {
+        extended_schedule(&mut pipeline);
+        let (bounded, pressure) = ready_capacity::bounded_pipeline(pipeline);
+        pipeline = bounded;
+        Some(pressure)
+    } else {
+        None
+    };
     if matches!(mode, Mode::BlockedDownstream) {
         extended_schedule(&mut pipeline);
         pipeline.execution.config.maximum_batch_size = 3;
@@ -627,6 +665,7 @@ fn start_cohort_with_policy(
     let boundary = Arc::new(Boundary::default());
     let trace = Arc::new(Mutex::new(Vec::new()));
     let control = Arc::new(Control::default());
+    control.state.lock().unwrap().native_pressure = native_pressure;
     let service = ImageService::new(
         Cohorted {
             inner: Preconditioned {
@@ -644,7 +683,7 @@ fn start_cohort_with_policy(
             maximum_pending: 4,
             maximum_pending_bytes: 1 << 18,
             maximum_prompt_bytes: 1024,
-            max_num_seqs: if matches!(mode, Mode::BlockedDownstream) {
+            max_num_seqs: if matches!(mode, Mode::BlockedDownstream | Mode::ReadyCapacity) {
                 3
             } else {
                 2
@@ -1189,7 +1228,7 @@ async fn finite_initialization_cohort_does_not_apply_idle_wait_to_a_real_survivo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn finite_initialization_cohort_ready_lane_advances_while_later_downstream_waits_for_its_real_host_owner(
+async fn finite_initialization_cohort_ready_lane_commits_before_later_downstream_needs_its_host_owner(
 ) {
     let (service, boundary, trace, runtime, control) = start_cohort(Mode::BlockedDownstream);
     let _release = Release(control.clone());
@@ -1214,8 +1253,22 @@ async fn finite_initialization_cohort_ready_lane_advances_while_later_downstream
         (survivor, a, b)
     })
     .await
-    .expect("Ready lane must execute rather than wait on its blocked downstream peer");
-    assert!(control.state.lock().unwrap().downstream_waited);
+    .expect("Ready lane must execute before its downstream peer needs the same Host capacity");
+    let downstream_after_commits = {
+        let state = control.state.lock().unwrap();
+        assert!(!state.downstream_waited);
+        state
+            .initialized
+            .iter()
+            .find(|(seed, _)| *seed == 2)
+            .expect("the later original initialization completes")
+            .1
+    };
+    assert!(trace.lock().unwrap()[..downstream_after_commits]
+        .iter()
+        .any(|wave| wave
+            .iter()
+            .any(|(seed, progress, _)| *seed == 1 && *progress > 0)));
     assert!(control.state.lock().unwrap().deferred_ready_join);
     assert!(control.state.lock().unwrap().pressure.is_none());
     assert!(trace

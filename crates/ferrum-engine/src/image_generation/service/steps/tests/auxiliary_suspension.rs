@@ -70,7 +70,9 @@ impl ImageGenerator for Generator {
         self.inner.host_account()
     }
     fn capabilities(&self) -> Result<ImageGeneratorCapabilities, GeneratorError> {
-        self.inner.capabilities()
+        let mut capabilities = self.inner.capabilities()?;
+        capabilities.maximum_batch_size = self.inner.pipeline.execution.config.maximum_batch_size;
+        Ok(capabilities)
     }
     fn generate_batch(
         &mut self,
@@ -256,11 +258,7 @@ impl ImageDenoisingGenerator for Generator {
     }
 }
 
-async fn trajectory(cancel: bool, inconsistent_restore: bool) {
-    let independent = [
-        fixture_trajectory(&[0], &[0]),
-        fixture_trajectory(&[1], &[0]),
-    ];
+fn generator(inconsistent_restore: bool, maximum_batch_size: usize) -> Generator {
     let (original, source) = fixture_pipeline();
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let composition = ReferenceVNextComposition::create_with_capacity(
@@ -284,6 +282,7 @@ async fn trajectory(cancel: bool, inconsistent_restore: bool) {
         ..
     } = execution;
     config.residency = crate::image_generation::ImageResidencyPolicy::Adaptive;
+    config.maximum_batch_size = maximum_batch_size;
     let assets =
         Arc::try_unwrap(sources.assets).unwrap_or_else(|_| panic!("one fresh source owner"));
     let pipeline = QwenImage21Pipeline::new(
@@ -297,27 +296,39 @@ async fn trajectory(cancel: bool, inconsistent_restore: bool) {
         config,
     )
     .unwrap();
-    let runtime = pipeline.execution.runtime.clone();
     let boundary = Arc::new(Boundary::default());
     let trace = Arc::new(Mutex::new(Vec::new()));
     let control = Arc::new(Control {
         restore_still_exclusive: inconsistent_restore,
         ..Control::default()
     });
+    Generator {
+        inner: Preconditioned {
+            pipeline,
+            _source: source,
+            boundary,
+            trace,
+            denied_native_join: Arc::new(AtomicBool::new(false)),
+        },
+        control,
+        suspended: false,
+        native: None,
+    }
+}
+
+async fn trajectory(cancel: bool, inconsistent_restore: bool) {
+    let independent = [
+        fixture_trajectory(&[0], &[0]),
+        fixture_trajectory(&[1], &[0]),
+    ];
+    let generator = generator(inconsistent_restore, 2);
+    let runtime = generator.inner.pipeline.execution.runtime.clone();
+    let boundary = generator.inner.boundary.clone();
+    let trace = generator.inner.trace.clone();
+    let control = generator.control.clone();
     let _release = (Release(control.clone()), ReleaseOnDrop(boundary.clone()));
     let service = ImageService::new(
-        Generator {
-            inner: Preconditioned {
-                pipeline,
-                _source: source,
-                boundary: boundary.clone(),
-                trace: trace.clone(),
-                denied_native_join: Arc::new(AtomicBool::new(false)),
-            },
-            control: control.clone(),
-            suspended: false,
-            native: None,
-        },
+        generator,
         ImageServiceConfig {
             batching: ImageBatchPolicy::Auto,
             maximum_pending: 4,
@@ -450,3 +461,5 @@ async fn suspended_worker_auxiliary_cancel_retires_native_owner_before_survivor_
 async fn suspended_worker_auxiliary_inconsistent_restore_retains_real_native_and_host_owners() {
     trajectory(false, true).await;
 }
+
+mod ready_native;

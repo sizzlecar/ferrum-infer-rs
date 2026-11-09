@@ -89,7 +89,26 @@ pub(super) fn advance<O: Send + 'static>(
     let index = pending
         .iter()
         .position(|p| p.initialization.is_some() && cancelled(p))
-        .or_else(|| pending.iter().position(|p| p.initialization.is_some()));
+        .or_else(|| {
+            // A ready FIFO member must try joining the current cohort before
+            // later initialization replaces its resident working set. If that
+            // fresh admission cannot fit, the authorized cohort advances and
+            // may retry after its next real step. Cancellation above still
+            // retires original initialization owners across this boundary.
+            // An existing native initialization that blocks denoiser restore
+            // must also reach retirement; suppressing it would strand both
+            // the suspended cohort and its ready FIFO waiter.
+            if !running.is_empty() && pending.front().is_some_and(|p| p.state.is_some()) {
+                let generator = worker.denoising_generator().unwrap();
+                pending.iter().position(|p| {
+                    p.initialization.as_ref().is_some_and(|initialization| {
+                        generator.initialization_blocks_denoising(initialization)
+                    })
+                })
+            } else {
+                pending.iter().position(|p| p.initialization.is_some())
+            }
+        });
     let Some(index) = index else {
         return Ok(Tick::default());
     };
