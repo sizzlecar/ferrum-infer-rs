@@ -1,6 +1,6 @@
 //! Closed admission policy for sharing a bounded tensor runtime with the
 //! dense F16 causal providers. This is a declaration, not measured qualification.
-use ferrum_runtime::{BufferUsage, CapabilityId};
+use ferrum_runtime::{BufferUsage, CapabilityId, DeviceCommandPhase};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -34,6 +34,31 @@ impl CudaCausalDecodeReplay {
 
     pub fn memory_bytes_per_stream(self) -> u64 {
         self.opaque_memory_bytes + Self::BLAS_WORKSPACE_BYTES
+    }
+}
+
+/// An N2 continuation requires the exact work declared by Core's admitted
+/// reusable program. An untagged prefill cannot acquire replay from its size.
+pub(crate) fn permits_command_replay(
+    enabled: bool,
+    phase: DeviceCommandPhase,
+    participants: u32,
+    tokens: u64,
+    admitted_shape: Option<(u32, u64)>,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    if phase != DeviceCommandPhase::Compute {
+        return true;
+    }
+    if participants == 0 {
+        return false;
+    }
+    let n1 = u64::from(participants);
+    match admitted_shape {
+        None => tokens == n1,
+        Some(shape) => shape == (participants, tokens) && (tokens == n1 || tokens == 2 * n1),
     }
 }
 
@@ -225,6 +250,25 @@ pub(crate) fn add_module_allowance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_causal_replay_requires_exact_admission_for_two_row_work() {
+        let compute = DeviceCommandPhase::Compute;
+        assert!(permits_command_replay(true, compute, 2, 2, None));
+        assert!(permits_command_replay(true, compute, 1, 2, Some((1, 2))));
+        assert!(permits_command_replay(true, compute, 2, 4, Some((2, 4))));
+        // Replay disabled and ordinary untagged multi-token prefill stay eager.
+        assert!(!permits_command_replay(false, compute, 2, 4, Some((2, 4))));
+        assert!(!permits_command_replay(true, compute, 2, 4, None));
+        assert!(!permits_command_replay(true, compute, 2, 6, None));
+        // A real capture identity does not authorize different or empty work.
+        assert!(!permits_command_replay(true, compute, 1, 2, Some((2, 4))));
+        assert!(!permits_command_replay(true, compute, 2, 3, Some((2, 4))));
+        assert!(!permits_command_replay(true, compute, 2, 2, Some((2, 4))));
+        assert!(!permits_command_replay(true, compute, 2, 6, Some((2, 6))));
+        assert!(!permits_command_replay(true, compute, 0, 0, Some((0, 0))));
+    }
+
     fn capabilities() -> BTreeSet<CapabilityId> {
         std::iter::once(ferrum_runtime::SILU_BF16_CAPABILITY_ID)
             .chain(DENSE_F16_CAUSAL_CAPABILITIES)

@@ -753,7 +753,7 @@ impl OperationProvider<Runtime> for Provider {
         &self,
         _: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        Ok(ReusableExecutionTopology::Static)
+        Ok(ReusableExecutionTopology::EagerBoundary)
     }
     fn encode_selected(
         &self,
@@ -927,6 +927,33 @@ impl Fixture {
                 ReusableExecutionCapacity::new(2, 32, 32)?,
             )?],
         )?;
+        Self::build(true, false, None, false, Some(workspace))
+    }
+
+    pub fn with_program_policy(
+        preparation: ReusableExecutionProgramPreparation,
+    ) -> Result<Self, VNextError> {
+        let class = ReusableExecutionClassId::new("workspace.selected.compute")?;
+        let programs = vec![ReusableExecutionProgramSpec::new(
+            class.clone(),
+            ReusableExecutionProgramShape::uniform_decode(2, 2)?,
+        )?];
+        let programs = match preparation {
+            ReusableExecutionProgramPreparation::OnDemand => {
+                ReusableExecutionProgramPolicy::exact_on_demand(programs)?
+            }
+            ReusableExecutionProgramPreparation::BeforeReadiness => {
+                ReusableExecutionProgramPolicy::exact_startup_sealed(1, 1, 1, programs)?
+            }
+        };
+        let workspace = ReusableExecutionPolicy::new(
+            1,
+            vec![ReusableExecutionBucketSpec::new(
+                class,
+                ReusableExecutionCapacity::new(2, 32, 32)?,
+            )?],
+        )?
+        .with_program_policy(programs)?;
         Self::build(true, false, None, false, Some(workspace))
     }
     fn build(
@@ -1211,6 +1238,37 @@ impl Fixture {
         histories: &[&[u32]],
         starts: &[usize],
     ) -> Result<Wave, VNextError> {
+        self.try_step_inner(sessions, histories, starts, None)
+    }
+
+    pub fn try_reusable_step(
+        &self,
+        sessions: &[Arc<SequenceSession<Runtime>>],
+        histories: &[&[u32]],
+        starts: &[usize],
+    ) -> Result<Wave, VNextError> {
+        let bucket = self
+            .compilation
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory()
+            .reusable_execution()
+            .unwrap()
+            .buckets()[0]
+            .bucket()
+            .bucket_id()
+            .clone();
+        self.try_step_inner(sessions, histories, starts, Some(bucket))
+    }
+
+    fn try_step_inner(
+        &self,
+        sessions: &[Arc<SequenceSession<Runtime>>],
+        histories: &[&[u32]],
+        starts: &[usize],
+        bucket: Option<ReusableExecutionBucketId>,
+    ) -> Result<Wave, VNextError> {
         let batch = ExecutionBatchParticipants::new(sessions.to_vec())?;
         let spans = histories
             .iter()
@@ -1220,11 +1278,14 @@ impl Fixture {
                     .with_checkpoint_tokens(Arc::from(*tokens))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let request = StepResourceAdmissionRequest::new(
+        let mut request = StepResourceAdmissionRequest::new(
             batch.bind_work_shape(spans)?,
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
         )?;
+        if let Some(bucket) = bucket {
+            request = request.with_reusable_execution_bucket(bucket);
+        }
         match batch.try_begin_step(request, &self.lane)? {
             StepResourceAdmissionDecision::Admitted(step) => Ok(Wave { step, batch }),
             other => panic!("preprovisioned step: {:?}", std::mem::discriminant(&other)),

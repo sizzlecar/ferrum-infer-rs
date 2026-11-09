@@ -10,6 +10,7 @@ mod diagnostics;
 mod fixture;
 mod product;
 mod recovery;
+mod replay;
 use fixture::*;
 
 async fn ordinary(

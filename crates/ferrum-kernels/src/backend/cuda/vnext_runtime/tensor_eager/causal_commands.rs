@@ -1,11 +1,13 @@
 //! Eager token commands admitted by the closed additional-module profile.
 use super::*;
+use ferrum_runtime::DeviceReusableExecutionProgramId;
 
 impl CudaDeviceCommand {
     pub(crate) fn prepare_bounded_causal_phase(
         &mut self,
         phase: DeviceCommandPhase,
         replay_enabled: bool,
+        capture: Option<&DeviceReusableExecutionProgramId>,
     ) -> Result<(), CudaDeviceRuntimeError> {
         if self.tensor_work.is_some() || self.tensor_transfer.is_some() {
             return self.validate_tensor_phase(phase);
@@ -50,11 +52,13 @@ impl CudaDeviceCommand {
         // F16 providers also serve the unbounded legacy runtime. Their existing
         // replay keys authorize capture only in the explicitly bounded decode
         // route. Regions, functions, bindings and the module quota stay owned.
-        if !replay_enabled
-            || (phase == DeviceCommandPhase::Compute
-                && (self.participant_count == 0
-                    || self.token_count != u64::from(self.participant_count)))
-        {
+        if !crate::backend::cuda_tensor_causal_policy::permits_command_replay(
+            replay_enabled,
+            phase,
+            self.participant_count,
+            self.token_count,
+            capture.map(|id| (id.immediate_sequences(), id.immediate_tokens())),
+        ) {
             self.replay_key = None;
             self.reusable_address_scope = None;
         }

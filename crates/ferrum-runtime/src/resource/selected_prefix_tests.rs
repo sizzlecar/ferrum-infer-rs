@@ -8,6 +8,52 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[test]
+fn selected_prefix_on_demand_backing_keeps_current_candidates_and_exact_history() {
+    let f = Fixture::with_program_policy(ReusableExecutionProgramPreparation::OnDemand).unwrap();
+    let left = f.session("left");
+    let right = f.session("right");
+    let wave = f
+        .try_reusable_step(
+            &[left.clone(), right.clone()],
+            &[&[3, 5], &[11, 13]],
+            &[0, 0],
+        )
+        .unwrap();
+    f.compute(&wave, &[&[3, 5], &[11, 13]]);
+    let before = f.runtime.probes();
+    assert_eq!(before[0][0].values(), [0., 0.]);
+    assert_eq!(before[0][1].values(), [0., 0., 0.]);
+    f.select(wave, vec![SelectedPrefix::One, SelectedPrefix::Two]);
+    assert_eq!(before[0][0].values(), [0., 6.]);
+    assert_eq!(before[0][1].values(), [3., 6., 9.]);
+    assert_eq!(before[1][0].values(), [22., 26.]);
+    assert_eq!(before[1][1].values(), [24., 48., 83.]);
+    assert!(f
+        .try_reusable_step(&[left.clone()], &[&[99, 7]], &[1])
+        .is_err());
+    assert!(f
+        .try_reusable_step(&[left.clone()], &[&[3, 5, 7]], &[2])
+        .is_err());
+    let survivor = f
+        .try_reusable_step(&[left.clone()], &[&[3, 7]], &[1])
+        .unwrap();
+    f.compute(&survivor, &[&[3, 7]]);
+    f.select(survivor, vec![SelectedPrefix::All]);
+    let actual = f.runtime.probes();
+    assert_eq!(actual[0][0].values(), [6., 14.]);
+    assert_eq!(actual[0][1].values(), [10., 20., 33.]);
+    assert_eq!(before[1][0].values(), [22., 26.]);
+    f.close(vec![left, right]);
+}
+
+#[test]
+fn selected_prefix_replay_rejects_startup_state_reexecution() {
+    assert!(
+        Fixture::with_program_policy(ReusableExecutionProgramPreparation::BeforeReadiness).is_err()
+    );
+}
+
+#[test]
 fn selected_prefix_eager_execution_preserves_workspace_capacity_policy() {
     let fixture = Fixture::with_workspace_policy().unwrap();
     let session = fixture.session("workspace");

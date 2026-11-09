@@ -16,7 +16,7 @@ use ferrum_runtime::{
     DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
 };
 
-fn composition(
+pub(in crate::image_generation::p_h3::expansion) fn composition(
     replay: bool,
 ) -> (
     RuntimeComposition<CudaDeviceRuntime>,

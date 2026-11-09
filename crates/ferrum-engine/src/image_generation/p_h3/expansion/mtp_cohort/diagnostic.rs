@@ -46,6 +46,7 @@ pub(super) struct Observations {
     roles: [RoleFacts; 4],
     next_wave: u64,
     retiring: bool,
+    replay: Option<serde_json::Value>,
 }
 impl Observations {
     pub(super) fn new(
@@ -84,6 +85,7 @@ impl Observations {
             roles: std::array::from_fn(|_| RoleFacts::default()),
             next_wave: 0,
             retiring: false,
+            replay: None,
         }
     }
 
@@ -173,6 +175,29 @@ impl Observations {
         }
     }
 
+    /// Read once after waves drain and before program close consumes the lanes.
+    /// Keep the original summary across deferred retirement retries.
+    pub(super) fn snapshot_replay<R: DeviceRuntime>(
+        &mut self,
+        programs: &cleanup::ProgramOwners<R>,
+    ) {
+        if self.replay.is_some() {
+            return;
+        }
+        let summarize = |program: &CausalProgramSession<R>| {
+            let snapshot = program.reusable_execution_snapshot();
+            serde_json::json!({
+                "enabled": snapshot["enabled"],
+                "direct_waves": snapshot["direct_waves"],
+                "fallback_waves": snapshot["fallback_waves"],
+                "catalog_programs": snapshot["catalog_programs"]
+            })
+        };
+        let main = programs.main().ok().map(&summarize);
+        let draft = programs.draft().ok().map(summarize);
+        self.replay = Some(serde_json::json!({"main": main, "draft": draft}));
+    }
+
     pub(super) fn record(
         &mut self,
         results: &[Option<ExpansionParticipantResult>],
@@ -190,6 +215,7 @@ impl Observations {
                 "poll_wall_includes_synchronous_native_wait": true,
                 "prefill": self.roles[0], "draft": self.roles[1],
                 "verify": self.roles[2], "last": self.roles[3],
+                "reusable_execution": self.replay,
                 "request": self.requests[index]
             }}));
             let (outcome, text) = if normal {

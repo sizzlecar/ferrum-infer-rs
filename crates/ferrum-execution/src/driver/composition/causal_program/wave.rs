@@ -238,17 +238,124 @@ impl<R: DeviceRuntime> CausalProgramSession<R> {
             Ok(prepared) => prepared,
             Err(error) => return Err(owner.error(error)),
         };
-        let handle = match OperationDispatch::encode_and_submit_wave_with_inputs(
-            self.providers.providers(),
-            &self.plan,
-            &identity,
-            active.iter(),
-            DeviceTimingMode::Off,
-            &uploads,
-            prepared,
+        let reusable = match self
+            .replay
+            .as_ref()
+            .map(|replay| replay.program(self, &prepared, &lane))
+            .transpose()
+        {
+            Ok(program) => program.flatten(),
+            Err(error) => return Err(owner.error(error)),
+        };
+        let capture = self.replay.is_some()
+            && prepared
+                .claimed_backing()
+                .reusable_execution_bucket_id()
+                .is_some();
+        let mut direct = reusable.is_some();
+        #[cfg(feature = "test-support")]
+        let diagnostic = replay::diagnostic::Observation::begin(
+            self,
+            &prepared,
             &lane,
-            &owner.reaper,
-        ) {
+            capture && !direct,
+            direct,
+        );
+        let submitted = match &reusable {
+            Some(program) => OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
+                self.providers.providers(),
+                &self.plan,
+                &identity,
+                active.iter(),
+                DeviceTimingMode::Off,
+                &uploads,
+                program,
+                prepared,
+                &lane,
+                &owner.reaper,
+            ),
+            #[cfg(feature = "test-support")]
+            None if diagnostic.is_some() => {
+                OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
+                    self.providers.providers(),
+                    &self.plan,
+                    &identity,
+                    active.iter(),
+                    DeviceTimingMode::Off,
+                    &uploads,
+                    if capture {
+                        SubmissionExecutionPolicy::adaptive()
+                    } else {
+                        SubmissionExecutionPolicy::eager()
+                    },
+                    diagnostic.as_ref().unwrap(),
+                    prepared,
+                    &lane,
+                    &owner.reaper,
+                )
+                .map(|profiled| profiled.into_parts().0)
+            }
+            None => OperationDispatch::encode_and_submit_wave_with_inputs_and_policy(
+                self.providers.providers(),
+                &self.plan,
+                &identity,
+                active.iter(),
+                DeviceTimingMode::Off,
+                &uploads,
+                if capture {
+                    SubmissionExecutionPolicy::adaptive()
+                } else {
+                    SubmissionExecutionPolicy::eager()
+                },
+                prepared,
+                &lane,
+                &owner.reaper,
+            ),
+        };
+        #[cfg(feature = "test-support")]
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.finish(submitted.is_ok());
+        }
+        // A stale native catalog may reject before submission. Only its real
+        // definitely-not-submitted authority permits one eager retry on the
+        // same original frame. Unknown/submitted work is never retried here.
+        let submitted = match submitted {
+            Err(SubmissionWaveDispatchError::DefinitelyNotSubmitted { retry, .. }) if direct => {
+                direct = false;
+                self.replay
+                    .as_ref()
+                    .unwrap()
+                    .fallback_waves
+                    .fetch_add(1, Ordering::Relaxed);
+                let prepared = match retry.retry() {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Err(owner.error(error)),
+                };
+                let identity = match OperationDispatch::bind_submission_wave_identity(
+                    &self.plan,
+                    active.iter(),
+                    &prepared,
+                    &lane,
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => return Err(owner.error(error)),
+                };
+                OperationDispatch::encode_and_submit_wave_with_inputs_and_policy(
+                    self.providers.providers(),
+                    &self.plan,
+                    &identity,
+                    active.iter(),
+                    DeviceTimingMode::Off,
+                    &uploads,
+                    SubmissionExecutionPolicy::eager(),
+                    prepared,
+                    &lane,
+                    &owner.reaper,
+                )
+            }
+            result => result,
+        };
+        let handle = match submitted {
             Ok(handle) => handle,
             Err(error) => {
                 owner.message = format!("causal dispatch: {error:?}");
@@ -271,6 +378,15 @@ impl<R: DeviceRuntime> CausalProgramSession<R> {
             if matches!(receipt.disposition(), OperationCompletionDisposition::Succeeded))
         {
             return Err(owner.error(format!("causal compute did not succeed: {completion:?}")));
+        }
+        if let Some(replay) = &self.replay {
+            if direct {
+                replay.direct_waves.fetch_add(1, Ordering::Relaxed);
+            } else if capture {
+                if let Err(error) = replay.refresh(self, &lane) {
+                    return Err(owner.error(error));
+                }
+            }
         }
         let outputs = match outputs {
             Some(Ok(outputs)) if outputs.len() == sources.len() * 2 => outputs,

@@ -5945,7 +5945,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 command.validate_managed_transfer()?;
                 if let Some(owner) = &self.tensor_eager {
                     if owner.execution_profile() != CudaTensorExecutionProfile::TensorOnly {
-                        command.prepare_bounded_causal_phase(phase, bounded_replay)?;
+                        command.prepare_bounded_causal_phase(
+                            phase,
+                            bounded_replay,
+                            reusable_execution_capture
+                                .as_ref()
+                                .map(DeviceReusableExecutionCapture::program_id),
+                        )?;
                     } else {
                         command.validate_tensor_phase(phase)?;
                     }

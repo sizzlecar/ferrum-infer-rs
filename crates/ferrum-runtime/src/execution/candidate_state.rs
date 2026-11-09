@@ -34,6 +34,47 @@ pub(crate) struct CandidateStateCopy {
     pub element_type: ElementType,
 }
 impl CandidateStateLayout {
+    /// Candidate copies remain same-frame effects. On-demand replay may
+    /// accelerate other compute nodes, but complete candidate-state producers
+    /// must remain eager boundaries and their outputs must retain Step storage.
+    pub(crate) fn validate_replay_policy<P: RuntimePolicy>(
+        &self,
+        nodes: &[PlanNode],
+        policy: &P,
+    ) -> Result<(), VNextError> {
+        let Some(programs) = policy
+            .reusable_execution_policy()
+            .and_then(|reusable| reusable.program_policy())
+        else {
+            return Ok(());
+        };
+        if programs.preparation() != crate::ReusableExecutionProgramPreparation::OnDemand
+            || policy.execution_determinism_requirement()
+                != crate::ExecutionDeterminismRequirement::BitwiseSameRuntime
+        {
+            return Err(invalid_plan(
+                "candidate replay requires explicit on-demand compute segments with declared eager boundaries",
+            ));
+        }
+        for copy in &self.copies {
+            let node = nodes
+                .iter()
+                .find(|node| node.id() == &copy.node)
+                .ok_or_else(|| invalid_plan("candidate copy producer is absent"))?;
+            if node.provider_execution_semantics().replay_equivalence()
+                != crate::ProviderReplayEquivalence::Ineligible
+            {
+                return Err(invalid_plan(
+                    "candidate state producers must remain outside reusable compute segments",
+                ));
+            }
+        }
+        // Dispatch independently requires every ineligible provider to declare
+        // EagerBoundary. It rejects Static/Dynamic topology for such providers;
+        // this planning permission never grants candidate-state replay.
+        Ok(())
+    }
+
     pub(crate) fn retained_values(&self) -> impl Iterator<Item = &ProgramValueId> {
         self.copies.iter().map(|x| &x.candidate_value)
     }

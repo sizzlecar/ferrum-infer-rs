@@ -294,6 +294,7 @@ pub(super) struct Wave<R: DeviceRuntime> {
     input_indices: Vec<usize>,
     spans: Vec<TokenSpanWork>,
     uploads: Vec<SubmissionWaveInputUpload>,
+    continuation: bool,
     extension_index: usize,
     step: Option<Arc<StepResourceLease<R>>>,
     wait: Option<Wait>,
@@ -307,6 +308,7 @@ impl<R: DeviceRuntime> Wave<R> {
         program: &CausalProgramSession<R>,
         members: Vec<Member<R>>,
         fit_ceiling: usize,
+        kind: super::WaveKind,
     ) -> Result<Self> {
         if program.installation_only() {
             return Err(error("installation-only program cannot form a wave"));
@@ -366,7 +368,7 @@ impl<R: DeviceRuntime> Wave<R> {
             })
             .collect::<Result<Vec<_>>>()?;
         let uploads = uploads(program, &members)?;
-        let lane = program.resources().create_execution_lane().map_err(error)?;
+        let lane = program.execution_lane()?;
         Ok(Self {
             resources: Arc::clone(program.resources()),
             batch: Some(batch),
@@ -375,6 +377,7 @@ impl<R: DeviceRuntime> Wave<R> {
             input_indices,
             spans,
             uploads,
+            continuation: kind != super::WaveKind::Prefill,
             extension_index: 0,
             step: None,
             wait: None,
@@ -473,12 +476,15 @@ impl<R: DeviceRuntime> Wave<R> {
         }
         let batch = self.batch.as_ref().expect("unsubmitted batch");
         if self.step.is_none() {
-            let request = StepResourceAdmissionRequest::new(
+            let mut request = StepResourceAdmissionRequest::new(
                 batch.bind_work_shape(self.spans.clone()).map_err(error)?,
                 AdmissionFitPolicy::ImmediateOnly,
                 AdmissionPressureAction::WaitForRelease,
             )
             .map_err(error)?;
+            if self.continuation {
+                request = program.continuation_step_request(request)?;
+            }
             match batch.try_begin_step(request, &self.lane).map_err(error)? {
                 StepResourceAdmissionDecision::Admitted(step) => {
                     self.step = Some(step);

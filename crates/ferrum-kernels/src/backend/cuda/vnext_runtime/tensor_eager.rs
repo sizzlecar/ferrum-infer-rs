@@ -1113,7 +1113,7 @@ mod tests {
         let (capacity, state, quota) = causal_module_test_owners();
         let mut command = transfer_only_command(Some(quota));
         command
-            .prepare_bounded_causal_phase(DeviceCommandPhase::Compute, false)
+            .prepare_bounded_causal_phase(DeviceCommandPhase::Compute, false, None)
             .unwrap();
         assert_eq!(command.compute_dispatch_count, 0);
         assert_eq!(command.transfer_command_count, 6);
@@ -1146,13 +1146,13 @@ mod tests {
         // a compute-phase command with no physical work at all.
         empty.transfer_command_count = 0;
         assert!(empty
-            .prepare_bounded_causal_phase(DeviceCommandPhase::Compute, false)
+            .prepare_bounded_causal_phase(DeviceCommandPhase::Compute, false, None)
             .is_err());
         drop(empty);
 
         let mut unowned = transfer_only_command(None);
         assert!(unowned
-            .prepare_bounded_causal_phase(DeviceCommandPhase::Compute, false)
+            .prepare_bounded_causal_phase(DeviceCommandPhase::Compute, false, None)
             .is_err());
         drop(unowned);
 
@@ -1163,7 +1163,7 @@ mod tests {
             .push(vec![0u8; 4].into_boxed_slice());
         executable.host_upload_layout = Some(HostTransferLayout::new(ElementType::F16, 2).unwrap());
         assert!(upload
-            .prepare_bounded_causal_phase(DeviceCommandPhase::Compute, false)
+            .prepare_bounded_causal_phase(DeviceCommandPhase::Compute, false, None)
             .is_err());
         drop(upload);
         drop(quota);
@@ -1234,7 +1234,7 @@ mod tests {
             .unwrap()
             ._causal_modules = Some(quota);
         assert!(command
-            .prepare_bounded_causal_phase(DeviceCommandPhase::Compute, false)
+            .prepare_bounded_causal_phase(DeviceCommandPhase::Compute, false, None)
             .is_err());
         drop(command);
         assert!(state.causal_retention().is_none());

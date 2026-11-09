@@ -215,6 +215,15 @@ impl<'source> MtpExpansionSource<'source> {
     ) -> Result<CompiledMtpExpansion<'a, 'source, R>> {
         validate_engine(engine)?;
         let mut engine = engine.clone();
+        if self.role == Qwen35MtpRole::InstallUnion {
+            // This graph only installs the shared weights. It never executes
+            // token work and must not reserve another reusable lane/catalog.
+            engine.backend.enable_reusable_execution = false;
+            engine
+                .backend
+                .reusable_execution_capture
+                .maximum_executables_per_lane = None;
+        }
         engine.numerical_execution = self.role.numerical_profile().parse().map_err(model_error)?;
         let model = self.assets.role(self.role)?.model.prepared();
         let info = model.model_info(engine.model.model_id.clone(), engine.backend.device.clone());
@@ -248,7 +257,7 @@ impl<'source> MtpExpansionSource<'source> {
                     model::MAIN_HIDDEN_TAIL,
                 )
             };
-            composition.compile_causal_program(
+            composition.compile_causal_program_with_declared_eager_boundaries(
                 prepared,
                 config.runtime_policy,
                 options,
@@ -549,11 +558,20 @@ fn validate_engine(engine: &EngineConfig) -> Result<()> {
         || p.structured_output_start != greedy.structured_output_start
         || p.response_completion_boundary != greedy.response_completion_boundary
         || p.model_output_protocol != greedy.model_output_protocol
-        || engine.backend.enable_reusable_execution
         || engine.runtime.vnext_checkpoint_capture.is_some()
     {
         return Err(FerrumError::unsupported(
-            "one-draft MTP requires eager greedy execution without logits processors or checkpoint capture",
+            "one-draft MTP requires greedy execution without logits processors or checkpoint capture",
+        ));
+    }
+    if engine.backend.enable_reusable_execution
+        && (engine.backend.reusable_execution_capture.preparation
+            != ferrum_types::ReusableExecutionPreparationMode::OnDemand
+            || engine.backend.reusable_execution_capture.scope
+                != ferrum_types::ReusableExecutionCaptureScope::DecodeOnly)
+    {
+        return Err(FerrumError::unsupported(
+            "one-draft MTP replay requires on-demand decode-only preparation",
         ));
     }
     Ok(())

@@ -2,7 +2,7 @@ use super::tests::fixture::Fixture;
 use super::*;
 
 #[cfg(feature = "cuda")]
-mod cuda;
+pub(super) mod cuda;
 mod nonzero;
 
 #[test]

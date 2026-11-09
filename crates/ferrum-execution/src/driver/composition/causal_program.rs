@@ -2,6 +2,7 @@
 //! installation and Core sequence ownership as the ordinary language driver.
 //! This layer does not interpret model names or invent sampling-policy inputs.
 use super::*;
+mod replay;
 mod wave;
 pub use wave::{
     CausalAcceptedOutput, CausalCommittedWave, CausalComputedWave, CausalVerifiedDraftOutput,
@@ -93,7 +94,37 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
         terminal: CausalTailTwoOutput,
     ) -> std::result::Result<CompiledCausalProgram<'a, R>, ProgramCompilationError> {
         terminal.validate_program(prepared.family().program())?;
-        self.compile_causal_inner(prepared, policy, options, materializer, Some(terminal))
+        self.compile_causal_inner(
+            prepared,
+            policy,
+            options,
+            materializer,
+            Some(terminal),
+            false,
+        )
+    }
+
+    /// Replay only eligible compute segments. Providers declaring an eager
+    /// boundary retain ordinary execution and fresh invocation ownership.
+    /// The resolved policy promises runtime repeatability; each captured
+    /// segment must independently provide bitwise eager equivalence.
+    pub fn compile_causal_program_with_declared_eager_boundaries<'a>(
+        &'a self,
+        prepared: PreparedExecutionInput<'a>,
+        policy: ResolvedRuntimePolicy,
+        options: ProgramPlanCompileOptions,
+        materializer: WeightMaterializerSelection,
+        terminal: CausalTailTwoOutput,
+    ) -> std::result::Result<CompiledCausalProgram<'a, R>, ProgramCompilationError> {
+        terminal.validate_program(prepared.family().program())?;
+        self.compile_causal_inner(
+            prepared,
+            policy,
+            options,
+            materializer,
+            Some(terminal),
+            true,
+        )
     }
 
     pub fn compile_causal_weight_installation<'a>(
@@ -103,7 +134,7 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
         options: ProgramPlanCompileOptions,
         materializer: WeightMaterializerSelection,
     ) -> std::result::Result<CompiledCausalProgram<'a, R>, ProgramCompilationError> {
-        self.compile_causal_inner(prepared, policy, options, materializer, None)
+        self.compile_causal_inner(prepared, policy, options, materializer, None, false)
     }
 
     fn compile_causal_inner<'a>(
@@ -113,21 +144,22 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
         mut options: ProgramPlanCompileOptions,
         materializer: WeightMaterializerSelection,
         terminal: Option<CausalTailTwoOutput>,
+        declared_eager_boundaries: bool,
     ) -> std::result::Result<CompiledCausalProgram<'a, R>, ProgramCompilationError> {
         if self.runtime.descriptor() != self.catalog.device() {
             return Err(FerrumError::device("causal catalog differs from its runtime").into());
         }
-        if !matches!(policy.work_limits(), RuntimeWorkLimits::Tokens { .. })
-            || policy
-                .reusable_execution_policy()
-                .and_then(|policy| policy.program_policy())
-                .is_some()
-        {
+        if !matches!(policy.work_limits(), RuntimeWorkLimits::Tokens { .. }) {
             return Err(FerrumError::unsupported(
-                "bounded causal programs require eager token execution",
+                "bounded causal programs require token execution",
             )
             .into());
         }
+        let policy = if declared_eager_boundaries {
+            replay::resolve_policy_with_eager_boundaries(policy, terminal.is_some())?
+        } else {
+            replay::resolve_policy(policy, terminal.is_some())?
+        };
         if !self.runtime.supports_managed_tensor_io() {
             return Err(FerrumError::unsupported(
                 "causal programs require managed uploads and readbacks",
@@ -269,6 +301,7 @@ pub struct CausalProgramSession<R: DeviceRuntime> {
     shared_receipt: Option<ProgramSharedWeightsReceipt>,
     static_attribution: Option<StaticProviderAttributionWitness>,
     vocabulary_size: usize,
+    replay: Option<replay::CausalReplay<R>>,
 }
 
 impl<'a, R: DeviceRuntime> CompiledCausalProgram<'a, R> {
@@ -379,6 +412,9 @@ impl<'a, R: DeviceRuntime> CompiledCausalProgram<'a, R> {
                 .registry
                 .bind_plan(&plan)
                 .map_err(|e| FerrumError::model(format!("causal provider binding: {e}")))?;
+            // Resolve and validate the bounded catalog before any native
+            // installation. Its physical lane is acquired lazily by real work.
+            let replay = replay::CausalReplay::from_plan(&plan)?;
             let run_id = RunId::new(format!("run.causal.{}", uuid::Uuid::new_v4()))
                 .map_err(|e| FerrumError::internal(e.to_string()))?;
             let initialized = static_installation::initialize_program_resources(
@@ -400,6 +436,7 @@ impl<'a, R: DeviceRuntime> CompiledCausalProgram<'a, R> {
                 shared_receipt: initialized.shared_weights_receipt,
                 static_attribution: initialized.static_provider_attribution,
                 vocabulary_size: self.prepared.facts().vocabulary_size(),
+                replay,
             };
             Ok((session, initialized.published_weights))
         })();
@@ -459,7 +496,16 @@ impl<R: DeviceRuntime> CausalProgramSession<R> {
     pub fn close(
         self,
     ) -> std::result::Result<PlanRuntimeCloseOutcome<R>, PlanRuntimeCloseFailure<R>> {
-        let Self { resources, .. } = self;
+        tracing::debug!(
+            target: "ferrum.causal.replay",
+            plan = %self.plan.execution_plan().plan_hash(),
+            replay = %self.reusable_execution_snapshot(),
+            "retiring causal program"
+        );
+        let Self {
+            resources, replay, ..
+        } = self;
+        drop(replay);
         PlanRuntimeResources::close(resources)
     }
 }

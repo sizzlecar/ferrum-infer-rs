@@ -238,16 +238,8 @@ impl ExecutionPlan {
         };
         let candidate_state_layout =
             super::candidate_state::derive_candidate_state(program, &nodes, request.capabilities)?;
-        if candidate_state_layout.is_some()
-            && request
-                .policy
-                .reusable_execution_policy()
-                .and_then(|policy| policy.program_policy())
-                .is_some()
-        {
-            return Err(invalid_plan(
-                "candidate settlement currently requires eager full-plan execution",
-            ));
+        if let Some(layout) = &candidate_state_layout {
+            layout.validate_replay_policy(&nodes, request.policy)?;
         }
         let retention = if work_limits.is_tensor() {
             CompletionRetentionSpec::new(

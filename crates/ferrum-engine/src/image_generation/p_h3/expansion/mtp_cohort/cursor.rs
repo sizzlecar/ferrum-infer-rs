@@ -71,6 +71,21 @@ impl<R: DeviceRuntime> Cursor<R> {
         self.frontier
     }
 
+    #[cfg(test)]
+    pub(super) fn accepted_hidden_bytes(
+        &self,
+        host: &HostMemoryAccount,
+    ) -> Result<Option<Vec<u8>>> {
+        self.accepted
+            .as_ref()
+            .map(|output| {
+                output
+                    .copy_hidden_input(host)
+                    .map(|bytes| bytes.bytes().to_vec())
+            })
+            .transpose()
+    }
+
     pub(super) fn cancel(&mut self) -> Result<()> {
         if self.main_terminal.is_none() {
             self.main.request_cancel().map_err(core_error)?;

@@ -362,7 +362,7 @@ impl<R: DeviceRuntime> MtpExpansionCohort<R> {
                 .iter()
                 .map(|member| member.range.start)
                 .collect::<Vec<_>>();
-            let native = core::Wave::new(program, members, self.maximum_tokens)?;
+            let native = core::Wave::new(program, members, self.maximum_tokens, kind)?;
             let observation = self.diagnostics.as_mut().map(|diagnostics| {
                 diagnostics.begin(
                     kind,
@@ -666,6 +666,9 @@ impl<R: DeviceRuntime> MtpExpansionCohort<R> {
             self.stranded.pop();
         }
         self.inputs.clear();
+        if let Some(diagnostics) = &mut self.diagnostics {
+            diagnostics.snapshot_replay(&self.programs);
+        }
         self.programs.poll_close()
     }
 }

@@ -15,6 +15,14 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub(super) fn new() -> Self {
+        Self::build(false)
+    }
+
+    pub(super) fn nonzero_continuations() -> Self {
+        Self::build(true)
+    }
+
+    fn build(continuations: bool) -> Self {
         let mut original = OriginalFixture::new_two_answers();
         // No active mmap is edited. Reopen the finished source only after all
         // original fixture mappings and model owners have been dropped.
@@ -94,6 +102,56 @@ impl Fixture {
                 .collect();
             tensors.push((format!("mtp.{role}.weight"), shape, bytes));
         }
+        if continuations {
+            for (name, _, bytes) in &mut tensors {
+                if name == "model.embed_tokens.weight" {
+                    for (token, vector) in [
+                        (ANSWER_ID as usize, [0.0_f32, 1.0]),
+                        (SECOND_ANSWER_ID as usize, [-1.0_f32, -1.0]),
+                        (0, [1.0_f32, 0.0]),
+                    ] {
+                        for (column, value) in vector.into_iter().enumerate() {
+                            let offset = (token * h + column) * 2;
+                            bytes[offset..offset + 2]
+                                .copy_from_slice(&half::bf16::from_f32(value).to_le_bytes());
+                        }
+                    }
+                } else if name == "model.lm_head.weight" {
+                    // Three valid source tokens form a cycle. EOS remains the
+                    // protocol's original token; this fixture is cancelled.
+                    bytes[0..4].copy_from_slice(
+                        &[
+                            half::bf16::from_f32(-1.0).to_le_bytes(),
+                            half::bf16::from_f32(-1.0).to_le_bytes(),
+                        ]
+                        .concat(),
+                    );
+                    bytes[EOS_ID as usize * h * 2..(EOS_ID as usize + 1) * h * 2].fill(0);
+                } else if name == "mtp.fc.weight" {
+                    // This draft intentionally misses one transition in each
+                    // cycle, exercising rejection after catalogs are populated.
+                    bytes.fill(0);
+                    for column in 0..h {
+                        bytes[column * 2..column * 2 + 2]
+                            .copy_from_slice(&half::bf16::from_f32(1.0).to_le_bytes());
+                    }
+                } else if name.contains("norm") {
+                    // Gated-delta output normalization uses an ordinary
+                    // multiplicative scale: zero would erase its changing state.
+                    for value in bytes.chunks_exact_mut(2) {
+                        value.copy_from_slice(&half::bf16::from_f32(0.5).to_le_bytes());
+                    }
+                } else if name != "model.lm_head.weight" {
+                    // Real nonzero attention, recurrent and FFN state. The
+                    // existing short-EOS fixture stays unchanged above.
+                    for (index, value) in bytes.chunks_exact_mut(2).enumerate() {
+                        value.copy_from_slice(
+                            &half::bf16::from_f32((index % 7 + 1) as f32 / 64.0).to_le_bytes(),
+                        );
+                    }
+                }
+            }
+        }
         let views = tensors
             .iter()
             .map(|(name, shape, bytes)| {
@@ -134,7 +192,17 @@ impl Fixture {
         composition: &RuntimeComposition<CpuDeviceRuntime>,
         host: &HostMemoryAccount,
     ) -> MtpExpansionCohort<CpuDeviceRuntime> {
-        let mut prepared = self.assets.prepare_text_cohort(self.requests()).unwrap();
+        assert_eq!(composition.runtime().resident_bytes(), 0);
+        self.machine_with_requests(composition, host, self.requests())
+    }
+
+    pub(super) fn machine_with_requests<R: DeviceRuntime>(
+        &self,
+        composition: &RuntimeComposition<R>,
+        host: &HostMemoryAccount,
+        requests: Vec<PreparedTextExpansion>,
+    ) -> MtpExpansionCohort<R> {
+        let mut prepared = self.assets.prepare_text_cohort(requests).unwrap();
         let capacity = prepared.engine.scheduler.max_running_requests;
         initialization::prepare_engine(&mut prepared).unwrap();
         assert_eq!(prepared.engine.scheduler.max_running_requests, capacity);
@@ -149,7 +217,6 @@ impl Fixture {
         )
         .unwrap();
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
-        assert_eq!(composition.runtime().resident_bytes(), 0);
         assert!(requirements.startup_device_bytes() > 0);
         let phase = host.reserve_scope(&requirements.claims()).unwrap();
         let mut initialization = initialization::MtpInitialization::new(
