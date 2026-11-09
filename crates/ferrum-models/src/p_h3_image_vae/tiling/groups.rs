@@ -33,8 +33,8 @@ impl From<PH3ImageVaeTileBatch> for usize {
     }
 }
 
-/// Actual adjacent tiles in one row, without padding. Returned by the model's
-/// traversal; callers select the admitted recipe with this exact tile count.
+/// Consecutive tiles in row-major order, without padding. A group may cross a
+/// row boundary; callers select the admitted recipe with this exact tile count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PH3ImageVaeTileGroup {
     first_tile: usize,
@@ -55,19 +55,19 @@ impl PH3ImageVaeTilePlan {
         batch: PH3ImageVaeTileBatch,
     ) -> Result<PH3ImageVaeTileGroup> {
         self.tile(first_tile)?;
-        let column = first_tile % self.x.starts.len();
+        let largest = batch.0.min(self.x.starts.len());
         ensure!(
-            column % batch.0 == 0,
-            "VAE group must start at its declared row boundary"
+            first_tile % largest == 0,
+            "VAE group must start at its declared traversal boundary"
         );
         Ok(PH3ImageVaeTileGroup {
             first_tile,
-            tile_count: batch.0.min(self.x.starts.len() - column),
+            tile_count: largest.min(self.tile_count() - first_tile),
         })
     }
     pub fn group_shapes(&self, batch: PH3ImageVaeTileBatch) -> Vec<usize> {
         let largest = batch.0.min(self.x.starts.len());
-        let tail = self.x.starts.len() % largest;
+        let tail = self.tile_count() % largest;
         if tail == 0 {
             vec![largest]
         } else {
@@ -80,33 +80,58 @@ impl PH3ImageVaeTilePlan {
 mod tests {
     use super::*;
     #[test]
-    fn declared_groups_have_real_row_tails_and_no_padding() {
-        for (size, expected, total) in [(2912, vec![4, 3], 60), (1024, vec![4, 1], 10)] {
-            let plan = PH3ImageVaeTilePlan::new(
-                size,
-                size,
-                16,
-                PH3ImageVaeSpatialPolicy::comfy_default(256),
-            )
-            .unwrap();
-            let batch = PH3ImageVaeTileBatch::new(4).unwrap();
-            assert_eq!(plan.group_shapes(batch), expected);
-            let mut first = 0;
-            let mut groups = 0;
-            while first < plan.tile_count() {
-                let g = plan.group(first, batch).unwrap();
-                assert_eq!(g.first_tile(), first);
-                assert_eq!(
-                    plan.tile(first).unwrap().y,
-                    plan.tile(first + g.tile_count() - 1).unwrap().y
-                );
-                first += g.tile_count();
-                groups += 1;
+    fn declared_groups_cross_rows_in_order_with_only_a_final_real_tail() {
+        let mut crossed_row = false;
+        let mut saw_tail = false;
+        for columns in 1..=7 {
+            for rows in 1..=4 {
+                let plan = PH3ImageVaeTilePlan::new(
+                    (columns + 1) * 16,
+                    (rows + 1) * 16,
+                    16,
+                    PH3ImageVaeSpatialPolicy::Tiled {
+                        tile_pixels: 32,
+                        minimum_overlap_pixels: 16,
+                        max_tiles: 32,
+                    },
+                )
+                .unwrap();
+                for maximum in 1..=4 {
+                    let batch = PH3ImageVaeTileBatch::new(maximum).unwrap();
+                    let largest = maximum.min(columns);
+                    let mut visited = Vec::new();
+                    let mut shapes = Vec::new();
+                    while visited.len() < plan.tile_count() {
+                        let first = visited.len();
+                        let g = plan.group(first, batch).unwrap();
+                        assert_eq!(g.first_tile(), first);
+                        assert!((1..=largest).contains(&g.tile_count()));
+                        if g.tile_count() < largest {
+                            saw_tail = true;
+                            assert_eq!(first + g.tile_count(), plan.tile_count());
+                        }
+                        if !shapes.contains(&g.tile_count()) {
+                            shapes.push(g.tile_count());
+                        }
+                        let initial = plan.tile(first).unwrap();
+                        for index in first..first + g.tile_count() {
+                            let tile = plan.tile(index).unwrap();
+                            assert_eq!((tile.width, tile.height), (initial.width, initial.height));
+                            crossed_row |= tile.y != initial.y;
+                            visited.push(tile.index);
+                        }
+                    }
+                    assert_eq!(visited, (0..columns * rows).collect::<Vec<_>>());
+                    assert_eq!(plan.group_shapes(batch), shapes);
+                    assert!(plan.group(plan.tile_count(), batch).is_err());
+                    assert!(plan.group(usize::MAX, batch).is_err());
+                    if largest > 1 {
+                        assert!(plan.group(1, batch).is_err());
+                    }
+                }
             }
-            assert_eq!(first, plan.tile_count());
-            assert_eq!(groups, total);
-            assert!(plan.group(1, batch).is_err());
         }
+        assert!(crossed_row && saw_tail);
         for invalid in [0, 5, usize::MAX] {
             assert!(PH3ImageVaeTileBatch::new(invalid).is_err());
             assert!(

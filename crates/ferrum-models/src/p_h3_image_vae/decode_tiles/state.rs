@@ -95,7 +95,7 @@ impl<'a> PH3ImageVaeDecodeState<'a> {
         let expected = plan.group_shapes(tile_batch);
         ensure!(
             shapes.iter().map(|s| s.tile_count).collect::<Vec<_>>() == expected,
-            "decoder recipes must describe exactly the real row groups and tail"
+            "decoder recipes must describe exactly the real traversal groups and tail"
         );
         let first = &shapes[0];
         let architecture = first.config.architecture();

@@ -150,7 +150,7 @@ pub(super) fn families(
             .family()
             .clone(),
     );
-    // Cover every legal physical tile count, including real row tails. These
+    // Cover every legal physical tile count, including a real final tail. These
     // small payload-free geometries establish the selected provider topology;
     // request preparation still compiles/admit-checks every actual full shape.
     let maximum_count = match options.vae_spatial_policy {

@@ -1,12 +1,12 @@
-//! The product decoder crosses every real row tail, sharing one installation
-//! and preserving Cold retirement. This is a tiny Disabled-route wiring test;
-//! model-level tests separately check nonconstant tile isolation and Host retry.
+//! The product decoder batches across rows and attaches only the final real tail, sharing one
+//! installation and preserving Cold retirement. This tiny Disabled-route wiring test complements
+//! model-level tests of nonconstant tile isolation and Host retry.
 use super::*;
 use ferrum_models::p_h3_image_vae::PH3ImageVaeTileBatch;
 
 #[test]
-#[ignore = "requires CUDA, pinned native set and explicit cuDNN9 paths; actual product decoder spatial4/1 transitions"]
-fn cuda_h3_decoder_tile_batches_cross_row_tails_and_retire_cold_shared_weights() -> Result<()> {
+#[ignore = "requires CUDA, pinned native set and explicit cuDNN9 paths; actual product decoder cross-row4/3 tail transition"]
+fn cuda_h3_decoder_tile_batches_cross_rows_and_retire_cold_shared_weights() -> Result<()> {
     let fixture = CompleteFixture::new()?;
     let mut baseline = None;
     for maximum in [1, 4] {
@@ -53,20 +53,13 @@ fn cuda_h3_decoder_tile_batches_cross_row_tails_and_retire_cold_shared_weights()
             .iter()
             .map(|s| s.execution.plan.batch_size)
             .collect::<Vec<_>>();
-        assert_eq!(
-            batches,
-            if maximum == 1 {
-                vec![1]
-            } else {
-                vec![4, 1, 4, 1, 4, 1]
-            }
-        );
+        assert_eq!(batches, if maximum == 1 { vec![1] } else { vec![4, 3] });
         assert_eq!(
             decoder
                 .iter()
                 .map(|s| s.execution.completed_executions)
-                .sum::<usize>(),
-            if maximum == 1 { 15 } else { 6 }
+                .collect::<Vec<_>>(),
+            if maximum == 1 { vec![15] } else { vec![3, 1] }
         );
         for (index, stage) in decoder.iter().enumerate() {
             assert_eq!(
@@ -97,7 +90,7 @@ fn cuda_h3_decoder_tile_batches_cross_row_tails_and_retire_cold_shared_weights()
         if let Some(expected) = &baseline {
             let expected: &Vec<f32> = expected;
             assert_eq!(pixels.len(), expected.len());
-            // Predeclared fixture-local tolerance for changed cuDNN physical
+            // Predeclared fixture-local tolerance for changed decoder physical
             // batch geometry, matching the raw decoder's CUDA comparison.
             for (&actual, &expected) in pixels.iter().zip(expected) {
                 assert!(

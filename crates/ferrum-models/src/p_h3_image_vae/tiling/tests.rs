@@ -149,7 +149,26 @@ fn tile_rows_crop_original_nchw_and_denormalize_in_tile_then_request_order() {
     );
     assert_eq!(input.bytes().bytes(), original);
     drop(rows);
-    for (start, count) in [(0, 0), (1, 2), (4, 1), (0, usize::MAX)] {
+    // Crossing a row changes each tile's source y/x, never its physical
+    // dimensions or tile-then-request ordering. Compare with actual single
+    // tile extraction rather than reconstructing the denormalization formula.
+    for (start, count) in [(1, 2), (0, 4), (2, 2)] {
+        let grouped = plan
+            .managed_tile_rows(&account, &input, &statistics, start, count, id.clone())
+            .unwrap();
+        let mut singles = Vec::new();
+        for index in start..start + count {
+            let single = plan
+                .managed_tile_rows(&account, &input, &statistics, index, 1, id.clone())
+                .unwrap();
+            singles.extend_from_slice(single.bytes().bytes());
+        }
+        assert_eq!(grouped.bytes().bytes(), singles);
+        assert_eq!(input.bytes().bytes(), original);
+        drop(grouped);
+        assert_eq!(account.usage().unwrap().committed_bytes(), before);
+    }
+    for (start, count) in [(0, 0), (3, 2), (4, 1), (0, usize::MAX), (1, usize::MAX)] {
         assert!(plan
             .managed_tile_rows(&account, &input, &statistics, start, count, id.clone())
             .is_err());

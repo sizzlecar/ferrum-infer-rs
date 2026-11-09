@@ -211,8 +211,8 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                 else {
                     break;
                 };
-                // A row tail can recur on every row. Close the previous
-                // session before admitting the next shape's dynamic pools;
+                // Only the final traversal group can have a shorter shape.
+                // Close the previous session before admitting its dynamic pools;
                 // the original pin keeps their one static installation live.
                 if active_shape != Some(group.tile_count()) {
                     if let Some(previous) = active.take() {

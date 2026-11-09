@@ -83,7 +83,7 @@ fn decoder_tile_batch_keeps_one_image_and_queries_every_real_group_without_host_
                 shape.physical_batch()
             ))
             .collect::<Vec<_>>(),
-        [(1, 4, 4), (1, 1, 1)]
+        [(1, 4, 4), (1, 3, 3)]
     );
     assert_eq!(
         grouped.shapes()[0].family().stored_weight_schema()?,

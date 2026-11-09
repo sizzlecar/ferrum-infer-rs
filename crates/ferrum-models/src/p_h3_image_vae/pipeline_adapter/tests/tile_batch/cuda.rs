@@ -217,9 +217,9 @@ fn run(
     assert_eq!(consumer.completed_tiles(), 15);
     assert_eq!(consumer.executed_tiles(), 15);
     assert_eq!(consumer.executed_groups(), submitted_groups);
-    assert_eq!(submitted_groups, if maximum == 1 { 15 } else { 6 });
+    assert_eq!(submitted_groups, if maximum == 1 { 15 } else { 4 });
     if maximum == 4 {
-        assert_eq!(attachments, 5);
+        assert_eq!(attachments, 1);
     } else {
         assert_eq!(attachments, 0);
     }
@@ -254,7 +254,7 @@ fn run(
     out
 }
 #[test]
-#[ignore = "requires CUDA; complete raw-W8 decoder with actual4/1 tail sessions and one original shared installation"]
+#[ignore = "requires CUDA; complete raw-W8 decoder with cross-row4/3 tail sessions and one original shared installation"]
 fn actual_cuda_spatial_tile_batches_share_one_installation_and_match_ordered_single_tiles() {
     let _guard = GPU.lock().unwrap_or_else(|p| p.into_inner());
     let f = Execution::new();
@@ -272,7 +272,7 @@ fn actual_cuda_spatial_tile_batches_share_one_installation_and_match_ordered_sin
             "serial={a}, grouped={b}, delta={delta}"
         );
     }
-    eprintln!("spatial4/1 vs serial1 maximum normalized F32 pixel delta={maximum}");
+    eprintln!("spatial4/3 vs serial1 maximum normalized F32 pixel delta={maximum}");
     // Only the bottom-right normalized latent position changes (each channel
     // has24 spatial values). No other physical lane in the first row may see it.
     let perturbed = run(&f, &adapter, 4, true, false);

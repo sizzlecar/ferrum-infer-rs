@@ -196,7 +196,7 @@ impl PH3ImageVaeTilePlan {
         })
     }
 
-    /// Extract adjacent tiles of one row directly from immutable normalized
+    /// Extract consecutive row-major tiles directly from immutable normalized
     /// NCHW sampler storage into denormalized [tiles*B*TH*TW,C]. Tiles precede
     /// requests in batch order, matching the pinned decoder microbatch layout.
     /// No temporary full-resolution or tile NCHW copy is created.
@@ -211,10 +211,10 @@ impl PH3ImageVaeTilePlan {
     ) -> Result<ManagedHostTensor> {
         ensure!(tile_count > 0, "decoder microbatch must contain a tile");
         let tile = self.tile(first_tile)?;
-        ensure!(
-            tile_count <= self.x.starts.len() - first_tile % self.x.starts.len(),
-            "decoder microbatch must stay within one tile row"
-        );
+        let end = first_tile
+            .checked_add(tile_count)
+            .filter(|&end| end <= self.tile_count())
+            .context("decoder microbatch exceeds the tile traversal")?;
         let [batch, channels, height, width] = normalized.tensor().dimensions() else {
             anyhow::bail!("VAE sampler input must be NCHW");
         };
@@ -243,8 +243,8 @@ impl PH3ImageVaeTilePlan {
         let tensor = f32_spec(&[rows, channels])?;
         let mut output =
             host.allocate_zeroed(HostMemoryClass::InputPreprocess, byte_len(&tensor)?)?;
-        for n in 0..tile_count {
-            let tile = self.tile(first_tile + n)?;
+        for (n, index) in (first_tile..end).enumerate() {
+            let tile = self.tile(index)?;
             for b in 0..batch {
                 for y in 0..th {
                     for x in 0..tw {

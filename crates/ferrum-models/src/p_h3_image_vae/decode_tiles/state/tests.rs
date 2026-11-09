@@ -18,10 +18,10 @@ where
 fn host(alignment: usize) -> HostMemoryAccount {
     HostMemoryAccount::with_allocation_alignment(
         HostMemoryLimits::new(
-            64 << 20,
+            256 << 20,
             HostMemoryClassLimits {
                 input_preprocess_bytes: 16 << 20,
-                output_bytes: 32 << 20,
+                output_bytes: 192 << 20,
                 transfer_staging_bytes: 8 << 20,
                 weight_backing_bytes: 8 << 20,
             },
@@ -43,13 +43,22 @@ fn prepare(
     batch: u64,
     tiles: usize,
 ) -> PreparedPH3ImageVaeDecoderTiles {
+    prepare_geometry(f, batch, tiles, [96, 64], policy())
+}
+fn prepare_geometry(
+    f: &TinyPH3ImageVaeFixture,
+    batch: u64,
+    tiles: usize,
+    [width, height]: [usize; 2],
+    spatial: PH3ImageVaeSpatialPolicy,
+) -> PreparedPH3ImageVaeDecoderTiles {
     PH3ImageVaeAdapter::new(f.source(), f.metadata(), f.limits())
         .unwrap()
         .prepare_decoder_with_tile_batch(
             batch,
-            96,
-            64,
-            policy(),
+            width,
+            height,
+            spatial,
             PH3ImageVaeDecoderPreset::F32A8FullAttention,
             PH3ImageVaeTileBatch::new(tiles).unwrap(),
         )
@@ -75,6 +84,16 @@ fn state<'a>(
     input: HostMemoryAccount,
     output: HostMemoryAccount,
 ) -> PH3ImageVaeDecodeState<'a> {
+    state_with_policy(p, source, normalized, input, output, policy())
+}
+fn state_with_policy<'a>(
+    p: &PreparedPH3ImageVaeDecoderTiles,
+    source: &'a ferrum_quantization::comfy_convrot::ComfyCanonicalWeightSource,
+    normalized: &'a ManagedHostTensor,
+    input: HostMemoryAccount,
+    output: HostMemoryAccount,
+    spatial: PH3ImageVaeSpatialPolicy,
+) -> PH3ImageVaeDecodeState<'a> {
     let configs = p
         .shapes()
         .iter()
@@ -99,8 +118,15 @@ fn state<'a>(
             .unwrap()
         })
         .collect();
+    let pixels = p.pixel_output_spec().unwrap();
     PH3ImageVaeDecodeState::new(
-        PH3ImageVaeTilePlan::new(96, 64, 16, policy()).unwrap(),
+        PH3ImageVaeTilePlan::new(
+            pixels.dimensions()[3] as usize,
+            pixels.dimensions()[2] as usize,
+            16,
+            spatial,
+        )
+        .unwrap(),
         p.shapes()[0].request_batch(),
         p.tile_batch(),
         shapes,
@@ -147,88 +173,126 @@ fn install_pixels(s: &mut PH3ImageVaeDecodeState<'_>, group: PH3ImageVaeTileGrou
 fn grouped_partial_commit_retains_original_owner_and_cursor_then_matches_single_tiles() {
     let f = TinyPH3ImageVaeFixture::new().unwrap();
     let source = f.source();
-    let p = prepare(&f, 2, 4);
-    let parent = host(64);
-    let sample = sample(&p, &parent);
-    let r = p.host_requirements(&parent).unwrap();
-    let scope = parent.reserve_scope(&r.scope_claims()).unwrap();
-    let h = scope.account();
-    let mut s = state(&p, &source, &sample, h.clone(), h.clone());
-    let group = s.next_group().unwrap().unwrap();
-    install_pixels(&mut s, group).unwrap();
-    let physical = |n| parent.backing_bytes(n).unwrap();
-    let first_peak = r.canvas_output_bytes
-        + physical(4 * 2 * 3 * 32 * 32 * 4)
-        + physical(2 * 3 * 32 * 32 * 4)
-        + physical(2 * 3 * 32 * 16 * 4)
-        + physical(2 * 3 * 16 * 96 * 4);
-    assert!(r.output_peak_bytes > first_peak);
-    let available_blocker = r.output_peak_bytes - first_peak;
-    let blocker_logical = (1..=available_blocker)
-        .rev()
-        .find(|&n| physical(n) <= available_blocker)
-        .unwrap();
-    assert!(available_blocker - physical(blocker_logical) < physical(2 * 3 * 32 * 16 * 4));
-    let blocker = h
-        .allocate_zeroed(HostMemoryClass::Output, blocker_logical)
-        .unwrap();
-    let pointer = match &s.pending {
-        Some(Pending::Pixels(_, p)) => p.bytes().as_ptr(),
-        _ => unreachable!(),
-    };
-    assert!(s.commit_pending().is_err());
-    assert_eq!(s.completed_tiles(), 1);
-    assert_eq!(s.next_commit, 1);
-    assert_eq!(s.next_group().unwrap(), Some(group));
-    assert!(s.commit_pending().is_err());
-    assert_eq!(s.completed_tiles(), 1);
-    assert_eq!(
-        match &s.pending {
+    // The second case stops after the old row's last tile, before the same
+    // pending group's first tile of the next row can allocate its new strip.
+    for prior_groups in [0, 1] {
+        let p = prepare(&f, 2, 4);
+        let parent = host(64);
+        let sample = sample(&p, &parent);
+        let r = p.host_requirements(&parent).unwrap();
+        let scope = parent.reserve_scope(&r.scope_claims()).unwrap();
+        let h = scope.account();
+        let mut s = state(&p, &source, &sample, h.clone(), h.clone());
+        for _ in 0..prior_groups {
+            let group = s.next_group().unwrap().unwrap();
+            install_pixels(&mut s, group).unwrap();
+            s.commit_pending().unwrap();
+        }
+        let group = s.next_group().unwrap().unwrap();
+        if prior_groups > 0 {
+            assert_ne!(
+                s.plan.tile(group.first_tile()).unwrap().y,
+                s.plan
+                    .tile(group.first_tile() + group.tile_count() - 1)
+                    .unwrap()
+                    .y
+            );
+        }
+        install_pixels(&mut s, group).unwrap();
+        let physical = |n| parent.backing_bytes(n).unwrap();
+        let tile = s.plan.tile(group.first_tile()).unwrap();
+        let first_peak = parent
+            .usage()
+            .unwrap()
+            .class_allocated_bytes(HostMemoryClass::Output)
+            + physical(2 * 3 * tile.height * tile.width * 4)
+            + if tile.trim_right > 0 {
+                physical(2 * 3 * tile.height * tile.trim_right * 4)
+            } else {
+                0
+            }
+            + if tile.x == 0 && tile.trim_bottom > 0 {
+                physical(2 * 3 * tile.trim_bottom * s.plan.dimensions()[1] * 4)
+            } else {
+                0
+            };
+        assert!(r.output_peak_bytes > first_peak);
+        let available_blocker = r.output_peak_bytes - first_peak;
+        let blocker_logical = (1..=available_blocker)
+            .rev()
+            .find(|&n| physical(n) <= available_blocker)
+            .unwrap();
+        assert!(available_blocker - physical(blocker_logical) < physical(2 * 3 * 32 * 16 * 4));
+        let blocker = h
+            .allocate_zeroed(HostMemoryClass::Output, blocker_logical)
+            .unwrap();
+        let pointer = match &s.pending {
             Some(Pending::Pixels(_, p)) => p.bytes().as_ptr(),
             _ => unreachable!(),
-        },
-        pointer
-    );
-    drop(blocker);
-    assert!(!s.commit_pending().unwrap());
-    assert_eq!(s.completed_tiles(), 4);
-    while let Some(group) = s.next_group().unwrap() {
-        install_pixels(&mut s, group).unwrap();
-        s.commit_pending().unwrap();
+        };
+        assert!(s.commit_pending().is_err());
+        assert_eq!(s.completed_tiles(), group.first_tile() + 1);
+        assert_eq!(s.next_commit, 1);
+        assert_eq!(s.next_group().unwrap(), Some(group));
+        assert!(s.commit_pending().is_err());
+        assert_eq!(s.completed_tiles(), group.first_tile() + 1);
+        assert_eq!(
+            match &s.pending {
+                Some(Pending::Pixels(_, p)) => p.bytes().as_ptr(),
+                _ => unreachable!(),
+            },
+            pointer
+        );
+        drop(blocker);
+        assert!(!s.commit_pending().unwrap());
+        assert_eq!(s.completed_tiles(), group.first_tile() + group.tile_count());
+        while let Some(group) = s.next_group().unwrap() {
+            install_pixels(&mut s, group).unwrap();
+            s.commit_pending().unwrap();
+        }
+        let (_, actual) = s.finish().unwrap();
+        scope.close().unwrap();
+        assert_eq!(
+            parent.usage().unwrap().committed_bytes(),
+            sample.bytes().backing_bytes() + actual.backing_bytes()
+        );
+        let single = prepare(&f, 2, 1);
+        let scope = parent
+            .reserve_scope(&single.host_requirements(&parent).unwrap().scope_claims())
+            .unwrap();
+        let h = scope.account();
+        let mut s = state(&single, &source, &sample, h.clone(), h);
+        while let Some(group) = s.next_group().unwrap() {
+            install_pixels(&mut s, group).unwrap();
+            s.commit_pending().unwrap();
+        }
+        let (_, expected) = s.finish().unwrap();
+        assert_eq!(
+            actual.bytes(),
+            expected.bytes(),
+            "ordered seam arithmetic must be unchanged"
+        );
+        scope.close().unwrap();
+        drop((sample, actual, expected));
+        assert_eq!(parent.usage().unwrap().committed_bytes(), 0);
     }
-    let (_, actual) = s.finish().unwrap();
-    scope.close().unwrap();
-    assert_eq!(
-        parent.usage().unwrap().committed_bytes(),
-        sample.bytes().backing_bytes() + actual.backing_bytes()
-    );
-    let single = prepare(&f, 2, 1);
-    let scope = parent
-        .reserve_scope(&single.host_requirements(&parent).unwrap().scope_claims())
-        .unwrap();
-    let h = scope.account();
-    let mut s = state(&single, &source, &sample, h.clone(), h);
-    while let Some(group) = s.next_group().unwrap() {
-        install_pixels(&mut s, group).unwrap();
-        s.commit_pending().unwrap();
-    }
-    let (_, expected) = s.finish().unwrap();
-    assert_eq!(
-        actual.bytes(),
-        expected.bytes(),
-        "ordered seam arithmetic must be unchanged"
-    );
-    scope.close().unwrap();
-    drop((sample, actual, expected));
-    assert_eq!(parent.usage().unwrap().committed_bytes(), 0);
 }
 
-fn host_stages(f: &TinyPH3ImageVaeFixture, alignment: usize, short: bool) -> Result<()> {
+fn host_stages(
+    f: &TinyPH3ImageVaeFixture,
+    alignment: usize,
+    short: bool,
+    dimensions: [usize; 2],
+    spatial: PH3ImageVaeSpatialPolicy,
+) -> Result<()> {
     let source = f.source();
-    let p = prepare(f, 2, 4);
+    let p = prepare_geometry(f, 1, 4, dimensions, spatial);
     let parent = host(alignment);
     let sample = sample(&p, &parent);
     let r = p.host_requirements(&parent)?;
+    if !short {
+        eprintln!("decoder Host budget dimensions={dimensions:?} alignment={alignment} input={} output={} scope={}", r.input_peak_bytes, r.output_peak_bytes, r.single_scope_bytes);
+    }
     let result = (|| -> Result<_> {
         let scope = parent.reserve_scope(&[
             (HostMemoryClass::InputPreprocess, r.input_peak_bytes),
@@ -238,7 +302,7 @@ fn host_stages(f: &TinyPH3ImageVaeFixture, alignment: usize, short: bool) -> Res
             ),
         ])?;
         let h = scope.account();
-        let mut s = state(&p, &source, &sample, h.clone(), h.clone());
+        let mut s = state_with_policy(&p, &source, &sample, h.clone(), h.clone(), spatial);
         let cache = (
             s.cosine.bytes().bytes().as_ptr(),
             s.sine.bytes().bytes().as_ptr(),
@@ -287,19 +351,30 @@ fn host_stages(f: &TinyPH3ImageVaeFixture, alignment: usize, short: bool) -> Res
 #[test]
 fn grouped_exact_host_grants_cover_tail_and_each_cursor_one_byte_less_rejects() {
     let f = TinyPH3ImageVaeFixture::new().unwrap();
-    for alignment in [1, 64, 4096] {
-        host_stages(&f, alignment, false).unwrap();
-        let e = host_stages(&f, alignment, true).unwrap_err();
-        assert!(
-            e.chain().any(|e| matches!(
-                e.downcast_ref::<HostMemoryError>(),
-                Some(HostMemoryError::ScopeCapacity {
-                    class: HostMemoryClass::Output,
-                    ..
-                })
-            )),
-            "{e:#}"
-        );
+    for (dimensions, spatial, alignments) in [
+        ([96, 64], policy(), &[1, 64, 4096][..]),
+        ([112, 80], policy(), &[64][..]),
+        ([48, 80], policy(), &[64][..]),
+        (
+            [2720, 1536],
+            PH3ImageVaeSpatialPolicy::comfy_default(256),
+            &[64][..],
+        ),
+    ] {
+        for &alignment in alignments {
+            host_stages(&f, alignment, false, dimensions, spatial).unwrap();
+            let e = host_stages(&f, alignment, true, dimensions, spatial).unwrap_err();
+            assert!(
+                e.chain().any(|e| matches!(
+                    e.downcast_ref::<HostMemoryError>(),
+                    Some(HostMemoryError::ScopeCapacity {
+                        class: HostMemoryClass::Output,
+                        ..
+                    })
+                )),
+                "{e:#}"
+            );
+        }
     }
 }
 #[test]

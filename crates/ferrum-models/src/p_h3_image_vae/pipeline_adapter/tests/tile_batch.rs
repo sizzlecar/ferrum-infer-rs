@@ -24,7 +24,7 @@ fn spatial_tile_recipes_keep_semantic_request_batch_and_original_numerical_weigh
             .iter()
             .map(|s| (s.tile_count(), s.physical_batch()))
             .collect::<Vec<_>>(),
-        [(4, 8), (1, 2)]
+        [(4, 8), (3, 6)]
     );
     assert_eq!(
         prepared.normalized_latent_spec().unwrap().dimensions(),
@@ -62,7 +62,7 @@ fn spatial_tile_recipes_keep_semantic_request_batch_and_original_numerical_weigh
         );
     }
     assert!(prepared.shape(2).is_err());
-    assert!(prepared.shape(3).is_err());
+    assert!(prepared.shape(1).is_err());
     let whole = adapter
         .prepare_decoder_with_tile_batch(
             1,
