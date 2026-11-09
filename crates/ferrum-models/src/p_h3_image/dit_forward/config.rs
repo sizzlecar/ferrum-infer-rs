@@ -37,6 +37,8 @@ impl Extent {
 pub struct PH3ImageDiTRequest {
     pub(super) target: Extent,
     pub(super) reference: Option<Extent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    additional_references: Vec<Extent>,
     pub(super) text_rows: u64,
     text_tags: Vec<TextTagRun>,
     pub(super) block: PH3ImageCurveBlockRequest,
@@ -51,8 +53,25 @@ impl PH3ImageDiTRequest {
         time_indices: &[u64],
         metadata_capacity: usize,
     ) -> Result<Self, VNextError> {
-        let refs = reference.into_iter().collect::<Vec<_>>();
-        let layout = PH3ImageRequestLayout::new(t, tags, target, &refs)
+        Self::with_references(
+            t,
+            tags,
+            target,
+            reference.as_slice(),
+            time_indices,
+            metadata_capacity,
+        )
+    }
+
+    pub fn with_references(
+        t: &PH3ImageTransformerConfig,
+        tags: &[PH3ImageModality],
+        target: PH3ImageReferenceImage,
+        references: &[PH3ImageReferenceImage],
+        time_indices: &[u64],
+        metadata_capacity: usize,
+    ) -> Result<Self, VNextError> {
+        let layout = PH3ImageRequestLayout::new(t, tags, target, references)
             .map_err(|e| invalid(e.to_string()))?;
         let block =
             PH3ImageCurveBlockRequest::from_layout(layout, time_indices, metadata_capacity)?;
@@ -70,6 +89,13 @@ impl PH3ImageDiTRequest {
                     >())?)
                 })
                 .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
+                .and_then(|n| {
+                    n.checked_add(
+                        references
+                            .len()
+                            .checked_mul(std::mem::size_of::<Extent>())?,
+                    )
+                })
                 .ok_or_else(|| invalid("request tag/time metadata overflow"))?;
         if bytes > metadata_capacity {
             return Err(invalid("request tag/time metadata exceeds capacity"));
@@ -97,12 +123,27 @@ impl PH3ImageDiTRequest {
         }
         Ok(Self {
             target: Extent::from_image(target)?,
-            reference: reference.map(Extent::from_image).transpose()?,
+            reference: references
+                .first()
+                .copied()
+                .map(Extent::from_image)
+                .transpose()?,
+            additional_references: references
+                .iter()
+                .skip(1)
+                .copied()
+                .map(Extent::from_image)
+                .collect::<Result<_, _>>()?,
             text_rows: u64::try_from(tags.len()).map_err(|_| invalid("text rows exceed u64"))?,
             text_tags,
             block,
             final_layer: PH3ImageFinalLayerRequest::from_layout(layout, time_indices)?,
         })
+    }
+    pub(super) fn reference_extents(&self) -> impl Iterator<Item = Extent> + '_ {
+        self.reference
+            .into_iter()
+            .chain(self.additional_references.iter().copied())
     }
     pub(super) fn image_rows(&self, c: &PH3ImageDiTConfig) -> Result<u64, VNextError> {
         self.target_rows(c)?
@@ -113,10 +154,17 @@ impl PH3ImageDiTRequest {
         patch_rows(self.target, c)
     }
     pub(super) fn reference_rows(&self, c: &PH3ImageDiTConfig) -> Result<u64, VNextError> {
-        self.reference
-            .map(|r| patch_rows(r, c))
-            .transpose()
-            .map(|n| n.unwrap_or(0))
+        if self.additional_references.len() + usize::from(self.reference.is_some()) > 8
+            || self.reference.is_none() && !self.additional_references.is_empty()
+        {
+            return Err(invalid(
+                "reference list requires a first image and at most eight images",
+            ));
+        }
+        self.reference_extents().try_fold(0u64, |sum, extent| {
+            sum.checked_add(patch_rows(extent, c)?)
+                .ok_or_else(|| invalid("reference rows overflow"))
+        })
     }
     fn validate_crosswalk(&self, reference_rows: u64) -> Result<(), VNextError> {
         if self.text_tags.is_empty()
@@ -482,7 +530,7 @@ pub(super) fn tensor(dimensions: Vec<u64>, element_type: ElementType) -> Program
         layout: ResolvedTensorLayout::Contiguous,
     }
 }
-fn patch_rows(extent: Extent, c: &PH3ImageDiTConfig) -> Result<u64, VNextError> {
+pub(super) fn patch_rows(extent: Extent, c: &PH3ImageDiTConfig) -> Result<u64, VNextError> {
     if extent.height == 0
         || extent.width == 0
         || extent.height % c.patch_h != 0

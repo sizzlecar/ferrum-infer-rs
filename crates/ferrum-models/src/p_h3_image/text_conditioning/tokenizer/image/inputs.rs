@@ -13,6 +13,18 @@ impl PH3ImageEditPrompt {
         host: &HostMemoryAccount,
         visual_outputs: &[TensorExecutionOutput],
     ) -> Result<Vec<ManagedHostTensor>> {
+        self.managed_image_inputs(config, host, &[visual_outputs])
+    }
+
+    /// Preserve each Picture's feature rows and DeepStack outputs in input order.
+    /// Every source remains an admitted Output owner until all seven text inputs
+    /// have been allocated atomically and copied into their real Input owners.
+    pub fn managed_image_inputs(
+        &self,
+        config: &PH3ImageTextConditioningConfig,
+        host: &HostMemoryAccount,
+        visual_outputs: &[&[TensorExecutionOutput]],
+    ) -> Result<Vec<ManagedHostTensor>> {
         let text = config.encoder().text();
         ensure!(
             text.layout() == self.text.layout()
@@ -21,8 +33,9 @@ impl PH3ImageEditPrompt {
             "image presentation differs from the declared text/visual configuration"
         );
         ensure!(
-            visual_outputs.len() == 4,
-            "image text requires all four visual outputs"
+            visual_outputs.len() == self.images.len()
+                && visual_outputs.iter().all(|outputs| outputs.len() == 4),
+            "image text requires four actual visual outputs per ordered Picture"
         );
         let shape = ResolvedTensorSpec::new(
             vec![self.visual.rows()?, text.architecture().hidden_size()],
@@ -35,27 +48,35 @@ impl PH3ImageEditPrompt {
             .chain(Qwen3VLTextComfyFamily::DEEPSTACK_IDS);
         let mut features = BTreeMap::new();
         for (source, target) in source_ids.zip(target_ids) {
-            let mut matches = visual_outputs
-                .iter()
-                .filter(|o| o.value_id().as_str() == source);
-            let output = matches.next().context("missing original visual output")?;
-            ensure!(
-                matches.next().is_none()
-                    && output.tensor() == &shape
-                    && output.bytes().len() as u64 == shape.minimum_storage_bytes()?
+            let mut chunks = Vec::with_capacity(self.images.len());
+            for (image, outputs) in self.images.iter().zip(visual_outputs) {
+                let mut matches = outputs.iter().filter(|o| o.value_id().as_str() == source);
+                let output = matches.next().context("missing original visual output")?;
+                let expected = ResolvedTensorSpec::new(
+                    vec![
+                        (image.merged_height * image.merged_width) as u64,
+                        text.architecture().hidden_size(),
+                    ],
+                    ElementType::F32,
+                    ResolvedTensorLayout::Contiguous,
+                )?;
+                ensure!(matches.next().is_none()
+                    && output.tensor() == &expected
+                    && output.bytes().len() as u64 == expected.minimum_storage_bytes()?
                     && host.owns(output.bytes())
                     && output.bytes().class() == HostMemoryClass::Output,
-                "visual readback has foreign ownership, duplicate identity or incompatible shape"
-            );
-            ensure!(
-                output
-                    .bytes()
-                    .bytes()
-                    .chunks_exact(4)
-                    .all(|b| f32::from_le_bytes(b.try_into().unwrap()).is_finite()),
-                "visual readback contains nonfinite features"
-            );
-            features.insert(ProgramValueId::new(target)?, output.bytes().bytes());
+                    "visual readback has foreign ownership, duplicate identity or incompatible Picture shape");
+                ensure!(
+                    output
+                        .bytes()
+                        .bytes()
+                        .chunks_exact(4)
+                        .all(|b| f32::from_le_bytes(b.try_into().unwrap()).is_finite()),
+                    "visual readback contains nonfinite features"
+                );
+                chunks.push(output.bytes().bytes());
+            }
+            features.insert(ProgramValueId::new(target)?, chunks);
         }
         let specs = config.input_tensor_specs()?;
         ensure!(
@@ -102,9 +123,17 @@ impl PH3ImageEditPrompt {
                         buffer.as_mut(),
                     )?;
                 }
-                _ => buffer
-                    .as_mut()
-                    .copy_from_slice(features.get(&id).context("undeclared image text input")?),
+                _ => {
+                    let mut offset = 0;
+                    for chunk in features.get(&id).context("undeclared image text input")? {
+                        buffer.as_mut()[offset..offset + chunk.len()].copy_from_slice(chunk);
+                        offset += chunk.len();
+                    }
+                    ensure!(
+                        offset == buffer.len(),
+                        "ordered Picture features do not cover text input"
+                    );
+                }
             }
             inputs.push(ManagedHostTensor::new(
                 id,

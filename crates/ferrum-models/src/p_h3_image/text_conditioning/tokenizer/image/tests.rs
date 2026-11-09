@@ -73,6 +73,43 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
 }
 
 #[test]
+fn multiple_pictures_keep_separate_visual_runs_and_resume_rotary_after_each_grid() {
+    let t = tokenizer(512, 512);
+    let prompt = t
+        .prepare_images("cat after", &[grid(4, 6), grid(6, 4)], 2)
+        .unwrap();
+    assert_eq!(prompt.grids().count(), 2);
+    let runs = prompt.visual_rows().runs();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(prompt.visual_rows().rows().unwrap(), 12);
+    for run in runs {
+        let start = run.start() as usize;
+        let end = (run.start() + run.length()) as usize;
+        assert_eq!(prompt.text().token_ids()[start - 1], 11);
+        assert_eq!(prompt.text().token_ids()[end], 12);
+        assert!(prompt.token_tags()[start - 1..=end]
+            .iter()
+            .all(|tag| *tag == PH3ImageModality::Image));
+    }
+    let second = runs[1].start() as usize;
+    let base = second - 3; // First 2x3 image compresses six token rows to max axis three.
+    assert_eq!(prompt.position_ids(second).unwrap(), [base as u32; 3]);
+    assert_eq!(
+        prompt.position_ids(second + 5).unwrap(),
+        [base as u32, base as u32 + 2, base as u32 + 1]
+    );
+    assert_eq!(
+        prompt.position_ids(second + 6).unwrap(),
+        [base as u32 + 3; 3]
+    );
+    assert!(t.prepare_images("", &[], 2).is_err());
+    assert!(t.prepare_images("", &vec![grid(2, 2); 9], 2).is_err());
+    assert!(tokenizer(512, 16)
+        .prepare_images("cat after", &[grid(4, 6), grid(6, 4)], 2)
+        .is_err());
+}
+
+#[test]
 fn original_label_markers_and_expanded_slots_have_distinct_visual_and_modality_ranges() {
     let t = tokenizer(128, 128);
     let prompt = t.prepare_single_image("cat after", &grid(4, 6), 2).unwrap();

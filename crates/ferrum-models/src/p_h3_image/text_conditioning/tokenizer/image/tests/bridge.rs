@@ -66,6 +66,56 @@ fn check_copied_ports(inputs: &[ManagedHostTensor], visual: &[TensorExecutionOut
 }
 
 #[test]
+fn multiple_picture_readbacks_are_concatenated_in_order_with_shape_and_owner_validation() {
+    let h = host(16);
+    let first = reference_outputs(4, 6, 0, &h);
+    let second = reference_outputs(6, 4, 1, &h);
+    let prompt = tokenizer(512, 512)
+        .prepare_images("cat after", &[grid(4, 6), grid(6, 4)], 2)
+        .unwrap();
+    let c = config(&prompt);
+    let inputs = prompt
+        .managed_image_inputs(&c, &h, &[&first, &second])
+        .unwrap();
+    for (source, target) in std::iter::once(Qwen3VLVisionComfyFamily::OUTPUT_ID)
+        .chain(Qwen3VLVisionComfyFamily::DEEPSTACK_IDS)
+        .zip(
+            std::iter::once(Qwen3VLTextComfyFamily::VISUAL_EMBEDDINGS_ID)
+                .chain(Qwen3VLTextComfyFamily::DEEPSTACK_IDS),
+        )
+    {
+        let expected = [&first, &second]
+            .into_iter()
+            .flat_map(|outputs| {
+                outputs
+                    .iter()
+                    .find(|output| output.value_id().as_str() == source)
+                    .unwrap()
+                    .bytes()
+                    .bytes()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        let input = inputs
+            .iter()
+            .find(|input| input.value_id().as_str() == target)
+            .unwrap();
+        assert_eq!(input.bytes().bytes(), expected);
+        assert_eq!(input.tensor().dimensions()[0], 12);
+    }
+    assert!(prompt.managed_image_inputs(&c, &h, &[&first]).is_err());
+    let wrong_shape = reference_outputs(2, 4, 0, &h);
+    assert!(prompt
+        .managed_image_inputs(&c, &h, &[&first, &wrong_shape])
+        .is_err());
+    let foreign = reference_outputs(6, 4, 1, &host(16));
+    assert!(prompt
+        .managed_image_inputs(&c, &h, &[&first, &foreign])
+        .is_err());
+}
+
+#[test]
 fn actual_three_layer_visual_readbacks_copy_to_seven_exact_inputs_with_atomic_host_admission() {
     let h = host(16);
     let outputs = reference_outputs(4, 6, 0, &h);

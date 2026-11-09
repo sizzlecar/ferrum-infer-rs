@@ -171,14 +171,24 @@ impl PH3ImageDenoiserAdapter {
         reference: Option<PH3ImageReferenceImage>,
         time_indices: &[u64],
     ) -> Result<PH3ImageDenoiserRequest> {
+        self.request_with_references(identity, tags, target, reference.as_slice(), time_indices)
+    }
+    pub fn request_with_references(
+        &self,
+        identity: RequestIdentity,
+        tags: &[PH3ImageModality],
+        target: PH3ImageReferenceImage,
+        references: &[PH3ImageReferenceImage],
+        time_indices: &[u64],
+    ) -> Result<PH3ImageDenoiserRequest> {
         Ok(PH3ImageDenoiserRequest {
             identity,
             target,
-            inner: PH3ImageDiTRequest::new(
+            inner: PH3ImageDiTRequest::with_references(
                 &self.transformer,
                 tags,
                 target,
-                reference,
+                references,
                 time_indices,
                 self.limits.max_metadata_bytes,
             )?,
@@ -392,6 +402,31 @@ impl PreparedPH3ImageDenoiser {
         times: &[f32],
         positions: &[[f64; 3]],
     ) -> Result<Vec<ManagedHostTensor>> {
+        let references = references
+            .iter()
+            .map(|reference| reference.iter().copied().collect())
+            .collect::<Vec<Vec<_>>>();
+        self.prepare_inputs_with_references(
+            host,
+            samples,
+            &references,
+            caches,
+            weights,
+            times,
+            positions,
+        )
+    }
+
+    pub fn prepare_inputs_with_references(
+        &self,
+        host: &HostMemoryAccount,
+        samples: &[PH3ImageDenoiserSample<'_>],
+        references: &[Vec<PH3ImageDenoiserReference<'_>>],
+        caches: &[PH3ImageRefinedTextCache],
+        weights: &SharedComponentWeightsEvidence,
+        times: &[f32],
+        positions: &[[f64; 3]],
+    ) -> Result<Vec<ManagedHostTensor>> {
         ensure!(
             self.phase == PH3ImageDenoiserPhase::DenoiseRefinedText,
             "install/refine stages cannot consume image/audio sampler inputs"
@@ -415,12 +450,15 @@ impl PreparedPH3ImageDenoiser {
             .collect::<Vec<_>>();
         let references = references
             .iter()
-            .map(|r| {
-                r.map(|r| dit_forward::PH3ImageDiTReference {
-                    latent: r.latent,
-                    patch_noise: r.patch_noise,
-                    augmentation: r.augmentation,
-                })
+            .map(|references| {
+                references
+                    .iter()
+                    .map(|r| dit_forward::PH3ImageDiTReference {
+                        latent: r.latent,
+                        patch_noise: r.patch_noise,
+                        augmentation: r.augmentation,
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let basis = self.managed_basis(host, times)?;
@@ -433,7 +471,7 @@ impl PreparedPH3ImageDenoiser {
             )?;
         Ok(
             dit_forward::PH3ImageDiTInputAdapter::new(&self.config, host)?
-                .prepare(
+                .prepare_references(
                     &samples,
                     &references,
                     dit_forward::PH3ImageDiTTextInput::RefinedText {

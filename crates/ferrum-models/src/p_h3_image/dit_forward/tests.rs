@@ -4,6 +4,7 @@ use half::bf16;
 mod cuda;
 mod edit_prefix_oracle;
 mod header;
+mod multiple_references;
 pub(in crate::p_h3_image) use super::test_fixture as shared_fixture;
 pub(in crate::p_h3_image) use super::test_fixture::{limits, transformer};
 pub(super) fn config(batch: usize) -> PH3ImageDiTConfig {

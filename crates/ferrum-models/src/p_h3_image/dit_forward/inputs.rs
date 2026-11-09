@@ -68,6 +68,22 @@ impl<'a> PH3ImageDiTInputAdapter<'a> {
         cosine: ManagedHostTensor,
         sine: ManagedHostTensor,
     ) -> Result<PreparedPH3ImageDiTInputs> {
+        let references = references
+            .iter()
+            .map(|reference| reference.iter().copied().collect())
+            .collect::<Vec<Vec<_>>>();
+        self.prepare_references(samples, &references, text, basis, cosine, sine)
+    }
+
+    pub fn prepare_references(
+        &self,
+        samples: &[PH3ImageDiTSample<'_>],
+        references: &[Vec<PH3ImageDiTReference<'_>>],
+        text: PH3ImageDiTTextInput<'_>,
+        basis: ManagedHostTensor,
+        cosine: ManagedHostTensor,
+        sine: ManagedHostTensor,
+    ) -> Result<PreparedPH3ImageDiTInputs> {
         let c = self.config;
         ensure!(
             c.phase != PH3ImageDiTPhase::RefineOnly,
@@ -90,40 +106,40 @@ impl<'a> PH3ImageDiTInputAdapter<'a> {
                 &[1, c.audio_channels, 2, 2],
                 ElementType::F32,
             )?;
-            match (r.reference, reference) {
-                (None, None) => {}
-                (Some(extent), Some(reference)) => {
-                    ensure!(
-                        reference.augmentation.is_finite()
-                            && (0.0..=1.0).contains(&reference.augmentation),
-                        "reference augmentation must lie in [0,1]"
-                    );
+            ensure!(
+                r.reference_extents().count() == reference.len(),
+                "ordered reference extents and provided values differ"
+            );
+            for (extent, reference) in r.reference_extents().zip(reference) {
+                ensure!(
+                    reference.augmentation.is_finite()
+                        && (0.0..=1.0).contains(&reference.augmentation),
+                    "reference augmentation must lie in [0,1]"
+                );
+                check(
+                    self.host,
+                    reference.latent,
+                    &[1, c.channels, 1, extent.height, extent.width],
+                    ElementType::F32,
+                )?;
+                if reference.augmentation < 1.0 {
+                    let noise = reference
+                        .patch_noise
+                        .context("reference augmentation requires explicit patch-order noise")?;
                     check(
                         self.host,
-                        reference.latent,
-                        &[1, c.channels, 1, extent.height, extent.width],
+                        noise,
+                        &[config::patch_rows(extent, c)?, c.image_width()?],
                         ElementType::F32,
                     )?;
-                    if reference.augmentation < 1.0 {
-                        let noise = reference.patch_noise.context(
-                            "reference augmentation requires explicit patch-order noise",
-                        )?;
-                        check(
-                            self.host,
-                            noise,
-                            &[r.reference_rows(c)?, c.image_width()?],
-                            ElementType::F32,
-                        )?;
-                    } else if let Some(noise) = reference.patch_noise {
-                        check(
-                            self.host,
-                            noise,
-                            &[r.reference_rows(c)?, c.image_width()?],
-                            ElementType::F32,
-                        )?;
-                    }
+                } else if let Some(noise) = reference.patch_noise {
+                    check(
+                        self.host,
+                        noise,
+                        &[config::patch_rows(extent, c)?, c.image_width()?],
+                        ElementType::F32,
+                    )?;
                 }
-                _ => anyhow::bail!("reference extents and provided values differ"),
             }
         }
         let image_spec = config::tensor(vec![c.image_rows()?, c.image_width()?], ElementType::F32);
@@ -140,9 +156,9 @@ impl<'a> PH3ImageDiTInputAdapter<'a> {
         for (index, ((r, s), reference)) in
             c.requests.iter().zip(samples).zip(references).enumerate()
         {
-            if let (Some(extent), Some(reference)) = (r.reference, reference) {
+            for (extent, reference) in r.reference_extents().zip(reference) {
                 let elements = usize::try_from(
-                    r.reference_rows(c)?
+                    config::patch_rows(extent, c)?
                         .checked_mul(c.image_width()?)
                         .context("reference elements overflow")?,
                 )?;

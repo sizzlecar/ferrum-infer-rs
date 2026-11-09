@@ -13,8 +13,17 @@ impl PH3ImageTextTokenizer {
         grid: &Qwen3VLVisionGrid,
         merge_size: u64,
     ) -> Result<PH3ImageEditPrompt> {
+        self.prepare_images_instruction(prompt, std::slice::from_ref(grid), merge_size)
+    }
+
+    pub fn prepare_images_instruction(
+        &self,
+        prompt: &str,
+        grids: &[Qwen3VLVisionGrid],
+        merge_size: u64,
+    ) -> Result<PH3ImageEditPrompt> {
         let text = instruction(prompt, self.limits.max_prompt_bytes)?;
-        self.prepare_single_image(&text, grid, merge_size)
+        self.prepare_images(&text, grids, merge_size)
     }
 }
 
