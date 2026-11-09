@@ -206,6 +206,32 @@ fn typed_transfers_do_not_create_blas_and_first_compute_initializes_once() {
     let mut stream = runtime.create_stream().unwrap();
     assert!(stream.blas.is_none());
     let (buffer, quota) = buffer(&runtime, &stream);
+    // Keep real pool storage live while filling independently releasable idle
+    // backing. The original allowances cover these backend-owner fixtures.
+    const MIB: usize = 1024 * 1024;
+    let pool = runtime.tensor_allocation_pool().unwrap();
+    let live_allowance = runtime.reserve_tensor_opaque(8 * MIB as u64).unwrap();
+    let mut live = pool.allocate(8 * MIB).unwrap();
+    runtime.allocation_stream.memset_zeros(&mut live).unwrap();
+    runtime.allocation_stream.synchronize().unwrap();
+    let cached_bytes = pool
+        .snapshot()
+        .unwrap()
+        .reserved_bytes
+        .checked_mul(2)
+        .unwrap();
+    let cached_allowance = runtime.reserve_tensor_opaque(cached_bytes).unwrap();
+    let threshold = pool.snapshot().unwrap().release_threshold_bytes;
+    assert!(cached_bytes < threshold);
+    let cached = pool
+        .allocate(usize::try_from(cached_bytes).unwrap())
+        .unwrap();
+    runtime.allocation_stream.synchronize().unwrap();
+    drop(cached);
+    runtime.allocation_stream.synchronize().unwrap();
+    let cached_before = pool.snapshot().unwrap();
+    assert!(cached_before.reserved_bytes - cached_before.used_bytes >= cached_bytes);
+    let lane = stream.tensor_lane.as_ref().unwrap().clone();
     let host = host();
     let mut zero = runtime.encode_zero(&buffer, 0, 12).unwrap();
     let upload = upload(&runtime, &buffer, &host);
@@ -215,6 +241,10 @@ fn typed_transfers_do_not_create_blas_and_first_compute_initializes_once() {
     runtime
         .ensure_submission_blas(&mut stream, needs_blas)
         .unwrap();
+    assert_eq!(
+        pool.snapshot().unwrap().reserved_bytes,
+        cached_before.reserved_bytes
+    );
     zero.tensor_flight = Some(
         stream
             .tensor_lane
@@ -299,10 +329,34 @@ fn typed_transfers_do_not_create_blas_and_first_compute_initializes_once() {
             submission_requires_blas([&clear_output, &compute]),
         )
         .unwrap();
+    let after_creation = pool.snapshot().unwrap();
+    eprintln!(
+        "first BLAS allocator preparation: before={cached_before:?}, after={after_creation:?}"
+    );
+    assert!(after_creation.reserved_bytes < cached_before.reserved_bytes);
+    assert_eq!(after_creation.used_bytes, cached_before.used_bytes);
+    assert_eq!(after_creation.release_threshold_bytes, threshold);
+    assert_eq!(after_creation.pool_identity, cached_before.pool_identity);
+    assert!(Arc::ptr_eq(&lane, stream.tensor_lane.as_ref().unwrap()));
+    // Refill idle backing after the first native handle exists. Reusing that
+    // handle must neither trim the pool again nor acquire another lane.
+    let cached = pool
+        .allocate(usize::try_from(cached_bytes).unwrap())
+        .unwrap();
+    runtime.allocation_stream.synchronize().unwrap();
+    drop(cached);
+    runtime.allocation_stream.synchronize().unwrap();
+    let cached_again = pool.snapshot().unwrap();
+    assert!(cached_again.reserved_bytes - cached_again.used_bytes >= cached_bytes);
     let first = stream.blas.clone().unwrap();
     for _ in 0..2 {
         runtime.ensure_submission_blas(&mut stream, true).unwrap();
         assert!(Arc::ptr_eq(&first, stream.blas.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(&lane, stream.tensor_lane.as_ref().unwrap()));
+        let after_reuse = pool.snapshot().unwrap();
+        assert_eq!(after_reuse.reserved_bytes, cached_again.reserved_bytes);
+        assert_eq!(after_reuse.used_bytes, cached_again.used_bytes);
+        assert_eq!(after_reuse.release_threshold_bytes, threshold);
         stream.enqueue_command(&clear_output).unwrap();
         stream.enqueue_command(&compute).unwrap();
         runtime.synchronize(&mut stream).unwrap();
@@ -312,7 +366,17 @@ fn typed_transfers_do_not_create_blas_and_first_compute_initializes_once() {
             .unwrap();
         assert_eq!(f32::from_le_bytes(values[8..12].try_into().unwrap()), 6.0);
     }
-    drop((compute, clear_output, buffer, first, stream));
+    assert_eq!(
+        runtime
+            .allocation_stream
+            .clone_dtoh(&live.slice(..16))
+            .unwrap(),
+        vec![0_u8; 16]
+    );
+    drop(live);
+    runtime.allocation_stream.synchronize().unwrap();
+    drop((live_allowance, cached_allowance));
+    drop((compute, clear_output, buffer, first, stream, lane));
     drop(quota);
 }
 

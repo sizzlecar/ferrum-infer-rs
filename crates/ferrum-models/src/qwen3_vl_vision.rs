@@ -3,7 +3,9 @@
 //! Inputs are processor-ordered patch rows, interpolated learned positions and
 //! explicit FP32 axial rotary tables. Image preprocessing and position-table
 //! lookup are governed caller adapters; no HWC reinterpretation occurs here.
+pub mod comfy;
 mod config;
+pub mod hf;
 mod position;
 mod program;
 mod weights;

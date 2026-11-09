@@ -20,12 +20,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         requests: &[ImageRequestRef<'_>],
     ) -> anyhow::Result<usize> {
         ensure!(
-            !requests.is_empty() && requests.len() <= self.config.maximum_batch_size,
+            !requests.is_empty() && requests.len() <= self.execution.config.maximum_batch_size,
             "output geometry requires a supported nonempty batch"
         );
         let first = requests[0].generation();
-        let (height, width) =
-            first.latent_dimensions(&self.config, self.assets.spatial_scale()?)?;
+        let (height, width) = first.latent_dimensions(
+            &self.execution.config,
+            self.execution.sources.assets.spatial_scale()?,
+        )?;
         let edit = matches!(requests[0], ImageRequestRef::Edit(_));
         for request in requests {
             let generation = request.generation();
@@ -35,7 +37,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     && matches!(request, ImageRequestRef::Edit(_)) == edit,
                 "output geometry requires compatible request types and dimensions"
             );
-            generation.latent_dimensions(&self.config, self.assets.spatial_scale()?)?;
+            generation.latent_dimensions(
+                &self.execution.config,
+                self.execution.sources.assets.spatial_scale()?,
+            )?;
         }
         let batch = requests.len();
         let prompts: Vec<_> = requests
@@ -45,6 +50,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let mut edit_output = 0usize;
         let text = if edit {
             let assets = self
+                .execution
+                .sources
                 .assets
                 .editing
                 .as_ref()
@@ -59,7 +66,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                         .context("invalid bounded reference PNG header")?;
                 // This shares the processor's complete metadata validation,
                 // including pixel bounds; it performs no backing allocation.
-                assets.processor.prepared_backing_bytes(&self.host, w, h)?;
+                assets
+                    .processor
+                    .prepared_backing_bytes(&self.execution.host, w, h)?;
                 let current = QwenImage21ImageProcessor::condition_dimensions(w, h)?;
                 ensure!(
                     geometry.is_none_or(|previous| previous == current),
@@ -78,30 +87,37 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             )?;
             // Main merger and three DeepStack outputs are separate readbacks
             // for every reference, all retained until the text bridge copies.
-            edit_output = physical(&self.host, &merged)?
+            edit_output = physical(&self.execution.host, &merged)?
                 .checked_mul(1 + Qwen3VLVisionFamily::DEEPSTACK_IDS.len())
                 .and_then(|bytes| bytes.checked_mul(batch))
                 .context("vision output peak overflows")?;
             edit_output = edit_output.max(physical(
-                &self.host,
+                &self.execution.host,
                 &assets.encoder_config(h, w)?.output_tensor()?,
             )?);
-            self.assets
+            self.execution
+                .sources
+                .assets
                 .tokenizer
                 .prepare_edit_batch(
                     &prompts,
-                    self.config.maximum_user_tokens,
+                    self.execution.config.maximum_user_tokens,
                     u64::from(h / patch),
                     u64::from(w / patch),
                     assets.vision.merge_size(),
                 )?
-                .text_config(&self.assets.text)?
+                .text_config(&self.execution.sources.assets.text)?
         } else {
             let (prompts, _) = self
+                .execution
+                .sources
                 .assets
                 .tokenizer
-                .prepare_canonical(&prompts, self.config.maximum_user_tokens)?;
-            Qwen3VLTextConfig::new(self.assets.text.clone(), prompts.layout().clone())?
+                .prepare_canonical(&prompts, self.execution.config.maximum_user_tokens)?;
+            Qwen3VLTextConfig::new(
+                self.execution.sources.assets.text.clone(),
+                prompts.layout().clone(),
+            )?
         };
         // The text graph preserves the embedding geometry through its final
         // residual. This is the full hidden readback, before prefix cropping.
@@ -121,19 +137,19 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let velocity = latent.tensor(QwenImage21LatentLayout::Packed)?;
         let noise =
             NormalNoiseConfig::new(64, u64::from(height), u64::from(width))?.output_tensor()?;
-        let decoder = self.assets.decoder_batch(
-            self.config.decoder_batch_policy.batch_size(batch),
+        let decoder = self.execution.sources.assets.decoder_batch(
+            self.execution.config.decoder_batch_policy.batch_size(batch),
             height,
             width,
         )?;
         let decoded = decoder_output_peak(
-            physical(&self.host, &decoder.output_tensor()?)?,
+            physical(&self.execution.host, &decoder.output_tensor()?)?,
             batch,
-            self.config.decoder_batch_policy,
+            self.execution.config.decoder_batch_policy,
         )?;
-        Ok(physical(&self.host, &hidden)?
-            .max(physical(&self.host, &velocity)?)
-            .max(physical(&self.host, &noise)?)
+        Ok(physical(&self.execution.host, &hidden)?
+            .max(physical(&self.execution.host, &velocity)?)
+            .max(physical(&self.execution.host, &noise)?)
             .max(decoded)
             .max(edit_output))
     }

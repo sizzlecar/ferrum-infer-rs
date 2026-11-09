@@ -95,6 +95,70 @@ async fn streaming_fields_preserve_png_owner_and_use_common_image_controls() {
 }
 
 #[tokio::test]
+async fn eight_megapixel_multipart_uses_shared_limits_and_real_managed_decoder() {
+    use ferrum_models::qwen_image21::image_input::ManagedRgba8Image;
+    use ferrum_output::png::{encoded_rgba8_png_bytes, PngDimensions, PngLimits};
+    use std::io::Write;
+
+    let dimensions = PngDimensions::new(2912, 2912).unwrap();
+    let encoded_limit = ImageInputLimits::default().maximum_encoded_bytes();
+    let output_bytes = encoded_rgba8_png_bytes(dimensions, PngLimits::default()).unwrap();
+    let envelope_bytes = wire(&[
+        ("model", b"image", false),
+        ("prompt", b"", false),
+        ("image", b"", true),
+    ])
+    .len();
+    assert!(output_bytes <= encoded_limit as u64);
+    assert!(encoded_limit + PROMPT_LIMIT + envelope_bytes <= EDIT_BODY_LIMIT);
+
+    // Stream highly compressible pixels into a small fixture; dimensions and
+    // decoded Host admission still cover the full 2912² source image.
+    let mut png = Vec::new();
+    let row = [1, 17, 255, 128].repeat(2912);
+    {
+        let mut encoder = ::png::Encoder::new(&mut png, 2912, 2912);
+        encoder.set_color(::png::ColorType::Rgba);
+        encoder.set_depth(::png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        {
+            let mut stream = writer.stream_writer().unwrap();
+            for _ in 0..2912 {
+                stream.write_all(&row).unwrap();
+            }
+            stream.finish().unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    assert!(png.len() < dimensions.rgba_bytes() / 100);
+    let account = account(png.len() + dimensions.rgba_bytes());
+    let (request, encoded) = parse(
+        multipart(wire(&[
+            ("model", b"image", false),
+            ("prompt", b"edit", false),
+            ("image", &png, true),
+        ]))
+        .await,
+        &account,
+    )
+    .await
+    .unwrap();
+    assert_eq!(request.prompt, "edit");
+    let decoded =
+        ManagedRgba8Image::decode_png(&account, &encoded, ImageInputLimits::default()).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (2912, 2912));
+    for actual in decoded.bytes().bytes().chunks_exact(row.len()) {
+        assert_eq!(actual, row);
+    }
+    assert_eq!(
+        account.usage().unwrap().allocated_bytes(),
+        png.len() + dimensions.rgba_bytes()
+    );
+    drop((decoded, encoded));
+    assert_eq!(account.usage().unwrap().committed_bytes(), 0);
+}
+
+#[tokio::test]
 async fn duplicate_files_masks_unknown_controls_and_bad_fields_release_ingress() {
     let account = account(32 * 1024 * 1024);
     let png = b"\x89PNG\r\n\x1a\n";
@@ -172,6 +236,101 @@ struct DecoderOnly {
     host: HostMemoryAccount,
     calls: Arc<std::sync::atomic::AtomicUsize>,
     decoded: Arc<std::sync::Mutex<Option<(u32, u32, usize)>>>,
+}
+
+#[tokio::test]
+async fn image_correlation_multipart_worker_error_keeps_service_identity() {
+    use ferrum_types::image_trace::{
+        IMAGE_ATTEMPT_ID_HEADER, IMAGE_REQUEST_ID_HEADER, IMAGE_TRACE_SESSION_HEADER,
+    };
+    use tower::ServiceExt;
+    use uuid::Uuid;
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            4 * 1024 * 1024,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: 8192,
+                output_bytes: 2 * 1024 * 1024,
+                transfer_staging_bytes: 0,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let decoded = Arc::new(std::sync::Mutex::new(None));
+    let service = ImageService::new(
+        DecoderOnly {
+            host: host.clone(),
+            calls: calls.clone(),
+            decoded: decoded.clone(),
+        },
+        ferrum_engine::image_generation::service::ImageServiceConfig {
+            batching: ferrum_types::ImageBatchPolicy::Configured,
+            maximum_pending: 2,
+            maximum_pending_bytes: 4096,
+            maximum_prompt_bytes: 1024,
+            max_num_seqs: 1,
+            request_batch_max_wait_ms: 0,
+        },
+    )
+    .unwrap();
+    let images = ImageHttpService::new("image", service, super::super::tests::config()).unwrap();
+    let router = super::super::super::AxumServer::from_state(
+        AppState::default().with_images(images.clone()),
+    )
+    .build_router()
+    .unwrap();
+    let mut png = Vec::new();
+    ferrum_output::png::write_rgba8_png(
+        &mut png,
+        PngDimensions::new(1, 1).unwrap(),
+        PngLimits::default(),
+        |writer| writer.write_all(&[1, 17, 55, 255]),
+    )
+    .unwrap();
+    let attempt = Uuid::new_v4();
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/edits")
+                .header("content-type", "multipart/form-data; boundary=bound")
+                .header(IMAGE_ATTEMPT_ID_HEADER, attempt.to_string())
+                .body(Body::from(wire(&[
+                    ("model", b"image", false),
+                    ("prompt", b"edit", false),
+                    ("image", &png, true),
+                ])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // The real codec succeeds; this existing fixture deliberately has no model
+    // executor and returns its nonfatal worker error, not a fabricated image.
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let request_id = Uuid::parse_str(
+        response.headers()[IMAGE_REQUEST_ID_HEADER]
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(request_id, attempt);
+    assert_eq!(
+        response.headers()[IMAGE_ATTEMPT_ID_HEADER]
+            .to_str()
+            .unwrap(),
+        attempt.to_string()
+    );
+    assert!(!response.headers().contains_key(IMAGE_TRACE_SESSION_HEADER));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(*decoded.lock().unwrap(), Some((1, 1, 4)));
+    drop(response);
+    images.shutdown().await.unwrap();
+    assert!(!images.take_shutdown().await.unwrap().has_failure());
 }
 impl ferrum_engine::image_generation::service::ImageGenerator for DecoderOnly {
     fn host_account(&self) -> &HostMemoryAccount {

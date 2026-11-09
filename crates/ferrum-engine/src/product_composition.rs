@@ -750,13 +750,37 @@ fn composite_has_shared_m4_m8_route(
         })
 }
 
-fn resolve_model_plan(
+pub(crate) fn resolve_model_plan(
     engine: &EngineConfig,
     prepared: &PreparedProductionModel,
     catalog: &CapabilityCatalog,
     runtime: &ResolvedRuntimePolicy,
     compilation: &ProgramPlanCompilation,
     numerical_execution: &NumericalProfileResolution,
+) -> Result<ResolvedModelPlan> {
+    let registry = ProductionModelFamilyRegistry::new()?;
+    resolve_model_plan_with_registry(
+        engine,
+        prepared,
+        catalog,
+        runtime,
+        compilation,
+        numerical_execution,
+        &registry,
+    )
+}
+
+/// Explicit model compositions supply their actual typed family registration.
+/// The same source, numerical and resolution-evidence checks still apply;
+/// supplying a registry does not change automatic model-family selection.
+pub(crate) fn resolve_model_plan_with_registry(
+    engine: &EngineConfig,
+    prepared: &PreparedProductionModel,
+    catalog: &CapabilityCatalog,
+    runtime: &ResolvedRuntimePolicy,
+    compilation: &ProgramPlanCompilation,
+    numerical_execution: &NumericalProfileResolution,
+    registry: &dyn ferrum_runtime::ModelFamilyRegistry,
 ) -> Result<ResolvedModelPlan> {
     let sources = prepared.sources();
     let config_sha256 = sources
@@ -822,9 +846,8 @@ fn resolve_model_plan(
         structured_output,
     };
     let (source_evidence, bindings) = resolution_evidence(&inputs)?;
-    let registry = ProductionModelFamilyRegistry::new()?;
     let context = ResolvedPlanValidationContext::new(
-        &registry,
+        registry,
         &source_evidence,
         compilation.node_resolutions(),
         catalog.device(),
@@ -1134,17 +1157,34 @@ const fn decision_source_name(source: ResolutionDecisionSource) -> &'static str 
 mod tests {
     use super::*;
 
+    mod managed_causal;
+    mod visual_prompt_consumer;
+
     fn prepared_execution_fixture() -> (
         std::path::PathBuf,
         DefinedProductionModel,
         PreparedProductionModel,
         EngineConfig,
     ) {
+        prepared_execution_fixture_with(ferrum_types::NumericalExecutionPolicy::Auto, |_| {})
+    }
+
+    fn prepared_execution_fixture_with(
+        numerical_execution: ferrum_types::NumericalExecutionPolicy,
+        configure: impl FnOnce(&std::path::Path),
+    ) -> (
+        std::path::PathBuf,
+        DefinedProductionModel,
+        PreparedProductionModel,
+        EngineConfig,
+    ) {
         let directory = crate::registry::tests::write_qwen35_fixture_model_dir();
+        configure(&directory);
         std::fs::write(directory.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
         std::fs::write(directory.join("tokenizer_config.json"), br#"{"chat_template":"{% for message in messages %}{{ message['content'] }}{% endfor %}","eos_token_id":2,"unk_token":"<unk>"}"#).unwrap();
         let defined = ferrum_models::vnext::qwen35::define_from_model_dir(&directory).unwrap();
         let mut engine = EngineConfig::default();
+        engine.numerical_execution = numerical_execution;
         engine.backend.device = ferrum_types::Device::CPU;
         engine.scheduler.max_running_requests = 4;
         engine.batching.max_num_batched_tokens = 8;

@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fmt};
 
+pub mod continuous_trace;
 mod png_response;
 pub use png_response::{
-    validate_image_response, validate_image_response_with_png, validate_reference_png,
-    ValidatedImage, ValidatedPngResponse,
+    validate_image_response, validate_image_response_with_png, validate_png_response,
+    validate_reference_png, ValidatedImage, ValidatedPngResponse,
 };
 mod request_mode;
 pub mod resource_usage;
@@ -224,6 +225,9 @@ pub enum ImageFailureKind {
     /// A scheduled arrival exceeded the client's declared in-flight bound.
     /// No HTTP request was sent; this is never a server rejection.
     ClientCapacity,
+    /// No HTTP operation was started: graceful cancellation or an unknown
+    /// prior remote job stopped further admission. Distinct from capacity.
+    ClientStopped,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +237,16 @@ pub struct ImageRequestRecord {
     pub phase: ImageRequestPhase,
     pub repetition: usize,
     pub dispatch_index: usize,
+    /// One opaque ID per actual client dispatch, including failed/cancelled
+    /// attempts. Unsent capacity/stopped records and older reports omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_attempt_id: Option<uuid::Uuid>,
+    /// Validated response metadata from a service which supplies correlation.
+    /// These IDs require matching the original sealed trace before analysis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_request_id: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_session_uuid: Option<uuid::Uuid>,
     pub http_status: Option<u16>,
     /// Send start through complete body reception. Excludes local PNG validation.
     pub e2e_ms: f64,
@@ -311,7 +325,12 @@ impl ImageMetrics {
             .count();
         let client_not_dispatched = records
             .iter()
-            .filter(|r| r.failure == Some(ImageFailureKind::ClientCapacity))
+            .filter(|r| {
+                matches!(
+                    r.failure,
+                    Some(ImageFailureKind::ClientCapacity | ImageFailureKind::ClientStopped)
+                )
+            })
             .count();
         let p50 = (!latencies.is_empty()).then(|| crate::percentile(&latencies, 0.50));
         let p95 = (!latencies.is_empty()).then(|| crate::percentile(&latencies, 0.95));

@@ -20,7 +20,10 @@ use super::{
     tiling::{PH3ImageVaeCanvas, PH3ImageVaeMomentCanvas, PH3ImageVaeTilePlan},
     PH3ImageVaeDecoderConfig,
 };
-pub use super::{encode_layout::PH3ImageVaePixelDomain, tiling::PH3ImageVaeSpatialPolicy};
+pub use super::{
+    encode_layout::PH3ImageVaePixelDomain,
+    tiling::{PH3ImageVaeSpatialPolicy, PH3ImageVaeTileBatch, PH3ImageVaeTileGroup},
+};
 use crate::image_pixels::{ImagePixelEncoding, OwnedImagePixels};
 use anyhow::{ensure, Context, Result};
 use ferrum_execution::{
@@ -30,9 +33,11 @@ use ferrum_quantization::comfy_convrot::ComfyCanonicalWeightSource;
 use ferrum_runtime::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+mod decoder_tiles;
 mod encoder_host_requirements;
 mod host_backing;
 mod host_requirements;
+pub use decoder_tiles::{PH3ImageVaeDecoderTilesConsumer, PreparedPH3ImageVaeDecoderTiles};
 pub use encoder_host_requirements::{
     PH3ImageVaeEncoderHostPhase, PH3ImageVaeEncoderHostPhaseBudget,
     PH3ImageVaeEncoderHostRequirements,
@@ -304,6 +309,18 @@ impl PH3ImageVaeAdapter {
         policy: PH3ImageVaeSpatialPolicy,
         preset: PH3ImageVaeDecoderPreset,
     ) -> Result<PreparedPH3ImageVaeDecoder> {
+        self.prepare_decoder_shape(batch, 1, width, height, policy, preset)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_decoder_shape(
+        &self,
+        request_batch: u64,
+        tile_count: usize,
+        width: usize,
+        height: usize,
+        policy: PH3ImageVaeSpatialPolicy,
+        preset: PH3ImageVaeDecoderPreset,
+    ) -> Result<PreparedPH3ImageVaeDecoder> {
         let v = &self.validated;
         let scale = usize::try_from(v.decoder.patch_size())?;
         let plan = PH3ImageVaeTilePlan::new(width, height, scale, policy)?;
@@ -315,7 +332,9 @@ impl PH3ImageVaeAdapter {
         };
         let config = PH3ImageVaeDecoderExecutionConfig::new(
             v.decoder.clone(),
-            batch,
+            request_batch
+                .checked_mul(u64::try_from(tile_count)?)
+                .context("VAE physical tile batch overflows")?,
             u64::try_from(tile.height / scale)?,
             u64::try_from(tile.width / scale)?,
             execution_preset,
@@ -332,6 +351,8 @@ impl PH3ImageVaeAdapter {
         );
         Ok(PreparedPH3ImageVaeDecoder {
             validated: Arc::clone(v),
+            request_batch,
+            tile_count,
             config,
             family,
             options,
@@ -459,12 +480,23 @@ impl PreparedPH3ImageVaeEncoder {
 
 pub struct PreparedPH3ImageVaeDecoder {
     validated: Arc<ValidatedSource>,
+    request_batch: u64,
+    tile_count: usize,
     config: PH3ImageVaeDecoderExecutionConfig,
     family: PreparedModelFamily,
     options: ProgramPlanCompileOptions,
     plan: PH3ImageVaeTilePlan,
 }
 impl PreparedPH3ImageVaeDecoder {
+    pub fn request_batch(&self) -> u64 {
+        self.request_batch
+    }
+    pub fn tile_count(&self) -> usize {
+        self.tile_count
+    }
+    pub fn physical_batch(&self) -> u64 {
+        self.config.batch()
+    }
     pub fn family(&self) -> &PreparedModelFamily {
         &self.family
     }
@@ -490,7 +522,7 @@ impl PreparedPH3ImageVaeDecoder {
         let [h, w] = self.plan.dimensions();
         let s = self.plan.spatial_scale();
         spec(&[
-            self.config.batch(),
+            self.request_batch,
             self.validated.decoder.latent_channels(),
             (h / s) as u64,
             (w / s) as u64,
@@ -498,7 +530,7 @@ impl PreparedPH3ImageVaeDecoder {
     }
     pub fn pixel_output_spec(&self) -> Result<ResolvedTensorSpec> {
         let [h, w] = self.plan.dimensions();
-        spec(&[self.config.batch(), 3, h as u64, w as u64])
+        spec(&[self.request_batch, 3, h as u64, w as u64])
     }
     pub const fn pixel_encoding(&self) -> ImagePixelEncoding {
         ImagePixelEncoding::F32UnitRgbRne
@@ -507,7 +539,7 @@ impl PreparedPH3ImageVaeDecoder {
     /// canvas/work/old+new seam storage, one pending unpatchified tile, and one
     /// complete decoder readback. No uncharged temporary tile is assumed.
     pub fn output_peak(&self, host: &HostMemoryAccount) -> Result<usize> {
-        let batch = usize::try_from(self.config.batch())?;
+        let batch = usize::try_from(self.request_batch)?;
         let tile = self.plan.tile(0)?;
         let pixels = spec(&[
             self.config.batch(),
@@ -556,6 +588,10 @@ impl PreparedPH3ImageVaeDecoder {
         input_host: HostMemoryAccount,
         output_host: HostMemoryAccount,
     ) -> Result<PH3ImageVaeDecoderConsumer<'a, R>> {
+        ensure!(
+            self.tile_count == 1,
+            "multiple spatial tiles require the grouped consumer"
+        );
         let v = &self.validated;
         let checkpoint = PH3ImageVaeDecoderCheckpoint::view_validated(
             &self.config,

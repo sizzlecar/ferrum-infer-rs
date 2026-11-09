@@ -2,6 +2,7 @@ use super::*;
 use half::bf16;
 #[cfg(feature = "cuda")]
 mod cuda;
+mod edit_prefix_oracle;
 mod header;
 pub(in crate::p_h3_image) use super::test_fixture as shared_fixture;
 pub(in crate::p_h3_image) use super::test_fixture::{limits, transformer};
@@ -466,8 +467,8 @@ fn managed_patch_adapter_preserves_f32_solver_and_separate_reference_boundary() 
     // Independent explicit first patch, channels before the two spatial axes.
     for (column, source) in [0, 1, 4, 5, 8, 9, 12, 13].into_iter().enumerate() {
         let raw = 1.00390625 + source as f32 / 32.;
-        let a = 0.999_f32 * raw;
-        let b = (1.0_f32 - 0.999) * (-0.25);
+        let a = f32::from_bits(0x3f7f_be77) * raw;
+        let b = f32::from_bits(0x3a83_126f) * (-0.25);
         assert_eq!(image_values[column].to_bits(), (a + b).to_bits());
     }
     assert_ne!(image_values[0], bf16::from_f32(image_values[0]).to_f32());
@@ -510,6 +511,138 @@ fn managed_patch_adapter_preserves_f32_solver_and_separate_reference_boundary() 
     drop(connector);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }
+
+fn augmented_reference_values(
+    augmentation: f64,
+    value: f32,
+    noise: Option<f32>,
+) -> anyhow::Result<Vec<f32>> {
+    let c = config(1);
+    let host = account(1 << 20);
+    let result = (|| {
+        let image = f32_tensor(
+            &host,
+            "value.sample",
+            vec![1, 2, 1, 4, 4],
+            std::iter::repeat_n(0.0, 32),
+        );
+        let audio = f32_tensor(
+            &host,
+            "value.audio",
+            vec![1, 2, 2, 2],
+            std::iter::repeat_n(0.0, 8),
+        );
+        let reference = f32_tensor(
+            &host,
+            "value.reference",
+            vec![1, 2, 1, 2, 4],
+            std::iter::repeat_n(value, 16),
+        );
+        let noise = noise.map(|v| {
+            f32_tensor(
+                &host,
+                "value.reference.noise",
+                vec![2, 8],
+                std::iter::repeat_n(v, 16),
+            )
+        });
+        let connector = f32_tensor(
+            &host,
+            "value.connector",
+            vec![3, 4],
+            std::iter::repeat_n(0.0, 12),
+        );
+        let keys = cache::fixture_keys(&c, &connector);
+        let (basis, cos, sin) = supplemental(&c, &host);
+        let prepared = PH3ImageDiTInputAdapter::new(&c, &host)?.prepare(
+            &[PH3ImageDiTSample {
+                image: &image,
+                audio: &audio,
+            }],
+            &[Some(PH3ImageDiTReference {
+                latent: &reference,
+                patch_noise: noise.as_ref(),
+                augmentation,
+            })],
+            PH3ImageDiTTextInput::WithTextRefiner {
+                connector: &connector,
+                keys: &keys,
+            },
+            basis,
+            cos,
+            sin,
+        )?;
+        let patches = prepared
+            .inputs
+            .iter()
+            .find(|t| t.value_id().as_str() == PH3ImageDiTFamily::IMAGE_PATCHES_ID)
+            .unwrap();
+        Ok(patches.bytes().bytes()[..reference.bytes().len()]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect())
+    })();
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    result
+}
+
+#[test]
+fn reference_augmentation_preserves_python_scalar_coefficients_at_f32_boundary() {
+    // Literal IEEE-754 expectations: isolate each coefficient through the
+    // real managed adapter instead of recomputing its subtraction as an oracle.
+    for (augmentation, signal_bits, noise_bits) in [
+        (0.0, 0x0000_0000, 0x3f80_0000),
+        (1.0, 0x3f80_0000, 0x0000_0000),
+        (0.999, 0x3f7f_be77, 0x3a83_126f),
+        (0.5, 0x3f00_0000, 0x3f00_0000),
+        (2.0_f64.powi(-25), 0x3300_0000, 0x3f80_0000),
+        (2.0_f64.powi(-149), 0x0000_0001, 0x3f80_0000),
+        (2.0_f64.powi(-150), 0x0000_0000, 0x3f80_0000),
+        (f64::from_bits(1), 0x0000_0000, 0x3f80_0000),
+        // The nearest f64 below one still needs noise even though its signal
+        // coefficient rounds to exactly one in F32; its complement is 2^-53.
+        (
+            f64::from_bits(1.0_f64.to_bits() - 1),
+            0x3f80_0000,
+            0x2500_0000,
+        ),
+    ] {
+        for (value, noise, expected) in [(1.0, 0.0, signal_bits), (0.0, 1.0, noise_bits)] {
+            let actual = augmented_reference_values(augmentation, value, Some(noise)).unwrap();
+            assert!(
+                actual.iter().all(|v| v.to_bits() == expected),
+                "augmentation={augmentation:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn reference_augmentation_rounds_two_products_before_addition() {
+    // signal = 0x3f7fbe79, noise = 0xbf7fbe78: separately rounded
+    // products differ by exactly 2^-24. Fusing the signal product with
+    // the rounded noise product would instead produce 0x337f7cee.
+    let actual =
+        augmented_reference_values(0.999, f32::from_bits(0x3f80_0001), Some(-999.0)).unwrap();
+    assert!(actual.iter().all(|v| v.to_bits() == 0x3380_0000));
+}
+
+#[test]
+fn reference_augmentation_checks_f64_range_and_noise_before_rounding() {
+    for augmentation in [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        -f64::from_bits(1),
+        f64::from_bits(1.0_f64.to_bits() + 1),
+    ] {
+        assert!(augmented_reference_values(augmentation, 1.0, Some(1.0)).is_err());
+    }
+    assert!(augmented_reference_values(f64::from_bits(1.0_f64.to_bits() - 1), 1.0, None).is_err());
+    let unchanged = augmented_reference_values(1.0, f32::from_bits(0x3f80_0001), None).unwrap();
+    assert!(unchanged.iter().all(|v| v.to_bits() == 0x3f80_0001));
+}
+
 #[test]
 fn adapter_second_allocation_failure_refunds_and_wrong_host_is_rejected() {
     // Use an unchanged valid text-to-image configuration, selecting its request.

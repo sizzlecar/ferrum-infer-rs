@@ -156,7 +156,12 @@ fn stage(
     PreparedStage<ReferenceDeviceRuntime>,
     QwenImage21VaeDecoderConfig,
 ) {
-    let decoder = pipeline.assets.decoder_batch(batch, 2, 2).unwrap();
+    let decoder = pipeline
+        .execution
+        .sources
+        .assets
+        .decoder_batch(batch, 2, 2)
+        .unwrap();
     let family = TypedFamilyRegistration::new(QwenImage21VaeDecoderFamily::new().unwrap())
         .prepare_with_profile(
             &serde_json::to_value(&decoder).unwrap(),
@@ -177,22 +182,28 @@ fn stage(
 #[test]
 fn real_reference_decoder_microbatch_reuses_initialization_and_matches_full_batch() {
     let (mut pipeline, directory) = super::adapter::pipeline(2);
-    pipeline.host = host(65536);
-    pipeline.config.static_initialization = StaticInitializationPolicy::new(65536, 64).unwrap();
-    let config = pipeline.assets.decoder_batch(1, 2, 2).unwrap();
-    Arc::get_mut(&mut pipeline.assets)
+    pipeline.execution.host = host(65536);
+    pipeline.execution.config.static_initialization =
+        StaticInitializationPolicy::new(65536, 64).unwrap();
+    let config = pipeline
+        .execution
+        .sources
+        .assets
+        .decoder_batch(1, 2, 2)
+        .unwrap();
+    Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("unique fixture assets")
         .sources
         .vae = decoder_source(&directory.path().join("numeric-vae"), &config);
     let weights = config.expected_weights().unwrap();
     let weight_bytes: u64 = weights.iter().map(|w| w.bytes()).sum();
-    let source = input(&pipeline.host);
+    let source = input(&pipeline.execution.host);
     let mut results = Vec::new();
     for (job, policy, batch, executions) in [
         (0, ImageDecoderBatchPolicy::SingleImage, 1, 2),
         (1, ImageDecoderBatchPolicy::FullBatch, 2, 1),
     ] {
-        pipeline.config.decoder_batch_policy = policy;
+        pipeline.execution.config.decoder_batch_policy = policy;
         let (stage, decoder) = stage(&pipeline, batch);
         let mut receipts = Vec::new();
         let images = pipeline
@@ -209,10 +220,11 @@ fn real_reference_decoder_microbatch_reuses_initialization_and_matches_full_batc
         };
         assert_eq!(receipt.uploaded_component_count(), weights.len());
         assert_eq!(receipt.uploaded_bytes(), weight_bytes); // Once, not per execution.
-        assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+        assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
         for output in &images {
             assert_eq!(output.tensor().dimensions(), [1, 4, 32, 32]);
-            QwenImage21RgbaOutput::new(&pipeline.host, output.tensor(), output.bytes()).unwrap();
+            QwenImage21RgbaOutput::new(&pipeline.execution.host, output.tensor(), output.bytes())
+                .unwrap();
         }
         assert_ne!(images[0].bytes().bytes(), images[1].bytes().bytes());
         results.push(images);
@@ -227,7 +239,7 @@ fn real_reference_decoder_microbatch_reuses_initialization_and_matches_full_batc
     }
     let micro_alias = results[0][1].bytes().clone();
     let full_alias = results[1][1].bytes().clone();
-    let host = pipeline.host.clone();
+    let host = pipeline.execution.host.clone();
     drop((source, results, pipeline));
     assert_eq!(
         host.usage().unwrap().committed_bytes(),
@@ -246,12 +258,20 @@ fn real_reference_decoder_microbatch_reuses_initialization_and_matches_full_batc
 #[test]
 fn later_decoder_output_quota_failure_retains_the_active_session_for_close() {
     let (mut pipeline, _directory) = super::adapter::pipeline(2);
-    pipeline.host = host(4 * 32 * 32 * 2); // Exactly one returned image.
-    pipeline.config.static_initialization = StaticInitializationPolicy::new(65536, 64).unwrap();
+    pipeline.execution.host = host(4 * 32 * 32 * 2); // Exactly one returned image.
+    pipeline.execution.config.static_initialization =
+        StaticInitializationPolicy::new(65536, 64).unwrap();
     let (stage, decoder) = stage(&pipeline, 1);
     let mut receipts = Vec::new();
     let failure = pipeline
-        .decode_batch(stage, &decoder, input(&pipeline.host), 2, 0, &mut receipts)
+        .decode_batch(
+            stage,
+            &decoder,
+            input(&pipeline.execution.host),
+            2,
+            0,
+            &mut receipts,
+        )
         .err()
         .unwrap();
     let ImageGenerationFailure::Execution { source, active } = failure else {
@@ -259,26 +279,35 @@ fn later_decoder_output_quota_failure_retains_the_active_session_for_close() {
     };
     assert_eq!(active.receipt.completed_executions, 1);
     assert!(receipts.is_empty());
-    assert!(pipeline.runtime.snapshot().live_allocations > 0);
+    assert!(pipeline.execution.runtime.snapshot().live_allocations > 0);
     drop(source);
     active
         .close()
         .unwrap_or_else(|_| panic!("quiescent quota rejection must permit explicit close"));
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
 fn cached_decoder_plan_reinitializes_without_retaining_device_or_host_payloads() {
     let (mut pipeline, directory) = super::adapter::pipeline(2);
-    pipeline.host = host(65536);
-    pipeline.config.static_initialization = StaticInitializationPolicy::new(65536, 64).unwrap();
-    let config = pipeline.assets.decoder_batch(1, 2, 2).unwrap();
-    Arc::get_mut(&mut pipeline.assets)
+    pipeline.execution.host = host(65536);
+    pipeline.execution.config.static_initialization =
+        StaticInitializationPolicy::new(65536, 64).unwrap();
+    let config = pipeline
+        .execution
+        .sources
+        .assets
+        .decoder_batch(1, 2, 2)
+        .unwrap();
+    Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("unique fixture assets")
         .sources
         .vae = decoder_source(&directory.path().join("cached-numeric-vae"), &config);
-    let source = input(&pipeline.host);
+    let source = input(&pipeline.execution.host);
     let mut previous = None;
     let mut previous_plan = None;
     for job in 0..2 {
@@ -294,7 +323,7 @@ fn cached_decoder_plan_reinitializes_without_retaining_device_or_host_payloads()
             .unwrap_or_else(|_| {
                 panic!("cached component must initialize a new independent session")
             });
-        assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+        assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
         assert_eq!(receipts[0].execution.completed_executions, 2);
         assert!(!receipts[0].execution.session_reused);
         assert!(receipts[0].close.is_some());
@@ -319,22 +348,31 @@ fn cached_decoder_plan_reinitializes_without_retaining_device_or_host_payloads()
         drop(images);
     }
     drop(source);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }
 
 #[test]
 fn resident_real_decoder_reuses_one_initialization_and_shutdown_preserves_host_images() {
     let (mut pipeline, directory) = super::adapter::pipeline(2);
-    pipeline.host = host(65536);
-    pipeline.config.residency = ImageResidencyPolicy::DenoiserAndDecoder;
-    pipeline.config.static_initialization = StaticInitializationPolicy::new(65536, 64).unwrap();
-    let config = pipeline.assets.decoder_batch(1, 2, 2).unwrap();
-    Arc::get_mut(&mut pipeline.assets)
+    pipeline.execution.host = host(65536);
+    pipeline.execution.config.residency = ImageResidencyPolicy::DenoiserAndDecoder;
+    pipeline.execution.config.static_initialization =
+        StaticInitializationPolicy::new(65536, 64).unwrap();
+    let config = pipeline
+        .execution
+        .sources
+        .assets
+        .decoder_batch(1, 2, 2)
+        .unwrap();
+    Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("unique fixture assets")
         .sources
         .vae = decoder_source(&directory.path().join("resident-numeric-vae"), &config);
-    let source = input(&pipeline.host);
+    let source = input(&pipeline.execution.host);
     let mut outputs = Vec::new();
     let mut uploaded = 0;
     for job in 0..2 {
@@ -351,7 +389,7 @@ fn resident_real_decoder_reuses_one_initialization_and_shutdown_preserves_host_i
             receipts[0].retirement,
             ImageStageRetirement::Resident { .. }
         ));
-        let snapshot = pipeline.runtime.snapshot();
+        let snapshot = pipeline.execution.runtime.snapshot();
         if job == 1 {
             assert_eq!(
                 snapshot.uploaded_bytes - uploaded,
@@ -376,17 +414,21 @@ fn resident_real_decoder_reuses_one_initialization_and_shutdown_preserves_host_i
         receipt[1].retirement,
         ImageStageRetirement::SharedWeightsClosed { .. }
     ));
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
     drop(source);
     assert_eq!(
-        pipeline.host.usage().unwrap().committed_bytes(),
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
         4 * 4 * 32 * 32 * 2
     );
     for batch in &outputs {
         for output in batch {
-            QwenImage21RgbaOutput::new(&pipeline.host, output.tensor(), output.bytes()).unwrap();
+            QwenImage21RgbaOutput::new(&pipeline.execution.host, output.tensor(), output.bytes())
+                .unwrap();
         }
     }
     drop(outputs);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }

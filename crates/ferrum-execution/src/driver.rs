@@ -66,13 +66,25 @@ use self::{
 };
 
 mod backing_maintenance;
+mod causal_inputs;
 mod composition;
+pub use causal_inputs::{
+    CausalInputSchema, CausalInputSegment, CausalRequestInputs, CausalTokenInput,
+    CausalTokenInputSpec, CausalTokenInputStorage,
+};
 mod determinism;
 mod input_uploads;
+mod managed_io;
+use managed_io::{ManagedCausalIo, ManagedWaveIo};
+pub use managed_io::{
+    ManagedCausalIoProfile, ManagedCausalIoRequirements, ManagedCausalIoWork, ManagedCausalReadback,
+};
 mod invocation_preparation;
 mod resident_decode;
 use composition::StaticInstallation;
 pub use composition::{
+    CausalAcceptedOutput, CausalCommittedWave, CausalComputedWave, CausalProgramSession,
+    CausalTailTwoOutput, CausalVerifiedDraftOutput, CausalWaveFailure, CompiledCausalProgram,
     CompiledProgram, ProgramCompilationError, ProgramSharedWeightsReceipt, RuntimeComposition,
     SharedProgramWeights, SharedProgramWeightsCloseOutcome,
 };
@@ -640,6 +652,19 @@ pub struct ProgramExecutorConfig {
 }
 
 impl ProgramExecutorConfig {
+    /// Extra causal inputs remain current-wave managed uploads. Only decode
+    /// segments may be captured, after real input-bearing work has arrived.
+    fn supports_causal_input_replay(&self) -> bool {
+        self.device_reusable_execution_decode_only
+            && self
+                .runtime_policy
+                .reusable_execution_policy()
+                .and_then(|policy| policy.program_policy())
+                .is_some_and(|policy| {
+                    policy.preparation() == ReusableExecutionProgramPreparation::OnDemand
+                })
+    }
+
     pub fn from_engine_config<R: DeviceRuntime>(
         engine: &EngineConfig,
         info: &ModelInfo,
@@ -1350,6 +1375,7 @@ impl VNextStartupPreparationState {
 
 #[derive(Debug, Clone)]
 struct VNextLanguageIoIds {
+    causal_inputs: Option<CausalInputSchema>,
     token_input: ProgramValueId,
     token_mask_input: ProgramValueId,
     repetition_token_ids_input: ProgramValueId,
@@ -1371,6 +1397,7 @@ fn is_language_masked_argmax_operation(operation_id: &str) -> bool {
 
 #[derive(Debug, Clone)]
 struct VNextIoBinding {
+    causal_inputs: Option<causal_inputs::ResolvedInputs>,
     input_node_id: NodeId,
     input_ordinal: u32,
     token_mask_input_node_id: NodeId,
@@ -2977,27 +3004,7 @@ struct VNextDeviceTimingMetrics {
 
 impl VNextDeviceTimingMetrics {
     fn record(&self, receipt: &CompletionReadbackBatchReceipt) {
-        let fence = receipt.completion().fence_timing();
-        self.physical_spans
-            .record(receipt.completion().submission_timing());
-        match fence.device_execution() {
-            DeviceTimingMeasurement::Measured(timing) => self
-                .device_execution
-                .record(Duration::from_nanos(timing.elapsed_ns())),
-            DeviceTimingMeasurement::Unavailable(_) => {
-                self.device_unavailable.fetch_add(1, Ordering::Relaxed);
-            }
-            DeviceTimingMeasurement::NotRequested => {}
-        }
-        match fence.blocking_wait_host_ns() {
-            DeviceTimingMeasurement::Measured(nanoseconds) => self
-                .fence_wait_host
-                .record(Duration::from_nanos(nanoseconds)),
-            DeviceTimingMeasurement::Unavailable(_) => {
-                self.fence_wait_unavailable.fetch_add(1, Ordering::Relaxed);
-            }
-            DeviceTimingMeasurement::NotRequested => {}
-        }
+        self.record_completion(receipt.completion());
         if let Some(readbacks) = receipt.readback_timings() {
             for readback in readbacks {
                 match readback {
@@ -3015,6 +3022,29 @@ impl VNextDeviceTimingMetrics {
                     DeviceTimingMeasurement::NotRequested => {}
                 }
             }
+        }
+    }
+
+    fn record_completion(&self, receipt: &OperationCompletionReceipt) {
+        let fence = receipt.fence_timing();
+        self.physical_spans.record(receipt.submission_timing());
+        match fence.device_execution() {
+            DeviceTimingMeasurement::Measured(timing) => self
+                .device_execution
+                .record(Duration::from_nanos(timing.elapsed_ns())),
+            DeviceTimingMeasurement::Unavailable(_) => {
+                self.device_unavailable.fetch_add(1, Ordering::Relaxed);
+            }
+            DeviceTimingMeasurement::NotRequested => {}
+        }
+        match fence.blocking_wait_host_ns() {
+            DeviceTimingMeasurement::Measured(nanoseconds) => self
+                .fence_wait_host
+                .record(Duration::from_nanos(nanoseconds)),
+            DeviceTimingMeasurement::Unavailable(_) => {
+                self.fence_wait_unavailable.fetch_add(1, Ordering::Relaxed);
+            }
+            DeviceTimingMeasurement::NotRequested => {}
         }
     }
 
@@ -3860,6 +3890,7 @@ impl VNextExecutionJournal {
 }
 
 struct VNextSequence<R: DeviceRuntime> {
+    causal_inputs: Option<Arc<CausalRequestInputs>>,
     token_identity: ExecutorSequence,
     token_recovery_key: ExecutionRecoveryKey,
     token_issuer: ExecutorSequenceIssuer,
@@ -4621,6 +4652,7 @@ pub struct ProgramExecutor<R: DeviceRuntime> {
     resident_decode: Mutex<Option<ResidentCache<R>>>,
     resident_metrics: ResidentMetrics,
     sampling_readback_mode: SamplingReadbackMode,
+    managed_io: Option<ManagedCausalIo>,
     plan_resources: Arc<PlanRuntimeResources<R>>,
     lane: Arc<ExecutionLane<R>>,
     submission_wave_identity: CompiledSubmissionWaveIdentity,
@@ -4805,6 +4837,13 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
     }
 
     fn resolve_language_io_ids(program: &ModelProgram) -> Result<VNextLanguageIoIds> {
+        Self::resolve_language_io_ids_with_inputs(program, None)
+    }
+
+    fn resolve_language_io_ids_with_inputs(
+        program: &ModelProgram,
+        causal_inputs: Option<&CausalInputSchema>,
+    ) -> Result<VNextLanguageIoIds> {
         let embedding_nodes = program
             .blocks()
             .iter()
@@ -4845,13 +4884,35 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 "vNext masked argmax operation must produce one token",
             ));
         };
-        let expected_inputs = [
+        let mut expected_inputs = vec![
             &token_input,
             token_mask_input,
             repetition_token_ids_input,
             repetition_offsets_input,
             repetition_penalty_input,
         ];
+        if let Some(schema) = causal_inputs {
+            let checkpoint = program.checkpoint_inputs().ok_or_else(|| {
+                FerrumError::model("extra causal inputs require declared conditioning roles")
+            })?;
+            let declared = schema
+                .specs()
+                .iter()
+                .map(|s| &s.value_id)
+                .collect::<BTreeSet<_>>();
+            if declared.iter().any(|id| expected_inputs.contains(id))
+                || declared
+                    != checkpoint
+                        .conditioning_inputs()
+                        .iter()
+                        .collect::<BTreeSet<_>>()
+            {
+                return Err(FerrumError::model(
+                    "causal input schema differs from exact non-token conditioning roles",
+                ));
+            }
+            expected_inputs.extend(schema.specs().iter().map(|s| &s.value_id));
+        }
         if program.inputs().len() != expected_inputs.len()
             || expected_inputs
                 .iter()
@@ -4872,6 +4933,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             ));
         }
         Ok(VNextLanguageIoIds {
+            causal_inputs: causal_inputs.cloned(),
             token_input,
             token_mask_input: token_mask_input.clone(),
             repetition_token_ids_input: repetition_token_ids_input.clone(),
@@ -4952,6 +5014,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
     fn from_compiled_model<F>(
         compiled: CompiledProgram<'_, R>,
         static_installation: StaticInstallation<'_, R>,
+        static_host: Option<&HostMemoryAccount>,
+        managed_io: Option<ManagedCausalIo>,
+        phase_native_started: Option<&std::cell::Cell<bool>>,
         resolve_plan: F,
     ) -> crate::ExecutorBuildResult<(Self, Option<SharedProgramWeights<R>>)>
     where
@@ -4987,20 +5052,12 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         prepared.validate_resolved_plan(&resolved_plan)?;
         // Reject an incompatible/closing installation before creating a lane,
         // worker or native buffer. bind_plan repeats the check under its gate.
-        match &static_installation {
-            StaticInstallation::Private => {}
-            StaticInstallation::PublishShared => {
-                SharedComponentWeights::<R>::validate_plan(resolved_plan.execution_plan())
-                    .map_err(|e| FerrumError::model(format!("shared static publication: {e}")))?;
-            }
-            StaticInstallation::AttachShared(weights) => {
-                weights.validate_for(
-                    resolved_plan.execution_plan(),
-                    &runtime,
-                    &prepared.resolved_sources().weights,
-                )?;
-            }
-        }
+        composition::static_installation::validate_static_installation(
+            composition,
+            prepared,
+            &resolved_plan,
+            &static_installation,
+        )?;
         let sequence_state_memory = state_memory::logical_sequence_state_memory(
             &family.numerical_profile().states,
             &family.numerical_profile().kv_storage,
@@ -5016,6 +5073,24 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             usize::try_from(repetition_capacity)
                 .map_err(|_| FerrumError::config("vNext repetition capacity exceeds usize"))?,
         )?;
+        if let Some(managed) = &managed_io {
+            managed.validate_config(
+                runtime.as_ref(),
+                &io,
+                &config,
+                checkpoint_selection.is_some(),
+            )?;
+        }
+        if io.causal_inputs.is_some()
+            && (managed_io.is_none()
+                || (config.device_reusable_execution_enabled
+                    && !config.supports_causal_input_replay()))
+        {
+            return Err(FerrumError::unsupported(
+                "extra causal inputs require managed I/O and either eager or on-demand decode-only execution",
+            )
+            .into());
+        }
         let family_fingerprint = family
             .fingerprint()
             .map_err(|error| FerrumError::model(error.to_string()))?;
@@ -5116,164 +5191,21 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             .map(|config| RetainedOutputCapture::new(config).map(Arc::new))
             .transpose()?;
 
-        let provision_request = RequestIdentity::new(format!("request.vnext.provision.{run_id}"))
-            .map_err(|error| FerrumError::internal(error.to_string()))?;
-        let provision_phase = StartupPhaseTimer::start("static_provision");
-        let mut published_weights = None;
-        let mut shared_weights_receipt = None;
-        let (plan_resources, static_provider_attribution) =
-            if let StaticInstallation::AttachShared(weights) = &static_installation {
-                let resources = weights
-                    .weights
-                    .bind_plan(
-                        resolved_plan.execution_plan(),
-                        Arc::clone(&runtime),
-                        provision_request,
-                    )
-                    .map_err(|e| FerrumError::device(format!("shared static attachment: {e}")))?;
-                provision_phase.finish();
-                shared_weights_receipt = Some(ProgramSharedWeightsReceipt::Attached {
-                    evidence: weights.evidence().clone(),
-                    source: weights.source.clone(),
-                });
-                (resources, None)
-            } else {
-                let provisioned = resolved_plan
-                    .execution_plan()
-                    .provision_static(Arc::clone(&runtime), provision_request)
-                    .map_err(|error| {
-                        FerrumError::device(format!("vNext static provision: {error}"))
-                    })?;
-                provision_phase.finish();
-                match provisioned.into_provisioning() {
-                    StaticProvisioning::NoStatic(no_static) => {
-                        (no_static.into_plan_runtime(), None)
-                    }
-                    StaticProvisioning::Required(permit) => {
-                        let identity = ResourceTransactionIdentity::for_admission(
-                            permit.binding(),
-                            run_id.clone(),
-                            TransactionId::new(format!("transaction.vnext.provision.{run_id}"))
-                                .map_err(|error| FerrumError::internal(error.to_string()))?,
-                        );
-                        let driver = RuntimeResourceDriver::new(Arc::clone(&runtime))
-                            .map_err(|error| FerrumError::device(error.to_string()))?;
-                        let transaction_begin_phase =
-                            StartupPhaseTimer::start("resource_transaction_begin");
-                        let transaction =
-                            ResourceTransaction::<VNextDriver<R>, TransactionNew>::begin(
-                                driver, identity, permit,
-                            )
-                            .map_err(|error| FerrumError::device(error.to_string()))?;
-                        transaction_begin_phase.finish();
-                        let reserve_phase = StartupPhaseTimer::start("resource_reserve");
-                        let reserved = match transaction.reserve() {
-                            Ok(reserved) => reserved,
-                            Err(error) => {
-                                let cause = FerrumError::device(format!(
-                                    "vNext static reserve failed: {:?}",
-                                    error.failure()
-                                ));
-                                let original =
-                                    ferrum_runtime::ResourcePreparationRetirement::from_reserve(
-                                        error,
-                                    );
-                                return Err(shutdown::preparation_error(original, cause));
-                            }
-                        };
-                        reserve_phase.finish();
-                        let commit_phase = StartupPhaseTimer::start("resource_commit");
-                        let committed = match reserved.commit() {
-                            Ok(committed) => committed,
-                            Err(error) => {
-                                let cause = match &error {
-                                    ResourceCommitTransitionError::Recoverable(error) => {
-                                        FerrumError::device(format!(
-                                            "vNext static commit failed: {:?}",
-                                            error.failure()
-                                        ))
-                                    }
-                                    ResourceCommitTransitionError::Poisoned(error) => {
-                                        FerrumError::device(format!(
-                                            "vNext static commit was indeterminate: {:?}",
-                                            error.failure()
-                                        ))
-                                    }
-                                };
-                                let original =
-                                    ferrum_runtime::ResourcePreparationRetirement::from_commit(
-                                        error,
-                                    );
-                                return Err(shutdown::preparation_error(original, cause));
-                            }
-                        };
-                        commit_phase.finish();
-                        let initialized = match committed.initialize_static(
-                            family,
-                            resolved_plan.execution_plan(),
-                            prepared.weights(),
-                            config.static_initialization,
-                        ) {
-                            Ok(initialized) => initialized,
-                            Err(failure) => {
-                                let cause = FerrumError::device(format!(
-                                    "vNext static initialization failed: {}",
-                                    failure.failure().message()
-                                ));
-                                return Err(shutdown::initialization_error(failure, cause));
-                            }
-                        };
-                        log_static_initialization_receipt(initialized.receipt());
-                        let provider_attribution =
-                    match StaticProviderAttributionWitness::from_completed_static_initialization(
-                        &resolved_plan,
-                        initialized.receipt(),
-                    ) {
-                        Ok(attribution) => attribution,
-                        Err(error) => {
-                            let cause = FerrumError::model(format!(
-                                "vNext static provider attribution failed: {error}"
-                            ));
-                            let original = initialized.abort_activation(error);
-                            return Err(shutdown::initialization_error(original, cause));
-                        }
-                    };
-                        let handoff_phase = StartupPhaseTimer::start("runtime_handoff");
-                        let handoff =
-                            if matches!(static_installation, StaticInstallation::PublishShared) {
-                                initialized
-                                    .into_shared_plan_runtime(resolved_plan.execution_plan())
-                                    .map(|(resources, weights)| {
-                                        shared_weights_receipt =
-                                            Some(ProgramSharedWeightsReceipt::Published {
-                                                evidence: weights.evidence().clone(),
-                                                source: prepared.resolved_sources().weights.clone(),
-                                            });
-                                        published_weights = Some(SharedProgramWeights {
-                                            weights,
-                                            source: prepared.resolved_sources().weights.clone(),
-                                        });
-                                        resources
-                                    })
-                            } else {
-                                initialized.into_plan_runtime()
-                            };
-                        match handoff {
-                            Ok(resources) => {
-                                handoff_phase.finish();
-                                (resources, provider_attribution)
-                            }
-                            Err(original) => {
-                                let cause = FerrumError::device(format!(
-                                    "vNext runtime handoff failed: {}",
-                                    original.failure().message()
-                                ));
-                                return Err(shutdown::initialization_error(original, cause));
-                            }
-                        }
-                    }
-                }
-            };
+        let composition::static_installation::InitializedProgramResources {
+            plan_resources,
+            static_provider_attribution,
+            shared_weights_receipt,
+            published_weights,
+        } = composition::static_installation::initialize_program_resources(
+            composition,
+            prepared,
+            &resolved_plan,
+            static_installation,
+            static_host,
+            config.static_initialization,
+            &run_id,
+            phase_native_started,
+        )?;
         executor_startup.finish();
         metrics
             .program_binding_upload
@@ -5292,6 +5224,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 resident_metrics: ResidentMetrics::default(),
                 completion_readback_policy: config.completion_readback_policy,
                 sampling_readback_mode: config.sampling_readback_mode,
+                managed_io,
                 plan_resources,
                 lane,
                 submission_wave_identity,
@@ -6331,6 +6264,11 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         let token_mask_residency_eligible =
             Self::token_mask_residency_eligible(executable, token_mask_input);
         Ok(VNextIoBinding {
+            causal_inputs: language_io
+                .causal_inputs
+                .as_ref()
+                .map(|schema| causal_inputs::ResolvedInputs::resolve(executable, schema))
+                .transpose()?,
             input_node_id: (*input_node_id).clone(),
             input_ordinal: input.ordinal(),
             token_mask_input_node_id: (*token_mask_input_node_id).clone(),
@@ -6472,6 +6410,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         product_prompt_tokens: usize,
         replayed_output_tokens: usize,
         work: ResourceWorkShape,
+        causal_inputs: Option<Arc<CausalRequestInputs>>,
     ) -> Result<VNextPrefillProbeResolution<R>> {
         let product_prompt_tokens = u64::try_from(product_prompt_tokens).map_err(|_| {
             FerrumError::request_validation("product prompt token count exceeds u64")
@@ -6503,6 +6442,32 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 return Ok(VNextPrefillProbeResolution::PermanentRejected(rejected));
             }
         };
+        if self
+            .resolved_plan
+            .execution_plan()
+            .requires_selected_prefix_commit()
+        {
+            let bind = || -> Result<()> {
+                let inputs = match &causal_inputs {
+                    Some(inputs) => {
+                        let managed = self.managed_io.as_ref().ok_or_else(|| {
+                            FerrumError::config(
+                                "selected-prefix conditioning requires managed causal I/O",
+                            )
+                        })?;
+                        inputs.sequence_conditioning(&managed.host)?
+                    }
+                    None => SequenceConditioningInputs::new(Vec::new())
+                        .map_err(|error| FerrumError::backend(error.to_string()))?,
+                };
+                session
+                    .bind_conditioning_inputs(Arc::new(inputs))
+                    .map_err(|error| FerrumError::backend(error.to_string()))
+            };
+            if let Err(error) = bind() {
+                return Err(terminalize_unsubmitted_session(&session, error));
+            }
+        }
         let request = match VNextRequestRoot::bind_initial(request_id.clone(), &identity, &session)
         {
             Ok(request) => request,
@@ -6534,6 +6499,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             .recovery_key(&token_identity)
             .map_err(|error| terminalize_unsubmitted_session(&session, error))?;
         let sequence = Arc::new(VNextSequence {
+            causal_inputs,
             token_identity,
             token_recovery_key,
             token_issuer: self.token_issuer.clone(),
@@ -7545,6 +7511,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_modes: &ProductReadbackModes,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
+        managed_wave: Option<&ManagedWaveIo>,
         mut cold_wave: Option<&mut reusable_cold_path::WaveObservation<'_>>,
         resident_bootstrap: Option<Arc<ResidentDecodeReservation<R>>>,
         resident_install: &mut Option<Arc<ResidentDecodeProgram<R>>>,
@@ -7570,6 +7537,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             kind,
             output_modes,
             token_mask_plans,
+            managed_wave,
         ) {
             Ok(uploads) => uploads,
             Err(error) => return DispatchOutcome::QuiescentFailure(error),
@@ -7982,6 +7950,10 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
 
     fn checkpoint_token_evidence_enabled(&self) -> bool {
         self.prefix_restore_enabled()
+            || self
+                .resolved_plan
+                .execution_plan()
+                .requires_selected_prefix_commit()
     }
 
     fn retain_checkpoint_token_evidence(
@@ -8000,6 +7972,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
         output_roles: &[VNextParticipantOutputRole],
+        managed_wave: &mut Option<ManagedWaveIo>,
     ) -> std::result::Result<
         VNextExecutionCapacityDecision<RetiredWave<Vec<ExecutorSamplingOutput>, R>>,
         WaveFailure,
@@ -8127,7 +8100,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 PreparedVNextPrefill::ordinary(step, wave)
             }
         };
-        self.execute_prepared_participants(&participants, prepared, kind)
+        self.execute_prepared_participants(&participants, prepared, kind, managed_wave)
             .await
             .map(VNextExecutionCapacityDecision::Ready)
     }
@@ -8137,6 +8110,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         participants: &[VNextExecutionParticipant<'_, R>],
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
+        managed_wave: &mut Option<ManagedWaveIo>,
     ) -> std::result::Result<RetiredWave<Vec<ExecutorSamplingOutput>, R>, WaveFailure> {
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let phase_timing = self.metrics.wave_timing_for(kind);
@@ -8218,6 +8192,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         let readbacks = self
             .prepare_terminal_readbacks(participants, capture_claim, &output_modes)
             .map_err(|error| guard.fail(error))?;
+        let managed_readbacks = self
+            .managed_readbacks(&readbacks, managed_wave)
+            .map_err(|error| guard.fail(error))?;
         // This optional observation never changes the product mode, terminal
         // packet, execution plan, or resident/replay eligibility.
         let mut row_capture = self.retained_output_capture.as_ref().and_then(|capture| {
@@ -8232,13 +8209,17 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         };
         let extra_output = extra_request.as_ref().map(|_| Arc::new(Mutex::new(None)));
         let worker_extra_output = extra_output.clone();
-        if let Some(request) = output_modes.uniform().and_then(|mode| {
-            readbacks.terminal_packet_request(
-                self.completion_readback_policy,
-                mode,
-                capture_claim.is_some(),
-            )
-        }) {
+        if let Some(request) = output_modes
+            .uniform()
+            .filter(|_| self.managed_io.is_none())
+            .and_then(|mode| {
+                readbacks.terminal_packet_request(
+                    self.completion_readback_policy,
+                    mode,
+                    capture_claim.is_some(),
+                )
+            })
+        {
             wave.set_terminal_readbacks(request.clone())
                 .map_err(|error| guard.fail(FerrumError::backend(error.to_string())))?;
         }
@@ -8282,6 +8263,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 kind,
                 &output_modes,
                 token_mask_residency.plans(),
+                managed_wave.as_ref(),
                 cold_wave.as_mut(),
                 &mut resident_install,
                 facts_capture,
@@ -8316,13 +8298,17 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                             Ok(wave) => wave,
                             Err(error) => return Err(guard.fail(error)),
                         };
-                    if let Some(request) = output_modes.uniform().and_then(|mode| {
-                        readbacks.terminal_packet_request(
-                            self.completion_readback_policy,
-                            mode,
-                            capture_claim.is_some(),
-                        )
-                    }) {
+                    if let Some(request) = output_modes
+                        .uniform()
+                        .filter(|_| self.managed_io.is_none())
+                        .and_then(|mode| {
+                            readbacks.terminal_packet_request(
+                                self.completion_readback_policy,
+                                mode,
+                                capture_claim.is_some(),
+                            )
+                        })
+                    {
                         ordinary_wave
                             .set_terminal_readbacks(request.clone())
                             .map_err(|e| guard.fail(FerrumError::backend(e.to_string())))?;
@@ -8443,6 +8429,21 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     execution_event_error.get_or_insert_with(|| error.to_string());
                 }
             }
+        }
+        if let Some(readbacks) = managed_readbacks {
+            return self
+                .finish_managed_participants(
+                    guard,
+                    completion,
+                    participants,
+                    kind,
+                    output_modes,
+                    token_mask_residency,
+                    readbacks,
+                    execution_event_error,
+                    resident_install,
+                )
+                .await;
         }
         let diagnostic_failure_requested =
             self.claim_prefill_resource_diagnostic_fault(participants, kind);
@@ -9467,6 +9468,14 @@ impl<R: DeviceRuntime> ModelExecutor for ProgramExecutor<R> {
         input: crate::token_execution::ExecutionAdmission<'_>,
     ) -> Result<crate::token_execution::TokenAdmissionOutcome> {
         self.admit_native_tokens(input)
+    }
+
+    async fn admit_tokens_with_inputs(
+        &self,
+        input: crate::token_execution::ExecutionAdmission<'_>,
+        inputs: Arc<CausalRequestInputs>,
+    ) -> Result<crate::token_execution::TokenAdmissionOutcome> {
+        self.admit_native_tokens_with_inputs(input, Some(inputs))
     }
 
     async fn execute_tokens(

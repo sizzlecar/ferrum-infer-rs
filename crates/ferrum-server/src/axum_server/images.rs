@@ -23,7 +23,9 @@ use ferrum_types::OutputConfig;
 use serde::Deserialize;
 use std::{sync::Arc, time::Instant};
 
+mod correlation;
 mod edits;
+pub(super) mod playground;
 mod response;
 pub(super) use edits::{edits_handler, EDIT_BODY_LIMIT};
 
@@ -292,8 +294,10 @@ fn service_error(error: ImageServiceError) -> ServerError {
 
 pub(super) async fn generations_handler(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     request: Result<Json<ImageRequest>, JsonRejection>,
-) -> Result<Response, ServerError> {
+) -> Result<Response, correlation::HttpError> {
+    let client_attempt = correlation::attempt(&headers)?;
     let Json(request) = request.map_err(|error| {
         ServerError::invalid_request(
             format!("invalid image request: {}", json_rejection_detail(&error)),
@@ -317,19 +321,26 @@ pub(super) async fn generations_handler(
         .map_err(|error| ServerError::CapacityExceeded(error.to_string()))?;
     let response = admit_response(images, session, &request)?;
     let wait_started = Instant::now();
-    let (result, grant) = images
+    let job = images
         .service
-        .try_submit_with_output(request, response)
-        .map_err(service_error)?
+        .try_submit_with_output_and_client_attempt(request, response, client_attempt)
+        .map_err(|error| correlation::service_failure(images, error))?;
+    let correlation = correlation::Context::for_job(images, job.correlation());
+    let (result, grant) = job
         .wait_with_output()
         .await
-        .map_err(service_error)?;
+        .map_err(|error| correlation.error(service_error(error)))?;
     let queue_and_generation_wait_us =
         u64::try_from(wait_started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let admission = grant.into_inner::<response::Admission>().map_err(|_| {
-        ServerError::InternalError("image response grant belongs to another output gate".into())
+        correlation.error(ServerError::InternalError(
+            "image response grant belongs to another output gate".into(),
+        ))
     })?;
-    encode_result(admission, result, queue_and_generation_wait_us).await
+    encode_result(admission, result, queue_and_generation_wait_us)
+        .await
+        .map(|response| correlation.response(response))
+        .map_err(|error| correlation.error(error))
 }
 
 fn admit_response(
@@ -344,6 +355,7 @@ fn admit_response(
             .map_err(|error| ServerError::InternalError(error.to_string()))?,
         images.config.png_limits,
         images.config.rgba_scratch_bytes,
+        images.service.retained_output_bytes(),
     )
     .map(Arc::new)
 }
@@ -355,9 +367,7 @@ async fn encode_result(
 ) -> Result<Response, ServerError> {
     let encode_started = Instant::now();
     let session = response.session();
-    let encoded = response
-        .encode(result.rgba.tensor().clone(), result.rgba.bytes().clone())
-        .await;
+    let encoded = response.encode(result.rgba.clone()).await;
     let response_encode_us =
         u64::try_from(encode_started.elapsed().as_micros()).unwrap_or(u64::MAX);
     // Includes encoding and blocking-pool scheduling. This stops before the

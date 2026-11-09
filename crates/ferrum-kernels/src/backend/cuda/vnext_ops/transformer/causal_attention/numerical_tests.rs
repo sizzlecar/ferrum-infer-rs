@@ -5,6 +5,9 @@ use crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config;
 use ferrum_runtime::DeviceId;
 use half::f16;
 
+#[path = "parallel_explicit_rope_tests.rs"]
+mod parallel_explicit_rope_tests;
+
 fn runtime() -> CudaDeviceRuntime {
     CudaDeviceRuntime::new(
         cuda_vnext_runtime_config(
@@ -164,6 +167,7 @@ fn launch(shape: CausalAttentionShape, position: usize, tokens: usize) -> Causal
         )
         .unwrap(),
         path: CausalAttentionKernelPath::TokenMajorFallback,
+        rotary: None,
     }
 }
 

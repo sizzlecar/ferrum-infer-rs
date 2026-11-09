@@ -8,8 +8,10 @@ use ferrum_runtime::{
 };
 
 mod canvas;
+mod groups;
 mod moments;
 pub(crate) use canvas::{PH3ImageVaeCanvas, PH3ImageVaeCanvasDomain};
+pub use groups::{PH3ImageVaeTileBatch, PH3ImageVaeTileGroup};
 pub(crate) use moments::PH3ImageVaeMomentCanvas;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

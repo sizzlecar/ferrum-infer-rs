@@ -310,6 +310,7 @@ impl DirectoryOptions {
             maximum_width: maximum_dimension,
             maximum_height: maximum_dimension,
             maximum_batch_size: self.maximum_batch_size,
+            weight_arena_target_bytes: None,
             decoder_batch_policy:
                 ferrum_engine::image_generation::ImageDecoderBatchPolicy::SingleImage,
             edit_prefix_policy: match self.backend {
@@ -461,7 +462,8 @@ pub(super) struct PreparedProduct {
     pub profile: &'static str,
     pub serving: Option<ServingConfig>,
     pub backend: super::factory::PreparedBackend,
-    pub assets: ferrum_engine::image_generation::QwenImage21Assets,
+    pub assets: super::factory::PreparedAssets,
+    pub continuous_trace: Option<super::trace_artifact::PreparedTraceArtifact>,
 }
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
@@ -482,18 +484,70 @@ impl ImageProductSource {
     }
 
     pub(super) fn prepare(&self) -> Result<PreparedProduct> {
+        self.prepare_with_trace(true)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn prepare_for_profile(&self) -> Result<PreparedProduct> {
+        self.prepare_with_trace(false)
+    }
+
+    fn prepare_with_trace(&self, trace_allowed: bool) -> Result<PreparedProduct> {
         match self {
             Self::ExplicitConfig(path) => {
-                let config = super::ImageProductConfig::load(path)?;
-                let backend = super::factory::PreparedBackend::from_config(&config.backend)?;
-                let assets = config.prepare_assets()?;
-                Ok(PreparedProduct {
-                    model: config.model,
-                    profile: config.execution_profile.as_str(),
-                    serving: config.serving,
-                    backend,
-                    assets,
-                })
+                match super::document::ImageProductDocument::load(path)? {
+                    super::document::ImageProductDocument::QwenImage21(config) => {
+                        let backend =
+                            super::factory::PreparedBackend::from_config(&config.backend)?;
+                        let assets =
+                            super::factory::PreparedAssets::QwenImage21(config.prepare_assets()?);
+                        Ok(PreparedProduct {
+                            model: config.model,
+                            profile: config.execution_profile.as_str(),
+                            serving: config.serving,
+                            backend,
+                            assets,
+                            continuous_trace: None,
+                        })
+                    }
+                    super::document::ImageProductDocument::PH3Image(config) => {
+                        ensure!(
+                            trace_allowed || config.continuous_trace.is_none(),
+                            "continuous_trace is supported by image run/serve, not image profile"
+                        );
+                        let backend = super::factory::PreparedBackend::from_p_h3_config(&config)?;
+                        #[cfg(feature = "cuda")]
+                        {
+                            let continuous_trace = config
+                                .continuous_trace
+                                .as_ref()
+                                .map(super::trace_artifact::PreparedTraceArtifact::open)
+                                .transpose()?
+                                .map(|trace| {
+                                    trace.with_prompt_expansion_diagnostics(
+                                        config.prompt_expansion_diagnostics,
+                                    )
+                                });
+                            let assets =
+                                super::factory::PreparedAssets::PH3Image(config.prepare_assets()?);
+                            Ok(PreparedProduct {
+                                model: config.model,
+                                profile: config.preset.identity(),
+                                serving: config.serving,
+                                backend,
+                                assets,
+                                continuous_trace,
+                            })
+                        }
+                        #[cfg(not(feature = "cuda"))]
+                        {
+                            let _ = backend;
+                            anyhow::bail!(
+                                "H3 Comfy preset requires a binary built with the cuda feature"
+                            )
+                        }
+                    }
+                }
             }
             Self::LocalDirectory { path, options } => {
                 options.validate()?;
@@ -531,7 +585,8 @@ impl ImageProductSource {
                         backend.host_output_bytes(),
                     )?),
                     backend,
-                    assets,
+                    assets: super::factory::PreparedAssets::QwenImage21(assets),
+                    continuous_trace: None,
                 })
             }
         }

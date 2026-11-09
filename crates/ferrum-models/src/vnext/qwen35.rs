@@ -69,12 +69,18 @@ use super::{
 };
 
 pub const FAMILY_ID: &str = "family.qwen3_5.hybrid";
+pub const VISUAL_ROWS_INPUT_ID: &str = "value.input.visual_rows";
+pub const VISUAL_REPLACE_MASK_INPUT_ID: &str = "value.input.visual_replace_mask";
+pub const ROPE_COS_INPUT_ID: &str = "value.input.rope_cos";
+pub const ROPE_SIN_INPUT_ID: &str = "value.input.rope_sin";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
 pub const MOE_EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5MoeForConditionalGeneration";
 mod hadamard;
+pub mod mtp;
 mod numerical;
 pub use numerical::{
     F16_INT8_KV_NUMERICAL_PROFILE_ID, F16_NUMERICAL_PROFILE_ID,
+    F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID,
     F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_NUMERICAL_PROFILE_ID,
     F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_NUMERICAL_PROFILE_ID,
     F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_NUMERICAL_PROFILE_ID,
@@ -465,6 +471,14 @@ impl Qwen35OperationProfile {
                 Ok(Self::F32_MASTER_UPSTREAM_EXTRA_MARKER_V2_PREFILL)
             }
             F16_NUMERICAL_PROFILE_ID => Ok(Self::F16),
+            F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID => Ok(Self {
+                causal_attention: OperationSelection::new(
+                    ferrum_runtime::CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_F16_OPERATION_ID,
+                    1,
+                    0,
+                ),
+                ..Self::F16
+            }),
             F32_MASTER_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER),
             F32_MASTER_FFN_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID => {
                 Ok(Self::F32_MASTER_FFN_IQ4XS_Q8ACT_G32)
@@ -1026,6 +1040,15 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             }
         }
         let operations = Qwen35OperationProfile::for_profile(profile)?;
+        let visual_prompt = profile.id.as_str() == F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID;
+        if visual_prompt
+            && numerical::profiles(&self.family_id, config)?.resolve(&profile.id)? != profile
+        {
+            return Err(invalid_config(
+                "numerical_profile",
+                "visual prompting requires its exact declared dense F16 profile",
+            ));
+        }
         let mut weight_refs = Vec::with_capacity(config.weights.len());
         for weight in &config.weights {
             if is_moe_source_role(&weight.role) {
@@ -1109,6 +1132,24 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 attribute("vocab_size", config.vocab_size)?,
             ]),
         });
+
+        if visual_prompt {
+            let selected = value_id("value.hidden.visual")?;
+            nodes.push(ProgramNode {
+                id: node_id("node.visual_embedding_select")?,
+                operation_id: operation_id(ferrum_runtime::ROW_SELECT_F16_OPERATION_ID)?,
+                required_version: ContractVersion::new(1, 0),
+                work: ProgramNodeWorkSpec::tokens(hidden.clone(), 0),
+                inputs: vec![
+                    hidden,
+                    value_id("value.input.visual_rows")?,
+                    value_id("value.input.visual_replace_mask")?,
+                ],
+                outputs: vec![selected.clone()],
+                attributes: BTreeMap::from([attribute("hidden_size", text.hidden_size as u64)?]),
+            });
+            hidden = selected;
+        }
 
         let states = profile.states.clone();
         for (layer_index, layer_type) in text.layer_types.iter().copied().enumerate() {
@@ -1260,6 +1301,20 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 AttributeId::new("layer_index")?,
                 SemanticValue::Unsigned(layer_index as u64),
             );
+            if visual_prompt && layer_type == Qwen35LayerType::FullAttention {
+                attention_inputs.extend([
+                    value_id("value.input.rope_cos")?,
+                    value_id("value.input.rope_sin")?,
+                ]);
+                attributes.insert(
+                    AttributeId::new("rope_pairs")?,
+                    SemanticValue::Unsigned((text.full_attention_rope_dim() / 2) as u64),
+                );
+                attributes.insert(
+                    AttributeId::new("rope_interleaved")?,
+                    SemanticValue::Bool(false),
+                );
+            }
             attributes.insert(
                 AttributeId::new("hidden_size")?,
                 SemanticValue::Unsigned(text.hidden_size as u64),
@@ -1429,23 +1484,40 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             attributes: BTreeMap::from([attribute("vocab_size", config.vocab_size)?]),
         });
 
-        let checkpoint_inputs =
-            ProgramCheckpointInputs::new(value_id("value.input.token_ids")?, BTreeSet::new())?
-                .with_output_only_inputs(BTreeSet::from([
-                    greedy_mask.clone(),
-                    greedy_repetition_token_ids.clone(),
-                    greedy_repetition_offsets.clone(),
-                    greedy_repetition_penalty.clone(),
-                ]))?;
+        let visual_inputs = if visual_prompt {
+            [
+                "value.input.visual_rows",
+                "value.input.visual_replace_mask",
+                "value.input.rope_cos",
+                "value.input.rope_sin",
+            ]
+            .into_iter()
+            .map(value_id)
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let checkpoint_inputs = ProgramCheckpointInputs::new(
+            value_id("value.input.token_ids")?,
+            visual_inputs.iter().cloned().collect(),
+        )?
+        .with_output_only_inputs(BTreeSet::from([
+            greedy_mask.clone(),
+            greedy_repetition_token_ids.clone(),
+            greedy_repetition_offsets.clone(),
+            greedy_repetition_penalty.clone(),
+        ]))?;
+        let mut program_inputs = vec![
+            value_id("value.input.token_ids")?,
+            greedy_mask,
+            greedy_repetition_token_ids,
+            greedy_repetition_offsets,
+            greedy_repetition_penalty,
+        ];
+        program_inputs.extend(visual_inputs);
         ModelProgram::new(
             self.family_id.clone(),
-            vec![
-                value_id("value.input.token_ids")?,
-                greedy_mask,
-                greedy_repetition_token_ids,
-                greedy_repetition_offsets,
-                greedy_repetition_penalty,
-            ],
+            program_inputs,
             vec![ProgramBlock {
                 id: "block.decoder".to_owned(),
                 nodes,
@@ -4682,6 +4754,10 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 
 #[cfg(test)]
 mod tests {
+    mod mtp;
+    mod single_file;
+    mod visual_prompt;
+
     use crate::vnext::test_support::{prepare_product_fixture, PrepareFamilyFixture};
     use crate::vnext::PreparedProductionModel;
 
@@ -8580,7 +8656,50 @@ mod tests {
                 gguf.stored_weight_schema().unwrap().format_id,
                 safetensors.stored_weight_schema().unwrap().format_id
             );
-            assert_eq!(gguf.numerical_profiles(), safetensors.numerical_profiles());
+            let gguf_profiles = gguf.numerical_profiles();
+            let safetensors_profiles = safetensors.numerical_profiles();
+            let shared_ids = [
+                F16_NUMERICAL_PROFILE_ID,
+                F16_INT8_KV_NUMERICAL_PROFILE_ID,
+                F32_MASTER_NUMERICAL_PROFILE_ID,
+                F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID,
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+            let profile_ids = |catalog: &FamilyNumericalProfiles| {
+                catalog
+                    .profiles()
+                    .iter()
+                    .map(|profile| profile.id.as_str().to_owned())
+                    .collect::<BTreeSet<_>>()
+            };
+            assert_eq!(profile_ids(gguf_profiles), shared_ids);
+            let mut safetensors_ids = shared_ids.clone();
+            safetensors_ids.insert(F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID.to_owned());
+            assert_eq!(profile_ids(safetensors_profiles), safetensors_ids);
+            assert_eq!(gguf_profiles.version(), safetensors_profiles.version());
+            assert_eq!(
+                gguf_profiles.auto_preference(),
+                safetensors_profiles.auto_preference()
+            );
+            for id in shared_ids {
+                let id = id.parse().unwrap();
+                assert_eq!(
+                    gguf_profiles.resolve(&id).unwrap(),
+                    safetensors_profiles.resolve(&id).unwrap()
+                );
+            }
+            // Visual prompting is a separately declared dense-safetensors
+            // capability. It cannot change any shared contract or Auto choice.
+            let visual_id = F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID.parse().unwrap();
+            assert!(gguf_profiles.resolve(&visual_id).is_err());
+            assert!(!safetensors_profiles.auto_preference().contains(&visual_id));
+            let visual = registration.prepare(&safetensors, &visual_id).unwrap();
+            assert_eq!(
+                visual.numerical_profile(),
+                safetensors_profiles.resolve(&visual_id).unwrap()
+            );
             for candidate in gguf
                 .numerical_profiles()
                 .candidates(

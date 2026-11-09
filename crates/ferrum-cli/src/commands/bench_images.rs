@@ -23,6 +23,13 @@ pub use capture::{
     PngCaptureConfig, PngCaptureFailureKind, PngCaptureRecord, PngCaptureResult, PngCaptureSummary,
 };
 mod edit;
+mod protocol;
+pub use protocol::{
+    BenchmarkStopReason, ComfyBinding, ComfyCleanupOutcome, ComfyExecutionAuditConfig,
+    ComfyExecutionAuditEvidence, ComfyExecutionAuditLimits, ComfyInputValue, ComfyProtocolConfig,
+    ComfyProtocolLimits, ComfyRequestEvidence, ComfySteps, ComfyWorkflowSpec,
+    ImageEndpointProtocol, ImageProtocolIdentity,
+};
 mod resources;
 mod runner;
 pub use resources::{ImageProcessScope, ImageResourceSamplingConfig, ImageResourceWindow};
@@ -40,14 +47,18 @@ pub enum InitialServerState {
 
 #[derive(Debug, Clone, Args)]
 pub struct BenchImagesCommand {
-    /// Full /v1/images/generations or /v1/images/edits URL, matching dataset mode.
-    /// Repeat for sequential endpoint comparison; the client never rewrites URLs.
+    /// Full OpenAI image URL, or an explicit Comfy origin selected by a protocol
+    /// config. Endpoints run sequentially with the identical ordered dataset.
     #[arg(long, required = true)]
     pub endpoint: Vec<String>,
     /// Explicit /v1/images/edits companion, one per endpoint, for v3 mixed
     /// generation/edit datasets. URLs are never inferred by rewriting paths.
     #[arg(long)]
     pub edit_endpoint: Vec<String>,
+    /// Optional protocol JSON, one per endpoint. Omitted selects OpenAI images;
+    /// Comfy entries use an explicit origin and immutable bound API workflows.
+    #[arg(long)]
+    pub endpoint_protocol_config: Vec<PathBuf>,
     /// One model alias shared by endpoints, or one per endpoint in the same order.
     #[arg(long, required = true)]
     pub model: Vec<String>,
@@ -106,6 +117,10 @@ pub struct BenchImagesCommand {
     pub resource_gpu_index: Vec<u32>,
     #[arg(long, default_value_t = 200)]
     pub resource_sample_interval_ms: u64,
+    /// Bounded nvidia-smi query deadline. Keep this identical across compared
+    /// endpoints; timeouts remain incomplete sampling evidence.
+    #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u64).range(100..=10_000))]
+    pub resource_gpu_query_timeout_ms: u64,
     #[arg(long, default_value_t = 1800)]
     pub timeout_seconds: u64,
     /// Optional predeclared successful-response E2E P99 threshold. Any error violates it.
@@ -141,6 +156,7 @@ pub struct ImageBenchmarkEndpoint {
     pub edit_url: Option<String>,
     pub model: String,
     pub server_config_declaration: String,
+    pub protocol: ImageEndpointProtocol,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -241,13 +257,13 @@ impl ImageBenchmarkConfig {
                 .as_deref()
                 .map(validate_endpoint_url)
                 .transpose()?;
-            if has_generation && has_edit {
+            if !endpoint.protocol.is_comfy() && has_generation && has_edit {
                 ensure!(
                     edit_url.is_some() && url.path().ends_with("/v1/images/generations"),
                     "mixed datasets require explicit generation and edit endpoints"
                 );
             }
-            if has_edit {
+            if !endpoint.protocol.is_comfy() && has_edit {
                 ensure!(
                     edit_url
                         .as_ref()
@@ -301,6 +317,9 @@ pub struct ImageBenchmarkRepetition {
 #[derive(Debug, Serialize)]
 pub struct ImageEndpointReport {
     pub endpoint_index: usize,
+    pub protocol: ImageProtocolIdentity,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub protocol_requests: Vec<ComfyRequestEvidence>,
     pub repetitions: Vec<ImageBenchmarkRepetition>,
     pub measured: ImageMetrics,
     pub measured_workloads: Vec<ferrum_bench_core::images::ImageWorkloadMetrics>,
@@ -315,6 +334,11 @@ pub struct ImageEndpointReport {
 #[derive(Debug, Serialize)]
 pub struct ImageBenchmarkReport {
     pub schema_version: u32,
+    /// False after graceful cancellation or an unproven remote retirement.
+    /// Every remaining planned sample is recorded as not dispatched.
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<BenchmarkStopReason>,
     pub client_version: String,
     pub started_unix_ms: u128,
     pub configuration: ImageBenchmarkConfig,
@@ -420,17 +444,32 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
         command.edit_endpoint.is_empty() || command.edit_endpoint.len() == command.endpoint.len(),
         "provide one edit-endpoint per endpoint for mixed datasets"
     );
+    ensure!(
+        command.endpoint_protocol_config.is_empty()
+            || command.endpoint_protocol_config.len() == command.endpoint.len(),
+        "provide one endpoint-protocol-config per endpoint, or omit all for OpenAI images"
+    );
     let endpoints = command
         .endpoint
         .iter()
         .enumerate()
-        .map(|(index, url)| ImageBenchmarkEndpoint {
-            url: url.clone(),
-            edit_url: command.edit_endpoint.get(index).cloned(),
-            model: command.model[if command.model.len() == 1 { 0 } else { index }].clone(),
-            server_config_declaration: command.server_config[index].clone(),
+        .map(|(index, url)| -> anyhow::Result<ImageBenchmarkEndpoint> {
+            Ok(ImageBenchmarkEndpoint {
+                url: url.clone(),
+                edit_url: command.edit_endpoint.get(index).cloned(),
+                model: command.model[if command.model.len() == 1 { 0 } else { index }].clone(),
+                server_config_declaration: command.server_config[index].clone(),
+                protocol: command
+                    .endpoint_protocol_config
+                    .get(index)
+                    .map(|path| {
+                        ImageEndpointProtocol::from_path(path, command.maximum_dataset_bytes)
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let capture = match (command.capture_dir, command.maximum_capture_bytes) {
         (None, None) => None,
         (Some(directory), Some(maximum_capture_bytes)) => Some(PngCaptureConfig {
@@ -460,6 +499,7 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
             process_scope: command.resource_process_scope,
             gpu_indices: command.resource_gpu_index,
             interval_ms: command.resource_sample_interval_ms,
+            gpu_query_timeout_ms: command.resource_gpu_query_timeout_ms,
             ..ImageResourceSamplingConfig::default()
         }),
         limits: ImageResponseLimits {
@@ -480,7 +520,17 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
         .create_new(true)
         .open(&command.output)
         .context("reserve new report path")?;
-    let mut report = run_benchmark(config, dataset).await?;
+    let control = protocol::RunControl::new();
+    let running = runner::run_benchmark_with_control(config, dataset, control.clone());
+    tokio::pin!(running);
+    let mut report = tokio::select! {
+        result = &mut running => result?,
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("listen for benchmark cancellation")?;
+            control.stop(BenchmarkStopReason::Cancelled);
+            running.await?
+        }
+    };
     report.dataset_file_sha256 = Some(sha256(&bytes));
     let mut writer = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut writer, &report)?;
@@ -512,6 +562,11 @@ async fn execute_inner(command: BenchImagesCommand) -> anyhow::Result<()> {
             capture.saved, capture.requested, capture.failed, capture.not_produced
         );
     }
+    ensure!(
+        report.complete,
+        "benchmark incomplete after cancellation or unknown remote state; report saved to {}",
+        command.output.display()
+    );
     ensure!(
         errors == 0,
         "request errors recorded in {}",

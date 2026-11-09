@@ -25,6 +25,10 @@ use ferrum_types::{
 
 use crate::models::llama_family::LlamaFamilyConfig;
 use crate::models::LlamaFamilyModel;
+pub use crate::p_h3_image::test_support::{
+    TinyPH3ImageConditioningFixture, TinyPH3ImageDiTFixture,
+};
+pub use crate::p_h3_image_vae::test_support::TinyPH3ImageVaeFixture;
 use crate::LlmExecutor;
 
 #[cfg(test)]

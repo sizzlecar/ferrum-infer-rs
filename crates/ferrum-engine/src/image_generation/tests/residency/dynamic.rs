@@ -16,23 +16,29 @@ fn pipeline() -> (
     let composition = composition(&format!("device.image.dynamic.residency.{instance}"));
     let mut pipeline = QwenImage21Pipeline::new(
         composition.runtime().clone(),
-        original.host,
+        original.execution.host,
         reference_vnext_operation_registry(composition.runtime()).unwrap(),
         composition.catalog().clone(),
         WeightMaterializerRegistry::identity_only().unwrap(),
-        Arc::try_unwrap(original.assets)
+        Arc::try_unwrap(original.execution.sources.assets)
             .ok()
             .expect("unique fixture assets"),
         original.profiles,
-        original.config,
+        original.execution.config,
     )
     .unwrap();
     // The same small numerical projection exercises a decoder-lifetime owner.
-    Arc::get_mut(&mut pipeline.assets)
+    Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("unique fixture assets")
         .sources
-        .vae = pipeline.assets.sources.transformer.clone();
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainDecoder {
+        .vae = pipeline
+        .execution
+        .sources
+        .assets
+        .sources
+        .transformer
+        .clone();
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainDecoder {
         maximum_bytes: DEVICE_BYTES / 2,
     };
     (pipeline, directory)
@@ -72,7 +78,7 @@ fn retain_decoder(
         .start_stage(stage, 0, stages)
         .unwrap_or_else(|_| panic!("decoder start"));
     let (active, outputs) = pipeline
-        .execute_stage(active, 0, vec![input(&pipeline.host, rows, 0)])
+        .execute_stage(active, 0, vec![input(&pipeline.execution.host, rows, 0)])
         .unwrap_or_else(|_| panic!("decoder execute"));
     drop(outputs);
     pipeline
@@ -150,7 +156,8 @@ fn decoder_dynamic_policy_is_explicit_bounded_and_requires_session_residency() {
 #[test]
 fn decoder_dynamic_reuse_preserves_outputs_and_original_device_capacity_grants() {
     let (mut pipeline, _directory) = pipeline();
-    let capacity = DeviceCapacityOwner::open(pipeline.runtime.descriptor(), DEVICE_BYTES).unwrap();
+    let capacity =
+        DeviceCapacityOwner::open(pipeline.execution.runtime.descriptor(), DEVICE_BYTES).unwrap();
     let mut stages = Vec::new();
     let mut outputs = Vec::new();
     let mut first_allocations = 0;
@@ -165,7 +172,7 @@ fn decoder_dynamic_reuse_preserves_outputs_and_original_device_capacity_grants()
             .execute_stage(
                 active,
                 job,
-                vec![input(&pipeline.host, 1, job as usize * 8)],
+                vec![input(&pipeline.execution.host, 1, job as usize * 8)],
             )
             .unwrap_or_else(|_| panic!("decoder forward"));
         let output = only_output(output, IMAGE_PROJECTION_OUTPUT_ID).unwrap();
@@ -194,7 +201,7 @@ fn decoder_dynamic_reuse_preserves_outputs_and_original_device_capacity_grants()
             .reserve(DeviceOpaqueMemoryKind::Bootstrap, 1)
             .is_err());
         drop(remaining);
-        let snapshot = pipeline.runtime.snapshot();
+        let snapshot = pipeline.execution.runtime.snapshot();
         if job == 0 {
             first_allocations = snapshot.allocations;
         } else {
@@ -203,10 +210,13 @@ fn decoder_dynamic_reuse_preserves_outputs_and_original_device_capacity_grants()
         outputs.push(output);
     }
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
     assert_eq!(&outputs[0].bytes().bytes()[..2], &0x3f80_u16.to_le_bytes());
     drop(outputs);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
@@ -216,7 +226,7 @@ fn decoder_dynamic_budget_counts_other_stages_and_actual_old_shape_without_doubl
     let retention = retain_decoder(&mut pipeline, 4, &mut stages);
     assert!(retention.retained_bytes() > 1);
     // Tightening a future retention ceiling cannot erase the actual old pool.
-    pipeline.config.dynamic_residency =
+    pipeline.execution.config.dynamic_residency =
         ImageDynamicResidencyPolicy::RetainDecoder { maximum_bytes: 1 };
     let dit = prepared(&pipeline, 1);
     let decoder = decoder_stage(&pipeline, 1);
@@ -231,23 +241,23 @@ fn decoder_dynamic_budget_counts_other_stages_and_actual_old_shape_without_doubl
     };
     // The changed shape closes its old pool before allocating new backing.
     let own_peak = memory(&decoder);
-    pipeline.config.device_capacity_bytes = decoder.plan.static_bytes + own_peak;
+    pipeline.execution.config.device_capacity_bytes = decoder.plan.static_bytes + own_peak;
     pipeline.validate_resident_capacity(&[&decoder]).unwrap();
     let required = decoder.plan.static_bytes
         + dit.plan.static_bytes
         + own_peak.max(memory(&dit) + retention.retained_bytes());
-    let before = pipeline.runtime.snapshot();
-    pipeline.config.device_capacity_bytes = required - 1;
+    let before = pipeline.execution.runtime.snapshot();
+    pipeline.execution.config.device_capacity_bytes = required - 1;
     assert!(pipeline
         .validate_resident_capacity(&[&dit, &decoder])
         .is_err());
-    pipeline.config.device_capacity_bytes = required;
+    pipeline.execution.config.device_capacity_bytes = required;
     pipeline
         .validate_resident_capacity(&[&dit, &decoder])
         .unwrap();
-    assert_eq!(pipeline.runtime.snapshot(), before);
+    assert_eq!(pipeline.execution.runtime.snapshot(), before);
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }
 
 #[test]
@@ -256,7 +266,7 @@ fn decoder_plan_replacement_closes_retained_pool_before_admitting_new_dynamic_ba
     let mut stages = Vec::new();
     let retention = retain_decoder(&mut pipeline, 4, &mut stages);
     let changed = decoder_stage(&pipeline, 1);
-    let before = pipeline.runtime.snapshot();
+    let before = pipeline.execution.runtime.snapshot();
     let active = pipeline
         .start_stage(changed, 1, &mut stages)
         .unwrap_or_else(|_| panic!("decoder replacement"));
@@ -266,28 +276,31 @@ fn decoder_plan_replacement_closes_retained_pool_before_admitting_new_dynamic_ba
         stages.last().unwrap().retirement,
         ImageStageRetirement::Closed
     ));
-    let after = pipeline.runtime.snapshot();
+    let after = pipeline.execution.runtime.snapshot();
     assert_eq!(after.allocations, before.allocations);
     assert_eq!(
         after.live_allocations + retention.retained_chunks() as u64,
         before.live_allocations
     );
     let (active, outputs) = active
-        .execute(1, vec![input(&pipeline.host, 1, 0)])
+        .execute(1, vec![input(&pipeline.execution.host, 1, 0)])
         .unwrap_or_else(|_| panic!("replacement execute"));
     pipeline
         .finish_stage(active, &mut stages)
         .unwrap_or_else(|_| panic!("replacement retain"));
     drop(outputs);
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
 fn decoder_pool_over_its_retention_ceiling_is_released_and_other_stages_still_trim() {
     let (mut pipeline, _directory) = pipeline();
-    pipeline.config.dynamic_residency =
+    pipeline.execution.config.dynamic_residency =
         ImageDynamicResidencyPolicy::RetainDecoder { maximum_bytes: 1 };
     let mut stages = Vec::new();
     for stage in [decoder_stage(&pipeline, 1), prepared(&pipeline, 1)] {
@@ -295,7 +308,7 @@ fn decoder_pool_over_its_retention_ceiling_is_released_and_other_stages_still_tr
             .start_stage(stage, 0, &mut stages)
             .unwrap_or_else(|_| panic!("stage start"));
         let (active, outputs) = active
-            .execute(0, vec![input(&pipeline.host, 1, 0)])
+            .execute(0, vec![input(&pipeline.execution.host, 1, 0)])
             .unwrap_or_else(|_| panic!("stage execute"));
         drop(outputs);
         pipeline
@@ -308,7 +321,7 @@ fn decoder_pool_over_its_retention_ceiling_is_released_and_other_stages_still_tr
         assert!(idle_release.reclaimed_bytes() > 1);
     }
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }
 
 fn small_pipeline(
@@ -318,12 +331,18 @@ fn small_pipeline(
     tempfile::TempDir,
 ) {
     let (mut pipeline, directory) = pipeline();
-    Arc::get_mut(&mut pipeline.assets)
+    Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("unique fixture assets")
         .sources
-        .text_encoder = pipeline.assets.sources.transformer.clone();
-    pipeline.config.residency = ImageResidencyPolicy::AllModelComponents;
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainSmallStages {
+        .text_encoder = pipeline
+        .execution
+        .sources
+        .assets
+        .sources
+        .transformer
+        .clone();
+    pipeline.execution.config.residency = ImageResidencyPolicy::AllModelComponents;
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainSmallStages {
         maximum_bytes_per_stage,
     };
     (pipeline, directory)
@@ -345,7 +364,7 @@ fn small_stages_reuse_two_independent_pools_and_preserve_numerical_outputs() {
                 .execute_stage(
                     active,
                     job,
-                    vec![input(&pipeline.host, 1, job as usize * 8)],
+                    vec![input(&pipeline.execution.host, 1, job as usize * 8)],
                 )
                 .unwrap_or_else(|_| panic!("small stage execute"));
             let output = only_output(output, IMAGE_PROJECTION_OUTPUT_ID).unwrap();
@@ -366,7 +385,7 @@ fn small_stages_reuse_two_independent_pools_and_preserve_numerical_outputs() {
             assert!((1..=4096).contains(&retention.retained_bytes()));
             assert!(retention.retained_chunks() > 0);
         }
-        let snapshot = pipeline.runtime.snapshot();
+        let snapshot = pipeline.execution.runtime.snapshot();
         if job == 0 {
             first_allocations = snapshot.allocations;
         } else {
@@ -374,8 +393,11 @@ fn small_stages_reuse_two_independent_pools_and_preserve_numerical_outputs() {
         }
     }
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
@@ -399,17 +421,17 @@ fn small_stage_capacity_reserves_every_eligible_slot_and_keeps_actual_old_shape_
         .sum::<u64>();
     // AllModelComponents has five eligible slots; the active slot is excluded.
     let required = static_sum + demands[0].max(demands[1]) + 4 * limit;
-    let before = pipeline.runtime.snapshot();
-    pipeline.config.device_capacity_bytes = required - 1;
+    let before = pipeline.execution.runtime.snapshot();
+    pipeline.execution.config.device_capacity_bytes = required - 1;
     assert!(pipeline
         .validate_resident_capacity(&planned.iter().collect::<Vec<_>>())
         .is_err());
-    pipeline.config.device_capacity_bytes = required;
+    pipeline.execution.config.device_capacity_bytes = required;
     pipeline
         .validate_resident_capacity(&planned.iter().collect::<Vec<_>>())
         .unwrap();
-    assert_eq!(pipeline.runtime.snapshot(), before);
-    pipeline.config.device_capacity_bytes = DEVICE_BYTES;
+    assert_eq!(pipeline.execution.runtime.snapshot(), before);
+    pipeline.execution.config.device_capacity_bytes = DEVICE_BYTES;
 
     let mut receipts = Vec::new();
     let mut actual = [0; 2];
@@ -419,7 +441,7 @@ fn small_stage_capacity_reserves_every_eligible_slot_and_keeps_actual_old_shape_
             .start_stage(stage, 0, &mut receipts)
             .unwrap_or_else(|_| panic!("old shape start"));
         let (active, outputs) = active
-            .execute(0, vec![input(&pipeline.host, 4, 0)])
+            .execute(0, vec![input(&pipeline.execution.host, 4, 0)])
             .unwrap_or_else(|_| panic!("old shape execute"));
         drop(outputs);
         pipeline
@@ -433,20 +455,20 @@ fn small_stage_capacity_reserves_every_eligible_slot_and_keeps_actual_old_shape_
         actual[index] = retention.retained_bytes();
         assert!(actual[index] > 1);
     }
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainSmallStages {
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainSmallStages {
         maximum_bytes_per_stage: 1,
     };
     let required = static_sum + (demands[0] + actual[1]).max(demands[1] + actual[0]) + 3;
-    pipeline.config.device_capacity_bytes = required - 1;
+    pipeline.execution.config.device_capacity_bytes = required - 1;
     assert!(pipeline
         .validate_resident_capacity(&planned.iter().collect::<Vec<_>>())
         .is_err());
-    pipeline.config.device_capacity_bytes = required;
+    pipeline.execution.config.device_capacity_bytes = required;
     pipeline
         .validate_resident_capacity(&planned.iter().collect::<Vec<_>>())
         .unwrap();
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }
 
 #[test]
@@ -459,7 +481,7 @@ fn small_stages_over_their_individual_ceiling_release_backing() {
             .start_stage(stage, 0, &mut stages)
             .unwrap_or_else(|_| panic!("small stage start"));
         let (active, outputs) = active
-            .execute(0, vec![input(&pipeline.host, 1, 0)])
+            .execute(0, vec![input(&pipeline.execution.host, 1, 0)])
             .unwrap_or_else(|_| panic!("small stage execute"));
         drop(outputs);
         pipeline
@@ -472,5 +494,5 @@ fn small_stages_over_their_individual_ceiling_release_backing() {
         assert!(idle_release.reclaimed_bytes() > 1);
     }
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }

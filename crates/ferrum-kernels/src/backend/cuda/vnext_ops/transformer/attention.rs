@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use super::replay_encoding::{Encoding, EncodingTarget};
 use super::{
     attach_invocation_binding, contiguous_bindings, ensure_estimator_request, estimate,
-    launch_gemm_f16, provider_failure,
+    launch_gemm_f16, provider_failure, ProjectionWeightSupport,
 };
 #[cfg(feature = "vllm-marlin")]
 use super::{
@@ -64,6 +64,7 @@ use crate::marlin_fp8_materializer::{
     MARLIN_FP8_WEIGHT_FORMAT_ID,
 };
 
+mod candidate_scan;
 mod native_projection;
 mod precision;
 pub(in crate::backend::cuda::vnext_ops) mod segment_bindings;
@@ -84,6 +85,7 @@ const DELTA_INTERLEAVED_FUNCTION: &str = "vnext_gated_delta_varlen_interleaved_f
 const DELTA_TILED_INTERLEAVED_FUNCTION: &str =
     "vnext_gated_delta_varlen_tiled16_interleaved_f32_indirect";
 const GATED_NORM_FUNCTION: &str = "gated_rms_norm_f16_z_f32_weight";
+const GATED_NORM_F16_FUNCTION: &str = "gated_rms_norm_f16_z_f32_weight_to_f16";
 const F32_TO_F16_FUNCTION: &str = "f32_to_activation_f16";
 #[cfg(feature = "vllm-marlin")]
 const PROJECTION_STITCH_FUNCTION: &str = "projection_stitch_f16";
@@ -99,11 +101,13 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionP
     execution_capabilities: GatedDeltaExecutionCapabilities,
     functions: AttentionFunctions,
     #[cfg(feature = "vllm-marlin")]
-    projection_runtime: MarlinProjectionRuntime,
+    projection_runtime: Option<MarlinProjectionRuntime>,
 }
 
 #[derive(Clone)]
 struct AttentionFunctions {
+    weight_support: ProjectionWeightSupport,
+    candidates: Option<candidate_scan::Functions>,
     native: CudaNativeBlockKernels,
     q8act: Option<Q8ActKernels>,
 
@@ -118,6 +122,7 @@ struct AttentionFunctions {
     delta_interleaved: CudaFunction,
     delta_tiled_interleaved: CudaFunction,
     gated_norm: CudaFunction,
+    gated_norm_f16: CudaFunction,
     f32_to_f16: CudaFunction,
     residual_add: CudaFunction,
     #[cfg(feature = "vllm-marlin")]
@@ -181,6 +186,36 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         Self::with_precision(runtime, AttentionPrecision::F16)
     }
 
+    pub(in crate::backend::cuda::vnext_ops) fn new_dense_f16(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision_and_weights(
+            runtime,
+            AttentionPrecision::F16,
+            ProjectionWeightSupport::DenseF16,
+        )
+    }
+
+    pub(in crate::backend::cuda::vnext_ops) fn new_candidate(
+        runtime: &CudaDeviceRuntime,
+        f32_master: bool,
+        dense_only: bool,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision_and_weights(
+            runtime,
+            if f32_master {
+                AttentionPrecision::CandidateF32Master
+            } else {
+                AttentionPrecision::CandidateF16
+            },
+            if dense_only {
+                ProjectionWeightSupport::DenseF16
+            } else {
+                ProjectionWeightSupport::LegacyFormats
+            },
+        )
+    }
+
     pub(in crate::backend::cuda::vnext_ops) fn new_f32_master(
         runtime: &CudaDeviceRuntime,
     ) -> Result<Self, CudaDeviceRuntimeError> {
@@ -197,6 +232,14 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         runtime: &CudaDeviceRuntime,
         precision: AttentionPrecision,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision_and_weights(runtime, precision, ProjectionWeightSupport::LegacyFormats)
+    }
+
+    fn with_precision_and_weights(
+        runtime: &CudaDeviceRuntime,
+        precision: AttentionPrecision,
+        weight_support: ProjectionWeightSupport,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let contract = precision.contract().map_err(contract_error)?;
         let execution_capabilities = GatedDeltaExecutionCapabilities::recurrent_only();
         let capability = CapabilityId::new(precision.capability()).map_err(contract_error)?;
@@ -209,8 +252,15 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         let source = include_str!("attention.rs");
         let mut provider_fingerprint_parts = vec![
             source.as_bytes(),
+            include_bytes!("../transformer.rs"),
+            if weight_support == ProjectionWeightSupport::DenseF16 {
+                &b"explicit-dense-f16"[..]
+            } else {
+                &b"legacy-declared-formats"[..]
+            },
             precision.operation().as_bytes(),
             include_bytes!("attention/precision.rs"),
+            include_bytes!("attention/candidate_scan.rs"),
             include_bytes!("q8act_attention.rs"),
             include_bytes!("replay_encoding.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
@@ -271,9 +321,11 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 .as_runtime_value()
                 .as_bytes(),
             source.as_bytes(),
+            include_bytes!("../transformer.rs"),
             include_bytes!("q8act_attention.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
             include_bytes!("attention/precision.rs"),
+            include_bytes!("attention/candidate_scan.rs"),
             include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("attention/native_projection.rs"),
             include_bytes!("native_matrix.rs"),
@@ -287,12 +339,18 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?
             ]);
         let mut accepted_quantization_formats =
-            super::native_linear::quantization_formats().map_err(contract_error)?;
-        accepted_weight_formats.insert(
-            WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
-        );
+            if weight_support == ProjectionWeightSupport::LegacyFormats {
+                super::native_linear::quantization_formats().map_err(contract_error)?
+            } else {
+                BTreeSet::new()
+            };
+        if weight_support == ProjectionWeightSupport::LegacyFormats {
+            accepted_weight_formats.insert(
+                WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
+            );
+        }
         #[cfg(feature = "vllm-marlin")]
-        {
+        if weight_support == ProjectionWeightSupport::LegacyFormats {
             let marlin_capability =
                 CapabilityId::new(MARLIN_FP8_CAPABILITY_ID).map_err(contract_error)?;
             if !runtime
@@ -354,13 +412,17 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 .fingerprint()
                 .map_err(contract_error)?,
             provider_fingerprint,
-            ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            if precision.candidate_scan() {
+                ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_only()
+            } else {
+                ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay()
+            },
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
             provider_capabilities,
             accepted_weight_formats,
             accepted_quantization_formats,
-            contiguous_bindings(10),
+            candidate_scan::storage_bindings(precision.candidate_scan()),
             precision.estimator(),
             ContractVersion::new(1, 0),
             estimator_fingerprint,
@@ -396,9 +458,13 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             ),
         ])
         .map_err(contract_error)?;
-        let descriptor = descriptor.with_checkpoint_capability(
-            ProviderCheckpointCapability::CompletedBoundary(checkpoint),
-        );
+        let descriptor = if precision.candidate_scan() {
+            candidate_scan::candidate_effects(descriptor, storage)
+        } else {
+            descriptor.with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
+                checkpoint,
+            ))
+        };
 
         let rms_module = runtime
             .context()
@@ -421,6 +487,15 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             .load_module(Ptx::from_src(crate::ptx::RESIDUAL_ADD.to_owned()))
             .map_err(|error| CudaDeviceRuntimeError::driver("attention residual module", error))?;
         let functions = AttentionFunctions {
+            weight_support,
+            candidates: if precision.candidate_scan() {
+                Some(candidate_scan::Functions::load(
+                    &linear_module,
+                    &delta_module,
+                )?)
+            } else {
+                None
+            },
             native: CudaNativeBlockKernels::load(runtime.context())?,
 
             upstream: precision
@@ -472,6 +547,11 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 "attention tiled interleaved delta",
             )?,
             gated_norm: load_function(&linear_module, GATED_NORM_FUNCTION, "attention gated norm")?,
+            gated_norm_f16: load_function(
+                &linear_module,
+                GATED_NORM_F16_FUNCTION,
+                "attention gated norm F16 epilogue",
+            )?,
             f32_to_f16: load_function(&sandwich_module, F32_TO_F16_FUNCTION, "attention cast")?,
             residual_add: load_function(
                 &residual_module,
@@ -491,7 +571,9 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             execution_capabilities,
             functions,
             #[cfg(feature = "vllm-marlin")]
-            projection_runtime: MarlinProjectionRuntime::query(runtime)?,
+            projection_runtime: (weight_support == ProjectionWeightSupport::LegacyFormats)
+                .then(|| MarlinProjectionRuntime::query(runtime))
+                .transpose()?,
         })
     }
 }
@@ -549,6 +631,7 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
         let shape = AttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
         let projection = AttentionProjection::from_values(
             request.values(),
+            self.functions.weight_support,
             #[cfg(feature = "vllm-marlin")]
             self.projection_runtime,
         )
@@ -571,7 +654,10 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
                             .ok_or_else(|| "attention fixed scratch size overflows".to_owned())
                     })
                     .map_err(invalid_plan)?,
-                shape.scratch_bytes_per_sequence().map_err(invalid_plan)?,
+                candidate_scan::scratch_bytes_per_sequence(
+                    shape.scratch_bytes_per_sequence().map_err(invalid_plan)?,
+                    self.precision.candidate_scan(),
+                )?,
                 shape
                     .scratch_bytes_per_token()
                     .and_then(|bytes| {
@@ -614,8 +700,12 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
             VALUE_ALIGNMENT_BYTES,
             Some(scratch),
             persistent,
-        )
-        .with_binding(binding);
+        );
+        let estimate = if self.precision.candidate_scan() {
+            estimate
+        } else {
+            estimate.with_binding(binding)
+        };
         Ok(match q8act {
             Some(plan) => estimate.with_projection_numerics(plan.into_numerics()),
             None => estimate,
@@ -625,7 +715,7 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
 
 impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionProvider {
     fn reusable_binding_resources(&self) -> ferrum_runtime::ReusableBindingResources {
-        if self.precision.upstream() {
+        if self.precision.upstream() || self.precision.candidate_scan() {
             ferrum_runtime::ReusableBindingResources::All
         } else {
             ferrum_runtime::ReusableBindingResources::RequestStateAndBinding
@@ -636,6 +726,9 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
+        if self.precision.candidate_scan() {
+            return Ok(ReusableExecutionTopology::EagerBoundary);
+        }
         let mut values = (0..8)
             .map(|ordinal| {
                 ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, ordinal)
@@ -734,6 +827,25 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
+        if self.precision.candidate_scan() {
+            return Err(provider_failure(
+                identity,
+                "cuda.gated_delta_candidate_scan.bindings",
+                "candidate state scan does not support replay or resident bindings".to_owned(),
+            ));
+        }
+        for participant in invocation.participants() {
+            self.functions
+                .weight_support
+                .validate_values(participant.bindings(), &[2, 7])
+                .map_err(|message| {
+                    provider_failure(
+                        identity.clone(),
+                        "cuda.gated_delta_recurrent_attention.bindings",
+                        message,
+                    )
+                })?;
+        }
         let small_hybrid = self
             .functions
             .upstream
@@ -1086,8 +1198,13 @@ enum AttentionProjection {
 impl AttentionProjection {
     fn from_values(
         values: &[ResolvedValueBinding],
-        #[cfg(feature = "vllm-marlin")] runtime: MarlinProjectionRuntime,
+        weight_support: ProjectionWeightSupport,
+        #[cfg(feature = "vllm-marlin")] runtime: Option<MarlinProjectionRuntime>,
     ) -> Result<Self, String> {
+        if weight_support == ProjectionWeightSupport::DenseF16 {
+            weight_support.validate_values(values, &[2, 7])?;
+            return Ok(Self::F16);
+        }
         if native_projection::uses_native(values)? {
             return Ok(Self::Native {
                 transform_bytes_per_token:
@@ -1147,11 +1264,15 @@ impl AttentionProjection {
             }
             Ok(if uses_fp8 {
                 Self::MarlinFp8 {
-                    runtime,
+                    runtime: runtime
+                        .ok_or("FP8 recurrent projection has no admitted Marlin implementation")?,
                     segmented: uses_segmented_fp8,
                 }
             } else if uses_compressed_tensors {
-                Self::CompressedTensorsMarlin { runtime }
+                Self::CompressedTensorsMarlin {
+                    runtime: runtime
+                        .ok_or("INT4 recurrent projection has no admitted Marlin implementation")?,
+                }
             } else {
                 Self::F16
             })
@@ -1421,12 +1542,25 @@ struct AttentionLaunch {
     input_region: usize,
     output_region: usize,
     state_binding_offset: u64,
+    candidate_binding_offset: Option<u64>,
     host_control: usize,
     host_token_seq_indices: Option<usize>,
     execution_form: GatedDeltaExecutionForm,
     batch_i32: i32,
     tokens: u64,
     tokens_i32: i32,
+    fused_gated_norm: bool,
+}
+
+fn fused_gated_norm_for(
+    precision: AttentionPrecision,
+    weights: ProjectionWeightSupport,
+    participant_tokens: &[u64],
+) -> bool {
+    precision.hidden() == ElementType::F16
+        && weights == ProjectionWeightSupport::DenseF16
+        && !participant_tokens.is_empty()
+        && participant_tokens.iter().all(|n| (1..=2).contains(n))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1626,10 +1760,11 @@ fn attention_dispatches_per_launch(
     qkvzba: &SharedProjectionWeight,
     output: &SharedProjectionWeight,
     rows: u64,
+    fused_gated_norm: bool,
 ) -> Result<u64, String> {
     let qkvzba = qkvzba.dispatch_count(rows)?;
     let output = output.dispatch_count(rows)?;
-    8_u64
+    (8_u64 - u64::from(fused_gated_norm))
         .checked_add(qkvzba)
         .and_then(|count| count.checked_add(output))
         .ok_or_else(|| "attention dispatch count overflows".to_owned())
@@ -1651,16 +1786,30 @@ fn encode_attention(
     functions: &AttentionFunctions,
     precision: AttentionPrecision,
     execution_capabilities: GatedDeltaExecutionCapabilities,
-    #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
+    #[cfg(feature = "vllm-marlin")] projection_runtime: Option<MarlinProjectionRuntime>,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     target: EncodingTarget,
     segment_declaration: Option<&mut Option<ferrum_runtime::SegmentBindingDeclaration>>,
 ) -> Result<Encoding<CudaDeviceCommand>, String> {
+    let candidate = precision.candidate_scan();
+    if candidate && (target != EncodingTarget::Full || invocation.program_binding().is_some()) {
+        return Err(
+            "candidate scan requires eager execution without resident/replay bindings".into(),
+        );
+    }
     let mut segment_validations = segment_declaration.as_ref().map(|_| Vec::new());
     if invocation.participants().is_empty()
         || invocation.operation().id.as_str() != precision.operation()
     {
         return Err("CUDA recurrent attention received another or empty operation".to_owned());
+    }
+    if candidate {
+        for participant in invocation.participants() {
+            invocation
+                .operation()
+                .validate_resolved_bindings(participant.bindings())
+                .map_err(|error| error.to_string())?;
+        }
     }
     let first = &invocation.participants()[0];
     let q8act = precision
@@ -1687,11 +1836,15 @@ fn encode_attention(
     let shape = AttentionShape::from_attributes(first.attributes())?;
     let projection = AttentionProjection::from_values(
         first.bindings(),
+        functions.weight_support,
         #[cfg(feature = "vllm-marlin")]
         projection_runtime,
     )?;
     validate_signature(first, shape, precision)?;
     for participant in &invocation.participants()[1..] {
+        functions
+            .weight_support
+            .validate_values(participant.bindings(), &[2, 7])?;
         if AttentionShape::from_attributes(participant.attributes())? != shape {
             return Err("CUDA recurrent attention participant attributes disagree".to_owned());
         }
@@ -1708,7 +1861,18 @@ fn encode_attention(
     let required_bytes = q8act.as_ref().map_or(Ok(layout.required_bytes), |plan| {
         plan.required_bytes(layout.required_bytes, total_tokens)
     })?;
-    let binding_layout = StateBindingLayout::new(participant_count_usize)?;
+    let binding_layout = StateBindingLayout::new(
+        participant_count_usize
+            .checked_mul(if candidate { 2 } else { 1 })
+            .ok_or("candidate control count overflows")?,
+    )?;
+    let required_bytes = if candidate {
+        required_bytes
+            .checked_add(binding_layout.required_bytes)
+            .ok_or("candidate scratch overflows")?
+    } else {
+        required_bytes
+    };
     let cuda_shape = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
@@ -1744,10 +1908,13 @@ fn encode_attention(
         },
         binding: {
             let index = compute_regions.len();
-            compute_regions.push(super::shared_binding_region(
-                &invocation,
-                binding_layout.required_bytes,
-            )?);
+            compute_regions.push(if candidate {
+                shared_scratch_region(&invocation, required_bytes)?
+                    .subregion(layout.required_bytes, binding_layout.required_bytes)
+                    .map_err(|error| error.to_string())?
+            } else {
+                super::shared_binding_region(&invocation, binding_layout.required_bytes)?
+            });
             index
         },
     };
@@ -1902,12 +2069,22 @@ fn encode_attention(
                 input_region,
                 output_region,
                 state_binding_offset: binding_offset,
+                candidate_binding_offset: if candidate {
+                    Some(binding_layout.offset(participant_count_usize + participant_index)?)
+                } else {
+                    None
+                },
                 host_control,
                 host_token_seq_indices: None,
                 execution_form,
                 batch_i32: 1,
                 tokens,
                 tokens_i32,
+                fused_gated_norm: fused_gated_norm_for(
+                    precision,
+                    functions.weight_support,
+                    &[tokens],
+                ),
             });
         }
     }
@@ -1925,6 +2102,11 @@ fn encode_attention(
             input_region,
             output_region,
             state_binding_offset: 0,
+            candidate_binding_offset: if candidate {
+                Some(binding_layout.offset(participant_count_usize)?)
+            } else {
+                None
+            },
             host_control,
             host_token_seq_indices: Some(host_token_seq_indices),
             execution_form: packed_execution_form.ok_or_else(|| {
@@ -1933,9 +2115,48 @@ fn encode_attention(
             batch_i32: checked_i32(participant_count_u64, "attention packed participant count")?,
             tokens: total_tokens,
             tokens_i32: checked_i32(total_tokens, "attention packed token count")?,
+            fused_gated_norm: fused_gated_norm_for(
+                precision,
+                functions.weight_support,
+                &participant_token_counts,
+            ),
         });
     }
 
+    if candidate {
+        for (index, participant) in invocation.participants().iter().enumerate() {
+            let conv = contiguous_region(
+                participant,
+                binding(participant.bindings(), ResolvedValueRole::Output, 1)?,
+                ElementType::F16,
+            )?;
+            let delta = contiguous_region(
+                participant,
+                binding(participant.bindings(), ResolvedValueRole::Output, 2)?,
+                ElementType::F32,
+            )?;
+            let first_state_region = binding_regions.len();
+            binding_regions.extend([conv.clone(), delta.clone()]);
+            compute_fence_dependencies.extend([conv.clone(), delta.clone()]);
+            let host_binding = binding_host_storage.len();
+            binding_host_storage.push(state_binding_payload(&conv, &delta));
+            state_bindings.push(AttentionStateBinding {
+                first_state_region,
+                host_binding,
+                binding_offset: binding_layout.offset(participant_count_usize + index)?,
+                conv_state_bytes: conv.length_bytes(),
+                delta_state_bytes: delta.length_bytes(),
+            });
+        }
+    }
+
+    if candidate {
+        candidate_scan::validate_output_aliases(
+            &compute_regions,
+            &compute_fence_dependencies,
+            participant_count_usize,
+        )?;
+    }
     if let Some(plan) = q8act.as_mut().filter(|p| p.is_upstream()) {
         for launch in &launches {
             for (role, weight, input, output) in [
@@ -2047,7 +2268,7 @@ fn encode_attention(
                 participant_count,
                 total_tokens,
                 0,
-                u64::from(participant_count),
+                u64::from(participant_count) * if candidate { 2 } else { 1 },
             )
         })
         .map_err(|error| error.to_string())?;
@@ -2063,7 +2284,7 @@ fn encode_attention(
         return Ok(Encoding::Bindings(bindings));
     }
 
-    if let Some(declaration) = segment_declaration {
+    if let Some(declaration) = segment_declaration.filter(|_| !candidate) {
         *declaration =
             segment_bindings::declare(&invocation, segment_validations.unwrap_or_default())?;
     }
@@ -2120,15 +2341,21 @@ fn encode_attention(
             .i32(launch.batch_i32)
             .u64(launch.tokens)
             .i32(launch.tokens_i32);
+        replay_key = replay_key.boolean(launch.fused_gated_norm);
     }
     let logical_compute_dispatches = launches.iter().try_fold(0_u64, |total, launch| {
-        let count = attention_dispatches_per_launch(&shared.qkvzba, &shared.output, launch.tokens)?
-            .checked_add(
-                q8act
-                    .as_ref()
-                    .map_or(Ok(0), |p| p.pack_count(launch.tokens as u32))?,
-            )
-            .ok_or("Q8act recurrent dispatch count overflows")?;
+        let count = attention_dispatches_per_launch(
+            &shared.qkvzba,
+            &shared.output,
+            launch.tokens,
+            launch.fused_gated_norm,
+        )?
+        .checked_add(
+            q8act
+                .as_ref()
+                .map_or(Ok(0), |p| p.pack_count(launch.tokens as u32))?,
+        )
+        .ok_or("Q8act recurrent dispatch count overflows")?;
 
         let (extra, _, reduction) = q8act
             .as_ref()
@@ -2160,47 +2387,62 @@ fn encode_attention(
                 .ok_or_else(|| "attention transfer count overflows".to_owned())
             })?;
 
-    let compute_command =
+    let enqueue = move |stream: &CudaStream,
+                        blas: &CudaBlas,
+                        regions: &[CudaBufferRegion],
+                        host_storage: &[Box<[u8]>]| {
+        for launch in &launches {
+            enqueue_attention(
+                stream,
+                blas,
+                &functions,
+                cuda_shape,
+                shape,
+                layout,
+                &shared,
+                projection,
+                q8act.as_ref(),
+                *launch,
+                regions,
+                host_storage,
+            )?;
+        }
+        Ok(())
+    };
+    let compute_command = if candidate {
+        // Eager command retains both read-only originals and all candidate outputs
+        // through its completion fence without exposing a replay segment.
+        compute_regions.extend(compute_fence_dependencies);
+        CudaDeviceCommand::operation_with_host_storage_and_blas(
+            "vnext_gated_delta_candidate_scan",
+            compute_regions,
+            host_storage,
+            enqueue,
+        )
+    } else {
         CudaDeviceCommand::replayable_operation_with_host_storage_blas_and_fence_dependencies(
             "vnext_gated_delta_recurrent_attention",
             compute_regions,
             host_storage,
             compute_fence_dependencies,
             replay_key.finish(),
-            move |stream, blas, regions, host_storage| {
-                for launch in &launches {
-                    enqueue_attention(
-                        stream,
-                        blas,
-                        &functions,
-                        cuda_shape,
-                        shape,
-                        layout,
-                        &shared,
-                        projection,
-                        q8act.as_ref(),
-                        *launch,
-                        regions,
-                        host_storage,
-                    )?;
-                }
-                Ok(())
-            },
+            enqueue,
         )
-        .and_then(|command| {
-            command.with_work_attribution(
-                if use_packed {
-                    DeviceBatchingForm::Packed
-                } else {
-                    DeviceBatchingForm::ParticipantLoop
-                },
-                participant_count,
-                total_tokens,
-                logical_compute_dispatches,
-                physical_transfer_commands,
-            )
-        })
-        .map_err(|error| error.to_string())?;
+    }
+    .and_then(|command| {
+        command.with_work_attribution(
+            if use_packed {
+                DeviceBatchingForm::Packed
+            } else {
+                DeviceBatchingForm::ParticipantLoop
+            },
+            participant_count,
+            total_tokens,
+            logical_compute_dispatches,
+            physical_transfer_commands,
+        )
+    })
+    .map_err(|error| error.to_string())?;
 
     let operation = attach_invocation_binding(
         EncodedDeviceOperation::compute(compute_command),
@@ -2392,6 +2634,10 @@ fn enqueue_attention(
     };
     let binding = &regions[shared.binding];
     let state_binding = scratch_pointer(binding.device_ptr(), launch.state_binding_offset)?;
+    let candidate_binding = launch
+        .candidate_binding_offset
+        .map(|offset| scratch_pointer(binding.device_ptr(), offset))
+        .transpose()?;
     let scratch_base = scratch.device_ptr();
     let cu_seqlens = scratch_base;
     let token_seq_indices = scratch_pointer(scratch_base, layout.token_seq_indices)?;
@@ -2527,14 +2773,31 @@ fn enqueue_attention(
     .map_err(|_| {
         CudaDeviceRuntimeError::contract("attention convolution state elements exceed i32")
     })?;
-    launch_conv_state_commit(
-        stream,
-        &functions.conv_state_commit,
-        final_conv_state,
-        state_binding,
-        launch.batch_i32,
-        conv_state_elements,
-    )?;
+    if let Some(candidate_binding) = candidate_binding {
+        let candidates = functions
+            .candidates
+            .as_ref()
+            .ok_or_else(|| CudaDeviceRuntimeError::contract("candidate kernels are unavailable"))?;
+        candidate_scan::launch_convolution(
+            stream,
+            &candidates.convolution,
+            qkvzba,
+            state_binding,
+            candidate_binding,
+            cu_seqlens,
+            launch.batch_i32,
+            shape,
+        )?;
+    } else {
+        launch_conv_state_commit(
+            stream,
+            &functions.conv_state_commit,
+            final_conv_state,
+            state_binding,
+            launch.batch_i32,
+            conv_state_elements,
+        )?;
+    }
     launch_qk_norm(
         stream,
         &functions.qk_norm,
@@ -2544,7 +2807,7 @@ fn enqueue_attention(
         launch.tokens_i32,
         cuda,
     )?;
-    launch_delta(
+    launch_delta_with_candidates(
         stream,
         functions,
         query,
@@ -2558,26 +2821,18 @@ fn enqueue_attention(
         launch.batch_i32,
         launch.tokens_i32,
         cuda,
+        candidate_binding,
     )?;
-    launch_gated_norm(
+    let projection_input = launch_gated_norm_epilogue(
         stream,
-        &functions.gated_norm,
+        functions,
         core,
         z,
         regions[shared.norm].device_ptr(),
         gated,
         launch.tokens,
         cuda,
-    )?;
-    launch_cast(
-        stream,
-        &functions.f32_to_f16,
-        gated,
-        z,
-        launch
-            .tokens
-            .checked_mul(shape.value_features)
-            .ok_or_else(|| CudaDeviceRuntimeError::contract("attention cast size overflows"))?,
+        launch.fused_gated_norm,
     )?;
     launch_attention_projection(
         stream,
@@ -2587,7 +2842,7 @@ fn enqueue_attention(
         &functions.native,
         #[cfg(feature = "vllm-marlin")]
         &functions.projection_stitch,
-        z,
+        projection_input,
         projected,
         scratch,
         #[cfg(feature = "vllm-marlin")]
@@ -3308,17 +3563,65 @@ fn launch_delta(
     tokens: i32,
     shape: CudaAttentionShape,
 ) -> Result<(), CudaDeviceRuntimeError> {
+    launch_delta_with_candidates(
+        stream,
+        functions,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        state_binding,
+        cu_seqlens,
+        output,
+        batch,
+        tokens,
+        shape,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_delta_with_candidates(
+    stream: &CudaStream,
+    functions: &AttentionFunctions,
+    query: u64,
+    key: u64,
+    value: u64,
+    g: u64,
+    beta: u64,
+    state_binding: u64,
+    cu_seqlens: u64,
+    output: u64,
+    batch: i32,
+    tokens: i32,
+    shape: CudaAttentionShape,
+    candidate_binding: Option<u64>,
+) -> Result<(), CudaDeviceRuntimeError> {
     if batch <= 0 {
         return Err(CudaDeviceRuntimeError::contract(
             "attention delta batch is not positive",
         ));
     }
-    let function = match (shape.tiled_delta, shape.value_head_mapping) {
-        (false, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta,
-        (true, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta_tiled,
-        (false, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => &functions.delta_interleaved,
-        (true, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => {
-            &functions.delta_tiled_interleaved
+    let function = if candidate_binding.is_some() {
+        let candidates = functions.candidates.as_ref().ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("candidate delta kernels are unavailable")
+        })?;
+        if shape.tiled_delta {
+            &candidates.tiled_delta
+        } else {
+            &candidates.delta
+        }
+    } else {
+        match (shape.tiled_delta, shape.value_head_mapping) {
+            (false, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta,
+            (true, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta_tiled,
+            (false, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => {
+                &functions.delta_interleaved
+            }
+            (true, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => {
+                &functions.delta_tiled_interleaved
+            }
         }
     };
     let pointers = [
@@ -3359,6 +3662,11 @@ fn launch_delta(
         builder.arg(&shape.scale);
         (shape.value_heads as u32, batch as u32, 1)
     };
+    let interleaved =
+        i32::from(shape.value_head_mapping == GatedDeltaValueHeadMapping::InterleavedByKeyHead);
+    if let Some(ref pointer) = candidate_binding {
+        builder.arg(pointer).arg(&interleaved);
+    }
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim,
@@ -3415,6 +3723,45 @@ fn launch_gated_norm(
     }
     .map(|_| ())
     .map_err(|error| CudaDeviceRuntimeError::driver("attention gated norm launch", error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_gated_norm_epilogue(
+    stream: &CudaStream,
+    functions: &AttentionFunctions,
+    core: u64,
+    z: u64,
+    weight: u64,
+    gated_scratch: u64,
+    tokens: u64,
+    shape: CudaAttentionShape,
+    fused: bool,
+) -> Result<u64, CudaDeviceRuntimeError> {
+    launch_gated_norm(
+        stream,
+        if fused {
+            &functions.gated_norm_f16
+        } else {
+            &functions.gated_norm
+        },
+        core,
+        z,
+        weight,
+        gated_scratch,
+        tokens,
+        shape,
+    )?;
+    if fused {
+        // The existing F32 scratch has at least this many F16 elements. Retain
+        // its original budget/owner and leave z read-only in the fused kernel.
+        Ok(gated_scratch)
+    } else {
+        let elements = tokens
+            .checked_mul(shape.value_features as u64)
+            .ok_or_else(|| CudaDeviceRuntimeError::contract("attention cast size overflows"))?;
+        launch_cast(stream, &functions.f32_to_f16, gated_scratch, z, elements)?;
+        Ok(z)
+    }
 }
 
 fn launch_cast(
@@ -3480,6 +3827,9 @@ fn validate_signature(
     shape: AttentionShape,
     precision: AttentionPrecision,
 ) -> Result<(), String> {
+    if precision.candidate_scan() {
+        candidate_scan::validate_outputs(participant, shape)?;
+    }
     let value = |ordinal| binding(participant.bindings(), ResolvedValueRole::Input, ordinal);
     let hidden = value(0)?;
     let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
@@ -4541,7 +4891,7 @@ mod tests {
         };
         assert_eq!(qkvzba.dispatch_count(3).unwrap(), 8);
         assert_eq!(
-            attention_dispatches_per_launch(&qkvzba, &output, 3).unwrap(),
+            attention_dispatches_per_launch(&qkvzba, &output, 3, false).unwrap(),
             17
         );
         assert_eq!(qkvzba.marlin_workspace_zero_count().unwrap(), 2);

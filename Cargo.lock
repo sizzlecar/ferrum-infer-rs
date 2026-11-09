@@ -1283,6 +1283,7 @@ dependencies = [
  "syn 2.0.108",
  "tempfile",
  "toml_edit 0.22.27",
+ "uuid",
 ]
 
 [[package]]
@@ -1337,6 +1338,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
@@ -1567,6 +1569,7 @@ dependencies = [
  "half",
  "hf-hub",
  "indicatif",
+ "libc",
  "libm",
  "memmap2",
  "minijinja",
@@ -1639,6 +1642,7 @@ name = "ferrum-quantization"
 version = "0.18.5"
 dependencies = [
  "candle-core",
+ "ferrum-execution",
  "ferrum-interfaces",
  "ferrum-kernels",
  "ferrum-runtime",
@@ -5320,8 +5324,12 @@ checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -5629,6 +5637,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.8.5",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 1.0.69",
  "utf-8",

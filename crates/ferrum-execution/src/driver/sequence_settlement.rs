@@ -433,6 +433,12 @@ impl<'a, R: DeviceRuntime> PreparedWaveGuard<'a, R> {
             _ => panic!("readback access requires the actual terminal receipt"),
         }
     }
+    pub(super) fn completion_receipt(&self) -> &OperationCompletionReceipt {
+        self.observation
+            .as_ref()
+            .and_then(RetainedWaveObservation::terminal_completion)
+            .expect("completion access requires the original terminal receipt")
+    }
     pub(super) fn rollback_unsubmitted(&mut self) -> Result<StepRetirementReceipt> {
         let retirement = self
             .retirement

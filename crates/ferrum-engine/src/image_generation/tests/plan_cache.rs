@@ -2,6 +2,9 @@ use super::fixture::*;
 use super::*;
 use crate::image_generation::plan_cache::PreparedFamilyKey;
 
+#[path = "plan_cache/prepared_builds.rs"]
+mod prepared_builds;
+
 #[test]
 fn prepared_family_reuse_requires_exact_geometry_identity_and_stage_role() {
     let (pipeline, _directory) = super::adapter::pipeline(2);
@@ -23,8 +26,9 @@ fn prepared_family_reuse_requires_exact_geometry_identity_and_stage_role() {
     };
     let lookup = |key| {
         pipeline
+            .execution
             .plan_cache
-            .prepared_family(pipeline.config.plan_cache, key)
+            .prepared_family(pipeline.execution.config.plan_cache, key)
             .unwrap()
     };
     assert_eq!(lookup(key).as_ref(), Some(family));
@@ -77,8 +81,11 @@ fn prepared_family_reuse_requires_exact_geometry_identity_and_stage_role() {
     assert!(Arc::ptr_eq(&first.component, &repeated.component));
     let receipt = repeated.plan.plan_cache.as_ref().unwrap();
     assert_eq!((receipt.entries, receipt.hits, receipt.misses), (1, 1, 1));
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }
 
 #[test]
@@ -110,7 +117,7 @@ fn prepared_family_reuse_still_checks_new_compile_options() {
 #[test]
 fn prepared_family_lookup_does_not_extend_lru_or_disabled_retention() {
     let (mut pipeline, _directory) = super::adapter::pipeline(2);
-    pipeline.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
+    pipeline.execution.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
     let first = cached_projection(&pipeline, ImageStage::Denoiser, 1);
     let family = first.component.family().clone();
     let weak = Arc::downgrade(&first.component);
@@ -128,8 +135,9 @@ fn prepared_family_lookup_does_not_extend_lru_or_disabled_retention() {
     let second_weak = Arc::downgrade(&second.component);
     drop(second);
     assert!(pipeline
+        .execution
         .plan_cache
-        .prepared_family(pipeline.config.plan_cache, key)
+        .prepared_family(pipeline.execution.config.plan_cache, key)
         .unwrap()
         .is_some());
     // A metadata-only lookup does not acquire a plan or refresh its LRU slot.
@@ -141,8 +149,9 @@ fn prepared_family_lookup_does_not_extend_lru_or_disabled_retention() {
     ));
     assert!(weak.upgrade().is_none());
     assert!(pipeline
+        .execution
         .plan_cache
-        .prepared_family(pipeline.config.plan_cache, key)
+        .prepared_family(pipeline.execution.config.plan_cache, key)
         .unwrap()
         .is_none());
     let second_key = PreparedFamilyKey {
@@ -150,18 +159,23 @@ fn prepared_family_lookup_does_not_extend_lru_or_disabled_retention() {
         ..key
     };
     assert!(pipeline
+        .execution
         .plan_cache
-        .prepared_family(pipeline.config.plan_cache, second_key)
+        .prepared_family(pipeline.execution.config.plan_cache, second_key)
         .unwrap()
         .is_some());
     assert!(pipeline
+        .execution
         .plan_cache
         .prepared_family(ImagePlanCachePolicy::Disabled, second_key)
         .unwrap()
         .is_none());
     assert!(second_weak.upgrade().is_none());
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }
 
 #[test]
@@ -195,14 +209,17 @@ fn stage_cache_reuses_compilation_and_misses_changed_geometry_or_options() {
     let changed_options = compile(1, &explicit_retention);
     assert!(!changed_options.plan.plan_cache_hit);
     assert!(compile(1, &explicit_retention).plan.plan_cache_hit);
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
 fn disabled_cache_compiles_again_without_retaining_component() {
     let (mut pipeline, _directory) = super::adapter::pipeline(1);
-    pipeline.config.plan_cache = ImagePlanCachePolicy::Disabled;
+    pipeline.execution.config.plan_cache = ImagePlanCachePolicy::Disabled;
     let options = projection_options();
     let compile = || {
         PreparedStage::compile(ImageStage::Denoiser, 1, projection(), &options, &pipeline).unwrap()
@@ -287,9 +304,10 @@ fn equal_tensor_shape_different_key_mask_or_profile_never_reuses_a_plan() {
         masked.plan.family_fingerprint
     );
     assert!(pipeline
+        .execution
         .plan_cache
         .get(
-            pipeline.config.plan_cache,
+            pipeline.execution.config.plan_cache,
             ImageStage::Denoiser,
             ImageStagePlanRole::WholeStage,
             1,
@@ -300,9 +318,10 @@ fn equal_tensor_shape_different_key_mask_or_profile_never_reuses_a_plan() {
         .is_none());
     let (other_pipeline, _other_directory) = super::adapter::pipeline(1);
     assert!(other_pipeline
+        .execution
         .plan_cache
         .get(
-            other_pipeline.config.plan_cache,
+            other_pipeline.execution.config.plan_cache,
             ImageStage::Denoiser,
             ImageStagePlanRole::WholeStage,
             1,
@@ -402,13 +421,13 @@ fn cooperating_roles_hit_on_later_rounds_and_replace_only_their_own_last_shape()
             .plan_cache_hit
     );
     assert_eq!(whole.plan.role, ImageStagePlanRole::WholeStage);
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }
 
 #[test]
 fn multi_shape_stage_limit_counts_all_roles_together() {
     let (mut pipeline, _directory) = super::adapter::pipeline(2);
-    pipeline.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
+    pipeline.execution.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
     let compile =
         |role, batch| cached_projection_with_role(&pipeline, ImageStage::Denoiser, role, batch);
     let old = compile(ImageStagePlanRole::PrefixPrefill, 1);
@@ -442,7 +461,7 @@ fn multi_shape_stage_limit_counts_all_roles_together() {
 #[test]
 fn multi_shape_revisits_hit_and_stage_limit_evicts_least_recent_entry() {
     let (mut pipeline, _directory) = super::adapter::pipeline(2);
-    pipeline.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
+    pipeline.execution.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
     let a = cached_projection(&pipeline, ImageStage::Denoiser, 1);
     let a_weak = Arc::downgrade(&a.component);
     let b = cached_projection(&pipeline, ImageStage::Denoiser, 2);
@@ -468,8 +487,11 @@ fn multi_shape_revisits_hit_and_stage_limit_evicts_least_recent_entry() {
             .plan
             .plan_cache_hit
     );
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
@@ -477,7 +499,7 @@ fn global_encoded_budget_evicts_lru_across_stages_without_recounting_hits() {
     // Derive the byte limit from these real serialized plans, not assumptions
     // about JSON formatting or a particular provider's metadata size.
     let (mut measurement, _directory) = super::adapter::pipeline(2);
-    measurement.config.plan_cache = multi_shape(4, 16 * 1024 * 1024);
+    measurement.execution.config.plan_cache = multi_shape(4, 16 * 1024 * 1024);
     let mut previous = 0;
     let mut sizes = Vec::new();
     for stage in [ImageStage::Denoiser, ImageStage::Decoder, ImageStage::Noise] {
@@ -495,7 +517,7 @@ fn global_encoded_budget_evicts_lru_across_stages_without_recounting_hits() {
     sizes.sort_unstable();
     let limit = sizes[1] + sizes[2];
     let mut pipeline = measurement;
-    pipeline.config.plan_cache = multi_shape(4, limit);
+    pipeline.execution.config.plan_cache = multi_shape(4, limit);
     let a = cached_projection(&pipeline, ImageStage::Denoiser, 1);
     let b = cached_projection(&pipeline, ImageStage::Decoder, 1);
     let b_weak = Arc::downgrade(&b.component);
@@ -527,7 +549,7 @@ fn global_encoded_budget_evicts_lru_across_stages_without_recounting_hits() {
 #[test]
 fn oversized_entry_is_returned_without_retention_and_does_not_displace_smaller_entry() {
     let (mut pipeline, _directory) = super::adapter::pipeline(2);
-    pipeline.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
+    pipeline.execution.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
     let small = cached_projection(&pipeline, ImageStage::Denoiser, 1);
     let size = small
         .plan
@@ -537,7 +559,7 @@ fn oversized_entry_is_returned_without_retention_and_does_not_displace_smaller_e
         .encoded_metadata_bytes
         .unwrap();
     // Reconfigure explicitly before acquiring the entry under the smaller cap.
-    pipeline.config.plan_cache = multi_shape(2, size);
+    pipeline.execution.config.plan_cache = multi_shape(2, size);
     let small = cached_projection(&pipeline, ImageStage::Denoiser, 1);
     let small_weak = Arc::downgrade(&small.component);
     drop(small);
@@ -626,13 +648,13 @@ fn failed_candidate_releases_new_cache_owners_and_old_plan_still_executes() {
     use super::residency::{input, numeric_pipeline, prepared};
     use ferrum_models::qwen_image21::IMAGE_PROJECTION_OUTPUT_ID;
     let (mut pipeline, _directory) = numeric_pipeline();
-    pipeline.config.residency = ImageResidencyPolicy::Cold;
-    pipeline.config.plan_cache = multi_shape(1, 16 * 1024 * 1024);
+    pipeline.execution.config.residency = ImageResidencyPolicy::Cold;
+    pipeline.execution.config.plan_cache = multi_shape(1, 16 * 1024 * 1024);
     let a = prepared(&pipeline, 1);
     let weak = Arc::downgrade(&a.component);
-    let capacity = pipeline.config.device_capacity_bytes;
-    pipeline.config.device_capacity_bytes = 1;
-    let candidate = pipeline.plan_cache.begin_candidate().unwrap();
+    let capacity = pipeline.execution.config.device_capacity_bytes;
+    pipeline.execution.config.device_capacity_bytes = 1;
+    let candidate = pipeline.execution.plan_cache.begin_candidate().unwrap();
     let b = prepared(&pipeline, 2);
     let rejected = Arc::downgrade(&b.component);
     assert_eq!(b.plan.plan_cache.as_ref().unwrap().evictions, 1);
@@ -645,9 +667,9 @@ fn failed_candidate_releases_new_cache_owners_and_old_plan_still_executes() {
     assert!(rejected.upgrade().is_some()); // Candidate cache reference.
     drop(candidate);
     assert!(rejected.upgrade().is_none());
-    assert_eq!(pipeline.runtime.snapshot().allocations, 0);
-    assert_eq!(pipeline.runtime.snapshot().submissions, 0);
-    pipeline.config.device_capacity_bytes = capacity;
+    assert_eq!(pipeline.execution.runtime.snapshot().allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().submissions, 0);
+    pipeline.execution.config.device_capacity_bytes = capacity;
     let mut stages = Vec::new();
     let active = pipeline
         .start_stage(a, 0, &mut stages)
@@ -655,15 +677,18 @@ fn failed_candidate_releases_new_cache_owners_and_old_plan_still_executes() {
     // Session owns executable/provider authority independently of cached Arc.
     assert!(weak.upgrade().is_none());
     let (active, outputs) = active
-        .execute(0, vec![input(&pipeline.host, 1, 0)])
+        .execute(0, vec![input(&pipeline.execution.host, 1, 0)])
         .unwrap_or_else(|_| panic!("evicted component execution"));
     let output = only_output(outputs, IMAGE_PROJECTION_OUTPUT_ID).unwrap();
     pipeline
         .finish_stage(active, &mut stages)
         .unwrap_or_else(|_| panic!("evicted component retirement"));
     assert!(matches!(stages[0].retirement, ImageStageRetirement::Closed));
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 16);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        16
+    );
     for (index, part) in output.bytes().bytes().chunks_exact(2).enumerate() {
         assert_eq!(
             u16::from_le_bytes([part[0], part[1]]),
@@ -671,14 +696,17 @@ fn failed_candidate_releases_new_cache_owners_and_old_plan_still_executes() {
         );
     }
     drop(output);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
     assert!(pipeline.shutdown().unwrap().is_empty());
 }
 
 #[test]
 fn failed_batch_preparation_cleans_partial_stages_without_removing_existing_hits() {
     let (mut pipeline, _directory) = super::adapter::pipeline(1);
-    pipeline.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
+    pipeline.execution.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
     let old = cached_projection(&pipeline, ImageStage::Denoiser, 1);
     let request = ImageGenerationRequest {
         prompt: "cat".into(),
@@ -702,15 +730,18 @@ fn failed_batch_preparation_cleans_partial_stages_without_removing_existing_hits
         assert!(retained.plan.plan_cache_hit);
         assert_eq!(retained.plan.plan_cache.as_ref().unwrap().entries, 1);
     }
-    assert_eq!(pipeline.runtime.snapshot().allocations, 0);
-    assert_eq!(pipeline.runtime.snapshot().submissions, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().submissions, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
 fn successful_candidate_reuses_exact_compiled_owners_after_commit() {
     let (pipeline, _directory) = super::adapter::pipeline(1);
-    let candidate = pipeline.plan_cache.begin_candidate().unwrap();
+    let candidate = pipeline.execution.plan_cache.begin_candidate().unwrap();
     let prepared = cached_projection(&pipeline, ImageStage::Denoiser, 1);
     let weak = Arc::downgrade(&prepared.component);
     candidate.defer().unwrap().commit();
@@ -718,15 +749,15 @@ fn successful_candidate_reuses_exact_compiled_owners_after_commit() {
     let cached = cached_projection(&pipeline, ImageStage::Denoiser, 1);
     assert!(cached.plan.plan_cache_hit);
     assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), &cached.component));
-    assert_eq!(pipeline.runtime.snapshot().allocations, 0);
-    assert_eq!(pipeline.runtime.snapshot().submissions, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().submissions, 0);
 }
 
 #[test]
 fn cancelled_host_wait_releases_only_its_candidate_cache_interval() {
     let (mut pipeline, _directory) = super::adapter::pipeline(2);
-    pipeline.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
-    let first = pipeline.plan_cache.begin_candidate().unwrap();
+    pipeline.execution.config.plan_cache = multi_shape(2, 16 * 1024 * 1024);
+    let first = pipeline.execution.plan_cache.begin_candidate().unwrap();
     let waiting = cached_projection(&pipeline, ImageStage::Denoiser, 1);
     let waiting_weak = Arc::downgrade(&waiting.component);
     let pending = first.defer().unwrap();
@@ -735,7 +766,7 @@ fn cancelled_host_wait_releases_only_its_candidate_cache_interval() {
 
     // Preparation no longer holds the serial mutex while waiting. A distinct
     // later candidate may publish its own plans and must survive this cancel.
-    let second = pipeline.plan_cache.begin_candidate().unwrap();
+    let second = pipeline.execution.plan_cache.begin_candidate().unwrap();
     let running = cached_projection(&pipeline, ImageStage::Denoiser, 2);
     let running_weak = Arc::downgrade(&running.component);
     second.defer().unwrap().commit();
@@ -749,7 +780,53 @@ fn cancelled_host_wait_releases_only_its_candidate_cache_interval() {
         &retained.component
     ));
     assert_eq!(retained.plan.plan_cache.as_ref().unwrap().entries, 1);
-    assert_eq!(pipeline.runtime.snapshot().allocations, 0);
-    assert_eq!(pipeline.runtime.snapshot().submissions, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().submissions, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
+}
+
+#[test]
+fn pipeline_weight_arena_target_is_applied_before_cache_lookup_and_preserves_caller_defaults() {
+    let (mut pipeline, _directory) = super::adapter::pipeline(1);
+    pipeline.execution.config.plan_cache = multi_shape(4, 1 << 20);
+    let options = projection_options();
+    let compile = |pipeline: &QwenImage21Pipeline<
+        ferrum_kernels::backend::reference::ReferenceDeviceRuntime,
+    >,
+                   options: &ProgramPlanCompileOptions| {
+        PreparedStage::compile(ImageStage::Denoiser, 1, projection(), options, pipeline).unwrap()
+    };
+    let original = compile(&pipeline, &options);
+    assert!(!original.plan.plan_cache_hit);
+    for target in [512, 1024] {
+        pipeline.execution.config.weight_arena_target_bytes = std::num::NonZeroU64::new(target);
+        let bounded = compile(&pipeline, &options);
+        assert!(!bounded.plan.plan_cache_hit);
+        assert_ne!(original.plan.plan_hash, bounded.plan.plan_hash);
+        let repeated = compile(&pipeline, &options);
+        assert!(repeated.plan.plan_cache_hit);
+        assert!(Arc::ptr_eq(&bounded.component, &repeated.component));
+        // The same policy supplied by the caller must retain the same cache
+        // identity when the pipeline override is absent.
+        pipeline.execution.config.weight_arena_target_bytes = None;
+        let explicit = options.clone().with_weight_arena_packing(
+            ferrum_runtime::WeightArenaPacking::Bounded {
+                target_bytes: std::num::NonZeroU64::new(target).unwrap(),
+            },
+        );
+        let caller = compile(&pipeline, &explicit);
+        assert!(caller.plan.plan_cache_hit);
+        assert!(Arc::ptr_eq(&bounded.component, &caller.component));
+    }
+    let restored = compile(&pipeline, &options);
+    assert!(restored.plan.plan_cache_hit);
+    assert!(Arc::ptr_eq(&original.component, &restored.component));
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }

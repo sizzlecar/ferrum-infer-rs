@@ -85,9 +85,27 @@ pub fn execute_run_source_with_image(
             .validate(dimensions)
             .map_err(anyhow::Error::from)?;
         // Opening archives and validating metadata precedes either device runtime.
-        let (pipeline, composition) = product.backend.create(product.assets)?;
+        let (mut pipeline, composition) = product.backend.create(product.assets)?;
+        let model = super::composed_model_name(&product.model, &composition)?;
+        let trace = if let Some(prepared) = product.continuous_trace {
+            let context = serde_json::json!({"entrypoint":"run", "composition":&composition});
+            match pipeline.enable_continuous_trace_artifact(&prepared, &context) {
+                Ok(handle) => Some(prepared.bind(handle)),
+                Err(source) => {
+                    // Attachment is before the first job, but the constructor
+                    // already owns a real runtime/actor. Preserve an original
+                    // close failure rather than discarding that owner.
+                    if let Err(failure) = pipeline.shutdown() {
+                        return Err(ImageProductError::generation_pipeline(failure, pipeline));
+                    }
+                    return Err(source.into());
+                }
+            }
+        } else {
+            None
+        };
         let context = RunContext {
-            model: super::composed_model_name(&product.model, &composition)?,
+            model,
             profile: product.profile,
             composition,
             request: ImageGenerationRequest {
@@ -100,14 +118,11 @@ pub fn execute_run_source_with_image(
             destination,
             image_file,
         };
-        match pipeline {
-            #[cfg(feature = "cuda")]
-            super::factory::PreparedPipeline::Cuda(pipeline) => execute_pipeline(pipeline, context),
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            super::factory::PreparedPipeline::Metal(pipeline) => {
-                execute_pipeline(pipeline, context)
-            }
+        let result = execute_pipeline(pipeline, context);
+        if let Some(trace) = trace {
+            trace.export_best_effort();
         }
+        result
     }
 }
 
@@ -122,12 +137,11 @@ struct RunContext<'a> {
 }
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-fn execute_pipeline<R: ferrum_runtime::DeviceRuntime>(
-    mut pipeline: Box<ferrum_engine::image_generation::QwenImage21Pipeline<R>>,
+fn execute_pipeline(
+    mut pipeline: super::factory::PreparedPipeline,
     context: RunContext<'_>,
 ) -> Result<(), ImageProductError> {
     use ferrum_engine::image_generation::ImageEditRequest;
-    use ferrum_models::qwen_image21::pipeline_adapters::QwenImage21RgbaOutput;
     use ferrum_output::png::{write_rgba8_png, PngDimensions, PngLimits};
     use ferrum_runtime::HostMemoryClass;
     use std::{fs::OpenOptions, io};
@@ -160,7 +174,7 @@ fn execute_pipeline<R: ferrum_runtime::DeviceRuntime>(
             Ok(encoded) => encoded,
             Err(error) => {
                 if let Err(source) = pipeline.shutdown() {
-                    return Err(ImageProductError::generation(source, pipeline));
+                    return Err(ImageProductError::generation_pipeline(source, pipeline));
                 }
                 return Err(error.into());
             }
@@ -174,21 +188,17 @@ fn execute_pipeline<R: ferrum_runtime::DeviceRuntime>(
     };
     let output = match result {
         Ok(output) => output,
-        Err(source) => return Err(ImageProductError::generation(source, pipeline)),
+        Err(source) => return Err(ImageProductError::generation_pipeline(source, pipeline)),
     };
     // Close native sessions before fallible output encoding. The returned
     // image keeps its independent managed Host backing after device close.
     let shutdown = match pipeline.shutdown() {
         Ok(receipts) => receipts,
-        Err(source) => return Err(ImageProductError::generation(source, pipeline)),
+        Err(source) => return Err(ImageProductError::generation_pipeline(source, pipeline)),
     };
     // The model adapter checks every pixel is finite before touching a sink.
-    let rgba = QwenImage21RgbaOutput::new(
-        pipeline.host_account(),
-        output.rgba.tensor(),
-        output.rgba.bytes(),
-    )?;
-    if rgba.dimensions() != [1, 4, height as usize, width as usize] {
+    let rgba = output.rgba.view(pipeline.host_account())?;
+    if rgba.rgba_dimensions() != [1, 4, height as usize, width as usize] {
         return Err(
             anyhow::anyhow!("image pipeline output dimensions differ from the request").into(),
         );

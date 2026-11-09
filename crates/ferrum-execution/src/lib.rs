@@ -5,6 +5,10 @@
 
 mod build_error;
 pub use build_error::{ExecutorBuildError, ExecutorBuildResult};
+pub use driver::{
+    CausalInputSchema, CausalInputSegment, CausalRequestInputs, CausalTokenInput,
+    CausalTokenInputSpec, CausalTokenInputStorage,
+};
 
 pub mod component;
 pub mod driver;
@@ -25,10 +29,13 @@ pub use tensor::{
 #[cfg(any(test, feature = "test-support"))]
 pub use driver::test_support;
 pub use driver::{
+    CausalAcceptedOutput, CausalCommittedWave, CausalComputedWave, CausalProgramSession,
+    CausalTailTwoOutput, CausalVerifiedDraftOutput, CausalWaveFailure, CompiledCausalProgram,
     CompiledProgram, DeterminismExecutionMode, DeterminismExecutionSpec, DeterminismInitialState,
     DeterminismParticipantSpec, DeterminismPhase, DeterminismWorkspacePoison,
-    ProgramCompilationError, ProgramExecutor, ProgramExecutorConfig, RuntimeComposition,
-    MAX_DETERMINISM_PARTICIPANTS,
+    ManagedCausalIoProfile, ManagedCausalIoRequirements, ManagedCausalIoWork,
+    ManagedCausalReadback, ProgramCompilationError, ProgramExecutor, ProgramExecutorConfig,
+    RuntimeComposition, MAX_DETERMINISM_PARTICIPANTS,
 };
 pub use event_sink::ProductExecutionEventSink;
 pub use executor_lifecycle::{

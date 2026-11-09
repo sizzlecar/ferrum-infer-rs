@@ -313,6 +313,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_modes: &ProductReadbackModes,
         mask_plans: &[VNextProductTokenMaskSubmissionPlan],
+        managed_wave: Option<&ManagedWaveIo>,
         cold_wave: Option<&mut reusable_cold_path::WaveObservation<'_>>,
         pending_install: &mut Option<Arc<ResidentDecodeProgram<R>>>,
         facts_capture: ExecutionFactsCapture,
@@ -326,6 +327,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     kind,
                     output_modes,
                     mask_plans,
+                    managed_wave,
                     cold_wave,
                     reservation,
                     pending_install,
@@ -338,15 +340,18 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 FerrumError::internal("resident decode requires uniform greedy readbacks"),
             ));
         }
-        let uploads =
-            match self.prepare_participant_uploads(participants, kind, output_modes, mask_plans) {
-                Ok(uploads) => uploads,
-                Err(error) => {
-                    return PreparedDispatchResult::Outcome(DispatchOutcome::QuiescentFailure(
-                        error,
-                    ))
-                }
-            };
+        let uploads = match self.prepare_participant_uploads(
+            participants,
+            kind,
+            output_modes,
+            mask_plans,
+            managed_wave,
+        ) {
+            Ok(uploads) => uploads,
+            Err(error) => {
+                return PreparedDispatchResult::Outcome(DispatchOutcome::QuiescentFailure(error))
+            }
+        };
         let mut retries = 0;
         loop {
             let identity = match OperationDispatch::bind_resident_decode_identity(

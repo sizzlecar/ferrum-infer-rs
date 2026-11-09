@@ -1,10 +1,12 @@
 use super::*;
 use std::{fmt, time::Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageStage {
     TextEncoder,
+    TextConnector,
+    TextRefiner,
     VisionEncoder,
     VaeEncoder,
     Noise,
@@ -15,6 +17,8 @@ impl ImageStage {
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::TextEncoder => "text",
+            Self::TextConnector => "connector",
+            Self::TextRefiner => "refine",
             Self::VisionEncoder => "vision",
             Self::VaeEncoder => "encode",
             Self::Noise => "noise",
@@ -108,12 +112,37 @@ pub enum ImageStageRetirement {
 pub struct ActiveImageStage<R: DeviceRuntime> {
     pub receipt: ImageStageExecutionReceipt,
     pub session: TensorComponentSession<R>,
+    pub(super) declaration: ImageStageDeclaration,
 }
 
 #[must_use = "pipeline failure may own pending execution or plan cleanup"]
 pub enum ImageGenerationFailure<R: DeviceRuntime> {
     Preflight(anyhow::Error),
+    /// An auxiliary initializer retains its own original causal cleanup chain.
+    /// Its error may carry Send-only execution observations and native custody.
+    InitializationPhase {
+        source: Box<dyn std::error::Error + Send + 'static>,
+    },
+    /// A stage already completed real executions before this failure. Keep
+    /// the original typed cleanup owner, but do not classify a later clean
+    /// allocation refusal as permission to restart the whole stage.
+    StageExecutionProgress {
+        stage: ImageStage,
+        completed_executions: usize,
+        source: Box<ImageGenerationFailure<R>>,
+    },
     Unavailable,
+    /// A composed pipeline can have several initialized peers when one
+    /// operation fails. Keep their actual sessions, exact snapshot pins and
+    /// original Host guards available for explicit retirement/recovery.
+    /// These are existing owners, not replacement capacity reservations.
+    Pipeline {
+        source: Box<ImageGenerationFailure<R>>,
+        stages: Vec<ActiveImageStage<R>>,
+        weights: Vec<ImageWeightOwnerPin<R>>,
+        host_scopes: Vec<HostMemoryScope>,
+        host_backing: Vec<HostBackingPreparation>,
+    },
     /// Retains every owner from a two-plan prefix handoff on failure. The inner
     /// failure owns the failed operation; these are the still-live peers.
     Prefix {
@@ -145,9 +174,22 @@ pub enum ImageGenerationFailure<R: DeviceRuntime> {
         additional_bytes: u64,
         available_bytes: u64,
     },
+    /// Pool admission failed before upload/submission and the committed
+    /// allocation journal was explicitly released. Preserve its exact native
+    /// pressure evidence after finite idle-owner reclamation is exhausted.
+    InitializationCapacityRejected {
+        plan: ImageStagePlanReceipt,
+        pressure: DeviceCapacityPressure,
+    },
     InitializationRollback {
         plan: ImageStagePlanReceipt,
         source: ResourceRollbackTransitionError<RuntimeResourceDriver<R>>,
+    },
+    /// A fresh, unsubmitted initialization hit typed capacity pressure. Its
+    /// committed buffers could not all be released; keep the actual journal.
+    InitializationRelease {
+        plan: ImageStagePlanReceipt,
+        source: ResourceReleaseTransitionError<RuntimeResourceDriver<R>>,
     },
     Execution {
         source: TensorExecutionError<R>,
@@ -186,6 +228,17 @@ impl<R: DeviceRuntime> fmt::Display for ImageGenerationFailure<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ImageGenerationFailure::Preflight(e) => write!(f, "image preflight: {e:#}"),
+            ImageGenerationFailure::InitializationPhase { source } => {
+                write!(f, "image initialization: {source}")
+            }
+            ImageGenerationFailure::StageExecutionProgress {
+                stage,
+                completed_executions,
+                source,
+            } => write!(
+                f,
+                "image {stage:?} failed after {completed_executions} completed executions: {source}"
+            ),
             ImageGenerationFailure::CapacityRejected {
                 stage,
                 additional_bytes,
@@ -200,6 +253,13 @@ impl<R: DeviceRuntime> fmt::Display for ImageGenerationFailure<R> {
                     failure.message()
                 )
             }
+            ImageGenerationFailure::InitializationCapacityRejected { plan, pressure } => {
+                write!(
+                    f,
+                    "image {:?} pool admission rejected after acknowledged cleanup: {pressure}",
+                    plan.stage
+                )
+            }
             ImageGenerationFailure::InitializationRollback { plan, source } => {
                 write!(
                     f,
@@ -208,9 +268,18 @@ impl<R: DeviceRuntime> fmt::Display for ImageGenerationFailure<R> {
                     source.failure()
                 )
             }
+            ImageGenerationFailure::InitializationRelease { plan, source } => write!(
+                f,
+                "image {:?} unsubmitted initialization release: {:?}",
+                plan.stage,
+                source.failure()
+            ),
             ImageGenerationFailure::Unavailable => f.write_str(
                 "image pipeline stopped; recover any retained failure owners before replacing it",
             ),
+            ImageGenerationFailure::Pipeline { source, .. } => {
+                write!(f, "image pipeline: {source}")
+            }
             ImageGenerationFailure::Prefix { source, .. } => {
                 write!(f, "image prefix: {source}")
             }
@@ -267,12 +336,13 @@ impl<R: DeviceRuntime> fmt::Debug for ImageGenerationError<R> {
 }
 impl<R: DeviceRuntime> std::error::Error for ImageGenerationError<R> {}
 
-pub(super) struct PreparedStage<R: DeviceRuntime> {
+pub struct PreparedStage<R: DeviceRuntime> {
     pub(super) component: Arc<CompiledTensorComponent<R>>,
     pub(super) plan: ImageStagePlanReceipt,
     // Prefix handoff is admitted as one group: the decode request is created
     // while prefill Step/output storage and the original full weights live.
     prefix_admission: Option<(u64, u64)>,
+    declaration: ImageStageDeclaration,
 }
 
 impl<R: DeviceRuntime> Clone for PreparedStage<R> {
@@ -281,11 +351,28 @@ impl<R: DeviceRuntime> Clone for PreparedStage<R> {
             component: Arc::clone(&self.component),
             plan: self.plan.clone(),
             prefix_admission: self.prefix_admission,
+            declaration: self.declaration,
         }
     }
 }
 
 impl<R: DeviceRuntime> ImageGenerationFailure<R> {
+    pub(super) fn with_stage_execution_progress(
+        self,
+        stage: ImageStage,
+        completed_executions: usize,
+    ) -> Self {
+        if completed_executions == 0 {
+            self
+        } else {
+            Self::StageExecutionProgress {
+                stage,
+                completed_executions,
+                source: Box::new(self),
+            }
+        }
+    }
+
     pub(super) fn recover_allocation(self) -> Result<(ImageStage, FailureEnvelope), Self> {
         let Self::Initialization {
             plan,
@@ -329,6 +416,27 @@ enum StageWeightInitialization<'a, R: DeviceRuntime> {
     Attach(&'a SharedComponentWeights<R>),
 }
 impl<R: DeviceRuntime> PreparedStage<R> {
+    pub(super) fn validate_declaration(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.plan.stage == self.declaration.stage
+                && self.plan.role == self.declaration.role
+                && self.plan.batch_size == self.declaration.batch_size,
+            "prepared image receipt differs from its sealed stage declaration"
+        );
+        Ok(())
+    }
+    pub fn declaration(&self) -> &ImageStageDeclaration {
+        &self.declaration
+    }
+    pub fn plan(&self) -> &ImageStagePlanReceipt {
+        &self.plan
+    }
+    pub fn family(&self) -> &PreparedModelFamily {
+        self.component.family()
+    }
+    pub fn executable(&self) -> &ExecutablePlan {
+        self.component.executable()
+    }
     pub(super) fn bind_prefix_admission(&mut self, decode: &Self) -> anyhow::Result<()> {
         let prefill = self
             .component
@@ -391,9 +499,60 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         options: &ProgramPlanCompileOptions,
         pipeline: &QwenImage21Pipeline<R>,
     ) -> anyhow::Result<Self> {
+        Self::compile_declared(
+            ImageStageDeclaration {
+                stage,
+                role,
+                batch_size,
+                weight_owner: pipeline.execution.sources.weight_owner(stage),
+                attachment: ImageStageAttachment::MayInitializeStored,
+            },
+            family,
+            options,
+            &pipeline.execution,
+        )
+    }
+
+    pub(super) fn compile_declared<S: ImagePipelineSourceAdapter>(
+        declaration: ImageStageDeclaration,
+        family: PreparedModelFamily,
+        options: &ProgramPlanCompileOptions,
+        pipeline: &ImagePipelineExecution<R, S>,
+    ) -> anyhow::Result<Self> {
+        declaration.validate()?;
+        ensure!(
+            pipeline.sources.supports_stage(declaration.stage),
+            "stage is not declared by the fixed source adapter"
+        );
+        ensure!(
+            declaration.attachment == ImageStageAttachment::MayInitializeStored
+                || matches!(family.weights(), ModelWeights::Stored(_)),
+            "shared image attachments require a Stored family"
+        );
+        ensure!(
+            declaration.weight_owner == pipeline.sources.weight_owner(declaration.stage),
+            "stage weight owner differs from the fixed source adapter"
+        );
+        let ImageStageDeclaration {
+            stage,
+            role,
+            batch_size,
+            ..
+        } = declaration;
         let started = Instant::now();
         ensure!(batch_size > 0, "stage batch size must be positive");
         let family_fingerprint = family.fingerprint()?;
+        // Apply one physical layout policy to every role before cache lookup.
+        // None preserves the caller's complete original options unchanged.
+        let packed_options = pipeline
+            .config
+            .weight_arena_target_bytes
+            .map(|target_bytes| {
+                options.clone().with_weight_arena_packing(
+                    ferrum_runtime::WeightArenaPacking::Bounded { target_bytes },
+                )
+            });
+        let options = packed_options.as_ref().unwrap_or(options);
         if pipeline.config.plan_cache != ImagePlanCachePolicy::Disabled {
             if let Some((component, mut plan)) = pipeline.plan_cache.get(
                 pipeline.config.plan_cache,
@@ -409,6 +568,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                     component,
                     plan,
                     prefix_admission: None,
+                    declaration,
                 });
             }
         }
@@ -437,6 +597,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         let mut prepared = Self {
             component: Arc::new(component),
             prefix_admission: None,
+            declaration,
             plan: ImageStagePlanReceipt {
                 stage,
                 role,
@@ -464,9 +625,9 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         Ok(prepared)
     }
 
-    pub(super) fn start(
+    pub(super) fn start<S: ImagePipelineSourceAdapter>(
         self,
-        pipeline: &QwenImage21Pipeline<R>,
+        pipeline: &ImagePipelineExecution<R, S>,
         job: u64,
         source: ComponentWeightSource<'_>,
     ) -> Result<ActiveImageStage<R>, ImageGenerationFailure<R>> {
@@ -474,9 +635,9 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             .map(|(active, _)| active)
     }
 
-    pub(super) fn start_shared(
+    pub(super) fn start_shared<S: ImagePipelineSourceAdapter>(
         self,
-        pipeline: &QwenImage21Pipeline<R>,
+        pipeline: &ImagePipelineExecution<R, S>,
         job: u64,
         source: ComponentWeightSource<'_>,
     ) -> Result<(ActiveImageStage<R>, SharedComponentWeights<R>), ImageGenerationFailure<R>> {
@@ -489,9 +650,9 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             })
     }
 
-    pub(super) fn start_attached(
+    pub(super) fn start_attached<S: ImagePipelineSourceAdapter>(
         self,
-        pipeline: &QwenImage21Pipeline<R>,
+        pipeline: &ImagePipelineExecution<R, S>,
         job: u64,
         weights: &SharedComponentWeights<R>,
     ) -> Result<ActiveImageStage<R>, ImageGenerationFailure<R>> {
@@ -499,15 +660,18 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             .map(|(active, _)| active)
     }
 
-    fn start_with_mode(
+    fn start_with_mode<S: ImagePipelineSourceAdapter>(
         self,
-        pipeline: &QwenImage21Pipeline<R>,
+        pipeline: &ImagePipelineExecution<R, S>,
         job: u64,
         mode: StageWeightInitialization<'_, R>,
     ) -> Result<(ActiveImageStage<R>, Option<SharedComponentWeights<R>>), ImageGenerationFailure<R>>
     {
         let Self {
-            component, plan, ..
+            component,
+            plan,
+            declaration,
+            ..
         } = self;
         let name = plan.stage.name();
         let config = (|| -> anyhow::Result<_> {
@@ -562,6 +726,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                         device_profiles: Vec::new(),
                     },
                     session,
+                    declaration,
                 },
                 weights,
             )),
@@ -642,7 +807,9 @@ impl<R: DeviceRuntime> ActiveImageStage<R> {
         }
     }
     pub(super) fn close(self) -> Result<ImageStageReceipt, ImageGenerationFailure<R>> {
-        let Self { receipt, session } = self;
+        let Self {
+            receipt, session, ..
+        } = self;
         let started = Instant::now();
         match session.close() {
             Ok(PlanRuntimeCloseOutcome::Closed(close)) => Ok(ImageStageReceipt {

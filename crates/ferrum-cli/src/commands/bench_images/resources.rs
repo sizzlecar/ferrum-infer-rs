@@ -692,6 +692,7 @@ mod tests {
             edit_url: None,
             model: "test".into(),
             server_config_declaration: "test".into(),
+            protocol: super::ImageEndpointProtocol::default(),
         };
         let mut config = ImageResourceSamplingConfig::default();
         assert!(config.validate(std::slice::from_ref(&endpoint)).is_err());

@@ -227,6 +227,7 @@ fn actual_stored_cuda_tile_consumer_runs_inside_queried_decoder_scope_and_keeps_
         )
         .unwrap();
     let f = Execution::new();
+    let runtime_owner = Arc::downgrade(&f.runtime);
     let d = f.runtime.descriptor();
     let component = CompiledTensorComponent::compile(
         prepared.family().clone(),
@@ -297,11 +298,19 @@ fn actual_stored_cuda_tile_consumer_runs_inside_queried_decoder_scope_and_keeps_
             .class_allocated_bytes(HostMemoryClass::InputPreprocess),
         sample.bytes().backing_bytes()
     );
-    session
-        .close()
-        .unwrap_or_else(|e| panic!("VAE close: {:?}", e.failure()));
     drop(actor);
-    assert_eq!(f.runtime.snapshot().live_allocations, 0);
+    assert!(matches!(
+        session
+            .close()
+            .unwrap_or_else(|e| panic!("VAE close: {:?}", e.failure())),
+        PlanRuntimeCloseOutcome::Closed(_)
+    ));
+    drop(component);
+    drop(f);
+    assert!(
+        runtime_owner.upgrade().is_none(),
+        "CUDA owners must retire while the final Host output remains live"
+    );
     assert!(host.owns(pixels.bytes()));
     drop((sample, pixels));
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);

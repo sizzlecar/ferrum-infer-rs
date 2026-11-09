@@ -40,6 +40,7 @@ fn metal_config() -> QwenImage21MetalConfig {
             maximum_width: 64,
             maximum_height: 64,
             maximum_batch_size: 2,
+            weight_arena_target_bytes: None,
             decoder_batch_policy: ImageDecoderBatchPolicy::SingleImage,
             edit_prefix_policy: ImageEditPrefixPolicy::Recompute,
             plan_cache: ImagePlanCachePolicy::LastPerStage,
@@ -53,7 +54,7 @@ fn metal_config() -> QwenImage21MetalConfig {
 fn assets() -> (QwenImage21Assets, tempfile::TempDir) {
     let (reference, directory) = adapter::pipeline(2);
     (
-        Arc::try_unwrap(reference.assets)
+        Arc::try_unwrap(reference.execution.sources.assets)
             .ok()
             .expect("unique fixture assets"),
         directory,
@@ -130,7 +131,7 @@ fn metal_factory_generates_real_managed_batches_and_retires_cold_and_resident_st
         );
         assert!(observation.effective_ceiling_bytes <= fixture::DEVICE_BYTES);
         assert_eq!(
-            pipeline.runtime.tensor_capacity_bytes(),
+            pipeline.execution.runtime.tensor_capacity_bytes(),
             Some(composition.device_capacity_bytes)
         );
         assert!(!pipeline.supports_edits());

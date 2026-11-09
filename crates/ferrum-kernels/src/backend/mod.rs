@@ -73,4 +73,9 @@ mod cuda_tensor_memory_policy;
 #[path = "cuda/vnext_runtime/tensor_eager/capability_policy.rs"]
 mod cuda_tensor_capability_policy;
 
+#[cfg(any(feature = "cuda", test))]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[path = "cuda/vnext_runtime/tensor_eager/causal_policy.rs"]
+mod cuda_tensor_causal_policy;
+
 pub mod timer;

@@ -12,22 +12,78 @@ fn values(count: usize, salt: usize) -> Vec<f16> {
 
 fn projection(input: &[f16], weight: &[f16], actual: &[f16], hidden: usize, outputs: usize) {
     assert_eq!(actual.len(), input.len() / hidden * outputs);
-    for (row, x) in input.chunks_exact(hidden).enumerate() {
-        for (column, w) in weight.chunks_exact(hidden).enumerate() {
-            let products = x.iter().zip(w).map(|(a, b)| a.to_f64() * b.to_f64());
-            let expected = products.clone().sum::<f64>();
-            // Same bound as native_swiglu: F32 reduction error plus one F16
-            // relative spacing and the smallest F16 subnormal for output rounding.
-            let bound = (hidden as f64 * f64::from(f32::EPSILON) + 0.0009765625)
-                * products.map(f64::abs).sum::<f64>()
-                + f16::from_bits(1).to_f64();
-            let value = actual[row * outputs + column].to_f64();
-            assert!(
-                value.is_finite() && (value - expected).abs() <= bound,
-                "projection[{row},{column}]: {value}, F64={expected}, bound={bound}"
-            );
+    for row in 0..input.len() / hidden {
+        for column in 0..outputs {
+            projection_element(input, weight, actual, hidden, outputs, row, column);
         }
     }
+}
+
+fn projection_element(
+    input: &[f16],
+    weight: &[f16],
+    actual: &[f16],
+    hidden: usize,
+    outputs: usize,
+    row: usize,
+    column: usize,
+) {
+    let x = &input[row * hidden..][..hidden];
+    let w = &weight[column * hidden..][..hidden];
+    let products = x.iter().zip(w).map(|(a, b)| a.to_f64() * b.to_f64());
+    let expected = products.clone().sum::<f64>();
+    // F32 reduction error plus one F16 relative spacing and the smallest F16
+    // subnormal for output rounding; the same bound as the full small oracle.
+    let bound = (hidden as f64 * f64::from(f32::EPSILON) + 0.0009765625)
+        * products.map(f64::abs).sum::<f64>()
+        + f16::from_bits(1).to_f64();
+    let value = actual[row * outputs + column].to_f64();
+    assert!(
+        value.is_finite() && (value - expected).abs() <= bound,
+        "projection[{row},{column}]: {value}, F64={expected}, bound={bound}"
+    );
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn f16_projection_uses_supported_compute_type_for_decode_and_prefill_on_cuda() {
+    let context = CudaContext::new(0).expect("F16 projection conformance requires CUDA");
+    let stream = context.default_stream();
+    let blas = CudaBlas::new(stream.clone()).unwrap();
+    // Exercise a wide, non-square transformer projection with decode, tail and
+    // prefill rows. FAST_16F with F16 A/B/C is an unsupported cuBLAS tuple even
+    // though tiny or zero-work fixtures may not reach a rejecting GEMM kernel.
+    let (hidden, outputs) = (4096, 8256);
+    let weight = values(hidden * outputs, 11);
+    let guard = f16::from_f32(-117.0);
+    let w = Guarded::new(&stream, &weight, guard);
+    for rows in [1, 33, 256] {
+        let input = values(rows * hidden, rows);
+        let x = Guarded::new(&stream, &input, guard);
+        let y = Guarded::new(&stream, &vec![f16::NAN; rows * outputs], guard);
+        launch_gemm_f16(
+            &blas,
+            x.pointer(&stream),
+            w.pointer(&stream),
+            y.pointer(&stream),
+            rows as i32,
+            outputs as i32,
+            hidden as i32,
+            "F16 prefill/decode projection conformance",
+        )
+        .unwrap();
+        let actual = y.read(&stream);
+        assert!(actual.iter().all(|value| value.is_finite()));
+        // Sparse F64 reductions keep the oracle bounded while checking the
+        // first/last rows and columns, interior tiles and the projection tail.
+        for row in BTreeSet::from([0, rows / 2, rows - 1]) {
+            for column in [0, 1, 31, 64, outputs / 2, outputs - 1] {
+                projection_element(&input, &weight, &actual, hidden, outputs, row, column);
+            }
+        }
+        x.assert_unchanged(&stream);
+    }
+    w.assert_unchanged(&stream);
 }
 
 fn activation(actual: f16, expected: f64) {

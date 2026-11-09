@@ -14,7 +14,6 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
 use ferrum_runtime::{
@@ -36,7 +35,8 @@ use crate::backend::reusable_execution::{
 };
 
 use super::vnext_runtime::{
-    CudaCommandExecutable, CudaDeviceCommand, CudaDeviceRuntimeError, CudaSubmissionStageTimer,
+    CudaBlasOwner, CudaCommandExecutable, CudaDeviceCommand, CudaDeviceRuntimeError,
+    CudaSubmissionStageTimer,
 };
 use super::vnext_tool_correlation::correlate_replay_launch;
 use crate::backend::enqueue_timing;
@@ -305,7 +305,7 @@ struct CudaExecutableSegment {
     executable: sys::CUgraphExec,
     context: Arc<CudaContext>,
     _stream: Arc<CudaStream>,
-    _blas: Arc<CudaBlas>,
+    _blas: Arc<CudaBlasOwner>,
     _executables: Vec<Arc<CudaCommandExecutable>>,
     command_graph_node_counts: Option<Arc<[u32]>>,
     // Only descriptions from the commands actually captured by this entry.
@@ -315,6 +315,8 @@ struct CudaExecutableSegment {
     uploaded: bool,
     last_used: u64,
     profile_identity: OnceLock<CudaExecutableProfileIdentity>,
+    // Last: native graphs, commands, BLAS and stream must retire before this original quota.
+    tensor_lane: Option<Arc<super::vnext_runtime::TensorLaneRetention>>,
 }
 
 struct CudaExecutableProfileIdentity {
@@ -666,10 +668,11 @@ impl CudaExecutableSegment {
         key: CudaExecutableSegmentKey,
         context: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
-        blas: &Arc<CudaBlas>,
+        blas: &Arc<CudaBlasOwner>,
         commands: &[CudaDeviceCommand],
         facts_capture: ExecutionFactsCapture,
         last_used: u64,
+        tensor_lane: Option<Arc<super::vnext_runtime::TensorLaneRetention>>,
         timing_sink: &S,
     ) -> Result<Self, CudaReplayError> {
         let record_stage = CudaSubmissionStageTimer::start(
@@ -694,6 +697,7 @@ impl CudaExecutableSegment {
         let mut command_frontiers = Some(Vec::with_capacity(commands.len()));
         let encoded = catch_unwind(AssertUnwindSafe(|| {
             for command in commands {
+                blas.bind_workspace()?;
                 command.enqueue(stream, blas)?;
                 if let Some(frontiers) = command_frontiers.as_mut() {
                     match capture_dependency_frontier(stream) {
@@ -719,39 +723,52 @@ impl CudaExecutableSegment {
             unsafe { sys::cuStreamIsCapturing(stream.cu_stream(), &mut capture_state) };
         let capture_terminated = capture_query_status == sys::CUresult::CUDA_SUCCESS
             && capture_state == sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        let retain_uncertain_capture_owners = || {
+            if let Some(owner) = tensor_lane.clone() {
+                // A later successful stream synchronization cannot prove that
+                // an unterminated capture or undestroyed graph released its
+                // native dependencies. Keep the same owners as a failed Drop.
+                std::mem::forget(owner);
+                std::mem::forget(
+                    commands
+                        .iter()
+                        .map(CudaDeviceCommand::executable)
+                        .collect::<Vec<_>>(),
+                );
+                std::mem::forget(Arc::clone(context));
+                std::mem::forget(Arc::clone(stream));
+                std::mem::forget(Arc::clone(blas));
+            }
+        };
+        let destroy_graph = |graph: sys::CUgraph| {
+            let clean = graph.is_null()
+                || unsafe { sys::cuGraphDestroy(graph) } == sys::CUresult::CUDA_SUCCESS;
+            if !clean || !capture_terminated {
+                retain_uncertain_capture_owners();
+            }
+            clean
+        };
         let encoded = match encoded {
             Ok(encoded) => encoded,
             Err(_panic) => {
-                if !graph.is_null() {
-                    unsafe {
-                        sys::cuGraphDestroy(graph);
-                    }
-                }
-                return Err(CudaReplayError::provider_panic(capture_terminated));
+                let clean = destroy_graph(graph);
+                return Err(CudaReplayError::provider_panic(capture_terminated && clean));
             }
         };
         if let Err(error) = encoded {
-            if !graph.is_null() {
-                unsafe {
-                    sys::cuGraphDestroy(graph);
-                }
-            }
+            let clean = destroy_graph(graph);
             return Err(CudaReplayError::runtime(
                 "encode reusable executable capture",
                 error,
-                capture_terminated,
+                capture_terminated && clean,
             ));
         }
         if end_status != sys::CUresult::CUDA_SUCCESS || graph.is_null() || !capture_terminated {
-            if !graph.is_null() {
-                unsafe {
-                    sys::cuGraphDestroy(graph);
-                }
-            }
+            let clean = destroy_graph(graph);
             return Err(CudaReplayError::cuda(
                 "end reusable executable capture",
                 end_status,
-                capture_terminated,
+                capture_terminated && clean,
             ));
         }
         drop(record_stage);
@@ -764,6 +781,24 @@ impl CudaExecutableSegment {
                     DeviceSubmissionStage::ReusableCaptureTopology,
                 );
                 let (nodes, edges) = captured_graph_topology(graph)?;
+                if tracing::enabled!(target: "ferrum.cuda.replay_preparation", tracing::Level::DEBUG) {
+                    let mut allocations = 0;
+                    let mut frees = 0;
+                    let mut unknown = 0;
+                    for node in &nodes {
+                        let mut kind = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
+                        if unsafe { sys::cuGraphNodeGetType(*node, &mut kind) } != sys::CUresult::CUDA_SUCCESS {
+                            unknown += 1;
+                        } else {
+                            allocations += usize::from(kind == sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC);
+                            frees += usize::from(kind == sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE);
+                        }
+                    }
+                    tracing::debug!(target: "ferrum.cuda.replay_preparation", command_count = commands.len(),
+                        nodes = nodes.len(), edges = edges.len(), graph_allocations = allocations,
+                        graph_frees = frees, unknown_node_types = unknown, blas_workspace_bytes = blas.workspace_bytes(),
+                        "CUDA replay captured graph memory");
+                }
                 command_graph_node_counts_from_topology(&nodes, &edges, &frontiers)
             })
             .map(Arc::<[u32]>::from);
@@ -777,13 +812,16 @@ impl CudaExecutableSegment {
             unsafe { sys::cuGraphInstantiateWithFlags(&mut executable, graph, 0) };
         drop(instantiate_stage);
         if instantiate_status != sys::CUresult::CUDA_SUCCESS || executable.is_null() {
-            unsafe {
-                sys::cuGraphDestroy(graph);
+            let executable_clean = executable.is_null()
+                || unsafe { sys::cuGraphExecDestroy(executable) } == sys::CUresult::CUDA_SUCCESS;
+            let clean = destroy_graph(graph) && executable_clean;
+            if !executable_clean {
+                retain_uncertain_capture_owners();
             }
             return Err(CudaReplayError::cuda(
                 "instantiate reusable executable",
                 instantiate_status,
-                true,
+                clean,
             ));
         }
         Ok(Self {
@@ -804,6 +842,7 @@ impl CudaExecutableSegment {
             uploaded: false,
             last_used,
             profile_identity: OnceLock::new(),
+            tensor_lane,
         })
     }
 
@@ -890,15 +929,27 @@ impl Drop for CudaExecutableSegment {
         if self.context.bind_to_thread().is_err() {
             // Destruction in an unknown context is unsafe. The process will
             // reclaim these handles; normal lane shutdown binds successfully.
+            self.retain_uncertain_bounded_owners();
             return;
         }
-        unsafe {
-            if !self.executable.is_null() {
-                sys::cuGraphExecDestroy(self.executable);
-            }
-            if !self.graph.is_null() {
-                sys::cuGraphDestroy(self.graph);
-            }
+        let executable_clean = self.executable.is_null()
+            || unsafe { sys::cuGraphExecDestroy(self.executable) } == sys::CUresult::CUDA_SUCCESS;
+        let graph_clean = self.graph.is_null()
+            || unsafe { sys::cuGraphDestroy(self.graph) } == sys::CUresult::CUDA_SUCCESS;
+        if !executable_clean || !graph_clean {
+            self.retain_uncertain_bounded_owners();
+        }
+    }
+}
+
+impl CudaExecutableSegment {
+    fn retain_uncertain_bounded_owners(&mut self) {
+        if let Some(owner) = self.tensor_lane.take() {
+            std::mem::forget(owner);
+            std::mem::forget(std::mem::take(&mut self._executables));
+            std::mem::forget(Arc::clone(&self.context));
+            std::mem::forget(Arc::clone(&self._stream));
+            std::mem::forget(Arc::clone(&self._blas));
         }
     }
 }
@@ -914,6 +965,7 @@ pub(crate) struct CudaExecutableCache {
     warmup: DemandWarmup<CudaExecutableSegmentKey>,
     capture_cost: CaptureCost<CudaExecutableSegmentKey>,
     clock: u64,
+    tensor_lane: Option<Arc<super::vnext_runtime::TensorLaneRetention>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1209,13 +1261,30 @@ impl CudaExecutableCache {
             warmup: DemandWarmup::default(),
             capture_cost: CaptureCost::default(),
             clock: 0,
+            tensor_lane: None,
         }
+    }
+
+    pub(crate) fn with_tensor_lane(
+        mut self,
+        lane: Option<Arc<super::vnext_runtime::TensorLaneRetention>>,
+    ) -> Self {
+        self.tensor_lane = lane;
+        self
     }
 
     pub(crate) fn configure(
         &mut self,
         plan: DeviceReusableExecutionPlan,
     ) -> Result<DeviceReusableExecutionPreparation, String> {
+        if let Some(lane) = &self.tensor_lane {
+            if plan.maximum_executables() > lane.replay_limit().unwrap_or(0)
+                || plan.preparation()
+                    != ferrum_runtime::ReusableExecutionProgramPreparation::OnDemand
+            {
+                return Err("bounded causal replay requires on-demand preparation within its original graph-slot allowance".into());
+            }
+        }
         self.preparation
             .configure(plan, self.entries.len(), self.rejected.len())
     }
@@ -1281,7 +1350,7 @@ impl CudaExecutableCache {
         &mut self,
         context: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
-        blas: Option<&Arc<CudaBlas>>,
+        blas: Option<&Arc<CudaBlasOwner>>,
         commands: &[CudaDeviceCommand],
         candidates: &[CudaExecutableCandidate],
         capture_allowed: bool,
@@ -1450,6 +1519,7 @@ impl CudaExecutableCache {
                 candidate.commands(commands),
                 facts_capture,
                 now,
+                self.tensor_lane.clone(),
                 timing_sink,
             ) {
                 Ok(entry) => captured.push((key, entry, preparation_started.map(elapsed_ns))),

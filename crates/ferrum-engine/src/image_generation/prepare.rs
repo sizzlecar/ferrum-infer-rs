@@ -30,6 +30,10 @@ pub(super) struct BatchOrder {
     request_indices: Vec<usize>,
 }
 impl BatchOrder {
+    pub(super) fn caller_indices(&self) -> &[usize] {
+        &self.request_indices
+    }
+
     pub(super) fn new(request_indices: Vec<usize>, batch: usize) -> anyhow::Result<Self> {
         ensure!(
             (1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&batch)
@@ -98,10 +102,13 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         edit: Option<super::editing::EditInputs>,
         reserve_host: bool,
     ) -> anyhow::Result<PreparedRequest<R>> {
-        let candidate_cache = self.plan_cache.begin_candidate()?;
+        let candidate_cache = self.execution.plan_cache.begin_candidate()?;
         let prepare_started = std::time::Instant::now();
-        let (height, width) =
-            batch_dimensions(requests, &self.config, self.assets.spatial_scale()?)?;
+        let (height, width) = batch_dimensions(
+            requests,
+            &self.execution.config,
+            self.execution.sources.assets.spatial_scale()?,
+        )?;
         let request = &requests[0];
         let batch = requests.len();
         let prompt_text = requests
@@ -114,15 +121,21 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             // apply generation's prompt-length canonicalization to edits.
             (edit.prompt.prompts().clone(), (0..batch).collect())
         } else {
-            self.assets
+            self.execution
+                .sources
+                .assets
                 .tokenizer
-                .prepare_canonical(&prompt_text, self.config.maximum_user_tokens)?
+                .prepare_canonical(&prompt_text, self.execution.config.maximum_user_tokens)?
         };
         let request_order = BatchOrder::new(order, batch)?;
         let text = if let Some(edit) = &edit {
-            edit.prompt.text_config(&self.assets.text)?
+            edit.prompt
+                .text_config(&self.execution.sources.assets.text)?
         } else {
-            Qwen3VLTextConfig::new(self.assets.text.clone(), prompts.layout().clone())?
+            Qwen3VLTextConfig::new(
+                self.execution.sources.assets.text.clone(),
+                prompts.layout().clone(),
+            )?
         };
         let layout = QwenImage21T2iLayout::new(
             u32::try_from(prompts.feature_sequence_length())?,
@@ -134,9 +147,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .map(u32::try_from)
                 .collect::<Result<_, _>>()?,
         )?;
-        let mut transformer =
-            QwenImage21TransformerConfig::new(self.assets.transformer.clone(), layout)?
-                .with_weight_encodings(self.assets.transformer_encodings.clone())?;
+        let mut transformer = QwenImage21TransformerConfig::new(
+            self.execution.sources.assets.transformer.clone(),
+            layout,
+        )?
+        .with_weight_encodings(self.execution.sources.assets.transformer_encodings.clone())?;
         if let Some(edit) = &edit {
             let (reference_height, reference_width) = edit.dimensions(batch)?;
             transformer = transformer.with_reference_image(
@@ -147,7 +162,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             )?;
         }
         let prefix_decode_config = if edit.is_some()
-            && self.config.edit_prefix_policy == ImageEditPrefixPolicy::RequestCache
+            && self.execution.config.edit_prefix_policy == ImageEditPrefixPolicy::RequestCache
         {
             let decode = transformer
                 .clone()
@@ -158,8 +173,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         } else {
             None
         };
-        let decoder_batch = self.config.decoder_batch_policy.batch_size(batch);
-        let decoder = self.assets.decoder_batch(decoder_batch, height, width)?;
+        let decoder_batch = self.execution.config.decoder_batch_policy.batch_size(batch);
+        let decoder = self
+            .execution
+            .sources
+            .assets
+            .decoder_batch(decoder_batch, height, width)?;
         ensure!(
             decoder.output_tensor()?.dimensions()
                 == [
@@ -204,10 +223,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         if Qwen3VLTextEncoderFamily::is_fp8_profile(self.profiles.text_encoder.as_str()) {
             let conversion = precision::materializer(
                 precision::TEXT_MATERIALIZER,
-                &self.host,
+                &self.execution.host,
                 Qwen3VLTextEncoderFamily::fp8_weight_groups(&text)?,
             )?;
-            precision::select(&text_family, &mut text_options, &conversion, &self.host)?;
+            precision::select(
+                &text_family,
+                &mut text_options,
+                &conversion,
+                &self.execution.host,
+            )?;
         }
         let text_fp8_select_us = trace_elapsed_us(started);
         let text_stage = PreparedStage::compile(
@@ -261,7 +285,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         // It must not be added to those subspans or stage compile receipts.
         tracing::debug!(
             target: "ferrum_engine::image_generation::timing",
-            job = self.next_job,
+            job = self.execution.next_job,
             batch_size = batch,
             prepare_batch_us = trace_elapsed_us(prepare_started),
             text_compile_options_us,
@@ -317,22 +341,22 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let compile_options_us = trace_elapsed_us(started);
         let started = std::time::Instant::now();
         let fp8 = QwenImage21TransformerFamily::is_fp8_profile(self.profiles.denoiser.as_str());
-        if fp8 || self.assets.lora_materializer.is_some() {
+        if fp8 || self.execution.sources.assets.lora_materializer.is_some() {
             let conversion = precision::materializer_with_adapter(
                 precision::DIT_MATERIALIZER,
-                &self.host,
+                &self.execution.host,
                 if fp8 {
                     QwenImage21TransformerFamily::fp8_weight_groups(transformer)?
                 } else {
                     Vec::new()
                 },
-                self.assets.lora_materializer.clone(),
+                self.execution.sources.assets.lora_materializer.clone(),
             )?;
-            precision::select(&family, &mut options, &conversion, &self.host)?;
+            precision::select(&family, &mut options, &conversion, &self.execution.host)?;
         }
         tracing::debug!(
             target: "ferrum_engine::image_generation::timing",
-            job = self.next_job,
+            job = self.execution.next_job,
             ?role,
             batch_size = batch,
             compile_options_us,

@@ -10,6 +10,7 @@ use resource_fixture as f;
 
 mod fixture;
 use fixture::*;
+mod custody;
 
 struct UnreadSource(AtomicUsize);
 

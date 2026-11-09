@@ -27,7 +27,7 @@ impl CudaNativeLaneReuse {
 
 pub(super) struct NativeLane {
     // Destroy BLAS (which itself retains the stream) before the stream owner.
-    pub(super) blas: Arc<CudaBlas>,
+    pub(super) blas: Arc<CudaBlasOwner>,
     pub(super) stream: Arc<CudaStream>,
     pub(super) previous_stream_id: u64,
 }
@@ -83,12 +83,12 @@ fn exclusively_owned<T>(owner: &mut Arc<T>) -> bool {
 
 // Unlike the single-owner gates above, this is a balance check within a closed
 // native ownership graph, not a general atomic Arc uniqueness predicate. The
-// facade and its already exclusively owned CudaBlas retain these two Arcs.
+// facade, exclusively owned CudaBlas, and optional owned workspace retain Arcs.
 // Production never exports or downgrades this execution stream Arc: callbacks
 // borrow only &CudaStream; fences/guards/graphs retain the paired owners checked
 // above. If a future API exposes a native Weak, this contract must be redesigned.
-fn only_private_native_pair(stream: &Arc<CudaStream>) -> bool {
-    Arc::strong_count(stream) == 2 && Arc::weak_count(stream) == 0
+fn only_private_native_pair(stream: &Arc<CudaStream>, blas: &CudaBlasOwner) -> bool {
+    Arc::strong_count(stream) == 1 + blas.native_stream_owners() && Arc::weak_count(stream) == 0
 }
 
 impl CudaDeviceStream {
@@ -133,7 +133,10 @@ impl CudaDeviceStream {
         }
         if !exclusively_owned(self.blas.as_mut().expect("eligibility checked BLAS"))
             || !exclusively_owned(self.tensor_lane.as_mut().expect("eligibility checked lane"))
-            || !only_private_native_pair(&self.stream)
+            || !only_private_native_pair(
+                &self.stream,
+                self.blas.as_ref().expect("eligibility checked BLAS"),
+            )
         {
             self.log_native_return(false, "external_native_owner_or_uncertain_graph");
             return;

@@ -22,6 +22,8 @@ ferrum serve /path/to/Qwen-Image-2.1-Turbo --backend cuda \
 
 The directory preset supports outputs up to 2048×2048, subject to capacity checks. Serving automatically batches compatible requests; `--max-num-seqs` is an optional upper bound, not a fixed batch size. Scheduling occurs between complete batches, so large requests can delay smaller ones. `/health` exposes image scheduling and resource limits.
 
+For generators that support continuous denoising, `serving.batching: "auto"` also considers auxiliary model initialization. When every resident request has exactly one denoising step left, it completes that step before starting another auxiliary model. Already initialized requests can still join, and pending initialization and cancellation continue to advance. The generator must declare both the auxiliary model and the remaining steps; unknown progress keeps ordinary admission. `"configured"` preserves immediate admission at step boundaries. This scheduling policy applies to `serve`; a single `run` request has no competing request to defer.
+
 ## Metal
 
 Validated at 1024×1024 on an M4 Mac mini with 16 GiB unified memory. Uses a Q4_K_M GGUF DiT, FP8 text encoder and BF16 vision/VAE.

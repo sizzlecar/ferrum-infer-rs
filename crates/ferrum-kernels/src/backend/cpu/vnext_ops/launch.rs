@@ -18,6 +18,20 @@ pub(super) enum ResidualStorage {
 }
 
 pub(super) enum CpuAction {
+    ConcatColumnsF16 {
+        left: usize,
+        right: usize,
+        output: usize,
+        left_columns: usize,
+        right_columns: usize,
+    },
+    RowSelectF16 {
+        input: usize,
+        visual: usize,
+        mask: usize,
+        output: usize,
+        columns: usize,
+    },
     TailTwoGreedy(Box<super::tail_two_greedy::CpuTailTwoGreedyLaunch>),
     GatedDelta(Box<super::gated_delta_launch::CpuGatedDeltaLaunch>),
     CausalAttention(Box<super::causal_attention_launch::CpuCausalLaunch>),
@@ -105,6 +119,58 @@ impl CpuKernelLaunch for CpuOperatorLaunch {
 impl CpuAction {
     fn execute(&self, views: &mut CpuRegionSet<'_>) -> Result<(), CpuRuntimeError> {
         match *self {
+            Self::ConcatColumnsF16 {
+                left,
+                right,
+                output,
+                left_columns,
+                right_columns,
+            } => views.with_io([left, right], [output], |[left, right], [output]| {
+                let l = left_columns
+                    .checked_mul(2)
+                    .ok_or_else(|| CpuRuntimeError::new("concat left width overflows"))?;
+                let r = right_columns
+                    .checked_mul(2)
+                    .ok_or_else(|| CpuRuntimeError::new("concat right width overflows"))?;
+                let width = l
+                    .checked_add(r)
+                    .ok_or_else(|| CpuRuntimeError::new("concat width overflows"))?;
+                if l == 0
+                    || r == 0
+                    || left.len() % l != 0
+                    || right.len() % r != 0
+                    || left.len() / l != right.len() / r
+                    || output.len()
+                        != left
+                            .len()
+                            .checked_add(right.len())
+                            .ok_or_else(|| CpuRuntimeError::new("concat length overflows"))?
+                {
+                    return Err(CpuRuntimeError::new("concat row extents disagree"));
+                }
+                for ((a, b), out) in left
+                    .chunks_exact(l)
+                    .zip(right.chunks_exact(r))
+                    .zip(output.chunks_exact_mut(width))
+                {
+                    out[..l].copy_from_slice(a);
+                    out[l..].copy_from_slice(b);
+                }
+                Ok(())
+            }),
+            Self::RowSelectF16 {
+                input,
+                visual,
+                mask,
+                output,
+                columns,
+            } => views.with_io(
+                [input, visual, mask],
+                [output],
+                |[input, visual, mask], [output]| {
+                    super::elementwise::select_f16_rows(input, visual, mask, output, columns)
+                },
+            ),
             Self::TailTwoGreedy(ref launch) => launch.execute(views),
             Self::GatedDelta(ref launch) => launch.execute(views),
             Self::CausalAttention(ref launch) => launch.execute(views),

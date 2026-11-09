@@ -1,6 +1,37 @@
 use super::*;
 use base64::{engine::general_purpose::STANDARD, Engine};
 
+#[test]
+fn image_request_correlation_fields_preserve_legacy_reports_and_validate_uuid_wire() {
+    let legacy = serde_json::json!({
+        "sample_index":0,"sample_id":"one","phase":"measured","repetition":0,
+        "dispatch_index":0,"http_status":null,"e2e_ms":1.0,"validation_ms":0.0,
+        "response_bytes":0,"image":null,"failure":null,"error":null
+    });
+    let mut record: ImageRequestRecord = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(record.client_attempt_id, None);
+    assert_eq!(record.server_request_id, None);
+    assert_eq!(record.trace_session_uuid, None);
+    assert_eq!(serde_json::to_value(&record).unwrap(), legacy);
+    record.client_attempt_id = Some(uuid::Uuid::new_v4());
+    record.server_request_id = Some(uuid::Uuid::new_v4());
+    record.trace_session_uuid = Some(uuid::Uuid::new_v4());
+    let wire = serde_json::to_value(&record).unwrap();
+    let roundtrip: ImageRequestRecord = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(roundtrip.client_attempt_id, record.client_attempt_id);
+    assert_eq!(roundtrip.server_request_id, record.server_request_id);
+    assert_eq!(roundtrip.trace_session_uuid, record.trace_session_uuid);
+    for name in [
+        "client_attempt_id",
+        "server_request_id",
+        "trace_session_uuid",
+    ] {
+        let mut malformed = wire.clone();
+        malformed[name] = serde_json::json!("not-a-uuid");
+        assert!(serde_json::from_value::<ImageRequestRecord>(malformed).is_err());
+    }
+}
+
 fn png(color: png::ColorType, pixels: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
     {
@@ -155,6 +186,9 @@ fn metrics_do_not_hide_errors_or_invent_missing_slo() {
         phase: ImageRequestPhase::Measured,
         repetition: 0,
         dispatch_index: 0,
+        client_attempt_id: None,
+        server_request_id: None,
+        trace_session_uuid: None,
         http_status: Some(200),
         e2e_ms: 10.0,
         validation_ms: 2.0,
@@ -188,6 +222,9 @@ fn rejection_and_unsent_arrivals_remain_failures_without_success_percentiles() {
         phase: ImageRequestPhase::Measured,
         repetition: 0,
         dispatch_index: index,
+        client_attempt_id: None,
+        server_request_id: None,
+        trace_session_uuid: None,
         http_status: status,
         e2e_ms: 1.0,
         validation_ms: 0.0,
@@ -289,6 +326,9 @@ fn mixed_workloads_require_v3_and_partition_failures_by_request_kind_and_size() 
             phase: ImageRequestPhase::Measured,
             repetition: 0,
             dispatch_index: index,
+            client_attempt_id: None,
+            server_request_id: None,
+            trace_session_uuid: None,
             http_status: if index == 0 { Some(429) } else { None },
             e2e_ms: 0.0,
             validation_ms: 0.0,

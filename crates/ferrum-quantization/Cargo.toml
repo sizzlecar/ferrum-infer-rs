@@ -25,6 +25,9 @@ tempfile = "3.8"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+ferrum-execution = { workspace = true }
+
 [features]
 default = []
 metal = ["ferrum-kernels/metal"]

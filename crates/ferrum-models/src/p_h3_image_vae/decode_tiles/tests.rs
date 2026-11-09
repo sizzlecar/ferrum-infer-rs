@@ -277,13 +277,13 @@ fn run_controller(
     )
     .unwrap();
     let frequency_owners = (
-        decoder.cosine.bytes().bytes().as_ptr(),
-        decoder.sine.bytes().bytes().as_ptr(),
+        decoder.state.cosine.bytes().bytes().as_ptr(),
+        decoder.state.sine.bytes().bytes().as_ptr(),
     );
     if retry {
         output_pressure(decoder.advance(&mut actor, id("run.tiled.first.gpu")));
         assert_eq!(decoder.completed_tiles(), 0);
-        let patch_pointer = match decoder.pending.as_ref() {
+        let patch_pointer = match decoder.state.pending.as_ref() {
             Some(Pending::Patches(p)) => p[0].bytes().bytes().as_ptr(),
             _ => panic!("actual completed patch owner must survive Host failure"),
         };
@@ -296,7 +296,7 @@ fn run_controller(
         output_pressure(decoder.advance(&mut actor, id("run.tiled.retry.patches")));
         assert!(decoder.session.take_execution_profile().is_none());
         assert_eq!(
-            match decoder.pending.as_ref() {
+            match decoder.state.pending.as_ref() {
                 Some(Pending::Patches(p)) => p[0].bytes().bytes().as_ptr(),
                 _ => panic!("pending patch was lost"),
             },
@@ -306,14 +306,14 @@ fn run_controller(
         output_pressure(decoder.advance(&mut actor, id("run.tiled.retry.unpatchify")));
         assert_eq!(decoder.completed_tiles(), 0);
         assert!(decoder.session.take_execution_profile().is_none());
-        let pixel_pointer = match decoder.pending.as_ref() {
+        let pixel_pointer = match decoder.state.pending.as_ref() {
             Some(Pending::Pixels(_, p)) => p.bytes().as_ptr(),
             _ => panic!("completed pixels must survive stitch admission failure"),
         };
         output_pressure(decoder.advance(&mut actor, id("run.tiled.retry.pixels")));
         assert!(decoder.session.take_execution_profile().is_none());
         assert_eq!(
-            match decoder.pending.as_ref() {
+            match decoder.state.pending.as_ref() {
                 Some(Pending::Pixels(_, p)) => p.bytes().as_ptr(),
                 _ => panic!("pending pixels were lost"),
             },
@@ -339,8 +339,8 @@ fn run_controller(
         assert!(decoder.session.take_execution_profile().is_some());
         assert_eq!(
             (
-                decoder.cosine.bytes().bytes().as_ptr(),
-                decoder.sine.bytes().bytes().as_ptr()
+                decoder.state.cosine.bytes().bytes().as_ptr(),
+                decoder.state.sine.bytes().bytes().as_ptr()
             ),
             frequency_owners,
             "each tile retains the same charged immutable frequencies"

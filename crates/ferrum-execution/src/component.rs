@@ -14,6 +14,12 @@ use crate::{
     PreparedTensorExecutor, TensorExecutionError, TensorExecutionOutput, TensorExecutorConfig,
 };
 
+mod custody;
+pub use custody::{
+    RetainedComponentCloseError, RetainedComponentInitializationError,
+    RetainedTensorComponentSession,
+};
+
 /// Single-participant, ordinary fixed-tensor execution. Capacity is a policy
 /// ceiling consumed by the existing device account, not a new allocation ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -206,6 +212,7 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
             &host,
             &config,
             false,
+            None,
         )?;
         self.create_session(resources, receipt, host, config.executor)
     }
@@ -231,6 +238,7 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
             &host,
             &config,
             true,
+            None,
         )?;
         let weights = weights.expect("shared initialization returns its sealed owner");
         self.create_session(resources, receipt, host, config.executor)
@@ -352,6 +360,7 @@ fn initialize_resources<R: DeviceRuntime>(
     host: &HostMemoryAccount,
     config: &ComponentInitializationConfig,
     share_weights: bool,
+    native_started: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<
     (
         Arc<PlanRuntimeResources<R>>,
@@ -362,6 +371,9 @@ fn initialize_resources<R: DeviceRuntime>(
 > {
     source.validate(family.weights())?;
     let driver = RuntimeResourceDriver::new(runtime.clone())?;
+    if let Some(native_started) = native_started {
+        native_started.store(true, std::sync::atomic::Ordering::Release);
+    }
     let provisioning = plan
         .provision_static(runtime, config.request_id.clone())?
         .into_provisioning();

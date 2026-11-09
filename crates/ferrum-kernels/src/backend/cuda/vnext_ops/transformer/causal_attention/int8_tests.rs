@@ -86,6 +86,7 @@ fn launch(shape: CausalAttentionShape, position: usize, tokens: usize) -> Causal
         )
         .unwrap(),
         path: CausalAttentionKernelPath::TokenMajorFallback,
+        rotary: None,
     }
 }
 

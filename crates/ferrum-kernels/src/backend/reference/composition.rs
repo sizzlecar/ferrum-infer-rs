@@ -3,37 +3,59 @@ use std::sync::Arc;
 
 use ferrum_runtime::{
     adjacent_rope_bf16_contract, batched_row_concat_bf16_contract, dense_linear_bf16_contract,
-    dense_linear_contract, gated_residual_bf16_contract, gelu_tanh_bf16_contract,
-    half_split_rope_bf16_contract, head_rms_norm_bf16_contract, layer_norm_bf16_contract,
-    modulation_scale_bf16_contract, plain_residual_add_bf16_contract, row_gather_bf16_contract,
-    silu_bf16_contract, silu_mul_bf16_contract, structured_attention_bf16_contract,
-    structured_gqa_attention_bf16_contract, tanh_bf16_contract,
+    dense_linear_contract, dense_linear_f32_contract, gated_residual_bf16_contract,
+    gelu_tanh_bf16_contract, half_split_rope_bf16_contract, head_rms_norm_bf16_contract,
+    layer_norm_bf16_contract, modulation_scale_bf16_contract, plain_residual_add_bf16_contract,
+    row_gather_bf16_contract, silu_bf16_contract, silu_mul_bf16_contract,
+    structured_attention_bf16_contract, structured_gqa_attention_bf16_contract, tanh_bf16_contract,
     zero_centered_rms_norm_bf16_contract, CapabilityCatalog, CapabilityId, ContractVersion,
     DeviceClass, DeviceDescriptor, DeviceId, DeviceRuntime, DynamicStorageAllocator,
     DynamicStorageProfile, DynamicStorageView, EngineProviderDescriptor, OperationContract,
     OperationProvider, OperationRuntimeRegistry, ProviderId, VNextError, WeightMaterializerId,
     WeightMaterializerRegistry, ADJACENT_ROPE_BF16_CAPABILITY_ID,
     BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID, DENSE_LINEAR_BF16_CAPABILITY_ID,
-    DENSE_LINEAR_F16_CAPABILITY_ID, GATED_RESIDUAL_BF16_CAPABILITY_ID,
-    GELU_TANH_BF16_CAPABILITY_ID, HALF_SPLIT_ROPE_BF16_CAPABILITY_ID,
-    HEAD_RMS_NORM_BF16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
-    LAYER_NORM_BF16_CAPABILITY_ID, MODULATION_SCALE_BF16_CAPABILITY_ID,
-    PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID, ROW_GATHER_BF16_CAPABILITY_ID, SILU_BF16_CAPABILITY_ID,
-    SILU_MUL_BF16_CAPABILITY_ID, STRUCTURED_ATTENTION_BF16_CAPABILITY_ID,
-    STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID, TANH_BF16_CAPABILITY_ID,
-    ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID,
+    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_F32_CAPABILITY_ID,
+    GATED_RESIDUAL_BF16_CAPABILITY_ID, GELU_TANH_BF16_CAPABILITY_ID,
+    HALF_SPLIT_ROPE_BF16_CAPABILITY_ID, HEAD_RMS_NORM_BF16_CAPABILITY_ID,
+    IDENTITY_WEIGHT_MATERIALIZER_ID, LAYER_NORM_BF16_CAPABILITY_ID,
+    MODULATION_SCALE_BF16_CAPABILITY_ID, PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID,
+    ROW_GATHER_BF16_CAPABILITY_ID, SILU_BF16_CAPABILITY_ID, SILU_MUL_BF16_CAPABILITY_ID,
+    STRUCTURED_ATTENTION_BF16_CAPABILITY_ID, STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID,
+    TANH_BF16_CAPABILITY_ID, ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID,
 };
 
 use super::adjacent_rope::ReferenceAdjacentRopeProvider;
+use super::affine_f32::reference_vnext_affine_linear_f32_provider;
+use super::batched_suffix_append_f32::reference_vnext_batched_suffix_append_f32_provider;
 use super::cast_f32_to_bf16::reference_vnext_cast_f32_to_bf16_provider;
+use super::channelwise_f32::reference_vnext_channelwise_f32_provider;
+use super::cnn_f32::reference_vnext_cnn_f32_provider;
 use super::cross_attention::ReferenceCrossAttentionProvider;
 use super::dense_linear::{implementation_fingerprint, ReferenceDenseLinearProvider};
+use super::fused_head_rms_partial_rope::ReferenceFusedHeadRmsPartialRopeProvider;
+use super::gelu_f32::{
+    reference_vnext_gelu_erf_f32_provider, reference_vnext_gelu_tanh_f32_provider,
+};
 use super::gelu_tanh::ReferenceGeluTanhProvider;
 use super::half_split_rope::ReferenceHalfSplitRopeProvider;
 use super::head_rms_norm::ReferenceHeadRmsNormProvider;
 use super::layer_norm::ReferenceLayerNormProvider;
+use super::layer_norm_f32::reference_vnext_layer_norm_f32_provider;
+use super::norm_rope_f32::{
+    reference_vnext_half_split_rope_f32_provider, reference_vnext_head_rms_norm_f32_provider,
+    reference_vnext_unit_head_rms_partial_rope_f32_provider,
+};
 use super::plain_residual_add::ReferencePlainResidualAddProvider;
 use super::pointwise::{ReferencePointwiseKind, ReferencePointwiseProvider};
+use super::pointwise_f32::{
+    reference_vnext_plain_residual_add_f32_provider, reference_vnext_silu_mul_f32_provider,
+};
+use super::row_rms_addcmul::{Kind as RowRmsAddcmulKind, ReferenceRowRmsAddcmulProvider};
+use super::row_scatter_f32::{
+    reference_vnext_row_scatter_add_f32_provider, reference_vnext_row_scatter_replace_f32_provider,
+};
+use super::row_selected_bf16::reference_vnext_row_selected_bf16_provider;
+use super::row_selected_modulation::reference_vnext_row_selected_modulation_bf16_f32_provider;
 use super::row_transport::{ReferenceRowTransportKind, ReferenceRowTransportProvider};
 use super::runtime::{
     ReferenceDeviceRuntime, ReferenceDeviceRuntimeConfig, ReferenceDeviceRuntimeError,
@@ -48,8 +70,15 @@ use super::transcendental::{
     numerical_implementation_fingerprint, ReferenceTranscendentalKind,
     ReferenceTranscendentalProvider,
 };
+use super::vision_layout_f32::{
+    reference_vnext_patch_projection_f32_provider, reference_vnext_reshape_copy_f32_provider,
+};
 use super::zero_centered_rms_norm::ReferenceZeroCenteredRmsNormProvider;
 use ferrum_runtime::TensorPrimitiveBf16;
+use ferrum_runtime::{
+    addcmul_bf16_contract, row_rms_norm_single_round_bf16_contract, ADDCMUL_BF16_CAPABILITY_ID,
+    ROW_RMS_NORM_SINGLE_ROUND_BF16_CAPABILITY_ID,
+};
 use ferrum_runtime::{
     channel_l2_norm_bf16_contract, conv2d_bf16_contract, CHANNEL_L2_NORM_BF16_CAPABILITY_ID,
     CONV2D_BF16_CAPABILITY_ID,
@@ -60,6 +89,12 @@ use ferrum_runtime::{
     SPATIAL_ATTENTION_BF16_CAPABILITY_ID, SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID,
 };
 use ferrum_runtime::{cross_attention_bf16_contract, CROSS_ATTENTION_BF16_CAPABILITY_ID};
+use ferrum_runtime::{
+    fused_head_rms_partial_rope_bf16_contract, FUSED_HEAD_RMS_PARTIAL_ROPE_BF16_CAPABILITY_ID,
+};
+use ferrum_runtime::{
+    partial_half_split_rope_bf16_contract, PARTIAL_HALF_SPLIT_ROPE_BF16_CAPABILITY_ID,
+};
 use ferrum_runtime::{
     plain_residual_add_nchw_bf16_contract, silu_nchw_bf16_contract,
     PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID, SILU_NCHW_BF16_CAPABILITY_ID,
@@ -82,11 +117,37 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
         CapabilityId::new(PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID)?,
         CapabilityId::new(PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID)?,
         CapabilityId::new(HALF_SPLIT_ROPE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(PARTIAL_HALF_SPLIT_ROPE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(FUSED_HEAD_RMS_PARTIAL_ROPE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ROW_RMS_NORM_SINGLE_ROUND_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ADDCMUL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::STRUCTURED_GQA_ATTENTION_F32_CAPABILITY_ID)?,
         CapabilityId::new(DENSE_LINEAR_F16_CAPABILITY_ID)?,
         CapabilityId::new(DENSE_LINEAR_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(DENSE_LINEAR_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::AFFINE_LINEAR_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::CAST_F32_TO_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SILU_MUL_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GELU_TANH_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GELU_ERF_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SCATTER_REPLACE_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SCATTER_ADD_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PATCH_PROJECTION_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::RESHAPE_COPY_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::HEAD_RMS_NORM_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::HALF_SPLIT_ROPE_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::UNIT_HEAD_RMS_PARTIAL_ROPE_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GROUPED_COLUMN_SLICE_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CHANNEL_BIAS_ADD_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CHANNEL_SCALED_RESIDUAL_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::NAN_TO_NUM_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SELECTED_MODULATION_BF16_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SELECTED_MODULATION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SELECTED_ADDCMUL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::BATCHED_SUFFIX_APPEND_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::LAYER_NORM_F32_CAPABILITY_ID)?,
         CapabilityId::new(LAYER_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ROW_GATHER_BF16_CAPABILITY_ID)?,
@@ -103,6 +164,9 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
         CapabilityId::new(TANH_BF16_CAPABILITY_ID)?,
     ]);
     for kind in TensorPrimitiveBf16::ALL {
+        capabilities.insert(CapabilityId::new(kind.capability_id())?);
+    }
+    for kind in ferrum_runtime::F32CnnOp::ALL {
         capabilities.insert(CapabilityId::new(kind.capability_id())?);
     }
     Ok(capabilities)
@@ -146,12 +210,36 @@ fn reference_vnext_runtime_config_with_capacity(
             include_str!("half_split_rope.rs").as_bytes(),
             include_str!("runtime/half_split_rope.rs").as_bytes(),
             include_str!("structured_gqa_attention.rs").as_bytes(),
-            include_str!("runtime/structured_gqa_attention.rs").as_bytes(),
             include_str!("structured_gqa_attention_f32.rs").as_bytes(),
             include_str!("runtime/structured_gqa_attention_f32.rs").as_bytes(),
+            include_str!("runtime/structured_gqa_attention.rs").as_bytes(),
             include_str!("dense_linear.rs").as_bytes(),
+            include_str!("affine_f32.rs").as_bytes(),
+            include_str!("runtime/affine_f32.rs").as_bytes(),
             include_str!("cast_f32_to_bf16.rs").as_bytes(),
             include_str!("runtime/cast_f32_to_bf16.rs").as_bytes(),
+            include_str!("pointwise_f32.rs").as_bytes(),
+            include_str!("gelu_f32.rs").as_bytes(),
+            include_str!("runtime/gelu_f32.rs").as_bytes(),
+            include_str!("row_scatter_f32.rs").as_bytes(),
+            include_str!("runtime/row_scatter_f32.rs").as_bytes(),
+            include_str!("vision_layout_f32.rs").as_bytes(),
+            include_str!("runtime/vision_layout_f32.rs").as_bytes(),
+            include_str!("channelwise_f32.rs").as_bytes(),
+            include_str!("runtime/channelwise_f32.rs").as_bytes(),
+            include_str!("row_selected_modulation.rs").as_bytes(),
+            include_str!("runtime/row_selected_modulation.rs").as_bytes(),
+            include_str!("row_selected_bf16.rs").as_bytes(),
+            include_str!("runtime/row_selected_bf16.rs").as_bytes(),
+            include_str!("batched_suffix_append_f32.rs").as_bytes(),
+            include_str!("runtime/batched_suffix_append_f32.rs").as_bytes(),
+            include_str!("layer_norm_f32.rs").as_bytes(),
+            include_str!("runtime/layer_norm_f32.rs").as_bytes(),
+            include_str!("cnn_f32.rs").as_bytes(),
+            include_str!("runtime/cnn_f32.rs").as_bytes(),
+            include_str!("runtime/pointwise_f32.rs").as_bytes(),
+            include_str!("norm_rope_f32.rs").as_bytes(),
+            include_str!("runtime/norm_rope_f32.rs").as_bytes(),
             include_str!("layer_norm.rs").as_bytes(),
             include_str!("runtime/layer_norm.rs").as_bytes(),
             include_str!("zero_centered_rms_norm.rs").as_bytes(),
@@ -198,11 +286,41 @@ pub fn reference_vnext_operation_registry(
         Box::new(plain_residual_add_nchw_bf16_contract().map_err(contract_error)?),
         Box::new(plain_residual_add_bf16_contract().map_err(contract_error)?),
         Box::new(half_split_rope_bf16_contract().map_err(contract_error)?),
+        Box::new(partial_half_split_rope_bf16_contract().map_err(contract_error)?),
+        Box::new(fused_head_rms_partial_rope_bf16_contract().map_err(contract_error)?),
+        Box::new(row_rms_norm_single_round_bf16_contract().map_err(contract_error)?),
+        Box::new(addcmul_bf16_contract().map_err(contract_error)?),
         Box::new(structured_gqa_attention_bf16_contract().map_err(contract_error)?),
         Box::new(ferrum_runtime::structured_gqa_attention_f32_contract().map_err(contract_error)?),
         Box::new(dense_linear_contract().map_err(contract_error)?),
         Box::new(dense_linear_bf16_contract().map_err(contract_error)?),
+        Box::new(dense_linear_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::affine_linear_f32_contract().map_err(contract_error)?),
         Box::new(ferrum_runtime::cast_f32_to_bf16_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::plain_residual_add_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::silu_mul_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::gelu_tanh_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::gelu_erf_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::row_scatter_replace_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::row_scatter_add_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::patch_projection_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::reshape_copy_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::head_rms_norm_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::half_split_rope_f32_contract().map_err(contract_error)?),
+        Box::new(
+            ferrum_runtime::unit_head_rms_partial_rope_f32_contract().map_err(contract_error)?,
+        ),
+        Box::new(ferrum_runtime::grouped_column_slice_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::channel_bias_add_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::channel_scaled_residual_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::nan_to_num_f32_contract().map_err(contract_error)?),
+        Box::new(
+            ferrum_runtime::row_selected_modulation_bf16_f32_contract().map_err(contract_error)?,
+        ),
+        Box::new(ferrum_runtime::row_selected_modulation_bf16_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::row_selected_addcmul_bf16_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::batched_suffix_append_f32_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::layer_norm_f32_contract().map_err(contract_error)?),
         Box::new(layer_norm_bf16_contract().map_err(contract_error)?),
         Box::new(head_rms_norm_bf16_contract().map_err(contract_error)?),
         Box::new(row_gather_bf16_contract().map_err(contract_error)?),
@@ -221,6 +339,9 @@ pub fn reference_vnext_operation_registry(
     for kind in TensorPrimitiveBf16::ALL {
         contracts.push(Box::new(kind.contract().map_err(contract_error)?));
     }
+    for kind in ferrum_runtime::F32CnnOp::ALL {
+        contracts.push(Box::new(kind.contract().map_err(contract_error)?));
+    }
     let mut providers = vec![
         reference_vnext_channel_l2_norm_image_bf16_provider(runtime)?,
         reference_vnext_spatial_attention_bf16_provider(runtime)?,
@@ -232,11 +353,55 @@ pub fn reference_vnext_operation_registry(
         reference_vnext_plain_residual_add_nchw_bf16_provider(runtime)?,
         reference_vnext_plain_residual_add_bf16_provider(runtime)?,
         reference_vnext_half_split_rope_bf16_provider(runtime)?,
+        reference_vnext_partial_half_split_rope_bf16_provider(runtime)?,
+        reference_vnext_fused_head_rms_partial_rope_bf16_provider(runtime)?,
+        reference_vnext_row_rms_norm_single_round_bf16_provider(runtime)?,
+        reference_vnext_addcmul_bf16_provider(runtime)?,
         reference_vnext_structured_gqa_attention_bf16_provider(runtime)?,
         reference_vnext_structured_gqa_attention_f32_provider(runtime)?,
         reference_vnext_dense_linear_provider(runtime)?,
         reference_vnext_dense_linear_bf16_provider(runtime)?,
+        reference_vnext_dense_linear_f32_provider(runtime)?,
+        reference_vnext_affine_linear_f32_provider(runtime)?,
         reference_vnext_cast_f32_to_bf16_provider(runtime)?,
+        reference_vnext_plain_residual_add_f32_provider(runtime)?,
+        reference_vnext_silu_mul_f32_provider(runtime)?,
+        reference_vnext_gelu_tanh_f32_provider(runtime)?,
+        reference_vnext_gelu_erf_f32_provider(runtime)?,
+        reference_vnext_row_scatter_replace_f32_provider(runtime)?,
+        reference_vnext_row_scatter_add_f32_provider(runtime)?,
+        reference_vnext_patch_projection_f32_provider(runtime)?,
+        reference_vnext_reshape_copy_f32_provider(runtime)?,
+        reference_vnext_head_rms_norm_f32_provider(runtime)?,
+        reference_vnext_half_split_rope_f32_provider(runtime)?,
+        reference_vnext_unit_head_rms_partial_rope_f32_provider(runtime)?,
+        reference_vnext_row_selected_modulation_bf16_f32_provider(runtime)?,
+        reference_vnext_row_selected_bf16_provider(
+            runtime,
+            ferrum_runtime::RowSelectedBf16Kind::Modulation,
+        )?,
+        reference_vnext_row_selected_bf16_provider(
+            runtime,
+            ferrum_runtime::RowSelectedBf16Kind::Addcmul,
+        )?,
+        reference_vnext_batched_suffix_append_f32_provider(runtime)?,
+        reference_vnext_layer_norm_f32_provider(runtime)?,
+        reference_vnext_channelwise_f32_provider(
+            runtime,
+            ferrum_runtime::F32ChannelwiseOp::GroupedColumnSlice,
+        )?,
+        reference_vnext_channelwise_f32_provider(
+            runtime,
+            ferrum_runtime::F32ChannelwiseOp::BiasAdd,
+        )?,
+        reference_vnext_channelwise_f32_provider(
+            runtime,
+            ferrum_runtime::F32ChannelwiseOp::ScaledResidual,
+        )?,
+        reference_vnext_channelwise_f32_provider(
+            runtime,
+            ferrum_runtime::F32ChannelwiseOp::NanToNum,
+        )?,
         reference_vnext_layer_norm_bf16_provider(runtime)?,
         reference_vnext_head_rms_norm_bf16_provider(runtime)?,
         reference_vnext_row_gather_bf16_provider(runtime)?,
@@ -256,6 +421,9 @@ pub fn reference_vnext_operation_registry(
         providers.push(reference_vnext_tensor_primitive_bf16_provider(
             runtime, kind,
         )?);
+    }
+    for kind in ferrum_runtime::F32CnnOp::ALL {
+        providers.push(reference_vnext_cnn_f32_provider(runtime, kind)?);
     }
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }
@@ -298,6 +466,13 @@ pub fn reference_vnext_dense_linear_bf16_provider(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
     Ok(Box::new(ReferenceDenseLinearProvider::new_bf16(runtime)?))
+}
+
+/// Full-matrix F32 operands and left-to-right F32 arithmetic.
+pub fn reference_vnext_dense_linear_f32_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceDenseLinearProvider::new_f32(runtime)?))
 }
 
 /// Builds the fixed-tensor BF16 population LayerNorm implementation without
@@ -396,6 +571,40 @@ pub fn reference_vnext_half_split_rope_bf16_provider(
     Ok(Box::new(ReferenceHalfSplitRopeProvider::new(runtime)?))
 }
 
+/// Builds leading-channel half-split BF16 rotation with exact tail copies.
+pub fn reference_vnext_fused_head_rms_partial_rope_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceFusedHeadRmsPartialRopeProvider::new(
+        runtime,
+    )?))
+}
+
+pub fn reference_vnext_row_rms_norm_single_round_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceRowRmsAddcmulProvider::new(
+        runtime,
+        RowRmsAddcmulKind::RowRms,
+    )?))
+}
+pub fn reference_vnext_addcmul_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceRowRmsAddcmulProvider::new(
+        runtime,
+        RowRmsAddcmulKind::Addcmul,
+    )?))
+}
+
+pub fn reference_vnext_partial_half_split_rope_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceHalfSplitRopeProvider::new_partial(
+        runtime,
+    )?))
+}
+
 /// Builds the independent fixed-tensor BF16 structured gqa attention provider.
 pub fn reference_vnext_structured_gqa_attention_bf16_provider(
     runtime: &ReferenceDeviceRuntime,
@@ -403,6 +612,16 @@ pub fn reference_vnext_structured_gqa_attention_bf16_provider(
     Ok(Box::new(ReferenceStructuredGqaAttentionProvider::new(
         runtime,
     )?))
+}
+
+pub fn reference_vnext_structured_gqa_attention_f32_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(
+        super::structured_gqa_attention_f32::ReferenceStructuredGqaAttentionF32Provider::new(
+            runtime,
+        )?,
+    ))
 }
 
 /// Builds rectangular noncausal attention with explicit key validity and FP32 online softmax.
@@ -641,14 +860,4 @@ pub fn reference_vnext_tensor_primitive_bf16_provider(
     Ok(Box::new(ReferenceTensorPrimitiveProvider::new(
         runtime, kind,
     )?))
-}
-
-pub fn reference_vnext_structured_gqa_attention_f32_provider(
-    runtime: &ReferenceDeviceRuntime,
-) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
-    Ok(Box::new(
-        super::structured_gqa_attention_f32::ReferenceStructuredGqaAttentionF32Provider::new(
-            runtime,
-        )?,
-    ))
 }

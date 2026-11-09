@@ -56,6 +56,7 @@ mod allocation;
 mod binding_scatter;
 mod binding_transfers;
 mod blas;
+pub(super) use blas::CudaBlasOwner;
 #[cfg(test)]
 mod compact_upload_scatter_tests;
 mod cudnn;
@@ -76,7 +77,7 @@ mod tensor_io;
 mod terminal_readback;
 pub use cudnn::CudaCudnnConfig;
 pub use cudnn::CudnnSdpaPlanPolicy;
-pub(crate) use cudnn::{CudaCudnnOwner, CudnnConv2dDescriptor, PreparedConv};
+pub(crate) use cudnn::{CudaCudnnOwner, CudnnConv2dDescriptor, CudnnConvScalar, PreparedConv};
 pub(crate) use cudnn::{
     CudaCudnnSdpaCache, CudnnSdpaBindings, CudnnSdpaExecution, CudnnSdpaPlan, CudnnSdpaSignature,
 };
@@ -87,9 +88,12 @@ pub(crate) use sequence_physical::{
     CudaBindingProgramRanges, CudaPhysicalOwnerBuilder, CudaPhysicalRowWindow,
     CudaSequencePhysicalTable,
 };
+pub(crate) use tensor_eager::create_native;
+pub(crate) use tensor_eager::{CudaCausalProviderRetention, TensorLaneRetention};
 pub use tensor_eager::{
-    CudaMemoryUtilization, CudaTensorMemoryObservation, CudaTensorRuntimeAutoConfig,
-    CudaTensorRuntimeConfig, CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
+    CudaDenseF16CausalProfile, CudaMemoryUtilization, CudaTensorAndCausalRuntimeAutoConfig,
+    CudaTensorAndCausalRuntimeConfig, CudaTensorExecutionProfile, CudaTensorMemoryObservation,
+    CudaTensorRuntimeAutoConfig, CudaTensorRuntimeConfig, CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
     CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION,
 };
 pub(crate) use tensor_eager::{CudaTensorCutlassRetention, CudaTensorProviderRetention};
@@ -98,6 +102,24 @@ use tensor_io::validate_tensor_command;
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(target_os = "linux")]
+fn replay_preparation_process_usage() -> Option<[i64; 5]> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // getrusage writes the complete output on success. This process-wide
+    // diagnostic distinguishes CPU work and paging from a blocked API call.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    Some([
+        usage.ru_utime.tv_sec * 1_000_000 + usage.ru_utime.tv_usec,
+        usage.ru_stime.tv_sec * 1_000_000 + usage.ru_stime.tv_usec,
+        usage.ru_minflt,
+        usage.ru_majflt,
+        usage.ru_nivcsw,
+    ])
+}
+
 pub(super) struct CudaSubmissionStageTimer<'sink, S>
 where
     S: DeviceSubmissionTimingSink,
@@ -105,6 +127,9 @@ where
     sink: &'sink S,
     stage: DeviceSubmissionStage,
     started: Option<Instant>,
+    trace_replay_preparation: bool,
+    #[cfg(target_os = "linux")]
+    preparation_usage: Option<[i64; 5]>,
 }
 
 impl<'sink, S> CudaSubmissionStageTimer<'sink, S>
@@ -113,10 +138,24 @@ where
 {
     #[inline(always)]
     pub(super) fn start(sink: &'sink S, stage: DeviceSubmissionStage) -> Self {
+        // A bounded cold-path log can diagnose capture stalls without opening
+        // per-command CUDA events or serializing a full execution profile.
+        let trace_replay_preparation = matches!(
+            stage,
+            DeviceSubmissionStage::ReusableCaptureRecord
+                | DeviceSubmissionStage::ReusableCaptureTopology
+                | DeviceSubmissionStage::ReusableGraphInstantiate
+                | DeviceSubmissionStage::ReusableGraphUpload
+        ) && tracing::enabled!(target: "ferrum.cuda.replay_preparation", tracing::Level::DEBUG);
         Self {
             sink,
             stage,
-            started: S::ENABLED.then(Instant::now),
+            started: (S::ENABLED || trace_replay_preparation).then(Instant::now),
+            trace_replay_preparation,
+            #[cfg(target_os = "linux")]
+            preparation_usage: trace_replay_preparation
+                .then(replay_preparation_process_usage)
+                .flatten(),
         }
     }
 }
@@ -128,8 +167,36 @@ where
     fn drop(&mut self) {
         if let Some(started) = self.started.take() {
             if !std::thread::panicking() {
-                self.sink
-                    .record_device_submission(self.stage, started.elapsed());
+                let elapsed = started.elapsed();
+                if S::ENABLED {
+                    self.sink.record_device_submission(self.stage, elapsed);
+                }
+                if self.trace_replay_preparation {
+                    #[cfg(target_os = "linux")]
+                    let process_usage = self
+                        .preparation_usage
+                        .zip(replay_preparation_process_usage())
+                        .map(|(start, end)| {
+                            std::array::from_fn::<_, 5, _>(|index| {
+                                end[index].saturating_sub(start[index])
+                            })
+                        });
+                    #[cfg(target_os = "linux")]
+                    tracing::debug!(
+                        target: "ferrum.cuda.replay_preparation",
+                        stage = ?self.stage,
+                        elapsed_us = elapsed.as_micros() as u64,
+                        process_usage = ?process_usage,
+                        "CUDA replay preparation host timing; usage=[user_us,system_us,minor_faults,major_faults,involuntary_switches]"
+                    );
+                    #[cfg(not(target_os = "linux"))]
+                    tracing::debug!(
+                        target: "ferrum.cuda.replay_preparation",
+                        stage = ?self.stage,
+                        elapsed_us = elapsed.as_micros() as u64,
+                        "CUDA replay preparation host timing"
+                    );
+                }
             }
         }
     }
@@ -553,6 +620,8 @@ pub(crate) struct CudaCommandExecutable {
     host_upload_layout: Option<HostTransferLayout>,
     work_declaration: CudaWorkDeclaration,
     enqueue: Mutex<CudaEnqueueAction>,
+    // Functions in enqueue drop before their separately admitted module quota.
+    _causal_modules: Option<Arc<CudaCausalProviderRetention>>,
 }
 
 impl CudaCommandExecutable {
@@ -561,14 +630,28 @@ impl CudaCommandExecutable {
         host_storage: Vec<Box<[u8]>>,
         enqueue: EnqueueAction,
     ) -> Self {
+        let causal_modules = causal_retention_for_regions(&regions);
         Self {
             regions,
             host_storage,
             host_upload_layout: None,
             work_declaration: CudaWorkDeclaration::Static,
             enqueue: Mutex::new(CudaEnqueueAction::Static(enqueue)),
+            _causal_modules: causal_modules,
         }
     }
+}
+
+fn causal_retention_for_regions(
+    regions: &[CudaBufferRegion],
+) -> Option<Arc<CudaCausalProviderRetention>> {
+    regions.iter().find_map(|region| {
+        region
+            ._allocation
+            ._tensor_owner
+            .as_ref()
+            .and_then(|owner| owner.causal_retention())
+    })
 }
 
 /// A snapshot of provider numerical status, retained by the submission rather
@@ -1407,6 +1490,7 @@ impl CudaDeviceCommand {
             + 'static,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let runtime_instance = common_runtime_instance(&regions)?;
+        let causal_modules = causal_retention_for_regions(&regions);
         Ok(Self {
             runtime_instance,
             operation: operation.as_str(),
@@ -1426,6 +1510,7 @@ impl CudaDeviceCommand {
                         enqueue(stream, regions).map(CudaEnqueuedWork::Dependency)
                     },
                 ))),
+                _causal_modules: causal_modules,
             })),
             fence_dependencies: Vec::new(),
             binding_owner_tables: Vec::new(),
@@ -2893,7 +2978,7 @@ pub struct CudaDeviceStream {
     id: u64,
     runtime_instance: u64,
     stream: Arc<CudaStream>,
-    blas: Option<Arc<CudaBlas>>,
+    blas: Option<Arc<CudaBlasOwner>>,
     state: Arc<CudaStreamState>,
     executable_cache: CudaExecutableCache,
     terminal_readback_pool: Arc<terminal_readback::Pool>,
@@ -3015,7 +3100,7 @@ pub struct CudaDeviceFence {
     stream_state: Arc<CudaStreamState>,
     terminal_accounted: AtomicBool,
     _stream: Arc<CudaStream>,
-    _blas: Option<Arc<CudaBlas>>,
+    _blas: Option<Arc<CudaBlasOwner>>,
     _commands: Vec<CudaDeviceCommand>,
 }
 
@@ -3287,7 +3372,7 @@ fn cuda_event_elapsed_ns(start: &CudaEvent, end: &CudaEvent) -> Option<u64> {
 struct QuarantinedSubmission {
     stream_id: u64,
     _stream: Arc<CudaStream>,
-    _blas: Option<Arc<CudaBlas>>,
+    _blas: Option<Arc<CudaBlasOwner>>,
     _commands: Vec<CudaDeviceCommand>,
 }
 
@@ -3772,6 +3857,11 @@ impl CudaDeviceRuntime {
 
     pub(super) fn context(&self) -> &Arc<CudaContext> {
         &self.context
+    }
+
+    /// Distinguishes independently admitted runtimes even on the same GPU.
+    pub(super) const fn instance_identity(&self) -> u64 {
+        self.runtime_instance
     }
 
     fn validate_buffer(&self, buffer: &CudaDeviceBuffer) -> Result<(), CudaDeviceRuntimeError> {
@@ -5021,9 +5111,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             let blas = if self.tensor_eager.is_some() {
                 None
             } else {
-                Some(Arc::new(CudaBlas::new(Arc::clone(&stream)).map_err(
-                    |error| CudaDeviceRuntimeError::blas("cuBLAS handle creation", error),
-                )?))
+                Some(Arc::new(CudaBlasOwner::new(Arc::clone(&stream), 0)?))
             };
             if trace_enabled {
                 tracing::debug!(
@@ -5076,7 +5164,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
             stream,
             blas,
             state: Arc::new(CudaStreamState::new()),
-            executable_cache: CudaExecutableCache::new(),
+            executable_cache: CudaExecutableCache::new().with_tensor_lane(
+                tensor_lane
+                    .clone()
+                    .filter(|lane| lane.replay_limit().is_some()),
+            ),
             terminal_readback_pool: Arc::new(terminal_readback::Pool::new()),
             tensor_lane,
             idle_native_lanes: self
@@ -5689,13 +5781,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
             "CUDA zero",
         )?;
         let destination_region = destination.region(destination_offset_bytes..destination_end)?;
-        if self.tensor_eager.is_some() {
-            if !matches!(
+        if let Some(owner) = &self.tensor_eager {
+            if !crate::backend::cuda_tensor_causal_policy::permits_zero(
+                owner.execution_profile(),
                 destination.descriptor.usage,
-                ferrum_runtime::BufferUsage::Weights | ferrum_runtime::BufferUsage::Persistent
             ) {
                 return Err(CudaDeviceRuntimeError::contract(
-                    "CUDA tensor static zero requires weights or plan-persistent storage",
+                    "CUDA bounded zero usage is not authorized by its execution profile",
                 ));
             }
             return CudaDeviceCommand::static_zero(self.runtime_instance, destination_region);
@@ -5764,7 +5856,14 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 CudaDeviceRuntimeError::contract("CUDA command batch is empty"),
             ));
         }
-        if self.tensor_eager.is_some() && commands.reusable_execution_capture().is_some() {
+        let bounded_replay = self
+            .tensor_eager
+            .as_ref()
+            .is_some_and(|state| state.decode_replay().is_some());
+        if self.tensor_eager.is_some()
+            && !bounded_replay
+            && commands.reusable_execution_capture().is_some()
+        {
             return Err(DefinitelyNotSubmitted::new(
                 CudaDeviceRuntimeError::contract(
                     "CUDA tensor eager runtime cannot capture reusable executables",
@@ -5799,6 +5898,19 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 .map_err(DefinitelyNotSubmitted::new)?;
         }
         let compute_path_requirement = commands.compute_path_requirement();
+        if self.tensor_eager.is_some()
+            && !bounded_replay
+            && !matches!(
+                compute_path_requirement,
+                DeviceComputePathRequirement::Adaptive | DeviceComputePathRequirement::EagerOnly
+            )
+        {
+            return Err(DefinitelyNotSubmitted::new(
+                CudaDeviceRuntimeError::contract(
+                    "bounded tensor/causal runtime requires eager execution without replay",
+                ),
+            ));
+        }
         let declared_eager_compute_node_indices = commands
             .declared_eager_compute_node_indices()
             .iter()
@@ -5815,20 +5927,25 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .into_iter()
             .map(|entry| {
                 let (phase, node_index, logical_work, command) = entry.into_parts();
-                let command = match logical_work {
+                let mut command = match logical_work {
                     Some(logical_work) => command.bind_core_logical_work(logical_work)?,
                     None => command,
                 };
                 validate_tensor_command(&command)?;
                 command.validate_managed_transfer()?;
-                if self.tensor_eager.is_some() {
-                    command.validate_tensor_phase(phase)?;
+                if let Some(owner) = &self.tensor_eager {
+                    if owner.execution_profile() != CudaTensorExecutionProfile::TensorOnly {
+                        command.prepare_bounded_causal_phase(phase, bounded_replay)?;
+                    } else {
+                        command.validate_tensor_phase(phase)?;
+                    }
                 } else if command.tensor_work.is_some() || command.tensor_transfer.is_some() {
                     return Err(CudaDeviceRuntimeError::contract(
                         "CUDA tensor work requires a bounded tensor eager runtime",
                     ));
                 }
-                if (command.tensor_work.is_some() || command.tensor_transfer.is_some())
+                if (command.tensor_work.is_some()
+                    || (command.tensor_transfer.is_some() && !bounded_replay))
                     && (reusable_execution_capture.is_some()
                         || !matches!(
                             compute_path_requirement,
@@ -6034,27 +6151,32 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
             }
         }
-        let executable_candidates = match compute_path_requirement {
-            DeviceComputePathRequirement::Adaptive => {
-                let eager_boundary_node_indices = reusable_execution_capture
-                    .as_ref()
-                    .map(DeviceReusableExecutionCapture::eager_boundary_node_indices)
-                    .unwrap_or_default();
-                match cuda_executable_candidates(
-                    &command_phases,
-                    &commands,
-                    command_node_indices.as_deref(),
-                    eager_boundary_node_indices,
-                ) {
-                    Ok(candidates) => candidates,
-                    Err(error) => return Err(DefinitelyNotSubmitted::new(error)),
+        let executable_candidates = if self.tensor_eager.is_some() && !bounded_replay {
+            Vec::new()
+        } else {
+            match compute_path_requirement {
+                DeviceComputePathRequirement::Adaptive => {
+                    let eager_boundary_node_indices = reusable_execution_capture
+                        .as_ref()
+                        .map(DeviceReusableExecutionCapture::eager_boundary_node_indices)
+                        .unwrap_or_default();
+                    match cuda_executable_candidates(
+                        &command_phases,
+                        &commands,
+                        command_node_indices.as_deref(),
+                        eager_boundary_node_indices,
+                    ) {
+                        Ok(candidates) => candidates,
+                        Err(error) => return Err(DefinitelyNotSubmitted::new(error)),
+                    }
                 }
+                DeviceComputePathRequirement::EagerOnly
+                | DeviceComputePathRequirement::ReplayedOnly
+                | DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => Vec::new(),
             }
-            DeviceComputePathRequirement::EagerOnly
-            | DeviceComputePathRequirement::ReplayedOnly
-            | DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => Vec::new(),
         };
-        let capture_allowed = stream.state.is_quiescent();
+        let capture_allowed =
+            (self.tensor_eager.is_none() || bounded_replay) && stream.state.is_quiescent();
         let mut commands = tensor_io::SubmissionGuard::new(self, stream, commands);
         if let Err(error) = stream.state.begin_submission() {
             return Err(DefinitelyNotSubmitted::new(error));
@@ -7769,3 +7891,6 @@ mod tests {
             .contains("non-portable native operation identity"));
     }
 }
+
+#[cfg(test)]
+mod row_bias_retention_tests;

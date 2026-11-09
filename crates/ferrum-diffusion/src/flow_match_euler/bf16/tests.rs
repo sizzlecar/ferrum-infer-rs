@@ -62,6 +62,98 @@ fn bits(data: &ManagedHostBytes) -> Vec<u16> {
 }
 
 #[test]
+fn cancelling_prepared_update_releases_backing_without_consuming_step() {
+    let host = account(6, 4, 2);
+    let mut euler = solver(host.clone(), spec(&[1]), &[1.0], 0.0);
+    let x = sample(&host, &[1], &[0x4000]);
+    let v = bytes(&host, HostMemoryClass::Output, &[0x3f80]);
+    let pending = euler.prepare_advance(&x, &spec(&[1]), &v).unwrap();
+    assert_eq!(pending.step().index(), 0);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 6);
+    drop(pending);
+    assert_eq!(euler.step_index(), 0);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 4);
+    assert_eq!(bits(x.bytes()), [0x4000]);
+
+    let (_, updated) = euler.prepare_advance(&x, &spec(&[1]), &v).unwrap().commit();
+    assert_eq!(bits(updated.bytes()), [0x3f80]);
+    assert!(euler.is_complete());
+    drop((updated, x, v, euler));
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn late_row_failure_rolls_back_all_prepared_rows_with_independent_progress() {
+    let host = account(12, 8, 4);
+    let mut first = solver(host.clone(), spec(&[1]), &[1.0, 0.5], 0.0);
+    let mut second = solver(host.clone(), spec(&[1]), &[1.0, 0.5], 0.0);
+    let initial = sample(&host, &[1], &[0x4000]);
+    let valid = bytes(&host, HostMemoryClass::Output, &[0x3f80]);
+    let (_, first_sample) = first.advance(&initial, &spec(&[1]), &valid).unwrap();
+    let invalid = bytes(&host, HostMemoryClass::Output, &[0x7fc0]);
+
+    let first_pending = first
+        .prepare_advance(&first_sample, &spec(&[1]), &valid)
+        .unwrap();
+    assert_eq!(first_pending.step().index(), 1);
+    assert!(matches!(
+        second.prepare_advance(&initial, &spec(&[1]), &invalid),
+        Err(Bf16EulerError::NonFiniteInput { .. })
+    ));
+    drop(first_pending);
+    assert_eq!(first.step_index(), 1);
+    assert_eq!(second.step_index(), 0);
+    assert_eq!(bits(first_sample.bytes()), [0x3fc0]);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 8);
+
+    let first_pending = first
+        .prepare_advance(&first_sample, &spec(&[1]), &valid)
+        .unwrap();
+    let second_pending = second
+        .prepare_advance(&initial, &spec(&[1]), &valid)
+        .unwrap();
+    let (first_step, first_output) = first_pending.commit();
+    let (second_step, second_output) = second_pending.commit();
+    assert_eq!((first_step.index(), second_step.index()), (1, 0));
+    assert_eq!(bits(first_output.bytes()), [0x3f80]);
+    assert_eq!(bits(second_output.bytes()), [0x3fc0]);
+    assert!(first.is_complete());
+    assert!(!second.is_complete());
+    drop((
+        first_output,
+        second_output,
+        first_sample,
+        initial,
+        valid,
+        invalid,
+        first,
+        second,
+    ));
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn late_row_admission_failure_does_not_consume_an_earlier_row() {
+    let host = account(10, 6, 4);
+    let mut first = solver(host.clone(), spec(&[1]), &[1.0], 0.0);
+    let mut second = solver(host.clone(), spec(&[1]), &[1.0], 0.0);
+    let first_sample = sample(&host, &[1], &[0x4000]);
+    let second_sample = sample(&host, &[1], &[0x4040]);
+    let first_velocity = bytes(&host, HostMemoryClass::Output, &[0x3f80]);
+    let second_velocity = bytes(&host, HostMemoryClass::Output, &[0x4000]);
+    let pending = first
+        .prepare_advance(&first_sample, &spec(&[1]), &first_velocity)
+        .unwrap();
+    assert!(matches!(
+        second.prepare_advance(&second_sample, &spec(&[1]), &second_velocity),
+        Err(Bf16EulerError::Host(HostMemoryError::Capacity { .. }))
+    ));
+    drop(pending);
+    assert_eq!((first.step_index(), second.step_index()), (0, 0));
+    assert_eq!(host.usage().unwrap().committed_bytes(), 8);
+}
+
+#[test]
 fn scalar_and_product_rounding_are_independently_observable() {
     // dt=-257/512 is exactly halfway between -1/2 and -129/256.
     // dtB=-1/2 (even); v=129/128 => y=-129/256, bits bf01.

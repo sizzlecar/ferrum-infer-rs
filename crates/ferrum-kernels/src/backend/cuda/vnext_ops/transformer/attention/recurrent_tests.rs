@@ -516,3 +516,9 @@ fn recurrent_master_provider_preserves_hidden_precision_and_residual_aliasing_on
 
 #[path = "recurrent_tests/implicit_control.rs"]
 mod implicit_control;
+
+#[path = "recurrent_tests/candidate_scan.rs"]
+mod candidate_scan_tests;
+
+#[path = "recurrent_tests/gated_norm_fusion.rs"]
+mod gated_norm_fusion;

@@ -649,3 +649,5 @@ fn actual_cuda_decoder_static_groups_initialize_with_the_predicted_promotion_pea
     scope.close().unwrap();
     assert_eq!(parent.usage().unwrap().committed_bytes(), 0);
 }
+
+mod tile_batch;

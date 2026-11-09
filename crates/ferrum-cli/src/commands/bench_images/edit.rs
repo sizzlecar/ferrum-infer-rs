@@ -82,6 +82,10 @@ pub(super) struct PreparedReference {
 }
 
 impl PreparedReference {
+    pub(super) fn encoded_png(&self) -> Bytes {
+        self.png.clone()
+    }
+
     pub(super) fn load(
         mode: &ImageRequestMode,
         config: &ImageBenchmarkConfig,

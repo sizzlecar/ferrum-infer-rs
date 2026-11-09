@@ -16,8 +16,32 @@ use ferrum_runtime::{
 };
 use half::{bf16, f16};
 
+mod affine_f32;
+pub(crate) use affine_f32::ReferenceAffineF32Launch;
 mod cast_f32_to_bf16;
 pub(crate) use cast_f32_to_bf16::ReferenceCastF32ToBf16Launch;
+mod pointwise_f32;
+pub(crate) use pointwise_f32::ReferenceF32PointwiseLaunch;
+mod gelu_f32;
+pub(crate) use gelu_f32::ReferenceGeluF32Launch;
+mod row_scatter_f32;
+pub(crate) use row_scatter_f32::ReferenceRowScatterF32Launch;
+mod vision_layout_f32;
+pub(crate) use vision_layout_f32::ReferenceReshapeCopyF32Launch;
+mod channelwise_f32;
+pub(crate) use channelwise_f32::ReferenceF32ChannelwiseLaunch;
+mod row_selected_modulation;
+pub(crate) use row_selected_modulation::ReferenceRowSelectedModulationLaunch;
+mod row_selected_bf16;
+pub(crate) use row_selected_bf16::ReferenceRowSelectedBf16Launch;
+mod batched_suffix_append_f32;
+pub(crate) use batched_suffix_append_f32::ReferenceBatchedSuffixAppendF32Launch;
+mod layer_norm_f32;
+pub(crate) use layer_norm_f32::ReferenceLayerNormF32Launch;
+mod cnn_f32;
+pub(crate) use cnn_f32::ReferenceCnnF32Launch;
+mod norm_rope_f32;
+pub(crate) use norm_rope_f32::{ReferenceF32NormRopeGeometry, ReferenceF32NormRopeLaunch};
 
 mod row_transport;
 pub(crate) use row_transport::{
@@ -45,6 +69,10 @@ mod plain_residual_add;
 pub(crate) use plain_residual_add::ReferencePlainResidualAddLaunch;
 mod half_split_rope;
 pub(crate) use half_split_rope::{ReferenceHalfSplitRopeLaunch, ReferenceHalfSplitRopeShape};
+mod fused_head_rms_partial_rope;
+pub(crate) use fused_head_rms_partial_rope::ReferenceFusedHeadRmsPartialRopeLaunch;
+mod row_rms_addcmul;
+pub(crate) use row_rms_addcmul::{ReferenceRowRmsAddcmulGeometry, ReferenceRowRmsAddcmulLaunch};
 mod structured_gqa_attention;
 pub(crate) use structured_gqa_attention::ReferenceStructuredGqaAttentionLaunch;
 mod structured_gqa_attention_f32;
@@ -269,6 +297,7 @@ impl ReferenceBufferRegion {
 pub(crate) enum ReferenceDenseScalar {
     F16,
     Bf16,
+    F32,
 }
 
 impl ReferenceDenseScalar {
@@ -276,20 +305,23 @@ impl ReferenceDenseScalar {
         match self {
             Self::F16 => ElementType::F16,
             Self::Bf16 => ElementType::Bf16,
+            Self::F32 => ElementType::F32,
         }
     }
 
-    fn decode(self, bits: u16) -> f32 {
+    fn decode(self, bits: u32) -> f32 {
         match self {
-            Self::F16 => f16::from_bits(bits).to_f32(),
-            Self::Bf16 => bf16::from_bits(bits).to_f32(),
+            Self::F16 => f16::from_bits(bits as u16).to_f32(),
+            Self::Bf16 => bf16::from_bits(bits as u16).to_f32(),
+            Self::F32 => f32::from_bits(bits),
         }
     }
 
-    fn encode(self, value: f32) -> u16 {
+    fn encode(self, value: f32) -> u32 {
         match self {
-            Self::F16 => f16::from_f32(value).to_bits(),
-            Self::Bf16 => bf16::from_f32(value).to_bits(),
+            Self::F16 => u32::from(f16::from_f32(value).to_bits()),
+            Self::Bf16 => u32::from(bf16::from_f32(value).to_bits()),
+            Self::F32 => value.to_bits(),
         }
     }
 }
@@ -317,10 +349,11 @@ impl ReferenceDenseLinearLaunch {
             (&self.output, self.rows, self.out_features),
         ] {
             region.validate_range()?;
-            let expected = left.checked_mul(right).and_then(|n| n.checked_mul(2));
+            let width = self.scalar.element_type().size_bytes() as usize;
+            let expected = left.checked_mul(right).and_then(|n| n.checked_mul(width));
             if expected != Some(region.length_bytes)
                 || region.element_type != self.scalar.element_type()
-                || (region.offset_bytes - region.allocation.logical_offset_bytes) % 2 != 0
+                || (region.offset_bytes - region.allocation.logical_offset_bytes) % width != 0
             {
                 return Err(ReferenceDeviceRuntimeError::contract(
                     "reference dense-linear shape, range, alignment or scalar type differs",
@@ -364,8 +397,44 @@ enum ReferenceCommandKind {
     DenseLinear {
         launches: Box<[ReferenceDenseLinearLaunch]>,
     },
+    AffineF32 {
+        launch: ReferenceAffineF32Launch,
+    },
     CastF32ToBf16 {
         launch: ReferenceCastF32ToBf16Launch,
+    },
+    F32Pointwise {
+        launch: ReferenceF32PointwiseLaunch,
+    },
+    GeluF32 {
+        launch: ReferenceGeluF32Launch,
+    },
+    RowScatterF32 {
+        launch: ReferenceRowScatterF32Launch,
+    },
+    ReshapeCopyF32 {
+        launch: ReferenceReshapeCopyF32Launch,
+    },
+    F32Channelwise {
+        launch: ReferenceF32ChannelwiseLaunch,
+    },
+    RowSelectedModulation {
+        launch: ReferenceRowSelectedModulationLaunch,
+    },
+    RowSelectedBf16 {
+        launch: ReferenceRowSelectedBf16Launch,
+    },
+    BatchedSuffixAppendF32 {
+        launch: ReferenceBatchedSuffixAppendF32Launch,
+    },
+    LayerNormF32 {
+        launch: ReferenceLayerNormF32Launch,
+    },
+    CnnF32 {
+        launch: ReferenceCnnF32Launch,
+    },
+    F32NormRope {
+        launch: ReferenceF32NormRopeLaunch,
     },
     LayerNorm {
         launch: ReferenceLayerNormLaunch,
@@ -393,6 +462,12 @@ enum ReferenceCommandKind {
     },
     HalfSplitRope {
         launch: ReferenceHalfSplitRopeLaunch,
+    },
+    FusedHeadRmsPartialRope {
+        launch: ReferenceFusedHeadRmsPartialRopeLaunch,
+    },
+    RowRmsAddcmul {
+        launch: ReferenceRowRmsAddcmulLaunch,
     },
     StructuredGqaAttention {
         launch: ReferenceStructuredGqaAttentionLaunch,
@@ -434,7 +509,7 @@ pub struct ReferenceDeviceCommand {
 
 impl fmt::Debug for ReferenceDeviceCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = match self.kind {
+        let kind = match &self.kind {
             ReferenceCommandKind::SpatialDecoder { .. } => "spatial_decoder",
             ReferenceCommandKind::SpatialGroupMean { .. } => "spatial_group_mean",
             ReferenceCommandKind::TensorPrimitive { .. } => "tensor_primitive",
@@ -443,7 +518,26 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::ManagedUpload { .. } => "managed_upload",
             ReferenceCommandKind::Zero { .. } => "zero",
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
+            ReferenceCommandKind::AffineF32 { .. } => "affine_linear_f32",
             ReferenceCommandKind::CastF32ToBf16 { .. } => "cast_f32_to_bf16",
+            ReferenceCommandKind::F32Pointwise { launch } => match launch.kind {
+                ferrum_runtime::F32PointwiseOp::ResidualAdd => "plain_residual_add_f32",
+                ferrum_runtime::F32PointwiseOp::SiluMul => "silu_mul_f32",
+            },
+            ReferenceCommandKind::GeluF32 { launch } => launch.name(),
+            ReferenceCommandKind::RowScatterF32 { launch } => launch.name(),
+            ReferenceCommandKind::ReshapeCopyF32 { .. } => "reshape_copy_f32",
+            ReferenceCommandKind::F32Channelwise { launch } => {
+                launch.geometry.kind().operation_id()
+            }
+            ReferenceCommandKind::RowSelectedModulation { .. } => {
+                "row_selected_modulation_bf16_f32"
+            }
+            ReferenceCommandKind::RowSelectedBf16 { .. } => "row_selected_bf16",
+            ReferenceCommandKind::F32NormRope { launch } => launch.name(),
+            ReferenceCommandKind::BatchedSuffixAppendF32 { .. } => "batched_suffix_append_f32",
+            ReferenceCommandKind::LayerNormF32 { .. } => "layer_norm_f32",
+            ReferenceCommandKind::CnnF32 { launch } => launch.geometry.kind().operation_id(),
             ReferenceCommandKind::LayerNorm { .. } => "layer_norm",
             ReferenceCommandKind::ZeroCenteredRmsNorm { .. } => "zero_centered_rms_norm",
             ReferenceCommandKind::RowGather { .. } => "row_gather",
@@ -453,6 +547,8 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::ChannelL2Norm { .. } => "channel_l2_norm",
             ReferenceCommandKind::PlainResidualAdd { .. } => "plain_residual_add",
             ReferenceCommandKind::HalfSplitRope { .. } => "half_split_rope",
+            ReferenceCommandKind::FusedHeadRmsPartialRope { .. } => "fused_head_rms_partial_rope",
+            ReferenceCommandKind::RowRmsAddcmul { launch } => launch.operation_name(),
             ReferenceCommandKind::StructuredGqaAttention { .. } => "structured_gqa_attention",
             ReferenceCommandKind::StructuredGqaAttentionF32 { .. } => {
                 "structured_gqa_attention_f32"
@@ -550,6 +646,34 @@ impl ReferenceDeviceCommand {
         })
     }
 
+    pub(crate) fn affine_f32_tensor(
+        launch: ReferenceAffineF32Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        let count = (launch.dense.rows as u64)
+            .checked_mul(launch.dense.out_features as u64)
+            .ok_or_else(|| {
+                ReferenceDeviceRuntimeError::contract("F32 affine output count overflows")
+            })?;
+        let operations = (launch.dense.in_features as u64)
+            .checked_mul(2)
+            .and_then(|dot| dot.checked_add(1))
+            .and_then(|per_output| count.checked_mul(per_output))
+            .ok_or_else(|| {
+                ReferenceDeviceRuntimeError::contract("F32 affine logical work overflows")
+            })?;
+        Ok(Self {
+            operation: "vnext_affine_linear_f32",
+            logical_work: Some(
+                DeviceCommandLogicalWork::tensor(count, operations)
+                    .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?,
+            ),
+            compute_dispatch_count: 2,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::AffineF32 { launch },
+        })
+    }
+
     pub(crate) fn cast_f32_to_bf16_tensor(
         launch: ReferenceCastF32ToBf16Launch,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
@@ -569,6 +693,83 @@ impl ReferenceDeviceCommand {
         })
     }
 
+    pub(crate) fn f32_pointwise_tensor(
+        launch: ReferenceF32PointwiseLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        let (operation, per_element) = match launch.kind {
+            ferrum_runtime::F32PointwiseOp::ResidualAdd => ("vnext_plain_residual_add_f32", 1u64),
+            ferrum_runtime::F32PointwiseOp::SiluMul => ("vnext_silu_mul_f32", 5),
+        };
+        let work = launch
+            .geometry
+            .elements()
+            .checked_mul(per_element)
+            .ok_or_else(|| {
+                ReferenceDeviceRuntimeError::contract("F32 pointwise logical work overflows")
+            })?;
+        Ok(Self {
+            operation,
+            logical_work: Some(
+                DeviceCommandLogicalWork::tensor(launch.geometry.elements(), work)
+                    .map_err(|e| ReferenceDeviceRuntimeError::contract(e.to_string()))?,
+            ),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::F32Pointwise { launch },
+        })
+    }
+    pub(crate) fn channelwise_f32_tensor(
+        launch: ReferenceF32ChannelwiseLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: launch.geometry.kind().operation_id(),
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::F32Channelwise { launch },
+        })
+    }
+    pub(crate) fn norm_rope_f32_tensor(
+        launch: ReferenceF32NormRopeLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: launch.name(),
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::F32NormRope { launch },
+        })
+    }
+
+    pub(crate) fn row_selected_modulation_tensor(
+        launch: ReferenceRowSelectedModulationLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_row_selected_modulation_bf16_f32",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::RowSelectedModulation { launch },
+        })
+    }
+
+    pub(crate) fn row_selected_bf16_tensor(
+        launch: ReferenceRowSelectedBf16Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_row_selected_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::RowSelectedBf16 { launch },
+        })
+    }
+
     pub(crate) fn plain_residual_add_tensor(
         launch: ReferencePlainResidualAddLaunch,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
@@ -582,6 +783,43 @@ impl ReferenceDeviceCommand {
         })
     }
 
+    pub(crate) fn batched_suffix_append_f32_tensor(
+        launch: ReferenceBatchedSuffixAppendF32Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_batched_suffix_append_f32",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::BatchedSuffixAppendF32 { launch },
+        })
+    }
+    pub(crate) fn layer_norm_f32_tensor(
+        launch: ReferenceLayerNormF32Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_layer_norm_f32",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::LayerNormF32 { launch },
+        })
+    }
+    pub(crate) fn cnn_f32_tensor(
+        launch: ReferenceCnnF32Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: launch.geometry.kind().operation_id(),
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::CnnF32 { launch },
+        })
+    }
+
     pub(crate) fn half_split_rope_tensor(
         launch: ReferenceHalfSplitRopeLaunch,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
@@ -592,6 +830,32 @@ impl ReferenceDeviceCommand {
             compute_dispatch_count: 1,
             transfer_command_count: 0,
             kind: ReferenceCommandKind::HalfSplitRope { launch },
+        })
+    }
+
+    pub(crate) fn fused_head_rms_partial_rope_tensor(
+        launch: ReferenceFusedHeadRmsPartialRopeLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_fused_head_rms_partial_rope_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::FusedHeadRmsPartialRope { launch },
+        })
+    }
+
+    pub(crate) fn row_rms_addcmul_tensor(
+        launch: ReferenceRowRmsAddcmulLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: launch.operation_name(),
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::RowRmsAddcmul { launch },
         })
     }
 
@@ -932,9 +1196,39 @@ impl ReferenceDeviceCommand {
                 }
                 Ok(())
             }
+            ReferenceCommandKind::AffineF32 { launch } => launch.validate_runtime(runtime_instance),
             ReferenceCommandKind::CastF32ToBf16 { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::F32Pointwise { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::GeluF32 { launch } => launch.validate_runtime(runtime_instance),
+            ReferenceCommandKind::RowScatterF32 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::ReshapeCopyF32 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::F32Channelwise { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::RowSelectedModulation { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::RowSelectedBf16 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::F32NormRope { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::BatchedSuffixAppendF32 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::LayerNormF32 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::CnnF32 { launch } => launch.validate_runtime(runtime_instance),
             ReferenceCommandKind::ZeroCenteredRmsNorm { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
@@ -962,6 +1256,12 @@ impl ReferenceDeviceCommand {
                 launch.validate_runtime(runtime_instance)
             }
             ReferenceCommandKind::HalfSplitRope { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::FusedHeadRmsPartialRope { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::RowRmsAddcmul { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
             ReferenceCommandKind::StructuredGqaAttention { launch } => {
@@ -1034,7 +1334,28 @@ impl ReferenceDeviceCommand {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
+            ReferenceCommandKind::AffineF32 { launch } => {
+                affine_f32::execute(launch);
+                counters
+                    .dense_linear_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             ReferenceCommandKind::CastF32ToBf16 { launch } => cast_f32_to_bf16::execute(launch),
+            ReferenceCommandKind::F32Pointwise { launch } => pointwise_f32::execute(launch),
+            ReferenceCommandKind::GeluF32 { launch } => gelu_f32::execute(launch),
+            ReferenceCommandKind::RowScatterF32 { launch } => row_scatter_f32::execute(launch),
+            ReferenceCommandKind::ReshapeCopyF32 { launch } => vision_layout_f32::execute(launch),
+            ReferenceCommandKind::F32Channelwise { launch } => channelwise_f32::execute(launch),
+            ReferenceCommandKind::RowSelectedModulation { launch } => {
+                row_selected_modulation::execute(launch)
+            }
+            ReferenceCommandKind::RowSelectedBf16 { launch } => row_selected_bf16::execute(launch),
+            ReferenceCommandKind::F32NormRope { launch } => norm_rope_f32::execute(launch),
+            ReferenceCommandKind::BatchedSuffixAppendF32 { launch } => {
+                batched_suffix_append_f32::execute(launch)
+            }
+            ReferenceCommandKind::LayerNormF32 { launch } => layer_norm_f32::execute(launch),
+            ReferenceCommandKind::CnnF32 { launch } => cnn_f32::execute(launch),
             ReferenceCommandKind::LayerNorm { launch } => {
                 layer_norm::execute(launch);
                 counters.layer_norm_launches.fetch_add(1, Ordering::Relaxed);
@@ -1098,6 +1419,22 @@ impl ReferenceDeviceCommand {
                 counters
                     .half_split_rope_launches
                     .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::FusedHeadRmsPartialRope { launch } => {
+                fused_head_rms_partial_rope::execute(launch);
+                counters
+                    .fused_head_rms_partial_rope_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::RowRmsAddcmul { launch } => {
+                row_rms_addcmul::execute(launch);
+                let count = match launch.geometry {
+                    ReferenceRowRmsAddcmulGeometry::RowRms(_) => {
+                        &counters.row_rms_single_round_launches
+                    }
+                    ReferenceRowRmsAddcmulGeometry::Addcmul(_) => &counters.addcmul_launches,
+                };
+                count.fetch_add(1, Ordering::Relaxed);
             }
             ReferenceCommandKind::StructuredGqaAttention { launch } => {
                 structured_gqa_attention::execute(launch);
@@ -1169,14 +1506,23 @@ fn execute_dense_linear(launch: &ReferenceDenseLinearLaunch) {
             for in_feature in 0..launch.in_features {
                 let input_index = row * launch.in_features + in_feature;
                 let weight_index = out_feature * launch.in_features + in_feature;
-                let input = launch.scalar.decode(storage.read_bits(0, input_index));
-                let weight = launch.scalar.decode(storage.read_bits(1, weight_index));
+                let read = |role, index| match launch.scalar {
+                    ReferenceDenseScalar::F32 => storage.read_f32(role, index),
+                    _ => launch
+                        .scalar
+                        .decode(u32::from(storage.read_bits(role, index))),
+                };
+                let input = read(0, input_index);
+                let weight = read(1, weight_index);
                 // Preserve the existing F16 left-to-right FP32 arithmetic.
                 // BF16 follows the same order and rounds only at the output.
                 sum += input * weight;
             }
             let output_index = row * launch.out_features + out_feature;
-            storage.write_bits(2, output_index, launch.scalar.encode(sum));
+            match launch.scalar {
+                ReferenceDenseScalar::F32 => storage.write_f32(2, output_index, sum),
+                _ => storage.write_bits(2, output_index, launch.scalar.encode(sum) as u16),
+            }
         }
     }
 }
@@ -1348,6 +1694,9 @@ struct ReferenceRuntimeCounters {
     adjacent_rope_launches: AtomicU64,
     plain_residual_add_launches: AtomicU64,
     half_split_rope_launches: AtomicU64,
+    fused_head_rms_partial_rope_launches: AtomicU64,
+    row_rms_single_round_launches: AtomicU64,
+    addcmul_launches: AtomicU64,
     structured_gqa_attention_launches: AtomicU64,
     structured_attention_launches: AtomicU64,
     cross_attention_launches: AtomicU64,
@@ -1380,6 +1729,9 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub adjacent_rope_launches: u64,
     pub plain_residual_add_launches: u64,
     pub half_split_rope_launches: u64,
+    pub fused_head_rms_partial_rope_launches: u64,
+    pub row_rms_single_round_launches: u64,
+    pub addcmul_launches: u64,
     pub structured_gqa_attention_launches: u64,
     pub structured_attention_launches: u64,
     pub cross_attention_launches: u64,
@@ -1543,6 +1895,15 @@ impl ReferenceDeviceRuntime {
                 .counters
                 .half_split_rope_launches
                 .load(Ordering::Relaxed),
+            fused_head_rms_partial_rope_launches: self
+                .counters
+                .fused_head_rms_partial_rope_launches
+                .load(Ordering::Relaxed),
+            row_rms_single_round_launches: self
+                .counters
+                .row_rms_single_round_launches
+                .load(Ordering::Relaxed),
+            addcmul_launches: self.counters.addcmul_launches.load(Ordering::Relaxed),
             structured_gqa_attention_launches: self
                 .counters
                 .structured_gqa_attention_launches

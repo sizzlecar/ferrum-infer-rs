@@ -33,8 +33,114 @@ struct CaptureHarness {
     cache: CudaExecutableCache,
     counter: Arc<CudaSlice<u32>>,
     stream: Arc<CudaStream>,
-    blas: Arc<CudaBlas>,
+    blas: Arc<CudaBlasOwner>,
     context: Arc<CudaContext>,
+}
+
+#[test]
+#[ignore = "requires actual CUDA; tests bounded cache state-once and original lane ownership, not provider admission"]
+fn bounded_decode_replay_cache_keeps_original_allowance_and_executes_state_once() {
+    use super::tensor_eager::{
+        CudaDenseF16CausalProfile, CudaTensorAndCausalRuntimeConfig, CudaTensorRuntimeConfig,
+    };
+    use crate::backend::cuda::vnext_ops::cuda_tensor_and_dense_f16_causal_runtime_config;
+    let mut device =
+        cuda_tensor_and_dense_f16_causal_runtime_config(0, DeviceId::new("device.cuda.0").unwrap())
+            .unwrap();
+    for id in [
+        ferrum_runtime::DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
+        ferrum_runtime::DEVICE_ON_DEMAND_REUSABLE_EXECUTION_CAPABILITY_ID,
+    ] {
+        device.capabilities.insert(CapabilityId::new(id).unwrap());
+    }
+    let runtime =
+        CudaDeviceRuntime::new_tensor_and_causal_eager(CudaTensorAndCausalRuntimeConfig {
+            tensor: CudaTensorRuntimeConfig {
+                device,
+                usable_memory_bytes: 512 << 20,
+                bootstrap_memory_bytes: 128 << 20,
+                stream_memory_bytes: 16 << 20,
+                maximum_streams: 1,
+                maximum_in_flight_per_stream: 1,
+                maximum_commands_per_submission: 8,
+                opaque_memory_profile: "unqualified-bounded-cache-fixture-v1".into(),
+            },
+            causal: CudaDenseF16CausalProfile::new(
+                64 << 20,
+                "unqualified-bounded-cache-modules-v1",
+            )
+            .unwrap()
+            .with_decode_replay(1, 32 << 20)
+            .unwrap(),
+        })
+        .unwrap();
+    let mut lane = runtime.create_stream().unwrap();
+    runtime.ensure_submission_blas(&mut lane, true).unwrap();
+    let original_owner = Arc::downgrade(lane.tensor_lane.as_ref().unwrap());
+    let mut h = CaptureHarness {
+        cache: std::mem::replace(&mut lane.executable_cache, CudaExecutableCache::new()),
+        counter: Arc::new(lane.stream.clone_htod(&[0u32]).unwrap()),
+        stream: Arc::clone(&lane.stream),
+        blas: lane.blas.as_ref().unwrap().clone(),
+        context: Arc::clone(&runtime.context),
+    };
+    h.stream.synchronize().unwrap();
+    assert!(h
+        .cache
+        .configure(DeviceReusableExecutionPlan::on_demand(2).unwrap())
+        .is_err());
+    h.cache
+        .configure(DeviceReusableExecutionPlan::on_demand(1).unwrap())
+        .unwrap();
+    // execute() separately reads the original state after prepare_all and
+    // before launch, proving capture itself did not apply an extra increment.
+    assert_eq!(
+        h.execute(h.command(1, false), true, 1)
+            .warmup_required_segments(),
+        1
+    );
+    assert_eq!(
+        h.execute(h.command(1, false), true, 2).captured_segments(),
+        1
+    );
+    assert_eq!(
+        h.execute(h.command(1, false), true, 3).cache_hit_segments(),
+        1
+    );
+    assert_eq!(
+        h.execute(h.command(2, false), true, 5)
+            .warmup_required_segments(),
+        1
+    );
+    assert_eq!(
+        h.execute(h.command(2, false), true, 7).captured_segments(),
+        1
+    );
+    assert_eq!(h.cache.preparation().unwrap().resident_executables(), 1);
+    assert_eq!(
+        h.execute(h.command(4, true), true, 11)
+            .warmup_required_segments(),
+        1
+    );
+    assert_eq!(
+        h.execute(h.command(4, true), true, 15)
+            .capture_rejected_segments(),
+        1
+    );
+    assert_eq!(
+        h.execute(h.command(4, true), true, 19)
+            .cached_rejected_segments(),
+        1
+    );
+    drop(lane);
+    assert!(
+        runtime.create_stream().is_err(),
+        "retained cache must still own the only original lane allowance"
+    );
+    assert!(original_owner.upgrade().is_some());
+    drop(h);
+    assert!(original_owner.upgrade().is_none());
+    drop(runtime.create_stream().unwrap());
 }
 
 impl CaptureHarness {
@@ -45,7 +151,7 @@ impl CaptureHarness {
     fn with_plan(plan: DeviceReusableExecutionPlan) -> Self {
         let context = CudaContext::new(0).expect("CUDA capture tests require a configured GPU");
         let stream = context.new_stream().unwrap();
-        let blas = Arc::new(CudaBlas::new(Arc::clone(&stream)).unwrap());
+        let blas = Arc::new(CudaBlasOwner::new(Arc::clone(&stream), 0).unwrap());
         let counter = Arc::new(stream.clone_htod(&[0_u32]).unwrap());
         stream.synchronize().unwrap();
         let mut cache = CudaExecutableCache::new();

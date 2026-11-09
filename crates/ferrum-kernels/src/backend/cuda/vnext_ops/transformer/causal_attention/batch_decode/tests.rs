@@ -268,6 +268,7 @@ fn batched_launch_rejects_reordered_query_rows_and_single_owner_scratch() {
                 )
                 .unwrap(),
                 path: CausalAttentionKernelPath::VllmAddressedDecodeV2,
+                rotary: None,
             }
         })
         .collect::<Vec<_>>();
@@ -603,6 +604,7 @@ fn build_launches(
                 table_entries_i32: shape.table_entries(length).unwrap() as i32,
                 replay_topology: CausalAttentionReplayTopology::new(shape, path, length).unwrap(),
                 path,
+                rotary: None,
             }
         })
         .collect()

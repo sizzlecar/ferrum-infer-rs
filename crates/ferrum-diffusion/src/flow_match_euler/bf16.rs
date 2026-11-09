@@ -97,6 +97,31 @@ pub struct ManagedBf16Euler {
     profile: Bf16EulerProfile,
 }
 
+/// A validated update which has not advanced its request's schedule yet.
+///
+/// The exclusive borrow prevents submitting a second update against the same
+/// cursor. Dropping this owner releases the new sample and leaves the cursor
+/// unchanged. A step batch can prepare each independent request first and
+/// commit only after every row succeeds, including Host capacity admission.
+#[must_use = "commit the update to advance, or drop it to leave the request unchanged"]
+pub struct PreparedBf16EulerAdvance<'a> {
+    solver: &'a mut ManagedBf16Euler,
+    step: EulerStep,
+    output: ManagedHostTensor,
+}
+
+impl PreparedBf16EulerAdvance<'_> {
+    pub fn step(&self) -> EulerStep {
+        self.step
+    }
+
+    /// All fallible numerical and allocation work finished during preparation.
+    pub fn commit(self) -> (EulerStep, ManagedHostTensor) {
+        self.solver.solver.step_index += 1;
+        (self.step, self.output)
+    }
+}
+
 impl ManagedBf16Euler {
     pub fn new(
         schedule: FlowMatchEulerSchedule,
@@ -156,6 +181,22 @@ impl ManagedBf16Euler {
         velocity_spec: &ResolvedTensorSpec,
         velocity: &ManagedHostBytes,
     ) -> Result<(EulerStep, ManagedHostTensor), Bf16EulerError> {
+        Ok(self
+            .prepare_advance(sample, velocity_spec, velocity)?
+            .commit())
+    }
+
+    /// Compute the next sample without publishing progress. This is useful when
+    /// a completed DiT batch contains requests at different schedule positions:
+    /// every row can be validated before any request consumes its evaluation.
+    /// The prepared value owns only its new admitted sample and cursor borrow;
+    /// the caller retains the old sample until the complete batch is committed.
+    pub fn prepare_advance(
+        &mut self,
+        sample: &ManagedHostTensor,
+        velocity_spec: &ResolvedTensorSpec,
+        velocity: &ManagedHostBytes,
+    ) -> Result<PreparedBf16EulerAdvance<'_>, Bf16EulerError> {
         let step = self.current_step().ok_or(Bf16EulerError::Complete)?;
         self.validate_input(
             Bf16EulerOperand::Sample,
@@ -211,8 +252,11 @@ impl ManagedBf16Euler {
             self.tensor.clone(),
             output.freeze(),
         )?;
-        self.solver.step_index += 1;
-        Ok((step, output))
+        Ok(PreparedBf16EulerAdvance {
+            solver: self,
+            step,
+            output,
+        })
     }
 
     fn validate_input(

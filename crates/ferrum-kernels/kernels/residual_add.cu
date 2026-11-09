@@ -2,6 +2,21 @@
 
 #include <cuda_fp16.h>
 
+extern "C" __global__ void vnext_visual_row_select_f16(
+    const unsigned short* __restrict__ input,
+    const unsigned short* __restrict__ visual,
+    const unsigned char* __restrict__ mask,
+    unsigned short* __restrict__ output,
+    const unsigned long long elements,
+    const unsigned long long columns) {
+    const unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < elements) {
+        // Mask=0 never touches visual memory, including poison/unused slots.
+        // Every nonzero U8 predicate selects visual; no binary-only precondition.
+        output[index] = mask[index / columns] == 0 ? input[index] : visual[index];
+    }
+}
+
 extern "C" __global__ void residual_add_f16(
     // The vNext residual and recurrent providers permit output to alias a.
     // Do not promise the compiler that these two pointers are disjoint.

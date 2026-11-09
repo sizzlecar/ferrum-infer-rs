@@ -2,6 +2,9 @@
 use super::*;
 use crate::{ResolvedTensorLayout, ResolvedTensorSpec};
 
+mod partial;
+pub use partial::*;
+
 pub const HALF_SPLIT_ROPE_BF16_OPERATION_ID: &str = "operation.half_split_rope.bf16";
 pub const HALF_SPLIT_ROPE_BF16_CAPABILITY_ID: &str = "capability.operation.half_split_rope.bf16";
 

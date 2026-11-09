@@ -41,9 +41,13 @@ fn compile(
     registry: &OperationRuntimeRegistry<CudaDeviceRuntime>,
     catalog: &CapabilityCatalog,
     materializers: &WeightMaterializerRegistry,
+    packing: ferrum_runtime::WeightArenaPacking,
 ) -> CompiledTensorComponent<CudaDeviceRuntime> {
     let family = PH3ImageDiTFamily::new(limits()).unwrap();
-    let options = family.compile_options(config).unwrap();
+    let options = family
+        .compile_options(config)
+        .unwrap()
+        .with_weight_arena_packing(packing);
     let prepared = TypedFamilyRegistration::new(family)
         .prepare_with_profile(
             &serde_json::to_value(config).unwrap(),
@@ -270,6 +274,18 @@ fn output<'a>(outputs: &'a [TensorExecutionOutput], id: &str) -> &'a TensorExecu
 #[test]
 #[ignore = "requires configured CUDA host with admitted full DiT first/steady fixture capacity"]
 fn full_dit_first_refine_then_steady_reuses_one_installation_and_isolates_requests() {
+    shared_installation(ferrum_runtime::WeightArenaPacking::ByElementType);
+}
+
+#[test]
+#[ignore = "requires configured CUDA host with admitted full DiT first/steady fixture capacity"]
+fn bounded_dit_first_refine_then_steady_reuses_one_installation_and_isolates_requests() {
+    shared_installation(ferrum_runtime::WeightArenaPacking::Bounded {
+        target_bytes: std::num::NonZeroU64::new(512 << 10).unwrap(),
+    });
+}
+
+fn shared_installation(packing: ferrum_runtime::WeightArenaPacking) {
     let c = fixture::config();
     let steady = c.clone().with_phase(PH3ImageDiTPhase::RefinedText);
     let files = fixture::files(&c);
@@ -289,8 +305,15 @@ fn full_dit_first_refine_then_steady_reuses_one_installation_and_isolates_reques
         .unwrap(),
     );
     let (registry, catalog, materializers) = registry(&runtime);
-    let first_plan = compile(&c, &runtime, &registry, &catalog, &materializers);
-    let steady_plan = compile(&steady, &runtime, &registry, &catalog, &materializers);
+    let first_plan = compile(&c, &runtime, &registry, &catalog, &materializers, packing);
+    let steady_plan = compile(
+        &steady,
+        &runtime,
+        &registry,
+        &catalog,
+        &materializers,
+        packing,
+    );
     let refine_config = c.clone().with_phase(PH3ImageDiTPhase::RefineOnly);
     let refine_plan = compile(
         &refine_config,
@@ -298,7 +321,24 @@ fn full_dit_first_refine_then_steady_reuses_one_installation_and_isolates_reques
         &registry,
         &catalog,
         &materializers,
+        packing,
     );
+    if matches!(packing, ferrum_runtime::WeightArenaPacking::Bounded { .. }) {
+        let allocations = first_plan
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory()
+            .static_allocations();
+        let types = allocations
+            .iter()
+            .map(|allocation| allocation.element_type())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            allocations.len() > types.len(),
+            "bounded fixture must split at least one dtype arena"
+        );
+    }
     assert_eq!(
         first_plan
             .executable()
@@ -310,6 +350,18 @@ fn full_dit_first_refine_then_steady_reuses_one_installation_and_isolates_reques
             .execution_plan()
             .payload()
             .execution_weights()
+    );
+    assert_eq!(
+        first_plan
+            .executable()
+            .execution_plan()
+            .payload()
+            .execution_weights(),
+        refine_plan
+            .executable()
+            .execution_plan()
+            .payload()
+            .execution_weights(),
     );
     let host = HostMemoryAccount::new(
         HostMemoryLimits::new(
@@ -572,5 +624,8 @@ fn full_dit_first_refine_then_steady_reuses_one_installation_and_isolates_reques
     drop(first_plan);
     drop(steady_plan);
     drop(refine_plan);
+    // The scope still owns its reserved credit after the sessions and their
+    // readbacks retire. Close that original grant before checking total usage.
+    refine_work.close().unwrap();
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

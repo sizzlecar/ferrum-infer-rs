@@ -11,7 +11,13 @@ use std::time::Duration;
 fn encode(values: &[f32], scalar: ReferenceDenseScalar) -> Vec<u8> {
     values
         .iter()
-        .flat_map(|value| scalar.encode(*value).to_le_bytes())
+        .flat_map(|value| {
+            scalar
+                .encode(*value)
+                .to_le_bytes()
+                .into_iter()
+                .take(scalar.element_type().size_bytes() as usize)
+        })
         .collect()
 }
 
@@ -49,6 +55,87 @@ fn fixture(
         out_features: 2,
         scalar,
     }
+}
+
+#[test]
+fn f32_dense_executes_every_row_without_half_precision_rounding() {
+    let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+    let scalar = ReferenceDenseScalar::F32;
+    let x = encode(
+        &[
+            1.000244140625,
+            1.0,
+            0.0,
+            0.125,
+            -0.75,
+            2.0,
+            -3.25,
+            0.0625,
+            -0.5,
+        ],
+        scalar,
+    );
+    let w = encode(&[1.0, -1.0, 0.0, 0.5, 0.25, -0.125], scalar);
+    let input = buffer(
+        &runtime,
+        "resource.dense_f32.input",
+        &x,
+        16,
+        ElementType::F32,
+    );
+    let weight = buffer(
+        &runtime,
+        "resource.dense_f32.weight",
+        &w,
+        16,
+        ElementType::F32,
+    );
+    let output = buffer(
+        &runtime,
+        "resource.dense_f32.output",
+        &[0xa5; 24],
+        16,
+        ElementType::F32,
+    );
+    let launch = ReferenceDenseLinearLaunch {
+        input: input.region(0..36).unwrap(),
+        weight: weight.region(0..24).unwrap(),
+        output: output.region(0..24).unwrap(),
+        rows: 3,
+        in_features: 3,
+        out_features: 2,
+        scalar,
+    };
+    submit(
+        &runtime,
+        vec![ReferenceDeviceCommand::dense_tensor(launch).unwrap()],
+    )
+    .unwrap();
+    assert_eq!(
+        output.region(0..24).unwrap().read(),
+        encode(
+            &[
+                0.000244140625,
+                0.7501220703125,
+                0.875,
+                -0.375,
+                -3.3125,
+                -1.546875,
+            ],
+            scalar
+        )
+    );
+    // Precision and physical byte ranges are validated before submission.
+    let bad = ReferenceDenseLinearLaunch {
+        input: input.region(0..18).unwrap(),
+        weight: weight.region(0..24).unwrap(),
+        output: output.region(0..24).unwrap(),
+        rows: 3,
+        in_features: 3,
+        out_features: 2,
+        scalar,
+    };
+    assert!(ReferenceDeviceCommand::dense_tensor(bad).is_err());
 }
 
 fn submit(

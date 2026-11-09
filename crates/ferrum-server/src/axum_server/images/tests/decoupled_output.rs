@@ -50,14 +50,14 @@ impl WeightComponentSource for Weights {
     }
 }
 
-struct Decoder {
+pub(super) struct Decoder {
     host: HostMemoryAccount,
     session: Option<TensorComponentSession<ReferenceDeviceRuntime>>,
     input: ResolvedTensorSpec,
     calls: Arc<AtomicUsize>,
 }
 impl Decoder {
-    fn new(host: HostMemoryAccount, calls: Arc<AtomicUsize>) -> Self {
+    pub(super) fn new(host: HostMemoryAccount, calls: Arc<AtomicUsize>) -> Self {
         let decoder = QwenImage21VaeDecoderConfig::new(
             64,
             1,
@@ -184,6 +184,13 @@ impl ImageGenerator for Decoder {
         assert_eq!(outputs.len(), 1);
         let rgba = outputs.remove(0);
         assert_eq!(rgba.tensor().dimensions(), [1, 4, 32, 32]);
+        let rgba = ferrum_models::image_pixels::OwnedImagePixels::new(
+            &self.host,
+            rgba.tensor().clone(),
+            rgba.bytes().clone(),
+            ferrum_models::image_pixels::ImagePixelEncoding::Bf16SignedRgbaStaged,
+        )
+        .unwrap();
         Ok(vec![ImageGenerationOutput {
             rgba,
             receipt: ImageGenerationReceipt {
@@ -206,6 +213,7 @@ impl ImageGenerator for Decoder {
                     payload_verification: "zero BF16 test weights; no image quality claim",
                 },
                 euler_profile: "not-run-decoder-only-fixture",
+                noise_layout_profile: None,
             },
         }])
     }

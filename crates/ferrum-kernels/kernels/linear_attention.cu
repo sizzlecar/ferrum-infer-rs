@@ -474,6 +474,35 @@ extern "C" __global__ void recurrent_conv_state_commit_f16_indirect(
   destination[sequence_offset] = source[index];
 }
 
+// Save the two convolution histories without mutating the original state.
+// These are selections of already-rounded projection/history F16 values.
+extern "C" __global__ void vnext_gated_delta_candidate_conv_states_f16(
+    const __half* mixed_qkvzba,
+    const unsigned long long* original_bindings,
+    const unsigned long long* candidate_bindings,
+    const unsigned int* cu_seqlens,
+    const int batch, const int qkvzba_width, const int channels,
+    const int state_width) {
+  const unsigned long long index =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const unsigned long long per_state =
+      static_cast<unsigned long long>(channels) * state_width;
+  if (index >= static_cast<unsigned long long>(batch) * 2 * per_state) return;
+  const int seq = index / (2 * per_state);
+  const int slot = (index / per_state) % 2;
+  const int offset = index % per_state;
+  const int channel = offset / state_width;
+  const int pos = offset % state_width;
+  const int start = cu_seqlens[seq];
+  const int count = static_cast<int>(cu_seqlens[seq + 1]) - start;
+  const int source = count - 1 + slot + pos - state_width;
+  const __half* original = reinterpret_cast<const __half*>(original_bindings[seq * 2]);
+  __half* output = reinterpret_cast<__half*>(candidate_bindings[seq * 2]);
+  output[slot * per_state + offset] = source >= 0
+      ? mixed_qkvzba[static_cast<unsigned long long>(start + source) * qkvzba_width + channel]
+      : original[channel * state_width + state_width + source];
+}
+
 template <typename InputT, typename ParamT, typename StateT = float,
           typename ZT = float, bool NegativeRate = false, bool ImplicitSingleToken = false>
 static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
@@ -1889,6 +1918,45 @@ extern "C" __global__ void gated_rms_norm_f16_z_f32_weight(
     const int dim,
     const float eps) {
   gated_rms_norm_impl<__half, float>(core, z, weight, out, rows, dim, eps);
+}
+
+// Decode epilogue: preserve the original F32 reduction/expression, then perform
+// exactly the conversion used by f32_to_activation_f16. `out` is a separate
+// scratch region, never the restrict-qualified input `z`. Keep the original
+// F32-output entry above as the long-span path and independent CUDA reference.
+extern "C" __global__ void gated_rms_norm_f16_z_f32_weight_to_f16(
+    const float* __restrict__ core,
+    const __half* __restrict__ z,
+    const float* __restrict__ weight,
+    __half* __restrict__ out,
+    const int rows,
+    const int dim,
+    const float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int base = row * dim;
+
+  float sum_sq = 0.0f;
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float x = core[base + d];
+    sum_sq += x * x;
+  }
+
+  __shared__ float shared[256];
+  shared[threadIdx.x] = sum_sq;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float inv = rsqrtf(shared[0] / static_cast<float>(dim) + eps);
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float value = core[base + d] * inv * ferrum_load_value(weight, d) *
+                        ferrum_silu(ferrum_load_value(z, base + d));
+    out[base + d] = __float2half(value);
+  }
 }
 
 // Stitch one planar projection `[rows, source_width]` into a contiguous

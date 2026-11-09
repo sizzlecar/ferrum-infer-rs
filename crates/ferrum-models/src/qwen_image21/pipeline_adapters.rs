@@ -23,8 +23,9 @@ use half::bf16;
 use serde_json::Value;
 use std::io::Write;
 
-mod rgba8;
-use rgba8::rgba8_finite;
+#[cfg(test)]
+use crate::image_pixels::rgba8_finite;
+use crate::image_pixels::{ImagePixelEncoding, ManagedImagePixels};
 
 pub const QWEN_IMAGE21_LATENT_CHANNELS: usize = 64;
 pub const QWEN_IMAGE21_LATENT_DECODE_PROFILE: &str = "qwen_image21.latent.bf16.mul_b.add_b.v1";
@@ -407,101 +408,36 @@ impl QwenImage21ManagedLatents {
 
 /// A borrowed, validated decoder output. RGBA stays RGBA: the alpha channel
 /// receives the same conversion as RGB, without premultiplication or blending.
-pub struct QwenImage21RgbaOutput<'a> {
-    bytes: &'a ManagedHostBytes,
-    batch: usize,
-    height: usize,
-    width: usize,
-    positions: usize,
-    frame_bytes: usize,
-}
+pub struct QwenImage21RgbaOutput<'a>(ManagedImagePixels<'a>);
 
 impl<'a> QwenImage21RgbaOutput<'a> {
-    /// Checks the complete output for finite values before any writer is used.
-    /// Only exact contiguous BF16 `[N,4,H,W]` Output backing is accepted.
+    /// Retain the original Qwen BF16 RGBA contract while sharing the managed
+    /// output/streaming boundary used by other declared image encodings.
     pub fn new(
         host: &HostMemoryAccount,
         tensor: &ResolvedTensorSpec,
         bytes: &'a ManagedHostBytes,
     ) -> Result<Self> {
-        ensure!(
-            host.owns(bytes),
-            "RGBA output belongs to a different Host account"
-        );
-        ensure!(
-            bytes.class() == HostMemoryClass::Output,
-            "RGBA requires Output backing"
-        );
-        ensure!(
-            tensor.element_type() == ElementType::Bf16
-                && tensor.layout() == &ResolvedTensorLayout::Contiguous,
-            "RGBA requires contiguous BF16"
-        );
-        let [batch, channels, height, width] = tensor.dimensions() else {
-            anyhow::bail!("RGBA requires exactly NCHW dimensions");
-        };
-        ensure!(*channels == 4, "RGBA requires exactly four channels");
-        let shape = SingleFrameLatentShape::new(
-            usize::try_from(*batch)?,
-            4,
-            usize::try_from(*height)?,
-            usize::try_from(*width)?,
-        )?;
-        let length = shape.byte_len::<[u8; 2]>()?;
-        ensure!(
-            bytes.len() == length,
-            "RGBA byte length differs from its shape"
-        );
-        validate_finite(bytes.bytes())?;
-        let [batch, _, height, width] = shape.nchw_dims();
-        let positions = shape.sequence_dims()[1];
-        Ok(Self {
+        Ok(Self(ManagedImagePixels::new(
+            host,
+            tensor,
             bytes,
-            batch,
-            height,
-            width,
-            positions,
-            frame_bytes: positions * 4,
-        })
+            ImagePixelEncoding::Bf16SignedRgbaStaged,
+        )?))
     }
-
     pub fn dimensions(&self) -> [usize; 4] {
-        [self.batch, 4, self.height, self.width]
+        self.0.rgba_dimensions()
     }
     pub fn frame_bytes(&self) -> usize {
-        self.frame_bytes
+        self.0.frame_bytes()
     }
-
-    /// Write a single interleaved RGBA8 frame using caller-owned scratch.
-    /// Invalid frame/scratch is rejected before writing. An I/O error may leave
-    /// bytes in the writer: sink rollback is the caller's responsibility.
-    /// Scratch is neither allocated nor claimed by this adapter's Host account.
     pub fn write_frame_rgba8<W: Write + ?Sized>(
         &self,
         frame: usize,
         scratch: &mut [u8],
         writer: &mut W,
     ) -> Result<()> {
-        ensure!(frame < self.batch, "RGBA frame index exceeds batch");
-        ensure!(!scratch.is_empty(), "RGBA writer scratch must be nonempty");
-        let source = self.bytes.bytes();
-        let frame_start = frame * self.positions * 4;
-        let mut used = 0;
-        for position in 0..self.positions {
-            for channel in 0..4 {
-                let index = frame_start + channel * self.positions + position;
-                scratch[used] = rgba8_finite(decode(&source[index * 2..index * 2 + 2]));
-                used += 1;
-                if used == scratch.len() {
-                    writer.write_all(&scratch[..used])?;
-                    used = 0;
-                }
-            }
-        }
-        if used != 0 {
-            writer.write_all(&scratch[..used])?;
-        }
-        Ok(())
+        self.0.write_frame_rgba8(frame, scratch, writer)
     }
 }
 

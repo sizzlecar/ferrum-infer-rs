@@ -3,7 +3,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 mod bf16;
-pub use bf16::{Bf16EulerError, Bf16EulerOperand, Bf16EulerProfile, ManagedBf16Euler};
+pub use bf16::{
+    Bf16EulerError, Bf16EulerOperand, Bf16EulerProfile, ManagedBf16Euler, PreparedBf16EulerAdvance,
+};
 
 /// The scheduler's FP32 time coordinate, distinct from a step index.
 ///

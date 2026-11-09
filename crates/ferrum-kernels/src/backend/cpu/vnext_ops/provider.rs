@@ -23,6 +23,9 @@ pub(super) enum CpuOperation {
     GatedDelta(CpuFloat),
     GatedDeltaCandidateScan(CpuFloat),
     CausalAttention(CpuFloat),
+    CausalAttentionExplicitRope(CpuFloat),
+    RowSelectF16,
+    ConcatColumnsF16,
 }
 
 impl CpuOperation {
@@ -56,6 +59,9 @@ impl CpuOperation {
         Self::GatedDeltaCandidateScan(CpuFloat::F32),
         Self::CausalAttention(CpuFloat::F16),
         Self::CausalAttention(CpuFloat::F32),
+        Self::CausalAttentionExplicitRope(CpuFloat::F16),
+        Self::RowSelectF16,
+        Self::ConcatColumnsF16,
     ];
 
     pub(super) fn contract(self) -> Result<StandardOperationContract, VNextError> {
@@ -96,6 +102,14 @@ impl CpuOperation {
             }
             Self::CausalAttention(CpuFloat::F16) => causal_paged_attention_contract(),
             Self::CausalAttention(CpuFloat::F32) => causal_paged_attention_f32_master_contract(),
+            Self::CausalAttentionExplicitRope(CpuFloat::F16) => {
+                causal_paged_attention_explicit_rope_f16_contract()
+            }
+            Self::CausalAttentionExplicitRope(_) => Err(invalid_plan(
+                "explicit RoPE requires the declared F16 profile",
+            )),
+            Self::RowSelectF16 => row_select_f16_contract(),
+            Self::ConcatColumnsF16 => concat_columns_f16_contract(),
         }
     }
 
@@ -112,6 +126,9 @@ impl CpuOperation {
             Self::GatedDelta(_) => "cpu.gated_delta_recurrent_attention",
             Self::GatedDeltaCandidateScan(_) => "cpu.gated_delta_candidate_scan",
             Self::CausalAttention(_) => "cpu.causal_attention",
+            Self::CausalAttentionExplicitRope(_) => "cpu.causal_attention.explicit_rope.f16",
+            Self::RowSelectF16 => "cpu.row_select.f16",
+            Self::ConcatColumnsF16 => "cpu.concat_columns.f16",
         }
     }
 }
@@ -143,6 +160,7 @@ impl CpuOperationProvider {
                 | CpuOperation::GatedDelta(_)
                 | CpuOperation::GatedDeltaCandidateScan(_)
                 | CpuOperation::CausalAttention(_)
+                | CpuOperation::CausalAttentionExplicitRope(_)
         );
         let has_weights = has_matrix || matches!(operation, CpuOperation::RmsNorm { .. });
         let weight_formats = if matches!(operation, CpuOperation::TailTwoGreedy) {
@@ -182,7 +200,12 @@ impl CpuOperationProvider {
                 ProviderStorageBindingRequirement::new(
                     ResolvedValueRole::Input,
                     ordinal,
-                    if matches!(operation, CpuOperation::CausalAttention(_)) && ordinal == 8 {
+                    if matches!(
+                        operation,
+                        CpuOperation::CausalAttention(_)
+                            | CpuOperation::CausalAttentionExplicitRope(_)
+                    ) && ordinal == 8
+                    {
                         paged_kv.clone()
                     } else {
                         DynamicStorageRequirement::contiguous()
@@ -240,6 +263,33 @@ impl CpuOperationProvider {
                     }
                 } else if matches!(operation, CpuOperation::TailTwoGreedy) {
                     ferrum_runtime::ProviderCandidateStateEffects::TerminalOnly
+                } else if matches!(
+                    operation,
+                    CpuOperation::Embedding(_)
+                        | CpuOperation::RmsNorm { .. }
+                        | CpuOperation::Residual(_)
+                        | CpuOperation::SwiGlu
+                        | CpuOperation::RowSelectF16
+                ) {
+                    // These implementations process each token row independently.
+                    ferrum_runtime::ProviderCandidateStateEffects::PrefixCausal {
+                        ports: Vec::new(),
+                    }
+                } else if matches!(
+                    operation,
+                    CpuOperation::CausalAttention(_) | CpuOperation::CausalAttentionExplicitRope(_)
+                ) {
+                    // The actual CPU KV writer touches only this work span;
+                    // causal reads never use a later row in the same wave.
+                    ferrum_runtime::ProviderCandidateStateEffects::PrefixCausal {
+                        ports: vec![
+                            ferrum_runtime::ProviderCandidateStatePort::PrefixAppendOnly {
+                                role: ResolvedValueRole::Input,
+                                ordinal: 8,
+                                storage_profile: super::causal_attention::kv_storage_profile()?,
+                            },
+                        ],
+                    }
                 } else {
                     ferrum_runtime::ProviderCandidateStateEffects::Unsupported
                 },
@@ -298,7 +348,7 @@ impl OperationResourceEstimator for CpuOperationProvider {
                         .map_err(|error| invalid_plan(error.to_string()))?,
                 )?)
             }
-            CpuOperation::CausalAttention(_) => {
+            CpuOperation::CausalAttention(_) | CpuOperation::CausalAttentionExplicitRope(_) => {
                 let shape =
                     super::causal_attention::CausalShape::from_attributes(request.attributes())
                         .map_err(|error| invalid_plan(error.to_string()))?;
@@ -330,7 +380,10 @@ impl OperationResourceEstimator for CpuOperationProvider {
             scratch,
             None,
         );
-        if matches!(self.operation, CpuOperation::CausalAttention(_)) {
+        if matches!(
+            self.operation,
+            CpuOperation::CausalAttention(_) | CpuOperation::CausalAttentionExplicitRope(_)
+        ) {
             Ok(
                 estimate.with_binding(ProviderWorkspaceRequirement::from_formula(
                     ProviderWorkspaceSizeFormula::actual_sequences(16)?,

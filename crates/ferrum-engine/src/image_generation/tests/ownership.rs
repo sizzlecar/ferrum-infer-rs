@@ -68,6 +68,13 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
         )
         .unwrap();
     let active = ActiveImageStage {
+        declaration: ImageStageDeclaration {
+            stage: ImageStage::Denoiser,
+            role: ImageStagePlanRole::WholeStage,
+            batch_size: 1,
+            weight_owner: Some(ImageWeightOwnerKey::Denoiser),
+            attachment: ImageStageAttachment::MayInitializeStored,
+        },
         receipt: ImageStageExecutionReceipt {
             session_reused: false,
             weights_reused: false,

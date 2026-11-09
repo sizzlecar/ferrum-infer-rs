@@ -87,9 +87,10 @@ pub(super) fn expected(
             add(format!("model.visual.blocks.{layer}.{suffix}"), shape)?;
         }
     }
-    for (prefix, norm) in std::iter::once(("model.visual.merger".to_string(), h))
-        .chain((0..3).map(|i| (format!("model.visual.deepstack_merger_list.{i}"), merged)))
-    {
+    for (prefix, norm) in std::iter::once(("model.visual.merger".to_string(), h)).chain(
+        (0..a.deepstack_layers().len())
+            .map(|i| (format!("model.visual.deepstack_merger_list.{i}"), merged)),
+    ) {
         for (suffix, shape) in [
             ("norm.weight", vec![norm]),
             ("norm.bias", vec![norm]),

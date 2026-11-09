@@ -51,6 +51,7 @@ static CUDA_BUILD_SUMMARY_ROWS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLo
 const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/fused_add_rms_norm.cu",
     "kernels/fused_silu_mul.cu",
+    "kernels/dense_small_m_f16.cu",
     "kernels/vnext_bf16_silu.cu",
     "kernels/rms_norm.cu",
     "kernels/sandwich_norm.cu",
@@ -96,7 +97,26 @@ const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/qwen35_paged_qkv.cu",
 ];
 
-const CORE_PTX_HEADERS: &[&str] = &["kernels/common.cuh"];
+const CORE_PTX_HEADERS: &[&str] = &[
+    "kernels/common.cuh",
+    "kernels/vnext_comfy_convrot.cuh",
+    "kernels/vnext_comfy_convrot_embedding.cuh",
+    "kernels/vnext_fused_head_rms_partial_rope.cuh",
+    "kernels/vnext_row_rms_addcmul.cuh",
+    "kernels/vnext_cast_f32_to_bf16.cuh",
+    "kernels/vnext_pointwise_f32.cuh",
+    "kernels/vnext_gelu_f32.cuh",
+    "kernels/vnext_reshape_copy_f32.cuh",
+    "kernels/vnext_row_scatter_f32.cuh",
+    "kernels/vnext_channelwise_f32.cuh",
+    "kernels/vnext_row_selected_modulation.cuh",
+    "kernels/vnext_row_selected_bf16.cuh",
+    "kernels/vnext_batched_suffix_append_f32.cuh",
+    "kernels/vnext_layer_norm_f32.cuh",
+    "kernels/vnext_cnn_f32.cuh",
+    "kernels/vnext_philox_f32.cuh",
+    "kernels/vnext_f32_norm_rope.cuh",
+];
 const BLOCK_DECODE_HEADER: &str = "kernels/vnext_gguf_blocks.cuh";
 
 fn cuda_root_from_env() -> Option<PathBuf> {

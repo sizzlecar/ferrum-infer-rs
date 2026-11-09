@@ -24,6 +24,7 @@ mod source;
 pub use source::{ComfyCanonicalWeightSource, COMFY_CONVROT_CANONICAL_WEIGHT_FORMAT_ID};
 mod a8_reference;
 pub use a8_reference::{ComfyA8Bf16Reference, ComfyA8F32Reference};
+mod embedding_reference;
 #[cfg(test)]
 mod tests;
 

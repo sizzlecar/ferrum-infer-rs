@@ -4,6 +4,14 @@
 
 use super::*;
 
+mod causal_program;
+mod phase_custody;
+pub use causal_program::{
+    CausalAcceptedOutput, CausalCommittedWave, CausalComputedWave, CausalProgramSession,
+    CausalTailTwoOutput, CausalVerifiedDraftOutput, CausalWaveFailure, CompiledCausalProgram,
+};
+pub(super) mod static_installation;
+
 /// This executor either published the original completed installation or
 /// attached to it without reading, materializing or uploading static weights.
 /// Evidence identifies the original physical owner, not a second initialization.
@@ -180,8 +188,8 @@ mod tests {
 
 pub struct RuntimeComposition<R: DeviceRuntime> {
     pub(super) runtime: Arc<R>,
-    pub(super) registry: OperationRuntimeRegistry<R>,
-    weight_materializers: WeightMaterializerRegistry,
+    pub(super) registry: Arc<OperationRuntimeRegistry<R>>,
+    weight_materializers: Arc<WeightMaterializerRegistry>,
     pub(super) catalog: CapabilityCatalog,
 }
 
@@ -207,6 +215,23 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
         weight_materializers: WeightMaterializerRegistry,
         catalog: CapabilityCatalog,
     ) -> Self {
+        Self::from_shared(
+            runtime,
+            Arc::new(registry),
+            Arc::new(weight_materializers),
+            catalog,
+        )
+    }
+
+    /// Share the actual providers and materializers with an existing runtime
+    /// composition. This does not share an execution lane or dynamic I/O Host
+    /// authority; compilation still checks the original runtime/catalog pair.
+    pub fn from_shared(
+        runtime: Arc<R>,
+        registry: Arc<OperationRuntimeRegistry<R>>,
+        weight_materializers: Arc<WeightMaterializerRegistry>,
+        catalog: CapabilityCatalog,
+    ) -> Self {
         Self {
             runtime,
             registry,
@@ -217,6 +242,29 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
 
     pub fn runtime(&self) -> &R {
         self.runtime.as_ref()
+    }
+    /// Clone the original runtime owner for a neighboring tensor component.
+    /// This neither creates a runtime nor changes its capacity authority.
+    pub fn runtime_handle(&self) -> Arc<R> {
+        Arc::clone(&self.runtime)
+    }
+
+    /// Compile an actual tensor component against this composition's same
+    /// providers, catalog and materializers, without reconstructing a registry.
+    pub fn compile_tensor_component(
+        &self,
+        family: ferrum_runtime::PreparedModelFamily,
+        policy: &crate::component::TensorComponentPolicy,
+        options: &ferrum_runtime::ProgramPlanCompileOptions,
+    ) -> std::result::Result<crate::component::CompiledTensorComponent<R>, VNextError> {
+        crate::component::CompiledTensorComponent::compile(
+            family,
+            &self.registry,
+            &self.catalog,
+            policy,
+            &self.weight_materializers,
+            options,
+        )
     }
     pub fn catalog(&self) -> &CapabilityCatalog {
         &self.catalog
@@ -233,6 +281,44 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
         config: ProgramExecutorConfig,
         materializer_selection: WeightMaterializerSelection,
     ) -> std::result::Result<CompiledProgram<'a, R>, ProgramCompilationError> {
+        self.compile_model_inner(
+            prepared,
+            info,
+            engine_config,
+            config,
+            materializer_selection,
+            None,
+        )
+    }
+
+    pub fn compile_model_with_causal_inputs<'a>(
+        &'a self,
+        prepared: PreparedExecutionInput<'a>,
+        info: ModelInfo,
+        engine_config: &EngineConfig,
+        config: ProgramExecutorConfig,
+        materializer_selection: WeightMaterializerSelection,
+        inputs: &CausalInputSchema,
+    ) -> std::result::Result<CompiledProgram<'a, R>, ProgramCompilationError> {
+        self.compile_model_inner(
+            prepared,
+            info,
+            engine_config,
+            config,
+            materializer_selection,
+            Some(inputs),
+        )
+    }
+
+    fn compile_model_inner<'a>(
+        &'a self,
+        prepared: PreparedExecutionInput<'a>,
+        info: ModelInfo,
+        engine_config: &EngineConfig,
+        config: ProgramExecutorConfig,
+        materializer_selection: WeightMaterializerSelection,
+        causal_inputs: Option<&CausalInputSchema>,
+    ) -> std::result::Result<CompiledProgram<'a, R>, ProgramCompilationError> {
         prepared.validate_info(&info)?;
         if self.runtime.descriptor() != self.catalog.device() {
             return Err(FerrumError::device(
@@ -245,7 +331,23 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
             engine_config.runtime.vnext_checkpoint_capture.as_ref(),
         )?;
         let family = prepared.family();
-        let language_io = ProgramExecutor::<R>::resolve_language_io_ids(family.program())?;
+        let language_io = match causal_inputs {
+            Some(inputs) => ProgramExecutor::<R>::resolve_language_io_ids_with_inputs(
+                family.program(),
+                Some(inputs),
+            )?,
+            None => ProgramExecutor::<R>::resolve_language_io_ids(family.program())?,
+        };
+        if causal_inputs.is_some()
+            && (checkpoint_selection.is_some()
+                || (config.device_reusable_execution_enabled
+                    && !config.supports_causal_input_replay()))
+        {
+            return Err(FerrumError::unsupported(
+                "causal conditioning requires no checkpoint capture and either eager or on-demand decode-only execution",
+            )
+            .into());
+        }
         let input_capacity = u64::try_from(config.maximum_model_tokens)
             .map_err(|_| FerrumError::config("vNext model length exceeds u64"))?;
         let vocabulary_size = u64::try_from(info.vocab_size)
@@ -256,7 +358,7 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
             element_type,
             layout: ResolvedTensorLayout::Contiguous,
         };
-        let mut options = ProgramPlanCompileOptions::new(BTreeMap::from([
+        let mut input_tensors = BTreeMap::from([
             (
                 language_io.token_input.clone(),
                 tensor(vec![input_capacity], ElementType::U32),
@@ -277,9 +379,17 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
                 language_io.repetition_penalty_input.clone(),
                 tensor(vec![1], ElementType::F32),
             ),
-        ]))
-        .map_err(|error| FerrumError::model(format!("vNext compile input: {error}")))?
-        .with_weight_arena_packing(config.weight_arena_packing);
+        ]);
+        if let Some(schema) = causal_inputs {
+            for spec in schema.specs() {
+                let mut dimensions = vec![input_capacity];
+                dimensions.extend(&spec.row_dimensions);
+                input_tensors.insert(spec.value_id.clone(), tensor(dimensions, spec.element_type));
+            }
+        }
+        let mut options = ProgramPlanCompileOptions::new(input_tensors)
+            .map_err(|error| FerrumError::model(format!("vNext compile input: {error}")))?
+            .with_weight_arena_packing(config.weight_arena_packing);
         config.plan_observation.apply(family, &mut options)?;
         if let Some(selection) = &checkpoint_selection {
             selection.retain_in(&mut options);
@@ -319,6 +429,23 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
     }
     pub fn compilation(&self) -> &ProgramPlanCompilation {
         &self.compilation
+    }
+
+    /// Additional materializer WeightBacking for this retained plan and source.
+    /// Keep the returned lease through initialization: its warm backing may
+    /// already be charged to the caller's Host account. Source-adapter backing
+    /// and TransferStaging are separate requirements, not included here.
+    pub fn prepare_static_host_backing(&self) -> Result<HostBackingPreparation> {
+        self.compilation
+            .executable()
+            .execution_plan()
+            .prepare_host_backing(self.prepared.family(), Some(self.prepared.weights()))
+            .map_err(|error| FerrumError::model(format!("vNext static Host backing: {error}")))
+    }
+
+    /// The exact retained bounded-upload policy, not an allocation grant.
+    pub fn static_initialization_policy(&self) -> StaticInitializationPolicy {
+        self.config.static_initialization
     }
 
     /// Evaluate the retained compiled plan without allocating device memory.
@@ -387,8 +514,213 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
             &ProgramPlanCompilation,
         ) -> Result<ResolvedModelPlan>,
     {
-        ProgramExecutor::from_compiled_model(self, StaticInstallation::Private, resolve_plan)
-            .map(|(executor, _)| executor)
+        ProgramExecutor::from_compiled_model(
+            self,
+            StaticInstallation::Private,
+            None,
+            None,
+            None,
+            resolve_plan,
+        )
+        .map(|(executor, _)| executor)
+    }
+
+    /// Install static weights using the caller's actual Host authority.
+    ///
+    /// Managed source/materializer backing and upload staging use this account
+    /// on the same runtime and resource transaction as ordinary initialization.
+    /// The caller must bind Host-aware sources to the same account and retain
+    /// any prepared backing leases through this call. This entrypoint does not
+    /// change subsequent causal input/output allocation or execution lanes.
+    pub fn initialize_with_static_host<F>(
+        self,
+        host: &HostMemoryAccount,
+        resolve_plan: F,
+    ) -> crate::ExecutorBuildResult<ProgramExecutor<R>>
+    where
+        F: FnOnce(
+            &ResolvedRuntimePolicy,
+            &CapabilityCatalog,
+            &ProgramPlanCompilation,
+        ) -> Result<ResolvedModelPlan>,
+    {
+        ProgramExecutor::from_compiled_model(
+            self,
+            StaticInstallation::Private,
+            Some(host),
+            None,
+            None,
+            resolve_plan,
+        )
+        .map(|(executor, _)| executor)
+    }
+
+    /// Explicit causal I/O profile. Both static installation and every later
+    /// wave consume this original Host authority; legacy construction is unchanged.
+    pub fn initialize_with_managed_io<F>(
+        self,
+        host: &HostMemoryAccount,
+        profile: ManagedCausalIoProfile,
+        resolve_plan: F,
+    ) -> crate::ExecutorBuildResult<ProgramExecutor<R>>
+    where
+        F: FnOnce(
+            &ResolvedRuntimePolicy,
+            &CapabilityCatalog,
+            &ProgramPlanCompilation,
+        ) -> Result<ResolvedModelPlan>,
+    {
+        ProgramExecutor::from_compiled_model(
+            self,
+            StaticInstallation::Private,
+            Some(host),
+            Some(ManagedCausalIo {
+                host: host.clone(),
+                profile,
+            }),
+            None,
+            resolve_plan,
+        )
+        .map(|(executor, _)| executor)
+    }
+
+    /// Install and execute with this original Host authority while retaining an
+    /// owned phase resource through whole-executor retirement. The resource may
+    /// be an already granted HostMemoryScope or a tuple of phase-owned leases.
+    /// This creates no additional Host account, grant or retirement reporter.
+    ///
+    /// Successful construction transfers custody to the original ExecutorOwner;
+    /// failed construction transfers it to the original cleanup observer, or
+    /// releases it only when no retained native cleanup remains. An unhandled
+    /// panic after native acquisition starts continues unwinding and quarantines
+    /// the resource alongside runtime's original abandonment fallback. Such a
+    /// raw-panic quarantine currently has no recovery/retirement receipt and
+    /// cannot be reported as reclaimed. Pre-acquisition panic drops normally.
+    pub fn initialize_with_managed_io_retained<F, P>(
+        self,
+        host: &HostMemoryAccount,
+        profile: ManagedCausalIoProfile,
+        owned_phase: P,
+        resolve_plan: F,
+    ) -> crate::ExecutorBuildResult<crate::ExecutorOwner>
+    where
+        P: Send + 'static,
+        F: FnOnce(
+            &ResolvedRuntimePolicy,
+            &CapabilityCatalog,
+            &ProgramPlanCompilation,
+        ) -> Result<ResolvedModelPlan>,
+    {
+        self.initialize_retained_installation(
+            StaticInstallation::Private,
+            host,
+            profile,
+            owned_phase,
+            resolve_plan,
+        )
+        .map(|(owner, _)| owner)
+    }
+
+    /// Publish one completed static installation while the original phase
+    /// remains retained by this executor's ordinary shutdown authority.
+    pub fn initialize_shared_weights_with_managed_io_retained<F, P>(
+        self,
+        host: &HostMemoryAccount,
+        profile: ManagedCausalIoProfile,
+        owned_phase: P,
+        resolve_plan: F,
+    ) -> crate::ExecutorBuildResult<(crate::ExecutorOwner, SharedProgramWeights<R>)>
+    where
+        P: Send + 'static,
+        F: FnOnce(
+            &ResolvedRuntimePolicy,
+            &CapabilityCatalog,
+            &ProgramPlanCompilation,
+        ) -> Result<ResolvedModelPlan>,
+    {
+        self.initialize_retained_installation(
+            StaticInstallation::PublishShared,
+            host,
+            profile,
+            owned_phase,
+            resolve_plan,
+        )
+        .map(|(owner, weights)| {
+            (
+                owner,
+                weights.expect("shared publication returns its original owner"),
+            )
+        })
+    }
+
+    /// Attach managed causal execution to an existing installation. Static
+    /// source bytes are not read again; phase custody follows the same close
+    /// and failed-construction path as an ordinary managed executor.
+    pub fn initialize_with_shared_weights_and_managed_io_retained<F, P>(
+        self,
+        weights: &SharedProgramWeights<R>,
+        host: &HostMemoryAccount,
+        profile: ManagedCausalIoProfile,
+        owned_phase: P,
+        resolve_plan: F,
+    ) -> crate::ExecutorBuildResult<crate::ExecutorOwner>
+    where
+        P: Send + 'static,
+        F: FnOnce(
+            &ResolvedRuntimePolicy,
+            &CapabilityCatalog,
+            &ProgramPlanCompilation,
+        ) -> Result<ResolvedModelPlan>,
+    {
+        self.initialize_retained_installation(
+            StaticInstallation::AttachShared(weights),
+            host,
+            profile,
+            owned_phase,
+            resolve_plan,
+        )
+        .map(|(owner, _)| owner)
+    }
+
+    fn initialize_retained_installation<F, P>(
+        self,
+        installation: StaticInstallation<'_, R>,
+        host: &HostMemoryAccount,
+        profile: ManagedCausalIoProfile,
+        owned_phase: P,
+        resolve_plan: F,
+    ) -> crate::ExecutorBuildResult<(crate::ExecutorOwner, Option<SharedProgramWeights<R>>)>
+    where
+        P: Send + 'static,
+        F: FnOnce(
+            &ResolvedRuntimePolicy,
+            &CapabilityCatalog,
+            &ProgramPlanCompilation,
+        ) -> Result<ResolvedModelPlan>,
+    {
+        let custody = phase_custody::PhaseCustody::new(owned_phase);
+        let result = ProgramExecutor::from_compiled_model(
+            self,
+            installation,
+            Some(host),
+            Some(ManagedCausalIo {
+                host: host.clone(),
+                profile,
+            }),
+            Some(custody.native_started()),
+            resolve_plan,
+        );
+        match result {
+            Ok((executor, weights)) => {
+                let owner = crate::ExecutorOwner::new(Box::new(executor));
+                custody.handoff(&owner.shutdown_observer());
+                Ok((owner, weights))
+            }
+            Err(error) => {
+                custody.finish_error(&error);
+                Err(error)
+            }
+        }
     }
 
     /// Initialize once and publish that exact readonly physical installation.
@@ -405,13 +737,20 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
             &ProgramPlanCompilation,
         ) -> Result<ResolvedModelPlan>,
     {
-        ProgramExecutor::from_compiled_model(self, StaticInstallation::PublishShared, resolve_plan)
-            .map(|(executor, weights)| {
-                (
-                    executor,
-                    weights.expect("shared publication returns its original owner"),
-                )
-            })
+        ProgramExecutor::from_compiled_model(
+            self,
+            StaticInstallation::PublishShared,
+            None,
+            None,
+            None,
+            resolve_plan,
+        )
+        .map(|(executor, weights)| {
+            (
+                executor,
+                weights.expect("shared publication returns its original owner"),
+            )
+        })
     }
 
     /// Attach an independently compiled token executor to a compatible original
@@ -434,8 +773,57 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
         ProgramExecutor::from_compiled_model(
             self,
             StaticInstallation::AttachShared(weights),
+            None,
+            None,
+            None,
             resolve_plan,
         )
         .map(|(executor, _)| executor)
     }
+
+    /// Cold per-wave physical I/O bound. This metadata query grants no credit.
+    pub fn managed_io_requirements(
+        &self,
+        host: &HostMemoryAccount,
+        profile: ManagedCausalIoProfile,
+        work: &[ManagedCausalIoWork],
+    ) -> Result<ManagedCausalIoRequirements> {
+        let io = ProgramExecutor::<R>::resolve_io(
+            self.compilation.executable(),
+            &self.language_io,
+            self.info.vocab_size,
+            usize::try_from(self.repetition_capacity)
+                .map_err(|_| FerrumError::config("managed repetition capacity exceeds usize"))?,
+        )?;
+        profile.validate_logits_type(io.output_element_type)?;
+        managed_io::requirements_with_inputs(
+            host,
+            self.info.vocab_size,
+            profile,
+            work,
+            self.language_io.causal_inputs.as_ref(),
+        )
+    }
 }
+
+/// Both public initialization paths retain the original committed transaction
+/// and feed their result into the driver's existing activation/cleanup chain.
+pub(super) fn initialize_static_with_host<R: DeviceRuntime>(
+    transaction: ResourceTransaction<RuntimeResourceDriver<R>, TransactionCommitted>,
+    family: &PreparedModelFamily,
+    plan: &ExecutionPlan,
+    source: &dyn WeightComponentSource,
+    host: Option<&HostMemoryAccount>,
+    policy: StaticInitializationPolicy,
+) -> std::result::Result<
+    InitializedResourceTransaction<RuntimeResourceDriver<R>>,
+    StaticInitializationFailure<RuntimeResourceDriver<R>>,
+> {
+    match host {
+        Some(host) => transaction.initialize_static_managed(family, plan, source, host, policy),
+        None => transaction.initialize_static(family, plan, source, policy),
+    }
+}
+
+#[cfg(test)]
+mod static_host_tests;

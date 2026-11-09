@@ -10,7 +10,7 @@ pub(super) struct SubmissionGuard<'a> {
     runtime: &'a CudaDeviceRuntime,
     stream_id: u64,
     stream: Arc<CudaStream>,
-    blas: Option<Arc<CudaBlas>>,
+    blas: Option<Arc<CudaBlasOwner>>,
     state: Arc<CudaStreamState>,
     commands: Vec<CudaDeviceCommand>,
     armed: bool,
@@ -315,6 +315,10 @@ impl TensorTransfer {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tensor_io/weight_upload_bench.rs"]
+mod weight_upload_bench;
 
 #[cfg(test)]
 mod tests {

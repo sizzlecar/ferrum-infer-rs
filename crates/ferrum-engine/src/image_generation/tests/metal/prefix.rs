@@ -96,6 +96,7 @@ fn input(
         .unwrap();
     let tensor = ResolvedTensorSpec::new(spec.dimensions, spec.element_type, spec.layout).unwrap();
     let mut bytes = pipeline
+        .execution
         .host
         .allocate_zeroed(
             HostMemoryClass::InputPreprocess,
@@ -125,7 +126,7 @@ fn execute(
     job: u64,
 ) -> ResultImage {
     let full = QwenImage21TransformerConfig::new(
-        pipeline.assets.transformer.clone(),
+        pipeline.execution.sources.assets.transformer.clone(),
         QwenImage21T2iLayout::new(4, 2, 2, vec![4]).unwrap(),
     )
     .unwrap()
@@ -159,11 +160,11 @@ fn execute(
         );
         assert_eq!(
             config.prefix_cache_ports().unwrap().len(),
-            2 * pipeline.assets.transformer.layers() as usize
+            2 * pipeline.execution.sources.assets.transformer.layers() as usize
         );
         PreparedPrefixDecode { config, stage }
     });
-    let decoder = pipeline.assets.decoder(2, 2).unwrap();
+    let decoder = pipeline.execution.sources.assets.decoder(2, 2).unwrap();
     let family = pipeline
         .prepare_family(
             ImageStage::Decoder,
@@ -194,15 +195,22 @@ fn execute(
     let mut sample = input(pipeline, &full, F::LATENTS_ID, 0);
     let text = input(pipeline, &full, F::TEXT_ID, 3);
     let reference = input(pipeline, &full, F::REFERENCE_LATENTS_ID, reference_offset);
-    let frequencies = config.managed_rotary_frequencies(&pipeline.host).unwrap();
+    let frequencies = config
+        .managed_rotary_frequencies(&pipeline.execution.host)
+        .unwrap();
     let mut solver = ManagedBf16Euler::new(
-        pipeline.assets.schedule.solver().clone(),
-        pipeline.host.clone(),
+        pipeline.execution.sources.assets.schedule.solver().clone(),
+        pipeline.execution.host.clone(),
         sample.tensor().clone(),
         pipeline.profiles.euler,
     )
     .unwrap();
-    let expected_steps = pipeline.assets.schedule.evaluation_count();
+    let expected_steps = pipeline
+        .execution
+        .sources
+        .assets
+        .schedule
+        .evaluation_count();
     assert!(
         expected_steps >= 2,
         "fixture must execute prefill and decode"
@@ -229,7 +237,7 @@ fn execute(
         let mut active = complete(pipeline.start_stage(denoiser, job, &mut stages));
         while let Some(step) = solver.current_step() {
             let time = full
-                .managed_time_features(&pipeline.host, step.timestep().as_f32())
+                .managed_time_features(&pipeline.execution.host, step.timestep().as_f32())
                 .unwrap();
             let (next, outputs) = complete(pipeline.execute_stage(
                 active,
@@ -290,7 +298,7 @@ fn execute(
         );
     }
     let latents = QwenImage21ManagedLatents::new(
-        &pipeline.host,
+        &pipeline.execution.host,
         sample.clone(),
         QwenImage21LatentShape::new(1, 2, 2).unwrap(),
         QwenImage21LatentLayout::Packed,
@@ -298,7 +306,10 @@ fn execute(
     )
     .unwrap();
     let vae_input = latents
-        .denormalize_for_vae(&pipeline.host, &pipeline.assets.statistics)
+        .denormalize_for_vae(
+            &pipeline.execution.host,
+            &pipeline.execution.sources.assets.statistics,
+        )
         .unwrap()
         .into_input_tensor()
         .unwrap();
@@ -310,7 +321,7 @@ fn execute(
         s.retirement,
         ImageStageRetirement::Closed | ImageStageRetirement::SharedWeightsClosed { .. }
     )));
-    let native = pipeline.runtime.native_memory_snapshot().unwrap();
+    let native = pipeline.execution.runtime.native_memory_snapshot().unwrap();
     assert!(native.observed_peak_allocated_bytes > 0);
     assert!(native.observed_peak_allocated_bytes >= native.allocated_bytes);
     eprintln!(
@@ -370,9 +381,10 @@ fn metal_request_cache_matches_recompute_and_reinitializes_different_references(
     config.pipeline.edit_prefix_policy = ImageEditPrefixPolicy::RequestCache;
     let mut pipeline = config.create_pipeline(assets).unwrap();
     let host = pipeline.host_account().clone();
-    let runtime = Arc::downgrade(&pipeline.runtime);
-    let ceiling = pipeline.config.device_capacity_bytes;
-    let capacity = DeviceCapacityOwner::open(pipeline.runtime.descriptor(), ceiling).unwrap();
+    let runtime = Arc::downgrade(&pipeline.execution.runtime);
+    let ceiling = pipeline.execution.config.device_capacity_bytes;
+    let capacity =
+        DeviceCapacityOwner::open(pipeline.execution.runtime.descriptor(), ceiling).unwrap();
     let a = execute(&mut pipeline, ImageEditPrefixPolicy::Recompute, 1, 1);
     let b = execute(&mut pipeline, ImageEditPrefixPolicy::Recompute, 7, 2);
     assert_ne!(

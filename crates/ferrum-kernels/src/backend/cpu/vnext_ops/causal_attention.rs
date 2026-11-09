@@ -226,6 +226,7 @@ fn normalized_rotary(
     position: usize,
     raw: &[u8],
     norm: &[u8],
+    rotary: Option<(&[u8], &[u8])>,
     mut output: impl FnMut(usize, f32),
 ) {
     let half = CpuFloat::F16;
@@ -244,11 +245,15 @@ fn normalized_rotary(
         } else {
             (pair, pair + shape.rope_dim / 2)
         };
-        let angle = position as f32
-            * shape
-                .theta
-                .powf(-((pair * 2) as f32) / shape.rope_dim as f32);
-        let (sine, cosine) = angle.sin_cos();
+        let (sine, cosine) = if let Some((cos, sin)) = rotary {
+            (half.read(sin, pair), half.read(cos, pair))
+        } else {
+            let angle = position as f32
+                * shape
+                    .theta
+                    .powf(-((pair * 2) as f32) / shape.rope_dim as f32);
+            angle.sin_cos()
+        };
         let (left, right) = (normalized(low), normalized(high));
         output(low, left * cosine - right * sine);
         output(high, left * sine + right * cosine);
@@ -265,7 +270,25 @@ pub(super) fn step<K: CpuKvStorage + ?Sized>(
     kv: &mut K,
     scratch: CausalScratch<'_>,
 ) -> Result<(), CpuRuntimeError> {
+    step_with_rope(shape, position, input, kv, scratch, None)
+}
+
+pub(super) fn step_with_rope<K: CpuKvStorage + ?Sized>(
+    shape: CausalShape,
+    position: usize,
+    input: CausalInputs<'_>,
+    kv: &mut K,
+    scratch: CausalScratch<'_>,
+    rotary: Option<(&[u8], &[u8])>,
+) -> Result<(), CpuRuntimeError> {
     shape.validate()?;
+    if rotary.is_some_and(|(cos, sin)| {
+        shape.interleaved || cos.len() != shape.rope_dim || sin.len() != shape.rope_dim
+    }) {
+        return Err(CpuRuntimeError::new(
+            "explicit F16 RoPE has incompatible half-table geometry",
+        ));
+    }
     if position >= shape.maximum_context
         || kv.len_bytes() < (position + 1) * shape.state_bytes_per_token()
         || input.query.len() != shape.query_projection() * 2
@@ -288,6 +311,7 @@ pub(super) fn step<K: CpuKvStorage + ?Sized>(
             position,
             &input.query[head * query_stride * 2..(head * query_stride + shape.head_dim) * 2],
             input.query_norm,
+            rotary,
             |column, value| {
                 CpuFloat::F16.write(scratch.query, head * shape.head_dim + column, value)
             },
@@ -300,6 +324,7 @@ pub(super) fn step<K: CpuKvStorage + ?Sized>(
             position,
             &input.key[head * shape.head_dim * 2..(head + 1) * shape.head_dim * 2],
             input.key_norm,
+            rotary,
             |column, value| kv.write_half(token_start + head * shape.head_dim + column, value),
         );
     }

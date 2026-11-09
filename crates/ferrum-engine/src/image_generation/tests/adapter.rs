@@ -96,7 +96,7 @@ pub(super) fn tokenizer() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     )
 }
 
-pub(super) fn pipeline(
+pub(in crate::image_generation) fn pipeline(
     maximum_batch_size: usize,
 ) -> (
     QwenImage21Pipeline<ReferenceDeviceRuntime>,
@@ -225,7 +225,7 @@ fn real_qwen_adapter_exposes_configured_capacity_and_delegates_b2_preflight() {
             .maximum_batch_size,
         2
     );
-    let before = pipeline.runtime.snapshot();
+    let before = pipeline.execution.runtime.snapshot();
     let error = match ImageGenerator::generate_batch(&mut pipeline, two_requests()) {
         Ok(_) => panic!("Reference has no real Philox provider"),
         Err(error) => error,
@@ -235,7 +235,7 @@ fn real_qwen_adapter_exposes_configured_capacity_and_delegates_b2_preflight() {
     };
     assert!(message.contains("philox"), "{message}");
     assert!(!pipeline.is_stopped());
-    let after = pipeline.runtime.snapshot();
+    let after = pipeline.execution.runtime.snapshot();
     assert_eq!(after.allocations, before.allocations);
     assert_eq!(after.submissions, before.submissions);
     assert_eq!(
@@ -250,10 +250,11 @@ async fn real_plan_capacity_error_retains_stage_source_and_run_serve_diagnostics
     // Force the real text plan to exceed its policy before the deliberately
     // absent Reference Philox provider is reached. No fabricated error is used.
     let available = 1;
-    pipeline.config.device_capacity_bytes = available;
-    pipeline.policy = TensorComponentPolicy::new(
+    pipeline.execution.config.device_capacity_bytes = available;
+    pipeline.execution.policy = TensorComponentPolicy::new(
         available,
         pipeline
+            .execution
             .runtime
             .descriptor()
             .dynamic_storage_profiles
@@ -262,8 +263,8 @@ async fn real_plan_capacity_error_retains_stage_source_and_run_serve_diagnostics
             .collect(),
     )
     .unwrap();
-    let runtime = pipeline.runtime.clone();
-    let host = pipeline.host.clone();
+    let runtime = pipeline.execution.runtime.clone();
+    let host = pipeline.execution.host.clone();
     let before = runtime.snapshot();
     let request = two_requests().remove(0);
     let error = pipeline
@@ -374,9 +375,9 @@ async fn real_qwen_service_rejects_excess_capacity_and_preserves_default_one() {
 #[tokio::test]
 async fn real_qwen_token_preflight_rejects_job_without_stopping_service_or_submitting() {
     let (mut pipeline, _sources) = pipeline(1);
-    pipeline.config.maximum_user_tokens = 2;
-    let runtime = pipeline.runtime.clone();
-    let host = pipeline.host.clone();
+    pipeline.execution.config.maximum_user_tokens = 2;
+    let runtime = pipeline.execution.runtime.clone();
+    let host = pipeline.execution.host.clone();
     let before = runtime.snapshot();
     let service = ImageService::new(
         pipeline,

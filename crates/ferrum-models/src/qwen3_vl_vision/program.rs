@@ -406,7 +406,11 @@ pub(super) fn build(
         })
         .collect::<Result<Vec<_>, VNextError>>()?;
     let outputs = std::iter::once(Family::OUTPUT_ID)
-        .chain(Family::DEEPSTACK_IDS)
+        .chain(
+            Family::DEEPSTACK_IDS
+                .into_iter()
+                .take(a.deepstack_layers().len()),
+        )
         .map(ProgramValueId::new)
         .collect::<Result<Vec<_>, _>>()?;
     let graph = ModelProgram::new(

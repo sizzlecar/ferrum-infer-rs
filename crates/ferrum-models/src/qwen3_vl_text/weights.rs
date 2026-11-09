@@ -1,4 +1,6 @@
-use super::{invalid, Qwen3VLTextArchitecture, Qwen3VLTextConfig};
+use super::{
+    invalid, Qwen3VLTextArchitecture, Qwen3VLTextConfig, Qwen3VLTextEncoderFamily as Family,
+};
 use ferrum_runtime::*;
 use serde::Serialize;
 
@@ -76,7 +78,7 @@ pub(super) fn expected(
             .checked_add(bytes)
             .ok_or_else(|| invalid("weights", "layer bytes overflow"))?;
     }
-    per_layer
+    let layer_bytes = per_layer
         .checked_mul(config.architecture().layers())
         .ok_or_else(|| invalid("weights", "total layer bytes overflow"))?;
     let mut out = Vec::new();
@@ -93,6 +95,22 @@ pub(super) fn expected(
                 bytes: tensor.minimum_storage_bytes()?,
             });
         }
+    }
+    if config.hidden_state_indices().last() == Some(&config.architecture().layers()) {
+        let tensor = ResolvedTensorSpec::new(
+            vec![config.architecture().hidden_size()],
+            ElementType::Bf16,
+            ResolvedTensorLayout::Contiguous,
+        )?;
+        let bytes = tensor.minimum_storage_bytes()?;
+        layer_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("weights", "total bytes including final norm overflow"))?;
+        out.push(Qwen3VLTextExpectedWeight {
+            external_name: Family::FINAL_NORM_EXTERNAL_NAME.into(),
+            dimensions: tensor.dimensions().to_vec(),
+            bytes,
+        });
     }
     Ok(out)
 }

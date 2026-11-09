@@ -9,13 +9,16 @@ pub(crate) struct ReferenceHalfSplitRopeShape {
     pub(crate) rows: usize,
     pub(crate) columns: usize,
     pub(crate) head_dim: usize,
+    pub(crate) rotary_dim: usize,
 }
 impl ReferenceHalfSplitRopeShape {
     pub(crate) fn byte_extents(self) -> Result<(usize, usize), ReferenceDeviceRuntimeError> {
         if self.rows == 0
             || self.columns == 0
             || self.head_dim == 0
-            || self.head_dim % 2 != 0
+            || self.rotary_dim == 0
+            || self.rotary_dim % 2 != 0
+            || self.rotary_dim > self.head_dim
             || self.columns % self.head_dim != 0
         {
             return Err(invalid("invalid positive even head partition"));
@@ -26,7 +29,7 @@ impl ReferenceHalfSplitRopeShape {
                 .and_then(|n| n.checked_mul(2))
                 .ok_or_else(|| invalid("byte extent overflows"))
         };
-        Ok((bytes(self.columns)?, bytes(self.head_dim)?))
+        Ok((bytes(self.columns)?, bytes(self.rotary_dim)?))
     }
     pub(crate) fn logical_work(
         self,
@@ -39,7 +42,10 @@ impl ReferenceHalfSplitRopeShape {
             .ok_or_else(|| invalid("element count overflows"))?;
         // Per pair: four products, two sums, one sign negation. BF16
         // conversions excluded; this is nominal scalar work, not hardware FLOPs.
-        let operations = (elements / 2)
+        let pairs = (elements / self.head_dim as u64)
+            .checked_mul((self.rotary_dim / 2) as u64)
+            .ok_or_else(|| invalid("rotated pair count overflows"))?;
+        let operations = pairs
             .checked_mul(7)
             .ok_or_else(|| invalid("logical work overflows"))?;
         DeviceCommandLogicalWork::tensor(elements, operations).map_err(|e| invalid(e.to_string()))
@@ -92,11 +98,11 @@ pub(super) fn execute(launch: &ReferenceHalfSplitRopeLaunch) {
         AllocationLocks::new([&launch.input, &launch.cosine, &launch.sine, &launch.output]);
     let shape = launch.shape;
     for row in 0..shape.rows {
-        let frequency = row * shape.head_dim;
+        let frequency = row * shape.rotary_dim;
         for head in 0..shape.columns / shape.head_dim {
             let start = row * shape.columns + head * shape.head_dim;
-            for i in 0..shape.head_dim / 2 {
-                let j = i + shape.head_dim / 2;
+            for i in 0..shape.rotary_dim / 2 {
+                let j = i + shape.rotary_dim / 2;
                 let a = bf16::from_bits(storage.read_bits(0, start + i)).to_f32();
                 let b = bf16::from_bits(storage.read_bits(0, start + j)).to_f32();
                 let ca = bf16::from_bits(storage.read_bits(1, frequency + i)).to_f32();
@@ -109,6 +115,10 @@ pub(super) fn execute(launch: &ReferenceHalfSplitRopeLaunch) {
                 let right_b = bf16::from_f32(a * sb).to_f32();
                 storage.write_bits(3, start + i, bf16::from_f32(left_a + right_a).to_bits());
                 storage.write_bits(3, start + j, bf16::from_f32(left_b + right_b).to_bits());
+            }
+            for i in shape.rotary_dim..shape.head_dim {
+                let bits = storage.read_bits(0, start + i);
+                storage.write_bits(3, start + i, bits);
             }
         }
     }

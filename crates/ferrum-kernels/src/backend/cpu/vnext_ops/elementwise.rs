@@ -3,6 +3,34 @@ use rayon::prelude::*;
 use super::super::vnext_runtime::CpuRuntimeError;
 use super::scalar::CpuFloat;
 
+pub(super) fn select_f16_rows(
+    input: &[u8],
+    visual: &[u8],
+    mask: &[u8],
+    output: &mut [u8],
+    columns: usize,
+) -> Result<(), CpuRuntimeError> {
+    let stride = columns
+        .checked_mul(2)
+        .filter(|s| *s > 0)
+        .ok_or_else(|| CpuRuntimeError::new("F16 row selection width is invalid"))?;
+    let bytes = mask
+        .len()
+        .checked_mul(stride)
+        .ok_or_else(|| CpuRuntimeError::new("F16 row selection extent overflows"))?;
+    if input.len() != bytes || visual.len() != bytes || output.len() != bytes {
+        return Err(CpuRuntimeError::new(
+            "F16 row selection requires matching extents",
+        ));
+    }
+    for (row, select) in mask.iter().enumerate() {
+        let range = row * stride..(row + 1) * stride;
+        let source = if *select == 0 { input } else { visual };
+        output[range.clone()].copy_from_slice(&source[range]);
+    }
+    Ok(())
+}
+
 pub(super) fn rms_norm(
     input: &[u8],
     input_type: CpuFloat,

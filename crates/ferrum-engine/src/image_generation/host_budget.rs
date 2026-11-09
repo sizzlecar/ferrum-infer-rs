@@ -3,7 +3,6 @@
 //! separately. Returned images keep their ordinary parent charge after close.
 use super::*;
 use ferrum_models::qwen3_vl_vision::Qwen3VLVisionFamily;
-use ferrum_quantization::bf16_whole_tensor_fp8::ExactBf16TensorSource;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ExecutionHostBudget {
@@ -30,7 +29,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         prepared: &mut PreparedRequest<R>,
     ) -> anyhow::Result<()> {
         let (budget, backing) = self.execution_host_budget(prepared)?;
-        self.host.check_scope_capacity(&budget.claims())?;
+        self.execution.host.check_scope_capacity(&budget.claims())?;
         prepared.host_budget = budget;
         prepared.host_backing = backing;
         Ok(())
@@ -42,14 +41,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     ) -> anyhow::Result<HostMemoryScope> {
         let budget = prepared.host_budget;
         tracing::debug!(?budget, "image complete execution Host grant");
-        Ok(self.host.reserve_scope(&budget.claims())?)
+        Ok(self.execution.host.reserve_scope(&budget.claims())?)
     }
 
     fn execution_host_budget(
         &self,
         p: &PreparedRequest<R>,
     ) -> anyhow::Result<(ExecutionHostBudget, Vec<HostBackingPreparation>)> {
-        let host = &self.host;
+        let host = &self.execution.host;
         let batch = p.prompts.batch();
         let latent = host.backing_bytes(p.latent_shape.byte_len())?;
         let denoise = ports(&p.denoise_stage)?;
@@ -70,6 +69,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .max(sum_ports(host, ports(&p.noise_stage)?.outputs().iter())?),
             ..ExecutionHostBudget::default()
         };
+        if p.edit.is_none() && p.prefix_decode.is_none() {
+            budget.input = budget
+                .input
+                .max(full_generation_input_peak(host, denoise, batch)?);
+        }
         // Prefix KV outputs are copied directly into Request state on device;
         // only the velocity readback consumes Host Output credit.
         let cache_outputs = if p.prefix_decode.is_some() {
@@ -99,7 +103,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         budget.output = budget.output.max(decoder_output_peak(
             decoder_output,
             batch,
-            self.config.decoder_batch_policy,
+            self.execution.config.decoder_batch_policy,
         )?);
         let mut stages = vec![
             &p.text_stage,
@@ -146,11 +150,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 let (bytes, retention) = self.stage_host_backing(stage)?;
                 budget.weights = add(&[budget.weights, bytes])?;
                 backing.push(retention);
-                if self.runtime.requires_managed_static_staging() {
+                if self.execution.runtime.requires_managed_static_staging() {
                     budget.staging = budget.staging.max(staging_bytes(
                         host,
                         stage,
-                        self.config.static_initialization,
+                        self.execution.config.static_initialization,
                     )?);
                 }
             }
@@ -163,49 +167,18 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             return false;
         }
         // Adaptive residency may evict any installation between stages.
-        if self.config.residency == ImageResidencyPolicy::Adaptive {
+        if self.execution.config.residency == ImageResidencyPolicy::Adaptive {
             return true;
         }
-        !self.config.residency.retains(stage.plan.stage)
-            || !self.resident_stages.has_weights(stage.plan.stage)
+        !self.execution.config.residency.retains(stage.plan.stage)
+            || !self.execution.resident_stages.has_weights(stage.plan.stage)
     }
 
-    fn stage_host_backing(
+    pub(super) fn stage_host_backing(
         &self,
         stage: &PreparedStage<R>,
     ) -> anyhow::Result<(usize, HostBackingPreparation)> {
-        let family = stage.component.family();
-        let plan = stage.component.executable().execution_plan();
-        let source = match stage.plan.stage {
-            ImageStage::TextEncoder => self.assets.sources.text_encoder.as_ref(),
-            ImageStage::Denoiser => self.assets.sources.transformer.as_ref(),
-            ImageStage::VisionEncoder => self.assets.sources.text_encoder.as_ref(),
-            ImageStage::VaeEncoder | ImageStage::Decoder => self.assets.sources.vae.as_ref(),
-            ImageStage::Noise => return Ok((0, HostBackingPreparation::new(0))),
-        };
-        let exact = ExactBf16TensorSource::new(source);
-        let backing = plan.prepare_host_backing(family, Some(&exact))?;
-        let converted = backing.additional_bytes();
-        if stage.plan.stage != ImageStage::Denoiser
-            || QwenImage21TransformerFamily::is_fp8_profile(stage.plan.profile.as_str())
-        {
-            return Ok((converted, backing));
-        }
-        // The native dense archive wrapper can normalize F32/F16 stored
-        // components into BF16. It materializes one identity group at a time.
-        let mut normalized = 0;
-        for component in &family.stored_weight_schema()?.components {
-            let [name] = component.external_names.as_slice() else {
-                continue;
-            };
-            if source.tensor(name)?.encoding() != &component.encoding {
-                normalized = normalized.max(
-                    self.host
-                        .backing_bytes(usize::try_from(component.physical_bytes()?)?)?,
-                );
-            }
-        }
-        Ok((add(&[converted, normalized])?, backing))
+        self.execution.stage_host_backing(stage)
     }
 }
 
@@ -231,6 +204,23 @@ pub(super) fn sum_ports<'a>(
             host.backing_bytes(usize::try_from(port.tensor().minimum_storage_bytes()?)?)?,
         ])
     })
+}
+
+/// During one request-owned Euler wave the gathered batch, every old sample
+/// and every prepared successor coexist with the fixed conditioning inputs.
+/// Each request sample is a distinct allocation and needs its own padding.
+pub(super) fn full_generation_input_peak(
+    host: &HostMemoryAccount,
+    ports: &CompiledTensorPorts,
+    batch: usize,
+) -> anyhow::Result<usize> {
+    let latent = input_logical_bytes(ports, QwenImage21TransformerFamily::LATENTS_ID)?;
+    ensure!(
+        batch > 0 && latent % batch == 0,
+        "invalid latent Host budget partition"
+    );
+    let samples = multiply(host.backing_bytes(latent / batch)?, batch)?;
+    add(&[sum_ports(host, ports.inputs().iter())?, samples, samples])
 }
 
 fn input_logical_bytes(ports: &CompiledTensorPorts, name: &str) -> anyhow::Result<usize> {
@@ -271,23 +261,51 @@ pub(super) fn staging_bytes<R: DeviceRuntime>(
     stage: &PreparedStage<R>,
     policy: StaticInitializationPolicy,
 ) -> anyhow::Result<usize> {
-    let ExecutionWeights::Stored(weights) = stage
-        .component
-        .executable()
-        .execution_plan()
-        .payload()
-        .execution_weights()
-    else {
+    stored_staging_bytes(
+        host,
+        stage
+            .component
+            .executable()
+            .execution_plan()
+            .payload()
+            .execution_weights(),
+        policy,
+    )
+}
+
+/// The same per-allocation staging bound for an already compiled causal phase.
+pub(super) fn stored_staging_bytes(
+    host: &HostMemoryAccount,
+    weights: &ExecutionWeights,
+    policy: StaticInitializationPolicy,
+) -> anyhow::Result<usize> {
+    let ExecutionWeights::Stored(weights) = weights else {
         return Ok(0);
     };
     let mut largest_chunk = 0;
+    let mut all_chunks = 0usize;
     for component in &weights.schema().components {
         let element = component.physical_element_type().size_bytes();
-        let chunk = component
-            .physical_bytes()?
-            .min(policy.maximum_staging_bytes() - policy.maximum_staging_bytes() % element);
+        let maximum = policy.maximum_staging_bytes() - policy.maximum_staging_bytes() % element;
+        ensure!(
+            maximum != 0,
+            "static staging policy cannot hold one component element"
+        );
+        let bytes = component.physical_bytes()?;
+        let chunk = bytes.min(maximum);
         if chunk > 0 {
             largest_chunk = largest_chunk.max(host.backing_bytes(usize::try_from(chunk)?)?);
+        }
+        let full_chunks = usize::try_from(bytes / maximum)?;
+        if full_chunks > 0 {
+            all_chunks = add(&[
+                all_chunks,
+                multiply(host.backing_bytes(usize::try_from(maximum)?)?, full_chunks)?,
+            ])?;
+        }
+        let remainder = bytes % maximum;
+        if remainder > 0 {
+            all_chunks = add(&[all_chunks, host.backing_bytes(usize::try_from(remainder)?)?])?;
         }
     }
     if largest_chunk == 0 {
@@ -301,7 +319,15 @@ pub(super) fn staging_bytes<R: DeviceRuntime>(
         usize::try_from(policy.maximum_staging_bytes())?,
         multiply(padding, policy.maximum_commands_per_batch())?,
     ])?;
-    Ok(largest_chunk.max(ceiling.min(host.limits().class_bytes(HostMemoryClass::TransferStaging))))
+    // The stager visits every placed execution component once, with one
+    // independently padded allocation per chunk. An Arc retained by a command
+    // shares that allocation. Tiny plans cannot accumulate a full policy-sized
+    // batch: even retaining every chunk simultaneously is this smaller bound.
+    Ok(largest_chunk.max(
+        ceiling
+            .min(host.limits().class_bytes(HostMemoryClass::TransferStaging))
+            .min(all_chunks),
+    ))
 }
 
 fn add(bytes: &[usize]) -> anyhow::Result<usize> {

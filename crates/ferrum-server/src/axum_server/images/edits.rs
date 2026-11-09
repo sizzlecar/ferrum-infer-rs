@@ -18,8 +18,10 @@ const PROMPT_LIMIT: usize = 1024 * 1024;
 
 pub(in crate::axum_server) async fn edits_handler(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     multipart: Result<Multipart, MultipartRejection>,
-) -> Result<Response, ServerError> {
+) -> Result<Response, correlation::HttpError> {
+    let client_attempt = correlation::attempt(&headers)?;
     let images = state
         .images
         .as_ref()
@@ -28,7 +30,8 @@ pub(in crate::axum_server) async fn edits_handler(
         return Err(ServerError::unsupported_feature(
             "loaded image pipeline does not support editing",
             None,
-        ));
+        )
+        .into());
     }
     let multipart =
         multipart.map_err(|error| invalid(format!("invalid multipart request: {error}")))?;
@@ -49,20 +52,25 @@ pub(in crate::axum_server) async fn edits_handler(
         .map_err(service_error)?;
     let response = admit_response(images, session, &request.generation)?;
     let started = Instant::now();
-    let (result, grant) = images
+    let job = images
         .service
-        .try_submit_edit_with_output(request, response)
-        .map_err(service_error)?
+        .try_submit_edit_with_output_and_client_attempt(request, response, client_attempt)
+        .map_err(|error| correlation::service_failure(images, error))?;
+    let correlation = correlation::Context::for_job(images, job.correlation());
+    let (result, grant) = job
         .wait_with_output()
         .await
-        .map_err(service_error)?;
+        .map_err(|error| correlation.error(service_error(error)))?;
     let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let admission = grant.into_inner::<response::Admission>().map_err(|_| {
-        ServerError::InternalError(
+        correlation.error(ServerError::InternalError(
             "image edit response grant belongs to another output gate".into(),
-        )
+        ))
     })?;
-    encode_result(admission, result, elapsed).await
+    encode_result(admission, result, elapsed)
+        .await
+        .map(|response| correlation.response(response))
+        .map_err(|error| correlation.error(error))
 }
 
 async fn parse(

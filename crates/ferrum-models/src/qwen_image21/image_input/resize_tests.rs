@@ -104,3 +104,57 @@ fn two_axis_order_and_capacity_failure_keep_source_and_release_temporaries() {
     assert_eq!(small.usage().unwrap().committed_bytes(), 4);
     assert!(lanczos(&account, &source, 2, 2, limits()).is_err());
 }
+
+#[test]
+fn explicit_rgb_resize_keeps_transparent_color_and_uses_the_shared_physical_plan() {
+    let account = host(65536);
+    let image = ManagedRgba8Image::from_rgba8(
+        &account,
+        managed(&account, &[17, 129, 233, 0].repeat(4 * 3)),
+        4,
+        3,
+        limits(),
+    )
+    .unwrap();
+    let identity = ImageLanczosResizePlan::new(4, 3, 4, 3, limits()).unwrap();
+    assert_eq!(identity.input_peak_bytes(&account).unwrap(), 0);
+    let same = identity
+        .resize_rgb_ignoring_alpha(&account, &image)
+        .unwrap();
+    assert!(same.bytes().same_region(image.bytes()));
+    let plan = ImageLanczosResizePlan::new(4, 3, 2, 2, limits()).unwrap();
+    let peak = plan.input_peak_bytes(&account).unwrap();
+    let insufficient = account
+        .reserve_scope(&[(HostMemoryClass::InputPreprocess, peak - 1)])
+        .unwrap();
+    assert!(plan
+        .resize_rgb_ignoring_alpha(&insufficient.account(), &image)
+        .is_err());
+    assert_eq!(
+        account.usage().unwrap().allocated_bytes(),
+        image.bytes().backing_bytes()
+    );
+    drop(insufficient);
+    let exact = account
+        .reserve_scope(&[(HostMemoryClass::InputPreprocess, peak)])
+        .unwrap();
+    let resized = plan
+        .resize_rgb_ignoring_alpha(&exact.account(), &image)
+        .unwrap();
+    assert!(resized
+        .bytes()
+        .bytes()
+        .chunks_exact(4)
+        .all(|p| p == [17, 129, 233, 255]));
+    assert_eq!(
+        account.usage().unwrap().allocated_bytes(),
+        image.bytes().backing_bytes() + plan.retained_input_bytes(&account).unwrap()
+    );
+    // The original Qwen alpha-aware route is unchanged.
+    assert!(lanczos(&account, &image, 2, 2, limits())
+        .unwrap()
+        .bytes()
+        .bytes()
+        .iter()
+        .all(|&v| v == 0));
+}

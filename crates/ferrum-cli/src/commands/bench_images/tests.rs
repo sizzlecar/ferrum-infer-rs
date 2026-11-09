@@ -15,6 +15,9 @@ use std::sync::{
 };
 use tokio::sync::Barrier;
 
+#[path = "tests/correlation.rs"]
+mod correlation;
+
 pub(super) struct Server(tokio::task::JoinHandle<()>);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -59,6 +62,7 @@ pub(super) fn config(url: String) -> ImageBenchmarkConfig {
             edit_url: None,
             model: "image-model".into(),
             server_config_declaration: "CPU protocol fixture, no model performance evidence".into(),
+            protocol: ImageEndpointProtocol::default(),
         }],
         concurrency: 8,
         arrival: ImageArrivalPolicy::ClosedLoop,

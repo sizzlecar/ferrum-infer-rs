@@ -63,6 +63,7 @@ fn context() -> ImageCapacitySearchContext {
 
 fn queued(seed: u64) -> Queued<u64> {
     Queued {
+        trace: trace::RequestTrace::unobserved(),
         request: QueuedRequest::Generate(ImageGenerationRequest {
             prompt: "a".into(),
             width: 32,
@@ -85,6 +86,7 @@ fn queued(seed: u64) -> Queued<u64> {
 fn prepare(worker: &mut Worker, efficiency: &mut BatchEfficiency) -> (Vec<u64>, Vec<u64>) {
     let mut batch = (0..4).map(queued).collect::<Vec<_>>();
     let shared = Shared {
+        trace: None,
         state: Mutex::new(State {
             // A newer arrival must stay behind the returned original tail.
             queue: VecDeque::from([queued(4)]),

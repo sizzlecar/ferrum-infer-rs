@@ -33,17 +33,95 @@ use super::super::vnext_runtime::{
 use super::{binding, contract_error, implementation_fingerprint, provider_failure};
 
 mod attention;
+mod batched_suffix_append_f32;
 mod block_linear;
+mod cast_f32_to_bf16;
+mod channelwise_f32;
+mod cnn_f32;
+mod conv2d_f32;
+mod layer_norm_f32;
+pub use cnn_f32::numerical_profile as cnn_f32_numerical_profile;
+pub fn cuda_vnext_cnn_f32_providers(
+    runtime: &CudaDeviceRuntime,
+    config: &crate::backend::cuda::vnext_runtime::CudaCudnnConfig,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    conv2d_f32::providers(runtime, config, selected)
+}
+/// Explicit vendor segmented BF16 attention with the existing F32 convolution
+/// bundle. Shares its cuDNN owner, one module permit and a finite plan cache.
+/// Only selected SegmentedAttention is replaced; F32 convolution and F32 GQA
+/// retain their original providers. No additional operation contracts are added.
+pub fn cuda_vnext_cnn_f32_providers_with_segmented_sdpa(
+    runtime: &CudaDeviceRuntime,
+    config: &crate::backend::cuda::vnext_runtime::CudaCudnnConfig,
+    policy: crate::backend::cuda::vnext_runtime::CudnnSdpaPlanPolicy,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    conv2d_f32::providers_with_segmented_sdpa(runtime, config, policy, selected)
+}
+mod row_selected_bf16;
+mod row_selected_modulation;
+pub use batched_suffix_append_f32::NUMERICAL_PROFILE_ID as BATCHED_SUFFIX_APPEND_F32_PROFILE_ID;
+pub use layer_norm_f32::NUMERICAL_PROFILE_ID as LAYER_NORM_F32_PROFILE_ID;
+pub use row_selected_bf16::ADDCMUL_PROFILE as ROW_SELECTED_ADDCMUL_BF16_PROFILE_ID;
+pub use row_selected_bf16::MODULATION_PROFILE as ROW_SELECTED_MODULATION_BF16_PROFILE_ID;
+pub use row_selected_modulation::NUMERICAL_PROFILE as ROW_SELECTED_MODULATION_BF16_F32_PROFILE_ID;
+mod gelu_f32;
+mod reshape_copy_f32;
+pub use reshape_copy_f32::NUMERICAL_PROFILE as RESHAPE_COPY_F32_PROFILE_ID;
+mod row_scatter_f32;
+pub use row_scatter_f32::ADD_NUMERICAL_PROFILE as ROW_SCATTER_ADD_F32_PROFILE_ID;
+pub use row_scatter_f32::REPLACE_NUMERICAL_PROFILE as ROW_SCATTER_REPLACE_F32_PROFILE_ID;
+mod pointwise_f32;
+pub use channelwise_f32::numerical_profile as channelwise_f32_numerical_profile;
+pub use gelu_f32::ERF_NUMERICAL_PROFILE as GELU_ERF_F32_PROFILE_ID;
+pub use gelu_f32::TANH_NUMERICAL_PROFILE as GELU_TANH_F32_PROFILE_ID;
+pub use pointwise_f32::RESIDUAL_NUMERICAL_PROFILE as PLAIN_RESIDUAL_ADD_F32_PROFILE_ID;
+pub use pointwise_f32::SILU_MUL_NUMERICAL_PROFILE as SILU_MUL_F32_PROFILE_ID;
+mod comfy_convrot;
+mod comfy_embedding;
+mod norm_rope_f32;
+pub use cast_f32_to_bf16::NUMERICAL_PROFILE as CAST_F32_TO_BF16_NUMERICAL_PROFILE_ID;
+pub use comfy_convrot::F32_W4_NUMERICAL_PROFILE as COMFY_CONVROT_W4A8_F32_PROFILE_ID;
+pub use comfy_convrot::F32_W8_NUMERICAL_PROFILE as COMFY_CONVROT_W8A8_F32_PROFILE_ID;
+pub use comfy_convrot::INT8_NUMERICAL_PROFILE as COMFY_CONVROT_W8A8_PROFILE_ID;
+pub use comfy_convrot::NUMERICAL_PROFILE as COMFY_CONVROT_W4A8_PROFILE_ID;
+pub use comfy_convrot::SWIGLU_W4_NUMERICAL_PROFILE as COMFY_CONVROT_SWIGLU_F32_W4A8_PROFILE_ID;
+pub use comfy_convrot::SWIGLU_W8_NUMERICAL_PROFILE as COMFY_CONVROT_SWIGLU_F32_W8A8_PROFILE_ID;
+pub use comfy_embedding::NUMERICAL_PROFILE as COMFY_CONVROT_INT8_EMBEDDING_F32_NUMERICAL_PROFILE_ID;
+pub use norm_rope_f32::HEAD_PROFILE as HEAD_RMS_NORM_F32_PROFILE_ID;
+pub use norm_rope_f32::ROPE_PROFILE as HALF_SPLIT_ROPE_F32_PROFILE_ID;
+pub use norm_rope_f32::UNIT_PARTIAL_PROFILE as UNIT_HEAD_RMS_PARTIAL_ROPE_F32_PROFILE_ID;
 mod bundle;
+mod row_bias_f32;
+pub(super) use row_bias_f32::RetainedF32RowBias;
 mod conv2d;
 mod cudnn_attention;
 mod cudnn_cross_attention;
 mod cudnn_segmented;
+mod fused_head_rms_partial_rope;
+mod row_rms_addcmul;
+pub use row_rms_addcmul::{
+    ADDCMUL_PROFILE_ID as ADDCMUL_NUMERICAL_PROFILE_ID,
+    ROW_RMS_PROFILE_ID as ROW_RMS_SINGLE_ROUND_NUMERICAL_PROFILE_ID,
+};
 mod geometry;
 mod gqa;
+mod gqa_f32;
+pub use gqa_f32::{
+    NUMERICAL_IDENTITY as GQA_F32_NUMERICAL_IDENTITY,
+    NUMERICAL_PROFILE_ID as GQA_F32_NUMERICAL_PROFILE_ID,
+};
 mod half_split_rope;
+pub use fused_head_rms_partial_rope::NUMERICAL_PROFILE_ID as FUSED_HEAD_RMS_PARTIAL_ROPE_NUMERICAL_PROFILE_ID;
 mod norm;
 mod philox;
+mod philox_f32;
+pub use philox_f32::{
+    NUMERICAL_IDENTITY as PHILOX_NORMAL_F32_IDENTITY,
+    NUMERICAL_PROFILE_ID as PHILOX_NORMAL_F32_PROFILE_ID,
+};
 mod primitives;
 pub use philox::{
     CudaPhiloxDeviceGeometry, CudaPhiloxLaunchGeometry,
@@ -80,6 +158,7 @@ pub use gqa::{
 pub use half_split_rope::{
     NUMERICAL_IDENTITY as HALF_SPLIT_ROPE_NUMERICAL_IDENTITY,
     NUMERICAL_PROFILE_ID as HALF_SPLIT_ROPE_NUMERICAL_PROFILE_ID,
+    PARTIAL_NUMERICAL_PROFILE_ID as PARTIAL_HALF_SPLIT_ROPE_NUMERICAL_PROFILE_ID,
 };
 pub use norm::{
     HEAD_RMS_NORM_PROFILE_ID, LAYER_NORM_PROFILE_ID, NUMERICAL_IDENTITY as NORM_NUMERICAL_IDENTITY,
@@ -271,6 +350,78 @@ pub(super) fn numerical_fingerprint() -> String {
         include_bytes!("tensor_silu.rs"),
         include_bytes!("tensor_silu/bundle.rs"),
         include_bytes!("tensor_silu/primitives.rs"),
+        include_bytes!("tensor_silu/comfy_convrot.rs"),
+        include_bytes!("tensor_silu/comfy_embedding.rs"),
+        include_bytes!("tensor_silu/norm_rope_f32.rs"),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_f32_norm_rope.cuh"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_comfy_convrot_embedding.cuh"
+        )),
+        include_bytes!("tensor_silu/cast_f32_to_bf16.rs"),
+        include_bytes!("tensor_silu/pointwise_f32.rs"),
+        include_bytes!("tensor_silu/gelu_f32.rs"),
+        include_bytes!("tensor_silu/reshape_copy_f32.rs"),
+        include_bytes!("tensor_silu/row_scatter_f32.rs"),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_row_scatter_f32.cuh"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_reshape_copy_f32.cuh"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_gelu_f32.cuh"
+        )),
+        include_bytes!("tensor_silu/channelwise_f32.rs"),
+        include_bytes!("tensor_silu/row_selected_modulation.rs"),
+        include_bytes!("tensor_silu/row_selected_bf16.rs"),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_row_selected_bf16.cuh"
+        )),
+        include_bytes!("tensor_silu/batched_suffix_append_f32.rs"),
+        include_bytes!("tensor_silu/layer_norm_f32.rs"),
+        include_bytes!("tensor_silu/cnn_f32.rs"),
+        include_bytes!("tensor_silu/conv2d_f32.rs"),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_cnn_f32.cuh"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_batched_suffix_append_f32.cuh"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_layer_norm_f32.cuh"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_row_selected_modulation.cuh"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_channelwise_f32.cuh"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_pointwise_f32.cuh"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_cast_f32_to_bf16.cuh"
+        )),
+        include_bytes!("tensor_silu/comfy_convrot/launch.rs"),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_comfy_convrot.cuh"
+        )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/kernels/vnext_tensor_primitives.cuh"
@@ -286,6 +437,7 @@ pub(super) fn numerical_fingerprint() -> String {
         include_bytes!("tensor_silu/geometry.rs"),
         include_bytes!("tensor_silu/norm.rs"),
         include_bytes!("tensor_silu/philox.rs"),
+        include_bytes!("tensor_silu/philox_f32.rs"),
         philox::BUILD_IDENTITY_SHA256.as_bytes(),
         include_bytes!("tensor_silu/rope.rs"),
         include_bytes!("tensor_silu/attention.rs"),
@@ -621,3 +773,22 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(in crate::backend::cuda) fn row_bias_retention_fixture(
+    runtime: &CudaDeviceRuntime,
+    regions: Vec<CudaBufferRegion>,
+) -> Result<
+    (
+        Box<dyn OperationProvider<CudaDeviceRuntime>>,
+        CudaDeviceCommand,
+    ),
+    String,
+> {
+    let kernels = RetainedFunctions::load(runtime).map_err(|e| e.to_string())?;
+    super::tensor_dense_bf16::row_bias_retention_fixture(
+        runtime,
+        RetainedF32RowBias::new(&kernels),
+        regions,
+    )
+}

@@ -1,8 +1,6 @@
 //! Bounded model session/snapshot slots. Compatible plans share the same sealed
 //! physical weights; dynamic storage remains independently admitted.
 use super::*;
-use ferrum_quantization::bf16_whole_tensor_fp8::ExactBf16TensorSource;
-use ferrum_quantization::ManagedDenseArchiveSource;
 use std::num::NonZeroU64;
 
 mod adaptive;
@@ -72,6 +70,10 @@ pub struct ImageResidentStageSet {
     #[serde(skip_serializing_if = "is_false")]
     pub text_encoder: bool,
     #[serde(skip_serializing_if = "is_false")]
+    pub text_connector: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub text_refiner: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub vision_encoder: bool,
     #[serde(skip_serializing_if = "is_false")]
     pub vae_encoder: bool,
@@ -87,6 +89,8 @@ impl ImageResidentStageSet {
     fn contains(self, stage: ImageStage) -> bool {
         match stage {
             ImageStage::TextEncoder => self.text_encoder,
+            ImageStage::TextConnector => self.text_connector,
+            ImageStage::TextRefiner => self.text_refiner,
             ImageStage::VisionEncoder => self.vision_encoder,
             ImageStage::VaeEncoder => self.vae_encoder,
             ImageStage::Denoiser => self.denoiser,
@@ -109,6 +113,10 @@ pub struct ImageStageRetentionBudgets {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_encoder: Option<NonZeroU64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_connector: Option<NonZeroU64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_refiner: Option<NonZeroU64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vision_encoder: Option<NonZeroU64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vae_encoder: Option<NonZeroU64>,
@@ -123,6 +131,8 @@ impl ImageStageRetentionBudgets {
     pub fn maximum_bytes(self, stage: ImageStage) -> u64 {
         match stage {
             ImageStage::TextEncoder => self.text_encoder,
+            ImageStage::TextConnector => self.text_connector,
+            ImageStage::TextRefiner => self.text_refiner,
             ImageStage::VisionEncoder => self.vision_encoder,
             ImageStage::VaeEncoder => self.vae_encoder,
             ImageStage::Denoiser => self.denoiser,
@@ -225,8 +235,10 @@ impl ImageDynamicResidencyPolicy {
     }
 }
 
-const RETAINABLE_STAGES: [ImageStage; 6] = [
+const RETAINABLE_STAGES: [ImageStage; 8] = [
     ImageStage::TextEncoder,
+    ImageStage::TextConnector,
+    ImageStage::TextRefiner,
     ImageStage::VisionEncoder,
     ImageStage::VaeEncoder,
     ImageStage::Denoiser,
@@ -247,101 +259,106 @@ fn same_resident_plan(left: &ImageStagePlanReceipt, right: &ImageStagePlanReceip
 
 pub(super) struct ResidentStages<R: DeviceRuntime> {
     text_encoder: Option<ActiveImageStage<R>>,
+    text_connector: Option<ActiveImageStage<R>>,
+    text_refiner: Option<ActiveImageStage<R>>,
     vision_encoder: Option<ActiveImageStage<R>>,
     vae_encoder: Option<ActiveImageStage<R>>,
     denoiser: Option<ActiveImageStage<R>>,
     decoder: Option<ActiveImageStage<R>>,
     noise: Option<ActiveImageStage<R>>,
-    /// Last successful idle-retention receipts, including older shapes' pools.
-    dynamic_bytes: [u64; 6],
-    acquisition_order: [u64; 6],
+    dynamic_bytes: [u64; 8],
+    acquisition_order: [u64; 8],
     acquisition_clock: u64,
-    text_encoder_weights: Option<ResidentWeights<R>>,
-    vision_encoder_weights: Option<ResidentWeights<R>>,
-    vae_encoder_weights: Option<ResidentWeights<R>>,
-    denoiser_weights: Option<ResidentWeights<R>>,
-    decoder_weights: Option<ResidentWeights<R>>,
+    bindings: BTreeMap<ImageStage, ImageWeightOwnerKey>,
+    weights: BTreeMap<ImageWeightOwnerKey, Option<ResidentWeights<R>>>,
 }
 struct ResidentWeights<R: DeviceRuntime> {
     weights: SharedComponentWeights<R>,
     origin: ImageStageExecutionReceipt,
+    pins: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl<R: DeviceRuntime> ResidentStages<R> {
     pub(super) fn has_weights(&self, stage: ImageStage) -> bool {
-        match stage {
-            ImageStage::TextEncoder => self.text_encoder_weights.is_some(),
-            ImageStage::VisionEncoder => self.vision_encoder_weights.is_some(),
-            ImageStage::VaeEncoder => self.vae_encoder_weights.is_some(),
-            ImageStage::Denoiser => self.denoiser_weights.is_some(),
-            ImageStage::Decoder => self.decoder_weights.is_some(),
-            ImageStage::Noise => false,
-        }
+        self.weights(stage).is_some()
     }
-
-    pub(super) fn new() -> Self {
+    fn owner_key(&self, stage: ImageStage) -> Option<ImageWeightOwnerKey> {
+        self.bindings.get(&stage).copied()
+    }
+    fn has_pinned_weights(&self, stage: ImageStage) -> bool {
+        self.weights(stage)
+            .is_some_and(|w| w.pins.load(std::sync::atomic::Ordering::Acquire) != 0)
+    }
+    pub(super) fn new<S: ImagePipelineSourceAdapter>(sources: &S) -> Self {
         Self {
             text_encoder: None,
+            text_connector: None,
+            text_refiner: None,
             vision_encoder: None,
             vae_encoder: None,
             denoiser: None,
             decoder: None,
             noise: None,
-            dynamic_bytes: [0; 6],
-            acquisition_order: [0; 6],
+            dynamic_bytes: [0; 8],
+            acquisition_order: [0; 8],
             acquisition_clock: 0,
-            text_encoder_weights: None,
-            vision_encoder_weights: None,
-            vae_encoder_weights: None,
-            denoiser_weights: None,
-            decoder_weights: None,
+            bindings: RETAINABLE_STAGES
+                .into_iter()
+                .filter_map(|stage| sources.weight_owner(stage).map(|key| (stage, key)))
+                .collect(),
+            weights: BTreeMap::new(),
         }
     }
     fn weights_slot(&mut self, stage: ImageStage) -> Option<&mut Option<ResidentWeights<R>>> {
-        match stage {
-            ImageStage::TextEncoder => Some(&mut self.text_encoder_weights),
-            ImageStage::VisionEncoder => Some(&mut self.vision_encoder_weights),
-            ImageStage::VaeEncoder => Some(&mut self.vae_encoder_weights),
-            ImageStage::Denoiser => Some(&mut self.denoiser_weights),
-            ImageStage::Decoder => Some(&mut self.decoder_weights),
-            _ => None,
-        }
+        let key = self.owner_key(stage)?;
+        Some(self.weights.entry(key).or_default())
+    }
+    fn weights(&self, stage: ImageStage) -> Option<&ResidentWeights<R>> {
+        self.weights
+            .get(&self.owner_key(stage)?)
+            .and_then(Option::as_ref)
     }
     fn slot(&mut self, stage: ImageStage) -> Option<&mut Option<ActiveImageStage<R>>> {
-        match stage {
-            ImageStage::TextEncoder => Some(&mut self.text_encoder),
-            ImageStage::VisionEncoder => Some(&mut self.vision_encoder),
-            ImageStage::VaeEncoder => Some(&mut self.vae_encoder),
-            ImageStage::Denoiser => Some(&mut self.denoiser),
-            ImageStage::Decoder => Some(&mut self.decoder),
-            ImageStage::Noise => Some(&mut self.noise),
-        }
+        Some(match stage {
+            ImageStage::TextEncoder => &mut self.text_encoder,
+            ImageStage::TextConnector => &mut self.text_connector,
+            ImageStage::TextRefiner => &mut self.text_refiner,
+            ImageStage::VisionEncoder => &mut self.vision_encoder,
+            ImageStage::VaeEncoder => &mut self.vae_encoder,
+            ImageStage::Denoiser => &mut self.denoiser,
+            ImageStage::Decoder => &mut self.decoder,
+            ImageStage::Noise => &mut self.noise,
+        })
     }
     fn dynamic_bytes(&self, stage: ImageStage) -> u64 {
-        resident_stage_index(stage).map_or(0, |index| self.dynamic_bytes[index])
+        resident_stage_index(stage).map_or(0, |i| self.dynamic_bytes[i])
     }
     fn set_dynamic_bytes(&mut self, stage: ImageStage, bytes: u64) {
-        if let Some(index) = resident_stage_index(stage) {
-            self.dynamic_bytes[index] = bytes;
+        if let Some(i) = resident_stage_index(stage) {
+            self.dynamic_bytes[i] = bytes;
         }
     }
 }
 
-impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
+impl<R: DeviceRuntime, S: ImagePipelineSourceAdapter> ImagePipelineExecution<R, S> {
+    pub fn pin_weight_owner(
+        &self,
+        key: ImageWeightOwnerKey,
+    ) -> anyhow::Result<ImageWeightOwnerPin<R>> {
+        let weights = self
+            .resident_stages
+            .weights
+            .get(&key)
+            .and_then(Option::as_ref)
+            .context("image weight owner is not installed")?;
+        ImageWeightOwnerPin::new(key, weights.weights.clone(), weights.pins.clone())
+    }
     pub fn residency_policy(&self) -> ImageResidencyPolicy {
         self.config.residency
     }
 
     fn runnable_dynamic_bytes(&self, prepared: &PreparedStage<R>) -> anyhow::Result<u64> {
         if self.config.residency.retains(prepared.plan.stage) {
-            let previous = match prepared.plan.stage {
-                ImageStage::TextEncoder => &self.resident_stages.text_encoder,
-                ImageStage::VisionEncoder => &self.resident_stages.vision_encoder,
-                ImageStage::VaeEncoder => &self.resident_stages.vae_encoder,
-                ImageStage::Denoiser => &self.resident_stages.denoiser,
-                ImageStage::Decoder => &self.resident_stages.decoder,
-                ImageStage::Noise => &self.resident_stages.noise,
-            };
-            if let Some(previous) = previous {
+            if let Some(previous) = self.resident_stages.stage(prepared.plan.stage) {
                 if same_resident_plan(&previous.receipt.plan, &prepared.plan) {
                     // Partial retention may keep an oversized pool while another
                     // pool is cold. Account for each pool before summing them.
@@ -413,7 +430,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .validate(self.config.residency)?;
         let adaptive = self.config.residency == ImageResidencyPolicy::Adaptive;
         let retained_dynamic_by_stage = RETAINABLE_STAGES.map(|stage| {
-            if adaptive {
+            if !self.sources.supports_stage(stage) || adaptive {
                 return 0;
             }
             let ceiling = if self.config.residency.retains(stage) {
@@ -441,21 +458,35 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         // bytes contribute only to the active peak, not a resident sum.
         let mut retained_static = 0_u64;
         let mut active_peak = 0_u64;
-        let mut counted_static = Vec::new();
+        let mut counted_static =
+            BTreeMap::<(Option<ImageWeightOwnerKey>, Option<ImageStage>), u64>::new();
         for stage in stages {
+            stage.validate_declaration()?;
             let payload = stage.component.executable().execution_plan().payload();
             ensure!(
                 payload.work_limits() == RuntimeWorkLimits::FixedTensor,
                 "image resident capacity requires compiled fixed tensor plans"
             );
             let memory = payload.memory();
+            let owner = stage.declaration().weight_owner;
+            let key = (owner, owner.is_none().then_some(stage.plan.stage));
             let retained = retain_required_weights
-                || (!adaptive && self.config.residency.retains(stage.plan.stage));
-            if retained && !counted_static.contains(&stage.plan.stage) {
+                || (!adaptive && self.config.residency.retains(stage.plan.stage))
+                || stage.declaration().attachment != ImageStageAttachment::MayInitializeStored
+                || self.resident_stages.has_pinned_weights(stage.plan.stage);
+            if retained {
+                let bytes = self
+                    .resident_stages
+                    .weights(stage.plan.stage)
+                    .map_or(memory.static_bytes(), |w| {
+                        memory.static_bytes().max(w.origin.plan.static_bytes)
+                    });
+                let previous = counted_static.get(&key).copied().unwrap_or(0);
+                let next = previous.max(bytes);
                 retained_static = retained_static
-                    .checked_add(memory.static_bytes())
+                    .checked_add(next - previous)
                     .context("resident static bytes overflow")?;
-                counted_static.push(stage.plan.stage);
+                counted_static.insert(key, next);
             }
             // Fixed demand includes actual compiled provider scratch, per-pool
             // alignment, and proven activation/invocation lifetime reuse. Do
@@ -542,28 +573,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         }
         // A planning subset does not retire installations owned by other slots.
         // Count every live snapshot whose stage was not already accounted for.
-        for (kind, weights) in [
-            (
-                ImageStage::TextEncoder,
-                &self.resident_stages.text_encoder_weights,
-            ),
-            (
-                ImageStage::VisionEncoder,
-                &self.resident_stages.vision_encoder_weights,
-            ),
-            (
-                ImageStage::VaeEncoder,
-                &self.resident_stages.vae_encoder_weights,
-            ),
-            (ImageStage::Denoiser, &self.resident_stages.denoiser_weights),
-            (ImageStage::Decoder, &self.resident_stages.decoder_weights),
-        ] {
-            if !adaptive && !counted_static.contains(&kind) {
-                if let Some(weights) = weights {
-                    retained_static = retained_static
-                        .checked_add(weights.origin.plan.static_bytes)
-                        .context("retained stage weights overflow")?;
-                }
+        for (owner, weights) in &self.resident_stages.weights {
+            let Some(weights) = weights else { continue };
+            if !adaptive || weights.pins.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                let key = (Some(*owner), None);
+                let previous = counted_static.get(&key).copied().unwrap_or(0);
+                let next = previous.max(weights.origin.plan.static_bytes);
+                retained_static = retained_static
+                    .checked_add(next - previous)
+                    .context("retained stage weights overflow")?;
+                counted_static.insert(key, next);
             }
         }
         let required = retained_static
@@ -598,36 +617,49 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let active = self.start_stage(prepared, job, stages)?;
             let weights = self
                 .resident_stages
-                .denoiser_weights
-                .as_ref()
+                .weights(ImageStage::Denoiser)
                 .expect("resident denoiser installation")
                 .weights
                 .clone();
             Ok((active, weights, false))
         } else {
-            let dit_source = ExactBf16TensorSource::new(self.assets.sources.transformer.as_ref());
-            let native_source = ManagedDenseArchiveSource::new(
-                self.assets.sources.transformer.as_ref(),
-                self.execution_host(),
-            );
-            let source =
-                if QwenImage21TransformerFamily::is_fp8_profile(prepared.plan.profile.as_str()) {
-                    ComponentWeightSource::Stored(&dit_source)
-                } else {
-                    ComponentWeightSource::Stored(&native_source)
-                };
+            let stored = self
+                .sources
+                .stage_source(
+                    prepared.declaration(),
+                    &prepared.plan.profile,
+                    self.execution_host(),
+                )
+                .map_err(ImageGenerationFailure::Preflight)?;
+            let source = match stored.as_ref() {
+                Some(source) => ComponentWeightSource::Stored(source),
+                None => ComponentWeightSource::None,
+            };
             prepared
                 .start_shared(self, job, source)
                 .map(|(active, weights)| (active, weights, true))
         }
     }
 
-    pub(super) fn start_stage(
+    pub fn start_stage(
         &mut self,
         mut prepared: PreparedStage<R>,
         job: u64,
         stages: &mut Vec<ImageStageReceipt>,
     ) -> Result<ActiveImageStage<R>, ImageGenerationFailure<R>> {
+        prepared
+            .validate_declaration()
+            .map_err(ImageGenerationFailure::Preflight)?;
+        if self.is_stopped() {
+            return Err(ImageGenerationFailure::Unavailable);
+        }
+        if prepared.declaration().attachment == ImageStageAttachment::RequireShared
+            && !self.resident_stages.has_weights(prepared.plan.stage)
+        {
+            return Err(ImageGenerationFailure::Preflight(anyhow::anyhow!(
+                "required shared image weight owner is absent"
+            )));
+        }
         if self.config.residency != ImageResidencyPolicy::Adaptive {
             return self.start_stage_once(prepared, job, stages);
         }
@@ -635,6 +667,39 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let retry = prepared.clone();
             match self.start_stage_once(prepared, job, stages) {
                 Ok(active) => return Ok(active),
+                Err(ImageGenerationFailure::Initialization {
+                    plan,
+                    source:
+                        ComponentInitializationError::Pool {
+                            source: VNextError::DeviceCapacityUnavailable(pressure),
+                            transaction,
+                            ..
+                        },
+                }) => {
+                    // Native/process capacity can change after the advisory
+                    // estimate (and some runtimes expose no free-memory query).
+                    // Pool initialization has not uploaded or submitted work.
+                    // Only its acknowledged journal release permits eviction
+                    // and retry; failed cleanup retains the original journal.
+                    match transaction.release() {
+                        Ok(released) => drop(released),
+                        Err(source) => {
+                            return Err(ImageGenerationFailure::InitializationRelease {
+                                plan,
+                                source,
+                            });
+                        }
+                    }
+                    if !self.reclaim_after_allocation_failure(plan.stage, stages)? {
+                        return Err(ImageGenerationFailure::InitializationCapacityRejected {
+                            plan,
+                            pressure,
+                        });
+                    }
+                    tracing::warn!(stage=?plan.stage, job, %pressure,
+                        "image pool initialization released; retrying after actual idle-owner reclamation");
+                    prepared = retry;
+                }
                 Err(failure) => {
                     // Only a recoverable allocation transaction qualifies. No
                     // submitted inference, partial upload, or unknown fence is retried.
@@ -659,15 +724,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         if self.config.residency == ImageResidencyPolicy::Adaptive {
             self.admit_adaptive_stage(&prepared, stages)?;
         }
+        let declaration = *prepared.declaration();
+        let stage = declaration.stage;
         let weightless = matches!(prepared.component.family().weights(), ModelWeights::None);
-        if self.config.residency.retains(prepared.plan.stage) {
-            if let Some(previous) = self
-                .resident_stages
-                .slot(prepared.plan.stage)
-                .and_then(Option::take)
-            {
-                let mut previous = previous;
-                // These counters describe this acquisition, not the old batch.
+        if !weightless && declaration.weight_owner.is_none() {
+            return Err(ImageGenerationFailure::Preflight(anyhow::anyhow!(
+                "weighted stage has no declared weight owner"
+            )));
+        }
+        if self.config.residency.retains(stage) {
+            if let Some(mut previous) = self.resident_stages.slot(stage).and_then(Option::take) {
                 previous.receipt.completed_executions = 0;
                 previous.receipt.execution_wall_durations_us.clear();
                 previous.receipt.device_profiles.clear();
@@ -684,72 +750,61 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 );
                 if same_resident_plan(&previous.receipt.plan, &prepared.plan) {
                     previous.receipt.plan = prepared.plan;
+                    previous.declaration = declaration;
+                    // Retirement detaches the preceding request's Output
+                    // view. Reacquiring its real executor must consume this
+                    // request's admitted grant, just as a fresh attachment
+                    // does, rather than allocating readbacks on the parent.
+                    if let Err(source) = previous
+                        .session
+                        .set_output_host_account(self.execution_host().clone())
+                    {
+                        return Err(previous.processing(source.into()));
+                    }
                     return Ok(previous);
                 }
-                // Publish an actual zero-execution eviction receipt. A failed
-                // close owns the original session and prevents initialization.
-                // The old plan was compiled during an earlier acquisition.
                 previous.receipt.plan.compile_wall_duration_us = 0;
                 stages.push(previous.close()?);
-                self.resident_stages
-                    .set_dynamic_bytes(prepared.plan.stage, 0);
+                self.resident_stages.set_dynamic_bytes(stage, 0);
             }
-            if let Some(weights) = self
-                .resident_stages
-                .weights_slot(prepared.plan.stage)
-                .and_then(|slot| slot.as_ref())
-                .map(|entry| entry.weights.clone())
-            {
-                // The runtime checks the actual Arc and full physical contract.
-                // On failure the slot keeps its snapshot; no source read or
-                // cold fallback can silently replace the selected installation.
-                return prepared.start_attached(self, job, &weights);
-            }
+        }
+        // This is the exact sealed physical owner, including a First graph's
+        // larger installation when a refiner/steady subset attaches to it.
+        if let Some(weights) = self
+            .resident_stages
+            .weights(stage)
+            .map(|w| w.weights.clone())
+        {
+            return prepared.start_attached(self, job, &weights);
+        }
+        if declaration.attachment == ImageStageAttachment::RequireShared {
+            return Err(ImageGenerationFailure::Preflight(anyhow::anyhow!(
+                "required shared image weight owner is absent"
+            )));
         }
         if weightless {
-            // A weightless contract has no Stored snapshot to share. Its normal
-            // managed session may still retain idle dynamic pools between runs.
             return prepared.start(self, job, ComponentWeightSource::None);
         }
-        // Keep the archive's optional implicit dtype conversion out of the
-        // managed FP8 conversion path. These wrappers borrow the original mmap
-        // and stay alive throughout synchronous static initialization.
-        let text_source = ExactBf16TensorSource::new(self.assets.sources.text_encoder.as_ref());
-        let dit_source = ExactBf16TensorSource::new(self.assets.sources.transformer.as_ref());
-        let native_source = ManagedDenseArchiveSource::new(
-            self.assets.sources.transformer.as_ref(),
-            self.execution_host(),
-        );
-        let profile = prepared.plan.profile.as_str();
-        let source = match prepared.plan.stage {
-            ImageStage::TextEncoder if Qwen3VLTextEncoderFamily::is_fp8_profile(profile) => {
-                ComponentWeightSource::Stored(&text_source)
-            }
-            ImageStage::TextEncoder => {
-                ComponentWeightSource::Stored(self.assets.sources.text_encoder.as_ref())
-            }
-            ImageStage::Noise => ComponentWeightSource::None,
-            ImageStage::VisionEncoder => {
-                ComponentWeightSource::Stored(self.assets.sources.text_encoder.as_ref())
-            }
-            ImageStage::VaeEncoder => {
-                ComponentWeightSource::Stored(self.assets.sources.vae.as_ref())
-            }
-            ImageStage::Denoiser if QwenImage21TransformerFamily::is_fp8_profile(profile) => {
-                ComponentWeightSource::Stored(&dit_source)
-            }
-            ImageStage::Denoiser => ComponentWeightSource::Stored(&native_source),
-            ImageStage::Decoder => ComponentWeightSource::Stored(self.assets.sources.vae.as_ref()),
+        let stored = self
+            .sources
+            .stage_source(&declaration, &prepared.plan.profile, self.execution_host())
+            .map_err(ImageGenerationFailure::Preflight)?;
+        let source = match stored.as_ref() {
+            Some(source) => ComponentWeightSource::Stored(source),
+            None => ComponentWeightSource::None,
         };
-        let stage = prepared.plan.stage;
-        if self.config.residency.retains(stage) {
+        if self.config.residency.retains(stage)
+            || declaration.attachment == ImageStageAttachment::InitializeShared
+        {
             let (active, weights) = prepared.start_shared(self, job, source)?;
+            drop(stored);
             *self
                 .resident_stages
                 .weights_slot(stage)
-                .expect("resident weight stage") = Some(ResidentWeights {
+                .expect("declared weighted stage") = Some(ResidentWeights {
                 weights,
                 origin: active.receipt.clone(),
+                pins: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             });
             Ok(active)
         } else {
@@ -757,11 +812,19 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         }
     }
 
-    pub(super) fn finish_stage(
+    pub fn finish_stage(
         &mut self,
         mut active: ActiveImageStage<R>,
         stages: &mut Vec<ImageStageReceipt>,
     ) -> Result<(), ImageGenerationFailure<R>> {
+        if active.receipt.plan.stage != active.declaration.stage
+            || active.receipt.plan.role != active.declaration.role
+            || active.receipt.plan.batch_size != active.declaration.batch_size
+        {
+            return Err(active.processing(anyhow::anyhow!(
+                "active image receipt differs from its sealed stage declaration"
+            )));
+        }
         // Resident executors must not carry a closed request's scoped view
         // into the next batch. The root still proves the same Host provenance.
         if let Err(error) = active.session.set_output_host_account(self.host.clone()) {
@@ -856,14 +919,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     pub fn shutdown(&mut self) -> Result<Vec<ImageStageReceipt>, ImageGenerationError<R>> {
         self.stopped = true;
         let mut completed_stages = Vec::new();
-        for stage in [
-            ImageStage::TextEncoder,
-            ImageStage::VisionEncoder,
-            ImageStage::VaeEncoder,
-            ImageStage::Denoiser,
-            ImageStage::Decoder,
-            ImageStage::Noise,
-        ] {
+        for stage in RETAINABLE_STAGES {
             if let Some(mut active) = self.resident_stages.slot(stage).and_then(Option::take) {
                 active.receipt.completed_executions = 0;
                 active.receipt.execution_wall_durations_us.clear();
@@ -897,16 +953,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         }
         // Every session has retired before any final snapshot release. A live
         // failure/foreign execution owner makes close Referenced, never success.
-        for stage in [
-            ImageStage::TextEncoder,
-            ImageStage::VisionEncoder,
-            ImageStage::VaeEncoder,
-            ImageStage::Denoiser,
-            ImageStage::Decoder,
-        ] {
+        for stage in RETAINABLE_STAGES {
             if let Some(ResidentWeights {
                 weights,
                 mut origin,
+                ..
             }) = self
                 .resident_stages
                 .weights_slot(stage)
@@ -947,6 +998,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         // External failure/completion owners keep their own lane authority;
         // releasing this owner alone never proves their quiescence.
         drop(self.serial_actor.take());
+        if let Some(trace) = &self.continuous_trace {
+            // End of this producer, not a claim about global GPU memory or
+            // separately retained failure owners.
+            trace.seal();
+        }
         Ok(completed_stages)
     }
 }

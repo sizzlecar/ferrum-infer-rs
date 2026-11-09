@@ -329,7 +329,9 @@ extern "C" __global__ void vnext_causal_prepare_f16(
     const float rope_theta,
     const int rope_interleaved,
     const int value_rms_norm,
-    const unsigned long long binding_slot_bytes) {
+    const unsigned long long binding_slot_bytes,
+    const __half* __restrict__ explicit_cos,
+    const __half* __restrict__ explicit_sin) {
   const int participant = blockIdx.z;
   if (binding_slot_bytes != 0) {
     control = vnext_participant_control(
@@ -449,7 +451,14 @@ extern "C" __global__ void vnext_causal_prepare_f16(
           absolute_position * powf(rope_theta, exponent);
       float sine = 0.0f;
       float cosine = 0.0f;
-      sincosf(angle, &sine, &cosine);
+      if (explicit_cos != nullptr) {
+        // Tables address this participant's immediate rows. The physical
+        // absolute_position continues to own paged-KV addressing and causality.
+        cosine = __half2float(explicit_cos[(long long)token * half_rope + pair]);
+        sine = __half2float(explicit_sin[(long long)token * half_rope + pair]);
+      } else {
+        sincosf(angle, &sine, &cosine);
+      }
       vnext_store_prepared_value(
           query, page_pointers, page_count, page_elements, kv_layout, is_query,
           packed_token, absolute_position, head, low, query_heads, kv_heads,

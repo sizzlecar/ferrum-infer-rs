@@ -465,6 +465,10 @@ impl AxumServer {
                     images::EDIT_BODY_LIMIT,
                 )),
             )
+            .route("/playground", get(images::playground::page))
+            .route("/playground/config", get(images::playground::config))
+            .route("/playground/app.js", get(images::playground::javascript))
+            .route("/playground/style.css", get(images::playground::stylesheet))
             .route("/v1/models", get(models_handler))
             // Health & observability
             .route("/health", get(health_handler))

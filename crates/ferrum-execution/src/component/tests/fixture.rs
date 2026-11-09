@@ -116,7 +116,14 @@ pub(super) fn family(config: &Config) -> PreparedModelFamily {
         .unwrap()
 }
 pub(super) fn compile(config: &Config) -> CompiledTensorComponent<f::TestRuntime> {
-    let (registry, catalog) = registry(config);
+    compile_for::<f::TestRuntime>(config)
+}
+
+pub(super) fn compile_for<R>(config: &Config) -> CompiledTensorComponent<R>
+where
+    R: DeviceRuntime<Buffer = f::TestBuffer, Command = ()>,
+{
+    let (registry, catalog) = registry_for::<R>(config);
     CompiledTensorComponent::compile(
         family(config),
         &registry,
@@ -179,7 +186,10 @@ impl OperationResourceEstimator for Provider {
         ))
     }
 }
-impl OperationProvider<f::TestRuntime> for Provider {
+impl<R> OperationProvider<R> for Provider
+where
+    R: DeviceRuntime<Buffer = f::TestBuffer, Command = ()>,
+{
     fn reusable_execution_topology(
         &self,
         _: ReusableExecutionTopologyRequest<'_>,
@@ -190,13 +200,31 @@ impl OperationProvider<f::TestRuntime> for Provider {
         &self,
         _: BatchedOperationInvocation<'_, f::TestBuffer>,
     ) -> Result<EncodedDeviceOperation<()>, OperationFailure> {
-        unreachable!("fixture stops before execution")
+        // Metadata-only lifecycle device: no tensor numerical qualification.
+        Ok(EncodedDeviceOperation::compute(()))
+    }
+    fn encode_tensor_selected(
+        &self,
+        invocation: TensorOperationInvocation<'_, f::TestBuffer>,
+    ) -> Result<Option<EncodedDeviceOperation<()>>, OperationFailure> {
+        assert_eq!(invocation.participants().len(), 1);
+        // The original lifecycle device has a unit command and no numerical
+        // kernel. Encode its declared fixed-tensor domain so ownership tests
+        // reach the real submission/fence protocol, not a capability rejection.
+        Ok(Some(EncodedDeviceOperation::compute(())))
     }
 }
 
 pub(super) fn registry(
     config: &Config,
 ) -> (OperationRuntimeRegistry<f::TestRuntime>, CapabilityCatalog) {
+    registry_for::<f::TestRuntime>(config)
+}
+
+fn registry_for<R>(config: &Config) -> (OperationRuntimeRegistry<R>, CapabilityCatalog)
+where
+    R: DeviceRuntime<Buffer = f::TestBuffer, Command = ()>,
+{
     // The existing fixture supplies a fresh isolated device capacity identity.
     let device = f::catalog().device().clone();
     let mut inputs = vec![f::tensor_contract(

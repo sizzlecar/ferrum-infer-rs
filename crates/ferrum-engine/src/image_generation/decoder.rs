@@ -16,11 +16,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let expected = decoder.input_tensor()?;
             ensure!(
                 expected.dimensions()[0]
-                    == u64::try_from(self.config.decoder_batch_policy.batch_size(request_batch))?,
+                    == u64::try_from(
+                        self.execution
+                            .config
+                            .decoder_batch_policy
+                            .batch_size(request_batch)
+                    )?,
                 "decoder plan differs from the selected batch policy"
             );
             Ok((
-                decoder_inputs(&self.host, input, &expected, request_batch)?,
+                decoder_inputs(&self.execution.host, input, &expected, request_batch)?,
                 decoder.output_tensor()?,
             ))
         })();
@@ -40,7 +45,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     rgba.tensor() == &expected_output,
                     "actual RGBA differs from the decoder's compiled batch shape"
                 );
-                QwenImage21RgbaOutput::new(&self.host, rgba.tensor(), rgba.bytes())?;
+                QwenImage21RgbaOutput::new(&self.execution.host, rgba.tensor(), rgba.bytes())?;
                 for index in 0..usize::try_from(expected_output.dimensions()[0])? {
                     images.push(rgba.batch_item(index)?);
                 }

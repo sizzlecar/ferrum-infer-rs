@@ -18,24 +18,58 @@ use ferrum_runtime::{
     TensorOperationInvocation, VNextError, HALF_SPLIT_ROPE_BF16_CAPABILITY_ID,
     HALF_SPLIT_ROPE_BF16_OPERATION_ID,
 };
+use ferrum_runtime::{
+    partial_half_split_rope_bf16_contract, PartialHalfSplitRopeBf16Geometry,
+    PARTIAL_HALF_SPLIT_ROPE_BF16_CAPABILITY_ID, PARTIAL_HALF_SPLIT_ROPE_BF16_OPERATION_ID,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const REFERENCE_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_ID: &str =
     "reference.half_split_rope.bf16.staged_rne.v1";
+pub const REFERENCE_PARTIAL_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_ID: &str =
+    "reference.partial_half_split_rope.bf16.staged_rne.v1";
 const PROVIDER_ID: &str = "provider.reference.half_split_rope.bf16";
 const ESTIMATOR_ID: &str = "resource-estimator.reference.half_split_rope.bf16";
 
 pub(super) struct ReferenceHalfSplitRopeProvider {
     descriptor: OperationProviderDescriptor,
+    partial: bool,
 }
 
 impl ReferenceHalfSplitRopeProvider {
     pub(super) fn new(
         runtime: &ReferenceDeviceRuntime,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
-        let contract = half_split_rope_bf16_contract().map_err(contract_error)?;
-        let capability =
-            CapabilityId::new(HALF_SPLIT_ROPE_BF16_CAPABILITY_ID).map_err(contract_error)?;
+        Self::new_kind(runtime, false)
+    }
+    pub(super) fn new_partial(
+        runtime: &ReferenceDeviceRuntime,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        Self::new_kind(runtime, true)
+    }
+    fn new_kind(
+        runtime: &ReferenceDeviceRuntime,
+        partial: bool,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        let (contract, capability, provider, estimator_id, profile) = if partial {
+            (
+                partial_half_split_rope_bf16_contract(),
+                PARTIAL_HALF_SPLIT_ROPE_BF16_CAPABILITY_ID,
+                "provider.reference.partial_half_split_rope.bf16",
+                "resource-estimator.reference.partial_half_split_rope.bf16",
+                REFERENCE_PARTIAL_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_ID,
+            )
+        } else {
+            (
+                half_split_rope_bf16_contract(),
+                HALF_SPLIT_ROPE_BF16_CAPABILITY_ID,
+                PROVIDER_ID,
+                ESTIMATOR_ID,
+                REFERENCE_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_ID,
+            )
+        };
+        let contract = contract.map_err(contract_error)?;
+        let capability = CapabilityId::new(capability).map_err(contract_error)?;
         if !runtime.descriptor().capabilities.contains(&capability) {
             return Err(ReferenceDeviceRuntimeError::contract(
                 "reference runtime lacks BF16 half-split RoPE capability",
@@ -44,13 +78,13 @@ impl ReferenceHalfSplitRopeProvider {
         let implementation = implementation_fingerprint(&[
             include_str!("half_split_rope.rs").as_bytes(),
             include_str!("runtime/half_split_rope.rs").as_bytes(),
-            REFERENCE_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_ID.as_bytes(),
-            PROVIDER_ID.as_bytes(),
+            profile.as_bytes(),
+            provider.as_bytes(),
         ]);
         let estimator =
-            implementation_fingerprint(&[ESTIMATOR_ID.as_bytes(), implementation.as_bytes()]);
+            implementation_fingerprint(&[estimator_id.as_bytes(), implementation.as_bytes()]);
         let descriptor = OperationProviderDescriptor::new(
-            ProviderId::new(PROVIDER_ID).map_err(contract_error)?,
+            ProviderId::new(provider).map_err(contract_error)?,
             contract.descriptor().id.clone(),
             contract
                 .descriptor()
@@ -64,13 +98,16 @@ impl ReferenceHalfSplitRopeProvider {
             BTreeSet::new(),
             BTreeSet::new(),
             contiguous_bindings(3),
-            ESTIMATOR_ID,
+            estimator_id,
             ContractVersion::new(1, 0),
             estimator,
         )
         .map_err(contract_error)?
         .with_fixed_tensor_work(true);
-        Ok(Self { descriptor })
+        Ok(Self {
+            descriptor,
+            partial,
+        })
     }
 }
 
@@ -89,7 +126,11 @@ impl OperationResourceEstimator for ReferenceHalfSplitRopeProvider {
                 "half-split RoPE estimator received another operation",
             ));
         }
-        geometry(request.values(), request.attributes()).map_err(invalid_plan)?;
+        if self.partial {
+            partial_geometry(request.values(), request.attributes()).map_err(invalid_plan)?;
+        } else {
+            geometry(request.values(), request.attributes()).map_err(invalid_plan)?;
+        }
         // Direct admitted storage and scalar FP32 operations; no scratch allocation.
         Ok(OperationResourceEstimate::new(
             self.descriptor.resource_estimator_id(),
@@ -125,7 +166,7 @@ impl OperationProvider<ReferenceDeviceRuntime> for ReferenceHalfSplitRopeProvide
         invocation: TensorOperationInvocation<'_, ReferenceDeviceBuffer>,
     ) -> Result<Option<EncodedDeviceOperation<ReferenceDeviceCommand>>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode(invocation)
+        encode(invocation, self.partial)
             .map(EncodedDeviceOperation::compute)
             .map(Some)
             .map_err(|error| provider_failure(identity, error))
@@ -134,17 +175,27 @@ impl OperationProvider<ReferenceDeviceRuntime> for ReferenceHalfSplitRopeProvide
 
 fn encode(
     invocation: TensorOperationInvocation<'_, ReferenceDeviceBuffer>,
+    partial: bool,
 ) -> Result<ReferenceDeviceCommand, String> {
     let [participant] = invocation.participants() else {
         return Err("half-split RoPE requires one tensor participant".into());
     };
-    if invocation.operation().id.as_str() != HALF_SPLIT_ROPE_BF16_OPERATION_ID
+    let operation = if partial {
+        PARTIAL_HALF_SPLIT_ROPE_BF16_OPERATION_ID
+    } else {
+        HALF_SPLIT_ROPE_BF16_OPERATION_ID
+    };
+    if invocation.operation().id.as_str() != operation
         || !matches!(participant.work(), NodeWorkContract::Fixed)
         || !invocation.resource_work_shape().resource_work().is_tensor()
     {
         return Err("half-split RoPE requires its fixed tensor contract".into());
     }
-    let checked = geometry(participant.bindings(), participant.attributes())?;
+    let shape = if partial {
+        partial_geometry(participant.bindings(), participant.attributes())?
+    } else {
+        backend_shape(geometry(participant.bindings(), participant.attributes())?)?
+    };
     ReferenceDeviceCommand::half_split_rope_tensor(ReferenceHalfSplitRopeLaunch {
         input: contiguous_region(
             participant,
@@ -166,7 +217,7 @@ fn encode(
             binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
             ElementType::Bf16,
         )?,
-        shape: backend_shape(checked)?,
+        shape,
     })
     .map_err(|error| error.to_string())
 }
@@ -213,7 +264,47 @@ fn backend_shape(
             .map_err(|_| "half-split RoPE columns exceed usize")?,
         head_dim: usize::try_from(geometry.head_dim())
             .map_err(|_| "half-split RoPE head_dim exceeds usize")?,
+        rotary_dim: usize::try_from(geometry.head_dim())
+            .map_err(|_| "half-split RoPE rotary_dim exceeds usize")?,
     })
+}
+
+fn partial_geometry(
+    bindings: &[ResolvedValueBinding],
+    attributes: &BTreeMap<AttributeId, SemanticValue>,
+) -> Result<ReferenceHalfSplitRopeShape, String> {
+    if bindings.len() != 4 || attributes.len() != 2 {
+        return Err(
+            "partial half-split RoPE requires three inputs, one output, head_dim and rotary_dim"
+                .into(),
+        );
+    }
+    let unsigned = |name| match attributes
+        .iter()
+        .find(|(id, _)| id.as_str() == name)
+        .map(|(_, value)| value)
+    {
+        Some(SemanticValue::Unsigned(value)) => Ok(*value),
+        _ => Err(format!("partial RoPE requires unsigned {name}")),
+    };
+    let geometry = PartialHalfSplitRopeBf16Geometry::new(
+        binding(bindings, ResolvedValueRole::Input, 0)?.tensor(),
+        binding(bindings, ResolvedValueRole::Input, 1)?.tensor(),
+        binding(bindings, ResolvedValueRole::Input, 2)?.tensor(),
+        binding(bindings, ResolvedValueRole::Output, 0)?.tensor(),
+        unsigned("head_dim")?,
+        unsigned("rotary_dim")?,
+    )
+    .map_err(|error| error.to_string())?;
+    let shape = ReferenceHalfSplitRopeShape {
+        rows: usize::try_from(geometry.rows()).map_err(|_| "rows exceed usize")?,
+        columns: usize::try_from(geometry.columns()).map_err(|_| "columns exceed usize")?,
+        head_dim: usize::try_from(geometry.head_dim()).map_err(|_| "head_dim exceeds usize")?,
+        rotary_dim: usize::try_from(geometry.rotary_dim())
+            .map_err(|_| "rotary_dim exceeds usize")?,
+    };
+    shape.logical_work().map_err(|error| error.to_string())?;
+    Ok(shape)
 }
 
 fn provider_failure(identity: ExecutionIdentityEnvelope, message: String) -> OperationFailure {

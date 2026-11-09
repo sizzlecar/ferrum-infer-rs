@@ -16,26 +16,38 @@ fn pipeline() -> (
     ));
     let mut pipeline = QwenImage21Pipeline::new(
         composition.runtime().clone(),
-        original.host,
+        original.execution.host,
         reference_vnext_operation_registry(composition.runtime()).unwrap(),
         composition.catalog().clone(),
         WeightMaterializerRegistry::identity_only().unwrap(),
-        Arc::try_unwrap(original.assets)
+        Arc::try_unwrap(original.execution.sources.assets)
             .ok()
             .expect("unique fixture assets"),
         original.profiles,
-        original.config,
+        original.execution.config,
     )
     .unwrap();
-    Arc::get_mut(&mut pipeline.assets)
+    Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("unique fixture assets")
         .sources
-        .text_encoder = pipeline.assets.sources.transformer.clone();
-    Arc::get_mut(&mut pipeline.assets)
+        .text_encoder = pipeline
+        .execution
+        .sources
+        .assets
+        .sources
+        .transformer
+        .clone();
+    Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("unique fixture assets")
         .sources
-        .vae = pipeline.assets.sources.transformer.clone();
-    pipeline.config.residency = ImageResidencyPolicy::SelectedStages {
+        .vae = pipeline
+        .execution
+        .sources
+        .assets
+        .sources
+        .transformer
+        .clone();
+    pipeline.execution.config.residency = ImageResidencyPolicy::SelectedStages {
         stages: ImageResidentStageSet {
             vision_encoder: true,
             vae_encoder: true,
@@ -44,7 +56,7 @@ fn pipeline() -> (
             ..ImageResidentStageSet::default()
         },
     };
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
     (pipeline, directory)
 }
 
@@ -96,7 +108,8 @@ fn selected_incompatible_weight_plan_preserves_original_installation() {
 #[test]
 fn selected_installations_reuse_weights_but_cold_text_reloads_and_inputs_stay_independent() {
     let (mut pipeline, _directory) = pipeline();
-    let capacity = DeviceCapacityOwner::open(pipeline.runtime.descriptor(), DEVICE_BYTES).unwrap();
+    let capacity =
+        DeviceCapacityOwner::open(pipeline.execution.runtime.descriptor(), DEVICE_BYTES).unwrap();
     let mut receipts = Vec::new();
     let mut outputs = Vec::new();
     for job in 0..2_u64 {
@@ -116,13 +129,13 @@ fn selected_installations_reuse_weights_but_cold_text_reloads_and_inputs_stay_in
             if selected {
                 retained_static += prepared.plan.static_bytes;
             }
-            let before = pipeline.runtime.snapshot().uploaded_bytes;
+            let before = pipeline.execution.runtime.snapshot().uploaded_bytes;
             let active = pipeline
                 .start_stage(prepared, job, &mut receipts)
                 .unwrap_or_else(|e| panic!("start selected fixture: {e}"));
             assert_eq!(active.receipt.session_reused, selected && job > 0);
             assert_eq!(active.receipt.weights_reused, selected && job > 0);
-            let uploaded = pipeline.runtime.snapshot().uploaded_bytes - before;
+            let uploaded = pipeline.execution.runtime.snapshot().uploaded_bytes - before;
             if selected && job > 0 {
                 assert_eq!(uploaded, 0);
             } else {
@@ -130,7 +143,11 @@ fn selected_installations_reuse_weights_but_cold_text_reloads_and_inputs_stay_in
             }
             let offset = job as usize * 16 + index * 2;
             let (active, result) = pipeline
-                .execute_stage(active, job, vec![input(&pipeline.host, 1, offset)])
+                .execute_stage(
+                    active,
+                    job,
+                    vec![input(&pipeline.execution.host, 1, offset)],
+                )
                 .unwrap_or_else(|e| panic!("execute fresh input: {e}"));
             let output = only_output(result, IMAGE_PROJECTION_OUTPUT_ID).unwrap();
             for (channel, bytes) in output.bytes().bytes().chunks_exact(2).enumerate() {
@@ -166,20 +183,23 @@ fn selected_installations_reuse_weights_but_cold_text_reloads_and_inputs_stay_in
     }
     let retained_output_bytes = outputs.iter().map(|o| o.bytes().len()).sum::<usize>();
     pipeline.shutdown().unwrap();
-    assert!(pipeline.serial_actor.is_none());
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert!(pipeline.execution.serial_actor.is_none());
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
     drop(
         capacity
             .reserve(DeviceOpaqueMemoryKind::Bootstrap, DEVICE_BYTES)
             .unwrap(),
     );
     assert_eq!(
-        pipeline.host.usage().unwrap().committed_bytes(),
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
         retained_output_bytes
     );
     assert_eq!(&outputs[0].bytes().bytes()[..2], &0x3f80_u16.to_le_bytes());
     drop(outputs);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
@@ -204,12 +224,12 @@ fn selected_capacity_counts_cold_text_only_during_its_active_stage() {
         .all(|s| dynamic_bytes(s) < text_peak));
     let required = retained + text_peak;
     let refs = planned.iter().collect::<Vec<_>>();
-    let before = pipeline.runtime.snapshot();
-    pipeline.config.device_capacity_bytes = required - 1;
+    let before = pipeline.execution.runtime.snapshot();
+    pipeline.execution.config.device_capacity_bytes = required - 1;
     assert!(pipeline.validate_resident_capacity(&refs).is_err());
-    pipeline.config.device_capacity_bytes = required;
+    pipeline.execution.config.device_capacity_bytes = required;
     pipeline.validate_resident_capacity(&refs).unwrap();
-    assert_eq!(pipeline.runtime.snapshot(), before);
+    assert_eq!(pipeline.execution.runtime.snapshot(), before);
     pipeline.shutdown().unwrap();
 }
 
@@ -226,9 +246,9 @@ fn generation_after_edit_counts_absent_vision_and_encoder_installations() {
         + generation[0].plan.static_bytes
         + dynamic_bytes(&generation[0]);
     let refs = generation.iter().collect::<Vec<_>>();
-    pipeline.config.device_capacity_bytes = generation_only;
+    pipeline.execution.config.device_capacity_bytes = generation_only;
     pipeline.validate_resident_capacity(&refs).unwrap();
-    pipeline.config.device_capacity_bytes = DEVICE_BYTES;
+    pipeline.execution.config.device_capacity_bytes = DEVICE_BYTES;
     let mut receipts = Vec::new();
     let mut editing_static = 0;
     for kind in [ImageStage::VisionEncoder, ImageStage::VaeEncoder] {
@@ -238,7 +258,7 @@ fn generation_after_edit_counts_absent_vision_and_encoder_installations() {
             .start_stage(prepared, 0, &mut receipts)
             .unwrap_or_else(|e| panic!("install editing stage: {e}"));
         let (active, output) = pipeline
-            .execute_stage(active, 0, vec![input(&pipeline.host, 1, 0)])
+            .execute_stage(active, 0, vec![input(&pipeline.execution.host, 1, 0)])
             .unwrap_or_else(|e| panic!("execute editing stage: {e}"));
         drop(output);
         pipeline
@@ -247,7 +267,8 @@ fn generation_after_edit_counts_absent_vision_and_encoder_installations() {
     }
     // These stages are absent from the next generation plan, but their actual
     // shared-weight owners are still live and consume the same device ledger.
-    let capacity = DeviceCapacityOwner::open(pipeline.runtime.descriptor(), DEVICE_BYTES).unwrap();
+    let capacity =
+        DeviceCapacityOwner::open(pipeline.execution.runtime.descriptor(), DEVICE_BYTES).unwrap();
     let remaining = capacity
         .reserve(
             DeviceOpaqueMemoryKind::Bootstrap,
@@ -258,28 +279,31 @@ fn generation_after_edit_counts_absent_vision_and_encoder_installations() {
         .reserve(DeviceOpaqueMemoryKind::Bootstrap, 1)
         .is_err());
     drop(remaining);
-    let before = pipeline.runtime.snapshot();
-    pipeline.config.device_capacity_bytes = generation_only;
+    let before = pipeline.execution.runtime.snapshot();
+    pipeline.execution.config.device_capacity_bytes = generation_only;
     assert!(pipeline.validate_resident_capacity(&refs).is_err());
-    pipeline.config.device_capacity_bytes = generation_only + editing_static - 1;
+    pipeline.execution.config.device_capacity_bytes = generation_only + editing_static - 1;
     assert!(pipeline.validate_resident_capacity(&refs).is_err());
-    pipeline.config.device_capacity_bytes = generation_only + editing_static;
+    pipeline.execution.config.device_capacity_bytes = generation_only + editing_static;
     pipeline.validate_resident_capacity(&refs).unwrap();
-    assert_eq!(pipeline.runtime.snapshot(), before);
+    assert_eq!(pipeline.execution.runtime.snapshot(), before);
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
     drop(
         capacity
             .reserve(DeviceOpaqueMemoryKind::Bootstrap, DEVICE_BYTES)
             .unwrap(),
     );
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
 fn subset_capacity_keeps_other_weight_owners_without_counting_active_snapshot_twice() {
     let (mut pipeline, _directory) = pipeline();
-    pipeline.config.residency = ImageResidencyPolicy::SelectedStages {
+    pipeline.execution.config.residency = ImageResidencyPolicy::SelectedStages {
         stages: ImageResidentStageSet {
             text_encoder: true,
             denoiser: true,
@@ -300,7 +324,7 @@ fn subset_capacity_keeps_other_weight_owners_without_counting_active_snapshot_tw
             .start_stage(prepared, 0, &mut receipts)
             .unwrap_or_else(|e| panic!("install subset fixture: {e}"));
         let (active, outputs) = pipeline
-            .execute_stage(active, 0, vec![input(&pipeline.host, 1, 0)])
+            .execute_stage(active, 0, vec![input(&pipeline.execution.host, 1, 0)])
             .unwrap_or_else(|e| panic!("execute subset fixture: {e}"));
         drop(outputs);
         pipeline
@@ -311,13 +335,16 @@ fn subset_capacity_keeps_other_weight_owners_without_counting_active_snapshot_tw
     // All three physical installations remain live. Only Decoder is in the
     // requested subset, and its one installation must not be charged twice.
     let required = installed_static + dynamic_bytes(&decoder);
-    let before = pipeline.runtime.snapshot();
-    pipeline.config.device_capacity_bytes = required - 1;
+    let before = pipeline.execution.runtime.snapshot();
+    pipeline.execution.config.device_capacity_bytes = required - 1;
     assert!(pipeline.validate_resident_capacity(&[&decoder]).is_err());
-    pipeline.config.device_capacity_bytes = required;
+    pipeline.execution.config.device_capacity_bytes = required;
     pipeline.validate_resident_capacity(&[&decoder]).unwrap();
-    assert_eq!(pipeline.runtime.snapshot(), before);
+    assert_eq!(pipeline.execution.runtime.snapshot(), before);
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }

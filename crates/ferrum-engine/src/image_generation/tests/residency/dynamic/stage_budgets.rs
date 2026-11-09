@@ -65,7 +65,7 @@ fn stage_budgets_require_known_positive_selected_resident_stages() {
 fn selected_stage_budgets_reuse_real_backing_and_omit_other_stages() {
     let (mut pipeline, _directory) = small_pipeline(4096);
     let limits = budgets();
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
         maximum_bytes_by_stage: limits,
     };
     let mut receipts = Vec::new();
@@ -76,7 +76,7 @@ fn selected_stage_budgets_reuse_real_backing_and_omit_other_stages() {
             ImageStage::Decoder,
             ImageStage::Denoiser,
         ] {
-            let before = pipeline.runtime.snapshot().allocations;
+            let before = pipeline.execution.runtime.snapshot().allocations;
             let stage = projection_stage(&pipeline, kind, 1);
             let active = pipeline
                 .start_stage(stage, job, &mut receipts)
@@ -85,7 +85,7 @@ fn selected_stage_budgets_reuse_real_backing_and_omit_other_stages() {
                 .execute_stage(
                     active,
                     job,
-                    vec![input(&pipeline.host, 1, job as usize * 8)],
+                    vec![input(&pipeline.execution.host, 1, job as usize * 8)],
                 )
                 .unwrap_or_else(|_| panic!("stage execute"));
             let output = only_output(outputs, IMAGE_PROJECTION_OUTPUT_ID).unwrap();
@@ -115,21 +115,24 @@ fn selected_stage_budgets_reuse_real_backing_and_omit_other_stages() {
                 assert!(retention.retained_bytes() > 0);
                 assert!(retention.retained_bytes() < limits.maximum_bytes(kind));
                 if job == 1 {
-                    assert_eq!(pipeline.runtime.snapshot().allocations, before);
+                    assert_eq!(pipeline.execution.runtime.snapshot().allocations, before);
                 }
             }
         }
     }
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
 fn stage_budget_capacity_keeps_actual_old_receipts_after_ceiling_and_selection_changes() {
     let (mut pipeline, _directory) = small_pipeline(4096);
     let limits = budgets();
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
         maximum_bytes_by_stage: limits,
     };
     let kinds = [
@@ -163,17 +166,17 @@ fn stage_budget_capacity_keeps_actual_old_receipts_after_ceiling_and_selection_c
             .map(|(index, &kind)| demands[index] + declared_sum - limits.maximum_bytes(kind))
             .max()
             .unwrap();
-    let before = pipeline.runtime.snapshot();
-    pipeline.config.device_capacity_bytes = required - 1;
+    let before = pipeline.execution.runtime.snapshot();
+    pipeline.execution.config.device_capacity_bytes = required - 1;
     assert!(pipeline
         .validate_resident_capacity(&planned.iter().collect::<Vec<_>>())
         .is_err());
-    pipeline.config.device_capacity_bytes = required;
+    pipeline.execution.config.device_capacity_bytes = required;
     pipeline
         .validate_resident_capacity(&planned.iter().collect::<Vec<_>>())
         .unwrap();
-    assert_eq!(pipeline.runtime.snapshot(), before);
-    pipeline.config.device_capacity_bytes = DEVICE_BYTES;
+    assert_eq!(pipeline.execution.runtime.snapshot(), before);
+    pipeline.execution.config.device_capacity_bytes = DEVICE_BYTES;
     let mut receipts = Vec::new();
     let mut actual = [0_u64; 4];
     for (index, &kind) in kinds[..3].iter().enumerate() {
@@ -182,7 +185,7 @@ fn stage_budget_capacity_keeps_actual_old_receipts_after_ceiling_and_selection_c
             .start_stage(old, 0, &mut receipts)
             .unwrap_or_else(|_| panic!("old shape start"));
         let (active, outputs) = pipeline
-            .execute_stage(active, 0, vec![input(&pipeline.host, 4, 0)])
+            .execute_stage(active, 0, vec![input(&pipeline.execution.host, 4, 0)])
             .unwrap_or_else(|_| panic!("old shape execute"));
         drop(outputs);
         pipeline
@@ -197,7 +200,7 @@ fn stage_budget_capacity_keeps_actual_old_receipts_after_ceiling_and_selection_c
         assert!(actual[index] > 1);
     }
     // A lowered cap and an omitted stage cannot erase existing physical pools.
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
         maximum_bytes_by_stage: ImageStageRetentionBudgets {
             decoder: NonZeroU64::new(1),
             ..ImageStageRetentionBudgets::default()
@@ -211,15 +214,15 @@ fn stage_budget_capacity_keeps_actual_old_receipts_after_ceiling_and_selection_c
             .map(|(index, &demand)| demand + actual_sum - actual[index])
             .max()
             .unwrap();
-    pipeline.config.device_capacity_bytes = required - 1;
+    pipeline.execution.config.device_capacity_bytes = required - 1;
     assert!(pipeline
         .validate_resident_capacity(&planned.iter().collect::<Vec<_>>())
         .is_err());
-    pipeline.config.device_capacity_bytes = required;
+    pipeline.execution.config.device_capacity_bytes = required;
     pipeline
         .validate_resident_capacity(&planned.iter().collect::<Vec<_>>())
         .unwrap();
-    pipeline.config.device_capacity_bytes = DEVICE_BYTES;
+    pipeline.execution.config.device_capacity_bytes = DEVICE_BYTES;
     // Changing the decoder's plan retires its old pool before the replacement.
     let replacement = projection_stage(&pipeline, ImageStage::Decoder, 1);
     let active = pipeline
@@ -239,14 +242,14 @@ fn stage_budget_capacity_keeps_actual_old_receipts_after_ceiling_and_selection_c
             .map(|(index, &demand)| demand + allowance_sum - allowances[index])
             .max()
             .unwrap();
-    pipeline.config.device_capacity_bytes = required_after_replacement;
+    pipeline.execution.config.device_capacity_bytes = required_after_replacement;
     pipeline
         .validate_resident_capacity(&planned.iter().collect::<Vec<_>>())
         .unwrap();
-    pipeline.config.device_capacity_bytes = DEVICE_BYTES;
+    pipeline.execution.config.device_capacity_bytes = DEVICE_BYTES;
     pipeline
         .finish_stage(active, &mut receipts)
         .unwrap_or_else(|_| panic!("replacement retire"));
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }

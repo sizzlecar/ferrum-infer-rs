@@ -160,6 +160,55 @@ fn philox_mixed_selection_queries_once_only_when_explicitly_requested() {
 }
 
 #[test]
+fn both_philox_precisions_share_one_query_and_keep_independent_capabilities() {
+    let device = device();
+    let calls = std::cell::Cell::new(0);
+    let selected = [
+        CudaTensorOperation::PhiloxNormal,
+        CudaTensorOperation::PhiloxNormalF32,
+    ];
+    let described = runtime_descriptors_with_query(&device, &selected, || {
+        calls.set(calls.get() + 1);
+        CudaPhiloxDeviceGeometry::new(2, 768)
+    })
+    .unwrap();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(described[0].operation(), selected[0]);
+    assert_eq!(described[1].operation(), selected[1]);
+    assert_eq!(
+        described[0].descriptor().operation_id().as_str(),
+        ferrum_runtime::PHILOX_NORMAL_BF16_OPERATION_ID
+    );
+    assert_eq!(
+        described[1].descriptor().operation_id().as_str(),
+        ferrum_runtime::PHILOX_NORMAL_F32_OPERATION_ID
+    );
+    assert_ne!(
+        described[0]
+            .descriptor()
+            .provider_implementation_fingerprint(),
+        described[1]
+            .descriptor()
+            .provider_implementation_fingerprint()
+    );
+    assert_ne!(
+        described[0]
+            .descriptor()
+            .resource_estimator_implementation_fingerprint(),
+        described[1]
+            .descriptor()
+            .resource_estimator_implementation_fingerprint()
+    );
+    let mut missing = device;
+    missing
+        .capabilities
+        .remove(&CapabilityId::new(ferrum_runtime::PHILOX_NORMAL_F32_CAPABILITY_ID).unwrap());
+    let geometry = Some(CudaPhiloxDeviceGeometry::new(2, 768).unwrap());
+    assert!(selected_descriptors(&missing, &selected, geometry).is_err());
+    assert!(selected_descriptors(&missing, &selected[..1], geometry).is_ok());
+}
+
+#[test]
 fn philox_selection_retains_geometry_in_implementation_and_estimator_identity() {
     let device = device();
     let selected = [CudaTensorOperation::PhiloxNormal];

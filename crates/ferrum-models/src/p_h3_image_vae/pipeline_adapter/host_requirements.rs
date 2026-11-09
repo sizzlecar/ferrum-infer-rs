@@ -25,7 +25,7 @@ pub struct PH3ImageVaeDecoderHostRequirements {
     pub borrowed_normalized_latents: ResolvedTensorSpec,
     /// Two separately allocated frequency backings, cached until finish/drop.
     pub cached_rotary_input_bytes: usize,
-    /// One gathered/denormalized tile-row allocation during device execution.
+    /// Largest actual gathered/denormalized group-row allocation during device execution.
     pub work_input_bytes: usize,
     /// Full canvas is allocated at bind and returned as the final pixel owner.
     pub canvas_output_bytes: usize,
@@ -57,100 +57,133 @@ impl PreparedPH3ImageVaeDecoder {
         &self,
         host: &HostMemoryAccount,
     ) -> Result<PH3ImageVaeDecoderHostRequirements> {
-        let (rows, frequencies, patches) = self.tile_layout_specs()?;
-        let cached_rotary_input_bytes = backing(host, &frequencies)?
-            .checked_mul(2)
-            .context("VAE decoder rotary backing overflows")?;
-        let work_input_bytes = backing(host, &rows)?;
-        let input_peak_bytes = checked_sum(&[cached_rotary_input_bytes, work_input_bytes])?;
-        let canvas_output_bytes = backing(host, &self.pixel_output_spec()?)?;
-        let readback = backing(host, &patches)?;
-        let [_, canvas_width] = self.plan.dimensions();
-        let batch = usize::try_from(self.config.batch())?;
-        let pixels = |height: usize, width: usize| -> Result<usize> {
-            if height == 0 || width == 0 {
-                return Ok(0);
-            }
-            backing(
-                host,
-                &spec(&[batch as u64, 3, height as u64, width as u64])?,
-            )
-        };
-        let mut peaks: [Option<PH3ImageVaeDecoderHostPhaseBudget>; 3] = [None; 3];
-        for index in 0..self.plan.tile_count() {
-            let tile = self.plan.tile(index)?;
+        ensure!(
+            self.tile_count == 1,
+            "use the grouped decoder requirements for a spatial batch recipe"
+        );
+        decoder_requirements(self, PH3ImageVaeTileBatch::default(), host)
+    }
+}
+
+pub(super) fn decoder_requirements(
+    prepared: &PreparedPH3ImageVaeDecoder,
+    tile_batch: PH3ImageVaeTileBatch,
+    host: &HostMemoryAccount,
+) -> Result<PH3ImageVaeDecoderHostRequirements> {
+    let layout = |count: usize| {
+        PH3ImageVaeImageLayout::new(
+            prepared.validated.decoder.clone(),
+            usize::try_from(prepared.request_batch)?
+                .checked_mul(count)
+                .context("physical decoder batch overflows")?,
+            usize::try_from(prepared.config.latent_height())?,
+            usize::try_from(prepared.config.latent_width())?,
+        )
+    };
+    let largest = prepared.plan.group_shapes(tile_batch)[0];
+    let maximum = layout(largest)?;
+    let cached_rotary_input_bytes = backing(host, &maximum.frequency_spec()?)?
+        .checked_mul(2)
+        .context("VAE decoder rotary backing overflows")?;
+    let work_input_bytes = backing(host, &maximum.row_spec()?)?;
+    let canvas_output_bytes = backing(host, &prepared.pixel_output_spec()?)?;
+    let [_, canvas_width] = prepared.plan.dimensions();
+    let batch = prepared.request_batch;
+    let pixels = |height: usize, width: usize| -> Result<usize> {
+        if height == 0 || width == 0 {
+            return Ok(0);
+        }
+        backing(host, &spec(&[batch, 3, height as u64, width as u64])?)
+    };
+    let mut peaks: [Option<PH3ImageVaeDecoderHostPhaseBudget>; 3] = [None; 3];
+    let mut input_peak_bytes = 0;
+    let mut output_peak_bytes = 0;
+    let mut observe = |slot: usize, phase: PH3ImageVaeDecoderHostPhaseBudget| {
+        input_peak_bytes = input_peak_bytes.max(phase.input_bytes);
+        output_peak_bytes = output_peak_bytes.max(phase.output_bytes);
+        if peaks[slot].is_none_or(|old| phase.total_bytes > old.total_bytes) {
+            peaks[slot] = Some(phase);
+        }
+    };
+    let mut first = 0;
+    while first < prepared.plan.tile_count() {
+        let group = prepared.plan.group(first, tile_batch)?;
+        let actual = layout(group.tile_count())?;
+        let readback = backing(host, &actual.patch_output_spec()?)?;
+        let group_pixels = backing(host, &actual.pixel_spec()?)?;
+        for index in first..first + group.tile_count() {
+            let tile = prepared.plan.tile(index)?;
             let tile_pixels = pixels(tile.height, tile.width)?;
             let upper = pixels(tile.overlap_top, canvas_width)?;
             let left = pixels(tile.height, tile.overlap_left)?;
-            // A new bottom strip is allocated in the first column and remains
-            // live across the rest of that row. It coexists with the old top
-            // strip until the row commits, exactly as Canvas::push requires.
             let building = if tile.x != 0 {
                 pixels(tile.trim_bottom, canvas_width)?
             } else {
                 0
             };
-            let old_seams = checked_sum(&[upper, left, building])?;
+            let base = checked_sum(&[canvas_output_bytes, upper, left, building])?;
+            if index == first {
+                observe(
+                    0,
+                    decoder_phase(
+                        PH3ImageVaeDecoderHostPhase::ExecuteReadback,
+                        index,
+                        checked_sum(&[
+                            cached_rotary_input_bytes,
+                            backing(host, &actual.row_spec()?)?,
+                        ])?,
+                        checked_sum(&[base, readback])?,
+                    )?,
+                );
+                observe(
+                    1,
+                    decoder_phase(
+                        PH3ImageVaeDecoderHostPhase::Unpatchify,
+                        index,
+                        cached_rotary_input_bytes,
+                        checked_sum(&[base, readback, group_pixels])?,
+                    )?,
+                );
+            }
+            // Every tile view retains the full group's original pixel backing.
+            // Account old/new seams at each cursor, including a retry after
+            // earlier group members have committed. The patch owner is gone.
             let new_left = pixels(tile.height, tile.trim_right)?;
             let new_strip = if tile.x == 0 {
                 pixels(tile.trim_bottom, canvas_width)?
             } else {
                 0
             };
-            let base = checked_sum(&[canvas_output_bytes, old_seams])?;
-            let phases = [
-                decoder_phase(
-                    PH3ImageVaeDecoderHostPhase::ExecuteReadback,
-                    index,
-                    input_peak_bytes,
-                    checked_sum(&[base, readback])?,
-                )?,
-                // The tile rows retire when execute returns. Unpatchify needs
-                // both the original patch readback and its new pixel tile.
-                decoder_phase(
-                    PH3ImageVaeDecoderHostPhase::Unpatchify,
-                    index,
-                    cached_rotary_input_bytes,
-                    checked_sum(&[base, readback, tile_pixels])?,
-                )?,
-                // Pending becomes Pixels before push, releasing all patches.
-                // push preallocates working/new-neighbour owners before it
-                // changes any persistent seam or canvas on successful commit.
+            observe(
+                2,
                 decoder_phase(
                     PH3ImageVaeDecoderHostPhase::Stitch,
                     index,
                     cached_rotary_input_bytes,
-                    checked_sum(&[base, tile_pixels, tile_pixels, new_left, new_strip])?,
+                    checked_sum(&[base, group_pixels, tile_pixels, new_left, new_strip])?,
                 )?,
-            ];
-            for (peak, phase) in peaks.iter_mut().zip(phases) {
-                if peak
-                    .as_ref()
-                    .is_none_or(|old| phase.total_bytes > old.total_bytes)
-                {
-                    *peak = Some(phase);
-                }
-            }
+            );
         }
-        let phases = peaks.map(|p| p.expect("validated VAE plan contains a tile"));
-        let output_peak_bytes = phases.iter().map(|p| p.output_bytes).max().unwrap();
-        Ok(PH3ImageVaeDecoderHostRequirements {
-            borrowed_normalized_latents: self.normalized_latent_spec()?,
-            cached_rotary_input_bytes,
-            work_input_bytes,
-            canvas_output_bytes,
-            work_output_peak_bytes: output_peak_bytes
-                .checked_sub(canvas_output_bytes)
-                .context("VAE decoder canvas backing exceeds its peak")?,
-            input_peak_bytes,
-            output_peak_bytes,
-            live_peak_bytes: phases.iter().map(|p| p.total_bytes).max().unwrap(),
-            single_scope_bytes: checked_sum(&[input_peak_bytes, output_peak_bytes])?,
-            retained_pixel_output_bytes: canvas_output_bytes,
-            phases,
-        })
+        first += group.tile_count();
     }
+    let phases = peaks.map(|p| p.expect("validated VAE plan contains a tile"));
+    Ok(PH3ImageVaeDecoderHostRequirements {
+        borrowed_normalized_latents: prepared.normalized_latent_spec()?,
+        cached_rotary_input_bytes,
+        work_input_bytes,
+        canvas_output_bytes,
+        work_output_peak_bytes: output_peak_bytes
+            .checked_sub(canvas_output_bytes)
+            .context("VAE decoder canvas backing exceeds its peak")?,
+        input_peak_bytes,
+        output_peak_bytes,
+        live_peak_bytes: phases.iter().map(|p| p.total_bytes).max().unwrap(),
+        single_scope_bytes: checked_sum(&[input_peak_bytes, output_peak_bytes])?,
+        retained_pixel_output_bytes: canvas_output_bytes,
+        phases,
+    })
 }
+
 fn decoder_phase(
     phase: PH3ImageVaeDecoderHostPhase,
     tile_index: usize,

@@ -1,16 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ferrum_runtime::{
-    dense_linear_bf16_contract, dense_linear_contract, AttributeId, BatchedOperationInvocation,
-    CapabilityId, ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement,
-    ElementType, EncodedDeviceOperation, ExecutionIdentityEnvelope, InvocationWorkProjection,
-    NodeWorkContract, OperationContract, OperationFailure, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, ProfilePhase, ProviderExecutionSemantics, ProviderId,
-    ProviderStorageBindingRequirement, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue,
-    TensorOperationInvocation, VNextError, WeightFormatId, DENSE_LINEAR_BF16_CAPABILITY_ID,
-    DENSE_LINEAR_BF16_OPERATION_ID, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
+    dense_linear_bf16_contract, dense_linear_contract, dense_linear_f32_contract, AttributeId,
+    BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceBatchingForm, DeviceRuntime,
+    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, ExecutionIdentityEnvelope,
+    InvocationWorkProjection, NodeWorkContract, OperationContract, OperationFailure,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase,
+    ProviderExecutionSemantics, ProviderId, ProviderStorageBindingRequirement,
+    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    ReusableExecutionTopologyRequest, SemanticValue, TensorOperationInvocation, VNextError,
+    WeightFormatId, DENSE_LINEAR_BF16_CAPABILITY_ID, DENSE_LINEAR_BF16_OPERATION_ID,
+    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_F32_CAPABILITY_ID, DENSE_LINEAR_F32_OPERATION_ID,
+    DENSE_LINEAR_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -26,6 +28,7 @@ fn operation_id(scalar: ReferenceDenseScalar) -> &'static str {
     match scalar {
         ReferenceDenseScalar::F16 => DENSE_LINEAR_OPERATION_ID,
         ReferenceDenseScalar::Bf16 => DENSE_LINEAR_BF16_OPERATION_ID,
+        ReferenceDenseScalar::F32 => DENSE_LINEAR_F32_OPERATION_ID,
     }
 }
 
@@ -47,6 +50,12 @@ impl ReferenceDenseLinearProvider {
         Self::new_for(runtime, ReferenceDenseScalar::Bf16)
     }
 
+    pub(super) fn new_f32(
+        runtime: &ReferenceDeviceRuntime,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        Self::new_for(runtime, ReferenceDenseScalar::F32)
+    }
+
     fn new_for(
         runtime: &ReferenceDeviceRuntime,
         scalar: ReferenceDenseScalar,
@@ -63,6 +72,12 @@ impl ReferenceDenseLinearProvider {
                 DENSE_LINEAR_BF16_CAPABILITY_ID,
                 "provider.reference.dense_linear.bf16",
                 "resource-estimator.reference.dense_linear.bf16",
+            ),
+            ReferenceDenseScalar::F32 => (
+                dense_linear_f32_contract(),
+                DENSE_LINEAR_F32_CAPABILITY_ID,
+                "provider.reference.dense_linear.f32",
+                "resource-estimator.reference.dense_linear.f32",
             ),
         };
         let contract = contract.map_err(contract_error)?;
@@ -610,8 +625,8 @@ pub(super) fn implementation_fingerprint(parts: &[&[u8]]) -> String {
 mod tests {
     use super::*;
     use crate::backend::reference::{
-        reference_vnext_dense_linear_bf16_provider, reference_vnext_dense_linear_provider,
-        ReferenceVNextComposition,
+        reference_vnext_dense_linear_bf16_provider, reference_vnext_dense_linear_f32_provider,
+        reference_vnext_dense_linear_provider, ReferenceVNextComposition,
     };
     use ferrum_runtime::DeviceId;
 
@@ -623,6 +638,7 @@ mod tests {
         .unwrap();
         let f16 = reference_vnext_dense_linear_provider(composition.runtime()).unwrap();
         let bf16 = reference_vnext_dense_linear_bf16_provider(composition.runtime()).unwrap();
+        let f32 = reference_vnext_dense_linear_f32_provider(composition.runtime()).unwrap();
         let a = f16.descriptor();
         let b = bf16.descriptor();
         assert_eq!(a.operation_id().as_str(), DENSE_LINEAR_OPERATION_ID);
@@ -659,5 +675,22 @@ mod tests {
         );
         assert!(a.supports_fixed_tensor_work());
         assert!(b.supports_fixed_tensor_work());
+        let c = f32.descriptor();
+        assert_eq!(c.operation_id().as_str(), DENSE_LINEAR_F32_OPERATION_ID);
+        assert_eq!(
+            c.operation_fingerprint(),
+            dense_linear_f32_contract()
+                .unwrap()
+                .descriptor()
+                .fingerprint()
+                .unwrap()
+        );
+        assert_eq!(
+            c.capabilities(),
+            &BTreeSet::from([CapabilityId::new(DENSE_LINEAR_F32_CAPABILITY_ID).unwrap()])
+        );
+        assert_ne!(b.provider_id(), c.provider_id());
+        assert_ne!(b.resource_estimator_id(), c.resource_estimator_id());
+        assert!(c.supports_fixed_tensor_work());
     }
 }

@@ -34,6 +34,41 @@ fn cli_requires_exactly_one_image_source() {
 }
 
 #[test]
+fn dit_capture_requires_explicit_budget_b1_and_excludes_other_captures() {
+    assert!(parse(&["--image-config", "h3.json"])
+        .unwrap()
+        .dit_input_capture_dir
+        .is_none());
+    let options = [
+        "--image-config",
+        "h3.json",
+        "--dit-input-capture-dir",
+        "inputs",
+        "--dit-input-capture-max-bytes",
+        "536870912",
+    ];
+    validate_arguments(&parse(&options).unwrap()).unwrap();
+    assert!(parse(&options[..4]).is_err());
+    let mut invalid = options.to_vec();
+    invalid[5] = "0";
+    assert!(parse(&invalid).is_err());
+    let mut mixed = options.to_vec();
+    mixed.extend(["--batch", "2"]);
+    assert!(validate_arguments(&parse(&mixed).unwrap()).is_err());
+    let mut conflict = options.to_vec();
+    conflict.extend([
+        "--final-latent-capture-dir",
+        "latent",
+        "--final-latent-capture-max-bytes",
+        "1000",
+    ]);
+    assert_eq!(
+        parse(&conflict).err().unwrap().kind(),
+        ErrorKind::ArgumentConflict
+    );
+}
+
+#[test]
 fn explicit_config_selects_the_document_for_kernel_and_off_without_loading_assets() {
     for timing in ["kernel", "off"] {
         let args = parse(&["--image-config", "h3.json", "--device-timing", timing]).unwrap();
@@ -105,4 +140,209 @@ fn directory_source_preserves_explicit_memory_library_and_batch_capacity() {
     );
     let invalid = parse(&["--model", "qwen", "--gpu-memory-utilization", "0"]).unwrap();
     assert!(invalid.source().is_err());
+}
+
+#[test]
+fn capture_is_disabled_by_default_and_explicit_bytes_cover_the_directory() {
+    let defaults = parse(&["--image-config", "h3.json"]).unwrap();
+    assert!(defaults.main_vision_capture_dir.is_none());
+    assert!(defaults.main_vision_capture_max_bytes.is_none());
+    let args = parse(&[
+        "--image-config",
+        "h3.json",
+        "--image",
+        "input.png",
+        "--main-vision-capture-dir",
+        "features",
+        "--main-vision-capture-max-bytes",
+        "72",
+    ])
+    .unwrap();
+    assert_eq!(
+        args.main_vision_capture_dir,
+        Some(PathBuf::from("features"))
+    );
+    assert_eq!(args.main_vision_capture_max_bytes.unwrap().get(), 72);
+}
+
+#[test]
+fn capture_requires_a_paired_nonzero_budget_and_an_explicit_edit_source() {
+    for options in [
+        vec![
+            "--image-config",
+            "h3.json",
+            "--image",
+            "input.png",
+            "--main-vision-capture-dir",
+            "features",
+        ],
+        vec![
+            "--image-config",
+            "h3.json",
+            "--image",
+            "input.png",
+            "--main-vision-capture-max-bytes",
+            "72",
+        ],
+        vec![
+            "--image-config",
+            "h3.json",
+            "--main-vision-capture-dir",
+            "features",
+            "--main-vision-capture-max-bytes",
+            "72",
+        ],
+    ] {
+        assert_eq!(
+            parse(&options).err().unwrap().kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+    let zero = parse(&[
+        "--image-config",
+        "h3.json",
+        "--image",
+        "input.png",
+        "--main-vision-capture-dir",
+        "features",
+        "--main-vision-capture-max-bytes",
+        "0",
+    ])
+    .err()
+    .unwrap();
+    assert_eq!(zero.kind(), ErrorKind::ValueValidation);
+    let directory = parse(&[
+        "--model",
+        "qwen",
+        "--image",
+        "input.png",
+        "--main-vision-capture-dir",
+        "features",
+        "--main-vision-capture-max-bytes",
+        "72",
+    ])
+    .err()
+    .unwrap();
+    assert_eq!(directory.kind(), ErrorKind::ArgumentConflict);
+}
+
+#[test]
+fn text_capture_requires_explicit_edit_budget_and_excludes_vision_capture() {
+    let defaults = parse(&["--image-config", "h3.json"]).unwrap();
+    assert!(defaults.main_text_capture_dir.is_none());
+    assert!(defaults.main_text_capture_max_bytes.is_none());
+    let options = [
+        "--image-config",
+        "h3.json",
+        "--image",
+        "input.png",
+        "--main-text-capture-dir",
+        "text",
+        "--main-text-capture-max-bytes",
+        "134217728",
+    ];
+    let args = parse(&options).unwrap();
+    validate_arguments(&args).unwrap();
+    assert_eq!(args.main_text_capture_max_bytes.unwrap().get(), 134217728);
+    for omitted_pair in [2, 4, 6] {
+        let missing: Vec<_> = options
+            .iter()
+            .enumerate()
+            .filter_map(|(i, arg)| (!(omitted_pair..omitted_pair + 2).contains(&i)).then_some(*arg))
+            .collect();
+        assert_eq!(
+            parse(&missing).err().unwrap().kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+    let mut zero = options;
+    zero[7] = "0";
+    assert_eq!(
+        parse(&zero).err().unwrap().kind(),
+        ErrorKind::ValueValidation
+    );
+    let mut both = options.to_vec();
+    both.extend([
+        "--main-vision-capture-dir",
+        "vision",
+        "--main-vision-capture-max-bytes",
+        "134217728",
+    ]);
+    assert_eq!(
+        parse(&both).err().unwrap().kind(),
+        ErrorKind::ArgumentConflict
+    );
+    let mut batched = options.to_vec();
+    batched.extend(["--batch", "2"]);
+    assert!(validate_arguments(&parse(&batched).unwrap()).is_err());
+    let mut directory = options;
+    directory[0] = "--model";
+    assert_eq!(
+        parse(&directory).err().unwrap().kind(),
+        ErrorKind::ArgumentConflict
+    );
+}
+
+#[test]
+fn final_latent_capture_is_explicit_b1_and_excludes_conditioning_modes() {
+    let defaults = parse(&["--image-config", "h3.json"]).unwrap();
+    assert!(defaults.final_latent_capture_dir.is_none());
+    assert!(defaults.final_latent_capture_max_bytes.is_none());
+    let options = [
+        "--image-config",
+        "h3.json",
+        "--final-latent-capture-dir",
+        "final",
+        "--final-latent-capture-max-bytes",
+        "8388608",
+    ];
+    let args = parse(&options).unwrap();
+    validate_arguments(&args).unwrap();
+    assert_eq!(args.final_latent_capture_max_bytes.unwrap().get(), 8388608);
+    // The same complete-target diagnostic supports both generation and edit.
+    let mut edit = options.to_vec();
+    edit.extend(["--image", "input.png"]);
+    validate_arguments(&parse(&edit).unwrap()).unwrap();
+    for pair in [2, 4] {
+        let missing: Vec<_> = options
+            .iter()
+            .enumerate()
+            .filter_map(|(i, arg)| (!(pair..pair + 2).contains(&i)).then_some(*arg))
+            .collect();
+        assert_eq!(
+            parse(&missing).err().unwrap().kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+    let mut zero = options;
+    zero[5] = "0";
+    assert_eq!(
+        parse(&zero).err().unwrap().kind(),
+        ErrorKind::ValueValidation
+    );
+    let mut directory = options;
+    directory[0] = "--model";
+    assert_eq!(
+        parse(&directory).err().unwrap().kind(),
+        ErrorKind::ArgumentConflict
+    );
+    for (dir, limit) in [
+        ("--main-text-capture-dir", "--main-text-capture-max-bytes"),
+        (
+            "--main-vision-capture-dir",
+            "--main-vision-capture-max-bytes",
+        ),
+    ] {
+        let mut both = edit.clone();
+        both.extend([dir, "other", limit, "134217728"]);
+        assert_eq!(
+            parse(&both).err().unwrap().kind(),
+            ErrorKind::ArgumentConflict
+        );
+    }
+    for batch in ["2", "1,1"] {
+        let mut batched = options.to_vec();
+        batched.extend(["--batch", batch]);
+        assert!(validate_arguments(&parse(&batched).unwrap()).is_err());
+    }
 }

@@ -34,12 +34,20 @@ mod capacity;
 pub use capacity::{ImageDeviceCapacityExceeded, ImageDeviceCapacityReport};
 mod composition;
 pub use composition::ImagePipelineLimits;
+pub mod continuous_trace;
 mod convolution_workspace;
 pub use convolution_workspace::ImageCudaConvolutionWorkspacePolicy;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 mod decoder;
+mod denoising;
 mod editing;
+mod execution;
+use execution::QwenImage21SourceAdapter;
+pub use execution::{
+    ImagePipelineExecution, ImagePipelineSourceAdapter, ImageStageAttachment,
+    ImageStageDeclaration, ImageWeightOwnerKey, ImageWeightOwnerPin,
+};
 mod host_budget;
 mod host_cache;
 mod output_requirements;
@@ -50,6 +58,7 @@ mod metal_attention_policy;
 pub use metal_attention_policy::ImageMetalAttentionPolicy;
 mod prefix_denoising;
 pub use editing::{ImageEditPrefixPolicy, QwenImage21EditProfiles};
+pub mod p_h3;
 mod plan_cache;
 mod precision;
 mod prepare;
@@ -75,6 +84,7 @@ pub use residency::{
     ImageDynamicResidencyPolicy, ImageResidencyPolicy, ImageResidentStageSet,
     ImageStageRetentionBudgets,
 };
+pub use stage::PreparedStage as PreparedImageStage;
 pub use stage::{
     ActiveImageStage, ImageGenerationError, ImageGenerationFailure, ImageStage,
     ImageStageExecutionReceipt, ImageStagePlanReceipt, ImageStagePlanRole, ImageStageReceipt,
@@ -94,6 +104,7 @@ use ferrum_execution::component::{
 use ferrum_execution::{
     TensorExecutionError, TensorExecutionOutput, TensorExecutorConfig, TensorSerialActor,
 };
+use ferrum_models::image_pixels::{ImagePixelEncoding, OwnedImagePixels};
 use ferrum_models::normal_noise::{NormalNoiseConfig, NormalNoiseFamily};
 use ferrum_models::qwen3_vl_text::{
     Qwen3VLTextArchitecture, Qwen3VLTextConfig, Qwen3VLTextEncoderFamily,
@@ -157,6 +168,8 @@ pub struct ImagePipelineConfig {
     /// selects the declared operator ceiling; each candidate still requires
     /// a complete capacity grant. Direct invocation uses a single request.
     pub maximum_batch_size: usize,
+    /// Optional packing target, not a hard cap on individual tensor bytes.
+    pub weight_arena_target_bytes: Option<std::num::NonZeroU64>,
     pub decoder_batch_policy: ImageDecoderBatchPolicy,
     pub edit_prefix_policy: ImageEditPrefixPolicy,
     pub plan_cache: ImagePlanCachePolicy,
@@ -265,51 +278,35 @@ pub struct ImageGenerationReceipt {
     pub native_memory: Option<DeviceNativeMemorySnapshot>,
     pub assets: ImageAssetReceipt,
     pub euler_profile: &'static str,
+    /// Optional model composition policy, separate from the selected noise
+    /// provider's numerical fingerprint in its actual stage receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise_layout_profile: Option<&'static str>,
 }
 
-/// Immutable BF16 `[1,4,H,W]` with its actual Output backing/Host claim. The
-/// caller may close/drop the pipeline while keeping this artifact alive.
+/// Immutable image pixels with an explicit storage/encoding contract and the
+/// actual Output backing/Host claim. The caller may close/drop the pipeline
+/// while keeping this artifact alive. `rgba` names the rendered representation;
+/// its stored channel count and precision are declared by the artifact.
 pub struct ImageGenerationOutput {
-    pub rgba: TensorExecutionOutput,
+    pub rgba: OwnedImagePixels,
     pub receipt: ImageGenerationReceipt,
 }
 
 pub struct QwenImage21Pipeline<R: DeviceRuntime> {
-    runtime: Arc<R>,
-    host: HostMemoryAccount,
-    execution_host: Option<HostMemoryAccount>,
-    registry: Arc<OperationRuntimeRegistry<R>>,
-    catalog: CapabilityCatalog,
-    materializers: Arc<WeightMaterializerRegistry>,
-    assets: Arc<QwenImage21Assets>,
+    execution: ImagePipelineExecution<R, QwenImage21SourceAdapter>,
     profiles: QwenImage21Profiles,
     editing_profiles: Option<QwenImage21EditProfiles>,
-    config: ImagePipelineConfig,
-    policy: TensorComponentPolicy,
-    next_job: u64,
-    stopped: bool,
-    // Prepared service owners may move between threads, but can only be
-    // consumed by this exact pipeline instance, even with a shared runtime.
-    service_preparation_identity: Arc<()>,
-    plan_cache: Arc<plan_cache::StagePlanCache<R>>,
-    preparation_only: bool,
-    resident_stages: residency::ResidentStages<R>,
-    // Composition-supplied planning allowance. Actual native owners still
-    // reserve through the existing device account; this never claims bytes.
-    device_opaque_allowance_bytes: u64,
-    // One serial lane spans every component and prefix request. Keep this
-    // field after resident owners so implicit drop also releases them first.
-    serial_actor: Option<TensorSerialActor<R>>,
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// Select diagnostic device observation before any request or session exists.
     pub fn with_device_timing_mode(mut self, mode: DeviceTimingMode) -> anyhow::Result<Self> {
         ensure!(
-            self.next_job == 0,
+            self.execution.next_job == 0,
             "device timing must be selected before requests start"
         );
-        self.config.executor.device_timing_mode = mode;
+        self.execution.config.executor.device_timing_mode = mode;
         Ok(self)
     }
 
@@ -327,49 +324,25 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         profiles: QwenImage21Profiles,
         config: ImagePipelineConfig,
     ) -> anyhow::Result<Self> {
-        config.validate()?;
         ensure!(
             assets.lora.is_none() || assets.lora_materializer.is_some(),
             "image LoRA must be admitted and registered by the backend composition root"
         );
-        ensure!(
-            config.device_capacity_bytes <= runtime.descriptor().total_memory_bytes,
-            "component capacity exceeds physical device descriptor"
-        );
-        ensure!(
-            catalog.device() == runtime.descriptor(),
-            "catalog and actual runtime device descriptors differ"
-        );
-        let policy = TensorComponentPolicy::new(
-            config.device_capacity_bytes,
-            runtime
-                .descriptor()
-                .dynamic_storage_profiles
-                .iter()
-                .copied()
-                .collect(),
-        )?;
-        let serial_actor = TensorSerialActor::new(runtime.clone())?;
-        Ok(Self {
+        let execution = ImagePipelineExecution::new(
             runtime,
             host,
-            execution_host: None,
-            registry: Arc::new(registry),
+            registry,
             catalog,
-            materializers: Arc::new(materializers),
-            assets: Arc::new(assets),
+            materializers,
+            config,
+            QwenImage21SourceAdapter {
+                assets: Arc::new(assets),
+            },
+        )?;
+        Ok(Self {
+            execution,
             profiles,
             editing_profiles: None,
-            config,
-            policy,
-            next_job: 0,
-            stopped: false,
-            service_preparation_identity: Arc::new(()),
-            plan_cache: Arc::new(plan_cache::StagePlanCache::new()),
-            preparation_only: false,
-            resident_stages: residency::ResidentStages::new(),
-            device_opaque_allowance_bytes: 0,
-            serial_actor: Some(serial_actor),
         })
     }
 
@@ -379,57 +352,39 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos"), test))]
     pub(super) fn with_device_opaque_allowance(mut self, bytes: u64) -> anyhow::Result<Self> {
         ensure!(
-            bytes < self.config.device_capacity_bytes,
+            bytes < self.execution.config.device_capacity_bytes,
             "device opaque allowance leaves no component storage capacity"
         );
-        self.device_opaque_allowance_bytes = bytes;
+        self.execution.device_opaque_allowance_bytes = bytes;
         Ok(self)
     }
 
     // Shares immutable model/provider owners, but owns no device session or
     // serial actor. The returned worker can only prepare future requests.
     fn preparation_fork(&self) -> Option<Self> {
-        if self.config.residency != ImageResidencyPolicy::Adaptive || self.is_stopped() {
+        if self.execution.config.residency != ImageResidencyPolicy::Adaptive || self.is_stopped() {
             return None;
         }
         Some(Self {
-            runtime: self.runtime.clone(),
-            host: self.host.clone(),
-            execution_host: self.execution_host.clone(),
-            registry: self.registry.clone(),
-            catalog: self.catalog.clone(),
-            materializers: self.materializers.clone(),
-            assets: self.assets.clone(),
+            execution: self
+                .execution
+                .preparation_fork(self.adaptive_capacity_ceiling().ok()?),
             profiles: self.profiles.clone(),
             editing_profiles: self.editing_profiles.clone(),
-            // Observe before current device work starts, so its temporary
-            // allocations are not mistaken for permanent future pressure.
-            config: ImagePipelineConfig {
-                device_capacity_bytes: self.adaptive_capacity_ceiling().ok()?,
-                ..self.config.clone()
-            },
-            policy: self.policy.clone(),
-            next_job: self.next_job.saturating_add(1),
-            stopped: false,
-            service_preparation_identity: self.service_preparation_identity.clone(),
-            plan_cache: self.plan_cache.clone(),
-            preparation_only: true,
-            resident_stages: residency::ResidentStages::new(),
-            device_opaque_allowance_bytes: self.device_opaque_allowance_bytes,
-            serial_actor: None,
         })
     }
 
     pub fn host_account(&self) -> &HostMemoryAccount {
-        &self.host
+        &self.execution.host
     }
 
     fn execution_host(&self) -> &HostMemoryAccount {
-        self.execution_host.as_ref().unwrap_or(&self.host)
+        self.execution.execution_host()
     }
     pub fn is_stopped(&self) -> bool {
-        self.stopped
+        self.execution.stopped
             || self
+                .execution
                 .serial_actor
                 .as_ref()
                 .is_none_or(TensorSerialActor::is_failed)
@@ -458,6 +413,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         &mut self,
         requests: Vec<ImageGenerationRequest>,
     ) -> Result<Vec<ImageGenerationOutput>, ImageGenerationError<R>> {
+        if self.execution.config.decoder_batch_policy == ImageDecoderBatchPolicy::SingleImage {
+            return self.generate_continuous_batch(requests);
+        }
         let empty_error = |failure| ImageGenerationError {
             failure,
             completed_stages: Vec::new(),
@@ -482,14 +440,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             completed_stages: Vec::new(),
             completed_steps: Vec::new(),
         };
-        let job = self.next_job;
-        self.next_job = self.next_job.checked_add(1).ok_or_else(|| {
+        let job = self.execution.next_job;
+        self.execution.next_job = self.execution.next_job.checked_add(1).ok_or_else(|| {
             empty_error(ImageGenerationFailure::Preflight(anyhow::anyhow!(
                 "image job identity exhausted"
             )))
         })?;
         let mut stages = Vec::with_capacity(4);
-        let mut steps = Vec::with_capacity(self.assets.schedule.evaluation_count());
+        let mut steps =
+            Vec::with_capacity(self.execution.sources.assets.schedule.evaluation_count());
         let host_scope = match prepared.host_scope.take() {
             Some(scope) => scope,
             None => self
@@ -500,14 +459,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         if let Some(candidate) = prepared.plan_cache_candidate.take() {
             candidate.commit();
         }
-        self.execution_host = Some(host_scope.account());
+        self.execution.execution_host = Some(host_scope.account());
         let executed = self.run(prepared, &requests, job, &mut stages, &mut steps);
-        self.execution_host = None;
+        self.execution.execution_host = None;
         // Returned readbacks retain their real parent charge; unused execution
         // credit is immediately available to HTTP encoders and queued inputs.
         drop(host_scope);
         drop(host_backing);
-        let native_memory = self.runtime.native_memory_snapshot();
+        let native_memory = self.execution.runtime.native_memory_snapshot();
         if let Some(memory) = native_memory {
             tracing::info!(
                 target: "ferrum_engine::image_generation::native_memory",
@@ -533,27 +492,39 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .zip(outputs)
                 .enumerate()
                 .map(|(batch_index, (request, rgba))| {
+                    let rgba = OwnedImagePixels::new(
+                        &self.execution.host,
+                        rgba.tensor().clone(),
+                        rgba.bytes().clone(),
+                        ImagePixelEncoding::Bf16SignedRgbaStaged,
+                    )
+                    .map_err(|source| ImageGenerationFailure::Processing {
+                        source,
+                        active: None,
+                    })?;
                     Ok(ImageGenerationOutput {
                         rgba,
                         receipt: ImageGenerationReceipt {
                             job,
                             batch_size: requests.len(),
                             batch_index,
-                            decoder_batch_policy: self.config.decoder_batch_policy,
-                            residency: self.config.residency,
+                            decoder_batch_policy: self.execution.config.decoder_batch_policy,
+                            residency: self.execution.config.residency,
                             width: request.width,
                             height: request.height,
                             seed: request.seed,
                             stages: stages.clone(),
                             steps: steps.clone(),
                             runtime_fingerprint: self
+                                .execution
                                 .runtime
                                 .descriptor()
                                 .runtime_implementation_fingerprint
                                 .clone(),
                             native_memory,
-                            assets: self.assets.receipt().clone(),
+                            assets: self.execution.sources.assets.receipt().clone(),
                             euler_profile: self.profiles.euler.id(),
+                            noise_layout_profile: None,
                         },
                     })
                 })
@@ -562,7 +533,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         match result {
             Ok(outputs) => Ok(outputs),
             Err(failure) => {
-                self.stopped = !matches!(
+                self.execution.stopped = !matches!(
                     failure,
                     ImageGenerationFailure::AllocationRejected { .. }
                         | ImageGenerationFailure::CapacityRejected { .. }
@@ -614,8 +585,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let inputs = prompts
                 .managed_inputs(
                     self.execution_host(),
-                    &self.assets.text,
+                    &self.execution.sources.assets.text,
                     &self
+                        .execution
+                        .sources
                         .assets
                         .sources
                         .text_encoder
@@ -631,7 +604,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let hidden =
                 only_output(outputs, Qwen3VLTextEncoderFamily::OUTPUT_ID).map_err(process)?;
             let features = prompts
-                .crop_hidden(self.execution_host(), &self.assets.text, &hidden)
+                .crop_hidden(
+                    self.execution_host(),
+                    &self.execution.sources.assets.text,
+                    &hidden,
+                )
                 .map_err(process)?;
             drop(hidden);
             (features.into_tensor(), None)
@@ -711,80 +688,101 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             rotary_us = trace_elapsed_us(rotary_started),
             "image denoising rotary inputs prepared"
         );
-        let mut solver = ManagedBf16Euler::new(
-            self.assets.schedule.solver().clone(),
-            self.execution_host().clone(),
-            sample.tensor().clone(),
-            self.profiles.euler,
-        )
-        .map_err(|e| process(e.into()))?;
-        if let Some(decode) = prefix_decode {
-            sample = self.run_prefix_denoising(
-                prefix_denoising::PrefixDenoise {
-                    prefill: denoise_stage,
-                    decode,
-                    config: transformer,
-                    sample,
-                    text: text_input.clone(),
-                    reference: reference
-                        .clone()
-                        .context("prefix cache requires a reference image")
-                        .map_err(process)?,
-                    frequencies: frequencies.clone(),
-                },
-                &mut solver,
+        if reference.is_none() && prefix_decode.is_none() {
+            let mut denoising = denoising::FullGenerationDenoising::new(
+                self.execution_host(),
                 job,
-                stages,
-                steps,
-            )?;
-        } else {
+                request_order.caller_indices(),
+                transformer,
+                self.execution.sources.assets.schedule.solver(),
+                self.profiles.euler,
+                sample,
+                text_input.clone(),
+                frequencies.clone(),
+            )
+            .map_err(process)?;
             let mut denoiser = self.start_stage(denoise_stage, job, stages)?;
-            let mut euler_us = 0_u64;
-            while let Some(step) = solver.current_step() {
-                let time = match transformer
-                    .managed_time_features(self.execution_host(), step.timestep().as_f32())
-                {
-                    Ok(value) => value,
-                    Err(error) => return Err(denoiser.processing(error)),
-                };
-                let mut inputs = vec![
-                    sample.clone(),
-                    text_input.clone(),
-                    time,
-                    frequencies.clone(),
-                ];
-                if let Some(reference) = &reference {
-                    inputs.push(reference.clone());
-                }
-                let (active, outputs) = self.execute_stage(denoiser, job, inputs)?;
-                denoiser = active;
-                let velocity = match only_output(outputs, QwenImage21TransformerFamily::VELOCITY_ID)
-                {
-                    Ok(value) => value,
-                    Err(error) => return Err(denoiser.processing(error)),
-                };
-                let euler_started = std::time::Instant::now();
-                sample = match solver.advance(&sample, velocity.tensor(), velocity.bytes()) {
-                    Ok((_, next)) => next,
-                    Err(error) => return Err(denoiser.processing(error.into())),
-                };
-                euler_us = euler_us.saturating_add(trace_elapsed_us(euler_started));
-                steps.push(ImageDenoiseStepReceipt {
-                    index: step.index(),
-                    sigma: step.sigma(),
-                    next_sigma: step.next_sigma(),
-                    scheduler_timestep: step.timestep().as_f32(),
-                });
+            while !denoising.is_complete() {
+                denoiser = denoising.step(self, denoiser, steps)?;
             }
-            tracing::debug!(
-                target: "ferrum_engine::image_generation::timing",
-                job,
-                euler_us,
-                "image denoising host solver completed"
-            );
             self.finish_stage(denoiser, stages)?;
+            sample = denoising.finish(self.execution_host()).map_err(process)?;
+        } else {
+            let mut solver = ManagedBf16Euler::new(
+                self.execution.sources.assets.schedule.solver().clone(),
+                self.execution_host().clone(),
+                sample.tensor().clone(),
+                self.profiles.euler,
+            )
+            .map_err(|e| process(e.into()))?;
+            if let Some(decode) = prefix_decode {
+                sample = self.run_prefix_denoising(
+                    prefix_denoising::PrefixDenoise {
+                        prefill: denoise_stage,
+                        decode,
+                        config: transformer,
+                        sample,
+                        text: text_input.clone(),
+                        reference: reference
+                            .clone()
+                            .context("prefix cache requires a reference image")
+                            .map_err(process)?,
+                        frequencies: frequencies.clone(),
+                    },
+                    &mut solver,
+                    job,
+                    stages,
+                    steps,
+                )?;
+            } else {
+                let mut denoiser = self.start_stage(denoise_stage, job, stages)?;
+                let mut euler_us = 0_u64;
+                while let Some(step) = solver.current_step() {
+                    let time = match transformer
+                        .managed_time_features(self.execution_host(), step.timestep().as_f32())
+                    {
+                        Ok(value) => value,
+                        Err(error) => return Err(denoiser.processing(error)),
+                    };
+                    let mut inputs = vec![
+                        sample.clone(),
+                        text_input.clone(),
+                        time,
+                        frequencies.clone(),
+                    ];
+                    if let Some(reference) = &reference {
+                        inputs.push(reference.clone());
+                    }
+                    let (active, outputs) = self.execute_stage(denoiser, job, inputs)?;
+                    denoiser = active;
+                    let velocity =
+                        match only_output(outputs, QwenImage21TransformerFamily::VELOCITY_ID) {
+                            Ok(value) => value,
+                            Err(error) => return Err(denoiser.processing(error)),
+                        };
+                    let euler_started = std::time::Instant::now();
+                    sample = match solver.advance(&sample, velocity.tensor(), velocity.bytes()) {
+                        Ok((_, next)) => next,
+                        Err(error) => return Err(denoiser.processing(error.into())),
+                    };
+                    euler_us = euler_us.saturating_add(trace_elapsed_us(euler_started));
+                    steps.push(ImageDenoiseStepReceipt {
+                        index: step.index(),
+                        sigma: step.sigma(),
+                        next_sigma: step.next_sigma(),
+                        scheduler_timestep: step.timestep().as_f32(),
+                    });
+                }
+                tracing::debug!(
+                    target: "ferrum_engine::image_generation::timing",
+                    job,
+                    euler_us,
+                    "image denoising host solver completed"
+                );
+                self.finish_stage(denoiser, stages)?;
+            }
         }
-        drop((text_input, frequencies, solver, reference));
+        drop((text_input, frequencies, reference));
 
         let normalized = QwenImage21ManagedLatents::new(
             self.execution_host(),
@@ -795,7 +793,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         )
         .map_err(process)?;
         let input = normalized
-            .denormalize_for_vae(self.execution_host(), &self.assets.statistics)
+            .denormalize_for_vae(
+                self.execution_host(),
+                &self.execution.sources.assets.statistics,
+            )
             .map_err(process)?
             .into_input_tensor()
             .map_err(process)?;
@@ -817,7 +818,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         {
             return Err(active.processing(error.into()));
         }
-        let Some(actor) = self.serial_actor.as_mut() else {
+        let Some(actor) = self.execution.serial_actor.as_mut() else {
             return Err(active.processing(anyhow::anyhow!("image serial actor is closed")));
         };
         active.execute_on_actor(actor, job, inputs)

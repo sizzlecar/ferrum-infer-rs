@@ -5,24 +5,47 @@
 
 mod configuration;
 mod directory;
+#[cfg(any(feature = "cuda", test))]
+mod dit_input_capture;
+mod document;
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 mod factory;
+#[cfg(any(feature = "cuda", test))]
+mod final_latent_capture;
 #[cfg(all(test, feature = "cuda"))]
 mod gpu_tests;
 #[cfg(any(feature = "cuda", test))]
 mod host_cache;
 #[cfg(any(feature = "cuda", test))]
 mod library;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
+mod main_text_capture;
+#[cfg(any(feature = "cuda", test))]
+mod main_vision_capture;
+mod p_h3;
+#[cfg(any(feature = "cuda", test))]
 mod profile;
 mod run;
 mod serve;
 mod source;
 #[cfg(test)]
 mod tests;
+mod trace_artifact;
 
 pub use configuration::ImageProductConfig;
 pub use directory::{DirectoryOptions, ImageProductSource};
+#[cfg(feature = "cuda")]
+pub use dit_input_capture::ImageDitInputCaptureOptions;
+#[cfg(feature = "cuda")]
+pub use final_latent_capture::ImageFinalLatentCaptureOptions;
+#[cfg(feature = "cuda")]
+pub use main_text_capture::ImageMainTextCaptureOptions;
+#[cfg(feature = "cuda")]
+pub use main_vision_capture::ImageMainVisionCaptureOptions;
+pub use p_h3::{
+    PH3ImageContinuousTraceConfig, PH3ImageProductArchitecture, PH3ImageProductConfig,
+    PH3ImageProductPreset,
+};
 #[cfg(feature = "cuda")]
 pub use profile::{profile_image_source, ImageProfileWorkload};
 pub use run::execute_run;
@@ -333,6 +356,15 @@ pub enum ImageProductError {
 }
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 impl ImageProductError {
+    fn generation_pipeline(
+        source: Box<dyn std::error::Error + Send>,
+        pipeline: factory::PreparedPipeline,
+    ) -> Self {
+        Self::Generation {
+            source,
+            pipeline: pipeline.into_generator(),
+        }
+    }
     fn generation<R: ferrum_runtime::DeviceRuntime>(
         source: ferrum_engine::image_generation::ImageGenerationError<R>,
         pipeline: Box<ferrum_engine::image_generation::QwenImage21Pipeline<R>>,
@@ -349,6 +381,21 @@ impl From<anyhow::Error> for ImageProductError {
         Self::Configuration(value)
     }
 }
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
+fn image_server_error_message(
+    source: &anyhow::Error,
+    shutdown: Option<&ferrum_engine::image_generation::service::ImageServiceShutdown>,
+) -> String {
+    let mut message = format!("image server: {source:#}");
+    if let Some(failure) = shutdown.and_then(|shutdown| shutdown.failure()) {
+        // Observe the retained failure without moving its original recovery
+        // owner. A failing formatter cannot unwind that owner out of the report.
+        let cause = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| failure.to_string()))
+            .unwrap_or_else(|_| "error formatter panicked; original owner retained".to_owned());
+        message.push_str(&format!("; image worker: {cause}"));
+    }
+    message
+}
 impl fmt::Display for ImageProductError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -357,7 +404,9 @@ impl fmt::Display for ImageProductError {
             #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
             Self::Generation { source, .. } => write!(f, "{source}"),
             #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
-            Self::Server { source, .. } => write!(f, "image server: {source:#}"),
+            Self::Server {
+                source, shutdown, ..
+            } => f.write_str(&image_server_error_message(source, shutdown.as_ref())),
         }
     }
 }
@@ -366,7 +415,23 @@ impl fmt::Debug for ImageProductError {
         fmt::Display::fmt(self, f)
     }
 }
-impl std::error::Error for ImageProductError {}
+impl std::error::Error for ImageProductError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Configuration(source) => Some(source.as_ref()),
+            Self::Unsupported(_) => None,
+            #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+            Self::Generation { source, .. } => Some(source.as_ref()),
+            #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+            Self::Server {
+                source, shutdown, ..
+            } => match shutdown.as_ref().and_then(|shutdown| shutdown.failure()) {
+                Some(failure) => Some(failure),
+                None => Some(source.as_ref()),
+            },
+        }
+    }
+}
 
 /// Text construction cleanup retains its existing observation API.
 pub enum CommandError {

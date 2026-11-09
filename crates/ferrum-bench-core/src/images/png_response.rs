@@ -102,6 +102,19 @@ pub fn validate_image_response_with_png(
     if png_bytes.len() > limits.maximum_png_bytes {
         return Err(invalid("PNG exceeds byte limit"));
     }
+    validate_png_response(png_bytes, width, height, limits)
+}
+
+/// Validate an original, already bounded PNG response without a JSON/base64
+/// round trip. Shares the complete decoder and hash contract with image APIs.
+pub fn validate_png_response(
+    png_bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+    limits: &ImageResponseLimits,
+) -> Result<ValidatedPngResponse, ImageBenchError> {
+    limits.validate()?;
+    limits.rgba_bytes(width, height)?;
     let image = validate_png(&png_bytes, Some((width, height)), limits)?;
     Ok(ValidatedPngResponse {
         image,

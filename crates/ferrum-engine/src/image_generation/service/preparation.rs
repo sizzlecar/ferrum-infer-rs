@@ -97,7 +97,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         &self,
         prepared: &PreparedRequest<R>,
     ) -> Result<Option<super::super::ImageDeviceCapacityReport>, ImageBatchError> {
-        if self.config.residency != super::super::ImageResidencyPolicy::Adaptive {
+        if self.execution.config.residency != super::super::ImageResidencyPolicy::Adaptive {
             return Ok(None);
         }
         let mut stages = vec![
@@ -124,7 +124,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     }
 
     fn validate_service_availability(&self) -> Result<(), ImageBatchError> {
-        if self.stopped || (!self.preparation_only && self.is_stopped()) {
+        if self.execution.stopped || (!self.execution.preparation_only && self.is_stopped()) {
             return Err(ImageBatchError::Fatal(Box::new(
                 ImageGenerationError::<R> {
                     failure: ImageGenerationFailure::Unavailable,
@@ -155,7 +155,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         validate_output_budget(output_bytes, prepared.host_budget.output)?;
         let resident = self.service_resident_preference(&prepared)?;
         let mut preparation = ImageBatchPreparation::new(BoundPreparation::new(
-            &self.service_preparation_identity,
+            &self.execution.service_preparation_identity,
             identities,
             prepared,
         ));
@@ -174,13 +174,15 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 || ImageBatchError::InvalidInput("invalid bounded PNG header".into()),
             )?;
         let assets = self
+            .execution
+            .sources
             .assets
             .editing
             .as_ref()
             .ok_or_else(|| ImageBatchError::Rejected("editing assets are missing".into()))?;
         assets
             .processor
-            .prepared_backing_bytes(&self.host, width, height)
+            .prepared_backing_bytes(&self.execution.host, width, height)
             .map_err(|error| preparation_error(error.into()))
     }
 
@@ -201,7 +203,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         .map_err(preparation_error)?;
         Ok(ImageEditPreparation::new(
             BoundPreparation::new(
-                &self.service_preparation_identity,
+                &self.execution.service_preparation_identity,
                 vec![EditIdentity::from(request)],
                 input,
             ),
@@ -228,7 +230,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let identity = EditIdentity::from(*request);
             let input = input.get::<EditInputPreparation>()?;
             input.validate(
-                &self.service_preparation_identity,
+                &self.execution.service_preparation_identity,
                 std::slice::from_ref(&identity),
             )?;
             identities.push(identity);
@@ -246,7 +248,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map_err(preparation_error)?;
         let _prompt_charge = if prompt_bytes > 0 {
             Some(
-                self.host
+                self.execution
+                    .host
                     .reserve(HostMemoryClass::InputPreprocess, prompt_bytes)
                     .map_err(|error| preparation_error(error.into()))?,
             )
@@ -263,7 +266,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         validate_output_budget(output_bytes, prepared.host_budget.output)?;
         let resident = self.service_resident_preference(&prepared)?;
         let mut preparation = ImageBatchPreparation::new(BoundPreparation::new(
-            &self.service_preparation_identity,
+            &self.execution.service_preparation_identity,
             identities,
             prepared,
         ));
@@ -283,7 +286,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         prepared: &mut ImageBatchPreparation,
         resources: &ImagePreparationResources,
     ) -> Result<bool, ImageBatchError> {
-        if self.preparation_only {
+        if self.execution.preparation_only {
             return Err(ImageBatchError::Rejected(
                 "plan-only worker cannot execute or admit resources".into(),
             ));
@@ -294,14 +297,20 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         })?;
         let payload = if owner.is::<GenerationPreparation<R>>() {
             let bound = owner.downcast_mut::<GenerationPreparation<R>>().unwrap();
-            if !Arc::ptr_eq(&self.service_preparation_identity, &bound.pipeline) {
+            if !Arc::ptr_eq(
+                &self.execution.service_preparation_identity,
+                &bound.pipeline,
+            ) {
                 return Err(ImageBatchError::Rejected(
                     "image preparation belongs to another pipeline".into(),
                 ));
             }
             &mut bound.payload
         } else if let Some(bound) = owner.downcast_mut::<EditBatchPreparation<R>>() {
-            if !Arc::ptr_eq(&self.service_preparation_identity, &bound.pipeline) {
+            if !Arc::ptr_eq(
+                &self.execution.service_preparation_identity,
+                &bound.pipeline,
+            ) {
                 return Err(ImageBatchError::Rejected(
                     "edit preparation belongs to another pipeline".into(),
                 ));
@@ -336,10 +345,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             return Ok(true);
         }
         let claims = payload.host_budget.claims();
-        self.host
+        self.execution
+            .host
             .check_scope_after_output_release(&claims, resources.output_credit_bytes)
             .map_err(|error| preparation_error(error.into()))?;
-        match self.host.reserve_scope(&claims) {
+        match self.execution.host.reserve_scope(&claims) {
             Ok(scope) => {
                 payload.host_scope = Some(scope);
                 Ok(true)
@@ -347,7 +357,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             Err(error) if error.is_temporary_capacity() => {
                 // Queue admission can race the first snapshot. Recheck the
                 // non-releasable owners before parking on output consumption.
-                self.host
+                self.execution
+                    .host
                     .check_scope_after_output_release(&claims, resources.output_credit_bytes)
                     .map_err(|error| preparation_error(error.into()))?;
                 Ok(false)
@@ -361,7 +372,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         prepared: ImageBatchPreparation,
         requests: Vec<ImageGenerationRequest>,
     ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError> {
-        if self.preparation_only {
+        if self.execution.preparation_only {
             return Err(ImageBatchError::Rejected(
                 "plan-only worker cannot execute or admit resources".into(),
             ));
@@ -370,7 +381,19 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let identities: Vec<_> = requests.iter().map(GenerationIdentity::from).collect();
         let prepared = prepared
             .into_inner::<GenerationPreparation<R>>()?
-            .into_payload(&self.service_preparation_identity, &identities)?;
+            .into_payload(&self.execution.service_preparation_identity, &identities)?;
+        if self.execution.config.decoder_batch_policy
+            == super::super::ImageDecoderBatchPolicy::SingleImage
+        {
+            // Authentication consumes this exact whole-batch token, but its
+            // grant/plan can never be rebound to independently progressing
+            // requests. The common run/serve continuation consumer prepares
+            // and admits the required owners itself.
+            drop(prepared);
+            return self
+                .generate_batch(requests)
+                .map_err(|error| qwen_batch_error(self.is_stopped(), error));
+        }
         self.execute_prepared(prepared, &requests)
             .map_err(|error| qwen_batch_error(self.is_stopped(), error))
     }
@@ -380,7 +403,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         prepared: ImageBatchPreparation,
         requests: Vec<ImageEditRequest>,
     ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError> {
-        if self.preparation_only {
+        if self.execution.preparation_only {
             return Err(ImageBatchError::Rejected(
                 "plan-only worker cannot execute or admit resources".into(),
             ));
@@ -389,7 +412,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let identities: Vec<_> = requests.iter().map(EditIdentity::from).collect();
         let prepared = prepared
             .into_inner::<EditBatchPreparation<R>>()?
-            .into_payload(&self.service_preparation_identity, &identities)?;
+            .into_payload(&self.execution.service_preparation_identity, &identities)?;
         drop(identities);
         let generation: Vec<_> = requests
             .into_iter()

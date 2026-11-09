@@ -368,7 +368,8 @@ fn recurrent_state_is_indirect_and_fence_retained_not_captured() {
 
 #[test]
 fn recurrent_attention_packs_wave_projections_and_keeps_exact_qkvzba() {
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("contiguous_bindings(10)"));
+    // Port and state ownership are covered by the actual CUDA candidate-provider
+    // regressions; the binding helper's source-file location is not a contract.
     assert!(RECURRENT_ATTENTION_SOURCE.contains("shared.qkvzba"));
     assert!(RECURRENT_ATTENTION_SOURCE.contains(
         "linear_attention_prepare_varlen_packed_qkvzba_f16_params_f32_state_f16_z_f16_indirect"

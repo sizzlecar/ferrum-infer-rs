@@ -57,6 +57,9 @@ pub(super) fn take_batch<O: Send + 'static>(
             || remaining == Some(Duration::ZERO)
         {
             let batch: Vec<_> = state.queue.drain(..count).collect();
+            for job in &batch {
+                job.trace.dequeued();
+            }
             state.preparing = count;
             state.preparing_bytes = batch.iter().map(Queued::pending_bytes).sum();
             return Some(batch);
@@ -91,6 +94,7 @@ fn return_tail<O>(
         }
         state.preparing -= 1;
         state.preparing_bytes -= job.pending_bytes();
+        job.trace.requeued();
         state.queue.push_front(job);
     }
     if device_capacity {
@@ -180,7 +184,7 @@ fn admit_output_prefix<O: Send + 'static>(
     }
 }
 
-fn output_prefix_available<O: Send + 'static>(
+pub(super) fn output_prefix_available<O: Send + 'static>(
     worker: &dyn BatchWorker<Output = O>,
     batch: &[Queued<O>],
     index: usize,
@@ -190,9 +194,15 @@ fn output_prefix_available<O: Send + 'static>(
         return Ok(true);
     };
     let requests: Vec<_> = batch[..=index].iter().map(|job| &job.request).collect();
-    let Some(engine_bytes) = worker.execution_output_bytes(&requests)? else {
+    let engine_bytes = worker.execution_output_bytes(&requests)?;
+    let fixed = usize::try_from(worker.retained_output_bytes()).map_err(|_| {
+        ImageBatchError::Overloaded(
+            "retained generator Output exceeds the Host address range".into(),
+        )
+    })?;
+    if engine_bytes.is_none() && fixed == 0 {
         return Ok(true);
-    };
+    }
     let held = batch
         .iter()
         .filter_map(|job| job.output.as_ref())
@@ -200,20 +210,26 @@ fn output_prefix_available<O: Send + 'static>(
         .map(|output| output.gate.host_output_bytes(host))
         .try_fold(0usize, |total, bytes| total.checked_add(bytes))
         .ok_or_else(|| ImageBatchError::Overloaded("held output credit overflows".into()))?;
+    // The fixed owner is already charged. Include it only in the hypothetical
+    // release proof; adding it to actual demand would charge it twice.
+    let retained = held
+        .checked_add(fixed)
+        .ok_or_else(|| ImageBatchError::Overloaded("retained Output baseline overflows".into()))?;
     let next = batch[index]
         .output
         .as_ref()
         .map_or(0, |output| output.gate.host_output_bytes(host));
     let demand = engine_bytes
+        .unwrap_or(0)
         .checked_add(next)
         .ok_or_else(|| ImageBatchError::Overloaded("combined output demand overflows".into()))?;
     let claims = [(HostMemoryClass::Output, demand)];
-    host.check_scope_after_output_release(&claims, held)
+    host.check_scope_after_output_release(&claims, retained)
         .map_err(|error| preparation_error(error.into()))?;
     match host.check_scope_admission(&claims) {
         Ok(()) => Ok(true),
         Err(error) if error.is_temporary_capacity() => {
-            host.check_scope_after_output_release(&claims, held)
+            host.check_scope_after_output_release(&claims, retained)
                 .map_err(|error| preparation_error(error.into()))?;
             Ok(false)
         }
@@ -234,10 +250,9 @@ fn remove_cancelled<O>(batch: &mut Vec<Queued<O>>, state: &mut State<O>) -> bool
             } else {
                 ImageServiceErrorKind::Cancelled
             };
-            let _ = job.response.send(Err(service_error(
-                kind,
-                "image request withdrawn before execution",
-            )));
+            let _ = job.response.send(Err(job
+                .trace
+                .error(kind, "image request withdrawn before execution")));
         } else {
             index += 1;
         }
@@ -245,7 +260,7 @@ fn remove_cancelled<O>(batch: &mut Vec<Queued<O>>, state: &mut State<O>) -> bool
     before != batch.len()
 }
 
-fn rejection(
+pub(super) fn rejection(
     error: ImageBatchError,
 ) -> Result<(ImageServiceErrorKind, String), ImageWorkerFailure> {
     match error {
@@ -257,6 +272,12 @@ fn rejection(
             Ok((ImageServiceErrorKind::Generation, diagnostic))
         }
         ImageBatchError::Overloaded(message) => Ok((ImageServiceErrorKind::QueueFull, message)),
+        ImageBatchError::InitializationAwaitDenoisingProgress { diagnostic } => {
+            Ok((ImageServiceErrorKind::QueueFull, diagnostic))
+        }
+        error @ ImageBatchError::AwaitDenoisingProgress { .. } => {
+            Err(ImageWorkerFailure::Generation(Box::new(error)))
+        }
         ImageBatchError::Fatal(error) => Err(ImageWorkerFailure::Generation(error)),
     }
 }
@@ -282,7 +303,7 @@ fn reject_candidate<O>(
         } else {
             kind
         };
-        let _ = job.response.send(Err(service_error(kind, message)));
+        let _ = job.response.send(Err(job.trace.error(kind, message)));
     }
 }
 
@@ -339,9 +360,17 @@ fn reserve_preprocessing<O: Send + 'static>(
                     .ok_or_else(|| {
                         ImageBatchError::Overloaded("held output credit overflows".into())
                     })?;
+                let fixed = usize::try_from(worker.retained_output_bytes()).map_err(|_| {
+                    ImageBatchError::Overloaded(
+                        "retained generator Output exceeds the Host address range".into(),
+                    )
+                })?;
+                let retained = held.checked_add(fixed).ok_or_else(|| {
+                    ImageBatchError::Overloaded("retained Output baseline overflows".into())
+                })?;
                 host.check_scope_after_output_release(
                     &[(HostMemoryClass::InputPreprocess, next)],
-                    held,
+                    retained,
                 )
                 .is_ok()
             } else {
@@ -589,6 +618,21 @@ pub(super) fn worker_loop<O: Send + 'static>(
                 );
                 return failure;
             }
+            let step_supported = batch.first().is_some_and(|job| {
+                worker.denoising_generator().is_some_and(|generator| {
+                    generator.supports_image_request(job.request.image_request_ref())
+                })
+            });
+            if step_supported {
+                // A plan-only prefetch has submitted no work. The step
+                // protocol prepares each joining request and current cohort
+                // afresh, rather than retargeting a whole-batch token.
+                drop(prepared_ahead.take());
+                if let Err(failure) = steps::execute(worker.as_mut(), &shared, batch) {
+                    return Some(failure);
+                }
+                continue 'batches;
+            }
             if let Some(Ok(Ok(Some(prepared)))) = &prepared_ahead {
                 if let Some(context) = &prepared.1 {
                     if let Some(chosen) = efficiency.reconsider_ready(
@@ -812,6 +856,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     job.response,
                     job._prompt_reservation,
                     job.output,
+                    job.trace,
                 ));
             }
             let outcome = prepared.and_then(|(mut prepared, _)| {
@@ -908,7 +953,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
                                         state.rejected.saturating_add(responses.len() as u64);
                                 }
                             }
-                            for (cancelled, response, prompt_reservation, output) in
+                            for (cancelled, response, prompt_reservation, output, trace) in
                                 responses.drain(..)
                             {
                                 let kind = if cancelled.load(Ordering::Acquire) {
@@ -920,7 +965,7 @@ pub(super) fn worker_loop<O: Send + 'static>(
                                 // the waiter can submit its next request.
                                 drop(output);
                                 drop(prompt_reservation);
-                                let _ = response.send(Err(service_error(kind, &message)));
+                                let _ = response.send(Err(trace.error(kind, &message)));
                             }
                             Ok(Vec::new())
                         }
@@ -953,8 +998,8 @@ pub(super) fn worker_loop<O: Send + 'static>(
                     state.preparing = 0;
                     state.preparing_bytes = 0;
                     reject_pending(&mut state, ImageServiceErrorKind::Stopped);
-                    for (_, response, _, _) in responses {
-                        let _ = response.send(Err(service_error(kind, &message)));
+                    for (_, response, _, _, trace) in responses {
+                        let _ = response.send(Err(trace.error(kind, &message)));
                     }
                     return Some(failure);
                 }
@@ -1048,11 +1093,12 @@ type Response<O> = (
     oneshot::Sender<Result<O, ImageServiceError>>,
     Option<HostMemoryReservation>,
     Option<QueuedOutput>,
+    trace::RequestTrace,
 );
 fn deliver_outputs<O>(shared: &Shared<O>, responses: &mut Vec<Response<O>>, outputs: Vec<O>) {
-    for ((cancelled, response, _, gate), output) in responses.drain(..).zip(outputs) {
+    for ((cancelled, response, _, gate, trace), output) in responses.drain(..).zip(outputs) {
         let result = if cancelled.load(Ordering::Acquire) {
-            Err(service_error(
+            Err(trace.error(
                 ImageServiceErrorKind::Cancelled,
                 "image response cancelled; active execution completed",
             ))
@@ -1067,12 +1113,20 @@ fn deliver_outputs<O>(shared: &Shared<O>, responses: &mut Vec<Response<O>>, outp
             }
             Ok(output)
         };
-        let _ = response.send(result);
+        let completed = result.is_ok();
+        let delivered = response.send(result).is_ok();
+        if completed {
+            trace.finished(if delivered {
+                trace::ImageTraceRequestOutcome::Completed
+            } else {
+                trace::ImageTraceRequestOutcome::Cancelled
+            });
+        }
     }
     shared.lock().active = 0;
 }
 
-fn compatible_queued<O: Send + 'static>(
+pub(super) fn compatible_queued<O: Send + 'static>(
     worker: &dyn BatchWorker<Output = O>,
     first: &Queued<O>,
     other: &Queued<O>,

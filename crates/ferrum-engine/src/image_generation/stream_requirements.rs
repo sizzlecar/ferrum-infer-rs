@@ -16,6 +16,7 @@ pub struct ImageStreamRequirements {
     static_initialization: BlockingStreamRequirement,
     tensor_execution: BlockingStreamRequirement,
     request_state: BlockingStreamRequirement,
+    causal_lane: BlockingStreamRequirement,
 }
 
 impl ImageStreamRequirements {
@@ -34,11 +35,22 @@ impl ImageStreamRequirements {
                 serial_actor.execution_additional_streams(),
             ),
             request_state: executor.request_state_stream_requirement(),
+            causal_lane: BlockingStreamRequirement::new(0),
         }
+    }
+
+    /// A serial causal phase retains its own lane while installing static
+    /// weights. The existing tensor actor remains retained across that phase;
+    /// the ordinary temporary static-initialization stream is additional.
+    /// This is a declared schedule requirement, not permission to create lanes.
+    pub fn with_serial_causal_phase(mut self) -> Self {
+        self.causal_lane = BlockingStreamRequirement::new(1);
+        self
     }
 
     pub fn required_streams(self) -> usize {
         self.serial_actor.retained_streams()
+            + self.causal_lane.maximum_live_streams()
             + self
                 .static_initialization
                 .maximum_live_streams()
@@ -152,6 +164,7 @@ mod tests {
             static_initialization: BlockingStreamRequirement::new(3),
             tensor_execution: BlockingStreamRequirement::new(2),
             request_state: BlockingStreamRequirement::new(0),
+            causal_lane: BlockingStreamRequirement::new(0),
         };
         assert_eq!(
             ImageStreamLimit::Auto
@@ -179,6 +192,41 @@ mod tests {
             receipt["requirements"]["serial_actor"]["execution_additional_streams"],
             0
         );
+    }
+
+    #[test]
+    fn causal_phase_counts_retained_tensor_actor_lane_and_static_stream() {
+        let tensor = ImageStreamRequirements::for_serial_pipeline(
+            StaticInitializationPolicy::new(1024, 8).unwrap(),
+            TensorExecutorConfig::default(),
+        );
+        assert_eq!(
+            ImageStreamLimit::Auto
+                .resolve(tensor)
+                .unwrap()
+                .required_streams(),
+            2
+        );
+        let causal = tensor.with_serial_causal_phase();
+        assert_eq!(
+            ImageStreamLimit::Auto
+                .resolve(causal)
+                .unwrap()
+                .required_streams(),
+            3
+        );
+        assert!(ImageStreamLimit::Explicit(2).resolve(causal).is_err());
+        assert_eq!(
+            ImageStreamLimit::Explicit(3)
+                .resolve(causal)
+                .unwrap()
+                .resolved_streams(),
+            3
+        );
+        let wire = serde_json::to_value(causal).unwrap();
+        assert_eq!(wire["causal_lane"]["maximum_live_streams"], 1);
+        assert_eq!(wire["serial_actor"]["retained_streams"], 1);
+        assert_eq!(wire["static_initialization"]["maximum_live_streams"], 1);
     }
 
     #[test]

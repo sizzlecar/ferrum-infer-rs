@@ -13,7 +13,8 @@ pub(crate) struct PH3ImageDiTSample<'a> {
 pub(crate) struct PH3ImageDiTReference<'a> {
     pub latent: &'a ManagedHostTensor,
     pub patch_noise: Option<&'a ManagedHostTensor>,
-    pub augmentation: f32,
+    /// Python scalar precision is retained until each F32 tensor multiplier.
+    pub augmentation: f64,
 }
 impl<'a> PH3ImageDiTReference<'a> {
     pub fn default_augmented(
@@ -46,7 +47,7 @@ pub(crate) struct PH3ImageDiTInputAdapter<'a> {
     host: &'a HostMemoryAccount,
 }
 impl<'a> PH3ImageDiTInputAdapter<'a> {
-    pub const NUMERICAL_PROFILE_ID:&'static str="p_h3_image.dit_inputs.target_f32_after_bf16.reference_f32_supplied_patch_noise.separate_mul_add.v1";
+    pub const NUMERICAL_PROFILE_ID:&'static str="p_h3_image.dit_inputs.target_f32_after_bf16.reference_f32_supplied_patch_noise.f64_scalar_complement.separate_mul_add.v2";
     pub fn new(config: &'a PH3ImageDiTConfig, host: &'a HostMemoryAccount) -> Result<Self> {
         config.validate()?;
         ensure!(
@@ -150,8 +151,11 @@ impl<'a> PH3ImageDiTInputAdapter<'a> {
                         v
                     } else {
                         let n = read(reference.patch_noise.unwrap(), i);
-                        let signal = reference.augmentation * v;
-                        let noise = (1.0 - reference.augmentation) * n;
+                        // Comfy subtracts its Python float before either scalar
+                        // becomes a F32 tensor multiplier. Keep the products
+                        // and addition separate, without FMA contraction.
+                        let signal = (reference.augmentation as f32) * v;
+                        let noise = ((1.0_f64 - reference.augmentation) as f32) * n;
                         signal + noise
                     };
                     image.as_mut()[4 * (image_offset + i)..4 * (image_offset + i + 1)]

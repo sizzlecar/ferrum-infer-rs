@@ -32,7 +32,9 @@ pub struct QwenImage21Sources {
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageAssetReceipt {
     pub metadata_sha256: BTreeMap<String, String>,
-    /// Text encoder, denoiser, decoder; excludes the mapped CPU embedding table.
+    /// Selected device weight payloads for conditioning, denoising and latent
+    /// codec components. This is not simultaneous residency or peak memory.
+    /// Includes a connector/encoder when selected; CPU-only tables are excluded.
     pub required_weight_bytes: [u64; 3],
     /// Header/schema agreement is not authentication of checkpoint payloads.
     pub payload_verification: &'static str,

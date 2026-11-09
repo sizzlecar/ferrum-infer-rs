@@ -1,7 +1,8 @@
 //! Real image pipeline node profiling. No GPU work without --run.
 use anyhow::{ensure, Result};
 use clap::{Parser, ValueEnum};
-use std::path::PathBuf;
+use ferrum_cli::commands::image_product::ImageProductError;
+use std::{num::NonZeroUsize, path::PathBuf};
 
 #[derive(Parser)]
 #[command(group(
@@ -27,6 +28,41 @@ struct Arguments {
     /// One PNG reference per request; omission profiles text-to-image.
     #[arg(long)]
     image: Option<PathBuf>,
+    /// Fresh directory for main-vision RGBA and four F32 features, including warmup.
+    /// Synchronous capture adds diagnostic overhead to conditioning wall time.
+    #[arg(
+        long,
+        requires_all = ["main_vision_capture_max_bytes", "image", "image_config"],
+        conflicts_with = "model"
+    )]
+    main_vision_capture_dir: Option<PathBuf>,
+    /// Cumulative raw payload limit for the entire capture directory; metadata
+    /// is excluded. This is not a process RSS or Host allocation limit.
+    #[arg(long, requires = "main_vision_capture_dir")]
+    main_vision_capture_max_bytes: Option<NonZeroUsize>,
+    /// Fresh directory for five raw main-text taps, including shape warmup.
+    #[arg(long,
+        requires_all = ["main_text_capture_max_bytes", "image", "image_config"],
+        conflicts_with_all = ["model", "main_vision_capture_dir"])]
+    main_text_capture_dir: Option<PathBuf>,
+    /// Cumulative raw F32 payload limit for the entire text capture directory.
+    #[arg(long, requires = "main_text_capture_dir")]
+    main_text_capture_max_bytes: Option<NonZeroUsize>,
+    /// Fresh directory for the completed normalized target and same-job PNG.
+    #[arg(long, requires_all = ["final_latent_capture_max_bytes", "image_config"],
+        conflicts_with_all = ["model", "main_vision_capture_dir", "main_text_capture_dir"])]
+    final_latent_capture_dir: Option<PathBuf>,
+    /// Cumulative raw latent byte limit including warmup; excludes PNG and
+    /// metadata. PNG uses the ordinary encoder limits and existing Host scratch.
+    #[arg(long, requires = "final_latent_capture_dir")]
+    final_latent_capture_max_bytes: Option<NonZeroUsize>,
+    /// Fresh directory for actual B1 DiT inputs, initial F32 state and same-job PNG.
+    #[arg(long, requires_all = ["dit_input_capture_max_bytes", "image_config"],
+        conflicts_with_all = ["model", "main_vision_capture_dir", "main_text_capture_dir", "final_latent_capture_dir"])]
+    dit_input_capture_dir: Option<PathBuf>,
+    /// Cumulative raw input budget across all steps and runs, excluding JSON/PNG.
+    #[arg(long, requires = "dit_input_capture_dir")]
+    dit_input_capture_max_bytes: Option<NonZeroUsize>,
     /// Fixed batches, each with its own warmup. This is not a serving sweep.
     #[arg(long, value_delimiter = ',', default_value = "1")]
     batch: Vec<usize>,
@@ -80,12 +116,11 @@ enum Timing {
     Kernel,
 }
 
-fn main() -> Result<()> {
-    let args = Arguments::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+fn validate_arguments(args: &Arguments) -> Result<()> {
+    ensure!(
+        args.dit_input_capture_dir.is_none() || args.batch == [1],
+        "DiT input capture requires one B1 shape"
+    );
     ensure!(
         args.run,
         "explicit --run is required; run only while the GPU is exclusively available"
@@ -98,13 +133,60 @@ fn main() -> Result<()> {
         args.warm_repetitions > 0,
         "warm repetitions must be positive"
     );
+    ensure!(
+        args.main_text_capture_dir.is_none() || args.batch == [1],
+        "main text capture requires one B=1 profile shape"
+    );
+    ensure!(
+        args.final_latent_capture_dir.is_none() || args.batch == [1],
+        "final latent capture requires one B=1 profile shape"
+    );
+    Ok(())
+}
+
+fn main() -> Result<(), ImageProductError> {
+    let args = Arguments::parse();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+    validate_arguments(&args)?;
     #[cfg(not(feature = "cuda-cutlass-fp8"))]
-    anyhow::bail!("build with cuda-cutlass-fp8 and the matching locked native set");
+    return Err(ImageProductError::Unsupported(
+        "build with cuda-cutlass-fp8 and the matching locked native set",
+    ));
     #[cfg(feature = "cuda-cutlass-fp8")]
     {
-        use ferrum_cli::commands::image_product::{profile_image_source, ImageProfileWorkload};
+        use ferrum_cli::commands::image_product::{
+            profile_image_source, ImageDitInputCaptureOptions, ImageFinalLatentCaptureOptions,
+            ImageMainTextCaptureOptions, ImageMainVisionCaptureOptions, ImageProfileWorkload,
+        };
         use ferrum_engine::image_generation::ImageGenerationRequest;
         let source = args.source()?;
+        let main_vision_capture =
+            args.main_vision_capture_dir
+                .map(|output_directory| ImageMainVisionCaptureOptions {
+                    output_directory,
+                    maximum_payload_bytes: args
+                        .main_vision_capture_max_bytes
+                        .expect("clap requires a capture byte limit"),
+                });
+        let main_text_capture =
+            args.main_text_capture_dir
+                .map(|output_directory| ImageMainTextCaptureOptions {
+                    output_directory,
+                    maximum_payload_bytes: args
+                        .main_text_capture_max_bytes
+                        .expect("clap requires a text capture byte limit"),
+                });
+        let final_latent_capture =
+            args.final_latent_capture_dir
+                .map(|output_directory| ImageFinalLatentCaptureOptions {
+                    output_directory,
+                    maximum_payload_bytes: args
+                        .final_latent_capture_max_bytes
+                        .expect("clap requires a final latent byte limit"),
+                });
         let request = ImageGenerationRequest {
             prompt: args.prompt,
             width: args.width,
@@ -115,7 +197,8 @@ fn main() -> Result<()> {
         let file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(args.output)?;
+            .open(args.output)
+            .map_err(anyhow::Error::from)?;
         profile_image_source(
             source,
             ImageProfileWorkload {
@@ -127,6 +210,17 @@ fn main() -> Result<()> {
                     Timing::Off => ferrum_runtime::DeviceTimingMode::Off,
                     Timing::Kernel => ferrum_runtime::DeviceTimingMode::Kernel,
                 },
+                main_vision_capture,
+                main_text_capture,
+                final_latent_capture,
+                dit_input_capture: args.dit_input_capture_dir.map(|output_directory| {
+                    ImageDitInputCaptureOptions {
+                        output_directory,
+                        maximum_payload_bytes: args
+                            .dit_input_capture_max_bytes
+                            .expect("clap requires a DiT capture byte limit"),
+                    }
+                }),
             },
             std::io::BufWriter::new(file),
         )

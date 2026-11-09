@@ -14,9 +14,9 @@
 use super::{configuration::ImageBackendConfig, source, ImageProductConfig, ImageProductError};
 use anyhow::{ensure, Context, Result};
 use ferrum_engine::image_generation::{
-    ImageDecoderBatchPolicy, ImageGenerationOutput, ImageGenerationRequest, ImageStage,
+    service::ImageGenerator, ImageDecoderBatchPolicy, ImageGenerationOutput,
+    ImageGenerationRequest, ImageStage,
 };
-use ferrum_models::qwen_image21::pipeline_adapters::QwenImage21RgbaOutput;
 use ferrum_output::png::{write_rgba8_png, PngDimensions, PngLimits};
 use ferrum_runtime::{HostMemoryAccount, HostMemoryClass};
 use serde_json::{json, Value};
@@ -126,9 +126,9 @@ fn write_output(
         "receipt differs from the submitted request"
     );
     // This validates all BF16 elements for finiteness before creating the PNG.
-    let pixels = QwenImage21RgbaOutput::new(host, output.rgba.tensor(), output.rgba.bytes())?;
+    let pixels = output.rgba.view(host)?;
     ensure!(
-        pixels.dimensions() == [1, 4, request.height as usize, request.width as usize],
+        pixels.rgba_dimensions() == [1, 4, request.height as usize, request.width as usize],
         "returned item is not exact [1,4,H,W]"
     );
     let dimensions = PngDimensions::new(request.width.into(), request.height.into())?;
@@ -195,8 +195,15 @@ fn cuda_product_one_real_batch_preserves_outputs_and_retires_host() -> Result<()
     )?;
     let mut pipeline = Box::new(cuda.create_pipeline(assets)?);
     let host = pipeline.host_account().clone();
+    let continuous = pipeline.denoising_generator().is_some();
     let outputs = match pipeline.generate_batch(requests.clone()) {
         Ok(outputs) => outputs,
+        Err(source) => return Err(ImageProductError::generation(source, pipeline)),
+    };
+    // Adaptive execution may retain idle native/Host weight owners. Their
+    // original close must complete before claiming only output owners remain.
+    let shutdown = match pipeline.shutdown() {
+        Ok(receipts) => receipts,
         Err(source) => return Err(ImageProductError::generation(source, pipeline)),
     };
     let inspect = (|| -> Result<(Vec<Value>, usize)> {
@@ -204,13 +211,36 @@ fn cuda_product_one_real_batch_preserves_outputs_and_retires_host() -> Result<()
             outputs.len() == requests.len(),
             "batch output count mismatch"
         );
+        let jobs = outputs
+            .iter()
+            .map(|output| output.receipt.job)
+            .collect::<std::collections::BTreeSet<_>>();
         ensure!(
-            outputs
-                .iter()
-                .all(|output| output.receipt.job == outputs[0].receipt.job),
-            "outputs did not originate in one admitted batch"
+            jobs.len() == if continuous { batch_size } else { 1 },
+            "receipt identities differ from the declared request execution capability"
         );
         for output in &outputs {
+            // Request-local jobs are not physical batch identities. Prove the
+            // executed denoiser geometry and forward count from its receipts.
+            let denoisers = output
+                .receipt
+                .stages
+                .iter()
+                .filter(|stage| stage.execution.plan.stage == ImageStage::Denoiser)
+                .filter(|stage| stage.execution.completed_executions > 0)
+                .collect::<Vec<_>>();
+            ensure!(
+                !output.receipt.steps.is_empty()
+                    && denoisers
+                        .iter()
+                        .all(|stage| stage.execution.plan.batch_size == batch_size)
+                    && denoisers
+                        .iter()
+                        .map(|stage| stage.execution.completed_executions)
+                        .sum::<usize>()
+                        == output.receipt.steps.len(),
+                "denoiser receipts do not prove one full-width forward per committed step"
+            );
             ensure!(
                 output.receipt.decoder_batch_policy == decoder_policy,
                 "decoder policy receipt mismatch"
@@ -222,7 +252,9 @@ fn cuda_product_one_real_batch_preserves_outputs_and_retires_host() -> Result<()
                 .find(|stage| stage.execution.plan.stage == ImageStage::Decoder)
                 .context("missing decoder receipt")?;
             let (batch, executions) = match decoder_policy {
-                ImageDecoderBatchPolicy::SingleImage => (1, batch_size),
+                ImageDecoderBatchPolicy::SingleImage => {
+                    (1, if continuous { 1 } else { batch_size })
+                }
                 ImageDecoderBatchPolicy::FullBatch => (batch_size, 1),
             };
             ensure!(
@@ -300,6 +332,7 @@ fn cuda_product_one_real_batch_preserves_outputs_and_retires_host() -> Result<()
             &json!({
                 "status":"passed", "qualification":"functional cold batch; no G3/performance/Torch parity claim",
                 "batch_size":batch_size,"outputs":records,"decoder_batch_policy":decoder_policy,
+                "continuous_requests":continuous,"shutdown":shutdown,
                 "total_output_bytes":batch_bytes,"retained_execution_bytes":retained_bytes,
                 "host_final_committed_bytes":released.committed_bytes(),
                 "host_final_allocated_bytes":released.allocated_bytes(),
@@ -308,3 +341,6 @@ fn cuda_product_one_real_batch_preserves_outputs_and_retires_host() -> Result<()
     })();
     finish.map_err(Into::into)
 }
+
+mod continuous_service;
+mod h3_vae_roundtrip;

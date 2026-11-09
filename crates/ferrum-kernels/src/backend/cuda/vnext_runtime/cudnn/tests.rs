@@ -87,6 +87,7 @@ fn forward_performance_abi_matches_64_bit_cudnn_header() {
 
 fn convolution_shape() -> CudnnConv2dDescriptor {
     CudnnConv2dDescriptor {
+        scalar: CudnnConvScalar::Bf16,
         input: [2, 4, 8, 9],
         filter: [6, 2, 3, 3],
         output: [2, 6, 8, 9],
@@ -103,6 +104,58 @@ fn selected_algorithm() -> ConvolutionAlgorithm {
         math_type: ffi::TENSOR_OP_MATH,
         required_bytes: 64,
     }
+}
+
+#[test]
+fn f32_convolution_requires_fma_candidates_and_retains_distinct_dtype_policy_identity() {
+    let candidate = ForwardPerformance {
+        algo: 1,
+        status: ffi::SUCCESS,
+        time: 1.,
+        memory: 64,
+        determinism: ffi::DETERMINISTIC,
+        math_type: 0,
+        reserved: [0; 3],
+    };
+    let candidates = [
+        candidate,
+        ForwardPerformance {
+            math_type: 1,
+            ..candidate
+        },
+        ForwardPerformance {
+            math_type: 3,
+            ..candidate
+        },
+    ];
+    assert_eq!(
+        choose_algorithm_for(&candidates, 64, CudnnConvScalar::F32Fma)
+            .unwrap()
+            .math_type,
+        3
+    );
+    assert!(choose_algorithm_for(&candidates[..2], 64, CudnnConvScalar::F32Fma).is_none());
+    assert!(choose_algorithm_for(&candidates, 63, CudnnConvScalar::F32Fma).is_none());
+    assert_eq!(choose_algorithm(&candidates, 64).unwrap().math_type, 0);
+    let fma = ConvolutionAlgorithm {
+        math_type: 3,
+        ..selected_algorithm()
+    };
+    assert!(fma.validate_for(64, CudnnConvScalar::F32Fma).is_ok());
+    assert!(selected_algorithm()
+        .validate_for(64, CudnnConvScalar::F32Fma)
+        .is_err());
+    assert!(fma.validate(64).is_err());
+    let bf16 = convolution_shape();
+    let f32 = CudnnConv2dDescriptor {
+        scalar: CudnnConvScalar::F32Fma,
+        ..bf16
+    };
+    assert_ne!(bf16, f32);
+    assert_ne!(
+        convolution_fingerprint("owner", bf16, 64, fma),
+        convolution_fingerprint("owner", f32, 64, fma)
+    );
 }
 
 #[test]

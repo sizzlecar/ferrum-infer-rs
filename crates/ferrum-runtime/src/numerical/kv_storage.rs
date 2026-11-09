@@ -4,6 +4,7 @@ use super::{invalid, ElementType, KvStorageFormat, ModelFamilyId, StateSpec, VNe
 use crate::{
     ModelProgram, NumericalExecutionProfile, ResolvedTensorLayout, StateCapacityDemand,
     StateCheckpointCapability, StateCheckpointContents, StateId, StateLifetime,
+    CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_F16_OPERATION_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
@@ -125,6 +126,7 @@ pub(super) fn validate_program_kv_storage(
     for node in program.blocks().iter().flat_map(|block| &block.nodes) {
         let (format, payload_port, scale_port) = match node.operation_id.as_str() {
             CAUSAL_PAGED_ATTENTION_OPERATION_ID
+            | CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_F16_OPERATION_ID
             | CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID
             | CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID
             | CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_Q8ACT_G32_OPERATION_ID

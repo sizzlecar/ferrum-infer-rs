@@ -5,11 +5,13 @@
 //! generators keep single-request edits. Pending prompts are bounded separately
 //! from the generator's shared Host tensor account.
 
+use super::continuous_trace::ImageContinuousTraceHandle;
 use super::{ImageEditRequest, ImageGenerationOutput, ImageGenerationRequest, QwenImage21Pipeline};
 use ferrum_models::qwen_image21::image_input::{
     png_dimensions_hint, ImageInputLimits, QwenImage21ImageProcessor,
 };
 use ferrum_runtime::{DeviceRuntime, HostMemoryAccount, HostMemoryClass, HostMemoryReservation};
+use ferrum_types::image_trace::ImageRequestCorrelation;
 use ferrum_types::ImageBatchPolicy;
 use serde::Serialize;
 use std::{
@@ -26,6 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 type GeneratorError = Box<dyn Error + Send + 'static>;
 
@@ -42,6 +45,20 @@ pub enum ImageBatchError {
     },
     /// Explicit Host admission pressure; distinct from device capacity search.
     Overloaded(String),
+    /// Completion only: decoder admission did not submit work and every
+    /// allocation rollback/release was acknowledged. A live survivor may
+    /// release a required native pin by advancing; there is no external native
+    /// capacity subscription and an idle worker must reject this finitely.
+    AwaitDenoisingProgress {
+        stage: super::ImageStage,
+        diagnostic: String,
+    },
+    /// Initialization admission only, before any native work/recovery owner.
+    /// Live denoising members may release capacity; idle workers reject this
+    /// finitely because this protocol has no external native-release wake.
+    InitializationAwaitDenoisingProgress {
+        diagnostic: String,
+    },
     /// Typed request input rejection, with no native work/recovery obligation.
     InvalidInput(String),
     Rejected(String),
@@ -55,9 +72,10 @@ impl From<GeneratorError> for ImageBatchError {
 impl fmt::Display for ImageBatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Capacity { diagnostic, .. } | Self::Overloaded(diagnostic) => {
-                f.write_str(diagnostic)
-            }
+            Self::Capacity { diagnostic, .. }
+            | Self::Overloaded(diagnostic)
+            | Self::AwaitDenoisingProgress { diagnostic, .. }
+            | Self::InitializationAwaitDenoisingProgress { diagnostic } => f.write_str(diagnostic),
             Self::InvalidInput(message) => f.write_str(message),
             Self::Rejected(message) => f.write_str(message),
             Self::Fatal(error) => fmt::Display::fmt(error, f),
@@ -87,6 +105,16 @@ pub struct ImageBatchPreparation(
 impl ImageBatchPreparation {
     pub fn new<T: Any + Send>(prepared: T) -> Self {
         Self(Some(Box::new(prepared)), None, None)
+    }
+    /// Borrow the original typed preparation for nonblocking admission. A
+    /// foreign or already consumed owner is rejected without replacing it.
+    pub fn get_mut<T: Any + Send>(&mut self) -> Result<&mut T, ImageBatchError> {
+        self.0
+            .as_mut()
+            .and_then(|owner| owner.downcast_mut::<T>())
+            .ok_or_else(|| {
+                ImageBatchError::Rejected("image preparation belongs to another generator".into())
+            })
     }
     /// Optional compiled demand for keeping the workload's weights resident.
     /// Exceeding this advisory boundary does not make staged execution unsafe.
@@ -165,6 +193,18 @@ impl ImageRequestRef<'_> {
 /// remains usable and no recovery obligation exists. Compatibility must be deterministic and may
 /// only restrict the common width/height grouping enforced by this service.
 pub trait ImageGenerator: Send + 'static {
+    /// Observation of the original optional collector, without retaining a
+    /// runtime or creating a second clock or diagnostic allocation.
+    fn continuous_trace_handle(&self) -> Option<ImageContinuousTraceHandle> {
+        None
+    }
+    /// Opt into the completed-step protocol. Default generators retain their
+    /// existing whole-batch behavior and cancellation/delivery contract.
+    fn denoising_generator(
+        &mut self,
+    ) -> Option<&mut dyn ImageDenoisingGenerator<Output = ImageGenerationOutput>> {
+        None
+    }
     /// Optional plan-only worker sharing model/provider identity and Host account.
     /// It must never submit device execution or admit execution resources.
     fn preparation_worker(&self) -> Option<Box<dyn ImageGenerator>> {
@@ -200,6 +240,14 @@ pub trait ImageGenerator: Send + 'static {
         _requests: &[ImageRequestRef<'_>],
     ) -> Result<Option<usize>, ImageBatchError> {
         Ok(None)
+    }
+    /// Physical Output backing retained by this generator for its complete
+    /// worker lifetime, on `host_account()`'s original parent. This is an
+    /// observation of an actual owner, not an additional admission request.
+    /// Install such diagnostics before constructing the service; their fixed
+    /// backing must not disappear or grow while the worker can admit work.
+    fn retained_output_bytes(&self) -> u64 {
+        0
     }
     /// Bound the retained preprocessed reference before allocating it. The
     /// queue reserves this many waiting bytes across preparation and requeue.
@@ -314,12 +362,19 @@ pub trait ImageGenerator: Send + 'static {
 }
 
 impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
+    fn denoising_generator(
+        &mut self,
+    ) -> Option<&mut dyn ImageDenoisingGenerator<Output = ImageGenerationOutput>> {
+        self.declared_denoising_generator()
+    }
     fn preparation_worker(&self) -> Option<Box<dyn ImageGenerator>> {
         self.preparation_fork()
             .map(|p| Box::new(p) as Box<dyn ImageGenerator>)
     }
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
-        self.assets
+        self.execution
+            .sources
+            .assets
             .receipt()
             .lora
             .as_ref()
@@ -405,7 +460,7 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
         }
     }
     fn maximum_edit_batch_size(&self) -> usize {
-        self.config.maximum_batch_size
+        self.execution.config.maximum_batch_size
     }
     fn compatible_edits(&self, a: &ImageEditRequest, b: &ImageEditRequest) -> bool {
         self.supports_edits() && compatible_edit_geometry(a, b)
@@ -430,6 +485,8 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
 
     fn capabilities(&self) -> Result<ImageGeneratorCapabilities, GeneratorError> {
         let scale = self
+            .execution
+            .sources
             .assets
             .spatial_scale()
             .map_err(|e| -> GeneratorError { e.into() })?;
@@ -446,9 +503,9 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
             )) as GeneratorError
         })?;
         Ok(ImageGeneratorCapabilities {
-            maximum_batch_size: self.config.maximum_batch_size,
-            maximum_width: self.config.maximum_width.min(maximum),
-            maximum_height: self.config.maximum_height.min(maximum),
+            maximum_batch_size: self.execution.config.maximum_batch_size,
+            maximum_width: self.execution.config.maximum_width.min(maximum),
+            maximum_height: self.execution.config.maximum_height.min(maximum),
             dimension_multiple: multiple,
         })
     }
@@ -464,7 +521,7 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
     }
 }
 
-fn preparation_error(error: anyhow::Error) -> ImageBatchError {
+pub(in crate::image_generation) fn preparation_error(error: anyhow::Error) -> ImageBatchError {
     if let Some(capacity) = error.downcast_ref::<super::ImageDeviceCapacityExceeded>() {
         return ImageBatchError::Capacity {
             proof: *capacity,
@@ -516,6 +573,7 @@ fn qwen_batch_error<R: DeviceRuntime>(
             error.failure,
             super::ImageGenerationFailure::AllocationRejected { .. }
                 | super::ImageGenerationFailure::CapacityRejected { .. }
+                | super::ImageGenerationFailure::InitializationCapacityRejected { .. }
         )
     {
         return ImageBatchError::Rejected(error.to_string());
@@ -559,10 +617,14 @@ pub enum ImageServiceErrorKind {
 pub struct ImageServiceError {
     kind: ImageServiceErrorKind,
     message: String,
+    correlation: Option<ImageRequestCorrelation>,
 }
 impl ImageServiceError {
     pub fn kind(&self) -> ImageServiceErrorKind {
         self.kind
+    }
+    pub fn correlation(&self) -> Option<ImageRequestCorrelation> {
+        self.correlation
     }
 }
 impl fmt::Display for ImageServiceError {
@@ -575,6 +637,7 @@ fn service_error(kind: ImageServiceErrorKind, message: impl Into<String>) -> Ima
     ImageServiceError {
         kind,
         message: message.into(),
+        correlation: None,
     }
 }
 
@@ -605,6 +668,7 @@ pub struct ImageService {
     capabilities: ImageGeneratorCapabilities,
     supports_edits: bool,
     maximum_edit_batch_size: usize,
+    retained_output_bytes: u64,
 }
 
 impl ImageService {
@@ -624,6 +688,7 @@ impl ImageService {
         })?;
         validate_config(config, capabilities)?;
         let host = generator.host_account().clone();
+        let retained_output_bytes = generator.retained_output_bytes();
         let supports_edits = generator.supports_edits();
         let edit_cap = generator.maximum_edit_batch_size();
         if edit_cap == 0 || edit_cap > capabilities.maximum_batch_size {
@@ -646,11 +711,20 @@ impl ImageService {
             } else {
                 0
             },
+            retained_output_bytes,
         })
     }
 
     pub fn host_account(&self) -> &HostMemoryAccount {
         &self.host
+    }
+    pub fn continuous_trace_handle(&self) -> Option<ImageContinuousTraceHandle> {
+        self.core.shared.trace.clone()
+    }
+    /// Original generator-owned Output backing that response admission must
+    /// retain when proving that releasing ordinary caller outputs can help.
+    pub fn retained_output_bytes(&self) -> u64 {
+        self.retained_output_bytes
     }
     pub fn adapter_batch_identity(&self) -> Option<&ImageAdapterBatchIdentity> {
         self.core.shared.adapter.as_deref()
@@ -697,11 +771,14 @@ impl ImageService {
         &self,
         request: ImageGenerationRequest,
     ) -> Result<ImageJob, ImageServiceError> {
-        self.validate_request(&request)?;
-        self.core.try_submit(request).map(|inner| ImageJob {
-            inner,
-            output: None,
-        })
+        self.try_submit_with_client_attempt(request, None)
+    }
+    pub fn try_submit_with_client_attempt(
+        &self,
+        request: ImageGenerationRequest,
+        client_attempt_id: Option<Uuid>,
+    ) -> Result<ImageJob, ImageServiceError> {
+        self.submit_request(QueuedRequest::Generate(request), None, client_attempt_id)
     }
 
     /// Queue only the request and gate metadata. Output credit is acquired by
@@ -711,26 +788,52 @@ impl ImageService {
         request: ImageGenerationRequest,
         gate: Arc<dyn ImageOutputGate>,
     ) -> Result<ImageJob, ImageServiceError> {
-        self.validate_request(&request)?;
-        self.submit_with_output(QueuedRequest::Generate(request), gate)
+        self.try_submit_with_output_and_client_attempt(request, gate, None)
+    }
+    pub fn try_submit_with_output_and_client_attempt(
+        &self,
+        request: ImageGenerationRequest,
+        gate: Arc<dyn ImageOutputGate>,
+        client_attempt_id: Option<Uuid>,
+    ) -> Result<ImageJob, ImageServiceError> {
+        self.submit_request(
+            QueuedRequest::Generate(request),
+            Some(gate),
+            client_attempt_id,
+        )
     }
 
-    fn submit_with_output(
+    fn submit_request(
         &self,
         request: QueuedRequest,
-        gate: Arc<dyn ImageOutputGate>,
+        gate: Option<Arc<dyn ImageOutputGate>>,
+        client_attempt_id: Option<Uuid>,
     ) -> Result<ImageJob, ImageServiceError> {
-        let (response, receiver) = oneshot::channel();
-        let output = QueuedOutput {
-            gate,
-            lease: None,
-            response,
+        let correlation = ImageRequestCorrelation::new(client_attempt_id);
+        let validated = match &request {
+            QueuedRequest::Generate(request) => self.validate_request(request),
+            QueuedRequest::Edit(request, _) => self.validate_edit_request(request),
+        };
+        validated.map_err(|error| self.core.submission_error(correlation, error))?;
+        let (output, receiver) = match gate {
+            Some(gate) => {
+                let (response, receiver) = oneshot::channel();
+                (
+                    Some(QueuedOutput {
+                        gate,
+                        lease: None,
+                        response,
+                    }),
+                    Some(receiver),
+                )
+            }
+            None => (None, None),
         };
         self.core
-            .try_submit_request_with_output(request, Some(output))
+            .try_submit_request_with_output_and_correlation(request, output, correlation)
             .map(|inner| ImageJob {
                 inner,
-                output: Some(receiver),
+                output: receiver,
             })
     }
 
@@ -757,13 +860,14 @@ impl ImageService {
         &self,
         request: ImageEditRequest,
     ) -> Result<ImageJob, ImageServiceError> {
-        self.validate_edit_request(&request)?;
-        self.core
-            .try_submit_request(QueuedRequest::Edit(request, None))
-            .map(|inner| ImageJob {
-                inner,
-                output: None,
-            })
+        self.try_submit_edit_with_client_attempt(request, None)
+    }
+    pub fn try_submit_edit_with_client_attempt(
+        &self,
+        request: ImageEditRequest,
+        client_attempt_id: Option<Uuid>,
+    ) -> Result<ImageJob, ImageServiceError> {
+        self.submit_request(QueuedRequest::Edit(request, None), None, client_attempt_id)
     }
 
     pub fn try_submit_edit_with_output(
@@ -771,8 +875,19 @@ impl ImageService {
         request: ImageEditRequest,
         gate: Arc<dyn ImageOutputGate>,
     ) -> Result<ImageJob, ImageServiceError> {
-        self.validate_edit_request(&request)?;
-        self.submit_with_output(QueuedRequest::Edit(request, None), gate)
+        self.try_submit_edit_with_output_and_client_attempt(request, gate, None)
+    }
+    pub fn try_submit_edit_with_output_and_client_attempt(
+        &self,
+        request: ImageEditRequest,
+        gate: Arc<dyn ImageOutputGate>,
+        client_attempt_id: Option<Uuid>,
+    ) -> Result<ImageJob, ImageServiceError> {
+        self.submit_request(
+            QueuedRequest::Edit(request, None),
+            Some(gate),
+            client_attempt_id,
+        )
     }
 
     /// Stops admission, discards queued requests, lets active work reach its
@@ -791,7 +906,11 @@ pub struct ImageJob {
     output: Option<oneshot::Receiver<ImageOutputLease>>,
 }
 impl ImageJob {
-    /// Cancellation suppresses delivery, not active backend execution.
+    pub fn correlation(&self) -> ImageRequestCorrelation {
+        self.inner.correlation
+    }
+    /// Step-capable generators withdraw at a completed denoising boundary.
+    /// Whole-batch generators preserve delivery-only cancellation.
     pub fn cancel(&self) {
         self.inner.cancel();
     }
@@ -925,10 +1044,21 @@ fn validate_config(
 // Generic only inside this module so scheduler tests can use small scalar
 // outputs; production fixes the output to the managed image artifact above.
 trait BatchWorker: Send + 'static {
+    fn continuous_trace_handle(&self) -> Option<ImageContinuousTraceHandle> {
+        None
+    }
+    fn denoising_generator(
+        &mut self,
+    ) -> Option<&mut dyn ImageDenoisingGenerator<Output = Self::Output>> {
+        None
+    }
     fn preparation_worker(&self) -> Option<Box<dyn BatchWorker<Output = Self::Output>>> {
         None
     }
     type Output: Send + 'static;
+    fn retained_output_bytes(&self) -> u64 {
+        0
+    }
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
         None
     }
@@ -1027,12 +1157,23 @@ trait BatchWorker: Send + 'static {
 }
 struct GeneratorAdapter(Box<dyn ImageGenerator>);
 impl BatchWorker for GeneratorAdapter {
+    fn continuous_trace_handle(&self) -> Option<ImageContinuousTraceHandle> {
+        self.0.continuous_trace_handle()
+    }
+    fn denoising_generator(
+        &mut self,
+    ) -> Option<&mut dyn ImageDenoisingGenerator<Output = Self::Output>> {
+        self.0.denoising_generator()
+    }
     fn preparation_worker(&self) -> Option<Box<dyn BatchWorker<Output = Self::Output>>> {
         self.0
             .preparation_worker()
             .map(|p| Box::new(GeneratorAdapter(p)) as Box<dyn BatchWorker<Output = Self::Output>>)
     }
     type Output = ImageGenerationOutput;
+    fn retained_output_bytes(&self) -> u64 {
+        self.0.retained_output_bytes()
+    }
     fn adapter_batch_identity(&self) -> Option<ImageAdapterBatchIdentity> {
         self.0.adapter_batch_identity()
     }
@@ -1260,6 +1401,10 @@ fn trace_request_timing(
             let outcome = match error {
                 ImageBatchError::Capacity { .. } => "capacity",
                 ImageBatchError::Overloaded(_) => "overloaded",
+                ImageBatchError::AwaitDenoisingProgress { .. } => "native_completion_capacity",
+                ImageBatchError::InitializationAwaitDenoisingProgress { .. } => {
+                    "native_initialization_capacity"
+                }
                 ImageBatchError::InvalidInput(_) => "invalid_input",
                 ImageBatchError::Rejected(_) => "rejected",
                 ImageBatchError::Fatal(_) => "fatal",
@@ -1282,6 +1427,12 @@ enum QueuedRequest {
 }
 
 impl QueuedRequest {
+    fn image_request_ref(&self) -> ImageRequestRef<'_> {
+        match self {
+            Self::Generate(request) => ImageRequestRef::Generate(request),
+            Self::Edit(request, _) => ImageRequestRef::Edit(request),
+        }
+    }
     fn generation(&self) -> &ImageGenerationRequest {
         match self {
             Self::Generate(request) => request,
@@ -1301,6 +1452,7 @@ impl QueuedRequest {
 }
 
 struct Queued<O> {
+    trace: trace::RequestTrace,
     request: QueuedRequest,
     adapter: Option<Arc<ImageAdapterBatchIdentity>>,
     submitted: Instant,
@@ -1404,6 +1556,7 @@ impl<O> State<O> {
     }
 }
 struct Shared<O> {
+    trace: Option<ImageContinuousTraceHandle>,
     state: Mutex<State<O>>,
     changed: Condvar,
     resources: Arc<ResourceSignal>,
@@ -1424,6 +1577,7 @@ impl<O> Shared<O> {
     }
 }
 struct Job<O> {
+    correlation: ImageRequestCorrelation,
     receiver: Option<oneshot::Receiver<Result<O, ImageServiceError>>>,
     cancelled: Arc<AtomicBool>,
     shared: Arc<Shared<O>>,
@@ -1478,7 +1632,9 @@ impl<O: Send + 'static> ServiceCore<O> {
         host: Option<HostMemoryAccount>,
     ) -> Result<Self, ImageServiceError> {
         let adapter = worker.adapter_batch_identity().map(Arc::new);
+        let trace = worker.continuous_trace_handle();
         let shared = Arc::new(Shared {
+            trace,
             state: Mutex::new(State {
                 queue: VecDeque::new(),
                 queue_backing: None,
@@ -1550,80 +1706,109 @@ impl<O: Send + 'static> ServiceCore<O> {
         request: QueuedRequest,
         output: Option<QueuedOutput>,
     ) -> Result<Job<O>, ImageServiceError> {
-        let mut state = self.shared.lock();
-        prune_cancelled(&mut state.queue);
-        if !state.accepting {
-            return Err(service_error(
-                ImageServiceErrorKind::Stopped,
-                "image service is stopped",
-            ));
-        }
-        let queued_bytes = state
-            .queue
-            .iter()
-            .map(|job| job.pending_bytes())
-            .sum::<usize>();
-        if state.queue.len() + state.preparing >= self.shared.config.maximum_pending
-            || queued_bytes
-                .saturating_add(state.preparing_bytes)
-                .saturating_add(request.pending_bytes())
-                > self.shared.config.maximum_pending_bytes
-        {
-            state.rejected = state.rejected.saturating_add(1);
-            return Err(service_error(
-                ImageServiceErrorKind::QueueFull,
-                "image pending queue count or Host byte budget is full",
-            ));
-        }
-        let prompt_reservation = self
-            .shared
-            .host
-            .as_ref()
-            .map(|host| {
-                host.reserve(
-                    HostMemoryClass::InputPreprocess,
-                    request
-                        .generation()
-                        .prompt
-                        .capacity()
-                        .saturating_add(ImageService::minimum_pending_request_bytes()),
-                )
-            })
-            .transpose()
-            .map_err(|error| {
-                state.rejected = state.rejected.saturating_add(1);
-                service_error(
-                    ImageServiceErrorKind::QueueFull,
-                    format!("image queue Host admission failed: {error}"),
-                )
-            })?;
-        if let Err(error) = state.reserve_queue_slot(
-            self.shared.host.as_ref(),
-            self.shared.config.maximum_pending,
-        ) {
-            state.rejected = state.rejected.saturating_add(1);
-            return Err(error);
-        }
-        let (response, receiver) = oneshot::channel();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        state.queue.push_back(Queued {
+        self.try_submit_request_with_output_and_correlation(
             request,
-            adapter: self.shared.adapter.clone(),
-            submitted: Instant::now(),
-            cancelled: cancelled.clone(),
-            response,
             output,
-            _prompt_reservation: prompt_reservation,
-            preprocessing_bytes: 0,
-            preparation_duration: Duration::ZERO,
-            preparation_group: None,
-        });
-        self.shared.changed.notify_one();
-        Ok(Job {
-            receiver: Some(receiver),
-            cancelled,
-            shared: self.shared.clone(),
-        })
+            ImageRequestCorrelation::new(None),
+        )
+    }
+    fn submission_error(
+        &self,
+        correlation: ImageRequestCorrelation,
+        mut error: ImageServiceError,
+    ) -> ImageServiceError {
+        trace::submission_rejected(self.shared.trace.as_ref(), correlation, error.kind());
+        error.correlation = Some(correlation);
+        error
+    }
+    fn try_submit_request_with_output_and_correlation(
+        &self,
+        request: QueuedRequest,
+        output: Option<QueuedOutput>,
+        correlation: ImageRequestCorrelation,
+    ) -> Result<Job<O>, ImageServiceError> {
+        (|| {
+            let mut state = self.shared.lock();
+            prune_cancelled(&mut state.queue);
+            if !state.accepting {
+                return Err(service_error(
+                    ImageServiceErrorKind::Stopped,
+                    "image service is stopped",
+                ));
+            }
+            let queued_bytes = state
+                .queue
+                .iter()
+                .map(|job| job.pending_bytes())
+                .sum::<usize>();
+            if state.queue.len() + state.preparing >= self.shared.config.maximum_pending
+                || queued_bytes
+                    .saturating_add(state.preparing_bytes)
+                    .saturating_add(request.pending_bytes())
+                    > self.shared.config.maximum_pending_bytes
+            {
+                state.rejected = state.rejected.saturating_add(1);
+                return Err(service_error(
+                    ImageServiceErrorKind::QueueFull,
+                    "image pending queue count or Host byte budget is full",
+                ));
+            }
+            let prompt_reservation = self
+                .shared
+                .host
+                .as_ref()
+                .map(|host| {
+                    host.reserve(
+                        HostMemoryClass::InputPreprocess,
+                        request
+                            .generation()
+                            .prompt
+                            .capacity()
+                            .saturating_add(ImageService::minimum_pending_request_bytes()),
+                    )
+                })
+                .transpose()
+                .map_err(|error| {
+                    state.rejected = state.rejected.saturating_add(1);
+                    service_error(
+                        ImageServiceErrorKind::QueueFull,
+                        format!("image queue Host admission failed: {error}"),
+                    )
+                })?;
+            if let Err(error) = state.reserve_queue_slot(
+                self.shared.host.as_ref(),
+                self.shared.config.maximum_pending,
+            ) {
+                state.rejected = state.rejected.saturating_add(1);
+                return Err(error);
+            }
+            let (response, receiver) = oneshot::channel();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let trace = trace::RequestTrace::new(correlation, self.shared.trace.clone());
+            let submitted = Instant::now();
+            trace.queued(submitted);
+            state.queue.push_back(Queued {
+                trace,
+                request,
+                adapter: self.shared.adapter.clone(),
+                submitted,
+                cancelled: cancelled.clone(),
+                response,
+                output,
+                _prompt_reservation: prompt_reservation,
+                preprocessing_bytes: 0,
+                preparation_duration: Duration::ZERO,
+                preparation_group: None,
+            });
+            self.shared.changed.notify_one();
+            Ok(Job {
+                correlation,
+                receiver: Some(receiver),
+                cancelled,
+                shared: self.shared.clone(),
+            })
+        })()
+        .map_err(|error| self.submission_error(correlation, error))
     }
     fn take_join(&self) -> Option<JoinHandle<Retirement<O>>> {
         self.join.lock().unwrap_or_else(|e| e.into_inner()).take()
@@ -1681,7 +1866,7 @@ fn prune_cancelled<O>(queue: &mut VecDeque<Queued<O>>) {
     while index < queue.len() {
         if queue[index].cancelled.load(Ordering::Acquire) {
             if let Some(job) = queue.remove(index) {
-                let _ = job.response.send(Err(service_error(
+                let _ = job.response.send(Err(job.trace.error(
                     ImageServiceErrorKind::Cancelled,
                     "image request cancelled before execution",
                 )));
@@ -1693,10 +1878,9 @@ fn prune_cancelled<O>(queue: &mut VecDeque<Queued<O>>) {
 }
 fn reject_pending<O>(state: &mut State<O>, kind: ImageServiceErrorKind) {
     for job in state.queue.drain(..) {
-        let _ = job.response.send(Err(service_error(
-            kind,
-            "image service stopped before execution",
-        )));
+        let _ = job.response.send(Err(job
+            .trace
+            .error(kind, "image service stopped before execution")));
     }
     // Terminal shutdown releases both the retained allocation and its charge.
     state.queue = VecDeque::new();
@@ -1704,6 +1888,7 @@ fn reject_pending<O>(state: &mut State<O>, kind: ImageServiceErrorKind) {
 }
 
 mod capacity_hint;
+mod trace;
 pub use capacity_hint::ImageCapacitySearchContext;
 mod batch_efficiency;
 pub use batch_efficiency::{ImageBatchExecutionFeedback, ImageBatchStageFeedback};
@@ -1714,6 +1899,14 @@ pub use output_gate::{ImageOutputGate, ImageOutputGateError, ImageOutputLease};
 use output_gate::{QueuedOutput, ResourceSignal};
 mod scheduler;
 use scheduler::worker_loop;
+mod steps;
+pub use steps::{
+    ImageDenoisingBatch, ImageDenoisingExitReason, ImageDenoisingGenerator, ImageDenoisingRequest,
+    ImageInitializationCohortCompletion, ImageInitializationCohortGenerator,
+    ImageInitializationCohortMember, ImageInitializationCohortOutcome,
+    ImageInitializationCohortProgress, ImageInitializationCohortRequest,
+    ImageInitializationOutcome, ImageInitializationProgress, ImageRequestInitialization,
+};
 
 #[cfg(test)]
 mod auto_tests;
@@ -1723,6 +1916,8 @@ mod edit_auto_tests;
 mod edit_tests;
 #[cfg(test)]
 mod output_gate_tests;
+#[cfg(test)]
+mod retained_output_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

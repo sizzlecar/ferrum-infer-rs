@@ -5,6 +5,8 @@ use ferrum_kernels::backend::reference::reference_vnext_operation_registry;
 use ferrum_models::qwen_image21::QwenImage21TransformerPhase;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod auxiliary;
+
 #[test]
 fn resident_preference_counts_required_weights_without_tightening_staged_admission() {
     let (mut pipeline, _directory) = pipeline();
@@ -20,13 +22,13 @@ fn resident_preference_counts_required_weights_without_tightening_staged_admissi
         text.plan.static_bytes + denoiser.plan.static_bytes
     );
     assert!(resident.required_bytes > staged.required_bytes);
-    pipeline.config.device_capacity_bytes = resident.required_bytes - 1;
+    pipeline.execution.config.device_capacity_bytes = resident.required_bytes - 1;
     assert!(pipeline.capacity_with_prefix(&stages, None).unwrap().fits());
     assert!(!pipeline
         .resident_preference_with_prefix(&stages, None)
         .unwrap()
         .fits());
-    pipeline.config.device_capacity_bytes = resident.required_bytes;
+    pipeline.execution.config.device_capacity_bytes = resident.required_bytes;
     assert!(pipeline
         .resident_preference_with_prefix(&stages, None)
         .unwrap()
@@ -46,27 +48,39 @@ fn pipeline() -> (
     ));
     let mut pipeline = QwenImage21Pipeline::new(
         composition.runtime().clone(),
-        original.host,
+        original.execution.host,
         reference_vnext_operation_registry(composition.runtime()).unwrap(),
         composition.catalog().clone(),
         WeightMaterializerRegistry::identity_only().unwrap(),
-        Arc::try_unwrap(original.assets)
+        Arc::try_unwrap(original.execution.sources.assets)
             .ok()
             .expect("unique fixture assets"),
         original.profiles,
-        original.config,
+        original.execution.config,
     )
     .unwrap();
-    Arc::get_mut(&mut pipeline.assets)
+    Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("unique fixture assets")
         .sources
-        .text_encoder = pipeline.assets.sources.transformer.clone();
-    Arc::get_mut(&mut pipeline.assets)
+        .text_encoder = pipeline
+        .execution
+        .sources
+        .assets
+        .sources
+        .transformer
+        .clone();
+    Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("unique fixture assets")
         .sources
-        .vae = pipeline.assets.sources.transformer.clone();
-    pipeline.config.residency = ImageResidencyPolicy::Adaptive;
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::Adaptive;
+        .vae = pipeline
+        .execution
+        .sources
+        .assets
+        .sources
+        .transformer
+        .clone();
+    pipeline.execution.config.residency = ImageResidencyPolicy::Adaptive;
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::Adaptive;
     (pipeline, directory)
 }
 
@@ -75,10 +89,31 @@ fn stage(
     kind: ImageStage,
     rows: u64,
 ) -> PreparedStage<ReferenceDeviceRuntime> {
-    let mut stage = prepared(pipeline, rows);
-    // The same genuine numerical graph isolates typed stage ownership.
-    stage.plan.stage = kind;
-    stage
+    // The same genuine graph isolates ownership, with an internally
+    // consistent declaration rather than retargeting a compiled receipt.
+    let options = ProgramPlanCompileOptions::new(BTreeMap::from([(
+        id(IMAGE_PROJECTION_INPUT_ID).unwrap(),
+        ProgramTensorSpec {
+            dimensions: vec![rows, 64],
+            element_type: ElementType::Bf16,
+            layout: ResolvedTensorLayout::Contiguous,
+        },
+    )]))
+    .unwrap();
+    pipeline
+        .execution
+        .compile_stage(
+            ImageStageDeclaration {
+                stage: kind,
+                role: ImageStagePlanRole::WholeStage,
+                batch_size: rows as usize,
+                weight_owner: pipeline.execution.sources.weight_owner(kind),
+                attachment: ImageStageAttachment::MayInitializeStored,
+            },
+            projection(),
+            &options,
+        )
+        .unwrap()
 }
 
 fn demand(stage: &PreparedStage<ReferenceDeviceRuntime>) -> u64 {
@@ -89,6 +124,45 @@ fn demand(stage: &PreparedStage<ReferenceDeviceRuntime>) -> u64 {
         .payload()
         .memory()
         .minimum_runnable_request_bytes()
+}
+
+#[test]
+fn changed_receipt_cannot_retarget_a_sealed_stage_or_allocate_device_weights() {
+    let (mut pipeline, _directory) = pipeline();
+    let original = stage(&pipeline, ImageStage::Denoiser, 1);
+    let before = pipeline.execution.runtime.snapshot();
+    for (kind, role, batch) in [
+        (ImageStage::TextEncoder, ImageStagePlanRole::WholeStage, 1),
+        (ImageStage::Denoiser, ImageStagePlanRole::PrefixDecode, 1),
+        (ImageStage::Denoiser, ImageStagePlanRole::WholeStage, 2),
+    ] {
+        let mut tampered = original.clone();
+        tampered.plan.stage = kind;
+        tampered.plan.role = role;
+        tampered.plan.batch_size = batch;
+        assert!(pipeline.capacity_with_prefix(&[&tampered], None).is_err());
+        assert!(pipeline.execution.stage_host_backing(&tampered).is_err());
+        let mut receipts = Vec::new();
+        let error = match pipeline.start_stage(tampered, 0, &mut receipts) {
+            Err(error) => error,
+            Ok(_) => panic!("changed declaration must reject before initialization"),
+        };
+        assert!(matches!(error, ImageGenerationFailure::Preflight(_)));
+        assert!(receipts.is_empty());
+        let after = pipeline.execution.runtime.snapshot();
+        assert_eq!(after.live_allocations, before.live_allocations);
+        assert_eq!(after.allocations, before.allocations);
+        assert_eq!(after.submissions, before.submissions);
+        assert!(!pipeline
+            .execution
+            .resident_stages
+            .has_weights(ImageStage::Denoiser));
+        assert!(!pipeline
+            .execution
+            .resident_stages
+            .has_weights(ImageStage::TextEncoder));
+    }
+    close(&mut pipeline);
 }
 
 fn execute(
@@ -103,7 +177,7 @@ fn execute(
     let active = pipeline
         .start_stage(plan, job, receipts)
         .unwrap_or_else(|e| panic!("{e}"));
-    let inputs = vec![input(&pipeline.host, rows, job as usize)];
+    let inputs = vec![input(&pipeline.execution.host, rows, job as usize)];
     let (active, outputs) = pipeline
         .execute_stage(active, job, inputs)
         .unwrap_or_else(|e| panic!("{e}"));
@@ -126,9 +200,13 @@ fn execute(
 
 fn close(pipeline: &mut QwenImage21Pipeline<ReferenceDeviceRuntime>) {
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
-    let capacity = DeviceCapacityOwner::open(pipeline.runtime.descriptor(), DEVICE_BYTES).unwrap();
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
+    let capacity =
+        DeviceCapacityOwner::open(pipeline.execution.runtime.descriptor(), DEVICE_BYTES).unwrap();
     drop(
         capacity
             .reserve(DeviceOpaqueMemoryKind::Bootstrap, DEVICE_BYTES)
@@ -170,24 +248,28 @@ fn allocation_pressure_reclaims_dynamic_then_lru_weights_and_stops_when_empty() 
     execute(&mut pipeline, ImageStage::Decoder, 1, 0, &mut receipts);
     let target = ImageStage::TextEncoder;
     assert!(pipeline
+        .execution
         .reclaim_after_allocation_failure(target, &mut receipts)
         .unwrap_or_else(|error| panic!("{error}")));
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 2);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 2);
     assert!(pipeline
+        .execution
         .reclaim_after_allocation_failure(target, &mut receipts)
         .unwrap_or_else(|error| panic!("{error}")));
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 1);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 1);
     assert_eq!(
         receipts.last().unwrap().execution.plan.stage,
         ImageStage::Denoiser
     );
     assert!(pipeline
+        .execution
         .reclaim_after_allocation_failure(target, &mut receipts)
         .unwrap_or_else(|error| panic!("{error}")));
     assert!(!pipeline
+        .execution
         .reclaim_after_allocation_failure(target, &mut receipts)
         .unwrap_or_else(|error| panic!("{error}")));
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
     // Successful later work still produces exact numerical output.
     execute(&mut pipeline, target, 1, 1, &mut receipts);
     close(&mut pipeline);
@@ -257,12 +339,16 @@ fn adaptive_reclaims_only_needed_other_pool_and_keeps_target_reuse() {
     execute(&mut pipeline, ImageStage::TextEncoder, 8, 0, &mut receipts);
     execute(&mut pipeline, ImageStage::Denoiser, 1, 0, &mut receipts);
     let target = stage(&pipeline, ImageStage::Denoiser, 1);
-    pipeline.config.device_capacity_bytes = 2 * target.plan.static_bytes + demand(&target);
-    let before = pipeline.runtime.snapshot();
+    pipeline.execution.config.device_capacity_bytes =
+        2 * target.plan.static_bytes + demand(&target);
+    let before = pipeline.execution.runtime.snapshot();
     let offset = receipts.len();
     let receipt = execute(&mut pipeline, ImageStage::Denoiser, 1, 1, &mut receipts);
     assert!(receipt.session_reused && receipt.weights_reused);
-    assert_eq!(pipeline.runtime.snapshot().allocations, before.allocations);
+    assert_eq!(
+        pipeline.execution.runtime.snapshot().allocations,
+        before.allocations
+    );
     assert!(receipts[offset..]
         .iter()
         .any(|r| r.execution.plan.stage == ImageStage::TextEncoder
@@ -279,7 +365,7 @@ fn adaptive_reclaims_only_needed_other_pool_and_keeps_target_reuse() {
 #[test]
 fn adaptive_static_eviction_without_reload_observations_uses_lru() {
     let (mut pipeline, _directory) = pipeline();
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
     let mut receipts = Vec::new();
     for kind in [
         ImageStage::TextEncoder,
@@ -287,10 +373,14 @@ fn adaptive_static_eviction_without_reload_observations_uses_lru() {
         ImageStage::Decoder,
     ] {
         execute(&mut pipeline, kind, 1, 0, &mut receipts);
-        pipeline.resident_stages.set_weight_reload_timing(kind, 0);
+        pipeline
+            .execution
+            .resident_stages
+            .set_weight_reload_timing(kind, 0);
     }
     let target = stage(&pipeline, ImageStage::Denoiser, 1);
-    pipeline.config.device_capacity_bytes = 3 * target.plan.static_bytes + demand(&target);
+    pipeline.execution.config.device_capacity_bytes =
+        3 * target.plan.static_bytes + demand(&target);
     let offset = receipts.len();
     execute(&mut pipeline, ImageStage::Denoiser, 1, 1, &mut receipts);
     let evicted = receipts[offset..]
@@ -315,7 +405,7 @@ fn adaptive_static_eviction_without_reload_observations_uses_lru() {
 #[test]
 fn adaptive_static_eviction_minimizes_reload_cost_and_preserves_live_capacity() {
     let (mut pipeline, _directory) = pipeline();
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
     let mut receipts = Vec::new();
     for (kind, reload_us) in [
         (ImageStage::TextEncoder, 90),
@@ -326,12 +416,13 @@ fn adaptive_static_eviction_minimizes_reload_cost_and_preserves_live_capacity() 
         // Supply deterministic measured costs without a wall-clock assertion.
         // Static installations and their device-account ownership are real.
         pipeline
+            .execution
             .resident_stages
             .set_weight_reload_timing(kind, reload_us);
     }
     let target = stage(&pipeline, ImageStage::Denoiser, 1);
     let ceiling = 2 * target.plan.static_bytes + demand(&target);
-    pipeline.config.device_capacity_bytes = ceiling;
+    pipeline.execution.config.device_capacity_bytes = ceiling;
     let offset = receipts.len();
     execute(&mut pipeline, ImageStage::Denoiser, 1, 1, &mut receipts);
     let evicted: Vec<_> = receipts[offset..]
@@ -345,14 +436,18 @@ fn adaptive_static_eviction_minimizes_reload_cost_and_preserves_live_capacity() 
         .map(|r| r.execution.plan.stage)
         .collect();
     assert_eq!(evicted, [ImageStage::VisionEncoder, ImageStage::Decoder]);
-    let before = pipeline.runtime.snapshot().uploaded_bytes;
+    let before = pipeline.execution.runtime.snapshot().uploaded_bytes;
     let reused = execute(&mut pipeline, ImageStage::TextEncoder, 1, 2, &mut receipts);
     assert!(reused.session_reused && reused.weights_reused);
-    assert_eq!(pipeline.runtime.snapshot().uploaded_bytes - before, 128);
+    assert_eq!(
+        pipeline.execution.runtime.snapshot().uploaded_bytes - before,
+        128
+    );
     // Insufficient capacity still rejects before evicting useful installations.
-    pipeline.config.device_capacity_bytes = target.plan.static_bytes + demand(&target) - 1;
+    pipeline.execution.config.device_capacity_bytes =
+        target.plan.static_bytes + demand(&target) - 1;
     assert!(pipeline.start_stage(target, 3, &mut receipts).is_err());
-    pipeline.config.device_capacity_bytes = ceiling;
+    pipeline.execution.config.device_capacity_bytes = ceiling;
     close(&mut pipeline);
 }
 
@@ -362,8 +457,9 @@ fn adaptive_impossible_cold_stage_rejects_before_destroying_prior_residency() {
     let mut receipts = Vec::new();
     execute(&mut pipeline, ImageStage::TextEncoder, 1, 0, &mut receipts);
     let target = stage(&pipeline, ImageStage::Decoder, 64);
-    pipeline.config.device_capacity_bytes = target.plan.static_bytes + demand(&target) - 1;
-    let before = pipeline.runtime.snapshot();
+    pipeline.execution.config.device_capacity_bytes =
+        target.plan.static_bytes + demand(&target) - 1;
+    let before = pipeline.execution.runtime.snapshot();
     let count = receipts.len();
     assert!(pipeline.validate_resident_capacity(&[&target]).is_err());
     assert!(matches!(
@@ -372,14 +468,14 @@ fn adaptive_impossible_cold_stage_rejects_before_destroying_prior_residency() {
     ));
     assert_eq!(receipts.len(), count);
     assert_eq!(
-        pipeline.runtime.snapshot().live_allocations,
+        pipeline.execution.runtime.snapshot().live_allocations,
         before.live_allocations
     );
     assert_eq!(
-        pipeline.runtime.snapshot().uploaded_bytes,
+        pipeline.execution.runtime.snapshot().uploaded_bytes,
         before.uploaded_bytes
     );
-    pipeline.config.device_capacity_bytes = DEVICE_BYTES;
+    pipeline.execution.config.device_capacity_bytes = DEVICE_BYTES;
     assert!(execute(&mut pipeline, ImageStage::TextEncoder, 1, 2, &mut receipts).session_reused);
     close(&mut pipeline);
 }
@@ -436,11 +532,11 @@ fn adaptive_prefix_admission_keeps_both_caches_and_full_installation_in_the_boun
         prefill.admission_dynamic_bytes(prefill_dynamic).unwrap(),
         joint
     );
-    pipeline.config.device_capacity_bytes = required;
+    pipeline.execution.config.device_capacity_bytes = required;
     pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .unwrap();
-    pipeline.config.device_capacity_bytes = required - 1;
+    pipeline.execution.config.device_capacity_bytes = required - 1;
     assert!(pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .is_err());
@@ -450,14 +546,14 @@ fn adaptive_prefix_admission_keeps_both_caches_and_full_installation_in_the_boun
         Err(ImageGenerationFailure::Preflight(_))
     ));
     assert!(receipts.is_empty());
-    assert_eq!(pipeline.runtime.snapshot().uploaded_bytes, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().uploaded_bytes, 0);
     close(&mut pipeline);
 }
 
 #[test]
 fn adaptive_referenced_weight_eviction_returns_the_original_recovery_owner() {
     let (mut pipeline, _directory) = pipeline();
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
     let mut receipts = Vec::new();
     let prefill = stage(&pipeline, ImageStage::Denoiser, 1);
     let (active, peer_weights, temporary) = pipeline
@@ -468,13 +564,13 @@ fn adaptive_referenced_weight_eviction_returns_the_original_recovery_owner() {
         .finish_stage(active, &mut receipts)
         .unwrap_or_else(|e| panic!("{e}"));
     let target = stage(&pipeline, ImageStage::Decoder, 1);
-    pipeline.config.device_capacity_bytes = target.plan.static_bytes + demand(&target);
+    pipeline.execution.config.device_capacity_bytes = target.plan.static_bytes + demand(&target);
     let Err(ImageGenerationFailure::SharedWeightsReferenced { outcome, .. }) =
         pipeline.start_stage(target, 1, &mut receipts)
     else {
         panic!("external snapshot lease must prevent eviction success")
     };
-    assert!(pipeline.runtime.snapshot().live_allocations > 0);
+    assert!(pipeline.execution.runtime.snapshot().live_allocations > 0);
     assert!(!receipts.iter().any(|r| matches!(
         r.retirement,
         ImageStageRetirement::SharedWeightsClosed { .. }
@@ -496,7 +592,7 @@ fn adaptive_active_request_cannot_be_stored_as_an_idle_reusable_pool() {
     let mut receipts = Vec::new();
     // Reuse the adapter's complete tiny transformer archive. A projection has
     // no readonly Request state and cannot exercise this lifetime boundary.
-    Arc::get_mut(&mut pipeline.assets)
+    Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("unique fixture assets")
         .sources
         .transformer = Arc::new(SafetensorsArchive::open(directory.path().join("dit")).unwrap());
@@ -523,7 +619,7 @@ fn adaptive_active_request_cannot_be_stored_as_an_idle_reusable_pool() {
         .unwrap_or_else(|e| panic!("{e}"));
     assert!(!temporary);
     let active = prepared
-        .start_attached(&pipeline, 0, &weights)
+        .start_attached(&pipeline.execution, 0, &weights)
         .unwrap_or_else(|e| panic!("{e}"));
     prefill.close().unwrap_or_else(|e| panic!("{e}"));
     drop(weights);
@@ -535,6 +631,7 @@ fn adaptive_active_request_cannot_be_stored_as_an_idle_reusable_pool() {
             let tensor =
                 ResolvedTensorSpec::new(spec.dimensions, spec.element_type, spec.layout).unwrap();
             let bytes = pipeline
+                .execution
                 .host
                 .allocate_zeroed(
                     HostMemoryClass::InputPreprocess,

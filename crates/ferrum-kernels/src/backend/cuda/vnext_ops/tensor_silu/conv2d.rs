@@ -537,6 +537,7 @@ impl Shape {
         let (workspace_offset, scratch_bytes) = scratch_layout(padding_bytes, workspace_bytes)?;
         Ok(Self {
             native: CudnnConv2dDescriptor {
+                scalar: crate::backend::cuda::vnext_runtime::CudnnConvScalar::Bf16,
                 input: [
                     dim(g.batch())?,
                     dim(g.input_channels())?,

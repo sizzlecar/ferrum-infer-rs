@@ -1,11 +1,13 @@
 //! Typed selection from one fixed native module. Selection never grants a
 //! capability absent from the runtime descriptor and is checked before load.
 
+use super::super::tensor_dense_bf16::{self as dense, RowBiasProjection};
 use super::*;
 use ferrum_runtime::TensorPrimitiveBf16;
 
 /// BF16 fixed-tensor operations implemented by the shared CUDA native module.
-/// Dense remains a separate provider because it uses the admitted lane BLAS.
+/// Bias-free dense remains separate. F32 affine/patch combine the admitted
+/// lane BLAS with one broadcast in this same admitted native module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum CudaTensorOperation {
@@ -26,6 +28,7 @@ pub enum CudaTensorOperation {
     BatchedRowConcat,
     PlainResidualAdd,
     HalfSplitRope,
+    PartialHalfSplitRope,
     StructuredGqaAttention,
     ChannelL2Norm,
     SiluNchw,
@@ -45,12 +48,74 @@ pub enum CudaTensorOperation {
     /// Explicit-state normal generation. Its launch geometry is queried from
     /// the existing runtime only when this operation is selected.
     PhiloxNormal,
+    /// Canonical codebook W4 storage, regular ConvRot A8, integer GEMM.
+    ComfyConvRotW4A8,
+    /// Already-rotated signed INT8 weights and per-output [N,1] scales.
+    ComfyConvRotW8A8,
+    FusedHeadRmsPartialRope,
+    RowRmsNormSingleRound,
+    Addcmul,
+    /// F32 SiLU(gate)*up retained through ConvRot; no M-dependent rounding.
+    ComfyConvRotSwiGluF32W4A8,
+    ComfyConvRotSwiGluF32W8A8,
+    CastF32ToBf16,
+    ComfyConvRotW4A8F32,
+    ComfyConvRotW8A8F32,
+    ComfyConvRotInt8EmbeddingF32,
+    StructuredGqaAttentionF32,
+    HeadRmsNormF32,
+    HalfSplitRopeF32,
+    PlainResidualAddF32,
+    SiluMulF32,
+    GroupedColumnSliceF32,
+    ChannelBiasAddF32,
+    ChannelScaledResidualF32,
+    NanToNumF32,
+    UnitHeadRmsPartialRopeF32,
+    RowSelectedModulationBf16F32,
+    BatchedSuffixAppendF32,
+    LayerNormF32,
+    GroupNormSiluNchwF32,
+    PlainResidualAddNchwF32,
+    /// Direct native F32 draws; shares explicit seed/offset and launch mapping.
+    PhiloxNormalF32,
+    GeluTanhF32,
+    GeluErfF32,
+    ReshapeCopyF32,
+    RowScatterReplaceF32,
+    RowScatterAddF32,
+    RowSelectedModulationBf16,
+    RowSelectedAddcmulBf16,
+    /// Pedantic SGEMM dot-store followed by one retained F32 row broadcast.
+    AffineLinearF32,
+    /// Original rank5 patch weights, SGEMM then the same F32 row broadcast.
+    PatchProjectionF32,
 }
 
 impl CudaTensorOperation {
+    /// Pure provider metadata for matching a selected operation to its actual
+    /// registered contract before native module acquisition. Philox requires
+    /// explicitly checked launch geometry; this never opens or queries a GPU.
+    /// F32 affine/patch query the loaded cuBLAS software version with a null
+    /// handle, without creating a context, module or BLAS handle.
+    pub fn provider_descriptor(
+        self,
+        device: &DeviceDescriptor,
+        philox_geometry: Option<CudaPhiloxDeviceGeometry>,
+    ) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
+        let mut selected = selected_descriptors(device, &[self], philox_geometry)?;
+        Ok(
+            match selected.pop().expect("one explicit operation descriptor") {
+                SelectedDescriptor::Fixed(_, descriptor) => descriptor,
+                SelectedDescriptor::Philox(prepared) => prepared.descriptor().clone(),
+                SelectedDescriptor::PhiloxF32(prepared) => prepared.descriptor().clone(),
+            },
+        )
+    }
+
     // Legacy factories select the original leading operation subsets.
     // Append new capabilities so those callers never acquire a new dependency.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 70] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -84,6 +149,43 @@ impl CudaTensorOperation {
         Self::SegmentedAttention,
         Self::PhiloxNormal,
         Self::BlockLinear,
+        Self::ComfyConvRotW4A8,
+        Self::PartialHalfSplitRope,
+        Self::ComfyConvRotW8A8,
+        Self::FusedHeadRmsPartialRope,
+        Self::RowRmsNormSingleRound,
+        Self::Addcmul,
+        Self::ComfyConvRotSwiGluF32W4A8,
+        Self::ComfyConvRotSwiGluF32W8A8,
+        Self::CastF32ToBf16,
+        Self::ComfyConvRotW4A8F32,
+        Self::ComfyConvRotW8A8F32,
+        Self::ComfyConvRotInt8EmbeddingF32,
+        Self::StructuredGqaAttentionF32,
+        Self::HeadRmsNormF32,
+        Self::HalfSplitRopeF32,
+        Self::PlainResidualAddF32,
+        Self::SiluMulF32,
+        Self::GroupedColumnSliceF32,
+        Self::ChannelBiasAddF32,
+        Self::ChannelScaledResidualF32,
+        Self::NanToNumF32,
+        Self::UnitHeadRmsPartialRopeF32,
+        Self::RowSelectedModulationBf16F32,
+        Self::BatchedSuffixAppendF32,
+        Self::LayerNormF32,
+        Self::GroupNormSiluNchwF32,
+        Self::PlainResidualAddNchwF32,
+        Self::PhiloxNormalF32,
+        Self::GeluTanhF32,
+        Self::GeluErfF32,
+        Self::ReshapeCopyF32,
+        Self::RowScatterReplaceF32,
+        Self::RowScatterAddF32,
+        Self::RowSelectedModulationBf16,
+        Self::RowSelectedAddcmulBf16,
+        Self::AffineLinearF32,
+        Self::PatchProjectionF32,
     ];
 
     fn primitive(self) -> Option<TensorPrimitiveBf16> {
@@ -136,7 +238,39 @@ impl CudaTensorOperation {
             return norm::descriptor(device, kind);
         }
         match self {
+            Self::PlainResidualAddF32 => {
+                pointwise_f32::descriptor(device, ferrum_runtime::F32PointwiseOp::ResidualAdd)
+            }
+            Self::SiluMulF32 => {
+                pointwise_f32::descriptor(device, ferrum_runtime::F32PointwiseOp::SiluMul)
+            }
+            Self::GeluTanhF32 => gelu_f32::descriptor(device, ferrum_runtime::GeluF32Variant::Tanh),
+            Self::GeluErfF32 => gelu_f32::descriptor(device, ferrum_runtime::GeluF32Variant::Erf),
+            Self::ReshapeCopyF32 => reshape_copy_f32::descriptor(device),
+            Self::AffineLinearF32 => dense::row_bias_descriptor(device, RowBiasProjection::Affine),
+            Self::PatchProjectionF32 => {
+                dense::row_bias_descriptor(device, RowBiasProjection::Patch)
+            }
+            Self::RowScatterReplaceF32 => {
+                row_scatter_f32::descriptor(device, ferrum_runtime::RowScatterF32Op::Replace)
+            }
+            Self::RowScatterAddF32 => {
+                row_scatter_f32::descriptor(device, ferrum_runtime::RowScatterF32Op::Add)
+            }
             Self::BlockLinear => block_linear::descriptor(device),
+            Self::ComfyConvRotW4A8 => comfy_convrot::descriptor(device),
+            Self::ComfyConvRotW8A8 => comfy_convrot::int8_descriptor(device),
+            Self::ComfyConvRotSwiGluF32W4A8 => comfy_convrot::swiglu_w4_descriptor(device),
+            Self::ComfyConvRotSwiGluF32W8A8 => comfy_convrot::swiglu_w8_descriptor(device),
+            Self::CastF32ToBf16 => cast_f32_to_bf16::descriptor(device),
+            Self::ComfyConvRotW4A8F32 => comfy_convrot::f32_w4_descriptor(device),
+            Self::ComfyConvRotW8A8F32 => comfy_convrot::f32_w8_descriptor(device),
+            Self::ComfyConvRotInt8EmbeddingF32 => comfy_embedding::descriptor(device),
+            Self::FusedHeadRmsPartialRope => fused_head_rms_partial_rope::descriptor(device),
+            Self::RowRmsNormSingleRound => {
+                row_rms_addcmul::descriptor(device, row_rms_addcmul::Kind::RowRms)
+            }
+            Self::Addcmul => row_rms_addcmul::descriptor(device, row_rms_addcmul::Kind::Addcmul),
             Self::ChannelL2NormImage => {
                 spatial::descriptor(device, spatial::SpatialKind::ChannelL2Image)
             }
@@ -157,7 +291,46 @@ impl CudaTensorOperation {
             Self::AdjacentRope => rope::descriptor(device),
             Self::StructuredAttention => attention::descriptor(device),
             Self::HalfSplitRope => half_split_rope::descriptor(device),
+            Self::PartialHalfSplitRope => half_split_rope::partial_descriptor(device),
             Self::StructuredGqaAttention => gqa::descriptor(device),
+            Self::StructuredGqaAttentionF32 => gqa_f32::descriptor(device),
+            Self::GroupedColumnSliceF32 => channelwise_f32::descriptor(
+                device,
+                ferrum_runtime::F32ChannelwiseOp::GroupedColumnSlice,
+            ),
+            Self::ChannelBiasAddF32 => {
+                channelwise_f32::descriptor(device, ferrum_runtime::F32ChannelwiseOp::BiasAdd)
+            }
+            Self::ChannelScaledResidualF32 => channelwise_f32::descriptor(
+                device,
+                ferrum_runtime::F32ChannelwiseOp::ScaledResidual,
+            ),
+            Self::NanToNumF32 => {
+                channelwise_f32::descriptor(device, ferrum_runtime::F32ChannelwiseOp::NanToNum)
+            }
+            Self::UnitHeadRmsPartialRopeF32 => {
+                norm_rope_f32::descriptor(device, norm_rope_f32::Kind::UnitHeadRmsPartialRope)
+            }
+            Self::HeadRmsNormF32 => norm_rope_f32::descriptor(device, norm_rope_f32::Kind::HeadRms),
+            Self::RowSelectedModulationBf16F32 => row_selected_modulation::descriptor(device),
+            Self::RowSelectedModulationBf16 => row_selected_bf16::descriptor(
+                device,
+                ferrum_runtime::RowSelectedBf16Kind::Modulation,
+            ),
+            Self::RowSelectedAddcmulBf16 => {
+                row_selected_bf16::descriptor(device, ferrum_runtime::RowSelectedBf16Kind::Addcmul)
+            }
+            Self::BatchedSuffixAppendF32 => batched_suffix_append_f32::descriptor(device),
+            Self::LayerNormF32 => layer_norm_f32::descriptor(device),
+            Self::GroupNormSiluNchwF32 => {
+                cnn_f32::descriptor(device, ferrum_runtime::F32CnnOp::GroupNormSilu)
+            }
+            Self::PlainResidualAddNchwF32 => {
+                cnn_f32::descriptor(device, ferrum_runtime::F32CnnOp::ResidualAdd)
+            }
+            Self::HalfSplitRopeF32 => {
+                norm_rope_f32::descriptor(device, norm_rope_f32::Kind::HalfSplitRope)
+            }
             Self::RowGather => transport::descriptor(device, transport::Kind::RowGather),
             Self::BatchedRowConcat => {
                 transport::descriptor(device, transport::Kind::BatchedRowConcat)
@@ -187,7 +360,63 @@ impl CudaTensorOperation {
             return norm::provider(kind, descriptor, kernels);
         }
         match self {
+            Self::PlainResidualAddF32 => pointwise_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32PointwiseOp::ResidualAdd,
+            ),
+            Self::SiluMulF32 => pointwise_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32PointwiseOp::SiluMul,
+            ),
+            Self::GeluTanhF32 => {
+                gelu_f32::provider(descriptor, kernels, ferrum_runtime::GeluF32Variant::Tanh)
+            }
+            Self::GeluErfF32 => {
+                gelu_f32::provider(descriptor, kernels, ferrum_runtime::GeluF32Variant::Erf)
+            }
+            Self::ReshapeCopyF32 => reshape_copy_f32::provider(descriptor, kernels),
+            Self::AffineLinearF32 => dense::row_bias_provider(
+                descriptor,
+                RetainedF32RowBias::new(kernels),
+                RowBiasProjection::Affine,
+            ),
+            Self::PatchProjectionF32 => dense::row_bias_provider(
+                descriptor,
+                RetainedF32RowBias::new(kernels),
+                RowBiasProjection::Patch,
+            ),
+            Self::RowScatterReplaceF32 => row_scatter_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::RowScatterF32Op::Replace,
+            ),
+            Self::RowScatterAddF32 => {
+                row_scatter_f32::provider(descriptor, kernels, ferrum_runtime::RowScatterF32Op::Add)
+            }
             Self::BlockLinear => block_linear::provider(descriptor, kernels),
+            Self::ComfyConvRotW4A8 => comfy_convrot::provider(descriptor, kernels),
+            Self::ComfyConvRotW8A8 => comfy_convrot::int8_provider(descriptor, kernels),
+            Self::ComfyConvRotSwiGluF32W4A8 => {
+                comfy_convrot::swiglu_w4_provider(descriptor, kernels)
+            }
+            Self::ComfyConvRotSwiGluF32W8A8 => {
+                comfy_convrot::swiglu_w8_provider(descriptor, kernels)
+            }
+            Self::CastF32ToBf16 => cast_f32_to_bf16::provider(descriptor, kernels),
+            Self::ComfyConvRotW4A8F32 => comfy_convrot::f32_w4_provider(descriptor, kernels),
+            Self::ComfyConvRotW8A8F32 => comfy_convrot::f32_w8_provider(descriptor, kernels),
+            Self::ComfyConvRotInt8EmbeddingF32 => comfy_embedding::provider(descriptor, kernels),
+            Self::RowRmsNormSingleRound => {
+                row_rms_addcmul::provider(row_rms_addcmul::Kind::RowRms, descriptor, kernels)
+            }
+            Self::Addcmul => {
+                row_rms_addcmul::provider(row_rms_addcmul::Kind::Addcmul, descriptor, kernels)
+            }
+            Self::FusedHeadRmsPartialRope => {
+                fused_head_rms_partial_rope::provider(descriptor, kernels)
+            }
             Self::ChannelL2NormImage => {
                 spatial::provider(spatial::SpatialKind::ChannelL2Image, descriptor, kernels)
             }
@@ -210,7 +439,63 @@ impl CudaTensorOperation {
             Self::AdjacentRope => rope::provider(descriptor, kernels),
             Self::StructuredAttention => attention::provider(descriptor, kernels),
             Self::HalfSplitRope => half_split_rope::provider(descriptor, kernels),
+            Self::PartialHalfSplitRope => half_split_rope::provider(descriptor, kernels),
             Self::StructuredGqaAttention => gqa::provider(descriptor, kernels),
+            Self::StructuredGqaAttentionF32 => gqa_f32::provider(descriptor, kernels),
+            Self::GroupedColumnSliceF32 => channelwise_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32ChannelwiseOp::GroupedColumnSlice,
+            ),
+            Self::ChannelBiasAddF32 => channelwise_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32ChannelwiseOp::BiasAdd,
+            ),
+            Self::ChannelScaledResidualF32 => channelwise_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32ChannelwiseOp::ScaledResidual,
+            ),
+            Self::NanToNumF32 => channelwise_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32ChannelwiseOp::NanToNum,
+            ),
+            Self::UnitHeadRmsPartialRopeF32 => norm_rope_f32::provider(
+                norm_rope_f32::Kind::UnitHeadRmsPartialRope,
+                descriptor,
+                kernels,
+            ),
+            Self::HeadRmsNormF32 => {
+                norm_rope_f32::provider(norm_rope_f32::Kind::HeadRms, descriptor, kernels)
+            }
+            Self::RowSelectedModulationBf16F32 => {
+                row_selected_modulation::provider(descriptor, kernels)
+            }
+            Self::RowSelectedModulationBf16 => row_selected_bf16::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::RowSelectedBf16Kind::Modulation,
+            ),
+            Self::RowSelectedAddcmulBf16 => row_selected_bf16::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::RowSelectedBf16Kind::Addcmul,
+            ),
+            Self::BatchedSuffixAppendF32 => {
+                batched_suffix_append_f32::provider(descriptor, kernels)
+            }
+            Self::LayerNormF32 => layer_norm_f32::provider(descriptor, kernels),
+            Self::GroupNormSiluNchwF32 => {
+                cnn_f32::provider(descriptor, kernels, ferrum_runtime::F32CnnOp::GroupNormSilu)
+            }
+            Self::PlainResidualAddNchwF32 => {
+                cnn_f32::provider(descriptor, kernels, ferrum_runtime::F32CnnOp::ResidualAdd)
+            }
+            Self::HalfSplitRopeF32 => {
+                norm_rope_f32::provider(norm_rope_f32::Kind::HalfSplitRope, descriptor, kernels)
+            }
             Self::RowGather => transport::provider(transport::Kind::RowGather, descriptor, kernels),
             Self::BatchedRowConcat => {
                 transport::provider(transport::Kind::BatchedRowConcat, descriptor, kernels)
@@ -225,6 +510,7 @@ impl CudaTensorOperation {
 pub(super) enum SelectedDescriptor {
     Fixed(CudaTensorOperation, OperationProviderDescriptor),
     Philox(philox::PreparedProvider),
+    PhiloxF32(philox_f32::PreparedProvider),
 }
 
 impl SelectedDescriptor {
@@ -233,6 +519,7 @@ impl SelectedDescriptor {
         match self {
             Self::Fixed(operation, _) => *operation,
             Self::Philox(_) => CudaTensorOperation::PhiloxNormal,
+            Self::PhiloxF32(_) => CudaTensorOperation::PhiloxNormalF32,
         }
     }
 
@@ -241,6 +528,7 @@ impl SelectedDescriptor {
         match self {
             Self::Fixed(_, descriptor) => descriptor,
             Self::Philox(prepared) => prepared.descriptor(),
+            Self::PhiloxF32(prepared) => prepared.descriptor(),
         }
     }
 
@@ -251,6 +539,7 @@ impl SelectedDescriptor {
         match self {
             Self::Fixed(operation, descriptor) => operation.provider(descriptor, kernels),
             Self::Philox(prepared) => prepared.into_provider(kernels),
+            Self::PhiloxF32(prepared) => prepared.into_provider(kernels),
         }
     }
 }
@@ -283,13 +572,21 @@ pub(super) fn selected_descriptors(
         .iter()
         .copied()
         .map(|operation| {
-            if operation == CudaTensorOperation::PhiloxNormal {
+            if matches!(
+                operation,
+                CudaTensorOperation::PhiloxNormal | CudaTensorOperation::PhiloxNormalF32
+            ) {
                 let geometry = philox_geometry.ok_or_else(|| {
                     CudaDeviceRuntimeError::contract(
                         "Philox selection requires explicit device launch geometry",
                     )
                 })?;
-                philox::PreparedProvider::new(device, geometry).map(SelectedDescriptor::Philox)
+                if operation == CudaTensorOperation::PhiloxNormal {
+                    philox::PreparedProvider::new(device, geometry).map(SelectedDescriptor::Philox)
+                } else {
+                    philox_f32::PreparedProvider::new(device, geometry)
+                        .map(SelectedDescriptor::PhiloxF32)
+                }
             } else {
                 operation
                     .descriptor(device)
@@ -314,7 +611,12 @@ fn runtime_descriptors_with_query(
     query: impl FnOnce() -> Result<CudaPhiloxDeviceGeometry, CudaDeviceRuntimeError>,
 ) -> Result<Vec<SelectedDescriptor>, CudaDeviceRuntimeError> {
     validate_selection(selected)?;
-    let geometry = if selected.contains(&CudaTensorOperation::PhiloxNormal) {
+    let geometry = if selected.iter().any(|op| {
+        matches!(
+            op,
+            CudaTensorOperation::PhiloxNormal | CudaTensorOperation::PhiloxNormalF32
+        )
+    }) {
         Some(query()?)
     } else {
         None

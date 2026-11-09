@@ -12,7 +12,6 @@ use cudarc::cublas::{
 use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
-#[cfg(feature = "vllm-marlin")]
 use ferrum_runtime::PhysicalWeightLayout;
 use ferrum_runtime::{
     constant_scale_contract, dense_geglu_tanh_contract, dense_linear_contract,
@@ -65,6 +64,8 @@ use moe_weights::{
 
 mod attention;
 mod causal_attention;
+mod visual_row_select_f16;
+pub(super) use visual_row_select_f16::CudaVisualRowSelectF16Provider;
 #[cfg(test)]
 mod f16_tests;
 mod gguf_f16_projection;
@@ -246,6 +247,9 @@ impl CudaRmsNormProvider {
                 precision.kernel().as_bytes(),
             ]),
         )?;
+        let descriptor = descriptor.with_candidate_state_effects(
+            ferrum_runtime::ProviderCandidateStateEffects::PrefixCausal { ports: Vec::new() },
+        );
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::RMS_NORM.to_owned()))
@@ -304,11 +308,26 @@ impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
 
 pub(super) struct CudaDenseLinearProvider {
     descriptor: OperationProviderDescriptor,
+    weight_mode: ProjectionWeightSupport,
     native: super::native_blocks::CudaNativeBlockKernels,
 }
 
 impl CudaDenseLinearProvider {
     pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_weight_mode(runtime, ProjectionWeightSupport::LegacyFormats)
+    }
+
+    /// The bounded causal profile accepts only the original dense F16 carrier.
+    pub(super) fn new_dense_f16(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_weight_mode(runtime, ProjectionWeightSupport::DenseF16)
+    }
+
+    fn with_weight_mode(
+        runtime: &CudaDeviceRuntime,
+        mode: ProjectionWeightSupport,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let contract = dense_linear_contract().map_err(contract_error)?;
         let descriptor = provider_descriptor_with_formats(
             runtime,
@@ -317,12 +336,28 @@ impl CudaDenseLinearProvider {
             DENSE_LINEAR_F16_CAPABILITY_ID,
             DENSE_LINEAR_ESTIMATOR_ID,
             contiguous_bindings(2),
-            BTreeSet::from([
-                WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
-                WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
-            ]),
-            native_linear::quantization_formats().map_err(contract_error)?,
+            if mode == ProjectionWeightSupport::DenseF16 {
+                BTreeSet::from([
+                    WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?
+                ])
+            } else {
+                BTreeSet::from([
+                    WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
+                    WeightFormatId::new("weight-format.gguf.native-block")
+                        .map_err(contract_error)?,
+                ])
+            },
+            if mode == ProjectionWeightSupport::DenseF16 {
+                BTreeSet::new()
+            } else {
+                native_linear::quantization_formats().map_err(contract_error)?
+            },
             implementation_fingerprint(&[
+                if mode == ProjectionWeightSupport::DenseF16 {
+                    b"explicit-dense-f16"
+                } else {
+                    b"legacy-declared-formats"
+                },
                 include_str!("transformer.rs").as_bytes(),
                 include_str!("transformer/native_linear.rs").as_bytes(),
                 include_str!("transformer/native_matrix.rs").as_bytes(),
@@ -334,8 +369,18 @@ impl CudaDenseLinearProvider {
                 DENSE_LINEAR_PROVIDER_ID.as_bytes(),
             ]),
         )?;
+        // Each GEMM output row reads only its matching input row and the shared
+        // immutable weight. No token-axis reduction or persistent write occurs.
+        let descriptor = if mode == ProjectionWeightSupport::DenseF16 {
+            descriptor.with_candidate_state_effects(
+                ferrum_runtime::ProviderCandidateStateEffects::PrefixCausal { ports: Vec::new() },
+            )
+        } else {
+            descriptor
+        };
         Ok(Self {
             descriptor,
+            weight_mode: mode,
             native: super::native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
         })
     }
@@ -351,6 +396,9 @@ impl OperationResourceEstimator for CudaDenseLinearProvider {
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
         ensure_estimator_request(&self.descriptor, &request, DENSE_LINEAR_OPERATION_ID)?;
+        self.weight_mode
+            .validate_values(request.values(), &[1])
+            .map_err(invalid_plan)?;
         Ok(estimate(
             &self.descriptor,
             request.input_fingerprint(),
@@ -372,18 +420,26 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseLinearProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        let native = invocation.participants().iter().any(|participant| {
-            participant.bindings().iter().any(|binding| {
-                binding.role() == ResolvedValueRole::Input
-                    && binding.ordinal() == 1
-                    && binding.weight().is_some_and(|weight| {
-                        !matches!(
-                            weight.physical_layout(),
-                            ferrum_runtime::PhysicalWeightLayout::Dense { .. }
-                        )
-                    })
-            })
-        });
+        for participant in invocation.participants() {
+            self.weight_mode
+                .validate_values(participant.bindings(), &[1])
+                .map_err(|message| {
+                    provider_failure(identity.clone(), "cuda.dense_linear.select", message)
+                })?;
+        }
+        let native = self.weight_mode == ProjectionWeightSupport::LegacyFormats
+            && invocation.participants().iter().any(|participant| {
+                participant.bindings().iter().any(|binding| {
+                    binding.role() == ResolvedValueRole::Input
+                        && binding.ordinal() == 1
+                        && binding.weight().is_some_and(|weight| {
+                            !matches!(
+                                weight.physical_layout(),
+                                ferrum_runtime::PhysicalWeightLayout::Dense { .. }
+                            )
+                        })
+                })
+            });
         let encoded = if native {
             native_linear::encode(
                 self.descriptor.provider_implementation_fingerprint(),
@@ -609,18 +665,128 @@ fn dense_swiglu_projection(
 
 pub(super) struct CudaDenseSwiGluProvider {
     descriptor: OperationProviderDescriptor,
+    weight_mode: ProjectionWeightSupport,
     silu_mul: CudaFunction,
     native: super::native_blocks::CudaNativeBlockKernels,
     #[cfg(feature = "vllm-marlin")]
-    planar_silu_mul: CudaFunction,
-    #[cfg(feature = "vllm-marlin")]
-    projection_runtime: MarlinProjectionRuntime,
+    marlin: Option<(CudaFunction, MarlinProjectionRuntime)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectionWeightSupport {
+    DenseF16,
+    LegacyFormats,
+}
+impl ProjectionWeightSupport {
+    /// Dense execution accepts the original one-component F16 carrier,
+    /// including its declared contiguous reshape. Quantized, transformed and
+    /// segmented layouts cannot borrow a dense provider's capability or budget.
+    fn validate_values(
+        self,
+        values: &[ResolvedValueBinding],
+        ordinals: &[u32],
+    ) -> Result<(), String> {
+        if self == Self::LegacyFormats {
+            return Ok(());
+        }
+        for &ordinal in ordinals {
+            let value = binding(values, ResolvedValueRole::Input, ordinal)?;
+            let weight = value
+                .weight()
+                .ok_or("dense-F16 projection lacks physical weight metadata")?;
+            if !f16_contiguous(value)
+                || !dense_f16_row_major_layout(
+                    weight.physical_layout(),
+                    value.tensor().dimensions(),
+                )
+                || weight.components().len() != 1
+                || !matches!(
+                    weight.components()[0].encoding(),
+                    ferrum_runtime::WeightEncoding::Dense {
+                        element_type: ElementType::F16
+                    }
+                )
+            {
+                return Err(
+                    "explicit dense-F16 projection requires one original dense F16 carrier"
+                        .to_owned(),
+                );
+            }
+            if weight.components()[0]
+                .physical_bytes()
+                .map_err(|error| error.to_string())?
+                != value
+                    .tensor()
+                    .minimum_storage_bytes()
+                    .map_err(|error| error.to_string())?
+            {
+                return Err(
+                    "explicit dense-F16 projection carrier differs from its exact logical extent"
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn dense_f16_row_major_layout(layout: &PhysicalWeightLayout, dimensions: &[u64]) -> bool {
+    use ferrum_runtime::{PhysicalStorageLayout, PhysicalWeightPadding};
+    match layout {
+        PhysicalWeightLayout::Dense { .. } => true,
+        PhysicalWeightLayout::Stored { component } => match &component.storage {
+            PhysicalStorageLayout::Contiguous {
+                padding: PhysicalWeightPadding::Exact,
+            } => true,
+            PhysicalStorageLayout::Strided {
+                strides_in_elements,
+                padding: PhysicalWeightPadding::Exact,
+            } => {
+                if strides_in_elements.len() != dimensions.len() {
+                    return false;
+                }
+                let mut stride = 1u64;
+                for (&extent, &declared) in dimensions.iter().zip(strides_in_elements).rev() {
+                    if extent == 0 || declared != stride {
+                        return false;
+                    }
+                    let Some(next) = stride.checked_mul(extent) else {
+                        return false;
+                    };
+                    stride = next;
+                }
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 impl CudaDenseSwiGluProvider {
     pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_weight_mode(runtime, ProjectionWeightSupport::LegacyFormats)
+    }
+
+    /// A dense physical ABI is selected by this constructor, independently of
+    /// which optional quantized kernels happen to be compiled into the binary.
+    pub(super) fn new_dense_f16(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_weight_mode(runtime, ProjectionWeightSupport::DenseF16)
+    }
+
+    fn with_weight_mode(
+        runtime: &CudaDeviceRuntime,
+        mode: ProjectionWeightSupport,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let contract = dense_swiglu_contract().map_err(contract_error)?;
         let provider_fingerprint = implementation_fingerprint(&[
+            if mode == ProjectionWeightSupport::DenseF16 {
+                b"explicit-dense-f16"
+            } else {
+                b"legacy-declared-formats"
+            },
             include_str!("transformer.rs").as_bytes(),
             include_str!("transformer/native_swiglu.rs").as_bytes(),
             include_str!("transformer/native_matrix.rs").as_bytes(),
@@ -640,24 +806,43 @@ impl CudaDenseSwiGluProvider {
             #[cfg(feature = "vllm-marlin")]
             include_str!("../vllm_marlin.rs").as_bytes(),
         ]);
-        #[cfg(not(feature = "vllm-marlin"))]
-        let descriptor = provider_descriptor_with_formats(
-            runtime,
-            &contract,
-            DENSE_SWIGLU_PROVIDER_ID,
-            DENSE_SWIGLU_F16_CAPABILITY_ID,
-            DENSE_SWIGLU_ESTIMATOR_ID,
-            contiguous_bindings(3),
-            BTreeSet::from([
-                WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
-                WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
-            ]),
-            native_linear::quantization_formats().map_err(contract_error)?,
-            provider_fingerprint,
-        )?;
-        #[cfg(feature = "vllm-marlin")]
-        let descriptor =
-            marlin_swiglu_provider_descriptor(runtime, &contract, provider_fingerprint)?;
+        let descriptor = if mode == ProjectionWeightSupport::DenseF16 {
+            provider_descriptor(
+                runtime,
+                &contract,
+                DENSE_SWIGLU_PROVIDER_ID,
+                DENSE_SWIGLU_F16_CAPABILITY_ID,
+                DENSE_SWIGLU_ESTIMATOR_ID,
+                contiguous_bindings(3),
+                provider_fingerprint,
+            )?
+        } else {
+            #[cfg(not(feature = "vllm-marlin"))]
+            {
+                provider_descriptor_with_formats(
+                    runtime,
+                    &contract,
+                    DENSE_SWIGLU_PROVIDER_ID,
+                    DENSE_SWIGLU_F16_CAPABILITY_ID,
+                    DENSE_SWIGLU_ESTIMATOR_ID,
+                    contiguous_bindings(3),
+                    BTreeSet::from([
+                        WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
+                        WeightFormatId::new("weight-format.gguf.native-block")
+                            .map_err(contract_error)?,
+                    ]),
+                    native_linear::quantization_formats().map_err(contract_error)?,
+                    provider_fingerprint,
+                )?
+            }
+            #[cfg(feature = "vllm-marlin")]
+            {
+                marlin_swiglu_provider_descriptor(runtime, &contract, provider_fingerprint)?
+            }
+        };
+        let descriptor = descriptor.with_candidate_state_effects(
+            ferrum_runtime::ProviderCandidateStateEffects::PrefixCausal { ports: Vec::new() },
+        );
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL.to_owned()))
@@ -666,22 +851,106 @@ impl CudaDenseSwiGluProvider {
             .load_function(SILU_MUL_FUNCTION_NAME)
             .map_err(|error| CudaDeviceRuntimeError::driver("SwiGLU function load", error))?;
         #[cfg(feature = "vllm-marlin")]
-        let planar_silu_mul = module
-            .load_function(PLANAR_SILU_MUL_FUNCTION_NAME)
-            .map_err(|error| {
-                CudaDeviceRuntimeError::driver("planar SwiGLU function load", error)
-            })?;
-        #[cfg(feature = "vllm-marlin")]
-        let projection_runtime = MarlinProjectionRuntime::query(runtime)?;
+        let marlin = if mode == ProjectionWeightSupport::LegacyFormats {
+            let planar_silu_mul = module
+                .load_function(PLANAR_SILU_MUL_FUNCTION_NAME)
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("planar SwiGLU function load", error)
+                })?;
+            Some((planar_silu_mul, MarlinProjectionRuntime::query(runtime)?))
+        } else {
+            None
+        };
         Ok(Self {
             descriptor,
+            weight_mode: mode,
             silu_mul,
             native: super::native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
             #[cfg(feature = "vllm-marlin")]
-            planar_silu_mul,
-            #[cfg(feature = "vllm-marlin")]
-            projection_runtime,
+            marlin,
         })
+    }
+}
+
+fn dense_swiglu_workspace_formula(
+    bytes_per_token: u64,
+    marlin_workspace: Option<u64>,
+) -> Result<ProviderWorkspaceSizeFormula, VNextError> {
+    match marlin_workspace {
+        None => ProviderWorkspaceSizeFormula::tokens(bytes_per_token),
+        Some(bytes) => ProviderWorkspaceSizeFormula::affine(
+            bytes
+                .checked_add(VALUE_ALIGNMENT_BYTES - 1)
+                .ok_or_else(|| invalid_plan("CUDA dense SwiGLU Marlin scratch overflows"))?,
+            0,
+            bytes_per_token,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod dense_swiglu_workspace_tests {
+    use super::*;
+    #[test]
+    fn dense_f16_scratch_has_no_unselected_marlin_fixed_workspace() {
+        // This branch must stay token-only even in a binary compiled with
+        // vllm-marlin. Only a constructed Marlin owner supplies Some(bytes).
+        assert_eq!(
+            dense_swiglu_workspace_formula(96, None).unwrap(),
+            ProviderWorkspaceSizeFormula::Tokens {
+                bytes_per_token: 96
+            }
+        );
+        assert_eq!(
+            dense_swiglu_workspace_formula(96, Some(512)).unwrap(),
+            ProviderWorkspaceSizeFormula::Affine {
+                fixed_bytes: 512 + VALUE_ALIGNMENT_BYTES - 1,
+                bytes_per_sequence: 0,
+                bytes_per_token: 96
+            }
+        );
+        assert!(dense_swiglu_workspace_formula(96, Some(u64::MAX)).is_err());
+        assert!(dense_swiglu_workspace_formula(0, None).is_err());
+    }
+
+    #[test]
+    fn dense_f16_carrier_checks_the_declared_reshape_instead_of_reinterpreting_strides() {
+        use ferrum_runtime::{
+            PhysicalStorageLayout, PhysicalWeightComponentBinding, PhysicalWeightPadding, WeightId,
+        };
+        let component_id = WeightId::new("weight.test.f16").unwrap();
+        let stored = |strides| PhysicalWeightLayout::Stored {
+            component: PhysicalWeightComponentBinding {
+                component_id: component_id.clone(),
+                storage: PhysicalStorageLayout::Strided {
+                    strides_in_elements: strides,
+                    padding: PhysicalWeightPadding::Exact,
+                },
+            },
+        };
+        assert!(dense_f16_row_major_layout(
+            &stored(vec![12, 4, 1]),
+            &[2, 3, 4]
+        ));
+        assert!(!dense_f16_row_major_layout(
+            &stored(vec![4, 8, 1]),
+            &[2, 3, 4]
+        ));
+        assert!(!dense_f16_row_major_layout(
+            &stored(vec![12, 4]),
+            &[2, 3, 4]
+        ));
+        let padded = PhysicalWeightLayout::Stored {
+            component: PhysicalWeightComponentBinding {
+                component_id,
+                storage: PhysicalStorageLayout::Contiguous {
+                    padding: PhysicalWeightPadding::ZeroFill {
+                        padded_dimensions: vec![2, 4, 4],
+                    },
+                },
+            },
+        };
+        assert!(!dense_f16_row_major_layout(&padded, &[2, 3, 4]));
     }
 }
 
@@ -695,6 +964,9 @@ impl OperationResourceEstimator for CudaDenseSwiGluProvider {
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
         ensure_estimator_request(&self.descriptor, &request, DENSE_SWIGLU_OPERATION_ID)?;
+        self.weight_mode
+            .validate_values(request.values(), &[1, 2])
+            .map_err(invalid_plan)?;
         let intermediate_size =
             unsigned_attribute(request.attributes(), "intermediate_size").map_err(invalid_plan)?;
         let bytes_per_token = intermediate_size
@@ -707,21 +979,15 @@ impl OperationResourceEstimator for CudaDenseSwiGluProvider {
             )
             .ok_or_else(|| invalid_plan("CUDA Hadamard SwiGLU scratch size overflows"))?;
         #[cfg(not(feature = "vllm-marlin"))]
-        let formula = ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?;
+        let marlin_workspace = None;
         #[cfg(feature = "vllm-marlin")]
-        let formula = if native_swiglu::uses_native(request.values()) {
-            ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?
-        } else {
-            ProviderWorkspaceSizeFormula::affine(
-                self.projection_runtime
-                    .workspace_bytes()
-                    .map_err(invalid_plan)?
-                    .checked_add(VALUE_ALIGNMENT_BYTES - 1)
-                    .ok_or_else(|| invalid_plan("CUDA dense SwiGLU Marlin scratch overflows"))?,
-                0,
-                bytes_per_token,
-            )?
-        };
+        let marlin_workspace = self
+            .marlin
+            .as_ref()
+            .filter(|_| !native_swiglu::uses_native(request.values()))
+            .map(|(_, runtime)| runtime.workspace_bytes().map_err(invalid_plan))
+            .transpose()?;
+        let formula = dense_swiglu_workspace_formula(bytes_per_token, marlin_workspace)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             formula,
             VALUE_ALIGNMENT_BYTES,
@@ -750,10 +1016,18 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
+        for participant in invocation.participants() {
+            self.weight_mode
+                .validate_values(participant.bindings(), &[1, 2])
+                .map_err(|message| {
+                    provider_failure(identity.clone(), "cuda.dense_swiglu.select", message)
+                })?;
+        }
         if invocation
             .participants()
             .iter()
             .any(|participant| native_swiglu::uses_native(participant.bindings()))
+            && self.weight_mode == ProjectionWeightSupport::LegacyFormats
         {
             return native_swiglu::encode(
                 self.descriptor.provider_implementation_fingerprint(),
@@ -773,10 +1047,19 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
             })?;
             match projection {
                 DenseSwiGluProjection::CompressedTensorsMarlin => {
+                    let (planar_silu_mul, projection_runtime) =
+                        self.marlin.as_ref().ok_or_else(|| {
+                            provider_failure(
+                                identity.clone(),
+                                "cuda.dense_swiglu.select",
+                                "selected Marlin projection has no admitted Marlin implementation"
+                                    .to_owned(),
+                            )
+                        })?;
                     return encode_compressed_tensors_dense_swiglu(
                         self.descriptor.provider_implementation_fingerprint(),
-                        &self.planar_silu_mul,
-                        self.projection_runtime,
+                        planar_silu_mul,
+                        *projection_runtime,
                         invocation,
                     )
                     .map(EncodedDeviceOperation::compute)
@@ -789,10 +1072,19 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
                     });
                 }
                 DenseSwiGluProjection::MarlinFp8 => {
+                    let (planar_silu_mul, projection_runtime) =
+                        self.marlin.as_ref().ok_or_else(|| {
+                            provider_failure(
+                                identity.clone(),
+                                "cuda.dense_swiglu.select",
+                                "selected Marlin projection has no admitted Marlin implementation"
+                                    .to_owned(),
+                            )
+                        })?;
                     return encode_marlin_fp8_dense_swiglu(
                         self.descriptor.provider_implementation_fingerprint(),
-                        &self.planar_silu_mul,
-                        self.projection_runtime,
+                        planar_silu_mul,
+                        *projection_runtime,
                         invocation,
                     )
                     .map(EncodedDeviceOperation::compute)
@@ -1199,6 +1491,9 @@ impl CudaResidualAddProvider {
                 precision.kernel().as_bytes(),
             ]),
         )?;
+        let descriptor = descriptor.with_candidate_state_effects(
+            ferrum_runtime::ProviderCandidateStateEffects::PrefixCausal { ports: Vec::new() },
+        );
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::RESIDUAL_ADD.to_owned()))
@@ -4173,7 +4468,10 @@ pub(super) fn launch_gemm_f16(
             output as *mut c_void,
             cudaDataType_t::CUDA_R_16F,
             out_features,
-            cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
+            // F16 storage with F32 accumulation uses COMPUTE_32F. The FAST_16F
+            // mode instead permits down-converting F32 input/output matrices;
+            // combining it with F16 storage is not a supported cuBLAS ABI tuple.
+            cublasComputeType_t::CUBLAS_COMPUTE_32F,
             cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
         )
     }

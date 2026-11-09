@@ -1,6 +1,6 @@
 use super::*;
 
-mod adapter;
+pub(super) mod adapter;
 mod batch_order;
 mod decoder;
 mod directory;
@@ -21,6 +21,7 @@ fn config() -> ImagePipelineConfig {
         maximum_width: 1024,
         maximum_height: 1024,
         maximum_batch_size: ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE,
+        weight_arena_target_bytes: None,
         decoder_batch_policy: ImageDecoderBatchPolicy::default(),
         edit_prefix_policy: ImageEditPrefixPolicy::default(),
         plan_cache: ImagePlanCachePolicy::default(),

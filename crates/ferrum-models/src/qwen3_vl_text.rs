@@ -1,4 +1,4 @@
-//! Qwen3-VL conditioning component, ending before the final RMSNorm.
+//! Qwen3-VL conditioning component with optional selected hidden states.
 //!
 //! Embedding lookup, tokenization and position generation are caller adapters.
 //! This family consumes their actual BF16 tensors through ordinary managed
@@ -11,12 +11,17 @@ mod config;
 mod edit;
 mod mrope;
 mod program;
+mod quantized;
 mod weights;
 pub use config::{
     Qwen3VLTextArchitecture, Qwen3VLTextConfig, Qwen3VLTextKeyRun, Qwen3VLTextLayout,
 };
 pub use edit::{Qwen3VLTextDeepStack, Qwen3VLTextVisualRun};
 pub use mrope::{Qwen3VLTextImageSpan, QWEN3_VL_EDIT_MROPE_PROFILE};
+pub use quantized::{
+    Qwen3VLTextComfyCheckpoint, Qwen3VLTextComfyConfig, Qwen3VLTextComfyFamily,
+    Qwen3VLTextComfyInputMode, Qwen3VLTextComfyLimits, Qwen3VLTextComfyProjectionQuantization,
+};
 pub use weights::Qwen3VLTextExpectedWeight;
 
 use ferrum_runtime::*;
@@ -48,6 +53,18 @@ impl Qwen3VLTextEncoderFamily {
     ];
     pub const OUTPUT_ID: &'static str = "value.qwen3_vl.text.pre_final_norm";
     pub const EMBEDDING_EXTERNAL_NAME: &'static str = "model.language_model.embed_tokens.weight";
+    pub const FINAL_NORM_EXTERNAL_NAME: &'static str = "model.language_model.norm.weight";
+    /// Stable additional output port for a selected decoder hidden state.
+    /// Configuration validates the index against the actual layer count.
+    pub fn hidden_state_output_id(index: u64) -> Result<ProgramValueId, VNextError> {
+        if index == 0 {
+            return Err(invalid(
+                "hidden_state_indices",
+                "embedding index zero is unsupported",
+            ));
+        }
+        ProgramValueId::new(format!("value.qwen3_vl.text.hidden_state.{index}"))
+    }
     pub fn new() -> Result<Self, VNextError> {
         Ok(Self {
             id: ModelFamilyId::new(Self::FAMILY_ID)?,

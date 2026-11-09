@@ -21,26 +21,61 @@ fn reuse_limits_and_external_weak_owners_are_not_silent_permissions() {
 }
 
 fn runtime(maximum_streams: usize) -> CudaDeviceRuntime {
-    CudaDeviceRuntime::new_tensor_eager_with_native_lane_reuse(
-        CudaTensorRuntimeConfig {
-            device: crate::backend::cuda::vnext_ops::cuda_tensor_runtime_config(
+    runtime_with_replay(maximum_streams, false)
+}
+
+fn runtime_with_replay(maximum_streams: usize, replay: bool) -> CudaDeviceRuntime {
+    let mut tensor = CudaTensorRuntimeConfig {
+        device: crate::backend::cuda::vnext_ops::cuda_tensor_runtime_config(
+            0,
+            DeviceId::new("device.cuda.0").unwrap(),
+        )
+        .unwrap(),
+        usable_memory_bytes: 2 << 30,
+        bootstrap_memory_bytes: 1 << 30,
+        stream_memory_bytes: 64 << 20,
+        maximum_streams,
+        maximum_in_flight_per_stream: 1,
+        maximum_commands_per_submission: 8,
+        opaque_memory_profile: "experimental-unqualified-retired-native-lane-test-v1".into(),
+    };
+    let reuse = CudaNativeLaneReuse::Bounded {
+        maximum_idle_lanes: NonZeroUsize::new(1).unwrap(),
+    };
+    if replay {
+        use super::super::tensor_eager::{
+            CudaDenseF16CausalProfile, CudaTensorAndCausalRuntimeConfig,
+        };
+        tensor.device =
+            crate::backend::cuda::vnext_ops::cuda_tensor_and_dense_f16_causal_runtime_config(
                 0,
                 DeviceId::new("device.cuda.0").unwrap(),
             )
-            .unwrap(),
-            usable_memory_bytes: 2 << 30,
-            bootstrap_memory_bytes: 1 << 30,
-            stream_memory_bytes: 64 << 20,
-            maximum_streams,
-            maximum_in_flight_per_stream: 1,
-            maximum_commands_per_submission: 8,
-            opaque_memory_profile: "experimental-unqualified-retired-native-lane-test-v1".into(),
-        },
-        CudaNativeLaneReuse::Bounded {
-            maximum_idle_lanes: NonZeroUsize::new(1).unwrap(),
-        },
-    )
-    .unwrap()
+            .unwrap();
+        for id in [
+            ferrum_runtime::DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
+            ferrum_runtime::DEVICE_ON_DEMAND_REUSABLE_EXECUTION_CAPABILITY_ID,
+        ] {
+            tensor
+                .device
+                .capabilities
+                .insert(CapabilityId::new(id).unwrap());
+        }
+        let causal = CudaDenseF16CausalProfile::new(
+            64 << 20,
+            "unqualified-retired-native-owned-workspace-test-v1",
+        )
+        .unwrap()
+        .with_decode_replay(2, 32 << 20)
+        .unwrap();
+        CudaDeviceRuntime::new_tensor_and_causal_eager_with_native_lane_reuse(
+            CudaTensorAndCausalRuntimeConfig { tensor, causal },
+            reuse,
+        )
+        .unwrap()
+    } else {
+        CudaDeviceRuntime::new_tensor_eager_with_native_lane_reuse(tensor, reuse).unwrap()
+    }
 }
 
 // Backend native-owner fixture: the original explicit opaque claim covers
@@ -84,19 +119,33 @@ fn gemm(runtime: &CudaDeviceRuntime, stream: &mut CudaDeviceStream) {
 #[test]
 #[ignore = "requires an exclusive CUDA window; real native pair, BLAS reset and original quota"]
 fn retired_native_lane_reuses_exact_pair_and_quota_with_fresh_logical_state() {
+    check_retired_native_lane(runtime(1));
+}
+
+#[test]
+#[ignore = "requires an exclusive CUDA window; owned workspace survives native reuse and retires with its original quota"]
+fn retired_native_lane_keeps_owned_workspace_without_retaining_a_cycle() {
+    check_retired_native_lane(runtime_with_replay(1, true));
+}
+
+fn check_retired_native_lane(runtime: CudaDeviceRuntime) {
     use cudarc::{cublas::sys, driver::DevicePtrMut};
-    let runtime = runtime(1);
     let cache = runtime.idle_native_lanes.as_ref().unwrap();
     let mut first = runtime.create_stream().unwrap();
     gemm(&runtime, &mut first);
     let old_id = first.id;
     let old_stream = first.stream.cu_stream();
     let old_blas = *first.blas.as_ref().unwrap().handle();
+    let workspace_bytes = first.blas.as_ref().unwrap().workspace_bytes();
     let old_lane = Arc::as_ptr(first.tensor_lane.as_ref().unwrap());
-    first
-        .executable_cache
-        .configure(DeviceReusableExecutionPlan::new(2).unwrap())
-        .unwrap();
+    let replay = if first.tensor_lane.as_ref().unwrap().replay_limit().is_some() {
+        assert_eq!(workspace_bytes, 32 << 20);
+        DeviceReusableExecutionPlan::on_demand(2)
+    } else {
+        DeviceReusableExecutionPlan::new(2)
+    }
+    .unwrap();
+    first.executable_cache.configure(replay).unwrap();
     assert!(first.executable_cache.preparation().is_ok());
     let quota = runtime.reserve_tensor_opaque(4096).unwrap();
     let mut workspace = runtime.allocation_stream.alloc_zeros::<u8>(4096).unwrap();
@@ -137,6 +186,10 @@ fn retired_native_lane_reuses_exact_pair_and_quota_with_fresh_logical_state() {
     assert_ne!(second.id, old_id);
     assert_eq!(second.stream.cu_stream(), old_stream);
     assert_eq!(*second.blas.as_ref().unwrap().handle(), old_blas);
+    assert_eq!(
+        second.blas.as_ref().unwrap().workspace_bytes(),
+        workspace_bytes
+    );
     assert_eq!(Arc::as_ptr(second.tensor_lane.as_ref().unwrap()), old_lane);
     assert!(second.state.is_quiescent());
     assert!(

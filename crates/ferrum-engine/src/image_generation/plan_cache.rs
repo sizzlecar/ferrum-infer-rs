@@ -112,7 +112,7 @@ pub(super) struct PreparedFamilyKey<'a> {
     pub profile: &'a NumericalProfileId,
 }
 
-impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
+impl<R: DeviceRuntime, S: ImagePipelineSourceAdapter> ImagePipelineExecution<R, S> {
     /// Reuse only a family already validated by this pipeline's fixed built-in
     /// provider. Config identity is checked even on hits; compile options,
     /// materializer selection, full fingerprints and capacity checks follow.
@@ -556,19 +556,37 @@ fn encoded_size<R: DeviceRuntime>(
 // cache key still compares the complete options, including private preferences
 // and quality artifact bytes; those private fields are outside this size proxy.
 fn compile_options_projection(options: &ProgramPlanCompileOptions) -> impl Serialize + '_ {
-    let required_materializer = match options.weight_preparation() {
-        WeightPreparation::Auto => None,
-        WeightPreparation::Require(selection) => Some((
-            selection.materializer_id(),
-            selection.has_numeric_quality_artifact(),
-        )),
-    };
-    (
-        options.tensor_specs(),
-        options.completion_retention().values(),
-        required_materializer,
-    )
+    CompileOptionsProjection(options)
 }
+struct CompileOptionsProjection<'a>(&'a ProgramPlanCompileOptions);
+impl Serialize for CompileOptionsProjection<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let options = self.0;
+        let target = match options.weight_arena_packing() {
+            ferrum_runtime::WeightArenaPacking::ByElementType => None,
+            ferrum_runtime::WeightArenaPacking::Bounded { target_bytes } => {
+                Some(target_bytes.get())
+            }
+        };
+        let required_materializer = match options.weight_preparation() {
+            WeightPreparation::Auto => None,
+            WeightPreparation::Require(selection) => Some((
+                selection.materializer_id(),
+                selection.has_numeric_quality_artifact(),
+            )),
+        };
+        let mut tuple = serializer.serialize_tuple(if target.is_some() { 4 } else { 3 })?;
+        tuple.serialize_element(options.tensor_specs())?;
+        tuple.serialize_element(options.completion_retention().values())?;
+        tuple.serialize_element(&required_materializer)?;
+        if let Some(target) = target {
+            tuple.serialize_element(&target)?;
+        }
+        tuple.end()
+    }
+}
+
 struct LimitedCounter {
     bytes: usize,
     limit: usize,
@@ -593,6 +611,36 @@ impl io::Write for LimitedCounter {
 #[cfg(test)]
 mod encoded_options_tests {
     use super::*;
+
+    #[test]
+    fn packing_projection_preserves_legacy_bytes_and_counts_explicit_target() {
+        let options = ProgramPlanCompileOptions::new(BTreeMap::new()).unwrap();
+        let legacy = serde_json::to_vec(&(
+            options.tensor_specs(),
+            options.completion_retention().values(),
+            None::<(WeightMaterializerId, bool)>,
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&compile_options_projection(&options)).unwrap(),
+            legacy
+        );
+        let bounded =
+            options.with_weight_arena_packing(ferrum_runtime::WeightArenaPacking::Bounded {
+                target_bytes: std::num::NonZeroU64::new(1024).unwrap(),
+            });
+        let encoded = serde_json::to_vec(&compile_options_projection(&bounded)).unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(view[3], 1024);
+        assert!(encoded.len() > legacy.len());
+        let mut short = LimitedCounter {
+            bytes: 0,
+            limit: legacy.len(),
+            exceeded: false,
+        };
+        assert!(serde_json::to_writer(&mut short, &compile_options_projection(&bounded)).is_err());
+        assert!(short.exceeded);
+    }
 
     #[test]
     fn public_projection_counts_retention_and_materializer_without_runtime_wire() {

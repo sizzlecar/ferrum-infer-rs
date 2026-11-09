@@ -680,7 +680,7 @@ pub(super) fn retain_token_evidence(
     span: TokenSpanWork,
     tokens: &[u32],
 ) -> Result<TokenSpanWork> {
-    if usable_layout(plan).is_none() {
+    if usable_layout(plan).is_none() && !plan.requires_selected_prefix_commit() {
         return Ok(span);
     }
     // Keep the ordinary range, fit ceiling, wire and fingerprint. No complete

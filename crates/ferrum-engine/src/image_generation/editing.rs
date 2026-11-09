@@ -105,14 +105,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         profiles: QwenImage21EditProfiles,
     ) -> anyhow::Result<Self> {
         ensure!(
-            self.assets.editing.is_some(),
+            self.execution.sources.assets.editing.is_some(),
             "editing profiles require validated vision/encoder assets"
         );
         self.editing_profiles = Some(profiles);
         Ok(self)
     }
     pub fn supports_edits(&self) -> bool {
-        self.assets.editing.is_some() && self.editing_profiles.is_some()
+        self.execution.sources.assets.editing.is_some() && self.editing_profiles.is_some()
     }
 
     /// Decode each admitted reference once. The queue can retain this owner
@@ -122,27 +122,32 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         request: &ImageEditRequest,
     ) -> anyhow::Result<QwenImage21ConditionInputs> {
         ensure!(self.supports_edits(), "editing assets/profiles are missing");
-        request
-            .generation
-            .latent_dimensions(&self.config, self.assets.spatial_scale()?)?;
+        request.generation.latent_dimensions(
+            &self.execution.config,
+            self.execution.sources.assets.spatial_scale()?,
+        )?;
         ensure!(
-            self.host.owns(&request.image),
+            self.execution.host.owns(&request.image),
             "edit reference belongs to another Host account"
         );
         let assets = self
+            .execution
+            .sources
             .assets
             .editing
             .as_ref()
             .context("editing assets are missing")?;
         let limits = ImageInputLimits::default();
         let started = std::time::Instant::now();
-        let decoded = ManagedRgba8Image::decode_png(&self.host, &request.image, limits)?;
+        let decoded = ManagedRgba8Image::decode_png(&self.execution.host, &request.image, limits)?;
         let decode_png_us = trace_elapsed_us(started);
         let started = std::time::Instant::now();
-        let input = assets.processor.prepare(&self.host, &decoded, limits)?;
+        let input = assets
+            .processor
+            .prepare(&self.execution.host, &decoded, limits)?;
         tracing::debug!(
             target: "ferrum_engine::image_generation::timing",
-            job = self.next_job,
+            job = self.execution.next_job,
             decode_png_us,
             reference_preprocess_us = trace_elapsed_us(started),
             "image edit reference prepared"
@@ -168,16 +173,22 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         reserve_host: bool,
     ) -> anyhow::Result<PreparedRequest<R>> {
         ensure!(self.supports_edits(), "editing assets/profiles are missing");
-        super::prepare::batch_dimensions(requests, &self.config, self.assets.spatial_scale()?)?;
+        super::prepare::batch_dimensions(
+            requests,
+            &self.execution.config,
+            self.execution.sources.assets.spatial_scale()?,
+        )?;
         for input in inputs {
             ensure!(
-                self.host.owns(input.vision_patches().bytes())
-                    && self.host.owns(input.vae_rgba().bytes()),
+                self.execution.host.owns(input.vision_patches().bytes())
+                    && self.execution.host.owns(input.vae_rgba().bytes()),
                 "preprocessed edit input belongs to another Host account"
             );
         }
         let started = std::time::Instant::now();
         let assets = self
+            .execution
+            .sources
             .assets
             .editing
             .as_ref()
@@ -193,16 +204,16 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .iter()
             .map(|request| request.prompt.as_str())
             .collect();
-        let prompt = self.assets.tokenizer.prepare_edit_batch(
+        let prompt = self.execution.sources.assets.tokenizer.prepare_edit_batch(
             &prompt_text,
-            self.config.maximum_user_tokens,
+            self.execution.config.maximum_user_tokens,
             height,
             width,
             assets.vision.merge_size(),
         )?;
         tracing::debug!(
             target: "ferrum_engine::image_generation::timing",
-            job = self.next_job,
+            job = self.execution.next_job,
             batch_size = requests.len(),
             edit_layout_and_prompt_us = trace_elapsed_us(started),
             "image edit batch metadata prepared"
@@ -248,9 +259,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         }
         let (prepared, generation) = (|| -> anyhow::Result<_> {
             ensure!(self.supports_edits(), "image editing is not configured");
-            self.config.validate()?;
+            self.execution.config.validate()?;
             ensure!(
-                (1..=self.config.maximum_batch_size).contains(&requests.len()),
+                (1..=self.execution.config.maximum_batch_size).contains(&requests.len()),
                 "image request batch exceeds configured maximum_batch_size"
             );
             let generation: Vec<_> = requests
@@ -259,8 +270,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .collect();
             super::prepare::batch_dimensions(
                 &generation,
-                &self.config,
-                self.assets.spatial_scale()?,
+                &self.execution.config,
+                self.execution.sources.assets.spatial_scale()?,
             )?;
             let mut inputs = Vec::with_capacity(generation.len());
             for request in requests {
@@ -294,6 +305,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         } = edit;
         let started = std::time::Instant::now();
         let positions = self
+            .execution
+            .sources
             .assets
             .sources
             .text_encoder
@@ -322,6 +335,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         drop(position_inputs);
         let started = std::time::Instant::now();
         let embedding = self
+            .execution
+            .sources
             .assets
             .sources
             .text_encoder
@@ -330,7 +345,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let text_inputs = prompt
             .managed_text_batch_inputs(
                 self.execution_host(),
-                &self.assets.text,
+                &self.execution.sources.assets.text,
                 &embedding,
                 vision_outputs,
             )
@@ -343,7 +358,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let hidden = only_output(outputs, Qwen3VLTextEncoderFamily::OUTPUT_ID).map_err(process)?;
         let text = prompt
             .prompts()
-            .crop_hidden(self.execution_host(), &self.assets.text, &hidden)
+            .crop_hidden(
+                self.execution_host(),
+                &self.execution.sources.assets.text,
+                &hidden,
+            )
             .map_err(process)?
             .into_tensor();
         drop(hidden);
@@ -378,7 +397,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 let reference = posterior
                     .normalize_from_vae(
                         self.execution_host(),
-                        &self.assets.statistics,
+                        &self.execution.sources.assets.statistics,
                         id(QwenImage21TransformerFamily::REFERENCE_LATENTS_ID)?,
                     )?
                     .into_input_tensor()?;

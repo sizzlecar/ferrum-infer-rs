@@ -10,6 +10,58 @@ fn request() -> axum::http::Request<Body> {
 }
 
 #[tokio::test]
+async fn retained_output_baseline_rejects_impossible_http_frame_before_queue_or_inference() {
+    let geometry = host_account(8 << 20);
+    let config = config();
+    let frame_upper = config
+        .response_backing_bytes(
+            &geometry,
+            PngDimensions::new(config.default_width.into(), config.default_height.into()).unwrap(),
+        )
+        .unwrap();
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            8 << 20,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: 4096,
+                // One response fits without the fixed owner; even the longest i64
+                // timestamp cannot fit it alongside this actual retained allocation.
+                output_bytes: frame_upper + frame_upper / 2,
+                transfer_staging_bytes: 0,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    let retained = host
+        .allocate_zeroed(HostMemoryClass::Output, frame_upper)
+        .unwrap()
+        .freeze();
+    let physical = retained.backing_bytes();
+    let (images, calls) = image_service_with_retained_output(host.clone(), None, Some(retained));
+    assert_eq!(images.service().retained_output_bytes(), physical as u64);
+    let router = super::super::super::AxumServer::from_state(
+        AppState::default().with_images(images.clone()),
+    )
+    .build_router()
+    .unwrap();
+    let response =
+        tokio::time::timeout(std::time::Duration::from_secs(5), router.oneshot(request()))
+            .await
+            .expect("an impossible retained-baseline frame must reject finitely")
+            .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(images.service().snapshot().pending_requests, 0);
+    assert_eq!(images.service().snapshot().rejected_requests, 0);
+    assert_eq!(images.output_usage().sessions, 0);
+    assert_eq!(host.usage().unwrap().committed_bytes(), physical);
+    images.shutdown().await.unwrap();
+    drop(images.take_shutdown().await.unwrap());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[tokio::test]
 async fn single_output_hard_limit_rejects_before_inference_but_encoded_pressure_does_not() {
     for encoded_pressure in [false, true] {
         let host = HostMemoryAccount::new(

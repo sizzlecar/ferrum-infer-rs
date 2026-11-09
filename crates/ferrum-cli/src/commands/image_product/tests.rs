@@ -3,6 +3,21 @@ use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf};
 
+#[path = "tests/errors.rs"]
+mod errors;
+
+#[test]
+fn prompt_expansion_diagnostics_are_rejected_by_a_product_without_that_capability() {
+    for policy in [json!({"mode":"disabled"}), json!({"mode":"summary"})] {
+        let mut wire = configuration();
+        wire["prompt_expansion_diagnostics"] = policy;
+        let error = serde_json::from_value::<ImageProductConfig>(wire).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown field `prompt_expansion_diagnostics`"));
+    }
+}
+
 fn configuration() -> Value {
     json!({
         "model":"local-picture", "execution_profile":"experimental_serial_cold",
@@ -43,6 +58,12 @@ fn explicit_image_json_keeps_configured_batching_and_resolves_queue_budget() {
         "default_seed":0,"rgba_scratch_bytes":16384,"output":{}
     });
     let loaded = load(&wire).unwrap();
+    let document::ImageProductDocument::QwenImage21(shared) =
+        document::ImageProductDocument::load(&path).unwrap()
+    else {
+        panic!("legacy documents must retain their declared Qwen schema");
+    };
+    assert_eq!(shared.model, loaded.model);
     let ImageBackendConfig::Cuda(cuda) = &loaded.backend else {
         panic!("expected CUDA configuration")
     };
@@ -1482,5 +1503,73 @@ fn bounded_plan_cache_configuration_is_strict_and_shared_by_run_and_serve() {
     ] {
         wire["backend"]["pipeline"]["plan_cache"] = invalid;
         assert!(load(&wire).is_err());
+    }
+}
+
+#[test]
+fn weight_arena_target_is_explicit_positive_and_shared_by_run_and_serve() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    for serving in [false, true] {
+        let mut wire = configuration();
+        if serving {
+            wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+                "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
+                "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+        }
+        let ImageBackendConfig::Cuda(default) = load(&wire).unwrap().backend else {
+            unreachable!()
+        };
+        assert_eq!(
+            default
+                .resolved_pipeline()
+                .unwrap()
+                .weight_arena_target_bytes,
+            None
+        );
+        for target in [1, 256 << 20, u64::MAX] {
+            wire["backend"]["pipeline"]["weight_arena_target_bytes"] = json!(target);
+            let ImageBackendConfig::Cuda(backend) = load(&wire).unwrap().backend else {
+                unreachable!()
+            };
+            let expected = std::num::NonZeroU64::new(target);
+            assert_eq!(
+                backend
+                    .resolved_pipeline()
+                    .unwrap()
+                    .weight_arena_target_bytes,
+                expected
+            );
+            assert_eq!(
+                backend
+                    .pipeline
+                    .resolved_limits()
+                    .unwrap()
+                    .with_device_capacity(
+                        std::num::NonZeroU64::new(backend.usable_memory_bytes).unwrap()
+                    )
+                    .weight_arena_target_bytes,
+                expected
+            );
+        }
+        for invalid in [json!(0), json!(-1), json!(1.5), json!("1024")] {
+            wire["backend"]["pipeline"]["weight_arena_target_bytes"] = invalid;
+            assert!(load(&wire).is_err());
+        }
+        wire["backend"]["pipeline"]["weight_arena_target_bytes"] = Value::Null;
+        let ImageBackendConfig::Cuda(default) = load(&wire).unwrap().backend else {
+            unreachable!()
+        };
+        assert_eq!(
+            default
+                .resolved_pipeline()
+                .unwrap()
+                .weight_arena_target_bytes,
+            None
+        );
     }
 }

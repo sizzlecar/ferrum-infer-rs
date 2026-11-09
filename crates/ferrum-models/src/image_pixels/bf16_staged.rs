@@ -3,12 +3,12 @@
 
 use half::bf16;
 
-// Nonfinite entries are deliberately unused: QwenImage21RgbaOutput validates
+// Nonfinite entries are deliberately unused: ManagedImagePixels validates
 // the complete immutable backing before any output writer can reach this code.
 static RGBA8: [u8; 1 << 16] = conversion_table();
 
 #[inline]
-pub(super) fn rgba8_finite(value: bf16) -> u8 {
+pub(crate) fn rgba8_finite(value: bf16) -> u8 {
     RGBA8[usize::from(value.to_bits())]
 }
 

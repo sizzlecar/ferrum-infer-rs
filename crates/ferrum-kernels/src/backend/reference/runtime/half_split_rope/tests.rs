@@ -63,6 +63,7 @@ fn fixture(
             rows: x.len() / 2 / columns,
             columns,
             head_dim: d,
+            rotary_dim: d,
         },
     }
 }
@@ -193,6 +194,7 @@ fn exact_extents_scalar_alignment_noalias_and_work_overflow_fail_before_executio
         rows: 1,
         columns: 2,
         head_dim: 2,
+        rotary_dim: 2,
     };
     assert_eq!(shape.byte_extents().unwrap(), (4, 4));
     assert!(ReferenceHalfSplitRopeShape {
@@ -235,6 +237,7 @@ fn shared_backing_nonzero_regions_and_late_foreign_frequency_respect_preflight()
             rows: 1,
             columns: 2,
             head_dim: 2,
+            rotary_dim: 2,
         },
     };
     submit(
@@ -275,4 +278,108 @@ fn shared_backing_nonzero_regions_and_late_foreign_frequency_respect_preflight()
         .is_err());
     assert_eq!(first_output.read(), [0xa5; 4]);
     assert_eq!(runtime.snapshot().submissions, before.submissions);
+}
+
+#[test]
+fn partial_rotation_partitions_each_head_and_copies_all_tail_bits() {
+    for (head, rotary) in [(8, 6), (128, 96), (7, 6)] {
+        let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+        let columns = head * 2;
+        let x: Vec<_> = (0..3 * columns)
+            .map(|index| (index % 127 + 1) as f32)
+            .collect();
+        let cosine: Vec<_> = (0..3 * rotary)
+            .map(|index| if index < rotary { 1. } else { 0. })
+            .collect();
+        let sine: Vec<_> = (0..3 * rotary)
+            .map(|index| if index < rotary { 0. } else { 1. })
+            .collect();
+        let mut launch = fixture(&runtime, &x, columns, &cosine, &sine, rotary);
+        launch.shape.head_dim = head;
+        let mut input_bits: Vec<_> = x
+            .iter()
+            .map(|value| bf16::from_f32(*value).to_bits())
+            .collect();
+        for row in 0..3 {
+            for h in 0..2 {
+                input_bits[row * columns + h * head + rotary] =
+                    if h == 0 { 0x8000 } else { 0x7fc1 };
+            }
+        }
+        let bytes: Vec<_> = input_bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect();
+        launch.input.write(&bytes);
+        let output = launch.output.clone();
+        let before = runtime.snapshot();
+        submit(
+            &runtime,
+            ReferenceDeviceCommand::half_split_rope_tensor(launch).unwrap(),
+        );
+        let actual = bits(&output);
+        for row in 0..3 {
+            for h in 0..2 {
+                for channel in 0..head {
+                    let index = row * columns + h * head + channel;
+                    let expected = if row == 0 || channel >= rotary {
+                        input_bits[index]
+                    } else if channel < rotary / 2 {
+                        input_bits[index + rotary / 2] ^ 0x8000
+                    } else {
+                        input_bits[index - rotary / 2]
+                    };
+                    assert_eq!(
+                        actual[index], expected,
+                        "head{head}/rot{rotary} row{row} head{h} channel{channel}"
+                    );
+                }
+            }
+        }
+        assert_eq!(runtime.snapshot().allocations, before.allocations);
+    }
+}
+
+#[test]
+fn partial_product_boundary_and_foreign_resource_preflight_are_preserved() {
+    let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+    let mut launch = fixture(
+        &runtime,
+        &[1.0078125, 0., 0., 1.015625, 0., 0., 9., 10.],
+        8,
+        &[0.50390625; 6],
+        &[0.50390625; 6],
+        6,
+    );
+    launch.shape.head_dim = 8;
+    let output = launch.output.clone();
+    submit(
+        &runtime,
+        ReferenceDeviceCommand::half_split_rope_tensor(launch).unwrap(),
+    );
+    assert_eq!(bf16::from_bits(bits(&output)[0]).to_f32(), -0.00390625);
+    let foreign = ReferenceDeviceRuntime::new(config()).unwrap();
+    let mut launch = fixture(&runtime, &[1.; 8], 8, &[1.; 6], &[0.; 6], 6);
+    launch.shape.head_dim = 8;
+    launch.cosine = fixture(&foreign, &[1.; 8], 8, &[1.; 6], &[0.; 6], 6).cosine;
+    let output = launch.output.clone();
+    let before = runtime.snapshot();
+    let mut stream = runtime.create_stream().unwrap();
+    assert!(runtime
+        .submit_entries(
+            &mut stream,
+            vec![(
+                DeviceCommandPhase::Compute,
+                Some(0),
+                ReferenceDeviceCommand::half_split_rope_tensor(launch).unwrap()
+            )],
+            false
+        )
+        .is_err());
+    assert_eq!(output.read(), [0xa5; 16]);
+    assert_eq!(runtime.snapshot().submissions, before.submissions);
+    let mut alias = fixture(&runtime, &[1.; 8], 8, &[1.; 6], &[0.; 6], 6);
+    alias.shape.head_dim = 8;
+    alias.output = alias.input.clone();
+    assert!(ReferenceDeviceCommand::half_split_rope_tensor(alias).is_err());
 }

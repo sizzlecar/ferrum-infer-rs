@@ -49,7 +49,9 @@ impl CudaPhiloxDeviceGeometry {
             attr(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?,
         )
     }
-    pub(super) fn new(multiprocessors: i32, threads: i32) -> Result<Self, CudaDeviceRuntimeError> {
+    /// Validate launch-limit metadata without opening a CUDA device. Executable
+    /// provider factories still query their original runtime via `query`.
+    pub fn new(multiprocessors: i32, threads: i32) -> Result<Self, CudaDeviceRuntimeError> {
         if multiprocessors <= 0 || threads < THREADS as i32 {
             return Err(CudaDeviceRuntimeError::contract(
                 "Philox requires positive SM count and at least 256 threads per SM",
@@ -88,6 +90,19 @@ impl CudaPhiloxDeviceGeometry {
             elements,
             rounds,
         })
+    }
+    /// Same native mapping as BF16, with the independent four-byte extent
+    /// bound. This does not change `launch` or the existing BF16 profile.
+    pub fn launch_f32(
+        self,
+        elements: u64,
+    ) -> Result<CudaPhiloxLaunchGeometry, CudaDeviceRuntimeError> {
+        if elements == 0 || elements > i32::MAX as u64 / 4 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "Philox requires positive 32-bit F32 byte extent",
+            ));
+        }
+        self.launch(elements)
     }
 }
 impl CudaPhiloxLaunchGeometry {
@@ -128,7 +143,6 @@ impl PreparedProvider {
         })
     }
 
-    #[cfg(test)]
     pub(super) fn descriptor(&self) -> &OperationProviderDescriptor {
         &self.descriptor
     }
@@ -375,5 +389,16 @@ mod tests {
         assert_eq!(p.launch((1 << 30) - 1).unwrap().offset_advance(), 4194304);
         assert!(nonoverlapping_ranges(0x1000, 16, 0x1008, 32).is_err());
         assert!(nonoverlapping_ranges(0x1000, 16, 0x1010, 32).is_ok());
+    }
+    #[test]
+    fn direct_f32_uses_same_launch_mapping_and_its_own_byte_bound() {
+        let p = CudaPhiloxDeviceGeometry::new(2, 768).unwrap();
+        for n in [1, 256, 257, 1536, 6144, 6145] {
+            assert_eq!(p.launch_f32(n).unwrap(), p.launch(n).unwrap());
+        }
+        assert!(p.launch_f32(0).is_err());
+        assert!(p.launch_f32(1 << 29).is_err());
+        assert!(p.launch_f32((1 << 29) - 1).is_ok());
+        assert!(p.launch(1 << 29).is_ok());
     }
 }
