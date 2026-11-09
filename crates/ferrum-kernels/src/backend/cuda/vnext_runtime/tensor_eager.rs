@@ -4,7 +4,7 @@
 use std::sync::atomic::AtomicUsize;
 
 pub use crate::backend::cuda_tensor_causal_policy::{
-    CudaDenseF16CausalProfile, CudaTensorExecutionProfile,
+    CudaDenseCausalProfile, CudaDenseF16CausalProfile, CudaTensorExecutionProfile,
 };
 use crate::backend::cuda_tensor_memory_policy::{AutoMemoryPolicy, RetainedNative};
 pub use crate::backend::cuda_tensor_memory_policy::{
@@ -448,6 +448,9 @@ impl CudaDeviceRuntime {
     ) -> Result<Self, CudaDeviceRuntimeError> {
         options.native_lane_reuse.validate(config.maximum_streams)?;
         options.native_allocation_reuse.validate()?;
+        if let Some(policy) = options.pinned_weight_upload {
+            policy.validate()?;
+        }
         let policy = AutoMemoryPolicy::new(config.utilization, config.maximum_memory_bytes)
             .map_err(CudaDeviceRuntimeError::contract)?;
         let total = query_device_total(config.device.ordinal)?;
@@ -485,6 +488,9 @@ impl CudaDeviceRuntime {
     ) -> Result<Self, CudaDeviceRuntimeError> {
         options.native_lane_reuse.validate(config.maximum_streams)?;
         options.native_allocation_reuse.validate()?;
+        if let Some(policy) = options.pinned_weight_upload {
+            policy.validate()?;
+        }
         if config.device.device_id.as_str() != format!("device.cuda.{}", config.device.ordinal) {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA tensor runtime requires the canonical physical device identity",
@@ -602,6 +608,12 @@ impl CudaDeviceRuntime {
             hash.update(maximum_entry_bytes.get().to_le_bytes());
             hash.update((maximum_entries.get() as u64).to_le_bytes());
             hash.update(include_bytes!("idle_allocations.rs"));
+        }
+        if let Some(policy) = options.pinned_weight_upload {
+            hash.update(b"cuda.pinned-managed-weights.v1\0");
+            hash.update((policy.maximum_allocation_bytes.get() as u64).to_le_bytes());
+            hash.update((policy.maximum_registered_bytes.get() as u64).to_le_bytes());
+            hash.update(include_bytes!("pinned_host.rs"));
         }
         // Allocator ownership/recovery is part of the executable runtime
         // contract, including for explicitly bounded (non-auto) construction.
@@ -765,6 +777,15 @@ impl CudaDeviceRuntime {
         }
         let (mut runtime, state) = guard.into_parts();
         runtime.tensor_eager = Some(state);
+        if let Some(policy) = options.pinned_weight_upload {
+            runtime.pinned_weight_upload = Some((
+                pinned_host::CudaPinnedHostRegistry::new(
+                    Arc::clone(&runtime.context),
+                    policy.maximum_registered_bytes.get(),
+                )?,
+                policy.maximum_allocation_bytes.get(),
+            ));
+        }
         runtime.idle_native_lanes = idle_lanes::IdleNativeLanes::new(options.native_lane_reuse);
         runtime.idle_native_allocations = idle_allocations::IdleAllocations::new(
             options.native_allocation_reuse,

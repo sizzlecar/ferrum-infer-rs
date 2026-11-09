@@ -14,7 +14,9 @@ async fn mtp_product_wrapper_runs_original_assets_and_reports_real_retirement() 
     // Neither the verified mapping nor the tokenizer/template is reconstructed.
     let assets =
         Arc::get_mut(&mut fixture.assets).expect("fixture has not shared its expansion assets");
-    assets.configure_mtp(PH3ImagePromptExpansionMtp::OneDraft);
+    assets
+        .configure_mtp(PH3ImagePromptExpansionMtp::OneDraft)
+        .unwrap();
     let prepared = fixture
         .assets
         .prepare_text_cohort(fixture.requests())
@@ -84,7 +86,8 @@ fn mtp_product_wrapper_cancel_before_initialization_refunds_original_phase() {
     let mut fixture = Fixture::new();
     Arc::get_mut(&mut fixture.assets)
         .unwrap()
-        .configure_mtp(PH3ImagePromptExpansionMtp::OneDraft);
+        .configure_mtp(PH3ImagePromptExpansionMtp::OneDraft)
+        .unwrap();
     let (composition, runtime) = composition();
     let host = host();
     let prepared = fixture
@@ -138,7 +141,8 @@ async fn mtp_product_wrapper_latches_partial_cancel_during_initialization() {
     let (_, answers) = ordinary(&fixture, &host, &composition).await;
     Arc::get_mut(&mut fixture.assets)
         .unwrap()
-        .configure_mtp(PH3ImagePromptExpansionMtp::OneDraft);
+        .configure_mtp(PH3ImagePromptExpansionMtp::OneDraft)
+        .unwrap();
     let prepared = fixture
         .assets
         .prepare_text_cohort(fixture.requests())
@@ -208,7 +212,8 @@ async fn mtp_product_wrapper_invalid_membership_retires_partial_installation_wit
     let mut fixture = Fixture::new();
     Arc::get_mut(&mut fixture.assets)
         .unwrap()
-        .configure_mtp(PH3ImagePromptExpansionMtp::OneDraft);
+        .configure_mtp(PH3ImagePromptExpansionMtp::OneDraft)
+        .unwrap();
     let (composition, runtime) = composition();
     let host = host();
     let prepared = fixture

@@ -130,6 +130,9 @@ pub struct PH3ImageCudaBackendConfig {
     /// device ceiling. Every hit still receives fresh Core initialization.
     #[serde(default)]
     pub native_allocation_reuse: Option<PH3ImageNativeAllocationReuseConfig>,
+    #[serde(default)]
+    pub pinned_weight_upload:
+        Option<ferrum_engine::image_generation::p_h3::PH3ImagePinnedWeightUpload>,
     pub maximum_in_flight_per_stream: usize,
     pub maximum_commands_per_submission: usize,
     pub opaque_memory_profile: String,
@@ -213,6 +216,16 @@ impl PH3ImageProductConfig {
         ensure!(self.prompt_expansion.is_enabled() == backend.prompt_expansion_causal.is_some(),
             "enabled H3 prompt expansion requires an explicit causal-module allowance; disabled mode must omit it");
         backend.validate()?;
+        if let (PH3ImagePromptExpansionConfig::Enabled(expansion), Some(causal)) =
+            (&self.prompt_expansion, &backend.prompt_expansion_causal)
+        {
+            ensure!(
+                causal.precision != ferrum_models::vnext::qwen35::Qwen35DensePrecision::Bf16
+                    || expansion.mtp
+                        == ferrum_engine::image_generation::p_h3::PH3ImagePromptExpansionMtp::Off,
+                "BF16 prompt expansion currently requires MTP off"
+            );
+        }
         // Tile shape/alignment is checked against the actual VAE architecture
         // by prepare_decoder/encoder. Reject malformed policy values now too.
         if let PH3ImageVaeSpatialPolicy::Tiled {
@@ -341,6 +354,9 @@ impl PH3ImageCudaBackendConfig {
     /// native command-record and actual-family checks before its sole context.
     pub fn validate(&self) -> Result<()> {
         let limits = self.pipeline.resolved_limits()?;
+        if let Some(policy) = self.pinned_weight_upload {
+            policy.validate()?;
+        }
         if let Some(reuse) = self.native_allocation_reuse {
             reuse.validate()?;
         }
@@ -479,6 +495,9 @@ impl PH3ImageCudaBackendConfig {
             CudaCudnnConfig,
         };
         self.validate()?;
+        if let Some(policy) = self.pinned_weight_upload {
+            policy.validate()?;
+        }
         let mut options = PH3ImagePipelineOptions::comfy_f32(
             ferrum_runtime::NumericalProfileId::new(CUDA_PHILOX_NORMAL_F32_NUMERICAL_PROFILE_ID)
                 .map_err(anyhow::Error::msg)?,
@@ -503,6 +522,7 @@ impl PH3ImageCudaBackendConfig {
                 CudaNativeAllocationReuse::Off,
                 PH3ImageNativeAllocationReuseConfig::resolved,
             ),
+            pinned_weight_upload: self.pinned_weight_upload,
             maximum_in_flight_per_stream: self.maximum_in_flight_per_stream,
             maximum_commands_per_submission: self.maximum_commands_per_submission,
             opaque_memory_profile: self.opaque_memory_profile.clone(),

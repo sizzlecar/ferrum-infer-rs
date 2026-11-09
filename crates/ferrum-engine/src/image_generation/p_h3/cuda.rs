@@ -70,6 +70,7 @@ pub struct PH3ImageCudaConfig {
     pub native_lane_reuse: CudaNativeLaneReuse,
     /// Fixed opaque reservation; reused bytes still require fresh Core permits.
     pub native_allocation_reuse: CudaNativeAllocationReuse,
+    pub pinned_weight_upload: Option<super::PH3ImagePinnedWeightUpload>,
     pub maximum_in_flight_per_stream: usize,
     pub maximum_commands_per_submission: usize,
     pub opaque_memory_profile: String,
@@ -95,6 +96,7 @@ pub struct PH3ImageCudaCompositionReceipt {
     pub native_lane_reuse_maximum_idle_lanes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_allocation_reuse: Option<PH3ImageNativeAllocationReuseReceipt>,
+    pub pinned_weight_upload: Option<super::PH3ImagePinnedWeightUpload>,
     pub device_capacity_bytes: u64,
     pub observed_memory: Option<CudaTensorMemoryObservation>,
     pub runtime_opaque_profile: String,
@@ -160,6 +162,9 @@ impl PH3ImageCudaConfig {
     pub fn validate(&self) -> Result<()> {
         self.pipeline.validate()?;
         self.native_allocation_reuse.validate()?;
+        if let Some(policy) = self.pinned_weight_upload {
+            policy.validate()?;
+        }
         ensure!(
             self.pipeline.decoder_batch_policy == ImageDecoderBatchPolicy::SingleImage
                 && self.pipeline.edit_prefix_policy == ImageEditPrefixPolicy::Recompute,
@@ -257,6 +262,18 @@ impl PH3ImageCudaConfig {
         PH3ImageCudaCompositionReceipt,
     )> {
         let visual_expansion = assets.has_prompt_expansion_visual();
+        let bf16_expansion = self
+            .prompt_expansion_causal
+            .as_ref()
+            .is_some_and(|p| p.is_bf16());
+        ensure!(
+            assets
+                .expansion
+                .as_ref()
+                .is_some_and(|e| e.assets.is_bf16())
+                == bf16_expansion,
+            "causal CUDA precision differs from the prepared model definition"
+        );
         if visual_expansion {
             self.prompt_expansion_causal = self
                 .prompt_expansion_causal
@@ -296,7 +313,13 @@ impl PH3ImageCudaConfig {
         let (selection, mut contracts): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
         contracts.extend(operations::independent_contracts()?);
         if self.prompt_expansion_causal.is_some() {
-            contracts.extend(if visual_expansion {
+            contracts.extend(if bf16_expansion {
+                if visual_expansion {
+                    cuda_vnext_dense_bf16_visual_causal_contracts()?
+                } else {
+                    cuda_vnext_dense_bf16_causal_contracts()?
+                }
+            } else if visual_expansion {
                 cuda_vnext_dense_f16_visual_causal_contracts()?
             } else {
                 cuda_vnext_dense_f16_causal_contracts()?
@@ -320,7 +343,16 @@ impl PH3ImageCudaConfig {
         let stream_plan = self.stream_plan()?;
         let device_id = DeviceId::new(format!("device.cuda.{}", self.ordinal))?;
         let mut device = if self.prompt_expansion_causal.is_some() {
-            if visual_expansion {
+            if bf16_expansion {
+                if visual_expansion {
+                    cuda_tensor_and_dense_bf16_visual_causal_runtime_config(
+                        self.ordinal,
+                        device_id,
+                    )?
+                } else {
+                    cuda_tensor_and_dense_bf16_causal_runtime_config(self.ordinal, device_id)?
+                }
+            } else if visual_expansion {
                 cuda_tensor_and_dense_f16_visual_causal_runtime_config(self.ordinal, device_id)?
             } else {
                 cuda_tensor_and_dense_f16_causal_runtime_config(self.ordinal, device_id)?
@@ -343,9 +375,15 @@ impl PH3ImageCudaConfig {
         let runtime_options = CudaTensorRuntimeOptions {
             native_lane_reuse: self.native_lane_reuse,
             native_allocation_reuse: self.native_allocation_reuse,
+            pinned_weight_upload: self.pinned_weight_upload.map(|policy| {
+                ferrum_kernels::backend::cuda::vnext_runtime::CudaPinnedWeightUploadConfig {
+                    maximum_allocation_bytes: policy.maximum_allocation_bytes,
+                    maximum_registered_bytes: policy.maximum_registered_bytes,
+                }
+            }),
         };
         // Exactly one context, and automatic capacity observes this same one.
-        let runtime = Arc::new(match self.memory {
+        let runtime = match self.memory {
             ImageCudaMemoryPolicy::ExplicitTotal(bytes) => {
                 let tensor = CudaTensorRuntimeConfig {
                     device,
@@ -401,7 +439,8 @@ impl PH3ImageCudaConfig {
                     )?,
                 }
             }
-        });
+        };
+        let runtime = Arc::new(runtime);
         let observed_memory = runtime.tensor_memory_observation().copied();
         let capacity = match self.memory {
             ImageCudaMemoryPolicy::ExplicitTotal(bytes) => bytes,
@@ -445,7 +484,13 @@ impl PH3ImageCudaConfig {
         // Selected affine/patch providers share the union module above.
         // The independent bias-free dense provider still needs only lane BLAS.
         if self.prompt_expansion_causal.is_some() {
-            providers.extend(if visual_expansion {
+            providers.extend(if bf16_expansion {
+                if visual_expansion {
+                    cuda_vnext_dense_bf16_visual_causal_providers(&runtime)?
+                } else {
+                    cuda_vnext_dense_bf16_causal_providers(&runtime)?
+                }
+            } else if visual_expansion {
                 cuda_vnext_dense_f16_visual_causal_providers(&runtime)?
             } else {
                 cuda_vnext_dense_f16_causal_providers(&runtime)?
@@ -487,6 +532,7 @@ impl PH3ImageCudaConfig {
             stream_plan,
             native_lane_reuse_maximum_idle_lanes: self.native_lane_reuse_maximum_idle_lanes(),
             native_allocation_reuse: self.native_allocation_reuse_receipt(),
+            pinned_weight_upload: self.pinned_weight_upload,
             device_capacity_bytes: capacity.get(),
             observed_memory,
             runtime_opaque_profile: self.opaque_memory_profile.clone(),
@@ -503,7 +549,13 @@ impl PH3ImageCudaConfig {
                 .as_ref()
                 .and_then(CudaDenseF16CausalProfile::decode_replay_limits),
             prompt_expansion_causal_mode: self.prompt_expansion_causal.as_ref().map(|_| {
-                if visual_expansion {
+                if bf16_expansion {
+                    if visual_expansion {
+                        "qwen3_5.bf16.visual_prompt_v1"
+                    } else {
+                        "qwen3_5.bf16"
+                    }
+                } else if visual_expansion {
                     "qwen3_5.f16.visual_prompt_v1"
                 } else {
                     "qwen3_5.f16"
@@ -524,7 +576,14 @@ impl PH3ImageCudaConfig {
             vae_decoder_tile_batch: self.options.vae_decoder_tile_batch,
         };
         let opaque = self.opaque_bytes()?;
-        let host = HostMemoryAccount::new(self.host);
+        let host = if self.pinned_weight_upload.is_some() {
+            HostMemoryAccount::with_allocation_alignment(
+                self.host,
+                CudaDeviceRuntime::pinned_weight_upload_alignment()?,
+            )?
+        } else {
+            HostMemoryAccount::new(self.host)
+        };
         let mut pipeline = PH3ImagePipeline::new(
             runtime,
             host,

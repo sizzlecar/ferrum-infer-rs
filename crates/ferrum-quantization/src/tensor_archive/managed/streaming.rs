@@ -47,13 +47,16 @@ impl Default for Bf16F16ConversionPolicy {
 /// Complete source metadata bound to the original archive. Preparing this
 /// descriptor reads no tensor values and allocates no converted payload.
 /// Execution-plan identity and placement remain the caller's responsibility.
-pub struct PreparedBf16F16Component<'archive> {
+pub struct PreparedDenseArchiveComponent<'archive> {
     _archive: &'archive dyn TensorArchive,
     component: WeightComponentSpec,
     source_files: Vec<String>,
     parts: Vec<RetainedHostMemoryRegion>,
     full_bytes: usize,
 }
+
+/// Compatibility name for existing BF16-to-F16 streaming callers.
+pub type PreparedBf16F16Component<'archive> = PreparedDenseArchiveComponent<'archive>;
 
 /// One continuously charged Host allocation. Every published range retains
 /// this entire allocation, including padding. Native users must release all
@@ -76,6 +79,24 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
                 element_type: ElementType::F16,
             })
         {
+            return Ok(None);
+        }
+        self.prepare_dense_stream(component)
+    }
+
+    /// Stream an original BF16 tensor into an accounted slot, preserving BF16
+    /// bits or performing the explicitly declared F16 conversion. Composite
+    /// ranges retain their source order; no full tensor payload is allocated.
+    pub fn prepare_dense_stream(
+        &self,
+        component: &WeightComponentSpec,
+    ) -> std::result::Result<Option<PreparedDenseArchiveComponent<'archive>>, VNextError> {
+        if !matches!(
+            component.encoding,
+            WeightEncoding::Dense {
+                element_type: ElementType::F16 | ElementType::Bf16
+            }
+        ) {
             return Ok(None);
         }
         if component.external_names.is_empty()
@@ -154,7 +175,7 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
                 "combined source extent differs from the full component",
             ));
         }
-        Ok(Some(PreparedBf16F16Component {
+        Ok(Some(PreparedDenseArchiveComponent {
             _archive: self.archive,
             component: component.clone(),
             source_files: tensors.iter().map(|t| t.source_file().to_owned()).collect(),
@@ -168,7 +189,7 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
 
     /// Allocate only after the caller validates its original admitted Host
     /// scope and computes physical capacity with `HostMemoryAccount::backing_bytes`.
-    /// The logical capacity must hold complete F16 elements. No second slot or
+    /// The logical capacity must hold complete 16-bit elements. No second slot or
     /// unaccounted fallback is allocated if this reservation is rejected.
     pub fn bounded_streaming_slot(
         &self,
@@ -194,7 +215,7 @@ impl ManagedDenseArchiveStreamingSlot<'_> {
     }
 }
 
-impl PreparedBf16F16Component<'_> {
+impl PreparedDenseArchiveComponent<'_> {
     pub fn component(&self) -> &WeightComponentSpec {
         &self.component
     }
@@ -258,13 +279,22 @@ impl PreparedBf16F16Component<'_> {
             let stop = end.min(part_end);
             if start < stop {
                 let bytes = stop - start;
-                convert_part_with(
-                    &part.bytes()[start - part_start..stop - part_start],
-                    &mut destination.as_mut()[written..written + bytes],
-                    policy,
-                    |_, input, output| bf16_to_f16::convert(input, output),
-                    |_| Ok(()),
-                )?;
+                if self.component.encoding
+                    == (WeightEncoding::Dense {
+                        element_type: ElementType::Bf16,
+                    })
+                {
+                    destination.as_mut()[written..written + bytes]
+                        .copy_from_slice(&part.bytes()[start - part_start..stop - part_start]);
+                } else {
+                    convert_part_with(
+                        &part.bytes()[start - part_start..stop - part_start],
+                        &mut destination.as_mut()[written..written + bytes],
+                        policy,
+                        |_, input, output| bf16_to_f16::convert(input, output),
+                        |_| Ok(()),
+                    )?;
+                }
                 written += bytes;
             }
             part_start = part_end;

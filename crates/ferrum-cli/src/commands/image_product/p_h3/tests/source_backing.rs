@@ -110,3 +110,83 @@ fn expansion_source_backing_rejects_unknown_disabled_and_process_mapped_combinat
     }
     assert!(!directory.path().join("normalized").exists());
 }
+
+#[test]
+fn bf16_causal_config_selects_matching_model_kv_and_decode_replay_but_rejects_mtp() {
+    use ferrum_models::vnext::qwen35::Qwen35DensePrecision;
+    let directory = tempfile::tempdir().unwrap();
+    let mut wire = enabled_document();
+    let default = load(directory.path(), &wire).unwrap();
+    let PH3ImageBackendConfig::Cuda(backend) = default.backend;
+    assert_eq!(
+        backend.prompt_expansion_causal.unwrap().precision,
+        Qwen35DensePrecision::F16
+    );
+    wire["backend"]["prompt_expansion_causal"]["precision"] = json!("bf16");
+    let config = load(directory.path(), &wire).unwrap();
+    let PH3ImageBackendConfig::Cuda(backend) = config.backend;
+    let PH3ImagePromptExpansionConfig::Enabled(expansion) = config.prompt_expansion else {
+        panic!("enabled fixture")
+    };
+    let mut options = expansion.options(0).unwrap();
+    backend
+        .prompt_expansion_causal
+        .unwrap()
+        .configure_expansion(&mut options);
+    assert_eq!(
+        options.engine.numerical_execution,
+        ferrum_models::vnext::qwen35::BF16_NUMERICAL_PROFILE_ID
+            .parse()
+            .unwrap()
+    );
+    assert_eq!(
+        options.engine.kv_cache.dtype,
+        ferrum_types::KvCacheDtype::Bf16
+    );
+    assert!(!options.engine.backend.enable_reusable_execution);
+    wire["prompt_expansion"]["mtp"] = json!("one_draft");
+    assert!(load(directory.path(), &wire).is_err());
+    wire["prompt_expansion"]["mtp"] = json!("off");
+    wire["backend"]["prompt_expansion_causal"]["decode_replay"] =
+        json!({"maximum_executables":4,"opaque_memory_bytes_per_stream":1048576});
+    let config = load(directory.path(), &wire).unwrap();
+    let PH3ImageBackendConfig::Cuda(backend) = config.backend;
+    let causal = backend.prompt_expansion_causal.unwrap();
+    causal.configure_expansion(&mut options);
+    assert_eq!(causal.precision, Qwen35DensePrecision::Bf16);
+    assert_eq!(
+        options.engine.kv_cache.dtype,
+        ferrum_types::KvCacheDtype::Bf16
+    );
+    assert!(options.engine.backend.enable_reusable_execution);
+    let capture = options.engine.backend.reusable_execution_capture;
+    assert_eq!(
+        capture.scope,
+        ferrum_types::ReusableExecutionCaptureScope::DecodeOnly
+    );
+    assert_eq!(
+        capture.preparation,
+        ferrum_types::ReusableExecutionPreparationMode::OnDemand
+    );
+    assert_eq!(capture.maximum_executables_per_lane, Some(4));
+    assert_eq!(
+        causal.decode_replay.unwrap().opaque_memory_bytes_per_stream,
+        1048576
+    );
+    wire["prompt_expansion"]["mtp"] = json!("one_draft");
+    assert!(load(directory.path(), &wire).is_err());
+}
+
+#[test]
+fn pinned_upload_config_bounds_physical_owner_and_total_before_source_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut wire = enabled_document();
+    wire["backend"]["pinned_weight_upload"] =
+        json!({"maximum_allocation_bytes":67108864,"maximum_registered_bytes":268435456});
+    load(directory.path(), &wire).unwrap();
+    for (owner, total) in [(0u64, 1u64), (2, 1), (1, 0), (1, u64::MAX)] {
+        wire["backend"]["pinned_weight_upload"] =
+            json!({"maximum_allocation_bytes":owner,"maximum_registered_bytes":total});
+        assert!(load(directory.path(), &wire).is_err());
+    }
+}

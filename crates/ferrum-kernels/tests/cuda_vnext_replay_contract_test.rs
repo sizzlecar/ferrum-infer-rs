@@ -1,6 +1,9 @@
 const CAUSAL_ATTENTION_SOURCE: &str =
     include_str!("../src/backend/cuda/vnext_ops/transformer/causal_attention.rs");
-const CAUSAL_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/vnext_causal_attention.cu");
+const CAUSAL_ATTENTION_KERNEL_SOURCE: &str = concat!(
+    include_str!("../kernels/vnext_causal_attention.cu"),
+    include_str!("../kernels/vnext_causal_attention_impl.cuh"),
+);
 const RECURRENT_ATTENTION_SOURCE: &str =
     include_str!("../src/backend/cuda/vnext_ops/transformer/attention.rs");
 const TRANSFORMER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer.rs");
@@ -444,7 +447,11 @@ fn causal_fallback_packs_prepare_and_attention_across_participants() {
     assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int packed_token = (int)blockIdx.x"));
     assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int kv_head = (int)blockIdx.y"));
     assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int queries_per_kv"));
-    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("extern __shared__ __half grouped_kv_tile[]"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE
+        .contains("namespace ferrum_causal_f16 {\nusing CausalScalar = __half;"));
+    assert!(
+        CAUSAL_ATTENTION_KERNEL_SOURCE.contains("extern __shared__ CausalScalar grouped_kv_tile[]")
+    );
     assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("VNEXT_GROUPED_GEMMA_LOCAL_KV_TILE_TOKENS"));
     assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("VNEXT_GROUPED_DEFAULT_KV_TILE_TOKENS"));
 }

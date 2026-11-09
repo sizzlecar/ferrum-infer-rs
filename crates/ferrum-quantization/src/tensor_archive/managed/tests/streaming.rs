@@ -6,6 +6,52 @@ fn capacity(bytes: usize) -> NonZeroUsize {
 }
 
 #[test]
+fn native_bf16_stream_preserves_bits_and_composite_order_with_bounded_backing() {
+    // Include signed zero, BF16-only finite range, infinities and NaN payloads.
+    let bits = [0x8000u16, 0x7f7f, 0xff7f, 0x7f80, 0x7fc1, 0x0001];
+    let bytes = bits
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let (_directory, archive) = archive(&[
+        Tensor {
+            name: "first",
+            shape: vec![1, 3],
+            dtype: Dtype::BF16,
+            bytes: bytes[..6].to_vec(),
+        },
+        Tensor {
+            name: "second",
+            shape: vec![1, 3],
+            dtype: Dtype::BF16,
+            bytes: bytes[6..].to_vec(),
+        },
+    ]);
+    let host = host();
+    let source = ManagedDenseArchiveSource::new(&archive, &host);
+    let spec = component(&["second", "first"], &[2, 3], ElementType::Bf16);
+    assert!(source.prepare_bf16_f16_stream(&spec).unwrap().is_none());
+    let prepared = source.prepare_dense_stream(&spec).unwrap().unwrap();
+    let slot = source.bounded_streaming_slot(capacity(4)).unwrap();
+    let mut output = Vec::new();
+    for offset in (0..12).step_by(4) {
+        output.extend_from_slice(
+            prepared
+                .materialize_range(&slot, offset, 4)
+                .unwrap()
+                .bytes(),
+        );
+        assert_eq!(
+            host.usage().unwrap().allocated_bytes(),
+            slot.backing_bytes()
+        );
+    }
+    assert_eq!(output, [&bytes[6..], &bytes[..6]].concat());
+    drop(slot);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
 fn metadata_survives_source_wrapper_and_ranges_reuse_one_original_owner() {
     let (_directory, archive) = archive(&[bf("a", 1, 9, &[1., -0., 2., 3., 4., 5., 6., 7., 8.])]);
     let spec = component(&["a"], &[1, 9], ElementType::F16);

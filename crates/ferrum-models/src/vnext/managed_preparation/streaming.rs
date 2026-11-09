@@ -1,6 +1,6 @@
 //! One-use bounded source normalization, armed by the exact selected plan.
 use super::*;
-use ferrum_quantization::{ManagedDenseArchiveStreamingSlot, PreparedBf16F16Component};
+use ferrum_quantization::{ManagedDenseArchiveStreamingSlot, PreparedDenseArchiveComponent};
 use ferrum_runtime::{
     PlanHash, StaticWeightSourceContext, StaticWeightSourceRetention, WeightComponentRange,
     WeightComponentRangeRequest, WeightComponentStreamSpec, WeightId,
@@ -19,7 +19,7 @@ const READY: u8 = 4;
 const FAILED: u8 = 5;
 
 enum Component<'archive> {
-    Stream(PreparedBf16F16Component<'archive>),
+    Stream(PreparedDenseArchiveComponent<'archive>),
     Full(WeightComponentSpec),
 }
 
@@ -87,7 +87,7 @@ impl<'archive> StaticStreaming<'archive> {
                         .ok_or_else(|| invalid("streaming group references an unknown source"))?;
                     let bytes = usize::try_from(source.component_backing_bytes(component)?)
                         .map_err(|_| invalid("source backing exceeds address space"))?;
-                    if let Some(prepared) = source.source.prepare_bf16_f16_stream(component)? {
+                    if let Some(prepared) = source.source.prepare_dense_stream(component)? {
                         maximum_full_stream_bytes =
                             maximum_full_stream_bytes.max(prepared.full_bytes());
                         components.insert(id.clone(), Component::Stream(prepared));
@@ -295,7 +295,7 @@ fn selected<'a, 'archive>(
 
 fn stream_spec(
     recipe: &Recipe<'_>,
-    component: &PreparedBf16F16Component<'_>,
+    component: &PreparedDenseArchiveComponent<'_>,
 ) -> Result<WeightComponentStreamSpec, VNextError> {
     WeightComponentStreamSpec::new(
         component.component(),

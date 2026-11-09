@@ -1388,11 +1388,13 @@ struct VNextLanguageIoIds {
 fn is_language_token_embedding_operation(operation_id: &str) -> bool {
     operation_id == TOKEN_EMBEDDING_OPERATION_ID
         || operation_id == TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID
+        || operation_id == ferrum_runtime::TOKEN_EMBEDDING_BF16_OPERATION_ID
 }
 
 fn is_language_masked_argmax_operation(operation_id: &str) -> bool {
     operation_id == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
         || operation_id == LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID
+        || operation_id == ferrum_runtime::LAST_TOKEN_MASKED_ARGMAX_BF16_OPERATION_ID
 }
 
 #[derive(Debug, Clone)]
@@ -9853,16 +9855,18 @@ mod tests {
     }
 
     #[test]
-    fn language_io_resolution_accepts_legacy_and_fp32_master_contracts_only() {
+    fn language_io_resolution_accepts_declared_causal_precision_contracts() {
         for operation_id in [
             TOKEN_EMBEDDING_OPERATION_ID,
             TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
+            ferrum_runtime::TOKEN_EMBEDDING_BF16_OPERATION_ID,
         ] {
             assert!(is_language_token_embedding_operation(operation_id));
         }
         for operation_id in [
             LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
             LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
+            ferrum_runtime::LAST_TOKEN_MASKED_ARGMAX_BF16_OPERATION_ID,
         ] {
             assert!(is_language_masked_argmax_operation(operation_id));
         }

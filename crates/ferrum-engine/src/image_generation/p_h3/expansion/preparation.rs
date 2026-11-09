@@ -111,15 +111,15 @@ impl NativeTextExpansion {
                     output: if decode {
                         ManagedCausalReadback::GreedyToken
                     } else {
-                        ManagedCausalReadback::F16Logits
+                        if self.is_bf16() {
+                            ManagedCausalReadback::Bf16Logits
+                        } else {
+                            ManagedCausalReadback::F16Logits
+                        }
                     },
                 })
                 .collect::<Vec<_>>();
-            compiled.managed_io_requirements(
-                host,
-                ManagedCausalIoProfile::ManagedGreedyF16V1,
-                &work,
-            )
+            compiled.managed_io_requirements(host, self.managed_io_profile(), &work)
         };
         let prefill = query(false)?;
         let decode = query(true)?;

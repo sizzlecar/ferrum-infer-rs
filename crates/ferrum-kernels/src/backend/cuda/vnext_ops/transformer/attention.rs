@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use super::replay_encoding::{Encoding, EncodingTarget};
 use super::{
     attach_invocation_binding, contiguous_bindings, ensure_estimator_request, estimate,
-    launch_gemm_f16, provider_failure, ProjectionWeightSupport,
+    launch_gemm_bf16, launch_gemm_f16, provider_failure, ProjectionWeightSupport,
 };
 #[cfg(feature = "vllm-marlin")]
 use super::{
@@ -196,6 +196,16 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         )
     }
 
+    pub(in crate::backend::cuda::vnext_ops) fn new_dense_bf16(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision_and_weights(
+            runtime,
+            AttentionPrecision::Bf16,
+            ProjectionWeightSupport::DenseBf16,
+        )
+    }
+
     pub(in crate::backend::cuda::vnext_ops) fn new_candidate(
         runtime: &CudaDeviceRuntime,
         f32_master: bool,
@@ -255,6 +265,8 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             include_bytes!("../transformer.rs"),
             if weight_support == ProjectionWeightSupport::DenseF16 {
                 &b"explicit-dense-f16"[..]
+            } else if weight_support == ProjectionWeightSupport::DenseBf16 {
+                &b"explicit-dense-bf16"[..]
             } else {
                 &b"legacy-declared-formats"[..]
             },
@@ -486,6 +498,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             .context()
             .load_module(Ptx::from_src(crate::ptx::RESIDUAL_ADD.to_owned()))
             .map_err(|error| CudaDeviceRuntimeError::driver("attention residual module", error))?;
+        let bf16 = precision.activation() == ElementType::Bf16;
         let functions = AttentionFunctions {
             weight_support,
             candidates: if precision.candidate_scan() {
@@ -518,15 +531,31 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             .then(|| Q8ActKernels::load_attention(runtime.context()))
             .transpose()?,
             rms_norm: load_function(&rms_module, precision.norm(), "attention RMSNorm")?,
-            prepare: load_function(&linear_module, PREPARE_FUNCTION, "attention prepare")?,
+            prepare: load_function(
+                &linear_module,
+                if bf16 {
+                    "linear_attention_prepare_varlen_packed_qkvzba_bf16_params_f32_state_bf16_z_bf16_indirect"
+                } else {
+                    PREPARE_FUNCTION
+                },
+                "attention prepare",
+            )?,
             prepare_negative_rate: load_function(
                 &linear_module,
-                PREPARE_NEGATIVE_RATE_FUNCTION,
+                if bf16 {
+                    "vnext_linear_attention_prepare_negative_rate_bf16_indirect"
+                } else {
+                    PREPARE_NEGATIVE_RATE_FUNCTION
+                },
                 "attention negative-rate prepare",
             )?,
             conv_state_commit: load_function(
                 &linear_module,
-                CONV_STATE_COMMIT_FUNCTION,
+                if bf16 {
+                    "recurrent_conv_state_commit_bf16_indirect"
+                } else {
+                    CONV_STATE_COMMIT_FUNCTION
+                },
                 "attention convolution-state commit",
             )?,
             qk_norm: load_function(&linear_module, QK_NORM_FUNCTION, "attention QK norm")?,
@@ -546,13 +575,29 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 DELTA_TILED_INTERLEAVED_FUNCTION,
                 "attention tiled interleaved delta",
             )?,
-            gated_norm: load_function(&linear_module, GATED_NORM_FUNCTION, "attention gated norm")?,
+            gated_norm: load_function(
+                &linear_module,
+                if bf16 {
+                    "gated_rms_norm_bf16_z_f32_weight"
+                } else {
+                    GATED_NORM_FUNCTION
+                },
+                "attention gated norm",
+            )?,
             gated_norm_f16: load_function(
                 &linear_module,
-                GATED_NORM_F16_FUNCTION,
-                "attention gated norm F16 epilogue",
+                if bf16 {
+                    "gated_rms_norm_bf16_z_f32_weight_to_bf16"
+                } else {
+                    GATED_NORM_F16_FUNCTION
+                },
+                "attention gated norm activation epilogue",
             )?,
-            f32_to_f16: load_function(&sandwich_module, F32_TO_F16_FUNCTION, "attention cast")?,
+            f32_to_f16: if bf16 {
+                load_function(&linear_module, "f32_to_activation_bf16", "attention cast")?
+            } else {
+                load_function(&sandwich_module, F32_TO_F16_FUNCTION, "attention cast")?
+            },
             residual_add: load_function(
                 &residual_module,
                 precision.residual(),
@@ -1181,6 +1226,7 @@ struct CudaAttentionShape {
 #[derive(Debug, Clone, Copy)]
 enum AttentionProjection {
     F16,
+    Bf16,
     Native {
         transform_bytes_per_token: u64,
     },
@@ -1204,6 +1250,10 @@ impl AttentionProjection {
         if weight_support == ProjectionWeightSupport::DenseF16 {
             weight_support.validate_values(values, &[2, 7])?;
             return Ok(Self::F16);
+        }
+        if weight_support == ProjectionWeightSupport::DenseBf16 {
+            weight_support.validate_values(values, &[2, 7])?;
+            return Ok(Self::Bf16);
         }
         if native_projection::uses_native(values)? {
             return Ok(Self::Native {
@@ -1281,7 +1331,7 @@ impl AttentionProjection {
 
     fn workspace_bytes(self) -> Result<u64, String> {
         match self {
-            Self::F16 | Self::Native { .. } => Ok(0),
+            Self::F16 | Self::Bf16 | Self::Native { .. } => Ok(0),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { runtime, .. } => runtime.workspace_bytes(),
             #[cfg(feature = "vllm-marlin")]
@@ -1304,7 +1354,7 @@ impl AttentionProjection {
             | Self::MarlinFp8 {
                 segmented: true, ..
             } => segmented_projection_staging_bytes_per_token(qkvzba_features),
-            Self::F16 => Ok(0),
+            Self::F16 | Self::Bf16 => Ok(0),
             Self::Native {
                 transform_bytes_per_token,
             } => Ok(transform_bytes_per_token),
@@ -1318,6 +1368,7 @@ impl AttentionProjection {
     fn replay_tag(self) -> &'static str {
         match self {
             Self::F16 => "f16-cublas",
+            Self::Bf16 => "bf16-cublas",
             Self::Native { .. } => "native-compressed",
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 {
@@ -1557,9 +1608,11 @@ fn fused_gated_norm_for(
     weights: ProjectionWeightSupport,
     participant_tokens: &[u64],
 ) -> bool {
-    precision.hidden() == ElementType::F16
-        && weights == ProjectionWeightSupport::DenseF16
-        && !participant_tokens.is_empty()
+    matches!(
+        (precision.hidden(), weights),
+        (ElementType::F16, ProjectionWeightSupport::DenseF16)
+            | (ElementType::Bf16, ProjectionWeightSupport::DenseBf16)
+    ) && !participant_tokens.is_empty()
         && participant_tokens.iter().all(|n| (1..=2).contains(n))
 }
 
@@ -1592,6 +1645,9 @@ enum SharedProjectionWeight {
         parts: Arc<[weights::MatrixPart]>,
     },
     F16 {
+        region: usize,
+    },
+    Bf16 {
         region: usize,
     },
     #[cfg(feature = "vllm-marlin")]
@@ -1636,6 +1692,7 @@ impl SharedProjectionWeight {
     fn replay_tag(&self) -> &'static str {
         match *self {
             Self::F16 { .. } => "f16",
+            Self::Bf16 { .. } => "bf16",
             Self::Native { .. } => "native-compressed",
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => "marlin-fp8",
@@ -1648,7 +1705,7 @@ impl SharedProjectionWeight {
 
     fn dispatch_count(&self, rows: u64) -> Result<u64, String> {
         match *self {
-            Self::F16 { .. } => Ok(1),
+            Self::F16 { .. } | Self::Bf16 { .. } => Ok(1),
             Self::Native { ref parts, .. } => {
                 native_projection::dispatch_count(weights::dispatches(parts) as usize, rows)
             }
@@ -1676,7 +1733,7 @@ impl SharedProjectionWeight {
 
     fn marlin_workspace_zero_count(&self) -> Result<u64, String> {
         match *self {
-            Self::F16 { .. } | Self::Native { .. } => Ok(0),
+            Self::F16 { .. } | Self::Bf16 { .. } | Self::Native { .. } => Ok(0),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => Ok(1),
             #[cfg(feature = "vllm-marlin")]
@@ -1707,7 +1764,7 @@ impl SharedProjectionWeight {
     ) -> CudaCommandReplayKeyBuilder {
         replay_key = replay_key.bytes(self.replay_tag().as_bytes());
         match *self {
-            Self::F16 { .. } => replay_key,
+            Self::F16 { .. } | Self::Bf16 { .. } => replay_key,
             Self::Native {
                 first_region,
                 ref parts,
@@ -1884,14 +1941,20 @@ fn encode_attention(
 
     let mut compute_regions = Vec::new();
     let shared = SharedRegions {
-        input_norm: push_shared_weight(&mut compute_regions, &invocation, 1, ElementType::F16)?,
+        input_norm: push_shared_weight(
+            &mut compute_regions,
+            &invocation,
+            1,
+            precision.activation(),
+        )?,
         qkvzba: push_shared_projection_weight(
             &mut compute_regions,
             &invocation,
             2,
             &[shape.qkvzba_features, shape.hidden_size],
+            precision.activation(),
         )?,
-        conv: push_shared_weight(&mut compute_regions, &invocation, 3, ElementType::F16)?,
+        conv: push_shared_weight(&mut compute_regions, &invocation, 3, precision.activation())?,
         a_log: push_shared_weight(&mut compute_regions, &invocation, 4, ElementType::F32)?,
         dt_bias: push_shared_weight(&mut compute_regions, &invocation, 5, ElementType::F32)?,
         norm: push_shared_weight(&mut compute_regions, &invocation, 6, ElementType::F32)?,
@@ -1900,6 +1963,7 @@ fn encode_attention(
             &invocation,
             7,
             &[shape.hidden_size, shape.value_features],
+            precision.activation(),
         )?,
         scratch: {
             let index = compute_regions.len();
@@ -1993,7 +2057,7 @@ fn encode_attention(
         let conv_state = contiguous_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 8)?,
-            ElementType::F16,
+            precision.activation(),
         )?;
         let delta_state = contiguous_region(
             participant,
@@ -2251,6 +2315,7 @@ fn encode_attention(
                     move |stream, _blas, regions, host_storage| {
                         enqueue_state_bindings(
                             stream,
+                            precision.activation(),
                             binding_layout,
                             &state_bindings,
                             regions,
@@ -2285,8 +2350,11 @@ fn encode_attention(
     }
 
     if let Some(declaration) = segment_declaration.filter(|_| !candidate) {
-        *declaration =
-            segment_bindings::declare(&invocation, segment_validations.unwrap_or_default())?;
+        *declaration = segment_bindings::declare(
+            &invocation,
+            precision.activation(),
+            segment_validations.unwrap_or_default(),
+        )?;
     }
 
     let q8act = q8act.map(PreparedAttentionProjections::into_owned);
@@ -2486,7 +2554,7 @@ fn encode_reusable_attention_bindings(
         let conv_state = contiguous_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 8)?,
-            ElementType::F16,
+            precision.activation(),
         )?;
         let delta_state = contiguous_region(
             participant,
@@ -2536,6 +2604,7 @@ fn state_binding_payload(
 
 fn enqueue_state_bindings(
     stream: &CudaStream,
+    conv_state_type: ElementType,
     layout: StateBindingLayout,
     bindings: &[AttentionStateBinding],
     regions: &[CudaBufferRegion],
@@ -2562,7 +2631,7 @@ fn enqueue_state_bindings(
         let payload = host_storage.get(binding.host_binding).ok_or_else(|| {
             CudaDeviceRuntimeError::contract("attention state binding payload is missing")
         })?;
-        if states[0].element_type() != ElementType::F16
+        if states[0].element_type() != conv_state_type
             || states[0].length_bytes() != binding.conv_state_bytes
             || states[1].element_type() != ElementType::F32
             || states[1].length_bytes() != binding.delta_state_bytes
@@ -2983,6 +3052,16 @@ fn launch_attention_projection(
                 .unwrap_or(0),
         ),
         SharedProjectionWeight::F16 { region } => launch_gemm_f16(
+            blas,
+            input,
+            regions[region].device_ptr(),
+            output,
+            rows,
+            output_features,
+            input_features,
+            operation,
+        ),
+        SharedProjectionWeight::Bf16 { region } => launch_gemm_bf16(
             blas,
             input,
             regions[region].device_ptr(),
@@ -3837,16 +3916,16 @@ fn validate_signature(
         return Err("recurrent attention hidden input is not two-dimensional".to_owned());
     };
     let expected = [
-        (value(1)?, vec![shape.hidden_size], ElementType::F16),
+        (value(1)?, vec![shape.hidden_size], precision.activation()),
         (
             value(2)?,
             vec![shape.qkvzba_features, shape.hidden_size],
-            ElementType::F16,
+            precision.activation(),
         ),
         (
             value(3)?,
             vec![shape.qkv_features, shape.conv_kernel],
-            ElementType::F16,
+            precision.activation(),
         ),
         (value(4)?, vec![shape.value_heads], ElementType::F32),
         (value(5)?, vec![shape.value_heads], ElementType::F32),
@@ -3854,12 +3933,12 @@ fn validate_signature(
         (
             value(7)?,
             vec![shape.hidden_size, shape.value_features],
-            ElementType::F16,
+            precision.activation(),
         ),
         (
             value(8)?,
             vec![shape.qkv_features, shape.conv_state_width],
-            ElementType::F16,
+            precision.activation(),
         ),
         (
             value(9)?,
@@ -4287,12 +4366,18 @@ fn push_shared_projection_weight(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ordinal: u32,
     logical_dimensions: &[u64],
+    activation: ElementType,
 ) -> Result<SharedProjectionWeight, String> {
     let [expected_output_features, expected_input_features] = logical_dimensions else {
         return Err(format!(
             "attention projection input {ordinal} must have two logical dimensions"
         ));
     };
+    if activation == ElementType::Bf16 {
+        return Ok(SharedProjectionWeight::Bf16 {
+            region: push_shared_weight(regions, invocation, ordinal, ElementType::Bf16)?,
+        });
+    }
     if native_projection::uses_native(invocation.participants()[0].bindings())? {
         return native_projection::resolve_shared(regions, invocation, ordinal, logical_dimensions);
     }

@@ -7,6 +7,7 @@ use ferrum_execution::{
     },
     token_execution::*,
 };
+use ferrum_models::vnext::qwen35::Qwen35DensePrecision;
 use ferrum_types::RequestId;
 use safetensors::tensor::{Dtype, TensorView};
 
@@ -17,6 +18,10 @@ pub(super) struct NonzeroFixture {
 
 impl NonzeroFixture {
     pub fn new() -> Self {
+        Self::with_precision(Qwen35DensePrecision::F16)
+    }
+
+    pub fn with_precision(precision: Qwen35DensePrecision) -> Self {
         let mut files = Fixture::new();
         drop(files.take_expansion());
         let original_dir = crate::registry::tests::write_qwen35_fixture_model_dir();
@@ -76,12 +81,17 @@ impl NonzeroFixture {
         let source = Arc::new(
             ProductionModelSourceBundle::open_colocated_safetensors(&files.directory).unwrap(),
         );
+        let mut assets = NativeTextExpansion::from_sources_with_precision(
+            source,
+            super::super::tests::fixture::protocol_limits(),
+            precision,
+        )
+        .unwrap();
+        assets
+            .configure_mtp(PH3ImagePromptExpansionMtp::Off)
+            .unwrap();
         Self {
-            assets: NativeTextExpansion::from_sources(
-                source,
-                super::super::tests::fixture::protocol_limits(),
-            )
-            .unwrap(),
+            assets,
             _files: files,
         }
     }
@@ -94,6 +104,18 @@ pub(super) async fn run<R: DeviceRuntime>(
     replay: bool,
     prompt: &[u32],
 ) -> (Vec<u32>, serde_json::Value) {
+    run_with_replay_limit(fixture, composition, device, replay, prompt, None).await
+}
+
+pub(super) async fn run_with_replay_limit<R: DeviceRuntime>(
+    fixture: &NonzeroFixture,
+    composition: &RuntimeComposition<R>,
+    device: ferrum_types::Device,
+    replay: bool,
+    prompt: &[u32],
+    maximum_executables_per_lane: Option<u64>,
+) -> (Vec<u32>, serde_json::Value) {
+    assert!(replay || maximum_executables_per_lane.is_none());
     let mut engine = EngineConfig::default();
     engine.backend.device = device;
     if replay {
@@ -101,6 +123,10 @@ pub(super) async fn run<R: DeviceRuntime>(
             ferrum_types::ReusableExecutionCaptureScope::DecodeOnly;
         engine.backend.reusable_execution_capture.preparation =
             ferrum_types::ReusableExecutionPreparationMode::OnDemand;
+        engine
+            .backend
+            .reusable_execution_capture
+            .maximum_executables_per_lane = maximum_executables_per_lane;
     }
     let mut prepared = fixture
         .assets

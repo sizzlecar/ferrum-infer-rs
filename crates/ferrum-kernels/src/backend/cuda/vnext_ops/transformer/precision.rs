@@ -12,6 +12,7 @@ use ferrum_runtime::{
 #[derive(Clone, Copy)]
 pub(super) enum RmsNormPrecision {
     F16,
+    Bf16,
     F32ToF16,
     F32,
 }
@@ -20,6 +21,7 @@ impl RmsNormPrecision {
     pub(super) fn operation(self) -> &'static str {
         match self {
             Self::F16 => RMS_NORM_OPERATION_ID,
+            Self::Bf16 => ferrum_runtime::RMS_NORM_BF16_OPERATION_ID,
             Self::F32ToF16 => RMS_NORM_F32_TO_F16_OPERATION_ID,
             Self::F32 => RMS_NORM_F32_OPERATION_ID,
         }
@@ -28,6 +30,7 @@ impl RmsNormPrecision {
     pub(super) fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::F16 => rms_norm_contract(),
+            Self::Bf16 => ferrum_runtime::rms_norm_bf16_contract(),
             Self::F32ToF16 => rms_norm_f32_to_f16_contract(),
             Self::F32 => rms_norm_f32_contract(),
         }
@@ -36,6 +39,7 @@ impl RmsNormPrecision {
     pub(super) fn capability(self) -> &'static str {
         match self {
             Self::F16 => RMS_NORM_F16_CAPABILITY_ID,
+            Self::Bf16 => ferrum_runtime::RMS_NORM_BF16_CAPABILITY_ID,
             Self::F32ToF16 => RMS_NORM_F32_TO_F16_CAPABILITY_ID,
             Self::F32 => RMS_NORM_F32_CAPABILITY_ID,
         }
@@ -44,6 +48,7 @@ impl RmsNormPrecision {
     pub(super) fn provider(self) -> &'static str {
         match self {
             Self::F16 => "provider.cuda.rms_norm.f16",
+            Self::Bf16 => "provider.cuda.rms_norm.bf16",
             Self::F32ToF16 => "provider.cuda.rms_norm.f32-to-f16",
             Self::F32 => "provider.cuda.rms_norm.f32",
         }
@@ -52,6 +57,7 @@ impl RmsNormPrecision {
     pub(super) fn estimator(self) -> &'static str {
         match self {
             Self::F16 => "resource-estimator.cuda.rms_norm.f16",
+            Self::Bf16 => "resource-estimator.cuda.rms_norm.bf16",
             Self::F32ToF16 => "resource-estimator.cuda.rms_norm.f32-to-f16",
             Self::F32 => "resource-estimator.cuda.rms_norm.f32",
         }
@@ -60,6 +66,7 @@ impl RmsNormPrecision {
     pub(super) fn kernel(self) -> &'static str {
         match self {
             Self::F16 => "rms_norm_f16",
+            Self::Bf16 => "rms_norm_bf16",
             Self::F32ToF16 => "vnext_rms_norm_f32_to_f16",
             Self::F32 => "vnext_rms_norm_f32",
         }
@@ -68,6 +75,7 @@ impl RmsNormPrecision {
     pub(super) fn input(self) -> ElementType {
         match self {
             Self::F16 => ElementType::F16,
+            Self::Bf16 => ElementType::Bf16,
             Self::F32ToF16 | Self::F32 => ElementType::F32,
         }
     }
@@ -75,7 +83,15 @@ impl RmsNormPrecision {
     pub(super) fn output(self) -> ElementType {
         match self {
             Self::F16 | Self::F32ToF16 => ElementType::F16,
+            Self::Bf16 => ElementType::Bf16,
             Self::F32 => ElementType::F32,
+        }
+    }
+
+    pub(super) fn weight(self) -> ElementType {
+        match self {
+            Self::Bf16 => ElementType::Bf16,
+            _ => ElementType::F16,
         }
     }
 }
@@ -83,6 +99,7 @@ impl RmsNormPrecision {
 #[derive(Clone, Copy)]
 pub(super) enum ResidualPrecision {
     F16,
+    Bf16,
     F32F16,
 }
 
@@ -90,6 +107,7 @@ impl ResidualPrecision {
     pub(super) fn operation(self) -> &'static str {
         match self {
             Self::F16 => RESIDUAL_ADD_OPERATION_ID,
+            Self::Bf16 => ferrum_runtime::RESIDUAL_ADD_BF16_OPERATION_ID,
             Self::F32F16 => RESIDUAL_ADD_F32_F16_OPERATION_ID,
         }
     }
@@ -97,6 +115,7 @@ impl ResidualPrecision {
     pub(super) fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::F16 => residual_add_contract(),
+            Self::Bf16 => ferrum_runtime::residual_add_bf16_contract(),
             Self::F32F16 => residual_add_f32_f16_contract(),
         }
     }
@@ -104,6 +123,7 @@ impl ResidualPrecision {
     pub(super) fn capability(self) -> &'static str {
         match self {
             Self::F16 => RESIDUAL_ADD_F16_CAPABILITY_ID,
+            Self::Bf16 => ferrum_runtime::RESIDUAL_ADD_BF16_CAPABILITY_ID,
             Self::F32F16 => RESIDUAL_ADD_F32_F16_CAPABILITY_ID,
         }
     }
@@ -111,6 +131,7 @@ impl ResidualPrecision {
     pub(super) fn provider(self) -> &'static str {
         match self {
             Self::F16 => "provider.cuda.residual_add.f16",
+            Self::Bf16 => "provider.cuda.residual_add.bf16",
             Self::F32F16 => "provider.cuda.residual_add.f32-f16",
         }
     }
@@ -118,6 +139,7 @@ impl ResidualPrecision {
     pub(super) fn estimator(self) -> &'static str {
         match self {
             Self::F16 => "resource-estimator.cuda.residual_add.f16",
+            Self::Bf16 => "resource-estimator.cuda.residual_add.bf16",
             Self::F32F16 => "resource-estimator.cuda.residual_add.f32-f16",
         }
     }
@@ -125,6 +147,7 @@ impl ResidualPrecision {
     pub(super) fn kernel(self) -> &'static str {
         match self {
             Self::F16 => "residual_add_f16",
+            Self::Bf16 => "residual_add_bf16",
             Self::F32F16 => "vnext_residual_add_f32_f16",
         }
     }
@@ -132,7 +155,15 @@ impl ResidualPrecision {
     pub(super) fn master(self) -> ElementType {
         match self {
             Self::F16 => ElementType::F16,
+            Self::Bf16 => ElementType::Bf16,
             Self::F32F16 => ElementType::F32,
+        }
+    }
+
+    pub(super) fn update(self) -> ElementType {
+        match self {
+            Self::Bf16 => ElementType::Bf16,
+            _ => ElementType::F16,
         }
     }
 }

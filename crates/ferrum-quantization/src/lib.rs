@@ -61,7 +61,7 @@ pub use tensor_archive::{
     ArchiveTensor, Bf16F16ConversionPolicy, Bf16ToF16BlockCounts,
     DenseArchiveMaterializationReport, DenseArchivePhaseTiming, DenseArchiveSourceTouch,
     ManagedDenseArchiveInstallation, ManagedDenseArchiveSource, ManagedDenseArchiveStreamingSlot,
-    PreparedBf16F16Component, TensorArchive,
+    PreparedBf16F16Component, PreparedDenseArchiveComponent, TensorArchive,
 };
 pub use traits::Linear;
 

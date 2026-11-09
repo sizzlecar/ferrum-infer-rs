@@ -47,7 +47,7 @@ pub(crate) fn cuda_attention_policy_for_kv(
             ))
         }
         (KvStorageFormat::Int8PerTokenHeadF32ScaleV1, _) => Ok(AttentionExecutionPolicy::Portable),
-        (KvStorageFormat::F16, requested) => Ok(requested),
+        (KvStorageFormat::F16 | KvStorageFormat::Bf16, requested) => Ok(requested),
     }
 }
 
@@ -1831,8 +1831,12 @@ mod tests {
                 cuda_attention_policy_for_kv(requested, Dtype::Fp16).unwrap(),
                 requested,
             );
+            assert_eq!(
+                cuda_attention_policy_for_kv(requested, Dtype::Bf16).unwrap(),
+                requested,
+            );
         }
-        for unsupported in [Dtype::Bf16, Dtype::Fp8] {
+        for unsupported in [Dtype::Fp8] {
             assert!(cuda_attention_policy_for_kv(Policy::Auto, unsupported).is_err());
         }
     }

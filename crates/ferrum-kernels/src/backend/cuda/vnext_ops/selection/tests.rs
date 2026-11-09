@@ -1,6 +1,6 @@
 use super::*;
 use cudarc::driver::{CudaContext, DevicePtrMut};
-use half::f16;
+use half::{bf16, f16};
 
 mod batched;
 mod partitioned;
@@ -16,6 +16,7 @@ struct Case {
 fn rounded(value: f32, precision: ArgmaxPrecision) -> f32 {
     match precision {
         ArgmaxPrecision::F16 => f16::from_f32(value).to_f32(),
+        ArgmaxPrecision::Bf16 => bf16::from_f32(value).to_f32(),
         ArgmaxPrecision::F32 => value,
     }
 }
@@ -70,7 +71,11 @@ fn signed_zero_case(n: usize, negative: usize, positive: usize, mask_positive: b
 
 #[test]
 fn selection_host_reference_distinguishes_signed_zero_and_rejects_nonfinite_values() {
-    for precision in [ArgmaxPrecision::F16, ArgmaxPrecision::F32] {
+    for precision in [
+        ArgmaxPrecision::F16,
+        ArgmaxPrecision::Bf16,
+        ArgmaxPrecision::F32,
+    ] {
         for penalty in [1.0, 1.75, 0.75] {
             assert_eq!(
                 reference(&signed_zero_case(2, 0, 1, false), precision, penalty),
@@ -170,7 +175,11 @@ fn masked_selection_matches_scalar_semantics_and_preserves_logits_on_cuda() {
             offsets: [1, 0],
         },
     ];
-    for precision in [ArgmaxPrecision::F16, ArgmaxPrecision::F32] {
+    for precision in [
+        ArgmaxPrecision::F16,
+        ArgmaxPrecision::Bf16,
+        ArgmaxPrecision::F32,
+    ] {
         let function = module.load_function(precision.kernel()).unwrap();
         for (index, case) in cases.iter().enumerate() {
             let original = case
@@ -178,6 +187,7 @@ fn masked_selection_matches_scalar_semantics_and_preserves_logits_on_cuda() {
                 .iter()
                 .flat_map(|&value| match precision {
                     ArgmaxPrecision::F16 => f16::from_f32(value).to_bits().to_le_bytes().to_vec(),
+                    ArgmaxPrecision::Bf16 => bf16::from_f32(value).to_bits().to_le_bytes().to_vec(),
                     ArgmaxPrecision::F32 => value.to_le_bytes().to_vec(),
                 })
                 .collect::<Vec<_>>();

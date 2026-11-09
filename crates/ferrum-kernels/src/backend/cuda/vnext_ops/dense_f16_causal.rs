@@ -9,9 +9,29 @@ pub fn cuda_tensor_and_dense_f16_causal_runtime_config(
     ordinal: usize,
     device_id: DeviceId,
 ) -> Result<CudaDeviceRuntimeConfig, VNextError> {
+    dense_causal_runtime_config(ordinal, device_id, false)
+}
+
+pub fn cuda_tensor_and_dense_bf16_causal_runtime_config(
+    ordinal: usize,
+    device_id: DeviceId,
+) -> Result<CudaDeviceRuntimeConfig, VNextError> {
+    dense_causal_runtime_config(ordinal, device_id, true)
+}
+
+fn dense_causal_runtime_config(
+    ordinal: usize,
+    device_id: DeviceId,
+    bf16: bool,
+) -> Result<CudaDeviceRuntimeConfig, VNextError> {
     let mut config = cuda_tensor_runtime_config(ordinal, device_id)?;
-    for capability in crate::backend::cuda_tensor_causal_policy::DENSE_F16_CAUSAL_CAPABILITIES {
-        config.capabilities.insert(CapabilityId::new(capability)?);
+    let capabilities: &[&str] = if bf16 {
+        &crate::backend::cuda_tensor_causal_policy::DENSE_BF16_CAUSAL_CAPABILITIES
+    } else {
+        &crate::backend::cuda_tensor_causal_policy::DENSE_F16_CAUSAL_CAPABILITIES
+    };
+    for capability in capabilities {
+        config.capabilities.insert(CapabilityId::new(*capability)?);
     }
     config
         .dynamic_storage_profiles
@@ -24,7 +44,11 @@ pub fn cuda_tensor_and_dense_f16_causal_runtime_config(
             },
         )?);
     config.runtime_implementation_fingerprint = implementation_fingerprint(&[
-        b"ferrum.cuda.bounded-tensor-and-dense-f16-causal.v1",
+        if bf16 {
+            b"ferrum.cuda.bounded-tensor-and-dense-bf16-causal.v1"
+        } else {
+            b"ferrum.cuda.bounded-tensor-and-dense-f16-causal.v1"
+        },
         config.runtime_implementation_fingerprint.as_bytes(),
         include_bytes!("dense_f16_causal.rs"),
     ]);
@@ -47,6 +71,47 @@ pub fn cuda_vnext_dense_f16_causal_contracts() -> Result<Vec<Box<dyn OperationCo
         Box::new(ferrum_runtime::gated_delta_candidate_scan_f16_contract()?),
         Box::new(causal_paged_attention_contract()?),
     ])
+}
+
+pub fn cuda_vnext_dense_bf16_causal_contracts(
+) -> Result<Vec<Box<dyn OperationContract>>, VNextError> {
+    Ok(vec![
+        Box::new(ferrum_runtime::token_embedding_bf16_contract()?),
+        Box::new(ferrum_runtime::last_token_dense_linear_bf16_contract()?),
+        Box::new(ferrum_runtime::last_token_masked_argmax_bf16_contract()?),
+        Box::new(ferrum_runtime::rms_norm_bf16_contract()?),
+        Box::new(ferrum_runtime::dense_swiglu_bf16_contract()?),
+        Box::new(ferrum_runtime::residual_add_bf16_contract()?),
+        Box::new(ferrum_runtime::gated_delta_recurrent_attention_bf16_contract()?),
+        Box::new(ferrum_runtime::causal_paged_attention_bf16_contract()?),
+    ])
+}
+
+pub fn cuda_tensor_and_dense_bf16_visual_causal_runtime_config(
+    ordinal: usize,
+    device_id: DeviceId,
+) -> Result<CudaDeviceRuntimeConfig, VNextError> {
+    let mut config = cuda_tensor_and_dense_bf16_causal_runtime_config(ordinal, device_id)?;
+    config.capabilities.extend([
+        CapabilityId::new(ferrum_runtime::ROW_SELECT_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_BF16_CAPABILITY_ID)?,
+    ]);
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        b"ferrum.cuda.bounded-tensor-and-dense-bf16-visual-causal.v1",
+        config.runtime_implementation_fingerprint.as_bytes(),
+        include_bytes!("transformer/visual_row_select_f16.rs"),
+    ]);
+    Ok(config)
+}
+
+pub fn cuda_vnext_dense_bf16_visual_causal_contracts(
+) -> Result<Vec<Box<dyn OperationContract>>, VNextError> {
+    let mut contracts = cuda_vnext_dense_bf16_causal_contracts()?;
+    contracts.push(Box::new(ferrum_runtime::row_select_bf16_contract()?));
+    contracts.push(Box::new(
+        ferrum_runtime::causal_paged_attention_explicit_rope_bf16_contract()?,
+    ));
+    Ok(contracts)
 }
 
 pub fn cuda_tensor_and_dense_f16_visual_causal_runtime_config(
@@ -84,20 +149,36 @@ pub fn cuda_vnext_dense_f16_visual_causal_contracts(
 pub fn cuda_vnext_dense_f16_causal_providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers(runtime, false)
+    providers(runtime, false, false)
 }
 
 pub fn cuda_vnext_dense_f16_visual_causal_providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers(runtime, true)
+    providers(runtime, true, false)
+}
+
+pub fn cuda_vnext_dense_bf16_causal_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    providers(runtime, false, true)
+}
+pub fn cuda_vnext_dense_bf16_visual_causal_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    providers(runtime, true, true)
 }
 
 fn providers(
     runtime: &CudaDeviceRuntime,
     visual: bool,
+    bf16: bool,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    let expected = if visual {
+    let expected = if bf16 && visual {
+        CudaTensorExecutionProfile::TensorAndDenseBf16VisualCausalV1
+    } else if bf16 {
+        CudaTensorExecutionProfile::TensorAndDenseBf16CausalV1
+    } else if visual {
         CudaTensorExecutionProfile::TensorAndDenseF16VisualCausalV1
     } else {
         CudaTensorExecutionProfile::TensorAndDenseF16CausalV1
@@ -114,46 +195,76 @@ fn providers(
     // Partial native construction is fail-closed, exactly like the original
     // bounded constructor: uncertain module cleanup never fabricates a refund.
     let (providers, _owner) = super::super::vnext_runtime::create_native(owner, || {
-        let mut providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
-            Box::new(CudaTokenEmbeddingProvider::with_precision(
-                runtime,
-                TokenPrecision::F16,
-            )?),
-            Box::new(CudaLastTokenDenseLinearProvider::with_precision(
-                runtime,
-                TokenPrecision::F16,
-            )?),
-            Box::new(CudaLastTokenMaskedArgmaxProvider::with_precision(
-                runtime,
-                ArgmaxPrecision::F16,
-            )?),
-            Box::new(tail_two_greedy::CudaTailTwoGreedyProvider::new(runtime)?),
-            Box::new(concat_columns_f16::CudaConcatColumnsProvider::new(runtime)?),
-            Box::new(transformer::CudaRmsNormProvider::new(runtime)?),
-            Box::new(transformer::CudaDenseLinearProvider::new_dense_f16(
-                runtime,
-            )?),
-            Box::new(transformer::CudaDenseSwiGluProvider::new_dense_f16(
-                runtime,
-            )?),
-            Box::new(transformer::CudaResidualAddProvider::new(runtime)?),
-            Box::new(
-                transformer::CudaGatedDeltaRecurrentAttentionProvider::new_dense_f16(runtime)?,
-            ),
-            Box::new(
-                transformer::CudaGatedDeltaRecurrentAttentionProvider::new_candidate(
-                    runtime, false, true,
-                )?,
-            ),
-            Box::new(transformer::CudaCausalPagedAttentionProvider::new_dense_f16(runtime)?),
-        ];
+        let mut providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = if bf16 {
+            vec![
+                Box::new(CudaTokenEmbeddingProvider::with_precision(
+                    runtime,
+                    TokenPrecision::Bf16,
+                )?),
+                Box::new(CudaLastTokenDenseLinearProvider::with_precision(
+                    runtime,
+                    TokenPrecision::Bf16,
+                )?),
+                Box::new(CudaLastTokenMaskedArgmaxProvider::with_precision(
+                    runtime,
+                    ArgmaxPrecision::Bf16,
+                )?),
+                Box::new(transformer::CudaRmsNormProvider::new_bf16(runtime)?),
+                Box::new(transformer::CudaDenseSwiGluProvider::new_dense_bf16(
+                    runtime,
+                )?),
+                Box::new(transformer::CudaResidualAddProvider::new_bf16(runtime)?),
+                Box::new(
+                    transformer::CudaGatedDeltaRecurrentAttentionProvider::new_dense_bf16(runtime)?,
+                ),
+                Box::new(transformer::CudaCausalPagedAttentionProvider::new_dense_bf16(runtime)?),
+            ]
+        } else {
+            vec![
+                Box::new(CudaTokenEmbeddingProvider::with_precision(
+                    runtime,
+                    TokenPrecision::F16,
+                )?),
+                Box::new(CudaLastTokenDenseLinearProvider::with_precision(
+                    runtime,
+                    TokenPrecision::F16,
+                )?),
+                Box::new(CudaLastTokenMaskedArgmaxProvider::with_precision(
+                    runtime,
+                    ArgmaxPrecision::F16,
+                )?),
+                Box::new(tail_two_greedy::CudaTailTwoGreedyProvider::new(runtime)?),
+                Box::new(concat_columns_f16::CudaConcatColumnsProvider::new(runtime)?),
+                Box::new(transformer::CudaRmsNormProvider::new(runtime)?),
+                Box::new(transformer::CudaDenseLinearProvider::new_dense_f16(
+                    runtime,
+                )?),
+                Box::new(transformer::CudaDenseSwiGluProvider::new_dense_f16(
+                    runtime,
+                )?),
+                Box::new(transformer::CudaResidualAddProvider::new(runtime)?),
+                Box::new(
+                    transformer::CudaGatedDeltaRecurrentAttentionProvider::new_dense_f16(runtime)?,
+                ),
+                Box::new(
+                    transformer::CudaGatedDeltaRecurrentAttentionProvider::new_candidate(
+                        runtime, false, true,
+                    )?,
+                ),
+                Box::new(transformer::CudaCausalPagedAttentionProvider::new_dense_f16(runtime)?),
+            ]
+        };
         if visual {
-            providers.push(Box::new(transformer::CudaVisualRowSelectF16Provider::new(
-                runtime,
-            )?));
-            providers.push(Box::new(
-                transformer::CudaCausalPagedAttentionProvider::new_explicit_rope_f16(runtime)?,
-            ));
+            providers.push(Box::new(if bf16 {
+                transformer::CudaVisualRowSelectF16Provider::new_bf16(runtime)?
+            } else {
+                transformer::CudaVisualRowSelectF16Provider::new(runtime)?
+            }));
+            providers.push(Box::new(if bf16 {
+                transformer::CudaCausalPagedAttentionProvider::new_explicit_rope_bf16(runtime)?
+            } else {
+                transformer::CudaCausalPagedAttentionProvider::new_explicit_rope_f16(runtime)?
+            }));
         }
         providers
             .into_iter()

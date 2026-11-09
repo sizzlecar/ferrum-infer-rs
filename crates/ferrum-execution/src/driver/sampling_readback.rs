@@ -39,7 +39,10 @@ impl ProductReadbackModes {
             || kind != VNextExecutionWaveKind::Decode
             || diagnostic_capture
             || teacher_forced
-            || !matches!(logits_type, ElementType::F32 | ElementType::F16)
+            || !matches!(
+                logits_type,
+                ElementType::F32 | ElementType::F16 | ElementType::Bf16
+            )
             || uniform != VNextProductOutputMode::FullLogits
         {
             return fallback;
@@ -137,7 +140,7 @@ mod tests {
             VNextParticipantOutputRole::Decode(LogitsReturnPolicy::FullLogits),
             greedy(),
         ];
-        for logits_type in [ElementType::F32, ElementType::F16] {
+        for logits_type in [ElementType::F32, ElementType::F16, ElementType::Bf16] {
             let modes = ProductReadbackModes::resolve(
                 SamplingReadbackMode::Participant,
                 VNextExecutionWaveKind::Decode,
@@ -201,7 +204,7 @@ mod tests {
             (
                 SamplingReadbackMode::Participant,
                 VNextExecutionWaveKind::Decode,
-                ElementType::Bf16,
+                ElementType::U32,
                 false,
                 false,
             ),

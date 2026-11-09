@@ -6,6 +6,19 @@
 // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+extern "C" __global__ void fused_silu_mul_interleaved_bf16(
+    const __nv_bfloat16* __restrict__ gate_up,
+    __nv_bfloat16* __restrict__ output, const int inter, const int total) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < static_cast<unsigned int>(total)) {
+        const size_t base = static_cast<size_t>(idx / inter) * 2 * inter + idx % inter;
+        const float g = __bfloat162float(gate_up[base]);
+        const float u = __bfloat162float(gate_up[base + inter]);
+        output[idx] = __float2bfloat16_rn((g / (1.0f + expf(-g))) * u);
+    }
+}
 
 // FP16 version: output[i] = silu(gate[i]) * up[i]
 extern "C" __global__ void fused_silu_mul_f16(

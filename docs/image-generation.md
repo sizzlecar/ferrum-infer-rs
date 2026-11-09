@@ -110,6 +110,46 @@ explicit Picture instructions; ordinary descriptions receive the model's
 `Edit <Picture 1>. ` prefix. Missing EOS, truncated or cancelled generation,
 malformed thinking delimiters and capacity violations still fail the request.
 
+## P-H3 causal precision and bounded weight uploads
+
+Both `run --image-config` and `serve --image-config` use the same P-H3
+configuration. The optional `backend.prompt_expansion_causal.precision` selects
+`f16` (the existing default) or `bf16` for the prompt upsampler's dense
+weights, activations, convolution history and KV; DeltaNet recurrent state and
+small decay/normalization parameters stay F32. BF16 is a separate model schema
+and native operation profile, available for dense Qwen3.5 safetensors on CUDA
+SM80 or newer. It requires `prompt_expansion.mtp: "off"`; ordinary single-token
+`decode_replay` uses the same explicit graph-count and per-stream memory limits
+as F16.
+This selection does not change the H3 W4A8 denoiser/text encoder or INT8 VAE.
+
+With `prompt_expansion.source_backing: "bounded_streaming"`, original BF16
+weight ranges copy directly into the existing bounded Host slot. F16 execution
+continues to convert those ranges. Affine normalization parameters retain their
+explicit conversion recipe. This policy does not cache completed weights or
+reference-image results across requests.
+
+An optional `backend.pinned_weight_upload` object declares
+`maximum_allocation_bytes` and `maximum_registered_bytes`, both positive
+physical byte counts including Host alignment padding. For a 64 MiB streaming
+slot on a host with 4 KiB pages, the following allowance includes that padding:
+
+```json
+"pinned_weight_upload": {
+  "maximum_allocation_bytes": 67112960,
+  "maximum_registered_bytes": 268435456
+}
+```
+
+CUDA registers eligible managed static-weight allocations in place; registration
+survives slot reuse and retires before the original allocation. The total must
+cover concurrently retained eligible owners, including fallback components.
+Owners above the declared allocation limit and immutable archive mappings keep
+their ordinary upload path. Eligible registration or capacity failures are
+errors. Omission retains ordinary uploads. The original Host limits still apply,
+with native page alignment accounted before allocation. These settings do not
+by themselves establish output quality, latency or concurrency performance.
+
 ## CUDA LoRA
 
 `run` and `serve` support one ordinary DiT adapter with a fixed strength at startup. A PEFT directory needs `adapter_config.json` and `adapter_model.safetensors`:

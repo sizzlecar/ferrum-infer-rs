@@ -34,6 +34,8 @@ mod row_scatter_f32;
 pub use row_scatter_f32::*;
 mod visual_causal_f16;
 pub use visual_causal_f16::*;
+mod causal_bf16;
+pub use causal_bf16::*;
 mod vision_layout_f32;
 pub use vision_layout_f32::*;
 mod channelwise_f32;

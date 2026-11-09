@@ -39,6 +39,9 @@ fn fixture_for(
     EngineConfig,
 ) {
     let numerical_profile = match profile {
+        ManagedCausalIoProfile::ManagedGreedyBf16V1 => {
+            panic!("this CPU llama fixture has no BF16 provider")
+        }
         ManagedCausalIoProfile::ManagedGreedyF16V1 => {
             ferrum_models::vnext::qwen35::F16_NUMERICAL_PROFILE_ID
         }
@@ -131,6 +134,7 @@ fn executor_with_profile(
         )
         .unwrap();
     let readback = match profile {
+        ManagedCausalIoProfile::ManagedGreedyBf16V1 => ManagedCausalReadback::Bf16Logits,
         ManagedCausalIoProfile::ManagedGreedyF16V1 => ManagedCausalReadback::F16Logits,
         ManagedCausalIoProfile::ManagedGreedyF32V1 => ManagedCausalReadback::F32Logits,
     };
@@ -153,6 +157,9 @@ fn executor_with_profile(
             .unwrap()
         );
         let foreign = match profile {
+            ManagedCausalIoProfile::ManagedGreedyBf16V1 => {
+                ManagedCausalIoProfile::ManagedGreedyF16V1
+            }
             ManagedCausalIoProfile::ManagedGreedyF16V1 => {
                 ManagedCausalIoProfile::ManagedGreedyF32V1
             }

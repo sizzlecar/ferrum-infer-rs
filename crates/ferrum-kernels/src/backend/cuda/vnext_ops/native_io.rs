@@ -6,6 +6,7 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TokenPrecision {
     F16,
+    Bf16,
     F32,
 }
 
@@ -13,6 +14,7 @@ impl TokenPrecision {
     pub(super) fn element(self) -> ElementType {
         match self {
             Self::F16 => ElementType::F16,
+            Self::Bf16 => ElementType::Bf16,
             Self::F32 => ElementType::F32,
         }
     }
@@ -20,6 +22,7 @@ impl TokenPrecision {
     pub(super) fn embedding_operation(self) -> &'static str {
         match self {
             Self::F16 => TOKEN_EMBEDDING_OPERATION_ID,
+            Self::Bf16 => ferrum_runtime::TOKEN_EMBEDDING_BF16_OPERATION_ID,
             Self::F32 => ferrum_runtime::TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
         }
     }
@@ -27,6 +30,7 @@ impl TokenPrecision {
     pub(super) fn projection_operation(self) -> &'static str {
         match self {
             Self::F16 => LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+            Self::Bf16 => ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_BF16_OPERATION_ID,
             Self::F32 => ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
         }
     }
@@ -38,7 +42,29 @@ pub(super) fn descriptor(
     provider: &str,
     capability: &str,
     estimator: &str,
+    precision: TokenPrecision,
 ) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
+    if precision == TokenPrecision::Bf16 {
+        return transformer::provider_descriptor_with_formats(
+            runtime,
+            contract,
+            provider,
+            capability,
+            estimator,
+            contiguous_bindings(),
+            BTreeSet::from([
+                WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?
+            ]),
+            BTreeSet::new(),
+            implementation_fingerprint(&[
+                include_bytes!("native_io.rs"),
+                include_bytes!("../vnext_ops.rs"),
+                include_bytes!("transformer.rs"),
+                crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
+                provider.as_bytes(),
+            ]),
+        );
+    }
     descriptor_with_fingerprint(
         runtime,
         contract,
@@ -158,6 +184,9 @@ pub(super) fn encode_embedding(
     precision: TokenPrecision,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
+    if precision == TokenPrecision::Bf16 {
+        return Err("BF16 embedding cannot use the native F16 block ABI".into());
+    }
     transformer::ensure_invocation(&invocation, precision.embedding_operation())?;
     let first = &invocation.participants()[0];
     let hidden = unsigned_attribute(first.attributes(), "hidden_size")?;
@@ -389,6 +418,9 @@ pub(super) fn encode_projection(
     precision: TokenPrecision,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
+    if precision == TokenPrecision::Bf16 {
+        return Err("BF16 projection cannot use the native F16 block ABI".into());
+    }
     transformer::ensure_invocation(&invocation, precision.projection_operation())?;
     let first = &invocation.participants()[0];
     let hidden = unsigned_attribute(first.attributes(), "hidden_size")?;

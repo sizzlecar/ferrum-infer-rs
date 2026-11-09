@@ -67,6 +67,8 @@ pub use idle_allocations::{CudaNativeAllocationReuse, CudaTensorRuntimeOptions};
 mod input_upload_packet;
 #[cfg(test)]
 mod input_upload_packet_tests;
+mod pinned_host;
+pub use pinned_host::CudaPinnedWeightUploadConfig;
 mod resident_program;
 mod segment_oracle;
 mod segment_owners;
@@ -91,9 +93,10 @@ pub(crate) use sequence_physical::{
 pub(crate) use tensor_eager::create_native;
 pub(crate) use tensor_eager::{CudaCausalProviderRetention, TensorLaneRetention};
 pub use tensor_eager::{
-    CudaDenseF16CausalProfile, CudaMemoryUtilization, CudaTensorAndCausalRuntimeAutoConfig,
-    CudaTensorAndCausalRuntimeConfig, CudaTensorExecutionProfile, CudaTensorMemoryObservation,
-    CudaTensorRuntimeAutoConfig, CudaTensorRuntimeConfig, CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
+    CudaDenseCausalProfile, CudaDenseF16CausalProfile, CudaMemoryUtilization,
+    CudaTensorAndCausalRuntimeAutoConfig, CudaTensorAndCausalRuntimeConfig,
+    CudaTensorExecutionProfile, CudaTensorMemoryObservation, CudaTensorRuntimeAutoConfig,
+    CudaTensorRuntimeConfig, CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
     CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION,
 };
 pub(crate) use tensor_eager::{CudaTensorCutlassRetention, CudaTensorProviderRetention};
@@ -3422,6 +3425,7 @@ pub struct CudaDeviceRuntime {
     program_binding_upload_counters: Arc<ProgramBindingUploadCounters>,
     binding_scatter: Option<binding_scatter::BindingScatter>,
     input_upload_scatter: binding_scatter::BindingScatter,
+    pinned_weight_upload: Option<(pinned_host::CudaPinnedHostRegistry, usize)>,
     segment_binding_oracle: ferrum_runtime::SegmentBindingOracleMode,
     segment_binding_oracle_audited_nodes: AtomicU64,
     segment_binding_owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
@@ -3487,6 +3491,11 @@ impl CudaDeviceRuntime {
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))
     }
 
+    /// Host account padding must be charged before allocating registered slots.
+    pub fn pinned_weight_upload_alignment() -> Result<usize, CudaDeviceRuntimeError> {
+        pinned_host::CudaPinnedHostRegistry::required_alignment()
+    }
+
     pub fn new(config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
         Self::new_with_program_binding_upload_strategy(config, ProgramBindingUploadStrategy::Sparse)
     }
@@ -3527,6 +3536,11 @@ impl CudaDeviceRuntime {
         // the actual device support its SM80 MMA instructions.
         let major = context.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
             .map_err(|error| CudaDeviceRuntimeError::driver("MMA compute capability", error))?;
+        crate::backend::cuda_tensor_causal_policy::validate_causal_compute_capability(
+            &config.capabilities,
+            major,
+        )
+        .map_err(CudaDeviceRuntimeError::contract)?;
         if major < 8 || !super::vnext_ops::rn_fragment_mma_compiled() {
             config.capabilities.retain(|capability| {
                 capability.as_str()
@@ -3660,6 +3674,7 @@ impl CudaDeviceRuntime {
             program_binding_upload_counters: Arc::new(ProgramBindingUploadCounters::default()),
             binding_scatter,
             input_upload_scatter,
+            pinned_weight_upload: None,
             segment_binding_oracle: ferrum_runtime::SegmentBindingOracleMode::Disabled,
             segment_binding_oracle_audited_nodes: AtomicU64::new(0),
             segment_binding_owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode::Legacy,
@@ -5767,6 +5782,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
             destination.descriptor.size_bytes,
             region,
         )?;
+        if destination.descriptor.usage == ferrum_runtime::BufferUsage::Weights {
+            if let Some((registry, maximum_allocation_bytes)) = &self.pinned_weight_upload {
+                if source.backing_bytes() <= *maximum_allocation_bytes {
+                    registry.register(&source)?;
+                }
+            }
+        }
         CudaDeviceCommand::managed_upload(
             self.runtime_instance,
             source,

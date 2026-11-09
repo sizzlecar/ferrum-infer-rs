@@ -7,6 +7,30 @@
 // layouts — the kernel just sees num_rows × row_size.
 
 #include "common.cuh"
+#include <cuda_bf16.h>
+
+extern "C" __global__ void rms_norm_bf16(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output,
+    const int row_size, const float eps) {
+    const size_t offset = static_cast<size_t>(blockIdx.x) * row_size;
+    float variance = 0.0f;
+    for (int i = threadIdx.x; i < row_size; i += blockDim.x) {
+        const float value = __bfloat162float(input[offset + i]);
+        variance += value * value;
+    }
+    variance = block_reduce_sum(variance);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) {
+        inverse_rms = rsqrtf(variance / static_cast<float>(row_size) + eps);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < row_size; i += blockDim.x) {
+        output[offset + i] = __float2bfloat16_rn(
+            __bfloat162float(input[offset + i]) * inverse_rms * __bfloat162float(weight[i]));
+    }
+}
 
 // Grid:  (num_rows,)   — one block per row
 // Block: (min(row_size, 1024),)

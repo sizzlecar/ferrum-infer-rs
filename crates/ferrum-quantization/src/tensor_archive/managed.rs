@@ -17,6 +17,7 @@ pub use reuse::ManagedDenseArchiveInstallation;
 use reuse::{BackingLease, ReusableBacking};
 pub use streaming::{
     Bf16F16ConversionPolicy, ManagedDenseArchiveStreamingSlot, PreparedBf16F16Component,
+    PreparedDenseArchiveComponent,
 };
 
 /// Native blocks remain borrowed and unchanged. Dense floating-point values

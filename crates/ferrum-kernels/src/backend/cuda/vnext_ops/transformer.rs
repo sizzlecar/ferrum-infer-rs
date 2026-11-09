@@ -209,6 +209,9 @@ pub(super) struct CudaRmsNormProvider {
 }
 
 impl CudaRmsNormProvider {
+    pub(super) fn new_bf16(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, RmsNormPrecision::Bf16)
+    }
     pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
         Self::with_precision(runtime, RmsNormPrecision::F16)
     }
@@ -673,15 +676,22 @@ pub(super) struct CudaDenseSwiGluProvider {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProjectionWeightSupport {
+pub(super) enum ProjectionWeightSupport {
     DenseF16,
+    DenseBf16,
     LegacyFormats,
 }
 impl ProjectionWeightSupport {
+    fn element_type(self) -> ElementType {
+        match self {
+            Self::DenseBf16 => ElementType::Bf16,
+            Self::DenseF16 | Self::LegacyFormats => ElementType::F16,
+        }
+    }
     /// Dense execution accepts the original one-component F16 carrier,
     /// including its declared contiguous reshape. Quantized, transformed and
     /// segmented layouts cannot borrow a dense provider's capability or budget.
-    fn validate_values(
+    pub(super) fn validate_values(
         self,
         values: &[ResolvedValueBinding],
         ordinals: &[u32],
@@ -689,12 +699,14 @@ impl ProjectionWeightSupport {
         if self == Self::LegacyFormats {
             return Ok(());
         }
+        let element_type = self.element_type();
         for &ordinal in ordinals {
             let value = binding(values, ResolvedValueRole::Input, ordinal)?;
             let weight = value
                 .weight()
                 .ok_or("dense-F16 projection lacks physical weight metadata")?;
-            if !f16_contiguous(value)
+            if value.tensor().element_type() != element_type
+                || value.tensor().layout() != &ResolvedTensorLayout::Contiguous
                 || !dense_f16_row_major_layout(
                     weight.physical_layout(),
                     value.tensor().dimensions(),
@@ -703,8 +715,8 @@ impl ProjectionWeightSupport {
                 || !matches!(
                     weight.components()[0].encoding(),
                     ferrum_runtime::WeightEncoding::Dense {
-                        element_type: ElementType::F16
-                    }
+                        element_type: actual
+                    } if *actual == element_type
                 )
             {
                 return Err(
@@ -764,6 +776,11 @@ fn dense_f16_row_major_layout(layout: &PhysicalWeightLayout, dimensions: &[u64])
 }
 
 impl CudaDenseSwiGluProvider {
+    pub(super) fn new_dense_bf16(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_weight_mode(runtime, ProjectionWeightSupport::DenseBf16)
+    }
     pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
         Self::with_weight_mode(runtime, ProjectionWeightSupport::LegacyFormats)
     }
@@ -780,9 +797,17 @@ impl CudaDenseSwiGluProvider {
         runtime: &CudaDeviceRuntime,
         mode: ProjectionWeightSupport,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        let contract = dense_swiglu_contract().map_err(contract_error)?;
+        let bf16 = mode == ProjectionWeightSupport::DenseBf16;
+        let contract = if bf16 {
+            ferrum_runtime::dense_swiglu_bf16_contract()
+        } else {
+            dense_swiglu_contract()
+        }
+        .map_err(contract_error)?;
         let provider_fingerprint = implementation_fingerprint(&[
-            if mode == ProjectionWeightSupport::DenseF16 {
+            if bf16 {
+                b"explicit-dense-bf16"
+            } else if mode == ProjectionWeightSupport::DenseF16 {
                 b"explicit-dense-f16"
             } else {
                 b"legacy-declared-formats"
@@ -806,13 +831,25 @@ impl CudaDenseSwiGluProvider {
             #[cfg(feature = "vllm-marlin")]
             include_str!("../vllm_marlin.rs").as_bytes(),
         ]);
-        let descriptor = if mode == ProjectionWeightSupport::DenseF16 {
+        let descriptor = if mode != ProjectionWeightSupport::LegacyFormats {
             provider_descriptor(
                 runtime,
                 &contract,
-                DENSE_SWIGLU_PROVIDER_ID,
-                DENSE_SWIGLU_F16_CAPABILITY_ID,
-                DENSE_SWIGLU_ESTIMATOR_ID,
+                if bf16 {
+                    "provider.cuda.dense_swiglu.bf16"
+                } else {
+                    DENSE_SWIGLU_PROVIDER_ID
+                },
+                if bf16 {
+                    ferrum_runtime::DENSE_SWIGLU_BF16_CAPABILITY_ID
+                } else {
+                    DENSE_SWIGLU_F16_CAPABILITY_ID
+                },
+                if bf16 {
+                    "resource-estimator.cuda.dense_swiglu.bf16"
+                } else {
+                    DENSE_SWIGLU_ESTIMATOR_ID
+                },
                 contiguous_bindings(3),
                 provider_fingerprint,
             )?
@@ -848,7 +885,11 @@ impl CudaDenseSwiGluProvider {
             .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL.to_owned()))
             .map_err(|error| CudaDeviceRuntimeError::driver("SwiGLU module load", error))?;
         let silu_mul = module
-            .load_function(SILU_MUL_FUNCTION_NAME)
+            .load_function(if bf16 {
+                "fused_silu_mul_interleaved_bf16"
+            } else {
+                SILU_MUL_FUNCTION_NAME
+            })
             .map_err(|error| CudaDeviceRuntimeError::driver("SwiGLU function load", error))?;
         #[cfg(feature = "vllm-marlin")]
         let marlin = if mode == ProjectionWeightSupport::LegacyFormats {
@@ -963,7 +1004,11 @@ impl OperationResourceEstimator for CudaDenseSwiGluProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        ensure_estimator_request(&self.descriptor, &request, DENSE_SWIGLU_OPERATION_ID)?;
+        ensure_estimator_request(
+            &self.descriptor,
+            &request,
+            self.descriptor.operation_id().as_str(),
+        )?;
         self.weight_mode
             .validate_values(request.values(), &[1, 2])
             .map_err(invalid_plan)?;
@@ -1098,6 +1143,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
         encode_dense_swiglu(
             self.descriptor.provider_implementation_fingerprint(),
             &self.silu_mul,
+            self.weight_mode.element_type(),
             invocation,
         )
         .map(EncodedDeviceOperation::compute)
@@ -1459,6 +1505,9 @@ pub(super) struct CudaResidualAddProvider {
 }
 
 impl CudaResidualAddProvider {
+    pub(super) fn new_bf16(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, ResidualPrecision::Bf16)
+    }
     pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
         Self::with_precision(runtime, ResidualPrecision::F16)
     }
@@ -1877,7 +1926,7 @@ fn encode_rms_norm(
         precision.input(),
         tokens,
     )?;
-    let weight = shared_full_region(&invocation, ResolvedValueRole::Input, 1, ElementType::F16)?;
+    let weight = shared_full_region(&invocation, ResolvedValueRole::Input, 1, precision.weight())?;
     let output = shared_token_region(
         &invocation,
         ResolvedValueRole::Output,
@@ -3649,9 +3698,22 @@ fn encode_marlin_fp8_dense_swiglu(
 fn encode_dense_swiglu(
     provider_fingerprint: &str,
     silu_mul: &CudaFunction,
+    element_type: ElementType,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    ensure_invocation(&invocation, DENSE_SWIGLU_OPERATION_ID)?;
+    ensure_invocation(
+        &invocation,
+        if element_type == ElementType::Bf16 {
+            ferrum_runtime::DENSE_SWIGLU_BF16_OPERATION_ID
+        } else {
+            DENSE_SWIGLU_OPERATION_ID
+        },
+    )?;
+    let gemm = if element_type == ElementType::Bf16 {
+        launch_gemm_bf16
+    } else {
+        launch_gemm_f16
+    };
     let first = &invocation.participants()[0];
     let first_input = binding(first.bindings(), ResolvedValueRole::Input, 0)?;
     let first_gate_up = binding(first.bindings(), ResolvedValueRole::Input, 1)?;
@@ -3659,13 +3721,14 @@ fn encode_dense_swiglu(
     let first_output = binding(first.bindings(), ResolvedValueRole::Output, 0)?;
     let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
     let intermediate_size = unsigned_attribute(first.attributes(), "intermediate_size")?;
-    validate_dense_swiglu(
+    validate_typed_dense_swiglu(
         first_input,
         first_gate_up,
         first_down,
         first_output,
         hidden_size,
         intermediate_size,
+        element_type,
     )?;
     for participant in &invocation.participants()[1..] {
         let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
@@ -3678,7 +3741,15 @@ fn encode_dense_swiglu(
         {
             return Err("CUDA dense SwiGLU participant attributes disagree".to_owned());
         }
-        validate_dense_swiglu(input, gate_up, down, output, hidden_size, intermediate_size)?;
+        validate_typed_dense_swiglu(
+            input,
+            gate_up,
+            down,
+            output,
+            hidden_size,
+            intermediate_size,
+            element_type,
+        )?;
     }
     let tokens = invocation.work_shape().immediate_tokens();
     let activation_elements = tokens
@@ -3686,12 +3757,12 @@ fn encode_dense_swiglu(
         .ok_or_else(|| "dense SwiGLU activation element count overflows".to_owned())?;
     let gate_up_bytes = activation_elements
         .checked_mul(2)
-        .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+        .and_then(|elements| elements.checked_mul(element_type.size_bytes()))
         .ok_or_else(|| "dense SwiGLU gate/up scratch size overflows".to_owned())?;
     let required_scratch_bytes = gate_up_bytes
         .checked_add(
             activation_elements
-                .checked_mul(ElementType::F16.size_bytes())
+                .checked_mul(element_type.size_bytes())
                 .ok_or_else(|| "dense SwiGLU activation scratch size overflows".to_owned())?,
         )
         .ok_or_else(|| "dense SwiGLU total scratch size overflows".to_owned())?;
@@ -3701,16 +3772,16 @@ fn encode_dense_swiglu(
             &invocation,
             ResolvedValueRole::Input,
             0,
-            ElementType::F16,
+            element_type,
             tokens,
         )?,
-        shared_full_region(&invocation, ResolvedValueRole::Input, 1, ElementType::F16)?,
-        shared_full_region(&invocation, ResolvedValueRole::Input, 2, ElementType::F16)?,
+        shared_full_region(&invocation, ResolvedValueRole::Input, 1, element_type)?,
+        shared_full_region(&invocation, ResolvedValueRole::Input, 2, element_type)?,
         shared_token_region(
             &invocation,
             ResolvedValueRole::Output,
             0,
-            ElementType::F16,
+            element_type,
             tokens,
         )?,
         scratch,
@@ -3750,7 +3821,7 @@ fn encode_dense_swiglu(
             let activation = gate_up_output.checked_add(gate_up_bytes).ok_or_else(|| {
                 CudaDeviceRuntimeError::contract("vNext dense SwiGLU activation pointer overflows")
             })?;
-            launch_gemm_f16(
+            gemm(
                 blas,
                 input,
                 gate_up_weight,
@@ -3772,7 +3843,7 @@ fn encode_dense_swiglu(
                 intermediate_size,
                 activation_elements,
             )?;
-            launch_gemm_f16(
+            gemm(
                 blas,
                 activation,
                 down_weight,
@@ -4375,7 +4446,7 @@ fn encode_residual_add(
             &invocation,
             ResolvedValueRole::Input,
             1,
-            ElementType::F16,
+            precision.update(),
             tokens,
         )?,
         shared_token_region(
@@ -4449,6 +4520,53 @@ pub(super) fn launch_gemm_f16(
     in_features: i32,
     operation: &'static str,
 ) -> Result<(), CudaDeviceRuntimeError> {
+    launch_gemm_dense_16(
+        blas,
+        input,
+        weight,
+        output,
+        rows,
+        out_features,
+        in_features,
+        cudaDataType_t::CUDA_R_16F,
+        operation,
+    )
+}
+
+pub(super) fn launch_gemm_bf16(
+    blas: &CudaBlas,
+    input: cudarc::driver::sys::CUdeviceptr,
+    weight: cudarc::driver::sys::CUdeviceptr,
+    output: cudarc::driver::sys::CUdeviceptr,
+    rows: i32,
+    out_features: i32,
+    in_features: i32,
+    operation: &'static str,
+) -> Result<(), CudaDeviceRuntimeError> {
+    launch_gemm_dense_16(
+        blas,
+        input,
+        weight,
+        output,
+        rows,
+        out_features,
+        in_features,
+        cudaDataType_t::CUDA_R_16BF,
+        operation,
+    )
+}
+
+fn launch_gemm_dense_16(
+    blas: &CudaBlas,
+    input: cudarc::driver::sys::CUdeviceptr,
+    weight: cudarc::driver::sys::CUdeviceptr,
+    output: cudarc::driver::sys::CUdeviceptr,
+    rows: i32,
+    out_features: i32,
+    in_features: i32,
+    storage_type: cudaDataType_t,
+    operation: &'static str,
+) -> Result<(), CudaDeviceRuntimeError> {
     unsafe {
         gemm_ex(
             *blas.handle(),
@@ -4459,14 +4577,14 @@ pub(super) fn launch_gemm_f16(
             in_features,
             &CUDA_GEMM_ALPHA_F32 as *const f32 as *const c_void,
             weight as *const c_void,
-            cudaDataType_t::CUDA_R_16F,
+            storage_type,
             in_features,
             input as *const c_void,
-            cudaDataType_t::CUDA_R_16F,
+            storage_type,
             in_features,
             &CUDA_GEMM_BETA_F32 as *const f32 as *const c_void,
             output as *mut c_void,
-            cudaDataType_t::CUDA_R_16F,
+            storage_type,
             out_features,
             // F16 storage with F32 accumulation uses COMPUTE_32F. The FAST_16F
             // mode instead permits down-converting F32 input/output matrices;
@@ -4583,7 +4701,7 @@ fn validate_rms_norm(
         || weight.tensor().dimensions() != [hidden_size]
         || output.tensor().dimensions() != [*rows, hidden_size]
         || !typed_contiguous(input, precision.input())
-        || !f16_contiguous(weight)
+        || !typed_contiguous(weight, precision.weight())
         || !typed_contiguous(output, precision.output())
     {
         return Err("CUDA RMSNorm invocation differs from its resolved signature".to_owned());
@@ -4621,6 +4739,26 @@ fn validate_dense_swiglu(
     hidden_size: u64,
     intermediate_size: u64,
 ) -> Result<u64, String> {
+    validate_typed_dense_swiglu(
+        input,
+        gate_up,
+        down,
+        output,
+        hidden_size,
+        intermediate_size,
+        ElementType::F16,
+    )
+}
+
+fn validate_typed_dense_swiglu(
+    input: &ResolvedValueBinding,
+    gate_up: &ResolvedValueBinding,
+    down: &ResolvedValueBinding,
+    output: &ResolvedValueBinding,
+    hidden_size: u64,
+    intermediate_size: u64,
+    element_type: ElementType,
+) -> Result<u64, String> {
     let [tokens, input_hidden] = input.tensor().dimensions() else {
         return Err("CUDA dense SwiGLU input is not two-dimensional".to_owned());
     };
@@ -4628,10 +4766,10 @@ fn validate_dense_swiglu(
         || gate_up.tensor().dimensions() != [2, intermediate_size, hidden_size]
         || down.tensor().dimensions() != [hidden_size, intermediate_size]
         || output.tensor().dimensions() != [*tokens, hidden_size]
-        || !f16_contiguous(input)
-        || !f16_contiguous(gate_up)
-        || !f16_contiguous(down)
-        || !f16_contiguous(output)
+        || !typed_contiguous(input, element_type)
+        || !typed_contiguous(gate_up, element_type)
+        || !typed_contiguous(down, element_type)
+        || !typed_contiguous(output, element_type)
     {
         return Err("CUDA dense SwiGLU invocation differs from its resolved signature".to_owned());
     }
@@ -4751,7 +4889,7 @@ fn validate_residual_add(
         || right.tensor().dimensions() != [*tokens, hidden_size]
         || output.tensor().dimensions() != [*tokens, hidden_size]
         || !typed_contiguous(left, precision.master())
-        || !f16_contiguous(right)
+        || !typed_contiguous(right, precision.update())
         || !typed_contiguous(output, precision.master())
     {
         return Err("CUDA residual add invocation differs from its resolved signature".to_owned());

@@ -72,8 +72,12 @@ mod dense_f16_causal;
 mod selection;
 mod tail_two_greedy;
 pub use dense_f16_causal::{
+    cuda_tensor_and_dense_bf16_causal_runtime_config,
+    cuda_tensor_and_dense_bf16_visual_causal_runtime_config,
     cuda_tensor_and_dense_f16_causal_runtime_config,
-    cuda_tensor_and_dense_f16_visual_causal_runtime_config, cuda_vnext_dense_f16_causal_contracts,
+    cuda_tensor_and_dense_f16_visual_causal_runtime_config, cuda_vnext_dense_bf16_causal_contracts,
+    cuda_vnext_dense_bf16_causal_providers, cuda_vnext_dense_bf16_visual_causal_contracts,
+    cuda_vnext_dense_bf16_visual_causal_providers, cuda_vnext_dense_f16_causal_contracts,
     cuda_vnext_dense_f16_causal_providers, cuda_vnext_dense_f16_visual_causal_contracts,
     cuda_vnext_dense_f16_visual_causal_providers,
 };
@@ -2769,6 +2773,12 @@ impl CudaTokenEmbeddingProvider {
                 TOKEN_EMBEDDING_F16_CAPABILITY_ID,
                 TOKEN_EMBEDDING_ESTIMATOR_ID,
             ),
+            TokenPrecision::Bf16 => (
+                ferrum_runtime::token_embedding_bf16_contract(),
+                "provider.cuda.token_embedding.bf16",
+                ferrum_runtime::TOKEN_EMBEDDING_BF16_CAPABILITY_ID,
+                "resource-estimator.cuda.token_embedding.bf16",
+            ),
             TokenPrecision::F32 => (
                 token_embedding_f32_master_contract(),
                 "provider.cuda.token_embedding.f32-master",
@@ -2780,16 +2790,17 @@ impl CudaTokenEmbeddingProvider {
         // Lookup reads immutable weights and the exact immediate token IDs;
         // it has no sequence state or partition-dependent accumulation. Its
         // completed output can accompany either KV state's retained prefix.
-        let descriptor =
-            native_io::descriptor(runtime, &contract, provider, capability, estimator)?
-                .with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
-                    ProviderCheckpointContract::new(
-                        CheckpointInputDependency::ExactTokenPrefix,
-                        CheckpointBoundaryConstraint::any_positive(),
-                        CheckpointPartitionNumerics::CapturedExecutionContinuation,
-                    )
-                    .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
-                ));
+        let descriptor = native_io::descriptor(
+            runtime, &contract, provider, capability, estimator, precision,
+        )?
+        .with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
+            ProviderCheckpointContract::new(
+                CheckpointInputDependency::ExactTokenPrefix,
+                CheckpointBoundaryConstraint::any_positive(),
+                CheckpointPartitionNumerics::CapturedExecutionContinuation,
+            )
+            .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
+        ));
         let descriptor = descriptor.with_candidate_state_effects(
             ferrum_runtime::ProviderCandidateStateEffects::PrefixCausal { ports: Vec::new() },
         );
@@ -2798,7 +2809,11 @@ impl CudaTokenEmbeddingProvider {
             .load_module(Ptx::from_src(crate::ptx::EMBEDDING_LOOKUP.to_owned()))
             .map_err(|error| CudaDeviceRuntimeError::driver("embedding module load", error))?;
         let function = module
-            .load_function(EMBEDDING_FUNCTION_NAME)
+            .load_function(if precision == TokenPrecision::Bf16 {
+                "vnext_embedding_lookup_bf16"
+            } else {
+                EMBEDDING_FUNCTION_NAME
+            })
             .map_err(|error| CudaDeviceRuntimeError::driver("embedding function load", error))?;
         Ok(Self {
             descriptor,
@@ -2854,21 +2869,23 @@ impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        let encoded =
-            if self.precision == TokenPrecision::F32 || native_io::requires_native(&invocation) {
-                native_io::encode_embedding(
-                    self.descriptor.provider_implementation_fingerprint(),
-                    &self.native,
-                    self.precision,
-                    invocation,
-                )
-            } else {
-                encode_token_embedding(
-                    &self.function,
-                    self.descriptor.provider_implementation_fingerprint(),
-                    invocation,
-                )
-            };
+        let encoded = if self.precision != TokenPrecision::Bf16
+            && (self.precision == TokenPrecision::F32 || native_io::requires_native(&invocation))
+        {
+            native_io::encode_embedding(
+                self.descriptor.provider_implementation_fingerprint(),
+                &self.native,
+                self.precision,
+                invocation,
+            )
+        } else {
+            encode_token_embedding(
+                &self.function,
+                self.descriptor.provider_implementation_fingerprint(),
+                self.precision,
+                invocation,
+            )
+        };
         encoded
             .map(EncodedDeviceOperation::compute)
             .map_err(|message| provider_failure(identity, "cuda.token_embedding.encode", message))
@@ -2903,6 +2920,12 @@ impl CudaLastTokenDenseLinearProvider {
                 LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
                 LAST_TOKEN_DENSE_LINEAR_ESTIMATOR_ID,
             ),
+            TokenPrecision::Bf16 => (
+                ferrum_runtime::last_token_dense_linear_bf16_contract(),
+                "provider.cuda.last_token_dense_linear.bf16.cublas",
+                ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_BF16_CAPABILITY_ID,
+                "resource-estimator.cuda.last_token_dense_linear.bf16.cublas",
+            ),
             TokenPrecision::F32 => (
                 last_token_dense_linear_f32_contract(),
                 "provider.cuda.last_token_dense_linear.f32.native",
@@ -2911,8 +2934,9 @@ impl CudaLastTokenDenseLinearProvider {
             ),
         };
         let contract = contract.map_err(contract_error)?;
-        let descriptor =
-            native_io::descriptor(runtime, &contract, provider, capability, estimator)?;
+        let descriptor = native_io::descriptor(
+            runtime, &contract, provider, capability, estimator, precision,
+        )?;
         Ok(Self {
             descriptor,
             native: native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
@@ -2975,20 +2999,22 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        let encoded =
-            if self.precision == TokenPrecision::F32 || native_io::requires_native(&invocation) {
-                native_io::encode_projection(
-                    self.descriptor.provider_implementation_fingerprint(),
-                    &self.native,
-                    self.precision,
-                    invocation,
-                )
-            } else {
-                encode_last_token_dense_linear(
-                    self.descriptor.provider_implementation_fingerprint(),
-                    invocation,
-                )
-            };
+        let encoded = if self.precision != TokenPrecision::Bf16
+            && (self.precision == TokenPrecision::F32 || native_io::requires_native(&invocation))
+        {
+            native_io::encode_projection(
+                self.descriptor.provider_implementation_fingerprint(),
+                &self.native,
+                self.precision,
+                invocation,
+            )
+        } else {
+            encode_last_token_dense_linear(
+                self.descriptor.provider_implementation_fingerprint(),
+                self.precision,
+                invocation,
+            )
+        };
         encoded
             .map(EncodedDeviceOperation::compute)
             .map_err(|message| {
@@ -3417,17 +3443,18 @@ struct LastTokenF16Row {
 }
 
 fn last_token_uses_dense_f16(precision: TokenPrecision, values: &[ResolvedValueBinding]) -> bool {
-    precision == TokenPrecision::F16
-        && !values.iter().any(|value| {
-            value.role() == ResolvedValueRole::Input
-                && value.ordinal() == 1
-                && value.weight().is_some_and(|weight| {
-                    !matches!(
-                        weight.physical_layout(),
-                        ferrum_runtime::PhysicalWeightLayout::Dense { .. }
-                    )
-                })
-        })
+    precision == TokenPrecision::Bf16
+        || (precision == TokenPrecision::F16
+            && !values.iter().any(|value| {
+                value.role() == ResolvedValueRole::Input
+                    && value.ordinal() == 1
+                    && value.weight().is_some_and(|weight| {
+                        !matches!(
+                            weight.physical_layout(),
+                            ferrum_runtime::PhysicalWeightLayout::Dense { .. }
+                        )
+                    })
+            }))
 }
 
 fn last_token_gather_workspace(hidden: u64) -> Result<ProviderWorkspaceRequirement, VNextError> {
@@ -3656,9 +3683,10 @@ fn packed_last_token_rows(
 
 fn encode_last_token_dense_linear(
     provider_fingerprint: &str,
+    precision: TokenPrecision,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    if invocation.operation().id.as_str() != LAST_TOKEN_DENSE_LINEAR_OPERATION_ID
+    if invocation.operation().id.as_str() != precision.projection_operation()
         || invocation.participants().is_empty()
     {
         return Err("CUDA last-token dense-linear received another or empty operation".to_owned());
@@ -3676,7 +3704,7 @@ fn encode_last_token_dense_linear(
         &invocation,
         ResolvedValueRole::Input,
         1,
-        ElementType::F16,
+        precision.element(),
     )?];
     let mut launches = Vec::with_capacity(invocation.participants().len());
     for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
@@ -3688,13 +3716,17 @@ fn encode_last_token_dense_linear(
         {
             return Err("CUDA last-token dense-linear participant attributes disagree".to_owned());
         }
+        if precision == TokenPrecision::Bf16 {
+            transformer::ProjectionWeightSupport::DenseBf16
+                .validate_values(participant.bindings(), &[1])?;
+        }
         validate_last_token_dense_linear_signature(
             input,
             participant_weight,
             output,
             hidden_size,
             out_features,
-            ElementType::F16,
+            precision.element(),
         )?;
         let source_range = token_range.source_token_range();
         let packed_range = token_range.immediate_token_range();
@@ -3708,10 +3740,11 @@ fn encode_last_token_dense_linear(
         }
         let last_token = selected_range.end - 1;
         let input_region = regions.len();
-        let source = contiguous_token_region(participant, input, ElementType::F16, last_token, 1)?;
+        let source =
+            contiguous_token_region(participant, input, precision.element(), last_token, 1)?;
         regions.push(source);
         let output_region = regions.len();
-        let destination = contiguous_region(participant, output, ElementType::F16)?;
+        let destination = contiguous_region(participant, output, precision.element())?;
         regions.push(destination);
         launches.push(LastTokenDenseLinearLaunch {
             input_region,
@@ -3821,7 +3854,12 @@ fn encode_last_token_dense_linear(
                 )?;
             }
             for launch in &launches {
-                transformer::launch_gemm_f16(
+                let gemm = if precision == TokenPrecision::Bf16 {
+                    transformer::launch_gemm_bf16
+                } else {
+                    transformer::launch_gemm_f16
+                };
+                gemm(
                     blas,
                     regions[launch.input_region].device_ptr(),
                     weight,
@@ -3900,7 +3938,12 @@ fn validate_last_token_dense_linear_signature(
     };
     let input_dimensions = input.tensor().dimensions();
     if input.tensor().element_type() != activation
-        || weight.tensor().element_type() != ElementType::F16
+        || weight.tensor().element_type()
+            != if activation == ElementType::Bf16 {
+                ElementType::Bf16
+            } else {
+                ElementType::F16
+            }
         || output.tensor().element_type() != activation
         || input_dimensions.len() != 2
         || input_dimensions[0] == 0
@@ -3931,9 +3974,10 @@ struct EmbeddingLaunch {
 fn encode_token_embedding(
     function: &CudaFunction,
     provider_fingerprint: &str,
+    precision: TokenPrecision,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    if invocation.operation().id.as_str() != TOKEN_EMBEDDING_OPERATION_ID
+    if invocation.operation().id.as_str() != precision.embedding_operation()
         || invocation.participants().is_empty()
     {
         return Err("CUDA token embedding received another or empty operation".to_owned());
@@ -3953,13 +3997,17 @@ fn encode_token_embedding(
         let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
         let hidden_size = unsigned_attribute(participant.attributes(), "hidden_size")?;
         let vocabulary_size = unsigned_attribute(participant.attributes(), "vocab_size")?;
+        if precision == TokenPrecision::Bf16 {
+            transformer::ProjectionWeightSupport::DenseBf16
+                .validate_values(participant.bindings(), &[1])?;
+        }
         validate_signature(
             token_ids,
             table,
             output,
             vocabulary_size,
             hidden_size,
-            ElementType::F16,
+            precision.element(),
         )?;
         let source_range = token_range.source_token_range();
         let packed_range = token_range.immediate_token_range();
@@ -3970,7 +4018,7 @@ fn encode_token_embedding(
             .map_err(|_| "embedding launch grid exceeds u32".to_owned())?;
 
         let first_region = regions.len();
-        regions.push(contiguous_region(participant, table, ElementType::F16)?);
+        regions.push(contiguous_region(participant, table, precision.element())?);
         regions.push(contiguous_token_region(
             participant,
             token_ids,
@@ -3985,7 +4033,7 @@ fn encode_token_embedding(
         regions.push(contiguous_token_region(
             participant,
             output,
-            ElementType::F16,
+            precision.element(),
             packed_range.start,
             token_count,
         )?);
@@ -4050,7 +4098,7 @@ fn encode_token_embedding(
                     let output = checked_pointer_offset(
                         output_base,
                         output_element_offset,
-                        ElementType::F16.size_bytes(),
+                        precision.element().size_bytes(),
                         "embedding output",
                     )?;
                     let batch = chunk_tokens as i32;
@@ -4116,7 +4164,12 @@ fn validate_signature(
         matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
     };
     if token_ids.tensor().element_type() != ElementType::U32
-        || table.tensor().element_type() != ElementType::F16
+        || table.tensor().element_type()
+            != if activation == ElementType::Bf16 {
+                ElementType::Bf16
+            } else {
+                ElementType::F16
+            }
         || output.tensor().element_type() != activation
         || token_dimensions.len() != 1
         || table_dimensions != [vocabulary_size, hidden_size]

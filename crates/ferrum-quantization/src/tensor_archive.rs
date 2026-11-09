@@ -13,6 +13,7 @@ pub use managed::{
     Bf16F16ConversionPolicy, Bf16ToF16BlockCounts, DenseArchiveMaterializationReport,
     DenseArchivePhaseTiming, DenseArchiveSourceTouch, ManagedDenseArchiveInstallation,
     ManagedDenseArchiveSource, ManagedDenseArchiveStreamingSlot, PreparedBf16F16Component,
+    PreparedDenseArchiveComponent,
 };
 
 /// An indexed archive whose payloads can also satisfy an explicit runtime

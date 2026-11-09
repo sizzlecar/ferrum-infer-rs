@@ -2,18 +2,13 @@
 //! supplies actual HF visual output; it never substitutes image-pad embeddings.
 use super::*;
 use ferrum_execution::TensorExecutionOutput;
-use ferrum_models::{
-    qwen35_config::Qwen35TextConfig, qwen3_vl_vision::Qwen3VLVisionGrid,
-    vnext::qwen35::F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID,
-};
+use ferrum_models::{qwen35_config::Qwen35TextConfig, qwen3_vl_vision::Qwen3VLVisionGrid};
 
 impl NativeTextExpansion {
     /// Explicitly enable the separate visual causal profile on the same
     /// already verified source mapping.
     pub(crate) fn with_visual_prompt(mut self) -> Result<Self> {
-        let profile = F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID
-            .parse()
-            .map_err(model_error)?;
+        let profile = self.numerical_profile(true).parse().map_err(model_error)?;
         self.visual_model = Some(
             self.model
                 .with_prepared(Arc::new(self.defined.prepare(&profile)?))?,
@@ -101,7 +96,8 @@ impl NativeTextExpansion {
         let raw =
             serde_json::from_slice(self.defined.sources().config_json()).map_err(model_error)?;
         let text = Qwen35TextConfig::from_hf_config_value(&raw).map_err(model_error)?;
-        let visual = visual_inputs::VisualExpansionInputs::new(tokens, &text)?;
+        let visual =
+            visual_inputs::VisualExpansionInputs::with_precision(tokens, &text, self.precision)?;
         let context = visual.tokens().maximum_tokens();
         let ids = visual.tokens().tokens();
         let mut engine = options.engine.clone();
@@ -128,9 +124,12 @@ impl NativeTextExpansion {
         // visual replacement and explicit RoPE providers remain eager boundaries.
         engine.backend.enable_reusable_execution &= engine.backend.reusable_execution_capture.scope
             == ferrum_types::ReusableExecutionCaptureScope::DecodeOnly;
-        engine.numerical_execution = F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID
-            .parse()
-            .map_err(model_error)?;
+        engine.kv_cache.dtype = if self.is_bf16() {
+            ferrum_types::KvCacheDtype::Bf16
+        } else {
+            ferrum_types::KvCacheDtype::Fp16
+        };
+        engine.numerical_execution = self.numerical_profile(true).parse().map_err(model_error)?;
         engine.sampling.default_params = SamplingParams::greedy();
         engine.sampling.default_params.max_tokens = generation.max_new_tokens as usize;
         Ok(PreparedTextExpansion {

@@ -29,8 +29,8 @@ use sha2::{Digest, Sha256};
 
 use super::replay_encoding::{Encoding, EncodingTarget};
 use super::{
-    attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16,
-    provider_failure, ProjectionWeightSupport,
+    attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_bf16,
+    launch_gemm_f16, provider_failure, ProjectionWeightSupport,
 };
 #[cfg(feature = "vllm-marlin")]
 use super::{
@@ -241,6 +241,39 @@ struct CausalAttentionFunctions {
 }
 
 impl CudaCausalPagedAttentionProvider {
+    pub(in crate::backend::cuda::vnext_ops) fn new_dense_bf16(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_for_contract_and_weights(
+            runtime,
+            AttentionExecutionPolicy::Portable,
+            &ferrum_runtime::causal_paged_attention_bf16_contract().map_err(contract_error)?,
+            ferrum_runtime::CAUSAL_PAGED_ATTENTION_BF16_CAPABILITY_ID,
+            CausalAttentionSemantics::Standard,
+            CausalPrecision::Bf16,
+            ProjectionWeightSupport::DenseBf16,
+        )
+    }
+
+    pub(in crate::backend::cuda::vnext_ops) fn new_explicit_rope_bf16(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let mut provider = Self::new_for_contract_and_weights(
+            runtime,
+            AttentionExecutionPolicy::Portable,
+            &ferrum_runtime::causal_paged_attention_explicit_rope_bf16_contract()
+                .map_err(contract_error)?,
+            ferrum_runtime::CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_BF16_CAPABILITY_ID,
+            CausalAttentionSemantics::ExplicitRope,
+            CausalPrecision::Bf16,
+            ProjectionWeightSupport::DenseBf16,
+        )?;
+        provider.packed_decode_prepare_gate = false;
+        provider.descriptor = provider
+            .descriptor
+            .with_checkpoint_capability(ferrum_runtime::ProviderCheckpointCapability::Unsupported);
+        Ok(provider)
+    }
     pub(in crate::backend::cuda::vnext_ops) fn new_dense_f16(
         runtime: &CudaDeviceRuntime,
     ) -> Result<Self, CudaDeviceRuntimeError> {
@@ -488,9 +521,9 @@ impl CudaCausalPagedAttentionProvider {
         .into_iter()
         .find(|profile| profile.operation_id() == contract.descriptor().id.as_str());
         let upstream = upstream_profile.is_some();
-        if weight_support == ProjectionWeightSupport::DenseF16
+        if weight_support != ProjectionWeightSupport::LegacyFormats
             && (attention_policy != AttentionExecutionPolicy::Portable
-                || precision != CausalPrecision::F16
+                || precision.hidden() != weight_support.element_type()
                 || !matches!(
                     semantics,
                     CausalAttentionSemantics::Standard | CausalAttentionSemantics::ExplicitRope
@@ -533,6 +566,7 @@ impl CudaCausalPagedAttentionProvider {
         let source = include_str!("causal_attention.rs");
         let weight_support_identity: &[u8] = match weight_support {
             ProjectionWeightSupport::DenseF16 => b"explicit-dense-f16",
+            ProjectionWeightSupport::DenseBf16 => b"explicit-dense-bf16",
             ProjectionWeightSupport::LegacyFormats => b"legacy-declared-formats",
         };
         let packed_decode_prepare_gate = runtime.packed_decode_prepare_gate_enabled();
@@ -662,7 +696,7 @@ impl CudaCausalPagedAttentionProvider {
                 WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?
             ]);
         let mut accepted_quantization_formats = if weight_support
-            == ProjectionWeightSupport::DenseF16
+            != ProjectionWeightSupport::LegacyFormats
         {
             BTreeSet::new()
         } else {
@@ -913,6 +947,8 @@ impl CudaCausalPagedAttentionProvider {
                 &attention_module,
                 if semantics.int8_kv() {
                     "vnext_causal_prepare_int8_kv"
+                } else if precision == CausalPrecision::Bf16 {
+                    "vnext_causal_prepare_bf16"
                 } else {
                     PREPARE_FUNCTION
                 },
@@ -944,6 +980,8 @@ impl CudaCausalPagedAttentionProvider {
                 &attention_module,
                 if semantics.int8_kv() {
                     "vnext_causal_attention_int8_kv"
+                } else if precision == CausalPrecision::Bf16 {
+                    "vnext_causal_attention_bf16"
                 } else {
                     ATTENTION_FUNCTION
                 },
@@ -951,22 +989,38 @@ impl CudaCausalPagedAttentionProvider {
             )?,
             grouped_attention: load_function(
                 &attention_module,
-                GROUPED_ATTENTION_FUNCTION,
+                if precision == CausalPrecision::Bf16 {
+                    "vnext_causal_attention_grouped_bf16"
+                } else {
+                    GROUPED_ATTENTION_FUNCTION
+                },
                 "causal grouped-query attention",
             )?,
             varlen_addressed: load_function(
                 &varlen_module,
-                VARLEN_ADDRESSED_FUNCTION,
+                if precision == CausalPrecision::Bf16 {
+                    "vnext_paged_varlen_attn_vllm_addressed_bf16"
+                } else {
+                    VARLEN_ADDRESSED_FUNCTION
+                },
                 "causal attention addressed varlen",
             )?,
             varlen_tiled_addressed: load_function(
                 &varlen_module,
-                VARLEN_TILED_ADDRESSED_FUNCTION,
+                if precision == CausalPrecision::Bf16 {
+                    "vnext_paged_varlen_attn_vllm_tiled_q4_addressed_bf16"
+                } else {
+                    VARLEN_TILED_ADDRESSED_FUNCTION
+                },
                 "causal attention addressed tiled varlen",
             )?,
             attention_gate: load_function(
                 &gate_module,
-                ATTENTION_GATE_FUNCTION,
+                if precision == CausalPrecision::Bf16 {
+                    "qwen35_apply_attention_gate_bf16"
+                } else {
+                    ATTENTION_GATE_FUNCTION
+                },
                 "causal attention output gate",
             )?,
             residual_add: load_function(
@@ -1372,6 +1426,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         encode_reusable_attention_bindings(
             invocation,
             self.semantics,
+            self.precision,
             self.decode_attention_grouping,
             self.execution_context_limit,
             self.program_binding_upload_strategy,
@@ -2112,6 +2167,14 @@ impl CausalAttentionShape {
         }
     }
 
+    fn kv_element_type_for(self, precision: CausalPrecision) -> ElementType {
+        if self.int8_kv {
+            ElementType::I8
+        } else {
+            precision.storage()
+        }
+    }
+
     fn scale_state_bytes(self, tokens: u64) -> Result<u64, String> {
         if !self.int8_kv {
             return Ok(0);
@@ -2343,6 +2406,7 @@ fn causal_projection_abi(
 #[derive(Debug, Clone, Copy)]
 enum CausalProjection {
     F16,
+    Bf16,
     Native {
         transform_bytes_per_token: u64,
     },
@@ -2362,9 +2426,13 @@ impl CausalProjection {
         support: ProjectionWeightSupport,
         #[cfg(feature = "vllm-marlin")] runtime: Option<MarlinProjectionRuntime>,
     ) -> Result<Self, String> {
-        if support == ProjectionWeightSupport::DenseF16 {
+        if support != ProjectionWeightSupport::LegacyFormats {
             support.validate_values(values, &[2, 3, 4, 5])?;
-            return Ok(Self::F16);
+            return Ok(if support == ProjectionWeightSupport::DenseBf16 {
+                Self::Bf16
+            } else {
+                Self::F16
+            });
         }
         if native_matrix::uses_native(values, &[2, 3, 4, 5])? {
             return Ok(Self::Native {
@@ -2406,7 +2474,7 @@ impl CausalProjection {
 
     fn workspace_bytes(self) -> Result<u64, String> {
         match self {
-            Self::F16 | Self::Native { .. } => Ok(0),
+            Self::F16 | Self::Bf16 | Self::Native { .. } => Ok(0),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { runtime } | Self::MarlinInt4 { runtime } => runtime.workspace_bytes(),
         }
@@ -2432,6 +2500,7 @@ impl CausalProjection {
     fn replay_tag(self) -> &'static str {
         match self {
             Self::F16 => "f16-cublas",
+            Self::Bf16 => "bf16-cublas",
             Self::Native { .. } => "native-compressed",
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => "mixed-fp8-marlin-f16-reduce",
@@ -2669,6 +2738,9 @@ enum SharedProjectionWeight {
     F16 {
         region: usize,
     },
+    Bf16 {
+        region: usize,
+    },
     #[cfg(feature = "vllm-marlin")]
     Marlin {
         packed_region: usize,
@@ -2683,6 +2755,7 @@ impl SharedProjectionWeight {
     fn replay_tag(&self) -> &'static str {
         match *self {
             Self::F16 { .. } => "f16",
+            Self::Bf16 { .. } => "bf16",
             Self::Native(_) => "native-compressed",
             #[cfg(feature = "vllm-marlin")]
             Self::Marlin { weight_type, .. } => marlin_projection_replay_tag(weight_type),
@@ -2695,7 +2768,7 @@ impl SharedProjectionWeight {
     ) -> CudaCommandReplayKeyBuilder {
         let replay_key = replay_key.bytes(self.replay_tag().as_bytes());
         match *self {
-            Self::F16 { .. } => replay_key.i32(0),
+            Self::F16 { .. } | Self::Bf16 { .. } => replay_key.i32(0),
             Self::Native(ref matrix) => {
                 weights::key(replay_key.u64(matrix.first_region as u64), &matrix.parts)
             }
@@ -3081,7 +3154,7 @@ fn encode_attention(
                 source.end,
                 token_range.full_input_tokens(),
             )?,
-            shape.kv_element_type(),
+            shape.kv_element_type_for(precision),
         )?;
         if packed_decode_prepare_gate {
             independent_sequence_kv &= state_is_sequence_owned(participant, state);
@@ -3131,7 +3204,7 @@ fn encode_attention(
             first_page_region,
             page_count,
             payload_page_count,
-            payload_element_type: shape.kv_element_type(),
+            payload_element_type: shape.kv_element_type_for(precision),
             host_binding,
             binding_offset,
         });
@@ -3149,7 +3222,7 @@ fn encode_attention(
                 let region = contiguous_token_region(
                     participant,
                     binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?,
-                    ElementType::F16,
+                    precision.storage(),
                     if packed_table {
                         packed_range.start
                     } else {
@@ -3415,6 +3488,7 @@ fn encode_attention(
         *declaration = segment_bindings::declare(
             &invocation,
             shape,
+            precision,
             attention_policy,
             &launches,
             batch_decode.as_ref().is_some_and(|batch| batch.is_fixed()),
@@ -3828,6 +3902,7 @@ fn prepare_causal_program_binding_writes(
 fn encode_reusable_attention_bindings(
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     semantics: CausalAttentionSemantics,
+    precision: CausalPrecision,
     grouping: CausalDecodeAttentionGrouping,
     execution_context_limit: Option<usize>,
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
@@ -3885,7 +3960,7 @@ fn encode_reusable_attention_bindings(
                 source.end,
                 token_range.full_input_tokens(),
             )?,
-            shape.kv_element_type(),
+            shape.kv_element_type_for(precision),
         )?;
         let scale_pages = scale_state_regions(participant, shape, source.end)?;
         let page_count = u64::try_from(pages.len())
@@ -4667,6 +4742,16 @@ fn launch_causal_projection(
                 .unwrap_or(0),
         ),
         SharedProjectionWeight::F16 { region } => launch_gemm_f16(
+            blas,
+            input,
+            regions[region].device_ptr(),
+            output,
+            rows,
+            output_features,
+            input_features,
+            operation,
+        ),
+        SharedProjectionWeight::Bf16 { region } => launch_gemm_bf16(
             blas,
             input,
             regions[region].device_ptr(),
@@ -5592,10 +5677,11 @@ fn validate_signature(
         || !matches!(hidden.tensor().layout(), ResolvedTensorLayout::Contiguous)
         || !matches!(output.tensor().layout(), ResolvedTensorLayout::Contiguous)
         || expected.iter().any(|(binding, dimensions)| {
-            binding.tensor().dimensions() != dimensions.as_slice() || !f16_contiguous(binding)
+            binding.tensor().dimensions() != dimensions.as_slice()
+                || !super::typed_contiguous(binding, precision.storage())
         })
         || value(8)?.tensor().dimensions() != [2, shape.key_value_heads, shape.head_dim]
-        || value(8)?.tensor().element_type() != shape.kv_element_type()
+        || value(8)?.tensor().element_type() != shape.kv_element_type_for(precision)
         || !matches!(
             value(8)?.tensor().layout(),
             ResolvedTensorLayout::Contiguous
@@ -5619,6 +5705,23 @@ fn push_shared_projection_weight(
     ordinal: u32,
     logical_dimensions: &[u64],
 ) -> Result<SharedProjectionWeight, String> {
+    if binding(
+        invocation.participants()[0].bindings(),
+        ResolvedValueRole::Input,
+        ordinal,
+    )?
+    .tensor()
+    .element_type()
+        == ElementType::Bf16
+    {
+        for participant in invocation.participants() {
+            ProjectionWeightSupport::DenseBf16
+                .validate_values(participant.bindings(), &[ordinal])?;
+        }
+        return Ok(SharedProjectionWeight::Bf16 {
+            region: push_shared_weight(regions, invocation, ordinal)?,
+        });
+    }
     let [expected_output_features, expected_input_features] = logical_dimensions else {
         return Err(format!(
             "causal attention projection input {ordinal} must have two logical dimensions"
@@ -5868,11 +5971,18 @@ fn push_shared_weight(
     ordinal: u32,
 ) -> Result<usize, String> {
     let index = regions.len();
+    let element_type = binding(
+        invocation.participants()[0].bindings(),
+        ResolvedValueRole::Input,
+        ordinal,
+    )?
+    .tensor()
+    .element_type();
     regions.push(super::shared_full_region(
         invocation,
         ResolvedValueRole::Input,
         ordinal,
-        ElementType::F16,
+        element_type,
     )?);
     Ok(index)
 }

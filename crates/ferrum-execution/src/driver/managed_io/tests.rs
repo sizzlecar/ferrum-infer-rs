@@ -218,7 +218,7 @@ fn f16_logits_use_the_actual_half_bytes_and_original_finite_total_order() {
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     }
     assert!(select_finite_logits(&[0; 3], 1, ElementType::F16).is_err());
-    assert!(select_finite_logits(&[0; 2], 1, ElementType::Bf16).is_err());
+    assert!(select_finite_logits(&[0; 2], 1, ElementType::U8).is_err());
 }
 
 #[test]
@@ -256,6 +256,89 @@ fn f16_profile_budget_is_half_head_storage_and_rejects_cross_profile_estimates()
         .validate_logits_type(ElementType::F16)
         .is_err());
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn bf16_logits_preserve_their_own_encoding_finite_order_and_lowest_ties() {
+    let cases: &[(&[u16], ExecutorSamplingOutput)] = &[
+        (
+            &[0x8000, 0x0000],
+            ExecutorSamplingOutput::greedy_token(TokenId::new(1)),
+        ),
+        (
+            &[0x0000, 0x8000],
+            ExecutorSamplingOutput::greedy_token(TokenId::new(0)),
+        ),
+        (
+            &[0x3f80, 0x3f81, 0x3f81],
+            ExecutorSamplingOutput::greedy_token(TokenId::new(1)),
+        ),
+        (
+            &[0x8001, 0x0000, 0x0001],
+            ExecutorSamplingOutput::greedy_token(TokenId::new(2)),
+        ),
+        // These BF16 infinities/NaN would be finite values if mislabeled F16.
+        (
+            &[0x7f80, 0xff80, 0x7fc1, 0xbf80],
+            ExecutorSamplingOutput::greedy_token(TokenId::new(3)),
+        ),
+        (
+            &[0x7f80, 0xff80, 0x7fc1],
+            ExecutorSamplingOutput::NoSelectableFiniteLogit,
+        ),
+    ];
+    for (bits, expected) in cases {
+        let account = host(bits.len() * 2, 1);
+        let mut bytes = account
+            .allocate_zeroed(HostMemoryClass::Output, bits.len() * 2)
+            .unwrap();
+        for (chunk, bits) in bytes.as_mut().chunks_exact_mut(2).zip(*bits) {
+            chunk.copy_from_slice(&bits.to_le_bytes());
+        }
+        let owner = bytes.freeze();
+        assert_eq!(
+            &select_finite_logits(owner.bytes(), bits.len(), ElementType::Bf16).unwrap(),
+            expected
+        );
+        assert_eq!(account.usage().unwrap().allocated_bytes(), bits.len() * 2);
+        drop(owner);
+        assert_eq!(account.usage().unwrap().committed_bytes(), 0);
+    }
+    assert!(select_finite_logits(&[0; 3], 1, ElementType::Bf16).is_err());
+}
+
+#[test]
+fn bf16_profile_admits_exact_head_bytes_and_rejects_f16_labels() {
+    let account = host(1024, 16);
+    let profile = ManagedCausalIoProfile::ManagedGreedyBf16V1;
+    let work = [ManagedCausalIoWork {
+        immediate_tokens: 1,
+        mask_upload: true,
+        output: ManagedCausalReadback::Bf16Logits,
+    }];
+    let report = requirements(&account, 13, profile, &work).unwrap();
+    assert_eq!(report.output_bytes, account.backing_bytes(13 * 2).unwrap());
+    for other in [
+        ManagedCausalIoProfile::ManagedGreedyF16V1,
+        ManagedCausalIoProfile::ManagedGreedyF32V1,
+    ] {
+        assert!(requirements(&account, 13, other, &work).is_err());
+    }
+    for output in [
+        ManagedCausalReadback::F16Logits,
+        ManagedCausalReadback::F32Logits,
+    ] {
+        assert!(requirements(
+            &account,
+            13,
+            profile,
+            &[ManagedCausalIoWork { output, ..work[0] }]
+        )
+        .is_err());
+    }
+    profile.validate_logits_type(ElementType::Bf16).unwrap();
+    assert!(profile.validate_logits_type(ElementType::F16).is_err());
+    assert_eq!(account.usage().unwrap().committed_bytes(), 0);
 }
 
 #[test]

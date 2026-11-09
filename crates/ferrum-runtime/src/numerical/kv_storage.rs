@@ -30,6 +30,9 @@ pub enum KvStateStorage {
     F16 {
         state: StateId,
     },
+    Bf16 {
+        state: StateId,
+    },
     Int8PerTokenHeadF32ScaleV1 {
         payload_state: StateId,
         scale_state: StateId,
@@ -40,20 +43,21 @@ impl KvStateStorage {
     pub const fn format(&self) -> KvStorageFormat {
         match self {
             Self::F16 { .. } => KvStorageFormat::F16,
+            Self::Bf16 { .. } => KvStorageFormat::Bf16,
             Self::Int8PerTokenHeadF32ScaleV1 { .. } => KvStorageFormat::Int8PerTokenHeadF32ScaleV1,
         }
     }
 
     pub fn payload_state(&self) -> &StateId {
         match self {
-            Self::F16 { state } => state,
+            Self::F16 { state } | Self::Bf16 { state } => state,
             Self::Int8PerTokenHeadF32ScaleV1 { payload_state, .. } => payload_state,
         }
     }
 
     pub fn scale_state(&self) -> Option<&StateId> {
         match self {
-            Self::F16 { .. } => None,
+            Self::F16 { .. } | Self::Bf16 { .. } => None,
             Self::Int8PerTokenHeadF32ScaleV1 { scale_state, .. } => Some(scale_state),
         }
     }
@@ -85,6 +89,7 @@ pub(super) fn validate_kv_storage(
         let shape = &payload.tensor.dimensions;
         let payload_type = match declaration.format() {
             KvStorageFormat::F16 => ElementType::F16,
+            KvStorageFormat::Bf16 => ElementType::Bf16,
             KvStorageFormat::Int8PerTokenHeadF32ScaleV1 => ElementType::I8,
         };
         if shape.len() != 3
@@ -125,6 +130,10 @@ pub(super) fn validate_program_kv_storage(
     let mut consumed = BTreeSet::new();
     for node in program.blocks().iter().flat_map(|block| &block.nodes) {
         let (format, payload_port, scale_port) = match node.operation_id.as_str() {
+            crate::CAUSAL_PAGED_ATTENTION_BF16_OPERATION_ID
+            | crate::CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_BF16_OPERATION_ID => {
+                (KvStorageFormat::Bf16, 8, None)
+            }
             CAUSAL_PAGED_ATTENTION_OPERATION_ID
             | CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_F16_OPERATION_ID
             | CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID

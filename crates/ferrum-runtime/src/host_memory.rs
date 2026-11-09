@@ -3,12 +3,14 @@
 //! Product composition injects one account into all cooperating engines. Limits
 //! cover physical backing bytes (including configured padding) and reservations,
 //! not allocator metadata, page cache, network buffers, or total process RSS.
-//! A transfer classification does not prove page locking: this module currently
-//! allocates pageable memory only.
+//! A transfer classification does not prove page locking. Allocations start
+//! pageable; an explicit backend registration can retain its native ownership
+//! on the same allocation without adding a second payload.
 
 use std::{
     alloc::Layout,
     collections::BTreeMap,
+    mem::ManuallyDrop,
     ops::Range,
     sync::{Arc, Mutex},
     task::Waker,
@@ -23,7 +25,9 @@ use scope::{ScopeAuthority, ScopeCredit};
 mod scope_exchange;
 pub use scope_exchange::HostMemoryScopeExchangeFailure;
 use scope_exchange::ScopeRefund;
+mod registration;
 mod scope_shrink;
+pub use registration::NativeHostMemoryRegistration;
 
 /// A quota dimension; it does not describe allocation or DMA capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,19 +546,21 @@ impl HostMemoryReservation {
         let bytes = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer, length)) };
         self.charge.mark_allocated()?;
         Ok(ManagedHostBuffer {
-            bytes,
+            bytes: ManuallyDrop::new(bytes),
             range,
-            charge: self.charge,
+            charge: ManuallyDrop::new(self.charge),
+            registrations: ManuallyDrop::new(Mutex::new(Vec::new())),
         })
     }
 }
 
-/// Exclusively writable, already admitted pageable backing. Fields are ordered
-/// so the actual bytes are freed before their capacity charge is returned.
+/// Exclusively writable, already admitted backing. Native registrations, if
+/// any, survive freeze/thaw and are retired before bytes and their charge.
 pub struct ManagedHostBuffer {
-    bytes: Box<[u8]>,
+    bytes: ManuallyDrop<Box<[u8]>>,
     range: Range<usize>,
-    charge: Charge,
+    charge: ManuallyDrop<Charge>,
+    registrations: ManuallyDrop<Mutex<Vec<registration::Registration>>>,
 }
 
 impl ManagedHostBuffer {

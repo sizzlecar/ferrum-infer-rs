@@ -9,17 +9,23 @@ pub enum CudaTensorExecutionProfile {
     TensorOnly,
     TensorAndDenseF16CausalV1,
     TensorAndDenseF16VisualCausalV1,
+    TensorAndDenseBf16CausalV1,
+    TensorAndDenseBf16VisualCausalV1,
 }
 
 /// Additional allowance for the exact dense-F16 portable causal provider set.
 /// Modules are admitted separately from the tensor provider's bootstrap slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CudaDenseF16CausalProfile {
+pub struct CudaDenseCausalProfile {
     module_memory_bytes: u64,
     opaque_memory_profile: String,
     visual_prompt: bool,
     decode_replay: Option<CudaCausalDecodeReplay>,
+    bf16: bool,
 }
+
+/// Compatibility name; `new` retains the original F16 execution profile.
+pub type CudaDenseF16CausalProfile = CudaDenseCausalProfile;
 
 /// Bounded graph inventory on each causal lane, charged to its original account.
 /// Opaque bytes are a declared allowance, not a measured CUDA memory profile.
@@ -62,7 +68,7 @@ pub(crate) fn permits_command_replay(
     }
 }
 
-impl CudaDenseF16CausalProfile {
+impl CudaDenseCausalProfile {
     pub fn new(
         module_memory_bytes: u64,
         opaque_memory_profile: impl Into<String>,
@@ -81,7 +87,19 @@ impl CudaDenseF16CausalProfile {
             opaque_memory_profile,
             visual_prompt: false,
             decode_replay: None,
+            bf16: false,
         })
+    }
+    pub fn new_bf16(
+        module_memory_bytes: u64,
+        opaque_memory_profile: impl Into<String>,
+    ) -> Result<Self, String> {
+        let mut profile = Self::new(module_memory_bytes, opaque_memory_profile)?;
+        profile.bf16 = true;
+        Ok(profile)
+    }
+    pub const fn is_bf16(&self) -> bool {
+        self.bf16
     }
     pub const fn module_memory_bytes(&self) -> u64 {
         self.module_memory_bytes
@@ -133,7 +151,11 @@ impl CudaDenseF16CausalProfile {
         self.decode_replay
     }
     pub(crate) const fn execution_profile(&self) -> CudaTensorExecutionProfile {
-        if self.visual_prompt {
+        if self.bf16 && self.visual_prompt {
+            CudaTensorExecutionProfile::TensorAndDenseBf16VisualCausalV1
+        } else if self.bf16 {
+            CudaTensorExecutionProfile::TensorAndDenseBf16CausalV1
+        } else if self.visual_prompt {
             CudaTensorExecutionProfile::TensorAndDenseF16VisualCausalV1
         } else {
             CudaTensorExecutionProfile::TensorAndDenseF16CausalV1
@@ -172,6 +194,47 @@ pub(crate) const DENSE_F16_VISUAL_CAUSAL_CAPABILITIES: [&str; 14] = [
     ferrum_runtime::CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_F16_CAPABILITY_ID,
 ];
 
+pub(crate) const DENSE_BF16_CAUSAL_CAPABILITIES: [&str; 8] = [
+    ferrum_runtime::TOKEN_EMBEDDING_BF16_CAPABILITY_ID,
+    ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_BF16_CAPABILITY_ID,
+    ferrum_runtime::LAST_TOKEN_MASKED_ARGMAX_BF16_CAPABILITY_ID,
+    ferrum_runtime::RMS_NORM_BF16_CAPABILITY_ID,
+    ferrum_runtime::DENSE_SWIGLU_BF16_CAPABILITY_ID,
+    ferrum_runtime::RESIDUAL_ADD_BF16_CAPABILITY_ID,
+    ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_BF16_CAPABILITY_ID,
+    ferrum_runtime::CAUSAL_PAGED_ATTENTION_BF16_CAPABILITY_ID,
+];
+
+/// Native BF16 projection GEMMs require Ampere or newer. Check the actual
+/// context before publishing these capabilities or installing any weights.
+pub(crate) fn validate_causal_compute_capability(
+    capabilities: &BTreeSet<CapabilityId>,
+    major: i32,
+) -> Result<(), String> {
+    if major < 8
+        && capabilities
+            .iter()
+            .any(|capability| DENSE_BF16_CAUSAL_CAPABILITIES.contains(&capability.as_str()))
+    {
+        return Err(
+            "native BF16 causal execution requires CUDA compute capability 8.0 or newer".into(),
+        );
+    }
+    Ok(())
+}
+pub(crate) const DENSE_BF16_VISUAL_CAUSAL_CAPABILITIES: [&str; 10] = [
+    DENSE_BF16_CAUSAL_CAPABILITIES[0],
+    DENSE_BF16_CAUSAL_CAPABILITIES[1],
+    DENSE_BF16_CAUSAL_CAPABILITIES[2],
+    DENSE_BF16_CAUSAL_CAPABILITIES[3],
+    DENSE_BF16_CAUSAL_CAPABILITIES[4],
+    DENSE_BF16_CAUSAL_CAPABILITIES[5],
+    DENSE_BF16_CAUSAL_CAPABILITIES[6],
+    DENSE_BF16_CAUSAL_CAPABILITIES[7],
+    ferrum_runtime::ROW_SELECT_BF16_CAPABILITY_ID,
+    ferrum_runtime::CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_BF16_CAPABILITY_ID,
+];
+
 pub(crate) fn validate_capabilities(
     capabilities: &BTreeSet<CapabilityId>,
     profile: CudaTensorExecutionProfile,
@@ -179,12 +242,16 @@ pub(crate) fn validate_capabilities(
     if profile == CudaTensorExecutionProfile::TensorOnly {
         return crate::backend::cuda_tensor_capability_policy::validate(capabilities);
     }
-    let required: &[&str] =
-        if profile == CudaTensorExecutionProfile::TensorAndDenseF16VisualCausalV1 {
+    let required: &[&str] = match profile {
+        CudaTensorExecutionProfile::TensorAndDenseF16VisualCausalV1 => {
             &DENSE_F16_VISUAL_CAUSAL_CAPABILITIES
-        } else {
-            &DENSE_F16_CAUSAL_CAPABILITIES
-        };
+        }
+        CudaTensorExecutionProfile::TensorAndDenseBf16CausalV1 => &DENSE_BF16_CAUSAL_CAPABILITIES,
+        CudaTensorExecutionProfile::TensorAndDenseBf16VisualCausalV1 => {
+            &DENSE_BF16_VISUAL_CAUSAL_CAPABILITIES
+        }
+        _ => &DENSE_F16_CAUSAL_CAPABILITIES,
+    };
     let tensor = capabilities
         .iter()
         .filter(|c| !required.contains(&c.as_str()))
@@ -235,6 +302,8 @@ pub(crate) const fn permits_zero(profile: CudaTensorExecutionProfile, usage: Buf
             profile,
             CudaTensorExecutionProfile::TensorAndDenseF16CausalV1
                 | CudaTensorExecutionProfile::TensorAndDenseF16VisualCausalV1
+                | CudaTensorExecutionProfile::TensorAndDenseBf16CausalV1
+                | CudaTensorExecutionProfile::TensorAndDenseBf16VisualCausalV1
         ) && matches!(usage, BufferUsage::State))
 }
 
@@ -349,6 +418,8 @@ mod tests {
             CudaTensorExecutionProfile::TensorOnly,
             CudaTensorExecutionProfile::TensorAndDenseF16CausalV1,
             CudaTensorExecutionProfile::TensorAndDenseF16VisualCausalV1,
+            CudaTensorExecutionProfile::TensorAndDenseBf16CausalV1,
+            CudaTensorExecutionProfile::TensorAndDenseBf16VisualCausalV1,
         ] {
             assert!(permits_zero(profile, BufferUsage::Weights));
             assert!(permits_zero(profile, BufferUsage::Persistent));
@@ -423,5 +494,16 @@ mod tests {
         assert_eq!(add_module_allowance(40, None).unwrap(), 40);
         assert_eq!(add_module_allowance(40, Some(&p)).unwrap(), 41);
         assert!(add_module_allowance(u64::MAX, Some(&p)).is_err());
+    }
+
+    #[test]
+    fn native_bf16_rejects_pre_ampere_without_changing_f16_qualification() {
+        let f16 = capabilities();
+        validate_causal_compute_capability(&f16, 7).unwrap();
+        for capability in DENSE_BF16_CAUSAL_CAPABILITIES {
+            let bf16 = BTreeSet::from([CapabilityId::new(capability).unwrap()]);
+            assert!(validate_causal_compute_capability(&bf16, 7).is_err());
+            validate_causal_compute_capability(&bf16, 8).unwrap();
+        }
     }
 }

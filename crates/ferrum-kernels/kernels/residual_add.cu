@@ -1,8 +1,41 @@
 // Element-wise residual add: output[i] = a[i] + b[i]
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+extern "C" __global__ void residual_add_bf16(
+    const __nv_bfloat16* a, const __nv_bfloat16* __restrict__ b,
+    __nv_bfloat16* output, const int n) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < static_cast<unsigned int>(n)) {
+        output[idx] = __float2bfloat16_rn(__bfloat162float(a[idx]) + __bfloat162float(b[idx]));
+    }
+}
+
+extern "C" __global__ void residual_add_inplace_bf16(
+    __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b, const int n) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < static_cast<unsigned int>(n)) {
+        a[idx] = __float2bfloat16_rn(__bfloat162float(a[idx]) + __bfloat162float(b[idx]));
+    }
+}
 
 extern "C" __global__ void vnext_visual_row_select_f16(
+    const unsigned short* __restrict__ input,
+    const unsigned short* __restrict__ visual,
+    const unsigned char* __restrict__ mask,
+    unsigned short* __restrict__ output,
+    const unsigned long long elements,
+    const unsigned long long columns) {
+    const unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < elements) {
+        // Mask=0 never touches visual memory, including poison/unused slots.
+        // Every nonzero U8 predicate selects visual; no binary-only precondition.
+        output[index] = mask[index / columns] == 0 ? input[index] : visual[index];
+    }
+}
+
+extern "C" __global__ void vnext_visual_row_select_bf16(
     const unsigned short* __restrict__ input,
     const unsigned short* __restrict__ visual,
     const unsigned char* __restrict__ mask,

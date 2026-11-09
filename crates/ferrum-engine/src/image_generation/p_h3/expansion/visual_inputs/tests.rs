@@ -3,6 +3,10 @@ use super::*;
 use ferrum_models::qwen3_vl_vision::Qwen3VLVisionGrid;
 
 fn plan() -> VisualExpansionInputs {
+    plan_with_precision(Qwen35DensePrecision::F16)
+}
+
+fn plan_with_precision(precision: Qwen35DensePrecision) -> VisualExpansionInputs {
     let fixture = Fixture::new();
     let expansion = fixture.expansion();
     let request = PH3ImagePromptExpansionRequest::edit("make the sky blue", 1)
@@ -21,7 +25,7 @@ fn plan() -> VisualExpansionInputs {
     text.rope_parameters.partial_rotary_factor = 1.;
     text.rope_parameters.mrope_interleaved = true;
     text.rope_parameters.mrope_section = Some(vec![1, 0, 0]);
-    VisualExpansionInputs::new(tokens, &text).unwrap()
+    VisualExpansionInputs::with_precision(tokens, &text, precision).unwrap()
 }
 
 fn output(
@@ -108,5 +112,44 @@ fn visual_bridge_rejects_foreign_wrong_class_and_nonfinite_features_without_leak
         );
     }
     assert!(plan.bind_sources(&host, &[]).is_err());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn bf16_visual_bridge_preserves_declared_type_and_large_finite_values() {
+    let host = host();
+    let plan = plan_with_precision(Qwen35DensePrecision::Bf16);
+    for spec in plan.schema().specs() {
+        assert_eq!(
+            spec.element_type,
+            if spec.value_id.as_str() == VISUAL_REPLACE_MASK_INPUT_ID {
+                ElementType::U8
+            } else {
+                ElementType::Bf16
+            }
+        );
+    }
+    // Representable in BF16, overflows F16; conversion must not pass through F16.
+    let value = 131072.0f32;
+    let source = output(&host, &plan, value, HostMemoryClass::Output);
+    let bound = plan.bind_sources(&host, &[&source]).unwrap();
+    let start = plan.tokens.image_runs()[0].token_start();
+    let (dtype, rows) = bound
+        .materialize_rows(
+            &host,
+            &ProgramValueId::new(VISUAL_ROWS_INPUT_ID).unwrap(),
+            start..start + 1,
+        )
+        .unwrap();
+    assert_eq!(dtype, ElementType::Bf16);
+    for bytes in rows.bytes().chunks_exact(2) {
+        assert_eq!(
+            bf16::from_le_bytes(bytes.try_into().unwrap()).to_f32(),
+            value
+        );
+    }
+    drop(rows);
+    drop(bound);
+    drop(source);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

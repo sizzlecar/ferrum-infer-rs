@@ -166,6 +166,9 @@ pub struct PH3ImageCausalDecodeReplayConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PH3ImageCausalModuleConfig {
+    /// Weight, activation and KV ABI of the native causal expander.
+    #[serde(default)]
+    pub precision: ferrum_models::vnext::qwen35::Qwen35DensePrecision,
     pub module_memory_bytes: u64,
     pub opaque_memory_profile: String,
     #[serde(default)]
@@ -183,6 +186,17 @@ impl PH3ImageCausalModuleConfig {
         Ok(())
     }
     pub(super) fn configure_expansion(&self, options: &mut PH3ImagePromptExpansionOptions) {
+        use ferrum_models::vnext::qwen35::*;
+        options.engine.numerical_execution = match self.precision {
+            Qwen35DensePrecision::F16 => F16_NUMERICAL_PROFILE_ID,
+            Qwen35DensePrecision::Bf16 => BF16_NUMERICAL_PROFILE_ID,
+        }
+        .parse()
+        .expect("static numerical profile");
+        options.engine.kv_cache.dtype = match self.precision {
+            Qwen35DensePrecision::F16 => ferrum_types::KvCacheDtype::Fp16,
+            Qwen35DensePrecision::Bf16 => ferrum_types::KvCacheDtype::Bf16,
+        };
         if let Some(replay) = self.decode_replay {
             options.engine.backend.enable_reusable_execution = true;
             options.engine.backend.reusable_execution_capture.scope =
@@ -204,11 +218,16 @@ impl PH3ImageCausalModuleConfig {
         &self,
     ) -> Result<ferrum_kernels::backend::cuda::CudaDenseF16CausalProfile> {
         self.validate()?;
-        let profile = ferrum_kernels::backend::cuda::CudaDenseF16CausalProfile::new(
-            self.module_memory_bytes,
-            self.opaque_memory_profile.clone(),
-        )
-        .map_err(anyhow::Error::msg)?;
+        let constructor = match self.precision {
+            ferrum_models::vnext::qwen35::Qwen35DensePrecision::F16 => {
+                ferrum_kernels::backend::cuda::CudaDenseF16CausalProfile::new
+            }
+            ferrum_models::vnext::qwen35::Qwen35DensePrecision::Bf16 => {
+                ferrum_kernels::backend::cuda::CudaDenseF16CausalProfile::new_bf16
+            }
+        };
+        let profile = constructor(self.module_memory_bytes, self.opaque_memory_profile.clone())
+            .map_err(anyhow::Error::msg)?;
         match self.decode_replay {
             Some(replay) => profile
                 .with_decode_replay(

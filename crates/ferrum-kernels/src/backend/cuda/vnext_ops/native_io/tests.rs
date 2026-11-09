@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "../transformer/test_support.rs"]
+mod bf16_guards;
 mod packed_projection;
 use crate::gguf_blocks::{
     fixtures::{oracle_blocks, FORMATS},
@@ -91,6 +93,7 @@ fn matrix(format: MatrixFormat, rows: usize) -> (Vec<u8>, Vec<f32>, usize) {
 fn scalar_bytes(value: f32, precision: TokenPrecision) -> Vec<u8> {
     match precision {
         TokenPrecision::F16 => f16::from_f32(value).to_bits().to_le_bytes().to_vec(),
+        TokenPrecision::Bf16 => half::bf16::from_f32(value).to_bits().to_le_bytes().to_vec(),
         TokenPrecision::F32 => value.to_le_bytes().to_vec(),
     }
 }
@@ -99,6 +102,9 @@ fn scalar_value(bytes: &[u8], precision: TokenPrecision) -> f32 {
     match precision {
         TokenPrecision::F16 => {
             f16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap())).to_f32()
+        }
+        TokenPrecision::Bf16 => {
+            half::bf16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap())).to_f32()
         }
         TokenPrecision::F32 => f32::from_le_bytes(bytes.try_into().unwrap()),
     }
@@ -249,5 +255,69 @@ fn final_row_projection_launcher_preserves_f32_input_and_guarded_logits_on_cuda(
             }
             assert_eq!(stream.clone_dtoh(&x).unwrap(), input);
         }
+    }
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn bf16_embedding_preserves_ids_invalid_rows_and_guarded_storage_on_cuda() {
+    use bf16_guards::Guarded;
+    use half::bf16;
+    let context = CudaContext::new(0).expect("BF16 embedding conformance requires CUDA");
+    let stream = context.default_stream();
+    let module = context
+        .load_module(Ptx::from_src(crate::ptx::EMBEDDING_LOOKUP))
+        .unwrap();
+    let function = module.load_function("vnext_embedding_lookup_bf16").unwrap();
+    let vocabulary = 7_u32;
+    for hidden in [1_usize, 33, 257] {
+        let weights = (0..vocabulary as usize * hidden)
+            .map(|i| bf16::from_f32((i % 31) as f32 / 7.0 - 2.0))
+            .collect::<Vec<_>>();
+        let ids = [6, 0, 6, 7, u32::MAX, 2];
+        let guard = bf16::from_f32(-117.0);
+        let table = Guarded::new(&stream, &weights, guard);
+        let tokens = Guarded::new(&stream, &ids, 0x5a5a1234_u32);
+        let output = Guarded::new(&stream, &vec![bf16::NAN; ids.len() * hidden], guard);
+        let (w, t, y, batch, dim) = (
+            table.pointer(&stream),
+            tokens.pointer(&stream),
+            output.pointer(&stream),
+            ids.len() as i32,
+            hidden as i32,
+        );
+        let mut launch = stream.launch_builder(&function);
+        launch
+            .arg(&w)
+            .arg(&t)
+            .arg(&y)
+            .arg(&batch)
+            .arg(&dim)
+            .arg(&vocabulary);
+        // SAFETY: Original retained BF16 allocations, bounded 2D lookup and
+        // canaries around every payload; invalid IDs must not read the table.
+        unsafe {
+            launch.launch(LaunchConfig {
+                grid_dim: (
+                    (hidden as u32).div_ceil(THREADS_PER_BLOCK),
+                    ids.len() as u32,
+                    1,
+                ),
+                block_dim: (THREADS_PER_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .unwrap();
+        let actual = output.read(&stream);
+        for (row, &id) in ids.iter().enumerate() {
+            let expected = if id < vocabulary {
+                weights[id as usize * hidden..][..hidden].to_vec()
+            } else {
+                vec![bf16::ZERO; hidden]
+            };
+            assert_eq!(&actual[row * hidden..][..hidden], expected);
+        }
+        table.assert_unchanged(&stream);
+        tokens.assert_unchanged(&stream);
     }
 }

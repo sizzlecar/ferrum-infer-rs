@@ -5,18 +5,48 @@ const KERNEL: &str = "vnext_visual_row_select_f16";
 pub(in crate::backend::cuda::vnext_ops) struct CudaVisualRowSelectF16Provider {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
+    element_type: ElementType,
 }
 impl CudaVisualRowSelectF16Provider {
     pub(in crate::backend::cuda::vnext_ops) fn new(
         runtime: &CudaDeviceRuntime,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        let contract = ferrum_runtime::row_select_f16_contract().map_err(contract_error)?;
+        Self::with_element_type(runtime, ElementType::F16)
+    }
+    pub(in crate::backend::cuda::vnext_ops) fn new_bf16(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_element_type(runtime, ElementType::Bf16)
+    }
+    fn with_element_type(
+        runtime: &CudaDeviceRuntime,
+        element_type: ElementType,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let bf16 = element_type == ElementType::Bf16;
+        let contract = if bf16 {
+            ferrum_runtime::row_select_bf16_contract()
+        } else {
+            ferrum_runtime::row_select_f16_contract()
+        }
+        .map_err(contract_error)?;
         let descriptor = weightless_provider_descriptor(
             runtime,
             &contract,
-            "provider.cuda.row_select.f16",
-            ferrum_runtime::ROW_SELECT_F16_CAPABILITY_ID,
-            "resource-estimator.cuda.row_select.f16",
+            if bf16 {
+                "provider.cuda.row_select.bf16"
+            } else {
+                "provider.cuda.row_select.f16"
+            },
+            if bf16 {
+                ferrum_runtime::ROW_SELECT_BF16_CAPABILITY_ID
+            } else {
+                ferrum_runtime::ROW_SELECT_F16_CAPABILITY_ID
+            },
+            if bf16 {
+                "resource-estimator.cuda.row_select.bf16"
+            } else {
+                "resource-estimator.cuda.row_select.f16"
+            },
             contiguous_bindings(3),
             implementation_fingerprint(&[
                 include_bytes!("visual_row_select_f16.rs"),
@@ -31,11 +61,16 @@ impl CudaVisualRowSelectF16Provider {
             .load_module(Ptx::from_src(crate::ptx::RESIDUAL_ADD.to_owned()))
             .map_err(|e| CudaDeviceRuntimeError::driver("visual row-selection module load", e))?;
         let function = module
-            .load_function(KERNEL)
+            .load_function(if bf16 {
+                "vnext_visual_row_select_bf16"
+            } else {
+                KERNEL
+            })
             .map_err(|e| CudaDeviceRuntimeError::driver("visual row-selection function load", e))?;
         Ok(Self {
             descriptor,
             function,
+            element_type,
         })
     }
 }
@@ -47,7 +82,11 @@ impl OperationResourceEstimator for CudaVisualRowSelectF16Provider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        estimate_without_workspace(&self.descriptor, &request, OP)
+        estimate_without_workspace(
+            &self.descriptor,
+            &request,
+            self.descriptor.operation_id().as_str(),
+        )
     }
 }
 impl OperationProvider<CudaDeviceRuntime> for CudaVisualRowSelectF16Provider {
@@ -62,7 +101,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaVisualRowSelectF16Provider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode(&self.function, &invocation)
+        encode(&self.function, &invocation, self.element_type)
             .map(EncodedDeviceOperation::compute)
             .map_err(|e| provider_failure(identity, "cuda.row_select.f16.encode", e))
     }
@@ -70,8 +109,16 @@ impl OperationProvider<CudaDeviceRuntime> for CudaVisualRowSelectF16Provider {
 fn encode(
     function: &CudaFunction,
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    element_type: ElementType,
 ) -> Result<CudaDeviceCommand, String> {
-    ensure_invocation(invocation, OP)?;
+    ensure_invocation(
+        invocation,
+        if element_type == ElementType::Bf16 {
+            ferrum_runtime::ROW_SELECT_BF16_OPERATION_ID
+        } else {
+            OP
+        },
+    )?;
     let mut regions = Vec::new();
     let mut launches = Vec::new();
     let first = &invocation.participants()[0];
@@ -95,10 +142,10 @@ fn encode(
             .ok_or("visual row-selection extent overflows")?;
         let base = regions.len();
         for (role, ordinal, dtype, expected) in [
-            (ResolvedValueRole::Input, 0, ElementType::F16, bytes),
-            (ResolvedValueRole::Input, 1, ElementType::F16, bytes),
+            (ResolvedValueRole::Input, 0, element_type, bytes),
+            (ResolvedValueRole::Input, 1, element_type, bytes),
             (ResolvedValueRole::Input, 2, ElementType::U8, tokens),
-            (ResolvedValueRole::Output, 0, ElementType::F16, bytes),
+            (ResolvedValueRole::Output, 0, element_type, bytes),
         ] {
             let packed = super::token_binding_is_packed(invocation, role, ordinal)?;
             let start = if packed {

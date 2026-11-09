@@ -57,3 +57,26 @@ fn invalid_frequency_sections_or_theta_cannot_create_a_visual_rotary_profile() {
         assert!(PH3ImagePromptExpansionRotary::checked(dim, sections, theta, interleaved).is_err());
     }
 }
+
+#[test]
+fn bf16_rotary_tables_follow_thw_axes_and_direct_rounding() {
+    let plan = PH3ImagePromptExpansionRotary::checked(8, [2, 1, 1], 10000., true).unwrap();
+    let mut cosine = [0; 8];
+    let mut sine = [0; 8];
+    plan.write_row_with_precision(
+        [7, 31, 13],
+        Qwen35DensePrecision::Bf16,
+        &mut cosine,
+        &mut sine,
+    )
+    .unwrap();
+    for (pair, axis) in [0usize, 1, 2, 0].into_iter().enumerate() {
+        let phase = [7f64, 31., 13.][axis] / 10000f64.powf(pair as f64 / 4.);
+        let cos =
+            bf16::from_le_bytes(cosine[pair * 2..pair * 2 + 2].try_into().unwrap()).to_f32() as f64;
+        let sin =
+            bf16::from_le_bytes(sine[pair * 2..pair * 2 + 2].try_into().unwrap()).to_f32() as f64;
+        assert!((cos - phase.cos()).abs() < 0.0021);
+        assert!((sin - phase.sin()).abs() < 0.0021);
+    }
+}

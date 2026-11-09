@@ -11,6 +11,8 @@ pub enum ManagedCausalIoProfile {
     ManagedGreedyF32V1,
     /// The same existing native greedy comparator over real F16 head output.
     ManagedGreedyF16V1,
+    /// Finite total-order greedy selection over real BF16 head output.
+    ManagedGreedyBf16V1,
 }
 
 impl ManagedCausalIoProfile {
@@ -18,6 +20,7 @@ impl ManagedCausalIoProfile {
         match self {
             Self::ManagedGreedyF32V1 => ElementType::F32,
             Self::ManagedGreedyF16V1 => ElementType::F16,
+            Self::ManagedGreedyBf16V1 => ElementType::Bf16,
         }
     }
 
@@ -36,6 +39,7 @@ impl ManagedCausalIoProfile {
 pub enum ManagedCausalReadback {
     F32Logits,
     F16Logits,
+    Bf16Logits,
     GreedyToken,
 }
 
@@ -108,7 +112,8 @@ impl ManagedCausalIo {
         match (self.profile, policy) {
             (
                 ManagedCausalIoProfile::ManagedGreedyF32V1
-                | ManagedCausalIoProfile::ManagedGreedyF16V1,
+                | ManagedCausalIoProfile::ManagedGreedyF16V1
+                | ManagedCausalIoProfile::ManagedGreedyBf16V1,
                 LogitsReturnPolicy::GreedyArgmax {
                     token_mask: None,
                     repetition_penalty: None,
@@ -179,10 +184,13 @@ pub(super) fn requirements_with_inputs(
                 .ok_or_else(|| FerrumError::config("causal wave Input demand overflows"))?;
         }
         let logical = match row.output {
-            ManagedCausalReadback::F32Logits | ManagedCausalReadback::F16Logits => {
+            ManagedCausalReadback::F32Logits
+            | ManagedCausalReadback::F16Logits
+            | ManagedCausalReadback::Bf16Logits => {
                 profile.validate_logits_type(match row.output {
                     ManagedCausalReadback::F32Logits => ElementType::F32,
                     ManagedCausalReadback::F16Logits => ElementType::F16,
+                    ManagedCausalReadback::Bf16Logits => ElementType::Bf16,
                     ManagedCausalReadback::GreedyToken => unreachable!(),
                 })?;
                 vocabulary
@@ -238,7 +246,7 @@ fn select_finite_logits(
 ) -> Result<ExecutorSamplingOutput> {
     let width = match element {
         ElementType::F32 => 4,
-        ElementType::F16 => 2,
+        ElementType::F16 | ElementType::Bf16 => 2,
         other => {
             return Err(FerrumError::backend(format!(
                 "unsupported managed greedy logits {other:?}"
@@ -256,6 +264,9 @@ fn select_finite_logits(
             ElementType::F32 => f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
             ElementType::F16 => {
                 half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32()
+            }
+            ElementType::Bf16 => {
+                half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32()
             }
             _ => unreachable!(),
         };

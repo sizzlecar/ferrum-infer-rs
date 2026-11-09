@@ -99,6 +99,8 @@ const CORE_PTX_KERNELS: &[&str] = &[
 
 const CORE_PTX_HEADERS: &[&str] = &[
     "kernels/common.cuh",
+    "kernels/vnext_causal_attention_impl.cuh",
+    "kernels/paged_varlen_attention_vllm_impl.cuh",
     "kernels/vnext_comfy_convrot.cuh",
     "kernels/vnext_comfy_convrot_embedding.cuh",
     "kernels/vnext_fused_head_rms_partial_rope.cuh",

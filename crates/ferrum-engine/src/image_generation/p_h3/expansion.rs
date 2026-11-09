@@ -89,6 +89,7 @@ pub(crate) struct ConfiguredTextExpansion {
 
 pub(crate) struct NativeTextExpansion {
     defined: DefinedProductionModel,
+    precision: ferrum_models::vnext::qwen35::Qwen35DensePrecision,
     model: ManagedProductionModel,
     visual_model: Option<ManagedProductionModel>,
     visual_assets: Option<Arc<visual_assets::ExpansionVisualAssets>>,
@@ -134,8 +135,64 @@ impl PreparedTextExpansion {
 }
 
 impl NativeTextExpansion {
-    pub(crate) fn configure_mtp(&mut self, policy: PH3ImagePromptExpansionMtp) {
+    pub(crate) fn configure_mtp(&mut self, policy: PH3ImagePromptExpansionMtp) -> Result<()> {
+        if self.precision == ferrum_models::vnext::qwen35::Qwen35DensePrecision::Bf16
+            && policy != PH3ImagePromptExpansionMtp::Off
+        {
+            return Err(FerrumError::config(
+                "BF16 prompt expansion currently requires MTP off",
+            ));
+        }
         self.mtp = policy;
+        Ok(())
+    }
+
+    pub(crate) fn precision_for_engine(
+        engine: &EngineConfig,
+    ) -> Result<ferrum_models::vnext::qwen35::Qwen35DensePrecision> {
+        use ferrum_models::vnext::qwen35::*;
+        match &engine.numerical_execution {
+            ferrum_types::NumericalExecutionPolicy::Auto => Ok(Qwen35DensePrecision::F16),
+            ferrum_types::NumericalExecutionPolicy::Require(id)
+                if id.as_str() == F16_NUMERICAL_PROFILE_ID =>
+            {
+                Ok(Qwen35DensePrecision::F16)
+            }
+            ferrum_types::NumericalExecutionPolicy::Require(id)
+                if id.as_str() == BF16_NUMERICAL_PROFILE_ID =>
+            {
+                Ok(Qwen35DensePrecision::Bf16)
+            }
+            _ => Err(FerrumError::config(
+                "unsupported prompt expansion numerical profile",
+            )),
+        }
+    }
+    pub(super) fn is_bf16(&self) -> bool {
+        self.precision == ferrum_models::vnext::qwen35::Qwen35DensePrecision::Bf16
+    }
+    fn numerical_profile(&self, visual: bool) -> &'static str {
+        use ferrum_models::vnext::qwen35::*;
+        match (self.is_bf16(), visual) {
+            (false, false) => F16_NUMERICAL_PROFILE_ID,
+            (false, true) => F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID,
+            (true, false) => BF16_NUMERICAL_PROFILE_ID,
+            (true, true) => BF16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID,
+        }
+    }
+    fn managed_io_profile(&self) -> ManagedCausalIoProfile {
+        if self.is_bf16() {
+            ManagedCausalIoProfile::ManagedGreedyBf16V1
+        } else {
+            ManagedCausalIoProfile::ManagedGreedyF16V1
+        }
+    }
+    fn kv_storage(&self) -> ferrum_types::KvStorageFormat {
+        if self.is_bf16() {
+            ferrum_types::KvStorageFormat::Bf16
+        } else {
+            ferrum_types::KvStorageFormat::F16
+        }
     }
     pub(crate) fn configure_vision_reuse(&mut self, policy: PH3ImagePromptExpansionVisionReuse) {
         self.vision_reuse = policy;
@@ -196,6 +253,18 @@ impl NativeTextExpansion {
         sources: Arc<ProductionModelSourceBundle>,
         limits: PH3ImagePromptExpansionLimits,
     ) -> Result<Self> {
+        Self::from_sources_with_precision(
+            sources,
+            limits,
+            ferrum_models::vnext::qwen35::Qwen35DensePrecision::F16,
+        )
+    }
+
+    pub(crate) fn from_sources_with_precision(
+        sources: Arc<ProductionModelSourceBundle>,
+        limits: PH3ImagePromptExpansionLimits,
+        precision: ferrum_models::vnext::qwen35::Qwen35DensePrecision,
+    ) -> Result<Self> {
         let config = sources.tokenizer_config_json().ok_or_else(|| {
             FerrumError::model("prompt expansion requires its original tokenizer config")
         })?;
@@ -226,14 +295,28 @@ impl NativeTextExpansion {
                 ));
             }
         }
-        let defined = resolve_registered_model_from_sources(&sources)?
-            .into_required()?
-            .define_from_sources(sources)?;
-        // Explicit first execution profile: BF16 storage is normalized to the
-        // existing F16 causal ABI. This does not claim BF16 compute equivalence.
-        let profile = ferrum_models::vnext::qwen35::F16_NUMERICAL_PROFILE_ID
-            .parse()
-            .map_err(model_error)?;
+        let defined = match precision {
+            ferrum_models::vnext::qwen35::Qwen35DensePrecision::F16 => {
+                resolve_registered_model_from_sources(&sources)?
+                    .into_required()?
+                    .define_from_sources(sources)?
+            }
+            ferrum_models::vnext::qwen35::Qwen35DensePrecision::Bf16 => {
+                ferrum_models::vnext::qwen35::define_from_sources_with_dense_precision(
+                    sources, precision,
+                )?
+            }
+        };
+        let profile = match precision {
+            ferrum_models::vnext::qwen35::Qwen35DensePrecision::F16 => {
+                ferrum_models::vnext::qwen35::F16_NUMERICAL_PROFILE_ID
+            }
+            ferrum_models::vnext::qwen35::Qwen35DensePrecision::Bf16 => {
+                ferrum_models::vnext::qwen35::BF16_NUMERICAL_PROFILE_ID
+            }
+        }
+        .parse()
+        .map_err(model_error)?;
         let prepared = Arc::new(defined.prepare(&profile)?);
         if [protocol.eos_token_id(), protocol.pad_token_id()]
             .into_iter()
@@ -245,6 +328,7 @@ impl NativeTextExpansion {
         }
         Ok(Self {
             defined,
+            precision,
             model: prepared.managed_safetensors()?,
             visual_model: None,
             visual_assets: None,
@@ -304,9 +388,12 @@ impl NativeTextExpansion {
         // H3 remains eager by default; only the explicit decode-only policy opts in.
         engine.backend.enable_reusable_execution &= engine.backend.reusable_execution_capture.scope
             == ferrum_types::ReusableExecutionCaptureScope::DecodeOnly;
-        engine.numerical_execution = ferrum_models::vnext::qwen35::F16_NUMERICAL_PROFILE_ID
-            .parse()
-            .map_err(model_error)?;
+        engine.kv_cache.dtype = if self.is_bf16() {
+            ferrum_types::KvCacheDtype::Bf16
+        } else {
+            ferrum_types::KvCacheDtype::Fp16
+        };
+        engine.numerical_execution = self.numerical_profile(false).parse().map_err(model_error)?;
         engine.sampling.default_params = SamplingParams::greedy();
         engine.sampling.default_params.max_tokens = generation.max_new_tokens as usize;
         Ok(PreparedTextExpansion {
@@ -415,7 +502,7 @@ impl NativeTextExpansion {
         )?;
         compiled.initialize_with_managed_io(
             phase_host,
-            ManagedCausalIoProfile::ManagedGreedyF16V1,
+            self.managed_io_profile(),
             |policy, catalog, compilation| self.resolve(prepared, policy, catalog, compilation),
         )
     }
@@ -449,7 +536,7 @@ impl NativeTextExpansion {
         )?;
         let owner = compiled.initialize_with_managed_io_retained(
             &host,
-            ManagedCausalIoProfile::ManagedGreedyF16V1,
+            self.managed_io_profile(),
             (phase, backing),
             |policy, catalog, compilation| {
                 self.resolve_with_engine(prepared, engine, policy, catalog, compilation)
@@ -479,7 +566,7 @@ impl NativeTextExpansion {
     ) -> Result<ferrum_runtime::ResolvedModelPlan> {
         let numerical = NumericalProfileResolution::from_static_plan(
             engine.numerical_execution.clone(),
-            ferrum_types::KvStorageFormat::F16,
+            self.kv_storage(),
             self.defined.definition(),
             self.selected_model(prepared)?.prepared().family(),
             catalog,

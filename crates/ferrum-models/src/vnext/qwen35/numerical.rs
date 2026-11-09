@@ -16,6 +16,8 @@ pub const F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_
 
 pub const F16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16";
 pub const F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16.visual_prompt_v1";
+pub const BF16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.bf16";
+pub const BF16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID: &str = "qwen3_5.bf16.visual_prompt_v1";
 pub const F32_MASTER_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master";
 pub const F32_MASTER_GGUF_Q8_HEAD_V1_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.gguf-q8-head-v1";
@@ -40,6 +42,7 @@ pub const F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID: &str =
 pub const F16_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16.int8-kv";
 pub const F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.int8-kv";
 
+mod bf16;
 mod q6_f16;
 mod q6_head;
 #[cfg(test)]
@@ -56,6 +59,9 @@ pub(super) fn profiles(
     config: &Qwen35FamilyConfig,
 ) -> Result<FamilyNumericalProfiles, VNextError> {
     let text = Qwen35FamilyProvider::text_config(config)?;
+    if config.dense_precision == Qwen35DensePrecision::Bf16 {
+        return bf16::profiles(family_id, config, &text);
+    }
     let (states, kv_storage) = states(&text, config.max_position_embeddings, KvStorageFormat::F16)?;
     let f16 = profile(family_id, &text, &states, &kv_storage, false, false)?;
     let visual = (config.weight_format == FamilyWeightFormat::SafetensorsDense

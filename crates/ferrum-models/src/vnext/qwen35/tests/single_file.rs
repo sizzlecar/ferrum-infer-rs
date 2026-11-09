@@ -4,6 +4,7 @@ use super::*;
 use sha2::{Digest, Sha256};
 
 mod managed;
+mod native_bf16;
 
 struct Fixture {
     _root: tempfile::TempDir,

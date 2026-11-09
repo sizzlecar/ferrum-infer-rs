@@ -8,6 +8,8 @@ use std::num::{NonZeroU64, NonZeroUsize};
 pub struct CudaTensorRuntimeOptions {
     pub native_lane_reuse: CudaNativeLaneReuse,
     pub native_allocation_reuse: CudaNativeAllocationReuse,
+    /// In-place registration policy fixed before device capacity admission.
+    pub pinned_weight_upload: Option<CudaPinnedWeightUploadConfig>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -12,6 +12,7 @@
 // Launch: grid=(m, 1, 1), block=(256, 1, 1). 32 KB shmem is plenty.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 extern "C" __global__ void apply_repetition_penalties_sparse_f16(
     __half* __restrict__ logits,                 // [m, n] row-major
@@ -493,6 +494,45 @@ extern "C" __global__ void last_token_masked_argmax_finalize_batched(
         reinterpret_cast<const unsigned int*>(row.repetition_offsets),
         reinterpret_cast<const float*>(row.repetition_penalty), row.repetition_capacity,
         reinterpret_cast<int*>(row.output));
+}
+
+
+
+// BF16 keeps the same token selection, mask and repetition semantics.
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_bf16(
+    const __nv_bfloat16* __restrict__ logits,
+    __nv_bfloat16* __restrict__ scratch,
+    int n,
+    const signed char* __restrict__ valid,
+    int mask_len,
+    const unsigned int* __restrict__ repetition_offsets,
+    const unsigned int* __restrict__ repetition_token_ids,
+    const float* __restrict__ repetition_penalty,
+    int repetition_capacity,
+    int* __restrict__ out_idx
+) {
+    vnext_masked_argmax_preserving_logits(logits, scratch, n, valid, mask_len,
+        repetition_offsets, repetition_token_ids, repetition_penalty, repetition_capacity, out_idx);
+}
+
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_bf16_partitioned(
+    const __nv_bfloat16* __restrict__ logits, __nv_bfloat16* __restrict__ scratch, int n,
+    const signed char* __restrict__ valid, int mask_len,
+    const unsigned int* __restrict__ repetition_offsets,
+    const unsigned int* __restrict__ repetition_token_ids,
+    const float* __restrict__ repetition_penalty, int repetition_capacity,
+    int* __restrict__ out_idx
+) {
+    vnext_masked_argmax_preserving_logits<__nv_bfloat16, true>(logits, scratch, n, valid, mask_len,
+        repetition_offsets, repetition_token_ids, repetition_penalty, repetition_capacity, out_idx);
+}
+
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_bf16_batched(
+    const VNEXT_ARGMAX_GRID_CONSTANT VNextArgmaxBatch batch, unsigned int row_count
+) {
+    if (blockIdx.y < row_count) {
+        vnext_masked_argmax_batched_row<__nv_bfloat16>(batch.rows[blockIdx.y]);
+    }
 }
 
 #undef VNEXT_ARGMAX_GRID_CONSTANT

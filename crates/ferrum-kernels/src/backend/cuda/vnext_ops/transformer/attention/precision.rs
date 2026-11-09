@@ -11,6 +11,7 @@ use ferrum_runtime::{
 #[derive(Clone, Copy)]
 pub(super) enum AttentionPrecision {
     F16,
+    Bf16,
     F32Master,
     CandidateF16,
     CandidateF32Master,
@@ -29,6 +30,7 @@ impl AttentionPrecision {
     pub(super) fn operation(self) -> &'static str {
         match self {
             Self::F16 => GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+            Self::Bf16 => ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_BF16_OPERATION_ID,
             Self::CandidateF16 => ferrum_runtime::GATED_DELTA_CANDIDATE_SCAN_F16_OPERATION_ID,
             Self::CandidateF32Master => ferrum_runtime::GATED_DELTA_CANDIDATE_SCAN_F32_MASTER_OPERATION_ID,
             Self::F32Master => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
@@ -47,6 +49,7 @@ impl AttentionPrecision {
     pub(super) fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::F16 => gated_delta_recurrent_attention_contract(),
+            Self::Bf16 => ferrum_runtime::gated_delta_recurrent_attention_bf16_contract(),
             Self::CandidateF16 => ferrum_runtime::gated_delta_candidate_scan_f16_contract(),
             Self::CandidateF32Master => ferrum_runtime::gated_delta_candidate_scan_f32_master_contract(),
             Self::F32Master => gated_delta_recurrent_attention_f32_master_contract(),
@@ -65,6 +68,7 @@ impl AttentionPrecision {
     pub(super) fn capability(self) -> &'static str {
         match self {
             Self::F16 => GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+            Self::Bf16 => ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_BF16_CAPABILITY_ID,
             Self::CandidateF16 => ferrum_runtime::GATED_DELTA_CANDIDATE_SCAN_F16_CAPABILITY_ID,
             Self::CandidateF32Master => ferrum_runtime::GATED_DELTA_CANDIDATE_SCAN_F32_MASTER_CAPABILITY_ID,
             Self::F32Master => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
@@ -83,6 +87,7 @@ impl AttentionPrecision {
     pub(super) fn provider(self) -> &'static str {
         match self {
             Self::F16 => "provider.cuda.gated_delta_recurrent_attention.f16",
+            Self::Bf16 => "provider.cuda.gated_delta_recurrent_attention.bf16",
             Self::CandidateF16 => "provider.cuda.gated_delta_candidate_scan.f16",
             Self::CandidateF32Master => "provider.cuda.gated_delta_candidate_scan.f32-master",
             Self::F32Master => "provider.cuda.gated_delta_recurrent_attention.f32-master",
@@ -105,6 +110,7 @@ impl AttentionPrecision {
     pub(super) fn estimator(self) -> &'static str {
         match self {
             Self::F16 => "resource-estimator.cuda.gated_delta_recurrent_attention.f16",
+            Self::Bf16 => "resource-estimator.cuda.gated_delta_recurrent_attention.bf16",
             Self::CandidateF16 => "resource-estimator.cuda.gated_delta_candidate_scan.f16",
             Self::CandidateF32Master => "resource-estimator.cuda.gated_delta_candidate_scan.f32-master",
             Self::F32Master => "resource-estimator.cuda.gated_delta_recurrent_attention.f32-master",
@@ -122,6 +128,7 @@ impl AttentionPrecision {
 
     pub(super) fn hidden(self) -> ElementType {
         match self {
+            Self::Bf16 => ElementType::Bf16,
             Self::F16 | Self::CandidateF16 => ElementType::F16,
             Self::F32Master
             | Self::CandidateF32Master
@@ -139,6 +146,7 @@ impl AttentionPrecision {
 
     pub(super) fn norm(self) -> &'static str {
         match self {
+            Self::Bf16 => "rms_norm_bf16",
             Self::F16 | Self::CandidateF16 => "rms_norm_f16",
             Self::F32Master
             | Self::CandidateF32Master
@@ -156,6 +164,7 @@ impl AttentionPrecision {
 
     pub(super) fn residual(self) -> &'static str {
         match self {
+            Self::Bf16 => "residual_add_bf16",
             Self::F16 | Self::CandidateF16 => "residual_add_f16",
             Self::F32Master
             | Self::CandidateF32Master
@@ -168,6 +177,16 @@ impl AttentionPrecision {
             | Self::F32MasterUpstreamExtraAllRows
             | Self::F32MasterUpstreamQ6F16
             | Self::F32MasterG32MmqPrefill => "vnext_residual_add_f32_f16",
+        }
+    }
+
+    /// Projection, convolution history and gate storage share the real 16-bit ABI.
+    /// F32 master variants retain their existing F16 internal representation.
+    pub(super) fn activation(self) -> ElementType {
+        if matches!(self, Self::Bf16) {
+            ElementType::Bf16
+        } else {
+            ElementType::F16
         }
     }
 

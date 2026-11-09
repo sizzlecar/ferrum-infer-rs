@@ -128,7 +128,8 @@ fn expansion_kernel_timing_rejects_unsupported_and_mixed_policies_before_install
     assert!(assets.prepare_text_cohort(rows).is_err());
     Arc::get_mut(&mut assets)
         .unwrap()
-        .configure_mtp(PH3ImagePromptExpansionMtp::OneDraft);
+        .configure_mtp(PH3ImagePromptExpansionMtp::OneDraft)
+        .unwrap();
     let mut request = prepared(&assets, 2);
     assert!(assets
         .configure_request_timing(&mut request, DeviceTimingMode::Kernel)

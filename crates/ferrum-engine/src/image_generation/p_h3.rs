@@ -47,3 +47,21 @@ pub use noise::PH3ImageInitialNoisePolicy;
 pub use pipeline::{PH3ImagePipeline, PH3ImagePipelineOptions};
 pub use source::{PH3ImageSourceAdapter, PH3ImageStageSource};
 pub use vision::reuse::PH3ImageMainVisionReuse;
+
+/// Opt-in native page registration for bounded managed static-weight owners.
+/// Both limits count the entire physical allocation, including Host padding.
+/// Owners larger than the declared eligibility limit and immutable mapped
+/// archives use ordinary uploads; eligible registration failures are errors.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PH3ImagePinnedWeightUpload {
+    pub maximum_allocation_bytes: std::num::NonZeroUsize,
+    pub maximum_registered_bytes: std::num::NonZeroUsize,
+}
+impl PH3ImagePinnedWeightUpload {
+    pub fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.maximum_allocation_bytes <= self.maximum_registered_bytes && self.maximum_registered_bytes.get() <= isize::MAX as usize,
+            "pinned weight upload requires an addressable allocation limit within total registered capacity");
+        Ok(())
+    }
+}

@@ -303,9 +303,13 @@ impl PH3ImageAssets {
             "prompt expansion requires one source and positive bounded settings"
         );
         self.expansion = Some(super::expansion::ConfiguredTextExpansion {
-            assets: Arc::new(super::expansion::NativeTextExpansion::from_sources(
-                sources, limits,
-            )?),
+            assets: Arc::new(
+                super::expansion::NativeTextExpansion::from_sources_with_precision(
+                    sources,
+                    limits,
+                    super::expansion::NativeTextExpansion::precision_for_engine(&options.engine)?,
+                )?,
+            ),
             options,
         });
         Ok(self)
@@ -372,7 +376,7 @@ impl PH3ImageAssets {
             .ok_or_else(|| anyhow::anyhow!("MTP requires configured prompt expansion"))?;
         let assets = Arc::get_mut(&mut expansion.assets)
             .ok_or_else(|| anyhow::anyhow!("configure MTP before sharing expansion assets"))?;
-        assets.configure_mtp(policy);
+        assets.configure_mtp(policy)?;
         Ok(self)
     }
     /// Reuse exact execution-precision weights through a bounded private file.
@@ -447,8 +451,12 @@ impl PH3ImageAssets {
                 && options.engine.runtime.max_model_len.is_none_or(|v| v > 0),
             "prompt expansion requires one source and positive bounded settings"
         );
-        let assets = super::expansion::NativeTextExpansion::from_sources(sources, limits)?
-            .with_visual_assets(processor, vision_limits, vision_profile)?;
+        let assets = super::expansion::NativeTextExpansion::from_sources_with_precision(
+            sources,
+            limits,
+            super::expansion::NativeTextExpansion::precision_for_engine(&options.engine)?,
+        )?
+        .with_visual_assets(processor, vision_limits, vision_profile)?;
         self.expansion = Some(super::expansion::ConfiguredTextExpansion {
             assets: Arc::new(assets),
             options,

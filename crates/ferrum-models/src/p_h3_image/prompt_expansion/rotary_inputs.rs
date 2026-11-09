@@ -3,7 +3,8 @@
 //! This is not a claim of Torch CPU/CUDA libm binary equivalence.
 use super::*;
 use crate::qwen35_config::Qwen35TextConfig;
-use half::f16;
+use crate::vnext::qwen35::Qwen35DensePrecision;
+use half::{bf16, f16};
 
 pub const PH3_IMAGE_EXPANSION_ROTARY_PROFILE: &str =
     "qwen35.thw.interleaved_frequencies.half_split.f32_libm_0_2_15.f16_rne.v1";
@@ -83,6 +84,21 @@ impl PH3ImagePromptExpansionRotary {
     /// Writes one cosine and sine row into already admitted backing. Callers
     /// allocate the two exact tables through the original Host account.
     pub fn write_row(&self, position: [u64; 3], cosine: &mut [u8], sine: &mut [u8]) -> Result<()> {
+        self.write_row_with_precision(position, Qwen35DensePrecision::F16, cosine, sine)
+    }
+    /// Round directly from the declared F32 rotary arithmetic to the selected
+    /// causal input boundary, without an intermediate F16 conversion.
+    pub fn write_row_with_precision(
+        &self,
+        position: [u64; 3],
+        precision: Qwen35DensePrecision,
+        cosine: &mut [u8],
+        sine: &mut [u8],
+    ) -> Result<()> {
+        let round = |value| match precision {
+            Qwen35DensePrecision::F16 => f16::from_f32(value).to_le_bytes(),
+            Qwen35DensePrecision::Bf16 => bf16::from_f32(value).to_le_bytes(),
+        };
         if cosine.len() != self.pairs() * 2
             || sine.len() != cosine.len()
             || position.iter().any(|&p| p > 1 << 24)
@@ -95,8 +111,8 @@ impl PH3ImagePromptExpansionRotary {
             let inverse =
                 1.0f32 / libm::powf(self.theta, (2 * pair) as f32 / self.dimension as f32);
             let phase = position[self.axis(pair)] as f32 * inverse;
-            let cos = f16::from_f32(libm::cosf(phase)).to_le_bytes();
-            let sin = f16::from_f32(libm::sinf(phase)).to_le_bytes();
+            let cos = round(libm::cosf(phase));
+            let sin = round(libm::sinf(phase));
             cosine[2 * pair..2 * pair + 2].copy_from_slice(&cos);
             sine[2 * pair..2 * pair + 2].copy_from_slice(&sin);
         }

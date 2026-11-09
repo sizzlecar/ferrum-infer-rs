@@ -7,6 +7,7 @@ use ferrum_execution::{
     CausalInputSchema, CausalInputSegment, CausalRequestInputs, CausalTokenInput,
     CausalTokenInputSpec, CausalTokenInputStorage, TensorExecutionOutput,
 };
+use ferrum_models::vnext::qwen35::Qwen35DensePrecision;
 use ferrum_models::{
     p_h3_image::{PH3ImagePromptExpansionImageTokens, PH3ImagePromptExpansionRotary},
     qwen35_config::Qwen35TextConfig,
@@ -18,13 +19,14 @@ use ferrum_models::{
 use ferrum_runtime::{
     ElementType, HostMemoryClass, ManagedHostBytes, ProgramValueId, ResolvedTensorLayout,
 };
-use half::f16;
+use half::{bf16, f16};
 
 pub(super) struct VisualExpansionInputs {
     tokens: PH3ImagePromptExpansionImageTokens,
     hidden: usize,
     rotary: PH3ImagePromptExpansionRotary,
     schema: CausalInputSchema,
+    precision: Qwen35DensePrecision,
 }
 
 impl VisualExpansionInputs {
@@ -32,6 +34,17 @@ impl VisualExpansionInputs {
         tokens: PH3ImagePromptExpansionImageTokens,
         text: &Qwen35TextConfig,
     ) -> Result<Self> {
+        Self::with_precision(tokens, text, Qwen35DensePrecision::F16)
+    }
+    pub(super) fn with_precision(
+        tokens: PH3ImagePromptExpansionImageTokens,
+        text: &Qwen35TextConfig,
+        precision: Qwen35DensePrecision,
+    ) -> Result<Self> {
+        let element_type = match precision {
+            Qwen35DensePrecision::F16 => ElementType::F16,
+            Qwen35DensePrecision::Bf16 => ElementType::Bf16,
+        };
         let rotary = PH3ImagePromptExpansionRotary::new(text).map_err(model_error)?;
         if text.hidden_size == 0 || tokens.image_runs().is_empty() {
             return Err(FerrumError::request_validation(
@@ -41,7 +54,7 @@ impl VisualExpansionInputs {
         let specs = [
             (
                 VISUAL_ROWS_INPUT_ID,
-                ElementType::F16,
+                element_type,
                 vec![text.hidden_size as u64],
                 CausalTokenInputStorage::ZeroOutsideSegments,
             ),
@@ -53,13 +66,13 @@ impl VisualExpansionInputs {
             ),
             (
                 ROPE_COS_INPUT_ID,
-                ElementType::F16,
+                element_type,
                 vec![rotary.pairs() as u64],
                 CausalTokenInputStorage::Exact,
             ),
             (
                 ROPE_SIN_INPUT_ID,
-                ElementType::F16,
+                element_type,
                 vec![rotary.pairs() as u64],
                 CausalTokenInputStorage::Exact,
             ),
@@ -76,6 +89,7 @@ impl VisualExpansionInputs {
         .collect::<Result<Vec<_>>>()?;
         let result = Self {
             tokens,
+            precision,
             hidden: text.hidden_size,
             rotary,
             schema: CausalInputSchema::new(specs)?,
@@ -184,13 +198,22 @@ impl VisualExpansionInputs {
                 .zip(rows.as_mut().chunks_exact_mut(2))
             {
                 let value = f32::from_le_bytes(src.try_into().expect("F32 chunk"));
-                let half = f16::from_f32(value);
-                if !value.is_finite() || !half.is_finite() {
+                let (bytes, finite) = match self.precision {
+                    Qwen35DensePrecision::F16 => {
+                        let half = f16::from_f32(value);
+                        (half.to_le_bytes(), half.is_finite())
+                    }
+                    Qwen35DensePrecision::Bf16 => {
+                        let half = bf16::from_f32(value);
+                        (half.to_le_bytes(), half.is_finite())
+                    }
+                };
+                if !value.is_finite() || !finite {
                     return Err(FerrumError::backend(
-                        "visual F32 output cannot be represented as finite F16 causal input",
+                        "visual F32 output cannot be represented as finite selected causal input",
                     ));
                 }
-                dst.copy_from_slice(&half.to_le_bytes());
+                dst.copy_from_slice(&bytes);
             }
             let mut ones = grants
                 .next()
@@ -227,8 +250,9 @@ impl VisualExpansionInputs {
             .enumerate()
         {
             self.rotary
-                .write_row(
+                .write_row_with_precision(
                     self.tokens.position(physical).map_err(model_error)?,
+                    self.precision,
                     cos,
                     sin,
                 )

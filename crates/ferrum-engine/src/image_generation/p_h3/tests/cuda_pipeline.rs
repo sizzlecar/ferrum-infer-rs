@@ -51,6 +51,7 @@ pub(in crate::image_generation::p_h3) fn config() -> Result<PH3ImageCudaConfig> 
     options.vae_spatial_policy = PH3ImageVaeSpatialPolicy::WholeImage;
     Ok(PH3ImageCudaConfig {
         attention_policy: crate::image_generation::ImageCudaAttentionPolicy::Sequential,
+        pinned_weight_upload: None,
         ordinal: 0,
         memory: ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(1 << 30).unwrap()),
         bootstrap_memory_bytes: 256 << 20,
