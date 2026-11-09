@@ -15,7 +15,7 @@ use super::fixture::CompleteFixture;
 use crate::image_generation::{
     continuous_trace::{ImageContinuousTraceHandle, ImageContinuousTraceLimits},
     cuda::ImageCudaMemoryPolicy,
-    p_h3::{cuda::PH3ImageCudaConfig, PH3ImagePipelineOptions},
+    p_h3::{cuda::PH3ImageCudaConfig, PH3ImageInitialNoisePolicy, PH3ImagePipelineOptions},
     service::{ImageGenerator, ImageService, ImageServiceConfig},
     ImageCudaAttentionPolicy, ImageCudaConvolutionWorkspacePolicy, ImageDecoderBatchPolicy,
     ImageDynamicResidencyPolicy, ImageEditPrefixPolicy, ImageEditRequest, ImageGenerationOutput,
@@ -45,6 +45,9 @@ pub(in crate::image_generation::p_h3) fn config() -> Result<PH3ImageCudaConfig> 
             .map_err(anyhow::Error::msg)?,
         1,
     )?;
+    // The tiny fixture has fewer than sixteen audio elements. Use its declared
+    // native Philox profile; the product CPU MT19937 route rejects that shape.
+    options.initial_noise = PH3ImageInitialNoisePolicy::NativeCudaPhiloxJointImageAudioV1;
     options.vae_spatial_policy = PH3ImageVaeSpatialPolicy::WholeImage;
     Ok(PH3ImageCudaConfig {
         attention_policy: crate::image_generation::ImageCudaAttentionPolicy::Sequential,
