@@ -383,11 +383,10 @@ impl PH3ImagePromptExpansionProtocol {
                 "expanded prompt requires at least five words",
             ));
         }
-        if request.image_count() > 0 && ph3_image_edit_prompt_form(prompt).is_none() {
-            return Err(PH3ImagePromptExpansionError::Answer(
-                "edit output lacks an official brief or preservation instruction",
-            ));
-        }
+        // Completed prose is also valid input to PH3ImageConditioning. Its
+        // image tokenizer preserves explicit Picture instructions and briefs,
+        // and prefixes ordinary descriptions with "Edit <Picture 1>. ". The
+        // upsampler's preferred brief grammar is not an acceptance contract.
         Ok(prompt.to_owned())
     }
 }

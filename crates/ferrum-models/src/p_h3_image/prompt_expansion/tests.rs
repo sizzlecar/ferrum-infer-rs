@@ -251,20 +251,80 @@ fn official_edit_brief_and_instruction_rules_retain_all_source_boundaries() {
     );
 }
 #[test]
-fn actual_edit_extraction_validates_form_after_the_generated_thinking_terminator() {
+fn edit_extraction_preserves_completed_descriptions_for_downstream_conditioning() {
     let brief = brief("<Picture 1>: partially_preserved - Keep its original face");
-    let good = format!("analysis</think>{brief}");
-    let bad = "analysis</think>Make a red cat look different.";
-    let (p, ids) = protocol(&[good.as_str(), bad]);
-    let r = PH3ImagePromptExpansionRequest::edit("change it", 1).unwrap();
-    assert_eq!(
-        p.extract(&r, &[ids[0], p.eos_token_id()], FinishReason::EOS)
-            .unwrap(),
-        brief
-    );
-    assert!(p
-        .extract(&r, &[ids[1], p.eos_token_id()], FinishReason::EOS)
-        .is_err());
+    let prompts = [
+        brief.as_str(),
+        "Make a red cat look different.",
+        "Edit <Picture 1>. keep the original face and change the pose.",
+        "Edit <Picture 1>. Change the pose.\nPreserve the face and clothes.",
+        "Edit <Picture 2>. Change the background and preserve the subject.",
+    ];
+    let answers = prompts.map(|prompt| format!("analysis</think>\n{prompt}\t"));
+    let (p, ids) = protocol(&answers.each_ref().map(String::as_str));
+    for image_count in [1, 2] {
+        let r = PH3ImagePromptExpansionRequest::edit("change it", image_count).unwrap();
+        for (&id, prompt) in ids.iter().zip(prompts) {
+            assert_eq!(
+                p.extract(&r, &[id, p.eos_token_id()], FinishReason::EOS)
+                    .unwrap(),
+                prompt
+            );
+            assert!(p.extract(&r, &[id], FinishReason::EOS).is_err());
+            for finish in [FinishReason::Length, FinishReason::Cancelled] {
+                assert!(p.extract(&r, &[id, p.eos_token_id()], finish).is_err());
+            }
+        }
+    }
+}
+#[test]
+fn completed_edit_prose_reaches_ordered_image_conditioning_with_model_prefix() {
+    use crate::p_h3_image::{PH3ImageTextTokenizer, PH3ImageTextTokenizerLimits};
+    use crate::qwen3_vl_vision::Qwen3VLVisionGrid;
+
+    let prose = "Make a red cat look different.";
+    let answer = format!("analysis</think>{prose}");
+    let presented = format!("Edit <Picture 1>. {prose}");
+    // Distinct whole-string tokens prove that conditioning receives the
+    // presented instruction, rather than just comparing unknown-token output.
+    let (bytes, ids) = source(&[&answer, prose, &presented]);
+    let protocol =
+        PH3ImagePromptExpansionProtocol::from_source_bytes(&bytes, CONFIG, TEMPLATE, limits())
+            .unwrap();
+    let vocabulary = Tokenizer::from_bytes(&bytes).unwrap().get_vocab_size(true) as u64;
+    let tokenizer = PH3ImageTextTokenizer::from_source_bytes(
+        &bytes,
+        br#"{"tokenizer_class":"Qwen2Tokenizer","pad_token":"<|endoftext|>","bos_token":null}"#,
+        vocabulary,
+        PH3ImageTextTokenizerLimits {
+            max_source_bytes: 64 << 10,
+            max_prompt_bytes: 4096,
+            max_tokens_per_prompt: 128,
+            max_batch: 1,
+        },
+    )
+    .unwrap();
+    for image_count in [1, 2] {
+        let request = PH3ImagePromptExpansionRequest::edit("change it", image_count).unwrap();
+        let effective = protocol
+            .extract(
+                &request,
+                &[ids[0], protocol.eos_token_id()],
+                FinishReason::EOS,
+            )
+            .unwrap();
+        let grids = vec![Qwen3VLVisionGrid::new(1, 2, 2).unwrap(); image_count as usize];
+        let conditioning = tokenizer
+            .prepare_images_instruction(&effective, &grids, 2)
+            .unwrap();
+        assert_eq!(conditioning.text().token_ids().last(), Some(&ids[2]));
+        assert_ne!(ids[1], ids[2]);
+        assert_eq!(conditioning.grids().count(), image_count as usize);
+        assert_eq!(
+            conditioning.visual_rows().runs().len(),
+            image_count as usize
+        );
+    }
 }
 #[test]
 fn parser_render_and_decoded_artifact_capacities_fail_closed_without_truncating() {

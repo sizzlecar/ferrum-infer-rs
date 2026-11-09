@@ -1,6 +1,7 @@
-//! The source accepts two forms. In particular it does not require every
-//! section to be nonempty, ASCII-only entity numbers, or a particular prose
-//! language. Keep those parser rules separate from any product preference.
+//! Recognition of the upsampler's preferred edit brief and instruction forms.
+//! This is descriptive metadata, not a validity gate: the conditioning node
+//! also accepts ordinary prose. Preferred forms do not require every section
+//! to be nonempty, ASCII-only entity numbers, or a particular prose language.
 use super::python_space;
 use std::sync::OnceLock;
 use tokenizers::utils::SysRegex;

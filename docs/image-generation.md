@@ -104,6 +104,12 @@ configured Host and device budgets. Multiple images increase those requirements.
 The optional H3 main-vision cohort cache currently applies to single-image edits;
 multi-image edits execute each Picture's visual encoder. Masks remain unsupported.
 
+With P-H3 prompt expansion enabled, both `run` and `serve` accept complete edit
+descriptions as well as structured briefs. Conditioning preserves briefs and
+explicit Picture instructions; ordinary descriptions receive the model's
+`Edit <Picture 1>. ` prefix. Missing EOS, truncated or cancelled generation,
+malformed thinking delimiters and capacity violations still fail the request.
+
 ## CUDA LoRA
 
 `run` and `serve` support one ordinary DiT adapter with a fixed strength at startup. A PEFT directory needs `adapter_config.json` and `adapter_model.safetensors`:
