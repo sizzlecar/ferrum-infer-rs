@@ -1,9 +1,48 @@
-//! Eager candidate state output for the existing recurrent scan arithmetic.
+//! Candidate state output for the existing recurrent scan arithmetic.
 //!
-//! State pointers occupy admitted Scratch, never a reusable Binding workspace.
+//! F16 state pointers use an admitted Binding workspace; only uniform N2 waves
+//! may replay. The unqualified F32-master route retains eager scratch controls.
 //! Inputs remain read-only; each output has exactly the N-1 and N tail states.
 
 use super::*;
+
+pub(super) fn replay_tokens_supported(
+    precision: AttentionPrecision,
+    token_counts: impl IntoIterator<Item = u64>,
+) -> bool {
+    let mut counts = token_counts.into_iter();
+    precision.candidate_replay() && counts.next() == Some(2) && counts.all(|count| count == 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_replay_is_closed_to_uniform_n2_f16() {
+        assert!(replay_tokens_supported(
+            AttentionPrecision::CandidateF16,
+            [2]
+        ));
+        assert!(replay_tokens_supported(
+            AttentionPrecision::CandidateF16,
+            [2, 2]
+        ));
+        for counts in [vec![], vec![0], vec![1], vec![3], vec![2, 1], vec![1, 2]] {
+            assert!(!replay_tokens_supported(
+                AttentionPrecision::CandidateF16,
+                counts
+            ));
+        }
+        for precision in [
+            AttentionPrecision::CandidateF32Master,
+            AttentionPrecision::F16,
+            AttentionPrecision::Bf16,
+        ] {
+            assert!(!replay_tokens_supported(precision, [2]));
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Functions {

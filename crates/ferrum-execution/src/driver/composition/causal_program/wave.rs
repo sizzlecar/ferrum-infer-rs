@@ -381,6 +381,16 @@ impl<R: DeviceRuntime> CausalProgramSession<R> {
         }
         if let Some(replay) = &self.replay {
             if direct {
+                #[cfg(feature = "test-support")]
+                if replay.diagnostic_enabled.load(Ordering::Relaxed) {
+                    *replay.last_successful_program.lock() = Some(
+                        reusable
+                            .as_ref()
+                            .expect("direct wave owns its selected reusable program")
+                            .program_id()
+                            .clone(),
+                    );
+                }
                 replay.direct_waves.fetch_add(1, Ordering::Relaxed);
             } else if capture {
                 if let Err(error) = replay.refresh(self, &lane) {

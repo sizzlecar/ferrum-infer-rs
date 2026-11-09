@@ -239,7 +239,7 @@ impl ExecutionPlan {
         let candidate_state_layout =
             super::candidate_state::derive_candidate_state(program, &nodes, request.capabilities)?;
         if let Some(layout) = &candidate_state_layout {
-            layout.validate_replay_policy(&nodes, request.policy)?;
+            layout.validate_replay_policy(request.policy)?;
         }
         let retention = if work_limits.is_tensor() {
             CompletionRetentionSpec::new(

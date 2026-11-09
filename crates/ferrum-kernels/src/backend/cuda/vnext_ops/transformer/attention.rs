@@ -424,7 +424,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 .fingerprint()
                 .map_err(contract_error)?,
             provider_fingerprint,
-            if precision.candidate_scan() {
+            if precision.candidate_scan() && !precision.candidate_replay() {
                 ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_only()
             } else {
                 ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay()
@@ -701,7 +701,7 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
                     .map_err(invalid_plan)?,
                 candidate_scan::scratch_bytes_per_sequence(
                     shape.scratch_bytes_per_sequence().map_err(invalid_plan)?,
-                    self.precision.candidate_scan(),
+                    self.precision.candidate_scan() && !self.precision.candidate_replay(),
                 )?,
                 shape
                     .scratch_bytes_per_token()
@@ -724,7 +724,14 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
             DynamicStorageRequirement::contiguous(),
         )?;
         let binding = ProviderWorkspaceRequirement::from_formula(
-            ProviderWorkspaceSizeFormula::actual_sequences(STATE_BINDING_SLOT_BYTES)?,
+            ProviderWorkspaceSizeFormula::actual_sequences(
+                STATE_BINDING_SLOT_BYTES
+                    * if self.precision.candidate_replay() {
+                        2
+                    } else {
+                        1
+                    },
+            )?,
             SCRATCH_ALIGNMENT,
             ProviderWorkspaceScope::Invocation,
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
@@ -746,7 +753,7 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
             Some(scratch),
             persistent,
         );
-        let estimate = if self.precision.candidate_scan() {
+        let estimate = if self.precision.candidate_scan() && !self.precision.candidate_replay() {
             estimate
         } else {
             estimate.with_binding(binding)
@@ -771,7 +778,16 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        if self.precision.candidate_scan() {
+        if self.precision.candidate_scan()
+            && !candidate_scan::replay_tokens_supported(
+                self.precision,
+                request
+                    .work_shape()
+                    .participant_token_ranges()
+                    .iter()
+                    .map(|range| range.immediate_tokens()),
+            )
+        {
             return Ok(ReusableExecutionTopology::EagerBoundary);
         }
         let mut values = (0..8)
@@ -784,6 +800,12 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
             ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 9),
             ReusableExecutionValueAddress::captured(ResolvedValueRole::Output, 0),
         ]);
+        if self.precision.candidate_scan() {
+            values.extend([
+                ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Output, 1),
+                ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Output, 2),
+            ]);
+        }
         let mut workspaces = vec![
             ReusableExecutionWorkspaceAddress::Scratch,
             ReusableExecutionWorkspaceAddress::Binding,
@@ -873,11 +895,28 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
     ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         if self.precision.candidate_scan() {
-            return Err(provider_failure(
-                identity,
-                "cuda.gated_delta_candidate_scan.bindings",
-                "candidate state scan does not support replay or resident bindings".to_owned(),
-            ));
+            // Candidate outputs are Step-owned. Keep the complete invocation
+            // and revalidate every alias before patching all four live state
+            // addresses; the ordinary two-input binding shortcut is insufficient.
+            return encode_attention(
+                self.descriptor.provider_implementation_fingerprint(),
+                &self.functions,
+                self.precision,
+                self.execution_capabilities,
+                #[cfg(feature = "vllm-marlin")]
+                self.projection_runtime,
+                invocation,
+                EncodingTarget::BindingsOnly,
+                None,
+            )
+            .and_then(Encoding::bindings)
+            .map_err(|message| {
+                provider_failure(
+                    identity,
+                    "cuda.gated_delta_candidate_scan.bindings",
+                    message,
+                )
+            });
         }
         for participant in invocation.participants() {
             self.functions
@@ -1849,9 +1888,23 @@ fn encode_attention(
     segment_declaration: Option<&mut Option<ferrum_runtime::SegmentBindingDeclaration>>,
 ) -> Result<Encoding<CudaDeviceCommand>, String> {
     let candidate = precision.candidate_scan();
-    if candidate && (target != EncodingTarget::Full || invocation.program_binding().is_some()) {
+    let candidate_replay = candidate_scan::replay_tokens_supported(
+        precision,
+        invocation
+            .participant_token_ranges()
+            .iter()
+            .map(|range| range.immediate_tokens()),
+    );
+    // A reusable wave assigns typed Binding slots even to its eager gaps.
+    // Full N1 execution may patch such a slot, but remains an EagerBoundary
+    // with no replay key. Only N2 may request the resident BindingsOnly path.
+    if candidate
+        && ((!precision.candidate_replay()
+            && (target != EncodingTarget::Full || invocation.program_binding().is_some()))
+            || (target == EncodingTarget::BindingsOnly && !candidate_replay))
+    {
         return Err(
-            "candidate scan requires eager execution without resident/replay bindings".into(),
+            "candidate replay requires the F16 provider and uniform two-token participants".into(),
         );
     }
     let mut segment_validations = segment_declaration.as_ref().map(|_| Vec::new());
@@ -1923,7 +1976,8 @@ fn encode_attention(
             .checked_mul(if candidate { 2 } else { 1 })
             .ok_or("candidate control count overflows")?,
     )?;
-    let required_bytes = if candidate {
+    let scratch_controls = candidate && !precision.candidate_replay();
+    let required_bytes = if scratch_controls {
         required_bytes
             .checked_add(binding_layout.required_bytes)
             .ok_or("candidate scratch overflows")?
@@ -1972,7 +2026,7 @@ fn encode_attention(
         },
         binding: {
             let index = compute_regions.len();
-            compute_regions.push(if candidate {
+            compute_regions.push(if scratch_controls {
                 shared_scratch_region(&invocation, required_bytes)?
                     .subregion(layout.required_bytes, binding_layout.required_bytes)
                     .map_err(|error| error.to_string())?
@@ -2384,6 +2438,7 @@ fn encode_attention(
     .u64(layout.required_bytes)
     .u64(binding_layout.required_bytes)
     .u64(STATE_BINDING_SLOT_BYTES)
+    .boolean(candidate)
     .boolean(use_packed)
     .u64(launches.len() as u64);
     replay_key = shared.qkvzba.bind_replay_topology(replay_key);
@@ -2399,6 +2454,7 @@ fn encode_attention(
             .u64(launch.input_region as u64)
             .u64(launch.output_region as u64)
             .u64(launch.state_binding_offset)
+            .u64(launch.candidate_binding_offset.unwrap_or(u64::MAX))
             .u64(launch.host_control as u64)
             .u64(
                 launch
@@ -2477,7 +2533,7 @@ fn encode_attention(
         }
         Ok(())
     };
-    let compute_command = if candidate {
+    let compute_command = if candidate && !candidate_replay {
         // Eager command retains both read-only originals and all candidate outputs
         // through its completion fence without exposing a replay segment.
         compute_regions.extend(compute_fence_dependencies);
@@ -2489,7 +2545,11 @@ fn encode_attention(
         )
     } else {
         CudaDeviceCommand::replayable_operation_with_host_storage_blas_and_fence_dependencies(
-            "vnext_gated_delta_recurrent_attention",
+            if candidate {
+                "vnext_gated_delta_candidate_scan"
+            } else {
+                "vnext_gated_delta_recurrent_attention"
+            },
             compute_regions,
             host_storage,
             compute_fence_dependencies,

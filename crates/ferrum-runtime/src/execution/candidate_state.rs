@@ -25,6 +25,8 @@ pub(crate) struct CandidateInputPort {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CandidateStateCopy {
     pub node: NodeId,
+    pub input_ordinal: u32,
+    pub output_ordinal: u32,
     pub candidate_value: ProgramValueId,
     pub candidate_resource: ResourceId,
     pub candidate_offset: u64,
@@ -34,12 +36,11 @@ pub(crate) struct CandidateStateCopy {
     pub element_type: ElementType,
 }
 impl CandidateStateLayout {
-    /// Candidate copies remain same-frame effects. On-demand replay may
-    /// accelerate other compute nodes, but complete candidate-state producers
-    /// must remain eager boundaries and their outputs must retain Step storage.
+    /// Candidate copies remain same-frame effects and retain Step storage.
+    /// Dispatch separately requires a fresh address-contract proof before
+    /// admitting a candidate producer to an on-demand compute segment.
     pub(crate) fn validate_replay_policy<P: RuntimePolicy>(
         &self,
-        nodes: &[PlanNode],
         policy: &P,
     ) -> Result<(), VNextError> {
         let Some(programs) = policy
@@ -53,26 +54,20 @@ impl CandidateStateLayout {
                 != crate::ExecutionDeterminismRequirement::BitwiseSameRuntime
         {
             return Err(invalid_plan(
-                "candidate replay requires explicit on-demand compute segments with declared eager boundaries",
+                "candidate replay requires on-demand preparation and bitwise same-runtime determinism",
             ));
         }
-        for copy in &self.copies {
-            let node = nodes
-                .iter()
-                .find(|node| node.id() == &copy.node)
-                .ok_or_else(|| invalid_plan("candidate copy producer is absent"))?;
-            if node.provider_execution_semantics().replay_equivalence()
-                != crate::ProviderReplayEquivalence::Ineligible
-            {
-                return Err(invalid_plan(
-                    "candidate state producers must remain outside reusable compute segments",
-                ));
-            }
-        }
-        // Dispatch independently requires every ineligible provider to declare
-        // EagerBoundary. It rejects Static/Dynamic topology for such providers;
-        // this planning permission never grants candidate-state replay.
         Ok(())
+    }
+
+    pub(crate) fn replay_ports<'a>(
+        &'a self,
+        node: &'a NodeId,
+    ) -> impl Iterator<Item = (u32, u32)> + 'a {
+        self.copies
+            .iter()
+            .filter(move |copy| &copy.node == node)
+            .map(|copy| (copy.input_ordinal, copy.output_ordinal))
     }
 
     pub(crate) fn retained_values(&self) -> impl Iterator<Item = &ProgramValueId> {
@@ -360,6 +355,8 @@ pub(super) fn derive_candidate_state(
                     }
                     copies.push(CandidateStateCopy {
                         node: node.id().clone(),
+                        input_ordinal: ordinal,
+                        output_ordinal: *output_ordinal,
                         candidate_value: out.value_id().clone(),
                         candidate_resource: src.resource_id().clone(),
                         candidate_offset: src.offset_bytes(),

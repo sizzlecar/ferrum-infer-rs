@@ -44,7 +44,7 @@ impl Drop for Allocation {
     }
 }
 #[derive(Clone)]
-struct Region {
+pub(super) struct Region {
     buffer: Buffer,
     range: Range<usize>,
     // Commands retain the actual Core translation owner, not only the backing.
@@ -92,6 +92,8 @@ pub struct Runtime {
     pub submitted: AtomicU64,
     pub next_copy: Mutex<CopyOutcome>,
     pub drain_fails: Mutex<bool>,
+    pub replay_address_checks: Arc<AtomicU64>,
+    pub eager_single_rows: Arc<AtomicU64>,
     probes: Arc<Mutex<Vec<[Probe; 3]>>>,
 }
 pub struct Stream {
@@ -105,6 +107,7 @@ pub enum Command {
     Copy(Buffer, Buffer, CopyRegion),
     Upload(ManagedHostBytes, Buffer, usize),
     Zero(Buffer, Range<usize>),
+    Binding(Vec<(Region, [u8; 16])>),
     Compute(Vec<Compute>),
     Output(Vec<OutputCompute>),
 }
@@ -121,6 +124,7 @@ pub struct Compute {
     weight: Region,
     visual: Option<Region>,
     start: usize,
+    binding: Option<Region>,
 }
 
 fn floats(bytes: &[u8]) -> Vec<f32> {
@@ -140,6 +144,15 @@ impl Compute {
             .chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .collect();
+        let start = if let Some(binding) = &self.binding {
+            let metadata = binding.read();
+            let start = u64::from_le_bytes(metadata[..8].try_into().unwrap()) as usize;
+            let count = u64::from_le_bytes(metadata[8..].try_into().unwrap()) as usize;
+            assert_eq!(count, tokens.len(), "fresh binding must describe this wave");
+            start
+        } else {
+            self.start
+        };
         let mut a = floats(&self.states[0].read());
         let mut b = floats(&self.states[1].read());
         let mut kv = floats(&self.states[2].read());
@@ -156,8 +169,8 @@ impl Compute {
             // Two different recurrences; small integer-valued F32 stays exact.
             a = vec![a[1], a[0] + 2.0 * t];
             b = vec![b[0] + t, b[1] + a[1], b[2] + b[0] + 3.0 * t];
-            kv[self.start + i] = a[1] + b[2];
-            output.push(kv[self.start + i]);
+            kv[start + i] = a[1] + b[2];
+            output.push(kv[start + i]);
         }
         previous_a.extend(a);
         previous_b.extend(b);
@@ -189,6 +202,8 @@ impl Runtime {
             submitted: AtomicU64::new(0),
             next_copy: Mutex::new(CopyOutcome::Succeed),
             drain_fails: Mutex::new(false),
+            replay_address_checks: Arc::new(AtomicU64::new(0)),
+            eager_single_rows: Arc::new(AtomicU64::new(0)),
             probes: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -331,6 +346,11 @@ impl DeviceRuntime for Runtime {
                     [*offset..*offset + src.len()]
                     .copy_from_slice(src.as_ref()),
                 Command::Zero(dst, range) => dst.0.bytes.lock().unwrap()[range.clone()].fill(0),
+                Command::Binding(writes) => {
+                    for (destination, bytes) in writes {
+                        destination.write(bytes);
+                    }
+                }
                 Command::Compute(members) => {
                     for member in members {
                         member.execute();
@@ -687,11 +707,28 @@ fn contract(visual: bool) -> OperationDescriptor {
     op
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayProbe {
+    Checked,
+    UncheckedStatic,
+    UncheckedDynamic,
+    CapturedCandidate,
+    OmittedCandidate,
+    MissingBindingDeclaration,
+    MissingBindingResource,
+    ErrorAfterValid,
+    UnavailableAfterValid,
+    UncheckedAfterPriorWave,
+}
+
 struct Provider {
     descriptor: OperationProviderDescriptor,
     probes: Arc<Mutex<Vec<[Probe; 3]>>>,
     visual: bool,
     output_only: bool,
+    replay_probe: Option<ReplayProbe>,
+    replay_address_checks: Arc<AtomicU64>,
+    eager_single_rows: Arc<AtomicU64>,
 }
 impl OperationResourceEstimator for Provider {
     fn descriptor(&self) -> &OperationProviderDescriptor {
@@ -701,7 +738,7 @@ impl OperationResourceEstimator for Provider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        Ok(OperationResourceEstimate::new(
+        let estimate = OperationResourceEstimate::new(
             self.descriptor.resource_estimator_id(),
             self.descriptor.resource_estimator_version(),
             self.descriptor
@@ -710,7 +747,22 @@ impl OperationResourceEstimator for Provider {
             16,
             None,
             None,
-        ))
+        );
+        Ok(
+            if self.replay_probe.is_some()
+                && self.replay_probe != Some(ReplayProbe::MissingBindingResource)
+            {
+                estimate.with_binding(ProviderWorkspaceRequirement::new(
+                    128,
+                    16,
+                    ProviderWorkspaceScope::Invocation,
+                    ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
+                    DynamicStorageRequirement::contiguous(),
+                )?)
+            } else {
+                estimate
+            },
+        )
     }
 }
 fn region(
@@ -751,9 +803,113 @@ fn region(
 impl OperationProvider<Runtime> for Provider {
     fn reusable_execution_topology(
         &self,
-        _: ReusableExecutionTopologyRequest<'_>,
+        request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        Ok(ReusableExecutionTopology::EagerBoundary)
+        let Some(probe) = self.replay_probe else {
+            return Ok(ReusableExecutionTopology::EagerBoundary);
+        };
+        if request
+            .work_shape()
+            .participant_token_ranges()
+            .iter()
+            .all(|span| span.immediate_tokens() == 1)
+        {
+            self.eager_single_rows.fetch_add(1, Ordering::SeqCst);
+            return Ok(ReusableExecutionTopology::EagerBoundary);
+        }
+        let dynamic = ReusableExecutionTopology::Dynamic(
+            DeviceReusableExecutionTopologyFingerprint::static_program(),
+        );
+        if probe == ReplayProbe::UncheckedStatic {
+            return Ok(ReusableExecutionTopology::Static);
+        }
+        if probe == ReplayProbe::UncheckedDynamic
+            || (probe == ReplayProbe::UncheckedAfterPriorWave
+                && request
+                    .work_shape()
+                    .participant_token_ranges()
+                    .iter()
+                    .any(|span| span.source_token_range().start > 0))
+        {
+            return Ok(dynamic);
+        }
+        let mut values = request
+            .bindings()
+            .iter()
+            .map(|binding| {
+                ReusableExecutionValueAddress::program_binding(binding.role(), binding.ordinal())
+            })
+            .collect::<Vec<_>>();
+        let binding = [ReusableExecutionWorkspaceAddress::Binding];
+        if matches!(
+            probe,
+            ReplayProbe::Checked
+                | ReplayProbe::ErrorAfterValid
+                | ReplayProbe::UnavailableAfterValid
+                | ReplayProbe::UncheckedAfterPriorWave
+        ) {
+            assert!(matches!(
+                request.reusable_address_scope(&values, &binding)?,
+                Some(DeviceReusableAddressScope::ExecutionLane(_))
+            ));
+            self.replay_address_checks.fetch_add(1, Ordering::SeqCst);
+            if matches!(
+                probe,
+                ReplayProbe::Checked | ReplayProbe::UncheckedAfterPriorWave
+            ) {
+                return Ok(dynamic);
+            }
+        }
+        let mut workspaces = binding.as_slice();
+        match probe {
+            ReplayProbe::CapturedCandidate => {
+                let value = values
+                    .iter_mut()
+                    .find(|value| {
+                        **value
+                            == ReusableExecutionValueAddress::program_binding(
+                                ResolvedValueRole::Output,
+                                1,
+                            )
+                    })
+                    .unwrap();
+                *value = ReusableExecutionValueAddress::captured(ResolvedValueRole::Output, 1);
+            }
+            ReplayProbe::OmittedCandidate | ReplayProbe::ErrorAfterValid => {
+                values.retain(|value| {
+                    *value
+                        != ReusableExecutionValueAddress::program_binding(
+                            ResolvedValueRole::Output,
+                            1,
+                        )
+                });
+            }
+            ReplayProbe::MissingBindingDeclaration => workspaces = &[],
+            ReplayProbe::MissingBindingResource => {}
+            ReplayProbe::UnavailableAfterValid => {
+                let value = values
+                    .iter_mut()
+                    .find(|value| {
+                        **value
+                            == ReusableExecutionValueAddress::program_binding(
+                                ResolvedValueRole::Input,
+                                3,
+                            )
+                    })
+                    .unwrap();
+                *value = ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, 3);
+            }
+            _ => unreachable!(),
+        }
+        let rejected = request.reusable_address_scope(&values, workspaces);
+        if probe == ReplayProbe::UnavailableAfterValid {
+            assert_eq!(rejected?, None);
+        } else {
+            assert!(rejected.is_err());
+        }
+        // Deliberately ignore the failed/absent address proof. Core, rather
+        // than this untrusted provider's cooperation, must reject the topology.
+        Ok(dynamic)
     }
     fn encode_selected(
         &self,
@@ -801,6 +957,7 @@ impl OperationProvider<Runtime> for Provider {
         }
         let mut members = Vec::new();
         let mut probes = Vec::new();
+        let mut binding_writes = Vec::new();
         for (i, p) in invocation.participants().iter().enumerate() {
             let span = &invocation.participant_token_ranges()[i];
             let source = span.source_token_range();
@@ -827,6 +984,23 @@ impl OperationProvider<Runtime> for Provider {
                 region(p, ResolvedValueRole::Input, 3, 0, source.end * 4),
             ];
             probes.push(s.each_ref().map(Probe::new));
+            let binding = invocation.participants()[0].binding_view().map(|view| {
+                let translated = view.translate(i as u64 * 16, 16).unwrap();
+                let mut regions = translated.iter();
+                let (buffer, range, retention) =
+                    regions.next().unwrap().buffer_and_physical_range();
+                assert!(regions.next().is_none());
+                let region = Region {
+                    buffer: buffer.clone(),
+                    range: range.start as usize..range.end as usize,
+                    _retention: retention,
+                };
+                let mut metadata = [0; 16];
+                metadata[..8].copy_from_slice(&source.start.to_le_bytes());
+                metadata[8..].copy_from_slice(&span.immediate_tokens().to_le_bytes());
+                binding_writes.push((region.clone(), metadata));
+                region
+            });
             members.push(Compute {
                 input: region(
                     p,
@@ -866,10 +1040,16 @@ impl OperationProvider<Runtime> for Provider {
                     )
                 }),
                 start: source.start as usize,
+                binding,
             });
         }
         *self.probes.lock().unwrap() = probes;
-        Ok(EncodedDeviceOperation::compute(Command::Compute(members)))
+        let operation = EncodedDeviceOperation::compute(Command::Compute(members));
+        Ok(if binding_writes.is_empty() {
+            operation
+        } else {
+            invocation.attach_binding_command(operation, Command::Binding(binding_writes))
+        })
     }
 }
 
@@ -881,6 +1061,7 @@ pub struct Fixture {
     lane: Arc<ExecutionLane<Runtime>>,
     pub reaper: Arc<CompletionReaper<Runtime>>,
     pub host: HostMemoryAccount,
+    replay_probe: Option<ReplayProbe>,
 }
 pub struct Wave {
     pub step: Arc<StepResourceLease<Runtime>>,
@@ -908,16 +1089,16 @@ impl Fixture {
         Self::with_effects(true).unwrap()
     }
     pub fn with_effects(include_kv: bool) -> Result<Self, VNextError> {
-        Self::build(include_kv, false, None, false, None)
+        Self::build(include_kv, false, None, false, None, None)
     }
     pub fn visual() -> Self {
-        Self::build(true, true, None, false, None).unwrap()
+        Self::build(true, true, None, false, None, None).unwrap()
     }
     pub fn with_output_only(state_dependency: bool) -> Result<Self, VNextError> {
-        Self::build(true, false, Some(state_dependency), false, None)
+        Self::build(true, false, Some(state_dependency), false, None, None)
     }
     pub fn with_terminal(state_dependency: bool) -> Result<Self, VNextError> {
-        Self::build(true, false, Some(state_dependency), true, None)
+        Self::build(true, false, Some(state_dependency), true, None, None)
     }
     pub fn with_workspace_policy() -> Result<Self, VNextError> {
         let workspace = ReusableExecutionPolicy::new(
@@ -927,11 +1108,18 @@ impl Fixture {
                 ReusableExecutionCapacity::new(2, 32, 32)?,
             )?],
         )?;
-        Self::build(true, false, None, false, Some(workspace))
+        Self::build(true, false, None, false, Some(workspace), None)
     }
 
     pub fn with_program_policy(
         preparation: ReusableExecutionProgramPreparation,
+    ) -> Result<Self, VNextError> {
+        Self::with_replay_probe(preparation, None)
+    }
+
+    pub fn with_replay_probe(
+        preparation: ReusableExecutionProgramPreparation,
+        replay_probe: Option<ReplayProbe>,
     ) -> Result<Self, VNextError> {
         let class = ReusableExecutionClassId::new("workspace.selected.compute")?;
         let programs = vec![ReusableExecutionProgramSpec::new(
@@ -954,7 +1142,7 @@ impl Fixture {
             )?],
         )?
         .with_program_policy(programs)?;
-        Self::build(true, false, None, false, Some(workspace))
+        Self::build(true, false, None, false, Some(workspace), replay_probe)
     }
     fn build(
         include_kv: bool,
@@ -962,9 +1150,13 @@ impl Fixture {
         output_only: Option<bool>,
         terminal: bool,
         workspace: Option<ReusableExecutionPolicy>,
+        replay_probe: Option<ReplayProbe>,
     ) -> Result<Self, VNextError> {
         let runtime = Runtime::new();
         let mut operation = contract(visual);
+        if replay_probe.is_some() {
+            operation.resources.binding = ResourcePresenceRequirement::Optional;
+        }
         let token_float = |access| {
             TensorContract::new(
                 vec![DimensionConstraint::Symbol("tokens".into())],
@@ -1002,7 +1194,11 @@ impl Fixture {
             operation.id.clone(),
             operation.fingerprint()?,
             sha('b'),
-            ProviderExecutionSemantics::bitwise_eager_only(),
+            if replay_probe.is_some() {
+                ProviderExecutionSemantics::bitwise_eager_and_replay()
+            } else {
+                ProviderExecutionSemantics::bitwise_eager_only()
+            },
             ContractVersion::new(1, 0),
             runtime.descriptor.id.clone(),
             runtime.descriptor.capabilities.clone(),
@@ -1020,6 +1216,9 @@ impl Fixture {
             probes: runtime.probes.clone(),
             visual,
             output_only: false,
+            replay_probe,
+            replay_address_checks: runtime.replay_address_checks.clone(),
+            eager_single_rows: runtime.eager_single_rows.clone(),
         }) as Box<dyn OperationProvider<Runtime>>];
         if output_only.is_some() {
             let mut output = contract(false);
@@ -1059,6 +1258,9 @@ impl Fixture {
                 probes: runtime.probes.clone(),
                 visual: false,
                 output_only: true,
+                replay_probe: None,
+                replay_address_checks: runtime.replay_address_checks.clone(),
+                eager_single_rows: runtime.eager_single_rows.clone(),
             }));
         }
         let registry = OperationRuntimeRegistry::new(contracts, providers)?;
@@ -1193,6 +1395,7 @@ impl Fixture {
             lane,
             reaper: CompletionReaper::new(),
             host,
+            replay_probe,
         })
     }
     pub fn session(&self, suffix: &str) -> Arc<SequenceSession<Runtime>> {
@@ -1294,6 +1497,7 @@ impl Fixture {
     pub fn compute(&self, wave: &Wave, histories: &[&[u32]]) {
         self.try_compute_with_visual(wave, histories, None).unwrap();
     }
+
     pub fn try_compute_with_visual(
         &self,
         wave: &Wave,
@@ -1320,6 +1524,19 @@ impl Fixture {
         else {
             panic!("preprovisioned wave")
         };
+        if self.replay_probe == Some(ReplayProbe::MissingBindingResource) {
+            assert_eq!(
+                OperationDispatch::reusable_execution_program_id_for_wave(
+                    self.providers.providers(),
+                    self.compilation.executable(),
+                    &prepared,
+                    &self.lane,
+                )
+                .unwrap(),
+                None,
+                "without a Binding resource, this original wave cannot replay"
+            );
+        }
         let active = wave
             .batch
             .sessions()
@@ -1434,6 +1651,7 @@ impl Fixture {
             host,
             compilation,
             providers,
+            replay_probe: _,
         } = self;
         drop((lane, reaper, compilation, providers));
         assert!(matches!(

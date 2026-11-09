@@ -124,6 +124,8 @@ pub(super) struct CausalReplay<R: DeviceRuntime> {
     pub(super) fallback_waves: AtomicU64,
     #[cfg(feature = "test-support")]
     pub(super) diagnostic_enabled: AtomicBool,
+    #[cfg(feature = "test-support")]
+    pub(super) last_successful_program: Mutex<Option<DeviceReusableExecutionProgramId>>,
 }
 
 impl<R: DeviceRuntime> CausalReplay<R> {
@@ -163,6 +165,8 @@ impl<R: DeviceRuntime> CausalReplay<R> {
             fallback_waves: AtomicU64::new(0),
             #[cfg(feature = "test-support")]
             diagnostic_enabled: AtomicBool::new(false),
+            #[cfg(feature = "test-support")]
+            last_successful_program: Mutex::new(None),
         }))
     }
 

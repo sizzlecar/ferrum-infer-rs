@@ -17,6 +17,16 @@ impl<R: DeviceRuntime> CausalProgramSession<R> {
             replay.diagnostic_enabled.store(true, Ordering::Relaxed);
         }
     }
+
+    /// The exact direct program whose original wave completed successfully.
+    /// This observation is absent unless test diagnostics were enabled.
+    pub fn last_successful_reusable_execution_test_program(
+        &self,
+    ) -> Option<DeviceReusableExecutionProgramId> {
+        self.replay
+            .as_ref()
+            .and_then(|replay| replay.last_successful_program.lock().clone())
+    }
 }
 
 impl Observation {

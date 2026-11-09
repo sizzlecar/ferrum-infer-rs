@@ -83,7 +83,10 @@ fn contract(
         )?,
         contiguous_tensor(prefix(recurrent()), [ElementType::F32], TensorAccess::Write)?,
     ];
-    descriptor.resources.binding = ResourcePresenceRequirement::Forbidden;
+    // Retain ordinary GDN's optional, accounted address-control workspace.
+    // Eager providers may omit it; replay eligibility and fresh state bindings
+    // are separately checked by Core and the selected provider. Neither this
+    // workspace nor its absence changes candidate storage or numerical types.
     descriptor.validate()?;
     Ok(StandardOperationContract { descriptor })
 }
@@ -123,7 +126,18 @@ mod tests {
                 assert_eq!(output.alias(), &AliasPolicy::NoAlias);
             }
             assert_eq!(c.resources.scratch, ResourcePresenceRequirement::Required);
-            assert_eq!(c.resources.binding, ResourcePresenceRequirement::Forbidden);
+            assert_eq!(c.resources, o.resources);
+            assert_eq!(c.resources.binding, ResourcePresenceRequirement::Optional);
+            for scratch in [false, true] {
+                for binding in [false, true] {
+                    for persistent in [false, true] {
+                        let allowed = c.resources.scratch.accepts(scratch)
+                            && c.resources.binding.accepts(binding)
+                            && c.resources.persistent.accepts(persistent);
+                        assert_eq!(allowed, scratch && !persistent);
+                    }
+                }
+            }
             assert_ne!(c.fingerprint().unwrap(), o.fingerprint().unwrap());
         }
     }

@@ -42,6 +42,55 @@ fn requests(
         .collect()
 }
 
+fn assert_candidate_gdn_segments<R: DeviceRuntime>(
+    program: &CausalProgramSession<R>,
+    participants: usize,
+) {
+    let plan = program.plan().execution_plan();
+    let candidate_nodes = plan
+        .payload()
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.operation_id().as_str()
+                == ferrum_runtime::GATED_DELTA_CANDIDATE_SCAN_F16_OPERATION_ID
+        })
+        .map(|(index, _)| index as u32)
+        .collect::<Vec<_>>();
+    assert!(
+        !candidate_nodes.is_empty(),
+        "fixture must execute candidate GDN"
+    );
+    let lane = program.execution_lane().unwrap();
+    let catalog = lane
+        .try_reusable_execution_catalog()
+        .unwrap()
+        .expect("completed verify must leave its original lane quiescent");
+    let id = program
+        .last_successful_reusable_execution_test_program()
+        .expect("successful direct verify must identify the exact replayed program");
+    assert_eq!(id.plan_hash(), plan.plan_hash());
+    assert_eq!(id.immediate_sequences() as usize, participants);
+    assert_eq!(id.immediate_tokens(), participants as u64 * 2);
+    let entry = catalog
+        .programs()
+        .iter()
+        .find(|entry| entry.program_id() == &id)
+        .expect("the completed verify must retain its exact resident program");
+    // Require positive coverage in the actual replayed program. Absence from
+    // eager boundaries alone could instead mean a rejected capture or a gap.
+    for &node in &candidate_nodes {
+        assert!(
+            entry
+                .segments()
+                .iter()
+                .any(|segment| segment.contains_node(node)),
+            "candidate GDN node {node} is not in a resident segment: {entry:?}"
+        );
+    }
+}
+
 async fn run<R: DeviceRuntime>(
     fixture: &Fixture,
     composition: &RuntimeComposition<R>,
@@ -53,6 +102,8 @@ async fn run<R: DeviceRuntime>(
         fixture.machine_with_requests(composition, &host, requests(fixture, device, replay));
     let mut observed = Outputs::default();
     let mut direct = [0; 2];
+    let mut candidate_replayed_b2 = false;
+    let mut candidate_replayed_after_cancel = false;
     let mut replay_snapshots = [serde_json::Value::Null, serde_json::Value::Null];
     let mut cancelled = [false; 2];
     let result = tokio::time::timeout(
@@ -70,7 +121,18 @@ async fn run<R: DeviceRuntime>(
                     stats.as_object_mut().unwrap().remove("workspace_buckets");
                     stats["plan"] =
                         serde_json::to_value(program.plan().execution_plan().plan_hash()).unwrap();
+                    let previous_direct = direct[index];
                     direct[index] = direct[index].max(stats["direct_waves"].as_u64().unwrap());
+                    if replay && index == 0 && direct[index] > previous_direct {
+                        if let Some(settling) = &cohort.settling {
+                            if settling.kind == WaveKind::Verify {
+                                assert_candidate_gdn_segments(program, settling.indices.len());
+                                candidate_replayed_b2 |= settling.indices.len() == 2;
+                                candidate_replayed_after_cancel |=
+                                    cancelled[0] && settling.indices == [1];
+                            }
+                        }
+                    }
                     if replay && direct[index] > 0 {
                         assert!(
                             stats["eager_boundary_operations"]
@@ -152,12 +214,18 @@ async fn run<R: DeviceRuntime>(
         "nonzero recurrent/attention state must change the accepted hidden rows"
     );
     if replay {
+        assert!(
+            candidate_replayed_b2 && candidate_replayed_after_cancel,
+            "candidate GDN must replay in actual B2 verification and the surviving B1 verification"
+        );
         eprintln!(
             "{}",
             serde_json::json!({
                 "diagnostic":"mtp_replay_catalogs",
                 "main":replay_snapshots[0],
                 "draft":replay_snapshots[1],
+                "candidate_gdn_replayed_b2":candidate_replayed_b2,
+                "candidate_gdn_replayed_after_cancel":candidate_replayed_after_cancel,
             })
         );
     }

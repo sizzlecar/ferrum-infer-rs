@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -54,6 +55,45 @@ pub struct ReusableExecutionTopologyRequest<'a> {
     work_shape: crate::TokenBatchWorkView<'a>,
     claimed_backing: &'a ClaimedSubmissionWaveBacking,
     step_backing: &'a [LogicalBackingSliceAuthority],
+    candidate_replay: Option<&'a CandidateReplayAddressWitness<'a>>,
+}
+
+/// Private to one Core topology callback. A provider cannot manufacture this
+/// proof or carry a successful address check into a different wave or node.
+pub(super) struct CandidateReplayAddressWitness<'a> {
+    layout: &'a crate::CandidateStateLayout,
+    node: &'a NodeId,
+    node_index: usize,
+    lane: crate::ExecutionLaneId,
+    validated: Cell<bool>,
+}
+
+impl<'a> CandidateReplayAddressWitness<'a> {
+    pub(super) fn for_node(
+        layout: Option<&'a crate::CandidateStateLayout>,
+        node: &'a NodeId,
+        node_index: usize,
+        lane: crate::ExecutionLaneId,
+    ) -> Option<Self> {
+        let layout = layout?;
+        layout.replay_ports(node).next()?;
+        Some(Self {
+            layout,
+            node,
+            node_index,
+            lane,
+            validated: Cell::new(false),
+        })
+    }
+
+    pub(super) fn consume(&self) -> Result<(), VNextError> {
+        if !self.validated.replace(false) {
+            return Err(invalid_operation(
+                "candidate reusable topology lacks current program-bound state proof",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// How one resolved value address enters a resident reusable executable.
@@ -111,6 +151,7 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
         work_shape: &'a BatchWorkShape,
         claimed_backing: &'a ClaimedSubmissionWaveBacking,
         step_backing: &'a [LogicalBackingSliceAuthority],
+        candidate_replay: Option<&'a CandidateReplayAddressWitness<'a>>,
     ) -> Result<Self, VNextError> {
         if work_shape.participants().is_empty() {
             return Err(invalid_operation(
@@ -129,6 +170,7 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
             work_shape: work_shape.token_view()?,
             claimed_backing,
             step_backing,
+            candidate_replay,
         })
     }
 
@@ -185,6 +227,11 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
         values: &[ReusableExecutionValueAddress],
         workspaces: &[ReusableExecutionWorkspaceAddress],
     ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        // A later failed or unavailable check invalidates an earlier success
+        // within this same callback as well as leaving no proof on first use.
+        if let Some(witness) = self.candidate_replay {
+            witness.validated.set(false);
+        }
         if values.len() != self.bindings.len()
             || values.iter().enumerate().any(|(index, value)| {
                 values[..index]
@@ -218,6 +265,23 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
             ));
         }
 
+        if let Some(witness) = self.candidate_replay {
+            for (input, output) in witness.layout.replay_ports(witness.node) {
+                for (role, ordinal) in [
+                    (ResolvedValueRole::Input, input),
+                    (ResolvedValueRole::Output, output),
+                ] {
+                    if !values.contains(&ReusableExecutionValueAddress::program_binding(
+                        role, ordinal,
+                    )) {
+                        return Err(invalid_operation(
+                            "candidate original and output ports require fresh program bindings",
+                        ));
+                    }
+                }
+            }
+        }
+
         let mut aggregate = DeviceReusableAddressScope::Plan;
         for value in values {
             let ReusableExecutionValueAddress::Captured { role, ordinal } = value else {
@@ -244,6 +308,28 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
                 return Ok(None);
             };
             aggregate = merge_reusable_address_scope(aggregate, scope)?;
+        }
+        if let Some(witness) = self.candidate_replay {
+            if self.binding_workspace_reusable_address_scope()?
+                != Some(DeviceReusableAddressScope::ExecutionLane(witness.lane))
+            {
+                return Ok(None);
+            }
+            let binding = self
+                .claimed_backing
+                .program_binding_node(witness.node_index)
+                .ok_or_else(|| {
+                    invalid_operation("candidate replay lacks a current compiled binding slot")
+                })?;
+            if binding.slot().node_id() != witness.node
+                || Some(binding.slot().resource_id()) != self.binding_resource
+                || binding.lane_slot_identity().lane_id() != witness.lane
+            {
+                return Err(invalid_operation(
+                    "candidate replay binding slot differs from its current node or lane",
+                ));
+            }
+            witness.validated.set(true);
         }
         Ok(Some(aggregate))
     }

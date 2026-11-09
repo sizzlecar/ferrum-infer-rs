@@ -9,7 +9,11 @@ use std::sync::Arc;
 
 #[test]
 fn selected_prefix_on_demand_backing_keeps_current_candidates_and_exact_history() {
-    let f = Fixture::with_program_policy(ReusableExecutionProgramPreparation::OnDemand).unwrap();
+    let f = Fixture::with_replay_probe(
+        ReusableExecutionProgramPreparation::OnDemand,
+        Some(ReplayProbe::Checked),
+    )
+    .unwrap();
     let left = f.session("left");
     let right = f.session("right");
     let wave = f
@@ -43,6 +47,8 @@ fn selected_prefix_on_demand_backing_keeps_current_candidates_and_exact_history(
     assert_eq!(actual[0][0].values(), [6., 14.]);
     assert_eq!(actual[0][1].values(), [10., 20., 33.]);
     assert_eq!(before[1][0].values(), [22., 26.]);
+    assert!(f.runtime.replay_address_checks.load(Ordering::SeqCst) > 0);
+    assert!(f.runtime.eager_single_rows.load(Ordering::SeqCst) > 0);
     f.close(vec![left, right]);
 }
 
@@ -51,6 +57,104 @@ fn selected_prefix_replay_rejects_startup_state_reexecution() {
     assert!(
         Fixture::with_program_policy(ReusableExecutionProgramPreparation::BeforeReadiness).is_err()
     );
+    assert!(Fixture::with_replay_probe(
+        ReusableExecutionProgramPreparation::BeforeReadiness,
+        Some(ReplayProbe::Checked),
+    )
+    .is_err());
+}
+
+#[test]
+fn selected_prefix_replay_rejects_missing_or_invalid_current_address_proof() {
+    for probe in [
+        ReplayProbe::UncheckedStatic,
+        ReplayProbe::UncheckedDynamic,
+        ReplayProbe::CapturedCandidate,
+        ReplayProbe::OmittedCandidate,
+        ReplayProbe::MissingBindingDeclaration,
+        ReplayProbe::ErrorAfterValid,
+        ReplayProbe::UnavailableAfterValid,
+    ] {
+        let f =
+            Fixture::with_replay_probe(ReusableExecutionProgramPreparation::OnDemand, Some(probe))
+                .unwrap();
+        let session = f.session("invalid-address");
+        let wave = f
+            .try_reusable_step(&[session.clone()], &[&[3, 5]], &[0])
+            .unwrap();
+        let submitted = f.runtime.submitted.load(Ordering::SeqCst);
+        let error = match f.try_compute_with_visual(&wave, &[&[3, 5]], None) {
+            Err(error) => error,
+            Ok(()) => panic!("invalid candidate replay probe was accepted: {probe:?}"),
+        };
+        assert!(
+            error.contains("candidate reusable topology lacks current program-bound state proof"),
+            "{probe:?}: {error}"
+        );
+        assert_eq!(f.runtime.submitted.load(Ordering::SeqCst), submitted);
+        assert_eq!(f.runtime.copied.load(Ordering::SeqCst), 0);
+        assert!(f.runtime.probes().is_empty());
+        if matches!(
+            probe,
+            ReplayProbe::ErrorAfterValid | ReplayProbe::UnavailableAfterValid
+        ) {
+            assert!(f.runtime.replay_address_checks.load(Ordering::SeqCst) > 0);
+        }
+        let Wave { step, batch } = wave;
+        step.try_abort().unwrap();
+        drop(batch);
+        f.close(vec![session]);
+    }
+}
+
+#[test]
+fn selected_prefix_without_binding_resource_has_no_reusable_program() {
+    let f = Fixture::with_replay_probe(
+        ReusableExecutionProgramPreparation::OnDemand,
+        Some(ReplayProbe::MissingBindingResource),
+    )
+    .unwrap();
+    let session = f.session("no-binding-slot");
+    let wave = f
+        .try_reusable_step(&[session.clone()], &[&[3, 5]], &[0])
+        .unwrap();
+    // The fixture checks program_id=None on the same Prepared wave consumed
+    // by compute; ordinary execution and selected retirement remain valid.
+    f.compute(&wave, &[&[3, 5]]);
+    f.select(wave, vec![SelectedPrefix::One]);
+    assert_eq!(f.runtime.probes()[0][1].values(), [3., 6., 9.]);
+    f.close(vec![session]);
+}
+
+#[test]
+fn selected_prefix_replay_cannot_reuse_an_earlier_waves_address_proof() {
+    let f = Fixture::with_replay_probe(
+        ReusableExecutionProgramPreparation::OnDemand,
+        Some(ReplayProbe::UncheckedAfterPriorWave),
+    )
+    .unwrap();
+    let session = f.session("fresh-proof");
+    let first = f
+        .try_reusable_step(&[session.clone()], &[&[3, 5]], &[0])
+        .unwrap();
+    f.compute(&first, &[&[3, 5]]);
+    f.select(first, vec![SelectedPrefix::One]);
+    assert!(f.runtime.replay_address_checks.load(Ordering::SeqCst) > 0);
+    let second = f
+        .try_reusable_step(&[session.clone()], &[&[3, 7, 9]], &[1])
+        .unwrap();
+    let submitted = f.runtime.submitted.load(Ordering::SeqCst);
+    let copied = f.runtime.copied.load(Ordering::SeqCst);
+    let error = f
+        .try_compute_with_visual(&second, &[&[3, 7, 9]], None)
+        .unwrap_err();
+    assert!(error.contains("candidate reusable topology lacks current program-bound state proof"));
+    assert_eq!(f.runtime.submitted.load(Ordering::SeqCst), submitted);
+    assert_eq!(f.runtime.copied.load(Ordering::SeqCst), copied);
+    let Wave { step, batch } = second;
+    step.try_abort().unwrap();
+    drop(batch);
+    f.close(vec![session]);
 }
 
 #[test]

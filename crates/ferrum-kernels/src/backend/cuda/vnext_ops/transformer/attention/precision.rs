@@ -230,6 +230,10 @@ impl AttentionPrecision {
         matches!(self, Self::CandidateF16 | Self::CandidateF32Master)
     }
 
+    pub(super) fn candidate_replay(self) -> bool {
+        matches!(self, Self::CandidateF16)
+    }
+
     pub(super) fn q8act(self) -> bool {
         matches!(self, Self::F32MasterQ8Act)
     }
