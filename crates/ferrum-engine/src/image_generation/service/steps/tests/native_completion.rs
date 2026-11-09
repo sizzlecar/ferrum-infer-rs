@@ -152,7 +152,9 @@ impl ImageDenoisingGenerator for NativeCompletion {
     }
 }
 
-fn native_pipeline(device_id: &str) -> (QwenImage21Pipeline<Runtime>, tempfile::TempDir) {
+pub(super) fn native_pipeline(
+    device_id: &str,
+) -> (QwenImage21Pipeline<Runtime>, tempfile::TempDir) {
     let (original, source) = fixture_pipeline();
     let composition = ReferenceVNextComposition::create_with_capacity(
         DeviceId::new(device_id).unwrap(),

@@ -5,6 +5,8 @@ use super::*;
 use ferrum_runtime::{HostMemoryScope, ManagedHostBuffer};
 use std::task::Waker;
 
+mod finish_priority;
+
 #[derive(Default)]
 struct State {
     begun: bool,
@@ -19,6 +21,11 @@ struct State {
     drops: usize,
     eos_joined: bool,
     wake: Option<Waker>,
+    completed_output_probe:
+        Option<oneshot::Receiver<Result<ImageGenerationOutput, ImageServiceError>>>,
+    observed_completed_output: Option<ImageGenerationOutput>,
+    native_finish_waited: bool,
+    host_finish_waited: bool,
 }
 #[derive(Default)]
 struct Control {
@@ -74,9 +81,17 @@ struct Phase {
     scope: Option<HostMemoryScope>,
     buffer: Option<ManagedHostBuffer>,
     control: Arc<Control>,
+    native: Option<super::native_pressure::NativePressure>,
+    output_hold: Option<HostMemoryScope>,
 }
 impl Phase {
     fn retire(&mut self) {
+        if let Some(native) = self.native.take() {
+            native.close();
+        }
+        if let Some(output) = self.output_hold.take() {
+            output.close().unwrap();
+        }
         drop(self.buffer.take());
         self.scope.take().unwrap().close().unwrap();
         let mut s = self.control.state.lock().unwrap();
@@ -93,6 +108,8 @@ impl Drop for Phase {
 enum Mode {
     Pending,
     NativePressure,
+    FinishNativePressure,
+    FinishHostPressure,
     Fatal,
     Rejected,
 }
@@ -100,6 +117,8 @@ struct Phased {
     inner: Preconditioned,
     control: Arc<Control>,
     mode: Mode,
+    native_pressure_bytes: Option<u64>,
+    host_pressure_bytes: Option<usize>,
 }
 impl ImageGenerator for Phased {
     fn denoising_generator(
@@ -187,6 +206,13 @@ impl ImageDenoisingGenerator for Phased {
                 scope: Some(scope),
                 buffer: Some(buffer),
                 control: self.control.clone(),
+                native: self.native_pressure_bytes.map(|bytes| {
+                    super::native_pressure::NativePressure::new(&self.inner.pipeline, bytes)
+                }),
+                output_hold: self.host_pressure_bytes.map(|bytes| {
+                    host.reserve_scope(&[(HostMemoryClass::Output, bytes)])
+                        .unwrap()
+                }),
             }),
         ))
     }
@@ -203,6 +229,26 @@ impl ImageDenoisingGenerator for Phased {
         };
         assert_eq!(p.seed, r.seed);
         let mut s = self.control.state.lock().unwrap();
+        if let Some(mut receiver) = s.completed_output_probe.take() {
+            s.observed_completed_output = Some(
+                receiver
+                    .try_recv()
+                    .expect("completed image must be delivered before ordinary initialization")
+                    .expect("real decoder must succeed"),
+            );
+        }
+        if matches!(self.mode, Mode::FinishNativePressure) {
+            assert!(
+                s.native_finish_waited,
+                "real completion pressure must fall through to original initialization"
+            );
+        }
+        if matches!(self.mode, Mode::FinishHostPressure) {
+            assert!(
+                s.host_finish_waited,
+                "real Host completion wait must preserve initializer progress"
+            );
+        }
         s.advances += 1;
         if cancelled {
             s.cancelling = true;
@@ -301,6 +347,47 @@ impl ImageDenoisingGenerator for Phased {
     ) -> Result<ImageGenerationOutput, ImageBatchError> {
         self.inner.finish_request(request, batch)
     }
+    fn try_finish_request(
+        &mut self,
+        request: &mut ImageDenoisingRequest,
+        batch: &mut ImageDenoisingBatch,
+    ) -> Result<Option<ImageGenerationOutput>, ImageBatchError> {
+        if matches!(self.mode, Mode::FinishHostPressure) {
+            let result = finish_priority::finish_with_f32_pixels(&mut self.inner, request, batch)?;
+            if result.is_none() {
+                self.control.state.lock().unwrap().host_finish_waited = true;
+            }
+            return Ok(result);
+        }
+        if !matches!(self.mode, Mode::FinishNativePressure) {
+            return self.finish_request(request, batch).map(Some);
+        }
+        match self.inner.pipeline.finish_continuous_request_borrowed(
+            request.get_mut::<ContinuousRequest<Runtime>>()?,
+            batch.get::<ContinuousBatch<Runtime>>()?,
+        ) {
+            Ok(output) => Ok(Some(output)),
+            Err(failure) => {
+                let diagnostic = failure.to_string();
+                match crate::image_generation::p_h3::clean_decoder_admission(failure) {
+                    Ok(()) => {
+                        self.control.state.lock().unwrap().native_finish_waited = true;
+                        Err(ImageBatchError::AwaitDenoisingProgress {
+                            stage: crate::image_generation::ImageStage::Decoder,
+                            diagnostic,
+                        })
+                    }
+                    Err(failure) => Err(ImageBatchError::Fatal(Box::new(
+                        crate::image_generation::ImageGenerationError {
+                            failure,
+                            completed_stages: vec![],
+                            completed_steps: vec![],
+                        },
+                    ))),
+                }
+            }
+        }
+    }
 }
 
 fn start(
@@ -313,7 +400,15 @@ fn start(
     Arc<Runtime>,
     Arc<Control>,
 ) {
-    let (pipeline, source) = fixture_pipeline();
+    let (pipeline, source) = if matches!(mode, Mode::FinishNativePressure) {
+        super::native_completion::native_pipeline("device.service.finish_before_initialization")
+    } else {
+        fixture_pipeline()
+    };
+    let native_pressure_bytes = matches!(mode, Mode::FinishNativePressure)
+        .then(|| finish_priority::native_pressure_bytes(&pipeline));
+    let host_pressure_bytes = matches!(mode, Mode::FinishHostPressure)
+        .then(|| finish_priority::host_pressure_bytes(&pipeline));
     let runtime = pipeline.execution.runtime.clone();
     let boundary = Arc::new(Boundary::default());
     let trace = Arc::new(Mutex::new(Vec::new()));
@@ -330,6 +425,8 @@ fn start(
             },
             control: control.clone(),
             mode,
+            native_pressure_bytes,
+            host_pressure_bytes,
         },
         ImageServiceConfig {
             batching: ImageBatchPolicy::Auto,

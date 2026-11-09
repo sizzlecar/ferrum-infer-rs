@@ -741,6 +741,43 @@ pub(super) fn execute<O: Send + 'static>(
                     shared,
                 ));
             }
+            // Give an already completed output one attempt before ordinary
+            // initialization replaces its working set. Existing native owners
+            // and cancellation must still reach their original retirement.
+            // A real completion wait falls through to the unchanged progress
+            // path below; it is not a reason to suppress initialization.
+            if !suspended
+                && !closing
+                && !finishing.is_empty()
+                && cohort.is_none()
+                && pending.iter().any(|p| p.initialization.is_some())
+                && !pending.iter().any(|p| {
+                    p.initialization.as_ref().is_some_and(|initialization| {
+                        p.job.cancelled.load(Ordering::Acquire)
+                            || worker
+                                .denoising_generator()
+                                .unwrap()
+                                .initialization_blocks_denoising(initialization)
+                    })
+                })
+            {
+                if let Err(error) = completion::drain_finished(
+                    worker,
+                    shared,
+                    &mut batch,
+                    &mut running,
+                    &mut finishing,
+                    true,
+                ) {
+                    return Err(fatal(
+                        source(error),
+                        batch,
+                        completion::failure_owners(running, finishing),
+                        pending,
+                        shared,
+                    ));
+                }
+            }
             let (cohort_tick, cohort_finished) = match cohorts::advance(
                 worker,
                 shared,
