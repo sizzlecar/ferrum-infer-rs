@@ -4944,13 +4944,18 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
         let pool_before = trace_enabled.then(|| self.allocation_pool_snapshot());
         let allocation_started = trace_enabled.then(Instant::now);
+        let cache_lookup_started = trace_enabled.then(Instant::now);
         let reused = self
             .idle_native_allocations
             .as_ref()
             .map(|cache| cache.take(allocation_bytes, request.alignment_bytes()))
             .transpose()?
             .flatten();
+        let cache_lookup_us = cache_lookup_started.map_or(0, |started| {
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
         let native_allocation_reused = reused.is_some();
+        let native_allocation_started = trace_enabled.then(Instant::now);
         let base = match reused {
             Some(base) => Ok(base),
             None => allocation::allocate(
@@ -4971,6 +4976,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
             );
             CudaDeviceRuntimeError::driver("allocation", error)
         })?;
+        let native_allocation_path_us = native_allocation_started.map_or(0, |started| {
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
         let alloc_us = allocation_started.map_or(0, |started| {
             u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
         });
@@ -5001,6 +5009,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 resource_id = %request.resource_id(),
                 allocation_bytes,
                 alloc_us,
+                cache_lookup_us,
+                native_allocation_path_us,
                 sync_us,
                 async_allocator = self.context.has_async_alloc(),
                 native_allocation_reused,

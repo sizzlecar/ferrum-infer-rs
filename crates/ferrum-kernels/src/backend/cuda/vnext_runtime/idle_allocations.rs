@@ -193,19 +193,33 @@ impl IdleAllocations {
         bytes: usize,
         alignment: u64,
     ) -> Result<Option<CudaSlice<u8>>, CudaDeviceRuntimeError> {
+        let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let mut entries = self.entries.lock().map_err(|_| {
             self.owner.poisoned.store(true, Ordering::Release);
             CudaDeviceRuntimeError::contract("native allocation reuse cache lock poisoned")
         })?;
+        let mutex_wait_us = started.map_or(0, |started| {
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
         if self.owner.poisoned.load(Ordering::Acquire) {
             return Err(CudaDeviceRuntimeError::contract(
                 "native allocation reuse cache is poisoned",
             ));
         }
-        Ok(entries
+        let result = entries
             .iter()
             .position(|entry| entry.bytes == bytes && entry.alignment == alignment)
-            .map(|index| entries.remove(index).into_slice()))
+            .map(|index| entries.remove(index).into_slice());
+        drop(entries);
+        if started.is_some() {
+            tracing::debug!(
+                allocation_bytes = bytes,
+                mutex_wait_us,
+                reused = result.is_some(),
+                "CUDA native backing checkout timing"
+            );
+        }
+        Ok(result)
     }
 
     pub(super) fn put(&self, base: CudaSlice<u8>, alignment: u64) {
@@ -227,6 +241,10 @@ impl IdleAllocations {
         else {
             return;
         };
+        let eviction_count = victims.len();
+        // Host wall time, including retirement's stream wait under this mutex;
+        // this is not a GPU event or a kernel execution duration.
+        let eviction_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         for index in victims.into_iter().rev() {
             let mut evicted = entries.remove(index);
             if let Err(error) = evicted.retire() {
@@ -236,6 +254,9 @@ impl IdleAllocations {
                 return;
             }
         }
+        let eviction_retirement_us = eviction_started.map_or(0, |started| {
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
         // The private pool has event tracking disabled, so leak transfers
         // ownership without recording/waiting on implicit cudarc events.
         let pointer = base.leak();
@@ -250,6 +271,8 @@ impl IdleAllocations {
             allocation_bytes = bytes,
             idle_entries = entries.len(),
             idle_bytes = entries.iter().map(|e| e.bytes as u64).sum::<u64>(),
+            eviction_count,
+            eviction_retirement_us,
             policy = "largest_retired_exact_v1",
             "CUDA native allocation retirement"
         );
