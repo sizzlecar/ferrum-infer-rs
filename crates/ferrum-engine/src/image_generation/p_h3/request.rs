@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 pub(super) struct RequestGeometry {
     pub identity: RequestIdentity,
     pub target: PH3ImageReferenceImage,
-    pub reference: Option<PH3ImageReferenceImage>,
+    pub references: Vec<PH3ImageReferenceImage>,
     pub tags: Vec<PH3ImageModality>,
     pub image_sample: ResolvedTensorSpec,
     pub audio_sample: ResolvedTensorSpec,
@@ -34,6 +34,25 @@ impl RequestGeometry {
         tags: Vec<PH3ImageModality>,
         reference: Option<PH3ImageReferenceImage>,
     ) -> Result<Self> {
+        Self::with_references(
+            request,
+            identity,
+            config,
+            spatial_scale,
+            transformer,
+            tags,
+            reference.into_iter().collect(),
+        )
+    }
+    pub fn with_references(
+        request: &ImageGenerationRequest,
+        identity: RequestIdentity,
+        config: &ImagePipelineConfig,
+        spatial_scale: u64,
+        transformer: &PH3ImageTransformerConfig,
+        tags: Vec<PH3ImageModality>,
+        references: Vec<PH3ImageReferenceImage>,
+    ) -> Result<Self> {
         validate_request_metadata(request, config, spatial_scale)?;
         ensure!(
             !tags.is_empty()
@@ -48,7 +67,7 @@ impl RequestGeometry {
             usize::try_from(u64::from(request.height) / spatial_scale)?,
             usize::try_from(u64::from(request.width) / spatial_scale)?,
         )?;
-        PH3ImageRequestLayout::new(transformer, &tags, target, reference.as_slice())?;
+        PH3ImageRequestLayout::new(transformer, &tags, target, &references)?;
         let tensor = |dimensions| -> Result<ResolvedTensorSpec> {
             let tensor = ResolvedTensorSpec::new(
                 dimensions,
@@ -72,7 +91,7 @@ impl RequestGeometry {
         Ok(Self {
             identity,
             target,
-            reference,
+            references,
             tags,
             image_sample,
             audio_sample,
@@ -82,12 +101,7 @@ impl RequestGeometry {
         &'a self,
         transformer: &PH3ImageTransformerConfig,
     ) -> Result<PH3ImageRequestLayout<'a>> {
-        PH3ImageRequestLayout::new(
-            transformer,
-            &self.tags,
-            self.target,
-            self.reference.as_slice(),
-        )
+        PH3ImageRequestLayout::new(transformer, &self.tags, self.target, &self.references)
     }
 }
 
@@ -168,11 +182,11 @@ impl<'a> BatchGeometry<'a> {
             layout.write_positions(&mut positions[start..])?;
             let mut mapping = vec![basis_rows as u64; layout.rows()];
             mapping[layout.audio_rows()].fill((basis_rows + 1) as u64);
-            if member.reference.is_some() {
+            if !member.references.is_empty() {
                 mapping[layout.reference_rows()].fill((basis_rows + 2) as u64);
             }
             basis_rows = basis_rows
-                .checked_add(if member.reference.is_some() { 3 } else { 2 })
+                .checked_add(if !member.references.is_empty() { 3 } else { 2 })
                 .context("H3 time basis extent overflows")?;
             indices.push(mapping);
         }
@@ -209,11 +223,11 @@ impl<'a> BatchGeometry<'a> {
             .iter()
             .zip(&self.indices)
             .map(|(member, indices)| {
-                adapter.request(
+                adapter.request_with_references(
                     member.identity.clone(),
                     &member.tags,
                     member.target,
-                    member.reference,
+                    &member.references,
                     indices,
                 )
             })
@@ -248,7 +262,7 @@ impl<'a> BatchGeometry<'a> {
         let mut times = Vec::with_capacity(self.basis_rows);
         for ((_, step), member) in steps.iter().zip(&self.members) {
             times.extend([step.timestep(), step.timestep()]);
-            if member.reference.is_some() {
+            if !member.references.is_empty() {
                 // Comfy compares Python scalars, then constructs the F32
                 // curve-input tensor. Solver/model timesteps remain F32.
                 times.push(f64::from(step.timestep()).max(augmentation) as f32);

@@ -41,9 +41,22 @@ pub fn execute_run_source_with_image(
     destination: &Path,
     image: Option<&Path>,
 ) -> Result<(), ImageProductError> {
+    let images = image.map(Path::to_owned).into_iter().collect::<Vec<_>>();
+    execute_run_source_with_images(source, prompt, width, height, seed, destination, &images)
+}
+
+pub fn execute_run_source_with_images(
+    source: ImageProductSource,
+    prompt: String,
+    width: u32,
+    height: u32,
+    seed: u64,
+    destination: &Path,
+    images: &[std::path::PathBuf],
+) -> Result<(), ImageProductError> {
     #[cfg(not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))))]
     {
-        let _ = (source, prompt, width, height, seed, destination, image);
+        let _ = (source, prompt, width, height, seed, destination, images);
         Err(ImageProductError::Unsupported(
             "image generation requires the cuda feature or the metal feature on macOS",
         ))
@@ -56,7 +69,15 @@ pub fn execute_run_source_with_image(
         let product = source.prepare_for_run()?;
         // Reject absent/oversized input before device construction. Keep this
         // open handle and recheck the read extent rather than trusting a path.
-        let image_file = image.map(open_image).transpose()?;
+        if images.len() > 8 {
+            return Err(
+                anyhow::anyhow!("image run supports at most eight ordered image inputs").into(),
+            );
+        }
+        let image_files = images
+            .iter()
+            .map(|image| open_image(image))
+            .collect::<anyhow::Result<Vec<_>>>()?;
         if width == 0
             || height == 0
             || width > product.backend.limits().maximum_width
@@ -116,7 +137,7 @@ pub fn execute_run_source_with_image(
                 n: 1,
             },
             destination,
-            image_file,
+            image_files,
         };
         let result = execute_pipeline(pipeline, context);
         if let Some(trace) = trace {
@@ -133,7 +154,7 @@ struct RunContext<'a> {
     composition: serde_json::Value,
     request: ferrum_engine::image_generation::ImageGenerationRequest,
     destination: &'a Path,
-    image_file: Option<(std::fs::File, usize)>,
+    image_files: Vec<(std::fs::File, usize)>,
 }
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
@@ -151,10 +172,10 @@ fn execute_pipeline(
         composition,
         request,
         destination,
-        image_file,
+        image_files,
     } = context;
     let (width, height) = (request.width, request.height);
-    let editing = image_file.is_some();
+    let editing = !image_files.is_empty();
     let dimensions =
         PngDimensions::new(width.into(), height.into()).map_err(anyhow::Error::from)?;
     let png_limits = PngLimits::default();
@@ -163,14 +184,18 @@ fn execute_pipeline(
         residency = ?pipeline.residency_policy(),
         "experimental image run; no throughput qualification"
     );
-    let result = if let Some((file, length)) = image_file {
+    let result = if editing {
         if !pipeline.supports_edits() {
             return Err(anyhow::anyhow!(
                 "this image package does not declare complete editing assets"
             )
             .into());
         }
-        let encoded = match read_image(pipeline.host_account(), file, length) {
+        let encoded = image_files
+            .into_iter()
+            .map(|(file, length)| read_image(pipeline.host_account(), file, length))
+            .collect::<anyhow::Result<Vec<_>>>();
+        let mut encoded = match encoded {
             Ok(encoded) => encoded,
             Err(error) => {
                 if let Err(source) = pipeline.shutdown() {
@@ -180,8 +205,9 @@ fn execute_pipeline(
             }
         };
         pipeline.edit(ImageEditRequest {
+            references: encoded.drain(1..).collect(),
             generation: request,
-            image: encoded,
+            image: encoded.remove(0),
         })
     } else {
         pipeline.generate(request)

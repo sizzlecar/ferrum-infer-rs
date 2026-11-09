@@ -202,6 +202,7 @@ fn failed_serial_actor_stops_generation_and_edit_admission_before_preparation() 
         .freeze();
     assert!(matches!(
         pipeline.edit(ImageEditRequest {
+            references: Vec::new(),
             generation: request(),
             image,
         }),

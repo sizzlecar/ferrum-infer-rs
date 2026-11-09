@@ -122,6 +122,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         request: &ImageEditRequest,
     ) -> anyhow::Result<QwenImage21ConditionInputs> {
         ensure!(self.supports_edits(), "editing assets/profiles are missing");
+        ensure!(
+            request.references.is_empty(),
+            "this image pipeline supports one reference image"
+        );
         request.generation.latent_dimensions(
             &self.execution.config,
             self.execution.sources.assets.spatial_scale()?,

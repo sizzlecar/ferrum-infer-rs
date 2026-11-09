@@ -35,18 +35,27 @@ impl From<&ImageGenerationRequest> for GenerationIdentity {
 struct EditIdentity {
     generation: GenerationIdentity,
     image: ManagedHostBytes,
+    references: Vec<ManagedHostBytes>,
 }
 impl From<&ImageEditRequest> for EditIdentity {
     fn from(request: &ImageEditRequest) -> Self {
         Self {
             generation: GenerationIdentity::from(&request.generation),
             image: request.image.clone(),
+            references: request.references.clone(),
         }
     }
 }
 impl PartialEq for EditIdentity {
     fn eq(&self, other: &Self) -> bool {
-        self.generation == other.generation && self.image.same_region(&other.image)
+        self.generation == other.generation
+            && self.image.same_region(&other.image)
+            && self.references.len() == other.references.len()
+            && self
+                .references
+                .iter()
+                .zip(&other.references)
+                .all(|(a, b)| a.same_region(b))
     }
 }
 

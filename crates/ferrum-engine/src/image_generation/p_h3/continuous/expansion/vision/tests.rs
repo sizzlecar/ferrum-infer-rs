@@ -102,6 +102,90 @@ fn prompt_expansion_vision_rejections_finish_failed_and_return_the_same_scope() 
     }
 }
 
+#[test]
+fn two_actual_visual_producers_bind_both_picture_inputs_before_causal_installation() {
+    let fixture = MergedExpansionFixture::new();
+    let mut pipeline = pipeline();
+    let host = pipeline.host_account().clone();
+    let runtime = pipeline.runtime().clone();
+    let images =
+        [(3, 2, [37, 91, 203, 255]), (2, 3, [217, 42, 13, 255])].map(|(width, height, pixel)| {
+            let mut png = Vec::new();
+            write_rgba8_png(
+                &mut png,
+                PngDimensions::new(width, height).unwrap(),
+                PngLimits::default(),
+                |writer| writer.write_all(&pixel.repeat((width * height) as usize)),
+            )
+            .unwrap();
+            let mut bytes = host
+                .allocate_zeroed(HostMemoryClass::InputPreprocess, png.len())
+                .unwrap();
+            bytes.as_mut().copy_from_slice(&png);
+            bytes.freeze()
+        });
+    let request = ImageEditRequest {
+        generation: ImageGenerationRequest {
+            prompt: "cat".into(),
+            width: 32,
+            height: 32,
+            seed: 42,
+            n: 1,
+        },
+        image: images[0].clone(),
+        references: vec![images[1].clone()],
+    };
+    let visual = PreparedVisual::prepare(
+        &fixture.expansion,
+        &pipeline.expansion_composition(),
+        &host,
+        &pipeline.execution.config,
+        &request,
+    )
+    .unwrap();
+    let mut engine = ferrum_types::EngineConfig::default();
+    engine.backend.device = ferrum_types::Device::CPU;
+    let mut prepared = fixture
+        .expansion
+        .prepare_edits(
+            "cat",
+            (32, 32),
+            &visual.grids(),
+            visual.plan().config().architecture().merge_size(),
+            &MergedExpansionFixture::native_options(engine),
+        )
+        .unwrap();
+    let report = visual.requirements(&host).unwrap();
+    // Execute visual forwards and the causal input bridge, without installing
+    // the causal model on this Reference-only visual composition.
+    let mut budget = report.budget;
+    budget.input += visual.decoded_backing_bytes(&host).unwrap()
+        + prepared.retained_visual_input_bytes(&host).unwrap();
+    let phase = host.reserve_scope(&budget.claims()).unwrap();
+    let original = phase.account();
+    let result = pipeline
+        .bind_visual_input(&fixture.expansion, &mut prepared, &visual, phase, 7, None)
+        .unwrap();
+    let VisualInputBinding::Bound { phase, output } = result else {
+        panic!("both images must bind")
+    };
+    assert_eq!(output.len(), 2);
+    assert_ne!(output[0].bytes().bytes(), output[1].bytes().bytes());
+    assert!(output.iter().all(|o| original.owns(o.bytes())));
+    assert!(prepared.retained_causal_inputs().is_some());
+    assert_eq!(
+        runtime.snapshot().live_allocations,
+        0,
+        "both visual owners retired before causal installation"
+    );
+    drop((output, prepared, visual, request, images, report, original));
+    phase.close().unwrap();
+    pipeline
+        .shutdown()
+        .unwrap_or_else(|e| panic!("shutdown: {e}"));
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
 fn exercise(
     tracing: bool,
     correlated: bool,
@@ -136,6 +220,7 @@ fn exercise(
         .unwrap();
     input.as_mut().copy_from_slice(&png);
     let request = ImageEditRequest {
+        references: Vec::new(),
         generation: ImageGenerationRequest {
             prompt: "cat".into(),
             width: 32,

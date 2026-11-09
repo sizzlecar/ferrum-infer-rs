@@ -77,12 +77,13 @@ pub(super) fn initialized<R: DeviceRuntime>(
             seed: request.seed,
             width: request.width,
             height: request.height,
-            editing: request.reference.is_some(),
+            editing: !request.reference.is_empty(),
             // Hash only with explicit diagnostic tracing enabled. This is
             // additional Host work, not a pure performance measurement.
+            // The legacy single digest identifies Picture 1 in a multi-image edit.
             reference_latent: request
                 .reference
-                .as_ref()
+                .first()
                 .map(|reference| ReferenceLatentDigest::new(&reference.latent)),
         });
     }

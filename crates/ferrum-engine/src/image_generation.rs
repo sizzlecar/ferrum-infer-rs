@@ -212,12 +212,27 @@ pub struct ImageGenerationRequest {
     pub n: u32,
 }
 
-/// One encoded PNG reference; its admitted backing belongs to this pipeline's
-/// Host account throughout queueing, preprocessing and execution.
+/// Ordered PNG inputs; each admitted backing belongs to this pipeline's Host
+/// account throughout queueing, preprocessing and execution.
 #[derive(Debug, Clone)]
 pub struct ImageEditRequest {
     pub generation: ImageGenerationRequest,
     pub image: ManagedHostBytes,
+    /// Additional ordered references. `image` is Picture 1, these start at Picture 2.
+    pub references: Vec<ManagedHostBytes>,
+}
+impl ImageEditRequest {
+    pub fn images(&self) -> impl Iterator<Item = &ManagedHostBytes> {
+        std::iter::once(&self.image).chain(self.references.iter())
+    }
+    pub fn image_count(&self) -> usize {
+        1 + self.references.len()
+    }
+    pub fn encoded_backing_bytes(&self) -> usize {
+        self.images().fold(0usize, |sum, image| {
+            sum.saturating_add(image.backing_bytes())
+        })
+    }
 }
 impl ImageGenerationRequest {
     fn latent_dimensions(

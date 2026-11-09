@@ -205,7 +205,12 @@ fn try_forward(
             audio: &mut l.audio,
             sampling: &mut l.sampling,
             cache: &l.cache,
-            reference: l.reference.as_ref().map(ReferenceState::view),
+            references: l
+                .reference
+                .as_ref()
+                .map(ReferenceState::view)
+                .into_iter()
+                .collect(),
         })
         .collect::<Vec<_>>();
     let recorded_before = f.trace.status().recorded;

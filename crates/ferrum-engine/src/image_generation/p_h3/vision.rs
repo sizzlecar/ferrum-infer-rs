@@ -20,6 +20,7 @@ pub(super) mod reuse;
 use reuse::{MainVisionBindingReceipt, MainVisionReuseBinding};
 
 pub(super) struct PreparedVision {
+    pub additional: Vec<PreparedVision>,
     pub prompt: PH3ImageEditPrompt,
     pub source_width: u32,
     pub source_height: u32,
@@ -55,6 +56,7 @@ impl PreparedVision {
                 )?;
         let options = pixels.config().compile_options()?;
         Ok(Self {
+            additional: Vec::new(),
             prompt,
             source_width,
             source_height,
@@ -63,8 +65,147 @@ impl PreparedVision {
             options,
         })
     }
+    pub fn images(&self) -> impl Iterator<Item = &PreparedVision> {
+        std::iter::once(self).chain(self.additional.iter())
+    }
+    pub fn new_images(
+        assets: &PH3ImageAssets,
+        text: &str,
+        dimensions: &[(u32, u32)],
+        policy: Qwen3VLVisionComfyPixelPolicy,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=8).contains(&dimensions.len()),
+            "H3 requires 1..=8 ordered Pictures"
+        );
+        let mut images = dimensions
+            .iter()
+            .map(|&(width, height)| Self::new(assets, text, width, height, policy))
+            .collect::<Result<Vec<_>>>()?;
+        let grids = images
+            .iter()
+            .map(|image| image.pixels.config().grid().clone())
+            .collect::<Vec<_>>();
+        let mut first = images.remove(0);
+        first.prompt = assets.tokenizer.prepare_images_instruction(
+            text,
+            &grids,
+            assets.vision.merge_size(),
+        )?;
+        first.additional = images;
+        Ok(first)
+    }
 }
 impl<R: DeviceRuntime> PH3ImagePipeline<R> {
+    pub(super) fn execute_vision_image_inputs(
+        &mut self,
+        recipe: &PreparedVision,
+        stages: &[&PreparedImageStage<R>],
+        images: &[ManagedRgba8Image],
+        text: &PH3ImageTextConditioningConfig,
+        identity: &RequestIdentity,
+        job: u64,
+        receipts: &mut Vec<ImageStageReceipt>,
+        reuse: Option<&MainVisionReuseBinding>,
+    ) -> std::result::Result<
+        (Vec<ManagedHostTensor>, Option<MainVisionBindingReceipt>),
+        ImageGenerationFailure<R>,
+    > {
+        let count = recipe.images().count();
+        if count != images.len() || count != stages.len() {
+            return Err(ImageGenerationFailure::Preflight(anyhow::anyhow!(
+                "ordered visual images and stages differ"
+            )));
+        }
+        if count == 1 {
+            return self.execute_vision_inputs(
+                recipe, stages[0], &images[0], text, identity, job, receipts, reuse,
+            );
+        }
+        let host = self.execution.execution_host().clone();
+        let mut readbacks = Vec::with_capacity(count);
+        for ((recipe, prepared), image) in recipe.images().zip(stages).zip(images) {
+            let inputs = (|| -> Result<_> {
+                ensure!(
+                    prepared.declaration().stage == ImageStage::VisionEncoder
+                        && prepared.family().fingerprint()? == recipe.family.fingerprint()?,
+                    "visual stage differs from its original component"
+                );
+                image.validate_parent(&host)?;
+                ensure!(
+                    (image.width(), image.height()) == (recipe.source_width, recipe.source_height),
+                    "visual Picture dimensions changed after preparation"
+                );
+                let source = &self.execution.sources.assets.sources.text_encoder;
+                let table = ferrum_quantization::TensorArchive::tensor(
+                    source.archive(),
+                    Qwen3VLVisionFamily::POSITION_EXTERNAL_NAME,
+                )?;
+                let positions = recipe
+                    .pixels
+                    .config()
+                    .managed_position_inputs(&host, &table)?;
+                let patches = recipe.pixels.managed_patches(&host, image)?;
+                Ok(std::iter::once(patches).chain(positions).collect())
+            })()
+            .map_err(ImageGenerationFailure::Preflight)?;
+            let mut active = self
+                .execution
+                .start_stage((*prepared).clone(), job, receipts)?;
+            if let Err(error) = active.session.set_output_host_account(host.clone()) {
+                return Err(active.processing(error.into()));
+            }
+            let Some(actor) = self.execution.serial_actor.as_mut() else {
+                return Err(active.processing(anyhow::anyhow!("image serial actor is closed")));
+            };
+            let (active, outputs) = active.execute_on_actor(actor, job, inputs)?;
+            let validate = (|| -> Result<()> {
+                let ports = active
+                    .session
+                    .executable()
+                    .execution_plan()
+                    .payload()
+                    .tensor_ports()
+                    .context("visual stage lacks actual ports")?;
+                ensure!(
+                    outputs.len() == 4 && ports.outputs().len() == 4,
+                    "each Picture requires all four visual readbacks"
+                );
+                for output in &outputs {
+                    let port = ports
+                        .outputs()
+                        .iter()
+                        .find(|p| p.value_id() == output.value_id())
+                        .context("visual readback is not declared by this session")?;
+                    ensure!(
+                        port.tensor() == output.tensor()
+                            && host.owns(output.bytes())
+                            && output.bytes().class() == HostMemoryClass::Output
+                            && output.tensor().element_type() == ElementType::F32
+                            && output
+                                .bytes()
+                                .bytes()
+                                .chunks_exact(4)
+                                .all(|b| f32::from_le_bytes(b.try_into().unwrap()).is_finite()),
+                        "visual readback has a foreign owner, invalid shape, precision or value"
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(error) = validate {
+                return Err(active.processing(error));
+            }
+            self.execution.finish_stage(active, receipts)?;
+            readbacks.push(outputs);
+        }
+        let ordered = readbacks.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let inputs = recipe
+            .prompt
+            .managed_image_inputs(text, &host, &ordered)
+            .map_err(ImageGenerationFailure::Preflight)?;
+        Ok((inputs, None))
+    }
+
     /// Four actual Output readbacks are copied by the model's checked adapter
     /// into request-local Input owners. An enabled cohort may retain only the
     /// immutable readbacks after the original visual stage becomes quiescent.

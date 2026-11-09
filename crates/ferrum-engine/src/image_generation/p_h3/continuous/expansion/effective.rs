@@ -13,6 +13,7 @@ impl EffectiveRequest {
                 ..original.clone()
             }),
             ImageRequestRef::Edit(original) => Self::Edit(ImageEditRequest {
+                references: original.references.clone(),
                 generation: ImageGenerationRequest {
                     prompt,
                     ..original.generation.clone()
@@ -52,6 +53,7 @@ mod tests {
             .unwrap()
             .freeze();
         let original = ImageEditRequest {
+            references: vec![image.clone()],
             generation: ImageGenerationRequest {
                 prompt: "change the sky".into(),
                 width: 512,
@@ -71,6 +73,8 @@ mod tests {
             panic!("edit kind changed")
         };
         assert!(edit.image.same_region(&original.image));
+        assert_eq!(edit.references.len(), 1);
+        assert!(edit.references[0].same_region(&original.references[0]));
         assert_eq!(host.usage().unwrap().allocated_bytes(), before);
         assert_eq!(
             (

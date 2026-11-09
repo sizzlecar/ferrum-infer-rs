@@ -134,16 +134,49 @@ impl PH3ImageAssets {
             &NumericalProfileId,
         ) -> Result<PreparedModelFamily>,
     ) -> Result<PreparedConditioning> {
-        let visual =
-            PreparedVision::new(self, &request.prompt, source_width, source_height, pixels)?;
-        let geometry = RequestGeometry::new(
+        self.prepare_images_conditioning_with_family(
+            request,
+            identity,
+            pipeline,
+            &[(source_width, source_height)],
+            vec![reference],
+            pixels,
+            encoder,
+            connector,
+        )
+    }
+    pub(super) fn prepare_images_conditioning_with_family(
+        &self,
+        request: &ImageGenerationRequest,
+        identity: RequestIdentity,
+        pipeline: &ImagePipelineConfig,
+        dimensions: &[(u32, u32)],
+        references: Vec<PH3ImageReferenceImage>,
+        pixels: Qwen3VLVisionComfyPixelPolicy,
+        encoder: impl FnOnce(
+            PH3ImageTextConditioningFamily,
+            &PH3ImageTextConditioningConfig,
+            &NumericalProfileId,
+        ) -> Result<PreparedModelFamily>,
+        connector: impl FnOnce(
+            PH3ImageTextConnectorProjectionFamily,
+            &PH3ImageTextConnectorProjectionConfig,
+            &NumericalProfileId,
+        ) -> Result<PreparedModelFamily>,
+    ) -> Result<PreparedConditioning> {
+        ensure!(
+            dimensions.len() == references.len(),
+            "Picture grids and reference latents differ"
+        );
+        let visual = PreparedVision::new_images(self, &request.prompt, dimensions, pixels)?;
+        let geometry = RequestGeometry::with_references(
             request,
             identity,
             pipeline,
             self.spatial_scale(),
             self.denoiser.transformer(),
             visual.prompt.token_tags().to_vec(),
-            Some(reference),
+            references,
         )?;
         self.conditioning_recipe(PreparedPrompts::Image(visual), geometry, encoder, connector)
     }

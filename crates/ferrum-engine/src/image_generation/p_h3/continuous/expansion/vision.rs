@@ -13,6 +13,7 @@ use ferrum_models::{
 };
 
 pub(super) struct PreparedVisual<R: DeviceRuntime> {
+    additional: Vec<PreparedVisual<R>>,
     producer: PreparedExpansionVision<R>,
     encoded: ManagedHostBytes,
     dimensions: (u32, u32),
@@ -27,14 +28,33 @@ impl<R: DeviceRuntime> PreparedVisual<R> {
         request: &ImageEditRequest,
     ) -> Result<Self> {
         ensure!(
-            host.owns(&request.image) && request.image.class() == HostMemoryClass::InputPreprocess,
+            (1..=8).contains(&request.image_count()),
+            "H3 requires 1..=8 ordered image inputs"
+        );
+        let mut images = request
+            .images()
+            .map(|image| Self::prepare_image(assets, composition, host, config, image))
+            .collect::<Result<Vec<_>>>()?;
+        let mut first = images.remove(0);
+        first.additional = images;
+        Ok(first)
+    }
+    fn prepare_image(
+        assets: &NativeTextExpansion,
+        composition: &RuntimeComposition<R>,
+        host: &HostMemoryAccount,
+        config: &ImagePipelineConfig,
+        image: &ManagedHostBytes,
+    ) -> Result<Self> {
+        ensure!(
+            host.owns(image) && image.class() == HostMemoryClass::InputPreprocess,
             "prompt expansion PNG requires its original Input Host owner"
         );
         let visual = assets.visual_assets().context(
             "image-conditioned prompt expansion requires validated visual sources and processor",
         )?;
         let limits = visual.processor().image_limits();
-        let dimensions = png_dimensions_hint(request.image.bytes(), limits)
+        let dimensions = png_dimensions_hint(image.bytes(), limits)
             .context("prompt expansion requires a bounded static RGB/RGBA8 PNG header")?;
         let producer = PreparedExpansionVision::compile_assets(
             composition,
@@ -50,8 +70,9 @@ impl<R: DeviceRuntime> PreparedVisual<R> {
             },
         )?;
         Ok(Self {
+            additional: Vec::new(),
             producer,
-            encoded: request.image.clone(),
+            encoded: image.clone(),
             dimensions,
             limits,
         })
@@ -59,27 +80,45 @@ impl<R: DeviceRuntime> PreparedVisual<R> {
     pub fn plan(&self) -> &Qwen3VLVisionHfImagePlan {
         self.producer.plan()
     }
+    fn images(&self) -> impl Iterator<Item = &Self> {
+        std::iter::once(self).chain(&self.additional)
+    }
+    pub fn grids(&self) -> Vec<ferrum_models::qwen3_vl_vision::Qwen3VLVisionGrid> {
+        self.images()
+            .map(|image| image.plan().config().grid().clone())
+            .collect()
+    }
     pub fn requirements(
         &self,
         host: &HostMemoryAccount,
     ) -> Result<ExpansionVisionHostRequirements> {
-        self.producer.host_requirements(host)
+        self.producer.host_requirements(host)?.combine(
+            self.additional
+                .iter()
+                .map(|image| image.producer.host_requirements(host))
+                .collect::<Result<Vec<_>>>()?,
+        )
     }
     pub fn decoded_backing_bytes(&self, host: &HostMemoryAccount) -> Result<usize> {
-        let bytes = u64::from(self.dimensions.0)
-            .checked_mul(u64::from(self.dimensions.1))
-            .and_then(|n| n.checked_mul(4))
-            .context("decoded visual PNG capacity overflow")?;
-        Ok(host.backing_bytes(usize::try_from(bytes)?)?)
+        self.images().try_fold(0usize, |peak, image| {
+            let bytes = u64::from(image.dimensions.0)
+                .checked_mul(u64::from(image.dimensions.1))
+                .and_then(|n| n.checked_mul(4))
+                .context("decoded visual PNG capacity overflow")?;
+            Ok(peak.max(host.backing_bytes(usize::try_from(bytes)?)?))
+        })
     }
 
     fn same_image(&self, other: &Self) -> bool {
-        self.dimensions == other.dimensions
-            && self.producer.same_reuse_domain(&other.producer)
+        self.images().count() == other.images().count()
+            && self.images().zip(other.images()).all(|(this, other)| {
+                this.dimensions == other.dimensions
+            && this.producer.same_reuse_domain(&other.producer)
             // Original encoded bytes are immutable and compared in full.
             // Different encodings of equal pixels may miss; no hash collision
             // or prompt/file-name identity can produce a hit.
-            && self.encoded.bytes() == other.encoded.bytes()
+            && this.encoded.bytes() == other.encoded.bytes()
+            })
     }
 }
 
@@ -88,7 +127,7 @@ impl<R: DeviceRuntime> PreparedVisual<R> {
 pub(super) struct RetainedCohortVisual<R: DeviceRuntime> {
     assets: Arc<NativeTextExpansion>,
     visual: PreparedVisual<R>,
-    output: TensorExecutionOutput,
+    output: Vec<TensorExecutionOutput>,
     producer_job: u64,
     producer_request_id: Option<uuid::Uuid>,
 }
@@ -96,7 +135,7 @@ impl<R: DeviceRuntime> RetainedCohortVisual<R> {
     pub(super) fn new(
         assets: Arc<NativeTextExpansion>,
         visual: PreparedVisual<R>,
-        output: TensorExecutionOutput,
+        output: Vec<TensorExecutionOutput>,
         producer_job: u64,
         correlation: Option<ferrum_types::ImageRequestCorrelation>,
     ) -> Self {
@@ -149,7 +188,7 @@ impl<R: DeviceRuntime> VisionInitialization<R> {
 pub(super) enum VisualInputBinding {
     Bound {
         phase: HostMemoryScope,
-        output: TensorExecutionOutput,
+        output: Vec<TensorExecutionOutput>,
     },
     Rejected {
         phase: HostMemoryScope,
@@ -270,7 +309,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                     producer_request_id: retained
                         .map(|r| r.producer_request_id)
                         .unwrap_or_else(|| correlation.map(|c| c.request_id)),
-                    output_bytes: output.bytes().len(),
+                    output_bytes: output.iter().map(|value| value.bytes().len()).sum(),
                 },
             );
         }
@@ -298,11 +337,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         if let Some(retained) = retained {
             ensure_reuse_identity(assets, visual, retained).map_err(preparation_error)?;
             return Ok(
-                match assets.bind_image_outputs(
-                    prepared,
-                    &host,
-                    std::slice::from_ref(&retained.output),
-                ) {
+                match assets.bind_image_outputs(prepared, &host, &retained.output) {
                     Ok(()) => VisualInputBinding::Bound {
                         phase,
                         output: retained.output.clone(),
@@ -316,66 +351,80 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         }
         // Strict decode is before any native acquisition. Bad CRC/chunks or
         // a changed geometry rejects just this request and returns its grant.
-        let decoded = match ManagedRgba8Image::decode_png(&host, &visual.encoded, visual.limits) {
-            Ok(decoded) if (decoded.width(), decoded.height()) == visual.dimensions => decoded,
-            Ok(_) => {
+        let mut phase = phase;
+        let mut outputs = Vec::with_capacity(visual.images().count());
+        for (index, visual) in visual.images().enumerate() {
+            let decoded = match ManagedRgba8Image::decode_png(&host, &visual.encoded, visual.limits)
+            {
+                Ok(decoded) if (decoded.width(), decoded.height()) == visual.dimensions => decoded,
+                Ok(_) => {
+                    return Ok(VisualInputBinding::Rejected {
+                        phase,
+                        diagnostic: "visual PNG differs from prepared dimensions".into(),
+                    });
+                }
+                Err(error) => {
+                    return Ok(VisualInputBinding::Rejected {
+                        phase,
+                        diagnostic: format!("visual PNG decode: {error:#}"),
+                    });
+                }
+            };
+            let suffix = if index == 0 {
+                String::new()
+            } else {
+                format!(".picture{}", index + 1)
+            };
+            let run = RunId::new(format!("run.image.h3.{job}.prompt_vision{suffix}"))
+                .map_err(|e| preparation_error(e.into()))?;
+            let request = RequestIdentity::new(format!("request.image.h3.{job}"))
+                .map_err(|e| preparation_error(e.into()))?;
+            let transaction =
+                TransactionId::new(format!("transaction.image.h3.{job}.prompt_vision{suffix}"))
+                    .map_err(|e| preparation_error(e.into()))?;
+            let Some(actor) = self.execution.serial_actor.as_mut() else {
                 return Ok(VisualInputBinding::Rejected {
                     phase,
-                    diagnostic: "visual PNG differs from prepared dimensions".into(),
+                    diagnostic: "image serial actor is closed".into(),
                 });
-            }
-            Err(error) => {
-                return Ok(VisualInputBinding::Rejected {
-                    phase,
-                    diagnostic: format!("visual PNG decode: {error:#}"),
-                });
-            }
-        };
-        let run = RunId::new(format!("run.image.h3.{job}.prompt_vision"))
-            .map_err(|e| preparation_error(e.into()))?;
-        let request = RequestIdentity::new(format!("request.image.h3.{job}"))
-            .map_err(|e| preparation_error(e.into()))?;
-        let transaction = TransactionId::new(format!("transaction.image.h3.{job}.prompt_vision"))
-            .map_err(|e| preparation_error(e.into()))?;
-        let Some(actor) = self.execution.serial_actor.as_mut() else {
-            return Ok(VisualInputBinding::Rejected {
+            };
+            let completed = match visual.producer.execute_on_actor(
                 phase,
-                diagnostic: "image serial actor is closed".into(),
-            });
-        };
-        let completed = match visual.producer.execute_on_actor(
-            phase,
-            &decoded,
-            actor,
-            run,
-            request,
-            transaction,
-        ) {
-            Ok(completed) => completed,
-            Err(ExpansionVisionFailure::Preflight { source, phase }) => {
-                return Ok(VisualInputBinding::Rejected {
-                    phase,
-                    diagnostic: format!("visual prompt preprocessing: {source:#}"),
-                });
-            }
-            Err(failure) => {
-                self.execution.stopped = true;
-                return Err(ImageBatchError::Fatal(Box::new(failure)));
-            }
-        };
-        drop(decoded);
-        // The completed value can only exist after original session.close()
-        // acknowledges Closed. Its exact same phase is used for the bridge.
-        let (output, phase, _close) = completed.into_parts();
-        if let Err(error) =
-            assets.bind_image_outputs(prepared, &host, std::slice::from_ref(&output))
-        {
+                &decoded,
+                actor,
+                run,
+                request,
+                transaction,
+            ) {
+                Ok(completed) => completed,
+                Err(ExpansionVisionFailure::Preflight { source, phase }) => {
+                    return Ok(VisualInputBinding::Rejected {
+                        phase,
+                        diagnostic: format!("visual prompt preprocessing: {source:#}"),
+                    });
+                }
+                Err(failure) => {
+                    self.execution.stopped = true;
+                    return Err(ImageBatchError::Fatal(Box::new(failure)));
+                }
+            };
+            drop(decoded);
+            // The completed value can only exist after original session.close()
+            // acknowledges Closed. Its exact same phase is used for the bridge.
+            let (output, returned_phase, _close) = completed.into_parts();
+            phase = returned_phase;
+            outputs.push(output);
+        }
+        if let Err(error) = assets.bind_image_outputs(prepared, &host, &outputs) {
             return Ok(VisualInputBinding::Rejected {
                 phase,
                 diagnostic: format!("visual prompt causal bridge: {error}"),
             });
         }
-        Ok(VisualInputBinding::Bound { phase, output })
+        Ok(VisualInputBinding::Bound {
+            phase,
+            output: outputs,
+        })
     }
 }
 

@@ -34,7 +34,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             .expect("one admitted H3 request returns one image"))
     }
 
-    /// Single-image editing shares the same admitted request lane, actual
+    /// Ordered reference-image editing shares the same admitted request lane, actual
     /// packed DiT step and final decoder as generation and serving.
     pub fn edit(
         &mut self,

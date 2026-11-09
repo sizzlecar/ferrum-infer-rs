@@ -95,6 +95,55 @@ async fn streaming_fields_preserve_png_owner_and_use_common_image_controls() {
 }
 
 #[tokio::test]
+async fn ordered_image_array_fields_respect_backend_count_and_release_every_ingress_owner() {
+    let host = account(4096);
+    let first = b"\x89PNG\r\n\x1a\nfirst-person";
+    let second = b"\x89PNG\r\n\x1a\nsecond-pose";
+    for names in [
+        ["image[]", "image[]"],
+        ["image", "image"],
+        ["image", "image[]"],
+    ] {
+        let fields = [
+            ("model", b"image".as_slice(), false),
+            (
+                "prompt",
+                b"Picture 1 adopts Picture 2 pose".as_slice(),
+                false,
+            ),
+            (names[0], first.as_slice(), true),
+            (names[1], second.as_slice(), true),
+        ];
+        let (_, images) = parse_images(multipart(wire(&fields)).await, &host, 2)
+            .await
+            .unwrap();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].bytes(), first);
+        assert_eq!(images[1].bytes(), second);
+        assert!(images
+            .iter()
+            .all(|image| host.owns(image) && image.class() == HostMemoryClass::InputPreprocess));
+        drop(images);
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+        assert!(parse_images(multipart(wire(&fields)).await, &host, 1)
+            .await
+            .is_err());
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    }
+    let fields = [
+        ("model", b"image".as_slice(), false),
+        ("prompt", b"pose".as_slice(), false),
+        ("image[]", first.as_slice(), true),
+        ("image[]", second.as_slice(), true),
+        ("prompt", b"duplicate".as_slice(), false),
+    ];
+    assert!(parse_images(multipart(wire(&fields)).await, &host, 8)
+        .await
+        .is_err());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[tokio::test]
 async fn eight_megapixel_multipart_uses_shared_limits_and_real_managed_decoder() {
     use ferrum_models::qwen_image21::image_input::ManagedRgba8Image;
     use ferrum_output::png::{encoded_rgba8_png_bytes, PngDimensions, PngLimits};

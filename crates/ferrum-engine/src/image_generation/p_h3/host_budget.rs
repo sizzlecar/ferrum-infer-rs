@@ -171,6 +171,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         if let Some(stage) = &prepared.conditioning.visual {
             installable.push(stage);
         }
+        installable.extend(&prepared.conditioning.additional_visuals);
         installable.extend([
             &prepared.conditioning.encoder,
             &prepared.conditioning.connector,
@@ -233,10 +234,25 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                     stage.family().fingerprint()? == recipe.family.fingerprint()?,
                     "visual budget belongs to another prepared recipe"
                 );
-                let visual_ports = host_budget::ports(stage)?;
                 let text_ports = host_budget::ports(&prepared.encoder)?;
-                let image_input = host_budget::sum_ports(host, visual_ports.inputs().iter())?;
-                let visual_output = host_budget::sum_ports(host, visual_ports.outputs().iter())?;
+                let mut image_input = 0;
+                let mut visual_output = 0usize;
+                ensure!(
+                    prepared.visual_stages().count() == recipe.images().count(),
+                    "visual budget requires every ordered Picture stage"
+                );
+                for (stage, recipe) in prepared.visual_stages().zip(recipe.images()) {
+                    ensure!(
+                        stage.family().fingerprint()? == recipe.family.fingerprint()?,
+                        "Picture visual budget belongs to another family"
+                    );
+                    let ports = host_budget::ports(stage)?;
+                    image_input =
+                        image_input.max(host_budget::sum_ports(host, ports.inputs().iter())?);
+                    visual_output = visual_output
+                        .checked_add(host_budget::sum_ports(host, ports.outputs().iter())?)
+                        .context("ordered visual output capacity overflows")?;
+                }
                 let text_input = host_budget::sum_ports(host, text_ports.inputs().iter())?;
                 Ok(Some(VisionHostRequirements::from_physical(
                     image_input,

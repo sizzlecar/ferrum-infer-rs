@@ -64,7 +64,7 @@ Save this Qwen-Image-2.1-Turbo architecture as `models/Qwen-Image-2.1-Turbo/tran
 
 ## HTTP API
 
-`POST /v1/images/generations` accepts a JSON text prompt. `POST /v1/images/edits` accepts multipart with one PNG. Both support `n=1` and return PNG in `b64_json`.
+`POST /v1/images/generations` accepts a JSON text prompt. `POST /v1/images/edits` accepts multipart PNG inputs. Both support `n=1` and return PNG in `b64_json`.
 
 ```sh
 curl http://127.0.0.1:8000/v1/images/generations \
@@ -77,6 +77,32 @@ curl http://127.0.0.1:8000/v1/images/edits \
 ```
 
 For Metal, replace `qwen-image` with `qwen-image-turbo-metal`.
+
+P-H3 accepts up to eight ordered input images per edit. The first is Picture 1,
+the image being edited; subsequent inputs are Picture 2 through Picture 8.
+Repeat `image[]` in the OpenAI-compatible multipart request (`image` is also
+accepted). State each image's purpose in the prompt, for example:
+
+```sh
+curl http://127.0.0.1:8000/v1/images/edits \
+  -F model=P-H3-Image \
+  -F 'image[]=@person.png' -F 'image[]=@pose.png' \
+  -F 'prompt=Keep the face, hair and clothing of the person in Picture 1. Change their body pose to match Picture 2.' \
+  -F size=1536x1024
+
+ferrum run --image-config ph3.json \
+  --image person.png --image pose.png \
+  --prompt 'Keep the person from Picture 1 and adopt the pose from Picture 2.' \
+  --width 1536 --height 1024 --output edited.png
+```
+
+The `/health` image capabilities report `maximum_reference_images` separately
+from the concurrent edit request capacity. Qwen's current pipeline accepts one
+input image. Each file must be a static RGB/RGBA8 PNG within the encoded image
+limit; all input backings, decoded pixels and visual outputs must also fit the
+configured Host and device budgets. Multiple images increase those requirements.
+The optional H3 main-vision cohort cache currently applies to single-image edits;
+multi-image edits execute each Picture's visual encoder. Masks remain unsupported.
 
 ## CUDA LoRA
 

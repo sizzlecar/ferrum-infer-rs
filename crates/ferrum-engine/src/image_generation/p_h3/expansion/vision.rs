@@ -52,13 +52,39 @@ pub(crate) struct ExpansionVisionHostRequirements {
     pub budget: ExecutionHostBudget,
     pub startup_device_bytes: u64,
     _materializer: HostBackingPreparation,
+    source: Arc<ExpansionVisualAssets>,
+    additional: Vec<ExpansionVisionHostRequirements>,
 }
 
 impl ExpansionVisionHostRequirements {
     /// Original retained backing, separate from this producer's temporary
     /// conversion peak when several visual stages execute in sequence.
     pub(crate) fn materializer_additional_bytes(&self) -> usize {
-        self._materializer.additional_bytes()
+        self.additional
+            .iter()
+            .fold(self._materializer.additional_bytes(), |peak, report| {
+                peak.max(report.materializer_additional_bytes())
+            })
+    }
+    pub(crate) fn combine(mut self, reports: Vec<Self>) -> Result<Self> {
+        for report in &reports {
+            ensure!(
+                Arc::ptr_eq(&self.source, &report.source),
+                "sequential visual requirements must retain the exact same source cache"
+            );
+            self.budget.input = self.budget.input.max(report.budget.input);
+            self.budget.output = self
+                .budget
+                .output
+                .checked_add(report.budget.output)
+                .context("ordered visual readback backing overflows")?;
+            self.budget.staging = self.budget.staging.max(report.budget.staging);
+            // Same immutable source cache; producers execute and retire in sequence.
+            self.budget.weights = self.budget.weights.max(report.budget.weights);
+            self.startup_device_bytes = self.startup_device_bytes.max(report.startup_device_bytes);
+        }
+        self.additional = reports;
+        Ok(self)
     }
 }
 
@@ -283,6 +309,8 @@ impl<R: DeviceRuntime> PreparedExpansionVision<R> {
             budget,
             startup_device_bytes,
             _materializer: materializer,
+            source: self.assets.clone(),
+            additional: Vec::new(),
         })
     }
     /// The caller supplies its existing actor and transfers its actual phase

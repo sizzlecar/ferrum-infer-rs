@@ -8,6 +8,7 @@ use crate::image_generation::{
 use ferrum_kernels::backend::reference::{
     reference_vnext_operation_registry, ReferenceDeviceRuntime, ReferenceVNextComposition,
 };
+use ferrum_models::qwen3_vl_text::Qwen3VLTextComfyFamily;
 use ferrum_models::qwen_image21::image_input::ImageInputLimits;
 use ferrum_output::png::{write_rgba8_png, PngDimensions, PngLimits};
 
@@ -156,6 +157,154 @@ fn request_work(host: &HostMemoryAccount) -> HostMemoryScope {
         (HostMemoryClass::WeightBacking, 4 << 20),
     ])
     .unwrap()
+}
+
+#[test]
+fn multiple_picture_visual_execution_matches_independent_single_image_features() {
+    let mut pipeline = pipeline();
+    let host = pipeline.host_account().clone();
+    let runtime = pipeline.runtime().clone();
+    let mut multi = PreparedVision::new_images(
+        &pipeline.execution.sources.assets,
+        "cat",
+        &[(4, 4), (4, 4)],
+        Qwen3VLVisionComfyPixelPolicy::new(16, 16).unwrap(),
+    )
+    .unwrap();
+    let assets = &pipeline.execution.sources.assets;
+    for recipe in std::iter::once(&mut multi).flat_map(|m| {
+        let PreparedVision {
+            family,
+            pixels,
+            additional,
+            ..
+        } = m;
+        std::iter::once((family, pixels)).chain(
+            additional
+                .iter_mut()
+                .map(|r| (&mut r.family, &mut r.pixels)),
+        )
+    }) {
+        *recipe.0 = TypedFamilyRegistration::new(
+            Qwen3VLVisionComfyFamily::new(assets.limits.vision).unwrap(),
+        )
+        .prepare_with_profile(
+            &serde_json::to_value(recipe.1.config()).unwrap(),
+            &NumericalProfileId::new(Qwen3VLVisionComfyFamily::REFERENCE_PROFILE_ID).unwrap(),
+        )
+        .unwrap();
+    }
+    let stages = multi
+        .images()
+        .map(|image| {
+            pipeline
+                .compile_recipe(
+                    ImageStage::VisionEncoder,
+                    ImageStageAttachment::MayInitializeStored,
+                    1,
+                    image.family.clone(),
+                    &image.options,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let text = PH3ImageTextConditioningConfig::from_comfy_checkpoint_with_connector(
+        assets.text.clone(),
+        multi.prompt.text().layout().clone(),
+        &assets.sources.text_encoder,
+        &assets.connector,
+    )
+    .unwrap()
+    .with_visual_inputs(multi.prompt.visual_rows().clone())
+    .unwrap();
+    let (single, single_stage, single_text, _) = prepared(&pipeline, "cat");
+    let work = host
+        .reserve_scope(&[
+            (HostMemoryClass::InputPreprocess, 8 << 20),
+            (HostMemoryClass::Output, 4 << 20),
+            (HostMemoryClass::TransferStaging, 2 << 20),
+            (HostMemoryClass::WeightBacking, 4 << 20),
+        ])
+        .unwrap();
+    pipeline.execution.execution_host = Some(work.account());
+    let account = work.account();
+    let encoded = [[31, 91, 203, 255], [217, 42, 13, 255]].map(|pixel| png(&account, pixel));
+    let images = encoded
+        .iter()
+        .map(|encoded| image(&account, encoded))
+        .collect::<Vec<_>>();
+    let mut receipts = Vec::new();
+    let mut expected = Vec::new();
+    for (index, image) in images.iter().enumerate() {
+        expected.push(
+            pipeline
+                .execute_vision_inputs(
+                    &single,
+                    &single_stage,
+                    image,
+                    &single_text,
+                    &RequestIdentity::new(format!("request.single.{index}")).unwrap(),
+                    index as u64,
+                    &mut receipts,
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("single visual: {e}"))
+                .0,
+        );
+    }
+    let feature_ids = std::iter::once(Qwen3VLTextComfyFamily::VISUAL_EMBEDDINGS_ID)
+        .chain(Qwen3VLTextComfyFamily::DEEPSTACK_IDS)
+        .collect::<Vec<_>>();
+    let before = runtime.snapshot().commands;
+    let (actual, binding) = pipeline
+        .execute_vision_image_inputs(
+            &multi,
+            &stages.iter().collect::<Vec<_>>(),
+            &images,
+            &text,
+            &RequestIdentity::new("request.multiple").unwrap(),
+            3,
+            &mut receipts,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("multiple visuals: {e}"));
+    assert!(binding.is_none());
+    assert!(runtime.snapshot().commands > before);
+    for id in feature_ids {
+        let parts = expected
+            .iter()
+            .map(|inputs| {
+                inputs
+                    .iter()
+                    .find(|input| input.value_id().as_str() == id)
+                    .unwrap()
+                    .bytes()
+                    .bytes()
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(
+            parts[0], parts[1],
+            "second image must carry its own actual features"
+        );
+        let joined = parts.concat();
+        assert_eq!(
+            actual
+                .iter()
+                .find(|input| input.value_id().as_str() == id)
+                .unwrap()
+                .bytes()
+                .bytes(),
+            joined
+        );
+    }
+    drop((actual, expected, images, encoded, account));
+    pipeline.execution.execution_host = None;
+    work.close().unwrap();
+    pipeline
+        .shutdown()
+        .unwrap_or_else(|e| panic!("shutdown: {e}"));
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(runtime.snapshot().live_allocations, 0);
 }
 
 #[test]

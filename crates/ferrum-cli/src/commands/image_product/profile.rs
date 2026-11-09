@@ -409,6 +409,7 @@ fn profile_iterations(
                         .map(|generation| ImageEditRequest {
                             generation,
                             image: image.clone(),
+                            references: Vec::new(),
                         })
                         .collect(),
                 )

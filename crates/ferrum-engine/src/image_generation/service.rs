@@ -10,7 +10,9 @@ use super::{ImageEditRequest, ImageGenerationOutput, ImageGenerationRequest, Qwe
 use ferrum_models::qwen_image21::image_input::{
     png_dimensions_hint, ImageInputLimits, QwenImage21ImageProcessor,
 };
-use ferrum_runtime::{DeviceRuntime, HostMemoryAccount, HostMemoryClass, HostMemoryReservation};
+use ferrum_runtime::{
+    DeviceRuntime, HostMemoryAccount, HostMemoryClass, HostMemoryReservation, ManagedHostBytes,
+};
 use ferrum_types::image_trace::ImageRequestCorrelation;
 use ferrum_types::ImageBatchPolicy;
 use serde::Serialize;
@@ -317,6 +319,10 @@ pub trait ImageGenerator: Send + 'static {
     fn capabilities(&self) -> Result<ImageGeneratorCapabilities, GeneratorError>;
     fn supports_edits(&self) -> bool {
         false
+    }
+    /// Ordered input image capacity, independent of concurrent request capacity.
+    fn maximum_reference_images(&self) -> usize {
+        usize::from(self.supports_edits())
     }
     fn edit(
         &mut self,
@@ -667,6 +673,7 @@ pub struct ImageService {
     host: HostMemoryAccount,
     capabilities: ImageGeneratorCapabilities,
     supports_edits: bool,
+    maximum_reference_images: usize,
     maximum_edit_batch_size: usize,
     retained_output_bytes: u64,
 }
@@ -690,6 +697,13 @@ impl ImageService {
         let host = generator.host_account().clone();
         let retained_output_bytes = generator.retained_output_bytes();
         let supports_edits = generator.supports_edits();
+        let maximum_reference_images = generator.maximum_reference_images();
+        if supports_edits && maximum_reference_images == 0 {
+            return Err(service_error(
+                ImageServiceErrorKind::InvalidRequest,
+                "editing capability requires a positive input image capacity",
+            ));
+        }
         let edit_cap = generator.maximum_edit_batch_size();
         if edit_cap == 0 || edit_cap > capabilities.maximum_batch_size {
             return Err(service_error(
@@ -706,6 +720,11 @@ impl ImageService {
             host,
             capabilities,
             supports_edits,
+            maximum_reference_images: if supports_edits {
+                maximum_reference_images
+            } else {
+                0
+            },
             maximum_edit_batch_size: if supports_edits {
                 edit_cap.min(config.max_num_seqs)
             } else {
@@ -734,6 +753,9 @@ impl ImageService {
     }
     pub fn supports_edits(&self) -> bool {
         self.supports_edits
+    }
+    pub fn maximum_reference_images(&self) -> usize {
+        self.maximum_reference_images
     }
     /// Effective editing ceiling after service admission limits, or zero when
     /// the generator does not support editing.
@@ -843,13 +865,16 @@ impl ImageService {
     ) -> Result<(), ImageServiceError> {
         self.validate_request(&request.generation)?;
         if !self.supports_edits
-            || !self.host.owns(&request.image)
-            || request.image.class() != ferrum_runtime::HostMemoryClass::InputPreprocess
-            || request.image.is_empty()
-            || request.image.len() > ImageInputLimits::default().maximum_encoded_bytes()
+            || request.image_count() > self.maximum_reference_images
+            || request.images().any(|image| {
+                !self.host.owns(image)
+                    || image.class() != ferrum_runtime::HostMemoryClass::InputPreprocess
+                    || image.is_empty()
+                    || image.len() > ImageInputLimits::default().maximum_encoded_bytes()
+            })
         {
             return Err(service_error(ImageServiceErrorKind::InvalidRequest,
-                "editing requires supported single-image capability and a bounded PNG backing from this service Host account"));
+                "editing requires an admitted ordered image list within this generator's declared input capacity"));
         }
         Ok(())
     }
@@ -1444,7 +1469,12 @@ impl QueuedRequest {
             .prompt
             .capacity()
             .saturating_add(match self {
-                Self::Edit(request, _) => request.image.backing_bytes(),
+                Self::Edit(request, _) => request.encoded_backing_bytes().saturating_add(
+                    request
+                        .references
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ManagedHostBytes>()),
+                ),
                 Self::Generate(_) => 0,
             })
             .saturating_add(ImageService::minimum_pending_request_bytes())

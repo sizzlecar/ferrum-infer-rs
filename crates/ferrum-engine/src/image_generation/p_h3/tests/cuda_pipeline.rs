@@ -112,6 +112,14 @@ pub(super) fn request(seed: u64) -> ImageGenerationRequest {
 }
 
 pub(super) fn edit(host: &HostMemoryAccount, seed: u64) -> Result<ImageEditRequest> {
+    edit_with_pattern(host, seed, false)
+}
+
+fn edit_with_pattern(
+    host: &HostMemoryAccount,
+    seed: u64,
+    alternate: bool,
+) -> Result<ImageEditRequest> {
     // Codec/test sink memory is separate from the admitted immutable ingress
     // owner. The actual controller strictly decodes these bytes after admission.
     let mut encoded = Vec::new();
@@ -122,7 +130,12 @@ pub(super) fn edit(host: &HostMemoryAccount, seed: u64) -> Result<ImageEditReque
         |writer| {
             for y in 0..32u8 {
                 for x in 0..32u8 {
-                    writer.write_all(&[x * 7, y * 7, (x ^ y) * 7, 255])?;
+                    let pixel = if alternate {
+                        [255 - y * 7, 255 - x * 7, (x | y) * 7, 255]
+                    } else {
+                        [x * 7, y * 7, (x ^ y) * 7, 255]
+                    };
+                    writer.write_all(&pixel)?;
                 }
             }
             Ok(())
@@ -131,6 +144,7 @@ pub(super) fn edit(host: &HostMemoryAccount, seed: u64) -> Result<ImageEditReque
     let mut image = host.allocate_zeroed(HostMemoryClass::InputPreprocess, encoded.len())?;
     image.as_mut().copy_from_slice(&encoded);
     Ok(ImageEditRequest {
+        references: Vec::new(),
         generation: request(seed),
         image: image.freeze(),
     })
@@ -515,6 +529,14 @@ async fn complete_disabled_run_service(policy: ImageCudaAttentionPolicy) -> Resu
         &trace_context,
     )?;
     let reference = edit(&host, 29)?;
+    let mut multiple_references = reference.clone();
+    multiple_references
+        .references
+        .push(edit_with_pattern(&host, 29, true)?.image);
+    assert_ne!(
+        multiple_references.image.bytes(),
+        multiple_references.references[0].bytes()
+    );
 
     // These are the same public single-request entrypoints consumed by run.
     // Failures retain the original typed runtime/session owners, not a fake
@@ -525,10 +547,25 @@ async fn complete_disabled_run_service(policy: ImageCudaAttentionPolicy) -> Resu
     let edited = pipeline
         .edit(reference.clone())
         .unwrap_or_else(|error| panic!("complete tiny CUDA edit failed: {error}"));
+    let multiple_edited = pipeline
+        .edit(multiple_references.clone())
+        .unwrap_or_else(|error| panic!("complete tiny CUDA multi-reference edit failed: {error}"));
     let generated_rgba = assert_output(&generated, &host, 17, &fingerprint, false)?;
     let edited_rgba = assert_output(&edited, &host, 29, &fingerprint, true)?;
+    let multiple_edited_rgba = assert_output(&multiple_edited, &host, 29, &fingerprint, true)?;
+    assert!(
+        multiple_edited
+            .receipt
+            .stages
+            .iter()
+            .filter(|stage| stage.execution.plan.stage == ImageStage::VaeEncoder)
+            .map(|stage| stage.execution.completed_executions)
+            .sum::<usize>()
+            >= multiple_references.image_count()
+    );
     assert_attention_profiles(&generated, policy);
     assert_attention_profiles(&edited, policy);
+    assert_attention_profiles(&multiple_edited, policy);
     let compared = ComparedPixels {
         generation: f32_pixels(&generated),
         editing: f32_pixels(&edited),
@@ -566,10 +603,16 @@ async fn complete_disabled_run_service(policy: ImageCudaAttentionPolicy) -> Resu
     let service = ImageService::new(pipeline, service_config)?;
     assert!(service.host_account().same_parent(&host));
     assert!(service.supports_edits());
+    assert_eq!(service.maximum_reference_images(), 8);
     let served = service.try_submit(request(17))?.wait().await?;
     let served_edit = service.try_submit_edit(reference.clone())?.wait().await?;
+    let served_multiple_edit = service
+        .try_submit_edit(multiple_references.clone())?
+        .wait()
+        .await?;
     assert_attention_profiles(&served, policy);
     assert_attention_profiles(&served_edit, policy);
+    assert_attention_profiles(&served_multiple_edit, policy);
     assert_eq!(
         generated.rgba.bytes().bytes(),
         served.rgba.bytes().bytes(),
@@ -587,6 +630,14 @@ async fn complete_disabled_run_service(policy: ImageCudaAttentionPolicy) -> Resu
         edited_rgba,
         assert_output(&served_edit, &host, 29, &fingerprint, true)?
     );
+    assert_eq!(
+        multiple_edited.rgba.bytes().bytes(),
+        served_multiple_edit.rgba.bytes().bytes()
+    );
+    assert_eq!(
+        multiple_edited_rgba,
+        assert_output(&served_multiple_edit, &host, 29, &fingerprint, true)?
+    );
 
     let retired = service.shutdown().await?;
     assert!(
@@ -599,7 +650,7 @@ async fn complete_disabled_run_service(policy: ImageCudaAttentionPolicy) -> Resu
     assert_eq!(snapshot.active_requests, 0);
     assert_eq!(snapshot.pending_requests, 0);
     assert_eq!(snapshot.preparing_requests, 0);
-    assert_eq!(snapshot.executed_requests, 2);
+    assert_eq!(snapshot.executed_requests, 3);
     // Successful service retirement calls the real pipeline shutdown, which
     // rejects any unacknowledged session/snapshot close. Keep immutable canvas
     // owners alive across it to check their independent Output lifetime.
@@ -615,6 +666,8 @@ async fn complete_disabled_run_service(policy: ImageCudaAttentionPolicy) -> Resu
         (&edited, true),
         (&served, false),
         (&served_edit, true),
+        (&multiple_edited, true),
+        (&served_multiple_edit, true),
     ];
     if let Some((independent, outputs)) = &packed {
         traced_outputs.push((independent, false));
@@ -623,7 +676,17 @@ async fn complete_disabled_run_service(policy: ImageCudaAttentionPolicy) -> Resu
     assert_complete_trace(&trace, &trace_context, &traced_outputs, false)?;
     drop(traced_outputs);
     let trace_backing = trace.status().backing_bytes;
-    drop((generated, edited, served, served_edit, reference, packed));
+    drop((
+        generated,
+        edited,
+        multiple_edited,
+        served,
+        served_edit,
+        served_multiple_edit,
+        reference,
+        multiple_references,
+        packed,
+    ));
     assert_eq!(host.usage()?.allocated_bytes(), trace_backing);
     assert_eq!(host.usage()?.committed_bytes(), trace_backing);
     drop(trace);

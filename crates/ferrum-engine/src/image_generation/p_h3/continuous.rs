@@ -44,7 +44,7 @@ struct ContinuousRequestParts<R: DeviceRuntime> {
     pub audio: ManagedHostTensor,
     pub cache: PH3ImageRefinedTextCache,
     pub restoration: Option<suspension::Restoration<R>>,
-    pub reference: Option<ReferenceState>,
+    pub reference: Vec<ReferenceState>,
     pub persistent: HostMemoryScope,
     pub minimum_work: HostMemoryScope,
     pub weights: ImageWeightOwnerPin<R>,
@@ -70,7 +70,7 @@ pub(in crate::image_generation) struct ContinuousRequest<R: DeviceRuntime> {
     audio: Option<ManagedHostTensor>,
     cache: Option<PH3ImageRefinedTextCache>,
     restoration: Option<suspension::Restoration<R>>,
-    reference: Option<ReferenceState>,
+    reference: Vec<ReferenceState>,
     sampling: Option<PH3ImageManagedSampling>,
     persistent: HostMemoryScope,
     minimum_work: Option<HostMemoryScope>,
@@ -104,15 +104,17 @@ impl<R: DeviceRuntime> ContinuousRequest<R> {
                         .matches_snapshot(parts.weights.weights().evidence()),
                 "H3 continuation scope, snapshot role or cache identity differs"
             );
-            match (&parts.reference, parts.geometry.reference) {
-                (None, None) => (),
-                (Some(reference), Some(_)) => reference.validate(
-                    &parts.geometry,
+            ensure!(
+                parts.reference.len() == parts.geometry.references.len(),
+                "H3 reference geometry and actual initialized image counts differ"
+            );
+            for (reference, extent) in parts.reference.iter().zip(&parts.geometry.references) {
+                reference.validate(
+                    *extent,
                     pipeline.execution.sources.assets.denoiser.transformer(),
                     host,
                     pipeline.options.edit_noise.augmentation(),
-                )?,
-                _ => anyhow::bail!("H3 reference geometry and actual initialized image disagree"),
+                )?;
             }
             for (sample, expected) in [
                 (&parts.image, &parts.geometry.image_sample),
@@ -272,7 +274,7 @@ impl<R: DeviceRuntime> ContinuousBatch<R> {
                 request.audio.take();
                 request.cache.take();
                 request.restoration.take();
-                request.reference.take();
+                request.reference.clear();
                 request.sampling.take();
                 // No completed lane can allocate another successor. Retain
                 // only its real image charge for the decoder, not the unused
@@ -399,7 +401,7 @@ impl<R: DeviceRuntime> ContinuousBatch<R> {
                     audio: audio.as_mut().context("retired H3 audio stream")?,
                     sampling: sampling.as_mut().context("retired H3 sampler")?,
                     cache: cache.as_ref().context("retired H3 refinement cache")?,
-                    reference: reference.as_ref().map(ReferenceState::view),
+                    references: reference.iter().map(ReferenceState::view).collect(),
                 })
             })
             .collect::<Result<Vec<_>>>();

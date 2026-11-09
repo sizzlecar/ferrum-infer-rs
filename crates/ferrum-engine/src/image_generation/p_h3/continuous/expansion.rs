@@ -227,10 +227,10 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                         &self.execution.config,
                         edit,
                     )?;
-                    let prepared = configured.assets.prepare_edit(
+                    let prepared = configured.assets.prepare_edits(
                         &request.prompt,
                         (request.width, request.height),
-                        visual.plan().config().grid(),
+                        &visual.grids(),
                         visual.plan().config().architecture().merge_size(),
                         &options,
                     )?;
@@ -254,7 +254,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             let requirements =
                 InitializationRequirements::new(causal, visual_requirements, decoded_rgba)?;
             let ingress_backing_bytes = match input {
-                ImageRequestRef::Edit(request) => request.image.backing_bytes(),
+                ImageRequestRef::Edit(request) => request.encoded_backing_bytes(),
                 ImageRequestRef::Generate(_) => 0,
             };
             let mut peak = requirements.claims().to_vec();

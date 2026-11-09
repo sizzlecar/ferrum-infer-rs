@@ -300,6 +300,9 @@ impl<R: DeviceRuntime> ImageGenerator for PH3ImagePipeline<R> {
     fn maximum_edit_batch_size(&self) -> usize {
         self.execution.config.maximum_batch_size
     }
+    fn maximum_reference_images(&self) -> usize {
+        8
+    }
     fn compatible_edits(&self, _a: &ImageEditRequest, _b: &ImageEditRequest) -> bool {
         true
     }

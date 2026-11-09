@@ -1,11 +1,12 @@
-//! Single-image editing metadata and the real reference initialization. The
-//! PNG stays with its original ingress owner until admission and strict decode.
+//! Ordered image editing metadata and real per-Picture reference initialization.
+//! Each PNG keeps its original ingress owner until admission and strict decode.
 use super::{
-    edit_noise::CompiledEditNoise, reference::CompiledReferenceEncoder, request::RequestGeometry,
-    stages::PreparedGeneration, PH3ImagePipeline,
+    edit_noise::CompiledEditNoise, reference::CompiledReferenceEncoder, stages::PreparedGeneration,
+    PH3ImagePipeline,
 };
 use crate::image_generation::{
-    ImageEditRequest, ImageGenerationFailure, ImageStage, ImageStagePlanRole, ImageStageReceipt,
+    ImageEditRequest, ImageGenerationFailure, ImageGenerationRequest, ImageStage,
+    ImageStagePlanRole, ImageStageReceipt,
 };
 use anyhow::{ensure, Context, Result};
 use ferrum_models::{
@@ -20,6 +21,7 @@ use ferrum_runtime::*;
 mod budget;
 
 pub(super) struct PreparedReferenceEdit<R: DeviceRuntime> {
+    pub additional: Vec<PreparedReferenceEdit<R>>,
     pub pixels: PH3ImageEditPixelPlan,
     pub source_dimensions: (u32, u32),
     pub ingress_backing_bytes: usize,
@@ -28,6 +30,17 @@ pub(super) struct PreparedReferenceEdit<R: DeviceRuntime> {
     pub noise: CompiledEditNoise<R>,
     pub latent_spec: ResolvedTensorSpec,
     pub patch_noise_spec: ResolvedTensorSpec,
+}
+impl<R: DeviceRuntime> PreparedReferenceEdit<R> {
+    pub fn images(&self) -> impl Iterator<Item = &Self> {
+        std::iter::once(self).chain(&self.additional)
+    }
+    pub fn ingress_bytes(&self) -> Result<usize> {
+        self.images().try_fold(0usize, |sum, image| {
+            sum.checked_add(image.ingress_backing_bytes)
+                .context("reference ingress backing overflows")
+        })
+    }
 }
 
 /// These immutable tensors belong to the request's persistent scope. They
@@ -47,14 +60,11 @@ impl ReferenceState {
     }
     pub fn validate(
         &self,
-        geometry: &RequestGeometry,
+        extent: ferrum_models::p_h3_image::PH3ImageReferenceImage,
         transformer: &PH3ImageTransformerConfig,
         host: &HostMemoryAccount,
         augmentation: f64,
     ) -> Result<()> {
-        let extent = geometry
-            .reference
-            .context("reference payload has no declared geometry")?;
         let (latent, patch) =
             reference_specs(transformer, extent.latent_height(), extent.latent_width())?;
         ensure!(
@@ -82,14 +92,24 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         prepared: &PreparedReferenceEdit<R>,
         request: &ImageEditRequest,
         work: &HostMemoryAccount,
-    ) -> Result<PH3ImageEditPixels> {
-        let decoded =
-            ManagedRgba8Image::decode_png(work, &request.image, ImageInputLimits::default())?;
+    ) -> Result<Vec<PH3ImageEditPixels>> {
         ensure!(
-            (decoded.width(), decoded.height()) == prepared.source_dimensions,
-            "decoded reference differs from its pre-admission dimensions"
+            prepared.images().count() == request.image_count(),
+            "prepared image count changed"
         );
-        prepared.pixels.prepare(work, &decoded)
+        prepared
+            .images()
+            .zip(request.images())
+            .map(|(prepared, image)| {
+                let decoded =
+                    ManagedRgba8Image::decode_png(work, image, ImageInputLimits::default())?;
+                ensure!(
+                    (decoded.width(), decoded.height()) == prepared.source_dimensions,
+                    "decoded reference differs from its pre-admission dimensions"
+                );
+                prepared.pixels.prepare(work, &decoded)
+            })
+            .collect()
     }
 
     pub(super) fn prepare_reference_edit(
@@ -98,38 +118,28 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         identity: RequestIdentity,
     ) -> Result<(PreparedGeneration<R>, PreparedReferenceEdit<R>)> {
         ensure!(
-            self.execution.host.owns(&request.image)
-                && request.image.class() == HostMemoryClass::InputPreprocess,
-            "H3 reference PNG requires the original Input Host owner"
+            (1..=8).contains(&request.image_count()),
+            "H3 editing supports 1..=8 ordered images"
         );
-        let limits = ImageInputLimits::default();
-        let dimensions = png_dimensions_hint(request.image.bytes(), limits)
-            .context("H3 reference requires a bounded static RGB/RGBA8 PNG header")?;
-        // IHDR is only a scheduling hint. CRC/chunks/pixels are checked by the
-        // strict managed decoder after admission, before any device submission.
-        let pixels = PH3ImageEditPixelPlan::new(
-            dimensions.0,
-            dimensions.1,
-            request.generation.width,
-            request.generation.height,
-            self.options.edit_pixels,
-            limits,
-        )?;
+        let mut images = request
+            .images()
+            .map(|image| self.prepare_reference_image(image, &request.generation))
+            .collect::<Result<Vec<_>>>()?;
         let assets = &self.execution.sources.assets;
-        let extent = pixels.reference_image(assets.spatial_scale())?;
-        let (latent_spec, patch_noise_spec) = reference_specs(
-            assets.denoiser.transformer(),
-            extent.latent_height(),
-            extent.latent_width(),
-        )?;
-        let (vw, vh) = pixels.vision_dimensions();
-        let conditioning = assets.prepare_image_conditioning_with_family(
+        let dimensions = images
+            .iter()
+            .map(|image| image.pixels.vision_dimensions())
+            .collect::<Vec<_>>();
+        let references = images
+            .iter()
+            .map(|image| image.pixels.reference_image(assets.spatial_scale()))
+            .collect::<Result<Vec<_>>>()?;
+        let conditioning = assets.prepare_images_conditioning_with_family(
             &request.generation,
             identity,
             &self.execution.config,
-            vw,
-            vh,
-            extent,
+            &dimensions,
+            references,
             Qwen3VLVisionComfyPixelPolicy::default(),
             |provider, config, profile| {
                 self.execution.prepare_family(
@@ -154,6 +164,40 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         )?;
         let generation =
             self.prepare_generation_with_conditioning(&request.generation, conditioning)?;
+        let mut first = images.remove(0);
+        first.additional = images;
+        Ok((generation, first))
+    }
+
+    fn prepare_reference_image(
+        &self,
+        image: &ManagedHostBytes,
+        request: &ImageGenerationRequest,
+    ) -> Result<PreparedReferenceEdit<R>> {
+        ensure!(
+            self.execution.host.owns(image) && image.class() == HostMemoryClass::InputPreprocess,
+            "H3 reference PNG requires the original Input Host owner"
+        );
+        let limits = ImageInputLimits::default();
+        let dimensions = png_dimensions_hint(image.bytes(), limits)
+            .context("H3 reference requires a bounded static RGB/RGBA8 PNG header")?;
+        // IHDR is only a scheduling hint. CRC/chunks/pixels are checked by the
+        // strict managed decoder after admission, before any device submission.
+        let pixels = PH3ImageEditPixelPlan::new(
+            dimensions.0,
+            dimensions.1,
+            request.width,
+            request.height,
+            self.options.edit_pixels,
+            limits,
+        )?;
+        let assets = &self.execution.sources.assets;
+        let extent = pixels.reference_image(assets.spatial_scale())?;
+        let (latent_spec, patch_noise_spec) = reference_specs(
+            assets.denoiser.transformer(),
+            extent.latent_height(),
+            extent.latent_width(),
+        )?;
         let (rw, rh) = pixels.vae_dimensions();
         let encoder = self.compile_reference_encoder(rw, rh)?;
         ensure!(
@@ -165,25 +209,46 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             "reference VAE and DiT latent storage differ"
         );
         let noise = self.compile_edit_noise(latent_spec.minimum_storage_bytes()? / 4)?;
-        Ok((
-            generation,
-            PreparedReferenceEdit {
-                pixels,
-                source_dimensions: dimensions,
-                ingress_backing_bytes: request.image.backing_bytes(),
-                encoded: request.image.clone(),
-                encoder,
-                noise,
-                latent_spec,
-                patch_noise_spec,
-            },
-        ))
+        Ok(PreparedReferenceEdit {
+            additional: Vec::new(),
+            pixels,
+            source_dimensions: dimensions,
+            ingress_backing_bytes: image.backing_bytes(),
+            encoded: image.clone(),
+            encoder,
+            noise,
+            latent_spec,
+            patch_noise_spec,
+        })
     }
 
     /// Encode the actual supplied image and retain its normalized latent and
     /// augmentation noise. Vision pixels outlive this call only until TE input
     /// preparation. Posterior draws cover the whole image exactly once.
     pub(super) fn initialize_reference_edit(
+        &mut self,
+        prepared: &PreparedReferenceEdit<R>,
+        request: &ImageEditRequest,
+        pixels: Vec<PH3ImageEditPixels>,
+        persistent: &HostMemoryAccount,
+        job: u64,
+        identity: &RequestIdentity,
+        receipts: &mut Vec<ImageStageReceipt>,
+    ) -> std::result::Result<(Vec<ReferenceState>, Vec<ManagedRgba8Image>), ImageGenerationFailure<R>>
+    {
+        let mut references = Vec::with_capacity(pixels.len());
+        let mut visions = Vec::with_capacity(pixels.len());
+        for (image, pixels) in prepared.images().zip(pixels) {
+            let (reference, vision) = self.initialize_reference_image(
+                image, request, pixels, persistent, job, identity, receipts,
+            )?;
+            references.push(reference);
+            visions.push(vision);
+        }
+        Ok((references, visions))
+    }
+
+    fn initialize_reference_image(
         &mut self,
         prepared: &PreparedReferenceEdit<R>,
         request: &ImageEditRequest,

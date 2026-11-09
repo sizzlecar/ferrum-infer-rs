@@ -1274,6 +1274,34 @@ struct TestCli {
     #[command(subcommand)]
     command: TestCommand,
 }
+
+#[test]
+fn repeated_image_cli_arguments_preserve_picture_order() {
+    let matches = TestCli::command()
+        .try_get_matches_from([
+            "ferrum",
+            "run",
+            "--image-config",
+            "h3.json",
+            "--prompt",
+            "Picture 1 adopts Picture 2 pose",
+            "--image",
+            "person.png",
+            "--image",
+            "pose.png",
+            "--output",
+            "edited.png",
+        ])
+        .unwrap();
+    let run = matches.subcommand_matches("run").unwrap();
+    assert_eq!(
+        run.get_many::<PathBuf>("image")
+            .unwrap()
+            .cloned()
+            .collect::<Vec<_>>(),
+        [PathBuf::from("person.png"), PathBuf::from("pose.png")]
+    );
+}
 #[derive(Subcommand)]
 enum TestCommand {
     Run(crate::commands::run::RunCliCommand),

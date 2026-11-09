@@ -5,24 +5,30 @@ use super::*;
 /// backing assumptions or replace the image between visual and causal work.
 pub(super) struct IngressIdentity {
     fingerprint: [u8; 32],
-    image: Option<ManagedHostBytes>,
+    images: Vec<ManagedHostBytes>,
 }
 impl IngressIdentity {
     pub fn new(input: ImageRequestRef<'_>) -> Self {
         Self {
             fingerprint: generation_fingerprint(input),
-            image: match input {
-                ImageRequestRef::Generate(_) => None,
-                ImageRequestRef::Edit(request) => Some(request.image.clone()),
+            images: match input {
+                ImageRequestRef::Generate(_) => Vec::new(),
+                ImageRequestRef::Edit(request) => request.images().cloned().collect(),
             },
         }
     }
     pub fn matches(&self, input: ImageRequestRef<'_>) -> bool {
         self.fingerprint == generation_fingerprint(input)
-            && match (&self.image, input) {
-                (None, ImageRequestRef::Generate(_)) => true,
-                (Some(image), ImageRequestRef::Edit(request)) => image.same_region(&request.image),
-                _ => false,
+            && match input {
+                ImageRequestRef::Generate(_) => self.images.is_empty(),
+                ImageRequestRef::Edit(request) => {
+                    self.images.len() == request.image_count()
+                        && self
+                            .images
+                            .iter()
+                            .zip(request.images())
+                            .all(|(a, b)| a.same_region(b))
+                }
             }
     }
 }
@@ -61,6 +67,7 @@ mod tests {
             .unwrap()
             .freeze();
         let original = ImageEditRequest {
+            references: Vec::new(),
             generation: ImageGenerationRequest {
                 prompt: "make the sky blue".into(),
                 width: 512,
@@ -72,6 +79,20 @@ mod tests {
         };
         let identity = IngressIdentity::new(ImageRequestRef::Edit(&original));
         assert!(identity.matches(ImageRequestRef::Edit(&original.clone())));
+        let mut multiple = original.clone();
+        multiple.references.push(backing.slice(8..12).unwrap());
+        let multiple_identity = IngressIdentity::new(ImageRequestRef::Edit(&multiple));
+        assert!(multiple_identity.matches(ImageRequestRef::Edit(&multiple.clone())));
+        assert!(!identity.matches(ImageRequestRef::Edit(&multiple)));
+        assert!(!multiple_identity.matches(ImageRequestRef::Edit(&original)));
+        let mut changed_reference = multiple.clone();
+        changed_reference.references[0] = backing.slice(12..16).unwrap();
+        assert!(!multiple_identity.matches(ImageRequestRef::Edit(&changed_reference)));
+        assert_eq!(
+            initialize::request_identity(ImageRequestRef::Edit(&multiple)),
+            initialize::request_identity(ImageRequestRef::Edit(&changed_reference))
+        );
+        drop((multiple_identity, multiple, changed_reference));
         for image in [
             backing.slice(8..12).unwrap(),
             host.allocate_zeroed(HostMemoryClass::InputPreprocess, 4)

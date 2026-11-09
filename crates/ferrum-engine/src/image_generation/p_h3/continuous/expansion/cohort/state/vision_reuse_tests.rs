@@ -21,6 +21,7 @@ fn image(host: &HostMemoryAccount, color: [u8; 4], prompt: &str) -> ImageEditReq
         .unwrap();
     bytes.as_mut().copy_from_slice(&png);
     ImageEditRequest {
+        references: Vec::new(),
         generation: ImageGenerationRequest {
             prompt: prompt.into(),
             width: 32,

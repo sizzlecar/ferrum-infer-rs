@@ -175,7 +175,8 @@ impl ImageHttpService {
                 "generations":true,
                 "edits":self.service.supports_edits(),
                 "maximum_edit_batch_size":self.service.maximum_edit_batch_size(),
-                "edit_input":if self.service.supports_edits() { Some("one static RGB/RGBA8 PNG; no mask") } else { None },
+                "maximum_reference_images":self.service.maximum_reference_images(),
+                "edit_input":if self.service.supports_edits() { Some("ordered static RGB/RGBA8 PNG images; no mask") } else { None },
             },
             "scheduler":self.service.snapshot(),
             "output":{

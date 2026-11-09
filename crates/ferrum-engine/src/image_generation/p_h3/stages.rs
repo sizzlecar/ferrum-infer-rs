@@ -20,8 +20,14 @@ use ferrum_runtime::*;
 pub(super) struct CompiledConditioning<R: DeviceRuntime> {
     pub recipe: PreparedConditioning,
     pub visual: Option<PreparedImageStage<R>>,
+    pub additional_visuals: Vec<PreparedImageStage<R>>,
     pub encoder: PreparedImageStage<R>,
     pub connector: PreparedImageStage<R>,
+}
+impl<R: DeviceRuntime> CompiledConditioning<R> {
+    pub fn visual_stages(&self) -> impl Iterator<Item = &PreparedImageStage<R>> {
+        self.visual.iter().chain(&self.additional_visuals)
+    }
 }
 pub(super) struct CompiledNoise<R: DeviceRuntime> {
     pub layout: JointNoiseLayout,
@@ -264,6 +270,21 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             recipe.encoder.clone(),
             &recipe.encoder_options,
         )?;
+        let additional_visuals = recipe
+            .prompts
+            .visual()
+            .into_iter()
+            .flat_map(|visual| visual.additional.iter())
+            .map(|visual| {
+                self.compile_recipe(
+                    ImageStage::VisionEncoder,
+                    ImageStageAttachment::MayInitializeStored,
+                    1,
+                    visual.family.clone(),
+                    &visual.options,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let connector = self.compile_recipe(
             ImageStage::TextConnector,
             ImageStageAttachment::MayInitializeStored,
@@ -274,6 +295,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         Ok(CompiledConditioning {
             recipe,
             visual,
+            additional_visuals,
             encoder,
             connector,
         })

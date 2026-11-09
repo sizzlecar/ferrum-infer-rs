@@ -51,6 +51,23 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         receipts: &mut Vec<ImageStageReceipt>,
         reuse: Option<&super::vision::reuse::MainVisionReuseBinding>,
     ) -> std::result::Result<ManagedHostTensor, ImageGenerationFailure<R>> {
+        self.execute_conditioning_with_images_reuse(
+            prepared,
+            image.map(std::slice::from_ref),
+            job,
+            receipts,
+            reuse,
+        )
+    }
+
+    pub(super) fn execute_conditioning_with_images_reuse(
+        &mut self,
+        prepared: &CompiledConditioning<R>,
+        image: Option<&[ManagedRgba8Image]>,
+        job: u64,
+        receipts: &mut Vec<ImageStageReceipt>,
+        reuse: Option<&super::vision::reuse::MainVisionReuseBinding>,
+    ) -> std::result::Result<ManagedHostTensor, ImageGenerationFailure<R>> {
         let span = self.trace_phase_started(
             None,
             Some(&prepared.recipe.geometry.identity),
@@ -72,7 +89,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
     fn execute_conditioning_with_image_inner(
         &mut self,
         prepared: &CompiledConditioning<R>,
-        image: Option<&ManagedRgba8Image>,
+        image: Option<&[ManagedRgba8Image]>,
         job: u64,
         receipts: &mut Vec<ImageStageReceipt>,
         reuse: Option<&super::vision::reuse::MainVisionReuseBinding>,
@@ -127,9 +144,12 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                     Some(&recipe.geometry.identity),
                     crate::image_generation::continuous_trace::ImageTracePhase::ConditioningVision,
                 );
-                let result = self.execute_vision_inputs(
+                let stages = std::iter::once(stage)
+                    .chain(&prepared.additional_visuals)
+                    .collect::<Vec<_>>();
+                let result = self.execute_vision_image_inputs(
                     visual,
-                    stage,
+                    &stages,
                     image.expect("checked admitted image"),
                     &recipe.config,
                     &recipe.geometry.identity,

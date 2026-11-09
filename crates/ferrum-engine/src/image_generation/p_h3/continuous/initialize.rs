@@ -23,6 +23,15 @@ pub(in crate::image_generation) struct PreparedContinuousRequest<R: DeviceRuntim
 }
 impl<R: DeviceRuntime> PreparedContinuousRequest<R> {
     pub(super) fn main_vision_output_capacity(&self, host: &HostMemoryAccount) -> Result<usize> {
+        // This optional cache owns one Picture's readbacks. Multi-image edits
+        // keep their independently admitted outputs on the normal execution path.
+        if self
+            .edit
+            .as_ref()
+            .is_some_and(|edit| !edit.additional.is_empty())
+        {
+            return Ok(0);
+        }
         let Some(visual) = &self.prepared.conditioning.visual else {
             return Ok(0);
         };
@@ -47,6 +56,9 @@ impl<R: DeviceRuntime> PreparedContinuousRequest<R> {
         cohort: Arc<super::super::vision::reuse::CohortMainVisionReuse>,
     ) {
         if let Some(edit) = &self.edit {
+            if !edit.additional.is_empty() {
+                return;
+            }
             self.main_vision_reuse = Some(super::super::vision::reuse::MainVisionReuseBinding {
                 cohort,
                 encoded: edit.encoded.clone(),
@@ -85,6 +97,13 @@ pub(super) fn request_identity(input: ImageRequestRef<'_>) -> [u8; 32] {
             digest.update([1]);
             digest.update((edit.image.len() as u64).to_le_bytes());
             digest.update(edit.image.bytes());
+            if !edit.references.is_empty() {
+                digest.update((edit.references.len() as u64).to_le_bytes());
+                for image in &edit.references {
+                    digest.update((image.len() as u64).to_le_bytes());
+                    digest.update(image.bytes());
+                }
+            }
         }
     }
     digest.finalize().into()
@@ -143,8 +162,11 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             stages.push(visual);
         }
         if let Some(edit) = &edit {
-            stages.extend([&edit.encoder.stage, &edit.noise.stage]);
+            for image in edit.images() {
+                stages.extend([&image.encoder.stage, &image.noise.stage]);
+            }
         }
+        stages.extend(&prepared.conditioning.additional_visuals);
         metadata_phase("device_capacity", || {
             self.execution.validate_capacity_with_prefix(&stages, None)
         })?;
@@ -155,7 +177,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         // even though phase work is reserved independently of persistent data.
         let mut whole = requirements.whole_request_budget()?.claims().to_vec();
         if let Some(edit) = &edit {
-            whole.push((HostMemoryClass::InputPreprocess, edit.ingress_backing_bytes));
+            whole.push((HostMemoryClass::InputPreprocess, edit.ingress_bytes()?));
         }
         self.execution
             .check_scope_capacity_with_retained_diagnostics(&whole)?;
@@ -411,7 +433,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         prepared: &super::super::stages::PreparedGeneration<R>,
         edit: Option<&PreparedReferenceEdit<R>>,
         input: ImageRequestRef<'_>,
-        pixels: Option<PH3ImageEditPixels>,
+        pixels: Option<Vec<PH3ImageEditPixels>>,
         job: u64,
         persistent: &HostMemoryScope,
         work: &HostMemoryScope,
@@ -423,7 +445,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             ManagedHostTensor,
             ManagedHostTensor,
             PH3ImageRefinedTextCache,
-            Option<ReferenceState>,
+            Vec<ReferenceState>,
             Option<ManagedHostTensor>,
         ),
         ImageGenerationFailure<R>,
@@ -465,9 +487,9 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                     },
                 );
                 let (reference, vision) = initialized?;
-                (Some(reference), Some(vision))
+                (reference, Some(vision))
             }
-            (None, ImageRequestRef::Generate(_), None) => (None, None),
+            (None, ImageRequestRef::Generate(_), None) => (Vec::new(), None),
             _ => {
                 return Err(ImageGenerationFailure::Preflight(anyhow::anyhow!(
                     "H3 prepared request kind changed"
@@ -475,9 +497,9 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             }
         };
         let conditioning = match vision.as_ref() {
-            Some(vision) => self.execute_conditioning_with_image_reuse(
+            Some(vision) => self.execute_conditioning_with_images_reuse(
                 &prepared.conditioning,
-                Some(vision),
+                Some(vision.as_slice()),
                 job,
                 stages,
                 main_vision_reuse,
@@ -608,7 +630,11 @@ fn ensure_prepared<R: DeviceRuntime>(
         match (&prepared.edit, request) {
             (None, ImageRequestRef::Generate(_)) => true,
             (Some(edit), ImageRequestRef::Edit(request)) =>
-                edit.encoded.same_region(&request.image),
+                edit.images().count() == request.image_count()
+                    && edit
+                        .images()
+                        .zip(request.images())
+                        .all(|(image, encoded)| image.encoded.same_region(encoded)),
             _ => false,
         },
         "H3 preparation must retain the original encoded image allocation and range"

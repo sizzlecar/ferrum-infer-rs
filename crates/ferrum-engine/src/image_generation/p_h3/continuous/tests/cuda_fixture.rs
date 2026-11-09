@@ -476,7 +476,10 @@ impl Fixture {
         RequestGeometry {
             identity: id(format!("request.ph3.step.{name}")),
             target: self.assets.target_latent(),
-            reference: reference.then(|| PH3ImageReferenceImage::new(2, 4).unwrap()),
+            references: reference
+                .then(|| PH3ImageReferenceImage::new(2, 4).unwrap())
+                .into_iter()
+                .collect(),
             tags,
             image_sample: spec(vec![1, 2, 1, 4, 4]),
             audio_sample: spec(vec![1, 2, 2, 2]),

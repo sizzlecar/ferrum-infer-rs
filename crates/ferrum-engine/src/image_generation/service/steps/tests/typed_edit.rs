@@ -208,6 +208,7 @@ fn edit(host: &HostMemoryAccount, seed: u64) -> ImageEditRequest {
         .unwrap();
     bytes.as_mut().copy_from_slice(&png);
     ImageEditRequest {
+        references: Vec::new(),
         generation: request(seed),
         image: bytes.freeze(),
     }

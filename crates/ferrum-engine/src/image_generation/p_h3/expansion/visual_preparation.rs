@@ -64,6 +64,22 @@ impl NativeTextExpansion {
         spatial_merge_size: u64,
         options: &PH3ImagePromptExpansionOptions,
     ) -> Result<PreparedTextExpansion> {
+        self.prepare_edits(
+            prompt,
+            dimensions,
+            std::slice::from_ref(grid),
+            spatial_merge_size,
+            options,
+        )
+    }
+    pub(crate) fn prepare_edits(
+        &self,
+        prompt: &str,
+        dimensions: (u32, u32),
+        grids: &[Qwen3VLVisionGrid],
+        spatial_merge_size: u64,
+        options: &PH3ImagePromptExpansionOptions,
+    ) -> Result<PreparedTextExpansion> {
         let model = self.visual_model.as_ref().ok_or_else(|| {
             FerrumError::unsupported(
                 "image-conditioned prompt expansion requires its declared visual profile",
@@ -72,13 +88,14 @@ impl NativeTextExpansion {
         if options.prefill_chunk_tokens == 0 {
             return Err(FerrumError::config("prompt prefill chunk must be positive"));
         }
-        let request = PH3ImagePromptExpansionRequest::edit(prompt, 1)
+        let count = u8::try_from(grids.len()).map_err(model_error)?;
+        let request = PH3ImagePromptExpansionRequest::edit(prompt, count)
             .and_then(|r| r.with_max_new_tokens(options.max_new_tokens))
             .map_err(model_error)?;
         let rendered = self.protocol.render(&request).map_err(model_error)?;
         let tokens = self
             .protocol
-            .encode_image_input(&rendered, std::slice::from_ref(grid), spatial_merge_size)
+            .encode_image_input(&rendered, grids, spatial_merge_size)
             .map_err(model_error)?;
         let generation = self.protocol.generation(&request).map_err(model_error)?;
         let raw =

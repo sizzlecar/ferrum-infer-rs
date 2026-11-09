@@ -12,7 +12,7 @@ pub(super) struct StepLane<'a> {
     pub audio: &'a mut ManagedHostTensor,
     pub sampling: &'a mut PH3ImageManagedSampling,
     pub cache: &'a PH3ImageRefinedTextCache,
-    pub reference: Option<PH3ImageDenoiserReference<'a>>,
+    pub references: Vec<PH3ImageDenoiserReference<'a>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -58,10 +58,13 @@ pub(super) fn execute<R: DeviceRuntime, S: ImagePipelineSourceAdapter>(
             .iter()
             .map(|lane| lane.cache.clone())
             .collect::<Vec<_>>();
-        prepared.recipe.prepare_inputs(
+        prepared.recipe.prepare_inputs_with_references(
             host,
             &samples,
-            &lanes.iter().map(|lane| lane.reference).collect::<Vec<_>>(),
+            &lanes
+                .iter()
+                .map(|lane| lane.references.clone())
+                .collect::<Vec<_>>(),
             &caches,
             weights.evidence(),
             times,

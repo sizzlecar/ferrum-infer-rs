@@ -50,7 +50,7 @@ pub use p_h3::{
 pub use profile::{profile_image_source, ImageProfileWorkload};
 pub use run::execute_run;
 pub use run::execute_run_source;
-pub use run::execute_run_source_with_image;
+pub use run::{execute_run_source_with_image, execute_run_source_with_images};
 pub use serve::execute_serve;
 pub use serve::execute_serve_source;
 
@@ -184,9 +184,9 @@ pub struct ImageRunArgs {
     /// PNG destination, created exclusively. Required for image generation.
     #[arg(long, value_name = "PNG")]
     pub output: Option<PathBuf>,
-    /// Edit one static 8-bit RGB/RGBA PNG. No masks or multiple input images.
+    /// Ordered RGB/RGBA PNG inputs. Repeat --image for additional references.
     #[arg(long, value_name = "PNG")]
-    pub image: Option<PathBuf>,
+    pub image: Vec<PathBuf>,
     /// Image width in pixels (image default: 512; never rounded).
     #[arg(long)]
     pub width: Option<u32>,
