@@ -147,20 +147,42 @@ pub(super) fn drain_finished<O: Send + 'static>(
             cancel(shared, finishing.pop_front().unwrap());
             continue;
         }
+        let finish_started = tracing::enabled!(
+            target: "ferrum_engine::image_generation::timing",
+            tracing::Level::DEBUG
+        )
+        .then(std::time::Instant::now);
         let output = worker.denoising_generator().unwrap().try_finish_request(
             &mut request.state,
             batch
                 .as_mut()
                 .expect("completed lane retains its fenced work owner"),
         );
+        let finish_us = finish_started.map(|started| started.elapsed().as_micros());
         match output {
             Ok(Some(output)) => {
                 let r = finishing.pop_front().unwrap();
+                let retire_started = finish_us.map(|_| std::time::Instant::now());
                 drop(r.state);
+                let retire_us = retire_started.map(|started| started.elapsed().as_micros());
                 // Move this canvas to the caller before allocating the next.
                 // A cancelled receiver drops it and immediately refunds its
                 // actual charge through the existing Host subscription.
+                let request_id = r.job.trace.correlation.request_id;
+                let delivery_started = finish_us.map(|_| std::time::Instant::now());
                 deliver(shared, r.job, output);
+                if let Some(finish_us) = finish_us {
+                    tracing::debug!(
+                        target: "ferrum_engine::image_generation::timing",
+                        %request_id,
+                        finish_including_decoder_us = finish_us as u64,
+                        request_retirement_us = retire_us.unwrap_or_default() as u64,
+                        response_delivery_us = delivery_started
+                            .map(|started| started.elapsed().as_micros() as u64)
+                            .unwrap_or_default(),
+                        "image completed request host intervals"
+                    );
+                }
             }
             Ok(None) => return Ok(false),
             Err(ImageBatchError::AwaitDenoisingProgress {
