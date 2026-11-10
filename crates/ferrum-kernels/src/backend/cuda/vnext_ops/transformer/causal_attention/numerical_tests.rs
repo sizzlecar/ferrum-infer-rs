@@ -5,6 +5,8 @@ use crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config;
 use ferrum_runtime::DeviceId;
 use half::f16;
 
+#[path = "explicit_batch_tests.rs"]
+mod explicit_batch_tests;
 #[path = "parallel_explicit_rope_tests.rs"]
 mod parallel_explicit_rope_tests;
 

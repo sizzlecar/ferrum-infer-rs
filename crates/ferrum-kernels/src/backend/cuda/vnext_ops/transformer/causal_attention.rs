@@ -76,6 +76,7 @@ const ESTIMATOR_ID: &str = "resource-estimator.cuda.causal_paged_attention.f16";
 const GEMMA4_PROVIDER_ID: &str = "provider.cuda.gemma4_causal_paged_attention.f16";
 const GEMMA4_ESTIMATOR_ID: &str = "resource-estimator.cuda.gemma4_causal_paged_attention.f16";
 mod batch_decode;
+mod explicit_decode;
 #[cfg(test)]
 #[path = "causal_attention/int8_tests.rs"]
 mod int8_tests;
@@ -598,6 +599,7 @@ impl CudaCausalPagedAttentionProvider {
             include_bytes!("../native_blocks/q8act.rs"),
             include_bytes!("causal_attention/precision.rs"),
             include_bytes!("causal_attention/batch_decode.rs"),
+            include_bytes!("causal_attention/explicit_decode.rs"),
             include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("native_matrix.rs"),
             include_bytes!("causal_attention/segment_bindings.rs"),
@@ -684,6 +686,7 @@ impl CudaCausalPagedAttentionProvider {
             include_bytes!("../native_blocks/hadamard.rs"),
             include_bytes!("causal_attention/precision.rs"),
             include_bytes!("causal_attention/batch_decode.rs"),
+            include_bytes!("causal_attention/explicit_decode.rs"),
             semantics.fingerprint_tag(),
         ];
         if decode_attention_grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity {
@@ -2850,6 +2853,13 @@ fn packed_fallback_launch(
     if launches.iter().any(|launch| launch.rotary.is_some()) {
         return Ok(None);
     }
+    packed_fallback_geometry(launches, binding_layout)
+}
+
+fn packed_fallback_geometry(
+    launches: &[CausalAttentionLaunch],
+    binding_layout: BindingLayout,
+) -> Result<Option<PackedFallbackLaunch>, String> {
     let Some(first) = launches.first() else {
         return Err("packed causal attention has no participants".to_owned());
     };
@@ -3156,7 +3166,7 @@ fn encode_attention(
             )?,
             shape.kv_element_type_for(precision),
         )?;
-        if packed_decode_prepare_gate {
+        if packed_decode_prepare_gate || semantics == CausalAttentionSemantics::ExplicitRope {
             independent_sequence_kv &= state_is_sequence_owned(participant, state);
         }
         let scale_pages = scale_state_regions(participant, shape, source.end)?;
@@ -3484,6 +3494,18 @@ fn encode_attention(
             causal_decode_kv_reuse,
         )?
     };
+    let explicit_decode = if packed_enabled
+        && semantics == CausalAttentionSemantics::ExplicitRope
+        && precision == CausalPrecision::F16
+    {
+        explicit_decode::PreparedExplicitDecode::for_launches(
+            &launches,
+            binding_layout,
+            independent_sequence_kv,
+        )?
+    } else {
+        None
+    };
     if let Some(declaration) = segment_declaration {
         *declaration = segment_bindings::declare(
             &invocation,
@@ -3503,6 +3525,8 @@ fn encode_attention(
     };
     let compute_dispatch_count = if let Some(batch) = &batch_decode {
         batch.dispatch_count(&launches, shape.output_gate, shape.post_attention_norm)
+    } else if let Some(batch) = &explicit_decode {
+        batch.dispatch_count(shape.output_gate, shape.post_attention_norm)
     } else if semantics == CausalAttentionSemantics::ExplicitRope {
         sequence_local_dispatch_count(
             launches.iter().map(|l| l.path),
@@ -3690,6 +3714,7 @@ fn encode_attention(
                     q8act.as_ref(),
                     packed,
                     batch_decode.as_ref(),
+                    explicit_decode.as_ref(),
                     &launches,
                     regions,
                 )?;
@@ -4136,6 +4161,7 @@ fn enqueue_packed_attention(
     q8act: Option<&PreparedAttentionProjections>,
     packed: PackedCausalAttentionLaunch,
     batch_decode: Option<&batch_decode::PreparedBatchDecode>,
+    explicit_decode: Option<&explicit_decode::PreparedExplicitDecode>,
     launches: &[CausalAttentionLaunch],
     regions: &[CudaBufferRegion],
 ) -> Result<(), CudaDeviceRuntimeError> {
@@ -4198,6 +4224,20 @@ fn enqueue_packed_attention(
             scratch_base,
             regions[shared.query_norm].device_ptr(),
             regions[shared.key_norm].device_ptr(),
+            logical.output_gate,
+        )?;
+    } else if let Some(batch) = explicit_decode {
+        batch.enqueue(
+            stream,
+            functions,
+            launches,
+            binding.device_ptr(),
+            cuda,
+            layout,
+            scratch_base,
+            regions[shared.query_norm].device_ptr(),
+            regions[shared.key_norm].device_ptr(),
+            regions,
             logical.output_gate,
         )?;
     } else if let Some(packed_fallback) = packed_fallback_launch(launches, binding_layout)
@@ -5165,7 +5205,7 @@ fn launch_fallback_attention(
     // has no cross-request dispatch overhead to amortize. Keep that latency
     // path unchanged; group Q heads only when multiple packed participants can
     // fill the wider KV-head grid and reuse each loaded K/V tile.
-    if packed.is_some() && !shape.int8_kv {
+    if packed.is_some() && launch.rotary.is_none() && !shape.int8_kv {
         if let Some(block_threads) = grouped_fallback_block_threads(shape) {
             return launch_grouped_fallback_attention(
                 stream,
