@@ -20,7 +20,9 @@ use ferrum_models::p_h3_image::{
 use ferrum_runtime::*;
 use std::sync::Arc;
 mod budget;
+mod continuation;
 mod expansion;
+pub(super) use expansion::downstream::PreparationSlot;
 mod finish;
 mod initialize;
 mod native_completion;
@@ -209,6 +211,8 @@ pub(in crate::image_generation) struct ContinuousBatch<R: DeviceRuntime> {
     job: u64,
     suspended: bool,
     suspended_floor: Option<ExecutionHostBudget>,
+    pending_survivors:
+        Option<continuation::PendingSurvivors<continuation::PreparedContinuation<R>>>,
 }
 fn process<R: DeviceRuntime>(source: anyhow::Error) -> ImageGenerationFailure<R> {
     ImageGenerationFailure::Processing {
@@ -377,6 +381,7 @@ impl<R: DeviceRuntime> ContinuousBatch<R> {
             Ok(metadata) => metadata,
             Err(source) => return Err(active.processing(source)),
         };
+        self.prepare_survivors(pipeline, requests);
         let diagnostic_identity = super::dit_input_diagnostics::DitInputIdentity {
             job: requests[0].job,
             seed: requests[0].seed,
@@ -447,7 +452,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         &mut self,
         requests: &mut [&mut ContinuousRequest<R>],
     ) -> std::result::Result<Option<ContinuousBatch<R>>, ImageGenerationFailure<R>> {
-        self.prepare_continuous_replacement(requests, None)
+        self.prepare_continuous_replacement(requests, None, None)
     }
 
     pub(in crate::image_generation) fn try_replace_continuous_batch(
@@ -455,13 +460,23 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         previous: &mut ContinuousBatch<R>,
         requests: &mut [&mut ContinuousRequest<R>],
     ) -> std::result::Result<Option<ContinuousBatch<R>>, ImageGenerationFailure<R>> {
-        self.prepare_continuous_replacement(requests, Some(previous))
+        let prepared = previous
+            .pending_survivors
+            .take()
+            .map(|pending| {
+                pending.finish_for(&requests.iter().map(|r| &r.geometry).collect::<Vec<_>>())
+            })
+            .transpose()
+            .map_err(ImageGenerationFailure::Preflight)?
+            .flatten();
+        self.prepare_continuous_replacement(requests, Some(previous), prepared)
     }
 
     fn prepare_continuous_replacement(
         &mut self,
         requests: &mut [&mut ContinuousRequest<R>],
         mut previous: Option<&mut ContinuousBatch<R>>,
+        prepared_candidate: Option<continuation::PreparedContinuation<R>>,
     ) -> std::result::Result<Option<ContinuousBatch<R>>, ImageGenerationFailure<R>> {
         if self.dit_input_diagnostics.is_some() && requests.len() != 1 {
             return Err(ImageGenerationFailure::Preflight(anyhow::anyhow!(
@@ -499,15 +514,14 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                     "H3 cohort requests refer to different native weight snapshots"
                 );
             }
-            let candidate_cache = self.execution.plan_cache.begin_candidate()?;
-            let assets = &self.execution.sources.assets;
-            let geometry = BatchGeometry::new(
-                assets.denoiser.transformer(),
-                requests.iter().map(|r| &r.geometry).collect(),
-                self.execution.config.maximum_batch_size,
-                assets.limits.denoiser.max_metadata_bytes,
-            )?;
-            let prepared = self.compile_steady_batch(&geometry)?;
+            let continuation::PreparedContinuation {
+                prepared,
+                candidate_cache,
+            } = match prepared_candidate {
+                Some(candidate) => candidate,
+                None => self
+                    .compile_continuation_recipe(requests.iter().map(|r| &r.geometry).collect())?,
+            };
             ensure!(
                 prepared.recipe.request_ids()
                     == requests
@@ -532,7 +546,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                 phase_backing,
                 job,
                 next_job,
-                candidate_cache.defer()?,
+                candidate_cache,
             ))
         };
         let (prepared, budget, mut phase_backing, job, next_job, candidate_cache) =
@@ -632,6 +646,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             job,
             suspended: false,
             suspended_floor: None,
+            pending_survivors: None,
         };
         trace::published(self, &batch);
         Ok(Some(batch))

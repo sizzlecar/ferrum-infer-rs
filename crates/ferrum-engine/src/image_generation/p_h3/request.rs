@@ -14,6 +14,7 @@ use ferrum_runtime::{
 };
 use std::collections::BTreeSet;
 
+#[derive(Clone, PartialEq)]
 pub(super) struct RequestGeometry {
     pub identity: RequestIdentity,
     pub target: PH3ImageReferenceImage,

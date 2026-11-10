@@ -17,7 +17,7 @@ use ferrum_execution::{executor_lifecycle::ExecutorShutdownPhase, RuntimeComposi
 use std::task::Waker;
 mod cohort;
 pub(super) use cohort::synchronous::PreparedRunInitialization;
-mod downstream;
+pub(super) mod downstream;
 mod effective;
 mod ingress;
 mod requirements;
@@ -628,7 +628,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                 {
                     let Some(permit) = downstream::PreparationPermit::try_acquire(
                         &self.downstream_preparation,
-                        wake,
+                        Some(wake),
                     ) else {
                         return Ok(ImageInitializationProgress::Pending {
                             made_progress: false,
@@ -639,18 +639,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                     else {
                         unreachable!()
                     };
-                    let fork = Self {
-                        execution: self
-                            .execution
-                            .preparation_fork(self.execution.config.device_capacity_bytes),
-                        options: self.options.clone(),
-                        prompt_expansion_diagnostics: self.prompt_expansion_diagnostics.clone(),
-                        main_text_diagnostics: None,
-                        main_vision_diagnostics: None,
-                        final_latent_diagnostics: None,
-                        dit_input_diagnostics: None,
-                        downstream_preparation: self.downstream_preparation.clone(),
-                    };
+                    let fork = self.metadata_preparation_fork();
                     let job = initialization.job;
                     let task = permit
                         .spawn(move || {

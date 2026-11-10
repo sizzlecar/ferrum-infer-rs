@@ -1,5 +1,6 @@
 //! One bounded CPU preparation, with request-owned completion and cleanup.
 use anyhow::{anyhow, Result};
+use futures::task::AtomicWaker;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -9,22 +10,34 @@ use std::{
     thread::JoinHandle,
 };
 
-pub(super) struct PreparationPermit {
-    busy: Arc<AtomicBool>,
-    wake: Waker,
+#[derive(Default)]
+pub(in crate::image_generation::p_h3) struct PreparationSlot {
+    busy: AtomicBool,
+    wake: AtomicWaker,
+}
+
+pub(in crate::image_generation::p_h3::continuous) struct PreparationPermit {
+    slot: Arc<PreparationSlot>,
 }
 
 impl PreparationPermit {
-    pub(super) fn try_acquire(busy: &Arc<AtomicBool>, wake: &Waker) -> Option<Self> {
-        busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+    pub(in crate::image_generation::p_h3::continuous) fn try_acquire(
+        slot: &Arc<PreparationSlot>,
+        wake: Option<&Waker>,
+    ) -> Option<Self> {
+        // Register before observing busy: completion may race this attempt.
+        // An optional join is driven by an old forward and must not replace
+        // the actual service waiter's notification with a noop waker.
+        if let Some(wake) = wake {
+            slot.wake.register(wake);
+        }
+        slot.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| Self {
-                busy: busy.clone(),
-                wake: wake.clone(),
-            })
+            .map(|_| Self { slot: slot.clone() })
     }
 
-    pub(super) fn spawn<T: Send + 'static>(
+    pub(in crate::image_generation::p_h3::continuous) fn spawn<T: Send + 'static>(
         self,
         work: impl FnOnce() -> Result<T> + Send + 'static,
     ) -> Result<PreparationTask<T>> {
@@ -49,18 +62,34 @@ impl PreparationPermit {
 
 impl Drop for PreparationPermit {
     fn drop(&mut self) {
-        self.busy.store(false, Ordering::Release);
-        self.wake.wake_by_ref();
+        self.slot.busy.store(false, Ordering::Release);
+        self.slot.wake.wake();
     }
 }
 
-pub(super) struct PreparationTask<T> {
+pub(in crate::image_generation::p_h3::continuous) struct PreparationTask<T> {
     receiver: mpsc::Receiver<Result<T>>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl<T> PreparationTask<T> {
-    pub(super) fn poll(&mut self) -> Poll<Result<T>> {
+    /// A mandatory completed-wave boundary may join its speculative metadata.
+    pub(in crate::image_generation::p_h3::continuous) fn finish(mut self) -> Result<T> {
+        let result = self
+            .receiver
+            .recv()
+            .map_err(|_| anyhow!("image metadata preparation worker disconnected"))?;
+        if self
+            .handle
+            .take()
+            .is_some_and(|handle| handle.join().is_err())
+        {
+            return Err(anyhow!("image metadata preparation worker failed"));
+        }
+        result
+    }
+
+    pub(in crate::image_generation::p_h3::continuous) fn poll(&mut self) -> Poll<Result<T>> {
         match self.receiver.try_recv() {
             Ok(result) => {
                 if self

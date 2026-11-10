@@ -55,9 +55,30 @@ pub struct PH3ImagePipeline<R: DeviceRuntime> {
     pub(super) final_latent_diagnostics:
         Option<super::final_latent_diagnostics::FinalLatentDiagnostics>,
     pub(super) dit_input_diagnostics: Option<super::dit_input_diagnostics::DitInputDiagnostics>,
-    pub(super) downstream_preparation: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) downstream_preparation: Arc<super::continuous::PreparationSlot>,
 }
 impl<R: DeviceRuntime> PH3ImagePipeline<R> {
+    /// Metadata preparation shares sources and bounded plans, with no actor,
+    /// tensor allocation or resident execution owner in the fork.
+    pub(super) fn metadata_preparation_fork(&self) -> Self {
+        let mut execution = self
+            .execution
+            .preparation_fork(self.execution.config.device_capacity_bytes);
+        // This fork may be created while the old wave holds its scoped Host
+        // account. Speculative metadata must not retain that work authority.
+        execution.execution_host = None;
+        Self {
+            execution,
+            options: self.options.clone(),
+            prompt_expansion_diagnostics: self.prompt_expansion_diagnostics.clone(),
+            main_text_diagnostics: None,
+            main_vision_diagnostics: None,
+            final_latent_diagnostics: None,
+            dit_input_diagnostics: None,
+            downstream_preparation: self.downstream_preparation.clone(),
+        }
+    }
+
     /// The composition root provides one backend and provider registry for all
     /// model stages. The shared owner creates its one original serial actor;
     /// this facade has no separate runtime, allocator or residency ledger.
@@ -97,7 +118,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             main_text_diagnostics: None,
             final_latent_diagnostics: None,
             dit_input_diagnostics: None,
-            downstream_preparation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            downstream_preparation: Arc::new(super::continuous::PreparationSlot::default()),
         })
     }
     /// Enable one synchronous borrowed capture after each validated main vision
