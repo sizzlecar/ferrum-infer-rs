@@ -59,6 +59,9 @@ struct Initialization<R: DeviceRuntime> {
 enum InitializationState<R: DeviceRuntime> {
     Vision(VisionInitialization<R>),
     Expansion(ProductExpansionPhase<R>),
+    PrepareDownstream {
+        effective: EffectiveRequest,
+    },
     Downstream {
         effective: EffectiveRequest,
         prepared: PreparedContinuousRequest<R>,
@@ -606,6 +609,37 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                         }
                     }
                 }
+            }
+            InitializationState::PrepareDownstream { .. } => {
+                let InitializationState::PrepareDownstream { effective } =
+                    std::mem::replace(&mut initialization.state, InitializationState::Done)
+                else {
+                    unreachable!()
+                };
+                if cancelled {
+                    return Ok(ImageInitializationProgress::Cancelled);
+                }
+                let prepared = match self.prepare_continuous_image_request_with_job(
+                    effective.as_ref(),
+                    initialization.job,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        return Ok(ImageInitializationProgress::Rejected {
+                            diagnostic: format!("expanded prompt cannot prepare image: {error:#}"),
+                        });
+                    }
+                };
+                if let Some(correlation) = initialization.correlation {
+                    prepared.link_correlation(self, correlation);
+                }
+                initialization.state = InitializationState::Downstream {
+                    effective,
+                    prepared,
+                };
+                Ok(ImageInitializationProgress::Pending {
+                    made_progress: true,
+                })
             }
             InitializationState::Downstream { prepared, .. } => {
                 if cancelled {

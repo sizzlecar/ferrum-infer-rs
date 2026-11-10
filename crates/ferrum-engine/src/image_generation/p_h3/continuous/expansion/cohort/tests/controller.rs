@@ -12,11 +12,19 @@ use ferrum_kernels::backend::cpu::{
 };
 use std::task::Poll;
 
+mod deferred;
+
 type Pipeline = PH3ImagePipeline<CpuDeviceRuntime>;
 fn pipeline() -> (Pipeline, MergedExpansionFixture) {
+    pipeline_with_main_vision_reuse(Default::default())
+}
+fn pipeline_with_main_vision_reuse(
+    reuse: crate::image_generation::p_h3::PH3ImageMainVisionReuse,
+) -> (Pipeline, MergedExpansionFixture) {
     let fixture = MergedExpansionFixture::new();
     let complete = crate::image_generation::p_h3::tests::fixture::CompleteFixture::new().unwrap();
     let mut assets = complete.assets().unwrap();
+    assets.main_vision_reuse = reuse;
     let mut engine = ferrum_types::EngineConfig::default();
     engine.backend.device = ferrum_types::Device::CPU;
     assets.expansion = Some(ConfiguredTextExpansion {
@@ -183,8 +191,7 @@ async fn product_cohort_cancelled_members_keep_original_ids_and_zero_one_many_na
             } else {
                 assert!(matches!(
                     completion.outcome,
-                    ImageInitializationCohortOutcome::Rejected { .. }
-                        | ImageInitializationCohortOutcome::Pending(_)
+                    ImageInitializationCohortOutcome::Pending(_)
                 ));
             }
         }

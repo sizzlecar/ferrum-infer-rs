@@ -411,6 +411,8 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         // The native owner and all visual sessions are quiescent. Release the
         // final initialization-only aliases before preparing downstream work.
         cohort.inputs.clear();
+        let reuse_main_vision = self.execution.sources.assets.main_vision_reuse
+            == crate::image_generation::p_h3::PH3ImageMainVisionReuse::ExactImageWithinCohort;
         let mut completed = Vec::with_capacity(outcomes.len());
         for ((member, input), outcome) in std::mem::take(&mut cohort.members)
             .into_iter()
@@ -423,30 +425,41 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                 match outcome {
                     ExpansionParticipantResult::Expanded(text) => {
                         let effective = EffectiveRequest::from_expanded(input.request, text);
-                        match self.prepare_continuous_image_request_with_job(
-                            effective.as_ref(),
-                            member.job,
-                        ) {
-                            Ok(prepared) => {
+                        let state = if reuse_main_vision {
+                            // This explicit policy needs every prepared visual output
+                            // extent before admitting its shared cohort allocation.
+                            self.prepare_continuous_image_request_with_job(
+                                effective.as_ref(),
+                                member.job,
+                            )
+                            .map(|prepared| {
                                 if let Some(correlation) = member.correlation {
-                                    prepared.link_correlation(self, correlation)
+                                    prepared.link_correlation(self, correlation);
                                 }
-                                ImageInitializationCohortOutcome::Pending(
-                                    ImageRequestInitialization::new(Initialization::<R> {
-                                        correlation: member.correlation,
-                                        prompt_trace: None,
-                                        pipeline: cohort.pipeline.clone(),
-                                        identity: member.identity,
-                                        job: member.job,
-                                        output_credit: member.output_credit,
-                                        receipts: std::mem::take(&mut cohort.receipts),
-                                        state: InitializationState::Downstream {
-                                            effective,
-                                            prepared,
-                                        },
-                                    }),
-                                )
-                            }
+                                InitializationState::Downstream {
+                                    effective,
+                                    prepared,
+                                }
+                            })
+                        } else {
+                            // Return independent requests after native retirement.
+                            // The worker prepares only the member it next advances,
+                            // so the first image does not wait for every recipe.
+                            Ok(InitializationState::PrepareDownstream { effective })
+                        };
+                        match state {
+                            Ok(state) => ImageInitializationCohortOutcome::Pending(
+                                ImageRequestInitialization::new(Initialization::<R> {
+                                    correlation: member.correlation,
+                                    prompt_trace: None,
+                                    pipeline: cohort.pipeline.clone(),
+                                    identity: member.identity,
+                                    job: member.job,
+                                    output_credit: member.output_credit,
+                                    receipts: std::mem::take(&mut cohort.receipts),
+                                    state,
+                                }),
+                            ),
                             Err(error) => ImageInitializationCohortOutcome::Rejected {
                                 diagnostic: format!(
                                     "expanded prompt cannot prepare image: {error:#}"
@@ -469,9 +482,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                 outcome,
             });
         }
-        if self.execution.sources.assets.main_vision_reuse
-            == crate::image_generation::p_h3::PH3ImageMainVisionReuse::ExactImageWithinCohort
-        {
+        if reuse_main_vision {
             let mut capacity = 0;
             let mut count = 0;
             let mut first_job = u64::MAX;
