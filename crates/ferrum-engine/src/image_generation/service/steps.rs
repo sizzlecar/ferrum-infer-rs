@@ -1113,7 +1113,18 @@ pub(super) fn execute<O: Send + 'static>(
                         pending.push_front(candidate);
                         break;
                     }
-                    Err(ImageBatchError::Capacity { .. }) if !running.is_empty() => {
+                    Err(ImageBatchError::Capacity { proof, .. }) if !running.is_empty() => {
+                        tracing::debug!(target: "ferrum.image.capacity",
+                            candidate_request_id = %candidate.job.trace.correlation.request_id,
+                            candidate_batch_size = running.len() + 1,
+                            complete_batch = proof.report.complete_batch,
+                            required_bytes = proof.report.required_bytes,
+                            capacity_bytes = proof.report.capacity_bytes,
+                            retained_static_bytes = proof.report.retained_static_bytes,
+                            active_stage_peak_bytes = proof.report.active_stage_peak_bytes,
+                            retained_dynamic_allowance_bytes = proof.report.retained_dynamic_allowance_bytes,
+                            native_allowance_bytes = proof.report.native_allowance_bytes,
+                            "image continuation candidate exceeds device capacity");
                         let mut state = shared.lock();
                         state.capacity_reductions = state.capacity_reductions.saturating_add(1);
                         drop(state);
