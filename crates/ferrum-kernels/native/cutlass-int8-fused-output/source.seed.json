@@ -1,0 +1,12 @@
+{
+  "purpose": "independent qualification prototype; no product operator registration",
+  "upstream_repository": "https://github.com/NVIDIA/cutlass.git",
+  "upstream_revision": "cb4247394dd82148787aed73e5dc7cef33cbf862",
+  "upstream_license": "BSD-3-Clause",
+  "translation_unit": "boundary.cu",
+  "headers": ["abi.h"],
+  "include_dirs": ["cutlass/include", "cutlass/tools/util/include"],
+  "nvcc_arguments": ["-std=c++17", "-O3", "--expt-relaxed-constexpr", "--expt-extended-lambda", "-Xcompiler", "-fPIC", "-shared"],
+  "use_fast_math": false,
+  "arithmetic": "INT8 dot into INT32 without overflow; RNE F32 accumulator conversion; row scale then channel scale in F32; BF16 RNE final store; no split-K"
+}
