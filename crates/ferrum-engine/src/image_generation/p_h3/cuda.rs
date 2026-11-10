@@ -1,7 +1,9 @@
 //! Native Comfy composition under the product's one CUDA runtime, Host parent,
 //! catalog and compiled native artifact set. Construction is not numerical or
 //! concurrency qualification of the complete released model.
-use super::{PH3ImageAssets, PH3ImagePipeline, PH3ImagePipelineOptions};
+use super::{
+    PH3ImageAssets, PH3ImageF32AttentionPolicy, PH3ImagePipeline, PH3ImagePipelineOptions,
+};
 use crate::image_generation::{
     cuda::ImageCudaMemoryPolicy, ImageCudaAttentionPolicy, ImageCudaConvolutionWorkspacePolicy,
     ImageDecoderBatchPolicy, ImageEditPrefixPolicy, ImagePipelineLimits, ImageStreamLimit,
@@ -79,6 +81,7 @@ pub struct PH3ImageCudaConfig {
     pub prompt_expansion_causal: Option<CudaDenseF16CausalProfile>,
     pub cudnn: CudaCudnnConfig,
     pub attention_policy: ImageCudaAttentionPolicy,
+    pub f32_attention_policy: PH3ImageF32AttentionPolicy,
     pub convolution_workspace: ImageCudaConvolutionWorkspacePolicy,
     pub host: HostMemoryLimits,
     pub pipeline: ImagePipelineLimits,
@@ -110,6 +113,10 @@ pub struct PH3ImageCudaCompositionReceipt {
     pub cudnn_convolution_workspace_policy: ImageCudaConvolutionWorkspacePolicy,
     pub cudnn_convolution_workspace_limit_bytes: u64,
     pub attention_policy: ImageCudaAttentionPolicy,
+    pub f32_attention_policy: PH3ImageF32AttentionPolicy,
+    pub fused_f32_attention: bool,
+    pub f32_attention_opaque_memory_bytes: u64,
+    pub main_vision_numerical_profile: &'static str,
     pub attention_opaque_memory_bytes: u64,
     pub operation_ids: Vec<OperationId>,
     pub largest_component_execution_weight_bytes: u64,
@@ -160,6 +167,8 @@ impl PH3ImageCudaConfig {
     /// Pure declared-policy checks, before source reads, native loads or a
     /// driver context. Actual request shapes still require ordinary admission.
     pub fn validate(&self) -> Result<()> {
+        self.f32_attention_policy
+            .resolve(cfg!(feature = "cuda-cutlass-fused-f32-attention"))?;
         self.pipeline.validate()?;
         self.native_allocation_reuse.validate()?;
         if let Some(policy) = self.pinned_weight_upload {
@@ -309,7 +318,48 @@ impl PH3ImageCudaConfig {
                 .map(|expansion| &expansion.options.engine),
             self.prompt_expansion_causal.as_ref(),
         )?;
-        let pairs = operations::selected()?;
+        let device_id = DeviceId::new(format!("device.cuda.{}", self.ordinal))?;
+        let mut device = if self.prompt_expansion_causal.is_some() {
+            if bf16_expansion {
+                if visual_expansion {
+                    cuda_tensor_and_dense_bf16_visual_causal_runtime_config(
+                        self.ordinal,
+                        device_id,
+                    )?
+                } else {
+                    cuda_tensor_and_dense_bf16_causal_runtime_config(self.ordinal, device_id)?
+                }
+            } else if visual_expansion {
+                cuda_tensor_and_dense_f16_visual_causal_runtime_config(self.ordinal, device_id)?
+            } else {
+                cuda_tensor_and_dense_f16_causal_runtime_config(self.ordinal, device_id)?
+            }
+        } else {
+            cuda_tensor_runtime_config(self.ordinal, device_id)?
+        };
+        if cfg!(feature = "cuda-cutlass-fused-f32-attention")
+            && self.f32_attention_policy != PH3ImageF32AttentionPolicy::Sequential
+        {
+            cuda_tensor_runtime_config_enable_cutlass_fused_f32(&mut device)?;
+        }
+        let fused_f32 = self
+            .f32_attention_policy
+            .resolve(device.capabilities.contains(&CapabilityId::new(
+                STRUCTURED_GQA_ATTENTION_FUSED_F32_CAPABILITY_ID,
+            )?))?;
+        assets.configure_f32_attention(fused_f32)?;
+        self.options.vae_decoder = if fused_f32 {
+            ferrum_models::p_h3_image_vae::PH3ImageVaeDecoderPreset::F32A8FusedAttention
+        } else {
+            ferrum_models::p_h3_image_vae::PH3ImageVaeDecoderPreset::F32A8FullAttention
+        };
+        let mut pairs = operations::selected()?;
+        if fused_f32 {
+            pairs.push((
+                CudaTensorOperation::StructuredGqaAttentionFusedF32,
+                Box::new(structured_gqa_attention_fused_f32_contract()?),
+            ));
+        }
         let (selection, mut contracts): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
         contracts.extend(operations::independent_contracts()?);
         if self.prompt_expansion_causal.is_some() {
@@ -341,25 +391,6 @@ impl PH3ImageCudaConfig {
             self.validate_capacity(capacity.get(), largest)?;
         }
         let stream_plan = self.stream_plan()?;
-        let device_id = DeviceId::new(format!("device.cuda.{}", self.ordinal))?;
-        let mut device = if self.prompt_expansion_causal.is_some() {
-            if bf16_expansion {
-                if visual_expansion {
-                    cuda_tensor_and_dense_bf16_visual_causal_runtime_config(
-                        self.ordinal,
-                        device_id,
-                    )?
-                } else {
-                    cuda_tensor_and_dense_bf16_causal_runtime_config(self.ordinal, device_id)?
-                }
-            } else if visual_expansion {
-                cuda_tensor_and_dense_f16_visual_causal_runtime_config(self.ordinal, device_id)?
-            } else {
-                cuda_tensor_and_dense_f16_causal_runtime_config(self.ordinal, device_id)?
-            }
-        } else {
-            cuda_tensor_runtime_config(self.ordinal, device_id)?
-        };
         if self
             .prompt_expansion_causal
             .as_ref()
@@ -462,22 +493,41 @@ impl PH3ImageCudaConfig {
         // This factory loads the union's one native module and adds its one
         // admitted cuDNN F32/FMA convolution owner. Calling a second tensor or
         // standalone Philox factory would acquire a duplicate module permit.
-        let mut providers = match self.attention_policy {
-            ImageCudaAttentionPolicy::Sequential => {
-                cuda_vnext_cnn_f32_providers(&runtime, &convolution, &selection)?
-            }
-            ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
-                cuda_vnext_cnn_f32_providers_with_segmented_sdpa(
-                    &runtime,
-                    &convolution,
-                    CudnnSdpaPlanPolicy {
+        let mut providers = if fused_f32 {
+            cuda_vnext_cnn_f32_providers_with_fused_f32(
+                &runtime,
+                &convolution,
+                (self.attention_policy == ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1)
+                    .then_some(CudnnSdpaPlanPolicy {
                         maximum_plans: 64,
                         maximum_live_bindings: 2048,
                         opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
                         workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
-                    },
-                    &selection,
-                )?
+                    }),
+                &CudaCutlassFusedF32Config {
+                    opaque_memory_bytes: self.f32_attention_policy.additional_opaque_bytes(),
+                    opaque_memory_profile: "cutlass_fused_f32_v1".into(),
+                },
+                &selection,
+            )?
+        } else {
+            match self.attention_policy {
+                ImageCudaAttentionPolicy::Sequential => {
+                    cuda_vnext_cnn_f32_providers(&runtime, &convolution, &selection)?
+                }
+                ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
+                    cuda_vnext_cnn_f32_providers_with_segmented_sdpa(
+                        &runtime,
+                        &convolution,
+                        CudnnSdpaPlanPolicy {
+                            maximum_plans: 64,
+                            maximum_live_bindings: 2048,
+                            opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
+                            workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
+                        },
+                        &selection,
+                    )?
+                }
             }
         };
         providers.push(cuda_vnext_dense_f32_provider(&runtime)?);
@@ -569,6 +619,10 @@ impl PH3ImageCudaConfig {
             cudnn_convolution_workspace_policy: self.convolution_workspace,
             cudnn_convolution_workspace_limit_bytes: convolution.workspace_limit_bytes,
             attention_policy: self.attention_policy,
+            f32_attention_policy: self.f32_attention_policy,
+            fused_f32_attention: fused_f32,
+            f32_attention_opaque_memory_bytes: self.f32_attention_policy.additional_opaque_bytes(),
+            main_vision_numerical_profile: assets.main_vision_profile,
             attention_opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
             operation_ids,
             largest_component_execution_weight_bytes: largest,
@@ -613,6 +667,7 @@ impl PH3ImageCudaConfig {
             .and_then(|n| n.checked_add(self.bootstrap_memory_bytes))
             .and_then(|n| n.checked_add(self.cudnn.opaque_memory_bytes))
             .and_then(|n| n.checked_add(self.attention_policy.additional_opaque_bytes()))
+            .and_then(|n| n.checked_add(self.f32_attention_policy.additional_opaque_bytes()))
             .and_then(|n| {
                 n.checked_add(
                     self.prompt_expansion_causal

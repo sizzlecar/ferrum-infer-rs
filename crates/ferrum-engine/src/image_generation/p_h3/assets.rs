@@ -105,6 +105,7 @@ impl Default for PH3ImageAssetLimits {
 /// capacity and does not advertise a successfully executed pipeline.
 pub struct PH3ImageAssets {
     pub(super) main_vision_reuse: super::PH3ImageMainVisionReuse,
+    pub(super) main_vision_profile: &'static str,
     pub(super) expansion: Option<super::expansion::ConfiguredTextExpansion>,
     pub(super) sources: PH3ImageSources,
     pub(super) text: Qwen3VLTextArchitecture,
@@ -262,6 +263,8 @@ impl PH3ImageAssets {
         );
         Ok(Self {
             main_vision_reuse: Default::default(),
+            main_vision_profile:
+                ferrum_models::qwen3_vl_vision::comfy::Qwen3VLVisionComfyFamily::CUDA_PROFILE_ID,
             expansion: None,
             sources, text, text_weights, vision, vision_weights, connector, tokenizer, denoiser, vae, schedule, declarations, limits,
             receipt: ImageAssetReceipt {

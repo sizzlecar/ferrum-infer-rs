@@ -1,6 +1,61 @@
 use super::*;
 
 #[test]
+fn fused_f32_preset_is_retained_for_full_and_tail_tile_recipes() {
+    let (_dir, source, _, _) = fixture();
+    let adapter = PH3ImageVaeAdapter::new(source, &metadata(), limits()).unwrap();
+    let prepare = |preset| {
+        adapter
+            .prepare_decoder_with_tile_batch(
+                2,
+                96,
+                64,
+                PH3ImageVaeSpatialPolicy::Tiled {
+                    tile_pixels: 32,
+                    minimum_overlap_pixels: 16,
+                    max_tiles: 32,
+                },
+                preset,
+                PH3ImageVaeTileBatch::new(4).unwrap(),
+            )
+            .unwrap()
+    };
+    let strict = prepare(PH3ImageVaeDecoderPreset::F32A8FullAttention);
+    let fused = prepare(PH3ImageVaeDecoderPreset::F32A8FusedAttention);
+    assert!(fused.shapes().iter().any(|shape| shape.tile_count() < 4));
+    for shape in fused.shapes() {
+        let old = strict.shape(shape.tile_count()).unwrap();
+        assert_eq!(
+            shape.family().numerical_profile().id.as_str(),
+            PH3ImageVaeDecoderFamily::CUDA_FUSED_F32_PROFILE_ID
+        );
+        assert_eq!(
+            shape.family().stored_weight_schema().unwrap(),
+            old.family().stored_weight_schema().unwrap()
+        );
+        assert_eq!(
+            shape.compile_options().tensor_specs(),
+            old.compile_options().tensor_specs()
+        );
+        assert_eq!(shape.physical_batch(), old.physical_batch());
+        assert_eq!(
+            shape.tile_layout_specs().unwrap(),
+            old.tile_layout_specs().unwrap()
+        );
+        let operations: Vec<_> = shape
+            .family()
+            .program()
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.nodes)
+            .map(|node| node.operation_id.as_str())
+            .collect();
+        assert!(operations.contains(&STRUCTURED_GQA_ATTENTION_FUSED_F32_OPERATION_ID));
+        assert!(!operations.contains(&STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID));
+    }
+}
+
+#[test]
 fn spatial_tile_recipes_keep_semantic_request_batch_and_original_numerical_weights() {
     let (_dir, source, _, _) = fixture();
     let adapter = PH3ImageVaeAdapter::new(source, &metadata(), limits()).unwrap();

@@ -142,6 +142,13 @@ pub(super) fn build(
     c: &PH3ImageVaeDecoderBlockConfig,
     family: &ModelFamilyId,
 ) -> Result<ModelProgram, VNextError> {
+    build_with_attention(c, family, STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID)
+}
+pub(super) fn build_with_attention(
+    c: &PH3ImageVaeDecoderBlockConfig,
+    family: &ModelFamilyId,
+    attention_operation: &str,
+) -> Result<ModelProgram, VNextError> {
     c.validate()?;
     type F = PH3ImageVaeDecoderBlockFamily;
     let a = c.architecture();
@@ -223,7 +230,7 @@ pub(super) fn build(
     let attention = value("attention")?;
     nodes.push(node(
         "attention",
-        STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID,
+        attention_operation,
         vec![qr, kr, v],
         attention.clone(),
         c.attention_attributes()?,

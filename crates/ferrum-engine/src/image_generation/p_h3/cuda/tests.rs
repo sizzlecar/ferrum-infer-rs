@@ -108,6 +108,7 @@ fn native_lane_reuse_stays_within_the_original_stream_quota() {
 fn config() -> PH3ImageCudaConfig {
     PH3ImageCudaConfig {
         attention_policy: ImageCudaAttentionPolicy::Sequential,
+        f32_attention_policy: PH3ImageF32AttentionPolicy::Sequential,
         pinned_weight_upload: None,
         ordinal: 0,
         memory: ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(4 << 30).unwrap()),

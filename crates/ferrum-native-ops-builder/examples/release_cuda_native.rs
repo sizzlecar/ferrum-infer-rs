@@ -570,6 +570,9 @@ fn materialize_source(
         CudaNativeBuildUnit::CutlassFp8ScaledMm => {
             return Err("FP8 uses its observed source closure".into())
         }
+        CudaNativeBuildUnit::CutlassFusedF32Attention => {
+            return Err("fused F32 attention uses its observed source closure".into())
+        }
         CudaNativeBuildUnit::FlashinferXqa => {
             return Err("XQA uses its observed source closure".into())
         }

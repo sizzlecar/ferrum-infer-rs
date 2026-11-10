@@ -107,6 +107,7 @@ candle-cuda-compat = [
     "ferrum-models/candle-cuda-compat",
     "ferrum-kernels/candle-cuda-compat",
 ]
+cuda-cutlass-fused-f32-attention = ["cuda", "ferrum-kernels/cuda-cutlass-fused-f32-attention"]
 cuda-indexed-causal-attention = ["cuda", "ferrum-kernels/cuda-indexed-causal-attention", "ferrum-models/cuda-indexed-causal-attention"]
 cuda-causal-gqa2 = ["cuda-indexed-causal-attention", "ferrum-kernels/cuda-causal-gqa2", "ferrum-models/cuda-causal-gqa2"]
 cuda-q6-f16-linear = ["cuda", "ferrum-kernels/cuda-q6-f16-linear", "ferrum-models/cuda-q6-f16-linear"]

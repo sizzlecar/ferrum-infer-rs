@@ -29,6 +29,13 @@ pub(super) fn admit(
     c: &PH3ImageVaeDecoderExecutionConfig,
     limits: PH3ImageVaeDecoderLimits,
 ) -> Result<Template, VNextError> {
+    admit_with_fused_attention(c, limits, false)
+}
+fn admit_with_fused_attention(
+    c: &PH3ImageVaeDecoderExecutionConfig,
+    limits: PH3ImageVaeDecoderLimits,
+    fused_attention: bool,
+) -> Result<Template, VNextError> {
     limits.validate()?;
     c.validate()?;
     let family = PH3ImageVaeDecoderBlockFamily::new(limits.block())?;
@@ -39,8 +46,12 @@ pub(super) fn admit(
     let profile = family
         .numerical_profiles(&block)?
         .resolve(
-            &NumericalProfileId::new(PH3ImageVaeDecoderBlockFamily::CUDA_F32_PROFILE_ID)
-                .map_err(invalid)?,
+            &NumericalProfileId::new(if fused_attention {
+                PH3ImageVaeDecoderBlockFamily::CUDA_FUSED_F32_PROFILE_ID
+            } else {
+                PH3ImageVaeDecoderBlockFamily::CUDA_F32_PROFILE_ID
+            })
+            .map_err(invalid)?,
         )?
         .clone();
     let program = family.semantic_program(&block, &profile)?;
@@ -141,7 +152,14 @@ pub(super) fn build(
     c: &PH3ImageVaeDecoderExecutionConfig,
     limits: PH3ImageVaeDecoderLimits,
 ) -> Result<Composed, VNextError> {
-    let template = admit(c, limits)?;
+    build_with_fused_attention(c, limits, false)
+}
+pub(super) fn build_with_fused_attention(
+    c: &PH3ImageVaeDecoderExecutionConfig,
+    limits: PH3ImageVaeDecoderLimits,
+    fused_attention: bool,
+) -> Result<Composed, VNextError> {
+    let template = admit_with_fused_attention(c, limits, fused_attention)?;
     let (mut components, mut tensors, mut weights) = outer::schema(c)?;
     let mut specs = c.input_tensor_specs()?;
     specs.extend(
@@ -239,7 +257,12 @@ pub(super) fn build(
         );
     }
     let profile = NumericalExecutionProfile {
-        id: NumericalProfileId::new(PH3ImageVaeDecoderFamily::CUDA_PROFILE_ID).map_err(invalid)?,
+        id: NumericalProfileId::new(if fused_attention {
+            PH3ImageVaeDecoderFamily::CUDA_FUSED_F32_PROFILE_ID
+        } else {
+            PH3ImageVaeDecoderFamily::CUDA_PROFILE_ID
+        })
+        .map_err(invalid)?,
         family_id: family,
         version: ContractVersion::new(1, 0),
         primary_activation: ProgramValueId::new(PH3ImageVaeDecoderFamily::OUTPUT_ID)?,

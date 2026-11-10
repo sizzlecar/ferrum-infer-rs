@@ -37,6 +37,8 @@ impl PH3ImageVaeDecoderBlockFamily {
     pub const FAMILY_ID: &'static str = "family.p_h3_image.vae.decoder_block";
     pub const CUDA_F32_PROFILE_ID: &'static str =
         "p_h3_image.vae.decoder_block.cuda.f32_a8.full_attention.fma_residual.v1";
+    pub const CUDA_FUSED_F32_PROFILE_ID: &'static str =
+        "p_h3_image.vae.decoder_block.cuda.f32_a8.fused_attention.fma_residual.v1";
     pub const INPUT_ID: &'static str = "value.p_h3_image.vae.decoder_block.input";
     pub const COSINE_ID: &'static str = "value.p_h3_image.vae.decoder_block.cosine";
     pub const SINE_ID: &'static str = "value.p_h3_image.vae.decoder_block.sine";
@@ -171,10 +173,19 @@ impl ModelFamilyProvider for PH3ImageVaeDecoderBlockFamily {
             kv_storage: vec![],
             operations,
         };
+        let mut fused_profile = profile.clone();
+        fused_profile.id = NumericalProfileId::new(Self::CUDA_FUSED_F32_PROFILE_ID)
+            .map_err(|e| invalid("profile", e))?;
+        for operation in &mut fused_profile.operations {
+            if operation.operation_id.as_str() == STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID {
+                operation.operation_id =
+                    OperationId::new(STRUCTURED_GQA_ATTENTION_FUSED_F32_OPERATION_ID)?;
+            }
+        }
         FamilyNumericalProfiles::new(
             &self.id,
             ContractVersion::new(1, 0),
-            vec![profile],
+            vec![profile, fused_profile],
             vec![NumericalProfileId::new(Self::CUDA_F32_PROFILE_ID)
                 .map_err(|e| invalid("profile", e))?],
         )
@@ -190,7 +201,12 @@ impl ModelFamilyProvider for PH3ImageVaeDecoderBlockFamily {
                 "block profile boundaries/arithmetic differ",
             ));
         }
-        program::build(c, &self.id)
+        let attention = if p.id.as_str() == Self::CUDA_FUSED_F32_PROFILE_ID {
+            STRUCTURED_GQA_ATTENTION_FUSED_F32_OPERATION_ID
+        } else {
+            STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID
+        };
+        program::build_with_attention(c, &self.id, attention)
     }
     fn semantic_metadata(&self, _: &Self::Config) -> Result<ModelSemanticMetadata, VNextError> {
         Ok(ModelSemanticMetadata::TensorComponent)

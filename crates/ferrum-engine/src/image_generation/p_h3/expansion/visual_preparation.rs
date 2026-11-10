@@ -39,6 +39,38 @@ impl NativeTextExpansion {
         self.visual_assets.as_ref()
     }
 
+    pub(crate) fn configure_visual_profile(
+        &mut self,
+        profile: ferrum_runtime::NumericalProfileId,
+    ) -> Result<()> {
+        let Some(previous) = &self.visual_assets else {
+            return Ok(());
+        };
+        use ferrum_models::qwen3_vl_vision::hf::Qwen3VLVisionHfFamily;
+        if !matches!(
+            previous.profile().as_str(),
+            Qwen3VLVisionHfFamily::CUDA_PROFILE_ID
+                | Qwen3VLVisionHfFamily::CUDA_FUSED_F32_PROFILE_ID
+        ) {
+            return Err(FerrumError::config(
+                "CUDA attention selection requires an existing CUDA HF vision profile",
+            ));
+        }
+        if previous.profile() == &profile {
+            return Ok(());
+        }
+        self.visual_assets = Some(Arc::new(
+            visual_assets::ExpansionVisualAssets::from_processor_with_profile(
+                &self.model,
+                previous.processor().clone(),
+                previous.limits(),
+                profile,
+            )
+            .map_err(model_error)?,
+        ));
+        Ok(())
+    }
+
     pub(crate) fn visual_causal_family(&self) -> Option<&ferrum_runtime::PreparedModelFamily> {
         self.visual_model
             .as_ref()

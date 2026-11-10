@@ -51,6 +51,8 @@ impl PH3ImageVaeDecoderFamily {
     pub const FAMILY_ID: &'static str = "family.p_h3_image.vae.decoder";
     pub const CUDA_PROFILE_ID: &'static str =
         "p_h3_image.vae.decoder.cuda.f32_a8.full_attention.two_pass_layernorm.v1";
+    pub const CUDA_FUSED_F32_PROFILE_ID: &'static str =
+        "p_h3_image.vae.decoder.cuda.f32_a8.fused_attention.two_pass_layernorm.v1";
     pub const INPUT_ID: &'static str = "value.p_h3_image.vae.decoder.latent_rows";
     pub const COSINE_ID: &'static str = "value.p_h3_image.vae.decoder.cosine";
     pub const SINE_ID: &'static str = "value.p_h3_image.vae.decoder.sine";
@@ -106,10 +108,22 @@ impl ModelFamilyProvider for PH3ImageVaeDecoderFamily {
         Ok(ModelWeights::Stored(compose::build(c, self.limits)?.schema))
     }
     fn numerical_profiles(&self, c: &Self::Config) -> Result<FamilyNumericalProfiles, VNextError> {
+        let profile = compose::build(c, self.limits)?.profile;
+        // Only attention arithmetic changes. Avoid composing the full decoder
+        // twice just to enumerate two profiles with identical tensor boundaries.
+        let mut fused_profile = profile.clone();
+        fused_profile.id =
+            NumericalProfileId::new(Self::CUDA_FUSED_F32_PROFILE_ID).map_err(invalid)?;
+        for operation in &mut fused_profile.operations {
+            if operation.operation_id.as_str() == STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID {
+                operation.operation_id =
+                    OperationId::new(STRUCTURED_GQA_ATTENTION_FUSED_F32_OPERATION_ID)?;
+            }
+        }
         FamilyNumericalProfiles::new(
             &self.id,
             ContractVersion::new(1, 0),
-            vec![compose::build(c, self.limits)?.profile],
+            vec![profile, fused_profile],
             vec![NumericalProfileId::new(Self::CUDA_PROFILE_ID).map_err(invalid)?],
         )
     }
@@ -118,7 +132,11 @@ impl ModelFamilyProvider for PH3ImageVaeDecoderFamily {
         c: &Self::Config,
         p: &NumericalExecutionProfile,
     ) -> Result<ModelProgram, VNextError> {
-        let built = compose::build(c, self.limits)?;
+        let built = compose::build_with_fused_attention(
+            c,
+            self.limits,
+            p.id.as_str() == Self::CUDA_FUSED_F32_PROFILE_ID,
+        )?;
         if &built.profile != p {
             return Err(invalid("decoder profile boundaries/arithmetic differ"));
         }

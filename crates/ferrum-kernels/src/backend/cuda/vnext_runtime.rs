@@ -99,7 +99,9 @@ pub use tensor_eager::{
     CudaTensorRuntimeConfig, CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
     CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION,
 };
-pub(crate) use tensor_eager::{CudaTensorCutlassRetention, CudaTensorProviderRetention};
+pub(crate) use tensor_eager::{
+    CudaTensorCutlassRetention, CudaTensorFusedF32Retention, CudaTensorProviderRetention,
+};
 use tensor_io::validate_tensor_command;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);

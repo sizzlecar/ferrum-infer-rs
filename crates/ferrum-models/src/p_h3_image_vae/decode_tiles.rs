@@ -53,12 +53,35 @@ impl<'a, R: DeviceRuntime> PH3ImageVaeTileDecoder<'a, R> {
         input_host: HostMemoryAccount,
         output_host: HostMemoryAccount,
     ) -> Result<Self> {
+        Self::bind_with_profile(
+            session,
+            checkpoint,
+            limits,
+            &NumericalProfileId::new(PH3ImageVaeDecoderFamily::CUDA_PROFILE_ID)
+                .map_err(anyhow::Error::msg)?,
+            plan,
+            normalized,
+            request,
+            input_host,
+            output_host,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_with_profile(
+        session: &'a mut TensorComponentSession<R>,
+        checkpoint: &PH3ImageVaeDecoderCheckpoint<'a>,
+        limits: PH3ImageVaeDecoderLimits,
+        profile: &NumericalProfileId,
+        plan: PH3ImageVaeTilePlan,
+        normalized: &'a ManagedHostTensor,
+        request: RequestIdentity,
+        input_host: HostMemoryAccount,
+        output_host: HostMemoryAccount,
+    ) -> Result<Self> {
         let config = checkpoint.config();
         let family = PH3ImageVaeDecoderFamily::new(limits)?;
         let profiles = family.numerical_profiles(config)?;
-        let profile = NumericalProfileId::new(PH3ImageVaeDecoderFamily::CUDA_PROFILE_ID)
-            .map_err(anyhow::Error::msg)?;
-        let program = family.semantic_program(config, profiles.resolve(&profile)?)?;
+        let program = family.semantic_program(config, profiles.resolve(profile)?)?;
         let shape = DecodeShape::new(
             config,
             1,

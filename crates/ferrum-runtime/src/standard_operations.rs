@@ -114,6 +114,8 @@ mod structured_gqa_attention_bf16;
 pub use structured_gqa_attention_bf16::*;
 mod structured_gqa_attention_f32;
 pub use structured_gqa_attention_f32::*;
+mod structured_gqa_attention_fused_f32;
+pub use structured_gqa_attention_fused_f32::*;
 mod structured_attention_bf16;
 pub use structured_attention_bf16::*;
 mod cross_attention_bf16;

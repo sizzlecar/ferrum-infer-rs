@@ -63,6 +63,8 @@ pub enum CudaTensorOperation {
     ComfyConvRotW8A8F32,
     ComfyConvRotInt8EmbeddingF32,
     StructuredGqaAttentionF32,
+    /// Explicit external CUTLASS module; requires its independently admitted factory.
+    StructuredGqaAttentionFusedF32,
     HeadRmsNormF32,
     HalfSplitRopeF32,
     PlainResidualAddF32,
@@ -294,6 +296,7 @@ impl CudaTensorOperation {
             Self::PartialHalfSplitRope => half_split_rope::partial_descriptor(device),
             Self::StructuredGqaAttention => gqa::descriptor(device),
             Self::StructuredGqaAttentionF32 => gqa_f32::descriptor(device),
+            Self::StructuredGqaAttentionFusedF32 => gqa_fused_f32::descriptor(device),
             Self::GroupedColumnSliceF32 => channelwise_f32::descriptor(
                 device,
                 ferrum_runtime::F32ChannelwiseOp::GroupedColumnSlice,
@@ -544,8 +547,10 @@ impl SelectedDescriptor {
     }
 }
 
-fn validate_selection(selected: &[CudaTensorOperation]) -> Result<(), CudaDeviceRuntimeError> {
-    if selected.is_empty() || selected.len() > CudaTensorOperation::ALL.len() {
+pub(super) fn validate_selection(
+    selected: &[CudaTensorOperation],
+) -> Result<(), CudaDeviceRuntimeError> {
+    if selected.is_empty() || selected.len() > CudaTensorOperation::ALL.len() + 1 {
         return Err(CudaDeviceRuntimeError::contract(
             "CUDA tensor operation selection must be nonempty and bounded by the module",
         ));
@@ -611,6 +616,11 @@ fn runtime_descriptors_with_query(
     query: impl FnOnce() -> Result<CudaPhiloxDeviceGeometry, CudaDeviceRuntimeError>,
 ) -> Result<Vec<SelectedDescriptor>, CudaDeviceRuntimeError> {
     validate_selection(selected)?;
+    if selected.contains(&CudaTensorOperation::StructuredGqaAttentionFusedF32) {
+        return Err(CudaDeviceRuntimeError::contract(
+            "fused F32 attention requires the explicit independently admitted factory",
+        ));
+    }
     let geometry = if selected.iter().any(|op| {
         matches!(
             op,

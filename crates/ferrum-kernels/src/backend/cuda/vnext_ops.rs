@@ -120,9 +120,9 @@ pub use tensor_dense_bf16::{
 };
 pub use tensor_silu::{
     channelwise_f32_numerical_profile, cnn_f32_numerical_profile, cuda_vnext_cnn_f32_providers,
-    cuda_vnext_cnn_f32_providers_with_segmented_sdpa,
-    tensor_primitive_profile as cuda_tensor_primitive_bf16_profile, CudaPhiloxDeviceGeometry,
-    CudaPhiloxLaunchGeometry, CudaTensorOperation,
+    cuda_vnext_cnn_f32_providers_with_fused_f32, cuda_vnext_cnn_f32_providers_with_segmented_sdpa,
+    tensor_primitive_profile as cuda_tensor_primitive_bf16_profile, CudaCutlassFusedF32Config,
+    CudaPhiloxDeviceGeometry, CudaPhiloxLaunchGeometry, CudaTensorOperation,
     ADDCMUL_NUMERICAL_PROFILE_ID as CUDA_ADDCMUL_BF16_NUMERICAL_PROFILE_ID,
     ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
     ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
@@ -522,6 +522,24 @@ pub fn cuda_tensor_runtime_config(
         DynamicStorageView::Contiguous,
     )?]);
     Ok(config)
+}
+
+/// Add the separate fused F32 contract only when its locked native artifact is
+/// present. This composes with the caller's existing tensor/causal configuration;
+/// actual module allowance is admitted by the explicit provider factory.
+pub fn cuda_tensor_runtime_config_enable_cutlass_fused_f32(
+    config: &mut CudaDeviceRuntimeConfig,
+) -> Result<(), VNextError> {
+    let native = tensor_silu::fused_f32_source_fingerprint()
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+    config.capabilities.insert(CapabilityId::new(
+        ferrum_runtime::STRUCTURED_GQA_ATTENTION_FUSED_F32_CAPABILITY_ID,
+    )?);
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        native.as_bytes(),
+    ]);
+    Ok(())
 }
 
 /// Explicit opt-in to the independently locked SM120 FP8 native artifact.

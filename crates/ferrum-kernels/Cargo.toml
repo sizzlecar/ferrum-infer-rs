@@ -81,6 +81,7 @@ native-op-artifact = []  # Internal build-graph marker, enabled by `cuda`.
                         # never compile third-party CUDA/C++.
 cuda-upstream-linear = ["cuda"] # Optional locked MMQ/MMVQ artifact; no default routing.
 cuda-cutlass-fp8 = ["cuda"] # Explicit locked SM120 W8A8 artifact; no default routing.
+cuda-cutlass-fused-f32-attention = ["cuda"] # Optional locked FastF32 attention; separate numerical profile.
 cuda-q4-shared-weight-decode = ["cuda-upstream-linear"] # Additive opt-in Q4 MMVQ M8 dot export.
 cuda-q5-shared-weight-decode = ["cuda-upstream-linear"] # Independent opt-in Q5 MMVQ M8 dot export.
 cuda-upstream-extra-linear = ["cuda-upstream-linear"] # Independent locked extra-format artifact.

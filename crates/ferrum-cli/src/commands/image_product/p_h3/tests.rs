@@ -8,6 +8,34 @@ mod diagnostics;
 mod source_backing;
 
 #[test]
+fn f32_attention_configuration_is_shared_by_run_and_serve_and_independent_of_dit() {
+    use ferrum_engine::image_generation::p_h3::PH3ImageF32AttentionPolicy;
+    let directory = tempfile::tempdir().unwrap();
+    let baseline = document();
+    let PH3ImageBackendConfig::Cuda(default) = load(directory.path(), &baseline).unwrap().backend;
+    assert_eq!(
+        default.f32_attention_policy,
+        PH3ImageF32AttentionPolicy::Auto
+    );
+    for (wire, expected) in [
+        ("auto", PH3ImageF32AttentionPolicy::Auto),
+        ("sequential", PH3ImageF32AttentionPolicy::Sequential),
+        ("cutlass_fused", PH3ImageF32AttentionPolicy::CutlassFused),
+    ] {
+        let mut configured = baseline.clone();
+        configured["backend"]["f32_attention_policy"] = json!(wire);
+        let PH3ImageBackendConfig::Cuda(parsed) =
+            load(directory.path(), &configured).unwrap().backend;
+        assert_eq!(parsed.f32_attention_policy, expected);
+        assert_eq!(parsed.attention_policy, default.attention_policy);
+        assert_eq!(parsed.usable_memory_bytes, default.usable_memory_bytes);
+    }
+    let mut invalid = baseline;
+    invalid["backend"]["f32_attention_policy"] = json!("tf32");
+    assert!(load(directory.path(), &invalid).is_err());
+}
+
+#[test]
 fn main_vision_reuse_is_explicit_and_uses_the_shared_asset_configuration() {
     let root = tempfile::tempdir().unwrap();
     assert_eq!(

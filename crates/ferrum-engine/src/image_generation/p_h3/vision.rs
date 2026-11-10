@@ -51,7 +51,7 @@ impl PreparedVision {
             TypedFamilyRegistration::new(Qwen3VLVisionComfyFamily::new(assets.limits.vision)?)
                 .prepare_with_profile(
                     &serde_json::to_value(pixels.config())?,
-                    &NumericalProfileId::new(Qwen3VLVisionComfyFamily::CUDA_PROFILE_ID)
+                    &NumericalProfileId::new(assets.main_vision_profile)
                         .map_err(anyhow::Error::msg)?,
                 )?;
         let options = pixels.config().compile_options()?;

@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.cutlass_fused_f32_attention",
+  "operator_abi_version": "1",
+  "backend": "cuda",
+  "compute_capabilities": [
+    "sm_120"
+  ],
+  "provider_bindings": [
+    {
+      "operation_id": "operation.structured_gqa_attention_fused.f32",
+      "provider_id": "provider.cuda.structured_gqa_attention_fused.f32.cutlass",
+      "entrypoints": [
+        "ferrum_cutlass_fused_f32_attention_prepare_v1",
+        "ferrum_cutlass_fused_f32_attention_run_v1"
+      ]
+    }
+  ],
+  "required_exports": [
+    "ferrum_cutlass_fused_f32_attention_prepare_v1",
+    "ferrum_cutlass_fused_f32_attention_run_v1"
+  ],
+  "license_files": [
+    {
+      "source_path": "native-operators/cuda/cutlass-fp8/CUTLASS-BSD-3-Clause.txt",
+      "output_path": "licenses/CUTLASS-BSD-3-Clause.txt"
+    },
+    {
+      "source_path": "LICENSE",
+      "output_path": "licenses/Ferrum-MIT.txt"
+    }
+  ],
+  "cuda_toolkit": "12.8",
+  "cuda_runtime_min": "12.8",
+  "system_libraries": [
+    "cuda_runtime",
+    "std_cxx"
+  ]
+}

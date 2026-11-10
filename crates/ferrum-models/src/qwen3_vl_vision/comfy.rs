@@ -85,6 +85,10 @@ impl Qwen3VLVisionComfyFamily {
         "qwen3vl.vision_comfy.reference.f32.staged_bf16_positions.v1";
     pub const CUDA_PROFILE_ID: &'static str =
         "qwen3vl.vision_comfy.cuda.f32.staged_bf16_positions.v1";
+    /// Independent fused attention arithmetic; F32 boundaries and all visual
+    /// processing remain unchanged. This is not the strict F32 reduction profile.
+    pub const CUDA_FUSED_F32_PROFILE_ID: &'static str =
+        "qwen3vl.vision_comfy.cuda.fused_f32_attention.staged_bf16_positions.v1";
     pub const PATCHES_ID: &'static str = "value.qwen3_vl.vision_comfy.patches";
     pub const POSITIONS_ID: &'static str = "value.qwen3_vl.vision_comfy.positions";
     pub const COSINE_ID: &'static str = "value.qwen3_vl.vision_comfy.cosine";
@@ -222,21 +226,38 @@ impl ModelFamilyProvider for Qwen3VLVisionComfyFamily {
                 }
             })
             .collect::<Vec<_>>();
-        let profiles = [Self::REFERENCE_PROFILE_ID, Self::CUDA_PROFILE_ID]
-            .into_iter()
-            .map(|id| {
-                Ok(NumericalExecutionProfile {
-                    id: NumericalProfileId::new(id).map_err(invalid)?,
-                    family_id: self.id.clone(),
-                    version: ContractVersion::new(1, 0),
-                    primary_activation: ProgramValueId::new(Self::OUTPUT_ID)?,
-                    boundaries: boundaries.clone(),
-                    states: vec![],
-                    kv_storage: vec![],
-                    operations: operations.clone(),
-                })
+        let profiles = [
+            Self::REFERENCE_PROFILE_ID,
+            Self::CUDA_PROFILE_ID,
+            Self::CUDA_FUSED_F32_PROFILE_ID,
+        ]
+        .into_iter()
+        .map(|id| {
+            Ok(NumericalExecutionProfile {
+                id: NumericalProfileId::new(id).map_err(invalid)?,
+                family_id: self.id.clone(),
+                version: ContractVersion::new(1, 0),
+                primary_activation: ProgramValueId::new(Self::OUTPUT_ID)?,
+                boundaries: boundaries.clone(),
+                states: vec![],
+                kv_storage: vec![],
+                operations: operations
+                    .iter()
+                    .cloned()
+                    .map(|mut operation| {
+                        if id == Self::CUDA_FUSED_F32_PROFILE_ID
+                            && operation.operation_id.as_str()
+                                == STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID
+                        {
+                            operation.operation_id =
+                                OperationId::new(STRUCTURED_GQA_ATTENTION_FUSED_F32_OPERATION_ID)?;
+                        }
+                        Ok(operation)
+                    })
+                    .collect::<std::result::Result<_, VNextError>>()?,
             })
-            .collect::<std::result::Result<Vec<_>, VNextError>>()?;
+        })
+        .collect::<std::result::Result<Vec<_>, VNextError>>()?;
         FamilyNumericalProfiles::new(
             &self.id,
             ContractVersion::new(1, 0),
@@ -252,7 +273,12 @@ impl ModelFamilyProvider for Qwen3VLVisionComfyFamily {
         if self.numerical_profiles(c)?.resolve(&p.id)? != p {
             return Err(invalid("F32 vision numerical profile differs"));
         }
-        Ok(program::build(c)?.0)
+        let attention = if p.id.as_str() == Self::CUDA_FUSED_F32_PROFILE_ID {
+            STRUCTURED_GQA_ATTENTION_FUSED_F32_OPERATION_ID
+        } else {
+            STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID
+        };
+        Ok(program::build_with_attention(c, attention)?.0)
     }
     fn semantic_metadata(
         &self,

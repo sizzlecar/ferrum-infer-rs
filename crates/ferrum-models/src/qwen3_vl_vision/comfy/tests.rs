@@ -13,6 +13,40 @@ mod cuda;
 pub(in crate::qwen3_vl_vision) mod fixture;
 pub(in crate::qwen3_vl_vision) mod oracle;
 use fixture::*;
+#[test]
+fn fused_f32_profile_changes_only_attention_contract_and_keeps_original_default() {
+    let config = config(4, 6);
+    let family = Qwen3VLVisionComfyFamily::new(limits()).unwrap();
+    let profiles = family.numerical_profiles(&config).unwrap();
+    let strict = profiles
+        .resolve(&id(Qwen3VLVisionComfyFamily::CUDA_PROFILE_ID))
+        .unwrap();
+    let fused = profiles
+        .resolve(&id(Qwen3VLVisionComfyFamily::CUDA_FUSED_F32_PROFILE_ID))
+        .unwrap();
+    assert_eq!(strict.boundaries, fused.boundaries);
+    let strict_graph = family.semantic_program(&config, strict).unwrap();
+    let fused_graph = family.semantic_program(&config, fused).unwrap();
+    fused.validate_program(&fused_graph).unwrap();
+    assert_eq!(strict_graph.inputs(), fused_graph.inputs());
+    assert_eq!(strict_graph.outputs(), fused_graph.outputs());
+    assert_eq!(strict_graph.weights(), fused_graph.weights());
+    let mut expected = strict_graph.blocks().to_vec();
+    let mut found_attention = false;
+    for node in expected.iter_mut().flat_map(|block| &mut block.nodes) {
+        if node.operation_id.as_str() == STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID {
+            found_attention = true;
+            node.operation_id = id(STRUCTURED_GQA_ATTENTION_FUSED_F32_OPERATION_ID);
+        }
+    }
+    assert!(found_attention);
+    assert_eq!(expected, fused_graph.blocks());
+    assert_ne!(
+        strict_graph.fingerprint().unwrap(),
+        fused_graph.fingerprint().unwrap()
+    );
+    assert_eq!(strict_graph, program::build(&config).unwrap().0);
+}
 fn compile(
     c: &Qwen3VLVisionComfyConfig,
     r: &ReferenceVNextComposition,

@@ -320,3 +320,27 @@ fn gelu_logical_work_boundary_is_checked_before_payload_allocation() {
     assert_eq!(valid.bytes, 3 * 4096 * 2);
     assert!(geometry::Shape::new(Kind::GeluTanh, 3, 4096, true).is_err());
 }
+
+#[test]
+fn fused_attention_requires_explicit_factory_before_any_device_query() {
+    let selected = [
+        CudaTensorOperation::PhiloxNormal,
+        CudaTensorOperation::StructuredGqaAttentionFusedF32,
+    ];
+    assert!(runtime_descriptors_with_query(&device(), &selected, || {
+        panic!("external native admission must reject before a device query")
+    })
+    .is_err());
+    assert!(selected_descriptors(
+        &device(),
+        &[CudaTensorOperation::StructuredGqaAttentionFusedF32],
+        None
+    )
+    .is_err());
+    assert!(selected_descriptors(
+        &device(),
+        &[CudaTensorOperation::StructuredGqaAttentionF32],
+        None
+    )
+    .is_ok());
+}

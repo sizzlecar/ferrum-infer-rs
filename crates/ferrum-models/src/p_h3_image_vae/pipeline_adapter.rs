@@ -91,6 +91,16 @@ impl PH3ImageVaeEncoderPreset {
 #[serde(rename_all = "snake_case")]
 pub enum PH3ImageVaeDecoderPreset {
     F32A8FullAttention,
+    /// F32 boundaries with independently declared vendor-fused attention.
+    F32A8FusedAttention,
+}
+impl PH3ImageVaeDecoderPreset {
+    fn profile(self) -> &'static str {
+        match self {
+            Self::F32A8FullAttention => PH3ImageVaeDecoderFamily::CUDA_PROFILE_ID,
+            Self::F32A8FusedAttention => PH3ImageVaeDecoderFamily::CUDA_FUSED_F32_PROFILE_ID,
+        }
+    }
 }
 
 struct ValidatedSource {
@@ -326,7 +336,8 @@ impl PH3ImageVaeAdapter {
         let plan = PH3ImageVaeTilePlan::new(width, height, scale, policy)?;
         let tile = plan.tile(0)?;
         let execution_preset = match preset {
-            PH3ImageVaeDecoderPreset::F32A8FullAttention => {
+            PH3ImageVaeDecoderPreset::F32A8FullAttention
+            | PH3ImageVaeDecoderPreset::F32A8FusedAttention => {
                 PH3ImageVaeDecoderBlockExecutionPreset::F32A8FullAttention
             }
         };
@@ -341,10 +352,8 @@ impl PH3ImageVaeAdapter {
         )?;
         let provider = PH3ImageVaeDecoderFamily::new(v.limits.decoder())?;
         let options = provider.compile_options(&config)?;
-        let family = TypedFamilyRegistration::new(provider).prepare_with_profile(
-            &serde_json::to_value(&config)?,
-            &profile(PH3ImageVaeDecoderFamily::CUDA_PROFILE_ID)?,
-        )?;
+        let family = TypedFamilyRegistration::new(provider)
+            .prepare_with_profile(&serde_json::to_value(&config)?, &profile(preset.profile())?)?;
         ensure!(
             family.weights().stored_schema()?.fingerprint()? == v.decoder_schema,
             "prepared decoder physical weights differ from validated source"
@@ -599,10 +608,11 @@ impl PreparedPH3ImageVaeDecoder {
             input_host.clone(),
         );
         Ok(PH3ImageVaeDecoderConsumer {
-            inner: PH3ImageVaeTileDecoder::bind(
+            inner: PH3ImageVaeTileDecoder::bind_with_profile(
                 session,
                 &checkpoint,
                 v.limits.decoder(),
+                &self.family.numerical_profile().id,
                 self.plan.clone(),
                 normalized,
                 request,

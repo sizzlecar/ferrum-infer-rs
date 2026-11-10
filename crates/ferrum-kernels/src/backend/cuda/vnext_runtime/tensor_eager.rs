@@ -15,7 +15,9 @@ use ferrum_runtime::{DeviceCapacityOwner, DeviceCapacityRetention, DeviceOpaqueM
 use super::*;
 mod causal_commands;
 mod cutlass_owner;
+mod fused_f32_owner;
 pub(crate) use cutlass_owner::CudaTensorCutlassRetention;
+pub(crate) use fused_f32_owner::CudaTensorFusedF32Retention;
 
 /// Default bound, including uploads, initialization and compute commands.
 /// The actual bound is explicitly configured and enters runtime identity.
@@ -81,6 +83,8 @@ pub(super) struct TensorEagerState {
     provider_live: AtomicBool,
     cutlass_module: Mutex<Option<cutlass_owner::ContextModuleQuota>>,
     cutlass_provider_live: AtomicBool,
+    fused_f32_module: Mutex<Option<fused_f32_owner::FusedF32ModuleQuota>>,
+    fused_f32_provider_live: AtomicBool,
     causal_profile: Option<CudaDenseF16CausalProfile>,
     causal_modules: Mutex<std::sync::Weak<CudaCausalProviderRetention>>,
 }
@@ -699,6 +703,8 @@ impl CudaDeviceRuntime {
             provider_live: AtomicBool::new(false),
             cutlass_module: Mutex::new(None),
             cutlass_provider_live: AtomicBool::new(false),
+            fused_f32_module: Mutex::new(None),
+            fused_f32_provider_live: AtomicBool::new(false),
             causal_profile: causal,
             causal_modules: Mutex::new(std::sync::Weak::new()),
         });
@@ -1001,6 +1007,8 @@ mod tests {
             provider_live: AtomicBool::new(false),
             cutlass_module: Mutex::new(None),
             cutlass_provider_live: AtomicBool::new(false),
+            fused_f32_module: Mutex::new(None),
+            fused_f32_provider_live: AtomicBool::new(false),
             causal_profile: None,
             causal_modules: Mutex::new(std::sync::Weak::new()),
         });
@@ -1058,6 +1066,8 @@ mod tests {
             provider_live: AtomicBool::new(false),
             cutlass_module: Mutex::new(None),
             cutlass_provider_live: AtomicBool::new(false),
+            fused_f32_module: Mutex::new(None),
+            fused_f32_provider_live: AtomicBool::new(false),
             causal_profile: Some(
                 CudaDenseF16CausalProfile::new(32, "test-declaration-v1").unwrap(),
             ),

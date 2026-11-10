@@ -61,8 +61,9 @@ pub(super) fn families(
                 "visual expansion families lack their validated capability"
             );
             ensure!(
-                vision.numerical_profile().id.as_str()
-                    == ferrum_models::qwen3_vl_vision::hf::Qwen3VLVisionHfFamily::CUDA_PROFILE_ID,
+                matches!(vision.numerical_profile().id.as_str(),
+                    ferrum_models::qwen3_vl_vision::hf::Qwen3VLVisionHfFamily::CUDA_PROFILE_ID
+                    | ferrum_models::qwen3_vl_vision::hf::Qwen3VLVisionHfFamily::CUDA_FUSED_F32_PROFILE_ID),
                 "CUDA composition requires the declared CUDA HF vision profile"
             );
             families.extend([causal.clone(), vision.clone()]);
@@ -85,7 +86,7 @@ pub(super) fn families(
         TypedFamilyRegistration::new(Qwen3VLVisionComfyFamily::new(assets.limits.vision)?)
             .prepare_with_profile(
                 &serde_json::to_value(visual_config)?,
-                &profile(Qwen3VLVisionComfyFamily::CUDA_PROFILE_ID)?,
+                &profile(assets.main_vision_profile)?,
             )?,
     );
     // The feature occupies the middle row. Boundary-token embeddings and the

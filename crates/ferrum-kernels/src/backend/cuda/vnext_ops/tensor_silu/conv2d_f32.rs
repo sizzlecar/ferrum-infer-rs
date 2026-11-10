@@ -19,7 +19,7 @@ pub(crate) fn providers(
     config: &CudaCudnnConfig,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, None)
+    providers_impl(runtime, config, selected, None, None)
 }
 
 pub(crate) fn providers_with_segmented_sdpa(
@@ -28,7 +28,17 @@ pub(crate) fn providers_with_segmented_sdpa(
     policy: CudnnSdpaPlanPolicy,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, Some(policy))
+    providers_impl(runtime, config, selected, Some(policy), None)
+}
+
+pub(crate) fn providers_with_fused_f32(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCudnnConfig,
+    policy: Option<CudnnSdpaPlanPolicy>,
+    fused: &CudaCutlassFusedF32Config,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    providers_impl(runtime, config, selected, policy, Some(fused))
 }
 
 fn providers_impl(
@@ -36,9 +46,32 @@ fn providers_impl(
     config: &CudaCudnnConfig,
     selected: &[CudaTensorOperation],
     policy: Option<CudnnSdpaPlanPolicy>,
+    fused: Option<&CudaCutlassFusedF32Config>,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     let cap = require_convolution_capability(runtime.descriptor())?;
-    let mut descriptors = selection::runtime_descriptors(runtime, selected)?;
+    selection::validate_selection(selected)?;
+    let wants_fused = selected.contains(&CudaTensorOperation::StructuredGqaAttentionFusedF32);
+    if wants_fused != fused.is_some() {
+        return Err(CudaDeviceRuntimeError::contract(
+            "fused F32 selection and native allowance must be supplied together",
+        ));
+    }
+    let fused_descriptor = fused
+        .map(|config| {
+            config.validate()?;
+            gqa_fused_f32::descriptor(runtime.descriptor())
+        })
+        .transpose()?;
+    let ordinary: Vec<_> = selected
+        .iter()
+        .copied()
+        .filter(|op| *op != CudaTensorOperation::StructuredGqaAttentionFusedF32)
+        .collect();
+    let mut descriptors = if ordinary.is_empty() {
+        Vec::new()
+    } else {
+        selection::runtime_descriptors(runtime, &ordinary)?
+    };
     if let Some(policy) = policy {
         select_segmented_sdpa(&mut descriptors, policy)?;
     }
@@ -83,6 +116,11 @@ fn providers_impl(
     .map_err(contract_error)?
     .with_fixed_tensor_work(true);
     let mut providers = selection::providers_from_descriptors(descriptors, &kernels);
+    if let (Some(descriptor), Some(config)) = (fused_descriptor, fused) {
+        providers.push(gqa_fused_f32::provider(
+            descriptor, &kernels, runtime, config,
+        )?);
+    }
     if let Some(cache) = sdpa {
         // No generic fused, cross-attention, spatial or F32 GQA replacement.
         // A missing/unsupported native plan is an explicit error, not fallback.

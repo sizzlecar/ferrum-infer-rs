@@ -10,6 +10,7 @@ use crate::ResolvedNativeOperatorArtifactSet;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CudaNativeBuildUnit {
     CutlassFp8ScaledMm,
+    CutlassFusedF32Attention,
     FlashinferXqa,
     Marlin,
     VllmMarlin,
@@ -22,8 +23,9 @@ pub enum CudaNativeBuildUnit {
 }
 
 impl CudaNativeBuildUnit {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::CutlassFp8ScaledMm,
+        Self::CutlassFusedF32Attention,
         Self::FlashinferXqa,
         Self::Marlin,
         Self::VllmMarlin,
@@ -38,6 +40,7 @@ impl CudaNativeBuildUnit {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CutlassFp8ScaledMm => "cutlass_fp8_scaled_mm",
+            Self::CutlassFusedF32Attention => "cutlass_fused_f32_attention",
             Self::FlashinferXqa => "flashinfer_xqa",
             Self::Marlin => "marlin",
             Self::VllmMarlin => "vllm_marlin",
@@ -53,6 +56,9 @@ impl CudaNativeBuildUnit {
     pub const fn artifact_operator(self) -> &'static str {
         match self {
             Self::CutlassFp8ScaledMm => crate::cutlass_fp8::CUTLASS_FP8_OPERATOR,
+            Self::CutlassFusedF32Attention => {
+                crate::cutlass_fused_f32_attention::CUTLASS_FUSED_F32_ATTENTION_OPERATOR
+            }
             Self::FlashinferXqa => "ferrum.cuda.flashinfer_xqa_decode",
             Self::Marlin => "ferrum.cuda.marlin",
             Self::VllmMarlin => "ferrum.cuda.vllm_marlin",
@@ -78,7 +84,9 @@ impl CudaNativeBuildUnit {
     /// the retained mathematical entrypoint signatures.
     pub const fn required_operator_abi_version(self) -> Option<&'static str> {
         match self {
-            Self::CutlassFp8ScaledMm | Self::FlashinferXqa => Some("1"),
+            Self::CutlassFp8ScaledMm | Self::CutlassFusedF32Attention | Self::FlashinferXqa => {
+                Some("1")
+            }
             Self::Marlin => Some("2"),
             Self::VllmMoeMarlin => Some("3"),
             _ => None,
@@ -142,6 +150,9 @@ impl CudaNativeBuildUnit {
     pub const fn required_exports(self) -> &'static [&'static str] {
         match self {
             Self::CutlassFp8ScaledMm => &crate::cutlass_fp8::CUTLASS_FP8_EXPORTS,
+            Self::CutlassFusedF32Attention => {
+                &crate::cutlass_fused_f32_attention::CUTLASS_FUSED_F32_ATTENTION_EXPORTS
+            }
             Self::FlashinferXqa => &[
                 "ferrum_flashinfer_xqa_plan_v1",
                 "ferrum_flashinfer_xqa_run_v1",

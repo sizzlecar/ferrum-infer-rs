@@ -36,6 +36,12 @@ pub(super) fn schema(
 pub(super) fn build(
     c: &Qwen3VLVisionComfyConfig,
 ) -> std::result::Result<(ModelProgram, BTreeMap<ProgramValueId, ProgramTensorSpec>), VNextError> {
+    build_with_attention(c, STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID)
+}
+pub(super) fn build_with_attention(
+    c: &Qwen3VLVisionComfyConfig,
+    attention_operation: &str,
+) -> std::result::Result<(ModelProgram, BTreeMap<ProgramValueId, ProgramTensorSpec>), VNextError> {
     let (base, specs) = super::super::program::build(
         &c.base,
         &ModelFamilyId::new(Qwen3VLVisionFamily::FAMILY_ID)?,
@@ -133,7 +139,7 @@ pub(super) fn build(
                             SemanticValue::Integers(vec![1]),
                         ),
                     ]);
-                    STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID
+                    attention_operation
                 }
                 other => {
                     return Err(invalid(format!(

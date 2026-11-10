@@ -80,6 +80,37 @@ fn config(p: &Qwen3VLVisionHfProcessor, h: u64, w: u64) -> Qwen3VLVisionHfConfig
 }
 
 #[test]
+fn fused_f32_hf_profile_preserves_ports_weights_and_processor_geometry() {
+    let p = processor(16, 96);
+    let config = config(&p, 4, 6);
+    let family = Qwen3VLVisionHfFamily::new(fixture::limits()).unwrap();
+    let profiles = family.numerical_profiles(&config).unwrap();
+    let strict = profiles
+        .resolve(&id(Qwen3VLVisionHfFamily::CUDA_PROFILE_ID))
+        .unwrap();
+    let fused = profiles
+        .resolve(&id(Qwen3VLVisionHfFamily::CUDA_FUSED_F32_PROFILE_ID))
+        .unwrap();
+    let strict_graph = family.semantic_program(&config, strict).unwrap();
+    let fused_graph = family.semantic_program(&config, fused).unwrap();
+    fused.validate_program(&fused_graph).unwrap();
+    assert_eq!(strict.boundaries, fused.boundaries);
+    assert_eq!(strict_graph.inputs(), fused_graph.inputs());
+    assert_eq!(strict_graph.outputs(), fused_graph.outputs());
+    assert_eq!(strict_graph.weights(), fused_graph.weights());
+    let mut expected = strict_graph.blocks().to_vec();
+    let mut found_attention = false;
+    for node in expected.iter_mut().flat_map(|block| &mut block.nodes) {
+        if node.operation_id.as_str() == STRUCTURED_GQA_ATTENTION_F32_OPERATION_ID {
+            found_attention = true;
+            node.operation_id = id(STRUCTURED_GQA_ATTENTION_FUSED_F32_OPERATION_ID);
+        }
+    }
+    assert!(found_attention);
+    assert_eq!(expected, fused_graph.blocks());
+}
+
+#[test]
 fn original_processor_policy_is_frozen_and_unsupported_resize_fails_closed() {
     // Exact processor fixture, from HF 7f98acef503cf2bcfba821a78cb1cf1a9928b2df,
     // prompt_upsampler_processor/processor_config.json (Apache-2.0).

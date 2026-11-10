@@ -3158,6 +3158,25 @@ mod canonical_input_tests {
     use super::*;
 
     #[test]
+    fn fused_f32_package_requires_its_registered_abi_and_provider_entrypoints() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../native-operators/cuda/package-definitions/cutlass-fused-f32-attention.json",
+        );
+        let definition: NativeOperatorPackageDefinition = read_json(&path).unwrap();
+        validate_package_definition(&definition).unwrap();
+        assert_eq!(
+            definition.operator,
+            CudaNativeBuildUnit::CutlassFusedF32Attention.artifact_operator()
+        );
+        let mut bad = definition.clone();
+        bad.operator_abi_version = "2".into();
+        assert!(validate_package_definition(&bad).is_err());
+        let mut missing = definition;
+        missing.required_exports.pop();
+        assert!(validate_package_definition(&missing).is_err());
+    }
+
+    #[test]
     fn moe_profiler_retirement_rejects_old_package_definition_contract() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../native-operators/cuda/package-definitions/vllm-moe-marlin.json");

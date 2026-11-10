@@ -11,6 +11,7 @@ mod dit_input_diagnostics;
 mod edit_noise;
 mod editing;
 pub(crate) mod expansion;
+mod f32_attention;
 mod final_latent_diagnostics;
 mod generation;
 mod host_budget;
@@ -42,6 +43,7 @@ pub use expansion::{
     PH3ImagePromptExpansionOptions, PH3ImagePromptExpansionSourceBacking,
     PH3ImagePromptExpansionVisionReuse, PH3_IMAGE_PROMPT_EXPANSION_MAX_CAPTURE_BYTES,
 };
+pub use f32_attention::PH3ImageF32AttentionPolicy;
 pub use final_latent_diagnostics::{PH3ImageFinalLatentObservation, PH3ImageFinalLatentObserver};
 pub use noise::PH3ImageInitialNoisePolicy;
 pub use pipeline::{PH3ImagePipeline, PH3ImagePipelineOptions};

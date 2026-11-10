@@ -60,6 +60,17 @@ pub fn cuda_vnext_cnn_f32_providers_with_segmented_sdpa(
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     conv2d_f32::providers_with_segmented_sdpa(runtime, config, policy, selected)
 }
+/// Explicit F32 fused attention, sharing the existing PTX and cuDNN bundle.
+/// The independently charged native module must be selected by its own op.
+pub fn cuda_vnext_cnn_f32_providers_with_fused_f32(
+    runtime: &CudaDeviceRuntime,
+    config: &crate::backend::cuda::vnext_runtime::CudaCudnnConfig,
+    policy: Option<crate::backend::cuda::vnext_runtime::CudnnSdpaPlanPolicy>,
+    fused: &CudaCutlassFusedF32Config,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    conv2d_f32::providers_with_fused_f32(runtime, config, policy, fused, selected)
+}
 mod row_selected_bf16;
 mod row_selected_modulation;
 pub use batched_suffix_append_f32::NUMERICAL_PROFILE_ID as BATCHED_SUFFIX_APPEND_F32_PROFILE_ID;
@@ -109,10 +120,13 @@ pub use row_rms_addcmul::{
 mod geometry;
 mod gqa;
 mod gqa_f32;
+mod gqa_fused_f32;
 pub use gqa_f32::{
     NUMERICAL_IDENTITY as GQA_F32_NUMERICAL_IDENTITY,
     NUMERICAL_PROFILE_ID as GQA_F32_NUMERICAL_PROFILE_ID,
 };
+pub(super) use gqa_fused_f32::source_fingerprint as fused_f32_source_fingerprint;
+pub use gqa_fused_f32::CudaCutlassFusedF32Config;
 mod half_split_rope;
 pub use fused_head_rms_partial_rope::NUMERICAL_PROFILE_ID as FUSED_HEAD_RMS_PARTIAL_ROPE_NUMERICAL_PROFILE_ID;
 mod norm;

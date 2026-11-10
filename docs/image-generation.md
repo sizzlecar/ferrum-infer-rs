@@ -112,6 +112,23 @@ malformed thinking delimiters and capacity violations still fail the request.
 
 ## P-H3 causal precision and bounded weight uploads
 
+`backend.f32_attention_policy` selects the shared F32 attention route for prompt
+vision, reference-image vision and the VAE decoder in both `run` and `serve`.
+Its default `auto` uses the declared fused capability when compiled with
+`cuda-cutlass-fused-f32-attention` and its locked native artifact; otherwise it
+keeps the original sequential F32 profiles. `sequential` explicitly selects
+the original profiles, while `cutlass_fused` requires the native capability.
+
+The fused profiles retain F32 inputs and outputs and use CUTLASS FastF32 tensor
+operations with a different softmax reduction. They do not promise bitwise
+equivalence to the sequential implementation. Full bidirectional, all-valid
+MHA with head dimensions 64 or 72 uses the fused kernel; other supported shapes
+and masks use the declared strict-kernel fallback. The native module has a
+separate 64 MiB allowance charged inside the existing device ceiling, with no
+global payload workspace. This route is independent of the DiT
+`backend.attention_policy`. A native-kernel qualification alone does not establish
+image quality or end-to-end latency and throughput.
+
 Both `run --image-config` and `serve --image-config` use the same P-H3
 configuration. The optional `backend.prompt_expansion_causal.precision` selects
 `f16` (the existing default) or `bf16` for the prompt upsampler's dense

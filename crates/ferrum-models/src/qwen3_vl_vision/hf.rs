@@ -101,6 +101,8 @@ impl Qwen3VLVisionHfFamily {
         "qwen3_5.vision_hf_input.reference.bf16_storage_f32_compute.native_aa_positions.v1";
     pub const CUDA_PROFILE_ID: &'static str =
         "qwen3_5.vision_hf_input.cuda.bf16_storage_f32_compute.native_aa_positions.v1";
+    pub const CUDA_FUSED_F32_PROFILE_ID: &'static str =
+        "qwen3_5.vision_hf_input.cuda.bf16_storage_fused_f32_attention.native_aa_positions.v1";
     // Internal ports deliberately retain the reused executable graph IDs.
     pub const PATCHES_ID: &'static str = Qwen3VLVisionComfyFamily::PATCHES_ID;
     pub const POSITIONS_ID: &'static str = Qwen3VLVisionComfyFamily::POSITIONS_ID;
@@ -176,6 +178,10 @@ impl ModelFamilyProvider for Qwen3VLVisionHfFamily {
                 Self::CUDA_PROFILE_ID,
                 Qwen3VLVisionComfyFamily::CUDA_PROFILE_ID,
             ),
+            (
+                Self::CUDA_FUSED_F32_PROFILE_ID,
+                Qwen3VLVisionComfyFamily::CUDA_FUSED_F32_PROFILE_ID,
+            ),
         ]
         .into_iter()
         .map(|(new, old)| {
@@ -202,10 +208,10 @@ impl ModelFamilyProvider for Qwen3VLVisionHfFamily {
         if self.numerical_profiles(c)?.resolve(&p.id)? != p {
             return Err(invalid("HF visual numerical profile differs"));
         }
-        let old = if p.id.as_str() == Self::CUDA_PROFILE_ID {
-            Qwen3VLVisionComfyFamily::CUDA_PROFILE_ID
-        } else {
-            Qwen3VLVisionComfyFamily::REFERENCE_PROFILE_ID
+        let old = match p.id.as_str() {
+            Self::CUDA_PROFILE_ID => Qwen3VLVisionComfyFamily::CUDA_PROFILE_ID,
+            Self::CUDA_FUSED_F32_PROFILE_ID => Qwen3VLVisionComfyFamily::CUDA_FUSED_F32_PROFILE_ID,
+            _ => Qwen3VLVisionComfyFamily::REFERENCE_PROFILE_ID,
         };
         let profiles = self.inner.numerical_profiles(&c.base)?;
         let g = self.inner.semantic_program(
