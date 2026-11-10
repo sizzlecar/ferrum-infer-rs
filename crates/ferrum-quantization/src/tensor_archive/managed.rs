@@ -417,7 +417,28 @@ fn convert_floating_counted<const COUNT: bool>(
             bf16_to_f16::convert(input, output)
         };
     }
+    if source == ElementType::Bf16 && target == ElementType::F32 && affine.is_none() {
+        return widen_bf16_to_f32(input, output);
+    }
     convert_floating_scalar(source, target, input, output, affine)
+}
+
+// All BF16 values fit F32. Keeping dtype dispatch outside this loop lets LLVM
+// vectorize widening without the generic converter's per-element conversion
+// and overflow branches. Use the same half conversion to retain its NaN
+// quieting/payload rule as well as signed zero and subnormal bits.
+fn widen_bf16_to_f32(input: &[u8], output: &mut [u8]) -> std::result::Result<(), &'static str> {
+    if !input.len().is_multiple_of(2)
+        || !output.len().is_multiple_of(4)
+        || input.len() / 2 != output.len() / 4
+    {
+        return Err("source and target floating element counts differ");
+    }
+    for (source, destination) in input.chunks_exact(2).zip(output.chunks_exact_mut(4)) {
+        let value = bf16::from_le_bytes([source[0], source[1]]).to_f32();
+        destination.copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
 }
 
 fn convert_floating_scalar(

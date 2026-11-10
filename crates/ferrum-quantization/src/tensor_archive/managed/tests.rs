@@ -5,6 +5,7 @@ use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 mod affine;
 mod bf16_simd;
+mod bf16_widen;
 mod diagnostics;
 mod reuse;
 mod streaming;
