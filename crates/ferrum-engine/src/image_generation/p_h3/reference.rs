@@ -26,7 +26,10 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         width: u32,
         height: u32,
     ) -> Result<CompiledReferenceEncoder<R>> {
-        ensure!(!self.is_stopped(), "H3 image pipeline is stopped");
+        ensure!(
+            !self.execution.stopped && (self.execution.preparation_only || !self.is_stopped()),
+            "H3 image pipeline is stopped"
+        );
         let recipe = self.execution.sources.assets.vae.prepare_encoder(
             1,
             usize::try_from(width)?,

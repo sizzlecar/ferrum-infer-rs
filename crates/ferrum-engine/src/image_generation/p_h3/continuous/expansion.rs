@@ -17,6 +17,7 @@ use ferrum_execution::{executor_lifecycle::ExecutorShutdownPhase, RuntimeComposi
 use std::task::Waker;
 mod cohort;
 pub(super) use cohort::synchronous::PreparedRunInitialization;
+mod downstream;
 mod effective;
 mod ingress;
 mod requirements;
@@ -62,6 +63,9 @@ enum InitializationState<R: DeviceRuntime> {
     PrepareDownstream {
         effective: EffectiveRequest,
     },
+    PreparingDownstream(
+        downstream::PreparationTask<(EffectiveRequest, PreparedContinuousRequest<R>)>,
+    ),
     Downstream {
         effective: EffectiveRequest,
         prepared: PreparedContinuousRequest<R>,
@@ -611,6 +615,57 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                 }
             }
             InitializationState::PrepareDownstream { .. } => {
+                if cancelled {
+                    initialization.state = InitializationState::Done;
+                    return Ok(ImageInitializationProgress::Cancelled);
+                }
+                // Diagnostic callbacks stay on their original synchronous path.
+                // A cohort may prepare one request while existing lanes execute.
+                if self.main_text_diagnostics.is_none()
+                    && self.main_vision_diagnostics.is_none()
+                    && self.final_latent_diagnostics.is_none()
+                    && self.dit_input_diagnostics.is_none()
+                {
+                    let Some(permit) = downstream::PreparationPermit::try_acquire(
+                        &self.downstream_preparation,
+                        wake,
+                    ) else {
+                        return Ok(ImageInitializationProgress::Pending {
+                            made_progress: false,
+                        });
+                    };
+                    let InitializationState::PrepareDownstream { effective } =
+                        std::mem::replace(&mut initialization.state, InitializationState::Done)
+                    else {
+                        unreachable!()
+                    };
+                    let fork = Self {
+                        execution: self
+                            .execution
+                            .preparation_fork(self.execution.config.device_capacity_bytes),
+                        options: self.options.clone(),
+                        prompt_expansion_diagnostics: self.prompt_expansion_diagnostics.clone(),
+                        main_text_diagnostics: None,
+                        main_vision_diagnostics: None,
+                        final_latent_diagnostics: None,
+                        dit_input_diagnostics: None,
+                        downstream_preparation: self.downstream_preparation.clone(),
+                    };
+                    let job = initialization.job;
+                    let task = permit
+                        .spawn(move || {
+                            let prepared = fork.prepare_continuous_image_request_with_job(
+                                effective.as_ref(),
+                                job,
+                            )?;
+                            Ok((effective, prepared))
+                        })
+                        .map_err(preparation_error)?;
+                    initialization.state = InitializationState::PreparingDownstream(task);
+                    return Ok(ImageInitializationProgress::Pending {
+                        made_progress: true,
+                    });
+                }
                 let InitializationState::PrepareDownstream { effective } =
                     std::mem::replace(&mut initialization.state, InitializationState::Done)
                 else {
@@ -640,6 +695,43 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                 Ok(ImageInitializationProgress::Pending {
                     made_progress: true,
                 })
+            }
+            InitializationState::PreparingDownstream(task) => {
+                // Cancellation waits for this metadata-only owner to retire;
+                // no thread or source backing is detached from its request.
+                if cancelled {
+                    initialization.state = InitializationState::Done;
+                    return Ok(ImageInitializationProgress::Cancelled);
+                }
+                match task.poll() {
+                    std::task::Poll::Pending => Ok(ImageInitializationProgress::Pending {
+                        made_progress: false,
+                    }),
+                    std::task::Poll::Ready(Ok((effective, prepared))) => {
+                        if let Err(error) = prepared.validate_device_capacity(self) {
+                            initialization.state = InitializationState::Done;
+                            return Ok(ImageInitializationProgress::Rejected {
+                                diagnostic: format!("expanded prompt image capacity: {error:#}"),
+                            });
+                        }
+                        if let Some(correlation) = initialization.correlation {
+                            prepared.link_correlation(self, correlation);
+                        }
+                        initialization.state = InitializationState::Downstream {
+                            effective,
+                            prepared,
+                        };
+                        Ok(ImageInitializationProgress::Pending {
+                            made_progress: true,
+                        })
+                    }
+                    std::task::Poll::Ready(Err(error)) => {
+                        initialization.state = InitializationState::Done;
+                        Ok(ImageInitializationProgress::Rejected {
+                            diagnostic: format!("expanded prompt cannot prepare image: {error:#}"),
+                        })
+                    }
+                }
             }
             InitializationState::Downstream { prepared, .. } => {
                 if cancelled {

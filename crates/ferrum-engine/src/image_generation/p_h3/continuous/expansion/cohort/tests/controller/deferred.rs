@@ -1,6 +1,37 @@
 use super::*;
 use crate::image_generation::p_h3::PH3ImageMainVisionReuse;
 
+#[test]
+fn downstream_reference_preparation_preserves_backend_validation_without_an_actor() {
+    let (mut pipeline, _fixture) = pipeline();
+    let original_error = pipeline
+        .compile_reference_encoder(32, 32)
+        .err()
+        .expect("CPU backend has no H3 reference encoder")
+        .to_string();
+    let fork = pipeline
+        .execution
+        .preparation_fork(pipeline.execution.config.device_capacity_bytes);
+    let original = std::mem::replace(&mut pipeline.execution, fork);
+    // A metadata fork must still be unavailable for device execution.
+    assert!(pipeline.is_stopped());
+    let prepared_error = pipeline
+        .compile_reference_encoder(32, 32)
+        .err()
+        .expect("metadata preparation must retain backend validation")
+        .to_string();
+    assert_eq!(prepared_error, original_error);
+    pipeline.execution.stopped = true;
+    let stopped_error = pipeline
+        .compile_reference_encoder(32, 32)
+        .err()
+        .expect("an explicitly stopped fork cannot prepare")
+        .to_string();
+    assert_ne!(stopped_error, original_error);
+    pipeline.execution = original;
+    pipeline.shutdown().unwrap();
+}
+
 #[tokio::test]
 async fn retired_cohort_defers_recipes_and_keeps_cancellation_request_local() {
     let (mut pipeline, _fixture) = pipeline();
@@ -91,15 +122,28 @@ async fn retired_cohort_defers_recipes_and_keeps_cancellation_request_local() {
     ));
     assert_eq!(host.usage().unwrap().committed_bytes(), charged);
     assert_eq!(runtime.resident_bytes(), 0);
-    assert!(matches!(
-        pipeline
+    let terminal = futures::future::poll_fn(|cx| {
+        match pipeline
             .advance_initialization(
                 &mut pending[1],
                 ImageRequestRef::Generate(&requests[1]),
                 false,
-                &futures::task::noop_waker(),
+                cx.waker(),
             )
-            .unwrap(),
+            .unwrap()
+        {
+            ImageInitializationProgress::Pending { made_progress } => {
+                if made_progress {
+                    cx.waker().wake_by_ref();
+                }
+                std::task::Poll::Pending
+            }
+            terminal => std::task::Poll::Ready(terminal),
+        }
+    })
+    .await;
+    assert!(matches!(
+        terminal,
         ImageInitializationProgress::Rejected { .. }
     ));
     assert!(!pipeline.is_stopped());

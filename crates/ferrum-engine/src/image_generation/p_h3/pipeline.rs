@@ -55,6 +55,7 @@ pub struct PH3ImagePipeline<R: DeviceRuntime> {
     pub(super) final_latent_diagnostics:
         Option<super::final_latent_diagnostics::FinalLatentDiagnostics>,
     pub(super) dit_input_diagnostics: Option<super::dit_input_diagnostics::DitInputDiagnostics>,
+    pub(super) downstream_preparation: Arc<std::sync::atomic::AtomicBool>,
 }
 impl<R: DeviceRuntime> PH3ImagePipeline<R> {
     /// The composition root provides one backend and provider registry for all
@@ -96,6 +97,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             main_text_diagnostics: None,
             final_latent_diagnostics: None,
             dit_input_diagnostics: None,
+            downstream_preparation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
     /// Enable one synchronous borrowed capture after each validated main vision

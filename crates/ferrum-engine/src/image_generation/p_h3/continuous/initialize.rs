@@ -22,6 +22,32 @@ pub(in crate::image_generation) struct PreparedContinuousRequest<R: DeviceRuntim
     main_vision_reuse: Option<super::super::vision::reuse::MainVisionReuseBinding>,
 }
 impl<R: DeviceRuntime> PreparedContinuousRequest<R> {
+    /// Metadata forks validate configured bounds. Recheck current physical
+    /// capacity on the original execution owner before admitting their result.
+    pub(super) fn validate_device_capacity(&self, pipeline: &PH3ImagePipeline<R>) -> Result<()> {
+        let prepared = &self.prepared;
+        let mut stages = vec![
+            &prepared.conditioning.encoder,
+            &prepared.conditioning.connector,
+        ];
+        stages.extend(prepared.noise.stage());
+        stages.extend([
+            &prepared.denoising.install,
+            &prepared.denoising.refine.stage,
+            &prepared.denoising.steady.stage,
+        ]);
+        stages.extend(&prepared.decoder.stages);
+        stages.extend(prepared.conditioning.visual.iter());
+        stages.extend(&prepared.conditioning.additional_visuals);
+        if let Some(edit) = &self.edit {
+            for image in edit.images() {
+                stages.extend([&image.encoder.stage, &image.noise.stage]);
+            }
+        }
+        pipeline
+            .execution
+            .validate_capacity_with_prefix(&stages, None)
+    }
     pub(super) fn main_vision_output_capacity(&self, host: &HostMemoryAccount) -> Result<usize> {
         // This optional cache owns one Picture's readbacks. Multi-image edits
         // keep their independently admitted outputs on the normal execution path.
