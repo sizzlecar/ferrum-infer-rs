@@ -517,6 +517,17 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         cancelled: bool,
         wake: &Waker,
     ) -> InitResult<ImageInitializationProgress> {
+        self.advance_initialization_at_boundary(opaque, input, cancelled, wake, None)
+    }
+
+    pub(super) fn advance_initialization_at_boundary(
+        &mut self,
+        opaque: &mut ImageRequestInitialization,
+        input: ImageRequestRef<'_>,
+        cancelled: bool,
+        wake: &Waker,
+        membership: Option<(&mut ContinuousBatch<R>, &[&mut ContinuousRequest<R>])>,
+    ) -> InitResult<ImageInitializationProgress> {
         let initialization = opaque.get_mut::<Initialization<R>>()?;
         if !Arc::ptr_eq(
             &initialization.pipeline,
@@ -742,6 +753,9 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                     return Ok(ImageInitializationProgress::Pending {
                         made_progress: false,
                     });
+                }
+                if let Some((batch, members)) = membership {
+                    batch.prepare_join(self, members, prepared.geometry());
                 }
                 let InitializationState::Downstream {
                     effective,

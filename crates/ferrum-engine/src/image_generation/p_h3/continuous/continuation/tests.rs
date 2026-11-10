@@ -23,13 +23,13 @@ impl Drop for Owner {
     }
 }
 
-fn pending(members: Vec<RequestGeometry>, drops: Arc<AtomicUsize>) -> PendingSurvivors<Owner> {
+fn pending(members: Vec<RequestGeometry>, drops: Arc<AtomicUsize>) -> PendingMembership<Owner> {
     let slot = Arc::new(PreparationSlot::default());
     let task = PreparationPermit::try_acquire(&slot, None)
         .unwrap()
         .spawn(move || Ok(Owner(drops)))
         .unwrap();
-    PendingSurvivors {
+    PendingMembership {
         geometry: members.into(),
         task,
     }
@@ -95,4 +95,17 @@ fn cancelled_joined_reordered_or_changed_geometry_retires_the_speculative_owner(
             .is_none());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
+}
+
+#[test]
+fn withdrawn_join_proposal_retires_at_membership_replacement() {
+    let a = geometry("request.running.a");
+    let b = geometry("request.running.b");
+    let joined = geometry("request.initializing");
+    let drops = Arc::new(AtomicUsize::new(0));
+    assert!(pending(vec![a.clone(), b.clone(), joined], drops.clone())
+        .finish_for(&[&a, &b])
+        .unwrap()
+        .is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }

@@ -22,6 +22,10 @@ pub(in crate::image_generation) struct PreparedContinuousRequest<R: DeviceRuntim
     main_vision_reuse: Option<super::super::vision::reuse::MainVisionReuseBinding>,
 }
 impl<R: DeviceRuntime> PreparedContinuousRequest<R> {
+    pub(super) fn geometry(&self) -> &RequestGeometry {
+        &self.prepared.conditioning.recipe.geometry
+    }
+
     /// Metadata forks validate configured bounds. Recheck current physical
     /// capacity on the original execution owner before admitting their result.
     pub(super) fn validate_device_capacity(&self, pipeline: &PH3ImagePipeline<R>) -> Result<()> {

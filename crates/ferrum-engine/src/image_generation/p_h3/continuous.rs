@@ -211,8 +211,8 @@ pub(in crate::image_generation) struct ContinuousBatch<R: DeviceRuntime> {
     job: u64,
     suspended: bool,
     suspended_floor: Option<ExecutionHostBudget>,
-    pending_survivors:
-        Option<continuation::PendingSurvivors<continuation::PreparedContinuation<R>>>,
+    pending_membership:
+        Option<continuation::PendingMembership<continuation::PreparedContinuation<R>>>,
 }
 fn process<R: DeviceRuntime>(source: anyhow::Error) -> ImageGenerationFailure<R> {
     ImageGenerationFailure::Processing {
@@ -461,7 +461,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         requests: &mut [&mut ContinuousRequest<R>],
     ) -> std::result::Result<Option<ContinuousBatch<R>>, ImageGenerationFailure<R>> {
         let prepared = previous
-            .pending_survivors
+            .pending_membership
             .take()
             .map(|pending| {
                 pending.finish_for(&requests.iter().map(|r| &r.geometry).collect::<Vec<_>>())
@@ -646,7 +646,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             job,
             suspended: false,
             suspended_floor: None,
-            pending_survivors: None,
+            pending_membership: None,
         };
         trace::published(self, &batch);
         Ok(Some(batch))

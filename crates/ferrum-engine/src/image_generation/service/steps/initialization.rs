@@ -123,11 +123,13 @@ pub(super) fn advance<O: Send + 'static>(
     let result = worker
         .denoising_generator()
         .unwrap()
-        .advance_image_initialization(
+        .advance_image_initialization_at_boundary(
             candidate.initialization.as_mut().unwrap(),
             candidate.job.request.image_request_ref(),
             cancel_requested,
             &shared.resources.waker(),
+            batch.as_mut(),
+            &mut running.iter_mut().map(|r| &mut r.state).collect::<Vec<_>>(),
         );
     candidate.job.trace.phase_finished(
         span,

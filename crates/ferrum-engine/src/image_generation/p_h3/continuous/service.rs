@@ -189,6 +189,32 @@ impl<R: DeviceRuntime> ImageDenoisingGenerator for PH3ImagePipeline<R> {
     ) -> Result<ImageInitializationProgress, ImageBatchError> {
         self.advance_initialization(initialization, request, cancelled, wake)
     }
+    fn advance_image_initialization_at_boundary(
+        &mut self,
+        initialization: &mut ImageRequestInitialization,
+        request: ImageRequestRef<'_>,
+        cancelled: bool,
+        wake: &std::task::Waker,
+        batch: Option<&mut ImageDenoisingBatch>,
+        requests: &mut [&mut ImageDenoisingRequest],
+    ) -> Result<ImageInitializationProgress, ImageBatchError> {
+        let requests = requests
+            .iter_mut()
+            .map(|r| r.get_mut::<H3Request<R>>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ImageBatchError::Fatal(Box::new(error)))?;
+        let batch = batch
+            .map(|b| b.get_mut::<H3Batch<R>>())
+            .transpose()
+            .map_err(|error| ImageBatchError::Fatal(Box::new(error)))?;
+        self.advance_initialization_at_boundary(
+            initialization,
+            request,
+            cancelled,
+            wake,
+            batch.map(|batch| (batch, requests.as_slice())),
+        )
+    }
     fn try_prepare_batch(
         &mut self,
         requests: &mut [&mut ImageDenoisingRequest],

@@ -220,6 +220,21 @@ pub trait ImageDenoisingGenerator: Send {
             "generator returned pending initialization without its continuation",
         ))))
     }
+    /// Advance the original initialization with the current paused membership.
+    /// Implementations may prepare immutable membership metadata during this
+    /// work, but must retain the original admission and publication boundaries.
+    /// The default preserves generators without such preparation.
+    fn advance_image_initialization_at_boundary(
+        &mut self,
+        initialization: &mut ImageRequestInitialization,
+        request: ImageRequestRef<'_>,
+        cancelled: bool,
+        wake: &std::task::Waker,
+        _batch: Option<&mut ImageDenoisingBatch>,
+        _requests: &mut [&mut ImageDenoisingRequest],
+    ) -> Result<ImageInitializationProgress, ImageBatchError> {
+        self.advance_image_initialization(initialization, request, cancelled, wake)
+    }
     /// Compile and physically admit this exact membership before publishing it.
     /// `None` may delay an optional join; it must not consume old step credit.
     fn try_prepare_batch(
