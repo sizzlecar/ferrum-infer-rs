@@ -1,4 +1,4 @@
-//! Prepare the known survivors during their cohort's final mixed-progress wave.
+//! Prepare known survivors during the two waves before a partial completion.
 //! This owns only immutable geometry and metadata, never a native/Host grant.
 use super::*;
 use crate::image_generation::plan_cache::PendingCandidatePlanCache;
@@ -30,16 +30,21 @@ impl<T> PendingSurvivors<T> {
 }
 
 fn survivor_indices(steps: impl Iterator<Item = usize>, total: usize) -> Option<Vec<usize>> {
-    let mut survivors = Vec::new();
-    let mut completes = false;
-    for (index, step) in steps.enumerate() {
-        match step.checked_add(1)? {
-            next if next == total => completes = true,
-            next if next < total => survivors.push(index),
-            _ => return None,
-        }
+    let steps = steps.collect::<Vec<_>>();
+    let first_finishing_step = *steps.iter().max()?;
+    let remaining = total.checked_sub(first_finishing_step)?;
+    if !(1..=2).contains(&remaining) {
+        return None;
     }
-    (completes && !survivors.is_empty()).then_some(survivors)
+    // One earlier opportunity avoids contending with downstream preparation
+    // launched at the last-wave boundary. The recipe has no live timestep;
+    // intervening joins/cancellations still require exact membership matching.
+    let survivors = steps
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, step)| (step < first_finishing_step).then_some(index))
+        .collect::<Vec<_>>();
+    (!survivors.is_empty()).then_some(survivors)
 }
 
 impl<R: DeviceRuntime> ContinuousBatch<R> {
