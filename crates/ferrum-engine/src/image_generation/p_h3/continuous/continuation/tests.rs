@@ -1,6 +1,7 @@
 use super::*;
 use ferrum_models::p_h3_image::{PH3ImageModality, PH3ImageReferenceImage};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{sync::mpsc, task::Wake};
 
 fn geometry(id: &str) -> RequestGeometry {
     let tensor = |shape| {
@@ -108,4 +109,109 @@ fn withdrawn_join_proposal_retires_at_membership_replacement() {
         .unwrap()
         .is_none());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+struct CompletionSignal(mpsc::SyncSender<()>);
+impl Wake for CompletionSignal {
+    fn wake(self: Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+}
+
+fn notified_pending(
+    members: Vec<RequestGeometry>,
+    work: impl FnOnce() -> Result<Owner> + Send + 'static,
+) -> (
+    PendingMembership<Owner>,
+    mpsc::Receiver<()>,
+    Arc<PreparationSlot>,
+) {
+    let slot = Arc::new(PreparationSlot::default());
+    let (signal, awakened) = mpsc::sync_channel(1);
+    let wake = std::task::Waker::from(Arc::new(CompletionSignal(signal)));
+    let task = PreparationPermit::try_acquire(&slot, Some(&wake))
+        .unwrap()
+        .spawn(work)
+        .unwrap();
+    (
+        PendingMembership {
+            geometry: members.into(),
+            task,
+        },
+        awakened,
+        slot,
+    )
+}
+
+#[test]
+fn obsolete_survivor_retires_only_after_completion_and_frees_join_preparation() {
+    let a = geometry("request.running");
+    let b = geometry("request.survivor");
+    let joining = geometry("request.joining");
+    let drops = Arc::new(AtomicUsize::new(0));
+    let owner = Owner(drops.clone());
+    let (release, blocked) = mpsc::sync_channel(0);
+    let (proposal, awakened, slot) = notified_pending(vec![b.clone()], move || {
+        blocked.recv().unwrap();
+        Ok(owner)
+    });
+    let mut proposal = Some(proposal);
+    let joined_geometry = [&a, &b, &joining];
+    PendingMembership::retire_completed_mismatch(&mut proposal, &joined_geometry);
+    let retained_unfinished = proposal.is_some();
+    let slot_still_busy = PreparationPermit::try_acquire(&slot, None).is_none();
+    release.send(()).unwrap();
+    awakened
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(retained_unfinished && slot_still_busy);
+
+    // Completion alone cannot consume a still-useful result.
+    PendingMembership::retire_completed_mismatch(&mut proposal, &[&b]);
+    assert!(proposal.is_some());
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+    PendingMembership::retire_completed_mismatch(&mut proposal, &joined_geometry);
+    assert!(proposal.is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let next_owner = Owner(drops.clone());
+    let next = PendingMembership {
+        geometry: vec![a.clone(), b.clone(), joining.clone()].into(),
+        task: PreparationPermit::try_acquire(&slot, None)
+            .unwrap()
+            .spawn(move || Ok(next_owner))
+            .unwrap(),
+    };
+    let admitted = next.finish_for(&joined_geometry).unwrap().unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop(admitted);
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn obsolete_preparation_failure_retires_but_matching_failure_reaches_admission() {
+    let a = geometry("request.a");
+    let b = geometry("request.b");
+    for matching in [false, true] {
+        let (proposal, awakened, slot) = notified_pending(vec![a.clone()], || {
+            Err(anyhow::anyhow!("metadata preparation failed"))
+        });
+        awakened
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut proposal = Some(proposal);
+        PendingMembership::retire_completed_mismatch(
+            &mut proposal,
+            &[if matching { &a } else { &b }],
+        );
+        if matching {
+            assert!(proposal.take().unwrap().finish_for(&[&a]).is_err());
+        } else {
+            assert!(proposal.is_none());
+        }
+        assert!(PreparationPermit::try_acquire(&slot, None).is_some());
+    }
 }

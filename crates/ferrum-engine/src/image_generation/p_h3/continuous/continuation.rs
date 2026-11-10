@@ -15,10 +15,28 @@ pub(super) struct PendingMembership<T> {
 }
 
 impl<T> PendingMembership<T> {
+    fn matches_geometry(&self, geometry: &[&RequestGeometry]) -> bool {
+        self.geometry.len() == geometry.len()
+            && self.geometry.iter().zip(geometry).all(|(a, b)| a == *b)
+    }
+
+    fn retire_completed_mismatch(pending: &mut Option<Self>, geometry: &[&RequestGeometry]) {
+        // A finished survivor proposal may be obsolete before the next join.
+        // Poll joins only a published result; Pending must retain its owner
+        // because dropping an unfinished task would wait on initialization.
+        // Keep an exact match untouched for the original admission boundary.
+        let retire = pending.as_mut().is_some_and(|proposal| {
+            !proposal.matches_geometry(geometry) && proposal.task.poll().is_ready()
+        });
+        if retire {
+            // The completed result (including its uncommitted cache) and the
+            // old worker have retired before another proposal can acquire work.
+            *pending = None;
+        }
+    }
+
     pub(super) fn finish_for(self, geometry: &[&RequestGeometry]) -> Result<Option<T>> {
-        if self.geometry.len() != geometry.len()
-            || !self.geometry.iter().zip(geometry).all(|(a, b)| a == *b)
-        {
+        if !self.matches_geometry(geometry) {
             // Cancellation or changed membership invalidates the proposal.
             // Dropping joins its worker and rolls back uncommitted metadata.
             return Ok(None);
@@ -75,10 +93,7 @@ impl<R: DeviceRuntime> ContinuousBatch<R> {
         requests: &[&mut ContinuousRequest<R>],
         joining: &RequestGeometry,
     ) {
-        // Never wait for or replace an existing proposal before initialization.
-        // The original boundary will retire it if membership has changed.
-        if self.pending_membership.is_some()
-            || pipeline.dit_input_diagnostics.is_some()
+        if pipeline.dit_input_diagnostics.is_some()
             || self.active.is_some()
             || requests.is_empty()
             || requests.len() >= pipeline.execution.config.maximum_batch_size
@@ -98,10 +113,14 @@ impl<R: DeviceRuntime> ContinuousBatch<R> {
         }
         let geometry = requests
             .iter()
-            .map(|r| r.geometry.clone())
-            .chain(std::iter::once(joining.clone()))
-            .collect();
-        self.prepare_membership(pipeline, geometry);
+            .map(|r| &r.geometry)
+            .chain(std::iter::once(joining))
+            .collect::<Vec<_>>();
+        PendingMembership::retire_completed_mismatch(&mut self.pending_membership, &geometry);
+        if self.pending_membership.is_some() {
+            return;
+        }
+        self.prepare_membership(pipeline, geometry.into_iter().cloned().collect());
     }
 
     fn prepare_membership(
