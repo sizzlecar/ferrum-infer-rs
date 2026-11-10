@@ -384,12 +384,26 @@ async fn encode_result(
         "image HTTP response timing"
     );
     let bytes = encoded?;
+    let job = result.receipt.job;
+    let release_started = Instant::now();
     drop(result);
-    Ok((
+    let response_release_us =
+        u64::try_from(release_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let response = (
         [(header::CONTENT_TYPE, "application/json")],
         super::output::retained_body(session, axum::body::Body::from(bytes)),
     )
-        .into_response())
+        .into_response();
+    // Encoding completion alone does not prove the response reached Axum:
+    // releasing the original pixels runs before the body can be returned.
+    tracing::debug!(
+        target: "ferrum_server::image_generation::timing",
+        job,
+        response_release_us,
+        response_ready_us = u64::try_from(encode_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        "image HTTP response ready"
+    );
+    Ok(response)
 }
 
 #[cfg(test)]
