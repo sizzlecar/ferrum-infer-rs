@@ -98,7 +98,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             &generation.conditioning.connector,
         ]);
         stages.extend(generation.noise.stage());
-        stages.push(&generation.denoising.install.stage);
+        stages.push(&generation.denoising.install);
         let (weights, backing) = self.source_backing_budget(&stages)?;
         requirements.initialization.weights = weights;
         requirements.initialization_backing = backing;

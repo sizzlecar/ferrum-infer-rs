@@ -2,12 +2,13 @@
 //! Host samples, solver state and progress credit never leave their owners.
 use super::super::stages::CompiledDenoiser;
 use super::*;
+use crate::image_generation::PreparedImageStage;
 
 /// Exact, separately charged input to RefineOnly. A refined cache is tied to
 /// its original native transaction and cannot authenticate a cold reinstall.
 pub(super) struct Restoration<R: DeviceRuntime> {
     pub conditioning: ManagedHostTensor,
-    pub install: CompiledDenoiser<R>,
+    pub install: PreparedImageStage<R>,
     pub refine: CompiledDenoiser<R>,
     pub work_budget: ExecutionHostBudget,
 }
@@ -50,7 +51,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             self.execution
                 .validate_capacity_with_prefix(
                     &[
-                        &restore.install.stage,
+                        &restore.install,
                         &restore.refine.stage,
                         &batch.prepared.stage,
                     ],
@@ -161,11 +162,9 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             .as_ref()
             .context("H3 restoration has no connector recipe")
             .map_err(process)?;
-        let active = self.execution.start_stage(
-            first.install.stage.clone(),
-            batch.job,
-            &mut batch.stages,
-        )?;
+        let active =
+            self.execution
+                .start_stage(first.install.clone(), batch.job, &mut batch.stages)?;
         let _installation = match self
             .execution
             .pin_weight_owner(ImageWeightOwnerKey::Denoiser)

@@ -263,3 +263,46 @@ fn complete_assets_preserve_metadata_provenance_and_reject_incompatible_componen
     .contains("five taps ending at the final normalized"));
     Ok(())
 }
+
+#[test]
+fn weight_installation_full_inventory_is_independent_of_reference_and_text_geometry(
+) -> anyhow::Result<()> {
+    use ferrum_models::p_h3_image::PH3ImageRequestLayout;
+    use ferrum_runtime::ExecutionWeightPlan;
+    let fixture = fixture::CompleteFixture::new()?;
+    let assets = fixture.assets()?;
+    let adapter = &assets.denoiser;
+    let mut first = None;
+    for (name, text_rows, width, references) in [
+        ("request.install.generate", 1, 4, vec![]),
+        (
+            "request.install.edit",
+            3,
+            6,
+            vec![
+                PH3ImageReferenceImage::new(2, 4)?,
+                PH3ImageReferenceImage::new(4, 4)?,
+            ],
+        ),
+    ] {
+        let tags = vec![PH3ImageModality::Text; text_rows];
+        let target = PH3ImageReferenceImage::new(width, 4)?;
+        let layout = PH3ImageRequestLayout::new(adapter.transformer(), &tags, target, &references)?;
+        let request = adapter.request_with_references(
+            RequestIdentity::new(name)?,
+            &tags,
+            target,
+            &references,
+            &vec![0; layout.rows()],
+        )?;
+        let prepared =
+            adapter.prepare(PH3ImageDenoiserPhase::InstallFullWeights, 3, vec![request])?;
+        let weights = ExecutionWeightPlan::identity(prepared.family())?;
+        if let Some(first) = &first {
+            assert_eq!(&weights, first);
+        } else {
+            first = Some(weights);
+        }
+    }
+    Ok(())
+}

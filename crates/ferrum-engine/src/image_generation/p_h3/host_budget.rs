@@ -177,7 +177,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             &prepared.conditioning.connector,
         ]);
         installable.extend(prepared.noise.stage());
-        installable.push(&prepared.denoising.install.stage);
+        installable.push(&prepared.denoising.install);
         let (weights, initialization_backing) = self.source_backing_budget(&installable)?;
         let staging = self.static_staging_budget(&installable)?;
         let initialization = ExecutionHostBudget {

@@ -99,6 +99,10 @@ struct CachedStage<R: DeviceRuntime> {
     component: Arc<CompiledTensorComponent<R>>,
     receipt: ImageStagePlanReceipt,
     encoded_bytes: usize,
+    declaration: ImageStageDeclaration,
+    // The fixed pipeline owns its source, runtime, registry and native policy.
+    // Preparation forks share this real domain token; other pipelines do not.
+    domain: Arc<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -418,12 +422,63 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
         drop(removed);
         Ok(result)
     }
+    /// An installation is never executed with request tensors. Return its
+    /// original declaration and geometry, subject to the same policy, LRU,
+    /// encoded-byte limits and candidate rollback as every other cached stage.
+    pub(super) fn get_weight_installation(
+        &self,
+        policy: ImagePlanCachePolicy,
+        stage: ImageStage,
+        weight_owner: Option<ImageWeightOwnerKey>,
+        domain: &Arc<()>,
+        packing: WeightArenaPacking,
+    ) -> anyhow::Result<
+        Option<(
+            Arc<CompiledTensorComponent<R>>,
+            ImageStagePlanReceipt,
+            ImageStageDeclaration,
+        )>,
+    > {
+        policy.validate()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image plan cache poisoned"))?;
+        let removed = state.configure(policy);
+        let found = state.entries.iter().position(|entry| {
+            entry.declaration.stage == stage
+                && entry.declaration.role == ImageStagePlanRole::WeightInstallation
+                && entry.declaration.attachment == ImageStageAttachment::InitializeShared
+                && weight_owner.is_some()
+                && entry.declaration.weight_owner == weight_owner
+                && Arc::ptr_eq(&entry.domain, domain)
+                && entry.options.weight_arena_packing() == packing
+        });
+        let result = if let Some(index) = found {
+            let entry = state.entries.remove(index).expect("located installation");
+            let component = Arc::clone(&entry.component);
+            let declaration = entry.declaration;
+            let mut receipt = entry.receipt.clone();
+            state.entries.push_back(entry);
+            state.hits = state.hits.saturating_add(1);
+            receipt.plan_cache = Some(state.snapshot(stage, true));
+            Some((component, receipt, declaration))
+        } else {
+            None
+        };
+        drop(state);
+        drop(removed);
+        Ok(result)
+    }
+
     pub(super) fn insert(
         &self,
         policy: ImagePlanCachePolicy,
         component: Arc<CompiledTensorComponent<R>>,
         mut receipt: ImageStagePlanReceipt,
         options: ProgramPlanCompileOptions,
+        declaration: ImageStageDeclaration,
+        domain: Arc<()>,
     ) -> anyhow::Result<ImagePlanCacheReceipt> {
         policy.validate()?;
         // Normalize receipt: neither timing digits nor an earlier cache snapshot
@@ -439,6 +494,7 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
                 &component,
                 &receipt,
                 &options,
+                &declaration,
                 maximum_encoded_metadata_bytes,
             )?,
             _ => Some(0),
@@ -507,6 +563,8 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
                 component,
                 receipt,
                 encoded_bytes,
+                declaration,
+                domain,
             });
             state.snapshot(stage, true)
         } else {
@@ -527,6 +585,7 @@ fn encoded_size<R: DeviceRuntime>(
     component: &CompiledTensorComponent<R>,
     receipt: &ImageStagePlanReceipt,
     options: &ProgramPlanCompileOptions,
+    declaration: &ImageStageDeclaration,
     limit: usize,
 ) -> anyhow::Result<Option<usize>> {
     let mut counter = LimitedCounter {
@@ -542,6 +601,7 @@ fn encoded_size<R: DeviceRuntime>(
             component.executable().capabilities(),
             compile_options_projection(options),
             receipt,
+            declaration,
         ),
     );
     if counter.exceeded {

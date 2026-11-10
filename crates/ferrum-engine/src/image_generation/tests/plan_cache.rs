@@ -2,6 +2,8 @@ use super::fixture::*;
 use super::*;
 use crate::image_generation::plan_cache::PreparedFamilyKey;
 
+#[path = "plan_cache/installation.rs"]
+mod installation;
 #[path = "plan_cache/prepared_builds.rs"]
 mod prepared_builds;
 

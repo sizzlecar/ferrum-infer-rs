@@ -37,6 +37,9 @@ pub enum ImageStagePlanRole {
     WholeStage,
     PrefixPrefill,
     PrefixDecode,
+    /// A complete Stored installation, started and retired without execution.
+    /// Its original compiled geometry is never rebound to request inputs.
+    WeightInstallation,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -513,6 +516,42 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         )
     }
 
+    /// Acquire the original installation plan within this pipeline's fixed
+    /// source/registry/native-policy domain. No request geometry is substituted.
+    pub(super) fn cached_weight_installation<S: ImagePipelineSourceAdapter>(
+        stage: ImageStage,
+        pipeline: &ImagePipelineExecution<R, S>,
+    ) -> anyhow::Result<Option<Self>> {
+        let started = Instant::now();
+        let packing = pipeline
+            .config
+            .weight_arena_target_bytes
+            .map_or(WeightArenaPacking::ByElementType, |target_bytes| {
+                WeightArenaPacking::Bounded { target_bytes }
+            });
+        let Some((component, mut plan, declaration)) =
+            pipeline.plan_cache.get_weight_installation(
+                pipeline.config.plan_cache,
+                stage,
+                pipeline.sources.weight_owner(stage),
+                &pipeline.service_preparation_identity,
+                packing,
+            )?
+        else {
+            return Ok(None);
+        };
+        plan.compile_wall_duration_us = elapsed_us(started);
+        plan.plan_cache_hit = true;
+        let prepared = Self {
+            component,
+            plan,
+            prefix_admission: None,
+            declaration,
+        };
+        prepared.validate_declaration()?;
+        Ok(Some(prepared))
+    }
+
     pub(super) fn compile_declared<S: ImagePipelineSourceAdapter>(
         declaration: ImageStageDeclaration,
         family: PreparedModelFamily,
@@ -520,6 +559,11 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         pipeline: &ImagePipelineExecution<R, S>,
     ) -> anyhow::Result<Self> {
         declaration.validate()?;
+        ensure!(
+            declaration.role != ImageStagePlanRole::WeightInstallation
+                || declaration.attachment == ImageStageAttachment::InitializeShared,
+            "weight installation plans must explicitly initialize their shared owner"
+        );
         ensure!(
             pipeline.sources.supports_stage(declaration.stage),
             "stage is not declared by the fixed source adapter"
@@ -619,6 +663,8 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                 prepared.component.clone(),
                 prepared.plan.clone(),
                 options.clone(),
+                declaration,
+                Arc::clone(&pipeline.service_preparation_identity),
             )?);
         }
         prepared.plan.compile_wall_duration_us = elapsed_us(started);
@@ -769,6 +815,11 @@ impl<R: DeviceRuntime> ActiveImageStage<R> {
             Vec<ManagedHostTensor>,
         ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>>,
     ) -> Result<(Self, Vec<TensorExecutionOutput>), ImageGenerationFailure<R>> {
+        if self.declaration.role == ImageStagePlanRole::WeightInstallation {
+            return Err(self.processing(anyhow::anyhow!(
+                "weight installation plans cannot execute request tensors"
+            )));
+        }
         let stage = self.receipt.plan.stage.name();
         let ordinal = self.receipt.completed_executions;
         let ids = (|| -> anyhow::Result<(RunId, RequestIdentity)> {

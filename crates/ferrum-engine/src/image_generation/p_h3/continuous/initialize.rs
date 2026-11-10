@@ -153,7 +153,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         ];
         stages.extend(prepared.noise.stage());
         stages.extend([
-            &prepared.denoising.install.stage,
+            &prepared.denoising.install,
             &prepared.denoising.refine.stage,
             &prepared.denoising.steady.stage,
         ]);
@@ -583,11 +583,9 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             crate::image_generation::continuous_trace::ImageTracePhaseOutcome::Completed,
         );
         if pins.is_empty() {
-            let active = self.execution.start_stage(
-                prepared.denoising.install.stage.clone(),
-                job,
-                stages,
-            )?;
+            let active =
+                self.execution
+                    .start_stage(prepared.denoising.install.clone(), job, stages)?;
             let pin = match self
                 .execution
                 .pin_weight_owner(ImageWeightOwnerKey::Denoiser)

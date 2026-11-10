@@ -50,7 +50,7 @@ pub(super) struct CompiledDenoiser<R: DeviceRuntime> {
     pub stage: PreparedImageStage<R>,
 }
 pub(super) struct CompiledDenoising<R: DeviceRuntime> {
-    pub install: CompiledDenoiser<R>,
+    pub install: PreparedImageStage<R>,
     pub refine: CompiledDenoiser<R>,
     pub steady: CompiledDenoiser<R>,
 }
@@ -190,7 +190,7 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             )
         })?;
         let install = metadata_phase("denoiser_install_plan", || {
-            self.compile_denoiser_phase(&geometry, PH3ImageDenoiserPhase::InstallFullWeights)
+            self.compile_weight_installation(&geometry)
         })?;
         let refine = metadata_phase("denoiser_refine_plan", || {
             self.compile_denoiser_phase(&geometry, PH3ImageDenoiserPhase::RefineFreshText)
@@ -307,6 +307,23 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
     ) -> Result<CompiledSteady<R>> {
         self.compile_denoiser_phase(geometry, PH3ImageDenoiserPhase::DenoiseRefinedText)
     }
+    fn compile_weight_installation(
+        &self,
+        geometry: &BatchGeometry<'_>,
+    ) -> Result<PreparedImageStage<R>> {
+        if let Some(stage) =
+            PreparedImageStage::cached_weight_installation(ImageStage::Denoiser, &self.execution)?
+        {
+            return Ok(stage);
+        }
+        // Keep the first real complete plan, never a fabricated fingerprint or
+        // a current request recipe relabeled onto another graph. Only static
+        // initialization consumes this stage; refine/steady compile separately.
+        Ok(self
+            .compile_denoiser_phase(geometry, PH3ImageDenoiserPhase::InstallFullWeights)?
+            .stage)
+    }
+
     fn compile_denoiser_phase(
         &self,
         geometry: &BatchGeometry<'_>,
@@ -323,13 +340,18 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
                 (ImageStage::Denoiser, ImageStageAttachment::RequireShared)
             }
         };
+        let role = if phase == PH3ImageDenoiserPhase::InstallFullWeights {
+            ImageStagePlanRole::WeightInstallation
+        } else {
+            ImageStagePlanRole::WholeStage
+        };
         let recipe = geometry.prepare_with_family(
             &self.execution.sources.assets.denoiser,
             phase,
             |provider, config, profile| {
                 self.execution.prepare_family(
                     stage,
-                    ImageStagePlanRole::WholeStage,
+                    role,
                     geometry.request_count(),
                     provider,
                     config,
@@ -341,10 +363,14 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             !recipe.request_ids().is_empty(),
             "H3 stage requires an exact nonempty membership"
         );
-        let compiled = self.compile_recipe(
-            stage,
-            attachment,
-            recipe.request_ids().len(),
+        let compiled = self.execution.compile_stage(
+            ImageStageDeclaration {
+                stage,
+                role,
+                attachment,
+                batch_size: recipe.request_ids().len(),
+                weight_owner: self.execution.sources.weight_owner(stage),
+            },
             recipe.family().clone(),
             recipe.compile_options(),
         )?;
