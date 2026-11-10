@@ -26,6 +26,7 @@ pub(super) fn enqueue(
     regions: &[CudaBufferRegion],
     shape: Shape,
     storage: Storage,
+    prepared: Option<&fused_native::Prepared>,
 ) -> Result<(), CudaDeviceRuntimeError> {
     let m = shape.rows;
     let k = shape.inputs;
@@ -37,7 +38,6 @@ pub(super) fn enqueue(
     let weight = shape
         .decoded_weight
         .map_or(regions[1].device_ptr(), |offset| scratch + offset);
-    let accumulator = scratch + shape.accumulator;
     let x = regions[0].device_ptr();
     let channel = regions[if storage.codebook() { 3 } else { 2 }].device_ptr();
     let y = regions[storage.inputs()].device_ptr();
@@ -83,6 +83,21 @@ pub(super) fn enqueue(
             CudaDeviceRuntimeError::driver("ConvRot W4 codebook INT8 decode", error)
         })?;
     }
+    if let Some(prepared) = prepared.filter(|p| p.fused()) {
+        // Every input/output/scratch span and the native owner are retained by
+        // the enclosing command. Failure after enqueue never retries another path.
+        return unsafe {
+            prepared.run(
+                quantized,
+                weight,
+                row_scales,
+                channel,
+                y,
+                stream.cu_stream() as _,
+            )
+        };
+    }
+    let accumulator = scratch + shape.accumulator;
     let handle = *blas.handle();
     let one = 1_i32;
     let zero = 0_i32;

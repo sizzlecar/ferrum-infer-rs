@@ -71,6 +71,18 @@ pub fn cuda_vnext_cnn_f32_providers_with_fused_f32(
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     conv2d_f32::providers_with_fused_f32(runtime, config, policy, fused, selected)
 }
+/// Compose native choices while retaining one shared PTX/cuDNN owner. Each
+/// optional static native module has its own admitted opaque allowance.
+pub fn cuda_vnext_cnn_f32_providers_with_native_options(
+    runtime: &CudaDeviceRuntime,
+    config: &crate::backend::cuda::vnext_runtime::CudaCudnnConfig,
+    policy: Option<crate::backend::cuda::vnext_runtime::CudnnSdpaPlanPolicy>,
+    fused: Option<&CudaCutlassFusedF32Config>,
+    convrot: Option<&CudaConvRotFusedOutputConfig>,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    conv2d_f32::providers_with_native_options(runtime, config, policy, fused, convrot, selected)
+}
 mod row_selected_bf16;
 mod row_selected_modulation;
 pub use batched_suffix_append_f32::NUMERICAL_PROFILE_ID as BATCHED_SUFFIX_APPEND_F32_PROFILE_ID;
@@ -91,6 +103,8 @@ pub use gelu_f32::TANH_NUMERICAL_PROFILE as GELU_TANH_F32_PROFILE_ID;
 pub use pointwise_f32::RESIDUAL_NUMERICAL_PROFILE as PLAIN_RESIDUAL_ADD_F32_PROFILE_ID;
 pub use pointwise_f32::SILU_MUL_NUMERICAL_PROFILE as SILU_MUL_F32_PROFILE_ID;
 mod comfy_convrot;
+pub(super) use comfy_convrot::fused_output_source_fingerprint;
+pub use comfy_convrot::CudaConvRotFusedOutputConfig;
 mod comfy_embedding;
 mod norm_rope_f32;
 pub use cast_f32_to_bf16::NUMERICAL_PROFILE as CAST_F32_TO_BF16_NUMERICAL_PROFILE_ID;

@@ -4,6 +4,7 @@ mod assets;
 mod conditioning;
 mod conditioning_diagnostics;
 mod continuous;
+mod convrot_output;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 mod directory;
@@ -35,6 +36,7 @@ pub use conditioning_diagnostics::{
 };
 #[cfg(test)]
 pub(in crate::image_generation) use continuous::clean_decoder_admission;
+pub use convrot_output::PH3ImageConvRotOutputPolicy;
 pub use directory::PH3ImageArchivePaths;
 pub use dit_input_diagnostics::{PH3ImageDitInputObservation, PH3ImageDitInputObserver};
 pub use edit_noise::PH3ImageEditNoisePolicy;

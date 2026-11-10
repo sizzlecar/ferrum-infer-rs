@@ -15,6 +15,22 @@ use ferrum_models::{
 };
 
 #[test]
+fn convrot_module_allowance_stays_inside_the_existing_total_capacity() {
+    let mut configured = config();
+    let separate = configured.opaque_bytes().unwrap();
+    configured.convrot_output_policy = PH3ImageConvRotOutputPolicy::Auto;
+    let extra = configured.convrot_output_policy.additional_opaque_bytes();
+    assert_eq!(configured.opaque_bytes().unwrap(), separate + extra);
+    let floor = separate + extra + configured.cudnn.workspace_limit_bytes;
+    configured.memory = ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(floor).unwrap());
+    assert!(configured.validate().is_err());
+    configured.memory = ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(floor + 1).unwrap());
+    configured.validate().unwrap();
+    configured.convrot_output_policy = PH3ImageConvRotOutputPolicy::Separate;
+    assert_eq!(configured.opaque_bytes().unwrap(), separate);
+}
+
+#[test]
 fn native_allocation_reuse_reserves_one_fixed_budget_for_explicit_and_auto_limits() {
     let mut configured = config();
     let original = configured.opaque_bytes().unwrap();
@@ -109,6 +125,7 @@ fn config() -> PH3ImageCudaConfig {
     PH3ImageCudaConfig {
         attention_policy: ImageCudaAttentionPolicy::Sequential,
         f32_attention_policy: PH3ImageF32AttentionPolicy::Sequential,
+        convrot_output_policy: crate::image_generation::p_h3::PH3ImageConvRotOutputPolicy::Separate,
         pinned_weight_upload: None,
         ordinal: 0,
         memory: ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(4 << 30).unwrap()),

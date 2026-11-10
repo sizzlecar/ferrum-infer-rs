@@ -8,6 +8,34 @@ mod diagnostics;
 mod source_backing;
 
 #[test]
+fn convrot_output_configuration_is_shared_by_run_and_serve_and_independent_of_dit() {
+    use ferrum_engine::image_generation::p_h3::PH3ImageConvRotOutputPolicy;
+    let directory = tempfile::tempdir().unwrap();
+    let baseline = document();
+    let PH3ImageBackendConfig::Cuda(default) = load(directory.path(), &baseline).unwrap().backend;
+    assert_eq!(
+        default.convrot_output_policy,
+        PH3ImageConvRotOutputPolicy::Auto
+    );
+    for (wire, expected) in [
+        ("auto", PH3ImageConvRotOutputPolicy::Auto),
+        ("separate", PH3ImageConvRotOutputPolicy::Separate),
+        ("cutlass_fused", PH3ImageConvRotOutputPolicy::CutlassFused),
+    ] {
+        let mut configured = baseline.clone();
+        configured["backend"]["convrot_output_policy"] = json!(wire);
+        let PH3ImageBackendConfig::Cuda(parsed) =
+            load(directory.path(), &configured).unwrap().backend;
+        assert_eq!(parsed.convrot_output_policy, expected);
+        assert_eq!(parsed.attention_policy, default.attention_policy);
+        assert_eq!(parsed.usable_memory_bytes, default.usable_memory_bytes);
+    }
+    let mut invalid = baseline;
+    invalid["backend"]["convrot_output_policy"] = json!("unknown");
+    assert!(load(directory.path(), &invalid).is_err());
+}
+
+#[test]
 fn f32_attention_configuration_is_shared_by_run_and_serve_and_independent_of_dit() {
     use ferrum_engine::image_generation::p_h3::PH3ImageF32AttentionPolicy;
     let directory = tempfile::tempdir().unwrap();

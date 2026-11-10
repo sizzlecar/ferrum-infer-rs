@@ -117,6 +117,7 @@ metal = ["ferrum-engine/metal", "ferrum-kernels/metal", "ferrum-quantization/met
 cuda = ["ferrum-engine/cuda", "ferrum-kernels/cuda", "ferrum-quantization/cuda"]    # NVIDIA CUDA
 cuda-cutlass-fp8 = ["cuda", "ferrum-kernels/cuda-cutlass-fp8", "ferrum-models/cuda-cutlass-fp8"]
 cuda-cutlass-fused-f32-attention = ["cuda", "ferrum-engine/cuda-cutlass-fused-f32-attention", "ferrum-kernels/cuda-cutlass-fused-f32-attention"]
+cuda-cutlass-int8-fused-output = ["cuda", "ferrum-engine/cuda-cutlass-int8-fused-output", "ferrum-kernels/cuda-cutlass-int8-fused-output"]
 # Full production capability set; requires a matching native operator-set lock.
 cuda-production = [
     "cuda-upstream-q6-f32-linear",

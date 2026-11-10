@@ -100,7 +100,8 @@ pub use tensor_eager::{
     CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION,
 };
 pub(crate) use tensor_eager::{
-    CudaTensorCutlassRetention, CudaTensorFusedF32Retention, CudaTensorProviderRetention,
+    CudaTensorConvRotFusedRetention, CudaTensorCutlassRetention, CudaTensorFusedF32Retention,
+    CudaTensorProviderRetention,
 };
 use tensor_io::validate_tensor_command;
 

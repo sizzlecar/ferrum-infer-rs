@@ -2,7 +2,8 @@
 //! catalog and compiled native artifact set. Construction is not numerical or
 //! concurrency qualification of the complete released model.
 use super::{
-    PH3ImageAssets, PH3ImageF32AttentionPolicy, PH3ImagePipeline, PH3ImagePipelineOptions,
+    PH3ImageAssets, PH3ImageConvRotOutputPolicy, PH3ImageF32AttentionPolicy, PH3ImagePipeline,
+    PH3ImagePipelineOptions,
 };
 use crate::image_generation::{
     cuda::ImageCudaMemoryPolicy, ImageCudaAttentionPolicy, ImageCudaConvolutionWorkspacePolicy,
@@ -82,6 +83,7 @@ pub struct PH3ImageCudaConfig {
     pub cudnn: CudaCudnnConfig,
     pub attention_policy: ImageCudaAttentionPolicy,
     pub f32_attention_policy: PH3ImageF32AttentionPolicy,
+    pub convrot_output_policy: PH3ImageConvRotOutputPolicy,
     pub convolution_workspace: ImageCudaConvolutionWorkspacePolicy,
     pub host: HostMemoryLimits,
     pub pipeline: ImagePipelineLimits,
@@ -114,7 +116,10 @@ pub struct PH3ImageCudaCompositionReceipt {
     pub cudnn_convolution_workspace_limit_bytes: u64,
     pub attention_policy: ImageCudaAttentionPolicy,
     pub f32_attention_policy: PH3ImageF32AttentionPolicy,
+    pub convrot_output_policy: PH3ImageConvRotOutputPolicy,
     pub fused_f32_attention: bool,
+    pub fused_convrot_output: bool,
+    pub convrot_output_opaque_memory_bytes: u64,
     pub f32_attention_opaque_memory_bytes: u64,
     pub main_vision_numerical_profile: &'static str,
     pub attention_opaque_memory_bytes: u64,
@@ -169,6 +174,8 @@ impl PH3ImageCudaConfig {
     pub fn validate(&self) -> Result<()> {
         self.f32_attention_policy
             .resolve(cfg!(feature = "cuda-cutlass-fused-f32-attention"))?;
+        self.convrot_output_policy
+            .resolve(cfg!(feature = "cuda-cutlass-int8-fused-output"))?;
         self.pipeline.validate()?;
         self.native_allocation_reuse.validate()?;
         if let Some(policy) = self.pinned_weight_upload {
@@ -347,6 +354,16 @@ impl PH3ImageCudaConfig {
             .resolve(device.capabilities.contains(&CapabilityId::new(
                 STRUCTURED_GQA_ATTENTION_FUSED_F32_CAPABILITY_ID,
             )?))?;
+        if cfg!(feature = "cuda-cutlass-int8-fused-output")
+            && self.convrot_output_policy != PH3ImageConvRotOutputPolicy::Separate
+        {
+            cuda_tensor_runtime_config_enable_cutlass_int8_fused_output(&mut device)?;
+        }
+        let fused_convrot = self
+            .convrot_output_policy
+            .resolve(device.capabilities.contains(&CapabilityId::new(
+                ferrum_kernels::native_ops::cutlass_int8_fused_output::CAPABILITY_ID,
+            )?))?;
         assets.configure_f32_attention(fused_f32)?;
         self.options.vae_decoder = if fused_f32 {
             ferrum_models::p_h3_image_vae::PH3ImageVaeDecoderPreset::F32A8FusedAttention
@@ -493,43 +510,29 @@ impl PH3ImageCudaConfig {
         // This factory loads the union's one native module and adds its one
         // admitted cuDNN F32/FMA convolution owner. Calling a second tensor or
         // standalone Philox factory would acquire a duplicate module permit.
-        let mut providers = if fused_f32 {
-            cuda_vnext_cnn_f32_providers_with_fused_f32(
-                &runtime,
-                &convolution,
-                (self.attention_policy == ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1)
-                    .then_some(CudnnSdpaPlanPolicy {
-                        maximum_plans: 64,
-                        maximum_live_bindings: 2048,
-                        opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
-                        workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
-                    }),
-                &CudaCutlassFusedF32Config {
-                    opaque_memory_bytes: self.f32_attention_policy.additional_opaque_bytes(),
-                    opaque_memory_profile: "cutlass_fused_f32_v1".into(),
+        let f32_config = fused_f32.then(|| CudaCutlassFusedF32Config {
+            opaque_memory_bytes: self.f32_attention_policy.additional_opaque_bytes(),
+            opaque_memory_profile: "cutlass_fused_f32_v1".into(),
+        });
+        let convrot_config = fused_convrot.then(|| CudaConvRotFusedOutputConfig {
+            opaque_memory_bytes: self.convrot_output_policy.additional_opaque_bytes(),
+            opaque_memory_profile: "cutlass_int8_fused_output_v1".into(),
+        });
+        let mut providers = cuda_vnext_cnn_f32_providers_with_native_options(
+            &runtime,
+            &convolution,
+            (self.attention_policy == ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1).then_some(
+                CudnnSdpaPlanPolicy {
+                    maximum_plans: 64,
+                    maximum_live_bindings: 2048,
+                    opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
+                    workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
                 },
-                &selection,
-            )?
-        } else {
-            match self.attention_policy {
-                ImageCudaAttentionPolicy::Sequential => {
-                    cuda_vnext_cnn_f32_providers(&runtime, &convolution, &selection)?
-                }
-                ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
-                    cuda_vnext_cnn_f32_providers_with_segmented_sdpa(
-                        &runtime,
-                        &convolution,
-                        CudnnSdpaPlanPolicy {
-                            maximum_plans: 64,
-                            maximum_live_bindings: 2048,
-                            opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
-                            workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
-                        },
-                        &selection,
-                    )?
-                }
-            }
-        };
+            ),
+            f32_config.as_ref(),
+            convrot_config.as_ref(),
+            &selection,
+        )?;
         providers.push(cuda_vnext_dense_f32_provider(&runtime)?);
         // Selected affine/patch providers share the union module above.
         // The independent bias-free dense provider still needs only lane BLAS.
@@ -620,6 +623,11 @@ impl PH3ImageCudaConfig {
             cudnn_convolution_workspace_limit_bytes: convolution.workspace_limit_bytes,
             attention_policy: self.attention_policy,
             f32_attention_policy: self.f32_attention_policy,
+            convrot_output_policy: self.convrot_output_policy,
+            fused_convrot_output: fused_convrot,
+            convrot_output_opaque_memory_bytes: self
+                .convrot_output_policy
+                .additional_opaque_bytes(),
             fused_f32_attention: fused_f32,
             f32_attention_opaque_memory_bytes: self.f32_attention_policy.additional_opaque_bytes(),
             main_vision_numerical_profile: assets.main_vision_profile,
@@ -668,6 +676,7 @@ impl PH3ImageCudaConfig {
             .and_then(|n| n.checked_add(self.cudnn.opaque_memory_bytes))
             .and_then(|n| n.checked_add(self.attention_policy.additional_opaque_bytes()))
             .and_then(|n| n.checked_add(self.f32_attention_policy.additional_opaque_bytes()))
+            .and_then(|n| n.checked_add(self.convrot_output_policy.additional_opaque_bytes()))
             .and_then(|n| {
                 n.checked_add(
                     self.prompt_expansion_causal

@@ -120,10 +120,11 @@ pub use tensor_dense_bf16::{
 };
 pub use tensor_silu::{
     channelwise_f32_numerical_profile, cnn_f32_numerical_profile, cuda_vnext_cnn_f32_providers,
-    cuda_vnext_cnn_f32_providers_with_fused_f32, cuda_vnext_cnn_f32_providers_with_segmented_sdpa,
-    tensor_primitive_profile as cuda_tensor_primitive_bf16_profile, CudaCutlassFusedF32Config,
-    CudaPhiloxDeviceGeometry, CudaPhiloxLaunchGeometry, CudaTensorOperation,
-    ADDCMUL_NUMERICAL_PROFILE_ID as CUDA_ADDCMUL_BF16_NUMERICAL_PROFILE_ID,
+    cuda_vnext_cnn_f32_providers_with_fused_f32, cuda_vnext_cnn_f32_providers_with_native_options,
+    cuda_vnext_cnn_f32_providers_with_segmented_sdpa,
+    tensor_primitive_profile as cuda_tensor_primitive_bf16_profile, CudaConvRotFusedOutputConfig,
+    CudaCutlassFusedF32Config, CudaPhiloxDeviceGeometry, CudaPhiloxLaunchGeometry,
+    CudaTensorOperation, ADDCMUL_NUMERICAL_PROFILE_ID as CUDA_ADDCMUL_BF16_NUMERICAL_PROFILE_ID,
     ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
     ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
     BATCHED_ROW_CONCAT_PROFILE_ID as CUDA_BATCHED_ROW_CONCAT_BF16_NUMERICAL_PROFILE_ID,
@@ -534,6 +535,23 @@ pub fn cuda_tensor_runtime_config_enable_cutlass_fused_f32(
         .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
     config.capabilities.insert(CapabilityId::new(
         ferrum_runtime::STRUCTURED_GQA_ATTENTION_FUSED_F32_CAPABILITY_ID,
+    )?);
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        native.as_bytes(),
+    ]);
+    Ok(())
+}
+
+/// Enable ConvRot's separately locked fused INT8 output implementation. The
+/// operation contracts and numerical profiles remain unchanged.
+pub fn cuda_tensor_runtime_config_enable_cutlass_int8_fused_output(
+    config: &mut CudaDeviceRuntimeConfig,
+) -> Result<(), VNextError> {
+    let native = tensor_silu::fused_output_source_fingerprint()
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+    config.capabilities.insert(CapabilityId::new(
+        crate::native_ops::cutlass_int8_fused_output::CAPABILITY_ID,
     )?);
     config.runtime_implementation_fingerprint = implementation_fingerprint(&[
         config.runtime_implementation_fingerprint.as_bytes(),

@@ -3158,22 +3158,30 @@ mod canonical_input_tests {
     use super::*;
 
     #[test]
-    fn fused_f32_package_requires_its_registered_abi_and_provider_entrypoints() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../native-operators/cuda/package-definitions/cutlass-fused-f32-attention.json",
-        );
-        let definition: NativeOperatorPackageDefinition = read_json(&path).unwrap();
-        validate_package_definition(&definition).unwrap();
-        assert_eq!(
-            definition.operator,
-            CudaNativeBuildUnit::CutlassFusedF32Attention.artifact_operator()
-        );
-        let mut bad = definition.clone();
-        bad.operator_abi_version = "2".into();
-        assert!(validate_package_definition(&bad).is_err());
-        let mut missing = definition;
-        missing.required_exports.pop();
-        assert!(validate_package_definition(&missing).is_err());
+    fn fused_cutlass_packages_require_registered_abi_and_provider_entrypoints() {
+        for (filename, unit) in [
+            (
+                "cutlass-fused-f32-attention.json",
+                CudaNativeBuildUnit::CutlassFusedF32Attention,
+            ),
+            (
+                "cutlass-int8-fused-output.json",
+                CudaNativeBuildUnit::CutlassInt8FusedOutput,
+            ),
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../native-operators/cuda/package-definitions")
+                .join(filename);
+            let definition: NativeOperatorPackageDefinition = read_json(&path).unwrap();
+            validate_package_definition(&definition).unwrap();
+            assert_eq!(definition.operator, unit.artifact_operator());
+            let mut bad = definition.clone();
+            bad.operator_abi_version = "2".into();
+            assert!(validate_package_definition(&bad).is_err());
+            let mut missing = definition;
+            missing.required_exports.pop();
+            assert!(validate_package_definition(&missing).is_err());
+        }
     }
 
     #[test]

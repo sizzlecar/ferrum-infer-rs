@@ -594,6 +594,10 @@ fn required_cuda_native_build_units() -> Vec<CudaNativeBuildUnit> {
             "CARGO_FEATURE_CUDA_CUTLASS_FUSED_F32_ATTENTION",
             CudaNativeBuildUnit::CutlassFusedF32Attention,
         ),
+        (
+            "CARGO_FEATURE_CUDA_CUTLASS_INT8_FUSED_OUTPUT",
+            CudaNativeBuildUnit::CutlassInt8FusedOutput,
+        ),
         ("CARGO_FEATURE_MARLIN", CudaNativeBuildUnit::Marlin),
         ("CARGO_FEATURE_VLLM_MARLIN", CudaNativeBuildUnit::VllmMarlin),
         (
@@ -850,6 +854,7 @@ fn emit_native_artifact_build_unit(unit: CudaNativeBuildUnit) {
     let summary_artifact = match unit {
         CudaNativeBuildUnit::CutlassFp8ScaledMm => "cutlass_fp8_scaled_mm",
         CudaNativeBuildUnit::CutlassFusedF32Attention => "cutlass_fused_f32_attention",
+        CudaNativeBuildUnit::CutlassInt8FusedOutput => "cutlass_int8_fused_output",
         CudaNativeBuildUnit::FlashinferXqa => "flashinfer_xqa",
         CudaNativeBuildUnit::Marlin => "marlin",
         CudaNativeBuildUnit::VllmMarlin => "vllm_marlin",

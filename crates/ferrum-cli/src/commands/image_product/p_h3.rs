@@ -145,6 +145,9 @@ pub struct PH3ImageCudaBackendConfig {
     /// F32 vision/decoder arithmetic, independent of the DiT attention policy.
     #[serde(default)]
     pub f32_attention_policy: ferrum_engine::image_generation::p_h3::PH3ImageF32AttentionPolicy,
+    /// BF16 ConvRot output; independent of attention arithmetic and request batching.
+    #[serde(default)]
+    pub convrot_output_policy: ferrum_engine::image_generation::p_h3::PH3ImageConvRotOutputPolicy,
     pub host: HostConfig,
     pub pipeline: PipelineConfig,
 }
@@ -455,6 +458,7 @@ impl PH3ImageCudaBackendConfig {
             .and_then(|n| n.checked_add(self.cudnn.opaque_memory_bytes))
             .and_then(|n| n.checked_add(self.attention_policy.additional_opaque_bytes()))
             .and_then(|n| n.checked_add(self.f32_attention_policy.additional_opaque_bytes()))
+            .and_then(|n| n.checked_add(self.convrot_output_policy.additional_opaque_bytes()))
             .and_then(|n| {
                 n.checked_add(
                     self.prompt_expansion_causal
@@ -545,6 +549,7 @@ impl PH3ImageCudaBackendConfig {
             convolution_workspace: self.cudnn.convolution_workspace,
             attention_policy: self.attention_policy,
             f32_attention_policy: self.f32_attention_policy,
+            convrot_output_policy: self.convrot_output_policy,
             host: self.host.limits()?,
             pipeline: self.pipeline.resolved_limits()?,
             options,

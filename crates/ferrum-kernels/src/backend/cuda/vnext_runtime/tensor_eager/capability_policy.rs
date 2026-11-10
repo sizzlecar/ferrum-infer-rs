@@ -37,6 +37,7 @@ pub(crate) fn validate(capabilities: &BTreeSet<CapabilityId>) -> Result<(), Stri
                 | ferrum_runtime::COMFY_CONVROT_W8A8_BF16_CAPABILITY_ID
                 | ferrum_runtime::COMFY_CONVROT_W4A8_F32_CAPABILITY_ID
                 | ferrum_runtime::COMFY_CONVROT_W8A8_F32_CAPABILITY_ID
+                | crate::native_ops::cutlass_int8_fused_output::CAPABILITY_ID
                 | ferrum_runtime::COMFY_CONVROT_INT8_EMBEDDING_F32_CAPABILITY_ID
                 | ferrum_runtime::HEAD_RMS_NORM_F32_CAPABILITY_ID
                 | ferrum_runtime::HALF_SPLIT_ROPE_F32_CAPABILITY_ID
@@ -168,6 +169,33 @@ mod tests {
         for group in [DenseLinearFp8Group::Pair, DenseLinearFp8Group::Triple] {
             assert!(capabilities.contains(&CapabilityId::new(group.capability_id()).unwrap()));
         }
+    }
+
+    #[test]
+    fn fused_convrot_and_original_operations_pass_constructor_policy() {
+        let capabilities = BTreeSet::from([
+            CapabilityId::new(ferrum_runtime::COMFY_CONVROT_W4A8_BF16_CAPABILITY_ID).unwrap(),
+            CapabilityId::new(ferrum_runtime::COMFY_CONVROT_W4A8_F32_CAPABILITY_ID).unwrap(),
+            CapabilityId::new(crate::native_ops::cutlass_int8_fused_output::CAPABILITY_ID).unwrap(),
+        ]);
+        validate(&capabilities).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "cuda-cutlass-int8-fused-output")]
+    fn enabled_fused_convrot_factory_passes_constructor_policy_without_a_device() {
+        use crate::backend::cuda::vnext_ops::{
+            cuda_tensor_runtime_config, cuda_tensor_runtime_config_enable_cutlass_int8_fused_output,
+        };
+        let mut config =
+            cuda_tensor_runtime_config(0, ferrum_runtime::DeviceId::new("device.cuda.0").unwrap())
+                .unwrap();
+        let fused =
+            CapabilityId::new(crate::native_ops::cutlass_int8_fused_output::CAPABILITY_ID).unwrap();
+        assert!(!config.capabilities.contains(&fused));
+        cuda_tensor_runtime_config_enable_cutlass_int8_fused_output(&mut config).unwrap();
+        assert!(config.capabilities.contains(&fused));
+        validate(&config.capabilities).unwrap();
     }
 
     #[test]

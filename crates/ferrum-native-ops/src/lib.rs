@@ -11,6 +11,7 @@ pub mod build_unit;
 pub mod coff;
 pub mod cutlass_fp8;
 pub mod cutlass_fused_f32_attention;
+pub mod cutlass_int8_fused_output;
 pub mod flashinfer_xqa;
 pub mod manifest;
 pub mod registry;

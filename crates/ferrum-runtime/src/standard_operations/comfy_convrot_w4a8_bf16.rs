@@ -248,6 +248,12 @@ impl ComfyConvRotW4A8Geometry {
     pub const fn scratch(self) -> ComfyConvRotScratch {
         self.scratch
     }
+    /// Prefix used when GEMM stores the final scaled output directly. Every
+    /// rotation/quantization/decoded-weight span remains unchanged; the trailing
+    /// I32 accumulator is omitted. This does not assert native availability.
+    pub const fn scratch_without_accumulator_bytes(self) -> u64 {
+        self.scratch.accumulator
+    }
     pub const fn output_elements(self) -> u64 {
         self.rows * self.outputs
     }
@@ -291,6 +297,10 @@ mod tests {
         assert!(scratch.decoded_weight >= scratch.row_scales + 3 * 4);
         assert!(scratch.accumulator >= scratch.decoded_weight + 4 * 256);
         assert_eq!(scratch.total_bytes, scratch.accumulator + 3 * 4 * 4);
+        assert_eq!(
+            shape.scratch_without_accumulator_bytes() + 3 * 4 * 4,
+            scratch.total_bytes
+        );
         assert_eq!(shape.logical_arithmetic_operations(), 3 * 4 * 256 * 2);
         assert!(geometry(132096, 4).is_ok());
         assert!(geometry(132352, 4).is_err());

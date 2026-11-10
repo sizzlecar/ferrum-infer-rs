@@ -52,6 +52,7 @@ pub(in crate::image_generation::p_h3) fn config() -> Result<PH3ImageCudaConfig> 
     Ok(PH3ImageCudaConfig {
         attention_policy: crate::image_generation::ImageCudaAttentionPolicy::Sequential,
         f32_attention_policy: super::PH3ImageF32AttentionPolicy::Sequential,
+        convrot_output_policy: crate::image_generation::p_h3::PH3ImageConvRotOutputPolicy::Separate,
         pinned_weight_upload: None,
         ordinal: 0,
         memory: ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(1 << 30).unwrap()),

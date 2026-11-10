@@ -19,7 +19,7 @@ pub(crate) fn providers(
     config: &CudaCudnnConfig,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, None, None)
+    providers_impl(runtime, config, selected, None, None, None)
 }
 
 pub(crate) fn providers_with_segmented_sdpa(
@@ -28,7 +28,7 @@ pub(crate) fn providers_with_segmented_sdpa(
     policy: CudnnSdpaPlanPolicy,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, Some(policy), None)
+    providers_impl(runtime, config, selected, Some(policy), None, None)
 }
 
 pub(crate) fn providers_with_fused_f32(
@@ -38,7 +38,18 @@ pub(crate) fn providers_with_fused_f32(
     fused: &CudaCutlassFusedF32Config,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, policy, Some(fused))
+    providers_impl(runtime, config, selected, policy, Some(fused), None)
+}
+
+pub(crate) fn providers_with_native_options(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCudnnConfig,
+    policy: Option<CudnnSdpaPlanPolicy>,
+    fused: Option<&CudaCutlassFusedF32Config>,
+    convrot: Option<&CudaConvRotFusedOutputConfig>,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    providers_impl(runtime, config, selected, policy, fused, convrot)
 }
 
 fn providers_impl(
@@ -47,6 +58,7 @@ fn providers_impl(
     selected: &[CudaTensorOperation],
     policy: Option<CudnnSdpaPlanPolicy>,
     fused: Option<&CudaCutlassFusedF32Config>,
+    convrot: Option<&CudaConvRotFusedOutputConfig>,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     let cap = require_convolution_capability(runtime.descriptor())?;
     selection::validate_selection(selected)?;
@@ -66,6 +78,7 @@ fn providers_impl(
         .iter()
         .copied()
         .filter(|op| *op != CudaTensorOperation::StructuredGqaAttentionFusedF32)
+        .filter(|op| convrot.is_none() || !comfy_convrot::supports_fused_operation(*op))
         .collect();
     let mut descriptors = if ordinary.is_empty() {
         Vec::new()
@@ -119,6 +132,11 @@ fn providers_impl(
     if let (Some(descriptor), Some(config)) = (fused_descriptor, fused) {
         providers.push(gqa_fused_f32::provider(
             descriptor, &kernels, runtime, config,
+        )?);
+    }
+    if let Some(config) = convrot {
+        providers.extend(comfy_convrot::fused_providers(
+            runtime, &kernels, config, selected,
         )?);
     }
     if let Some(cache) = sdpa {

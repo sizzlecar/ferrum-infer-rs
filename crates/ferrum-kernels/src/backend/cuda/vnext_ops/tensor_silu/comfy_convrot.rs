@@ -1,4 +1,4 @@
-//! Canonical W4/W8 static bytes and actual INT8/INT32 cuBLAS GEMM.
+//! Canonical W4/W8 static bytes with cuBLAS INT32 or fused BF16 GEMM output.
 //! No BF16 matrix multiplication or whole-model weight expansion is used.
 use super::super::{tensor_dense_bf16 as dense, tensor_storage};
 use super::*;
@@ -18,7 +18,59 @@ use ferrum_runtime::{
     COMFY_CONVROT_W8A8_F32_OPERATION_ID,
 };
 
+mod fused_native;
 mod launch;
+pub(crate) use fused_native::source_fingerprint as fused_output_source_fingerprint;
+pub use fused_native::CudaConvRotFusedOutputConfig;
+
+pub(super) fn supports_fused_operation(operation: CudaTensorOperation) -> bool {
+    fused_storage(operation).is_some()
+}
+fn fused_storage(operation: CudaTensorOperation) -> Option<Storage> {
+    match operation {
+        CudaTensorOperation::ComfyConvRotW4A8 => Some(Storage::CodebookW4),
+        CudaTensorOperation::ComfyConvRotW8A8 => Some(Storage::RotatedI8),
+        CudaTensorOperation::ComfyConvRotSwiGluF32W4A8 => Some(Storage::SwiGluCodebookW4),
+        CudaTensorOperation::ComfyConvRotSwiGluF32W8A8 => Some(Storage::SwiGluRotatedI8),
+        _ => None,
+    }
+}
+pub(super) fn fused_providers(
+    runtime: &CudaDeviceRuntime,
+    kernels: &Arc<RetainedFunctions>,
+    config: &CudaConvRotFusedOutputConfig,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    let storage: Vec<_> = selected.iter().copied().filter_map(fused_storage).collect();
+    if storage.is_empty() {
+        return Err(CudaDeviceRuntimeError::contract(
+            "fused ConvRot configuration requires a selected BF16 ConvRot operation",
+        ));
+    }
+    let descriptors = storage
+        .iter()
+        .map(|s| {
+            crate::native_ops::cutlass_int8_fused_output::provider_descriptor(
+                runtime.descriptor(),
+                s.operation(),
+            )
+            .map_err(contract_error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let native = fused_native::Native::new(runtime, config)?;
+    Ok(storage
+        .into_iter()
+        .zip(descriptors)
+        .map(|(storage, descriptor)| {
+            Box::new(Provider {
+                descriptor,
+                kernels: Arc::clone(kernels),
+                storage,
+                native: Some(Arc::clone(&native)),
+            }) as Box<dyn OperationProvider<CudaDeviceRuntime>>
+        })
+        .collect())
+}
 
 pub const NUMERICAL_PROFILE: &str = "cuda.comfy.regular_h256.codebook_w4a8.bf16_int32.v1";
 pub const INT8_NUMERICAL_PROFILE: &str =
@@ -143,10 +195,15 @@ struct Shape {
     row_scales: u64,
     decoded_weight: Option<u64>,
     accumulator: u64,
+    fused_scratch_bytes: u64,
     scratch_bytes: u64,
     arithmetic: u64,
 }
 impl Shape {
+    fn with_fused_output(mut self) -> Self {
+        self.scratch_bytes = self.fused_scratch_bytes;
+        self
+    }
     fn output_elements(self) -> u64 {
         self.rows * self.outputs
     }
@@ -253,6 +310,7 @@ pub(super) fn provider(
         descriptor,
         kernels: Arc::clone(kernels),
         storage: Storage::CodebookW4,
+        native: None,
     })
 }
 pub(super) fn int8_provider(
@@ -263,6 +321,7 @@ pub(super) fn int8_provider(
         descriptor,
         kernels: Arc::clone(kernels),
         storage: Storage::RotatedI8,
+        native: None,
     })
 }
 pub(super) fn swiglu_w4_provider(
@@ -273,6 +332,7 @@ pub(super) fn swiglu_w4_provider(
         descriptor,
         kernels: Arc::clone(kernels),
         storage: Storage::SwiGluCodebookW4,
+        native: None,
     })
 }
 pub(super) fn swiglu_w8_provider(
@@ -283,6 +343,7 @@ pub(super) fn swiglu_w8_provider(
         descriptor,
         kernels: Arc::clone(kernels),
         storage: Storage::SwiGluRotatedI8,
+        native: None,
     })
 }
 pub(super) fn f32_w4_provider(
@@ -293,6 +354,7 @@ pub(super) fn f32_w4_provider(
         descriptor,
         kernels: Arc::clone(kernels),
         storage: Storage::F32CodebookW4,
+        native: None,
     })
 }
 pub(super) fn f32_w8_provider(
@@ -303,12 +365,14 @@ pub(super) fn f32_w8_provider(
         descriptor,
         kernels: Arc::clone(kernels),
         storage: Storage::F32RotatedI8,
+        native: None,
     })
 }
 struct Provider {
     descriptor: OperationProviderDescriptor,
     kernels: Arc<RetainedFunctions>,
     storage: Storage,
+    native: Option<Arc<fused_native::Native>>,
 }
 impl OperationResourceEstimator for Provider {
     fn descriptor(&self) -> &OperationProviderDescriptor {
@@ -323,8 +387,17 @@ impl OperationResourceEstimator for Provider {
         {
             return Err(invalid("estimator received another operation"));
         }
-        let shape =
+        let mut shape =
             geometry(self.storage, request.values(), request.attributes()).map_err(invalid)?;
+        let prepared = self
+            .native
+            .as_ref()
+            .map(|native| native.prepare(shape, self.storage))
+            .transpose()
+            .map_err(|e| invalid(e.to_string()))?;
+        if prepared.as_ref().is_some_and(|p| p.fused()) {
+            shape = shape.with_fused_output();
+        }
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::fixed(shape.scratch_bytes)?,
             256,
@@ -332,7 +405,7 @@ impl OperationResourceEstimator for Provider {
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
-        Ok(OperationResourceEstimate::new(
+        let estimate = OperationResourceEstimate::new(
             self.descriptor.resource_estimator_id(),
             self.descriptor.resource_estimator_version(),
             self.descriptor
@@ -341,7 +414,13 @@ impl OperationResourceEstimator for Provider {
             16,
             Some(scratch),
             None,
-        ))
+        );
+        match prepared {
+            Some(prepared) => estimate
+                .with_prepared_implementation_fingerprint(prepared.fingerprint.clone())?
+                .with_prepared_implementation_retention(prepared),
+            None => Ok(estimate),
+        }
     }
 }
 impl OperationProvider<CudaDeviceRuntime> for Provider {
@@ -386,11 +465,28 @@ impl Provider {
         {
             return Err("ConvRot requires its selected fixed tensor contract".into());
         }
-        let shape = geometry(
+        let mut shape = geometry(
             self.storage,
             participant.bindings(),
             participant.attributes(),
         )?;
+        let prepared = if let Some(native) = &self.native {
+            let prepared = invocation
+                .prepared_implementation::<fused_native::Prepared>()
+                .ok_or("ConvRot missing admitted native selection")?;
+            prepared.validate(
+                native,
+                shape,
+                invocation.prepared_implementation_fingerprint(),
+            )?;
+            if prepared.fused() {
+                shape = shape.with_fused_output();
+            }
+            Some(prepared)
+        } else {
+            None
+        };
+        let fused = prepared.as_ref().is_some_and(|p| p.fused());
         let inputs = self.storage.inputs();
         let mut regions = Vec::with_capacity(inputs + 2);
         for (role, ordinal) in (0..inputs)
@@ -436,17 +532,29 @@ impl Provider {
         let kernels = Arc::clone(&self.kernels);
         let storage = self.storage;
         CudaDeviceCommand::operation_with_blas(
-            storage.command(),
+            if fused {
+                "vnext_comfy_convrot_cutlass_int8_fused_output"
+            } else {
+                storage.command()
+            },
             regions,
             move |stream, blas, regions| {
-                launch::enqueue(stream, blas, &kernels, regions, shape, storage)
+                launch::enqueue(
+                    stream,
+                    blas,
+                    &kernels,
+                    regions,
+                    shape,
+                    storage,
+                    prepared.as_deref(),
+                )
             },
         )
         .and_then(|command| {
             command.with_tensor_work(
                 shape.output_elements(),
                 shape.arithmetic(),
-                if storage.codebook() { 5 } else { 4 },
+                (if storage.codebook() { 5 } else { 4 }) - u64::from(fused),
                 0,
             )
         })
@@ -501,6 +609,7 @@ fn geometry(
                 row_scales: scratch.row_scales,
                 decoded_weight: Some(scratch.decoded_weight),
                 accumulator: scratch.accumulator,
+                fused_scratch_bytes: geometry.scratch_without_accumulator_bytes(),
                 scratch_bytes: scratch.total_bytes,
                 arithmetic: geometry.logical_arithmetic_operations(),
             })
@@ -524,6 +633,7 @@ fn geometry(
                 row_scales: scratch.row_scales,
                 decoded_weight: None,
                 accumulator: scratch.accumulator,
+                fused_scratch_bytes: geometry.scratch_without_accumulator_bytes(),
                 scratch_bytes: scratch.total_bytes,
                 arithmetic: geometry.logical_arithmetic_operations(),
             })

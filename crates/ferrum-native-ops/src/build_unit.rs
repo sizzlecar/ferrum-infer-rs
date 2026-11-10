@@ -11,6 +11,7 @@ use crate::ResolvedNativeOperatorArtifactSet;
 pub enum CudaNativeBuildUnit {
     CutlassFp8ScaledMm,
     CutlassFusedF32Attention,
+    CutlassInt8FusedOutput,
     FlashinferXqa,
     Marlin,
     VllmMarlin,
@@ -23,9 +24,10 @@ pub enum CudaNativeBuildUnit {
 }
 
 impl CudaNativeBuildUnit {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::CutlassFp8ScaledMm,
         Self::CutlassFusedF32Attention,
+        Self::CutlassInt8FusedOutput,
         Self::FlashinferXqa,
         Self::Marlin,
         Self::VllmMarlin,
@@ -41,6 +43,7 @@ impl CudaNativeBuildUnit {
         match self {
             Self::CutlassFp8ScaledMm => "cutlass_fp8_scaled_mm",
             Self::CutlassFusedF32Attention => "cutlass_fused_f32_attention",
+            Self::CutlassInt8FusedOutput => "cutlass_int8_fused_output",
             Self::FlashinferXqa => "flashinfer_xqa",
             Self::Marlin => "marlin",
             Self::VllmMarlin => "vllm_marlin",
@@ -58,6 +61,9 @@ impl CudaNativeBuildUnit {
             Self::CutlassFp8ScaledMm => crate::cutlass_fp8::CUTLASS_FP8_OPERATOR,
             Self::CutlassFusedF32Attention => {
                 crate::cutlass_fused_f32_attention::CUTLASS_FUSED_F32_ATTENTION_OPERATOR
+            }
+            Self::CutlassInt8FusedOutput => {
+                crate::cutlass_int8_fused_output::CUTLASS_INT8_FUSED_OUTPUT_OPERATOR
             }
             Self::FlashinferXqa => "ferrum.cuda.flashinfer_xqa_decode",
             Self::Marlin => "ferrum.cuda.marlin",
@@ -84,9 +90,10 @@ impl CudaNativeBuildUnit {
     /// the retained mathematical entrypoint signatures.
     pub const fn required_operator_abi_version(self) -> Option<&'static str> {
         match self {
-            Self::CutlassFp8ScaledMm | Self::CutlassFusedF32Attention | Self::FlashinferXqa => {
-                Some("1")
-            }
+            Self::CutlassFp8ScaledMm
+            | Self::CutlassFusedF32Attention
+            | Self::CutlassInt8FusedOutput
+            | Self::FlashinferXqa => Some("1"),
             Self::Marlin => Some("2"),
             Self::VllmMoeMarlin => Some("3"),
             _ => None,
@@ -152,6 +159,9 @@ impl CudaNativeBuildUnit {
             Self::CutlassFp8ScaledMm => &crate::cutlass_fp8::CUTLASS_FP8_EXPORTS,
             Self::CutlassFusedF32Attention => {
                 &crate::cutlass_fused_f32_attention::CUTLASS_FUSED_F32_ATTENTION_EXPORTS
+            }
+            Self::CutlassInt8FusedOutput => {
+                &crate::cutlass_int8_fused_output::CUTLASS_INT8_FUSED_OUTPUT_EXPORTS
             }
             Self::FlashinferXqa => &[
                 "ferrum_flashinfer_xqa_plan_v1",
