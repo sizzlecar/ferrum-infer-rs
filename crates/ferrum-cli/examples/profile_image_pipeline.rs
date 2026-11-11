@@ -82,6 +82,7 @@ struct Arguments {
     cudnn_library: Option<PathBuf>,
 }
 
+#[cfg(any(feature = "cuda-cutlass-fp8", test))]
 impl Arguments {
     /// Resolve metadata only; neither source loads assets or starts a device here.
     fn source(&self) -> Result<ferrum_cli::commands::image_product::ImageProductSource> {

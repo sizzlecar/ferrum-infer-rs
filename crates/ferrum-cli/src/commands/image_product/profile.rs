@@ -15,9 +15,10 @@ use super::{
 #[cfg(feature = "cuda")]
 use anyhow::Context;
 use anyhow::{ensure, Result};
-use ferrum_engine::image_generation::ImageGenerationRequest;
 #[cfg(feature = "cuda")]
-use ferrum_engine::image_generation::{ImageEditRequest, ImageGenerationReceipt};
+use ferrum_engine::image_generation::{
+    ImageEditRequest, ImageGenerationReceipt, ImageGenerationRequest,
+};
 use ferrum_runtime::DeviceTimingMode;
 #[cfg(feature = "cuda")]
 use ferrum_runtime::HostMemoryClass;
@@ -32,6 +33,7 @@ use std::{collections::BTreeMap, io::Write, time::Instant};
 /// Explicit diagnostic inputs. Batches bypass HTTP scheduling but retain the
 /// product pipeline, admission, residency, and request-prefix cache policy.
 pub struct ImageProfileWorkload {
+    #[cfg(feature = "cuda")]
     pub request: ImageGenerationRequest,
     pub image: Option<PathBuf>,
     pub batches: Vec<usize>,
@@ -733,6 +735,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let capture_path = root.path().join("captures");
         let mut workload = ImageProfileWorkload {
+            #[cfg(feature = "cuda")]
             request: ImageGenerationRequest {
                 prompt: "A ceramic teapot".into(),
                 width: 1024,

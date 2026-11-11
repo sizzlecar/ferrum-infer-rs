@@ -1,17 +1,20 @@
 //! An explicitly configured diagnostic sink. It is opened before native
 //! construction, never overwrites a file, and consumes the original bounded
 //! engine collector without a second payload buffer or inferred retirement.
-use anyhow::{ensure, Context, Result};
-use ferrum_engine::image_generation::continuous_trace::{
-    ImageContinuousTraceHandle, ImageContinuousTraceLimits,
-};
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
+use anyhow::Context;
+use anyhow::{ensure, Result};
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+use ferrum_engine::image_generation::continuous_trace::ImageContinuousTraceHandle;
+use ferrum_engine::image_generation::continuous_trace::ImageContinuousTraceLimits;
+#[cfg(feature = "cuda")]
 use ferrum_engine::image_generation::p_h3::PH3ImagePromptExpansionDiagnosticPolicy;
 use serde::Deserialize;
-use std::{
-    fs::{File, OpenOptions},
-    io::Write,
-    path::{Path, PathBuf},
-};
+#[cfg(any(test, feature = "cuda"))]
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
+use std::{fs::File, io::Write};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,13 +42,19 @@ impl PH3ImageContinuousTraceConfig {
     }
 }
 
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
 pub(super) struct PreparedTraceArtifact {
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     path: PathBuf,
     file: File,
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     limits: ImageContinuousTraceLimits,
+    #[cfg(feature = "cuda")]
     prompt_expansion_diagnostics: PH3ImagePromptExpansionDiagnosticPolicy,
 }
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
 impl PreparedTraceArtifact {
+    #[cfg(any(test, feature = "cuda"))]
     pub(super) fn open(config: &PH3ImageContinuousTraceConfig) -> Result<Self> {
         config.validate()?;
         let file = OpenOptions::new()
@@ -54,12 +63,16 @@ impl PreparedTraceArtifact {
             .open(&config.path)
             .with_context(|| format!("create new continuous trace {}", config.path.display()))?;
         Ok(Self {
+            #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
             path: config.path.clone(),
             file,
+            #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
             limits: config.limits(),
+            #[cfg(feature = "cuda")]
             prompt_expansion_diagnostics: PH3ImagePromptExpansionDiagnosticPolicy::Disabled,
         })
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn with_prompt_expansion_diagnostics(
         mut self,
         policy: PH3ImagePromptExpansionDiagnosticPolicy,
@@ -67,12 +80,15 @@ impl PreparedTraceArtifact {
         self.prompt_expansion_diagnostics = policy;
         self
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn prompt_expansion_diagnostics(&self) -> PH3ImagePromptExpansionDiagnosticPolicy {
         self.prompt_expansion_diagnostics
     }
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     pub(super) fn limits(&self) -> ImageContinuousTraceLimits {
         self.limits
     }
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     pub(super) fn bind(self, handle: ImageContinuousTraceHandle) -> ActiveTraceArtifact {
         ActiveTraceArtifact {
             path: self.path,
@@ -82,11 +98,13 @@ impl PreparedTraceArtifact {
     }
 }
 
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 pub(super) struct ActiveTraceArtifact {
     path: PathBuf,
     file: File,
     handle: ImageContinuousTraceHandle,
 }
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 impl ActiveTraceArtifact {
     /// The caller has already obtained its original inference/shutdown result.
     /// Diagnostic I/O cannot replace that result or consume its recovery owner.
@@ -113,6 +131,7 @@ impl ActiveTraceArtifact {
     }
 }
 
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
 fn write_snapshot<T>(file: &mut File, write: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
     let result = write(file)?;
     file.flush().context("flush continuous image trace")?;

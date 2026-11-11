@@ -7,6 +7,7 @@ mod configuration;
 mod directory;
 #[cfg(any(feature = "cuda", test))]
 mod dit_input_capture;
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
 mod document;
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 mod factory;

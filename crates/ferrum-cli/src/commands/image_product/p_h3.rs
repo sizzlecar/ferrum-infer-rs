@@ -18,10 +18,7 @@ use std::path::{Path, PathBuf};
 
 mod prompt_expansion;
 pub use super::trace_artifact::PH3ImageContinuousTraceConfig;
-pub use prompt_expansion::{
-    PH3ImageCausalModuleConfig, PH3ImagePromptExpansionConfig, PH3ImagePromptExpansionVisionLimits,
-    PH3ImagePromptExpansionWeightCacheConfig,
-};
+pub use prompt_expansion::{PH3ImageCausalModuleConfig, PH3ImagePromptExpansionConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
