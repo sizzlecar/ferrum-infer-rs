@@ -314,6 +314,21 @@ pub struct QwenImage21Pipeline<R: DeviceRuntime> {
     editing_profiles: Option<QwenImage21EditProfiles>,
 }
 
+/// Original plans and admitted conditioning owners for the remaining stages.
+/// Keep their execution in a separate frame from edit conditioning: unoptimized
+/// builds otherwise stack both stages' large, failure-owning Result temporaries.
+struct ConditionedRequest<R: DeviceRuntime> {
+    transformer: QwenImage21TransformerConfig,
+    decoder: QwenImage21VaeDecoderConfig,
+    latent_shape: QwenImage21LatentShape,
+    noise_stage: PreparedStage<R>,
+    denoise_stage: PreparedStage<R>,
+    prefix_decode: Option<prepare::PreparedPrefixDecode<R>>,
+    decode_stage: PreparedStage<R>,
+    text_input: ManagedHostTensor,
+    reference: Option<ManagedHostTensor>,
+}
+
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// Select diagnostic device observation before any request or session exists.
     pub fn with_device_timing_mode(mut self, mode: DeviceTimingMode) -> anyhow::Result<Self> {
@@ -591,6 +606,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             source,
             active: None,
         };
+        // Validate the permutation before any conditioning work, as for the
+        // subsequent noise stage. This iterator borrows only request metadata.
         let ordered_requests = request_order.requests(requests).map_err(process)?;
 
         let (text_input, reference) = if let Some(edit) = edit {
@@ -627,6 +644,51 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .map_err(process)?;
             drop(hidden);
             (features.into_tensor(), None)
+        };
+
+        self.run_conditioned(
+            ConditionedRequest {
+                transformer,
+                decoder,
+                latent_shape,
+                noise_stage,
+                denoise_stage,
+                prefix_decode,
+                decode_stage,
+                text_input,
+                reference,
+            },
+            &request_order,
+            ordered_requests,
+            job,
+            stages,
+            steps,
+        )
+    }
+
+    fn run_conditioned<'a>(
+        &mut self,
+        conditioned: ConditionedRequest<R>,
+        request_order: &prepare::BatchOrder,
+        ordered_requests: impl Iterator<Item = &'a ImageGenerationRequest>,
+        job: u64,
+        stages: &mut Vec<ImageStageReceipt>,
+        steps: &mut Vec<ImageDenoiseStepReceipt>,
+    ) -> Result<Vec<TensorExecutionOutput>, ImageGenerationFailure<R>> {
+        let ConditionedRequest {
+            transformer,
+            decoder,
+            latent_shape,
+            noise_stage,
+            denoise_stage,
+            prefix_decode,
+            decode_stage,
+            text_input,
+            reference,
+        } = conditioned;
+        let process = |source| ImageGenerationFailure::Processing {
+            source,
+            active: None,
         };
 
         // A batch has independent seed streams, not one longer draw. The
@@ -816,8 +878,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .into_input_tensor()
             .map_err(process)?;
         drop(normalized);
-        let outputs =
-            self.decode_batch(decode_stage, &decoder, input, requests.len(), job, stages)?;
+        let outputs = self.decode_batch(
+            decode_stage,
+            &decoder,
+            input,
+            request_order.caller_indices().len(),
+            job,
+            stages,
+        )?;
         request_order.restore_outputs(outputs).map_err(process)
     }
 

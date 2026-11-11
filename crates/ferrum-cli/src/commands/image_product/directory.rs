@@ -487,7 +487,7 @@ impl ImageProductSource {
         self.prepare_with_trace(true)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn prepare_for_profile(&self) -> Result<PreparedProduct> {
         self.prepare_with_trace(false)
     }
