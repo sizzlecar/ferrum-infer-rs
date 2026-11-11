@@ -220,29 +220,29 @@ impl PreparedPipeline {
         artifact: &super::trace_artifact::PreparedTraceArtifact,
         context: &serde_json::Value,
     ) -> Result<ferrum_engine::image_generation::continuous_trace::ImageContinuousTraceHandle> {
-        let handle = self.enable_continuous_trace(artifact.limits(), context)?;
+        let _handle = self.enable_continuous_trace(artifact.limits(), context)?;
         match self {
             #[cfg(feature = "cuda")]
             Self::PH3Cuda(pipeline) => {
                 pipeline
                     .set_prompt_expansion_diagnostics(artifact.prompt_expansion_diagnostics())?;
+                Ok(_handle)
             }
             #[allow(unreachable_patterns)]
             _ => {
                 anyhow::bail!("this product pipeline does not declare prompt expansion diagnostics")
             }
         }
-        Ok(handle)
     }
 
     pub(super) fn enable_continuous_trace(
         &mut self,
-        limits: ferrum_engine::image_generation::continuous_trace::ImageContinuousTraceLimits,
-        context: &serde_json::Value,
+        _limits: ferrum_engine::image_generation::continuous_trace::ImageContinuousTraceLimits,
+        _context: &serde_json::Value,
     ) -> Result<ferrum_engine::image_generation::continuous_trace::ImageContinuousTraceHandle> {
         match self {
             #[cfg(feature = "cuda")]
-            Self::PH3Cuda(pipeline) => pipeline.enable_continuous_trace(limits, context),
+            Self::PH3Cuda(pipeline) => pipeline.enable_continuous_trace(_limits, _context),
             #[allow(unreachable_patterns)]
             _ => anyhow::bail!("this product pipeline does not declare continuous trace support"),
         }

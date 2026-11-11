@@ -366,6 +366,7 @@ impl ImageProductError {
             pipeline: pipeline.into_generator(),
         }
     }
+    #[cfg(all(test, feature = "cuda"))]
     fn generation<R: ferrum_runtime::DeviceRuntime>(
         source: ferrum_engine::image_generation::ImageGenerationError<R>,
         pipeline: Box<ferrum_engine::image_generation::QwenImage21Pipeline<R>>,

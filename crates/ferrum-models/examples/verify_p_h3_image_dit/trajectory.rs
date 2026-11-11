@@ -195,7 +195,7 @@ impl<'a> EulerRun<'a> {
             "final F32 latent exceeds output budget"
         );
         let sigma = tensor(archive, "trajectory_sigmas", safetensors::Dtype::F32, &[9])?;
-        let sigmas = std::array::from_fn(|i| f32_at(sigma.bytes(), i));
+        let sigmas: [f32; 9] = std::array::from_fn(|i| f32_at(sigma.bytes(), i));
         ensure!(
             sigmas[0].to_bits() == (capture.sigma as f32).to_bits()
                 && sigmas[8] == 0.0
