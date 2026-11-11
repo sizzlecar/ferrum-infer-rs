@@ -7,6 +7,21 @@ on:
         description: "Completed Deliver formal release run whose candidate and frozen evidence will be reused"
         required: true
         type: string
+      manual_cargo_only:
+        description: "Explicit source-only recovery using approved archive checksums; does not pass the formal delivery gate"
+        required: false
+        default: false
+        type: boolean
+      cargo_manifest_asset_id:
+        description: "Same-repository release asset containing the approved source candidate and complete publishable crate inventory"
+        required: false
+        default: ''
+        type: string
+      cargo_manifest_sha256:
+        description: "SHA-256 of the approved cargo manifest; required for manual_cargo_only"
+        required: false
+        default: ''
+        type: string
       manual_sm120_evidence_asset_id:
         description: "Optional same-repository release asset containing original manually executed SM120 evidence; requires its SHA-256"
         required: false
@@ -46,8 +61,173 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
+  manual-cargo:
+    if: inputs.manual_cargo_only && github.repository == 'sizzlecar/ferrum-infer-rs'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - name: Resolve the approved source-only publication input
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_run_id }}
+          MANIFEST_ASSET: ${{ inputs.cargo_manifest_asset_id }}
+          MANIFEST_SHA: ${{ inputs.cargo_manifest_sha256 }}
+        run: |
+          [[ "$SOURCE_RUN" =~ ^[1-9][0-9]*$ ]]
+          [[ "$MANIFEST_ASSET" =~ ^[1-9][0-9]*$ ]]
+          [[ "$MANIFEST_SHA" =~ ^[0-9a-f]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/cargo-publication"
+          cd "$RUNNER_TEMP/cargo-publication"
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$MANIFEST_ASSET" > manifest-asset.json
+          jq -e --argjson id "$MANIFEST_ASSET" --arg digest "sha256:$MANIFEST_SHA" \
+            '.id == $id and .state == "uploaded" and .digest == $digest' manifest-asset.json
+          gh api -H 'Accept: application/octet-stream' \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$MANIFEST_ASSET" > manifest.json
+          printf '%s  manifest.json\n' "$MANIFEST_SHA" | sha256sum --check --status
+          jq -e --argjson run "$SOURCE_RUN" '
+            .schema_version == 1 and .source_run_id == $run and
+            .publication_scope == "source-only-manual-recovery" and
+            .cargo_toolchain == "1.91.0" and .package_verification == "no-verify" and
+            (.candidate_sha | test("^[0-9a-f]{40}$")) and
+            (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+            (.crates | length > 0) and
+            ([.crates[].name] | length == (unique | length)) and
+            (all(.crates[]; (.name | test("^[a-z0-9_-]+$")) and
+              (.sha256 | test("^[0-9a-f]{64}$"))))' manifest.json
+          candidate=$(jq -er .candidate_sha manifest.json)
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" > source-run.json
+          jq -e --argjson id "$SOURCE_RUN" --argjson repo "$GITHUB_REPOSITORY_ID" --arg candidate "$candidate" '
+            .id == $id and .repository.id == $repo and .head_repository.id == $repo and
+            .head_sha == $candidate and .head_branch == "main" and .status == "completed" and
+            .run_attempt > 0 and (.event == "push" or .event == "workflow_dispatch") and
+            (.path | split("@")[0]) == ".github/workflows/release-delivery.yml"' source-run.json
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/jobs?filter=all&per_page=100" > quality-pages.json
+          jq -e --argjson run "$SOURCE_RUN" --arg candidate "$candidate" --slurpfile source source-run.json '
+            [.[] | .jobs[] | select(.name == "Quality / CI required")] |
+            sort_by(.run_attempt) |
+            if length == 0 then error("missing required quality job") else . end |
+            if (group_by(.run_attempt) | any(.[]; length != 1)) then error("ambiguous quality attempt") else . end |
+            if all(.[]; .run_id == $run and .head_sha == $candidate and
+              .run_attempt > 0 and .run_attempt <= $source[0].run_attempt) then .[-1]
+            else error("quality identity mismatch") end |
+            select(.status == "completed" and .conclusion == "success")' quality-pages.json > accepted-quality.json
+          echo "candidate=$candidate" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.candidate }}
+          path: candidate
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Package the exact candidate and verify the complete archive inventory
+        working-directory: candidate
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
+        run: |
+          evidence="$RUNNER_TEMP/cargo-publication"
+          test "$(git rev-parse HEAD)" = "$(jq -er .candidate_sha "$evidence/manifest.json")"
+          test -z "$(git status --porcelain)"
+          cargo metadata --locked --no-deps --format-version 1 > "$evidence/metadata.json"
+          ruby -rjson -e '
+            manifest, metadata = ARGV.map { |p| JSON.parse(File.read(p)) }
+            members = metadata.fetch("workspace_members")
+            packages = metadata.fetch("packages").select { |p|
+              members.include?(p.fetch("id")) &&
+                (p["publish"].nil? || p["publish"].include?("crates-io"))
+            }.map { |p| [p.fetch("name"), p.fetch("version")] }.sort
+            expected = manifest.fetch("crates").map { |p| [p.fetch("name"), p.fetch("version")] }.sort
+            abort "publishable inventory/version mismatch" unless packages == expected &&
+              packages.all? { |_, v| v == manifest.fetch("version") }
+          ' "$evidence/manifest.json" "$evidence/metadata.json"
+          cargo package --workspace --registry crates-io --locked --allow-dirty --no-verify 2>&1 | tee "$evidence/package.log"
+          jq -r --arg dir "$CARGO_TARGET_DIR/package" \
+            '.crates[] | "\(.sha256)  \($dir)/\(.name)-\(.version).crate"' \
+            "$evidence/manifest.json" > "$evidence/expected.sha256"
+          sha256sum --check "$evidence/expected.sha256" | tee "$evidence/package-verification.log"
+          while IFS=$'\t' read -r name version; do
+            tar -xOf "$CARGO_TARGET_DIR/package/$name-$version.crate" "$name-$version/.cargo_vcs_info.json" |
+              jq -e --arg candidate "$(jq -er .candidate_sha "$evidence/manifest.json")" \
+                '.git.sha1 == $candidate and (.git.dirty // false) == false' > /dev/null
+          done < <(jq -r '.crates[] | [.name, .version] | @tsv' "$evidence/manifest.json")
+      - name: Reconcile and publish only missing approved crates
+        working-directory: candidate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
+        run: |
+          test -n "$CARGO_REGISTRY_TOKEN"
+          evidence="$RUNNER_TEMP/cargo-publication"
+          # Read public sparse-index entries without sending the publishing credential.
+          reconcile() {
+            local label="$1" name version expected path status
+            : > "$evidence/$label-missing.txt"
+            while IFS=$'\t' read -r name version expected; do
+              case ${#name} in
+                1|2) path="${#name}/$name" ;;
+                3) path="3/${name:0:1}/$name" ;;
+                *) path="${name:0:2}/${name:2:2}/$name" ;;
+              esac
+              status=$(curl --silent --show-error --retry 3 --retry-all-errors \
+                --connect-timeout 15 --max-time 60 --output "$evidence/$label-$name.index" \
+                --write-out '%{http_code}' "https://index.crates.io/$path") || return 1
+              case "$status" in
+                404) echo "$name" >> "$evidence/$label-missing.txt" ;;
+                200)
+                  jq -es --arg name "$name" --arg version "$version" --arg sha "$expected" '
+                    if length > 0 and all(.[]; .name == $name and
+                      (.vers | type == "string") and (.cksum | test("^[0-9a-f]{64}$")) and
+                      (.yanked | type == "boolean")) then . else error("invalid sparse index") end |
+                    [.[] | select(.vers == $version)] |
+                    if length == 0 then false
+                    elif length == 1 and .[0].name == $name and .[0].cksum == $sha and .[0].yanked == false then true
+                    else error("published archive conflict or yanked version") end' \
+                    "$evidence/$label-$name.index" > "$evidence/$label-$name.match" && continue
+                  result=$?
+                  # jq exit 1 means a valid index with the requested version absent.
+                  if [ "$result" = 1 ]; then echo "$name" >> "$evidence/$label-missing.txt"; else return "$result"; fi
+                  ;;
+                *) echo "Unverified registry HTTP status $status for $name" >&2; return 1 ;;
+              esac
+            done < <(jq -r '.crates[] | [.name, .version, .sha256] | @tsv' "$evidence/manifest.json")
+          }
+          reconcile before
+          sha256sum --check --status "$evidence/expected.sha256"
+          mapfile -t missing < "$evidence/before-missing.txt"
+          publish_status=0
+          if [ "${#missing[@]}" -gt 0 ]; then
+            packages=()
+            for name in "${missing[@]}"; do packages+=(-p "$name"); done
+            set +e
+            cargo publish "${packages[@]}" --registry crates-io --locked --allow-dirty --no-verify 2>&1 | tee "$evidence/publish.log"
+            publish_status=${PIPESTATUS[0]}
+            set -e
+          fi
+          printf '%s\n' "$publish_status" > "$evidence/publish-exit-code.txt"
+          sha256sum --check "$evidence/expected.sha256" | tee "$evidence/post-publish-verification.log"
+          for attempt in {1..30}; do
+            reconcile after
+            if [ ! -s "$evidence/after-missing.txt" ]; then
+              jq '{candidate_sha, source_run_id, version, package_verification,
+                publication_scope, crates, registry_verified: true,
+                formal_delivery_gate_passed: false}' "$evidence/manifest.json" > "$evidence/published.json"
+              echo 'Source-only publication: all approved crate checksums verified in crates.io. Package compilation was explicitly skipped; this does not pass or replace the formal delivery/model gate.' >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if [ "$publish_status" != 0 ]; then exit "$publish_status"; fi
+            sleep 10
+          done
+          echo 'Registry visibility remains incomplete; rerun reconciles and publishes only missing crates.' >&2
+          exit 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: manual-cargo-publication
+          path: ${{ runner.temp }}/cargo-publication/
+          if-no-files-found: warn
+          retention-days: 30
   publish:
-    if: github.repository == 'sizzlecar/ferrum-infer-rs' && github.ref == 'refs/heads/main'
+    if: ${{ !inputs.manual_cargo_only && github.repository == 'sizzlecar/ferrum-infer-rs' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
