@@ -1614,6 +1614,10 @@ impl WeightMaterializerRegistry {
             plan,
             descriptor: descriptor.clone(),
             materializer: Arc::clone(materializer),
+            // The registry installs this reserved ID itself and rejects any
+            // replacement. A user descriptor alone cannot mint this proof.
+            identity_range_authority: (materializer_id.as_str() == IDENTITY_WEIGHT_MATERIALIZER_ID)
+                .then_some(IdentityRangeAuthority),
         })
     }
 
@@ -1670,6 +1674,7 @@ impl WeightMaterializerRegistry {
             plan,
             descriptor: descriptor.clone(),
             materializer: Arc::clone(materializer),
+            identity_range_authority: None,
         })
     }
 
@@ -1706,7 +1711,11 @@ pub struct TrustedExecutionWeightPlan {
     plan: ExecutionWeightPlan,
     descriptor: WeightMaterializerDescriptor,
     materializer: Arc<dyn WeightMaterializer>,
+    identity_range_authority: Option<IdentityRangeAuthority>,
 }
+
+#[derive(Clone)]
+struct IdentityRangeAuthority;
 
 impl fmt::Debug for TrustedExecutionWeightPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1743,11 +1752,48 @@ impl TrustedExecutionWeightPlan {
             )?,
             descriptor,
             materializer,
+            identity_range_authority: Some(IdentityRangeAuthority),
         })
     }
 
     pub fn plan(&self) -> &ExecutionWeightPlan {
         &self.plan
+    }
+
+    pub(crate) fn validate_identity_range_component(
+        &self,
+        family: &PreparedModelFamily,
+        component: &WeightComponentSpec,
+    ) -> Result<(), VNextError> {
+        self.validate_runtime_authority()?;
+        if self.identity_range_authority.is_none()
+            || self.descriptor != WeightMaterializerDescriptor::identity()?
+            || !self.plan.static_weight_transforms.is_empty()
+            || self
+                .plan
+                .component_sources
+                .get(&component.id)
+                .map(Vec::as_slice)
+                != Some(std::slice::from_ref(&component.id))
+            || self
+                .plan
+                .schema
+                .components
+                .iter()
+                .find(|c| c.id == component.id)
+                != Some(component)
+            || family
+                .stored_weight_schema()?
+                .components
+                .iter()
+                .find(|c| c.id == component.id)
+                != Some(component)
+        {
+            return Err(invalid_plan(
+                "component ranges require the live canonical identity materializer and unchanged one-to-one schema",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn additional_host_backing_bytes(

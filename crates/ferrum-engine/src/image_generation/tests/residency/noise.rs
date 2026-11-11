@@ -133,23 +133,23 @@ fn pipeline() -> (
     ));
     let mut pipeline = QwenImage21Pipeline::new(
         composition.runtime().clone(),
-        original.host,
+        original.execution.host,
         reference_vnext_operation_registry(composition.runtime()).unwrap(),
         composition.catalog().clone(),
         WeightMaterializerRegistry::identity_only().unwrap(),
-        Arc::try_unwrap(original.assets)
+        Arc::try_unwrap(original.execution.sources.assets)
             .ok()
             .expect("unique fixture assets"),
         original.profiles,
-        original.config,
+        original.execution.config,
     )
     .unwrap();
-    pipeline.config.residency = ImageResidencyPolicy::AllStages;
+    pipeline.execution.config.residency = ImageResidencyPolicy::AllStages;
     set_ceiling(&mut pipeline, 4096);
     (pipeline, directory)
 }
 fn set_ceiling(pipeline: &mut QwenImage21Pipeline<ReferenceDeviceRuntime>, bytes: u64) {
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
         maximum_bytes_by_stage: ImageStageRetentionBudgets {
             noise: NonZeroU64::new(bytes),
             ..ImageStageRetentionBudgets::default()
@@ -184,6 +184,7 @@ fn execute(
     TensorExecutionOutput,
 ) {
     let mut bytes = pipeline
+        .execution
         .host
         .allocate_zeroed(HostMemoryClass::InputPreprocess, elements as usize * 2)
         .unwrap();
@@ -221,7 +222,8 @@ fn execute(
 #[test]
 fn weightless_noise_reuses_session_and_backing_without_claiming_weight_reuse() {
     let (mut pipeline, _directory) = pipeline();
-    let capacity = DeviceCapacityOwner::open(pipeline.runtime.descriptor(), DEVICE_BYTES).unwrap();
+    let capacity =
+        DeviceCapacityOwner::open(pipeline.execution.runtime.descriptor(), DEVICE_BYTES).unwrap();
     let mut receipts = Vec::new();
     let mut outputs = Vec::new();
     let mut allocations = 0;
@@ -252,7 +254,7 @@ fn weightless_noise_reuses_session_and_backing_without_claiming_weight_reuse() {
             .reserve(DeviceOpaqueMemoryKind::Bootstrap, 1)
             .is_err());
         drop(remaining);
-        let snapshot = pipeline.runtime.snapshot();
+        let snapshot = pipeline.execution.runtime.snapshot();
         if job == 0 {
             allocations = snapshot.allocations;
         } else {
@@ -268,13 +270,16 @@ fn weightless_noise_reuses_session_and_backing_without_claiming_weight_reuse() {
         "weightless sessions have no snapshot owner to close"
     );
     assert!(matches!(closed[0].retirement, ImageStageRetirement::Closed));
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
     assert_eq!(
         &outputs[0].bytes().bytes()[..2],
         &bf16::from_f32(2.).to_bits().to_le_bytes()
     );
     drop(outputs);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
@@ -291,7 +296,7 @@ fn weightless_noise_shape_replacement_and_tighter_cap_retire_real_backing() {
     pipeline
         .finish_stage(active, &mut receipts)
         .unwrap_or_else(|e| panic!("retain: {e}"));
-    assert!(pipeline.runtime.snapshot().live_allocations > 0);
+    assert!(pipeline.execution.runtime.snapshot().live_allocations > 0);
     let changed = stage(&pipeline, 4);
     assert_ne!(changed.plan.plan_hash, old_hash);
     let active = pipeline
@@ -305,7 +310,7 @@ fn weightless_noise_shape_replacement_and_tighter_cap_retire_real_backing() {
     ));
     assert_eq!(receipts.last().unwrap().execution.plan.plan_hash, old_hash);
     assert_eq!(
-        pipeline.runtime.snapshot().live_allocations,
+        pipeline.execution.runtime.snapshot().live_allocations,
         0,
         "old dynamic owner closes before replacement executes"
     );
@@ -320,9 +325,12 @@ fn weightless_noise_shape_replacement_and_tighter_cap_retire_real_backing() {
         panic!("over-cap chunks must retire")
     };
     assert!(idle_release.reclaimed_bytes() > 1);
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
@@ -358,21 +366,24 @@ fn weightless_noise_actual_backing_counts_after_lowering_its_declared_cap() {
     };
     let required =
         denoiser.plan.static_bytes + demand(&replacement).max(demand(&denoiser) + actual);
-    let before = pipeline.runtime.snapshot();
-    pipeline.config.device_capacity_bytes = required - 1;
+    let before = pipeline.execution.runtime.snapshot();
+    pipeline.execution.config.device_capacity_bytes = required - 1;
     assert!(pipeline
         .validate_resident_capacity(&[&replacement, &denoiser])
         .is_err());
-    pipeline.config.device_capacity_bytes = required;
+    pipeline.execution.config.device_capacity_bytes = required;
     pipeline
         .validate_resident_capacity(&[&replacement, &denoiser])
         .unwrap();
     assert_eq!(
-        pipeline.runtime.snapshot(),
+        pipeline.execution.runtime.snapshot(),
         before,
         "preflight never allocates or erases old receipts"
     );
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }

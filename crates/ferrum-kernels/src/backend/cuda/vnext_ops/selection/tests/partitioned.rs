@@ -7,6 +7,7 @@ pub(super) fn bytes(case: &Case, precision: ArgmaxPrecision) -> Vec<u8> {
         .iter()
         .flat_map(|&value| match precision {
             ArgmaxPrecision::F16 => f16::from_f32(value).to_bits().to_le_bytes().to_vec(),
+            ArgmaxPrecision::Bf16 => bf16::from_f32(value).to_bits().to_le_bytes().to_vec(),
             ArgmaxPrecision::F32 => value.to_le_bytes().to_vec(),
         })
         .collect()
@@ -97,7 +98,11 @@ fn partitioned_argmax_dispatch_threshold_preserves_small_rows() {
 fn partitioned_argmax_matches_scalar_and_old_kernel_with_guarded_windows_on_cuda() {
     let context = CudaContext::new(0).expect("partitioned selection requires CUDA");
     let stream = context.default_stream();
-    for precision in [ArgmaxPrecision::F16, ArgmaxPrecision::F32] {
+    for precision in [
+        ArgmaxPrecision::F16,
+        ArgmaxPrecision::Bf16,
+        ArgmaxPrecision::F32,
+    ] {
         let functions = ArgmaxFunctions::load(&context, precision).unwrap();
         for n in [8191, 8192, 8193, 65535, 65536, 65537, 248320] {
             let cases = large_cases(n);

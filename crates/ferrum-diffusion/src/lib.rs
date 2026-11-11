@@ -15,7 +15,8 @@ mod spatial_latent;
 
 pub use flow_match_euler::{
     Bf16EulerError, Bf16EulerOperand, Bf16EulerProfile, EulerStep, EulerStepError, FlowMatchEuler,
-    FlowMatchEulerSchedule, ManagedBf16Euler, ScheduleError, SchedulerTimestep,
+    FlowMatchEulerSchedule, ManagedBf16Euler, PreparedBf16EulerAdvance, ScheduleError,
+    SchedulerTimestep,
 };
 pub use latent_normalization::{
     denormalize_latent_f32_into, normalize_latent_f32_into, LatentNormalizationError,

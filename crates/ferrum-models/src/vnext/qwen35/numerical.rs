@@ -15,6 +15,9 @@ pub const F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_
 pub const F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.ffn-attention-q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows";
 
 pub const F16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16";
+pub const F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16.visual_prompt_v1";
+pub const BF16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.bf16";
+pub const BF16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID: &str = "qwen3_5.bf16.visual_prompt_v1";
 pub const F32_MASTER_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master";
 pub const F32_MASTER_GGUF_Q8_HEAD_V1_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.gguf-q8-head-v1";
@@ -39,6 +42,7 @@ pub const F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID: &str =
 pub const F16_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16.int8-kv";
 pub const F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.int8-kv";
 
+mod bf16;
 mod q6_f16;
 mod q6_head;
 #[cfg(test)]
@@ -55,8 +59,16 @@ pub(super) fn profiles(
     config: &Qwen35FamilyConfig,
 ) -> Result<FamilyNumericalProfiles, VNextError> {
     let text = Qwen35FamilyProvider::text_config(config)?;
+    if config.dense_precision == Qwen35DensePrecision::Bf16 {
+        return bf16::profiles(family_id, config, &text);
+    }
     let (states, kv_storage) = states(&text, config.max_position_embeddings, KvStorageFormat::F16)?;
     let f16 = profile(family_id, &text, &states, &kv_storage, false, false)?;
+    let visual = (config.weight_format == FamilyWeightFormat::SafetensorsDense
+        && text.moe.is_none()
+        && text.layer_types.contains(&Qwen35LayerType::FullAttention))
+    .then(|| visual_prompt_profile(&f16))
+    .transpose()?;
     let f32 = profile(family_id, &text, &states, &kv_storage, true, false)?;
     let rn_fragment = gguf_rn_f16_fragment_eligible(config, &text)
         .then(|| gguf_rn_f16_fragment_profile(&f32))
@@ -123,6 +135,7 @@ pub(super) fn profiles(
         }
     }
     let mut profiles = vec![f16, f32];
+    profiles.extend(visual);
     // Activation-rotation execution is qualified separately from KV encoding.
     // Until their combination has been validated, offer only F16 KV profiles
     // for source-declared Hadamard weights on both run and serve paths.
@@ -459,6 +472,42 @@ fn gguf_f16_projections_profile(
     profile
         .operations
         .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    Ok(profile)
+}
+
+fn visual_prompt_profile(
+    base: &NumericalExecutionProfile,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    let mut profile = base.clone();
+    profile.id = NumericalProfileId::new(F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID)
+        .map_err(|e| invalid_config("numerical_profile.id", e))?;
+    for operation in &mut profile.operations {
+        if operation.operation_id.as_str() == CAUSAL_PAGED_ATTENTION_OPERATION_ID {
+            operation.operation_id = operation_id(
+                ferrum_runtime::CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_F16_OPERATION_ID,
+            )?;
+            operation.version = ContractVersion::new(1, 0);
+        }
+    }
+    profile.operations.push(NumericalOperationContract {
+        operation_id: operation_id(ferrum_runtime::ROW_SELECT_F16_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        multiplication_type: None,
+        accumulation_type: None,
+        staged_arithmetic: None,
+        composite_arithmetic: None,
+    });
+    profile
+        .operations
+        .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    profile
+        .boundaries
+        .insert(value_id("value.hidden.visual")?, ElementType::F16);
+    // First qualification excludes checkpoint/prefix reuse. The engine must
+    // bind immutable visual payload and positional identities before enabling it.
+    for state in &mut profile.states {
+        state.checkpoint = StateCheckpointCapability::Unsupported;
+    }
     Ok(profile)
 }
 

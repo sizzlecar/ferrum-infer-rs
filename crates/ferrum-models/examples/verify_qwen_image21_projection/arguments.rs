@@ -28,6 +28,8 @@ pub struct CudaOptions {
 }
 
 impl Backend {
+    // Sibling CPU parser fixtures do not initialize a backend.
+    #[allow(dead_code)]
     pub fn ensure_available(&self) -> Result<()> {
         if matches!(self, Self::Cuda(_)) && !cfg!(feature = "cuda") {
             bail!("--backend cuda requires building this example with --features cuda");

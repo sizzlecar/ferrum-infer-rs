@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 static __device__ __forceinline__ float ferrum_load_value(const float* ptr,
@@ -11,6 +12,11 @@ static __device__ __forceinline__ float ferrum_load_value(const __half* ptr,
   return __half2float(ptr[idx]);
 }
 
+static __device__ __forceinline__ float ferrum_load_value(const __nv_bfloat16* ptr,
+                                                          int idx) {
+  return __bfloat162float(ptr[idx]);
+}
+
 static __device__ __forceinline__ void ferrum_store_value(float* ptr,
                                                           int idx,
                                                           float value) {
@@ -21,6 +27,12 @@ static __device__ __forceinline__ void ferrum_store_value(__half* ptr,
                                                           int idx,
                                                           float value) {
   ptr[idx] = __float2half(value);
+}
+
+static __device__ __forceinline__ void ferrum_store_value(__nv_bfloat16* ptr,
+                                                          int idx,
+                                                          float value) {
+  ptr[idx] = __float2bfloat16_rn(value);
 }
 
 static __device__ __forceinline__ float ferrum_sigmoid(float x) {
@@ -472,6 +484,35 @@ extern "C" __global__ void recurrent_conv_state_commit_f16_indirect(
   __half* destination =
       reinterpret_cast<__half*>(state_bindings[seq * 2]);
   destination[sequence_offset] = source[index];
+}
+
+// Save the two convolution histories without mutating the original state.
+// These are selections of already-rounded projection/history F16 values.
+extern "C" __global__ void vnext_gated_delta_candidate_conv_states_f16(
+    const __half* mixed_qkvzba,
+    const unsigned long long* original_bindings,
+    const unsigned long long* candidate_bindings,
+    const unsigned int* cu_seqlens,
+    const int batch, const int qkvzba_width, const int channels,
+    const int state_width) {
+  const unsigned long long index =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const unsigned long long per_state =
+      static_cast<unsigned long long>(channels) * state_width;
+  if (index >= static_cast<unsigned long long>(batch) * 2 * per_state) return;
+  const int seq = index / (2 * per_state);
+  const int slot = (index / per_state) % 2;
+  const int offset = index % per_state;
+  const int channel = offset / state_width;
+  const int pos = offset % state_width;
+  const int start = cu_seqlens[seq];
+  const int count = static_cast<int>(cu_seqlens[seq + 1]) - start;
+  const int source = count - 1 + slot + pos - state_width;
+  const __half* original = reinterpret_cast<const __half*>(original_bindings[seq * 2]);
+  __half* output = reinterpret_cast<__half*>(candidate_bindings[seq * 2]);
+  output[slot * per_state + offset] = source >= 0
+      ? mixed_qkvzba[static_cast<unsigned long long>(start + source) * qkvzba_width + channel]
+      : original[channel * state_width + state_width + source];
 }
 
 template <typename InputT, typename ParamT, typename StateT = float,
@@ -1891,6 +1932,45 @@ extern "C" __global__ void gated_rms_norm_f16_z_f32_weight(
   gated_rms_norm_impl<__half, float>(core, z, weight, out, rows, dim, eps);
 }
 
+// Decode epilogue: preserve the original F32 reduction/expression, then perform
+// exactly the conversion used by f32_to_activation_f16. `out` is a separate
+// scratch region, never the restrict-qualified input `z`. Keep the original
+// F32-output entry above as the long-span path and independent CUDA reference.
+extern "C" __global__ void gated_rms_norm_f16_z_f32_weight_to_f16(
+    const float* __restrict__ core,
+    const __half* __restrict__ z,
+    const float* __restrict__ weight,
+    __half* __restrict__ out,
+    const int rows,
+    const int dim,
+    const float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int base = row * dim;
+
+  float sum_sq = 0.0f;
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float x = core[base + d];
+    sum_sq += x * x;
+  }
+
+  __shared__ float shared[256];
+  shared[threadIdx.x] = sum_sq;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float inv = rsqrtf(shared[0] / static_cast<float>(dim) + eps);
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float value = core[base + d] * inv * ferrum_load_value(weight, d) *
+                        ferrum_silu(ferrum_load_value(z, base + d));
+    out[base + d] = __float2half(value);
+  }
+}
+
 // Stitch one planar projection `[rows, source_width]` into a contiguous
 // feature slice of `[rows, destination_width]`. Compressed-tensors mixed
 // projections use this after independent Marlin/dense GEMMs.
@@ -1909,4 +1989,148 @@ extern "C" __global__ void projection_stitch_f16(
     destination[row * destination_width + destination_offset + column] =
         source[index];
   }
+}
+
+// BF16 projection/history boundaries retain F32 parameters and recurrent state.
+// Each input and output is loaded/stored with its declared BF16 representation.
+
+extern "C" __global__ void recurrent_conv_state_commit_bf16_indirect(
+    const __nv_bfloat16* __restrict__ source,
+    const unsigned long long* __restrict__ state_bindings,
+    const int batch,
+    const int elements_per_sequence) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch * elements_per_sequence;
+  if (index >= total) return;
+  const int seq = index / elements_per_sequence;
+  const int sequence_offset = index - seq * elements_per_sequence;
+  __nv_bfloat16* destination =
+      reinterpret_cast<__nv_bfloat16*>(state_bindings[seq * 2]);
+  destination[sequence_offset] = source[index];
+}
+
+extern "C" __global__ void
+linear_attention_prepare_varlen_packed_qkvzba_bf16_params_f32_state_bf16_z_bf16_indirect(
+    const __nv_bfloat16* __restrict__ mixed_qkvzba_raw,
+    const __nv_bfloat16* __restrict__ conv_weight,
+    const unsigned long long* __restrict__ state_bindings,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    const unsigned int* __restrict__ cu_seqlens,
+    const unsigned int* __restrict__ token_seq_indices,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    __nv_bfloat16* __restrict__ z,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    __nv_bfloat16* __restrict__ final_conv_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  const int qk_total = key_heads * key_dim;
+  const int value_total = value_heads * value_dim;
+  const int qkvz_width = 2 * qk_total + 2 * value_total;
+  const int qkvzba_width = qkvz_width + 2 * value_heads;
+  const __nv_bfloat16* ba_raw = mixed_qkvzba_raw + qkvz_width;
+  linear_attention_prepare_varlen_packed_qkvz_ba_impl<
+      __nv_bfloat16, float, __nv_bfloat16, __nv_bfloat16>(
+      mixed_qkvzba_raw, ba_raw, conv_weight, nullptr, state_bindings, a_log,
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
+      final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel, qkvzba_width, qkvzba_width);
+}
+
+extern "C" __global__ void
+vnext_linear_attention_prepare_negative_rate_bf16_indirect(
+    const __nv_bfloat16* __restrict__ mixed_qkvzba_raw,
+    const __nv_bfloat16* __restrict__ conv_weight,
+    const unsigned long long* __restrict__ state_bindings,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    const unsigned int* __restrict__ cu_seqlens,
+    const unsigned int* __restrict__ token_seq_indices,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    __nv_bfloat16* __restrict__ z,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    __nv_bfloat16* __restrict__ final_conv_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  const int qk_total = key_heads * key_dim;
+  const int value_total = value_heads * value_dim;
+  const int qkvz_width = 2 * qk_total + 2 * value_total;
+  const int qkvzba_width = qkvz_width + 2 * value_heads;
+  const __nv_bfloat16* ba_raw = mixed_qkvzba_raw + qkvz_width;
+  linear_attention_prepare_varlen_packed_qkvz_ba_impl<
+      __nv_bfloat16, float, __nv_bfloat16, __nv_bfloat16, true>(
+      mixed_qkvzba_raw, ba_raw, conv_weight, nullptr, state_bindings, a_log,
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
+      final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel, qkvzba_width, qkvzba_width);
+}
+
+extern "C" __global__ void gated_rms_norm_bf16_z_f32_weight(
+    const float* __restrict__ core,
+    const __nv_bfloat16* __restrict__ z,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    const int rows,
+    const int dim,
+    const float eps) {
+  gated_rms_norm_impl<__nv_bfloat16, float>(core, z, weight, out, rows, dim, eps);
+}
+
+extern "C" __global__ void gated_rms_norm_bf16_z_f32_weight_to_bf16(
+    const float* __restrict__ core,
+    const __nv_bfloat16* __restrict__ z,
+    const float* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out,
+    const int rows,
+    const int dim,
+    const float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int base = row * dim;
+
+  float sum_sq = 0.0f;
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float x = core[base + d];
+    sum_sq += x * x;
+  }
+
+  __shared__ float shared[256];
+  shared[threadIdx.x] = sum_sq;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float inv = rsqrtf(shared[0] / static_cast<float>(dim) + eps);
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float value = core[base + d] * inv * ferrum_load_value(weight, d) *
+                        ferrum_silu(ferrum_load_value(z, base + d));
+    out[base + d] = __float2bfloat16_rn(value);
+  }
+}
+
+extern "C" __global__ void f32_to_activation_bf16(
+    const float* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    const int elements) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < elements) output[index] = __float2bfloat16_rn(input[index]);
 }

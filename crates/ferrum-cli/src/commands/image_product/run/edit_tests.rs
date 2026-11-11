@@ -79,6 +79,36 @@ fn edit_cli_reads_own_two_k_png_and_preserves_encoded_file_boundaries() {
 }
 
 #[test]
+fn edit_cli_admits_own_eight_megapixel_extent_with_shared_encoded_and_host_bounds() {
+    use ferrum_models::qwen_image21::image_input::ImageInputLimits;
+    use ferrum_output::png::{encoded_rgba8_png_bytes, PngDimensions, PngLimits};
+    let dimensions = PngDimensions::new(2912, 2912).unwrap();
+    let encoded_bytes = encoded_rgba8_png_bytes(dimensions, PngLimits::default()).unwrap();
+    let maximum = ImageInputLimits::default().maximum_encoded_bytes();
+    assert!(encoded_bytes > dimensions.rgba_bytes() as u64);
+    assert!(encoded_bytes <= maximum as u64);
+
+    // Sparse extent tests admission without writing a complete large asset.
+    // It does not claim these sparse bytes are a decodable PNG.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("extent.png");
+    let file = fs::File::create(&path).unwrap();
+    file.set_len(encoded_bytes).unwrap();
+    let (input, length) = open_image(&path).unwrap();
+    assert_eq!(length as u64, encoded_bytes);
+    let account = host(length - 1);
+    assert!(read_image(&account, input, length).is_err());
+    assert_eq!(account.usage().unwrap().committed_bytes(), 0);
+    file.set_len(maximum as u64).unwrap();
+    assert_eq!(open_image(&path).unwrap().1, maximum);
+    file.set_len(maximum as u64 + 1).unwrap();
+    assert!(open_image(&path)
+        .unwrap_err()
+        .to_string()
+        .contains(&maximum.to_string()));
+}
+
+#[test]
 fn edit_cli_rejects_invalid_extent_capacity_and_file_changes_without_leaking() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("input.png");

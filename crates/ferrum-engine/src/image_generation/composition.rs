@@ -21,6 +21,8 @@ pub struct ImagePipelineLimits {
     pub maximum_width: u32,
     pub maximum_height: u32,
     pub maximum_batch_size: usize,
+    /// Optional packing target, not a hard cap on individual tensor bytes.
+    pub weight_arena_target_bytes: Option<std::num::NonZeroU64>,
     pub decoder_batch_policy: super::ImageDecoderBatchPolicy,
     pub edit_prefix_policy: super::ImageEditPrefixPolicy,
     pub plan_cache: super::ImagePlanCachePolicy,
@@ -54,6 +56,7 @@ impl ImagePipelineLimits {
             maximum_width: self.maximum_width,
             maximum_height: self.maximum_height,
             maximum_batch_size: self.maximum_batch_size,
+            weight_arena_target_bytes: self.weight_arena_target_bytes,
             decoder_batch_policy: self.decoder_batch_policy,
             edit_prefix_policy: self.edit_prefix_policy,
             plan_cache: self.plan_cache,

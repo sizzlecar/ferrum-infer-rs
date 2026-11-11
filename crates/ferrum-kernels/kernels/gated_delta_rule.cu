@@ -782,7 +782,8 @@ static __device__ void recurrent_gated_delta_rule_varlen_f32_impl(
     const int key_dim,
     const int value_dim,
     const int use_qk_l2norm,
-    const float scale) {
+    const float scale,
+    const unsigned long long* __restrict__ candidate_bindings = nullptr) {
   const int value_head = blockIdx.x;
   const int seq = blockIdx.y;
   if (value_head >= value_heads || seq >= batch) return;
@@ -801,10 +802,13 @@ static __device__ void recurrent_gated_delta_rule_varlen_f32_impl(
       state_bindings == nullptr
           ? initial_states + seq * state_len
           : reinterpret_cast<const StateT*>(state_bindings[seq * 2 + 1]);
-  StateT* sequence_final_state =
-      state_bindings == nullptr
+  StateT* sequence_prefix_state = candidate_bindings == nullptr ? nullptr
+      : reinterpret_cast<StateT*>(candidate_bindings[seq * 2 + 1]);
+  StateT* sequence_final_state = sequence_prefix_state != nullptr
+      ? sequence_prefix_state + state_len
+      : (state_bindings == nullptr
           ? final_states + seq * state_len
-          : reinterpret_cast<StateT*>(state_bindings[seq * 2 + 1]);
+          : reinterpret_cast<StateT*>(state_bindings[seq * 2 + 1]));
 
   for (int value_offset = threadIdx.x; value_offset < value_dim;
        value_offset += blockDim.x) {
@@ -818,6 +822,13 @@ static __device__ void recurrent_gated_delta_rule_varlen_f32_impl(
     }
 
     for (int token = token_start; token < token_end; ++token) {
+      // Snapshot the admitted N-1 slot before the final row changes state.
+      // N=1 therefore preserves the original bytes in slot zero.
+      if (sequence_prefix_state != nullptr && token + 1 == token_end) {
+        for (int kd = 0; kd < key_dim; ++kd) {
+          sequence_prefix_state[state_base + kd] = sequence_final_state[state_base + kd];
+        }
+      }
       float q_inv = 1.0f;
       float k_inv = 1.0f;
       if (use_qk_l2norm != 0) {
@@ -995,7 +1006,8 @@ static __device__ void recurrent_gated_delta_rule_varlen_warp128_f32(
     const int key_heads,
     const int value_heads,
     const int value_dim,
-    const float scale) {
+    const float scale,
+    float* __restrict__ prefix_state = nullptr) {
   const int lane = threadIdx.x % 32;
   const int first_value = blockIdx.x * 16 + (threadIdx.x / 32) * 2;
   const int value_head = blockIdx.y;
@@ -1013,6 +1025,18 @@ static __device__ void recurrent_gated_delta_rule_varlen_warp128_f32(
     }
   }
   for (int token = token_start; token < token_end; ++token) {
+    if (prefix_state != nullptr && token + 1 == token_end) {
+#pragma unroll
+      for (int row = 0; row < 2; ++row) {
+        if (first_value + row >= value_dim) continue;
+#pragma unroll
+        for (int part = 0; part < 4; ++part) {
+          const int index = (value_head * value_dim + first_value + row) * 128
+              + lane + part * 32;
+          prefix_state[index] = states[row][part];
+        }
+      }
+    }
     const int gate_index = token * value_heads + value_head;
     const float decay = expf(g[gate_index]);
     const float beta_t = beta[gate_index];
@@ -1075,7 +1099,8 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
     const int value_heads,
     const int key_dim,
     const int value_dim,
-    const float scale) {
+    const float scale,
+    const unsigned long long* __restrict__ candidate_bindings = nullptr) {
   const int value_tile = blockIdx.x;
   const int value_head = blockIdx.y;
   const int seq = blockIdx.z;
@@ -1096,10 +1121,13 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
       state_bindings == nullptr
           ? initial_states + seq * state_len
           : reinterpret_cast<const StateT*>(state_bindings[seq * 2 + 1]);
-  StateT* sequence_final_state =
-      state_bindings == nullptr
+  StateT* sequence_prefix_state = candidate_bindings == nullptr ? nullptr
+      : reinterpret_cast<StateT*>(candidate_bindings[seq * 2 + 1]);
+  StateT* sequence_final_state = sequence_prefix_state != nullptr
+      ? sequence_prefix_state + state_len
+      : (state_bindings == nullptr
           ? final_states + seq * state_len
-          : reinterpret_cast<StateT*>(state_bindings[seq * 2 + 1]);
+          : reinterpret_cast<StateT*>(state_bindings[seq * 2 + 1]));
 
   // F16 state retains its per-step storage rounding in the original path.
   // This specialization changes neither global scratch nor launch dimensions.
@@ -1109,7 +1137,8 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
           query, key, value, g, beta,
           reinterpret_cast<const float*>(sequence_initial_state),
           reinterpret_cast<float*>(sequence_final_state), out,
-          token_start, token_end, key_heads, value_heads, value_dim, scale);
+          token_start, token_end, key_heads, value_heads, value_dim, scale,
+          reinterpret_cast<float*>(sequence_prefix_state));
       return;
     }
   }
@@ -1133,6 +1162,17 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
   __syncthreads();
 
   for (int token = token_start; token < token_end; ++token) {
+    if (sequence_prefix_state != nullptr && token + 1 == token_end) {
+      for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
+        const int local_v = i / key_dim;
+        const int kd = i - local_v * key_dim;
+        const int value_offset = value_start + local_v;
+        if (value_offset >= value_dim) continue;
+        const int state_idx = (value_head * value_dim + value_offset) * key_dim + kd;
+        sequence_prefix_state[state_idx] = sequence_final_state[state_idx];
+      }
+      __syncthreads();
+    }
     const int gate_idx = token * value_heads + value_head;
     const float decay = expf(g[gate_idx]);
     const float beta_t = beta[gate_idx];
@@ -1305,6 +1345,51 @@ extern "C" __global__ void vnext_gated_delta_varlen_tiled16_interleaved_f32_indi
       query, key, value, g, beta, nullptr, state_bindings, cu_seqlens, out,
       nullptr, batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
       scale);
+}
+
+
+// Candidate outputs are distinct, admitted [2] + state-shape tensors. Original
+// state bindings are read-only; slot one is the running state, slot zero N-1.
+extern "C" __global__ void vnext_gated_delta_candidate_scan_f32(
+    const float* query, const float* key, const float* value,
+    const float* g, const float* beta,
+    const unsigned long long* state_bindings, const unsigned int* cu_seqlens,
+    float* out, const int batch, const int total_tokens,
+    const int key_heads, const int value_heads, const int key_dim,
+    const int value_dim, const int use_qk_l2norm, const float scale,
+    const unsigned long long* candidate_bindings, const int interleaved) {
+  if (interleaved != 0) {
+    recurrent_gated_delta_rule_varlen_f32_impl<float, true>(
+        query, key, value, g, beta, nullptr, state_bindings, cu_seqlens, out,
+        nullptr, batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
+        use_qk_l2norm, scale, candidate_bindings);
+  } else {
+    recurrent_gated_delta_rule_varlen_f32_impl<float, false>(
+        query, key, value, g, beta, nullptr, state_bindings, cu_seqlens, out,
+        nullptr, batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
+        use_qk_l2norm, scale, candidate_bindings);
+  }
+}
+
+extern "C" __global__ void vnext_gated_delta_candidate_scan_tiled16_f32(
+    const float* query, const float* key, const float* value,
+    const float* g, const float* beta,
+    const unsigned long long* state_bindings, const unsigned int* cu_seqlens,
+    float* out, const int batch, const int total_tokens,
+    const int key_heads, const int value_heads, const int key_dim,
+    const int value_dim, const float scale,
+    const unsigned long long* candidate_bindings, const int interleaved) {
+  if (interleaved != 0) {
+    recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16, true>(
+        query, key, value, g, beta, nullptr, state_bindings, cu_seqlens, out,
+        nullptr, batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
+        scale, candidate_bindings);
+  } else {
+    recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16, false>(
+        query, key, value, g, beta, nullptr, state_bindings, cu_seqlens, out,
+        nullptr, batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
+        scale, candidate_bindings);
+  }
 }
 
 // Test-only entrypoint; production exports retain the default explicit controls.

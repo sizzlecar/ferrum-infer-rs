@@ -87,6 +87,14 @@ struct Build {
     #[arg(long)]
     fp8_plan: PathBuf,
     #[arg(long)]
+    fused_f32_source: PathBuf,
+    #[arg(long)]
+    fused_f32_plan: PathBuf,
+    #[arg(long)]
+    fused_int8_source: PathBuf,
+    #[arg(long)]
+    fused_int8_plan: PathBuf,
+    #[arg(long)]
     work: PathBuf,
     #[arg(long)]
     output: PathBuf,
@@ -211,6 +219,8 @@ fn required_units_for_set(
         .iter()
         .copied()
         .chain(final_set.then_some(CudaNativeBuildUnit::CutlassFp8ScaledMm))
+        .chain(final_set.then_some(CudaNativeBuildUnit::CutlassFusedF32Attention))
+        .chain(final_set.then_some(CudaNativeBuildUnit::CutlassInt8FusedOutput))
         .chain(
             (final_set && matches!(architecture, Architecture::Sm120))
                 .then_some(CudaNativeBuildUnit::FlashinferXqa),
@@ -282,7 +292,7 @@ fn validate_catalog_extension(
             );
         }
     }
-    let fp8 = [
+    let additions = [
         (
             "operation.dense_linear_fp8.bf16",
             "provider.cuda.dense_linear_fp8.bf16.cutlass",
@@ -295,17 +305,37 @@ fn validate_catalog_extension(
             "operation.dense_linear_fp8_triple.bf16",
             "provider.cuda.dense_linear_fp8_triple.bf16.cutlass",
         ),
+        (
+            "operation.structured_gqa_attention_fused.f32",
+            "provider.cuda.structured_gqa_attention_fused.f32.cutlass",
+        ),
+        (
+            "operation.comfy_convrot_codebook_w4a8.bf16",
+            "provider.cuda.comfy_convrot_codebook_w4a8.bf16.cutlass_int8_fused_output",
+        ),
+        (
+            "operation.comfy_convrot_codebook_w4a8.swiglu_f32.bf16",
+            "provider.cuda.comfy_convrot_w4a8.swiglu_f32.bf16.cutlass_int8_fused_output",
+        ),
+        (
+            "operation.comfy_convrot_w8a8.bf16",
+            "provider.cuda.comfy_convrot_w8a8.bf16.cutlass_int8_fused_output",
+        ),
+        (
+            "operation.comfy_convrot_w8a8.swiglu_f32.bf16",
+            "provider.cuda.comfy_convrot_w8a8.swiglu_f32.bf16.cutlass_int8_fused_output",
+        ),
     ];
-    if original
-        .providers
-        .iter()
-        .any(|row| fp8.iter().any(|(_, provider)| row.provider_id == *provider))
-        || combined.providers.len() != original.providers.len() + fp8.len()
+    if original.providers.iter().any(|row| {
+        additions
+            .iter()
+            .any(|(_, provider)| row.provider_id == *provider)
+    }) || combined.providers.len() != original.providers.len() + additions.len()
         || expected
             .providers
             .iter()
             .any(|row| !combined.providers.contains(row))
-        || fp8.iter().any(|(operation, provider)| {
+        || additions.iter().any(|(operation, provider)| {
             combined
                 .providers
                 .iter()
@@ -314,7 +344,7 @@ fn validate_catalog_extension(
                 != 1
         })
     {
-        return Err("combined catalog must preserve production rows (or the exact GPT-OSS source declaration) and add the scalar/pair/triple FP8 bundle".into());
+        return Err("combined catalog must preserve production rows (or the exact GPT-OSS source declaration) and add FP8, fused F32 attention and fused INT8 output providers".into());
     }
     Ok(())
 }
@@ -397,6 +427,42 @@ fn build(args: &Build) -> Result<()> {
     } else {
         None
     };
+    for (unit, name, source, plan) in [
+        (
+            CudaNativeBuildUnit::CutlassFusedF32Attention,
+            "cutlass-fused-f32-attention",
+            &args.fused_f32_source,
+            &args.fused_f32_plan,
+        ),
+        (
+            CudaNativeBuildUnit::CutlassInt8FusedOutput,
+            "cutlass-int8-fused-output",
+            &args.fused_int8_source,
+            &args.fused_int8_plan,
+        ),
+    ] {
+        let declared: NativeOperatorSourceBuildPlan = read_json(plan)?;
+        if declared.operator != unit.artifact_operator() {
+            return Err(format!("{name} source plan has wrong operator").into());
+        }
+        let source_spec = args.work.join(format!("{name}.source.package.json"));
+        materialize_native_operator_package_spec(&NativeOperatorPackageSpecRequest {
+            definition_path: args.workspace.join(format!(
+                "native-operators/cuda/package-definitions/{name}.json"
+            )),
+            g03_catalog_path: args.catalog.clone(),
+            output_path: source_spec.clone(),
+        })?;
+        let target_spec = args.work.join(format!("{name}.target.package.json"));
+        write_new(
+            &target_spec,
+            &serde_json::to_vec_pretty(&package_spec_for_target(
+                read_json(&source_spec)?,
+                args.architecture,
+            ))?,
+        )?;
+        prepared.push((unit, source.clone(), plan.clone(), target_spec));
+    }
     // Reject a missing historical source before spending time on any compiler.
     let mut receipts = Vec::new();
     for (unit, source, plan, spec) in prepared {
@@ -406,7 +472,15 @@ fn build(args: &Build) -> Result<()> {
             &source,
             &plan,
             &spec,
-            &args.reference_workspace,
+            if matches!(
+                unit,
+                CudaNativeBuildUnit::CutlassFusedF32Attention
+                    | CudaNativeBuildUnit::CutlassInt8FusedOutput
+            ) {
+                &args.workspace
+            } else {
+                &args.reference_workspace
+            },
         )?);
     }
     receipts.push(build_package(
@@ -569,6 +643,12 @@ fn materialize_source(
         CudaNativeBuildUnit::UpstreamQ6F32Linear => "upstream-q6-f32-linear",
         CudaNativeBuildUnit::CutlassFp8ScaledMm => {
             return Err("FP8 uses its observed source closure".into())
+        }
+        CudaNativeBuildUnit::CutlassFusedF32Attention => {
+            return Err("fused F32 attention uses its observed source closure".into())
+        }
+        CudaNativeBuildUnit::CutlassInt8FusedOutput => {
+            return Err("fused INT8 output uses its observed source closure".into())
         }
         CudaNativeBuildUnit::FlashinferXqa => {
             return Err("XQA uses its observed source closure".into())

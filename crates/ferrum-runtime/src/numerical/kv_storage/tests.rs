@@ -1,6 +1,47 @@
 use super::*;
 use crate::*;
 
+#[test]
+fn explicit_rope_accepts_only_declared_f16_kv_at_the_original_port() {
+    let program = |profile: &NumericalExecutionProfile, operation: &str, payload_port: usize| {
+        let mut inputs = (0..11)
+            .map(|i| ProgramValueId::new(format!("value.input.{i}")).unwrap())
+            .collect::<Vec<_>>();
+        let external = inputs.clone();
+        inputs[payload_port] = profile.states[0].value_id.clone();
+        ModelProgram::new(
+            profile.family_id.clone(),
+            external,
+            vec![ProgramBlock {
+                id: "block.attention".into(),
+                nodes: vec![ProgramNode {
+                    id: NodeId::new("node.attention").unwrap(),
+                    operation_id: OperationId::new(operation).unwrap(),
+                    required_version: ContractVersion::new(1, 0),
+                    work: ProgramNodeWorkSpec::tokens(inputs[0].clone(), 0),
+                    inputs,
+                    outputs: vec![ProgramValueId::new("value.output").unwrap()],
+                    attributes: BTreeMap::new(),
+                }],
+            }],
+            profile.states.clone(),
+            vec![],
+            vec![ProgramValueId::new("value.output").unwrap()],
+        )
+        .unwrap()
+    };
+    let f16 = profile(false);
+    let id = CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_F16_OPERATION_ID;
+    validate_program_kv_storage(&f16, &program(&f16, id, 8)).unwrap();
+    assert!(validate_program_kv_storage(&f16, &program(&f16, id, 9)).is_err());
+    assert!(
+        validate_program_kv_storage(&f16, &program(&f16, "operation.unowned.attention", 8))
+            .is_err()
+    );
+    let int8 = profile(true);
+    assert!(validate_program_kv_storage(&int8, &program(&int8, id, 8)).is_err());
+}
+
 fn state(name: &str, shape: Vec<u64>, dtype: ElementType) -> StateSpec {
     let tensor = ProgramTensorSpec {
         dimensions: shape,

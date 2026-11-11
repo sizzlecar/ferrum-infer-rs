@@ -214,14 +214,18 @@ jobs:
           work="$RUNNER_TEMP/sm89-native"
           mkdir "$work"
           cargo build --locked --profile release-tools -p ferrum-native-ops-builder --example release_cuda_native --bin ferrum-native-ops-builder
-          cargo build --locked --profile release-tools -p ferrum-kernels --example cutlass_fp8_catalog_declaration
+          cargo build --locked --profile release-tools -p ferrum-kernels --example cutlass_fp8_catalog_declaration --example cutlass_fused_f32_catalog_declaration --example cutlass_int8_fused_output_catalog_declaration
           ./target/release-tools/examples/release_cuda_native reference --architecture sm120 \
             --lock "$SM89_REFERENCE_LOCK" --catalog-output "$work/base-catalog.json"
           # The catalog configuration is explicit source provenance, not a
           # measured native-memory upper bound or a runtime capacity override.
           ./target/release-tools/examples/cutlass_fp8_catalog_declaration \
             134217728 512 experimental-release-source-declaration-v1 \
-            "$work/combined-catalog.json" "$work/base-catalog.json"
+            "$work/fp8-catalog.json" "$work/base-catalog.json"
+          ./target/release-tools/examples/cutlass_fused_f32_catalog_declaration \
+            "$work/fused-f32-catalog.json" "$work/fp8-catalog.json"
+          ./target/release-tools/examples/cutlass_int8_fused_output_catalog_declaration \
+            "$work/combined-catalog.json" "$work/fused-f32-catalog.json"
           mkdir "$work/reference-workspace" "$work/source-bundle" "$work/fp8-source"
           git archive "$NATIVE_REFERENCE_REVISION" | tar -xf - -C "$work/reference-workspace"
           manifest=native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json
@@ -252,6 +256,24 @@ jobs:
             --definition crates/ferrum-kernels/native/cutlass-fp8/cutlass-fp8-sm89.seed.json \
             --source-root "$work/fp8-source" --depfile "$work/fp8.d" \
             --out-definition "$work/fp8-observed.json" --out-plan "$work/fp8-plan.json"
+          for kind in fused-f32-attention int8-fused-output; do
+            source="$work/cutlass-$kind-source"
+            mkdir -p "$source/kernels"
+            cp -al "$work/fp8-source/cutlass" "$source/cutlass"
+            cp "crates/ferrum-kernels/native/cutlass-$kind/abi.h" "crates/ferrum-kernels/native/cutlass-$kind/boundary.cu" "$source/kernels/"
+            seed=source.seed.json
+            if [ "$kind" = int8-fused-output ]; then seed=source.build.seed.json; fi
+            /usr/local/cuda/bin/nvcc -M -MT boundary.o -MF "$work/$kind.d" \
+              -std=c++17 -O3 --expt-relaxed-constexpr --expt-extended-lambda \
+              -Xcompiler -fPIC -arch="sm_$CUDA_COMPUTE_CAP" -ccbin /usr/bin/g++ \
+              -I"$source/cutlass/include" -I"$source/cutlass/tools/util/include" \
+              -I"$source/cutlass/examples/41_fused_multi_head_attention" \
+              -I"$source/kernels" "$source/kernels/boundary.cu"
+            ./target/release-tools/ferrum-native-ops-builder lock-source-dependencies \
+              --definition "crates/ferrum-kernels/native/cutlass-$kind/$seed" \
+              --source-root "$source" --depfile "$work/$kind.d" \
+              --out-definition "$work/$kind-observed.json" --out-plan "$work/$kind-plan.json"
+          done
 
       - name: Build and verify complete SM89 production and FP8 native set
         run: |
@@ -262,6 +284,8 @@ jobs:
             --source-bundle "$work/source-bundle" --llama-source "$work/llama" \
             --workspace "$GITHUB_WORKSPACE" --catalog "$work/combined-catalog.json" \
             --fp8-source "$work/fp8-source" --fp8-plan "$work/fp8-plan.json" \
+            --fused-f32-source "$work/cutlass-fused-f32-attention-source" --fused-f32-plan "$work/fused-f32-attention-plan.json" \
+            --fused-int8-source "$work/cutlass-int8-fused-output-source" --fused-int8-plan "$work/int8-fused-output-plan.json" \
             --work "$work/builds" --output "$work/operator-set" \
             --object-cache "$RUNNER_TEMP/sm89-native-object-cache" --builder-sha "$RC_SHA" \
             --cuda-toolkit-root /usr/local/cuda --nvcc /usr/local/cuda/bin/nvcc \
@@ -303,7 +327,7 @@ jobs:
           export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
           test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
           cargo build --release --locked -p ferrum-cli --bin ferrum \
-            --features cuda,cuda-production,cuda-cutlass-fp8
+            --features cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output
 
       - name: Strip and audit CUDA binary
         run: |
@@ -342,7 +366,7 @@ jobs:
           Ferrum v${VERSION} CUDA release binary
           CUDA toolkit image: nvidia/cuda:12.4.0-devel-ubuntu22.04
           CUDA_COMPUTE_CAP: 89
-          Cargo features: cuda,cuda-production,cuda-cutlass-fp8
+          Cargo features: cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output
           Native operator set: rebuilt from locked production source plans plus pinned CUTLASS FP8
           Native operator lock SHA256: $(sha256sum "$FERRUM_NATIVE_OPERATOR_SET_LOCK" | cut -d ' ' -f 1)
           CUDA runtime libraries are not bundled. Install the NVIDIA driver and CUDA 12.4 or a compatible newer CUDA 12 runtime, and satisfy the shared-library list below.
@@ -360,7 +384,7 @@ jobs:
             --backend cuda --target-triple x86_64-unknown-linux-gnu \
             --asset "$asset" --binary target/release/ferrum \
             --dependencies ferrum-linux-x86_64-cuda-sm89.dependencies.txt \
-            --cargo-features cuda,cuda-production,cuda-cutlass-fp8 \
+            --cargo-features cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output \
             --cuda-compute-capability "$CUDA_COMPUTE_CAP" \
             --cuda-toolkit-image nvidia/cuda:12.4.0-devel-ubuntu22.04
 
@@ -516,7 +540,7 @@ jobs:
           work="$RUNNER_TEMP/sm120-native"
           mkdir "$work"
           cargo build --locked --profile release-tools -p ferrum-native-ops-builder --example release_cuda_native --bin ferrum-native-ops-builder
-          cargo build --locked --profile release-tools -p ferrum-kernels --example cutlass_fp8_catalog_declaration --example flashinfer_xqa_catalog_declaration
+          cargo build --locked --profile release-tools -p ferrum-kernels --example cutlass_fp8_catalog_declaration --example cutlass_fused_f32_catalog_declaration --example cutlass_int8_fused_output_catalog_declaration --example flashinfer_xqa_catalog_declaration
           ./target/release-tools/examples/release_cuda_native reference \
             --lock "$SM120_REFERENCE_LOCK" --catalog-output "$work/base-catalog.json"
           ./target/release-tools/examples/flashinfer_xqa_catalog_declaration \
@@ -525,7 +549,11 @@ jobs:
           # measured native-memory upper bound or a runtime capacity override.
           ./target/release-tools/examples/cutlass_fp8_catalog_declaration \
             134217728 512 experimental-release-source-declaration-v1 \
-            "$work/combined-catalog.json" "$work/gpt-oss-source-catalog.json"
+            "$work/fp8-catalog.json" "$work/gpt-oss-source-catalog.json"
+          ./target/release-tools/examples/cutlass_fused_f32_catalog_declaration \
+            "$work/fused-f32-catalog.json" "$work/fp8-catalog.json"
+          ./target/release-tools/examples/cutlass_int8_fused_output_catalog_declaration \
+            "$work/combined-catalog.json" "$work/fused-f32-catalog.json"
           mkdir "$work/reference-workspace" "$work/source-bundle" "$work/fp8-source"
           git archive "$NATIVE_REFERENCE_REVISION" | tar -xf - -C "$work/reference-workspace"
           manifest=native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json
@@ -575,6 +603,24 @@ jobs:
             --definition crates/ferrum-kernels/native/cutlass-fp8/cutlass-fp8.seed.json \
             --source-root "$work/fp8-source" --depfile "$work/fp8.d" \
             --out-definition "$work/fp8-observed.json" --out-plan "$work/fp8-plan.json"
+          for kind in fused-f32-attention int8-fused-output; do
+            source="$work/cutlass-$kind-source"
+            mkdir -p "$source/kernels"
+            cp -al "$work/fp8-source/cutlass" "$source/cutlass"
+            cp "crates/ferrum-kernels/native/cutlass-$kind/abi.h" "crates/ferrum-kernels/native/cutlass-$kind/boundary.cu" "$source/kernels/"
+            seed=source.seed.json
+            if [ "$kind" = int8-fused-output ]; then seed=source.build.seed.json; fi
+            /usr/local/cuda/bin/nvcc -M -MT boundary.o -MF "$work/$kind.d" \
+              -std=c++17 -O3 --expt-relaxed-constexpr --expt-extended-lambda \
+              -Xcompiler -fPIC -arch="sm_$CUDA_COMPUTE_CAP" -ccbin /usr/bin/g++-13 \
+              -I"$source/cutlass/include" -I"$source/cutlass/tools/util/include" \
+              -I"$source/cutlass/examples/41_fused_multi_head_attention" \
+              -I"$source/kernels" "$source/kernels/boundary.cu"
+            ./target/release-tools/ferrum-native-ops-builder lock-source-dependencies \
+              --definition "crates/ferrum-kernels/native/cutlass-$kind/$seed" \
+              --source-root "$source" --depfile "$work/$kind.d" \
+              --out-definition "$work/$kind-observed.json" --out-plan "$work/$kind-plan.json"
+          done
 
       - name: Build and verify complete SM120 production, FP8 and XQA native set
         run: |
@@ -585,6 +631,8 @@ jobs:
             --workspace "$GITHUB_WORKSPACE" --catalog "$work/combined-catalog.json" \
             --gpt-oss-source-catalog "$work/gpt-oss-source-catalog.json" \
             --fp8-source "$work/fp8-source" --fp8-plan "$work/fp8-plan.json" \
+            --fused-f32-source "$work/cutlass-fused-f32-attention-source" --fused-f32-plan "$work/fused-f32-attention-plan.json" \
+            --fused-int8-source "$work/cutlass-int8-fused-output-source" --fused-int8-plan "$work/int8-fused-output-plan.json" \
             --work "$work/builds" --output "$work/operator-set" \
             --object-cache "$RUNNER_TEMP/sm120-native-object-cache" --builder-sha "$RC_SHA" \
             --cuda-toolkit-root /usr/local/cuda --nvcc /usr/local/cuda/bin/nvcc \
@@ -626,7 +674,7 @@ jobs:
           export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
           test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
           cargo build --release --locked -p ferrum-cli --bin ferrum \
-            --features cuda,cuda-production,cuda-cutlass-fp8
+            --features cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output
 
       - name: Strip and audit CUDA binary
         run: |
@@ -657,7 +705,7 @@ jobs:
           Ferrum v${VERSION} CUDA release binary
           CUDA toolkit image: nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
           CUDA_COMPUTE_CAP: 120
-          Cargo features: cuda,cuda-production,cuda-cutlass-fp8
+          Cargo features: cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output
           Native production source baseline: ${NATIVE_OPERATOR_SET_ARCHIVE_URL}
           Native production source baseline SHA256: ${NATIVE_OPERATOR_SET_ARCHIVE_SHA256}
           Native operator set: rebuilt from locked production source plans plus pinned CUTLASS FP8
@@ -680,7 +728,7 @@ jobs:
             --backend cuda --target-triple x86_64-unknown-linux-gnu \
             --asset "$asset" --binary target/release/ferrum \
             --dependencies ferrum-linux-x86_64-cuda-sm120.dependencies.txt \
-            --cargo-features cuda,cuda-production,cuda-cutlass-fp8 \
+            --cargo-features cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output \
             --cuda-compute-capability "$CUDA_COMPUTE_CAP" \
             --cuda-toolkit-image nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
 

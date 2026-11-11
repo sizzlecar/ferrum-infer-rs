@@ -14,6 +14,12 @@ use crate::{
     PreparedTensorExecutor, TensorExecutionError, TensorExecutionOutput, TensorExecutorConfig,
 };
 
+mod custody;
+pub use custody::{
+    RetainedComponentCloseError, RetainedComponentInitializationError,
+    RetainedTensorComponentSession,
+};
+
 /// Single-participant, ordinary fixed-tensor execution. Capacity is a policy
 /// ceiling consumed by the existing device account, not a new allocation ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -206,6 +212,7 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
             &host,
             &config,
             false,
+            None,
         )?;
         self.create_session(resources, receipt, host, config.executor)
     }
@@ -231,6 +238,7 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
             &host,
             &config,
             true,
+            None,
         )?;
         let weights = weights.expect("shared initialization returns its sealed owner");
         self.create_session(resources, receipt, host, config.executor)
@@ -352,6 +360,7 @@ fn initialize_resources<R: DeviceRuntime>(
     host: &HostMemoryAccount,
     config: &ComponentInitializationConfig,
     share_weights: bool,
+    native_started: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<
     (
         Arc<PlanRuntimeResources<R>>,
@@ -362,6 +371,9 @@ fn initialize_resources<R: DeviceRuntime>(
 > {
     source.validate(family.weights())?;
     let driver = RuntimeResourceDriver::new(runtime.clone())?;
+    if let Some(native_started) = native_started {
+        native_started.store(true, std::sync::atomic::Ordering::Release);
+    }
     let provisioning = plan
         .provision_static(runtime, config.request_id.clone())?
         .into_provisioning();
@@ -417,12 +429,15 @@ fn initialize_resources<R: DeviceRuntime>(
         initialized_resource_count = static_receipt.initialized_resource_count(),
         uploaded_component_count = static_receipt.uploaded_component_count(),
         uploaded_bytes = static_receipt.uploaded_bytes(),
+        retained_source_upload_bytes = static_receipt.retained_source_upload_bytes(),
+        mapped_source_upload_bytes = static_receipt.mapped_source_upload_bytes(),
         upload_command_count = static_receipt.upload_command_count(),
         transform_command_count = static_receipt.transform_command_count(),
         submission_batch_count = static_receipt.submission_batch_count(),
         total_duration_us = static_receipt.total_duration_us(),
         setup_duration_us = static_receipt.setup_duration_us(),
         source_materialization_duration_us = static_receipt.source_materialization_duration_us(),
+        staging_copy_duration_us = static_receipt.staging_copy_duration_us(),
         device_encode_duration_us = static_receipt.device_encode_duration_us(),
         device_import_duration_us = static_receipt.device_import_duration_us(),
         submission_wait_duration_us = static_receipt.submission_wait_duration_us(),

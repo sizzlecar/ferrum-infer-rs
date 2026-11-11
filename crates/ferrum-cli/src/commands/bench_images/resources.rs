@@ -10,6 +10,9 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, sync::oneshot, task::JoinHandle};
 mod procfs;
+mod timing;
+pub use timing::ImageResourceQueryTiming;
+use timing::{milliseconds, PhaseCadence};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -117,13 +120,21 @@ pub struct ImageResourceWindow {
     pub interval_ms: u64,
     pub started_unix_ms: Option<u128>,
     pub duration_ms: f64,
+    /// Relative to the resource window, after baseline and before final probe.
+    pub phase_started_offset_ms: Option<f64>,
+    pub phase_finished_offset_ms: Option<f64>,
     pub attempted_samples: u64,
     pub skipped_intervals: u64,
+    /// Periodic observations taking longer than the declared interval cannot
+    /// establish that cadence, including the last query crossing phase end.
+    pub overlong_periodic_observations: u64,
     pub maximum_sample_gap_ms: f64,
     pub first_sample_offset_ms: Option<f64>,
     pub last_sample_offset_ms: Option<f64>,
     pub host: Option<SampledMemory>,
     pub device: Option<SampledMemory>,
+    pub host_query_timing: Option<ImageResourceQueryTiming>,
+    pub device_query_timing: Option<ImageResourceQueryTiming>,
     /// Complete means requested observations succeeded without missed intervals;
     /// it never means an instantaneous peak was captured.
     pub complete: bool,
@@ -144,6 +155,7 @@ impl ImageResourceWindow {
         self.complete = self.errors.is_empty()
             && self.omitted_errors == 0
             && self.skipped_intervals == 0
+            && self.overlong_periodic_observations == 0
             && self.host.as_ref().is_none_or(SampledMemory::complete)
             && self.device.as_ref().is_none_or(SampledMemory::complete);
     }
@@ -154,6 +166,10 @@ pub(super) struct EndpointSampler {
     server_pid: Option<u32>,
     process: Option<Mutex<procfs::ProcessSampler>>,
     gpu_identity: Mutex<Option<Vec<GpuIdentity>>>,
+    #[cfg(test)]
+    process_query_delay_ms: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    process_query_started: tokio::sync::Notify,
 }
 impl EndpointSampler {
     pub(super) fn new(config: &ImageResourceSamplingConfig, endpoint: usize) -> Arc<Self> {
@@ -165,9 +181,18 @@ impl EndpointSampler {
                 .get(endpoint)
                 .map(|&pid| Mutex::new(procfs::ProcessSampler::new(PathBuf::from("/proc"), pid))),
             gpu_identity: Mutex::new(None),
+            #[cfg(test)]
+            process_query_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            process_query_started: tokio::sync::Notify::new(),
         })
     }
-    async fn observe(self: &Arc<Self>, report: &mut ImageResourceWindow, start: Instant) {
+    async fn observe(
+        self: &Arc<Self>,
+        report: &mut ImageResourceWindow,
+        start: Instant,
+        periodic: bool,
+    ) {
         let offset = start.elapsed().as_secs_f64() * 1000.0;
         report.attempted_samples += 1;
         if let Some(last) = report.last_sample_offset_ms {
@@ -180,31 +205,43 @@ impl EndpointSampler {
             if sampler.process.is_none() {
                 return None;
             }
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    let mut process = sampler
-                        .process
-                        .as_ref()
-                        .unwrap()
-                        .lock()
-                        .map_err(|_| "process sampler is poisoned".to_string())?;
-                    let identity = process.identity();
-                    Ok::<_, String>((identity, process.sample(&sampler.config)))
-                })
-                .await
-                .map_err(|error| format!("process sampler task: {error}"))
-                .and_then(|value| value),
-            )
+            let query_started = Instant::now();
+            #[cfg(test)]
+            {
+                let delay = sampler
+                    .process_query_delay_ms
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if delay > 0 {
+                    sampler.process_query_started.notify_one();
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+            }
+            let result = tokio::task::spawn_blocking(move || {
+                let mut process = sampler
+                    .process
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .map_err(|_| "process sampler is poisoned".to_string())?;
+                let identity = process.identity();
+                Ok::<_, String>((identity, process.sample(&sampler.config)))
+            })
+            .await
+            .map_err(|error| format!("process sampler task: {error}"))
+            .and_then(|value| value);
+            Some((result, query_started, Instant::now()))
         };
         let gpu = async {
             if self.config.gpu_indices.is_empty() {
                 None
             } else {
-                Some(query_gpu(&self.config).await)
+                let query_started = Instant::now();
+                let result = query_gpu(&self.config).await;
+                Some((result, query_started, Instant::now()))
             }
         };
         let (process, gpu) = tokio::join!(process, gpu);
-        if let Some(process) = process {
+        if let Some((process, query_started, query_finished)) = process {
             let value = match process {
                 Ok((identity, sample)) => {
                     report.root_identity = identity;
@@ -212,16 +249,20 @@ impl EndpointSampler {
                 }
                 Err(error) => Err(error),
             };
-            report
-                .host
-                .as_mut()
-                .unwrap()
-                .record(value.as_ref().ok().copied(), offset);
+            record_query(
+                report.host.as_mut().unwrap(),
+                report.host_query_timing.as_mut().unwrap(),
+                value.as_ref().ok().copied(),
+                start,
+                query_started,
+                query_finished,
+                periodic.then(|| Duration::from_millis(self.config.interval_ms)),
+            );
             if let Err(error) = value {
                 report.error(format!("process: {error}"));
             }
         }
-        if let Some(gpu) = gpu {
+        if let Some((gpu, query_started, query_finished)) = gpu {
             let value = gpu.and_then(|(identities, bytes)| {
                 let mut expected = self
                     .gpu_identity
@@ -237,16 +278,38 @@ impl EndpointSampler {
                 report.gpu_identities = identities;
                 Ok(bytes)
             });
-            report
-                .device
-                .as_mut()
-                .unwrap()
-                .record(value.as_ref().ok().copied(), offset);
+            record_query(
+                report.device.as_mut().unwrap(),
+                report.device_query_timing.as_mut().unwrap(),
+                value.as_ref().ok().copied(),
+                start,
+                query_started,
+                query_finished,
+                periodic.then(|| Duration::from_millis(self.config.interval_ms)),
+            );
             if let Err(error) = value {
                 report.error(format!("GPU: {error}"));
             }
         }
     }
+}
+
+fn record_query(
+    memory: &mut SampledMemory,
+    timing: &mut ImageResourceQueryTiming,
+    value: Option<u64>,
+    epoch: Instant,
+    started: Instant,
+    finished: Instant,
+    periodic_interval: Option<Duration>,
+) {
+    let new_peak =
+        value.is_some_and(|bytes| memory.observed_peak_bytes.is_none_or(|prior| bytes > prior));
+    memory.record(
+        value,
+        milliseconds(started.saturating_duration_since(epoch)),
+    );
+    timing.record(epoch, started, finished, new_peak, periodic_interval);
 }
 
 async fn query_gpu(
@@ -311,7 +374,7 @@ async fn query_gpu(
 }
 
 pub(super) struct RunningResourceWindow {
-    stop: Option<oneshot::Sender<()>>,
+    stop: Option<oneshot::Sender<Instant>>,
     task: Option<JoinHandle<ImageResourceWindow>>,
     fallback: ImageResourceWindow,
     start: Instant,
@@ -327,38 +390,66 @@ impl RunningResourceWindow {
             requested_gpu_indices: sampler.config.gpu_indices.clone(),
             root_identity: None, gpu_identities: Vec::new(), process_scope: sampler.config.process_scope,
             interval_ms: sampler.config.interval_ms, started_unix_ms: super::started_unix_ms().ok(),
-            duration_ms: 0.0, attempted_samples: 0, skipped_intervals: 0, maximum_sample_gap_ms: 0.0,
+            duration_ms: 0.0, phase_started_offset_ms: None, phase_finished_offset_ms: None,
+            attempted_samples: 0, skipped_intervals: 0, overlong_periodic_observations: 0,
+            maximum_sample_gap_ms: 0.0,
             first_sample_offset_ms: None, last_sample_offset_ms: None,
             host: sampler.process.as_ref().map(|_| SampledMemory::default()),
             device: (!sampler.config.gpu_indices.is_empty()).then(SampledMemory::default), complete: false,
+            host_query_timing: sampler.process.as_ref().map(|_| ImageResourceQueryTiming::default()),
+            device_query_timing: (!sampler.config.gpu_indices.is_empty()).then(ImageResourceQueryTiming::default),
             errors: Vec::new(), omitted_errors: 0,
-            scope: "window brackets one phase/repetition: baseline before first dispatch, periodic observations through final response validation/capture, then final observation; boundary probes are outside request timers, periodic procfs/SMI probes compete for CPU/driver resources and can affect request latency and throughput; keep sampling settings identical across comparisons; all peaks are sampled lower bounds even when complete; RSS sums process VmRSS and may count shared pages multiple times; GPU sums whole-device memory.used for explicitly selected physical index/UUIDs including other processes and driver baseline; not allocator-only or per-server GPU usage; at most 8 errors of 512 characters, no raw sample series retained",
+            scope: "window brackets one phase/repetition: baseline before first dispatch, periodic observations through final response validation/capture, then final observation; cadence counts only deadlines within the phase after baseline and before finish was requested, including genuine holes caused by queries that finish later; boundary probes are outside request timers, periodic procfs/SMI probes compete for CPU/driver resources and can affect request latency and throughput; keep sampling settings identical across comparisons; all peaks are sampled lower bounds even when complete, peak offsets are query starts and per-source timing brackets the observation rather than claiming an exact measurement instant; query elapsed time includes task scheduling, process launch and driver/OS response, not isolated native driver time; RSS sums process VmRSS and may count shared pages multiple times; GPU sums whole-device memory.used for explicitly selected physical index/UUIDs including other processes and driver baseline; not allocator-only or per-server GPU usage; at most 8 errors of 512 characters, no raw sample series retained",
         };
         if report.started_unix_ms.is_none() {
             report.error("UNIX start timestamp unavailable".into());
         }
-        sampler.observe(&mut report, start).await;
+        sampler.observe(&mut report, start, false).await;
+        let phase_started = Instant::now();
+        report.phase_started_offset_ms = Some(milliseconds(phase_started.duration_since(start)));
         let fallback = report.clone();
         let (stop, mut stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
             let interval = Duration::from_millis(sampler.config.interval_ms);
-            let mut due = start + interval;
-            loop {
-                let now = Instant::now();
-                while due + interval <= now {
-                    report.skipped_intervals += 1;
-                    due += interval;
-                }
-                tokio::select! {
+            let mut cadence = PhaseCadence::new(phase_started, interval);
+            let phase_finished = loop {
+                let observed_at = tokio::select! {
                     biased;
-                    _ = &mut stopped => break,
-                    _ = tokio::time::sleep_until(due.into()) => {
-                        sampler.observe(&mut report, start).await;
-                        due += interval;
+                    stopped_at = &mut stopped => {
+                        break stopped_at.unwrap_or_else(|_| {
+                            report.error("resource window stop signal disappeared".into());
+                            Instant::now()
+                        });
+                    }
+                    _ = tokio::time::sleep_until(cadence.due().into()) => Instant::now(),
+                };
+                sampler.observe(&mut report, start, true).await;
+                let observation_finished = Instant::now();
+                // Finish may have arrived during this query. Its original
+                // timestamp limits cadence, even though we await and preserve
+                // the real query result rather than cancelling it.
+                let stopped_at = match stopped.try_recv() {
+                    Ok(finished) => Some(finished),
+                    Err(oneshot::error::TryRecvError::Empty) => None,
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        report.error("resource window stop signal disappeared".into());
+                        Some(observation_finished)
+                    }
+                };
+                if stopped_at.is_none_or(|finished| observed_at < finished) {
+                    cadence.observed(observed_at);
+                    if observation_finished.duration_since(observed_at) > interval {
+                        report.overlong_periodic_observations += 1;
                     }
                 }
-            }
-            sampler.observe(&mut report, start).await;
+                if let Some(finished) = stopped_at {
+                    break finished;
+                }
+            };
+            report.phase_finished_offset_ms =
+                Some(milliseconds(phase_finished.duration_since(start)));
+            report.skipped_intervals = cadence.finish(phase_finished);
+            sampler.observe(&mut report, start, false).await;
             report.finish(start.elapsed());
             report
         });
@@ -370,8 +461,11 @@ impl RunningResourceWindow {
         }
     }
     pub(super) async fn finish(mut self) -> ImageResourceWindow {
+        let finished = Instant::now();
+        self.fallback.phase_finished_offset_ms =
+            Some(milliseconds(finished.duration_since(self.start)));
         if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
+            let _ = stop.send(finished);
         }
         match self.task.take().unwrap().await {
             Ok(report) => report,
@@ -406,6 +500,8 @@ mod tests {
             server_pid: Some(42),
             process: Some(Mutex::new(procfs::ProcessSampler::new(path.into(), 42))),
             gpu_identity: Mutex::new(None),
+            process_query_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            process_query_started: tokio::sync::Notify::new(),
         })
     }
     fn process(path: &std::path::Path, rss: u64) {
@@ -463,6 +559,132 @@ mod tests {
             .all(|error| error.chars().count() <= 512));
         assert!(window.omitted_errors > 0);
     }
+    fn delayed_sampler(path: &std::path::Path) -> Arc<EndpointSampler> {
+        let mut sampler = fixture_sampler(path);
+        Arc::get_mut(&mut sampler).unwrap().config.interval_ms = 20;
+        sampler
+    }
+
+    #[tokio::test]
+    async fn slow_boundary_queries_do_not_create_pre_or_post_phase_missed_ticks() {
+        let temp = tempfile::tempdir().unwrap();
+        process(temp.path(), 7);
+        let sampler = delayed_sampler(temp.path());
+        sampler
+            .process_query_delay_ms
+            .store(60, std::sync::atomic::Ordering::SeqCst);
+        let window = RunningResourceWindow::begin(sampler).await.finish().await;
+        assert!(window.complete, "{window:?}");
+        assert_eq!(window.skipped_intervals, 0);
+        assert_eq!(window.overlong_periodic_observations, 0);
+        assert_eq!(window.attempted_samples, 2);
+        let started = window.phase_started_offset_ms.unwrap();
+        let finished = window.phase_finished_offset_ms.unwrap();
+        assert!(started >= 60.0);
+        assert!(finished >= started);
+        assert!(window.duration_ms >= finished + 60.0);
+        let timing = window.host_query_timing.unwrap();
+        assert_eq!(timing.queries, 2);
+        assert_eq!(timing.periodic_queries, 0);
+        assert_eq!(timing.overlong_periodic_queries, 0);
+        assert!(timing.maximum_query_ms >= 60.0);
+        assert_eq!(window.host.unwrap().observed_peak_bytes, Some(7 * 1024));
+    }
+
+    #[tokio::test]
+    async fn successful_slow_periodic_query_still_fails_coverage_at_original_stop_time() {
+        let temp = tempfile::tempdir().unwrap();
+        process(temp.path(), 7);
+        let sampler = delayed_sampler(temp.path());
+        let window = RunningResourceWindow::begin(Arc::clone(&sampler)).await;
+        sampler
+            .process_query_delay_ms
+            .store(160, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            sampler.process_query_started.notified(),
+        )
+        .await
+        .unwrap();
+        // Only the already-started periodic query is delayed. The final probe
+        // still performs a real procfs read, without an artificial delay.
+        sampler
+            .process_query_delay_ms
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        process(temp.path(), 11);
+        let report = window.finish().await;
+        assert!(!report.complete, "{report:?}");
+        assert!(report.skipped_intervals >= 2);
+        assert!(report.overlong_periodic_observations > 0);
+        assert!(report.errors.is_empty());
+        let host = report.host.unwrap();
+        assert_eq!(host.failed_samples, 0);
+        assert_eq!(host.observed_peak_bytes, Some(11 * 1024));
+        let timing = report.host_query_timing.unwrap();
+        assert!(timing.maximum_query_ms >= 160.0);
+        assert!(timing.maximum_periodic_query_ms >= 160.0);
+        assert!(timing.overlong_periodic_queries > 0);
+        assert!(
+            timing.peak_query_started_offset_ms.unwrap()
+                < timing.peak_query_finished_offset_ms.unwrap()
+        );
+        assert!(report.phase_finished_offset_ms.unwrap() < report.duration_ms);
+    }
+
+    #[tokio::test]
+    async fn slow_last_periodic_query_cannot_claim_complete_after_an_early_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        process(temp.path(), 7);
+        let sampler = delayed_sampler(temp.path());
+        let window = RunningResourceWindow::begin(Arc::clone(&sampler)).await;
+        sampler
+            .process_query_delay_ms
+            .store(80, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            sampler.process_query_started.notified(),
+        )
+        .await
+        .unwrap();
+        sampler
+            .process_query_delay_ms
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let report = window.finish().await;
+        assert!(!report.complete);
+        assert!(report.overlong_periodic_observations > 0);
+        assert_eq!(report.host.as_ref().unwrap().failed_samples, 0);
+        // Even if no further periodic deadline fell before this early stop,
+        // the long observation itself cannot establish the declared cadence.
+        let mut no_later_deadlines = report;
+        no_later_deadlines.skipped_intervals = 0;
+        let elapsed = Duration::from_secs_f64(no_later_deadlines.duration_ms / 1000.0);
+        no_later_deadlines.finish(elapsed);
+        assert!(!no_later_deadlines.complete);
+    }
+
+    #[test]
+    fn failed_source_query_retains_timing_without_creating_a_zero_peak() {
+        let epoch = Instant::now();
+        let mut memory = SampledMemory::default();
+        let mut timing = ImageResourceQueryTiming::default();
+        record_query(
+            &mut memory,
+            &mut timing,
+            None,
+            epoch,
+            epoch,
+            epoch + Duration::from_secs(10),
+            Some(Duration::from_secs(2)),
+        );
+        assert!(!memory.complete());
+        assert_eq!(memory.failed_samples, 1);
+        assert_eq!(memory.observed_peak_bytes, None);
+        assert_eq!(timing.queries, 1);
+        assert_eq!(timing.maximum_query_ms, 10_000.0);
+        assert_eq!(timing.peak_query_started_offset_ms, None);
+        assert_eq!(timing.peak_query_finished_offset_ms, None);
+    }
     #[test]
     fn optional_configuration_requires_explicit_local_mapping() {
         let endpoint = ImageBenchmarkEndpoint {
@@ -470,6 +692,7 @@ mod tests {
             edit_url: None,
             model: "test".into(),
             server_config_declaration: "test".into(),
+            protocol: super::ImageEndpointProtocol::default(),
         };
         let mut config = ImageResourceSamplingConfig::default();
         assert!(config.validate(std::slice::from_ref(&endpoint)).is_err());

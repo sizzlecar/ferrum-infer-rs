@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 extern "C" __global__ void embedding_lookup_f32(
     const float* __restrict__ table,   // [vocab_size, dim]
@@ -130,4 +131,26 @@ extern "C" __global__ void argmax_f32(
         }
         output[0] = (uint32_t)best_idx;
     }
+}
+
+
+// BF16 keeps the same token selection, mask and repetition semantics.
+extern "C" __global__ void vnext_embedding_lookup_bf16(
+    const __nv_bfloat16* __restrict__ table,      // [vocab_size, dim]
+    const uint32_t* __restrict__ indices, // [tokens]
+    __nv_bfloat16* __restrict__ output,           // [tokens, dim]
+    int batch,
+    int dim,
+    uint32_t vocab_size
+) {
+    int token = blockIdx.y;
+    int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= batch || column >= dim) return;
+    uint32_t index = indices[token];
+    if (index >= vocab_size) {
+        output[(unsigned long long)token * dim + column] = __float2bfloat16_rn(0.0f);
+        return;
+    }
+    output[(unsigned long long)token * dim + column] =
+        table[(unsigned long long)index * dim + column];
 }

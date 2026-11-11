@@ -13,7 +13,12 @@ fn installation() -> (tempfile::TempDir, [u64; 3]) {
     // Reuse actual tiny schemas and payloads; the directory API itself does
     // not construct this fixture's Reference runtime or any device context.
     let (pipeline, directory) = super::adapter::pipeline(1);
-    let expected = pipeline.assets.receipt().required_weight_bytes;
+    let expected = pipeline
+        .execution
+        .sources
+        .assets
+        .receipt()
+        .required_weight_bytes;
     drop(pipeline);
     let root = directory.path();
     fs::rename(root.join("text"), root.join("text_encoder")).unwrap();
@@ -129,6 +134,7 @@ fn output_requirements_follow_decoder_batch_geometry_without_payload_allocation(
         maximum_width: 2048,
         maximum_height: 2048,
         maximum_batch_size: STRUCTURED_ATTENTION_BF16_MAX_BATCH,
+        weight_arena_target_bytes: None,
         decoder_batch_policy: ImageDecoderBatchPolicy::SingleImage,
         edit_prefix_policy: ImageEditPrefixPolicy::Recompute,
         plan_cache: ImagePlanCachePolicy::LastPerStage,
@@ -137,8 +143,18 @@ fn output_requirements_follow_decoder_batch_geometry_without_payload_allocation(
         static_initialization: StaticInitializationPolicy::new(256, 8).unwrap(),
         executor: TensorExecutorConfig::default(),
     };
-    let batch = pipeline.assets.output_requirements(&limits, &host).unwrap();
-    let decoder = pipeline.assets.decoder_batch(1, 128, 128).unwrap();
+    let batch = pipeline
+        .execution
+        .sources
+        .assets
+        .output_requirements(&limits, &host)
+        .unwrap();
+    let decoder = pipeline
+        .execution
+        .sources
+        .assets
+        .decoder_batch(1, 128, 128)
+        .unwrap();
     let frame = decoder
         .output_tensor()
         .unwrap()
@@ -147,14 +163,24 @@ fn output_requirements_follow_decoder_batch_geometry_without_payload_allocation(
     assert_eq!(batch.raw_batch_bytes, frame * limits.maximum_batch_size);
     assert!(batch.execution_output_bytes >= batch.raw_batch_bytes);
     limits.maximum_batch_size = 1;
-    let single = pipeline.assets.output_requirements(&limits, &host).unwrap();
+    let single = pipeline
+        .execution
+        .sources
+        .assets
+        .output_requirements(&limits, &host)
+        .unwrap();
     assert_eq!(single.raw_batch_bytes, frame);
     assert_eq!(
         single.execution_output_bytes,
         batch.execution_output_bytes / batch.batch_size
     );
     limits.maximum_width = 2047;
-    assert!(pipeline.assets.output_requirements(&limits, &host).is_err());
+    assert!(pipeline
+        .execution
+        .sources
+        .assets
+        .output_requirements(&limits, &host)
+        .is_err());
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }
 

@@ -81,6 +81,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 bytes = "1"
 tokio-stream = "0.1"
 futures = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -115,6 +116,8 @@ accelerate = ["ferrum-engine/accelerate"]  # Use Apple Accelerate BLAS (matches 
 metal = ["ferrum-engine/metal", "ferrum-kernels/metal", "ferrum-quantization/metal"]  # Apple GPU
 cuda = ["ferrum-engine/cuda", "ferrum-kernels/cuda", "ferrum-quantization/cuda"]    # NVIDIA CUDA
 cuda-cutlass-fp8 = ["cuda", "ferrum-kernels/cuda-cutlass-fp8", "ferrum-models/cuda-cutlass-fp8"]
+cuda-cutlass-fused-f32-attention = ["cuda", "ferrum-engine/cuda-cutlass-fused-f32-attention", "ferrum-kernels/cuda-cutlass-fused-f32-attention"]
+cuda-cutlass-int8-fused-output = ["cuda", "ferrum-engine/cuda-cutlass-int8-fused-output", "ferrum-kernels/cuda-cutlass-int8-fused-output"]
 # Full production capability set; requires a matching native operator-set lock.
 cuda-production = [
     "cuda-upstream-q6-f32-linear",

@@ -19,12 +19,15 @@ mod fp8_linear;
 pub mod gguf_config;
 pub mod gguf_engine_loader;
 pub mod hf_download;
+pub mod image_pixels;
 pub mod legacy_capabilities;
 pub mod loader;
 pub mod lora;
 pub mod models;
 pub mod moe;
 pub mod normal_noise;
+pub mod p_h3_image;
+pub mod p_h3_image_vae;
 pub mod pipeline_source;
 pub mod qwen35_config;
 #[cfg(any(test, feature = "test-support"))]

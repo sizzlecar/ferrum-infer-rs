@@ -617,6 +617,15 @@ impl SubmissionExecutionPolicy {
         }
     }
 
+    /// Execute original providers without recording or launching reusable work.
+    /// Scratch remains governed by each provider's production contract.
+    pub const fn eager() -> Self {
+        Self {
+            compute_path: DeviceComputePathRequirement::EagerOnly,
+            scratch_initialization: SubmissionScratchInitialization::ProviderContract,
+        }
+    }
+
     pub const fn determinism_eager(scratch_fill: u8) -> Self {
         Self {
             compute_path: DeviceComputePathRequirement::EagerOnly,
@@ -744,12 +753,36 @@ impl SubmissionWaveInputUpload {
         source_layout: HostTransferLayout,
         bytes: crate::ManagedHostBytes,
     ) -> Result<Self, VNextError> {
+        Self::managed_range(node_id, 0, input_ordinal, 0, source_layout, bytes)
+    }
+
+    /// Binds an immutable, accounted source to a participant's semantic input
+    /// range. Token-scaled Step inputs use source-token coordinates; fixed
+    /// participant inputs use their local coordinates, as in [`Self::new`].
+    /// The source owner remains attached to the upload and each backend command;
+    /// its bytes must never be copied into an unaccounted aggregate upload.
+    pub fn managed_range(
+        node_id: NodeId,
+        participant_index: u32,
+        input_ordinal: u32,
+        logical_offset_bytes: u64,
+        source_layout: HostTransferLayout,
+        bytes: crate::ManagedHostBytes,
+    ) -> Result<Self, VNextError> {
         source_layout.validate_bytes(bytes.len())?;
+        let byte_len = source_layout.byte_len()?;
+        if logical_offset_bytes.checked_add(byte_len).is_none()
+            || logical_offset_bytes % source_layout.element_type().size_bytes() != 0
+        {
+            return Err(invalid_operation(
+                "submission input upload has an invalid aligned logical range",
+            ));
+        }
         Ok(Self {
             node_id,
-            participant_index: 0,
+            participant_index,
             input_ordinal,
-            logical_offset_bytes: 0,
+            logical_offset_bytes,
             source_layout,
             bytes: SubmissionInputBytes::Managed(bytes),
         })

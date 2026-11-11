@@ -23,7 +23,9 @@ mod definition;
 pub mod gemma4;
 pub mod gpt_oss;
 mod hf_metadata;
+mod managed_preparation;
 pub use definition::DefinedProductionModel;
+pub use managed_preparation::{ManagedProductionModel, ManagedProductionWeightSource};
 mod numerical;
 pub mod qwen35;
 pub mod qwen3_moe;
@@ -447,10 +449,19 @@ impl PreparedProductionModel {
     pub fn execution_input(
         &self,
     ) -> ferrum_types::Result<ferrum_execution::PreparedExecutionInput<'_>> {
+        self.execution_input_with_source(self.weights.as_ref())
+    }
+
+    // Only sealed adapters bound to this preparation may substitute the
+    // physical source while preserving its original semantic/source identity.
+    fn execution_input_with_source<'a>(
+        &'a self,
+        weights: &'a dyn WeightComponentSource,
+    ) -> ferrum_types::Result<ferrum_execution::PreparedExecutionInput<'a>> {
         let descriptor = &self.descriptor;
         ferrum_execution::PreparedExecutionInput::new(
             &self.family,
-            self.weights.as_ref(),
+            weights,
             ferrum_execution::CausalExecutionFacts::new(
                 descriptor.hidden_size(),
                 descriptor.layer_count(),

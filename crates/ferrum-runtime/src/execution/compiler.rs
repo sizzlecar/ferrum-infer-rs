@@ -1,5 +1,8 @@
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
+
+mod weight_arena;
 
 use super::{
     invalid_plan, AliasPolicy, BlockedTensorPadding, BufferUsage, CapabilityCatalog, CapabilityId,
@@ -22,6 +25,20 @@ pub enum WeightPreparation {
     Require(WeightMaterializerSelection),
 }
 
+/// Physical packing of complete weight components into independently admitted arenas.
+/// The bounded target is a packing preference, not a strict allocation limit:
+/// a component larger than the target occupies an arena on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum WeightArenaPacking {
+    /// Preserve the established single arena per element type, including IDs.
+    #[default]
+    ByElementType,
+    Bounded {
+        target_bytes: NonZeroU64,
+    },
+}
+
 /// Explicit semantic inputs, per-node selection preferences, and optional
 /// completion diagnostics for compiling a model program. Product input
 /// capacities are required because they bound request-lifetime backing; the
@@ -33,6 +50,7 @@ pub struct ProgramPlanCompileOptions {
     preferred_providers: BTreeMap<NodeId, ProviderId>,
     completion_retention: CompletionRetentionSpec,
     weight_preparation: WeightPreparation,
+    weight_arena_packing: WeightArenaPacking,
 }
 
 impl ProgramPlanCompileOptions {
@@ -48,6 +66,7 @@ impl ProgramPlanCompileOptions {
             preferred_providers: BTreeMap::new(),
             completion_retention: CompletionRetentionSpec::default(),
             weight_preparation: WeightPreparation::Auto,
+            weight_arena_packing: WeightArenaPacking::ByElementType,
         })
     }
 
@@ -119,6 +138,15 @@ impl ProgramPlanCompileOptions {
             WeightMaterializerSelection::numeric_quality_artifact(materializer_id, artifact_bytes)?,
         );
         Ok(())
+    }
+
+    pub fn with_weight_arena_packing(mut self, packing: WeightArenaPacking) -> Self {
+        self.weight_arena_packing = packing;
+        self
+    }
+
+    pub const fn weight_arena_packing(&self) -> WeightArenaPacking {
+        self.weight_arena_packing
     }
 
     pub fn weight_preparation(&self) -> &WeightPreparation {
@@ -306,6 +334,7 @@ impl ProgramPlanCompiler {
                 execution_weight_schema,
                 &execution_weight_fingerprint,
                 value_alignment_bytes,
+                options.weight_arena_packing(),
             )?;
             let final_storages = build_value_storages(
                 family,
@@ -823,8 +852,17 @@ fn arena_weight_locations(
     execution_weight_schema: Option<&WeightSchema>,
     execution_weight_fingerprint: &str,
     provider_alignment_bytes: u64,
+    packing: WeightArenaPacking,
 ) -> Result<BTreeMap<WeightId, WeightComponentLocation>, VNextError> {
     let components = referenced_weight_components(family, execution_weight_schema)?;
+    if let WeightArenaPacking::Bounded { target_bytes } = packing {
+        return weight_arena::bounded_locations(
+            components,
+            execution_weight_fingerprint,
+            provider_alignment_bytes,
+            target_bytes,
+        );
+    }
     let mut arena_ids = BTreeMap::<ElementType, ResourceId>::new();
     let mut next_offsets = BTreeMap::<ElementType, u64>::new();
     let mut locations = BTreeMap::new();

@@ -186,6 +186,19 @@ impl ScratchLayout {
             .and_then(|n| n.checked_mul(columns))
             .and_then(|n| n.checked_mul(2))
             .ok_or("cuDNN attention packing bytes overflow")?;
+        Self::from_payload(batches, payload, workspace_bytes)
+    }
+
+    /// Contiguous, all-valid K/V can remain in the retained input allocations.
+    /// Only the two sequence-length arrays and the native workspace are needed.
+    pub fn without_payload(batches: u32, workspace_bytes: u64) -> Result<Self, String> {
+        if batches == 0 || batches > 16 {
+            return Err("invalid cuDNN attention length extent".into());
+        }
+        Self::from_payload(batches, 0, workspace_bytes)
+    }
+
+    fn from_payload(batches: u32, payload: u64, workspace_bytes: u64) -> Result<Self, String> {
         let align = |n: u64| {
             n.checked_add(SCRATCH_ALIGNMENT - 1)
                 .map(|n| n / SCRATCH_ALIGNMENT * SCRATCH_ALIGNMENT)

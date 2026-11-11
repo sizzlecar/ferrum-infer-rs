@@ -5,7 +5,11 @@ use super::sequence_settlement::WaveProgress;
 use super::*;
 use crate::token_execution::*;
 
+#[cfg(test)]
+mod causal_admission_tests;
+
 pub(super) struct AdmissionBinding {
+    causal_inputs: Option<Arc<CausalRequestInputs>>,
     tokens: Vec<u32>,
     maximum_tokens: usize,
     product_prompt_tokens: usize,
@@ -14,8 +18,12 @@ pub(super) struct AdmissionBinding {
 }
 
 impl AdmissionBinding {
-    fn from_input(input: ExecutorPrefillAdmission<'_>) -> Self {
+    fn from_input(
+        input: ExecutorPrefillAdmission<'_>,
+        causal_inputs: Option<Arc<CausalRequestInputs>>,
+    ) -> Self {
         Self {
+            causal_inputs,
             tokens: input.input_tokens.iter().map(|token| token.get()).collect(),
             maximum_tokens: input.maximum_sequence_tokens,
             product_prompt_tokens: input.product_prompt_tokens,
@@ -24,8 +32,18 @@ impl AdmissionBinding {
         }
     }
 
-    fn matches(&self, input: ExecutorPrefillAdmission<'_>) -> bool {
-        self.maximum_tokens == input.maximum_sequence_tokens
+    fn matches(
+        &self,
+        input: ExecutorPrefillAdmission<'_>,
+        causal_inputs: Option<&Arc<CausalRequestInputs>>,
+    ) -> bool {
+        let same_inputs = match (&self.causal_inputs, causal_inputs) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        same_inputs
+            && self.maximum_tokens == input.maximum_sequence_tokens
             && self.product_prompt_tokens == input.product_prompt_tokens
             && self.replayed_output_tokens == input.replayed_output_tokens
             && self.origin == input.request_origin
@@ -96,7 +114,24 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         input: ExecutorPrefillAdmission<'_>,
         repeat_ready: bool,
     ) -> Result<ExecutorPrefillAdmissionDecision> {
+        self.admit_bound_prefill_with_inputs(input, repeat_ready, None)
+    }
+
+    fn admit_bound_prefill_with_inputs(
+        &self,
+        input: ExecutorPrefillAdmission<'_>,
+        repeat_ready: bool,
+        causal_inputs: Option<Arc<CausalRequestInputs>>,
+    ) -> Result<ExecutorPrefillAdmissionDecision> {
         input.validate()?;
+        match (&self.io.causal_inputs, &causal_inputs, &self.managed_io) {
+            (None, None, _) => (),
+            (Some(expected), Some(actual), Some(managed)) if expected.schema == *actual.schema()
+                && actual.maximum_tokens() == input.maximum_sequence_tokens => {
+                    actual.validate_host(&managed.host)?;
+                },
+            _ => return Err(FerrumError::request_validation("causal admission is missing its exact compiled schema, maximum extent or original managed input owner")),
+        }
         if input.maximum_sequence_tokens > self.maximum_model_tokens {
             return Err(FerrumError::request_validation(
                 "sequence ceiling exceeds the compiled model",
@@ -128,7 +163,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     .admission
                     .lock()
                     .as_ref()
-                    .is_some_and(|binding| !binding.matches(input))
+                    .is_some_and(|binding| !binding.matches(input, causal_inputs.as_ref()))
                 {
                     return Err(FerrumError::request_validation(
                         "prefill retry changed its immutable admission",
@@ -151,7 +186,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             let slot = registry.begin_prefill_probe(input.request_id, &work)?;
             let mut binding = slot.admission.lock();
             if binding.is_none() {
-                *binding = Some(AdmissionBinding::from_input(input));
+                *binding = Some(AdmissionBinding::from_input(input, causal_inputs.clone()));
             }
             drop(binding);
             slot
@@ -164,6 +199,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             input.product_prompt_tokens,
             input.replayed_output_tokens,
             work,
+            causal_inputs,
         ) {
             Ok(resolution) => resolution,
             Err(error) => {
@@ -178,13 +214,21 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         &self,
         input: ExecutionAdmission<'_>,
     ) -> Result<TokenAdmissionOutcome> {
+        self.admit_native_tokens_with_inputs(input, None)
+    }
+
+    pub(super) fn admit_native_tokens_with_inputs(
+        &self,
+        input: ExecutionAdmission<'_>,
+        causal_inputs: Option<Arc<CausalRequestInputs>>,
+    ) -> Result<TokenAdmissionOutcome> {
         input.validate()?;
         if input.adapter.is_some() {
             return Err(FerrumError::unsupported(
                 "native token execution does not implement LoRA",
             ));
         }
-        match self.admit_bound_prefill(input.context, true)? {
+        match self.admit_bound_prefill_with_inputs(input.context, true, causal_inputs)? {
             ExecutorPrefillAdmissionDecision::Admitted(_) => {
                 let registry = self.sequences.lock();
                 let slot = registry
@@ -572,6 +616,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             fn(&mut Vec<ExecutorSamplingOutput>),
         >,
     ) -> Result<ExecutionBatchOutcome> {
+        self.validate_managed_work(inputs)?;
         let scope = self.token_issuer.batch(inputs, self.io.output_elements)?;
         let candidates = inputs
             .iter()
@@ -681,6 +726,14 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             (false, true) => VNextExecutionWaveKind::Decode,
             (false, false) => unreachable!("batch scope rejects empty work"),
         };
+        // Atomically grant actual Input/Output buffers before marking a slot
+        // Executing or extending native state. No nested Host scope is created.
+        let retained_inputs = sequences
+            .iter()
+            .map(|s| s.causal_inputs.as_deref())
+            .collect::<Vec<_>>();
+        let mut managed_wave =
+            self.prepare_managed_wave_with_inputs(&token_batches, &actual, kind, &retained_inputs)?;
         if kind == VNextExecutionWaveKind::Mixed
             && (self.checkpoint_capture.is_some() || self.diagnostic_fault.is_some())
         {
@@ -712,212 +765,219 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         };
         let restore = || self.restore_token_batch_retryable(inputs, &sequences, &indices, &slots);
 
-        let retired = loop {
-            let mut spans = Vec::with_capacity(sequences.len());
-            let mut roles = Vec::with_capacity(sequences.len());
-            let mut deferral = None;
-            let mut failure = None;
-            let mut narrower = None;
-            for (canonical, ((sequence, tokens), work)) in sequences
-                .iter()
-                .zip(&token_batches)
-                .zip(&actual)
-                .enumerate()
-            {
-                let end = work.range()?.end();
-                let extension_span = TokenSpanWork::from_token_ids(&tokens[..end], 0..end)
-                    .map_err(|error| FerrumError::backend(error.to_string()));
-                let extension = extension_span.and_then(|span| {
-                    ResourceWorkShape::single(span)
-                        .map_err(|error| FerrumError::backend(error.to_string()))
-                });
-                match extension
-                    .and_then(|extension| self.extend_sequence_with_capacity(sequence, extension))
+        let retired =
+            loop {
+                let mut spans = Vec::with_capacity(sequences.len());
+                let mut roles = Vec::with_capacity(sequences.len());
+                let mut deferral = None;
+                let mut failure = None;
+                let mut narrower = None;
+                for (canonical, ((sequence, tokens), work)) in sequences
+                    .iter()
+                    .zip(&token_batches)
+                    .zip(&actual)
+                    .enumerate()
                 {
-                    Ok(VNextExecutionCapacityDecision::Ready(())) => {}
-                    Ok(VNextExecutionCapacityDecision::Deferred(value)) => {
+                    let end = work.range()?.end();
+                    let extension_span = TokenSpanWork::from_token_ids(&tokens[..end], 0..end)
+                        .map_err(|error| FerrumError::backend(error.to_string()));
+                    let extension = extension_span.and_then(|span| {
+                        ResourceWorkShape::single(span)
+                            .map_err(|error| FerrumError::backend(error.to_string()))
+                    });
+                    match extension.and_then(|extension| {
+                        self.extend_sequence_with_capacity(sequence, extension)
+                    }) {
+                        Ok(VNextExecutionCapacityDecision::Ready(())) => {}
+                        Ok(VNextExecutionCapacityDecision::Deferred(value)) => {
+                            if actual.len() == 1
+                                && sequence.request_origin != ExecutorRequestOrigin::Startup
+                            {
+                                if let ExecutedTokenWork::Prefill {
+                                    chunk,
+                                    capacity_probe_count,
+                                } = *work
+                                {
+                                    if let Some(width) =
+                                        value.narrower_prefill_tokens(chunk.tokens_to_process())
+                                    {
+                                        narrower = Some((chunk, width, capacity_probe_count));
+                                    }
+                                }
+                            }
+                            deferral = Some(ExecutorExecutionDeferral::from(value));
+                            break;
+                        }
+                        Ok(VNextExecutionCapacityDecision::RequestStateDeferred(value)) => {
+                            deferral = Some(ExecutorExecutionDeferral::from(value));
+                            break;
+                        }
+                        Err(error) => {
+                            failure = Some(WaveFailure::not_submitted(error));
+                            break;
+                        }
+                    }
+                    match TokenSpanWork::from_token_ids_with_fit(
+                        tokens,
+                        work.range()?.as_range(),
+                        sequence.maximum_tokens,
+                    ) {
+                        Ok(span) => spans.push(span),
+                        Err(error) => {
+                            failure = Some(WaveFailure::not_submitted(FerrumError::backend(
+                                error.to_string(),
+                            )));
+                            break;
+                        }
+                    }
+                    roles.push(match *work {
+                        ExecutedTokenWork::Prefill { chunk, .. } => {
+                            VNextParticipantOutputRole::prefill(chunk)
+                        }
+                        ExecutedTokenWork::Decode { .. } => VNextParticipantOutputRole::Decode(
+                            inputs[indices[canonical]].logits_policy().clone(),
+                        ),
+                    });
+                }
+                if let Some((chunk, width, probes)) = narrower {
+                    actual[0] = ExecutedTokenWork::Prefill {
+                        chunk: PrefillChunk::new(
+                            chunk.tokens_processed(),
+                            width,
+                            chunk.total_prompt_tokens(),
+                        )?,
+                        capacity_probe_count: probes
+                            .checked_add(1)
+                            .ok_or_else(|| FerrumError::internal("prefill probe overflow"))?,
+                    };
+                    self.metrics
+                        .prefill_frontier_narrowings
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let decision = if let Some(failure) = failure {
+                    Err(failure)
+                } else if let Some(deferral) = deferral {
+                    match restore() {
+                        Ok(()) => {
+                            cancellation.armed = false;
+                            return Ok(scope.not_submitted(NoSubmissionReason::Deferred(deferral)));
+                        }
+                        Err(error) => Err(WaveFailure::not_submitted(error)),
+                    }
+                } else {
+                    self.execute_batch_step(
+                        &batch,
+                        &sequences,
+                        &token_batches,
+                        &spans,
+                        kind,
+                        &roles,
+                        &mut managed_wave,
+                    )
+                    .await
+                };
+                match decision {
+                    Ok(VNextExecutionCapacityDecision::Ready(retired)) => break retired,
+                    Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
+                        // Product work may narrow; startup capture must retain its
+                        // exact fingerprinted range, including prerequisite chunks.
                         if actual.len() == 1
-                            && sequence.request_origin != ExecutorRequestOrigin::Startup
+                            && sequences[0].request_origin != ExecutorRequestOrigin::Startup
                         {
                             if let ExecutedTokenWork::Prefill {
                                 chunk,
                                 capacity_probe_count,
-                            } = *work
+                            } = actual[0]
                             {
                                 if let Some(width) =
-                                    value.narrower_prefill_tokens(chunk.tokens_to_process())
+                                    deferred.narrower_prefill_tokens(chunk.tokens_to_process())
                                 {
-                                    narrower = Some((chunk, width, capacity_probe_count));
+                                    actual[0] = ExecutedTokenWork::Prefill {
+                                        chunk: PrefillChunk::new(
+                                            chunk.tokens_processed(),
+                                            width,
+                                            chunk.total_prompt_tokens(),
+                                        )?,
+                                        capacity_probe_count: capacity_probe_count
+                                            .checked_add(1)
+                                            .ok_or_else(|| {
+                                            FerrumError::internal("prefill probe overflow")
+                                        })?,
+                                    };
+                                    self.metrics
+                                        .prefill_frontier_narrowings
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    continue;
                                 }
                             }
                         }
-                        deferral = Some(ExecutorExecutionDeferral::from(value));
-                        break;
-                    }
-                    Ok(VNextExecutionCapacityDecision::RequestStateDeferred(value)) => {
-                        deferral = Some(ExecutorExecutionDeferral::from(value));
-                        break;
-                    }
-                    Err(error) => {
-                        failure = Some(WaveFailure::not_submitted(error));
-                        break;
-                    }
-                }
-                match TokenSpanWork::from_token_ids_with_fit(
-                    tokens,
-                    work.range()?.as_range(),
-                    sequence.maximum_tokens,
-                ) {
-                    Ok(span) => spans.push(span),
-                    Err(error) => {
-                        failure = Some(WaveFailure::not_submitted(FerrumError::backend(
-                            error.to_string(),
-                        )));
-                        break;
-                    }
-                }
-                roles.push(match *work {
-                    ExecutedTokenWork::Prefill { chunk, .. } => {
-                        VNextParticipantOutputRole::prefill(chunk)
-                    }
-                    ExecutedTokenWork::Decode { .. } => VNextParticipantOutputRole::Decode(
-                        inputs[indices[canonical]].logits_policy().clone(),
-                    ),
-                });
-            }
-            if let Some((chunk, width, probes)) = narrower {
-                actual[0] = ExecutedTokenWork::Prefill {
-                    chunk: PrefillChunk::new(
-                        chunk.tokens_processed(),
-                        width,
-                        chunk.total_prompt_tokens(),
-                    )?,
-                    capacity_probe_count: probes
-                        .checked_add(1)
-                        .ok_or_else(|| FerrumError::internal("prefill probe overflow"))?,
-                };
-                self.metrics
-                    .prefill_frontier_narrowings
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            let decision = if let Some(failure) = failure {
-                Err(failure)
-            } else if let Some(deferral) = deferral {
-                match restore() {
-                    Ok(()) => {
-                        cancellation.armed = false;
-                        return Ok(scope.not_submitted(NoSubmissionReason::Deferred(deferral)));
-                    }
-                    Err(error) => Err(WaveFailure::not_submitted(error)),
-                }
-            } else {
-                self.execute_batch_step(&batch, &sequences, &token_batches, &spans, kind, &roles)
-                    .await
-            };
-            match decision {
-                Ok(VNextExecutionCapacityDecision::Ready(retired)) => break retired,
-                Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
-                    // Product work may narrow; startup capture must retain its
-                    // exact fingerprinted range, including prerequisite chunks.
-                    if actual.len() == 1
-                        && sequences[0].request_origin != ExecutorRequestOrigin::Startup
-                    {
-                        if let ExecutedTokenWork::Prefill {
-                            chunk,
-                            capacity_probe_count,
-                        } = actual[0]
-                        {
-                            if let Some(width) =
-                                deferred.narrower_prefill_tokens(chunk.tokens_to_process())
-                            {
-                                actual[0] = ExecutedTokenWork::Prefill {
-                                    chunk: PrefillChunk::new(
-                                        chunk.tokens_processed(),
-                                        width,
-                                        chunk.total_prompt_tokens(),
-                                    )?,
-                                    capacity_probe_count: capacity_probe_count
-                                        .checked_add(1)
-                                        .ok_or_else(|| {
-                                            FerrumError::internal("prefill probe overflow")
-                                        })?,
-                                };
-                                self.metrics
-                                    .prefill_frontier_narrowings
-                                    .fetch_add(1, Ordering::Relaxed);
-                                continue;
+                        match restore() {
+                            Ok(()) => {
+                                cancellation.armed = false;
+                                return Ok(scope
+                                    .not_submitted(NoSubmissionReason::Deferred(deferred.into())));
+                            }
+                            Err(error) => {
+                                drop(cancellation);
+                                return Ok(self.interrupted_native_tokens(
+                                    &scope,
+                                    inputs,
+                                    &sequences,
+                                    &indices,
+                                    &actual,
+                                    Vec::new(),
+                                    error,
+                                    &WaveProgress::BeforeSubmit,
+                                    None,
+                                    false,
+                                ));
                             }
                         }
                     }
-                    match restore() {
-                        Ok(()) => {
-                            cancellation.armed = false;
-                            return Ok(
-                                scope.not_submitted(NoSubmissionReason::Deferred(deferred.into()))
-                            );
-                        }
-                        Err(error) => {
-                            drop(cancellation);
-                            return Ok(self.interrupted_native_tokens(
-                                &scope,
-                                inputs,
-                                &sequences,
-                                &indices,
-                                &actual,
-                                Vec::new(),
-                                error,
-                                &WaveProgress::BeforeSubmit,
-                                None,
-                                false,
-                            ));
-                        }
-                    }
-                }
-                Ok(VNextExecutionCapacityDecision::RequestStateDeferred(deferred)) => {
-                    match restore() {
-                        Ok(()) => {
-                            cancellation.armed = false;
-                            return Ok(
-                                scope.not_submitted(NoSubmissionReason::Deferred(deferred.into()))
-                            );
-                        }
-                        Err(error) => {
-                            drop(cancellation);
-                            return Ok(self.interrupted_native_tokens(
-                                &scope,
-                                inputs,
-                                &sequences,
-                                &indices,
-                                &actual,
-                                Vec::new(),
-                                error,
-                                &WaveProgress::BeforeSubmit,
-                                None,
-                                false,
-                            ));
+                    Ok(VNextExecutionCapacityDecision::RequestStateDeferred(deferred)) => {
+                        match restore() {
+                            Ok(()) => {
+                                cancellation.armed = false;
+                                return Ok(scope
+                                    .not_submitted(NoSubmissionReason::Deferred(deferred.into())));
+                            }
+                            Err(error) => {
+                                drop(cancellation);
+                                return Ok(self.interrupted_native_tokens(
+                                    &scope,
+                                    inputs,
+                                    &sequences,
+                                    &indices,
+                                    &actual,
+                                    Vec::new(),
+                                    error,
+                                    &WaveProgress::BeforeSubmit,
+                                    None,
+                                    false,
+                                ));
+                            }
                         }
                     }
+                    Err(failure) => {
+                        let (error, progress, observation_error, observation_error_reported) =
+                            failure.into_parts();
+                        drop(cancellation);
+                        return Ok(self.interrupted_native_tokens(
+                            &scope,
+                            inputs,
+                            &sequences,
+                            &indices,
+                            &actual,
+                            Vec::new(),
+                            error,
+                            &progress,
+                            observation_error,
+                            observation_error_reported,
+                        ));
+                    }
                 }
-                Err(failure) => {
-                    let (error, progress, observation_error, observation_error_reported) =
-                        failure.into_parts();
-                    drop(cancellation);
-                    return Ok(self.interrupted_native_tokens(
-                        &scope,
-                        inputs,
-                        &sequences,
-                        &indices,
-                        &actual,
-                        Vec::new(),
-                        error,
-                        &progress,
-                        observation_error,
-                        observation_error_reported,
-                    ));
-                }
-            }
-        };
+            };
         let RetiredWave { output, retirement } = retired;
         #[cfg(any(test, feature = "test-support"))]
         let output = {

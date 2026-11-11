@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub mod cutlass_fp8;
+pub mod cutlass_fused_f32_attention;
+pub mod cutlass_int8_fused_output;
 pub mod flashinfer_xqa;
 pub mod upstream_linear;
 pub mod upstream_q6_f16_linear;

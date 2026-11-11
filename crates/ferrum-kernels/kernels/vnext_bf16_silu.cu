@@ -698,19 +698,25 @@ extern "C" __global__ void ferrum_vnext_plain_residual_add_bf16(
 // Each multiplication is explicitly rounded to BF16 before the final sum.
 extern "C" __global__ void ferrum_vnext_half_split_rope_bf16(
     const uint16_t* input, const uint16_t* cosine, const uint16_t* sine,
-    uint16_t* output, uint64_t pairs, uint64_t columns, uint64_t head_dim) {
+    uint16_t* output, uint64_t units, uint64_t columns, uint64_t head_dim, uint64_t rotary_dim) {
     const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
-    const uint64_t half = head_dim / 2;
-    const uint64_t pairs_per_row = columns / 2;
-    for (uint64_t pair = first; pair < pairs; pair += stride) {
-        const uint64_t row = pair / pairs_per_row;
-        const uint64_t row_pair = pair % pairs_per_row;
-        const uint64_t head = row_pair / half;
-        const uint64_t channel = row_pair % half;
+    const uint64_t half = rotary_dim / 2;
+    const uint64_t units_per_head = half + head_dim - rotary_dim;
+    const uint64_t units_per_row = (columns / head_dim) * units_per_head;
+    for (uint64_t unit = first; unit < units; unit += stride) {
+        const uint64_t row = unit / units_per_row;
+        const uint64_t row_unit = unit % units_per_row;
+        const uint64_t head = row_unit / units_per_head;
+        const uint64_t channel = row_unit % units_per_head;
+        if (channel >= half) {
+            const uint64_t tail = row * columns + head * head_dim + rotary_dim + channel - half;
+            output[tail] = input[tail];
+            continue;
+        }
         const uint64_t left = row * columns + head * head_dim + channel;
         const uint64_t right = left + half;
-        const uint64_t frequency = row * head_dim + channel;
+        const uint64_t frequency = row * rotary_dim + channel;
         const float a = ferrum_bf16_decode(input[left]);
         const float b = ferrum_bf16_decode(input[right]);
         const uint16_t ac = ferrum_bf16_rne(__fmul_rn(a, ferrum_bf16_decode(cosine[frequency])));
@@ -1032,3 +1038,139 @@ extern "C" __global__ void ferrum_vnext_spatial_upsample_gather_bf16(
 #include "vnext_bf16_spatial_group_mean.cuh"
 
 #include "vnext_tensor_primitives.cuh"
+#include "vnext_comfy_convrot.cuh"
+#include "vnext_comfy_convrot_embedding.cuh"
+#include "vnext_fused_head_rms_partial_rope.cuh"
+#include "vnext_row_rms_addcmul.cuh"
+#include "vnext_cast_f32_to_bf16.cuh"
+#include "vnext_pointwise_f32.cuh"
+#include "vnext_gelu_f32.cuh"
+#include "vnext_reshape_copy_f32.cuh"
+#include "vnext_row_scatter_f32.cuh"
+#include "vnext_channelwise_f32.cuh"
+#include "vnext_row_selected_modulation.cuh"
+#include "vnext_row_selected_bf16.cuh"
+#include "vnext_batched_suffix_append_f32.cuh"
+#include "vnext_layer_norm_f32.cuh"
+#include "vnext_cnn_f32.cuh"
+#include "vnext_f32_norm_rope.cuh"
+
+// Independent full-F32 structured GQA. One CTA owns one query/head; there is
+// no repeated KV, score matrix, global scratch or half-precision boundary.
+// General D2..256 retains the original adjacent-pair order. Incomplete final
+// subtrees are carried unchanged: no out-of-range shared read or padding +0.
+__device__ __forceinline__ float ferrum_gqa_f32_pairwise(
+    float scalar, float* values, uint32_t width) {
+    const uint32_t lane = threadIdx.x % 32;
+    const uint32_t warp = threadIdx.x / 32;
+    const uint32_t active = min(32U, width - warp * 32);
+    const uint32_t lanes = __activemask();
+    // Preserve the exact adjacent-pair tree within each warp, including a
+    // partial final warp. An unmatched subtree is carried without adding zero.
+    for (uint32_t stride = 1; stride < 32; stride *= 2) {
+        const float right = __shfl_down_sync(lanes, scalar, stride);
+        if (lane % (2 * stride) == 0 && lane + stride < active) {
+            scalar = __fadd_rn(scalar, right);
+        }
+    }
+    if (lane == 0) values[warp] = scalar;
+    __syncthreads();
+    // Only thread zero consumes the dot product. These are precisely the
+    // remaining levels (stride >= 32) of the original adjacent-pair tree.
+    // The caller's softmax barrier completes this stage before shared reuse.
+    if (threadIdx.x != 0) return 0.0f;
+    const uint32_t warps = (width + 31) / 32;
+    for (uint32_t stride = 1; stride < warps; stride *= 2) {
+        for (uint32_t left = 0; left < warps; left += 2 * stride) {
+            if (left + stride < warps) {
+                values[left] = __fadd_rn(values[left], values[left + stride]);
+            }
+        }
+    }
+    return values[0];
+}
+extern "C" __global__ void ferrum_vnext_structured_gqa_attention_f32(
+    const float* query, const float* key, const float* value,
+    float* output, uint64_t groups, uint64_t query_heads, uint64_t key_value_heads, uint32_t sequence,
+    uint32_t width, float scale, const FerrumStructuredAttentionMask mask) {
+    extern __shared__ float dot_values[];
+    __shared__ uint32_t visible_end, seen, poisoned, first_key;
+    __shared__ float maximum, denominator, correction, weight, inverse;
+    for (uint64_t group = blockIdx.x; group < groups; group += gridDim.x) {
+        const uint64_t head = group % query_heads;
+        const uint64_t kv_head = head / (query_heads / key_value_heads);
+        const uint64_t local_row = group / query_heads;
+        const uint32_t batch = static_cast<uint32_t>(local_row / sequence);
+        const uint32_t q = static_cast<uint32_t>(local_row % sequence);
+        const uint64_t row = static_cast<uint64_t>(batch) * sequence + q;
+        const uint64_t columns = query_heads * width;
+        const uint64_t kv_columns = key_value_heads * width;
+        const uint64_t query_offset = row * columns + head * width + threadIdx.x;
+        float q_scalar = 0.0f;
+        float accumulator = 0.0f;
+        if (threadIdx.x == 0) {
+            visible_end = q + 1;
+            for (uint32_t segment = 0; segment < mask.segment_count; ++segment) {
+                if (q < mask.segment_ends[segment]) {
+                    if ((mask.bidirectional_mask >> segment) & 1U) {
+                        visible_end = mask.segment_ends[segment];
+                    }
+                    break;
+                }
+            }
+            seen = 0;
+            poisoned = 0;
+        }
+        __syncthreads();
+        uint32_t run = 0;
+        for (uint32_t k = 0; k < visible_end; ++k) {
+            while (run + 1 < mask.key_run_counts[batch]
+                   && k >= mask.key_run_ends[batch * 32 + run]) {
+                ++run;
+            }
+            // Uniform within the CTA. Excluded keys are not loaded, so a
+            // masked NaN/Inf cannot contaminate either scores or values.
+            if (((mask.key_valid_masks[batch] >> run) & 1U) == 0) continue;
+            // No Q/K/V load for an empty visible set. Q is loaded only at
+            // the first visible key and retained in one scalar register.
+            if (!seen) q_scalar = query[query_offset];
+            const uint64_t kv_offset = (static_cast<uint64_t>(batch) * sequence + k)
+                * kv_columns + kv_head * width + threadIdx.x;
+            const float dot = ferrum_gqa_f32_pairwise(
+                __fmul_rn(q_scalar, key[kv_offset]), dot_values, width);
+            if (threadIdx.x == 0) {
+                const float score = __fmul_rn(dot, scale);
+                if (!isfinite(score)) {
+                    poisoned = 1;
+                } else if (!seen) {
+                    first_key = 1;
+                    seen = 1;
+                    maximum = score;
+                    denominator = 1.0f;
+                } else {
+                    first_key = 0;
+                    const float next_maximum = fmaxf(maximum, score);
+                    correction = expf(__fsub_rn(maximum, next_maximum));
+                    weight = expf(__fsub_rn(score, next_maximum));
+                    denominator = __fadd_rn(__fmul_rn(denominator, correction), weight);
+                    maximum = next_maximum;
+                }
+            }
+            __syncthreads();
+            if (poisoned) break;
+            const float v = value[kv_offset];
+            accumulator = first_key ? v : __fadd_rn(
+                __fmul_rn(accumulator, correction), __fmul_rn(weight, v));
+            __syncthreads();
+        }
+        if (threadIdx.x == 0 && seen && !poisoned) {
+            inverse = __fdiv_rn(1.0f, denominator);
+        }
+        __syncthreads();
+        output[query_offset] = poisoned ? __uint_as_float(0x7fc00000U) :
+            (seen ? __fmul_rn(accumulator, inverse) : 0.0f);
+        __syncthreads();
+    }
+}
+
+#include "vnext_philox_f32.cuh"

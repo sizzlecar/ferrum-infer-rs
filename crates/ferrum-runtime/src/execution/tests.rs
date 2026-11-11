@@ -14,6 +14,9 @@ mod completion_order_cache;
 #[path = "invocation_chain_tests.rs"]
 mod invocation_chain;
 
+#[path = "unused_weight_tests.rs"]
+mod unused_weights;
+
 #[test]
 fn execution_plan_wire_limit_is_symmetric() {
     super::validation::validate_execution_plan_wire_size(
@@ -924,6 +927,72 @@ fn startup_memory_counts_reusable_capacity_and_keeps_fallback_bound_monotone() {
     assert_eq!(plan.startup_peak_bytes(100, 1, 1).unwrap(), 128);
     assert_eq!(plan.startup_peak_bytes(100, 1, 9).unwrap(), 144);
     assert_eq!(plan.startup_peak_bytes(100, 2, 2).unwrap(), 128);
+}
+
+#[test]
+fn reusable_lane_caps_account_for_all_lanes_and_preserve_legacy_wire() {
+    let class = ReusableExecutionClassId::new("class/capped").unwrap();
+    let programs = [1, 2]
+        .into_iter()
+        .map(|width| {
+            ReusableExecutionProgramSpec::new(
+                class.clone(),
+                ReusableExecutionProgramShape::uniform_decode(width, 1).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let policy = ReusableExecutionPolicy::new(
+        3,
+        vec![ReusableExecutionBucketSpec::new(
+            class,
+            ReusableExecutionCapacity::new(2, 2, 1).unwrap(),
+        )
+        .unwrap()],
+    )
+    .unwrap()
+    .with_program_policy(ReusableExecutionProgramPolicy::exact_on_demand(programs).unwrap())
+    .unwrap();
+    let derive = |policy: &ReusableExecutionPolicy| {
+        MemoryPlan::derive_reusable_execution(policy, 5, &[], &[]).unwrap()
+    };
+    let legacy = derive(&policy);
+    assert_eq!(legacy.maximum_device_executables(), 30);
+    assert_eq!(legacy.capped_device_executables_per_lane(), None);
+    assert_eq!(
+        serde_json::to_value(&legacy).unwrap(),
+        serde_json::json!({
+            "maximum_reusable_lanes": 3, "maximum_device_executables": 30,
+            "buckets": legacy.buckets(), "program_policy": policy.program_policy(),
+        })
+    );
+    for (cap, per_lane) in [(4, 4), (32, 10)] {
+        let capped_policy = policy
+            .clone()
+            .with_maximum_executables_per_lane(cap)
+            .unwrap();
+        let memory = derive(&capped_policy);
+        assert_eq!(memory.maximum_device_executables(), 3 * per_lane);
+        assert_eq!(memory.capped_device_executables_per_lane(), Some(per_lane));
+        assert_eq!(memory.policy().unwrap(), capped_policy);
+        let wire = serde_json::to_value(&memory).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ReusableExecutionMemoryPlan>(wire.clone()).unwrap(),
+            memory
+        );
+        let mut invalid = wire;
+        invalid["maximum_device_executables"] = serde_json::json!(3 * cap + 1);
+        assert!(serde_json::from_value::<ReusableExecutionMemoryPlan>(invalid.clone()).is_err());
+        invalid["maximum_device_executables"] = serde_json::json!(3 * (cap + 1));
+        assert!(serde_json::from_value::<ReusableExecutionMemoryPlan>(invalid).is_err());
+    }
+    let overflow_policy = ReusableExecutionPolicy::new(u32::MAX, policy.buckets().to_vec())
+        .unwrap()
+        .with_program_policy(policy.program_policy().unwrap().clone())
+        .unwrap()
+        .with_maximum_executables_per_lane(u64::MAX)
+        .unwrap();
+    assert!(MemoryPlan::derive_reusable_execution(&overflow_policy, usize::MAX, &[], &[]).is_err());
 }
 
 #[test]

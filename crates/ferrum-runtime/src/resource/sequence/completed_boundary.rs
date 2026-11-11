@@ -57,6 +57,7 @@ pub(crate) struct CompletedSequenceBoundary {
     plan_hash: PlanHash,
     provenance: CompletedSequenceProvenance,
     continuation: Option<Arc<SequenceCheckpointContinuation>>,
+    selected_continuation: bool,
     epoch: SequenceSessionEpoch,
     session_fingerprint: SequenceSessionFingerprint,
     backing_generation: SequenceBackingGeneration,
@@ -169,7 +170,8 @@ impl SequenceCompletedFrontier {
         requested: &TokenSpanWork,
         plan_hash: &PlanHash,
     ) -> Result<Option<TokenSpanWork>, VNextError> {
-        if !matches!(self, Self::Proven(previous) if previous.continuation.is_some()) {
+        if !matches!(self, Self::Proven(previous) if (previous.continuation.is_some() || previous.selected_continuation))
+        {
             return Ok(None);
         }
         if admitted != requested {
@@ -192,7 +194,7 @@ impl SequenceCompletedFrontier {
         let Self::Proven(previous) = self else {
             return Ok(());
         };
-        if previous.continuation.is_none() {
+        if previous.continuation.is_none() && !previous.selected_continuation {
             return Ok(());
         }
         let tokens = span.checkpoint_tokens().ok_or_else(|| {
@@ -203,6 +205,22 @@ impl SequenceCompletedFrontier {
             .map_err(|_| invalid_resource("continuation token start exceeds usize"))?;
         let end = usize::try_from(range.end)
             .map_err(|_| invalid_resource("continuation token end exceeds usize"))?;
+        self.validate_continuation(start, end, tokens, plan_hash)
+    }
+
+    pub(in crate::resource) fn validate_candidate_work(
+        &self,
+        span: &TokenSpanWork,
+        plan_hash: &PlanHash,
+    ) -> Result<(), VNextError> {
+        let tokens = span.checkpoint_tokens().ok_or_else(|| {
+            invalid_resource("candidate state work requires exact token evidence")
+        })?;
+        let range = span.immediate_token_range();
+        let start = usize::try_from(range.start)
+            .map_err(|_| invalid_resource("candidate token start exceeds usize"))?;
+        let end = usize::try_from(range.end)
+            .map_err(|_| invalid_resource("candidate token end exceeds usize"))?;
         self.validate_continuation(start, end, tokens, plan_hash)
     }
 
@@ -255,14 +273,20 @@ pub(crate) enum StepCompletedBoundarySlot {
     #[default]
     Empty,
     Succeeded(StepCompletedBoundaryProof),
+    CandidateReady {
+        proof: StepCompletedBoundaryProof,
+        identity: crate::BatchOperationIdentity,
+    },
+    CopyPending,
+    CopySucceeded(StepCompletedBoundaryProof),
     Invalid,
 }
 
 impl StepCompletedBoundarySlot {
     pub(crate) fn proof(&self) -> Option<&StepCompletedBoundaryProof> {
         match self {
-            Self::Succeeded(proof) => Some(proof),
-            Self::Empty | Self::Invalid => None,
+            Self::Succeeded(proof) | Self::CopySucceeded(proof) => Some(proof),
+            _ => None,
         }
     }
 
@@ -470,6 +494,7 @@ fn boundary_from_span(
             SequenceCompletedFrontier::Proven(previous) => previous.continuation.clone(),
             _ => None,
         },
+        selected_continuation: matches!(&active.completed_boundary, SequenceCompletedFrontier::Proven(p) if p.selected_continuation),
         epoch: active.epoch,
         session_fingerprint: active.fingerprint.clone(),
         backing_generation,
@@ -479,7 +504,7 @@ fn boundary_from_span(
     })))
 }
 
-fn validate_active_frame(
+pub(in crate::resource) fn validate_active_frame(
     active: &ActiveSequenceSessionState,
     hold: &SessionFrameHold,
 ) -> Result<(), VNextError> {
@@ -525,7 +550,7 @@ pub(in crate::resource) fn completed_frontier_updates(
                     };
                     let missing_proof = || {
                         if matches!(&active.completed_boundary,
-                            SequenceCompletedFrontier::Proven(previous) if previous.continuation.is_some())
+                            SequenceCompletedFrontier::Proven(previous) if previous.continuation.is_some() || previous.selected_continuation)
                         {
                             Err(invalid_resource(
                                 "imported continuation cannot commit without complete FullPlan proof",
@@ -652,3 +677,6 @@ impl<R: DeviceRuntime> PreparedSequenceStateTransfer<R> {
         inspect(active)
     }
 }
+
+mod selected;
+pub(in crate::resource) use selected::*;

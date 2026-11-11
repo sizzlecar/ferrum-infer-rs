@@ -739,6 +739,8 @@ impl<'de> Deserialize<'de> for ReusableExecutionProgramPolicy {
 #[serde(deny_unknown_fields)]
 pub struct ReusableExecutionPolicy {
     maximum_reusable_lanes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maximum_executables_per_lane: Option<u64>,
     buckets: Vec<ReusableExecutionBucketSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     program_policy: Option<ReusableExecutionProgramPolicy>,
@@ -748,6 +750,8 @@ pub struct ReusableExecutionPolicy {
 #[serde(deny_unknown_fields)]
 struct ReusableExecutionPolicyWire {
     maximum_reusable_lanes: u32,
+    #[serde(default)]
+    maximum_executables_per_lane: Option<u64>,
     buckets: Vec<ReusableExecutionBucketSpec>,
     #[serde(default)]
     program_policy: Option<ReusableExecutionProgramPolicy>,
@@ -763,6 +767,7 @@ impl ReusableExecutionPolicy {
         });
         let policy = Self {
             maximum_reusable_lanes,
+            maximum_executables_per_lane: None,
             buckets,
             program_policy: None,
         };
@@ -779,6 +784,14 @@ impl ReusableExecutionPolicy {
         Ok(self)
     }
 
+    /// Bound each lane's on-demand cache independently. The memory plan still
+    /// accounts for all declared lanes, rather than treating this as a global cap.
+    pub fn with_maximum_executables_per_lane(mut self, maximum: u64) -> Result<Self, VNextError> {
+        self.maximum_executables_per_lane = Some(maximum);
+        self.validate()?;
+        Ok(self)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), VNextError> {
         if self.maximum_reusable_lanes == 0
             || self.buckets.is_empty()
@@ -790,6 +803,17 @@ impl ReusableExecutionPolicy {
         }
         for bucket in &self.buckets {
             bucket.validate()?;
+        }
+        if let Some(maximum) = self.maximum_executables_per_lane {
+            if maximum == 0
+                || !self.program_policy.as_ref().is_some_and(|policy| {
+                    policy.preparation() == ReusableExecutionProgramPreparation::OnDemand
+                })
+            {
+                return Err(invalid_plan(
+                    "a per-lane executable cap requires positive pure on-demand preparation",
+                ));
+            }
         }
         if let Some(program_policy) = &self.program_policy {
             program_policy.validate()?;
@@ -824,6 +848,10 @@ impl ReusableExecutionPolicy {
 
     pub const fn maximum_reusable_lanes(&self) -> u32 {
         self.maximum_reusable_lanes
+    }
+
+    pub const fn maximum_executables_per_lane(&self) -> Option<u64> {
+        self.maximum_executables_per_lane
     }
 
     pub fn buckets(&self) -> &[ReusableExecutionBucketSpec] {
@@ -870,6 +898,7 @@ impl<'de> Deserialize<'de> for ReusableExecutionPolicy {
         let wire = ReusableExecutionPolicyWire::deserialize(deserializer)?;
         let policy = Self {
             maximum_reusable_lanes: wire.maximum_reusable_lanes,
+            maximum_executables_per_lane: wire.maximum_executables_per_lane,
             buckets: wire.buckets,
             program_policy: wire.program_policy,
         };
@@ -1017,6 +1046,8 @@ impl<'de> Deserialize<'de> for ResolvedReusableExecutionBucket {
 pub struct ReusableExecutionMemoryPlan {
     maximum_reusable_lanes: u32,
     maximum_device_executables: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maximum_executables_per_lane: Option<u64>,
     buckets: Vec<ResolvedReusableExecutionBucket>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     program_policy: Option<ReusableExecutionProgramPolicy>,
@@ -1027,6 +1058,8 @@ pub struct ReusableExecutionMemoryPlan {
 struct ReusableExecutionMemoryPlanWire {
     maximum_reusable_lanes: u32,
     maximum_device_executables: u64,
+    #[serde(default)]
+    maximum_executables_per_lane: Option<u64>,
     buckets: Vec<ResolvedReusableExecutionBucket>,
     #[serde(default)]
     program_policy: Option<ReusableExecutionProgramPolicy>,
@@ -1044,6 +1077,7 @@ impl ReusableExecutionMemoryPlan {
             maximum_device_executables,
             buckets,
             None,
+            None,
         )
     }
 
@@ -1052,10 +1086,12 @@ impl ReusableExecutionMemoryPlan {
         maximum_device_executables: u64,
         buckets: Vec<ResolvedReusableExecutionBucket>,
         program_policy: Option<ReusableExecutionProgramPolicy>,
+        maximum_executables_per_lane: Option<u64>,
     ) -> Result<Self, VNextError> {
         let plan = Self {
             maximum_reusable_lanes,
             maximum_device_executables,
+            maximum_executables_per_lane,
             buckets,
             program_policy,
         };
@@ -1076,15 +1112,16 @@ impl ReusableExecutionMemoryPlan {
         for bucket in &self.buckets {
             bucket.validate()?;
         }
-        let mut canonical = ReusableExecutionPolicy::new(
-            self.maximum_reusable_lanes,
-            self.buckets
-                .iter()
-                .map(|bucket| bucket.bucket().clone())
-                .collect(),
-        )?;
-        if let Some(program_policy) = self.program_policy.clone() {
-            canonical = canonical.with_program_policy(program_policy)?;
+        let canonical = self.policy()?;
+        if let Some(maximum) = self.maximum_executables_per_lane {
+            let lanes = u64::from(self.maximum_reusable_lanes);
+            if self.maximum_device_executables % lanes != 0
+                || self.maximum_device_executables / lanes > maximum
+            {
+                return Err(invalid_plan(
+                    "reusable executable total exceeds or cannot be divided across its lane caps",
+                ));
+            }
         }
         if canonical.buckets().iter().ne(self
             .buckets
@@ -1104,6 +1141,13 @@ impl ReusableExecutionMemoryPlan {
 
     pub const fn maximum_device_executables(&self) -> u64 {
         self.maximum_device_executables
+    }
+
+    /// Effective capacity of one lane when an explicit lane cap was declared.
+    /// The total above remains the sum across every reusable lane.
+    pub fn capped_device_executables_per_lane(&self) -> Option<u64> {
+        self.maximum_executables_per_lane
+            .map(|_| self.maximum_device_executables / u64::from(self.maximum_reusable_lanes))
     }
 
     pub fn buckets(&self) -> &[ResolvedReusableExecutionBucket] {
@@ -1146,6 +1190,9 @@ impl ReusableExecutionMemoryPlan {
         )?;
         if let Some(program_policy) = self.program_policy.clone() {
             policy = policy.with_program_policy(program_policy)?;
+        }
+        if let Some(maximum) = self.maximum_executables_per_lane {
+            policy = policy.with_maximum_executables_per_lane(maximum)?;
         }
         Ok(policy)
     }
@@ -1225,6 +1272,7 @@ impl<'de> Deserialize<'de> for ReusableExecutionMemoryPlan {
             wire.maximum_device_executables,
             wire.buckets,
             wire.program_policy,
+            wire.maximum_executables_per_lane,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -1465,10 +1513,56 @@ mod tests {
         let value = serde_json::to_value(&policy).unwrap();
 
         assert!(value.get("program_policy").is_none());
+        assert!(value.get("maximum_executables_per_lane").is_none());
         assert_eq!(
             serde_json::from_value::<ReusableExecutionPolicy>(value).unwrap(),
             policy
         );
+    }
+
+    #[test]
+    fn lane_executable_cap_requires_pure_on_demand_and_changes_identity() {
+        let base = ReusableExecutionPolicy::new(2, vec![bucket("uniform-query", 2, 2)]).unwrap();
+        assert!(base.clone().with_maximum_executables_per_lane(4).is_err());
+        let programs = vec![program(
+            "uniform-query",
+            ReusableExecutionProgramShape::uniform_decode(1, 1).unwrap(),
+        )];
+        for preparation in [
+            ReusableExecutionProgramPolicy::exact_startup_sealed(1, 1, 1, programs.clone())
+                .unwrap(),
+            ReusableExecutionProgramPolicy::exact_startup_and_on_demand(1, 1, 1, programs.clone())
+                .unwrap(),
+        ] {
+            assert!(base
+                .clone()
+                .with_program_policy(preparation)
+                .unwrap()
+                .with_maximum_executables_per_lane(4)
+                .is_err());
+        }
+        let policy = base
+            .with_program_policy(ReusableExecutionProgramPolicy::exact_on_demand(programs).unwrap())
+            .unwrap();
+        assert!(policy.clone().with_maximum_executables_per_lane(0).is_err());
+        let legacy = serde_json::json!({
+            "maximum_reusable_lanes": policy.maximum_reusable_lanes(),
+            "buckets": policy.buckets(), "program_policy": policy.program_policy(),
+        });
+        let fingerprint =
+            |value| super::super::canonical_fingerprint(value, "test reusable policy").unwrap();
+        let policy_wire = serde_json::to_value(&policy).unwrap();
+        assert_eq!(fingerprint(&policy_wire), fingerprint(&legacy));
+        let capped = policy.with_maximum_executables_per_lane(4).unwrap();
+        let wire = serde_json::to_value(&capped).unwrap();
+        assert_ne!(fingerprint(&wire), fingerprint(&legacy));
+        assert_eq!(
+            serde_json::from_value::<ReusableExecutionPolicy>(wire.clone()).unwrap(),
+            capped
+        );
+        let mut invalid = wire;
+        invalid["maximum_executables_per_lane"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<ReusableExecutionPolicy>(invalid).is_err());
     }
 
     #[test]

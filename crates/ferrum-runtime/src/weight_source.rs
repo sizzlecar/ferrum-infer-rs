@@ -6,6 +6,9 @@ use super::{
     ElementType, HostMemoryClass, ManagedHostBytes, VNextError, WeightComponentSpec, WeightId,
 };
 
+mod streaming;
+pub use streaming::{WeightComponentRange, WeightComponentRangeRequest, WeightComponentStreamSpec};
+
 enum WeightPayloadBytes<'source> {
     Ordinary(Cow<'source, [u8]>),
     Managed(ManagedHostBytes),
@@ -41,12 +44,25 @@ pub unsafe trait StableHostMemory: Send + Sync + 'static {
     }
 }
 
+/// A stable owner of an immutable, read-only, file-backed memory mapping.
+///
+/// # Safety
+///
+/// The bytes must actually reside in a retained read-only file mapping, not a
+/// heap allocation or anonymous mapping. The owner must retain that mapping
+/// until its last reference drops, and uphold [`StableHostMemory`] even after
+/// the archive or source object drops. The mapped file must not be modified or
+/// truncated while a region exists. Implementations must not use this marker
+/// to reclassify an accounted Host allocation as unaccounted checkpoint data.
+pub unsafe trait ImmutableFileMappedHostMemory: StableHostMemory {}
+
 /// An owned, bounds-checked subregion of stable host memory.
 #[derive(Clone)]
 pub struct RetainedHostMemoryRegion {
     owner: Arc<dyn StableHostMemory>,
     offset_bytes: usize,
     length_bytes: usize,
+    readonly_file_mapping: bool,
 }
 
 impl RetainedHostMemoryRegion {
@@ -72,7 +88,33 @@ impl RetainedHostMemoryRegion {
             owner,
             offset_bytes,
             length_bytes,
+            readonly_file_mapping: false,
         })
+    }
+
+    /// Construct the explicit mapping proof from a loader's typed owner.
+    /// Ordinary stable owners remain unclassified, even when their Host class
+    /// is `None`; that alone does not distinguish a mapping from an owned Vec.
+    pub fn new_readonly_file_mapping<T: ImmutableFileMappedHostMemory>(
+        owner: Arc<T>,
+        offset_bytes: usize,
+        length_bytes: usize,
+    ) -> Result<Self, VNextError> {
+        if owner.managed_memory_class().is_some() {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "accounted Host memory cannot become an unaccounted file mapping".into(),
+            });
+        }
+        let mut region = Self::new(owner, offset_bytes, length_bytes)?;
+        region.readonly_file_mapping = true;
+        Ok(region)
+    }
+
+    pub fn readonly_file_mapping(&self) -> Option<ReadOnlyMappedHostMemoryRegion> {
+        self.readonly_file_mapping
+            .then(|| ReadOnlyMappedHostMemoryRegion {
+                region: self.clone(),
+            })
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -106,7 +148,53 @@ impl fmt::Debug for RetainedHostMemoryRegion {
             .debug_struct("RetainedHostMemoryRegion")
             .field("offset_bytes", &self.offset_bytes)
             .field("length_bytes", &self.length_bytes)
+            .field("readonly_file_mapping", &self.readonly_file_mapping)
             .finish_non_exhaustive()
+    }
+}
+
+/// An owned file-mapping region admitted only to the typed static upload hook.
+/// Its provenance can only originate from [`ImmutableFileMappedHostMemory`].
+/// This proves source lifetime, not pinned DMA or a bound on mapping RSS.
+#[derive(Clone, Debug)]
+pub struct ReadOnlyMappedHostMemoryRegion {
+    region: RetainedHostMemoryRegion,
+}
+
+impl ReadOnlyMappedHostMemoryRegion {
+    pub fn bytes(&self) -> &[u8] {
+        self.region.bytes()
+    }
+    pub fn owner_bytes(&self) -> &[u8] {
+        self.region.owner_bytes()
+    }
+    pub const fn offset_bytes(&self) -> usize {
+        self.region.offset_bytes
+    }
+    pub const fn length_bytes(&self) -> usize {
+        self.region.length_bytes
+    }
+    /// Retain the same mapping while exposing only this exact nonempty chunk.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Result<Self, VNextError> {
+        if range.start >= range.end || range.end > self.length_bytes() {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "read-only mapped slice is empty or outside its source region".into(),
+            });
+        }
+        let offset_bytes = self
+            .offset_bytes()
+            .checked_add(range.start)
+            .ok_or_else(|| VNextError::InvalidExecutionPlan {
+                reason: "read-only mapped slice offset overflows".into(),
+            })?;
+        Ok(Self {
+            region: RetainedHostMemoryRegion {
+                owner: Arc::clone(&self.region.owner),
+                offset_bytes,
+                length_bytes: range.end - range.start,
+                readonly_file_mapping: true,
+            },
+        })
     }
 }
 
@@ -346,7 +434,8 @@ impl<'source> WeightComponentPayload<'source> {
     /// Own a converted component without copying it into an unaccounted Vec.
     /// The materializer must allocate this backing from the composition's Host
     /// account. Slices retain the entire original allocation and its one claim;
-    /// the initializer's separate TransferStaging copies remain separately charged.
+    /// any separate TransferStaging copies remain separately charged. A capable
+    /// runtime can retain this original backing for static uploads instead.
     pub fn from_managed_host(
         component: &WeightComponentSpec,
         external_names: Vec<String>,
@@ -434,8 +523,86 @@ impl<'source> WeightComponentPayload<'source> {
         &self.bytes
     }
 
+    /// Only the concrete managed allocation qualifies for direct static upload;
+    /// a generic stable owner or a claimed memory class is insufficient.
+    pub(crate) fn managed_host_bytes(&self) -> Option<&ManagedHostBytes> {
+        match &self.bytes {
+            WeightPayloadBytes::Managed(bytes) => Some(bytes),
+            WeightPayloadBytes::Ordinary(_) => None,
+        }
+    }
+
     pub fn retained_host_memory(&self) -> Option<&RetainedHostMemoryRegion> {
         self.retained_host_memory.as_ref()
+    }
+}
+
+/// Retention of original Host sources on the selected static copy route.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StaticWeightSourceRetention {
+    /// An import or backend may keep a source for the plan lifetime.
+    #[default]
+    UnknownOrPlanRetained,
+    /// The backend copies the bytes. After the corresponding terminal fence
+    /// and command owners drop, it retains no source for future execution.
+    /// Other aliases must still be checked before mutable reuse.
+    FencedCopy,
+}
+
+/// Core-validated context for one static source installation. Only core can
+/// construct it, after plan/family validation and actual import-route choice.
+pub struct StaticWeightSourceContext<'a> {
+    family: &'a crate::PreparedModelFamily,
+    plan: &'a crate::ExecutionPlan,
+    host: Option<&'a crate::HostMemoryAccount>,
+    retention: StaticWeightSourceRetention,
+    maximum_source_chunk_bytes: u64,
+    supports_managed_source_upload: bool,
+}
+
+impl<'a> StaticWeightSourceContext<'a> {
+    pub(crate) fn new(
+        family: &'a crate::PreparedModelFamily,
+        plan: &'a crate::ExecutionPlan,
+        host: Option<&'a crate::HostMemoryAccount>,
+        retention: StaticWeightSourceRetention,
+        maximum_source_chunk_bytes: u64,
+        supports_managed_source_upload: bool,
+    ) -> Self {
+        Self {
+            family,
+            plan,
+            host,
+            retention,
+            maximum_source_chunk_bytes,
+            supports_managed_source_upload,
+        }
+    }
+
+    pub fn family(&self) -> &'a crate::PreparedModelFamily {
+        self.family
+    }
+
+    pub fn plan(&self) -> &'a crate::ExecutionPlan {
+        self.plan
+    }
+
+    pub fn source_retention(&self) -> StaticWeightSourceRetention {
+        self.retention
+    }
+
+    pub const fn maximum_source_chunk_bytes(&self) -> u64 {
+        self.maximum_source_chunk_bytes
+    }
+
+    pub const fn supports_managed_source_upload(&self) -> bool {
+        self.supports_managed_source_upload
+    }
+
+    /// Exact parent and admission-scope authority; legal clones match, while
+    /// parent-only and sibling views cannot spend this installation's credit.
+    pub fn matches_host_account(&self, host: &crate::HostMemoryAccount) -> bool {
+        self.host.is_some_and(|actual| actual.same_scope_view(host))
     }
 }
 
@@ -445,6 +612,41 @@ impl<'source> WeightComponentPayload<'source> {
 /// any repacking or quantization before resource initialization performs
 /// placement and device submission.
 pub trait WeightComponentSource: Send + Sync {
+    /// Metadata-only declaration, frozen before initialization starts. `Some`
+    /// selects the range route exclusively; a later failure cannot fall back
+    /// to allocating a complete payload. Existing sources use the full route.
+    fn streaming_component(
+        &self,
+        _component: &WeightComponentSpec,
+    ) -> Result<Option<WeightComponentStreamSpec>, VNextError> {
+        Ok(None)
+    }
+
+    /// Produce precisely the requested range using the installation's original
+    /// accounted Host owner. Core waits the previous range's terminal fence
+    /// before calling again. Implementations must still require unique mutable
+    /// ownership before reusing backing; terminal completion alone is not an
+    /// alias proof.
+    fn component_range(
+        &self,
+        _request: &WeightComponentRangeRequest,
+    ) -> Result<WeightComponentRange, VNextError> {
+        Err(VNextError::InvalidExecutionPlan {
+            reason: "weight source does not support component ranges".into(),
+        })
+    }
+
+    /// Validate or prepare invocation-local source backing after core has
+    /// checked this exact plan and selected its native import/copy route.
+    /// This runs before initialization zero/upload/import commands. Any new
+    /// backing must use the original admitted Host view; no grant is created.
+    fn validate_static_initialization(
+        &self,
+        _context: &StaticWeightSourceContext<'_>,
+    ) -> Result<(), VNextError> {
+        Ok(())
+    }
+
     fn component<'source>(
         &'source self,
         component: &WeightComponentSpec,
@@ -489,7 +691,7 @@ mod tests {
     use super::*;
     use crate::{BlockQuantizationSpec, WeightComponentRole, WeightEncoding};
 
-    fn managed_account(total: usize) -> crate::HostMemoryAccount {
+    pub(super) fn managed_account(total: usize) -> crate::HostMemoryAccount {
         crate::HostMemoryAccount::new(
             crate::HostMemoryLimits::new(
                 total,
@@ -615,7 +817,7 @@ mod tests {
         }
     }
 
-    fn packed_component() -> WeightComponentSpec {
+    pub(super) fn packed_component() -> WeightComponentSpec {
         WeightComponentSpec {
             id: WeightId::new("component.test.gate_up").unwrap(),
             role: WeightComponentRole::Values,

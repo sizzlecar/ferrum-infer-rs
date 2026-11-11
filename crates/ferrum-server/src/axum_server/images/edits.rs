@@ -1,4 +1,4 @@
-//! Single-image OpenAI multipart adapter. Transport/parser buffers are bounded
+//! Ordered-image OpenAI multipart adapter. Transport/parser buffers are bounded
 //! by EDIT_BODY_LIMIT. Uploaded PNG storage grows under Host admission and is
 //! compacted to its actual encoded length before entering the worker queue.
 
@@ -13,13 +13,15 @@ use ferrum_runtime::{HostMemoryAccount, HostMemoryClass, ManagedHostBytes};
 use std::collections::BTreeSet;
 
 pub(in crate::axum_server) const EDIT_BODY_LIMIT: usize =
-    ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES + 2 * 1024 * 1024;
+    8 * ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES + 2 * 1024 * 1024;
 const PROMPT_LIMIT: usize = 1024 * 1024;
 
 pub(in crate::axum_server) async fn edits_handler(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     multipart: Result<Multipart, MultipartRejection>,
-) -> Result<Response, ServerError> {
+) -> Result<Response, correlation::HttpError> {
+    let client_attempt = correlation::attempt(&headers)?;
     let images = state
         .images
         .as_ref()
@@ -28,7 +30,8 @@ pub(in crate::axum_server) async fn edits_handler(
         return Err(ServerError::unsupported_feature(
             "loaded image pipeline does not support editing",
             None,
-        ));
+        )
+        .into());
     }
     let multipart =
         multipart.map_err(|error| invalid(format!("invalid multipart request: {error}")))?;
@@ -38,8 +41,15 @@ pub(in crate::axum_server) async fn edits_handler(
         .output
         .try_open_session()
         .map_err(|error| ServerError::CapacityExceeded(error.to_string()))?;
-    let (wire, image) = parse(multipart, images.service.host_account()).await?;
+    let (wire, mut inputs) = parse_images(
+        multipart,
+        images.service.host_account(),
+        images.service.maximum_reference_images(),
+    )
+    .await?;
+    let image = inputs.remove(0);
     let request = ImageEditRequest {
+        references: inputs,
         generation: wire.convert(images.model_name(), &images.config)?,
         image,
     };
@@ -49,26 +59,32 @@ pub(in crate::axum_server) async fn edits_handler(
         .map_err(service_error)?;
     let response = admit_response(images, session, &request.generation)?;
     let started = Instant::now();
-    let (result, grant) = images
+    let job = images
         .service
-        .try_submit_edit_with_output(request, response)
-        .map_err(service_error)?
+        .try_submit_edit_with_output_and_client_attempt(request, response, client_attempt)
+        .map_err(|error| correlation::service_failure(images, error))?;
+    let correlation = correlation::Context::for_job(images, job.correlation());
+    let (result, grant) = job
         .wait_with_output()
         .await
-        .map_err(service_error)?;
+        .map_err(|error| correlation.error(service_error(error)))?;
     let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let admission = grant.into_inner::<response::Admission>().map_err(|_| {
-        ServerError::InternalError(
+        correlation.error(ServerError::InternalError(
             "image edit response grant belongs to another output gate".into(),
-        )
+        ))
     })?;
-    encode_result(admission, result, elapsed).await
+    encode_result(admission, result, elapsed)
+        .await
+        .map(|response| correlation.response(response))
+        .map_err(|error| correlation.error(error))
 }
 
-async fn parse(
+async fn parse_images(
     mut multipart: Multipart,
     host: &HostMemoryAccount,
-) -> Result<(ImageRequest, ManagedHostBytes), ServerError> {
+    maximum_images: usize,
+) -> Result<(ImageRequest, Vec<ManagedHostBytes>), ServerError> {
     let mut seen = BTreeSet::new();
     let mut model = None;
     let mut prompt = None;
@@ -76,14 +92,14 @@ async fn parse(
     let mut size = None;
     let mut response_format = b64_json();
     let mut seed = None;
-    let mut image = None;
+    let mut images = Vec::new();
     while let Some(mut field) = multipart.next_field().await.map_err(invalid)? {
         let name = field
             .name()
             .filter(|name| name.len() <= 64)
             .ok_or_else(|| invalid("multipart field requires a bounded name"))?
             .to_owned();
-        // image and image[] are aliases for the single accepted file. No
+        // image and image[] preserve file order as Picture 1, Picture 2, etc. No
         // filename is interpreted as a filesystem path or model identity.
         let key = if name == "image[]" { "image" } else { &name };
         if !matches!(
@@ -95,12 +111,15 @@ async fn parse(
                 None,
             ));
         }
-        if !seen.insert(key.to_owned()) {
-            return Err(invalid(
-                "duplicate field or multiple reference images are unsupported",
-            ));
+        if key != "image" && !seen.insert(key.to_owned()) {
+            return Err(invalid("duplicate text/control field"));
         }
         if key == "image" {
+            if images.len() >= maximum_images {
+                return Err(invalid(
+                    "reference image count exceeds the loaded generator capability",
+                ));
+            }
             if field
                 .content_type()
                 .is_some_and(|mime| mime != "image/png" && mime != "application/octet-stream")
@@ -110,7 +129,7 @@ async fn parse(
                     Some("image"),
                 ));
             }
-            image = Some(read_image(&mut field, host).await?);
+            images.push(read_image(&mut field, host).await?);
         } else {
             if field.file_name().is_some() {
                 return Err(invalid("text field cannot be a file"));
@@ -127,6 +146,9 @@ async fn parse(
             }
         }
     }
+    if images.is_empty() {
+        return Err(invalid("missing image"));
+    }
     Ok((
         ImageRequest {
             model: model.ok_or_else(|| invalid("missing model"))?,
@@ -136,8 +158,17 @@ async fn parse(
             response_format,
             seed,
         },
-        image.ok_or_else(|| invalid("missing image"))?,
+        images,
     ))
+}
+
+#[cfg(test)]
+async fn parse(
+    multipart: Multipart,
+    host: &HostMemoryAccount,
+) -> Result<(ImageRequest, ManagedHostBytes), ServerError> {
+    let (wire, mut images) = parse_images(multipart, host, 1).await?;
+    Ok((wire, images.remove(0)))
 }
 
 async fn read_image(

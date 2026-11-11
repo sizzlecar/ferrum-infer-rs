@@ -15,8 +15,9 @@ pub(super) fn numeric_pipeline() -> (
 ) {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     let (mut pipeline, directory) = super::adapter::pipeline(2);
-    pipeline.config.residency = ImageResidencyPolicy::DenoiserAndDecoder;
-    pipeline.config.static_initialization = StaticInitializationPolicy::new(1024, 8).unwrap();
+    pipeline.execution.config.residency = ImageResidencyPolicy::DenoiserAndDecoder;
+    pipeline.execution.config.static_initialization =
+        StaticInitializationPolicy::new(1024, 8).unwrap();
     let path = directory.path().join("projection");
     std::fs::create_dir(&path).unwrap();
     // Nonzero diagonal projection: y[o] = x[o] for o<8. The expectation is
@@ -34,7 +35,7 @@ pub(super) fn numeric_pipeline() -> (
         &path.join("model.safetensors"),
     )
     .unwrap();
-    Arc::get_mut(&mut pipeline.assets)
+    Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("unique fixture assets")
         .sources
         .transformer = Arc::new(SafetensorsArchive::open(&path).unwrap());
@@ -110,7 +111,7 @@ fn exact_plan_reuses_static_weights_trims_dynamic_and_preserves_independent_outp
             .execute_stage(
                 active,
                 job,
-                vec![input(&pipeline.host, 1, job as usize * 8)],
+                vec![input(&pipeline.execution.host, 1, job as usize * 8)],
             )
             .unwrap_or_else(|_| panic!("numeric projection"));
         let output = only_output(output, IMAGE_PROJECTION_OUTPUT_ID).unwrap();
@@ -123,7 +124,7 @@ fn exact_plan_reuses_static_weights_trims_dynamic_and_preserves_independent_outp
         pipeline
             .finish_stage(active, &mut stages)
             .unwrap_or_else(|_| panic!("idle trim"));
-        let snapshot = pipeline.runtime.snapshot();
+        let snapshot = pipeline.execution.runtime.snapshot();
         if job == 1 {
             // The second batch uploads only X, never the 1024-byte weight.
             assert_eq!(snapshot.uploaded_bytes - previous_uploads, 128);
@@ -143,7 +144,7 @@ fn exact_plan_reuses_static_weights_trims_dynamic_and_preserves_independent_outp
         retained.push(output);
     }
     let shutdown = pipeline.shutdown().unwrap();
-    assert!(pipeline.serial_actor.is_none());
+    assert!(pipeline.execution.serial_actor.is_none());
     assert_eq!(shutdown.len(), 2);
     assert!(shutdown[0].close.is_some());
     assert!(serde_json::to_value(&shutdown[0]).unwrap()["close"].is_object());
@@ -157,13 +158,19 @@ fn exact_plan_reuses_static_weights_trims_dynamic_and_preserves_independent_outp
         panic!("snapshot retires after its session")
     };
     assert_eq!(receipt.released_static_resources(), 1);
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 32);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        32
+    );
     assert!(pipeline.shutdown().unwrap().is_empty());
     assert!(pipeline.is_stopped());
     assert_eq!(&retained[0].bytes().bytes()[..2], &0x3f80_u16.to_le_bytes());
     drop(retained);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
@@ -179,7 +186,7 @@ fn failed_serial_actor_stops_generation_and_edit_admission_before_preparation() 
         panic!("missing inputs must fail without losing recovery owners")
     };
     assert!(pipeline.is_stopped());
-    let before = pipeline.runtime.snapshot();
+    let before = pipeline.execution.runtime.snapshot();
     assert!(matches!(
         pipeline.generate(request()),
         Err(ImageGenerationError {
@@ -188,12 +195,14 @@ fn failed_serial_actor_stops_generation_and_edit_admission_before_preparation() 
         })
     ));
     let image = pipeline
+        .execution
         .host
         .allocate_zeroed(HostMemoryClass::InputPreprocess, 1)
         .unwrap()
         .freeze();
     assert!(matches!(
         pipeline.edit(ImageEditRequest {
+            references: Vec::new(),
             generation: request(),
             image,
         }),
@@ -202,8 +211,8 @@ fn failed_serial_actor_stops_generation_and_edit_admission_before_preparation() 
             ..
         })
     ));
-    assert_eq!(pipeline.runtime.snapshot(), before);
-    assert!(pipeline.serial_actor.is_some());
+    assert_eq!(pipeline.execution.runtime.snapshot(), before);
+    assert!(pipeline.execution.serial_actor.is_some());
     // An input-validation error has no pending device work. Retire the returned
     // session explicitly, then shutdown may release the pipeline's actor owner.
     drop(source);
@@ -211,7 +220,7 @@ fn failed_serial_actor_stops_generation_and_edit_admission_before_preparation() 
         .close()
         .unwrap_or_else(|_| panic!("recover failed stage"));
     pipeline.shutdown().unwrap();
-    assert!(pipeline.serial_actor.is_none());
+    assert!(pipeline.execution.serial_actor.is_none());
 }
 
 #[test]
@@ -229,7 +238,7 @@ fn check_shape_replacement(mut pipeline: QwenImage21Pipeline<ReferenceDeviceRunt
         .start_stage(first, 0, &mut stages)
         .unwrap_or_else(|_| panic!("first initialization"));
     let (active, outputs) = active
-        .execute(0, vec![input(&pipeline.host, 1, 0)])
+        .execute(0, vec![input(&pipeline.execution.host, 1, 0)])
         .unwrap_or_else(|_| panic!("first execute"));
     drop(outputs);
     pipeline
@@ -237,7 +246,7 @@ fn check_shape_replacement(mut pipeline: QwenImage21Pipeline<ReferenceDeviceRunt
         .unwrap_or_else(|_| panic!("first trim"));
     let changed = prepared(&pipeline, 2);
     assert_ne!(changed.plan.plan_hash, old_hash);
-    let before = pipeline.runtime.snapshot();
+    let before = pipeline.execution.runtime.snapshot();
     let active = pipeline
         .start_stage(changed, 1, &mut stages)
         .unwrap_or_else(|_| panic!("replacement"));
@@ -248,10 +257,13 @@ fn check_shape_replacement(mut pipeline: QwenImage21Pipeline<ReferenceDeviceRunt
         ComponentInitializationReceipt::SharedWeights { .. }
     ));
     assert_eq!(
-        pipeline.runtime.snapshot().uploaded_bytes,
+        pipeline.execution.runtime.snapshot().uploaded_bytes,
         before.uploaded_bytes
     );
-    assert_eq!(pipeline.runtime.snapshot().allocations, before.allocations);
+    assert_eq!(
+        pipeline.execution.runtime.snapshot().allocations,
+        before.allocations
+    );
     assert_eq!(stages.len(), 2);
     assert_eq!(stages[1].execution.plan.plan_hash, old_hash);
     assert!(stages[1].close.is_some());
@@ -266,11 +278,11 @@ fn check_shape_replacement(mut pipeline: QwenImage21Pipeline<ReferenceDeviceRunt
     assert_eq!(stages[1].execution.completed_executions, 0);
     assert_eq!(stages[1].execution.plan.compile_wall_duration_us, 0);
     let (active, outputs) = active
-        .execute(1, vec![input(&pipeline.host, 2, 0)])
+        .execute(1, vec![input(&pipeline.execution.host, 2, 0)])
         .unwrap_or_else(|_| panic!("replacement execute"));
     assert_eq!(outputs[0].tensor().dimensions(), [2, 8]);
     assert_eq!(
-        pipeline.runtime.snapshot().uploaded_bytes - before.uploaded_bytes,
+        pipeline.execution.runtime.snapshot().uploaded_bytes - before.uploaded_bytes,
         2 * 64 * 2
     );
     assert_eq!(
@@ -281,9 +293,12 @@ fn check_shape_replacement(mut pipeline: QwenImage21Pipeline<ReferenceDeviceRunt
         .finish_stage(active, &mut stages)
         .unwrap_or_else(|_| panic!("replacement trim"));
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
     drop(outputs);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
@@ -299,7 +314,7 @@ fn check_failed_reused_session_owner(mut pipeline: QwenImage21Pipeline<Reference
         .start_stage(first, 0, &mut stages)
         .unwrap_or_else(|_| panic!("initialization"));
     let (active, outputs) = active
-        .execute(0, vec![input(&pipeline.host, 1, 0)])
+        .execute(0, vec![input(&pipeline.execution.host, 1, 0)])
         .unwrap_or_else(|_| panic!("execute"));
     drop(outputs);
     pipeline
@@ -315,7 +330,7 @@ fn check_failed_reused_session_owner(mut pipeline: QwenImage21Pipeline<Reference
         panic!("missing input must retain executor owner")
     };
     assert!(active.receipt.session_reused);
-    assert!(pipeline.runtime.snapshot().live_allocations > 0);
+    assert!(pipeline.execution.runtime.snapshot().live_allocations > 0);
     // Shutdown reports the retained snapshot owner rather than claiming that
     // an active session returned in the earlier error has retired.
     let shutdown = pipeline.shutdown().unwrap_err();
@@ -326,17 +341,17 @@ fn check_failed_reused_session_owner(mut pipeline: QwenImage21Pipeline<Reference
     else {
         panic!("snapshot close must return its referenced owner")
     };
-    assert!(pipeline.runtime.snapshot().live_allocations > 0);
+    assert!(pipeline.execution.runtime.snapshot().live_allocations > 0);
     drop(source);
     active
         .close()
         .unwrap_or_else(|_| panic!("quiescent explicit recovery"));
-    assert!(pipeline.runtime.snapshot().live_allocations > 0);
+    assert!(pipeline.execution.runtime.snapshot().live_allocations > 0);
     match weights.close() {
         Ok(SharedComponentWeightsCloseOutcome::Closed(_)) => {}
         _ => panic!("last recovered snapshot must retire"),
     }
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }
 
 #[test]
@@ -352,7 +367,7 @@ fn check_incompatible_weight_plan_owner(mut pipeline: QwenImage21Pipeline<Refere
         .start_stage(first, 0, &mut stages)
         .unwrap_or_else(|_| panic!("initialize"));
     let (active, outputs) = active
-        .execute(0, vec![input(&pipeline.host, 1, 0)])
+        .execute(0, vec![input(&pipeline.execution.host, 1, 0)])
         .unwrap_or_else(|_| panic!("execute"));
     drop(outputs);
     pipeline
@@ -379,7 +394,7 @@ fn check_incompatible_weight_plan_owner(mut pipeline: QwenImage21Pipeline<Refere
     .unwrap();
     let changed =
         PreparedStage::compile(ImageStage::Denoiser, 1, family, &options, &pipeline).unwrap();
-    let before = pipeline.runtime.snapshot();
+    let before = pipeline.execution.runtime.snapshot();
     assert!(matches!(
         pipeline.start_stage(changed, 1, &mut stages),
         Err(ImageGenerationFailure::Initialization {
@@ -388,17 +403,23 @@ fn check_incompatible_weight_plan_owner(mut pipeline: QwenImage21Pipeline<Refere
         })
     ));
     assert_eq!(
-        pipeline.runtime.snapshot().uploaded_bytes,
+        pipeline.execution.runtime.snapshot().uploaded_bytes,
         before.uploaded_bytes
     );
-    assert_eq!(pipeline.runtime.snapshot().allocations, before.allocations);
-    assert!(pipeline.runtime.snapshot().live_allocations > 0);
+    assert_eq!(
+        pipeline.execution.runtime.snapshot().allocations,
+        before.allocations
+    );
+    assert!(pipeline.execution.runtime.snapshot().live_allocations > 0);
     let shutdown = pipeline.shutdown().unwrap();
     assert_eq!(shutdown.len(), 1);
     assert!(matches!(
         shutdown[0].retirement,
         ImageStageRetirement::SharedWeightsClosed { .. }
     ));
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }

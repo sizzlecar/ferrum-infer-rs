@@ -332,6 +332,49 @@ impl DeviceRuntime for CpuDeviceRuntime {
         ))
     }
 
+    fn supports_managed_tensor_io(&self) -> bool {
+        true
+    }
+
+    fn static_weight_source_retention(&self) -> ferrum_runtime::StaticWeightSourceRetention {
+        // Managed uploads copy synchronously into destination-owned Storage.
+        // Submission drops its source-owning commands at the quiescent terminal;
+        // neither the returned fence nor the plan retains those source owners.
+        ferrum_runtime::StaticWeightSourceRetention::FencedCopy
+    }
+
+    fn encode_managed_upload(
+        &self,
+        source: ferrum_runtime::ManagedHostBytes,
+        layout: HostTransferLayout,
+        destination: &Self::Buffer,
+        offset: u64,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        self.validate_buffer(destination)?;
+        layout.validate_bytes(source.len())?;
+        if layout.element_type() != destination.descriptor.element_type
+            || offset % layout.element_type().size_bytes() != 0
+        {
+            return Err(CpuRuntimeError::new(
+                "CPU managed upload requires matching element type and aligned offset",
+            ));
+        }
+        let end = offset
+            .checked_add(layout.byte_len()?)
+            .ok_or_else(|| CpuRuntimeError::new("CPU managed upload range overflows"))?;
+        let destination = destination.region(offset..end)?;
+        // The command retains the caller's original charged backing. CPU
+        // submission is synchronous, so it may drop after execution reaches a
+        // quiescent terminal; no second Storage or unaccounted Vec is created.
+        Ok(Some(CpuDeviceCommand::transfer(
+            HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(),
+            CommandKind::ManagedUpload {
+                source,
+                destination,
+            },
+        )))
+    }
+
     fn encode_zero(
         &self,
         destination: &Self::Buffer,
@@ -460,6 +503,51 @@ impl DeviceRuntime for CpuDeviceRuntime {
         source.with_read(|bytes| output[output_start..output_end].copy_from_slice(bytes))?;
         stream.state = StreamState::Ready;
         Ok(output)
+    }
+
+    fn readback_managed_into(
+        &self,
+        stream: &mut Self::Stream,
+        source: &Self::Buffer,
+        region: CopyRegion,
+        layout: HostTransferLayout,
+        destination: &mut ferrum_runtime::ManagedHostBuffer,
+    ) -> Result<bool, Self::Error> {
+        self.validate_buffer(source)?;
+        self.validate_stream(stream)?;
+        let element = layout.element_type().size_bytes();
+        if layout.element_type() != source.descriptor.element_type
+            || layout.byte_len()? != region.length_bytes()
+            || region.source_offset_bytes() % element != 0
+            || region.destination_offset_bytes() % element != 0
+        {
+            return Err(CpuRuntimeError::new(
+                "CPU managed readback requires a matching aligned piece layout",
+            ));
+        }
+        let source_end = region
+            .source_offset_bytes()
+            .checked_add(region.length_bytes())
+            .ok_or_else(|| CpuRuntimeError::new("CPU managed readback source overflows"))?;
+        let source = source.region(region.source_offset_bytes()..source_end)?;
+        let start = usize::try_from(region.destination_offset_bytes())
+            .map_err(|_| CpuRuntimeError::new("CPU managed readback offset exceeds usize"))?;
+        let end = region
+            .destination_offset_bytes()
+            .checked_add(region.length_bytes())
+            .and_then(|end| usize::try_from(end).ok())
+            .ok_or_else(|| CpuRuntimeError::new("CPU managed readback destination overflows"))?;
+        let output = destination
+            .as_mut()
+            .get_mut(start..end)
+            .ok_or_else(|| CpuRuntimeError::new("CPU managed readback exceeds destination"))?;
+        let _execution = self
+            .execution
+            .lock()
+            .map_err(|_| CpuRuntimeError::new("CPU execution lock was poisoned"))?;
+        source.with_read(|bytes| output.copy_from_slice(bytes))?;
+        stream.state = StreamState::Ready;
+        Ok(true)
     }
 
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError> {

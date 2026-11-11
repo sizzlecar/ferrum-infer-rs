@@ -1,3 +1,4 @@
+#include <cuda_bf16.h>
 // Fused QK-norm + RoPE + transpose kernel (ported from Metal `norm_rope.metal`).
 //
 // Input:  [tokens, heads, head_dim]  (token-major, output of split_qkv)
@@ -231,6 +232,28 @@ extern "C" __global__ void qwen35_apply_attention_gate_f16(
     float value = __half2float(context[idx]);
     float gate = __half2float(query_raw[gate_idx]);
     context[idx] = __float2half(value * sigmoid_f32(gate));
+}
+
+extern "C" __global__ void qwen35_apply_attention_gate_bf16(
+    __nv_bfloat16* __restrict__ context,
+    const __nv_bfloat16* __restrict__ query_raw,
+    const int tokens,
+    const int q_total,
+    const int q_proj_total,
+    const int head_dim
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = tokens * q_total;
+    if (idx >= total) return;
+
+    const int tok = idx / q_total;
+    const int dim = idx - tok * q_total;
+    const int head = dim / head_dim;
+    const int dim_in_head = dim - head * head_dim;
+    const int gate_idx = tok * q_proj_total + head * (2 * head_dim) + head_dim + dim_in_head;
+    float value = __bfloat162float(context[idx]);
+    float gate = __bfloat162float(query_raw[gate_idx]);
+    context[idx] = __float2bfloat16_rn(value * sigmoid_f32(gate));
 }
 
 extern "C" __global__ void qwen35_apply_token_gate_f16(

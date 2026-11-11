@@ -78,11 +78,12 @@ async fn metal_service_cancellation_executes_active_work_then_recovers_and_relea
     config.pipeline.residency = ImageResidencyPolicy::AllStages;
     let pipeline = config.create_pipeline(assets).unwrap();
     let host = pipeline.host_account().clone();
-    let runtime = Arc::downgrade(&pipeline.runtime);
-    let ceiling = pipeline.config.device_capacity_bytes;
+    let runtime = Arc::downgrade(&pipeline.execution.runtime);
+    let ceiling = pipeline.execution.config.device_capacity_bytes;
     // This observer owns only a budget identity, not the native runtime. A
     // whole-ceiling reservation after shutdown proves all prior claims retired.
-    let capacity = DeviceCapacityOwner::open(pipeline.runtime.descriptor(), ceiling).unwrap();
+    let capacity =
+        DeviceCapacityOwner::open(pipeline.execution.runtime.descriptor(), ceiling).unwrap();
     let completed = Arc::new(Mutex::new(Vec::new()));
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();

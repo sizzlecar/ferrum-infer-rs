@@ -142,6 +142,7 @@ fn run(shape: CausalAttentionShape, position: usize, proportional: bool) {
             )
             .unwrap(),
             path: CausalAttentionKernelPath::TokenMajorFallback,
+            rotary: None,
         };
         // Production launcher owns the exact kernel ABI and grid. All raw
         // pointers are backed by live guarded allocations on this stream.

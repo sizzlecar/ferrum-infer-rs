@@ -14,18 +14,18 @@ fn pipeline(
     let composition = composition(name);
     let mut pipeline = QwenImage21Pipeline::new(
         composition.runtime().clone(),
-        original.host,
+        original.execution.host,
         reference_vnext_operation_registry(composition.runtime()).unwrap(),
         composition.catalog().clone(),
         WeightMaterializerRegistry::identity_only().unwrap(),
-        Arc::try_unwrap(original.assets)
+        Arc::try_unwrap(original.execution.sources.assets)
             .ok()
             .expect("unique fixture assets"),
         original.profiles,
-        original.config,
+        original.execution.config,
     )
     .unwrap();
-    pipeline.config.residency = ImageResidencyPolicy::AllModelComponents;
+    pipeline.execution.config.residency = ImageResidencyPolicy::AllModelComponents;
     (pipeline, directory)
 }
 
@@ -56,6 +56,7 @@ fn text_stage(
             let tensor =
                 ResolvedTensorSpec::new(spec.dimensions, spec.element_type, spec.layout).unwrap();
             let mut bytes = pipeline
+                .execution
                 .host
                 .allocate_zeroed(
                     HostMemoryClass::InputPreprocess,
@@ -97,7 +98,7 @@ fn all_components_reuses_real_text_session_then_attaches_changed_sequence_withou
             .iter()
             .map(|input| input.bytes().len() as u64)
             .sum::<u64>();
-        let before = pipeline.runtime.snapshot();
+        let before = pipeline.execution.runtime.snapshot();
         let active = pipeline
             .start_stage(stage, job as u64, &mut stages)
             .unwrap_or_else(|_| panic!("text acquire"));
@@ -105,7 +106,7 @@ fn all_components_reuses_real_text_session_then_attaches_changed_sequence_withou
         assert_eq!(active.receipt.weights_reused, job > 0);
         if job > 0 {
             assert_eq!(
-                pipeline.runtime.snapshot().uploaded_bytes,
+                pipeline.execution.runtime.snapshot().uploaded_bytes,
                 before.uploaded_bytes
             );
         }
@@ -124,7 +125,7 @@ fn all_components_reuses_real_text_session_then_attaches_changed_sequence_withou
         }
         if job > 0 {
             assert_eq!(
-                pipeline.runtime.snapshot().uploaded_bytes - before.uploaded_bytes,
+                pipeline.execution.runtime.snapshot().uploaded_bytes - before.uploaded_bytes,
                 input_bytes
             );
         }
@@ -144,14 +145,17 @@ fn all_components_reuses_real_text_session_then_attaches_changed_sequence_withou
         shutdown[1].retirement,
         ImageStageRetirement::SharedWeightsClosed { .. }
     ));
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
     assert_eq!(
-        pipeline.host.usage().unwrap().committed_bytes(),
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
         (1 + 1 + 2) * 8 * 2
     );
     assert_eq!(&outputs[0].bytes().bytes()[..2], &0x3f80_u16.to_le_bytes());
     drop(outputs);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
@@ -174,7 +178,7 @@ fn old_policies_keep_text_cold_and_new_policy_wire_is_explicit() {
     .enumerate()
     {
         let (mut pipeline, _directory) = pipeline(&format!("device.image.residency.old.{index}"));
-        pipeline.config.residency = policy;
+        pipeline.execution.config.residency = policy;
         let mut stages = Vec::new();
         let (stage, inputs) = text_stage(&pipeline, 1);
         let active = pipeline
@@ -187,17 +191,21 @@ fn old_policies_keep_text_cold_and_new_policy_wire_is_explicit() {
             .finish_stage(active, &mut stages)
             .unwrap_or_else(|_| panic!("cold retirement"));
         assert!(matches!(stages[0].retirement, ImageStageRetirement::Closed));
-        assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+        assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
         assert!(pipeline.shutdown().unwrap().is_empty());
         drop(outputs);
-        assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+        assert_eq!(
+            pipeline.execution.host.usage().unwrap().committed_bytes(),
+            0
+        );
     }
 }
 
 #[test]
 fn text_retention_consumes_shared_capacity_and_shutdown_retires_all_sessions_before_weights() {
     let (mut pipeline, _directory) = pipeline("device.image.residency.all.capacity");
-    let capacity = DeviceCapacityOwner::open(pipeline.runtime.descriptor(), DEVICE_BYTES).unwrap();
+    let capacity =
+        DeviceCapacityOwner::open(pipeline.execution.runtime.descriptor(), DEVICE_BYTES).unwrap();
     let mut stages = Vec::new();
     let (stage, inputs) = text_stage(&pipeline, 1);
     drop(inputs);
@@ -217,7 +225,7 @@ fn text_retention_consumes_shared_capacity_and_shutdown_retires_all_sessions_bef
     assert!(capacity
         .reserve(DeviceOpaqueMemoryKind::Bootstrap, 1)
         .is_err());
-    let before = pipeline.runtime.snapshot();
+    let before = pipeline.execution.runtime.snapshot();
     let dit = prepared(&pipeline, 1);
     let failure = pipeline
         .start_stage(dit, 1, &mut stages)
@@ -227,9 +235,12 @@ fn text_retention_consumes_shared_capacity_and_shutdown_retires_all_sessions_bef
         failure,
         ImageGenerationFailure::Initialization { .. }
     ));
-    assert_eq!(pipeline.runtime.snapshot().allocations, before.allocations);
     assert_eq!(
-        pipeline.runtime.snapshot().uploaded_bytes,
+        pipeline.execution.runtime.snapshot().allocations,
+        before.allocations
+    );
+    assert_eq!(
+        pipeline.execution.runtime.snapshot().uploaded_bytes,
         before.uploaded_bytes
     );
     drop(failure);
@@ -292,13 +303,16 @@ fn text_retention_consumes_shared_capacity_and_shutdown_retires_all_sessions_bef
             ImageStageRetirement::SharedWeightsClosed { .. }
         ));
     }
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
     drop(
         capacity
             .reserve(DeviceOpaqueMemoryKind::Bootstrap, DEVICE_BYTES)
             .unwrap(),
     );
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
@@ -323,18 +337,21 @@ fn text_execution_failure_and_snapshot_shutdown_preserve_recovery_owners() {
     else {
         panic!("snapshot cannot retire around the returned session")
     };
-    assert!(pipeline.runtime.snapshot().live_allocations > 0);
+    assert!(pipeline.execution.runtime.snapshot().live_allocations > 0);
     drop(source);
     active
         .close()
         .unwrap_or_else(|_| panic!("explicit quiescent recovery"));
-    assert!(pipeline.runtime.snapshot().live_allocations > 0);
+    assert!(pipeline.execution.runtime.snapshot().live_allocations > 0);
     assert!(matches!(
         weights.close(),
         Ok(SharedComponentWeightsCloseOutcome::Closed(_))
     ));
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 fn capacity_stages(
@@ -367,7 +384,7 @@ fn resident_preflight_uses_physical_plan_bytes_and_one_native_allowance_at_exact
     // Pure planning evidence: no native backend or opaque allocation is made.
     let opaque = 256;
     let mut pipeline = pipeline.with_device_opaque_allowance(opaque).unwrap();
-    pipeline.config.plan_cache = ImagePlanCachePolicy::Disabled;
+    pipeline.execution.config.plan_cache = ImagePlanCachePolicy::Disabled;
     let plans = capacity_stages(&pipeline);
     let memories = plans.each_ref().map(|plan| {
         plan.component
@@ -389,10 +406,11 @@ fn resident_preflight_uses_physical_plan_bytes_and_one_native_allowance_at_exact
     drop(plans);
 
     for (capacity, accepted) in [(exact - 1, false), (exact, true)] {
-        pipeline.config.device_capacity_bytes = capacity;
-        pipeline.policy = TensorComponentPolicy::new(
+        pipeline.execution.config.device_capacity_bytes = capacity;
+        pipeline.execution.policy = TensorComponentPolicy::new(
             capacity,
             pipeline
+                .execution
                 .runtime
                 .descriptor()
                 .dynamic_storage_profiles
@@ -404,15 +422,18 @@ fn resident_preflight_uses_physical_plan_bytes_and_one_native_allowance_at_exact
         // Every component really compiles under this ceiling. Only their
         // simultaneous retained static installations make the lower case fail.
         let plans = capacity_stages(&pipeline);
-        let before = pipeline.runtime.snapshot();
+        let before = pipeline.execution.runtime.snapshot();
         let result = pipeline.validate_resident_capacity(&plans.iter().collect::<Vec<_>>());
         assert_eq!(result.is_ok(), accepted, "{result:?}");
         assert!(!pipeline.is_stopped());
-        let after = pipeline.runtime.snapshot();
+        let after = pipeline.execution.runtime.snapshot();
         assert_eq!(after.allocations, before.allocations);
         assert_eq!(after.submissions, before.submissions);
         assert_eq!(after.live_allocations, 0);
-        assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+        assert_eq!(
+            pipeline.execution.host.usage().unwrap().committed_bytes(),
+            0
+        );
     }
 }
 
@@ -421,10 +442,10 @@ fn cold_preflight_counts_one_active_stage_and_native_allowance_before_execution(
     let (pipeline, _directory) = pipeline("device.image.residency.cold.preflight");
     let opaque = 256;
     let mut pipeline = pipeline.with_device_opaque_allowance(opaque).unwrap();
-    pipeline.config.residency = ImageResidencyPolicy::Cold;
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
-    pipeline.config.edit_prefix_policy = ImageEditPrefixPolicy::Recompute;
-    pipeline.config.plan_cache = ImagePlanCachePolicy::Disabled;
+    pipeline.execution.config.residency = ImageResidencyPolicy::Cold;
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
+    pipeline.execution.config.edit_prefix_policy = ImageEditPrefixPolicy::Recompute;
+    pipeline.execution.config.plan_cache = ImagePlanCachePolicy::Disabled;
     let plans = capacity_stages(&pipeline);
     let memories = plans.each_ref().map(|plan| {
         plan.component
@@ -452,10 +473,11 @@ fn cold_preflight_counts_one_active_stage_and_native_allowance_before_execution(
     drop(plans);
 
     for (capacity, accepted) in [(exact - 1, false), (exact, true)] {
-        pipeline.config.device_capacity_bytes = capacity;
-        pipeline.policy = TensorComponentPolicy::new(
+        pipeline.execution.config.device_capacity_bytes = capacity;
+        pipeline.execution.policy = TensorComponentPolicy::new(
             capacity,
             pipeline
+                .execution
                 .runtime
                 .descriptor()
                 .dynamic_storage_profiles
@@ -464,18 +486,21 @@ fn cold_preflight_counts_one_active_stage_and_native_allowance_before_execution(
                 .collect(),
         )
         .unwrap();
-        let before = pipeline.runtime.snapshot();
+        let before = pipeline.execution.runtime.snapshot();
         // All actual component plans fit independently at both ceilings. The
         // lower one fails only when their peak includes the native allowance.
         let plans = capacity_stages(&pipeline);
         let result = pipeline.validate_resident_capacity(&plans.iter().collect::<Vec<_>>());
         assert_eq!(result.is_ok(), accepted, "{result:?}");
         assert!(!pipeline.is_stopped());
-        let after = pipeline.runtime.snapshot();
+        let after = pipeline.execution.runtime.snapshot();
         assert_eq!(after.allocations, before.allocations);
         assert_eq!(after.submissions, before.submissions);
         assert_eq!(after.uploaded_bytes, before.uploaded_bytes);
         assert_eq!(after.live_allocations, 0);
-        assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+        assert_eq!(
+            pipeline.execution.host.usage().unwrap().committed_bytes(),
+            0
+        );
     }
 }

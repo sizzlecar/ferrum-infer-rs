@@ -19,14 +19,19 @@ fn compiled_stages(
     prompts: &[&str],
 ) -> [PreparedStage<ReferenceDeviceRuntime>; 2] {
     let (prompts, _) = pipeline
+        .execution
+        .sources
         .assets
         .tokenizer
         .prepare_canonical(prompts, 512)
         .unwrap();
-    let text =
-        Qwen3VLTextConfig::new(pipeline.assets.text.clone(), prompts.layout().clone()).unwrap();
+    let text = Qwen3VLTextConfig::new(
+        pipeline.execution.sources.assets.text.clone(),
+        prompts.layout().clone(),
+    )
+    .unwrap();
     let dit = QwenImage21TransformerConfig::new(
-        pipeline.assets.transformer.clone(),
+        pipeline.execution.sources.assets.transformer.clone(),
         QwenImage21T2iLayout::new(
             prompts.feature_sequence_length() as u32,
             2,
@@ -94,9 +99,12 @@ fn canonical_request_multiset_hits_exact_text_and_dit_plans_but_changed_mask_mis
         );
         assert_ne!(initial.plan.plan_hash, changed.plan.plan_hash);
     }
-    assert_eq!(pipeline.runtime.snapshot().allocations, 0);
-    assert_eq!(pipeline.runtime.snapshot().submissions, 0);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().submissions, 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]
@@ -104,9 +112,11 @@ fn canonical_request_order_keeps_prompt_seed_pairs_and_restores_real_managed_out
     // Exercise mapping through a real nonzero Reference projection. This is
     // not a substitute normal provider or a claimed complete image pipeline.
     let (mut pipeline, _directory) = super::residency::numeric_pipeline();
-    pipeline.config.residency = ImageResidencyPolicy::Cold;
+    pipeline.execution.config.residency = ImageResidencyPolicy::Cold;
     let requests = [request_with("blue cat", 42), request_with("cat", 43)];
     let (prompts, indices) = pipeline
+        .execution
+        .sources
         .assets
         .tokenizer
         .prepare_canonical(&[&requests[0].prompt, &requests[1].prompt], 512)
@@ -129,13 +139,14 @@ fn canonical_request_order_keeps_prompt_seed_pairs_and_restores_real_managed_out
     )
     .unwrap();
     let mut backing = pipeline
+        .execution
         .host
         .allocate_zeroed(HostMemoryClass::InputPreprocess, 256)
         .unwrap();
     for (execution_index, request) in ordered.into_iter().enumerate() {
         // Use the same fresh-seed builder as generation. Sorting does not
         // merge independent streams or substitute a batch seed.
-        let state = noise_state(&pipeline.host, request.seed).unwrap();
+        let state = noise_state(&pipeline.execution.host, request.seed).unwrap();
         let seed = u64::from_le_bytes(state.bytes().bytes()[..8].try_into().unwrap());
         assert_eq!(seed, [43, 42][execution_index]);
         assert!(state.bytes().bytes()[8..].iter().all(|&byte| byte == 0));
@@ -185,8 +196,8 @@ fn canonical_request_order_keeps_prompt_seed_pairs_and_restores_real_managed_out
         assert!(actual[2..].iter().all(|&value| value == 0.0));
         assert!(output.bytes().same_region(&original_regions[index]));
     }
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
-    let host = pipeline.host.clone();
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
+    let host = pipeline.execution.host.clone();
     assert_eq!(host.usage().unwrap().committed_bytes(), 32);
     let survivor = restored[0].bytes().clone();
     drop((restored, original_regions, pipeline));

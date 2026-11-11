@@ -9,6 +9,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_modes: &ProductReadbackModes,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
+        managed_wave: Option<&ManagedWaveIo>,
     ) -> Result<Vec<SubmissionWaveInputUpload>> {
         if participants.is_empty()
             || participants.len() != token_mask_plans.len()
@@ -16,6 +17,28 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         {
             return Err(FerrumError::backend(
                 "vNext submission wave requires matching participants and token-mask decisions",
+            ));
+        }
+        if let Some(wave) = managed_wave {
+            let uploads = self.managed_uploads(wave, participants, token_mask_plans)?;
+            let bytes = uploads.iter().try_fold(0u64, |total, upload| {
+                total
+                    .checked_add(
+                        upload
+                            .source_layout()
+                            .byte_len()
+                            .map_err(|e| FerrumError::backend(e.to_string()))?,
+                    )
+                    .ok_or_else(|| FerrumError::backend("managed upload byte count overflow"))
+            })?;
+            self.metrics
+                .uploaded_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            return Ok(uploads);
+        }
+        if self.managed_io.is_some() {
+            return Err(FerrumError::backend(
+                "managed execution cannot fall back to legacy input bytes",
             ));
         }
         let timing_enabled = self.host_dispatch_timing_enabled();

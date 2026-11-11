@@ -180,6 +180,7 @@ impl BatchWorker for Worker {
 
 fn shared() -> Shared<u64> {
     Shared {
+        trace: None,
         state: Mutex::new(State {
             queue: VecDeque::new(),
             queue_backing: None,
@@ -211,6 +212,7 @@ fn shared() -> Shared<u64> {
 
 fn queued(seed: u64, adapter: Option<Arc<ImageAdapterBatchIdentity>>) -> Queued<u64> {
     Queued {
+        trace: trace::RequestTrace::unobserved(),
         request: QueuedRequest::Generate(ImageGenerationRequest {
             prompt: "a".into(),
             width: 32,

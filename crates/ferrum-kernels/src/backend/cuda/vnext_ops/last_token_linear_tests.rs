@@ -1,7 +1,7 @@
 use super::*;
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaContext, DevicePtr};
-use half::f16;
+use half::{bf16, f16};
 
 mod gather_microbench;
 mod gather_tests;
@@ -142,21 +142,63 @@ fn values(count: usize, salt: usize) -> Vec<f16> {
         .collect()
 }
 
-fn assert_dot(actual: f16, input: &[f16], weight: &[f16]) {
+trait ProjectionScalar: cudarc::driver::DeviceRepr + Copy + PartialEq + std::fmt::Debug {
+    const BF16: bool;
+    const NAN: Self;
+    const EPSILON: f64;
+    fn from_f32(value: f32) -> Self;
+    fn to_f64(self) -> f64;
+    fn minimum_subnormal() -> f64;
+}
+impl ProjectionScalar for f16 {
+    const BF16: bool = false;
+    const NAN: Self = Self::NAN;
+    const EPSILON: f64 = 0.0009765625;
+    fn from_f32(value: f32) -> Self {
+        Self::from_f32(value)
+    }
+    fn to_f64(self) -> f64 {
+        self.to_f64()
+    }
+    fn minimum_subnormal() -> f64 {
+        Self::from_bits(1).to_f64()
+    }
+}
+impl ProjectionScalar for bf16 {
+    const BF16: bool = true;
+    const NAN: Self = Self::NAN;
+    const EPSILON: f64 = 0.0078125;
+    fn from_f32(value: f32) -> Self {
+        Self::from_f32(value)
+    }
+    fn to_f64(self) -> f64 {
+        self.to_f64()
+    }
+    fn minimum_subnormal() -> f64 {
+        Self::from_bits(1).to_f64()
+    }
+}
+fn scalar_values<T: ProjectionScalar>(count: usize, salt: usize) -> Vec<T> {
+    (0..count)
+        .map(|index| T::from_f32(((index * 13 + salt * 7) % 41) as f32 / 32.0 - 0.625))
+        .collect()
+}
+
+fn assert_dot<T: ProjectionScalar>(actual: T, input: &[T], weight: &[T]) {
     let products = input
         .iter()
         .zip(weight)
         .map(|(x, w)| x.to_f64() * w.to_f64());
     let expected = products.clone().sum::<f64>();
-    // F32 accumulation error, one F16 relative spacing and minimum subnormal:
-    // the same independent numerical bound as the existing F16 CUDA oracles.
-    let bound = (input.len() as f64 * f64::from(f32::EPSILON) + 0.0009765625)
+    // F32 accumulation error, one output-type relative spacing and minimum subnormal:
+    // the same independent numerical bound as the existing CUDA oracles.
+    let bound = (input.len() as f64 * f64::from(f32::EPSILON) + T::EPSILON)
         * products.map(f64::abs).sum::<f64>()
-        + f16::from_bits(1).to_f64();
+        + T::minimum_subnormal();
     assert!(
-        actual.is_finite() && (actual.to_f64() - expected).abs() <= bound,
+        actual.to_f64().is_finite() && (actual.to_f64() - expected).abs() <= bound,
         "projection={}, F64={expected}, bound={bound}",
-        actual.to_f32()
+        actual.to_f64()
     );
 }
 
@@ -171,31 +213,46 @@ fn projection_case_with_gather(
     layout: Layout,
     allow_gather: bool,
 ) {
+    projection_case_with_scalar::<f16>(rows, hidden, outputs, layout, allow_gather);
+}
+
+fn projection_case_with_scalar<T: ProjectionScalar>(
+    rows: usize,
+    hidden: usize,
+    outputs: usize,
+    layout: Layout,
+    allow_gather: bool,
+) {
+    let gemm = if T::BF16 {
+        transformer::launch_gemm_bf16
+    } else {
+        transformer::launch_gemm_f16
+    };
     let context = CudaContext::new(0).expect("LM head oracle requires an actual CUDA device");
     let stream = context.default_stream();
     let blas = CudaBlas::new(stream.clone()).unwrap();
-    let guard = f16::from_f32(-117.0);
+    let guard = T::from_f32(-117.0);
     let input_stride = hidden + layout.input_gap;
     let output_stride = outputs + layout.output_gap;
     let prefix = (layout.first_prefill_tokens - 1) * hidden;
     let mut input = vec![guard; 16 + prefix + rows * input_stride];
     let mut weight = vec![guard; 8];
-    weight.extend(values(outputs * hidden, 9));
+    weight.extend(scalar_values::<T>(outputs * hidden, 9));
     weight.extend([guard; 8]);
     let mut output = vec![guard; 16 + rows * output_stride];
     let mut oracle_output = vec![guard; 16 + rows * outputs];
     for row in 0..rows {
         // Distinct inputs in reverse semantic order expose accidental row sorting.
         let source = 8 + prefix + row * input_stride;
-        input[source..source + hidden].copy_from_slice(&values(hidden, rows - row));
+        input[source..source + hidden].copy_from_slice(&scalar_values::<T>(hidden, rows - row));
         let physical_row = if layout.reverse_outputs {
             rows - 1 - row
         } else {
             row
         };
         let destination = 8 + physical_row * output_stride;
-        output[destination..destination + outputs].fill(f16::NAN);
-        oracle_output[8 + row * outputs..8 + (row + 1) * outputs].fill(f16::NAN);
+        output[destination..destination + outputs].fill(T::NAN);
+        oracle_output[8 + row * outputs..8 + (row + 1) * outputs].fill(T::NAN);
     }
     let x = stream.clone_htod(&input).unwrap();
     let w = stream.clone_htod(&weight).unwrap();
@@ -280,7 +337,7 @@ fn projection_case_with_gather(
             spans.iter().map(|span| span.input_pointer),
         )
         .unwrap();
-        transformer::launch_gemm_f16(
+        gemm(
             &blas,
             scratch_pointer + 16,
             wp + 16,
@@ -294,7 +351,7 @@ fn projection_case_with_gather(
     }
     for (row, span) in spans.iter().enumerate() {
         if !gather && (row == 0 || packed.is_none()) {
-            transformer::launch_gemm_f16(
+            gemm(
                 &blas,
                 span.input_pointer,
                 wp + 16,
@@ -306,7 +363,7 @@ fn projection_case_with_gather(
             )
             .unwrap();
         }
-        transformer::launch_gemm_f16(
+        gemm(
             &blas,
             span.input_pointer,
             wp + 16,
@@ -337,12 +394,12 @@ fn projection_case_with_gather(
         }
     }
     for (actual, original) in actual.iter().zip(&output) {
-        if !original.is_nan() {
+        if !original.to_f64().is_nan() {
             assert_eq!(actual, original, "output padding/guard changed");
         }
     }
     for (actual, original) in reference.iter().zip(&oracle_output) {
-        if !original.is_nan() {
+        if !original.to_f64().is_nan() {
             assert_eq!(actual, original, "scalar guard changed");
         }
     }
@@ -416,5 +473,32 @@ fn f16_last_token_projection_fallback_preserves_gaps_order_and_final_rows_on_cud
         },
     ] {
         projection_case(4, 17, 19, layout);
+    }
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn bf16_last_token_projection_preserves_packed_gathered_and_distinct_rows_on_cuda() {
+    for layout in [
+        Layout {
+            input_gap: 0,
+            output_gap: 0,
+            reverse_outputs: false,
+            first_prefill_tokens: 1,
+        },
+        Layout {
+            input_gap: 3,
+            output_gap: 0,
+            reverse_outputs: false,
+            first_prefill_tokens: 3,
+        },
+        Layout {
+            input_gap: 3,
+            output_gap: 5,
+            reverse_outputs: true,
+            first_prefill_tokens: 1,
+        },
+    ] {
+        projection_case_with_scalar::<bf16>(4, 17, 19, layout, true);
     }
 }

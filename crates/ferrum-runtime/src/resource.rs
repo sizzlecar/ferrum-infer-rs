@@ -134,3 +134,13 @@ mod dynamic_pool_tests;
 #[cfg(test)]
 #[path = "resource/sequence_session_frame_tests.rs"]
 mod sequence_session_frame_tests;
+
+mod selected_state;
+mod sequence_conditioning;
+pub use selected_state::*;
+pub use sequence_conditioning::{
+    SequenceConditioningCoverage, SequenceConditioningInput, SequenceConditioningInputs,
+    SequenceConditioningSegment,
+};
+#[cfg(test)]
+mod selected_prefix_tests;

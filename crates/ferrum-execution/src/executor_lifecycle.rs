@@ -48,6 +48,99 @@ impl ExecutorShutdownReport {
 
 struct ReportPublisher {
     sender: watch::Sender<ExecutorShutdownReport>,
+    retention: Arc<RetirementRetention>,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum RetentionPhase {
+    #[default]
+    Pending,
+    Releasing,
+    Released,
+}
+
+#[derive(Default)]
+struct RetentionState {
+    phase: RetentionPhase,
+    resources: Vec<Box<dyn Any + Send>>,
+}
+
+/// The original reporter and every observation share this custody. It conveys
+/// no shutdown permission and cannot publish a retirement receipt.
+#[derive(Default)]
+struct RetirementRetention {
+    state: Mutex<RetentionState>,
+}
+
+impl RetirementRetention {
+    fn retain<T: Send + 'static>(&self, resource: T) {
+        let mut resource = Some(Box::new(resource) as Box<dyn Any + Send>);
+        {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.phase == RetentionPhase::Pending {
+                state.resources.push(
+                    resource
+                        .take()
+                        .expect("retention consumes its resource once"),
+                );
+            }
+        }
+        // Once the original reporter proved retirement, late registration is
+        // immediately released. Never call user destructors under our lock.
+        drop(resource);
+    }
+
+    /// False only while another original reporter call is releasing resources.
+    /// It will publish the same terminal report when release has completed.
+    fn release_after_retirement(&self) -> bool {
+        let resources = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            match state.phase {
+                RetentionPhase::Released => return true,
+                RetentionPhase::Releasing => return false,
+                RetentionPhase::Pending => {
+                    state.phase = RetentionPhase::Releasing;
+                    std::mem::take(&mut state.resources)
+                }
+            }
+        };
+        // Native retirement has already been proved by the original caller.
+        // Even a user destructor panic must not turn a subsequent checked
+        // retirement retry into an indefinitely incomplete release.
+        struct Release<'a>(&'a RetirementRetention);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .phase = RetentionPhase::Released;
+            }
+        }
+        let release = Release(self);
+        drop(resources);
+        drop(release);
+        true
+    }
+}
+
+impl Drop for RetirementRetention {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.phase != RetentionPhase::Released && !state.resources.is_empty() {
+            // A disconnected/missing publisher proves no retirement. There is
+            // no original recovery service to hand these obligations to here.
+            // Quarantine this one instance rather than refund phase credit
+            // underneath unknown work. Do not manufacture a Retired report.
+            tracing::error!(
+                "executor retirement publisher disappeared; attached resources quarantined"
+            );
+            std::mem::forget(std::mem::take(&mut state.resources));
+        }
+    }
 }
 
 impl Drop for ReportPublisher {
@@ -70,6 +163,13 @@ pub struct ExecutorShutdownReporter {
 }
 
 impl ExecutorShutdownReporter {
+    /// Transfer an owned resource to this original cleanup channel. Public
+    /// observer cancellation/drop and Retained reports do not release it.
+    /// Register before relinquishing the caller's resource custody.
+    pub fn retain_until_retired<T: Send + 'static>(&self, resource: T) {
+        self.inner.retention.retain(resource);
+    }
+
     pub fn retained(&self, error: FerrumError) {
         self.update(ExecutorShutdownPhase::Retained, Some(error));
     }
@@ -81,6 +181,24 @@ impl ExecutorShutdownReporter {
     }
 
     fn update(&self, phase: ExecutorShutdownPhase, error: Option<FerrumError>) {
+        if phase == ExecutorShutdownPhase::Retired {
+            // Resource destructors may overlap another original reporter's
+            // call. Preserve the first reported execution error before a
+            // Releasing caller returns; only the terminal publication below
+            // linearizes Retired. Recording an error confers no close proof.
+            if let Some(error) = &error {
+                self.inner.sender.send_if_modified(|report| {
+                    if report.phase == ExecutorShutdownPhase::Retired || report.error.is_some() {
+                        return false;
+                    }
+                    report.error = Some(error.clone());
+                    true
+                });
+            }
+            if !self.inner.retention.release_after_retirement() {
+                return;
+            }
+        }
         self.inner.sender.send_if_modified(|report| {
             if report.phase == ExecutorShutdownPhase::Retired {
                 return false;
@@ -100,6 +218,7 @@ impl ExecutorShutdownReporter {
 pub struct ExecutorShutdownObserver {
     receiver: watch::Receiver<ExecutorShutdownReport>,
     _custody: Arc<dyn Any + Send + Sync>,
+    retention: Arc<RetirementRetention>,
     retry: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -116,16 +235,35 @@ impl ExecutorShutdownObserver {
             phase: ExecutorShutdownPhase::Draining,
             error,
         });
+        let retention = Arc::new(RetirementRetention::default());
         (
             ExecutorShutdownReporter {
-                inner: Arc::new(ReportPublisher { sender }),
+                inner: Arc::new(ReportPublisher {
+                    sender,
+                    retention: Arc::clone(&retention),
+                }),
             },
             Self {
                 receiver,
                 _custody: custody,
+                retention,
                 retry: None,
             },
         )
+    }
+
+    /// Keep an owned resource in the original cleanup channel until its actual
+    /// reporter proves whole-executor retirement. This neither starts shutdown
+    /// nor grants permission to close the executor. It also works with an
+    /// ExecutorBuildError's original cleanup observation.
+    ///
+    /// Registration racing retirement either joins pre-retirement custody or
+    /// releases immediately after that proof; it never waits on an observer.
+    /// If the original publisher disappears without retirement, resources are
+    /// deliberately quarantined rather than silently released. Resource Drop
+    /// should not panic; a panic cannot undo a native retirement proof.
+    pub fn retain_until_retired<T: Send + 'static>(&self, resource: T) {
+        self.retention.retain(resource);
     }
 
     pub fn retained(custody: Arc<dyn Any + Send + Sync>, error: FerrumError) -> Self {
@@ -180,6 +318,9 @@ impl ExecutorShutdownObserver {
         self.receiver.borrow_and_update().clone()
     }
 }
+
+#[cfg(test)]
+mod retention_tests;
 
 /// Unforgeable final-close permission tied to the original live allocation.
 /// Address comparison confers no custody; the owning assembly retains the Arc

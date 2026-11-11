@@ -10,6 +10,7 @@ use ferrum_runtime::{
 #[derive(Clone)]
 pub(in crate::backend::cuda::vnext_ops) struct CausalRecipe {
     shape: CausalAttentionShape,
+    kv_type: ElementType,
     participants: usize,
     attention_policy: AttentionExecutionPolicy,
     replay_topologies: Vec<ResidentCausalReplayTopology>,
@@ -156,6 +157,7 @@ pub(crate) fn resident_control_rules(
 pub(super) fn declare(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     shape: CausalAttentionShape,
+    precision: CausalPrecision,
     attention_policy: AttentionExecutionPolicy,
     launches: &[CausalAttentionLaunch],
     fixed_capacity: bool,
@@ -167,6 +169,7 @@ pub(super) fn declare(
     }
     let layout = BindingLayout::new(shape, invocation.participants().len())?;
     let workspace_bytes = align_up(layout.required_bytes, SCRATCH_ALIGNMENT)?;
+    let kv_type = shape.kv_element_type_for(precision);
     let mut regions = vec![
         SegmentBindingRegionRequest {
             selector: SegmentBindingRegionSelector::Value {
@@ -176,7 +179,7 @@ pub(super) fn declare(
             },
             offset_bytes: 0,
             extent: SegmentBindingRegionExtent::CurrentResource,
-            element_type: shape.kv_element_type(),
+            element_type: kv_type,
             alignment_bytes: 1,
         },
         SegmentBindingRegionRequest {
@@ -206,6 +209,7 @@ pub(super) fn declare(
     segment::declaration(
         DynamicRecipe::Causal(CausalRecipe {
             shape,
+            kv_type,
             participants: invocation.participants().len(),
             attention_policy,
             replay_topologies: launches
@@ -323,7 +327,7 @@ pub(in crate::backend::cuda::vnext_ops) fn encode(
                 source.end,
                 token_range.full_input_tokens(),
             )?,
-            shape.kv_element_type(),
+            recipe.kv_type,
         )?;
         let scale_pages = if shape.int8_kv {
             pages(
@@ -513,7 +517,7 @@ pub(in crate::backend::cuda::vnext_ops) fn prepare_indexed(
                 source.end,
                 token_range.full_input_tokens(),
             )?,
-            shape.kv_element_type(),
+            recipe.kv_type,
             owners,
         )?;
         let scale_pages = if shape.int8_kv {
@@ -737,7 +741,7 @@ pub(in crate::backend::cuda::vnext_ops) fn write_program(
                 source.end,
                 token_range.full_input_tokens(),
             )?,
-            shape.kv_element_type(),
+            recipe.kv_type,
             owners,
         )?;
         let scale_pages = if shape.int8_kv {
@@ -907,7 +911,7 @@ fn write_physical_program_inner(
                 participant,
                 0,
                 required_state_bytes,
-                shape.kv_element_type(),
+                recipe.kv_type,
                 VNEXT_KV_PAGE_BYTES,
                 owners,
             )?
@@ -917,7 +921,7 @@ fn write_physical_program_inner(
                 participant,
                 0,
                 required_state_bytes,
-                shape.kv_element_type(),
+                recipe.kv_type,
                 Some(VNEXT_KV_PAGE_BYTES),
                 owners,
             )?

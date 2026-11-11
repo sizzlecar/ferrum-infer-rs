@@ -18,8 +18,8 @@ use super::{
 use super::{
     DeviceCommandBatch, DeviceTerminal, HostTransferLayout, PreparedModelFamily,
     StaticWeightTransformDestination, StaticWeightTransformPlan, StaticWeightTransformRequest,
-    WeightComponentPayload, WeightComponentSegments, WeightComponentSource, WeightComponentSpec,
-    WeightId,
+    WeightComponentPayload, WeightComponentRangeRequest, WeightComponentSegments,
+    WeightComponentSource, WeightComponentSpec, WeightId,
 };
 
 static STATIC_INITIALIZATION_CLEANUP_DOMAIN: OnceLock<DeferredDeviceCleanupDomainId> =
@@ -119,6 +119,8 @@ pub struct StaticInitializationReceipt {
     initialized_resource_count: usize,
     uploaded_component_count: usize,
     uploaded_bytes: u64,
+    retained_source_upload_bytes: u64,
+    mapped_source_upload_bytes: u64,
     imported_component_count: usize,
     imported_bytes: u64,
     transformed_component_count: usize,
@@ -129,6 +131,7 @@ pub struct StaticInitializationReceipt {
     total_duration_us: u64,
     setup_duration_us: u64,
     source_materialization_duration_us: u64,
+    staging_copy_duration_us: u64,
     device_encode_duration_us: u64,
     device_import_duration_us: u64,
     device_transform_encode_duration_us: u64,
@@ -150,6 +153,18 @@ impl StaticInitializationReceipt {
 
     pub const fn uploaded_bytes(&self) -> u64 {
         self.uploaded_bytes
+    }
+
+    /// Uploaded bytes borrowed from the original accounted WeightBacking,
+    /// without allocating a second TransferStaging payload.
+    pub const fn retained_source_upload_bytes(&self) -> u64 {
+        self.retained_source_upload_bytes
+    }
+
+    /// Uploaded bytes borrowed from explicitly proven read-only file mappings,
+    /// without a second TransferStaging payload. This is not mapping RSS.
+    pub const fn mapped_source_upload_bytes(&self) -> u64 {
+        self.mapped_source_upload_bytes
     }
 
     pub const fn imported_component_count(&self) -> usize {
@@ -190,6 +205,10 @@ impl StaticInitializationReceipt {
 
     pub const fn source_materialization_duration_us(&self) -> u64 {
         self.source_materialization_duration_us
+    }
+
+    pub const fn staging_copy_duration_us(&self) -> u64 {
+        self.staging_copy_duration_us
     }
 
     pub const fn device_encode_duration_us(&self) -> u64 {
@@ -260,7 +279,7 @@ where
     }
 
     /// Publish exactly this successfully initialized installation for immutable
-    /// reuse by compatible fixed-tensor plans. Original allocation, transaction,
+    /// reuse by compatible tensor or token plans. Original allocation, transaction,
     /// generation and capacity ownership remain intact.
     pub fn into_shared_plan_runtime(
         self,
@@ -307,6 +326,10 @@ where
 {
     stream: R::Stream,
     fence: Option<R::Fence>,
+    // A submit panic may drop the command before returning its fence. Keep the
+    // current streamed source's original charge until this same stream is
+    // proven quiescent, independently of backend command retention.
+    source_backing: Option<ManagedHostBytes>,
 }
 
 /// Failure owner for initialization. A quiescent failure can return the
@@ -499,6 +522,7 @@ where
         match synchronized {
             Ok(Ok(())) => {
                 drop(recovery.fence.take());
+                drop(recovery.source_backing.take());
                 Ok(self
                     .transaction
                     .take()
@@ -615,10 +639,12 @@ where
 
     /// Initializes weights through bounded staging or an explicit managed import.
     ///
-    /// Each chunk is admitted as [`HostMemoryClass::TransferStaging`] before
-    /// allocating or copying bytes. The backend must retain that exact owner
-    /// until its upload is quiescent; unsupported managed uploads never fall
-    /// back to a raw-byte upload. A backend may instead provide a managed
+    /// Copied chunks are admitted as [`HostMemoryClass::TransferStaging`] before
+    /// allocation. Capable backends may upload an existing WeightBacking from
+    /// the exact invocation scope without copying it; those transfers finish
+    /// before the next source group is materialized. The original owner and
+    /// charge remain live until quiescence. Unsupported managed uploads never
+    /// fall back to a raw-byte upload. A backend may instead provide a managed
     /// import transaction with no temporary host staging. The ordinary import
     /// hook and device transforms are not used. Existing source/materializer
     /// backing, including mmap pages or format conversion allocations, is outside
@@ -692,6 +718,13 @@ where
 {
     let initialization_started = Instant::now();
     let setup_started = Instant::now();
+    let trace_setup = tracing::enabled!(
+        target: "ferrum_runtime::static_initialization",
+        tracing::Level::DEBUG
+    );
+    let trace_elapsed_us =
+        |started: Option<Instant>| started.map_or(0, |started| duration_us(started.elapsed()));
+    let mut phase_started = trace_setup.then(Instant::now);
     preflight_transaction(transaction, family, plan).map_err(contract_failure)?;
     let (stored, managed_host) = match (input, family.weights(), plan.payload().execution_weights())
     {
@@ -711,12 +744,64 @@ where
             }))
         }
     };
+    let preflight_us = trace_elapsed_us(phase_started);
+    phase_started = trace_setup.then(Instant::now);
     let placements = if stored.is_some() {
         weight_placements(family, plan).map_err(contract_failure)?
     } else {
         BTreeMap::new()
     };
+    let placements_us = trace_elapsed_us(phase_started);
+    phase_started = trace_setup.then(Instant::now);
+    // The complete family/source-schema proof belongs to setup, before native
+    // import, stream creation or any zero/upload can write device storage.
+    // Keep immutable borrows for all CPU-materialized groups; required device
+    // transforms retain their original validation and submission path.
+    let materialization = stored
+        .map(|_| plan.weight_materialization_session(family))
+        .transpose()
+        .map_err(contract_failure)?;
+    let materialization_proof_us = trace_elapsed_us(phase_started);
+    phase_started = trace_setup.then(Instant::now);
     let runtime = Arc::clone(transaction.lease().runtime());
+    // Freeze every range/full route before source allocation or native work.
+    // A source declaration is not permission to bypass materialization: only
+    // the original live canonical identity implementation supplies that proof.
+    let mut streaming_components = BTreeMap::new();
+    if let Some((source, weights)) = stored {
+        for component in &weights.schema().components {
+            if !placements.contains_key(&component.id) {
+                continue;
+            }
+            if let Some(spec) = source
+                .streaming_component(component)
+                .map_err(contract_failure)?
+            {
+                if spec.component() != component {
+                    return Err(contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "streamed source metadata differs from the placed component".into(),
+                    }));
+                }
+                materialization
+                    .as_ref()
+                    .expect("stored materialization view")
+                    .validate_identity_range_component(component)
+                    .map_err(contract_failure)?;
+                if managed_host.is_none()
+                    || !runtime.supports_managed_static_weight_sources()
+                    || runtime.static_weight_source_retention()
+                        != super::StaticWeightSourceRetention::FencedCopy
+                    || policy.maximum_staging_bytes()
+                        < component.physical_element_type().size_bytes()
+                {
+                    return Err(contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "streamed weights require admitted managed direct upload with FencedCopy retention and an element-sized chunk".into(),
+                    }));
+                }
+                streaming_components.insert(component.id.clone(), spec);
+            }
+        }
+    }
     let has_required_weight_transforms = !plan
         .payload()
         .execution_weights()
@@ -742,6 +827,11 @@ where
             }
         }
     };
+    if !streaming_components.is_empty() && weight_import.is_some() {
+        return Err(contract_failure(VNextError::InvalidExecutionPlan {
+            reason: "streamed weights cannot use a plan-retained import route".into(),
+        }));
+    }
     if managed_host.is_some()
         && !placements.is_empty()
         && !has_required_weight_transforms
@@ -800,6 +890,25 @@ where
         }
         _ => None,
     };
+    if let Some((source, _)) = stored {
+        let retention = if weight_import.is_some() {
+            super::StaticWeightSourceRetention::UnknownOrPlanRetained
+        } else {
+            runtime.static_weight_source_retention()
+        };
+        source
+            .validate_static_initialization(&super::StaticWeightSourceContext::new(
+                family,
+                plan,
+                managed_host,
+                retention,
+                policy.maximum_staging_bytes(),
+                weight_import.is_none() && runtime.supports_managed_static_weight_sources(),
+            ))
+            .map_err(contract_failure)?;
+    }
+    let import_and_staging_reserve_us = trace_elapsed_us(phase_started);
+    phase_started = trace_setup.then(Instant::now);
     let created_stream = runtime.create_stream().map_err(|error| {
         InitializationStepFailure::Quiescent(device_failure(
             &runtime,
@@ -809,18 +918,39 @@ where
     })?;
     let mut stream = Some(created_stream);
     let setup_duration = setup_started.elapsed();
+    if trace_setup {
+        let stream_creation_us = trace_elapsed_us(phase_started);
+        tracing::debug!(
+            target: "ferrum_runtime::static_initialization",
+            family_id = %family.family_id(),
+            plan_id = %plan.payload().plan_id(),
+            plan_hash = %plan.plan_hash(),
+            run_id = %transaction.identity().run_id(),
+            request_id = %transaction.identity().request_id(),
+            preflight_us,
+            placements_us,
+            materialization_proof_us,
+            import_and_staging_reserve_us,
+            stream_creation_us,
+            setup_duration_us = duration_us(setup_duration),
+            "static initialization setup host timing"
+        );
+    }
     let mut pending = Vec::<<D::Runtime as DeviceRuntime>::Command>::new();
     let mut pending_staging_bytes = 0_u64;
     let mut submission_batch_count = 0_usize;
     let mut upload_command_count = 0_usize;
     let mut uploaded_component_count = 0_usize;
     let mut uploaded_bytes = 0_u64;
+    let mut retained_source_upload_bytes = 0_u64;
+    let mut mapped_source_upload_bytes = 0_u64;
     let mut imported_component_count = 0_usize;
     let mut imported_bytes = 0_u64;
     let mut transformed_component_count = 0_usize;
     let mut transformed_bytes = 0_u64;
     let mut transform_command_count = 0_usize;
     let mut source_materialization_duration = Duration::ZERO;
+    let mut staging_copy_duration = Duration::ZERO;
     let mut device_encode_duration = Duration::ZERO;
     let mut device_import_duration = Duration::ZERO;
     let mut device_transform_encode_duration = Duration::ZERO;
@@ -953,13 +1083,157 @@ where
                 }
                 continue;
             }
+            if let Some(spec) = streaming_components.get(&components[0].id) {
+                // Identity proof above establishes exactly one source and one
+                // output. Complete earlier work before the sole mutable slot
+                // can be acquired, then retire every range before requesting
+                // another. Existing submit/wait recovery retains unknown work.
+                if components.len() != 1 {
+                    return Err(contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "streamed identity component cannot share a materialization group"
+                            .into(),
+                    }));
+                }
+                if !pending.is_empty() {
+                    submission_wait_duration += submit_pending(
+                        &runtime,
+                        &mut stream,
+                        &mut pending,
+                        &mut pending_staging_bytes,
+                    )?;
+                    submission_batch_count += 1;
+                }
+                drop(first_staging.take());
+                let component = components[0];
+                let placement = placements
+                    .get(&component.id)
+                    .expect("placed streamed component");
+                let host = managed_host.expect("streamed source was admitted with Host authority");
+                let element_bytes = component.physical_element_type().size_bytes();
+                let maximum = policy
+                    .maximum_staging_bytes()
+                    .min(spec.maximum_range_bytes() as u64);
+                let maximum = maximum - maximum % element_bytes;
+                let maximum = usize::try_from(maximum).map_err(|_| {
+                    contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "streamed chunk exceeds address space".into(),
+                    })
+                })?;
+                let full_bytes = usize::try_from(placement.length_bytes).map_err(|_| {
+                    contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "streamed component exceeds address space".into(),
+                    })
+                })?;
+                source_files.extend(spec.source_files().iter().cloned());
+                let mut offset = 0;
+                let mut materialization_duration = Duration::ZERO;
+                while offset < full_bytes {
+                    let length = maximum.min(full_bytes - offset);
+                    let request = WeightComponentRangeRequest::new(spec, offset, length)
+                        .map_err(contract_failure)?;
+                    let started = Instant::now();
+                    let bytes = source
+                        .component_range(&request)
+                        .map_err(contract_failure)?
+                        .validate_and_take(&request, host)
+                        .map_err(contract_failure)?;
+                    // Zero-copy custody across encode/submit unwinding. Only
+                    // one range is in flight; success drops this alias before
+                    // the source can uniquely reclaim its slot for the next.
+                    let mut source_backing = Some(bytes.clone());
+                    materialization_duration += started.elapsed();
+                    let layout = HostTransferLayout::new(
+                        component.physical_element_type(),
+                        length as u64 / element_bytes,
+                    )
+                    .map_err(contract_failure)?;
+                    let destination_offset = placement
+                        .offset_bytes
+                        .checked_add(offset as u64)
+                        .ok_or_else(|| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
+                                reason: "streamed destination offset overflows".into(),
+                            })
+                        })?;
+                    let started = Instant::now();
+                    let command =
+                        with_static_buffer(transaction, &placement.resource_id, |buffer| {
+                            runtime.encode_managed_upload(bytes, layout, buffer, destination_offset)
+                        })
+                        .map_err(|error| {
+                            runtime_or_contract_failure(
+                                &runtime,
+                                error,
+                                "static_streamed_upload_encode",
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
+                            reason:
+                                "runtime declined streamed managed upload; fallback is forbidden"
+                                    .into(),
+                        })
+                        })?;
+                    device_encode_duration += started.elapsed();
+                    pending.push(command);
+                    pending_staging_bytes = length as u64;
+                    upload_command_count += 1;
+                    submission_wait_duration += submit_pending(
+                        &runtime,
+                        &mut stream,
+                        &mut pending,
+                        &mut pending_staging_bytes,
+                    )
+                    .map_err(|mut failure| {
+                        if let InitializationStepFailure::Indeterminate { recovery, .. } =
+                            &mut failure
+                        {
+                            recovery.source_backing = source_backing.take();
+                        }
+                        failure
+                    })?;
+                    drop(source_backing);
+                    submission_batch_count += 1;
+                    offset += length;
+                }
+                source_materialization_duration += materialization_duration;
+                if slowest_component_id.is_none()
+                    || materialization_duration > slowest_component_materialization_duration
+                {
+                    slowest_component_materialization_duration = materialization_duration;
+                    slowest_component_id = Some(component.id.clone());
+                }
+                uploaded_component_count += 1;
+                uploaded_bytes = uploaded_bytes
+                    .checked_add(placement.length_bytes)
+                    .ok_or_else(|| {
+                        contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: "streamed uploaded bytes overflow".into(),
+                        })
+                    })?;
+                retained_source_upload_bytes = retained_source_upload_bytes
+                    .checked_add(placement.length_bytes)
+                    .ok_or_else(|| {
+                        contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: "streamed retained source bytes overflow".into(),
+                        })
+                    })?;
+                continue;
+            }
             // Retain only outputs derived from one exact source set. This permits
             // multi-output transforms to read and convert a large source matrix
             // once without retaining converted payloads for the whole model.
             let materialization_started = Instant::now();
-            let uploads =
-                prepare_uploads(family, plan, source, &components, &placements, managed_host)
-                    .map_err(contract_failure)?;
+            let uploads = prepare_uploads(
+                materialization
+                    .as_ref()
+                    .expect("stored initialization retains its validated materialization view"),
+                source,
+                &components,
+                &placements,
+                managed_host,
+            )
+            .map_err(contract_failure)?;
             let materialization_duration = materialization_started.elapsed();
             source_materialization_duration += materialization_duration;
             if slowest_component_id.is_none()
@@ -968,6 +1242,7 @@ where
                 slowest_component_materialization_duration = materialization_duration;
                 slowest_component_id = Some(components[0].id.clone());
             }
+            let mut retained_group_source = false;
             for (component, upload) in components.into_iter().zip(uploads) {
                 let placement = placements
                     .get(&component.id)
@@ -1009,6 +1284,31 @@ where
                     }));
                 }
                 let bytes = upload.bytes();
+                let direct_source = managed_host
+                    .filter(|_| runtime.supports_managed_static_weight_sources())
+                    .and_then(|host| {
+                        upload
+                            .managed_host_bytes()
+                            .filter(|source| host.owns_in_scope(source))
+                    });
+                let mapped_source = if managed_host.is_some()
+                    && direct_source.is_none()
+                    && runtime.supports_readonly_mapped_static_weight_sources()
+                {
+                    upload
+                        .retained_host_memory()
+                        .and_then(|source| source.readonly_file_mapping())
+                } else {
+                    None
+                };
+                if direct_source.is_some() || mapped_source.is_some() {
+                    // Accounted sources keep their exact invocation claim;
+                    // mapping sources keep their explicit immutable owner.
+                    // Neither route may reclassify a generic stable owner or
+                    // reuse this reservation for a differently sized fallback.
+                    drop(first_staging.take());
+                    retained_group_source = true;
+                }
                 let mut source_offset = 0_usize;
                 while source_offset < bytes.len() {
                     let remaining = bytes.len() - source_offset;
@@ -1061,12 +1361,28 @@ where
                     // that bounded batch once before retrying admission. Never
                     // wait while retaining the very staging capacity needed
                     // by this chunk, and never bypass a genuine capacity error.
-                    let managed_bytes = if let Some(host) = managed_host {
+                    let mapped_chunk = mapped_source
+                        .as_ref()
+                        .map(|source| source.slice(source_offset..source_end))
+                        .transpose()
+                        .map_err(contract_failure)?;
+                    let managed_bytes = if mapped_chunk.is_some() {
+                        None
+                    } else if let Some(source) = direct_source {
+                        Some(source.slice(source_offset..source_end).map_err(|error| {
+                            InitializationStepFailure::Quiescent(resource_failure(
+                                "static_source_slice",
+                                error,
+                            ))
+                        })?)
+                    } else if let Some(host) = managed_host {
                         let source_bytes = &bytes[source_offset..source_end];
+                        let copy_started = Instant::now();
                         let mut staged = match first_staging.take() {
                             Some(reservation) => copy_staged_upload(reservation, source_bytes),
                             None => stage_upload(host, source_bytes),
                         };
+                        staging_copy_duration += copy_started.elapsed();
                         if matches!(
                             staged,
                             Err(HostMemoryError::Capacity { .. }
@@ -1080,7 +1396,9 @@ where
                                 &mut pending_staging_bytes,
                             )?;
                             submission_batch_count += 1;
+                            let copy_started = Instant::now();
                             staged = stage_upload(host, source_bytes);
+                            staging_copy_duration += copy_started.elapsed();
                         }
                         Some(staged.map_err(|error| {
                             InitializationStepFailure::Quiescent(resource_failure(
@@ -1092,7 +1410,22 @@ where
                         None
                     };
                     let encode_started = Instant::now();
-                    let command = if let Some(managed_bytes) = managed_bytes {
+                    let command = if let Some(mapped_chunk) = mapped_chunk {
+                        with_static_buffer(transaction, &placement.resource_id, |buffer| {
+                            runtime.encode_readonly_mapped_static_weight_upload(
+                                mapped_chunk,
+                                layout,
+                                buffer,
+                                destination_offset,
+                            )
+                        })
+                        .map_err(|error| {
+                            runtime_or_contract_failure(&runtime, error, "static_mapped_upload_encode")
+                        })?
+                        .ok_or_else(|| contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: "runtime declined declared read-only mapped static upload; raw fallback is forbidden".to_owned(),
+                        }))?
+                    } else if let Some(managed_bytes) = managed_bytes {
                         with_static_buffer(transaction, &placement.resource_id, |buffer| {
                             runtime.encode_managed_upload(
                                 managed_bytes,
@@ -1134,6 +1467,38 @@ where
                             reason: "static initialization uploaded bytes overflow u64".to_owned(),
                         })
                     })?;
+                if direct_source.is_some() {
+                    retained_source_upload_bytes = retained_source_upload_bytes
+                        .checked_add(placement.length_bytes)
+                        .ok_or_else(|| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
+                                reason: "retained static source bytes overflow u64".to_owned(),
+                            })
+                        })?;
+                }
+                if mapped_source.is_some() {
+                    mapped_source_upload_bytes = mapped_source_upload_bytes
+                        .checked_add(placement.length_bytes)
+                        .ok_or_else(|| {
+                            contract_failure(VNextError::InvalidExecutionPlan {
+                                reason: "mapped static source bytes overflow u64".to_owned(),
+                            })
+                        })?;
+                }
+            }
+            if retained_group_source && !pending.is_empty() {
+                // Source admission is bounded by the largest materialization
+                // group, not the sum of adjacent groups. A slice retains its
+                // entire allocation. Therefore finish this group's original
+                // transfers before the next group can allocate source backing.
+                // Indeterminate completion keeps the original recovery owners.
+                submission_wait_duration += submit_pending(
+                    &runtime,
+                    &mut stream,
+                    &mut pending,
+                    &mut pending_staging_bytes,
+                )?;
+                submission_batch_count += 1;
             }
         }
     }
@@ -1162,6 +1527,8 @@ where
         initialized_resource_count: plan.payload().memory().static_allocations().len(),
         uploaded_component_count,
         uploaded_bytes,
+        retained_source_upload_bytes,
+        mapped_source_upload_bytes,
         imported_component_count,
         imported_bytes,
         transformed_component_count,
@@ -1172,6 +1539,7 @@ where
         total_duration_us: duration_us(initialization_started.elapsed()),
         setup_duration_us: duration_us(setup_duration),
         source_materialization_duration_us: duration_us(source_materialization_duration),
+        staging_copy_duration_us: duration_us(staging_copy_duration),
         device_encode_duration_us: duration_us(device_encode_duration),
         device_import_duration_us: duration_us(device_import_duration),
         device_transform_encode_duration_us: duration_us(device_transform_encode_duration),
@@ -1253,6 +1621,7 @@ where
                         .take()
                         .expect("static initialization owns its stream"),
                     fence: None,
+                    source_backing: None,
                 },
             })
         }
@@ -1272,6 +1641,7 @@ where
                     .take()
                     .expect("static initialization owns its stream"),
                 fence: Some(fence),
+                source_backing: None,
             },
         }),
         Err(payload) => Err(InitializationStepFailure::Indeterminate {
@@ -1286,6 +1656,7 @@ where
                     .take()
                     .expect("static initialization owns its stream"),
                 fence: Some(fence),
+                source_backing: None,
             },
         }),
     }
@@ -1495,14 +1866,13 @@ fn weight_placements(
 }
 
 fn prepare_uploads<'source>(
-    family: &PreparedModelFamily,
-    plan: &ExecutionPlan,
+    materialization: &crate::ValidatedWeightMaterialization<'_>,
     source: &'source dyn WeightComponentSource,
     components: &[&WeightComponentSpec],
     placements: &BTreeMap<WeightId, WeightPlacement>,
     host: Option<&HostMemoryAccount>,
 ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
-    let payloads = plan.materialize_weight_components(family, source, components, host)?;
+    let payloads = materialization.materialize_components(source, components, host)?;
     for (component, payload) in components.iter().zip(&payloads) {
         let placement =
             placements

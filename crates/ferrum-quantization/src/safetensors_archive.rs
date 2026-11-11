@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ferrum_runtime::{
-    CanonicalRational, ElementType, RetainedHostMemoryRegion, StableHostMemory, VNextError,
-    WeightComponentPayload, WeightComponentSource, WeightComponentSpec, WeightEncoding,
+    CanonicalRational, ElementType, ImmutableFileMappedHostMemory, RetainedHostMemoryRegion,
+    StableHostMemory, VNextError, WeightComponentPayload, WeightComponentSource,
+    WeightComponentSpec, WeightEncoding,
 };
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
@@ -42,6 +43,11 @@ unsafe impl StableHostMemory for SafetensorsShard {
         &self.mmap
     }
 }
+
+// SAFETY: this private owner is constructed only from the archive's read-only
+// file Mmap. Arc retains the exact mapping after archive drop; the existing
+// immutable-checkpoint contract forbids modifying or truncating its file.
+unsafe impl ImmutableFileMappedHostMemory for SafetensorsShard {}
 
 /// Mmap-backed, once-indexed safetensors archive shared by vNext model
 /// packages. Tensor payload access does not reparse shard headers.
@@ -220,7 +226,7 @@ impl SafetensorsArchive {
                     "tensor {external_name:?} has an invalid safetensors byte range"
                 ))
             })?;
-        let retained_host_memory = RetainedHostMemoryRegion::new(
+        let retained_host_memory = RetainedHostMemoryRegion::new_readonly_file_mapping(
             Arc::clone(shard),
             metadata.data_start,
             metadata.data_end - metadata.data_start,

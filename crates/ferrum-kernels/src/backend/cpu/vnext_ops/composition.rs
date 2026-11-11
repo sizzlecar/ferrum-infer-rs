@@ -135,6 +135,7 @@ pub(super) fn implementation_fingerprint() -> String {
         include_str!("matrix.rs"),
         include_str!("scalar.rs"),
         include_str!("elementwise.rs"),
+        include_str!("tail_two_greedy.rs"),
         include_str!("gated_delta.rs"),
         include_str!("gated_delta_launch.rs"),
         include_str!("causal_attention.rs"),

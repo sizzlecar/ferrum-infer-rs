@@ -710,6 +710,16 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "src/report.rs"
             | "src/stats.rs"
             | "src/images.rs"
+            | "src/images/continuous_trace.rs"
+            | "src/images/continuous_trace/expansion.rs"
+            | "src/images/continuous_trace/join.rs"
+            | "src/images/continuous_trace/producer_extensions.rs"
+            | "src/images/continuous_trace/state.rs"
+            | "src/images/continuous_trace/timing.rs"
+            | "src/images/continuous_trace/tests.rs"
+            | "src/images/continuous_trace/tests/expansion.rs"
+            | "src/images/continuous_trace/tests/producer_extensions.rs"
+            | "src/images/continuous_trace/tests/timing.rs"
             | "src/images/png_response.rs"
             | "src/images/request_mode.rs"
             | "src/images/resource_usage.rs"
@@ -1476,6 +1486,9 @@ mod tests {
             "crates/ferrum-bench-core/examples/release_candidate/workspace.rs",
             "crates/ferrum-bench-core/src/stats.rs",
             "crates/ferrum-bench-core/src/images/png_response.rs",
+            "crates/ferrum-bench-core/src/images/continuous_trace.rs",
+            "crates/ferrum-bench-core/src/images/continuous_trace/join.rs",
+            "crates/ferrum-bench-core/src/images/continuous_trace/tests/timing.rs",
             "crates/ferrum-bench-core/examples/compare_png_pixels.rs",
             "crates/ferrum-bench-core/examples/image_run_comparison/fieller.rs",
             "crates/ferrum-bench-core/tests/release_staging_workflows/installer.rs",
@@ -1499,6 +1512,12 @@ mod tests {
         let nested =
             "crates/ferrum-bench-core/examples/regression_plan/native_artifacts/unreviewed.rs";
         assert_eq!(analyze_paths([nested]).unknown_paths, [nested]);
+        let new_trace_consumer =
+            "crates/ferrum-bench-core/src/images/continuous_trace/new_runtime_consumer.rs";
+        assert_eq!(
+            analyze_paths([new_trace_consumer]).unknown_paths,
+            [new_trace_consumer]
+        );
     }
 
     #[test]

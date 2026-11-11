@@ -550,14 +550,12 @@
       "execution_path": "production-plan-runtime"
     }
   ],
-  "checks": [
-
-  ],
+  "checks": [],
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "b824ae97bbfd9d0321393dae12e037a006194772fe34783e616a05be261a380b",
-      "after_sha256": "7a2504e4a4234e5c444ca999a55da23565014ca9aaed1f1b1aec6cedc21424ca",
+      "before_sha256": "7a2504e4a4234e5c444ca999a55da23565014ca9aaed1f1b1aec6cedc21424ca",
+      "after_sha256": "095bf2ba33d8874090f28f53fb5ff79f41865d2a490b64d72976d7066193f67b",
       "areas": [
         "build",
         "backend_submission",
@@ -568,12 +566,12 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the README changes since v0.18.4: existing version-scoped 5090 measurements are summarized in the bilingual performance tables, including all benchmarked popular models and the GPT-OSS R11 details. The text retains workload, precision, repetition, latency SLO failure and memory-accounting qualifications; historical results are not described as measurements of 0.18.5. Navigation links now point to those tables and their existing detailed reports. Installation commands, run/serve entrypoints, model/backend support limits and API behavior are unchanged. Retain all distribution, device, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This review certifies content scope only, not execution, performance or publication."
+      "rationale": "Reviewed the full README change since v0.18.5: add Linux CUDA P-H3 generation and ordered multi-reference editing, typed configuration setup, continuous batching, and explicitly candidate-scoped RTX5090 C1/C8 measurements. Preserve Qwen Image2.1 Turbo and all previous text/backend contracts. Image data discloses WSL48GB, precision,8steps,distinct references,n8/two repetitions,latency thresholds and unmeasured VRAM; it does not claim a final-release or current ComfyUI comparison. Retain build, backend, protocol, scheduler, KV, capacity and model obligations. P-H3 and Qwen image generation/editing receive separate real-model release checks in addition to the existing selected text models. This content review is not execution or performance evidence."
     },
     {
       "path": "README_zh.md",
-      "before_sha256": "b6356d62286391a07962a9a07fb97bc0b358133b92d0590fea94e63c405baa1f",
-      "after_sha256": "1c1ec4799a80fea9e6a92f8eb9925bdd8acced46322739766eddf9f9cd55f206",
+      "before_sha256": "1c1ec4799a80fea9e6a92f8eb9925bdd8acced46322739766eddf9f9cd55f206",
+      "after_sha256": "83980d5b16aca2905f13da766eea162135bf01deafb690d351318e022fcff789",
       "areas": [
         "build",
         "backend_submission",
@@ -584,7 +582,7 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the README changes since v0.18.4: existing version-scoped 5090 measurements are summarized in the bilingual performance tables, including all benchmarked popular models and the GPT-OSS R11 details. The text retains workload, precision, repetition, latency SLO failure and memory-accounting qualifications; historical results are not described as measurements of 0.18.5. Navigation links now point to those tables and their existing detailed reports. Installation commands, run/serve entrypoints, model/backend support limits and API behavior are unchanged. Retain all distribution, device, protocol, scheduler, KV, capacity, model and performance obligations and deferrals. This review certifies content scope only, not execution, performance or publication."
+      "rationale": "Reviewed the full README change since v0.18.5: add Linux CUDA P-H3 generation and ordered multi-reference editing, typed configuration setup, continuous batching, and explicitly candidate-scoped RTX5090 C1/C8 measurements. Preserve Qwen Image2.1 Turbo and all previous text/backend contracts. Image data discloses WSL48GB, precision,8steps,distinct references,n8/two repetitions,latency thresholds and unmeasured VRAM; it does not claim a final-release or current ComfyUI comparison. Retain build, backend, protocol, scheduler, KV, capacity and model obligations. P-H3 and Qwen image generation/editing receive separate real-model release checks in addition to the existing selected text models. This content review is not execution or performance evidence."
     }
   ],
   "release_profile_ids": [

@@ -438,6 +438,8 @@ pub(super) fn encode(
                     }))
                 },
             ))),
+            // A bounded tensor/causal runtime never admits resident programs.
+            _causal_modules: None,
         })),
         fence_dependencies: Vec::new(),
         binding_owner_tables: Vec::new(),

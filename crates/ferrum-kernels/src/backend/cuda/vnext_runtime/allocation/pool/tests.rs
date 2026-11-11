@@ -178,7 +178,8 @@ fn private_tensor_pool_outlives_runtime_and_yields_cache_to_native_owners() {
         },
         runtime_instance: runtime.runtime_instance,
         allocation: Arc::new(CudaAllocation {
-            _base: base,
+            _base: Some(base),
+            idle_allocation_return: None,
             aligned_ptr,
             requested_bytes: 8 * MIB as u64,
             _tensor_owner: runtime.tensor_eager.clone(),
@@ -188,7 +189,7 @@ fn private_tensor_pool_outlives_runtime_and_yields_cache_to_native_owners() {
     assert!(state.upgrade().is_some());
     assert_eq!(
         stream
-            .clone_dtoh(&buffer.allocation._base.slice(..16))
+            .clone_dtoh(&buffer.allocation._base.as_ref().unwrap().slice(..16))
             .unwrap(),
         vec![0_u8; 16]
     );

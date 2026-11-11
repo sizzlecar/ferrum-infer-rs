@@ -161,6 +161,38 @@ impl From<TrustedExecutionWeightPlan> for TrustedExecutionWeights {
     }
 }
 
+/// A materialization view whose immutable family/plan relation has already
+/// passed the complete structural and source-schema validation. Only core can
+/// construct it; payloads and the live materializer remain checked per group.
+/// Neither the source nor a Host scope is cached in this view.
+pub(crate) struct ValidatedWeightMaterialization<'a> {
+    family: &'a PreparedModelFamily,
+    plan: &'a TrustedExecutionWeightPlan,
+}
+
+impl ValidatedWeightMaterialization<'_> {
+    pub(crate) fn validate_identity_range_component(
+        &self,
+        component: &WeightComponentSpec,
+    ) -> Result<(), VNextError> {
+        self.plan
+            .validate_identity_range_component(self.family, component)
+    }
+
+    pub(crate) fn materialize_components<'source>(
+        &self,
+        source: &'source dyn WeightComponentSource,
+        components: &[&WeightComponentSpec],
+        host: Option<&crate::HostMemoryAccount>,
+    ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+        // Retain the original live descriptor check, exact component/source
+        // matching and post-materialization payload validation. The borrowed
+        // family and plan cannot change while this view is in use.
+        self.plan
+            .materialize_components(self.family, source, components, host)
+    }
+}
+
 impl TrustedExecutionWeights {
     pub(crate) fn for_family(family: &PreparedModelFamily) -> Result<Self, VNextError> {
         match family.weights() {
@@ -236,16 +268,15 @@ impl TrustedExecutionWeights {
         }
     }
 
-    pub(crate) fn materialize_components<'source>(
-        &self,
-        family: &PreparedModelFamily,
-        source: &'source dyn WeightComponentSource,
-        components: &[&WeightComponentSpec],
-        host: Option<&crate::HostMemoryAccount>,
-    ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+    pub(crate) fn materialization_session<'a>(
+        &'a self,
+        family: &'a PreparedModelFamily,
+    ) -> Result<ValidatedWeightMaterialization<'a>, VNextError> {
         self.validate_against_family(family)?;
-        self.stored()?
-            .materialize_components(family, source, components, host)
+        Ok(ValidatedWeightMaterialization {
+            family,
+            plan: self.stored()?,
+        })
     }
 
     pub(crate) fn additional_host_backing_bytes(

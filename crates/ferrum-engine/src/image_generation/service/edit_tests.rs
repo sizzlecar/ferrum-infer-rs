@@ -32,6 +32,7 @@ fn edit(host: &HostMemoryAccount, seed: u64) -> QueuedRequest {
     image.as_mut().copy_from_slice(b"\x89PNG\r\n\x1a\n");
     QueuedRequest::Edit(
         ImageEditRequest {
+            references: Vec::new(),
             generation: request(seed),
             image: image.freeze(),
         },
@@ -304,6 +305,7 @@ fn png_edit(
         .unwrap();
     image.as_mut().copy_from_slice(&encoded);
     ImageEditRequest {
+        references: Vec::new(),
         generation: request(seed),
         image: image.freeze(),
     }

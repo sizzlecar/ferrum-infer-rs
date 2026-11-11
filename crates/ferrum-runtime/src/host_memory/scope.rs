@@ -12,14 +12,17 @@ const CLASSES: [HostMemoryClass; 4] = [
 
 #[derive(Debug)]
 pub(super) struct ScopeAuthority {
-    id: u64,
-    classes: [bool; 4],
+    pub(super) id: u64,
+    pub(super) classes: [bool; 4],
 }
 
 #[derive(Debug)]
 pub(super) struct ScopeCredit {
-    capacity: Counters,
-    remaining: Counters,
+    pub(super) capacity: Counters,
+    pub(super) remaining: Counters,
+    /// Live charges from earlier exchanged authorities, included once in
+    /// capacity-minus-remaining and returned here through refund-only routing.
+    pub(super) inherited: Counters,
 }
 
 /// Non-cloneable execution lifetime. Account views may be cloned into sessions
@@ -27,7 +30,7 @@ pub(super) struct ScopeCredit {
 /// Existing allocations/reservations survive close and retain their real charge.
 #[derive(Debug)]
 pub struct HostMemoryScope {
-    account: HostMemoryAccount,
+    pub(super) account: HostMemoryAccount,
 }
 
 impl HostMemoryScope {
@@ -63,6 +66,9 @@ impl HostMemoryScope {
                     return Err(HostMemoryError::Poisoned);
                 }
             }
+            state
+                .scope_refunds
+                .retain(|_, refund| refund.target != authority.id);
             drop(state);
             self.account.0.capacity_changed.notify();
         }
@@ -136,7 +142,7 @@ impl HostMemoryAccount {
         self.check_hard_capacity(required, Counters::default())
     }
 
-    fn scope_demand(
+    pub(super) fn scope_demand(
         &self,
         budgets: &[(HostMemoryClass, usize)],
     ) -> Result<(Counters, [bool; 4]), HostMemoryError> {
@@ -189,6 +195,7 @@ impl HostMemoryAccount {
             ScopeCredit {
                 capacity: demand,
                 remaining: demand,
+                inherited: Counters::default(),
             },
         );
         state.next_scope = next_id;
@@ -203,16 +210,23 @@ impl HostMemoryAccount {
         state: &State,
         demand: Counters,
     ) -> Result<Counters, HostMemoryError> {
-        self.check_hard_capacity(demand, state.committed)?;
-        let next = state
-            .committed
+        self.check_admission_at(state.committed, demand)
+    }
+
+    pub(super) fn check_admission_at(
+        &self,
+        committed: Counters,
+        demand: Counters,
+    ) -> Result<Counters, HostMemoryError> {
+        self.check_hard_capacity(demand, committed)?;
+        let next = committed
             .add(demand)
             .ok_or(HostMemoryError::ArithmeticOverflow)?;
         if next.total > self.0.limits.total_bytes {
             return Err(HostMemoryError::Capacity {
                 scope: HostMemoryPressureScope::Total,
                 requested: demand.total,
-                committed: state.committed.total,
+                committed: committed.total,
                 limit: self.0.limits.total_bytes,
             });
         }
@@ -222,7 +236,7 @@ impl HostMemoryAccount {
                 return Err(HostMemoryError::Capacity {
                     scope: HostMemoryPressureScope::Class(class),
                     requested: demand.classes[index],
-                    committed: state.committed.classes[index],
+                    committed: committed.classes[index],
                     limit: self.0.limits.classes[index],
                 });
             }
@@ -310,9 +324,6 @@ impl HostMemoryAccount {
         let Some(authority) = &self.1 else {
             return false;
         };
-        let Some(credit) = state.scopes.get_mut(&authority.id) else {
-            return false;
-        };
         if amount
             .classes
             .iter()
@@ -321,18 +332,55 @@ impl HostMemoryAccount {
         {
             return false;
         }
-        match credit.remaining.add(amount) {
-            Some(remaining)
-                if remaining.total <= credit.capacity.total
-                    && remaining
-                        .classes
-                        .iter()
-                        .zip(credit.capacity.classes)
-                        .all(|(&bytes, cap)| bytes <= cap) =>
-            {
-                credit.remaining = remaining
+        let inherited_origin = state.scope_refunds.get(&authority.id);
+        let (target, origin_remaining) = if state.scopes.contains_key(&authority.id) {
+            (authority.id, None)
+        } else if let Some(origin) = inherited_origin {
+            let Some(remaining) = origin.remaining.subtract(amount) else {
+                state.fail_closed = true;
+                return true;
+            };
+            (origin.target, Some(remaining))
+        } else {
+            return false;
+        };
+        let Some(credit) = state.scopes.get(&target) else {
+            state.fail_closed = true;
+            return true;
+        };
+        let remaining = credit.remaining.add(amount).filter(|remaining| {
+            remaining.total <= credit.capacity.total
+                && remaining
+                    .classes
+                    .iter()
+                    .zip(credit.capacity.classes)
+                    .all(|(&bytes, cap)| bytes <= cap)
+        });
+        let inherited = if origin_remaining.is_some() {
+            credit.inherited.subtract(amount)
+        } else {
+            Some(credit.inherited)
+        };
+        let (Some(remaining), Some(inherited)) = (remaining, inherited) else {
+            state.fail_closed = true;
+            return true;
+        };
+        let credit = state
+            .scopes
+            .get_mut(&target)
+            .expect("validated live refund target");
+        credit.remaining = remaining;
+        credit.inherited = inherited;
+        if let Some(remaining) = origin_remaining {
+            if remaining.total == 0 {
+                state.scope_refunds.remove(&authority.id);
+            } else {
+                state
+                    .scope_refunds
+                    .get_mut(&authority.id)
+                    .expect("validated refund origin")
+                    .remaining = remaining;
             }
-            _ => state.fail_closed = true,
         }
         true
     }

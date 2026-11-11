@@ -83,7 +83,56 @@ pub(super) fn encode(
         };
         use ResolvedValueRole::{Input, Output};
         match operation {
-            CpuOperation::CausalAttention(dtype) => {
+            CpuOperation::ConcatColumnsF16 => {
+                let left_columns = size(attribute("left_features")?)?;
+                let right_columns = size(attribute("right_features")?)?;
+                let output_columns = size(attribute("out_features")?)?;
+                if left_columns == 0
+                    || right_columns == 0
+                    || left_columns.checked_add(right_columns) != Some(output_columns)
+                {
+                    return Err(CpuRuntimeError::new("F16 concat column widths disagree"));
+                }
+                let left = push(&mut regions, token(Input, 0, CpuFloat::F16, false)?);
+                let right = push(&mut regions, token(Input, 1, CpuFloat::F16, false)?);
+                let output = push(&mut regions, token(Output, 0, CpuFloat::F16, false)?);
+                for (region, columns) in [
+                    (left, left_columns),
+                    (right, right_columns),
+                    (output, output_columns),
+                ] {
+                    if regions[region].length_bytes() != CpuFloat::F16.byte_len(rows, columns)? {
+                        return Err(CpuRuntimeError::new(
+                            "F16 concat port extent differs from work",
+                        ));
+                    }
+                }
+                actions.push(CpuAction::ConcatColumnsF16 {
+                    left,
+                    right,
+                    output,
+                    left_columns,
+                    right_columns,
+                });
+            }
+            CpuOperation::TailTwoGreedy => {
+                let launch = super::tail_two_greedy::prepare(
+                    invocation,
+                    index,
+                    rows,
+                    workspace_offset,
+                    &mut regions,
+                )?;
+                let bytes = attribute("vocab_size")?
+                    .checked_mul(2)
+                    .ok_or_else(|| CpuRuntimeError::new("CPU tail head scratch overflows"))?;
+                workspace_offset = workspace_offset
+                    .checked_add(bytes)
+                    .ok_or_else(|| CpuRuntimeError::new("CPU tail head batch scratch overflows"))?;
+                actions.push(CpuAction::TailTwoGreedy(Box::new(launch)));
+            }
+            CpuOperation::CausalAttention(dtype)
+            | CpuOperation::CausalAttentionExplicitRope(dtype) => {
                 let (launch, preparation) = super::causal_attention_launch::prepare(
                     invocation,
                     index,
@@ -91,6 +140,7 @@ pub(super) fn encode(
                     dtype,
                     workspace_offset,
                     &mut regions,
+                    matches!(operation, CpuOperation::CausalAttentionExplicitRope(_)),
                 )?;
                 let bytes = super::causal_attention_launch::workspace_bytes(
                     super::causal_attention::CausalShape::from_attributes(
@@ -103,8 +153,44 @@ pub(super) fn encode(
                 actions.push(CpuAction::CausalAttention(Box::new(launch)));
                 bindings.push(Box::new(preparation));
             }
-            CpuOperation::GatedDelta(dtype) => {
-                let launch = super::gated_delta_launch::prepare(
+            CpuOperation::RowSelectF16 => {
+                let columns = size(attribute("hidden_size")?)?;
+                let input = push(&mut regions, token(Input, 0, CpuFloat::F16, false)?);
+                let visual = push(&mut regions, token(Input, 1, CpuFloat::F16, false)?);
+                let mask = push(
+                    &mut regions,
+                    token_region(invocation, index, Input, 2, ElementType::U8, false)?,
+                );
+                let output = push(&mut regions, token(Output, 0, CpuFloat::F16, false)?);
+                let bytes = rows
+                    .checked_mul(columns)
+                    .and_then(|n| n.checked_mul(2))
+                    .ok_or_else(|| CpuRuntimeError::new("F16 row selection extent overflows"))?;
+                if columns == 0
+                    || regions[input].length_bytes() != bytes
+                    || regions[visual].length_bytes() != bytes
+                    || regions[output].length_bytes() != bytes
+                    || regions[mask].length_bytes() != rows
+                {
+                    return Err(CpuRuntimeError::new(
+                        "F16 row selection ports have incompatible extents",
+                    ));
+                }
+                actions.push(CpuAction::RowSelectF16 {
+                    input,
+                    visual,
+                    mask,
+                    output,
+                    columns,
+                });
+            }
+            CpuOperation::GatedDelta(dtype) | CpuOperation::GatedDeltaCandidateScan(dtype) => {
+                let prepare = if matches!(operation, CpuOperation::GatedDeltaCandidateScan(_)) {
+                    super::gated_delta_launch::prepare_candidate_scan
+                } else {
+                    super::gated_delta_launch::prepare
+                };
+                let launch = prepare(
                     invocation,
                     index,
                     rows,

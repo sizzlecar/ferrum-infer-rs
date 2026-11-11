@@ -38,6 +38,7 @@ pub async fn execute_serve_source(
             .await
             .map_err(anyhow::Error::from)?;
         let prepared = prepare_http(source, aliases)?;
+        let trace = prepared.continuous_trace;
         let images = prepared.images;
         let server = Arc::new(AxumServer::from_state(
             AppState::default().with_images(images.clone()),
@@ -79,6 +80,9 @@ pub async fn execute_serve_source(
             .is_some_and(|receipt| receipt.has_failure())
             || result.is_err()
         {
+            if let Some(trace) = trace {
+                trace.export_best_effort();
+            }
             return Err(ImageProductError::Server {
                 source: result
                     .err()
@@ -88,6 +92,9 @@ pub async fn execute_serve_source(
             });
         }
         drop(shutdown);
+        if let Some(trace) = trace {
+            trace.export_best_effort();
+        }
         Ok(())
     }
 }
@@ -98,6 +105,7 @@ pub(super) struct PreparedHttp {
     profile: &'static str,
     composition: serde_json::Value,
     service_config: ferrum_engine::image_generation::service::ImageServiceConfig,
+    continuous_trace: Option<super::trace_artifact::ActiveTraceArtifact>,
 }
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
@@ -132,7 +140,7 @@ pub(super) fn prepare_http(
         vec![],
     )
     .map_err(anyhow::Error::from)?;
-    let (pipeline, composition) = product.backend.create(product.assets)?;
+    let (mut pipeline, composition) = product.backend.create(product.assets)?;
     let model = if explicit_alias {
         model
     } else {
@@ -156,10 +164,33 @@ pub(super) fn prepare_http(
         max_num_seqs: serving.max_num_seqs,
         request_batch_max_wait_ms: serving.request_batch_max_wait_ms,
     };
-    let service = pipeline
-        .into_service(service_config)
-        .map_err(anyhow::Error::from)?;
-    let images = ImageHttpService::new(
+    let continuous_trace = if let Some(prepared) = product.continuous_trace {
+        let context = serde_json::json!({
+            "entrypoint":"serve", "composition":&composition,
+            "service_config":&service_config
+        });
+        match pipeline.enable_continuous_trace_artifact(&prepared, &context) {
+            Ok(handle) => Some(prepared.bind(handle)),
+            Err(source) => {
+                if let Err(failure) = pipeline.shutdown() {
+                    return Err(ImageProductError::generation_pipeline(failure, pipeline));
+                }
+                return Err(source.into());
+            }
+        }
+    } else {
+        None
+    };
+    let service = match pipeline.into_service(service_config) {
+        Ok(service) => service,
+        Err(source) => {
+            if let Some(trace) = continuous_trace {
+                trace.export_best_effort();
+            }
+            return Err(source.into());
+        }
+    };
+    let images = match ImageHttpService::new(
         model,
         service,
         ImageHttpConfig {
@@ -170,11 +201,22 @@ pub(super) fn prepare_http(
             rgba_scratch_bytes: serving.rgba_scratch_bytes,
             png_limits: PngLimits::default(),
         },
-    )?;
+    ) {
+        Ok(images) => images,
+        Err(source) => {
+            // The original failed constructor retires/drops its service. Do
+            // not replace that error with a diagnostic writer failure.
+            if let Some(trace) = continuous_trace {
+                trace.export_best_effort();
+            }
+            return Err(source.into());
+        }
+    };
     Ok(PreparedHttp {
         images,
         profile: product.profile,
         composition,
         service_config,
+        continuous_trace,
     })
 }

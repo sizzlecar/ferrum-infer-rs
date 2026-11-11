@@ -5,11 +5,16 @@ use crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config;
 use ferrum_runtime::DeviceId;
 use half::f16;
 
+#[path = "explicit_batch_tests.rs"]
+mod explicit_batch_tests;
+#[path = "parallel_explicit_rope_tests.rs"]
+mod parallel_explicit_rope_tests;
+
 fn runtime() -> CudaDeviceRuntime {
     CudaDeviceRuntime::new(
         cuda_vnext_runtime_config(
             0,
-            DeviceId::new("device.test.causal-master").unwrap(),
+            DeviceId::new("device.cuda.0").unwrap(),
             AttentionExecutionPolicy::default(),
         )
         .unwrap(),
@@ -164,6 +169,7 @@ fn launch(shape: CausalAttentionShape, position: usize, tokens: usize) -> Causal
         )
         .unwrap(),
         path: CausalAttentionKernelPath::TokenMajorFallback,
+        rotary: None,
     }
 }
 
@@ -181,21 +187,26 @@ fn exercise(
     let kvstride = shape.kv_features as usize;
     let page_elements = VNEXT_KV_PAGE_BYTES as usize / 2;
     let unused = f16::from_f32(-73.0);
-    let mut initial = vec![unused; 2 * page_elements];
+    let end = prefix + batches.iter().sum::<usize>();
+    let page_count = (end * 2 * kvstride).div_ceil(page_elements).max(2);
+    let mut initial = vec![unused; page_count * page_elements];
     for (i, value) in initial[..prefix * 2 * kvstride].iter_mut().enumerate() {
         *value = sample(i, 11);
     }
-    // Independent physical pages are deliberately permuted; page 1 remains idle.
-    let pages = [
-        Guarded::new(stream, &initial[page_elements..], f16::from_f32(81.0)),
-        Guarded::new(stream, &vec![unused; page_elements], f16::from_f32(82.0)),
-        Guarded::new(stream, &initial[..page_elements], f16::from_f32(83.0)),
-    ];
-    let table = Guarded::new(
-        stream,
-        &[pages[2].pointer(stream), pages[0].pointer(stream)],
-        0xDEAD_u64,
-    );
+    // Independent physical pages are deliberately permuted; the idle owner is
+    // never in the original address table, including long-KV decode cases.
+    let pages = initial
+        .chunks_exact(page_elements)
+        .rev()
+        .map(|values| Guarded::new(stream, values, f16::from_f32(81.0)))
+        .collect::<Vec<_>>();
+    let idle = Guarded::new(stream, &vec![unused; page_elements], f16::from_f32(82.0));
+    let addresses = pages
+        .iter()
+        .rev()
+        .map(|page| page.pointer(stream))
+        .collect::<Vec<_>>();
+    let table = Guarded::new(stream, &addresses, 0xDEAD_u64);
     let norm = (0..width)
         .map(|i| f16::from_f32(0.75 + sample(i, 5).to_f32() * 0.25))
         .collect::<Vec<_>>();
@@ -218,7 +229,7 @@ fn exercise(
         let control = Guarded::new(
             stream,
             &[
-                2_i32,
+                page_count as i32,
                 position as i32,
                 tokens as i32,
                 (position + tokens) as i32,
@@ -237,7 +248,8 @@ fn exercise(
             &vec![f16::ZERO; tokens * qheads * width],
             f16::from_f32(89.0),
         );
-        let launch = launch(shape, position, tokens);
+        let mut launch = launch(shape, position, tokens);
+        launch.table_entries_i32 = page_count as i32;
         let cuda = shape.cuda_shape().unwrap();
         launch_prepare(
             stream,
@@ -257,7 +269,11 @@ fn exercise(
         )
         .unwrap();
         let query_host = query.read(stream);
-        let current = [pages[2].read(stream), pages[0].read(stream)].concat();
+        let current = pages
+            .iter()
+            .rev()
+            .flat_map(|page| page.read(stream))
+            .collect::<Vec<_>>();
         let written = position * 2 * kvstride..(position + tokens) * 2 * kvstride;
         for (i, (&actual, &before)) in current.iter().zip(&previous).enumerate() {
             if !written.contains(&i) {
@@ -324,7 +340,12 @@ fn exercise(
             for head in 0..qheads {
                 let kvhead = head / (qheads / kvheads);
                 let query = &query_host[(token * qheads + head) * width..][..width];
-                let logits = (0..=position + token)
+                let key_start = if shape.sliding_window_tokens > 0 {
+                    (position + token + 1).saturating_sub(shape.sliding_window_tokens as usize)
+                } else {
+                    0
+                };
+                let logits = (key_start..=position + token)
                     .map(|key_position| {
                         let key = &current[key_position * 2 * kvstride + kvhead * width..][..width];
                         query
@@ -343,7 +364,9 @@ fn exercise(
                         .iter()
                         .enumerate()
                         .map(|(p, s)| {
-                            s * current[p * 2 * kvstride + kvstride + kvhead * width + dim].to_f64()
+                            s * current
+                                [(p + key_start) * 2 * kvstride + kvstride + kvhead * width + dim]
+                                .to_f64()
                         })
                         .sum::<f64>()
                         / denominator;
@@ -384,7 +407,7 @@ fn exercise(
         }
         control.assert_unchanged(stream);
         table.assert_unchanged(stream);
-        pages[1].assert_unchanged(stream);
+        idle.assert_unchanged(stream);
         previous = current;
         position += tokens;
     }
@@ -415,6 +438,51 @@ fn causal_kv_carry_crosses_physical_pages_and_matches_f64_attention_on_cuda() {
                     "prefill/decode outputs and KV state differ: {shape:?}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn causal_parallel_decode_matches_f64_and_serial_across_live_kv_threshold_on_cuda() {
+    let runtime = runtime();
+    let provider =
+        CudaCausalPagedAttentionProvider::new(&runtime, AttentionExecutionPolicy::Portable)
+            .unwrap();
+    let stream = runtime.context().default_stream();
+    // First case crosses live KV 255 -> 256 -> 257 within the same state.
+    // Other widths cover long edit contexts and GQA under the same F32 oracle.
+    for (width, prefix, window, official_heads) in [
+        (64, 254, 0, false),
+        (128, 1072, 0, true),
+        (256, 1413, 0, true),
+        (128, 1072, 255, true),
+        (128, 1072, 256, true),
+    ] {
+        let mut shape = shape(width, true);
+        shape.maximum_context_tokens = 2048;
+        shape.sliding_window_tokens = window;
+        if official_heads {
+            shape.query_heads = 16;
+            shape.key_value_heads = 4;
+            shape.query_features = 16 * width;
+            shape.query_projection_features = 2 * 16 * width;
+            shape.kv_features = 4 * width;
+        }
+        let parallel = exercise(&stream, &provider.functions, shape, prefix, &[1, 1, 1]);
+        let serial = exercise(&stream, &provider.functions, shape, prefix, &[3]);
+        assert_eq!(parallel.0.len(), serial.0.len());
+        assert_eq!(
+            parallel.1, serial.1,
+            "the original KV stores must remain identical"
+        );
+        for (index, (&actual, expected)) in parallel.0.iter().zip(&serial.0).enumerate() {
+            close(
+                actual,
+                expected.to_f64(),
+                "parallel/serial attention",
+                index,
+            );
         }
     }
 }

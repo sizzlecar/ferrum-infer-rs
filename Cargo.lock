@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-bench-core"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -1283,11 +1283,12 @@ dependencies = [
  "syn 2.0.108",
  "tempfile",
  "toml_edit 0.22.27",
+ "uuid",
 ]
 
 [[package]]
 name = "ferrum-cli"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -1337,6 +1338,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
@@ -1347,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-devtools"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1375,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-diffusion"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "ferrum-runtime",
  "half",
@@ -1384,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-engine"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1446,7 +1448,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-execution"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "async-trait",
  "ferrum-interfaces",
@@ -1468,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-interfaces"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1486,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-journal"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "ferrum-types",
  "serde",
@@ -1495,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-kernels"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "bindgen_cuda",
  "block",
@@ -1521,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-kv"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1541,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-models"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1567,6 +1569,7 @@ dependencies = [
  "half",
  "hf-hub",
  "indicatif",
+ "libc",
  "libm",
  "memmap2",
  "minijinja",
@@ -1594,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-native-ops"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "ferrum-types",
  "half",
@@ -1608,7 +1611,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-native-ops-builder"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "clap",
  "ferrum-native-ops",
@@ -1623,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-output"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "chrono",
  "ferrum-types",
@@ -1636,9 +1639,10 @@ dependencies = [
 
 [[package]]
 name = "ferrum-quantization"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "candle-core",
+ "ferrum-execution",
  "ferrum-interfaces",
  "ferrum-kernels",
  "ferrum-runtime",
@@ -1656,9 +1660,10 @@ dependencies = [
 
 [[package]]
 name = "ferrum-runtime"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "ferrum-types",
+ "memmap2",
  "proc-macro2",
  "serde",
  "serde_json",
@@ -1672,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-sampler"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1696,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-scheduler"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1725,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-server"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1777,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-slo"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1799,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-testkit"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1819,7 +1824,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-tokenizer"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1845,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-types"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "chrono",
  "libc",
@@ -5319,8 +5324,12 @@ checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -5628,6 +5637,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.8.5",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 1.0.69",
  "utf-8",

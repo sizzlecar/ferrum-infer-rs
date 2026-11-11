@@ -1,0 +1,119 @@
+{
+  "architecture": "p_h3_image",
+  "model": "P-H3-Image",
+  "preset": "comfy_w4a8_f32_v1",
+  "metadata_directory": "models/P-H3-Image",
+  "archives": {
+    "text_encoder": "models/P-H3-Image-Comfy/text_encoders/p-h3-image_text_encoder_w4a8.safetensors",
+    "transformer": "models/P-H3-Image-Comfy/diffusion_models/p-h3-image_w4a8.safetensors",
+    "vae": "models/P-H3-Image-Comfy/vae/p-h3-image_vae_int8_convrot.safetensors"
+  },
+  "prompt_expansion": {
+    "mode": "enabled",
+    "semantic_directory": "models/P-H3-Image/prompt_upsampler",
+    "tokenizer_directory": "models/P-H3-Image/prompt_upsampler_processor",
+    "bf16_archive": "models/P-H3-Image/prompt_upsampler/p-h3-image_prompt_upsampler_bf16.safetensors",
+    "processor_config": "models/P-H3-Image/prompt_upsampler_processor/processor_config.json",
+    "max_context_tokens": 8192,
+    "max_new_tokens": 2048,
+    "prefill_chunk_tokens": 256,
+    "source_backing": "bounded_streaming",
+    "weight_arena_target_bytes": 268435456,
+    "source_conversion_workers": 4,
+    "mtp": "off",
+    "vision_reuse": "off"
+  },
+  "vae_spatial_policy": {
+    "kind": "tiled",
+    "tile_pixels": 256,
+    "minimum_overlap_pixels": 64,
+    "max_tiles": 4096
+  },
+  "backend": {
+    "kind": "cuda",
+    "ordinal": 0,
+    "usable_memory_bytes": 31138512896,
+    "bootstrap_memory_bytes": 1073741824,
+    "stream_memory_bytes": 33554432,
+    "maximum_streams": "auto",
+    "maximum_in_flight_per_stream": 1,
+    "maximum_commands_per_submission": 4096,
+    "opaque_memory_profile": "p-h3-sm120-29g-example-v1",
+    "cudnn": {
+      "library_path": "/opt/cudnn/lib/libcudnn.so.9",
+      "dependency_libraries": [
+        "/opt/cuda-13/lib64/libcudart.so.13",
+        "/opt/cuda-13/lib64/libnvrtc-builtins.so.13.0",
+        "/opt/cuda-13/lib64/libnvrtc.so.13",
+        "/opt/cuda-13/lib64/libnvJitLink.so.13",
+        "/opt/cuda-13/lib64/libcublasLt.so.13",
+        "/opt/cuda-13/lib64/libcublas.so.13"
+      ],
+      "opaque_memory_bytes": 1073741824,
+      "workspace_limit_bytes": 268435456,
+      "convolution_workspace": "configured_limit",
+      "opaque_memory_profile": "p-h3-cudnn9-cu13-f32-fma-example-v1"
+    },
+    "host": {
+      "total_bytes": 12884901888,
+      "input_preprocess_bytes": 4294967296,
+      "output_bytes": 2147483648,
+      "transfer_staging_bytes": 268435456,
+      "weight_backing_bytes": 4294967296
+    },
+    "pipeline": {
+      "maximum_user_tokens": 1024,
+      "maximum_width": 2720,
+      "maximum_height": 2048,
+      "maximum_batch_size": 8,
+      "decoder_batch_policy": "single_image",
+      "edit_prefix_policy": "recompute",
+      "plan_cache": {
+        "multi_shape": {
+          "maximum_entries_per_stage": 4,
+          "maximum_encoded_metadata_bytes": 67108864
+        }
+      },
+      "residency": "adaptive",
+      "dynamic_residency": "release",
+      "maximum_staging_bytes": 67108864,
+      "maximum_initialization_commands": 64,
+      "maximum_backing_maintenance_passes": 8
+    },
+    "attention_policy": "cudnn_sdpa_experimental_v1",
+    "prompt_expansion_causal": {
+      "module_memory_bytes": 268435456,
+      "opaque_memory_profile": "p-h3-sm120-f16-causal-example-v1",
+      "decode_replay": {
+        "maximum_executables": 64,
+        "opaque_memory_bytes_per_stream": 134217728
+      },
+      "precision": "f16"
+    },
+    "native_lane_reuse_maximum_idle_lanes": 1,
+    "native_allocation_reuse": {
+      "maximum_idle_bytes": 4294967296,
+      "maximum_entry_bytes": 2147483648,
+      "maximum_entries": 16
+    },
+    "f32_attention_policy": "auto"
+  },
+  "serving": {
+    "batching": "auto",
+    "maximum_pending": 8,
+    "maximum_pending_bytes": 67108864,
+    "maximum_prompt_bytes": 1048576,
+    "max_num_seqs": 8,
+    "request_batch_max_wait_ms": 0,
+    "default_width": 1024,
+    "default_height": 1024,
+    "default_seed": 42,
+    "rgba_scratch_bytes": 16384,
+    "output": {
+      "max_event_bytes": 33554432
+    }
+  },
+  "vae_decoder_tile_batch": 4,
+  "initial_noise": "cpu_mt19937_image_audio_v1",
+  "main_vision_reuse": "off"
+}

@@ -29,6 +29,7 @@ pub(super) struct CpuCausalLaunch {
     projections: [Vec<CpuMatrixPart>; 4],
     workspace: [usize; 8],
     residual_in_place: bool,
+    rotary: Option<[usize; 2]>,
 }
 
 fn workspace_layout(shape: CausalShape) -> Result<[(u64, u64); 8], CpuRuntimeError> {
@@ -71,10 +72,33 @@ pub(super) fn prepare(
     dtype: CpuFloat,
     workspace_offset: u64,
     regions: &mut Vec<CpuBufferRegion>,
+    explicit_rope: bool,
 ) -> Result<(CpuCausalLaunch, CpuOperatorLaunch), CpuRuntimeError> {
     use ResolvedValueRole::{Input, Output};
     let participant = &invocation.participants()[index];
     let shape = CausalShape::from_attributes(participant.attributes())?;
+    let rotary = if explicit_rope {
+        let pairs = super::provider::unsigned(participant.attributes(), "rope_pairs")?;
+        if shape.interleaved || pairs != (shape.rope_dim / 2) as u64 {
+            return Err(CpuRuntimeError::new(
+                "explicit F16 RoPE requires matching half-split pair geometry",
+            ));
+        }
+        let mut table_regions = [0; 2];
+        for (slot, ordinal) in table_regions.iter_mut().zip([9, 10]) {
+            let region = token_region(invocation, index, Input, ordinal, ElementType::F16, false)?;
+            if region.length_bytes() != rows * shape.rope_dim {
+                return Err(CpuRuntimeError::new(
+                    "explicit F16 RoPE table extent differs from token work",
+                ));
+            }
+            *slot = regions.len();
+            regions.push(region);
+        }
+        Some(table_regions)
+    } else {
+        None
+    };
     let source = invocation
         .participant_token_ranges()
         .get(index)
@@ -213,6 +237,7 @@ pub(super) fn prepare(
             projections,
             workspace,
             residual_in_place,
+            rotary,
         },
         preparation,
     ))
@@ -271,40 +296,45 @@ impl CpuCausalLaunch {
             ] {
                 project(views, parts, normalized, destination, width)?;
             }
-            views.with_io_slices(
-                &[
-                    raw_query,
-                    raw_key,
-                    raw_value,
-                    self.query_norm,
-                    self.key_norm,
-                ],
-                &attention_outputs,
-                |inputs, outputs| {
-                    let (pages, scratch) = outputs.split_at_mut(self.state.len());
-                    let [query, accumulated, context] = scratch else {
-                        return Err(CpuRuntimeError::new("CPU causal workspace arity differs"));
-                    };
-                    let mut state = CpuKvPages::new(pages)?;
-                    causal_attention::step(
-                        self.shape,
-                        start + row,
-                        CausalInputs {
-                            query: inputs[0],
-                            key: inputs[1],
-                            value: inputs[2],
-                            query_norm: inputs[3],
-                            key_norm: inputs[4],
-                        },
-                        &mut state,
-                        CausalScratch {
-                            query,
-                            accumulated,
-                            context,
-                        },
-                    )
-                },
-            )?;
+            let mut attention_inputs = vec![
+                raw_query,
+                raw_key,
+                raw_value,
+                self.query_norm,
+                self.key_norm,
+            ];
+            if let Some(rotary) = self.rotary {
+                attention_inputs.extend(rotary);
+            }
+            views.with_io_slices(&attention_inputs, &attention_outputs, |inputs, outputs| {
+                let (pages, scratch) = outputs.split_at_mut(self.state.len());
+                let [query, accumulated, context] = scratch else {
+                    return Err(CpuRuntimeError::new("CPU causal workspace arity differs"));
+                };
+                let mut state = CpuKvPages::new(pages)?;
+                let rotary = self.rotary.map(|_| {
+                    let range = row * self.shape.rope_dim..(row + 1) * self.shape.rope_dim;
+                    (&inputs[5][range.clone()], &inputs[6][range])
+                });
+                causal_attention::step_with_rope(
+                    self.shape,
+                    start + row,
+                    CausalInputs {
+                        query: inputs[0],
+                        key: inputs[1],
+                        value: inputs[2],
+                        query_norm: inputs[3],
+                        key_norm: inputs[4],
+                    },
+                    &mut state,
+                    CausalScratch {
+                        query,
+                        accumulated,
+                        context,
+                    },
+                    rotary,
+                )
+            })?;
             project(
                 views,
                 &self.projections[3],

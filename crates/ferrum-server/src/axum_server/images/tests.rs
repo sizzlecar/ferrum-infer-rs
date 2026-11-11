@@ -12,6 +12,8 @@ use tower::ServiceExt;
 
 #[path = "tests/admission.rs"]
 mod admission;
+#[path = "tests/correlation.rs"]
+mod correlation;
 #[path = "tests/decoupled_output.rs"]
 mod decoupled_output;
 
@@ -74,6 +76,13 @@ async fn encode(
     limits: PngLimits,
     scratch_bytes: usize,
 ) -> Result<axum::body::Bytes, ServerError> {
+    let pixels = ferrum_models::image_pixels::OwnedImagePixels::new(
+        &host,
+        tensor,
+        raw,
+        ferrum_models::image_pixels::ImagePixelEncoding::Bf16SignedRgbaStaged,
+    )
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
     response::Admission::new(
         session,
         host,
@@ -81,7 +90,7 @@ async fn encode(
         limits,
         scratch_bytes,
     )?
-    .encode(tensor, raw)
+    .encode(pixels)
     .await
 }
 
@@ -352,6 +361,7 @@ struct FailingGenerator {
     host: HostMemoryAccount,
     calls: Arc<AtomicUsize>,
     gate: Option<Arc<GenerationGate>>,
+    retained_output: Option<ManagedHostBytes>,
 }
 #[derive(Default)]
 struct GenerationGate {
@@ -362,6 +372,11 @@ struct GenerationGate {
 impl ferrum_engine::image_generation::service::ImageGenerator for FailingGenerator {
     fn host_account(&self) -> &HostMemoryAccount {
         &self.host
+    }
+    fn retained_output_bytes(&self) -> u64 {
+        self.retained_output
+            .as_ref()
+            .map_or(0, |bytes| bytes.backing_bytes() as u64)
     }
     fn capabilities(
         &self,
@@ -429,12 +444,21 @@ fn image_service_with_host(
     host: HostMemoryAccount,
     gate: Option<Arc<GenerationGate>>,
 ) -> (ImageHttpService, Arc<AtomicUsize>) {
+    image_service_with_retained_output(host, gate, None)
+}
+
+fn image_service_with_retained_output(
+    host: HostMemoryAccount,
+    gate: Option<Arc<GenerationGate>>,
+    retained_output: Option<ManagedHostBytes>,
+) -> (ImageHttpService, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let service = ImageService::new(
         FailingGenerator {
             host,
             calls: calls.clone(),
             gate,
+            retained_output,
         },
         ferrum_engine::image_generation::service::ImageServiceConfig {
             batching: ferrum_types::ImageBatchPolicy::Configured,

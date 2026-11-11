@@ -99,6 +99,10 @@ struct CachedStage<R: DeviceRuntime> {
     component: Arc<CompiledTensorComponent<R>>,
     receipt: ImageStagePlanReceipt,
     encoded_bytes: usize,
+    declaration: ImageStageDeclaration,
+    // The fixed pipeline owns its source, runtime, registry and native policy.
+    // Preparation forks share this real domain token; other pipelines do not.
+    domain: Arc<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -112,7 +116,7 @@ pub(super) struct PreparedFamilyKey<'a> {
     pub profile: &'a NumericalProfileId,
 }
 
-impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
+impl<R: DeviceRuntime, S: ImagePipelineSourceAdapter> ImagePipelineExecution<R, S> {
     /// Reuse only a family already validated by this pipeline's fixed built-in
     /// provider. Config identity is checked even on hits; compile options,
     /// materializer selection, full fingerprints and capacity checks follow.
@@ -418,12 +422,63 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
         drop(removed);
         Ok(result)
     }
+    /// An installation is never executed with request tensors. Return its
+    /// original declaration and geometry, subject to the same policy, LRU,
+    /// encoded-byte limits and candidate rollback as every other cached stage.
+    pub(super) fn get_weight_installation(
+        &self,
+        policy: ImagePlanCachePolicy,
+        stage: ImageStage,
+        weight_owner: Option<ImageWeightOwnerKey>,
+        domain: &Arc<()>,
+        packing: WeightArenaPacking,
+    ) -> anyhow::Result<
+        Option<(
+            Arc<CompiledTensorComponent<R>>,
+            ImageStagePlanReceipt,
+            ImageStageDeclaration,
+        )>,
+    > {
+        policy.validate()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image plan cache poisoned"))?;
+        let removed = state.configure(policy);
+        let found = state.entries.iter().position(|entry| {
+            entry.declaration.stage == stage
+                && entry.declaration.role == ImageStagePlanRole::WeightInstallation
+                && entry.declaration.attachment == ImageStageAttachment::InitializeShared
+                && weight_owner.is_some()
+                && entry.declaration.weight_owner == weight_owner
+                && Arc::ptr_eq(&entry.domain, domain)
+                && entry.options.weight_arena_packing() == packing
+        });
+        let result = if let Some(index) = found {
+            let entry = state.entries.remove(index).expect("located installation");
+            let component = Arc::clone(&entry.component);
+            let declaration = entry.declaration;
+            let mut receipt = entry.receipt.clone();
+            state.entries.push_back(entry);
+            state.hits = state.hits.saturating_add(1);
+            receipt.plan_cache = Some(state.snapshot(stage, true));
+            Some((component, receipt, declaration))
+        } else {
+            None
+        };
+        drop(state);
+        drop(removed);
+        Ok(result)
+    }
+
     pub(super) fn insert(
         &self,
         policy: ImagePlanCachePolicy,
         component: Arc<CompiledTensorComponent<R>>,
         mut receipt: ImageStagePlanReceipt,
         options: ProgramPlanCompileOptions,
+        declaration: ImageStageDeclaration,
+        domain: Arc<()>,
     ) -> anyhow::Result<ImagePlanCacheReceipt> {
         policy.validate()?;
         // Normalize receipt: neither timing digits nor an earlier cache snapshot
@@ -439,6 +494,7 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
                 &component,
                 &receipt,
                 &options,
+                &declaration,
                 maximum_encoded_metadata_bytes,
             )?,
             _ => Some(0),
@@ -507,6 +563,8 @@ impl<R: DeviceRuntime> StagePlanCache<R> {
                 component,
                 receipt,
                 encoded_bytes,
+                declaration,
+                domain,
             });
             state.snapshot(stage, true)
         } else {
@@ -527,6 +585,7 @@ fn encoded_size<R: DeviceRuntime>(
     component: &CompiledTensorComponent<R>,
     receipt: &ImageStagePlanReceipt,
     options: &ProgramPlanCompileOptions,
+    declaration: &ImageStageDeclaration,
     limit: usize,
 ) -> anyhow::Result<Option<usize>> {
     let mut counter = LimitedCounter {
@@ -542,6 +601,7 @@ fn encoded_size<R: DeviceRuntime>(
             component.executable().capabilities(),
             compile_options_projection(options),
             receipt,
+            declaration,
         ),
     );
     if counter.exceeded {
@@ -556,19 +616,37 @@ fn encoded_size<R: DeviceRuntime>(
 // cache key still compares the complete options, including private preferences
 // and quality artifact bytes; those private fields are outside this size proxy.
 fn compile_options_projection(options: &ProgramPlanCompileOptions) -> impl Serialize + '_ {
-    let required_materializer = match options.weight_preparation() {
-        WeightPreparation::Auto => None,
-        WeightPreparation::Require(selection) => Some((
-            selection.materializer_id(),
-            selection.has_numeric_quality_artifact(),
-        )),
-    };
-    (
-        options.tensor_specs(),
-        options.completion_retention().values(),
-        required_materializer,
-    )
+    CompileOptionsProjection(options)
 }
+struct CompileOptionsProjection<'a>(&'a ProgramPlanCompileOptions);
+impl Serialize for CompileOptionsProjection<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let options = self.0;
+        let target = match options.weight_arena_packing() {
+            ferrum_runtime::WeightArenaPacking::ByElementType => None,
+            ferrum_runtime::WeightArenaPacking::Bounded { target_bytes } => {
+                Some(target_bytes.get())
+            }
+        };
+        let required_materializer = match options.weight_preparation() {
+            WeightPreparation::Auto => None,
+            WeightPreparation::Require(selection) => Some((
+                selection.materializer_id(),
+                selection.has_numeric_quality_artifact(),
+            )),
+        };
+        let mut tuple = serializer.serialize_tuple(if target.is_some() { 4 } else { 3 })?;
+        tuple.serialize_element(options.tensor_specs())?;
+        tuple.serialize_element(options.completion_retention().values())?;
+        tuple.serialize_element(&required_materializer)?;
+        if let Some(target) = target {
+            tuple.serialize_element(&target)?;
+        }
+        tuple.end()
+    }
+}
+
 struct LimitedCounter {
     bytes: usize,
     limit: usize,
@@ -593,6 +671,36 @@ impl io::Write for LimitedCounter {
 #[cfg(test)]
 mod encoded_options_tests {
     use super::*;
+
+    #[test]
+    fn packing_projection_preserves_legacy_bytes_and_counts_explicit_target() {
+        let options = ProgramPlanCompileOptions::new(BTreeMap::new()).unwrap();
+        let legacy = serde_json::to_vec(&(
+            options.tensor_specs(),
+            options.completion_retention().values(),
+            None::<(WeightMaterializerId, bool)>,
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&compile_options_projection(&options)).unwrap(),
+            legacy
+        );
+        let bounded =
+            options.with_weight_arena_packing(ferrum_runtime::WeightArenaPacking::Bounded {
+                target_bytes: std::num::NonZeroU64::new(1024).unwrap(),
+            });
+        let encoded = serde_json::to_vec(&compile_options_projection(&bounded)).unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(view[3], 1024);
+        assert!(encoded.len() > legacy.len());
+        let mut short = LimitedCounter {
+            bytes: 0,
+            limit: legacy.len(),
+            exceeded: false,
+        };
+        assert!(serde_json::to_writer(&mut short, &compile_options_projection(&bounded)).is_err());
+        assert!(short.exceeded);
+    }
 
     #[test]
     fn public_projection_counts_retention_and_materializer_without_runtime_wire() {

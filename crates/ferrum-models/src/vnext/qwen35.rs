@@ -59,19 +59,29 @@ use crate::qwen35_weights::{
 };
 
 use super::{
-    hf_metadata::{is_hf_template_source, parse_hf_model_semantic_metadata},
+    hf_metadata::{
+        is_hf_template_source, parse_hf_model_semantic_metadata,
+        parse_hf_model_semantic_metadata_with_tokenizer,
+    },
     weight_layout::{contiguous_or_reshaped_binding, dense_or_reshaped_layout},
     CausalLanguageModelDescriptor, DefinedProductionModel, ProductionModelSourceBundle,
     ProductionWeightArtifact,
 };
 
 pub const FAMILY_ID: &str = "family.qwen3_5.hybrid";
+pub const VISUAL_ROWS_INPUT_ID: &str = "value.input.visual_rows";
+pub const VISUAL_REPLACE_MASK_INPUT_ID: &str = "value.input.visual_replace_mask";
+pub const ROPE_COS_INPUT_ID: &str = "value.input.rope_cos";
+pub const ROPE_SIN_INPUT_ID: &str = "value.input.rope_sin";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
 pub const MOE_EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5MoeForConditionalGeneration";
 mod hadamard;
+pub mod mtp;
 mod numerical;
 pub use numerical::{
+    BF16_NUMERICAL_PROFILE_ID, BF16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID,
     F16_INT8_KV_NUMERICAL_PROFILE_ID, F16_NUMERICAL_PROFILE_ID,
+    F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID,
     F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_NUMERICAL_PROFILE_ID,
     F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_NUMERICAL_PROFILE_ID,
     F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_NUMERICAL_PROFILE_ID,
@@ -86,6 +96,36 @@ pub use numerical::{
     F32_MASTER_NUMERICAL_PROFILE_ID, F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1_NUMERICAL_PROFILE_ID,
 };
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
+
+/// Physical dense-weight precision selected before family definition. It is
+/// separate from a numerical profile; specialization cannot change this ABI.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qwen35DensePrecision {
+    #[default]
+    F16,
+    Bf16,
+}
+
+impl Qwen35DensePrecision {
+    fn is_default(&self) -> bool {
+        *self == Self::F16
+    }
+
+    fn element_type(self) -> ElementType {
+        match self {
+            Self::F16 => ElementType::F16,
+            Self::Bf16 => ElementType::Bf16,
+        }
+    }
+
+    fn materialized_element_type(self, role: &str) -> ElementType {
+        match role {
+            "linear_attn_a_log" | "linear_attn_dt_bias" | "linear_attn_norm" => ElementType::F32,
+            _ => self.element_type(),
+        }
+    }
+}
 const PACKED_GATE_UP_ROLE: &str = "mlp_gate_up";
 const PACKED_LINEAR_ATTN_QKVZBA_ROLE: &str = "linear_attn_qkvzba";
 const MOE_ROUTER_ROLE: &str = "moe_router";
@@ -283,6 +323,51 @@ enum RecurrentWeightAbi {
 }
 
 impl Qwen35OperationProfile {
+    const BF16: Self = Self {
+        token_embedding: OperationSelection::new(
+            ferrum_runtime::TOKEN_EMBEDDING_BF16_OPERATION_ID,
+            1,
+            0,
+        ),
+        linear_attention: OperationSelection::new(
+            ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_BF16_OPERATION_ID,
+            1,
+            0,
+        ),
+        causal_attention: OperationSelection::new(
+            ferrum_runtime::CAUSAL_PAGED_ATTENTION_BF16_OPERATION_ID,
+            1,
+            0,
+        ),
+        post_attention_norm: OperationSelection::new(
+            ferrum_runtime::RMS_NORM_BF16_OPERATION_ID,
+            1,
+            0,
+        ),
+        dense_feed_forward: OperationSelection::new(
+            ferrum_runtime::DENSE_SWIGLU_BF16_OPERATION_ID,
+            1,
+            0,
+        ),
+        dense_residual: OperationSelection::new(
+            ferrum_runtime::RESIDUAL_ADD_BF16_OPERATION_ID,
+            1,
+            0,
+        ),
+        moe_residual: OperationSelection::new(ferrum_runtime::RESIDUAL_ADD_BF16_OPERATION_ID, 1, 0),
+        final_norm: OperationSelection::new(ferrum_runtime::RMS_NORM_BF16_OPERATION_ID, 1, 0),
+        logits: OperationSelection::new(
+            ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_BF16_OPERATION_ID,
+            1,
+            0,
+        ),
+        argmax: OperationSelection::new(
+            ferrum_runtime::LAST_TOKEN_MASKED_ARGMAX_BF16_OPERATION_ID,
+            1,
+            0,
+        ),
+    };
+
     const F16: Self = Self {
         token_embedding: OperationSelection::new(TOKEN_EMBEDDING_OPERATION_ID, 1, 0),
         linear_attention: OperationSelection::new(
@@ -448,6 +533,15 @@ impl Qwen35OperationProfile {
 
     fn for_profile(profile: &NumericalExecutionProfile) -> Result<Self, VNextError> {
         match profile.id.as_str() {
+            BF16_NUMERICAL_PROFILE_ID => Ok(Self::BF16),
+            BF16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID => Ok(Self {
+                causal_attention: OperationSelection::new(
+                    ferrum_runtime::CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_BF16_OPERATION_ID,
+                    1,
+                    0,
+                ),
+                ..Self::BF16
+            }),
             F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1_NUMERICAL_PROFILE_ID => {
                 Ok(Self::F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1)
             }
@@ -462,6 +556,14 @@ impl Qwen35OperationProfile {
                 Ok(Self::F32_MASTER_UPSTREAM_EXTRA_MARKER_V2_PREFILL)
             }
             F16_NUMERICAL_PROFILE_ID => Ok(Self::F16),
+            F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID => Ok(Self {
+                causal_attention: OperationSelection::new(
+                    ferrum_runtime::CAUSAL_PAGED_ATTENTION_EXPLICIT_ROPE_F16_OPERATION_ID,
+                    1,
+                    0,
+                ),
+                ..Self::F16
+            }),
             F32_MASTER_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER),
             F32_MASTER_FFN_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID => {
                 Ok(Self::F32_MASTER_FFN_IQ4XS_Q8ACT_G32)
@@ -503,6 +605,8 @@ pub struct Qwen35FamilyConfig {
     rms_norm_epsilon: CanonicalRational,
     metadata: CausalLanguageMetadata,
     weight_format: FamilyWeightFormat,
+    #[serde(default, skip_serializing_if = "Qwen35DensePrecision::is_default")]
+    dense_precision: Qwen35DensePrecision,
     recurrent_weight_abi: RecurrentWeightAbi,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     gguf_hadamard: Option<GgufHadamard>,
@@ -527,6 +631,16 @@ impl Qwen35FamilyProvider {
 
     fn validate_typed_config(&self, config: &Qwen35FamilyConfig) -> Result<(), VNextError> {
         let text = Self::text_config(config)?;
+        if config.dense_precision == Qwen35DensePrecision::Bf16
+            && (config.weight_format != FamilyWeightFormat::SafetensorsDense
+                || text.is_moe()
+                || config.recurrent_weight_abi != RecurrentWeightAbi::LogRateGrouped)
+        {
+            return Err(invalid_config(
+                "dense_precision",
+                "BF16 physical weights require dense non-MoE safetensors with the source recurrent ABI",
+            ));
+        }
         hadamard::validate(config, &text)?;
         let expected_epsilon = hf_rms_norm_epsilon(&config.hf_config)
             .map_err(|reason| invalid_config("hf_config.text_config.rms_norm_eps", reason))?;
@@ -1022,7 +1136,33 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 ));
             }
         }
+        let bf16_profile = matches!(
+            profile.id.as_str(),
+            BF16_NUMERICAL_PROFILE_ID | BF16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID
+        );
+        if (bf16_profile || config.dense_precision == Qwen35DensePrecision::Bf16)
+            && (config.dense_precision != Qwen35DensePrecision::Bf16
+                || !bf16_profile
+                || numerical::profiles(&self.family_id, config)?.resolve(&profile.id)? != profile)
+        {
+            return Err(invalid_config(
+                "numerical_profile",
+                "BF16 requires its exact profile and a BF16 physical family definition",
+            ));
+        }
         let operations = Qwen35OperationProfile::for_profile(profile)?;
+        let visual_prompt = matches!(
+            profile.id.as_str(),
+            F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID | BF16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID
+        );
+        if visual_prompt
+            && numerical::profiles(&self.family_id, config)?.resolve(&profile.id)? != profile
+        {
+            return Err(invalid_config(
+                "numerical_profile",
+                "visual prompting requires its exact declared dense precision profile",
+            ));
+        }
         let mut weight_refs = Vec::with_capacity(config.weights.len());
         for weight in &config.weights {
             if is_moe_source_role(&weight.role) {
@@ -1044,7 +1184,9 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     value_id: packed_gate_up_value_id(layer_index)?,
                     tensor: tensor_spec(
                         packed_gate_up_dimensions(weight, up)?,
-                        materialized_element_type(PACKED_GATE_UP_ROLE),
+                        config
+                            .dense_precision
+                            .materialized_element_type(PACKED_GATE_UP_ROLE),
                     ),
                 });
             } else if weight.role == "linear_attn_qkv" {
@@ -1068,7 +1210,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     )?,
                     tensor: tensor_spec(
                         packed_linear_attention_dimensions([weight, z, b, a])?,
-                        DENSE_MATERIALIZED_ELEMENT_TYPE,
+                        config.dense_precision.element_type(),
                     ),
                 });
             } else {
@@ -1077,7 +1219,9 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     value_id: weight_value_id(weight)?,
                     tensor: tensor_spec(
                         logical_weight_dimensions(weight)?,
-                        materialized_element_type(&weight.role),
+                        config
+                            .dense_precision
+                            .materialized_element_type(&weight.role),
                     ),
                 });
             }
@@ -1106,6 +1250,28 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 attribute("vocab_size", config.vocab_size)?,
             ]),
         });
+
+        if visual_prompt {
+            let selected = value_id("value.hidden.visual")?;
+            nodes.push(ProgramNode {
+                id: node_id("node.visual_embedding_select")?,
+                operation_id: operation_id(if bf16_profile {
+                    ferrum_runtime::ROW_SELECT_BF16_OPERATION_ID
+                } else {
+                    ferrum_runtime::ROW_SELECT_F16_OPERATION_ID
+                })?,
+                required_version: ContractVersion::new(1, 0),
+                work: ProgramNodeWorkSpec::tokens(hidden.clone(), 0),
+                inputs: vec![
+                    hidden,
+                    value_id("value.input.visual_rows")?,
+                    value_id("value.input.visual_replace_mask")?,
+                ],
+                outputs: vec![selected.clone()],
+                attributes: BTreeMap::from([attribute("hidden_size", text.hidden_size as u64)?]),
+            });
+            hidden = selected;
+        }
 
         let states = profile.states.clone();
         for (layer_index, layer_type) in text.layer_types.iter().copied().enumerate() {
@@ -1257,6 +1423,20 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 AttributeId::new("layer_index")?,
                 SemanticValue::Unsigned(layer_index as u64),
             );
+            if visual_prompt && layer_type == Qwen35LayerType::FullAttention {
+                attention_inputs.extend([
+                    value_id("value.input.rope_cos")?,
+                    value_id("value.input.rope_sin")?,
+                ]);
+                attributes.insert(
+                    AttributeId::new("rope_pairs")?,
+                    SemanticValue::Unsigned((text.full_attention_rope_dim() / 2) as u64),
+                );
+                attributes.insert(
+                    AttributeId::new("rope_interleaved")?,
+                    SemanticValue::Bool(false),
+                );
+            }
             attributes.insert(
                 AttributeId::new("hidden_size")?,
                 SemanticValue::Unsigned(text.hidden_size as u64),
@@ -1426,23 +1606,40 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             attributes: BTreeMap::from([attribute("vocab_size", config.vocab_size)?]),
         });
 
-        let checkpoint_inputs =
-            ProgramCheckpointInputs::new(value_id("value.input.token_ids")?, BTreeSet::new())?
-                .with_output_only_inputs(BTreeSet::from([
-                    greedy_mask.clone(),
-                    greedy_repetition_token_ids.clone(),
-                    greedy_repetition_offsets.clone(),
-                    greedy_repetition_penalty.clone(),
-                ]))?;
+        let visual_inputs = if visual_prompt {
+            [
+                "value.input.visual_rows",
+                "value.input.visual_replace_mask",
+                "value.input.rope_cos",
+                "value.input.rope_sin",
+            ]
+            .into_iter()
+            .map(value_id)
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let checkpoint_inputs = ProgramCheckpointInputs::new(
+            value_id("value.input.token_ids")?,
+            visual_inputs.iter().cloned().collect(),
+        )?
+        .with_output_only_inputs(BTreeSet::from([
+            greedy_mask.clone(),
+            greedy_repetition_token_ids.clone(),
+            greedy_repetition_offsets.clone(),
+            greedy_repetition_penalty.clone(),
+        ]))?;
+        let mut program_inputs = vec![
+            value_id("value.input.token_ids")?,
+            greedy_mask,
+            greedy_repetition_token_ids,
+            greedy_repetition_offsets,
+            greedy_repetition_penalty,
+        ];
+        program_inputs.extend(visual_inputs);
         ModelProgram::new(
             self.family_id.clone(),
-            vec![
-                value_id("value.input.token_ids")?,
-                greedy_mask,
-                greedy_repetition_token_ids,
-                greedy_repetition_offsets,
-                greedy_repetition_penalty,
-            ],
+            program_inputs,
             vec![ProgramBlock {
                 id: "block.decoder".to_owned(),
                 nodes,
@@ -1463,6 +1660,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
 }
 
 fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNextError> {
+    let precision = config.dense_precision;
     if Qwen35TextConfig::from_hf_config_value(&config.hf_config)
         .map_err(|reason| invalid_config("hf_config", reason))?
         .is_moe()
@@ -1506,14 +1704,14 @@ fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema
                     .collect(),
                 dimensions: dimensions.clone(),
                 encoding: WeightEncoding::Dense {
-                    element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+                    element_type: precision.element_type(),
                 },
                 required: true,
             });
             tensors.push(WeightTensorSpec {
                 id: packed_linear_attention_weight_id(layer_index, PACKED_LINEAR_ATTN_QKVZBA_ROLE)?,
                 dimensions,
-                logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+                logical_element_type: precision.element_type(),
                 physical_layout: PhysicalWeightLayout::Dense { component_id },
                 required: true,
             });
@@ -1547,14 +1745,17 @@ fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema
             role: WeightComponentRole::Values,
             external_names,
             dimensions: physical_dimensions.clone(),
-            encoding: dense_weight_encoding(if weight.role == "mlp_gate" {
-                PACKED_GATE_UP_ROLE
-            } else {
-                &weight.role
-            })?,
+            encoding: dense_weight_encoding_with_precision(
+                if weight.role == "mlp_gate" {
+                    PACKED_GATE_UP_ROLE
+                } else {
+                    &weight.role
+                },
+                precision,
+            )?,
             required: true,
         });
-        let element_type = materialized_element_type(if weight.role == "mlp_gate" {
+        let element_type = precision.materialized_element_type(if weight.role == "mlp_gate" {
             PACKED_GATE_UP_ROLE
         } else {
             &weight.role
@@ -2914,12 +3115,23 @@ pub fn define_from_model_dir(model_dir: &Path) -> ferrum_types::Result<DefinedPr
 pub(super) fn define_from_sources(
     sources: Arc<ProductionModelSourceBundle>,
 ) -> ferrum_types::Result<DefinedProductionModel> {
+    define_from_sources_with_dense_precision(sources, Qwen35DensePrecision::F16)
+}
+
+/// Define physical dense precision before selecting a numerical execution
+/// profile. The default registration retains its established F16 identity.
+pub fn define_from_sources_with_dense_precision(
+    sources: Arc<ProductionModelSourceBundle>,
+    dense_precision: Qwen35DensePrecision,
+) -> ferrum_types::Result<DefinedProductionModel> {
     preflight_semantic_config(sources.config_json()).map_err(ferrum_types::FerrumError::model)?;
     match sources.weights() {
-        ProductionWeightArtifact::SafetensorsDirectory(weight_root) => {
-            let weights = SafetensorsArchive::open(weight_root)?;
-            let config = load_safetensors_family_config(&sources, &weights)
+        ProductionWeightArtifact::SafetensorsDirectory(_)
+        | ProductionWeightArtifact::SafetensorsFile(_) => {
+            let weights = sources.weights().open_safetensors_archive()?;
+            let mut config = load_safetensors_family_config(&sources, &weights)
                 .map_err(ferrum_types::FerrumError::model)?;
+            config.dense_precision = dense_precision;
             match config.weight_format {
                 FamilyWeightFormat::SafetensorsGptqMarlin => {
                     finish_preparation(sources, GptqMarlinSafetensorsSource::new(weights), config)
@@ -2941,6 +3153,11 @@ pub(super) fn define_from_sources(
             }
         }
         ProductionWeightArtifact::GgufFile(path) => {
+            if dense_precision != Qwen35DensePrecision::F16 {
+                return Err(ferrum_types::FerrumError::model(
+                    "BF16 dense precision requires a safetensors artifact",
+                ));
+            }
             let file = NativeGgufFile::open(path)
                 .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
             let config = load_gguf_family_config(&sources, &file)
@@ -3030,7 +3247,10 @@ fn production_descriptor(
         text.head_dim,
         vocabulary_size,
         maximum_sequence_tokens,
-        DataType::FP16,
+        match config.dense_precision {
+            Qwen35DensePrecision::F16 => DataType::FP16,
+            Qwen35DensePrecision::Bf16 => DataType::BF16,
+        },
     )
     .map_err(|error| error.to_string())
 }
@@ -3053,9 +3273,10 @@ fn load_safetensors_family_config(
     let tokenizer_config_bytes = sources
         .tokenizer_config_json()
         .ok_or_else(|| "tokenizer source missing tokenizer_config.json".to_owned())?;
-    let metadata = parse_hf_model_semantic_metadata(
+    let metadata = parse_hf_model_semantic_metadata_with_tokenizer(
         &hf_config,
-        &tokenizer_config_bytes,
+        tokenizer_config_bytes,
+        sources.tokenizer_json(),
         sources.chat_template_jinja(),
         sources.chat_template_json(),
     )?;
@@ -3101,6 +3322,7 @@ fn load_safetensors_family_config(
 
     Ok(Qwen35FamilyConfig {
         hf_config,
+        dense_precision: Qwen35DensePrecision::F16,
         vocab_size,
         max_position_embeddings,
         rms_norm_epsilon,
@@ -3199,9 +3421,10 @@ fn load_gguf_family_config(
     let tokenizer_config_bytes = sources
         .tokenizer_config_json()
         .ok_or_else(|| "tokenizer source missing tokenizer_config.json".to_owned())?;
-    let metadata = parse_hf_model_semantic_metadata(
+    let metadata = parse_hf_model_semantic_metadata_with_tokenizer(
         &hf_config,
         tokenizer_config_bytes,
+        sources.tokenizer_json(),
         sources.chat_template_jinja(),
         sources.chat_template_json(),
     )?;
@@ -3236,6 +3459,7 @@ fn load_gguf_family_config(
 
     Ok(Qwen35FamilyConfig {
         hf_config,
+        dense_precision: Qwen35DensePrecision::F16,
         vocab_size,
         max_position_embeddings,
         rms_norm_epsilon,
@@ -4315,10 +4539,7 @@ fn moe_weight_value_id(layer_index: u32, role: &str) -> Result<ProgramValueId, V
 }
 
 fn materialized_element_type(role: &str) -> ElementType {
-    match role {
-        "linear_attn_a_log" | "linear_attn_dt_bias" | "linear_attn_norm" => ElementType::F32,
-        _ => DENSE_MATERIALIZED_ELEMENT_TYPE,
-    }
+    Qwen35DensePrecision::F16.materialized_element_type(role)
 }
 
 fn logical_weight_dimensions(weight: &FamilyWeight) -> Result<Vec<u64>, VNextError> {
@@ -4338,7 +4559,14 @@ fn logical_weight_dimensions(weight: &FamilyWeight) -> Result<Vec<u64>, VNextErr
 }
 
 fn dense_weight_encoding(role: &str) -> Result<WeightEncoding, VNextError> {
-    let element_type = materialized_element_type(role);
+    dense_weight_encoding_with_precision(role, Qwen35DensePrecision::F16)
+}
+
+fn dense_weight_encoding_with_precision(
+    role: &str,
+    precision: Qwen35DensePrecision,
+) -> Result<WeightEncoding, VNextError> {
+    let element_type = precision.materialized_element_type(role);
     if matches!(
         role,
         "final_norm"
@@ -4676,6 +4904,10 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 
 #[cfg(test)]
 mod tests {
+    mod mtp;
+    mod single_file;
+    mod visual_prompt;
+
     use crate::vnext::test_support::{prepare_product_fixture, PrepareFamilyFixture};
     use crate::vnext::PreparedProductionModel;
 
@@ -7344,6 +7576,7 @@ mod tests {
             max_position_embeddings: 128,
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             weight_format: FamilyWeightFormat::SafetensorsDense,
+            dense_precision: Qwen35DensePrecision::F16,
             recurrent_weight_abi: RecurrentWeightAbi::LogRateGrouped,
             gguf_hadamard: None,
             weights,
@@ -7491,6 +7724,7 @@ mod tests {
             max_position_embeddings,
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             weight_format: FamilyWeightFormat::SafetensorsBlockFp8,
+            dense_precision: Qwen35DensePrecision::F16,
             recurrent_weight_abi: RecurrentWeightAbi::LogRateGrouped,
             gguf_hadamard: None,
             weights,
@@ -7711,6 +7945,7 @@ mod tests {
             max_position_embeddings: 128,
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             weight_format: FamilyWeightFormat::GgufNative,
+            dense_precision: Qwen35DensePrecision::F16,
             recurrent_weight_abi: RecurrentWeightAbi::NegativeRateInterleaved,
             gguf_hadamard: None,
             weights,
@@ -8574,7 +8809,50 @@ mod tests {
                 gguf.stored_weight_schema().unwrap().format_id,
                 safetensors.stored_weight_schema().unwrap().format_id
             );
-            assert_eq!(gguf.numerical_profiles(), safetensors.numerical_profiles());
+            let gguf_profiles = gguf.numerical_profiles();
+            let safetensors_profiles = safetensors.numerical_profiles();
+            let shared_ids = [
+                F16_NUMERICAL_PROFILE_ID,
+                F16_INT8_KV_NUMERICAL_PROFILE_ID,
+                F32_MASTER_NUMERICAL_PROFILE_ID,
+                F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID,
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+            let profile_ids = |catalog: &FamilyNumericalProfiles| {
+                catalog
+                    .profiles()
+                    .iter()
+                    .map(|profile| profile.id.as_str().to_owned())
+                    .collect::<BTreeSet<_>>()
+            };
+            assert_eq!(profile_ids(gguf_profiles), shared_ids);
+            let mut safetensors_ids = shared_ids.clone();
+            safetensors_ids.insert(F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID.to_owned());
+            assert_eq!(profile_ids(safetensors_profiles), safetensors_ids);
+            assert_eq!(gguf_profiles.version(), safetensors_profiles.version());
+            assert_eq!(
+                gguf_profiles.auto_preference(),
+                safetensors_profiles.auto_preference()
+            );
+            for id in shared_ids {
+                let id = id.parse().unwrap();
+                assert_eq!(
+                    gguf_profiles.resolve(&id).unwrap(),
+                    safetensors_profiles.resolve(&id).unwrap()
+                );
+            }
+            // Visual prompting is a separately declared dense-safetensors
+            // capability. It cannot change any shared contract or Auto choice.
+            let visual_id = F16_VISUAL_PROMPT_NUMERICAL_PROFILE_ID.parse().unwrap();
+            assert!(gguf_profiles.resolve(&visual_id).is_err());
+            assert!(!safetensors_profiles.auto_preference().contains(&visual_id));
+            let visual = registration.prepare(&safetensors, &visual_id).unwrap();
+            assert_eq!(
+                visual.numerical_profile(),
+                safetensors_profiles.resolve(&visual_id).unwrap()
+            );
             for candidate in gguf
                 .numerical_profiles()
                 .candidates(

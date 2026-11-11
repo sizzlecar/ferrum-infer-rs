@@ -206,3 +206,18 @@ fn metadata_only_oversize_is_rejected_before_encoding() {
     let frequency = spec(&[1, 2], ElementType::Bf16);
     assert!(validate_specs(&x, &frequency, &frequency, &x, 2).is_err());
 }
+
+#[test]
+fn partial_geometry_counts_rotated_arithmetic_and_tail_copy_launch_units() {
+    for (head, rotary) in [(8, 6), (128, 96), (7, 6)] {
+        let x = spec(&[3, head * 2], ElementType::Bf16);
+        let f = spec(&[3, rotary], ElementType::Bf16);
+        let checked = PartialHalfSplitRopeBf16Geometry::new(&x, &f, &f, &x, head, rotary).unwrap();
+        let shape = Shape::new_partial(checked).unwrap();
+        assert_eq!(shape.elements, 3 * head * 2);
+        assert_eq!(shape.frequency_bytes, 3 * rotary * 2);
+        assert_eq!(shape.pairs, 3 * 2 * (rotary / 2));
+        assert_eq!(shape.operations, shape.pairs * 7);
+        assert_eq!(shape.launch_units, 3 * 2 * (rotary / 2 + head - rotary));
+    }
+}

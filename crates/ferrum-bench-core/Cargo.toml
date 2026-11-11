@@ -11,6 +11,7 @@ ferrum-journal = { workspace = true }
 ferrum-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
+uuid = { workspace = true }
 rand = { workspace = true }
 sha2 = "0.10"
 base64 = "0.22"

@@ -986,6 +986,7 @@ impl<D: ResourceTransactionDriver> ResourceTransaction<D, TransactionCommitted> 
             static_resources: PlanRuntimeStatic::Static(static_resources),
             runtime,
             deferred_cleanup_domain: new_deferred_device_cleanup_domain(),
+            retained_until_closed: Mutex::default(),
         }))
     }
 

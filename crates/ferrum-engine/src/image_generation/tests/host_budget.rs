@@ -12,16 +12,21 @@ fn stage_grant(
 ) -> Result<HostMemoryScope, HostMemoryError> {
     let ports = ports(stage).unwrap();
     let budget = ExecutionHostBudget {
-        input: sum_ports(&pipeline.host, ports.inputs().iter()).unwrap(),
-        output: sum_ports(&pipeline.host, ports.outputs().iter()).unwrap(),
+        input: sum_ports(&pipeline.execution.host, ports.inputs().iter()).unwrap(),
+        output: sum_ports(&pipeline.execution.host, ports.outputs().iter()).unwrap(),
         staging: if cold {
-            staging_bytes(&pipeline.host, stage, pipeline.config.static_initialization).unwrap()
+            staging_bytes(
+                &pipeline.execution.host,
+                stage,
+                pipeline.execution.config.static_initialization,
+            )
+            .unwrap()
         } else {
             0
         },
         weights: 0,
     };
-    pipeline.host.reserve_scope(&budget.claims())
+    pipeline.execution.host.reserve_scope(&budget.claims())
 }
 
 #[test]
@@ -29,7 +34,7 @@ fn scoped_stage_survives_competing_consumers_warm_reuse_and_shape_change() {
     // Reference lacks the production Philox provider. Use its real nonzero
     // projection to exercise stage initialization, execution and residency.
     let (mut pipeline, _directory) = residency::numeric_pipeline();
-    pipeline.host = HostMemoryAccount::new(
+    pipeline.execution.host = HostMemoryAccount::new(
         HostMemoryLimits::new(
             1312,
             HostMemoryClassLimits {
@@ -46,11 +51,11 @@ fn scoped_stage_survives_competing_consumers_warm_reuse_and_shape_change() {
     for job in 0..2 {
         let stage = residency::prepared(&pipeline, 1);
         let grant = stage_grant(&pipeline, &stage, job == 0).unwrap();
-        pipeline.execution_host = Some(grant.account());
+        pipeline.execution.execution_host = Some(grant.account());
         if job == 1 {
             // A previous consumer owns 16 bytes; this grant owns the other 16.
             assert!(matches!(
-                pipeline.host.reserve(HostMemoryClass::Output, 1),
+                pipeline.execution.host.reserve(HostMemoryClass::Output, 1),
                 Err(HostMemoryError::Capacity { .. })
             ));
         }
@@ -70,22 +75,28 @@ fn scoped_stage_survives_competing_consumers_warm_reuse_and_shape_change() {
         pipeline
             .finish_stage(active, &mut receipts)
             .unwrap_or_else(|_| panic!("finish scoped stage"));
-        pipeline.execution_host = None;
+        pipeline.execution.execution_host = None;
         drop(grant);
         outputs.push(output);
     }
     let next = residency::prepared(&pipeline, 2);
-    let before = pipeline.runtime.snapshot();
+    let before = pipeline.execution.runtime.snapshot();
     let rejected = stage_grant(&pipeline, &next, false).unwrap_err();
     assert!(matches!(rejected, HostMemoryError::Capacity { .. }));
-    assert_eq!(pipeline.runtime.snapshot().submissions, before.submissions);
+    assert_eq!(
+        pipeline.execution.runtime.snapshot().submissions,
+        before.submissions
+    );
     assert!(!pipeline.is_stopped());
     // Closing grants did not release a slow consumer's real bytes. Releasing
     // both consumers now admits a larger shape without recreating the pipeline.
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 32);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        32
+    );
     drop(outputs);
     let grant = stage_grant(&pipeline, &next, false).unwrap();
-    pipeline.execution_host = Some(grant.account());
+    pipeline.execution.execution_host = Some(grant.account());
     let input = residency::input(pipeline.execution_host(), 2, 0);
     let active = pipeline
         .start_stage(next, 2, &mut receipts)
@@ -97,12 +108,18 @@ fn scoped_stage_survives_competing_consumers_warm_reuse_and_shape_change() {
     pipeline
         .finish_stage(active, &mut receipts)
         .unwrap_or_else(|_| panic!("finish scoped stage"));
-    pipeline.execution_host = None;
+    pipeline.execution.execution_host = None;
     drop(grant);
     pipeline.shutdown().unwrap();
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 32);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        32
+    );
     drop(outputs);
-    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(
+        pipeline.execution.host.usage().unwrap().committed_bytes(),
+        0
+    );
 }
 
 #[test]

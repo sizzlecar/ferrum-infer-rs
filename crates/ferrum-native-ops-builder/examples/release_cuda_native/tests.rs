@@ -85,6 +85,30 @@ fn f32_only_q6_package_cannot_satisfy_the_production_f16_boundary() {
 }
 
 #[test]
+fn final_image_release_rejects_missing_fused_native_artifacts() {
+    let set = ResolvedNativeOperatorArtifactSet {
+        lock_path: PathBuf::from("fixture.lock.json"),
+        g03_catalog_sha256: "a".repeat(64),
+        artifacts: Vec::new(),
+    };
+    for architecture in [Architecture::Sm89, Architecture::Sm120] {
+        for unit in [
+            CudaNativeBuildUnit::CutlassFusedF32Attention,
+            CudaNativeBuildUnit::CutlassInt8FusedOutput,
+        ] {
+            let required = |final_set| {
+                required_units_for_set(architecture, final_set)
+                    .filter(move |candidate| *candidate == unit)
+            };
+            assert!(ResolvedCudaNativeBuildCoverage::resolve(&set, required(false)).is_ok());
+            assert!(
+                matches!(ResolvedCudaNativeBuildCoverage::resolve(&set, required(true)), Err(ferrum_native_ops::CudaNativeBuildCoverageError::MissingArtifact { operator, .. }) if operator == unit.artifact_operator())
+            );
+        }
+    }
+}
+
+#[test]
 fn cross_architecture_package_keeps_provider_contract_and_uses_the_build_target() {
     let exports = vec!["ferrum_upstream_q6_f16_dot_v1".to_owned()];
     let reference = NativeOperatorPackageSpec {
@@ -135,6 +159,31 @@ fn row(operation: &str, provider: &str) -> NativeOperatorProviderCatalogRow {
     }
 }
 
+fn image_provider_rows() -> Vec<NativeOperatorProviderCatalogRow> {
+    vec![
+        row(
+            "operation.structured_gqa_attention_fused.f32",
+            "provider.cuda.structured_gqa_attention_fused.f32.cutlass",
+        ),
+        row(
+            "operation.comfy_convrot_codebook_w4a8.bf16",
+            "provider.cuda.comfy_convrot_codebook_w4a8.bf16.cutlass_int8_fused_output",
+        ),
+        row(
+            "operation.comfy_convrot_codebook_w4a8.swiglu_f32.bf16",
+            "provider.cuda.comfy_convrot_w4a8.swiglu_f32.bf16.cutlass_int8_fused_output",
+        ),
+        row(
+            "operation.comfy_convrot_w8a8.bf16",
+            "provider.cuda.comfy_convrot_w8a8.bf16.cutlass_int8_fused_output",
+        ),
+        row(
+            "operation.comfy_convrot_w8a8.swiglu_f32.bf16",
+            "provider.cuda.comfy_convrot_w8a8.swiglu_f32.bf16.cutlass_int8_fused_output",
+        ),
+    ]
+}
+
 #[test]
 fn catalog_extension_preserves_text_contracts_and_rejects_missing_or_changed_rows() {
     let original = NativeOperatorProviderCatalog {
@@ -149,10 +198,18 @@ fn catalog_extension_preserves_text_contracts_and_rejects_missing_or_changed_row
             &format!("provider.cuda.dense_linear_fp8{suffix}.bf16.cutlass"),
         ));
     }
+    combined.providers.extend(image_provider_rows());
     combined
         .providers
         .sort_by(|a, b| (&a.operation_id, &a.provider_id).cmp(&(&b.operation_id, &b.provider_id)));
     validate_catalog_extension(&original, &combined, None).unwrap();
+    for image in image_provider_rows() {
+        let mut incomplete = combined.clone();
+        incomplete
+            .providers
+            .retain(|row| row.provider_id != image.provider_id);
+        assert!(validate_catalog_extension(&original, &incomplete, None).is_err());
+    }
     assert!(validate_catalog_extension(&original, &original, None).is_err());
     let mut missing_text = combined.clone();
     missing_text.providers.pop();
@@ -215,6 +272,7 @@ fn gpt_catalog_refresh_requires_exact_source_row_and_preserves_contracts() {
             &format!("provider.cuda.dense_linear_fp8{suffix}.bf16.cutlass"),
         ));
     }
+    combined.providers.extend(image_provider_rows());
     combined.providers.sort();
     validate_catalog_extension(&original, &combined, Some(&source)).unwrap();
     assert!(validate_catalog_extension(&original, &combined, None).is_err());

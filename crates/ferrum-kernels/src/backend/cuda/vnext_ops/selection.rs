@@ -10,6 +10,7 @@ use ferrum_runtime::{
 #[derive(Clone, Copy)]
 pub(super) enum ArgmaxPrecision {
     F16,
+    Bf16,
     F32,
 }
 
@@ -204,6 +205,7 @@ impl ArgmaxPrecision {
     pub(super) fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::F16 => last_token_masked_argmax_contract(),
+            Self::Bf16 => ferrum_runtime::last_token_masked_argmax_bf16_contract(),
             Self::F32 => last_token_masked_argmax_f32_contract(),
         }
     }
@@ -211,6 +213,7 @@ impl ArgmaxPrecision {
     pub(super) fn operation(self) -> &'static str {
         match self {
             Self::F16 => LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+            Self::Bf16 => ferrum_runtime::LAST_TOKEN_MASKED_ARGMAX_BF16_OPERATION_ID,
             Self::F32 => LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
         }
     }
@@ -218,6 +221,7 @@ impl ArgmaxPrecision {
     pub(super) fn capability(self) -> &'static str {
         match self {
             Self::F16 => LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
+            Self::Bf16 => ferrum_runtime::LAST_TOKEN_MASKED_ARGMAX_BF16_CAPABILITY_ID,
             Self::F32 => LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
         }
     }
@@ -225,6 +229,7 @@ impl ArgmaxPrecision {
     pub(super) fn provider(self) -> &'static str {
         match self {
             Self::F16 => LAST_TOKEN_MASKED_ARGMAX_PROVIDER_ID,
+            Self::Bf16 => "provider.cuda.last_token_masked_argmax.bf16",
             Self::F32 => "provider.cuda.last_token_masked_argmax.f32",
         }
     }
@@ -232,6 +237,7 @@ impl ArgmaxPrecision {
     pub(super) fn estimator(self) -> &'static str {
         match self {
             Self::F16 => LAST_TOKEN_MASKED_ARGMAX_ESTIMATOR_ID,
+            Self::Bf16 => "resource-estimator.cuda.last_token_masked_argmax.bf16",
             Self::F32 => "resource-estimator.cuda.last_token_masked_argmax.f32",
         }
     }
@@ -239,6 +245,7 @@ impl ArgmaxPrecision {
     pub(super) fn kernel(self) -> &'static str {
         match self {
             Self::F16 => MASKED_ARGMAX_PRESERVING_LOGITS_FUNCTION_NAME,
+            Self::Bf16 => "last_token_masked_argmax_preserving_logits_bf16",
             Self::F32 => "last_token_masked_argmax_preserving_logits_f32",
         }
     }
@@ -246,6 +253,7 @@ impl ArgmaxPrecision {
     pub(super) fn element(self) -> ElementType {
         match self {
             Self::F16 => ElementType::F16,
+            Self::Bf16 => ElementType::Bf16,
             Self::F32 => ElementType::F32,
         }
     }

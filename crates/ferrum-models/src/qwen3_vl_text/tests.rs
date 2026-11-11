@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+mod hidden_states;
 fn hf(layers: u64, h: u64, m: u64, q: u64, kv: u64, d: u64) -> Value {
     json!({"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl","dtype":"bfloat16",
         "text_config":{"model_type":"qwen3_vl_text","dtype":"bfloat16","attention_bias":false,"attention_dropout":0.0,
@@ -7,6 +8,122 @@ fn hf(layers: u64, h: u64, m: u64, q: u64, kv: u64, d: u64) -> Value {
         "vocab_size":151936,"max_position_embeddings":262144,"rms_norm_eps":0.000001,"rope_theta":5000000,
         "rope_scaling":{"rope_type":"default","mrope_interleaved":true,"mrope_section":[d/2,0,0]}}})
 }
+
+// The fixed P-H3 text encoder metadata uses the current HF wire: theta is
+// inside rope_parameters, with no legacy rope_scaling or outer rope_theta.
+fn released_nested_mrope() -> Value {
+    let mut raw = hf(36, 2560, 9728, 32, 8, 128);
+    let text = raw["text_config"].as_object_mut().unwrap();
+    let mut rope = text.remove("rope_scaling").unwrap();
+    rope["mrope_section"] = json!([24, 20, 20]);
+    rope["rope_theta"] = text.remove("rope_theta").unwrap();
+    text.insert("rope_parameters".into(), rope);
+    raw
+}
+
+#[test]
+fn nested_mrope_metadata_matches_the_explicit_legacy_mathematical_contract() {
+    let current = released_nested_mrope();
+    let parsed = Qwen3VLTextArchitecture::from_hf_value(&current).unwrap();
+    assert_eq!(parsed.rope_theta(), 5_000_000);
+    assert_eq!(parsed.mrope_sections(), [24, 20, 20]);
+    assert_eq!(
+        (
+            parsed.layers(),
+            parsed.hidden_size(),
+            parsed.intermediate_size(),
+            parsed.query_heads(),
+            parsed.key_value_heads(),
+            parsed.head_dim(),
+        ),
+        (36, 2560, 9728, 32, 8, 128)
+    );
+    let mut legacy = hf(36, 2560, 9728, 32, 8, 128);
+    legacy["text_config"]["rope_scaling"]["mrope_section"] = json!([24, 20, 20]);
+    assert_eq!(
+        parsed,
+        Qwen3VLTextArchitecture::from_hf_value(&legacy).unwrap()
+    );
+    let mut alternate = current.clone();
+    alternate["text_config"]["rope_parameters"]["rope_theta"] = json!(1_000_000);
+    let alternate = Qwen3VLTextArchitecture::from_hf_value(&alternate).unwrap();
+    assert_eq!(alternate.rope_theta(), 1_000_000);
+    assert_ne!(
+        alternate, parsed,
+        "nested theta must affect the actual contract"
+    );
+}
+
+#[test]
+fn nested_mrope_metadata_rejects_missing_conflicting_and_unsupported_parameters() {
+    let current = released_nested_mrope();
+    let mut missing = current.clone();
+    missing["text_config"]["rope_parameters"]
+        .as_object_mut()
+        .unwrap()
+        .remove("rope_theta");
+    // An outer value cannot silently substitute for a missing modern field.
+    missing["text_config"]["rope_theta"] = json!(5_000_000);
+    assert!(Qwen3VLTextArchitecture::from_hf_value(&missing).is_err());
+    for (field, value) in [
+        ("rope_theta", json!(0)),
+        ("rope_theta", json!(-1)),
+        ("rope_type", json!("linear")),
+        ("mrope_interleaved", json!(false)),
+        ("mrope_section", json!([24, 20, 19])),
+        ("mrope_section", json!([24, 40])),
+        ("factor", json!(2)),
+    ] {
+        let mut wrong = current.clone();
+        wrong["text_config"]["rope_parameters"][field] = value;
+        assert!(
+            Qwen3VLTextArchitecture::from_hf_value(&wrong).is_err(),
+            "unsupported explicit {field} cannot be ignored"
+        );
+    }
+    let mut duplicated = current.clone();
+    duplicated["text_config"]["rope_theta"] = json!(5_000_000);
+    assert_eq!(
+        Qwen3VLTextArchitecture::from_hf_value(&duplicated).unwrap(),
+        Qwen3VLTextArchitecture::from_hf_value(&current).unwrap()
+    );
+    duplicated["text_config"]["rope_theta"] = json!(10_000);
+    assert!(Qwen3VLTextArchitecture::from_hf_value(&duplicated).is_err());
+    let mut ambiguous = current;
+    ambiguous["text_config"]["rope_scaling"] =
+        json!({"rope_type":"default","mrope_interleaved":true,"mrope_section":[24,20,20]});
+    assert!(Qwen3VLTextArchitecture::from_hf_value(&ambiguous).is_err());
+}
+
+#[test]
+fn nested_mrope_metadata_preserves_the_same_containers_explicit_vision_rotary_validation() {
+    use crate::qwen3_vl_vision::Qwen3VLVisionArchitecture;
+
+    let mut raw = released_nested_mrope();
+    raw["vision_config"] = json!({
+        "model_type":"qwen3_vl_vision", "dtype":"bfloat16",
+        "hidden_act":"gelu_pytorch_tanh", "depth":24, "hidden_size":1024,
+        "intermediate_size":4096, "num_heads":16, "num_position_embeddings":2304,
+        "out_hidden_size":2560, "deepstack_visual_indexes":[5,11,17],
+        "in_channels":3, "patch_size":16, "temporal_patch_size":2,
+        "spatial_merge_size":2,
+        "rope_parameters":{"rope_type":"axial","rope_theta":10000.0}
+    });
+    Qwen3VLTextArchitecture::from_hf_value(&raw).unwrap();
+    let vision = Qwen3VLVisionArchitecture::from_hf_value(&raw).unwrap();
+    assert_eq!(
+        (vision.depth(), vision.hidden_size(), vision.output_size()),
+        (24, 1024, 2560)
+    );
+    raw["vision_config"]["rope_parameters"]["rope_theta"] = json!(10001);
+    assert!(Qwen3VLVisionArchitecture::from_hf_value(&raw).is_err());
+    raw["vision_config"]["rope_parameters"]
+        .as_object_mut()
+        .unwrap()
+        .remove("rope_theta");
+    assert!(Qwen3VLVisionArchitecture::from_hf_value(&raw).is_err());
+}
+
 fn layout(left: bool) -> Qwen3VLTextLayout {
     Qwen3VLTextLayout::new(
         3,

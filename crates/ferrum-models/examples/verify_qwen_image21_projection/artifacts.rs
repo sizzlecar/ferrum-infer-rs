@@ -12,6 +12,8 @@ pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+// Sibling CPU fixtures reuse artifact writers without reading execution inputs.
+#[allow(dead_code)]
 pub fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let metadata = file.metadata()?;

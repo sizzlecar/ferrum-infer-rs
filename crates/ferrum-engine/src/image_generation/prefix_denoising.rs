@@ -95,7 +95,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         };
         let result = (|| -> Result<ManagedHostTensor, ImageGenerationFailure<R>> {
             owners.decode = Some(decode.stage.start_attached(
-                self,
+                &self.execution,
                 job,
                 owners.weights.as_ref().unwrap(),
             )?);
@@ -128,7 +128,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             let prefill = owners.prefill.as_mut().unwrap();
             let started = Instant::now();
             let output = prefill.session.execute_initializing_request_on_actor(
-                self.serial_actor
+                self.execution
+                    .serial_actor
                     .as_mut()
                     .ok_or(ImageGenerationFailure::Unavailable)?,
                 id(format!("run.image.{job}.denoise.prefill")).map_err(process)?,
@@ -160,7 +161,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     .map_err(process)?;
                 let started = Instant::now();
                 let output = owners.request.as_mut().unwrap().execute_on_actor(
-                    self.serial_actor
+                    self.execution
+                        .serial_actor
                         .as_mut()
                         .ok_or(ImageGenerationFailure::Unavailable)?,
                     vec![sample.clone(), time, decode_frequencies.clone()],

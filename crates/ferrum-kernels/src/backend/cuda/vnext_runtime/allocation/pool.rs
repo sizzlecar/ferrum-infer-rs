@@ -79,14 +79,31 @@ impl TensorAllocationPool {
         &self,
         bytes: usize,
     ) -> Result<CudaSlice<u8>, DriverError> {
+        let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        let bind_started = trace_enabled.then(std::time::Instant::now);
         self.stream.context().bind_to_thread()?;
+        let context_bind_us = bind_started.map_or(0, |started| {
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
         // SAFETY: this is the same uninitialized admitted byte allocation as
         // CudaStream::alloc. Event tracking is disabled by the owning runtime;
         // upgrade creates no fallible events. CudaSlice queues free on this
         // stream. CudaAllocation keeps TensorEagerState (and this pool) alive
         // until after its CudaSlice drops.
         unsafe {
-            let pointer = result::mem_pool::alloc_async(self.pool, bytes, self.stream.cu_stream())?;
+            let started = trace_enabled.then(std::time::Instant::now);
+            let result = result::mem_pool::alloc_async(self.pool, bytes, self.stream.cu_stream());
+            if let Some(started) = started {
+                tracing::debug!(
+                    allocation_bytes = bytes,
+                    context_bind_us,
+                    driver_allocation_us =
+                        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    success = result.is_ok(),
+                    "CUDA private pool allocation timing"
+                );
+            }
+            let pointer = result?;
             Ok(self.stream.upgrade_device_ptr(pointer, bytes))
         }
     }

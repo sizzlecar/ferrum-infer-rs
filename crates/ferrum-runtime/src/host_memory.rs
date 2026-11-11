@@ -3,12 +3,14 @@
 //! Product composition injects one account into all cooperating engines. Limits
 //! cover physical backing bytes (including configured padding) and reservations,
 //! not allocator metadata, page cache, network buffers, or total process RSS.
-//! A transfer classification does not prove page locking: this module currently
-//! allocates pageable memory only.
+//! A transfer classification does not prove page locking. Allocations start
+//! pageable; an explicit backend registration can retain its native ownership
+//! on the same allocation without adding a second payload.
 
 use std::{
     alloc::Layout,
     collections::BTreeMap,
+    mem::ManuallyDrop,
     ops::Range,
     sync::{Arc, Mutex},
     task::Waker,
@@ -20,6 +22,12 @@ use thiserror::Error;
 mod scope;
 pub use scope::HostMemoryScope;
 use scope::{ScopeAuthority, ScopeCredit};
+mod scope_exchange;
+pub use scope_exchange::HostMemoryScopeExchangeFailure;
+use scope_exchange::ScopeRefund;
+mod registration;
+mod scope_shrink;
+pub use registration::NativeHostMemoryRegistration;
 
 /// A quota dimension; it does not describe allocation or DMA capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +184,7 @@ struct State {
     fail_closed: bool,
     next_scope: u64,
     scopes: BTreeMap<u64, ScopeCredit>,
+    scope_refunds: BTreeMap<u64, ScopeRefund>,
 }
 
 #[derive(Debug)]
@@ -260,10 +269,31 @@ impl HostMemoryAccount {
         Arc::ptr_eq(&self.0, &bytes.backing.charge.account.0)
     }
 
+    /// Exact admission provenance for borrowing an allocation in an operation
+    /// whose peak was reserved from this view. Parent identity alone cannot
+    /// authorize spending a sibling phase's backing allowance.
+    pub(crate) fn owns_in_scope(&self, bytes: &ManagedHostBytes) -> bool {
+        self.owns(bytes)
+            && match (&self.1, &bytes.backing.charge.account.1) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+
     /// Shared backing-budget and provenance identity, regardless of a view's
     /// scoped admission credit. Equal numeric limits do not establish ownership.
     pub fn same_parent(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn same_scope_view(&self, other: &Self) -> bool {
+        self.same_parent(other)
+            && match (&self.1, &other.1) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
     }
 
     pub fn usage(&self) -> Result<HostMemoryUsage, HostMemoryError> {
@@ -516,19 +546,21 @@ impl HostMemoryReservation {
         let bytes = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer, length)) };
         self.charge.mark_allocated()?;
         Ok(ManagedHostBuffer {
-            bytes,
+            bytes: ManuallyDrop::new(bytes),
             range,
-            charge: self.charge,
+            charge: ManuallyDrop::new(self.charge),
+            registrations: ManuallyDrop::new(Mutex::new(Vec::new())),
         })
     }
 }
 
-/// Exclusively writable, already admitted pageable backing. Fields are ordered
-/// so the actual bytes are freed before their capacity charge is returned.
+/// Exclusively writable, already admitted backing. Native registrations, if
+/// any, survive freeze/thaw and are retired before bytes and their charge.
 pub struct ManagedHostBuffer {
-    bytes: Box<[u8]>,
+    bytes: ManuallyDrop<Box<[u8]>>,
     range: Range<usize>,
-    charge: Charge,
+    charge: ManuallyDrop<Charge>,
+    registrations: ManuallyDrop<Mutex<Vec<registration::Registration>>>,
 }
 
 impl ManagedHostBuffer {
@@ -584,6 +616,23 @@ pub struct ManagedHostBytes {
 }
 
 impl ManagedHostBytes {
+    /// Recover the original writable buffer only when this view covers its
+    /// complete logical range and no other owner retains the allocation.
+    /// Clones, slices and retained native regions prevent recovery while live.
+    /// Failure returns this immutable view unchanged.
+    ///
+    /// This neither copies nor reallocates bytes and preserves the allocation's
+    /// physical charge, class and original Host scope. Existing contents remain
+    /// initialized; they are not reset to zero. Closing a scope does not revoke
+    /// its outstanding allocation, and recovery grants no new scoped capacity.
+    pub fn try_thaw(self) -> Result<ManagedHostBuffer, Self> {
+        if self.range != self.backing.range {
+            return Err(self);
+        }
+        let Self { backing, range } = self;
+        Arc::try_unwrap(backing).map_err(|backing| Self { backing, range })
+    }
+
     /// Retains the full initialized backing, including accounted padding, while
     /// exposing only this logical slice as the payload. A backend must still
     /// validate its own native page and alignment requirements.
@@ -633,8 +682,9 @@ impl ManagedHostBytes {
 
 struct FrozenHostAllocation(Arc<ManagedHostBuffer>);
 
-// SAFETY: constructed only after freeze. The Arc is private, never converted
-// back into a writable buffer, and retains the full allocation and its charge.
+// SAFETY: constructed only after freeze. This private Arc retains the full
+// allocation and its charge. While this owner lives, try_thaw cannot obtain
+// unique ownership, so the bytes remain immutable for its entire lifetime.
 unsafe impl crate::StableHostMemory for FrozenHostAllocation {
     fn stable_bytes(&self) -> &[u8] {
         &self.0.bytes
@@ -663,6 +713,8 @@ impl AsRef<[u8]> for ManagedHostBytes {
 
 // SAFETY: freeze removes the sole mutable owner. Arc retains the byte allocation
 // and its charge, and a view's private range never changes during its lifetime.
+// try_thaw consumes the sole full-range owner; any other view or retained region
+// prevents recovery, so no live immutable owner can observe writable storage.
 unsafe impl crate::StableHostMemory for ManagedHostBytes {
     fn stable_bytes(&self) -> &[u8] {
         self.bytes()
@@ -677,3 +729,5 @@ unsafe impl crate::StableHostMemory for ManagedHostBytes {
 mod capacity_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod thaw_tests;

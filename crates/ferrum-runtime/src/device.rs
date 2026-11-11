@@ -4005,6 +4005,13 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         None
     }
 
+    /// Source lifetime on a static copy route. This is not allocation or reuse
+    /// authority: core overrides it for actual imports, and the source must
+    /// still prove unique ownership before modifying any bytes.
+    fn static_weight_source_retention(&self) -> crate::StaticWeightSourceRetention {
+        crate::StaticWeightSourceRetention::UnknownOrPlanRetained
+    }
+
     /// Whether managed static initialization needs TransferStaging quota.
     /// This side-effect-free query allows preparation to reserve upload credit
     /// before submitting device work. Returning false promises that managed
@@ -4123,6 +4130,37 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     /// and synchronous managed readback without unaccounted staging copies.
     fn supports_managed_tensor_io(&self) -> bool {
         false
+    }
+
+    /// Whether managed uploads also accept WeightBacking into static Weights.
+    /// The backend retains the same immutable allocation through completion,
+    /// including indeterminate submission recovery, without a private copy.
+    /// Core drains each materialization group before preparing the next, so
+    /// retaining a chunk cannot extend one group's source peak into another.
+    fn supports_managed_static_weight_sources(&self) -> bool {
+        false
+    }
+
+    /// Accepts an explicitly proven immutable file mapping for static Weights.
+    /// This is independent of accounted Managed uploads: an arbitrary stable
+    /// owner, unaccounted Vec or claimed Host class does not provide this proof.
+    /// Original chunk/batch bounds and source-group quiescence still apply.
+    fn supports_readonly_mapped_static_weight_sources(&self) -> bool {
+        false
+    }
+
+    /// Retains the exact mapping through the original completion/recovery
+    /// owner. This does not imply pinned DMA, no driver staging or bounded RSS.
+    /// `None` declines before submission; unsupported backends use core's
+    /// existing accounted staging path without invoking this hook.
+    fn encode_readonly_mapped_static_weight_upload(
+        &self,
+        _source: crate::ReadOnlyMappedHostMemoryRegion,
+        _source_layout: HostTransferLayout,
+        _destination: &Self::Buffer,
+        _destination_offset_bytes: u64,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        Ok(None)
     }
 
     /// Retains the immutable, accounted backing through the completion fence.

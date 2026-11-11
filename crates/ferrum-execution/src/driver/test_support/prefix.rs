@@ -17,6 +17,7 @@ fn sequence<R: DeviceRuntime>(
     let active_binding = Arc::new(TrustedActiveSequenceBinding::from_session(&session).unwrap());
     let token_identity = issuer.issue_sequence().unwrap();
     Arc::new(VNextSequence {
+        causal_inputs: None,
         token_recovery_key: issuer.recovery_key(&token_identity).unwrap(),
         token_identity,
         token_issuer: issuer.clone(),

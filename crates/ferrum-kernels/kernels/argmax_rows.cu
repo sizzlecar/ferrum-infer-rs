@@ -12,6 +12,7 @@
 // Launch: grid=(m, 1, 1), block=(256, 1, 1). 32 KB shmem is plenty.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 extern "C" __global__ void apply_repetition_penalties_sparse_f16(
     __half* __restrict__ logits,                 // [m, n] row-major
@@ -217,7 +218,7 @@ __device__ __forceinline__ bool vnext_argmax_better(
         (order == selected_order && index < selected));
 }
 
-template<typename Logit, bool Partitioned = false>
+template<typename Logit, bool Partitioned = false, bool Greedy = false>
 __device__ void vnext_masked_argmax_preserving_logits(
     const Logit* __restrict__ logits,
     Logit* __restrict__ scratch,
@@ -232,9 +233,9 @@ __device__ void vnext_masked_argmax_preserving_logits(
 ) {
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
-    unsigned int repetition_start = min(repetition_offsets[0], (unsigned int)repetition_capacity);
-    unsigned int repetition_end = min(repetition_offsets[1], (unsigned int)repetition_capacity);
-    const float penalty = repetition_penalty[0];
+    unsigned int repetition_start = Greedy ? 0 : min(repetition_offsets[0], (unsigned int)repetition_capacity);
+    unsigned int repetition_end = Greedy ? 0 : min(repetition_offsets[1], (unsigned int)repetition_capacity);
+    const float penalty = Greedy ? 1.0f : repetition_penalty[0];
     const bool apply_penalty = penalty != 1.0f && repetition_start < repetition_end;
     if (Partitioned && apply_penalty && blockIdx.x != 0) {
         return;
@@ -269,7 +270,7 @@ __device__ void vnext_masked_argmax_preserving_logits(
     const int first = tid + (partition ? int(blockIdx.x) * block_size : 0);
     const int stride = block_size * (partition ? VNEXT_ARGMAX_PARTITIONS : 1);
     for (int token = first; token < n; token += stride) {
-        if (token >= mask_len || valid[token] == 0) {
+        if (!Greedy && (token >= mask_len || valid[token] == 0)) {
             continue;
         }
         const float value = static_cast<float>(selection_logits[token]);
@@ -323,6 +324,15 @@ __device__ void vnext_masked_argmax_preserving_logits(
             }
         }
     }
+}
+
+// Same finite/IEEE-total-order/lowest-id reduction, without policy inputs.
+// Logits have already been rounded to F16 by the ordinary dense head GEMM.
+extern "C" __global__ void tail_two_greedy_argmax_f16(
+    const __half* __restrict__ logits, int n, int* __restrict__ output
+) {
+    vnext_masked_argmax_preserving_logits<__half, false, true>(
+        logits, nullptr, n, nullptr, n, nullptr, nullptr, nullptr, 0, output);
 }
 
 extern "C" __global__ void last_token_masked_argmax_preserving_logits_f16(
@@ -484,6 +494,45 @@ extern "C" __global__ void last_token_masked_argmax_finalize_batched(
         reinterpret_cast<const unsigned int*>(row.repetition_offsets),
         reinterpret_cast<const float*>(row.repetition_penalty), row.repetition_capacity,
         reinterpret_cast<int*>(row.output));
+}
+
+
+
+// BF16 keeps the same token selection, mask and repetition semantics.
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_bf16(
+    const __nv_bfloat16* __restrict__ logits,
+    __nv_bfloat16* __restrict__ scratch,
+    int n,
+    const signed char* __restrict__ valid,
+    int mask_len,
+    const unsigned int* __restrict__ repetition_offsets,
+    const unsigned int* __restrict__ repetition_token_ids,
+    const float* __restrict__ repetition_penalty,
+    int repetition_capacity,
+    int* __restrict__ out_idx
+) {
+    vnext_masked_argmax_preserving_logits(logits, scratch, n, valid, mask_len,
+        repetition_offsets, repetition_token_ids, repetition_penalty, repetition_capacity, out_idx);
+}
+
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_bf16_partitioned(
+    const __nv_bfloat16* __restrict__ logits, __nv_bfloat16* __restrict__ scratch, int n,
+    const signed char* __restrict__ valid, int mask_len,
+    const unsigned int* __restrict__ repetition_offsets,
+    const unsigned int* __restrict__ repetition_token_ids,
+    const float* __restrict__ repetition_penalty, int repetition_capacity,
+    int* __restrict__ out_idx
+) {
+    vnext_masked_argmax_preserving_logits<__nv_bfloat16, true>(logits, scratch, n, valid, mask_len,
+        repetition_offsets, repetition_token_ids, repetition_penalty, repetition_capacity, out_idx);
+}
+
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_bf16_batched(
+    const VNEXT_ARGMAX_GRID_CONSTANT VNextArgmaxBatch batch, unsigned int row_count
+) {
+    if (blockIdx.y < row_count) {
+        vnext_masked_argmax_batched_row<__nv_bfloat16>(batch.rows[blockIdx.y]);
+    }
 }
 
 #undef VNEXT_ARGMAX_GRID_CONSTANT

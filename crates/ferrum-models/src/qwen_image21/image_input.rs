@@ -12,6 +12,7 @@ mod resize;
 
 pub use png::png_dimensions_hint;
 pub use preprocess::{QwenImage21ConditionInputs, QwenImage21ImageProcessor};
+pub use resize::ImageLanczosResizePlan;
 
 use ferrum_runtime::{HostMemoryAccount, HostMemoryClass, HostMemoryError, ManagedHostBytes};
 use thiserror::Error;
@@ -48,7 +49,7 @@ pub struct ImageInputLimits {
 }
 
 impl Default for ImageInputLimits {
-    /// Initial single-image ingress preset: 17 MiB encoded PNG, 24 million
+    /// Single-image ingress preset: 33 MiB encoded PNG, 24 million
     /// decoded pixels, at most 8192 pixels per axis, and a 64 MiB best-effort
     /// PNG codec workspace limit. These are caps, not reserved Host payload.
     fn default() -> Self {
@@ -63,9 +64,10 @@ impl Default for ImageInputLimits {
 }
 
 impl ImageInputLimits {
-    /// Includes PNG framing above the 16 MiB RGBA payload of a 2048² image.
+    /// Includes PNG framing above the RGBA payload of a 2912² image, so an
+    /// ordinary 8MP output can be submitted as a subsequent edit input.
     /// This is an ingress cap; every retained backing still needs Host admission.
-    pub const DEFAULT_MAXIMUM_ENCODED_BYTES: usize = 17 * 1024 * 1024;
+    pub const DEFAULT_MAXIMUM_ENCODED_BYTES: usize = 33 * 1024 * 1024;
 
     pub fn new(
         maximum_encoded_bytes: usize,
@@ -132,6 +134,8 @@ impl ImageInputLimits {
 
 /// Immutable HWC RGBA8 owner. Original RGB is distinguished from original
 /// RGBA because Pillow resampling premultiplies alpha only for the latter.
+/// An explicit ignore-alpha RGB resize may also retain a shallow RGB view of
+/// an original RGBA owner; its unused alpha bytes need not be rewritten.
 #[derive(Debug, Clone)]
 pub struct ManagedRgba8Image {
     bytes: ManagedHostBytes,

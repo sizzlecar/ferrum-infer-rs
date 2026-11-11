@@ -63,8 +63,8 @@ fn prefix_command_preflight_uses_selected_programs_and_all_state_copies() {
             assert!(validate_prefix_command_limit(&prefill, usize::MAX, usize::MAX).is_err());
         }
     }
-    assert_eq!(pipeline.runtime.snapshot().uploaded_bytes, 0);
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().uploaded_bytes, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn prefix_command_preflight_preserves_native_weight_encodings() {
             .flat_map(|b| &b.nodes)
             .any(|node| node.operation_id.as_str() == DENSE_LINEAR_BLOCK_BF16_OPERATION_ID));
     }
-    assert_eq!(pipeline.runtime.snapshot().uploaded_bytes, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().uploaded_bytes, 0);
 }
 
 #[test]
@@ -205,41 +205,41 @@ fn prefix_handoff_counts_two_caches_and_one_weight_installation_before_execution
             },
         },
     ] {
-        pipeline.config.residency = policy;
-        pipeline.config.device_capacity_bytes = transition - 1;
+        pipeline.execution.config.residency = policy;
+        pipeline.execution.config.device_capacity_bytes = transition - 1;
         assert!(pipeline
             .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)),)
             .is_err());
-        pipeline.config.device_capacity_bytes = transition;
+        pipeline.execution.config.device_capacity_bytes = transition;
         pipeline
             .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
             .unwrap();
     }
     // The remaining tests exercise the original all-component idle allowances;
     // do not let the selected subset above silently change those contracts.
-    pipeline.config.residency = ImageResidencyPolicy::AllModelComponents;
+    pipeline.execution.config.residency = ImageResidencyPolicy::AllModelComponents;
     let decoder_retention = 4096;
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainDecoder {
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainDecoder {
         maximum_bytes: decoder_retention,
     };
-    pipeline.config.device_capacity_bytes = transition + decoder_retention - 1;
+    pipeline.execution.config.device_capacity_bytes = transition + decoder_retention - 1;
     assert!(pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .is_err());
-    pipeline.config.device_capacity_bytes = transition + decoder_retention;
+    pipeline.execution.config.device_capacity_bytes = transition + decoder_retention;
     pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .unwrap();
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainSmallStages {
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainSmallStages {
         maximum_bytes_per_stage: decoder_retention,
     };
     // Five retained-stage allowances, with the one shared Denoiser slot excluded
     // for both cooperating plans throughout the two-cache handoff.
-    pipeline.config.device_capacity_bytes = transition + 4 * decoder_retention - 1;
+    pipeline.execution.config.device_capacity_bytes = transition + 4 * decoder_retention - 1;
     assert!(pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .is_err());
-    pipeline.config.device_capacity_bytes = transition + 4 * decoder_retention;
+    pipeline.execution.config.device_capacity_bytes = transition + 4 * decoder_retention;
     pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .unwrap();
@@ -249,49 +249,49 @@ fn prefix_handoff_counts_two_caches_and_one_weight_installation_before_execution
         decoder: std::num::NonZeroU64::new(4096),
         ..ImageStageRetentionBudgets::default()
     };
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
         maximum_bytes_by_stage: stage_budgets,
     };
     // The two-cache handoff coexists with every selected other stage's pool;
     // unselected Denoiser/VAE-encoder slots add no speculative allowance.
     let retained_other = 2048 + 3072 + 4096;
-    pipeline.config.device_capacity_bytes = transition + retained_other - 1;
+    pipeline.execution.config.device_capacity_bytes = transition + retained_other - 1;
     assert!(pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .is_err());
-    pipeline.config.device_capacity_bytes = transition + retained_other;
+    pipeline.execution.config.device_capacity_bytes = transition + retained_other;
     pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .unwrap();
-    pipeline.config.residency = ImageResidencyPolicy::AllStages;
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
+    pipeline.execution.config.residency = ImageResidencyPolicy::AllStages;
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::RetainStageBudgets {
         maximum_bytes_by_stage: ImageStageRetentionBudgets {
             noise: std::num::NonZeroU64::new(1024),
             ..stage_budgets
         },
     };
-    pipeline.config.device_capacity_bytes = transition + retained_other + 1024 - 1;
+    pipeline.execution.config.device_capacity_bytes = transition + retained_other + 1024 - 1;
     assert!(pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .is_err());
-    pipeline.config.device_capacity_bytes = transition + retained_other + 1024;
+    pipeline.execution.config.device_capacity_bytes = transition + retained_other + 1024;
     pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .unwrap();
     // Native declarations occupy the same total ceiling, even with a cold
     // handoff. Do not discount either cache or charge opaque storage twice.
-    pipeline.config.residency = ImageResidencyPolicy::Cold;
-    pipeline.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
+    pipeline.execution.config.residency = ImageResidencyPolicy::Cold;
+    pipeline.execution.config.dynamic_residency = ImageDynamicResidencyPolicy::Release;
     let opaque = 4096;
-    pipeline.device_opaque_allowance_bytes = opaque;
-    pipeline.config.device_capacity_bytes = transition + opaque - 1;
+    pipeline.execution.device_opaque_allowance_bytes = opaque;
+    pipeline.execution.config.device_capacity_bytes = transition + opaque - 1;
     assert!(pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .is_err());
-    pipeline.config.device_capacity_bytes = transition + opaque;
+    pipeline.execution.config.device_capacity_bytes = transition + opaque;
     pipeline
         .validate_capacity_with_prefix(&[&prefill, &decode], Some((&prefill, &decode)))
         .unwrap();
-    assert_eq!(pipeline.runtime.snapshot().uploaded_bytes, 0);
-    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().uploaded_bytes, 0);
+    assert_eq!(pipeline.execution.runtime.snapshot().live_allocations, 0);
 }

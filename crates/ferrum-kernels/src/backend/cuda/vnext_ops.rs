@@ -60,12 +60,27 @@ use super::vnext_runtime::{
 };
 
 #[cfg(test)]
+mod dense_small_m_tests;
+#[cfg(test)]
 mod last_token_linear_tests;
 mod native_blocks;
 mod native_io;
 mod q6_head;
 pub use q6_head::CudaQ6MmqF32LastTokenProvider;
+mod concat_columns_f16;
+mod dense_f16_causal;
 mod selection;
+mod tail_two_greedy;
+pub use dense_f16_causal::{
+    cuda_tensor_and_dense_bf16_causal_runtime_config,
+    cuda_tensor_and_dense_bf16_visual_causal_runtime_config,
+    cuda_tensor_and_dense_f16_causal_runtime_config,
+    cuda_tensor_and_dense_f16_visual_causal_runtime_config, cuda_vnext_dense_bf16_causal_contracts,
+    cuda_vnext_dense_bf16_causal_providers, cuda_vnext_dense_bf16_visual_causal_contracts,
+    cuda_vnext_dense_bf16_visual_causal_providers, cuda_vnext_dense_f16_causal_contracts,
+    cuda_vnext_dense_f16_causal_providers, cuda_vnext_dense_f16_visual_causal_contracts,
+    cuda_vnext_dense_f16_visual_causal_providers,
+};
 mod tensor_dense_bf16;
 mod tensor_dense_fp8_bf16;
 mod tensor_storage;
@@ -93,43 +108,81 @@ use selection::{
     ARGMAX_BATCH_ROWS,
 };
 pub use tensor_dense_bf16::{
+    F32_AFFINE_NUMERICAL_PROFILE_ID as CUDA_AFFINE_LINEAR_F32_NUMERICAL_PROFILE_ID,
+    F32_AFFINE_NUMERICAL_PROFILE_IDENTITY as CUDA_AFFINE_LINEAR_F32_NUMERICAL_PROFILE_IDENTITY,
+    F32_AFFINE_ROW_BIAS_NUMERICAL_PROFILE_ID as CUDA_AFFINE_LINEAR_F32_ROW_BIAS_NUMERICAL_PROFILE_ID,
+    F32_NUMERICAL_PROFILE_ID as CUDA_DENSE_F32_NUMERICAL_PROFILE_ID,
+    F32_NUMERICAL_PROFILE_IDENTITY as CUDA_DENSE_F32_NUMERICAL_PROFILE_IDENTITY,
+    F32_PATCH_ROW_BIAS_NUMERICAL_PROFILE_ID as CUDA_PATCH_PROJECTION_F32_ROW_BIAS_NUMERICAL_PROFILE_ID,
+    F32_ROW_BIAS_NUMERICAL_PROFILE_IDENTITY as CUDA_F32_ROW_BIAS_NUMERICAL_PROFILE_IDENTITY,
     NUMERICAL_PROFILE_ID as CUDA_DENSE_BF16_NUMERICAL_PROFILE_ID,
     NUMERICAL_PROFILE_IDENTITY as CUDA_DENSE_BF16_NUMERICAL_PROFILE_IDENTITY,
 };
 pub use tensor_silu::{
-    tensor_primitive_profile as cuda_tensor_primitive_bf16_profile, CudaPhiloxDeviceGeometry,
-    CudaPhiloxLaunchGeometry, CudaTensorOperation,
+    channelwise_f32_numerical_profile, cnn_f32_numerical_profile, cuda_vnext_cnn_f32_providers,
+    cuda_vnext_cnn_f32_providers_with_fused_f32, cuda_vnext_cnn_f32_providers_with_native_options,
+    cuda_vnext_cnn_f32_providers_with_segmented_sdpa,
+    tensor_primitive_profile as cuda_tensor_primitive_bf16_profile, CudaConvRotFusedOutputConfig,
+    CudaCutlassFusedF32Config, CudaPhiloxDeviceGeometry, CudaPhiloxLaunchGeometry,
+    CudaTensorOperation, ADDCMUL_NUMERICAL_PROFILE_ID as CUDA_ADDCMUL_BF16_NUMERICAL_PROFILE_ID,
     ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
     ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
     BATCHED_ROW_CONCAT_PROFILE_ID as CUDA_BATCHED_ROW_CONCAT_BF16_NUMERICAL_PROFILE_ID,
+    BATCHED_SUFFIX_APPEND_F32_PROFILE_ID as CUDA_BATCHED_SUFFIX_APPEND_F32_NUMERICAL_PROFILE_ID,
     BUNDLE_NUMERICAL_IDENTITY as CUDA_POINTWISE_BF16_NUMERICAL_PROFILE_IDENTITY,
+    CAST_F32_TO_BF16_NUMERICAL_PROFILE_ID as CUDA_CAST_F32_TO_BF16_NUMERICAL_PROFILE_ID,
     CHANNEL_L2_IMAGE_PROFILE_ID as CUDA_CHANNEL_L2_NORM_IMAGE_BF16_NUMERICAL_PROFILE_ID,
     CHANNEL_L2_PROFILE_ID as CUDA_CHANNEL_L2_NORM_BF16_NUMERICAL_PROFILE_ID,
+    COMFY_CONVROT_INT8_EMBEDDING_F32_NUMERICAL_PROFILE_ID as CUDA_COMFY_CONVROT_INT8_EMBEDDING_F32_NUMERICAL_PROFILE_ID,
+    COMFY_CONVROT_SWIGLU_F32_W4A8_PROFILE_ID as CUDA_COMFY_CONVROT_SWIGLU_F32_W4A8_NUMERICAL_PROFILE_ID,
+    COMFY_CONVROT_SWIGLU_F32_W8A8_PROFILE_ID as CUDA_COMFY_CONVROT_SWIGLU_F32_W8A8_NUMERICAL_PROFILE_ID,
+    COMFY_CONVROT_W4A8_F32_PROFILE_ID as CUDA_COMFY_CONVROT_W4A8_F32_NUMERICAL_PROFILE_ID,
+    COMFY_CONVROT_W4A8_PROFILE_ID as CUDA_COMFY_CONVROT_W4A8_NUMERICAL_PROFILE_ID,
+    COMFY_CONVROT_W8A8_F32_PROFILE_ID as CUDA_COMFY_CONVROT_W8A8_F32_NUMERICAL_PROFILE_ID,
+    COMFY_CONVROT_W8A8_PROFILE_ID as CUDA_COMFY_CONVROT_W8A8_NUMERICAL_PROFILE_ID,
     CONV2D_PROFILE_ID as CUDA_CONV2D_BF16_NUMERICAL_PROFILE_ID,
     CROSS_ATTENTION_FUSED_PROFILE_ID as CUDA_CROSS_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_ID,
     CUDNN_SEGMENTED_ATTENTION_PROFILE_ID as CUDA_CUDNN_SEGMENTED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
     FUSED_ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_IDENTITY,
     FUSED_ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_ID,
+    FUSED_HEAD_RMS_PARTIAL_ROPE_NUMERICAL_PROFILE_ID as CUDA_FUSED_HEAD_RMS_PARTIAL_ROPE_BF16_NUMERICAL_PROFILE_ID,
     GATED_RESIDUAL_NUMERICAL_PROFILE_ID as CUDA_GATED_RESIDUAL_BF16_NUMERICAL_PROFILE_ID,
+    GELU_ERF_F32_PROFILE_ID as CUDA_GELU_ERF_F32_NUMERICAL_PROFILE_ID,
+    GELU_TANH_F32_PROFILE_ID as CUDA_GELU_TANH_F32_NUMERICAL_PROFILE_ID,
     GELU_TANH_PROFILE_ID as CUDA_GELU_TANH_BF16_NUMERICAL_PROFILE_ID,
     GQA_NUMERICAL_IDENTITY as CUDA_STRUCTURED_GQA_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
     GQA_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_GQA_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
+    HALF_SPLIT_ROPE_F32_PROFILE_ID as CUDA_HALF_SPLIT_ROPE_F32_NUMERICAL_PROFILE_ID,
     HALF_SPLIT_ROPE_NUMERICAL_IDENTITY as CUDA_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_IDENTITY,
     HALF_SPLIT_ROPE_NUMERICAL_PROFILE_ID as CUDA_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_ID,
+    HEAD_RMS_NORM_F32_PROFILE_ID as CUDA_HEAD_RMS_NORM_F32_NUMERICAL_PROFILE_ID,
     HEAD_RMS_NORM_PROFILE_ID as CUDA_HEAD_RMS_NORM_BF16_NUMERICAL_PROFILE_ID,
+    LAYER_NORM_F32_PROFILE_ID as CUDA_LAYER_NORM_F32_NUMERICAL_PROFILE_ID,
     LAYER_NORM_PROFILE_ID as CUDA_LAYER_NORM_BF16_NUMERICAL_PROFILE_ID,
     MODULATION_NUMERICAL_PROFILE_ID as CUDA_MODULATION_SCALE_BF16_NUMERICAL_PROFILE_ID,
     NORM_NUMERICAL_IDENTITY as CUDA_NORMALIZATION_BF16_NUMERICAL_PROFILE_IDENTITY,
     NUMERICAL_PROFILE_ID as CUDA_SILU_BF16_NUMERICAL_PROFILE_ID,
     NUMERICAL_PROFILE_IDENTITY as CUDA_SILU_BF16_NUMERICAL_PROFILE_IDENTITY,
+    PARTIAL_HALF_SPLIT_ROPE_NUMERICAL_PROFILE_ID as CUDA_PARTIAL_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_ID,
     PHILOX_BUILD_IDENTITY_SHA256 as CUDA_PHILOX_BUILD_IDENTITY_SHA256,
+    PHILOX_NORMAL_F32_IDENTITY as CUDA_PHILOX_NORMAL_F32_NUMERICAL_PROFILE_IDENTITY,
+    PHILOX_NORMAL_F32_PROFILE_ID as CUDA_PHILOX_NORMAL_F32_NUMERICAL_PROFILE_ID,
     PHILOX_NORMAL_IDENTITY as CUDA_PHILOX_NORMAL_BF16_NUMERICAL_PROFILE_IDENTITY,
     PHILOX_NORMAL_PROFILE_ID as CUDA_PHILOX_NORMAL_BF16_NUMERICAL_PROFILE_ID,
+    PLAIN_RESIDUAL_ADD_F32_PROFILE_ID as CUDA_PLAIN_RESIDUAL_ADD_F32_NUMERICAL_PROFILE_ID,
     PLAIN_RESIDUAL_ADD_NUMERICAL_PROFILE_ID as CUDA_PLAIN_RESIDUAL_ADD_BF16_NUMERICAL_PROFILE_ID,
+    RESHAPE_COPY_F32_PROFILE_ID as CUDA_RESHAPE_COPY_F32_NUMERICAL_PROFILE_ID,
     RESIDUAL_ADD_NCHW_PROFILE_ID as CUDA_PLAIN_RESIDUAL_ADD_NCHW_BF16_NUMERICAL_PROFILE_ID,
     ROPE_NUMERICAL_IDENTITY as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_IDENTITY,
     ROPE_NUMERICAL_PROFILE_ID as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_ID,
     ROW_GATHER_PROFILE_ID as CUDA_ROW_GATHER_BF16_NUMERICAL_PROFILE_ID,
+    ROW_RMS_SINGLE_ROUND_NUMERICAL_PROFILE_ID as CUDA_ROW_RMS_NORM_SINGLE_ROUND_BF16_NUMERICAL_PROFILE_ID,
+    ROW_SCATTER_ADD_F32_PROFILE_ID as CUDA_ROW_SCATTER_ADD_F32_NUMERICAL_PROFILE_ID,
+    ROW_SCATTER_REPLACE_F32_PROFILE_ID as CUDA_ROW_SCATTER_REPLACE_F32_NUMERICAL_PROFILE_ID,
+    ROW_SELECTED_ADDCMUL_BF16_PROFILE_ID as CUDA_ROW_SELECTED_ADDCMUL_BF16_NUMERICAL_PROFILE_ID,
+    ROW_SELECTED_MODULATION_BF16_F32_PROFILE_ID as CUDA_ROW_SELECTED_MODULATION_BF16_F32_NUMERICAL_PROFILE_ID,
+    ROW_SELECTED_MODULATION_BF16_PROFILE_ID as CUDA_ROW_SELECTED_MODULATION_BF16_NUMERICAL_PROFILE_ID,
+    SILU_MUL_F32_PROFILE_ID as CUDA_SILU_MUL_F32_NUMERICAL_PROFILE_ID,
     SILU_MUL_NUMERICAL_PROFILE_ID as CUDA_SILU_MUL_BF16_NUMERICAL_PROFILE_ID,
     SILU_NCHW_PROFILE_ID as CUDA_SILU_NCHW_BF16_NUMERICAL_PROFILE_ID,
     SPATIAL_ATTENTION_PROFILE_ID as CUDA_SPATIAL_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
@@ -138,6 +191,7 @@ pub use tensor_silu::{
     TANH_NUMERICAL_PROFILE_ID as CUDA_TANH_BF16_NUMERICAL_PROFILE_ID,
     TEXT_PROJECTION_NUMERICAL_IDENTITY as CUDA_TEXT_PROJECTION_BF16_NUMERICAL_PROFILE_IDENTITY,
     TRANSPORT_NUMERICAL_IDENTITY as CUDA_TRANSPORT_BF16_NUMERICAL_PROFILE_IDENTITY,
+    UNIT_HEAD_RMS_PARTIAL_ROPE_F32_PROFILE_ID as CUDA_UNIT_HEAD_RMS_PARTIAL_ROPE_F32_NUMERICAL_PROFILE_ID,
     ZERO_CENTERED_RMS_NORM_PROFILE_ID as CUDA_ZERO_CENTERED_RMS_NORM_BF16_NUMERICAL_PROFILE_ID,
 };
 
@@ -223,6 +277,7 @@ pub fn cuda_vnext_runtime_config(
     let q6_head_fingerprint = q6_head::fingerprint();
     let fingerprint_parts: Vec<&[u8]> = vec![
         include_str!("vnext_runtime.rs").as_bytes(),
+        include_bytes!("vnext_runtime/blas.rs"),
         q6_head_fingerprint.as_bytes(),
         include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
         include_str!("vnext_runtime/binding_scatter.rs").as_bytes(),
@@ -388,11 +443,45 @@ pub fn cuda_tensor_runtime_config(
     config.capabilities = BTreeSet::from([
         CapabilityId::new(ferrum_runtime::SILU_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::PHILOX_NORMAL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PHILOX_NORMAL_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::SILU_MUL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::TANH_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::MODULATION_SCALE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::GATED_RESIDUAL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::DENSE_LINEAR_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::AFFINE_LINEAR_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CAST_F32_TO_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SILU_MUL_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GELU_TANH_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GELU_ERF_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PATCH_PROJECTION_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::RESHAPE_COPY_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SCATTER_REPLACE_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SCATTER_ADD_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::COMFY_CONVROT_W4A8_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::COMFY_CONVROT_W8A8_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::COMFY_CONVROT_W4A8_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::COMFY_CONVROT_W8A8_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::COMFY_CONVROT_INT8_EMBEDDING_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::HEAD_RMS_NORM_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::HALF_SPLIT_ROPE_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::UNIT_HEAD_RMS_PARTIAL_ROPE_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GROUPED_COLUMN_SLICE_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CHANNEL_BIAS_ADD_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CHANNEL_SCALED_RESIDUAL_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::NAN_TO_NUM_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SELECTED_MODULATION_BF16_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SELECTED_MODULATION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SELECTED_ADDCMUL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::BATCHED_SUFFIX_APPEND_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::LAYER_NORM_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CONV2D_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GROUP_NORM_SILU_NCHW_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_NCHW_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::COMFY_CONVROT_SWIGLU_F32_W4A8_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::COMFY_CONVROT_SWIGLU_F32_W8A8_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::DENSE_LINEAR_BLOCK_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::LAYER_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
@@ -406,7 +495,12 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::HALF_SPLIT_ROPE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PARTIAL_HALF_SPLIT_ROPE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::FUSED_HEAD_RMS_PARTIAL_ROPE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_RMS_NORM_SINGLE_ROUND_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ADDCMUL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::STRUCTURED_GQA_ATTENTION_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::CONV2D_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::CHANNEL_L2_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::CHANNEL_L2_NORM_IMAGE_BF16_CAPABILITY_ID)?,
@@ -429,6 +523,41 @@ pub fn cuda_tensor_runtime_config(
         DynamicStorageView::Contiguous,
     )?]);
     Ok(config)
+}
+
+/// Add the separate fused F32 contract only when its locked native artifact is
+/// present. This composes with the caller's existing tensor/causal configuration;
+/// actual module allowance is admitted by the explicit provider factory.
+pub fn cuda_tensor_runtime_config_enable_cutlass_fused_f32(
+    config: &mut CudaDeviceRuntimeConfig,
+) -> Result<(), VNextError> {
+    let native = tensor_silu::fused_f32_source_fingerprint()
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+    config.capabilities.insert(CapabilityId::new(
+        ferrum_runtime::STRUCTURED_GQA_ATTENTION_FUSED_F32_CAPABILITY_ID,
+    )?);
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        native.as_bytes(),
+    ]);
+    Ok(())
+}
+
+/// Enable ConvRot's separately locked fused INT8 output implementation. The
+/// operation contracts and numerical profiles remain unchanged.
+pub fn cuda_tensor_runtime_config_enable_cutlass_int8_fused_output(
+    config: &mut CudaDeviceRuntimeConfig,
+) -> Result<(), VNextError> {
+    let native = tensor_silu::fused_output_source_fingerprint()
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+    config.capabilities.insert(CapabilityId::new(
+        crate::native_ops::cutlass_int8_fused_output::CAPABILITY_ID,
+    )?);
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        native.as_bytes(),
+    ]);
+    Ok(())
 }
 
 /// Explicit opt-in to the independently locked SM120 FP8 native artifact.
@@ -523,6 +652,19 @@ pub fn cuda_vnext_philox_normal_bf16_provider(
     providers
         .pop()
         .ok_or_else(|| CudaDeviceRuntimeError::contract("Philox selection produced no provider"))
+}
+
+/// Direct F32 native cuRAND normal provider. No BF16 intermediate or Torch CPU
+/// seed-stream promise. Select `PhiloxNormalF32` with other tensor operations
+/// to share the single admitted module owner.
+pub fn cuda_vnext_philox_normal_f32_provider(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    let mut providers =
+        cuda_vnext_tensor_providers(runtime, &[CudaTensorOperation::PhiloxNormalF32])?;
+    providers.pop().ok_or_else(|| {
+        CudaDeviceRuntimeError::contract("F32 Philox selection produced no provider")
+    })
 }
 
 /// Assemble an explicitly selected subset from one shared native module and
@@ -646,6 +788,38 @@ pub fn cuda_vnext_dense_bf16_provider(
         tensor_dense_bf16::CudaTensorDenseBf16Provider::new(runtime)?,
     ))
 }
+
+/// Fixed-row F32 SGEMM using PEDANTIC_MATH, a lane-owned handle, and zero
+/// user workspace. No TF32/16-bit operand substitution or implicit fallback.
+pub fn cuda_vnext_dense_f32_provider(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(
+        tensor_dense_bf16::CudaTensorDenseBf16Provider::new_f32(runtime)?,
+    ))
+}
+
+/// Complete pedantic F32 SGEMM, then F32 bias via per-row SAXPY(alpha=1).
+/// Uses the existing lane handle and no module, workspace or broadcast buffer.
+pub fn cuda_vnext_affine_linear_f32_provider(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(
+        tensor_dense_bf16::CudaTensorDenseBf16Provider::new_affine_f32(runtime)?,
+    ))
+}
+
+/// Original contiguous rank-five O,C,T,H,W patch weight, flattened only by
+/// its checked native geometry. Uses the same lane-owned pedantic SGEMM and
+/// subsequent F32 bias boundary; no BF16 Conv3d result is introduced.
+pub fn cuda_vnext_patch_projection_f32_provider(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(
+        tensor_dense_bf16::CudaTensorDenseBf16Provider::new_patch_f32(runtime)?,
+    ))
+}
+pub use tensor_dense_bf16::F32_PATCH_NUMERICAL_PROFILE_ID as CUDA_PATCH_PROJECTION_F32_NUMERICAL_PROFILE_ID;
 
 /// Loaded cuBLAS version for validation provenance. NVIDIA supports this
 /// query with a null handle; it creates no extra cuBLAS handle or workspace.
@@ -1069,6 +1243,8 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
         LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
         LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
+        ferrum_runtime::TAIL_TWO_GREEDY_F16_CAPABILITY_ID,
+        ferrum_runtime::CONCAT_COLUMNS_F16_CAPABILITY_ID,
         LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
         RMS_NORM_F16_CAPABILITY_ID,
         RMS_NORM_F32_TO_F16_CAPABILITY_ID,
@@ -1086,6 +1262,8 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         RESIDUAL_ADD_F32_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
+        ferrum_runtime::GATED_DELTA_CANDIDATE_SCAN_F16_CAPABILITY_ID,
+        ferrum_runtime::GATED_DELTA_CANDIDATE_SCAN_F32_MASTER_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
@@ -1332,6 +1510,8 @@ fn cuda_operation_contracts(
         Box::new(last_token_dense_linear_contract().map_err(contract_error)?),
         Box::new(last_token_dense_linear_f32_contract().map_err(contract_error)?),
         Box::new(last_token_masked_argmax_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::tail_two_greedy_f16_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::concat_columns_f16_contract().map_err(contract_error)?),
         Box::new(last_token_masked_argmax_f32_contract().map_err(contract_error)?),
         Box::new(rms_norm_contract().map_err(contract_error)?),
         Box::new(rms_norm_f32_to_f16_contract().map_err(contract_error)?),
@@ -1346,6 +1526,8 @@ fn cuda_operation_contracts(
         Box::new(residual_add_contract().map_err(contract_error)?),
         Box::new(residual_add_f32_f16_contract().map_err(contract_error)?),
         Box::new(gated_delta_recurrent_attention_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::gated_delta_candidate_scan_f16_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::gated_delta_candidate_scan_f32_master_contract().map_err(contract_error)?),
         Box::new(gated_delta_recurrent_attention_f32_master_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_f32_master_contract().map_err(contract_error)?),
@@ -1387,6 +1569,7 @@ fn cuda_operation_contracts(
 pub fn cuda_vnext_operation_registry(
     runtime: &CudaDeviceRuntime,
 ) -> Result<OperationRuntimeRegistry<CudaDeviceRuntime>, CudaDeviceRuntimeError> {
+    dense_f16_causal::reject_legacy_bounded_provider(runtime)?;
     let mut contracts = cuda_operation_contracts(runtime.attention_execution_policy())?;
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
@@ -1394,6 +1577,8 @@ pub fn cuda_vnext_operation_registry(
         Box::new(CudaLastTokenDenseLinearProvider::new(runtime)?),
         Box::new(CudaLastTokenDenseLinearProvider::new_f32(runtime)?),
         Box::new(CudaLastTokenMaskedArgmaxProvider::new(runtime)?),
+        Box::new(tail_two_greedy::CudaTailTwoGreedyProvider::new(runtime)?),
+        Box::new(concat_columns_f16::CudaConcatColumnsProvider::new(runtime)?),
         Box::new(CudaLastTokenMaskedArgmaxProvider::new_f32(runtime)?),
         Box::new(transformer::CudaRmsNormProvider::new(runtime)?),
         Box::new(transformer::CudaRmsNormProvider::new_f32_to_f16(runtime)?),
@@ -1411,6 +1596,8 @@ pub fn cuda_vnext_operation_registry(
             runtime,
         )?),
         Box::new(transformer::CudaGatedDeltaRecurrentAttentionProvider::new_f32_master(runtime)?),
+        Box::new(transformer::CudaGatedDeltaRecurrentAttentionProvider::new_candidate(runtime, false, false)?),
+        Box::new(transformer::CudaGatedDeltaRecurrentAttentionProvider::new_candidate(runtime, true, false)?),
         Box::new(transformer::CudaCausalPagedAttentionProvider::new(
             runtime,
             runtime.attention_execution_policy(),
@@ -1883,6 +2070,7 @@ impl CudaVNextComposition {
             implementation_fingerprint(&[
                 include_str!("vnext_ops.rs").as_bytes(),
                 include_str!("vnext_runtime.rs").as_bytes(),
+                include_bytes!("vnext_runtime/blas.rs"),
                 q6_head::fingerprint().as_bytes(),
                 include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
                 include_str!("vnext_runtime/segment_oracle.rs").as_bytes(),
@@ -2601,10 +2789,12 @@ pub struct CudaTokenEmbeddingProvider {
 
 impl CudaTokenEmbeddingProvider {
     pub fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        dense_f16_causal::reject_legacy_bounded_provider(runtime)?;
         Self::with_precision(runtime, TokenPrecision::F16)
     }
 
     pub fn new_f32(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        dense_f16_causal::reject_legacy_bounded_provider(runtime)?;
         Self::with_precision(runtime, TokenPrecision::F32)
     }
 
@@ -2619,6 +2809,12 @@ impl CudaTokenEmbeddingProvider {
                 TOKEN_EMBEDDING_F16_CAPABILITY_ID,
                 TOKEN_EMBEDDING_ESTIMATOR_ID,
             ),
+            TokenPrecision::Bf16 => (
+                ferrum_runtime::token_embedding_bf16_contract(),
+                "provider.cuda.token_embedding.bf16",
+                ferrum_runtime::TOKEN_EMBEDDING_BF16_CAPABILITY_ID,
+                "resource-estimator.cuda.token_embedding.bf16",
+            ),
             TokenPrecision::F32 => (
                 token_embedding_f32_master_contract(),
                 "provider.cuda.token_embedding.f32-master",
@@ -2630,22 +2826,30 @@ impl CudaTokenEmbeddingProvider {
         // Lookup reads immutable weights and the exact immediate token IDs;
         // it has no sequence state or partition-dependent accumulation. Its
         // completed output can accompany either KV state's retained prefix.
-        let descriptor =
-            native_io::descriptor(runtime, &contract, provider, capability, estimator)?
-                .with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
-                    ProviderCheckpointContract::new(
-                        CheckpointInputDependency::ExactTokenPrefix,
-                        CheckpointBoundaryConstraint::any_positive(),
-                        CheckpointPartitionNumerics::CapturedExecutionContinuation,
-                    )
-                    .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
-                ));
+        let descriptor = native_io::descriptor(
+            runtime, &contract, provider, capability, estimator, precision,
+        )?
+        .with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
+            ProviderCheckpointContract::new(
+                CheckpointInputDependency::ExactTokenPrefix,
+                CheckpointBoundaryConstraint::any_positive(),
+                CheckpointPartitionNumerics::CapturedExecutionContinuation,
+            )
+            .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
+        ));
+        let descriptor = descriptor.with_candidate_state_effects(
+            ferrum_runtime::ProviderCandidateStateEffects::PrefixCausal { ports: Vec::new() },
+        );
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::EMBEDDING_LOOKUP.to_owned()))
             .map_err(|error| CudaDeviceRuntimeError::driver("embedding module load", error))?;
         let function = module
-            .load_function(EMBEDDING_FUNCTION_NAME)
+            .load_function(if precision == TokenPrecision::Bf16 {
+                "vnext_embedding_lookup_bf16"
+            } else {
+                EMBEDDING_FUNCTION_NAME
+            })
             .map_err(|error| CudaDeviceRuntimeError::driver("embedding function load", error))?;
         Ok(Self {
             descriptor,
@@ -2701,21 +2905,23 @@ impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        let encoded =
-            if self.precision == TokenPrecision::F32 || native_io::requires_native(&invocation) {
-                native_io::encode_embedding(
-                    self.descriptor.provider_implementation_fingerprint(),
-                    &self.native,
-                    self.precision,
-                    invocation,
-                )
-            } else {
-                encode_token_embedding(
-                    &self.function,
-                    self.descriptor.provider_implementation_fingerprint(),
-                    invocation,
-                )
-            };
+        let encoded = if self.precision != TokenPrecision::Bf16
+            && (self.precision == TokenPrecision::F32 || native_io::requires_native(&invocation))
+        {
+            native_io::encode_embedding(
+                self.descriptor.provider_implementation_fingerprint(),
+                &self.native,
+                self.precision,
+                invocation,
+            )
+        } else {
+            encode_token_embedding(
+                &self.function,
+                self.descriptor.provider_implementation_fingerprint(),
+                self.precision,
+                invocation,
+            )
+        };
         encoded
             .map(EncodedDeviceOperation::compute)
             .map_err(|message| provider_failure(identity, "cuda.token_embedding.encode", message))
@@ -2730,10 +2936,12 @@ pub struct CudaLastTokenDenseLinearProvider {
 
 impl CudaLastTokenDenseLinearProvider {
     pub fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        dense_f16_causal::reject_legacy_bounded_provider(runtime)?;
         Self::with_precision(runtime, TokenPrecision::F16)
     }
 
     pub fn new_f32(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        dense_f16_causal::reject_legacy_bounded_provider(runtime)?;
         Self::with_precision(runtime, TokenPrecision::F32)
     }
 
@@ -2748,6 +2956,12 @@ impl CudaLastTokenDenseLinearProvider {
                 LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
                 LAST_TOKEN_DENSE_LINEAR_ESTIMATOR_ID,
             ),
+            TokenPrecision::Bf16 => (
+                ferrum_runtime::last_token_dense_linear_bf16_contract(),
+                "provider.cuda.last_token_dense_linear.bf16.cublas",
+                ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_BF16_CAPABILITY_ID,
+                "resource-estimator.cuda.last_token_dense_linear.bf16.cublas",
+            ),
             TokenPrecision::F32 => (
                 last_token_dense_linear_f32_contract(),
                 "provider.cuda.last_token_dense_linear.f32.native",
@@ -2756,8 +2970,9 @@ impl CudaLastTokenDenseLinearProvider {
             ),
         };
         let contract = contract.map_err(contract_error)?;
-        let descriptor =
-            native_io::descriptor(runtime, &contract, provider, capability, estimator)?;
+        let descriptor = native_io::descriptor(
+            runtime, &contract, provider, capability, estimator, precision,
+        )?;
         Ok(Self {
             descriptor,
             native: native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
@@ -2820,20 +3035,22 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        let encoded =
-            if self.precision == TokenPrecision::F32 || native_io::requires_native(&invocation) {
-                native_io::encode_projection(
-                    self.descriptor.provider_implementation_fingerprint(),
-                    &self.native,
-                    self.precision,
-                    invocation,
-                )
-            } else {
-                encode_last_token_dense_linear(
-                    self.descriptor.provider_implementation_fingerprint(),
-                    invocation,
-                )
-            };
+        let encoded = if self.precision != TokenPrecision::Bf16
+            && (self.precision == TokenPrecision::F32 || native_io::requires_native(&invocation))
+        {
+            native_io::encode_projection(
+                self.descriptor.provider_implementation_fingerprint(),
+                &self.native,
+                self.precision,
+                invocation,
+            )
+        } else {
+            encode_last_token_dense_linear(
+                self.descriptor.provider_implementation_fingerprint(),
+                self.precision,
+                invocation,
+            )
+        };
         encoded
             .map(EncodedDeviceOperation::compute)
             .map_err(|message| {
@@ -2850,10 +3067,12 @@ pub struct CudaLastTokenMaskedArgmaxProvider {
 
 impl CudaLastTokenMaskedArgmaxProvider {
     pub fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        dense_f16_causal::reject_legacy_bounded_provider(runtime)?;
         Self::with_precision(runtime, ArgmaxPrecision::F16)
     }
 
     pub fn new_f32(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        dense_f16_causal::reject_legacy_bounded_provider(runtime)?;
         Self::with_precision(runtime, ArgmaxPrecision::F32)
     }
 
@@ -3260,17 +3479,18 @@ struct LastTokenF16Row {
 }
 
 fn last_token_uses_dense_f16(precision: TokenPrecision, values: &[ResolvedValueBinding]) -> bool {
-    precision == TokenPrecision::F16
-        && !values.iter().any(|value| {
-            value.role() == ResolvedValueRole::Input
-                && value.ordinal() == 1
-                && value.weight().is_some_and(|weight| {
-                    !matches!(
-                        weight.physical_layout(),
-                        ferrum_runtime::PhysicalWeightLayout::Dense { .. }
-                    )
-                })
-        })
+    precision == TokenPrecision::Bf16
+        || (precision == TokenPrecision::F16
+            && !values.iter().any(|value| {
+                value.role() == ResolvedValueRole::Input
+                    && value.ordinal() == 1
+                    && value.weight().is_some_and(|weight| {
+                        !matches!(
+                            weight.physical_layout(),
+                            ferrum_runtime::PhysicalWeightLayout::Dense { .. }
+                        )
+                    })
+            }))
 }
 
 fn last_token_gather_workspace(hidden: u64) -> Result<ProviderWorkspaceRequirement, VNextError> {
@@ -3499,9 +3719,10 @@ fn packed_last_token_rows(
 
 fn encode_last_token_dense_linear(
     provider_fingerprint: &str,
+    precision: TokenPrecision,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    if invocation.operation().id.as_str() != LAST_TOKEN_DENSE_LINEAR_OPERATION_ID
+    if invocation.operation().id.as_str() != precision.projection_operation()
         || invocation.participants().is_empty()
     {
         return Err("CUDA last-token dense-linear received another or empty operation".to_owned());
@@ -3519,7 +3740,7 @@ fn encode_last_token_dense_linear(
         &invocation,
         ResolvedValueRole::Input,
         1,
-        ElementType::F16,
+        precision.element(),
     )?];
     let mut launches = Vec::with_capacity(invocation.participants().len());
     for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
@@ -3531,13 +3752,17 @@ fn encode_last_token_dense_linear(
         {
             return Err("CUDA last-token dense-linear participant attributes disagree".to_owned());
         }
+        if precision == TokenPrecision::Bf16 {
+            transformer::ProjectionWeightSupport::DenseBf16
+                .validate_values(participant.bindings(), &[1])?;
+        }
         validate_last_token_dense_linear_signature(
             input,
             participant_weight,
             output,
             hidden_size,
             out_features,
-            ElementType::F16,
+            precision.element(),
         )?;
         let source_range = token_range.source_token_range();
         let packed_range = token_range.immediate_token_range();
@@ -3551,10 +3776,11 @@ fn encode_last_token_dense_linear(
         }
         let last_token = selected_range.end - 1;
         let input_region = regions.len();
-        let source = contiguous_token_region(participant, input, ElementType::F16, last_token, 1)?;
+        let source =
+            contiguous_token_region(participant, input, precision.element(), last_token, 1)?;
         regions.push(source);
         let output_region = regions.len();
-        let destination = contiguous_region(participant, output, ElementType::F16)?;
+        let destination = contiguous_region(participant, output, precision.element())?;
         regions.push(destination);
         launches.push(LastTokenDenseLinearLaunch {
             input_region,
@@ -3664,7 +3890,12 @@ fn encode_last_token_dense_linear(
                 )?;
             }
             for launch in &launches {
-                transformer::launch_gemm_f16(
+                let gemm = if precision == TokenPrecision::Bf16 {
+                    transformer::launch_gemm_bf16
+                } else {
+                    transformer::launch_gemm_f16
+                };
+                gemm(
                     blas,
                     regions[launch.input_region].device_ptr(),
                     weight,
@@ -3743,7 +3974,12 @@ fn validate_last_token_dense_linear_signature(
     };
     let input_dimensions = input.tensor().dimensions();
     if input.tensor().element_type() != activation
-        || weight.tensor().element_type() != ElementType::F16
+        || weight.tensor().element_type()
+            != if activation == ElementType::Bf16 {
+                ElementType::Bf16
+            } else {
+                ElementType::F16
+            }
         || output.tensor().element_type() != activation
         || input_dimensions.len() != 2
         || input_dimensions[0] == 0
@@ -3774,9 +4010,10 @@ struct EmbeddingLaunch {
 fn encode_token_embedding(
     function: &CudaFunction,
     provider_fingerprint: &str,
+    precision: TokenPrecision,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    if invocation.operation().id.as_str() != TOKEN_EMBEDDING_OPERATION_ID
+    if invocation.operation().id.as_str() != precision.embedding_operation()
         || invocation.participants().is_empty()
     {
         return Err("CUDA token embedding received another or empty operation".to_owned());
@@ -3796,13 +4033,17 @@ fn encode_token_embedding(
         let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
         let hidden_size = unsigned_attribute(participant.attributes(), "hidden_size")?;
         let vocabulary_size = unsigned_attribute(participant.attributes(), "vocab_size")?;
+        if precision == TokenPrecision::Bf16 {
+            transformer::ProjectionWeightSupport::DenseBf16
+                .validate_values(participant.bindings(), &[1])?;
+        }
         validate_signature(
             token_ids,
             table,
             output,
             vocabulary_size,
             hidden_size,
-            ElementType::F16,
+            precision.element(),
         )?;
         let source_range = token_range.source_token_range();
         let packed_range = token_range.immediate_token_range();
@@ -3813,7 +4054,7 @@ fn encode_token_embedding(
             .map_err(|_| "embedding launch grid exceeds u32".to_owned())?;
 
         let first_region = regions.len();
-        regions.push(contiguous_region(participant, table, ElementType::F16)?);
+        regions.push(contiguous_region(participant, table, precision.element())?);
         regions.push(contiguous_token_region(
             participant,
             token_ids,
@@ -3828,7 +4069,7 @@ fn encode_token_embedding(
         regions.push(contiguous_token_region(
             participant,
             output,
-            ElementType::F16,
+            precision.element(),
             packed_range.start,
             token_count,
         )?);
@@ -3893,7 +4134,7 @@ fn encode_token_embedding(
                     let output = checked_pointer_offset(
                         output_base,
                         output_element_offset,
-                        ElementType::F16.size_bytes(),
+                        precision.element().size_bytes(),
                         "embedding output",
                     )?;
                     let batch = chunk_tokens as i32;
@@ -3959,7 +4200,12 @@ fn validate_signature(
         matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
     };
     if token_ids.tensor().element_type() != ElementType::U32
-        || table.tensor().element_type() != ElementType::F16
+        || table.tensor().element_type()
+            != if activation == ElementType::Bf16 {
+                ElementType::Bf16
+            } else {
+                ElementType::F16
+            }
         || output.tensor().element_type() != activation
         || token_dimensions.len() != 1
         || table_dimensions != [vocabulary_size, hidden_size]
@@ -4189,3 +4435,6 @@ fn implementation_fingerprint(parts: &[&[u8]]) -> String {
 fn contract_error(error: VNextError) -> CudaDeviceRuntimeError {
     CudaDeviceRuntimeError::contract(error.to_string())
 }
+
+#[cfg(test)]
+pub(super) use tensor_silu::row_bias_retention_fixture;

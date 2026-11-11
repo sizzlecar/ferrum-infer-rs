@@ -77,6 +77,56 @@ fn time_features_keep_early_bf16_bridge_batch_rows_and_one_shared_t0() {
 }
 
 #[test]
+fn mixed_progress_rows_match_independent_conditioning_after_reordering() {
+    let combined = config(true, vec![3, 1]);
+    let singleton = config(true, vec![3]);
+    let host = account(8192);
+    let times = [499.015625, 0.0];
+    let a = singleton.managed_time_features(&host, times[0]).unwrap();
+    let b = singleton.managed_time_features(&host, times[1]).unwrap();
+    let batch = combined
+        .managed_time_features_per_sample(&host, &times)
+        .unwrap();
+    let rows = bits(&batch);
+    assert_eq!(&rows[..256], &bits(&a)[..256]);
+    assert_eq!(&rows[256..512], &bits(&b)[..256]);
+    assert_ne!(&rows[..256], &rows[256..512]);
+    // The causal prefix keeps its own zero-time embedding across late joins.
+    assert_eq!(&rows[512..], &bits(&a)[256..]);
+    drop(batch);
+    let reordered = combined
+        .managed_time_features_per_sample(&host, &[times[1], times[0]])
+        .unwrap();
+    let rows = bits(&reordered);
+    assert_eq!(&rows[..256], &bits(&b)[..256]);
+    assert_eq!(&rows[256..512], &bits(&a)[..256]);
+    drop((a, b, reordered));
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn invalid_mixed_progress_is_rejected_before_host_reservation() {
+    let checked = config(false, vec![3, 1]);
+    let host = account(1024);
+    for times in [
+        vec![],
+        vec![500.0],
+        vec![500.0, 0.0, 0.0],
+        vec![500.0, f32::NAN],
+    ] {
+        assert!(checked
+            .managed_time_features_per_sample(&host, &times)
+            .is_err());
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    }
+    let output = checked
+        .managed_time_features_per_sample(&host, &[500.0, 0.0])
+        .unwrap();
+    assert_eq!(output.tensor().dimensions(), &[2, 256]);
+    assert_eq!(host.usage().unwrap().allocated_bytes(), 1024);
+}
+
+#[test]
 fn noncausal_rows_and_negative_zero_keep_the_existing_adapter_bits() {
     let checked = config(false, vec![3, 1]);
     let host = account(1024);

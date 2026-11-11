@@ -111,6 +111,7 @@ fn edit_identity_requires_the_original_immutable_source_region() {
     let host = host();
     let marker = Arc::new(());
     let request = ImageEditRequest {
+        references: Vec::new(),
         generation: request(11),
         image: image(&host),
     };
@@ -121,6 +122,7 @@ fn edit_identity_requires_the_original_immutable_source_region() {
         .validate(&marker, &[EditIdentity::from(&request.clone())])
         .unwrap();
     let replacement = ImageEditRequest {
+        references: Vec::new(),
         generation: request.generation.clone(),
         image: image(&host),
     };
@@ -129,6 +131,7 @@ fn edit_identity_requires_the_original_immutable_source_region() {
         .validate(&marker, &[EditIdentity::from(&replacement)])
         .is_err());
     let sliced = ImageEditRequest {
+        references: Vec::new(),
         generation: request.generation.clone(),
         image: request.image.slice(1..4).unwrap(),
     };

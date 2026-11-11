@@ -9,6 +9,8 @@ use crate::*;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
+mod materialization_session;
+
 struct ComponentFamily {
     node: &'static str,
 }

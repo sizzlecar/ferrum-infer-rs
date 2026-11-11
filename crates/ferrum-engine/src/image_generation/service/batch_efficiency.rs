@@ -408,7 +408,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         &self,
         outputs: &[ImageGenerationOutput],
     ) -> Option<ImageBatchExecutionFeedback> {
-        if self.config.residency != ImageResidencyPolicy::Adaptive {
+        if self.execution.config.residency != ImageResidencyPolicy::Adaptive {
             return None;
         }
         let receipt = &outputs.first()?.receipt;
@@ -434,7 +434,10 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 feedback.stages.push(ImageBatchStageFeedback {
                     stage: execution.plan.stage,
                     initialization_us,
-                    weights_retained: self.resident_stages.has_weights(execution.plan.stage),
+                    weights_retained: self
+                        .execution
+                        .resident_stages
+                        .has_weights(execution.plan.stage),
                 });
             }
         }

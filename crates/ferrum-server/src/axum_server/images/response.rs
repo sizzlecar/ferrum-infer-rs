@@ -4,14 +4,13 @@ use base64::{engine::general_purpose::STANDARD, write::EncoderWriter};
 use ferrum_engine::image_generation::service::{
     ImageOutputGate, ImageOutputGateError, ImageOutputLease,
 };
-use ferrum_models::qwen_image21::pipeline_adapters::QwenImage21RgbaOutput;
+use ferrum_models::image_pixels::OwnedImagePixels;
 use ferrum_output::{
     png::{encoded_rgba8_png_bytes, write_rgba8_png, PngDimensions, PngLimits},
     OutputBytesLease, OutputSession,
 };
 use ferrum_runtime::{
     HostMemoryAccount, HostMemoryClass, HostMemoryScope, ManagedHostBuffer, ManagedHostBytes,
-    ResolvedTensorSpec,
 };
 use std::io::{self, Cursor, Write};
 
@@ -44,6 +43,9 @@ pub(super) struct ResponseGate {
     created: i64,
     count: usize,
     physical_bytes: usize,
+    /// Original pipeline-owned physical Output, such as a bounded trace. It
+    /// cannot be released by draining client responses and is already charged.
+    retained_output_bytes: usize,
 }
 
 impl ResponseGate {
@@ -53,6 +55,7 @@ impl ResponseGate {
         dimensions: PngDimensions,
         limits: PngLimits,
         scratch_bytes: usize,
+        retained_output_bytes: u64,
     ) -> Result<Self, ServerError> {
         let png_bytes = encoded_rgba8_png_bytes(dimensions, limits).map_err(internal)?;
         let created = chrono::Utc::now().timestamp();
@@ -63,7 +66,11 @@ impl ResponseGate {
             return Err(capacity("encoded image exceeds configured output limit"));
         }
         let physical = physical_response_bytes(&host, scratch_bytes, count).map_err(capacity)?;
-        host.check_scope_capacity(&[(HostMemoryClass::Output, physical)])
+        let retained_output_bytes = usize::try_from(retained_output_bytes).map_err(capacity)?;
+        let hard_requirement = physical
+            .checked_add(retained_output_bytes)
+            .ok_or_else(|| capacity("image response and retained Output capacity overflow"))?;
+        host.check_scope_capacity(&[(HostMemoryClass::Output, hard_requirement)])
             .map_err(capacity)?;
         Ok(Self {
             session,
@@ -74,6 +81,7 @@ impl ResponseGate {
             created,
             count,
             physical_bytes: physical,
+            retained_output_bytes,
         })
     }
 
@@ -114,11 +122,11 @@ impl ResponseGate {
         &self,
         demand: &[(HostMemoryClass, usize)],
     ) -> Result<Option<Admission>, ServerError> {
-        // No own Host grant exists yet. If releasing every external Output
-        // owner still cannot fit this frame, waiting on output would deadlock
-        // behind queued Input or retained Weight allocations.
+        // No own frame grant exists yet. Pipeline-retained Output is a fixed
+        // baseline, alongside queued Input/retained Weight. Only actual client
+        // Output owners may be hypothetically released in this proof.
         self.host
-            .check_scope_after_output_release(demand, 0)
+            .check_scope_after_output_release(demand, self.retained_output_bytes)
             .map_err(|error| match error {
                 ferrum_runtime::HostMemoryError::Capacity { .. } => capacity(error),
                 other => internal(other),
@@ -173,7 +181,7 @@ impl Admission {
         limits: PngLimits,
         scratch_bytes: usize,
     ) -> Result<Self, ServerError> {
-        ResponseGate::new(session, host, dimensions, limits, scratch_bytes)?
+        ResponseGate::new(session, host, dimensions, limits, scratch_bytes, 0)?
             .try_admit()?
             .ok_or_else(|| capacity("selected test request has no current output grant"))
     }
@@ -182,11 +190,7 @@ impl Admission {
         self.session.clone()
     }
 
-    pub(super) async fn encode(
-        self,
-        tensor: ResolvedTensorSpec,
-        raw: ManagedHostBytes,
-    ) -> Result<Bytes, ServerError> {
+    pub(super) async fn encode(self, pixels: OwnedImagePixels) -> Result<Bytes, ServerError> {
         // The service worker has already completed. Waiting for unread bodies
         // to return transport credit retains bounded Host backing and pixels,
         // but no execution slot. Cancelling this wait drops both owners.
@@ -197,19 +201,16 @@ impl Admission {
             .map_err(internal)?;
         // A cancelled blocking task retains its grant and pixels until the
         // writer exits, then drops its unpublished encoded owner safely.
-        tokio::task::spawn_blocking(move || {
-            PreparedEncoding::new(self, lease, tensor, raw)?.finish()
-        })
-        .await
-        .map_err(internal)?
+        tokio::task::spawn_blocking(move || PreparedEncoding::new(self, lease, pixels)?.finish())
+            .await
+            .map_err(internal)?
     }
 }
 
 struct PreparedEncoding {
     admission: Admission,
     lease: OutputBytesLease,
-    tensor: ResolvedTensorSpec,
-    raw: ManagedHostBytes,
+    pixels: OwnedImagePixels,
     scratch: ManagedHostBuffer,
 }
 
@@ -217,12 +218,11 @@ impl PreparedEncoding {
     fn new(
         admission: Admission,
         lease: OutputBytesLease,
-        tensor: ResolvedTensorSpec,
-        raw: ManagedHostBytes,
+        pixels: OwnedImagePixels,
     ) -> Result<Self, ServerError> {
         let host = admission.scope.account();
-        let rgba = QwenImage21RgbaOutput::new(&host, &tensor, &raw).map_err(internal)?;
-        let [batch, _, height, width] = rgba.dimensions();
+        let rgba = pixels.view(&host).map_err(internal)?;
+        let [batch, _, height, width] = rgba.rgba_dimensions();
         if batch != 1
             || width as u64 != u64::from(admission.dimensions.width())
             || height as u64 != u64::from(admission.dimensions.height())
@@ -237,16 +237,16 @@ impl PreparedEncoding {
         Ok(Self {
             admission,
             lease,
-            tensor,
-            raw,
+            pixels,
             scratch,
         })
     }
 
     fn write(&mut self, sink: &mut dyn Write) -> io::Result<()> {
-        let rgba =
-            QwenImage21RgbaOutput::new(&self.admission.scope.account(), &self.tensor, &self.raw)
-                .map_err(io::Error::other)?;
+        let rgba = self
+            .pixels
+            .view(&self.admission.scope.account())
+            .map_err(io::Error::other)?;
         sink.write_all(JSON_PREFIX)?;
         write!(sink, "{}", self.admission.created)?;
         sink.write_all(JSON_DATA)?;

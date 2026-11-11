@@ -1562,6 +1562,11 @@ pub struct MemoryConfig {
     /// device or pool capacity.
     #[serde(default)]
     pub usable_capacity_bytes: Option<usize>,
+    /// Optional target for each compiled weight arena. Individual tensors stay
+    /// contiguous; a tensor larger than the target receives its own arena.
+    /// This changes allocation layout, not the device-wide memory budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_arena_target_bytes: Option<std::num::NonZeroU64>,
     /// Enable memory pooling
     pub enable_pooling: bool,
     /// Memory alignment in bytes
@@ -1638,6 +1643,7 @@ impl Default for MemoryConfig {
         Self {
             pool_size: None,
             usable_capacity_bytes: None,
+            weight_arena_target_bytes: None,
             enable_pooling: true,
             alignment: 256,
             enable_defragmentation: false,
@@ -1723,6 +1729,16 @@ impl std::str::FromStr for ReusableExecutionPreparationMode {
     }
 }
 
+/// Execution waves eligible for reusable capture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReusableExecutionCaptureScope {
+    #[default]
+    All,
+    /// Learn only actual uniform decode waves. Prefill and mixed waves remain eager.
+    DecodeOnly,
+}
+
 /// Product policy for bounded reusable-execution capture.
 ///
 /// `None` requests an automatically resolved exact-width matrix. Explicit
@@ -1735,8 +1751,13 @@ impl std::str::FromStr for ReusableExecutionPreparationMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReusableExecutionCaptureConfig {
+    pub scope: ReusableExecutionCaptureScope,
     /// Preparation lifecycle, resolved from declared device capabilities.
     pub preparation: ReusableExecutionPreparationMode,
+    /// Optional executable-cache ceiling for each reusable lane. Only pure
+    /// on-demand preparation may reduce the derived program universe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_executables_per_lane: Option<u64>,
     /// Exact concurrent decode widths to prepare. `None` selects automatic
     /// resolution from the admitted runtime capacity.
     pub exact_decode_widths: Option<Vec<usize>>,
@@ -1748,7 +1769,9 @@ pub struct ReusableExecutionCaptureConfig {
 impl Default for ReusableExecutionCaptureConfig {
     fn default() -> Self {
         Self {
+            scope: ReusableExecutionCaptureScope::All,
             preparation: ReusableExecutionPreparationMode::default(),
+            maximum_executables_per_lane: None,
             exact_decode_widths: None,
             maximum_automatic_exact_decode_width: DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH,
         }
@@ -2042,6 +2065,29 @@ impl Default for BatchConfig {
 mod tests {
     use super::*;
     use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+
+    #[test]
+    fn weight_arena_target_is_explicit_positive_and_default_wire_compatible() {
+        let mut wire = serde_json::to_value(EngineConfig::default()).unwrap();
+        assert!(wire["memory"].get("weight_arena_target_bytes").is_none());
+        let default: EngineConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert!(default.memory.weight_arena_target_bytes.is_none());
+        wire["memory"]["weight_arena_target_bytes"] = serde_json::json!(536_870_912_u64);
+        let configured: EngineConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            configured.memory.weight_arena_target_bytes.unwrap().get(),
+            536_870_912
+        );
+        assert_eq!(serde_json::to_value(configured).unwrap(), wire);
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            wire["memory"]["weight_arena_target_bytes"] = invalid;
+            assert!(serde_json::from_value::<EngineConfig>(wire.clone()).is_err());
+        }
+    }
 
     #[test]
     fn retired_native_overrides_reject_before_mutating_engine_config() {

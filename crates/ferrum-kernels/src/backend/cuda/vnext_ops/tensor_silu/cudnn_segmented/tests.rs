@@ -83,24 +83,24 @@ fn d72_segments_are_independent_checked_subranges_with_no_prefix_keys() {
 }
 
 #[test]
-fn scratch_reuses_the_largest_segment_with_exact_workspace_and_two_length_arrays() {
-    let s = Schedule::new(&ports(5, 144), &attrs(72, &[2, 3])).unwrap();
-    let layouts: Vec<_> = s
-        .segments
-        .iter()
-        .map(|p| ScratchLayout::new(1, p.rows, 144, 256).unwrap())
-        .collect();
-    let peak = layouts.iter().map(|s| s.bytes).max().unwrap();
-    assert!(peak < layouts.iter().map(|s| s.bytes).sum::<u64>());
-    for (s, segment) in layouts.iter().zip(&s.segments) {
-        assert!(segment.bytes <= s.value_offset);
-        assert!(s.value_offset + segment.bytes <= s.query_lengths_offset);
-        assert!(s.query_lengths_offset + 4 <= s.key_lengths_offset);
-        assert!(s.key_lengths_offset + 4 <= s.workspace_offset);
-        assert_eq!(s.workspace_bytes, 256);
-        assert_eq!(s.workspace_offset + 256, s.bytes);
-        assert!(s.bytes <= peak);
+fn direct_segment_scratch_contains_only_disjoint_lengths_and_exact_workspace() {
+    for batches in [1, 16] {
+        for workspace in [0, 256, 256 << 20] {
+            let s = ScratchLayout::without_payload(batches, workspace).unwrap();
+            assert_eq!(s.value_offset, 0);
+            assert_eq!(s.query_lengths_offset, 0);
+            assert!(s.query_lengths_offset + u64::from(batches) * 4 <= s.key_lengths_offset);
+            assert!(s.key_lengths_offset + u64::from(batches) * 4 <= s.workspace_offset);
+            assert_eq!(s.workspace_offset % SCRATCH_ALIGNMENT, 0);
+            assert_eq!(s.workspace_bytes, workspace);
+            assert_eq!(s.workspace_offset + workspace, s.bytes);
+            let packed = ScratchLayout::new(batches, 9359, 56 * 128, workspace).unwrap();
+            assert_eq!(packed.bytes - s.bytes, packed.query_lengths_offset);
+        }
     }
+    assert!(ScratchLayout::without_payload(0, 0).is_err());
+    assert!(ScratchLayout::without_payload(17, 0).is_err());
+    assert!(ScratchLayout::without_payload(1, u64::MAX).is_err());
 }
 
 #[test]

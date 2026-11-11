@@ -218,7 +218,11 @@ fn batched_argmax_parameter_abi_and_supported_domain() {
 fn batched_argmax_matches_individual_rows_and_captured_graph_on_cuda() {
     let context = CudaContext::new(0).expect("batched selection requires CUDA");
     let stream = context.new_stream().unwrap();
-    for precision in [ArgmaxPrecision::F16, ArgmaxPrecision::F32] {
+    for precision in [
+        ArgmaxPrecision::F16,
+        ArgmaxPrecision::Bf16,
+        ArgmaxPrecision::F32,
+    ] {
         let functions = ArgmaxFunctions::load(&context, precision).unwrap();
         for (width, vocabulary) in [(2, 65536), (32, 248320)] {
             let mut fixture = Fixture::new(&stream, precision, width, vocabulary);
@@ -260,7 +264,7 @@ fn batched_argmax_matches_individual_rows_and_captured_graph_on_cuda() {
                 }
                 println!(
                     "{}",
-                    serde_json::json!({"probe":"batched_argmax_correctness","precision":if matches!(precision,ArgmaxPrecision::F16){"f16"}else{"f32"},"width":width,"vocabulary":vocabulary,"batched":batched,"captured_nodes":graph.node_count,"explicit_parameter_htod":0,"parameter_table_bytes":if batched{2048}else{0},"scalar_token_dtoh_calls":width})
+                    serde_json::json!({"probe":"batched_argmax_correctness","precision":match precision { ArgmaxPrecision::F16 => "f16", ArgmaxPrecision::Bf16 => "bf16", ArgmaxPrecision::F32 => "f32" },"width":width,"vocabulary":vocabulary,"batched":batched,"captured_nodes":graph.node_count,"explicit_parameter_htod":0,"parameter_table_bytes":if batched{2048}else{0},"scalar_token_dtoh_calls":width})
                 );
             }
         }

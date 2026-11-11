@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Ferrum · 图像工作台</title>
+  <link rel="stylesheet" href="/playground/style.css">
+  <script src="/playground/app.js" defer></script>
+</head>
+<body>
+  <header class="header">
+    <a class="brand" href="/playground"><span class="brand-mark" aria-hidden="true">F</span>Ferrum <span class="brand-separator">/</span> <span class="brand-sub">图像工作台</span></a>
+    <span id="model" class="model">正在连接模型…</span>
+  </header>
+  <main class="workspace">
+    <aside class="controls">
+      <div class="intro"><span class="eyebrow">IMAGE STUDIO</span><h1>让想法成为画面。</h1><p>描述想象，或上传一张图片继续创作。</p></div>
+      <form id="form" novalidate>
+        <div class="mode-switch" aria-label="创作方式">
+          <button id="mode-generate" class="mode active" type="button" aria-pressed="true">文生图</button>
+          <button id="mode-edit" class="mode" type="button" aria-pressed="false" disabled>图片编辑</button>
+        </div>
+        <section id="reference-panel" hidden>
+          <button id="drop-zone" class="drop-zone" type="button">
+            <img id="reference-preview" alt="待编辑的参考图" hidden>
+            <span id="reference-label">＋ 选择或拖入参考图</span>
+          </button>
+          <input id="file" type="file" accept="image/png,image/jpeg" hidden>
+          <p class="hint">上传 PNG；选择 JPG 时由浏览器转为 PNG。文件与尺寸仍需通过服务校验。</p>
+        </section>
+        <label class="field-label" for="prompt">画面描述</label>
+        <textarea id="prompt" rows="7" placeholder="描述主体、场景、光线和风格…" required></textarea>
+        <p id="edit-hint" class="hint" hidden>写下希望修改的部分，以及希望保留的内容。</p>
+        <div class="field-grid">
+          <div><label class="field-label" for="size">画面尺寸</label><select id="size" disabled><option>加载中…</option></select></div>
+          <div><label class="field-label" for="seed">Seed</label><input id="seed" type="text" inputmode="numeric" value="42" disabled></div>
+        </div>
+        <label class="random"><input id="random" type="checkbox" checked> 每次使用随机 Seed</label>
+        <p class="hint">固定 Seed 范围：0–9007199254740991。</p>
+        <button id="submit" class="primary" type="submit" disabled>连接中… <span aria-hidden="true">↗</span></button>
+        <p id="capacity" class="hint capacity">最多同时等待 2 个请求。</p>
+        <p id="notice" class="notice" role="status" aria-live="polite"></p>
+      </form>
+    </aside>
+    <section class="results" aria-labelledby="results-title">
+      <div class="results-heading"><div><span class="eyebrow">YOUR CREATIONS</span><h2 id="results-title">生成记录</h2></div><span class="local-note">仅保留在当前页面</span></div>
+      <div id="empty" class="empty"><div class="empty-symbol" aria-hidden="true">✧</div><h3>下一张画面，从这里开始</h3><p>结果会出现在这里。你可以下载，也可以继续编辑。</p></div>
+      <div id="history" class="history"></div>
+    </section>
+  </main>
+  <footer>Ferrum 图像推理 <span>·</span> 等待时间取决于尺寸、排队与实际计算</footer>
+</body>
+</html>

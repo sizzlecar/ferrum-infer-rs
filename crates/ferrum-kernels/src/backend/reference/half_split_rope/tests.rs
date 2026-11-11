@@ -150,3 +150,37 @@ fn logical_work_overflow_is_rejected_even_when_tensor_bytes_are_representable() 
     assert_eq!(v[0].tensor().minimum_storage_bytes().unwrap(), rows * 4);
     assert!(geometry(&v, &attrs(2)).is_err());
 }
+
+#[test]
+fn partial_provider_contract_geometry_and_registration_are_distinct() {
+    let composition = ReferenceVNextComposition::create(
+        DeviceId::new("device.reference.partial-rope-provider").unwrap(),
+    )
+    .unwrap();
+    let provider =
+        crate::backend::reference::reference_vnext_partial_half_split_rope_bf16_provider(
+            composition.runtime(),
+        )
+        .unwrap();
+    assert_eq!(
+        provider.descriptor().operation_id().as_str(),
+        PARTIAL_HALF_SPLIT_ROPE_BF16_OPERATION_ID
+    );
+    assert_eq!(
+        provider.descriptor().operation_fingerprint(),
+        partial_half_split_rope_bf16_contract()
+            .unwrap()
+            .descriptor()
+            .fingerprint()
+            .unwrap()
+    );
+    let mut attributes = attrs(8);
+    attributes.insert(
+        AttributeId::new("rotary_dim").unwrap(),
+        SemanticValue::Unsigned(6),
+    );
+    let shape = partial_geometry(&values(4, 16, 6), &attributes).unwrap();
+    assert_eq!((shape.rows, shape.head_dim, shape.rotary_dim), (4, 8, 6));
+    assert_eq!(shape.byte_extents().unwrap(), (128, 48));
+    assert!(geometry(&values(4, 16, 6), &attributes).is_err());
+}

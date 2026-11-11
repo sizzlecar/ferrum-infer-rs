@@ -29,6 +29,16 @@ pub(super) struct CpuGatedDeltaLaunch {
     out_projection: Vec<CpuMatrixPart>,
     workspace: [usize; 6],
     residual_in_place: bool,
+    prefix_candidates: Option<PrefixCandidates>,
+}
+
+struct PrefixCandidates {
+    convolution: usize,
+    recurrent: usize,
+    convolution_bytes: usize,
+    recurrent_bytes: usize,
+    reads: Vec<usize>,
+    writes: Vec<usize>,
 }
 
 fn workspace_layout(shape: GatedDeltaShape) -> Result<[(u64, u64); 6], CpuRuntimeError> {
@@ -146,13 +156,105 @@ pub(super) fn prepare(
         out_projection,
         workspace,
         residual_in_place,
+        prefix_candidates: None,
     })
+}
+
+/// Token-row scan retaining the last two candidate states in admitted output
+/// storage; the original state and every other input remain read-only.
+pub(super) fn prepare_candidate_scan(
+    invocation: &BatchedOperationInvocation<'_, CpuDeviceBuffer>,
+    index: usize,
+    rows: usize,
+    dtype: CpuFloat,
+    workspace_offset: u64,
+    regions: &mut Vec<CpuBufferRegion>,
+) -> Result<CpuGatedDeltaLaunch, CpuRuntimeError> {
+    let participant = &invocation.participants()[index];
+    if rows == 0 {
+        return Err(CpuRuntimeError::new(
+            "CPU GDN candidate scan requires at least one row",
+        ));
+    }
+    let region_start = regions.len();
+    let mut launch = prepare(invocation, index, rows, dtype, workspace_offset, regions)?;
+    let convolution_bytes = launch
+        .shape
+        .qkv()
+        .checked_mul(launch.shape.convolution - 1)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| CpuRuntimeError::new("CPU GDN convolution state overflows"))?;
+    let recurrent_bytes = launch
+        .shape
+        .values()
+        .checked_mul(launch.shape.key_dim)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| CpuRuntimeError::new("CPU GDN recurrent state overflows"))?;
+    if regions[launch.convolution_state].length_bytes() != convolution_bytes
+        || regions[launch.recurrent_state].length_bytes() != recurrent_bytes
+    {
+        return Err(CpuRuntimeError::new(
+            "CPU GDN candidate scan original state extent differs",
+        ));
+    }
+    let mut writes = vec![launch.output];
+    writes.extend(launch.workspace);
+    let reads = (region_start..regions.len())
+        .filter(|i| !writes.contains(i))
+        .collect();
+    let mut candidate = |ordinal, dtype, bytes: usize| {
+        let region = value_region(
+            participant,
+            binding(participant, ResolvedValueRole::Output, ordinal)?,
+            dtype,
+            None,
+        )?;
+        if bytes.checked_mul(2) != Some(region.length_bytes()) {
+            return Err(CpuRuntimeError::new(
+                "CPU GDN candidate scan candidate extent differs",
+            ));
+        }
+        let index = regions.len();
+        regions.push(region);
+        writes.push(index);
+        Ok(index)
+    };
+    let convolution = candidate(1, ElementType::F16, convolution_bytes)?;
+    let recurrent = candidate(2, ElementType::F32, recurrent_bytes)?;
+    launch.prefix_candidates = Some(PrefixCandidates {
+        convolution,
+        recurrent,
+        convolution_bytes,
+        recurrent_bytes,
+        reads,
+        writes,
+    });
+    Ok(launch)
 }
 
 impl CpuGatedDeltaLaunch {
     pub(super) fn execute(&self, views: &mut CpuRegionSet<'_>) -> Result<(), CpuRuntimeError> {
         let [normalized, mixed, qkv, core, context, projected] = self.workspace;
         let hidden_bytes = self.dtype.byte_len(1, self.shape.hidden)?;
+        if let Some(prefix) = &self.prefix_candidates {
+            // Validate all candidate writes (including hidden and workspace)
+            // against every read and each other before the first mutation.
+            views.with_io_slices(&prefix.reads, &prefix.writes, |_, _| Ok(()))?;
+            views.with_io(
+                [self.convolution_state, self.recurrent_state],
+                [prefix.convolution, prefix.recurrent],
+                |[original_conv, original_delta], [conv, delta]| {
+                    conv[prefix.convolution_bytes..].copy_from_slice(original_conv);
+                    delta[prefix.recurrent_bytes..].copy_from_slice(original_delta);
+                    Ok(())
+                },
+            )?;
+        }
+        let (convolution_state, recurrent_state) = self
+            .prefix_candidates
+            .as_ref()
+            .map(|prefix| (prefix.convolution, prefix.recurrent))
+            .unwrap_or((self.convolution_state, self.recurrent_state));
         for row in 0..self.rows {
             let span = row * hidden_bytes..(row + 1) * hidden_bytes;
             views.with_io(
@@ -185,15 +287,23 @@ impl CpuGatedDeltaLaunch {
                     self.bias,
                     self.gated_norm,
                 ],
-                [
-                    self.convolution_state,
-                    self.recurrent_state,
-                    qkv,
-                    core,
-                    context,
-                ],
+                [convolution_state, recurrent_state, qkv, core, context],
                 |[mixed, convolution, decay, dt_bias, norm],
                  [convolution_state, recurrent, qkv, core, output]| {
+                    let (convolution_state, recurrent) =
+                        if let Some(prefix) = &self.prefix_candidates {
+                            let c = prefix.convolution_bytes;
+                            let d = prefix.recurrent_bytes;
+                            if row + 1 == self.rows {
+                                // Preserve the N-1 boundary before computing row N.
+                                // For N=1 this is the untouched original state.
+                                convolution_state.copy_within(c.., 0);
+                                recurrent.copy_within(d.., 0);
+                            }
+                            (&mut convolution_state[c..], &mut recurrent[d..])
+                        } else {
+                            (convolution_state, recurrent)
+                        };
                     gated_delta::step(
                         self.shape,
                         mixed,
@@ -271,3 +381,6 @@ fn project(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

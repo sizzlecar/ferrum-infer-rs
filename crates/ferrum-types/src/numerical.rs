@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub enum KvStorageFormat {
     #[default]
     F16,
+    Bf16,
     Int8PerTokenHeadF32ScaleV1,
 }
 
@@ -21,6 +22,7 @@ impl KvStorageFormat {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::F16 => "f16",
+            Self::Bf16 => "bf16",
             Self::Int8PerTokenHeadF32ScaleV1 => "int8-per-token-head-f32-scale-v1",
         }
     }
@@ -39,9 +41,7 @@ impl TryFrom<crate::KvCacheDtype> for KvStorageFormat {
         match dtype {
             crate::KvCacheDtype::Fp16 => Ok(Self::F16),
             crate::KvCacheDtype::Int8 => Ok(Self::Int8PerTokenHeadF32ScaleV1),
-            crate::KvCacheDtype::Bf16 => Err(
-                "vNext BF16 KV storage is unsupported; use fp16 or a supported int8 plan".into(),
-            ),
+            crate::KvCacheDtype::Bf16 => Ok(Self::Bf16),
             crate::KvCacheDtype::Fp8 => {
                 Err("vNext FP8 KV storage is unsupported; use fp16 or a supported int8 plan".into())
             }
@@ -134,11 +134,12 @@ mod tests {
             KvStorageFormat::try_from(crate::KvCacheDtype::Int8).unwrap(),
             KvStorageFormat::Int8PerTokenHeadF32ScaleV1
         );
-        for dtype in [crate::KvCacheDtype::Bf16, crate::KvCacheDtype::Fp8] {
+        for dtype in [crate::KvCacheDtype::Fp8] {
             assert!(KvStorageFormat::try_from(dtype).is_err());
         }
         for storage in [
             KvStorageFormat::F16,
+            KvStorageFormat::Bf16,
             KvStorageFormat::Int8PerTokenHeadF32ScaleV1,
         ] {
             assert_eq!(

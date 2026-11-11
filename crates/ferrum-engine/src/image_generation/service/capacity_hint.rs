@@ -215,7 +215,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     ) -> anyhow::Result<Option<ImageCapacitySearchContext>> {
         // Non-adaptive policies include changing retained owners in the plan's
         // demand. Their existing full search remains authoritative.
-        if self.config.residency != super::super::ImageResidencyPolicy::Adaptive {
+        if self.execution.config.residency != super::super::ImageResidencyPolicy::Adaptive {
             return Ok(None);
         }
         let Some(first) = requests.first() else {
@@ -246,12 +246,14 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     return Ok(None);
                 }
                 shape.update(b"generate");
-                self.assets
+                self.execution
+                    .sources
+                    .assets
                     .tokenizer
-                    .prepare(&prompts, self.config.maximum_user_tokens)?
+                    .prepare(&prompts, self.execution.config.maximum_user_tokens)?
             }
             ImageRequestRef::Edit(_) => {
-                let Some(assets) = &self.assets.editing else {
+                let Some(assets) = &self.execution.sources.assets.editing else {
                     return Ok(None);
                 };
                 let mut geometry = None;
@@ -272,9 +274,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 }
                 let (width, height) = geometry.expect("nonempty edit requests");
                 let patch = u64::try_from(assets.processor.patch_size())?;
-                let prompt = self.assets.tokenizer.prepare_edit_batch(
+                let prompt = self.execution.sources.assets.tokenizer.prepare_edit_batch(
                     &prompts,
-                    self.config.maximum_user_tokens,
+                    self.execution.config.maximum_user_tokens,
                     u64::from(height) / patch,
                     u64::from(width) / patch,
                     assets.vision.merge_size(),

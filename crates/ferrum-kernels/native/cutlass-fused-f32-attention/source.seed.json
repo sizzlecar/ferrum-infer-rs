@@ -1,0 +1,45 @@
+{
+  "schema_version": 3,
+  "operator": "ferrum.cuda.cutlass_fused_f32_attention",
+  "source_package_kind": "ferrum-native-cutlass-fused-f32-attention",
+  "source_package_revision": "fused-f32-v1+cb4247394dd82148787aed73e5dc7cef33cbf862",
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/NVIDIA/cutlass.git",
+      "revision": "cb4247394dd82148787aed73e5dc7cef33cbf862",
+      "license": "BSD-3-Clause"
+    }
+  ],
+  "translation_units": [
+    "kernels/boundary.cu"
+  ],
+  "headers": [
+    "kernels/abi.h"
+  ],
+  "dependency_closures": [
+    {
+      "translation_unit": "kernels/boundary.cu",
+      "headers": [
+        "kernels/abi.h"
+      ]
+    }
+  ],
+  "include_dirs": [
+    "cutlass/examples/41_fused_multi_head_attention",
+    "cutlass/include",
+    "cutlass/tools/util/include",
+    "kernels"
+  ],
+  "defines": [],
+  "nvcc_policy": {
+    "cpp_standard": "cpp17",
+    "optimization": "o3",
+    "use_fast_math": false,
+    "relaxed_constexpr": true,
+    "extended_lambda": true,
+    "host_position_independent_code": true,
+    "host_default_visibility": false
+  },
+  "architecture": "device_compute_capability",
+  "archive_file": "libferrum_cutlass_fused_f32_attention.a"
+}

@@ -43,6 +43,7 @@ impl<R: DeviceRuntime> PreparedSequenceStateTransfer<R> {
                 return Err(invalid_resource("restore target is no longer fresh"));
             }
             let boundary = Arc::new(CompletedSequenceBoundary {
+                selected_continuation: false,
                 plan_hash: plan.plan_hash().clone(),
                 provenance: seal.provenance(),
                 continuation: Some(Arc::new(SequenceCheckpointContinuation {

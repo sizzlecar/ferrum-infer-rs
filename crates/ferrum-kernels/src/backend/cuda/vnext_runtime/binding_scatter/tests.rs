@@ -337,7 +337,7 @@ fn partial_upload_quarantine_retains_budget(addressed: bool) {
     let shared_executable = Arc::clone(command.executable.as_ref().unwrap());
     let mut pending = DrainOnDrop::new(command, &stream.stream);
     stream.state.begin_submission().unwrap();
-    let result = pending.get().enqueue(&stream.stream, &stream.blas);
+    let result = stream.enqueue_command(pending.get());
     // Exactly the production partial-submit retention sequence. This exercises
     // real runtime quarantine/drain, not DeviceCommandBatch/Core admission.
     stream.state.fail();

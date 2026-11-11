@@ -143,6 +143,69 @@ struct ArchitectureData {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct Qwen3VLTextArchitecture(ArchitectureData);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MropeDeclaration {
+    rope_type: String,
+    mrope_interleaved: bool,
+    mrope_section: [u64; 3],
+    rope_theta: Option<u64>,
+}
+
+fn explicit_mrope(text: &Value) -> Result<(u64, [u64; 3]), VNextError> {
+    let (raw, field, nested_theta) =
+        match (text.get("rope_scaling"), text.get("rope_parameters")) {
+            (Some(raw), None) => (raw, "rope_scaling", false),
+            (None, Some(raw)) => (raw, "rope_parameters", true),
+            (None, None) => {
+                return Err(invalid(
+                    "rope_parameters",
+                    "missing explicit mRoPE metadata",
+                ))
+            }
+            (Some(_), Some(_)) => return Err(invalid(
+                "rope_parameters",
+                "declare one explicit mRoPE container, not both rope_scaling and rope_parameters",
+            )),
+        };
+    let declaration: MropeDeclaration =
+        serde_json::from_value(raw.clone()).map_err(|e| invalid(field, e.to_string()))?;
+    if declaration.rope_type != "default" || !declaration.mrope_interleaved {
+        return Err(invalid(
+            field,
+            "supports explicit default interleaved mRoPE metadata only",
+        ));
+    }
+    let outer_theta = text
+        .get("rope_theta")
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| invalid("rope_theta", "requires an explicit unsigned theta"))
+        })
+        .transpose()?;
+    let theta = if nested_theta {
+        declaration.rope_theta.ok_or_else(|| {
+            invalid(
+                "rope_parameters.rope_theta",
+                "missing explicit nested theta",
+            )
+        })?
+    } else {
+        outer_theta.ok_or_else(|| invalid("rope_theta", "missing explicit legacy theta"))?
+    };
+    if outer_theta.is_some_and(|other| other != theta)
+        || declaration.rope_theta.is_some_and(|other| other != theta)
+    {
+        return Err(invalid(
+            field,
+            "conflicting explicit rotary theta declarations",
+        ));
+    }
+    Ok((theta, declaration.mrope_section))
+}
+
 impl<'de> Deserialize<'de> for Qwen3VLTextArchitecture {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Self::checked(ArchitectureData::deserialize(d)?).map_err(serde::de::Error::custom)
@@ -237,23 +300,7 @@ impl Qwen3VLTextArchitecture {
                 .and_then(Value::as_u64)
                 .ok_or_else(|| invalid(name, "missing unsigned dimension"))
         };
-        let rope = t
-            .get("rope_scaling")
-            .ok_or_else(|| invalid("rope_scaling", "missing explicit mRoPE metadata"))?;
-        if rope.get("rope_type").and_then(Value::as_str) != Some("default")
-            || rope.get("mrope_interleaved").and_then(Value::as_bool) != Some(true)
-        {
-            return Err(invalid(
-                "rope_scaling",
-                "supports explicit default interleaved mRoPE metadata only",
-            ));
-        }
-        let sections = serde_json::from_value(
-            rope.get("mrope_section")
-                .cloned()
-                .ok_or_else(|| invalid("mrope_section", "missing sections"))?,
-        )
-        .map_err(|e| invalid("mrope_section", e.to_string()))?;
+        let (rope_theta, sections) = explicit_mrope(t)?;
         let Some(Value::Number(epsilon)) = t.get("rms_norm_eps") else {
             return Err(invalid("rms_norm_eps", "missing numeric epsilon"));
         };
@@ -267,7 +314,7 @@ impl Qwen3VLTextArchitecture {
             vocabulary_size: u("vocab_size")?,
             maximum_positions: u("max_position_embeddings")?,
             epsilon: CanonicalRational::from_decimal_str(&epsilon.to_string())?,
-            rope_theta: u("rope_theta")?,
+            rope_theta,
             mrope_sections: sections,
         })
     }
@@ -324,6 +371,8 @@ pub struct Qwen3VLTextConfig {
     layout: Qwen3VLTextLayout,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     deepstack: Option<super::Qwen3VLTextDeepStack>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hidden_state_indices: Vec<u64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -332,6 +381,8 @@ struct ConfigWire {
     layout: Qwen3VLTextLayout,
     #[serde(default)]
     deepstack: Option<super::Qwen3VLTextDeepStack>,
+    #[serde(default)]
+    hidden_state_indices: Vec<u64>,
 }
 impl<'de> Deserialize<'de> for Qwen3VLTextConfig {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -342,7 +393,9 @@ impl<'de> Deserialize<'de> for Qwen3VLTextConfig {
                 .with_deepstack(deepstack)
                 .map_err(serde::de::Error::custom)?;
         }
-        Ok(config)
+        config
+            .with_hidden_state_indices(w.hidden_state_indices)
+            .map_err(serde::de::Error::custom)
     }
 }
 impl Qwen3VLTextConfig {
@@ -354,6 +407,7 @@ impl Qwen3VLTextConfig {
             architecture,
             layout,
             deepstack: None,
+            hidden_state_indices: Vec::new(),
         };
         c.validate()?;
         Ok(c)
@@ -384,6 +438,17 @@ impl Qwen3VLTextConfig {
     }
     pub fn deepstack(&self) -> Option<&super::Qwen3VLTextDeepStack> {
         self.deepstack.as_ref()
+    }
+    /// Additional Transformers-style hidden states in strictly increasing order.
+    /// Index i is after decoder block i (including DeepStack); index `layers`
+    /// is after the final RMSNorm. Embedding-only index zero is unsupported.
+    pub fn with_hidden_state_indices(mut self, indices: Vec<u64>) -> Result<Self, VNextError> {
+        self.hidden_state_indices = indices;
+        self.validate()?;
+        Ok(self)
+    }
+    pub fn hidden_state_indices(&self) -> &[u64] {
+        &self.hidden_state_indices
     }
     pub fn scale(&self) -> Result<CanonicalRational, VNextError> {
         let effective = (1.0 / (self.architecture.head_dim() as f64).sqrt()) as f32;
@@ -443,6 +508,20 @@ impl Qwen3VLTextConfig {
         super::weights::expected(self)
     }
     pub(super) fn validate(&self) -> Result<(), VNextError> {
+        if self
+            .hidden_state_indices
+            .iter()
+            .any(|&index| index == 0 || index > self.architecture.layers())
+            || self
+                .hidden_state_indices
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(invalid(
+                "hidden_state_indices",
+                "requires strictly increasing unique indices in 1..=layers",
+            ));
+        }
         if let Some(deepstack) = &self.deepstack {
             if self.architecture.layers() < Family::DEEPSTACK_IDS.len() as u64 {
                 return Err(invalid(

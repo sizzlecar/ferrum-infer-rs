@@ -6,6 +6,7 @@ use crate::gguf_blocks::{
 };
 use ferrum_runtime::{BlockQuantizationSpec, ElementType, WeightEncoding};
 use half::f16;
+mod visual_prompt;
 
 pub(super) fn encoded(values: &[f32], dtype: CpuFloat) -> Vec<u8> {
     let mut bytes = vec![0; values.len() * dtype.bytes()];

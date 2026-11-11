@@ -14,5 +14,7 @@ pub enum ImageBatchPolicy {
     /// compiled capacity/residency demand and measured execution costs. Unknown
     /// weight-swapping probes spend earned execution savings; fresh capacity
     /// admission remains authoritative. Never wait for future arrivals.
+    /// A declared auxiliary initializer yields to resident requests when all
+    /// have exactly one solver transition left; existing prepared work may join.
     Auto,
 }

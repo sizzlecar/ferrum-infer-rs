@@ -7,9 +7,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrum_quantization::{
-    GgufWeightComponentSource, GptqMarlinSafetensorsSource, SafetensorsArchive,
-};
+use ferrum_quantization::{GgufWeightComponentSource, GptqMarlinSafetensorsSource};
 use ferrum_runtime::{
     CausalLanguageMetadata, ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId,
     ModelFamilyProvider, ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata,
@@ -189,7 +187,8 @@ pub(super) fn define_from_sources(
     )
     .map_err(ferrum_types::FerrumError::model)?;
     match sources.weights() {
-        ProductionWeightArtifact::SafetensorsDirectory(weight_root) => {
+        ProductionWeightArtifact::SafetensorsDirectory(_)
+        | ProductionWeightArtifact::SafetensorsFile(_) => {
             let weight_config = sources.weight_config_json().ok_or_else(|| {
                 ferrum_types::FerrumError::model(
                     "Qwen3 MoE GPTQ weight source is missing physical config.json",
@@ -198,7 +197,7 @@ pub(super) fn define_from_sources(
             let (semantic, quantization) =
                 Qwen3MoeSemanticConfig::parse_sources(sources.config_json(), weight_config)
                     .map_err(ferrum_types::FerrumError::model)?;
-            let archive = SafetensorsArchive::open(weight_root)?;
+            let archive = sources.weights().open_safetensors_archive()?;
             let weights = Qwen3MoeWeightManifest::load(&archive, &semantic, &quantization)
                 .map_err(ferrum_types::FerrumError::model)?;
             let config = Qwen3MoeFamilyConfig {

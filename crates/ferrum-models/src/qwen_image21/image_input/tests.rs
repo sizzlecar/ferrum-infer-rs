@@ -90,6 +90,85 @@ fn own_two_k_png_roundtrips_default_ingress_with_exact_host_capacity() {
 }
 
 #[test]
+fn default_ingress_admits_eight_megapixel_output_without_weakening_decoded_capacity() {
+    use ferrum_output::png::{encoded_rgba8_png_bytes, write_rgba8_png, PngDimensions, PngLimits};
+    use std::io::Write;
+
+    let dimensions = PngDimensions::new(2912, 2912).unwrap();
+    let limits = ImageInputLimits::default();
+    let row = [31, 63, 127, 255].repeat(dimensions.width() as usize);
+    // Exercise the actual output writer without retaining a 34 MB PNG fixture.
+    let receipt = write_rgba8_png(
+        &mut std::io::sink(),
+        dimensions,
+        PngLimits::default(),
+        |writer| {
+            for _ in 0..dimensions.height() {
+                writer.write_all(&row)?;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        receipt.encoded_bytes(),
+        encoded_rgba8_png_bytes(dimensions, PngLimits::default()).unwrap()
+    );
+    assert!(receipt.encoded_bytes() > dimensions.rgba_bytes() as u64);
+    assert!(receipt.encoded_bytes() <= limits.maximum_encoded_bytes() as u64);
+
+    // A compressed image retains the same real dimensions and exercises the
+    // normal CRC/DEFLATE decoder, using only a small encoded fixture.
+    let mut wire = Vec::new();
+    {
+        let mut encoder = ::png::Encoder::new(&mut wire, 2912, 2912);
+        encoder.set_color(::png::ColorType::Rgba);
+        encoder.set_depth(::png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        {
+            let mut stream = writer.stream_writer().unwrap();
+            for _ in 0..dimensions.height() {
+                stream.write_all(&row).unwrap();
+            }
+            stream.finish().unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    assert!(wire.len() < dimensions.rgba_bytes() / 100);
+    assert_eq!(png_dimensions_hint(&wire, limits), Some((2912, 2912)));
+    let exact = wire.len() + dimensions.rgba_bytes();
+    for capacity in [exact - 1, exact] {
+        let account = host(capacity);
+        let encoded = managed(&account, &wire);
+        let result = ManagedRgba8Image::decode_png(&account, &encoded, limits);
+        if capacity < exact {
+            assert!(matches!(
+                result,
+                Err(ImageInputError::Host(HostMemoryError::Capacity { .. }))
+            ));
+            assert_eq!(account.usage().unwrap().allocated_bytes(), wire.len());
+        } else {
+            let decoded = result.unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (2912, 2912));
+            for actual in decoded.bytes().bytes().chunks_exact(row.len()) {
+                assert_eq!(actual, row);
+            }
+            assert_eq!(account.usage().unwrap().allocated_bytes(), exact);
+            drop(decoded);
+        }
+        drop(encoded);
+        assert_eq!(account.usage().unwrap().committed_bytes(), 0);
+    }
+
+    // Increasing the encoded cap grants no extra decoded-pixel authority.
+    assert!(limits.rgba_bytes(6000, 4000).is_ok());
+    assert!(matches!(
+        limits.rgba_bytes(6000, 4001),
+        Err(ImageInputError::Limit("decoded pixels"))
+    ));
+}
+
+#[test]
 fn png_rgb_and_rgba_have_exact_pixels_and_retained_parent_charges() {
     for (color, input, expected, alpha) in [
         (

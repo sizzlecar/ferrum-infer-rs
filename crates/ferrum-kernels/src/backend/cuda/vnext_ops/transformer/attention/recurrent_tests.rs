@@ -4,7 +4,35 @@ use super::*;
 use crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config;
 use ferrum_runtime::DeviceId;
 use ferrum_types::AttentionExecutionPolicy;
-use half::f16;
+use half::{bf16, f16};
+trait RecurrentScalar: cudarc::driver::DeviceRepr + Copy + PartialEq + std::fmt::Debug {
+    fn from_f32(value: f32) -> Self;
+    fn from_f64(value: f64) -> Self;
+    fn to_f64(self) -> f64;
+}
+impl RecurrentScalar for f16 {
+    fn from_f32(value: f32) -> Self {
+        Self::from_f32(value)
+    }
+    fn from_f64(value: f64) -> Self {
+        Self::from_f64(value)
+    }
+    fn to_f64(self) -> f64 {
+        self.to_f64()
+    }
+}
+impl RecurrentScalar for bf16 {
+    fn from_f32(value: f32) -> Self {
+        Self::from_f32(value)
+    }
+    fn from_f64(value: f64) -> Self {
+        Self::from_f64(value)
+    }
+    fn to_f64(self) -> f64 {
+        self.to_f64()
+    }
+}
+
 fn assert_close(actual: &[f32], expected: &[f64], stage: &str) {
     assert_eq!(actual.len(), expected.len());
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -25,26 +53,26 @@ struct Reference {
     delta: Vec<Vec<f64>>,
 }
 
-struct PreparedReference {
+struct PreparedReference<T = f16> {
     query: Vec<f64>,
     key: Vec<f64>,
     value: Vec<f64>,
     g: Vec<f64>,
     beta: Vec<f64>,
-    z: Vec<f16>,
+    z: Vec<T>,
     output: Vec<f64>,
 }
 
 impl Reference {
-    fn forward(
+    fn forward<T: RecurrentScalar>(
         &mut self,
         shape: AttentionShape,
         counts: &[usize],
-        raw: &[f16],
-        conv_weight: &[f16],
+        raw: &[T],
+        conv_weight: &[T],
         decay: &[f32],
         dt_bias: &[f32],
-    ) -> PreparedReference {
+    ) -> PreparedReference<T> {
         let kh = shape.key_heads as usize;
         let vh = shape.value_heads as usize;
         let kd = shape.key_head_dim as usize;
@@ -61,7 +89,7 @@ impl Reference {
             value: vec![0.0; tokens * values],
             g: vec![0.0; tokens * vh],
             beta: vec![0.0; tokens * vh],
-            z: vec![f16::ZERO; tokens * values],
+            z: vec![T::from_f32(0.0); tokens * values],
             output: vec![0.0; tokens * values],
         };
         let mut token = 0;
@@ -141,6 +169,15 @@ fn exercise(
     shape: AttentionShape,
     batches: &[[usize; 3]],
 ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    exercise_with_scalar::<f16>(stream, functions, shape, batches)
+}
+
+fn exercise_with_scalar<T: RecurrentScalar>(
+    stream: &Arc<CudaStream>,
+    functions: &AttentionFunctions,
+    shape: AttentionShape,
+    batches: &[[usize; 3]],
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let channels = shape.qkv_features as usize;
     let width = shape.qkvzba_features as usize;
     let qk = (shape.key_heads * shape.key_head_dim) as usize;
@@ -151,7 +188,7 @@ fn exercise(
     let conv_initial = (0..4)
         .map(|slot| {
             (0..conv_count)
-                .map(|i| f16::from_f32(sample(i, slot + 1, 0.015625)))
+                .map(|i| T::from_f32(sample(i, slot + 1, 0.015625)))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -164,7 +201,7 @@ fn exercise(
         .collect::<Vec<_>>();
     let conv = conv_initial
         .iter()
-        .map(|x| Guarded::new(stream, x, f16::from_f32(81.0)))
+        .map(|x| Guarded::new(stream, x, T::from_f32(81.0)))
         .collect::<Vec<_>>();
     let states = state_initial
         .iter()
@@ -178,7 +215,7 @@ fn exercise(
         .collect::<Vec<_>>();
     let bindings = Guarded::new(stream, &pointers, 0xDEAD_u64);
     let conv_weight = (0..channels * shape.conv_kernel as usize)
-        .map(|i| f16::from_f32(sample(i, 9, 0.03125)))
+        .map(|i| T::from_f32(sample(i, 9, 0.03125)))
         .collect::<Vec<_>>();
     let decay = (0..heads)
         .map(|i| match shape.decay_parameterization {
@@ -187,7 +224,7 @@ fn exercise(
         })
         .collect::<Vec<_>>();
     let bias = (0..heads).map(|i| sample(i, 5, 0.125)).collect::<Vec<_>>();
-    let weight_gpu = Guarded::new(stream, &conv_weight, f16::from_f32(71.0));
+    let weight_gpu = Guarded::new(stream, &conv_weight, T::from_f32(71.0));
     let decay_gpu = Guarded::new(stream, &decay, 61.0_f32);
     let bias_gpu = Guarded::new(stream, &bias, 51.0_f32);
     let mut reference = Reference {
@@ -210,7 +247,7 @@ fn exercise(
         for (sequence, &count) in counts.iter().enumerate() {
             for local in 0..count {
                 raw.extend((0..width).map(|i| {
-                    f16::from_f32(sample(
+                    T::from_f32(sample(
                         i + (positions[sequence] + local) * width,
                         sequence + 7,
                         0.0625,
@@ -222,7 +259,7 @@ fn exercise(
             lengths.push(lengths.last().unwrap() + count as u32);
         }
         let expected = reference.forward(shape, counts, &raw, &conv_weight, &decay, &bias);
-        let raw_gpu = Guarded::new(stream, &raw, f16::from_f32(41.0));
+        let raw_gpu = Guarded::new(stream, &raw, T::from_f32(41.0));
         let lengths_gpu = Guarded::new(stream, &lengths, u32::MAX);
         let sequence_gpu = Guarded::new(stream, &token_sequences, u32::MAX);
         let f32_buffer = |length| Guarded::new(stream, &vec![0.0_f32; length], 101.0);
@@ -234,13 +271,13 @@ fn exercise(
         let output = f32_buffer(tokens * values);
         let z = Guarded::new(
             stream,
-            &vec![f16::ZERO; tokens * values],
-            f16::from_f32(111.0),
+            &vec![T::from_f32(0.0); tokens * values],
+            T::from_f32(111.0),
         );
         let final_conv = Guarded::new(
             stream,
-            &vec![f16::ZERO; 3 * conv_count],
-            f16::from_f32(121.0),
+            &vec![T::from_f32(0.0); 3 * conv_count],
+            T::from_f32(121.0),
         );
         let cuda = shape.cuda_shape().unwrap();
         launch_prepare(AttentionPrepareRequest {
@@ -327,7 +364,7 @@ fn exercise(
                 conv[slots[sequence]].read(stream),
                 reference.conv[sequence]
                     .iter()
-                    .map(|&x| f16::from_f64(x))
+                    .map(|&x| T::from_f64(x))
                     .collect::<Vec<_>>()
             );
         }
@@ -380,6 +417,53 @@ fn recurrent_cuda_semantics_preserve_f64_oracle_state_carry_and_isolated_slots()
                 assert_eq!(
                     split, whole,
                     "prefill/decode state carry differs: {shape:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn recurrent_bf16_cuda_preserves_f32_state_carry_and_distinct_history_slots() {
+    let mut config = cuda_vnext_runtime_config(
+        0,
+        DeviceId::new("device.test.recurrent-bf16").unwrap(),
+        AttentionExecutionPolicy::default(),
+    )
+    .unwrap();
+    config.capabilities.insert(
+        CapabilityId::new(ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_BF16_CAPABILITY_ID)
+            .unwrap(),
+    );
+    let runtime = CudaDeviceRuntime::new(config).expect("BF16 recurrent conformance requires CUDA");
+    let provider = CudaGatedDeltaRecurrentAttentionProvider::new_dense_bf16(&runtime).unwrap();
+    let stream = runtime.context().default_stream();
+    for (key_dim, value_dim) in [(3, 5), (128, 128)] {
+        for decay in GatedDeltaDecayParameterization::ALL {
+            for mapping in GatedDeltaValueHeadMapping::ALL {
+                let mut shape = super::tests::test_shape();
+                shape.key_head_dim = key_dim;
+                shape.value_head_dim = value_dim;
+                shape.value_heads = 6;
+                shape.value_features = shape.value_heads * value_dim;
+                shape.qkv_features = 2 * shape.key_heads * key_dim + shape.value_features;
+                shape.qkvz_features = shape.qkv_features + shape.value_features;
+                shape.ba_features = 2 * shape.value_heads;
+                shape.qkvzba_features = shape.qkvz_features + shape.ba_features;
+                shape.decay_parameterization = decay;
+                shape.value_head_mapping = mapping;
+                let split = exercise_with_scalar::<bf16>(
+                    &stream,
+                    &provider.functions,
+                    shape,
+                    &[[0, 1, 4], [0, 1, 1]],
+                );
+                let whole =
+                    exercise_with_scalar::<bf16>(&stream, &provider.functions, shape, &[[0, 2, 5]]);
+                assert_eq!(
+                    split, whole,
+                    "BF16 prefill/decode state carry differs: {shape:?}"
                 );
             }
         }
@@ -516,3 +600,9 @@ fn recurrent_master_provider_preserves_hidden_precision_and_residual_aliasing_on
 
 #[path = "recurrent_tests/implicit_control.rs"]
 mod implicit_control;
+
+#[path = "recurrent_tests/candidate_scan.rs"]
+mod candidate_scan_tests;
+
+#[path = "recurrent_tests/gated_norm_fusion.rs"]
+mod gated_norm_fusion;

@@ -250,6 +250,9 @@ pub struct PipelineConfig {
     pub maximum_height: u32,
     #[serde(default = "default_maximum_batch_size")]
     pub maximum_batch_size: usize,
+    /// Optional packing target; individual tensors remain contiguous.
+    #[serde(default)]
+    pub weight_arena_target_bytes: Option<std::num::NonZeroU64>,
     #[serde(default)]
     pub decoder_batch_policy: ferrum_engine::image_generation::ImageDecoderBatchPolicy,
     #[serde(default)]
@@ -293,6 +296,7 @@ impl PipelineConfig {
             maximum_width: self.maximum_width,
             maximum_height: self.maximum_height,
             maximum_batch_size: self.maximum_batch_size,
+            weight_arena_target_bytes: self.weight_arena_target_bytes,
             decoder_batch_policy: self.decoder_batch_policy,
             edit_prefix_policy: self.edit_prefix_policy,
             plan_cache: self.plan_cache,
@@ -387,11 +391,14 @@ impl ImageProductConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let path = std::fs::canonicalize(path)?;
         let bytes = super::source::read_bounded(&path, 1024 * 1024)?;
+        Self::from_bytes(&path, &bytes)
+    }
+    pub(super) fn from_bytes(path: &Path, bytes: &[u8]) -> Result<Self> {
         ensure!(
             bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{'),
             "image configuration must be a JSON object"
         );
-        let mut config: Self = serde_json::from_slice(&bytes)?;
+        let mut config: Self = serde_json::from_slice(bytes)?;
         ensure!(
             config
                 .metadata
@@ -581,6 +588,7 @@ impl PipelineConfig {
             maximum_width: self.maximum_width,
             maximum_height: self.maximum_height,
             maximum_batch_size: self.maximum_batch_size,
+            weight_arena_target_bytes: self.weight_arena_target_bytes,
             decoder_batch_policy: self.decoder_batch_policy,
             edit_prefix_policy: self.edit_prefix_policy,
             plan_cache: self.plan_cache,

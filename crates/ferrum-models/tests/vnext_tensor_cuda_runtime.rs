@@ -8,6 +8,8 @@ mod attention;
 mod normalization;
 #[path = "vnext_tensor_cuda_runtime/philox.rs"]
 mod philox;
+#[path = "vnext_tensor_cuda_runtime/philox_f32.rs"]
+mod philox_f32;
 #[path = "vnext_tensor_cuda_runtime/rotary.rs"]
 mod rotary;
 #[path = "vnext_tensor_cuda_runtime/spatial.rs"]

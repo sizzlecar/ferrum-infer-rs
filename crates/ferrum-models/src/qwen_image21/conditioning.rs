@@ -48,20 +48,41 @@ impl QwenImage21TransformerConfig {
         host: &HostMemoryAccount,
         scheduler_timestep: f32,
     ) -> Result<ManagedHostTensor> {
-        let time = QwenImage21ModelTimestep::from_scheduler_timestep(scheduler_timestep)?;
         let batch = usize::try_from(self.layout().batch())?;
         ensure!(
             (1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&batch),
             "timestep batch exceeds checked conditioning capacity"
         );
+        self.managed_time_features_per_sample(host, &vec![scheduler_timestep; batch])
+    }
+
+    /// BF16 features for independently progressing batch rows. Times use the
+    /// scheduler's 0..1000 coordinate in the same order as the latent rows.
+    /// Each row preserves the existing early BF16 cast and normalization;
+    /// causal conditioning still adds one shared t=0 row, not one per request.
+    /// All times and the exact row count are validated before Host admission.
+    pub fn managed_time_features_per_sample(
+        &self,
+        host: &HostMemoryAccount,
+        scheduler_timesteps: &[f32],
+    ) -> Result<ManagedHostTensor> {
+        let batch = usize::try_from(self.layout().batch())?;
+        ensure!(
+            (1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&batch)
+                && scheduler_timesteps.len() == batch,
+            "timestep count must match the checked conditioning batch"
+        );
         // Bounded control values, not a [B,256] feature buffer.
-        let timesteps = vec![time; batch];
+        let timesteps = scheduler_timesteps
+            .iter()
+            .map(|&time| QwenImage21ModelTimestep::from_scheduler_timestep(time))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let adapter = QwenImage21Timestep256::new()?;
         let elements = QwenImage21Timestep256::output_elements(self)?;
         let (id, spec, bytes) =
             input_spec(self, Family::TIME_FEATURES_ID, ElementType::Bf16, elements)?;
         let mut output = host.allocate_zeroed(HostMemoryClass::InputPreprocess, bytes)?;
-        write_time_bytes(self, &adapter, &timesteps[..batch], output.as_mut())?;
+        write_time_bytes(self, &adapter, &timesteps, output.as_mut())?;
         Ok(ManagedHostTensor::new(id, spec, output.freeze())?)
     }
 }

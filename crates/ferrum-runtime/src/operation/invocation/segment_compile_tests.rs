@@ -5,6 +5,119 @@ use crate::operation::segment_compile::{
 };
 use vnext_device_operation_wave_contract::{setup_with_fixture, teardown};
 
+fn reusable_workspace_capture_boundary(device_capture: bool) {
+    use vnext_device_operation_wave_contract::wave_active_bindings;
+
+    let (fixture, sequence, session, batch, mut step) = setup_with_fixture(
+        fixture_with_reusable_workspace_device_capture(device_capture),
+    );
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture.registry.bind_plan(&fixture.resolved).unwrap();
+    let mut previous_workspace = None;
+    for round in 0..2 {
+        let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+        let workspace = wave
+            .claimed_backing()
+            .reusable_execution_program_id(
+                &fixture
+                    .runtime
+                    .descriptor()
+                    .runtime_implementation_fingerprint,
+                lane.id(),
+            )
+            .unwrap()
+            .expect("both devices retain an admitted reusable workspace");
+        if let Some(previous) = &previous_workspace {
+            assert_eq!(
+                previous, &workspace,
+                "the second step reuses the same workspace"
+            );
+        }
+        previous_workspace = Some(workspace);
+        assert_eq!(
+            OperationDispatch::reusable_execution_program_id_for_wave(
+                providers.providers(),
+                &fixture.resolved,
+                &wave,
+                &lane,
+            )
+            .unwrap()
+            .is_some(),
+            device_capture
+        );
+        // An unsupported device must still reject a foreign lane before
+        // declining capture. No capability shortcut may swallow authority errors.
+        let foreign_lane = fixture.plan_resources.create_execution_lane().unwrap();
+        assert!(OperationDispatch::reusable_execution_program_id_for_wave(
+            providers.providers(),
+            &fixture.resolved,
+            &wave,
+            &foreign_lane,
+        )
+        .is_err());
+        drop(foreign_lane);
+        let active = wave_active_bindings(&wave, &session);
+        let identity = OperationDispatch::bind_submission_wave_identity(
+            &fixture.resolved,
+            active.iter(),
+            &wave,
+            &lane,
+        )
+        .unwrap();
+        let handle = OperationDispatch::encode_and_submit_wave_with_inputs(
+            providers.providers(),
+            &fixture.resolved,
+            &identity,
+            active.iter(),
+            DeviceTimingMode::Off,
+            &[],
+            wave,
+            &lane,
+            &reaper,
+        )
+        .unwrap();
+        let CompletionObservation::Terminal(receipt) = handle.wait().unwrap() else {
+            panic!("the actual contract-runtime fence must terminalize");
+        };
+        assert_eq!(
+            receipt.disposition(),
+            &OperationCompletionDisposition::Succeeded
+        );
+        drop(handle);
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(trace.submitted_reusable_captures.len(), round + 1);
+        assert_eq!(
+            trace.submitted_reusable_captures[round].is_some(),
+            device_capture
+        );
+        drop(trace);
+        assert_eq!(lane.in_flight_count(), 0);
+        assert_eq!(reaper.retained_count(), 0);
+        if round == 0 {
+            step.try_retire_normal().unwrap();
+            step = begin_single_participant_step_on_lane_with_bucket(
+                &batch,
+                &lane,
+                fixture.reusable_execution_bucket.as_ref(),
+            );
+        }
+    }
+    drop(providers);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn reusable_workspace_without_device_capture_capability_submits_eagerly() {
+    reusable_workspace_capture_boundary(false);
+}
+
+#[test]
+fn reusable_workspace_with_device_capture_capability_keeps_capture_authority() {
+    reusable_workspace_capture_boundary(true);
+}
+
 fn with_compilation(run: impl FnOnce(&Fixture, &DeviceReusableExecutionProgramId)) {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_retained_dependencies(16, DependencyMode::Valid),

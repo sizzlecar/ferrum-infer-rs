@@ -82,9 +82,10 @@ pub mod vnext_ops;
 mod vnext_replay;
 pub mod vnext_runtime;
 pub use vnext_runtime::{
-    CudaCudnnConfig, CudaMemoryUtilization, CudaTensorMemoryObservation,
-    CudaTensorRuntimeAutoConfig, CudaTensorRuntimeConfig, CudnnSdpaPlanPolicy,
-    CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
+    CudaCudnnConfig, CudaDenseCausalProfile, CudaDenseF16CausalProfile, CudaMemoryUtilization,
+    CudaTensorAndCausalRuntimeAutoConfig, CudaTensorAndCausalRuntimeConfig,
+    CudaTensorExecutionProfile, CudaTensorMemoryObservation, CudaTensorRuntimeAutoConfig,
+    CudaTensorRuntimeConfig, CudnnSdpaPlanPolicy, CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
 };
 mod vnext_tool_correlation;
 

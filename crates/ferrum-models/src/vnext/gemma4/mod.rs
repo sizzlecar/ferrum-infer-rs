@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrum_quantization::{CompressedTensorsMarlinSafetensorsSource, SafetensorsArchive};
+use ferrum_quantization::CompressedTensorsMarlinSafetensorsSource;
 use ferrum_runtime::{
     CausalLanguageMetadata, ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId,
     ModelFamilyProvider, ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata,
@@ -192,8 +192,9 @@ pub(super) fn define_from_sources(
     let semantic = Gemma4SemanticConfig::parse(sources.config_json())
         .map_err(ferrum_types::FerrumError::model)?;
     match sources.weights() {
-        ProductionWeightArtifact::SafetensorsDirectory(weight_root) => {
-            let archive = SafetensorsArchive::open(weight_root)?;
+        ProductionWeightArtifact::SafetensorsDirectory(_)
+        | ProductionWeightArtifact::SafetensorsFile(_) => {
+            let archive = sources.weights().open_safetensors_archive()?;
             let weights = Gemma4WeightManifest::load(&archive, &semantic)
                 .map_err(ferrum_types::FerrumError::model)?;
             let config = Gemma4FamilyConfig {

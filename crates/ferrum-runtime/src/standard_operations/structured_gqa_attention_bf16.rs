@@ -75,6 +75,18 @@ impl StructuredGqaAttentionBf16Geometry {
         y: &ResolvedTensorSpec,
         attributes: &BTreeMap<AttributeId, SemanticValue>,
     ) -> Result<Self, VNextError> {
+        Self::new_with_element_type(q, k, v, y, attributes, ElementType::Bf16)
+    }
+    // Only shape/mask/work bookkeeping is shared with the independently
+    // versioned F32 contract. No tensor payload is converted or reinterpreted.
+    pub(super) fn new_with_element_type(
+        q: &ResolvedTensorSpec,
+        k: &ResolvedTensorSpec,
+        v: &ResolvedTensorSpec,
+        y: &ResolvedTensorSpec,
+        attributes: &BTreeMap<AttributeId, SemanticValue>,
+        element_type: ElementType,
+    ) -> Result<Self, VNextError> {
         structured_gqa_attention_bf16_contract()?
             .descriptor
             .validate_attributes(attributes)?;
@@ -87,13 +99,13 @@ impl StructuredGqaAttentionBf16Geometry {
         if q != y
             || k != v
             || rows != kv_rows
-            || k.element_type() != ElementType::Bf16
+            || k.element_type() != element_type
             || k.layout() != &ResolvedTensorLayout::Contiguous
-            || q.element_type() != ElementType::Bf16
+            || q.element_type() != element_type
             || q.layout() != &ResolvedTensorLayout::Contiguous
         {
             return Err(invalid(
-                "Q/Y and K/V must be respective identical contiguous BF16 rank-two tensors with equal rows",
+                "Q/Y and K/V must be respective identical contiguous rank-two tensors with equal rows and the contract's exact scalar type",
             ));
         }
         let sequence = unsigned(attributes, "sequence_length")?;
@@ -106,12 +118,12 @@ impl StructuredGqaAttentionBf16Geometry {
             || *rows % sequence != 0
             || head_dim < 2
             || head_dim > STRUCTURED_ATTENTION_BF16_MAX_HEAD_DIM
-            || !head_dim.is_power_of_two()
+            || (element_type == ElementType::Bf16 && !head_dim.is_power_of_two())
             || *columns % head_dim != 0
             || *kv_columns % head_dim != 0
             || (*columns / head_dim) % (*kv_columns / head_dim) != 0
         {
-            return Err(invalid("requires positive sequence, rows divisible by sequence, Q/KV columns divisible by power-of-two head_dim in 2..=256, and Hq a multiple of Hkv"));
+            return Err(invalid("requires positive sequence, rows divisible by sequence, Q/KV columns divisible by head_dim in 2..=256 (BF16 requires a power of two), and Hq a multiple of Hkv"));
         }
         let batch =
             usize::try_from(*rows / sequence).map_err(|_| invalid("batch exceeds usize"))?;

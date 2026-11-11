@@ -10,6 +10,8 @@ mod cross;
 mod family;
 #[path = "attention/newfused.rs"]
 mod newfused;
+#[path = "attention/segmented_long.rs"]
+mod segmented_long;
 use family::{AttentionConfig, AttentionFamily};
 const INPUTS: [&str; 3] = [
     "value.attention.query",

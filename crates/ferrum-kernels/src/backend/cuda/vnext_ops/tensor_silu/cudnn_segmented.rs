@@ -17,7 +17,8 @@ const NUMERICAL_IDENTITY: &str = concat!(
     "BF16-QKVY-contiguous-rows;D72-or-D128;independent-positive-noncausal-segments;",
     "F32-byvalue-scale;cuDNN9.20-forward-inference;deterministic-engine-filter;",
     "vendor-intermediate-rounding;finite-visible-domain;no-sequential-or-Torch-bitwise-claim;",
-    "each-segment-B1-QO-slice-and-stable-KV-pack;no-cross-segment-read;",
+    "each-segment-B1-QKVO-slice;all-valid-direct-KV;no-cross-segment-read;",
+    "lengths-only-launch-no-payload-copy-or-payload-scratch;",
     "one-admitted-scratch-reused-in-stream-order;exact-queried-workspace;",
     "shared-cuDNN-handle-cache-opaque-and-binding-limits;prepared-native-plan-digest;",
     "logical-work=mathematical-QK-scale-softmax-PV-scalar-operations;not-hardware-FLOPs"
@@ -44,6 +45,7 @@ pub(super) fn provider(
         NUMERICAL_IDENTITY.as_bytes(),
         cache.fingerprint().as_bytes(),
         include_bytes!("cudnn_segmented.rs"),
+        include_bytes!("cudnn_attention/layout.rs"),
     ]);
     let estimator = implementation_fingerprint(&[ESTIMATOR.as_bytes(), implementation.as_bytes()]);
     let descriptor = OperationProviderDescriptor::new(
@@ -217,12 +219,7 @@ impl Provider {
                 self.cache.lookup(&segment.signature)
             }
             .map_err(|e| e.to_string())?;
-            let scratch = ScratchLayout::new(
-                1,
-                segment.rows,
-                schedule.geometry.columns,
-                plan.workspace_bytes(),
-            )?;
+            let scratch = ScratchLayout::without_payload(1, plan.workspace_bytes())?;
             peak = peak.max(scratch.bytes);
             result.push(PreparedSegment {
                 segment,
@@ -391,8 +388,8 @@ impl Provider {
                 .plan
                 .bind(CudnnSdpaBindings {
                     q: address(regions[0].device_ptr(), p.segment.offset_bytes)?,
-                    k: scratch,
-                    v: address(scratch, s.value_offset)?,
+                    k: address(regions[1].device_ptr(), p.segment.offset_bytes)?,
+                    v: address(regions[2].device_ptr(), p.segment.offset_bytes)?,
                     o: address(regions[3].device_ptr(), p.segment.offset_bytes)?,
                     seq_len_q: address(scratch, s.query_lengths_offset)?,
                     seq_len_kv: address(scratch, s.key_lengths_offset)?,
@@ -424,7 +421,6 @@ impl Provider {
                 for b in &bound {
                     let k = regions[1].device_ptr() + b.segment.offset_bytes;
                     let v = regions[2].device_ptr() + b.segment.offset_bytes;
-                    let packed_v = scratch + b.scratch.value_offset;
                     let q_lengths = scratch + b.scratch.query_lengths_offset;
                     let k_lengths = scratch + b.scratch.key_lengths_offset;
                     let rows = b.segment.rows;
@@ -435,7 +431,7 @@ impl Provider {
                         .arg(&k)
                         .arg(&v)
                         .arg(&scratch)
-                        .arg(&packed_v)
+                        .arg(&scratch)
                         .arg(&q_lengths)
                         .arg(&k_lengths)
                         .arg(&columns)
@@ -445,22 +441,19 @@ impl Provider {
                         .arg(&rows)
                         .arg(&rows)
                         .arg(&rows)
-                        .arg(&one) // copy_payload: preserve stable segment packing
+                        // Each isolated segment is already contiguous and all
+                        // valid. The command retains its source regions through
+                        // the fence; the native plan keeps the same strides.
+                        .arg(&zero) // copy_payload: initialize lengths only
                         .arg(&b.mask);
                     unsafe {
                         launch.launch(LaunchConfig {
-                            grid_dim: (
-                                (b.segment.bytes / 2)
-                                    .div_ceil(u64::from(THREADS))
-                                    .min(MAX_BLOCKS) as u32,
-                                1,
-                                1,
-                            ),
+                            grid_dim: (1, 1, 1),
                             block_dim: (THREADS, 1, 1),
                             shared_mem_bytes: 0,
                         })
                     }
-                    .map_err(|e| CudaDeviceRuntimeError::driver("isolated segment KV pack", e))?;
+                    .map_err(|e| CudaDeviceRuntimeError::driver("isolated segment lengths", e))?;
                     b.execution.execute(stream)?;
                 }
                 Ok(())

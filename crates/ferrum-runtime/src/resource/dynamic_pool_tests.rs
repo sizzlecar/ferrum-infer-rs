@@ -934,6 +934,7 @@ fn harness_with_checkpoint_policy(
             logical_admission,
             domains,
             nodes,
+            None,
             reusable_execution,
         )
         .unwrap(),

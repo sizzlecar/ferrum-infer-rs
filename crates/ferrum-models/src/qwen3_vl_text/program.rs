@@ -226,8 +226,15 @@ pub(super) fn build(
             h,
         )?);
         let inject = config.deepstack().is_some() && layer < Family::DEEPSTACK_IDS.len() as u64;
+        let selected = layer + 1 < a.layers()
+            && config
+                .hidden_state_indices()
+                .binary_search(&(layer + 1))
+                .is_ok();
         let output = if layer + 1 == a.layers() && !inject {
             ProgramValueId::new(Family::OUTPUT_ID)?
+        } else if selected && !inject {
+            Family::hidden_state_output_id(layer + 1)?
         } else {
             value(layer, "output")?
         };
@@ -243,6 +250,8 @@ pub(super) fn build(
         if inject {
             let injected = if layer + 1 == a.layers() {
                 ProgramValueId::new(Family::OUTPUT_ID)?
+            } else if selected {
+                Family::hidden_state_output_id(layer + 1)?
             } else {
                 value(layer, "deepstack")?
             };
@@ -267,6 +276,28 @@ pub(super) fn build(
             nodes,
         });
     }
+    let mut outputs = vec![ProgramValueId::new(Family::OUTPUT_ID)?];
+    for &index in config.hidden_state_indices() {
+        let output = Family::hidden_state_output_id(index)?;
+        if index == a.layers() {
+            blocks.push(ProgramBlock {
+                id: "block.qwen3_vl.text.final_norm".into(),
+                nodes: vec![ProgramNode {
+                    id: NodeId::new("node.qwen3_vl.text.final_norm")?,
+                    operation_id: OperationId::new(HEAD_RMS_NORM_BF16_OPERATION_ID)?,
+                    required_version: ContractVersion::new(1, 0),
+                    work: ProgramNodeWorkSpec::Fixed,
+                    inputs: vec![
+                        input.clone(),
+                        weights::value_id(Family::FINAL_NORM_EXTERNAL_NAME)?,
+                    ],
+                    outputs: vec![output.clone()],
+                    attributes: norm_attrs(h)?,
+                }],
+            });
+        }
+        outputs.push(output);
+    }
     let mut inputs = vec![embeddings, cosine, sine];
     if config.deepstack().is_some() {
         inputs.extend(
@@ -276,13 +307,6 @@ pub(super) fn build(
                 .collect::<Result<Vec<_>, _>>()?,
         );
     }
-    ModelProgram::new(
-        family.clone(),
-        inputs,
-        blocks,
-        vec![],
-        weights,
-        vec![ProgramValueId::new(Family::OUTPUT_ID)?],
-    )?
-    .with_input_tensor_specs(config.input_tensor_specs()?)
+    ModelProgram::new(family.clone(), inputs, blocks, vec![], weights, outputs)?
+        .with_input_tensor_specs(config.input_tensor_specs()?)
 }

@@ -26,11 +26,13 @@ use super::{
 use super::{resolve_retained_completion_values, CompletionRetentionSpec, RetainedCompletionValue};
 use crate::{
     CompletionReadbackRequest, ExecutionDeterminismRequirement, HostTransferLayout,
-    ResourceWorkShape, WeightComponentPayload, WeightComponentSource, WeightComponentSpec,
+    ResourceWorkShape, WeightComponentSource, WeightComponentSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionPlan {
+    #[serde(skip)]
+    pub(super) candidate_state_layout: Option<super::CandidateStateLayout>,
     pub(super) payload: ExecutionPlanPayload,
     pub(super) plan_hash: PlanHash,
     #[serde(skip)]
@@ -234,6 +236,11 @@ impl ExecutionPlan {
         } else {
             None
         };
+        let candidate_state_layout =
+            super::candidate_state::derive_candidate_state(program, &nodes, request.capabilities)?;
+        if let Some(layout) = &candidate_state_layout {
+            layout.validate_replay_policy(request.policy)?;
+        }
         let retention = if work_limits.is_tensor() {
             CompletionRetentionSpec::new(
                 request
@@ -247,6 +254,18 @@ impl ExecutionPlan {
         } else {
             request.completion_retention.clone()
         };
+        let retention = CompletionRetentionSpec::new(
+            retention
+                .values()
+                .iter()
+                .cloned()
+                .chain(
+                    candidate_state_layout
+                        .iter()
+                        .flat_map(|layout| layout.retained_values().cloned()),
+                )
+                .collect(),
+        );
         let retained_completion_values = resolve_retained_completion_values(&nodes, &retention)?;
         let terminal_output_resources = nodes
             .iter()
@@ -276,6 +295,9 @@ impl ExecutionPlan {
             &retained_completion_resources,
         )?;
 
+        if let Some(layout) = &candidate_state_layout {
+            layout.validate_memory(&memory)?;
+        }
         let (sequence_checkpoint_layout, checkpoint_unsupported_reasons) =
             super::sequence_checkpoint::derive_sequence_checkpoint(
                 program,
@@ -317,6 +339,7 @@ impl ExecutionPlan {
         )?)?;
         payload.plan_id = Self::plan_id_for_hash(&plan_hash)?;
         let plan = Self {
+            candidate_state_layout,
             payload,
             plan_hash,
             operation_registry_authority,
@@ -1093,6 +1116,13 @@ impl ExecutionPlan {
         family: &PreparedModelFamily,
         bound: &BTreeSet<ProgramValueId>,
     ) -> Result<(), VNextError> {
+        let consumed = family
+            .program()
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.nodes)
+            .flat_map(|node| &node.inputs)
+            .collect::<BTreeSet<_>>();
         let required = family
             .program()
             .inputs()
@@ -1103,6 +1133,11 @@ impl ExecutionPlan {
                     .program()
                     .weights()
                     .iter()
+                    // A subgraph retains the complete Stored declaration for
+                    // shared-snapshot identity and stable arena offsets. Only
+                    // weights consumed by this graph need an active binding;
+                    // the complete schema/source map is validated separately.
+                    .filter(|weight| consumed.contains(&weight.value_id))
                     .map(|weight| weight.value_id.clone()),
             )
             .chain(
@@ -2658,15 +2693,14 @@ impl ExecutionPlan {
         &self.operation_registry_authority
     }
 
-    pub(crate) fn materialize_weight_components<'source>(
-        &self,
-        family: &PreparedModelFamily,
-        source: &'source dyn WeightComponentSource,
-        components: &[&WeightComponentSpec],
-        host: Option<&crate::HostMemoryAccount>,
-    ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+    /// Validate the complete immutable family/weight-plan relation before any
+    /// initialization write, then retain that proof for this installation.
+    pub(crate) fn weight_materialization_session<'a>(
+        &'a self,
+        family: &'a PreparedModelFamily,
+    ) -> Result<super::ValidatedWeightMaterialization<'a>, VNextError> {
         self.trusted_execution_weights
-            .materialize_components(family, source, components, host)
+            .materialization_session(family)
     }
 
     /// Additional physical Host WeightBacking peak for this exact retained

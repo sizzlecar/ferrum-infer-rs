@@ -739,3 +739,109 @@ async fn cancelling_a_prepared_future_batch_never_executes_it() {
     assert!(retired.failure.is_none());
     release_retirement(retired);
 }
+
+struct CollectionWaitBoundary {
+    signal: Arc<ResourceSignal>,
+    observed: u64,
+    entered: mpsc::Sender<()>,
+}
+
+struct CollectionWaitFixture {
+    inner: Fixture,
+    boundary: Arc<Mutex<Option<CollectionWaitBoundary>>>,
+}
+
+impl BatchWorker for CollectionWaitFixture {
+    type Output = u64;
+
+    fn compatible(&self, a: &ImageGenerationRequest, b: &ImageGenerationRequest) -> bool {
+        let boundary = self.boundary.lock().unwrap().take();
+        if let Some(boundary) = boundary {
+            assert_eq!((a.seed, b.seed), (11, 29));
+            // take_batch has checked cancellation and still holds Shared.state.
+            // Only this job's cancellation releases the compatibility scan;
+            // the real collection Condvar wait has not registered yet.
+            boundary.entered.send(()).unwrap();
+            boundary.signal.wait(boundary.observed);
+        }
+        self.inner.compatible(a, b)
+    }
+
+    fn generate_batch(
+        &mut self,
+        requests: Vec<ImageGenerationRequest>,
+    ) -> Result<Vec<u64>, ImageBatchError> {
+        self.inner.generate_batch(requests)
+    }
+
+    fn shutdown(&mut self) -> Result<(), GeneratorError> {
+        self.inner.shutdown()
+    }
+}
+
+async fn withdraw_during_collection_wait(drop_job: bool) {
+    let inner = fixture();
+    let calls = inner.calls.clone();
+    let boundary = Arc::new(Mutex::new(None));
+    let service = ServiceCore::start(
+        Box::new(CollectionWaitFixture {
+            inner,
+            boundary: boundary.clone(),
+        }),
+        config(3, 30_000, 3),
+    )
+    .unwrap();
+    let (entered, boundary_entered) = mpsc::channel();
+    let signal = service.shared.resources.clone();
+    *boundary.lock().unwrap() = Some(CollectionWaitBoundary {
+        observed: signal.epoch(),
+        signal,
+        entered,
+    });
+    let mut first = service.try_submit(request(11)).unwrap();
+    let second = service.try_submit(request(29)).unwrap();
+    boundary_entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("worker reached the first compatible FIFO scan");
+    let response = first.receiver.take().unwrap();
+    let cancellation = tokio::task::spawn_blocking(move || {
+        if drop_job {
+            drop(first);
+            None
+        } else {
+            first.cancel();
+            Some(first)
+        }
+    });
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        // Keep the explicitly cancelled handle until its original response.
+        // A notification from Drop must not repair the cancellation being tested.
+        let retained = cancellation.await.unwrap();
+        let result = response.await.unwrap();
+        (retained, result)
+    })
+    .await;
+
+    // Cleanup happens after the original response or its timeout is observed.
+    // The second job and shutdown cannot rescue the observation above.
+    second.cancel();
+    drop(second);
+    let retired = service.shutdown().await.unwrap();
+    assert!(retired.failure.is_none());
+    assert!(calls.lock().unwrap().is_empty());
+    release_retirement(retired);
+    let (retained, result) =
+        observed.expect("cancellation must wake collection before its batch deadline");
+    assert_eq!(result.unwrap_err().kind(), ImageServiceErrorKind::Cancelled);
+    drop(retained);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collection_wait_cancel_at_predicate_boundary_is_not_lost() {
+    withdraw_during_collection_wait(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collection_wait_drop_at_predicate_boundary_is_not_lost() {
+    withdraw_during_collection_wait(true).await;
+}

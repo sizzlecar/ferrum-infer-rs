@@ -16,6 +16,96 @@ use std::time::Duration;
 mod support;
 use support::*;
 
+fn close_custody_phase() -> (HostMemoryAccount, HostMemoryScope) {
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            64,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: 64,
+                transfer_staging_bytes: 0,
+                output_bytes: 0,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    let phase = host
+        .reserve_scope(&[(HostMemoryClass::InputPreprocess, 64)])
+        .unwrap();
+    (host, phase)
+}
+
+#[test]
+fn plan_runtime_close_custody_preserves_real_host_grant_through_reference_and_failure_retry() {
+    let plan = execution_plan();
+    let resources = plan_resources(&plan);
+    let fail = failure_key("release", &resources[1]);
+    let (driver, _) = configured_driver(&plan, &[(fail.as_str(), 1)], &[]);
+    let committed = transaction(&plan, driver, "close-custody-retry")
+        .reserve()
+        .unwrap()
+        .commit()
+        .unwrap();
+    let root = committed
+        .into_plan_runtime()
+        .unwrap_or_else(|_| panic!("handoff failed"));
+    let (host, phase) = close_custody_phase();
+    let expected = root.retain_until_closed(phase);
+    let alias = root.clone();
+    let root = match PlanRuntimeResources::close(root)
+        .unwrap_or_else(|_| panic!("close failed before reference check"))
+    {
+        PlanRuntimeCloseOutcome::Referenced { resources, .. } => resources,
+        PlanRuntimeCloseOutcome::Closed(_) => panic!("actual alias must retain original root"),
+    };
+    assert_eq!(host.usage().unwrap().committed_bytes(), 64);
+    drop(alias);
+    let failure = match PlanRuntimeResources::close(root) {
+        Err(failure) => failure,
+        Ok(_) => panic!("actual configured release failure must retain custody"),
+    };
+    assert_eq!(host.usage().unwrap().committed_bytes(), 64);
+    let receipt = failure
+        .retry()
+        .unwrap_or_else(|_| panic!("original close retry failed"));
+    assert_eq!(receipt.evidence(), &expected);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn plan_runtime_close_custody_quarantine_does_not_fabricate_closed_or_refund_host_grant() {
+    let plan = execution_plan();
+    let resources = plan_resources(&plan);
+    let fail = failure_key("release", &resources[1]);
+    let (driver, trace) = configured_driver(&plan, &[(fail.as_str(), 1)], &[]);
+    trace.lock().unwrap().retain_ownership = true;
+    let committed = transaction(&plan, driver, "close-custody-quarantine")
+        .reserve()
+        .unwrap()
+        .commit()
+        .unwrap();
+    let root = committed
+        .into_plan_runtime()
+        .unwrap_or_else(|_| panic!("handoff failed"));
+    let (host, phase) = close_custody_phase();
+    let expected = root.retain_until_closed(phase);
+    let failure = match PlanRuntimeResources::close(root) {
+        Err(failure) => failure,
+        Ok(_) => panic!("actual configured release failure must retain custody"),
+    };
+    let receipt = failure
+        .quarantine()
+        .unwrap_or_else(|_| panic!("original quarantine failed"));
+    assert_eq!(receipt.evidence(), &expected);
+    assert_eq!(receipt.quarantined_static_resources(), 1);
+    assert_eq!(trace.lock().unwrap().durable_ownership.len(), 1);
+    assert_eq!(
+        host.usage().unwrap().committed_bytes(),
+        64,
+        "quarantine is not the original successful close authority"
+    );
+}
+
 #[test]
 fn plan_runtime_close_recovery_is_ownership_safe() {
     const EXPECTED_CLOSE_CASES: usize = 18;

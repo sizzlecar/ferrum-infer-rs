@@ -9,6 +9,7 @@ use ferrum_runtime::{
 #[derive(Clone)]
 pub(in crate::backend::cuda::vnext_ops) struct GatedDeltaRecipe {
     participants: usize,
+    conv_type: ElementType,
     conv_bytes: u64,
     delta_bytes: u64,
 }
@@ -40,7 +41,7 @@ pub(in crate::backend::cuda::vnext_ops) fn write_program(
         let delta = segment::program_contiguous_region(node, participant, 1, owners)?;
         let conv_view = owners.region(&conv).map_err(|e| e.to_string())?;
         let delta_view = owners.region(&delta).map_err(|e| e.to_string())?;
-        if conv_view.element_type() != ElementType::F16
+        if conv_view.element_type() != recipe.conv_type
             || conv_view.length_bytes() != recipe.conv_bytes
             || delta_view.element_type() != ElementType::F32
             || delta_view.length_bytes() != recipe.delta_bytes
@@ -91,7 +92,7 @@ pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
             participant,
             0,
             recipe.conv_bytes,
-            ElementType::F16,
+            recipe.conv_type,
             None,
             owners,
         )?;
@@ -106,7 +107,7 @@ pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
         )?;
         let conv_view = owners.region(&conv, 0).map_err(|e| e.to_string())?;
         let delta_view = owners.region(&delta, 0).map_err(|e| e.to_string())?;
-        if conv_view.element_type() != ElementType::F16
+        if conv_view.element_type() != recipe.conv_type
             || conv_view.length_bytes() != recipe.conv_bytes
             || delta_view.element_type() != ElementType::F32
             || delta_view.length_bytes() != recipe.delta_bytes
@@ -132,6 +133,7 @@ pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
 
 pub(super) fn declare(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    conv_type: ElementType,
     validations: Vec<ValidationRecipe>,
 ) -> Result<Option<SegmentBindingDeclaration>, String> {
     if invocation.program_binding().is_none() {
@@ -141,7 +143,7 @@ pub(super) fn declare(
     let conv = contiguous_region(
         first,
         binding(first.bindings(), ResolvedValueRole::Input, 8)?,
-        ElementType::F16,
+        conv_type,
     )?;
     let delta = contiguous_region(
         first,
@@ -164,7 +166,7 @@ pub(super) fn declare(
                 component: None,
             },
             conv.length_bytes(),
-            ElementType::F16,
+            conv_type,
             2,
         ),
         request(
@@ -187,6 +189,7 @@ pub(super) fn declare(
     segment::declaration(
         DynamicRecipe::GatedDelta(GatedDeltaRecipe {
             participants: invocation.participants().len(),
+            conv_type,
             conv_bytes: conv.length_bytes(),
             delta_bytes: delta.length_bytes(),
         }),
@@ -210,7 +213,7 @@ pub(in crate::backend::cuda::vnext_ops) fn encode(
     for participant in 0..recipe.participants {
         let conv = segment::contiguous_region(node, participant, 0)?;
         let delta = segment::contiguous_region(node, participant, 1)?;
-        if conv.element_type() != ElementType::F16
+        if conv.element_type() != recipe.conv_type
             || conv.length_bytes() != recipe.conv_bytes
             || delta.element_type() != ElementType::F32
             || delta.length_bytes() != recipe.delta_bytes
@@ -270,7 +273,7 @@ pub(in crate::backend::cuda::vnext_ops) fn prepare_indexed(
         let delta = segment::indexed_contiguous_region(node, participant, 1, owners)?;
         let conv_view = owners.region(&conv).map_err(|e| e.to_string())?;
         let delta_view = owners.region(&delta).map_err(|e| e.to_string())?;
-        if conv_view.element_type() != ElementType::F16
+        if conv_view.element_type() != recipe.conv_type
             || conv_view.length_bytes() != recipe.conv_bytes
             || delta_view.element_type() != ElementType::F32
             || delta_view.length_bytes() != recipe.delta_bytes

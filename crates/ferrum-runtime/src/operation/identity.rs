@@ -369,6 +369,31 @@ impl Serialize for BatchOperationNodeFingerprints<'_> {
 }
 
 impl BatchOperationIdentity {
+    pub(crate) fn for_selected_state_commit(
+        &self,
+        selections: &[crate::SelectedPrefix],
+    ) -> Result<Self, VNextError> {
+        let digest = canonical_operation_fingerprint(
+            &(
+                "ferrum.selected-state-copy.v1",
+                self.fingerprint(),
+                selections,
+            ),
+            "selected state identity",
+        )?;
+        Self::from_validated(
+            self.data.batch_step_id,
+            self.data.batch_invocation_id,
+            self.data.plan_id.clone(),
+            self.data.plan_hash.clone(),
+            self.data.device_id.clone(),
+            self.data.runtime_implementation_fingerprint.clone(),
+            self.data.lane_id,
+            digest,
+            self.nodes().to_vec(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn from_deferred_validated(
         batch_step_id: BatchStepId,

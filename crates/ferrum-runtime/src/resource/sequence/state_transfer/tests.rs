@@ -22,6 +22,7 @@ fn candidate() -> SequenceFrameCandidate {
                     submission_wave_flight: None,
                     state_transfer: SequenceStateTransferSlot::default(),
                     completed_boundary: super::super::SequenceCompletedFrontier::default(),
+                    conditioning_inputs: None,
                     retired_frames: 0,
                 },
             )),

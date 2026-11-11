@@ -1,9 +1,8 @@
 use super::capture::{capture_validated_png, CaptureSink};
 use super::edit::{PreparedReference, PreparedReferences};
+use super::protocol::{PreparedProtocol, ReceivedPayload, RunControl};
 use super::*;
-use ferrum_bench_core::images::{
-    validate_image_response_with_png, ImageFailureKind, ImageHttpRequest, ImageSample,
-};
+use ferrum_bench_core::images::{ImageFailureKind, ImageHttpRequest, ImageSample};
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::{sync::Arc, time::Instant};
 
@@ -12,10 +11,24 @@ use std::{sync::Arc, time::Instant};
 /// No requests are retried: retrying would silently change the workload.
 pub async fn run_benchmark(
     config: ImageBenchmarkConfig,
+    dataset: ImageDataset,
+) -> anyhow::Result<ImageBenchmarkReport> {
+    run_benchmark_with_control(config, dataset, RunControl::new()).await
+}
+
+pub(super) async fn run_benchmark_with_control(
+    config: ImageBenchmarkConfig,
     mut dataset: ImageDataset,
+    control: RunControl,
 ) -> anyhow::Result<ImageBenchmarkReport> {
     config.validate(&dataset)?;
     let references = PreparedReferences::load(&mut dataset, &config)?;
+    // Read and validate every immutable workflow before any endpoint is called.
+    let protocols = config
+        .endpoints
+        .iter()
+        .map(|endpoint| PreparedProtocol::prepare(endpoint, &config, &dataset, &references))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let capture = config
         .capture
         .as_ref()
@@ -37,6 +50,7 @@ pub async fn run_benchmark(
             .map(|config| resources::EndpointSampler::new(config, endpoint_index));
         let mut records = Vec::new();
         let mut arrivals = Vec::new();
+        let mut protocol_requests = Vec::new();
         let mut captures = capture.as_ref().map(|_| Vec::new());
         let mut repetitions = Vec::new();
         let mut measured_seconds = 0.0;
@@ -48,22 +62,29 @@ pub async fn run_benchmark(
             };
             for repetition in 0..count {
                 let resource_window = if let Some(sampler) = &resource_sampler {
-                    Some(resources::RunningResourceWindow::begin(Arc::clone(sampler)).await)
+                    if control.reason().is_some() {
+                        None
+                    } else {
+                        Some(resources::RunningResourceWindow::begin(Arc::clone(sampler)).await)
+                    }
                 } else {
                     None
                 };
-                let (mut run, mut requests, mut artifacts, mut scheduled) = run_round(
-                    &client,
-                    endpoint_index,
-                    endpoint,
-                    &config,
-                    &dataset,
-                    phase,
-                    repetition,
-                    capture.as_ref(),
-                    &references,
-                )
-                .await;
+                let (mut run, mut requests, mut artifacts, mut scheduled, mut protocol_run) =
+                    run_round(
+                        &client,
+                        endpoint_index,
+                        endpoint,
+                        &config,
+                        &dataset,
+                        phase,
+                        repetition,
+                        capture.as_ref(),
+                        &references,
+                        &protocols[endpoint_index],
+                        &control,
+                    )
+                    .await;
                 if let Some(window) = resource_window {
                     run.resources = Some(window.finish().await);
                 }
@@ -73,6 +94,7 @@ pub async fn run_benchmark(
                 repetitions.push(run);
                 records.append(&mut requests);
                 arrivals.append(&mut scheduled);
+                protocol_requests.append(&mut protocol_run);
                 if let Some(captures) = &mut captures {
                     captures.append(&mut artifacts);
                 }
@@ -93,6 +115,8 @@ pub async fn run_benchmark(
         )?;
         endpoint_reports.push(ImageEndpointReport {
             endpoint_index,
+            protocol: protocols[endpoint_index].identity(),
+            protocol_requests,
             repetitions,
             measured: metrics,
             measured_workloads,
@@ -103,6 +127,13 @@ pub async fn run_benchmark(
     }
     let capture_summary = capture.as_ref().map(|sink| sink.summary(&endpoint_reports));
     let mut evidence = ImageEvidenceScope::default();
+    if config
+        .endpoints
+        .iter()
+        .any(|endpoint| endpoint.protocol.is_comfy())
+    {
+        evidence.latency_scope = "request start through protocol-specific complete image body reception, excludes local PNG validation/capture and bounded cancellation cleanup; Comfy includes each edit upload, acknowledgement, queue wait and polling granularity; see endpoint protocol identity";
+    }
     if config.resource_sampling.is_some() {
         evidence.resource_peak_scope = Some("sampled lower bounds across measured windows only, excludes warmup; aggregate peaks withheld if any measured sampling window is incomplete; per-window observed values and errors remain available; successful sampling never proves an instantaneous true peak");
         let windows = endpoint_reports
@@ -111,7 +142,9 @@ pub async fn run_benchmark(
             .filter(|run| run.phase == ImageRequestPhase::Measured)
             .filter_map(|run| run.resources.as_ref())
             .collect::<Vec<_>>();
-        let complete = !windows.is_empty() && windows.iter().all(|window| window.complete);
+        let complete = control.reason().is_none()
+            && !windows.is_empty()
+            && windows.iter().all(|window| window.complete);
         evidence.resource_sampling_complete = Some(complete);
         if complete {
             evidence.peak_host_memory_bytes = windows
@@ -143,6 +176,8 @@ pub async fn run_benchmark(
     let reference_image = (dataset.schema_version < 3 && !dataset.mode.is_generate())
         .then(|| references.entries[0].identity.clone());
     Ok(ImageBenchmarkReport {
+        complete: control.reason().is_none(),
+        stop_reason: control.reason(),
         schema_version: if dataset.schema_version == 3 {
             3
         } else if dataset.mode.is_generate() {
@@ -179,11 +214,14 @@ async fn run_round(
     repetition: usize,
     capture: Option<&Arc<CaptureSink>>,
     references: &PreparedReferences,
+    protocol: &PreparedProtocol,
+    control: &RunControl,
 ) -> (
     ImageBenchmarkRepetition,
     Vec<ImageRequestRecord>,
     Vec<PngCaptureRecord>,
     Vec<ImageArrivalRecord>,
+    Vec<ComfyRequestEvidence>,
 ) {
     let start = Instant::now();
     let mut next = 0usize;
@@ -191,10 +229,43 @@ async fn run_round(
     let mut records = Vec::with_capacity(dataset.samples.len());
     let mut captures = Vec::new();
     let mut arrivals = Vec::with_capacity(dataset.samples.len());
+    let mut protocol_records = Vec::new();
     let mut http_span = 0.0_f64;
     let bound = config.maximum_in_flight.unwrap_or(config.concurrency);
     while next < dataset.samples.len() || !active.is_empty() {
-        let completed = if config.arrival.is_open_loop() && next < dataset.samples.len() {
+        let completed = if control.reason().is_some() {
+            while next < dataset.samples.len() {
+                let sample = &dataset.samples[next];
+                let mut record = request_record(sample, next, phase, repetition);
+                record.failure = Some(ImageFailureKind::ClientStopped);
+                record.error = Some(
+                    "planned request not sent: benchmark cancelled or remote state unknown".into(),
+                );
+                records.push(record);
+                arrivals.push(ImageArrivalRecord {
+                    sample_index: next,
+                    phase,
+                    repetition,
+                    scheduled_offset_ms: config
+                        .arrival
+                        .offset(next)
+                        .map(|d| d.as_secs_f64() * 1000.0),
+                    dispatched_offset_ms: None,
+                    dispatch_lag_ms: None,
+                });
+                if capture.is_some() {
+                    captures.push(PngCaptureRecord {
+                        sample_index: next,
+                        sample_id: sample.id.clone(),
+                        phase,
+                        repetition,
+                        result: PngCaptureResult::NotProduced,
+                    });
+                }
+                next += 1;
+            }
+            active.next().await
+        } else if config.arrival.is_open_loop() && next < dataset.samples.len() {
             let due = start
                 + config
                     .arrival
@@ -215,7 +286,7 @@ async fn run_round(
                         if active.len() < bound {
                             active.push(run_request(client, endpoint_index, endpoint, config,
                                 sample, next, phase, repetition, start, Some(offset),
-                                capture.cloned(), references.for_sample(next)));
+                                capture.cloned(), references.for_sample(next), protocol, control));
                         } else {
                             let mut record = request_record(sample, next, phase, repetition);
                             record.failure = Some(ImageFailureKind::ClientCapacity);
@@ -254,15 +325,21 @@ async fn run_round(
                     None,
                     capture.cloned(),
                     references.for_sample(next),
+                    protocol,
+                    control,
                 ));
                 next += 1;
             }
             active.next().await
         };
-        if let Some((record, body_complete_seconds, captured, arrival)) = completed {
+        if let Some((record, body_complete_seconds, captured, arrival, protocol_record)) = completed
+        {
             http_span = http_span.max(body_complete_seconds);
             records.push(record);
             arrivals.push(arrival);
+            if let Some(protocol_record) = protocol_record {
+                protocol_records.push(protocol_record);
+            }
             if let Some(captured) = captured {
                 captures.push(captured);
             }
@@ -272,6 +349,7 @@ async fn run_round(
     records.sort_by_key(|record| record.sample_index);
     captures.sort_by_key(|record| record.sample_index);
     arrivals.sort_by_key(|record| record.sample_index);
+    protocol_records.sort_by_key(|record| record.sample_index);
     let metrics = ImageMetrics::from_records(
         elapsed,
         &records,
@@ -292,6 +370,7 @@ async fn run_round(
         records,
         captures,
         arrivals,
+        protocol_records,
     )
 }
 
@@ -308,15 +387,43 @@ async fn run_request(
     scheduled_offset: Option<Duration>,
     capture: Option<Arc<CaptureSink>>,
     reference: Option<&PreparedReference>,
+    protocol: &PreparedProtocol,
+    control: &RunControl,
 ) -> (
     ImageRequestRecord,
     f64,
     Option<PngCaptureRecord>,
     ImageArrivalRecord,
+    Option<ComfyRequestEvidence>,
 ) {
     let capture_enabled = capture.is_some();
     let mut capture_result = PngCaptureResult::NotProduced;
     let start = Instant::now();
+    if control.reason().is_some() {
+        let mut record = request_record(sample, sample_index, phase, repetition);
+        record.failure = Some(ImageFailureKind::ClientStopped);
+        record.error = Some("request not sent: benchmark stopped before dispatch".into());
+        return (
+            record,
+            0.0,
+            capture_enabled.then(|| PngCaptureRecord {
+                sample_index,
+                sample_id: sample.id.clone(),
+                phase,
+                repetition,
+                result: PngCaptureResult::NotProduced,
+            }),
+            ImageArrivalRecord {
+                sample_index,
+                phase,
+                repetition,
+                scheduled_offset_ms: scheduled_offset.map(|d| d.as_secs_f64() * 1000.0),
+                dispatched_offset_ms: None,
+                dispatch_lag_ms: None,
+            },
+            None,
+        );
+    }
     let dispatched = start.duration_since(round_start);
     let arrival = ImageArrivalRecord {
         sample_index,
@@ -328,17 +435,40 @@ async fn run_request(
             .map(|offset| dispatched.saturating_sub(offset).as_secs_f64() * 1000.0),
     };
     let mut record = request_record(sample, sample_index, phase, repetition);
-    let received = receive(
+    // Mint before polling any protocol operation. Timeout, cancellation and
+    // missing HTTP responses retain this ID; repetitions never reuse it.
+    record.client_attempt_id = Some(uuid::Uuid::new_v4());
+    let (received, mut protocol_record) = if matches!(protocol, PreparedProtocol::Comfy(_)) {
+        let (received, evidence) = protocol
+            .receive_comfy(client, sample, config, reference, &mut record, control)
+            .await;
+        (received, Some(evidence))
+    } else {
+        let received = tokio::select! {
+            biased;
+            _ = control.stopped() => Err((ImageFailureKind::ClientTask, "benchmark cancelled")),
+            received = receive(
         client,
         endpoint,
         sample,
         config.limits.maximum_response_bytes,
         &mut record,
         reference,
-    )
-    .await;
-    record.e2e_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let body_complete_seconds = round_start.elapsed().as_secs_f64();
+            ) => received.map(ReceivedPayload::OpenAiJson),
+        };
+        (received, None)
+    };
+    record.e2e_ms = (start.elapsed().as_secs_f64() * 1000.0
+        - protocol_record
+            .as_ref()
+            .map_or(0.0, |record| record.cleanup_ms + record.audit_tail_ms))
+    .max(0.0);
+    let body_complete_seconds = dispatched.as_secs_f64() + record.e2e_ms / 1000.0;
+    if let Some(protocol_record) = &mut protocol_record {
+        protocol_record.sample_index = sample_index;
+        protocol_record.phase = phase;
+        protocol_record.repetition = repetition;
+    }
     match received {
         Err((kind, message)) => {
             record.failure = Some(kind);
@@ -352,10 +482,9 @@ async fn run_request(
             // Decode and optional filesystem IO cannot stall the reactor. This
             // job retains its slot until joined: no unbounded writer queue.
             let result = tokio::task::spawn_blocking(move || {
-                let validated = validate_image_response_with_png(&body, width, height, &limits);
+                let validated = body.validate(width, height, &limits);
                 let validation_ms = validation_start.elapsed().as_secs_f64() * 1000.0;
                 // No need to retain JSON/base64 while the original PNG is saved.
-                drop(body);
                 let result = validated.map(|response| match capture.as_ref() {
                     Some(sink) => {
                         let (image, captured) = capture_validated_png(response, |image, png| {
@@ -405,7 +534,13 @@ async fn run_request(
         repetition,
         result: capture_result,
     });
-    (record, body_complete_seconds, captured, arrival)
+    (
+        record,
+        body_complete_seconds,
+        captured,
+        arrival,
+        protocol_record,
+    )
 }
 
 fn request_record(
@@ -420,6 +555,9 @@ fn request_record(
         phase,
         repetition,
         dispatch_index: sample_index,
+        client_attempt_id: None,
+        server_request_id: None,
+        trace_session_uuid: None,
         http_status: None,
         e2e_ms: 0.0,
         validation_ms: 0.0,
@@ -444,6 +582,13 @@ async fn receive(
         &endpoint.url
     };
     let request = client.post(url);
+    let request = match record.client_attempt_id {
+        Some(attempt) => request.header(
+            ferrum_types::image_trace::IMAGE_ATTEMPT_ID_HEADER,
+            attempt.to_string(),
+        ),
+        None => request,
+    };
     let request = match reference {
         Some(reference) => request.multipart(reference.form(endpoint, sample).map_err(|_| {
             (
@@ -455,6 +600,7 @@ async fn receive(
     };
     let mut response = request.send().await.map_err(transport_error)?;
     record.http_status = Some(response.status().as_u16());
+    read_correlation_headers(response.headers(), record)?;
     if !response.status().is_success() {
         return Err((
             ImageFailureKind::HttpStatus,
@@ -498,4 +644,48 @@ fn transport_error(error: reqwest::Error) -> (ImageFailureKind, &'static str) {
     } else {
         (ImageFailureKind::Transport, "HTTP transport failed")
     }
+}
+
+fn read_correlation_headers(
+    headers: &reqwest::header::HeaderMap,
+    record: &mut ImageRequestRecord,
+) -> Result<(), (ImageFailureKind, &'static str)> {
+    use ferrum_types::image_trace::{
+        parse_image_attempt_id, IMAGE_ATTEMPT_ID_HEADER, IMAGE_REQUEST_ID_HEADER,
+        IMAGE_TRACE_SESSION_HEADER,
+    };
+    let parse = |name: &'static str| {
+        let all = headers.get_all(name);
+        let mut values = all.iter();
+        let value = values.next();
+        if values.next().is_some() {
+            return Err("duplicate image response correlation header");
+        }
+        let value = value
+            .map(|value| {
+                value
+                    .to_str()
+                    .map_err(|_| "invalid image response correlation header")
+            })
+            .transpose()?;
+        parse_image_attempt_id(value).map_err(|_| "invalid image response correlation UUID")
+    };
+    // Read each independently so valid response IDs survive a later malformed
+    // header or a non-success response. No body/prompt/image data is retained.
+    let request = parse(IMAGE_REQUEST_ID_HEADER);
+    let trace = parse(IMAGE_TRACE_SESSION_HEADER);
+    let echo = parse(IMAGE_ATTEMPT_ID_HEADER);
+    record.server_request_id = request.as_ref().ok().copied().flatten();
+    record.trace_session_uuid = trace.as_ref().ok().copied().flatten();
+    let invalid = |message| (ImageFailureKind::InvalidResponse, message);
+    request.map_err(invalid)?;
+    trace.map_err(invalid)?;
+    if let Some(echo) = echo.map_err(invalid)? {
+        if Some(echo) != record.client_attempt_id {
+            return Err(invalid(
+                "image response attempt UUID does not match dispatch",
+            ));
+        }
+    }
+    Ok(())
 }

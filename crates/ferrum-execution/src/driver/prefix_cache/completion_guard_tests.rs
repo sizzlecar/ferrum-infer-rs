@@ -30,6 +30,7 @@ fn completion_sequence(
     let token_issuer = ExecutorSequenceIssuer::new();
     let token_identity = token_issuer.issue_sequence().unwrap();
     let sequence = Arc::new(VNextSequence {
+        causal_inputs: None,
         token_recovery_key: token_issuer.recovery_key(&token_identity).unwrap(),
         token_identity,
         token_issuer,

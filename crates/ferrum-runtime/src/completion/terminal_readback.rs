@@ -34,7 +34,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
         match self {
             Self::Wave(wave) => wave.take_terminal_readbacks(),
             Self::Resident(use_) => use_.take_terminal_readbacks(),
-            Self::Invocation(_) => None,
+            Self::Selected(_) | Self::Invocation(_) => None,
         }
     }
 }
@@ -54,7 +54,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         let request = match resources {
             CompletionResourceLease::Wave(wave) => wave.terminal_readback_request(),
             CompletionResourceLease::Resident(use_) => use_.terminal_readback_request(),
-            CompletionResourceLease::Invocation(_) => None,
+            CompletionResourceLease::Selected(_) | CompletionResourceLease::Invocation(_) => None,
         };
         let Some(request) = request else {
             return Ok(());
@@ -178,7 +178,9 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             CompletionResourceLease::Resident(use_) => {
                 use_.install_terminal_readback_payload(payload)
             }
-            CompletionResourceLease::Invocation(_) => unreachable!(),
+            CompletionResourceLease::Selected(_) | CompletionResourceLease::Invocation(_) => {
+                unreachable!()
+            }
         }
         Ok(())
     }

@@ -31,6 +31,7 @@ use super::dispatch_contract::{
 };
 use super::foundation::invalid_operation;
 use super::invocation::OperationInvocationResources;
+use super::registry::CandidateReplayAddressWitness;
 use super::work_facts::PreparedSubmissionWork;
 use super::workspace_encoding::{
     encode_provider_workspace_initialization, encode_submission_wave_workspace_initializations,
@@ -703,6 +704,12 @@ impl OperationDispatch {
                     "reusable execution topology provider or node differs from the immutable plan",
                 ));
             }
+            let candidate_replay = CandidateReplayAddressWitness::for_node(
+                plan.candidate_state_layout(),
+                node.id(),
+                plan_node_index,
+                lane.id(),
+            );
             let request = ReusableExecutionTopologyRequest::new(
                 node.id(),
                 node.operation_id(),
@@ -715,9 +722,15 @@ impl OperationDispatch {
                 prepared_node.work_shape(),
                 wave.claimed_backing(),
                 wave.step_resources().backing_slices(),
+                candidate_replay.as_ref(),
             )?;
             let declared = node.provider_execution_semantics().replay_equivalence();
             let topology = provider.provider().reusable_execution_topology(request)?;
+            if topology != ReusableExecutionTopology::EagerBoundary {
+                if let Some(witness) = candidate_replay {
+                    witness.consume()?;
+                }
+            }
             if topology == ReusableExecutionTopology::EagerBoundary {
                 eager_boundary_node_indices.push(u32::try_from(wave_node_index).map_err(|_| {
                     invalid_operation("reusable topology wave node index exceeds u32")
@@ -767,6 +780,14 @@ impl OperationDispatch {
             digest.update([topology_kind]);
             digest.update(topology_len.to_le_bytes());
             digest.update(topology_bytes);
+        }
+        // A reusable workspace binds stable storage, even on an eager-only
+        // device. It is not permission to capture a device executable. Keep
+        // all lane, claim and provider-topology validation above this boundary.
+        if !lane.descriptor().capabilities.iter().any(|capability| {
+            capability.as_str() == super::super::DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID
+        }) {
+            return Ok(None);
         }
         Ok(Some(ReusableExecutionWaveAuthority {
             program_id: program_id.with_topology_fingerprint(
@@ -1683,6 +1704,9 @@ impl OperationDispatch {
         if determinism_restore.is_some() {
             commands.require_logical_execution_path_attribution();
         }
+        completion
+            .validate_candidate_inputs(input_uploads)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
         let backing_initialization_command_count = completion
             .encode_backing_initializations(runtime, &mut commands)
             .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
@@ -3027,8 +3051,12 @@ where
         let mut validated_cursor = 0_usize;
         while validated_cursor < validated.len() {
             let mut contiguous_end = validated_cursor + 1;
-            if participant_packed {
+            // Only legacy bytes may use the legacy Vec aggregate. A managed
+            // slice retains its original accounted backing independently, even
+            // when adjacent legacy or managed slices share a packed allocation.
+            if participant_packed && validated[validated_cursor].upload.managed_bytes().is_none() {
                 while contiguous_end < validated.len()
+                    && validated[contiguous_end].upload.managed_bytes().is_none()
                     && validated[contiguous_end - 1].destination.end
                         == validated[contiguous_end].destination.start
                 {
@@ -3044,11 +3072,6 @@ where
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
             if let Some(managed) = first.upload.managed_bytes() {
-                if contiguous_end != validated_cursor + 1 {
-                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "managed tensor input aggregation requires an explicit accounted backing",
-                    )));
-                }
                 encode_submission_wave_managed_backing_upload(
                     runtime,
                     &first.identity,

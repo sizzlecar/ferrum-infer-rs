@@ -227,7 +227,7 @@ impl QwenImage21CudaConfig {
             .map_err(anyhow::Error::msg)?;
         }
         let editing = assets.editing.is_some();
-        let mut contracts = contracts(self.attention_policy)?;
+        let contracts = contracts_with_precision(self.attention_policy, self.precision_policy)?;
         // Exactly one Host ledger, also used by CPU weight conversion.
         let host = HostMemoryAccount::new(self.host);
         assets.prepare_lora(&host, self.precision_policy)?;
@@ -235,9 +235,6 @@ impl QwenImage21CudaConfig {
             self.prepare_assets(&assets, &profiles, &host)?;
         let device_id = DeviceId::new(format!("device.cuda.{}", self.ordinal))?;
         let device = if self.precision_policy.uses_fp8() {
-            contracts.push(Box::new(dense_linear_fp8_bf16_contract()?));
-            contracts.push(Box::new(dense_linear_fp8_pair_bf16_contract()?));
-            contracts.push(Box::new(dense_linear_fp8_triple_bf16_contract()?));
             cuda_tensor_runtime_config_with_cutlass_fp8_grouped(self.ordinal, device_id)?
         } else {
             cuda_tensor_runtime_config(self.ordinal, device_id)?
@@ -310,13 +307,14 @@ impl QwenImage21CudaConfig {
             lora: assets.receipt().lora.clone(),
             cudnn_opaque_profile: self.cudnn.opaque_memory_profile.clone(),
         };
-        // ALL includes Philox. Do not call the standalone Philox factory:
-        // it would try to acquire a second live native-module permit.
+        // This product declares a fixed operation union, including Philox.
+        // Module-wide ALL also contains unrelated capabilities. Select only
+        // the declared union while retaining one shared native-module permit.
         let mut providers = match self.attention_policy {
             ImageCudaAttentionPolicy::Sequential => cuda_vnext_tensor_providers_with_cudnn(
                 &runtime,
                 &convolution,
-                &CudaTensorOperation::ALL,
+                native_tensor_operations(),
             )?,
             ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
                 cuda_vnext_tensor_providers_with_cudnn_cross_attention(
@@ -328,7 +326,7 @@ impl QwenImage21CudaConfig {
                         opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
                         workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
                     },
-                    &CudaTensorOperation::ALL,
+                    native_tensor_operations(),
                 )?
             }
         };
@@ -648,6 +646,60 @@ fn cuda_profiles_with_precision(
     })
 }
 
+fn native_tensor_operations() -> &'static [CudaTensorOperation] {
+    use CudaTensorOperation as Op;
+    &[
+        Op::Silu,
+        Op::SiluMul,
+        Op::Tanh,
+        Op::ModulationScale,
+        Op::GatedResidual,
+        Op::LayerNorm,
+        Op::HeadRmsNorm,
+        Op::AdjacentRope,
+        Op::StructuredAttention,
+        Op::ZeroCenteredRmsNorm,
+        Op::GeluTanh,
+        Op::RowGather,
+        Op::BatchedRowConcat,
+        Op::PlainResidualAdd,
+        Op::HalfSplitRope,
+        Op::StructuredGqaAttention,
+        Op::ChannelL2Norm,
+        Op::SiluNchw,
+        Op::PlainResidualAddNchw,
+        Op::ChannelL2NormImage,
+        Op::SpatialAttention,
+        Op::SpatialUpsampleGather,
+        Op::SpatialGroupMean,
+        Op::AffineLinear,
+        Op::PatchProjection,
+        Op::AffineLayerNorm,
+        Op::GeluErf,
+        Op::HalfRotary,
+        Op::RowScatterAdd,
+        Op::ReshapeCopy,
+        Op::SegmentedAttention,
+        Op::PhiloxNormal,
+        Op::BlockLinear,
+    ]
+}
+
+fn contracts_with_precision(
+    attention: ImageCudaAttentionPolicy,
+    precision: ImageCudaPrecisionPolicy,
+) -> Result<Vec<Box<dyn OperationContract>>> {
+    let mut contracts = contracts(attention)?;
+    if precision.uses_fp8() {
+        contracts.extend([
+            Box::new(dense_linear_fp8_bf16_contract()?) as Box<dyn OperationContract>,
+            Box::new(dense_linear_fp8_pair_bf16_contract()?),
+            Box::new(dense_linear_fp8_triple_bf16_contract()?),
+        ]);
+    }
+    Ok(contracts)
+}
+
 fn contracts(attention: ImageCudaAttentionPolicy) -> Result<Vec<Box<dyn OperationContract>>> {
     let mut contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(silu_bf16_contract()?),
@@ -734,6 +786,7 @@ mod tests {
                 plan_cache: crate::image_generation::ImagePlanCachePolicy::default(),
                 residency: crate::image_generation::ImageResidencyPolicy::default(),
                 dynamic_residency: crate::image_generation::ImageDynamicResidencyPolicy::default(),
+                weight_arena_target_bytes: None,
                 static_initialization: StaticInitializationPolicy::new(1024, 32).unwrap(),
                 executor: TensorExecutorConfig::default(),
             },
@@ -856,6 +909,105 @@ mod tests {
             QwenImage21VaeDecoderFamily::CUDA_PROFILE_ID
         );
         assert_eq!(profiles.euler, Bf16EulerProfile::CudaScalarBf16StagedRneV1);
+    }
+
+    #[test]
+    fn product_native_provider_descriptors_match_registered_contracts() {
+        use super::super::{ImageComponentPrecision, ImageDenoiserPrecision, ImageTextPrecision};
+        use std::collections::BTreeSet;
+        // The real descriptors and fingerprints are prepared without a CUDA
+        // context, native module, cuDNN owner or dummy executable provider.
+        let runtime =
+            cuda_tensor_runtime_config(0, DeviceId::new("device.cuda.0").unwrap()).unwrap();
+        let device = DeviceDescriptor {
+            id: runtime.device_id,
+            class: DeviceClass::Accelerator,
+            ordinal: 0,
+            total_memory_bytes: 4096,
+            runtime_implementation_fingerprint: runtime.runtime_implementation_fingerprint,
+            capabilities: runtime.capabilities,
+            dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
+                DynamicStorageAllocator::LinearArena,
+                DynamicStorageView::Contiguous,
+            )
+            .unwrap()]),
+        };
+        let geometry = CudaPhiloxDeviceGeometry::new(2, 768).unwrap();
+        let selected = native_tensor_operations();
+        let unique = selected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            selected.len(),
+            "one native provider per selected operation"
+        );
+        for attention in [
+            ImageCudaAttentionPolicy::Sequential,
+            ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1,
+        ] {
+            for precision in [
+                ImageCudaPrecisionPolicy::Bf16,
+                ImageCudaPrecisionPolicy::Fp8LinearExperimentalV1,
+                ImageCudaPrecisionPolicy::Components(ImageComponentPrecision {
+                    text_encoder: ImageTextPrecision::Bf16,
+                    denoiser: ImageDenoiserPrecision::NativeSource,
+                }),
+                ImageCudaPrecisionPolicy::Components(ImageComponentPrecision {
+                    text_encoder: ImageTextPrecision::Fp8LinearExperimentalV1,
+                    denoiser: ImageDenoiserPrecision::NativeSource,
+                }),
+            ] {
+                let contracts = contracts_with_precision(attention, precision).unwrap();
+                let mut provided = BTreeSet::new();
+                for operation in selected {
+                    let provider = operation
+                        .provider_descriptor(&device, Some(geometry))
+                        .unwrap();
+                    let contract = contracts
+                        .iter()
+                        .find(|contract| &contract.descriptor().id == provider.operation_id())
+                        .expect(
+                            "every actually selected native provider needs its operation contract",
+                        );
+                    assert_eq!(
+                        provider.operation_fingerprint(),
+                        contract.descriptor().fingerprint().unwrap()
+                    );
+                    assert_eq!(provider.version(), contract.descriptor().version);
+                    assert!(provided.insert(provider.operation_id().clone()));
+                }
+                // These library providers are added explicitly by the same
+                // factory, independently of the shared native module selection.
+                provided.extend(
+                    [CONV2D_BF16_OPERATION_ID, DENSE_LINEAR_BF16_OPERATION_ID]
+                        .map(|id| OperationId::new(id).unwrap()),
+                );
+                if attention == ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 {
+                    provided.extend(
+                        [
+                            STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID,
+                            CROSS_ATTENTION_FUSED_BF16_OPERATION_ID,
+                        ]
+                        .map(|id| OperationId::new(id).unwrap()),
+                    );
+                }
+                if precision.uses_fp8() {
+                    for contract in [
+                        dense_linear_fp8_bf16_contract().unwrap(),
+                        dense_linear_fp8_pair_bf16_contract().unwrap(),
+                        dense_linear_fp8_triple_bf16_contract().unwrap(),
+                    ] {
+                        provided.insert(contract.descriptor().id.clone());
+                    }
+                }
+                assert_eq!(
+                    provided,
+                    contracts
+                        .iter()
+                        .map(|contract| contract.descriptor().id.clone())
+                        .collect()
+                );
+            }
+        }
     }
 
     #[test]

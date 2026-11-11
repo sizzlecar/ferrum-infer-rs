@@ -1,11 +1,12 @@
 //! Shared Hugging Face tokenizer metadata parser for production model packages.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ferrum_runtime::{
     CausalLanguageMetadata, SpecialTokenCollision, SpecialTokenCollisionPolicy,
     SpecialTokenMetadata, SpecialTokenRole, TemplateMetadata,
 };
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -17,6 +18,119 @@ pub(super) fn parse_hf_model_semantic_metadata(
 ) -> Result<CausalLanguageMetadata, String> {
     let tokenizer_config: Value = serde_json::from_slice(tokenizer_config_bytes)
         .map_err(|error| format!("parse tokenizer tokenizer_config.json: {error}"))?;
+    parse_hf_model_semantic_metadata_from_config(
+        model_config,
+        tokenizer_config_bytes,
+        &tokenizer_config,
+        chat_template_jinja,
+        chat_template_json,
+    )
+}
+
+/// Resolve named special tokens from both frozen HF tokenizer artifacts.
+/// Newer snapshots keep their IDs only in tokenizer.json's added_tokens.
+pub(super) fn parse_hf_model_semantic_metadata_with_tokenizer(
+    model_config: &Value,
+    tokenizer_config_bytes: &[u8],
+    tokenizer_json_bytes: &[u8],
+    chat_template_jinja: Option<&[u8]>,
+    chat_template_json: Option<&[u8]>,
+) -> Result<CausalLanguageMetadata, String> {
+    let mut tokenizer_config: Value = serde_json::from_slice(tokenizer_config_bytes)
+        .map_err(|error| format!("parse tokenizer tokenizer_config.json: {error}"))?;
+    merge_added_tokens(&mut tokenizer_config, tokenizer_json_bytes)?;
+    parse_hf_model_semantic_metadata_from_config(
+        model_config,
+        tokenizer_config_bytes,
+        &tokenizer_config,
+        chat_template_jinja,
+        chat_template_json,
+    )
+}
+
+#[derive(Deserialize)]
+struct TokenizerAddedTokens {
+    #[serde(default)]
+    added_tokens: Vec<TokenizerAddedToken>,
+}
+
+#[derive(Deserialize)]
+struct TokenizerAddedToken {
+    id: u32,
+    content: String,
+}
+
+fn merge_added_tokens(tokenizer_config: &mut Value, tokenizer_json: &[u8]) -> Result<(), String> {
+    // Ignore the model vocabulary while deserializing: only the small added-token
+    // table is needed, and the immutable bundle already owns the original bytes.
+    let added: TokenizerAddedTokens = serde_json::from_slice(tokenizer_json)
+        .map_err(|error| format!("parse tokenizer.json added_tokens: {error}"))?;
+    let config = tokenizer_config
+        .as_object_mut()
+        .ok_or("tokenizer_config.json root must be an object")?;
+    let mut by_id = BTreeMap::<u32, String>::new();
+    let mut by_content = BTreeMap::<String, u32>::new();
+    let mut insert = |id: u32, content: &str| -> Result<(), String> {
+        if let Some(previous) = by_id.get(&id) {
+            if previous != content {
+                return Err(format!(
+                    "conflicting added token id {id}: {previous:?} and {content:?}"
+                ));
+            }
+        }
+        if let Some(previous) = by_content.get(content) {
+            if *previous != id {
+                return Err(format!(
+                    "conflicting added token {content:?}: ids {previous} and {id}"
+                ));
+            }
+        }
+        by_id.insert(id, content.to_owned());
+        by_content.insert(content.to_owned(), id);
+        Ok(())
+    };
+    if let Some(decoder) = config
+        .get("added_tokens_decoder")
+        .filter(|value| !value.is_null())
+    {
+        let decoder = decoder
+            .as_object()
+            .ok_or("tokenizer_config.json added_tokens_decoder must be an object")?;
+        for (id, token) in decoder {
+            let id = id
+                .parse::<u32>()
+                .map_err(|error| format!("invalid added_tokens_decoder id {id:?}: {error}"))?;
+            let content = token
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or("added_tokens_decoder token must contain string content")?;
+            insert(id, content)?;
+        }
+    }
+    for token in added.added_tokens {
+        insert(token.id, &token.content)?;
+    }
+    // This is a transient semantic lookup, never a replacement source artifact.
+    // Template hashing below still uses the exact original selected file bytes.
+    config.insert(
+        "added_tokens_decoder".to_owned(),
+        Value::Object(
+            by_id
+                .into_iter()
+                .map(|(id, content)| (id.to_string(), serde_json::json!({"content": content})))
+                .collect(),
+        ),
+    );
+    Ok(())
+}
+
+fn parse_hf_model_semantic_metadata_from_config(
+    model_config: &Value,
+    tokenizer_config_bytes: &[u8],
+    tokenizer_config: &Value,
+    chat_template_jinja: Option<&[u8]>,
+    chat_template_json: Option<&[u8]>,
+) -> Result<CausalLanguageMetadata, String> {
     // Modern HF snapshots save a standalone template. Select it from the
     // immutable tokenizer source, with the same precedence as the product
     // renderer, and bind the digest to the file actually selected.
@@ -33,7 +147,7 @@ pub(super) fn parse_hf_model_semantic_metadata(
             .ok_or("chat_template.json missing chat_template")?;
         (template.to_owned(), "chat_template.json", bytes)
     } else {
-        let template = template_value(&tokenizer_config)
+        let template = template_value(tokenizer_config)
             .ok_or("tokenizer_config.json missing non-empty chat_template and no standalone template supplied")?;
         (
             template.to_owned(),
@@ -44,7 +158,7 @@ pub(super) fn parse_hf_model_semantic_metadata(
     if template.trim().is_empty() {
         return Err(format!("{source_file} chat template must be non-empty"));
     }
-    let special_tokens = parse_special_tokens(model_config, &tokenizer_config)?;
+    let special_tokens = parse_special_tokens(model_config, tokenizer_config)?;
     Ok(CausalLanguageMetadata {
         template: TemplateMetadata {
             template,
@@ -265,6 +379,114 @@ fn collision_policy(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tokenizer_added_tokens_resolve_modern_named_roles_without_rewriting_source() {
+        // Same schema as current HF processor packages; the IDs are arbitrary
+        // sparse fixture IDs so resolution must use the supplied artifact.
+        let config = br#"{
+            "bos_token":null,"eos_token":"<|im_end|>",
+            "pad_token":"<|endoftext|>","chat_template":"{{ messages }}"
+        }"#;
+        let tokenizer = br#"{
+            "added_tokens":[
+                {"id":137,"content":"<|endoftext|>","special":true},
+                {"id":901,"content":"<|im_end|>","special":true}
+            ],
+            "model":{"type":"BPE","vocab":{"ordinary":0},"merges":[]}
+        }"#;
+        let metadata = parse_hf_model_semantic_metadata_with_tokenizer(
+            &json!({"bos_token_id":1,"eos_token_id":2}),
+            config,
+            tokenizer,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(metadata.special_tokens.bos_token_id, None);
+        assert_eq!(metadata.special_tokens.pad_token_id, Some(137));
+        assert_eq!(metadata.special_tokens.eos_token_ids, BTreeSet::from([901]));
+        assert_eq!(metadata.template.source_file, "tokenizer_config.json");
+        assert_eq!(
+            metadata.template.sha256,
+            format!("{:x}", Sha256::digest(config))
+        );
+
+        let standalone = b"{{ messages[0].content }}\n";
+        let selected = parse_hf_model_semantic_metadata_with_tokenizer(
+            &json!({}),
+            config,
+            tokenizer,
+            Some(standalone),
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected.special_tokens, metadata.special_tokens);
+        assert_eq!(selected.template.source_file, "chat_template.jinja");
+        assert_eq!(
+            selected.template.sha256,
+            format!("{:x}", Sha256::digest(standalone))
+        );
+    }
+
+    #[test]
+    fn tokenizer_added_tokens_cross_check_legacy_decoder_and_numeric_roles() {
+        let config = br#"{
+            "eos_token":"end","pad_token_id":17,"chat_template":"template",
+            "added_tokens_decoder":{"4":{"content":"end","special":true}}
+        }"#;
+        let metadata = parse_hf_model_semantic_metadata_with_tokenizer(
+            &json!({}),
+            config,
+            br#"{"added_tokens":[{"id":4,"content":"end"}]}"#,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(metadata.special_tokens.eos_token_ids, BTreeSet::from([4]));
+        // Numeric roles may refer to base vocabulary IDs, not only added tokens.
+        assert_eq!(metadata.special_tokens.pad_token_id, Some(17));
+        for tokenizer in [
+            br#"{"added_tokens":[{"id":5,"content":"end"}]}"#.as_slice(),
+            br#"{"added_tokens":[{"id":4,"content":"other"}]}"#,
+            br#"{"added_tokens":[{"id":7,"content":"x"},{"id":8,"content":"x"}]}"#,
+            br#"{"added_tokens":[{"id":7,"content":"x"},{"id":7,"content":"y"}]}"#,
+        ] {
+            let error = parse_hf_model_semantic_metadata_with_tokenizer(
+                &json!({}),
+                config,
+                tokenizer,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains("conflicting added token"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tokenizer_added_tokens_reject_invalid_or_missing_id_sources() {
+        let config = br#"{"eos_token":"end","chat_template":"template"}"#;
+        for tokenizer in [
+            br#"{"added_tokens":[{"id":4294967296,"content":"end"}]}"#.as_slice(),
+            br#"{"added_tokens":[{"id":-1,"content":"end"}]}"#,
+            br#"{"added_tokens":[{"id":2.5,"content":"end"}]}"#,
+            br#"{"added_tokens":[{"content":"end"}]}"#,
+            br#"{"added_tokens":[{"id":2,"content":null}]}"#,
+            br#"{"added_tokens":{}}"#,
+            br#"{}"#,
+            br#"{"added_tokens":[{"id":2,"content":"different"}]}"#,
+        ] {
+            assert!(parse_hf_model_semantic_metadata_with_tokenizer(
+                &json!({}),
+                config,
+                tokenizer,
+                None,
+                None,
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn parses_numeric_and_named_special_tokens_into_one_typed_record() {

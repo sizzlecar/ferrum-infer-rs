@@ -2023,6 +2023,19 @@ pub trait ModelExecutor: Send + Sync + 'static {
         ))
     }
 
+    /// Bind additional immutable, token-scaled managed inputs to the original
+    /// sequence admission. Unsupported executors reject before admitting or
+    /// mutating work; later executions use the retained original input owner.
+    async fn admit_tokens_with_inputs(
+        &self,
+        _input: crate::token_execution::ExecutionAdmission<'_>,
+        _inputs: std::sync::Arc<crate::CausalRequestInputs>,
+    ) -> Result<crate::token_execution::TokenAdmissionOutcome> {
+        Err(FerrumError::unsupported(
+            "executor has not implemented token-scaled causal inputs",
+        ))
+    }
+
     /// Execute at exact, live frontiers. A bare error is permitted only before
     /// preparation starts. Once work may have advanced, preserve each member's
     /// actual progress and continuation in the returned batch outcome.

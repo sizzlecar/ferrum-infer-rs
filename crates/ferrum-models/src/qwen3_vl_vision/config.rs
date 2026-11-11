@@ -4,6 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+mod metadata;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArchitectureData {
@@ -17,7 +19,7 @@ struct ArchitectureData {
     merge_size: u64,
     position_embeddings: u64,
     output_size: u64,
-    deepstack_layers: [u64; 3],
+    deepstack_layers: Vec<u64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -45,11 +47,14 @@ impl Qwen3VLVisionArchitecture {
             || d.hidden_size % d.heads != 0
             || (d.hidden_size / d.heads) % 4 != 0
             || d.hidden_size / d.heads > 256
+            || !matches!(d.deepstack_layers.len(), 0 | 3)
             || d.deepstack_layers.windows(2).any(|v| v[0] >= v[1])
-            || d.deepstack_layers[2] >= d.depth
+            || d.deepstack_layers
+                .last()
+                .is_some_and(|&layer| layer >= d.depth)
             || d.depth.checked_mul(12).is_none_or(|n| n > 65536)
         {
-            return Err(invalid("architecture", "requires positive checked dimensions, axial head_dim divisible by four and three increasing DeepStack layers"));
+            return Err(invalid("architecture", "requires positive checked dimensions, axial head_dim divisible by four and either no DeepStack or three increasing DeepStack layers"));
         }
         let side = d.position_embeddings.isqrt();
         if side.checked_mul(side) != Some(d.position_embeddings) {
@@ -88,25 +93,44 @@ impl Qwen3VLVisionArchitecture {
         let v = raw
             .get("vision_config")
             .ok_or_else(|| invalid("vision_config", "missing vision configuration"))?;
-        if v.get("model_type").and_then(Value::as_str) != Some("qwen3_vl")
-            || v.get("dtype").and_then(Value::as_str) != Some("bfloat16")
-            || v.get("hidden_act").and_then(Value::as_str) != Some("gelu_pytorch_tanh")
-        {
+        metadata::check_vision_declaration(v)?;
+        let architecture = Self::from_vision_value(v)?;
+        if architecture.deepstack_layers().len() != 3 {
             return Err(invalid(
-                "vision_config",
-                "requires BF16 Qwen3VL vision with tanh-GELU blocks",
+                "deepstack_visual_indexes",
+                "Qwen3VL requires three declared DeepStack stages",
             ));
         }
-        // These are the defaults of the pinned Qwen3VL architecture, not backend knobs.
-        if v.get("rope_parameters").is_some()
-            || v.get("rope_theta").is_some()
-            || v.get("layer_norm_eps").is_some()
+        Ok(architecture)
+    }
+    /// The Qwen3.5 image encoder shares this graph's patch, axial attention and
+    /// main merger semantics, but declares no auxiliary DeepStack outputs.
+    /// The metadata activation dtype does not select a Stored weight format or
+    /// numerical execution profile; those remain explicit caller selections.
+    pub fn from_qwen35_hf_value(raw: &Value) -> Result<Self, VNextError> {
+        if raw.get("model_type").and_then(Value::as_str) != Some("qwen3_5")
+            || raw.get("architectures")
+                != Some(&serde_json::json!(["Qwen3_5ForConditionalGeneration"]))
         {
             return Err(invalid(
-                "vision_config",
-                "custom rotary or normalization parameters require a separate declared profile",
+                "architecture",
+                "requires Qwen3.5 conditional-generation metadata",
             ));
         }
+        let v = raw
+            .get("vision_config")
+            .ok_or_else(|| invalid("vision_config", "missing vision configuration"))?;
+        metadata::check_qwen35_vision_declaration(v)?;
+        let architecture = Self::from_vision_value(v)?;
+        if !architecture.deepstack_layers().is_empty() {
+            return Err(invalid(
+                "deepstack_visual_indexes",
+                "Qwen3.5 vision does not declare DeepStack stages",
+            ));
+        }
+        Ok(architecture)
+    }
+    fn from_vision_value(v: &Value) -> Result<Self, VNextError> {
         let u = |k: &str| {
             v.get(k)
                 .and_then(Value::as_u64)
@@ -124,9 +148,12 @@ impl Qwen3VLVisionArchitecture {
             position_embeddings: u("num_position_embeddings")?,
             output_size: u("out_hidden_size")?,
             deepstack_layers: serde_json::from_value(
-                v.get("deepstack_visual_indexes")
-                    .cloned()
-                    .ok_or_else(|| invalid("deepstack_visual_indexes", "missing three stages"))?,
+                v.get("deepstack_visual_indexes").cloned().ok_or_else(|| {
+                    invalid(
+                        "deepstack_visual_indexes",
+                        "missing explicit output topology",
+                    )
+                })?,
             )
             .map_err(|e| invalid("deepstack_visual_indexes", e.to_string()))?,
         })
@@ -164,8 +191,8 @@ impl Qwen3VLVisionArchitecture {
     pub const fn output_size(&self) -> u64 {
         self.0.output_size
     }
-    pub const fn deepstack_layers(&self) -> [u64; 3] {
-        self.0.deepstack_layers
+    pub fn deepstack_layers(&self) -> &[u64] {
+        &self.0.deepstack_layers
     }
     pub fn patch_columns(&self) -> Result<u64, VNextError> {
         [

@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.cutlass_int8_fused_output",
+  "operator_abi_version": "1",
+  "backend": "cuda",
+  "compute_capabilities": [
+    "sm_89"
+  ],
+  "provider_bindings": [
+    {
+      "operation_id": "operation.comfy_convrot_codebook_w4a8.bf16",
+      "provider_id": "provider.cuda.comfy_convrot_codebook_w4a8.bf16.cutlass_int8_fused_output",
+      "entrypoints": [
+        "ferrum_int8_fused_output_prepare_v1",
+        "ferrum_int8_fused_output_run_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.comfy_convrot_codebook_w4a8.swiglu_f32.bf16",
+      "provider_id": "provider.cuda.comfy_convrot_w4a8.swiglu_f32.bf16.cutlass_int8_fused_output",
+      "entrypoints": [
+        "ferrum_int8_fused_output_prepare_v1",
+        "ferrum_int8_fused_output_run_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.comfy_convrot_w8a8.bf16",
+      "provider_id": "provider.cuda.comfy_convrot_w8a8.bf16.cutlass_int8_fused_output",
+      "entrypoints": [
+        "ferrum_int8_fused_output_prepare_v1",
+        "ferrum_int8_fused_output_run_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.comfy_convrot_w8a8.swiglu_f32.bf16",
+      "provider_id": "provider.cuda.comfy_convrot_w8a8.swiglu_f32.bf16.cutlass_int8_fused_output",
+      "entrypoints": [
+        "ferrum_int8_fused_output_prepare_v1",
+        "ferrum_int8_fused_output_run_v1"
+      ]
+    }
+  ],
+  "required_exports": [
+    "ferrum_int8_fused_output_prepare_v1",
+    "ferrum_int8_fused_output_run_v1"
+  ],
+  "license_files": [
+    {
+      "source_path": "native-operators/cuda/cutlass-fp8/CUTLASS-BSD-3-Clause.txt",
+      "output_path": "licenses/CUTLASS-BSD-3-Clause.txt"
+    },
+    {
+      "source_path": "LICENSE",
+      "output_path": "licenses/Ferrum-MIT.txt"
+    }
+  ],
+  "cuda_toolkit": "12.8",
+  "cuda_runtime_min": "12.8",
+  "system_libraries": [
+    "cuda_runtime",
+    "std_cxx"
+  ]
+}

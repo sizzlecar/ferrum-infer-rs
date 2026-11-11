@@ -1,9 +1,61 @@
+mod gated_delta_candidate_scan;
+pub use gated_delta_candidate_scan::*;
+mod tail_two_greedy_f16;
+pub use tail_two_greedy_f16::*;
+mod concat_columns_f16;
+pub use concat_columns_f16::*;
 mod philox_normal_bf16;
 pub use philox_normal_bf16::*;
+mod philox_normal_f32;
+pub use philox_normal_f32::*;
 mod dense_linear_fp8_bf16;
 pub use dense_linear_fp8_bf16::*;
 mod dense_linear_fp8_group_bf16;
 pub use dense_linear_fp8_group_bf16::*;
+mod comfy_convrot_w4a8_bf16;
+pub use comfy_convrot_w4a8_bf16::*;
+mod comfy_convrot_w8a8_bf16;
+pub use comfy_convrot_w8a8_bf16::*;
+mod comfy_convrot_swiglu_f32_bf16;
+pub use comfy_convrot_swiglu_f32_bf16::*;
+mod comfy_convrot_f32;
+pub use comfy_convrot_f32::*;
+mod comfy_convrot_int8_embedding_f32;
+pub use comfy_convrot_int8_embedding_f32::*;
+mod affine_linear_f32;
+pub use affine_linear_f32::*;
+mod cast_f32_to_bf16;
+pub use cast_f32_to_bf16::*;
+mod pointwise_f32;
+pub use pointwise_f32::*;
+mod gelu_f32;
+pub use gelu_f32::*;
+mod row_scatter_f32;
+pub use row_scatter_f32::*;
+mod visual_causal_f16;
+pub use visual_causal_f16::*;
+mod causal_bf16;
+pub use causal_bf16::*;
+mod vision_layout_f32;
+pub use vision_layout_f32::*;
+mod channelwise_f32;
+pub use channelwise_f32::*;
+mod row_selected_modulation_bf16_f32;
+pub use row_selected_modulation_bf16_f32::*;
+mod row_selected_bf16;
+pub use row_selected_bf16::*;
+mod batched_suffix_append_f32;
+pub use batched_suffix_append_f32::*;
+mod layer_norm_f32;
+pub use layer_norm_f32::*;
+mod cnn_f32;
+pub use cnn_f32::*;
+mod unit_head_rms_partial_rope_f32;
+pub use unit_head_rms_partial_rope_f32::*;
+mod head_rms_norm_f32;
+pub use head_rms_norm_f32::*;
+mod half_split_rope_f32;
+pub use half_split_rope_f32::*;
 mod dense_linear_block_bf16;
 pub use dense_linear_block_bf16::*;
 mod channel_l2_norm_image_bf16;
@@ -52,8 +104,18 @@ mod plain_residual_add_bf16;
 pub use plain_residual_add_bf16::*;
 mod half_split_rope_bf16;
 pub use half_split_rope_bf16::*;
+mod fused_head_rms_partial_rope_bf16;
+pub use fused_head_rms_partial_rope_bf16::*;
+mod row_rms_norm_single_round_bf16;
+pub use row_rms_norm_single_round_bf16::*;
+mod addcmul_bf16;
+pub use addcmul_bf16::*;
 mod structured_gqa_attention_bf16;
 pub use structured_gqa_attention_bf16::*;
+mod structured_gqa_attention_f32;
+pub use structured_gqa_attention_f32::*;
+mod structured_gqa_attention_fused_f32;
+pub use structured_gqa_attention_fused_f32::*;
 mod structured_attention_bf16;
 pub use structured_attention_bf16::*;
 mod cross_attention_bf16;
@@ -102,6 +164,8 @@ pub const DENSE_LINEAR_OPERATION_ID: &str = "operation.dense_linear";
 pub const DENSE_LINEAR_F16_CAPABILITY_ID: &str = "capability.operation.dense_linear.f16";
 pub const DENSE_LINEAR_BF16_OPERATION_ID: &str = "operation.dense_linear.bf16";
 pub const DENSE_LINEAR_BF16_CAPABILITY_ID: &str = "capability.operation.dense_linear.bf16";
+pub const DENSE_LINEAR_F32_OPERATION_ID: &str = "operation.dense_linear.f32";
+pub const DENSE_LINEAR_F32_CAPABILITY_ID: &str = "capability.operation.dense_linear.f32";
 pub const DENSE_SWIGLU_OPERATION_ID: &str = "operation.dense_swiglu";
 pub const DENSE_SWIGLU_F16_CAPABILITY_ID: &str = "capability.operation.dense_swiglu.f16";
 pub const DENSE_GEGLU_TANH_OPERATION_ID: &str = "operation.dense_geglu_tanh";
@@ -694,6 +758,25 @@ pub fn dense_linear_bf16_contract() -> Result<StandardOperationContract, VNextEr
         ContractVersion::new(1, 0),
         DENSE_LINEAR_BF16_CAPABILITY_ID,
         ElementType::Bf16,
+        OracleSpec::OperationDefined,
+    )
+}
+
+/// Full row-wise F32 `Y[r,o] = sum_i X[r,i] * W[o,i]`, without bias or
+/// last-token selection. Operands, multiplication and accumulation retain F32
+/// precision; TF32 and F16/BF16 downcasts are outside this contract.
+///
+/// For finite inputs without product/sum overflow or underflow, and
+/// `2K * 2^-24 < 1`, the absolute dot-product error is bounded by
+/// `gamma(2K, 2^-24) * sum_i |X_i W_i|`. Reduction order and FMA use may
+/// differ between providers; no cross-backend bitwise equality is implied.
+/// An approximate high-precision oracle must add its own error bound.
+pub fn dense_linear_f32_contract() -> Result<StandardOperationContract, VNextError> {
+    dense_linear_contract_with_type(
+        DENSE_LINEAR_F32_OPERATION_ID,
+        ContractVersion::new(1, 0),
+        DENSE_LINEAR_F32_CAPABILITY_ID,
+        ElementType::F32,
         OracleSpec::OperationDefined,
     )
 }
@@ -2289,6 +2372,53 @@ mod tests {
         let mut mixed = new.inputs.clone();
         mixed[1] = old.inputs[1].clone();
         assert!(bf16.validate_signature(&mixed, &new.outputs).is_err());
+    }
+
+    #[test]
+    fn f32_dense_linear_preserves_all_rows_and_full_precision_signature() {
+        let contract = dense_linear_f32_contract().unwrap();
+        let descriptor = contract.descriptor();
+        assert_eq!(descriptor.id.as_str(), DENSE_LINEAR_F32_OPERATION_ID);
+        assert_eq!(descriptor.version, ContractVersion::new(1, 0));
+        assert_eq!(descriptor.oracle, OracleSpec::OperationDefined);
+        assert_eq!(
+            descriptor.inputs[0].dimensions(),
+            &[symbol("rows"), symbol("in_features")]
+        );
+        assert_eq!(
+            descriptor.inputs[1].dimensions(),
+            &[symbol("out_features"), symbol("in_features")]
+        );
+        assert_eq!(
+            descriptor.outputs[0].dimensions(),
+            &[symbol("rows"), symbol("out_features")]
+        );
+        for port in descriptor.inputs.iter().chain(&descriptor.outputs) {
+            assert_eq!(port.element_types(), &BTreeSet::from([ElementType::F32]));
+            assert_eq!(port.alias(), &AliasPolicy::NoAlias);
+        }
+        contract
+            .validate_signature(&descriptor.inputs, &descriptor.outputs)
+            .unwrap();
+        for incompatible in [
+            dense_linear_contract().unwrap(),
+            dense_linear_bf16_contract().unwrap(),
+        ] {
+            assert!(contract
+                .validate_signature(&incompatible.descriptor().inputs, &descriptor.outputs)
+                .is_err());
+            assert!(contract
+                .validate_signature(&descriptor.inputs, &incompatible.descriptor().outputs)
+                .is_err());
+        }
+        assert_ne!(
+            descriptor.fingerprint().unwrap(),
+            last_token_dense_linear_f32_contract()
+                .unwrap()
+                .descriptor()
+                .fingerprint()
+                .unwrap()
+        );
     }
 
     #[test]
