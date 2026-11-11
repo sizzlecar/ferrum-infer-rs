@@ -142,6 +142,18 @@ jobs:
               packages.all? { |_, v| v == manifest.fetch("version") }
           ' "$evidence/manifest.json" "$evidence/metadata.json"
           cargo package --workspace --registry crates-io --locked --allow-dirty --no-verify 2>&1 | tee "$evidence/package.log"
+          ruby -rjson -rdigest -rzlib -rrubygems/package -e '
+            result = Dir.glob(File.join(ARGV[0], "*.crate")).sort.map { |path|
+              entries = Zlib::GzipReader.open(path) { |gzip|
+                Gem::Package::TarReader.new(gzip).map { |entry|
+                  {path: entry.full_name, mode: entry.header.mode, size: entry.header.size,
+                    sha256: Digest::SHA256.hexdigest(entry.read)}
+                }
+              }
+              {archive: File.basename(path), sha256: Digest::SHA256.file(path).hexdigest, entries: entries}
+            }
+            File.write(ARGV[1], JSON.pretty_generate(result) + "\n")
+          ' "$CARGO_TARGET_DIR/package" "$evidence/archive-contents.json"
           jq -r --arg dir "$CARGO_TARGET_DIR/package" \
             '.crates[] | "\(.sha256)  \($dir)/\(.name)-\(.version).crate"' \
             "$evidence/manifest.json" > "$evidence/expected.sha256"
