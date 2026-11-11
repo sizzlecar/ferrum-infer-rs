@@ -3,8 +3,10 @@ import powerShellInstaller from "../scripts/install.ps1";
 
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
-const RELEASE_VERSION = "0.16.0";
+const RELEASE_VERSION = "0.19.0";
 const RELEASE_URL = `${REPOSITORY}/releases/tag/v${RELEASE_VERSION}`;
+const VALIDATION_URL = `${REPOSITORY}/releases/download/v${RELEASE_VERSION}/release-validation.json`;
+const IMAGE_GUIDE_URL = `${REPOSITORY}/blob/v${RELEASE_VERSION}/docs/image-generation.md`;
 const IMAGE_PERFORMANCE_URL = `${REPOSITORY}/releases/tag/v0.15.0#qwen-image-performance`;
 
 const css = String.raw`
@@ -146,6 +148,12 @@ const imageThroughput = [
   ["editing", "2048²", 2, "0.0686", "0.0685", "≈1.00×*"],
 ];
 
+// v0.19.0 final archive, RTX 5090: pooled throughput and per-repeat percentile ranges.
+const releaseTextThroughput = [
+  [8, "1051.67", "45.59–46.67 / 173.61–232.13", "6.68–7.27 / 7.46–8.56", "5.42–5.48 / 41.20–51.69"],
+  [16, "1427.57", "48.34–48.90 / 264.71–470.17", "9.02–10.32 / 10.18–12.38", "6.55–6.62 / 46.48–60.06"],
+];
+
 const pages = {
   en: {
     lang: "en",
@@ -153,11 +161,11 @@ const pages = {
     alternatePath: "/zh/",
     alternateLabel: "中文",
     title: "Ferrum — Text and image inference in Rust",
-    description: "Local text inference, Qwen-Image generation and editing, and OpenAI-compatible APIs in one Rust binary.",
+    description: "Local text inference, P-H3 and Qwen-Image generation and editing, and OpenAI-compatible APIs in one Rust binary.",
     nav: [["Quick start", "#quick-start"], ["Images", "#images"], ["Supported scope", "#support"], ["Throughput", "#performance"], ["Project", "#project"]],
     eyebrow: `v${RELEASE_VERSION} · Released`,
     h1: "Text and images.<br>One Rust binary.",
-    lead: "Run LLMs and Qwen-Image locally, with CLI and OpenAI-compatible APIs.",
+    lead: "Run LLMs, P-H3 and Qwen-Image locally, with CLI and OpenAI-compatible APIs.",
     goal: "Goal: maximize output throughput while meeting TTFT, TPOT and ITL SLOs.",
     goalContext: "Fix hardware, model and output policy; choose execution policy π from eligible policies Π under predeclared SLOs.",
     goalMathLabel: "Maximize valid output tokens from requests completed within fixed window T, divided by T, over eligible execution policies pi; require each latency percentile limit and completion fraction at least rho.",
@@ -181,15 +189,29 @@ const pages = {
     apiNote: 'API URL: <code>http://127.0.0.1:8000/v1</code>, model <code>ferrum</code>. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/openai-api-compatibility.md">Streaming, tools and structured output</a>.',
     defaultsNote: 'Defaults adapt execution and capacity to capabilities, hardware and memory; explicit settings prevail. Qualified SM120 GGUF paths can use 8-bit activation quantization and integer dot products. <code>--numerical-profile qwen3_5.f32-master</code> retains the original mixed-precision reference. Batch layouts can change output. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/numerical-execution.zh.md">Numerical profiles</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/cache-product.md">Caching</a>.',
     imageTitle: "Generate and edit images",
-    imageLead: 'CUDA: use a complete local <a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> directory. Validated on RTX 5090, Linux CUDA 12.8 and cuDNN 9.',
+    imageLead: 'P-H3-Image supports generation and ordered multi-reference editing on Linux CUDA SM89/SM120. <a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> supports generation and single-reference editing. Compatible requests batch automatically within the configured capacity.',
+    ph3Setup: `P-H3: copy the <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/p-h3-image-cuda.json">CUDA configuration</a>, set the model and CUDA/cuDNN library paths, then start the server below. It uses W4A8 text encoder/DiT, INT8 VAE and native prompt expansion. <a href="${IMAGE_GUIDE_URL}">Setup and capacity requirements</a>.`,
+    ph3ServeLabel: "P-H3: image API server",
+    ph3EditLabel: "P-H3: character and pose references",
     imageMetalNote: 'Metal supports Qwen-Image generation and single-PNG editing with a Q4_K_M GGUF DiT, FP8 text encoder and BF16 vision/VAE. Validated at 1024×1024 on an M4 Mac mini with 16 GiB unified memory. Use <code>--image-config</code> to select the backend, assets and memory budget.',
     imageMetalSetup: 'Metal: <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README.md#image-generation-and-editing">configuration and commands</a>.',
     imageRunLabel: "CUDA: text to image",
     imageEditLabel: "CUDA: edit one PNG",
     imageServeLabel: "CUDA: image API server",
-    imageApi: 'HTTP: <code>POST /v1/images/generations</code> (JSON), <code>POST /v1/images/edits</code> (multipart). One 8-bit RGB/RGBA PNG input; PNG output as <code>b64_json</code>. Editing may redraw background/details.',
-    imageConfigNote: 'The local-directory preset supports up to 1024×1024. 2K and the measured resident-service configurations use <code>--image-config</code>.',
-    imagePerformanceTitle: "Qwen-Image vs vLLM-Omni",
+    imageApi: 'HTTP: <code>POST /v1/images/generations</code> (JSON), <code>POST /v1/images/edits</code> (multipart). Qwen accepts one static 8-bit RGB/RGBA PNG; P-H3 accepts up to eight ordered references through repeated <code>image[]</code> fields. For example, use a character as Picture 1 and a pose as Picture 2. PNG output is returned as <code>b64_json</code>; masks are unsupported.',
+    imageConfigNote: 'P-H3 requires <code>--image-config</code> and supports landscape output such as 2720×1536. Qwen’s directory preset supports up to 2048×2048, subject to capacity checks. P-H3 Metal is not supported.',
+    releasePerformanceTitle: "v0.19.0 · RTX 5090 measurements",
+    releasePerformanceLead: "Qwen3.5-4B Q4_K_M · fixed server capacity 32, context/batch 2048 · pinned ShareGPT, 128–256 output tokens, ignore EOS · 64 requests × 2 repeats at each concurrency, plus 10 warmups per repeat. All 256 requests completed with zero errors; all repeats met P99 limits: TTFT 2000 ms, TPOT 50 ms, visible SSE text-event ITL 100 ms.",
+    releaseTextCaption: "Qwen3.5-4B · output tok/s; latency in ms",
+    releaseLatencyNote: "Throughput pools both repeats. Latency cells show the range of per-repeat P50 / P99, not pooled percentiles. TPOT uses the last visible text event; ITL measures successive nonempty SSE text events. Strict single-token ITL is unavailable; event/usage mismatches are retained.",
+    releaseResourceNote: "Sampled peaks across the whole text sweep, including startup/warmups: 7.07 GiB device-total VRAM and 3.55 GiB process RSS. All 377 GPU and 379 host samples succeeded. Device totals include driver/other processes; sampled peaks are lower bounds.",
+    releaseImageRows: [
+      ["P-H3 · 2720×1536", "Single edit: 24.04 s. C8: eight distinct references, 8/8 completed, zero request errors, 116.73 s total (0.06853 images/s). E2E P50/P99: 82.49/116.42 s; measured P99 met the 120 s limit. Capacity 8; W4A8 text/DiT, INT8 VAE, F16 prompt expansion."],
+      ["Image correctness", "P-H3 two-reference character-and-pose editing passed CLI/API checks with identical PNG bytes. Qwen-Image-2.1-Turbo passed CLI/API generation and four concurrent edits with distinct references at 512×512, FP8 Linear; all four edits retained the subject and applied the requested change."],
+    ],
+    releasePerformanceNote: `P-H3 is one C1/C8 repetition, not proof of stable production P99. Its RSS sampler lost one of 585 observations: observed peak 39.13 GiB is incomplete; VRAM was not sampled. Non-streaming images have no TTFT/TPOT/ITL. These are current-version measurements, not a controlled speedup over a different day or WSL memory configuration; no new llama.cpp/vLLM baseline was run. <a href="${VALIDATION_URL}">Exact configuration, results and limitations</a> · <a href="${RELEASE_URL}">Release notes</a>.`,
+    imagePerformanceTitle: "Historical Qwen-Image vs vLLM-Omni",
+    imagePerformanceLabel: "Historical image comparison · v0.15.0 candidate",
     imagePerformanceLead: "v0.15.0 candidate measurements · RTX 5090 · 8 steps · FP8 text encoder/DiT, BF16 VAE. Four paired pre-release runs per workload; 640 measured requests, zero errors. Mean images/s; C is client concurrency.",
     imageTasks: { generation: "generation", editing: "editing" },
     workloadLabel: "Workload",
@@ -200,16 +222,16 @@ const pages = {
       ["Text architectures", "Llama, Mistral, Qwen2, Qwen3 dense/MoE, Qwen3.5 hybrid dense/MoE, Gemma 3 text."],
       ["Weights", "GGUF, including Q4_K/Q5_K/Q6_K/Q8_0; SafeTensors. Selected CUDA paths: GPTQ INT4, compressed-tensors INT4, block-FP8."],
       ["Specific paths", "Gemma 4 compressed-tensors W4A16 and GPT-OSS MXFP4: CUDA. PQ2_0: complete-model validation on Metal; CUDA operator coverage only."],
-      ["Images", "Qwen-Image-2.1-Turbo generation and single-PNG editing; validated on Linux CUDA SM120 and at 1024×1024 on M4 Metal with the configuration above."],
+      ["Images", "P-H3-Image generation and multi-reference editing on Linux CUDA SM89/SM120. Qwen-Image-2.1-Turbo generation and single-PNG editing on Linux CUDA and Metal; M4 Metal validated at 1024×1024 with the configuration above."],
     ],
     supportNote: 'Support varies by architecture, format and backend. CPU is a compatibility backend; text support does not imply vision support. Embedding, ASR and TTS APIs were removed in 0.14.0. <a href="https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.14.0">Release notes</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">Validation scope</a>.',
-    performanceTitle: "Recent 27B throughput",
+    performanceTitle: "Historical 27B throughput",
     performanceLead: "RTX 5090 · Qwen3.8-27B · frozen ShareGPT workload. Accepted 0.13 candidate measurements: fixed 32 slots, context/batch 2048; 200 requests × 2 repeats per cell, 8 warmups per repeat, zero protocol errors. These tables fix the request count and use each repeat’s actual elapsed time, rather than a fixed window. Output tok/s = total output tokens / total measured time; C in the tables is client concurrency.",
     ggufCaption: "GGUF Q4_K_M · same weights",
     ctCaption: "Compressed-tensors INT4 · group size 32",
     concurrency: "C",
     ratio: "Ferrum / baseline",
-    performanceNote: 'Several cells fail latency SLOs. CT C32’s second repeat reached <strong>78.91%</strong>; 80% was not met in every repeat. CT uses FP16 activations/KV in Ferrum versus BF16 in vLLM (KV inferred from its auto setting). Same GGUF weights do not imply identical arithmetic. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">Full results</a> include latency percentiles, memory and quality limits. Joint SLO optimization follows in the next version.',
+    performanceNote: 'Several historical cells fail latency SLOs. CT C32’s second repeat reached <strong>78.91%</strong>; 80% was not met in every repeat. CT uses FP16 activations/KV in Ferrum versus BF16 in vLLM (KV inferred from its auto setting). Same GGUF weights do not imply identical arithmetic. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">Full historical results</a> include latency percentiles, memory and quality limits.',
     projectTitle: "An evolving open-source project",
     projectBody: "Ferrum uses AI-assisted development and iterates quickly. Internal APIs may change; model coverage and performance evolve. Quality remains a priority through correctness checks, model validation and honest reporting of failures. Personal GPU resources are limited; hardware access and contributions are welcome.",
     attribution: 'Thanks to <a href="https://github.com/vllm-project/vllm">vLLM</a> and <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> for code and implementation references. Component licenses and notices are preserved.',
@@ -223,11 +245,11 @@ const pages = {
     alternatePath: "/",
     alternateLabel: "English",
     title: "Ferrum — Rust 文本与图像推理",
-    description: "一个 Rust 二进制提供本地大模型推理、Qwen-Image 图像生成与编辑，以及 OpenAI 兼容 API。",
+    description: "一个 Rust 二进制提供本地大模型推理、P-H3 与 Qwen-Image 图像生成和编辑，以及 OpenAI 兼容 API。",
     nav: [["快速开始", "#quick-start"], ["图像", "#images"], ["支持范围", "#support"], ["吞吐结果", "#performance"], ["项目说明", "#project"]],
     eyebrow: `v${RELEASE_VERSION} · 已发布`,
     h1: "对话与生图，<br>一个 Rust 二进制。",
-    lead: "本地大模型与 Qwen-Image 图像生成、编辑，提供 CLI 和 OpenAI 兼容 API。",
+    lead: "本地运行大模型、P-H3 与 Qwen-Image 图像生成和编辑，提供 CLI 和 OpenAI 兼容 API。",
     goal: "目标：在满足 TTFT、TPOT、ITL SLO 的前提下，最大化输出吞吐。",
     goalContext: "固定硬件、模型与输出策略，在预设 SLO 下从可用策略集合 Π 中选择执行策略 π。",
     goalMathLabel: "在可用执行策略π中，最大化固定窗口T内成功完成请求的有效输出token数除以T，并满足各延迟分位上限及最低完成比例ρ。",
@@ -251,15 +273,29 @@ const pages = {
     apiNote: 'API 地址：<code>http://127.0.0.1:8000/v1</code>，模型名 <code>ferrum</code>。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/openai-api-compatibility.md">流式输出、工具与结构化输出</a>。',
     defaultsNote: '默认执行与容量按声明能力、硬件和内存选择，显式设置优先。合资格的 SM120 GGUF 路径可采用 8 位激活量化及整数点积。<code>--numerical-profile qwen3_5.f32-master</code> 保留原混合精度参考路径；批布局可能改变输出。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/numerical-execution.zh.md">数值策略</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/cache-product.md">缓存说明</a>。',
     imageTitle: "图像生成与编辑",
-    imageLead: 'CUDA：使用完整的本地 <a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> 模型目录。已验证 RTX 5090、Linux CUDA 12.8、cuDNN 9。',
+    imageLead: 'P-H3-Image 在 Linux CUDA SM89/SM120 上支持生图和有序多参考图编辑。<a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> 支持生图和单参考图编辑。兼容请求在配置容量内自动合批。',
+    ph3Setup: `P-H3：复制 <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/p-h3-image-cuda.json">CUDA 配置</a>，设置模型与 CUDA/cuDNN 库路径，再用下方命令启动。采用 W4A8 文本编码器/DiT、INT8 VAE 与原生提示词扩写。<a href="${IMAGE_GUIDE_URL}">配置及容量要求</a>。`,
+    ph3ServeLabel: "P-H3 图像 API 服务",
+    ph3EditLabel: "P-H3 人物与姿势双参考图",
     imageMetalNote: 'Metal 支持 Qwen-Image 生图与单张 PNG 编辑，使用 Q4_K_M GGUF DiT、FP8 文本编码器和 BF16 视觉编码器/VAE。已在 M4 Mac mini、16 GiB 统一内存上验证 1024×1024。通过 <code>--image-config</code> 配置后端、资产和内存预算。',
     imageMetalSetup: 'Metal：<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#图像生成与编辑">配置与使用命令</a>。',
     imageRunLabel: "CUDA 文生图",
     imageEditLabel: "CUDA 编辑单张 PNG",
     imageServeLabel: "CUDA 图像 API 服务",
-    imageApi: 'HTTP：<code>POST /v1/images/generations</code> 接收 JSON，<code>POST /v1/images/edits</code> 接收 multipart。编辑支持单张 8 位 RGB/RGBA PNG，返回 PNG 的 <code>b64_json</code>；背景和细节可能重绘。',
-    imageConfigNote: '本地目录预设最高支持 1024×1024；2K 及下表的常驻服务配置使用 <code>--image-config</code>。',
-    imagePerformanceTitle: "Qwen-Image 对比 vLLM-Omni",
+    imageApi: 'HTTP：<code>POST /v1/images/generations</code> 接收 JSON，<code>POST /v1/images/edits</code> 接收 multipart。Qwen 接受一张静态 8 位 RGB/RGBA PNG；P-H3 通过重复 <code>image[]</code> 字段接受最多八张有序参考图，例如 Picture 1 为人物、Picture 2 为姿势。返回 PNG 的 <code>b64_json</code>；不支持 mask。',
+    imageConfigNote: 'P-H3 必须使用 <code>--image-config</code>，支持 2720×1536 等横向尺寸。Qwen 本地目录预设最高支持 2048×2048，仍须满足容量检查。P-H3 不支持 Metal。',
+    releasePerformanceTitle: "v0.19.0 · RTX 5090 实测",
+    releasePerformanceLead: "Qwen3.5-4B Q4_K_M · 固定服务容量 32、上下文/批处理 2048 · 固定 ShareGPT，输出 128–256 token、忽略 EOS · 每档并发 64 请求 × 2 轮，每轮另预热 10 次。共 256 请求全部完成、零错误；各轮均满足 P99 上限：TTFT 2000 ms、TPOT 50 ms、可见 SSE 文本事件 ITL 100 ms。",
+    releaseTextCaption: "Qwen3.5-4B · 输出 token/s；延迟单位 ms",
+    releaseLatencyNote: "吞吐按两轮总量合并计算。延迟单元格列出各轮 P50 / P99 的范围，不是合并分位数。TPOT 截至最后可见文本事件；ITL 为相邻非空 SSE 文本事件间隔。严格单 token ITL 不可得；保留事件数与 usage 不一致的请求。",
+    releaseResourceNote: "整个文本测试（含启动与预热）的采样峰值：整卡显存 7.07 GiB、进程 RSS 3.55 GiB。377 次 GPU、379 次 Host 采样全部成功。整卡值包含驱动及其他进程；采样峰值是下界。",
+    releaseImageRows: [
+      ["P-H3 · 2720×1536", "单张编辑 24.04 秒。C8 使用八张不同参考图：8/8 完成、零请求错误，总耗时 116.73 秒（0.06853 张/秒）；E2E P50/P99 为 82.49/116.42 秒，实测 P99 满足 120 秒上限。容量固定 8；W4A8 文本/DiT、INT8 VAE、F16 扩写。"],
+      ["图像正确性", "P-H3 人物与姿势双参考图编辑通过 CLI/API 检查，相同输入得到相同 PNG。Qwen-Image-2.1-Turbo 在 512×512、FP8 Linear 下通过 CLI/API 生图及四张不同参考图的并发编辑；四张均保留主体并完成要求的修改。"],
+    ],
+    releasePerformanceNote: `P-H3 仅一轮 C1/C8，不能证明稳定生产 P99。RSS 采样 585 次中缺失一次，观测峰值 39.13 GiB 不完整；未采集显存。非流式图像不适用 TTFT/TPOT/ITL。这是当前版本实测，未把跨日期或不同 WSL 内存配置的差值作为受控加速比；本轮未重测 llama.cpp/vLLM。<a href="${VALIDATION_URL}">精确配置、结果与限制</a> · <a href="${RELEASE_URL}">发布说明</a>。`,
+    imagePerformanceTitle: "历史 Qwen-Image 对比 vLLM-Omni",
+    imagePerformanceLabel: "历史图像对比 · v0.15.0 候选",
     imagePerformanceLead: "v0.15.0 候选版实测 · RTX 5090 · 8 步 · 文本编码器/DiT FP8、VAE BF16。每项 4 对发布候选配对测试，共 640 个正式请求，零错误。单位：张/秒；C 为客户端并发。",
     imageTasks: { generation: "生成", editing: "编辑" },
     workloadLabel: "任务",
@@ -270,16 +306,16 @@ const pages = {
       ["文本架构", "Llama、Mistral、Qwen2、Qwen3 dense/MoE、Qwen3.5 hybrid dense/MoE、Gemma 3 文本。"],
       ["权重格式", "GGUF（含 Q4_K/Q5_K/Q6_K/Q8_0）、SafeTensors。部分 CUDA 路径支持 GPTQ INT4、compressed-tensors INT4、block-FP8。"],
       ["专用路径", "Gemma 4 compressed-tensors W4A16、GPT-OSS MXFP4 为 CUDA 路径。PQ2_0 完整模型仅在 Metal 实测，CUDA 目前为算子级验证。"],
-      ["图像", "Qwen-Image-2.1-Turbo 生成与单张 PNG 编辑；已验证 Linux CUDA SM120，以及上述配置下 M4 Metal 的 1024×1024。"],
+      ["图像", "P-H3-Image 在 Linux CUDA SM89/SM120 上支持生成与多参考图编辑。Qwen-Image-2.1-Turbo 在 Linux CUDA 和 Metal 上支持生成与单张 PNG 编辑；上述 M4 Metal 配置已验证 1024×1024。"],
     ],
     supportNote: '支持范围取决于架构、格式与后端组合。CPU 为兼容后端，文本支持不代表视觉支持。0.14.0 已移除 embedding、ASR 和 TTS API。<a href="https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.14.0">发布说明</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">验证范围</a>。',
-    performanceTitle: "近期 27B 吞吐",
+    performanceTitle: "历史 27B 吞吐",
     performanceLead: "RTX 5090 · Qwen3.8-27B · 冻结 ShareGPT 负载。已验收的 0.13 候选测量：固定 32 槽、上下文/批处理 2048；每格正式 200 请求 × 2 轮，每轮另有 8 次预热，零协议错误。本表固定请求数，以各轮实际耗时计算吞吐，不采用固定窗口。输出 token/s＝总输出 token / 总正式时长；表中 C 为客户端并发。",
     ggufCaption: "GGUF Q4_K_M · 同权重",
     ctCaption: "Compressed-tensors INT4 · group size 32",
     concurrency: "C",
     ratio: "Ferrum / 对照",
-    performanceNote: '多档延迟 SLO 未通过。CT C32 第二轮仅 <strong>78.91%</strong>，未证明每轮稳定达到 80%。CT 对比中 Ferrum 激活/KV 为 FP16，vLLM 为 BF16（KV 由 auto 配置推导）。同 GGUF 权重不等于内部算术相同。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">完整结果</a>列出延迟分位、内存与质量边界；联合 SLO 优化留到下一版本。',
+    performanceNote: '这些历史结果中多档延迟 SLO 未通过。CT C32 第二轮仅 <strong>78.91%</strong>，未证明每轮稳定达到 80%。CT 对比中 Ferrum 激活/KV 为 FP16，vLLM 为 BF16（KV 由 auto 配置推导）。同 GGUF 权重不等于内部算术相同。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">完整历史结果</a>列出延迟分位、内存与质量边界。',
     projectTitle: "持续迭代的开源项目",
     projectBody: "Ferrum 使用 AI 辅助开发，仍在快速迭代。内部 API 暂不承诺稳定，模型支持与性能持续更新。质量始终重要：保留正确性检查、模型验证并如实报告失败。个人 GPU 资源有限，欢迎提供硬件测试支持和贡献。",
     attribution: '感谢 <a href="https://github.com/vllm-project/vllm">vLLM</a> 与 <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a>，部分实现参考或复用了其代码；相关许可证与署名随组件保留。',
@@ -332,6 +368,12 @@ function render(page) {
     [page.imageEditLabel, 'ferrum run /path/to/Qwen-Image-2.1-Turbo --image fox.png --image-precision fp8_linear_experimental_v1 --prompt "Make the fox blue" --width 1024 --height 1024 --output edited.png'],
     [page.imageServeLabel, "ferrum serve --model /path/to/Qwen-Image-2.1-Turbo --served-model-name qwen-image --image-precision fp8_linear_experimental_v1 --port 8000"],
   ].map(([label, command], index) => codeBlock(label, command, `image-command-${index}`)).join("");
+  const ph3Commands = [
+    [page.ph3ServeLabel, "ferrum serve --image-config p-h3-image-cuda.json --served-model-name P-H3-Image --port 8000"],
+    [page.ph3EditLabel, 'ferrum run --image-config p-h3-image-cuda.json --image person.png --image pose.png --prompt "Keep the person from Picture 1 and adopt the pose from Picture 2." --width 2720 --height 1536 --output edited.png'],
+  ].map(([label, command], index) => codeBlock(label, command, `ph3-command-${index}`)).join("");
+  const releaseTable = `<div class="table-wrap"><table><caption>${page.releaseTextCaption}<span>P50 / P99</span></caption><thead><tr><th scope="col">C</th><th scope="col">token/s</th><th scope="col">TTFT</th><th scope="col">TPOT</th><th scope="col">ITL</th></tr></thead><tbody>${releaseTextThroughput.map(([c, rate, ttft, tpot, itl]) => `<tr><th scope="row">${c}</th><td>${rate}</td><td>${ttft}</td><td>${tpot}</td><td>${itl}</td></tr>`).join("")}</tbody></table></div>`;
+  const releaseImageResults = page.releaseImageRows.map(([title, body]) => `<div><dt>${title}</dt><dd>${body}</dd></div>`).join("");
   const imageTable = `<div class="table-wrap"><table><caption>Qwen-Image-2.1-Turbo<span>images/s</span></caption><thead><tr><th scope="col">${page.workloadLabel}</th><th scope="col">C</th><th scope="col">Ferrum</th><th scope="col">vLLM-Omni</th><th scope="col">${page.ratio}</th></tr></thead><tbody>${imageThroughput.map(([task, size, c, ferrum, omni, ratio]) => `<tr><th scope="row">${size} ${page.imageTasks[task]}</th><td>${c}</td><td>${ferrum}</td><td>${omni}</td><td>${ratio}</td></tr>`).join("")}</tbody></table></div>`;
   return `<!doctype html>
 <html lang="${page.lang}">
@@ -396,6 +438,8 @@ function render(page) {
     </div></section>
     <section id="images"><div class="wrap">
       <div class="section-head"><h2>${page.imageTitle}</h2><p>${page.imageLead}</p></div>
+      <p>${page.ph3Setup}</p>
+      <div class="install-commands">${ph3Commands}</div>
       <p class="note">${page.imageMetalNote}</p>
       <p>${page.imageMetalSetup}</p>
       <div class="install-commands">${imageCommands}</div>
@@ -409,9 +453,17 @@ function render(page) {
       <p class="muted">${page.supportNote}</p>
     </div></section>
     <section id="performance"><div class="wrap">
-      <div class="section-head"><h2>${page.imagePerformanceTitle}</h2><p>${page.imagePerformanceLead}</p></div>
-      ${imageTable}
-      <p class="note">${page.imagePerformanceNote}</p>
+      <div class="section-head"><h2>${page.releasePerformanceTitle}</h2><p>${page.releasePerformanceLead}</p></div>
+      ${releaseTable}
+      <p class="muted">${page.releaseLatencyNote}</p>
+      <p class="muted">${page.releaseResourceNote}</p>
+      <dl class="support-list">${releaseImageResults}</dl>
+      <p class="note">${page.releasePerformanceNote}</p>
+      <details><summary>${page.imagePerformanceLabel}</summary>
+        <div class="section-head"><h3>${page.imagePerformanceTitle}</h3><p>${page.imagePerformanceLead}</p></div>
+        ${imageTable}
+        <p class="note">${page.imagePerformanceNote}</p>
+      </details>
       <details><summary>${page.textPerformanceLabel}</summary>
         <div class="section-head"><h3>${page.performanceTitle}</h3><p>${page.performanceLead}</p></div>
         <div class="benchmark-grid">${table(page.ggufCaption, "llama.cpp b11429", throughput.gguf)}${table(page.ctCaption, "vLLM 0.31", throughput.ct)}</div>
