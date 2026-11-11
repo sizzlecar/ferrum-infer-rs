@@ -256,7 +256,7 @@ jobs:
       runner_id: ${{ steps.runner_id.outputs.artifact-id }}
       controller_id: ${{ steps.controller_id.outputs.artifact-id }}
     name: Stage macOS aarch64 CPU and Metal
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 90
     steps:
       - name: Validate immutable staging inputs
