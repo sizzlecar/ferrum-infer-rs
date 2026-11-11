@@ -994,6 +994,7 @@ pub(super) fn execute<O: Send + 'static>(
                     ));
                 }
                 let mut candidate = pending.pop_front().unwrap();
+                let was_ready = candidate.state.is_some();
                 gate_subscription = candidate
                     .job
                     .output
@@ -1088,6 +1089,16 @@ pub(super) fn execute<O: Send + 'static>(
                         });
                         drop(candidate.prepared);
                         batch = Some(next);
+                        // Collection inspected the old Ready FIFO head. Keep
+                        // joining Ready owners, but let fresh arrivals pass
+                        // through cohort collection at the next real boundary
+                        // instead of falling into singleton initialization.
+                        cohort_collection_handled |= was_ready
+                            && worker
+                                .denoising_generator()
+                                .unwrap()
+                                .initialization_cohort_generator()
+                                .is_some();
                     }
                     Ok(None)
                         if candidate.initialization.is_none()

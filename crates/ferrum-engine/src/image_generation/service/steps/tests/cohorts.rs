@@ -648,6 +648,20 @@ fn start_cohort_with_policy(
     Arc<Runtime>,
     Arc<Control>,
 ) {
+    start_cohort_with_capacity(mode, wait_ms, batching, None)
+}
+fn start_cohort_with_capacity(
+    mode: Mode,
+    wait_ms: u64,
+    batching: ImageBatchPolicy,
+    capacity: Option<usize>,
+) -> (
+    ImageService,
+    Arc<Boundary>,
+    Arc<Mutex<Trace>>,
+    Arc<Runtime>,
+    Arc<Control>,
+) {
     let (mut pipeline, source) = fixture_pipeline();
     let native_pressure = if matches!(mode, Mode::ReadyCapacity) {
         extended_schedule(&mut pipeline);
@@ -660,6 +674,9 @@ fn start_cohort_with_policy(
     if matches!(mode, Mode::BlockedDownstream) {
         extended_schedule(&mut pipeline);
         pipeline.execution.config.maximum_batch_size = 3;
+    }
+    if let Some(capacity) = capacity {
+        pipeline.execution.config.maximum_batch_size = capacity;
     }
     let runtime = pipeline.execution.runtime.clone();
     let boundary = Arc::new(Boundary::default());
@@ -683,11 +700,13 @@ fn start_cohort_with_policy(
             maximum_pending: 4,
             maximum_pending_bytes: 1 << 18,
             maximum_prompt_bytes: 1024,
-            max_num_seqs: if matches!(mode, Mode::BlockedDownstream | Mode::ReadyCapacity) {
-                3
-            } else {
-                2
-            },
+            max_num_seqs: capacity.unwrap_or(
+                if matches!(mode, Mode::BlockedDownstream | Mode::ReadyCapacity) {
+                    3
+                } else {
+                    2
+                },
+            ),
             request_batch_max_wait_ms: wait_ms,
         },
     )
@@ -866,6 +885,50 @@ async fn finite_initialization_cohort_seals_fifo_and_routes_reordered_results_to
     drop((a, b, c));
     finish(&service, &runtime).await;
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_arrivals_after_cohort_handoff_keep_the_cohort_initialization_protocol() {
+    let (service, boundary, trace, runtime, control) =
+        start_cohort_with_capacity(Mode::Handoff, 0, ImageBatchPolicy::Auto, Some(3));
+    let _release = Release(control.clone());
+    let _steps = ReleaseOnDrop(boundary.clone());
+    boundary.state.lock().unwrap().all = true;
+    let first = service.try_submit(request(1)).unwrap();
+    control.wait(|state| state.metadata_entered).await;
+    control.metadata();
+    control
+        .wait(|state| state.groups.len() == 1 && state.wake.is_some())
+        .await;
+    // These arrivals cannot join the sealed first phase. They must still use
+    // the declared cohort protocol after its downstream Ready owner joins.
+    let second = service.try_submit(request(2)).unwrap();
+    let third = service.try_submit(request(3)).unwrap();
+    control.finish();
+    let outputs = [
+        first.wait().await.unwrap(),
+        second.wait().await.unwrap(),
+        third.wait().await.unwrap(),
+    ];
+    assert_eq!(
+        outputs
+            .iter()
+            .map(|output| output.receipt.seed)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    let cohorts = control
+        .state
+        .lock()
+        .unwrap()
+        .groups
+        .iter()
+        .map(|group| group.iter().map(|(_, seed)| *seed).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(cohorts, [vec![1], vec![2, 3]]);
+    assert!(trace.lock().unwrap().iter().any(|wave| wave.len() == 2));
+    drop(outputs);
+    finish(&service, &runtime).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finite_initialization_cohort_handoff_uses_original_pending_downstream_consumer() {
     let (service, boundary, trace, runtime, control) = start_cohort(Mode::Handoff);
