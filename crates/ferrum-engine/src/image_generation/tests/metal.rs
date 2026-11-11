@@ -153,22 +153,31 @@ fn metal_factory_generates_real_managed_batches_and_retires_cold_and_resident_st
         let second = pipeline
             .generate_batch(vec![request("cat", 7), request("blue cat", 1 << 40)])
             .unwrap_or_else(|e| panic!("Metal repeat: {e:?}"));
-        let first_memory = first[0].receipt.native_memory.unwrap();
-        let second_memory = second[0].receipt.native_memory.unwrap();
-        assert_eq!(
-            first[0].receipt.native_memory,
-            first[1].receipt.native_memory
-        );
-        assert_eq!(
-            second[0].receipt.native_memory,
-            second[1].receipt.native_memory
-        );
-        assert_eq!(first_memory.scope, DeviceNativeMemoryScope::DeviceHandle);
+        // Single-image decoding samples the shared runtime separately for
+        // each completed output, including intervening allocation samples.
+        // Caller order need not be observation order, so compare the last
+        // first-batch observation with the earliest repeated-batch one.
+        let first_memory = first
+            .iter()
+            .map(|output| output.receipt.native_memory.unwrap())
+            .max_by_key(|memory| memory.samples)
+            .unwrap();
+        let second_memory = second
+            .iter()
+            .map(|output| output.receipt.native_memory.unwrap())
+            .min_by_key(|memory| memory.samples)
+            .unwrap();
+        for output in first.iter().chain(&second) {
+            let memory = output.receipt.native_memory.unwrap();
+            assert_eq!(memory.source, first_memory.source);
+            assert_eq!(memory.scope, DeviceNativeMemoryScope::DeviceHandle);
+            assert!(memory.observed_peak_allocated_bytes > 0);
+            assert!(memory.observed_peak_allocated_bytes >= memory.allocated_bytes);
+            assert!(memory.samples > 0);
+        }
         // Cold stages have already retired when the receipt is produced. The
         // high-water observation must still include their native allocations,
         // and subsequent jobs must not reset a shared runtime's history.
-        assert!(first_memory.observed_peak_allocated_bytes > 0);
-        assert!(first_memory.observed_peak_allocated_bytes >= first_memory.allocated_bytes);
         assert!(
             second_memory.observed_peak_allocated_bytes
                 >= first_memory.observed_peak_allocated_bytes
@@ -202,18 +211,35 @@ fn metal_factory_generates_real_managed_batches_and_retires_cold_and_resident_st
                 ));
         }
         if residency == ImageResidencyPolicy::AllStages {
-            assert!(second[0]
-                .receipt
-                .stages
-                .iter()
-                .all(|s| s.execution.session_reused));
+            for stage in second.iter().flat_map(|output| &output.receipt.stages) {
+                let execution = &stage.execution;
+                // Continuous initialization changes TE prompt geometry and
+                // grows DiT from B1 to B2. These plans attach the retained
+                // weights; only unchanged plans can reuse the entire session.
+                if matches!(
+                    execution.plan.stage,
+                    ImageStage::Noise | ImageStage::Decoder
+                ) {
+                    assert!(
+                        execution.session_reused,
+                        "unchanged {:?} plan did not reuse its session",
+                        execution.plan.stage
+                    );
+                } else {
+                    assert!(
+                        execution.weights_reused,
+                        "resident {:?} plan did not reuse its weights",
+                        execution.plan.stage
+                    );
+                }
+            }
         }
         drop(pipeline);
         assert!(host.usage().unwrap().committed_bytes() > 0); // Output owners remain valid.
         drop(first);
         drop(second);
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
-        eprintln!("Metal full image pipeline {precision:?} {residency:?}: true B2 text/DiT, separate seeds, Euler, VAE, repeat and release passed");
+        eprintln!("Metal full image pipeline {precision:?} {residency:?}: continuous two-request generation, separate seeds, Euler, VAE, repeat and release passed");
     }
 }
 
