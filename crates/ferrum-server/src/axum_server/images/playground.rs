@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use ferrum_models::qwen_image21::image_input::ImageInputLimits;
 use ferrum_output::png::PngDimensions;
 use serde::Serialize;
 
@@ -18,6 +19,8 @@ struct PlaygroundConfig<'a> {
     default_height: u32,
     default_seed: u64,
     supports_edits: bool,
+    maximum_reference_images: usize,
+    maximum_reference_image_bytes: usize,
     sizes: Vec<PlaygroundSize>,
     /// The browser's in-flight request limit, not a server batch capability.
     maximum_concurrency: u8,
@@ -75,6 +78,8 @@ fn configuration(images: &ImageHttpService) -> PlaygroundConfig<'_> {
         default_height: images.config.default_height,
         default_seed: images.config.default_seed,
         supports_edits: images.service.supports_edits(),
+        maximum_reference_images: images.service.maximum_reference_images(),
+        maximum_reference_image_bytes: ImageInputLimits::default().maximum_encoded_bytes(),
         sizes,
         maximum_concurrency: 2,
     }

@@ -2,8 +2,9 @@
 //!
 //! Reference: vllm-omni c0551d22674d0db81305c800b66ad83035fdc980,
 //! pipeline_qwen_image_21.py:434-457,572-715; Transformers v5.3.0,
-//! modeling_qwen3_vl.py:291-380,886-915,1223-1265. No image/video branch,
-//! KV cache, final text RMSNorm, or CPU model fallback is supplied here.
+//! modeling_qwen3_vl.py:291-380,886-915,1223-1265. Editing follows Diffusers'
+//! QwenImage21Pipeline raw numbered-image template. No video branch, KV cache,
+//! final text RMSNorm, or CPU model fallback is supplied here.
 //! Tokenizers 0.21 and libm 0.2.15 are explicit local implementations, not a
 //! claim of deployed Tokenizers 0.23.3 / Torch bitwise parity. Source hashes
 //! bind the supplied bytes, without authenticating a Hugging Face revision.
@@ -15,7 +16,7 @@
 mod edit;
 mod managed;
 mod tokenizer;
-pub use edit::QwenImage21EditPrompt;
+pub use edit::{QwenImage21EditImageGrid, QwenImage21EditImageSlots, QwenImage21EditPrompt};
 pub use managed::{QwenImage21T2iManagedInputs, QwenImage21T2iTextFeatures};
 pub use tokenizer::QwenImage21T2iTokenizer;
 

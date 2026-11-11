@@ -141,6 +141,39 @@ async fn ordered_image_array_fields_respect_backend_count_and_release_every_ingr
         .await
         .is_err());
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    for count in [8, 10] {
+        let payloads: Vec<_> = (0..count)
+            .map(|index| [b"\x89PNG\r\n\x1a\n".as_slice(), &[index as u8]].concat())
+            .collect();
+        let mut fields = vec![
+            ("model", b"image".as_slice(), false),
+            ("prompt", b"edit".as_slice(), false),
+        ];
+        fields.extend(
+            payloads
+                .iter()
+                .map(|bytes| ("image[]", bytes.as_slice(), true)),
+        );
+        let body = wire(&fields);
+        let (_, images) = parse_images(multipart(body.clone()).await, &host, count)
+            .await
+            .unwrap();
+        assert!(images
+            .iter()
+            .zip(&payloads)
+            .all(|(image, bytes)| image.bytes() == bytes));
+        assert_eq!(images.len(), count);
+        drop(images);
+        assert!(parse_images(multipart(body).await, &host, count - 1)
+            .await
+            .is_err());
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+        assert!(
+            edit_body_limit(count)
+                >= count * ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES + PROMPT_LIMIT
+        );
+    }
+    assert_eq!(edit_body_limit(usize::MAX), usize::MAX);
 }
 
 #[tokio::test]
@@ -159,7 +192,7 @@ async fn eight_megapixel_multipart_uses_shared_limits_and_real_managed_decoder()
     ])
     .len();
     assert!(output_bytes <= encoded_limit as u64);
-    assert!(encoded_limit + PROMPT_LIMIT + envelope_bytes <= EDIT_BODY_LIMIT);
+    assert!(encoded_limit + PROMPT_LIMIT + envelope_bytes <= edit_body_limit(1));
 
     // Stream highly compressible pixels into a small fixture; dimensions and
     // decoded Host admission still cover the full 2912² source image.
@@ -456,6 +489,7 @@ async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
     // the admitted prompt/queue metadata are live. This test exercises codec
     // limits; queue Host pressure has a separate HTTP 429 regression.
     let encoded_limit = ImageInputLimits::default().maximum_encoded_bytes();
+    let body_limit = edit_body_limit(1);
     let rgba_bytes = 2048 * 2048 * 4;
     let queue_bytes = 4096;
     let output_bytes = 2 * 1024 * 1024;
@@ -609,7 +643,7 @@ async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
         let payload_bytes = if encoded_rejection {
             encoded_limit + 1
         } else {
-            EDIT_BODY_LIMIT + 1 - envelope_bytes
+            body_limit + 1 - envelope_bytes
         };
         let mut bytes = vec![0; payload_bytes];
         bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
@@ -619,9 +653,9 @@ async fn two_k_png_round_trip_and_invalid_inputs_use_the_actual_router() {
             ("image", &bytes, true),
         ]);
         if !encoded_rejection {
-            assert_eq!(body.len(), EDIT_BODY_LIMIT + 1);
+            assert_eq!(body.len(), body_limit + 1);
         }
-        assert_eq!(body.len() <= EDIT_BODY_LIMIT, encoded_rejection);
+        assert_eq!(body.len() <= body_limit, encoded_rejection);
         let response = router
             .clone()
             .oneshot(

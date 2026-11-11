@@ -68,7 +68,7 @@ pub(super) fn build(
         SemanticValue::Rational(t.epsilon()),
     )]);
     let mut nodes = Vec::new();
-    if l.reference_image().is_some() && !config.is_decode() {
+    if !l.reference_images().is_empty() && !config.is_decode() {
         nodes.push(node(
             "combined_latents",
             BATCHED_ROW_CONCAT_BF16_OPERATION_ID,
@@ -107,7 +107,7 @@ pub(super) fn build(
         )?,
         dense(
             "image_in",
-            if l.reference_image().is_some() && !config.is_decode() {
+            if !l.reference_images().is_empty() && !config.is_decode() {
                 COMBINED_LATENTS
             } else {
                 F::LATENTS_ID
@@ -121,7 +121,7 @@ pub(super) fn build(
             "joint",
             BATCHED_ROW_CONCAT_BF16_OPERATION_ID,
             vec![id(TEXT_OUT)?, id(IMAGE_OUT)?],
-            if l.reference_image().is_some() {
+            if !l.reference_images().is_empty() {
                 UNORDERED_JOINT
             } else {
                 JOINT
@@ -176,28 +176,32 @@ pub(super) fn build(
             .ok_or_else(|| invalid("program", "decode lacks image projection"))?;
         image.outputs[0] = id(JOINT)?;
     }
-    if let Some(reference) = l.reference_image().filter(|_| !config.is_decode()) {
+    if !l.reference_images().is_empty() && !config.is_decode() {
         let text = u64::from(l.text_tokens());
-        let start = u64::from(reference.image_slot_start());
-        let slots = u64::from(reference.image_slots());
-        let refs = reference.latent_tokens();
+        let refs = l.reference_latent_tokens();
         let stride = text + refs + l.target_tokens();
+        let mut runs = Vec::new();
+        let mut text_cursor = 0;
+        let mut reference_cursor = text;
+        for reference in l.reference_images() {
+            let start = u64::from(reference.image_slot_start());
+            if start > text_cursor {
+                runs.push((start - text_cursor, text_cursor, stride, 1));
+            }
+            runs.push((reference.latent_tokens(), reference_cursor, stride, 1));
+            text_cursor = start + u64::from(reference.image_slots());
+            reference_cursor += reference.latent_tokens();
+        }
+        runs.extend([
+            (text - text_cursor, text_cursor, stride, 1),
+            (l.target_tokens(), text + refs, stride, 1),
+        ]);
         nodes.push(node(
             "interleaved_joint",
             ROW_GATHER_BF16_OPERATION_ID,
             vec![id(UNORDERED_JOINT)?],
             JOINT,
-            gather_attributes(
-                l.batch(),
-                0,
-                h,
-                &[
-                    (start, 0, stride, 1),
-                    (refs, text, stride, 1),
-                    (text - start - slots, start + slots, stride, 1),
-                    (l.target_tokens(), text + refs, stride, 1),
-                ],
-            )?,
+            gather_attributes(l.batch(), 0, h, &runs)?,
         )?);
     }
     for (index, output) in CONDITIONING.into_iter().enumerate() {
@@ -312,7 +316,7 @@ pub(super) fn build(
         .collect::<Result<Vec<_>, _>>()?;
     if config.is_decode() {
         inputs.retain(|input| input.as_str() != F::TEXT_ID);
-    } else if l.reference_image().is_some() {
+    } else if !l.reference_images().is_empty() {
         inputs.push(id(F::REFERENCE_LATENTS_ID)?);
     }
     let mut outputs = vec![id(F::VELOCITY_ID)?];
@@ -345,7 +349,7 @@ pub(super) fn build(
                 QwenImage21TransformerPhase::PrefixDecode => {
                     "block.qwen_image21.transformer.prefix_decode"
                 }
-                QwenImage21TransformerPhase::Full if l.reference_image().is_some() => {
+                QwenImage21TransformerPhase::Full if !l.reference_images().is_empty() => {
                     "block.qwen_image21.transformer.edit"
                 }
                 QwenImage21TransformerPhase::Full => "block.qwen_image21.transformer.t2i",

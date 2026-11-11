@@ -456,6 +456,9 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
     fn supports_edits(&self) -> bool {
         QwenImage21Pipeline::supports_edits(self)
     }
+    fn maximum_reference_images(&self) -> usize {
+        QwenImage21Pipeline::maximum_reference_images(self)
+    }
     fn edit(
         &mut self,
         request: ImageEditRequest,
@@ -560,9 +563,14 @@ pub(in crate::image_generation) fn preparation_error(error: anyhow::Error) -> Im
 
 fn compatible_edit_geometry(a: &ImageEditRequest, b: &ImageEditRequest) -> bool {
     let geometry = |request: &ImageEditRequest| {
-        let (width, height) =
-            png_dimensions_hint(request.image.bytes(), ImageInputLimits::default())?;
-        QwenImage21ImageProcessor::condition_dimensions(width, height).ok()
+        request
+            .images()
+            .map(|image| {
+                let (width, height) =
+                    png_dimensions_hint(image.bytes(), ImageInputLimits::default())?;
+                QwenImage21ImageProcessor::condition_dimensions(width, height).ok()
+            })
+            .collect::<Option<Vec<_>>>()
     };
     match (geometry(a), geometry(b)) {
         (Some(a), Some(b)) => a == b,

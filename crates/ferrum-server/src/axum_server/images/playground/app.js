@@ -5,9 +5,9 @@
   const cards = [];
   let config = null;
   let mode = 'generate';
-  let reference = null;
+  let references = [];
   let referenceVersion = 0;
-  let loadingReference = false;
+  let referenceQueue = Promise.resolve();
   let serial = 0;
   const PNG = [137, 80, 78, 71, 13, 10, 26, 10];
   const element = (tag, className, text) => {
@@ -22,8 +22,9 @@
   }
   function update() {
     const limit = config ? Math.max(1, Math.min(2, config.maximum_concurrency || 2)) : 2;
+    const loadingReference = references.some(reference => reference.loading);
     $('submit').disabled = !config || active.size >= limit || loadingReference;
-    $('submit').textContent = !config ? '等待服务连接' : active.size >= limit ? '已有 2 个请求在等待' : mode === 'edit' ? '开始编辑 ↗' : '生成画面 ↗';
+    $('submit').textContent = !config ? '等待服务连接' : active.size >= limit ? `已有 ${limit} 个请求在等待` : mode === 'edit' ? '开始编辑 ↗' : '生成画面 ↗';
     $('capacity').textContent = active.size ? `正在等待 ${active.size}/${limit} 个请求 · 可逐项取消` : `最多同时等待 ${limit} 个请求`;
     $('seed').disabled = $('random').checked;
   }
@@ -50,39 +51,120 @@
     if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 0) throw new Error('Seed 请输入 0–9007199254740991 之间的整数。');
     return value;
   }
-  function setReference(blob, name) {
-    if (reference) URL.revokeObjectURL(reference.url);
-    reference = { blob, name, url: URL.createObjectURL(blob) };
-    $('reference-preview').src = reference.url;
-    $('reference-preview').hidden = false;
-    $('reference-label').textContent = `${name} · ${(blob.size / 1048576).toFixed(1)} MB · 点击更换`;
-  }
-  async function selectFile(file) {
-    if (!file) return;
-    const version = ++referenceVersion;
-    loadingReference = true;
+  function referenceLimit() { return config?.supports_edits ? config.maximum_reference_images : 0; }
+  function renderReferences() {
+    $('reference-list').replaceChildren();
+    references.forEach((reference, index) => {
+      const item = element('li', 'reference-item');
+      if (reference.url) {
+        const image = element('img', 'reference-thumbnail');
+        image.alt = `参考图 ${index + 1}：${reference.name}`; image.src = reference.url; item.append(image);
+      } else item.append(element('span', 'reference-loading', '读取中…'));
+      const description = element('div', 'reference-description');
+      description.append(element('span', 'reference-number', `Picture ${index + 1}`));
+      const size = reference.blob ? ` · ${(reference.blob.size / 1048576).toFixed(1)} MB` : '';
+      description.append(element('span', 'reference-file', reference.name + size));
+      item.append(description);
+      const remove = action(item, '删除', () => removeReference(reference));
+      remove.setAttribute('aria-label', `删除参考图 ${index + 1}：${reference.name}`);
+      $('reference-list').append(item);
+    });
+    $('reference-count').textContent = `已选择 ${references.length}/${referenceLimit()} 张 · 按编号提交`;
+    $('clear-references').disabled = references.length === 0;
+    $('file').multiple = referenceLimit() > 1;
+    $('drop-zone').disabled = !config?.supports_edits;
+    $('reference-label').textContent = references.length >= referenceLimit() ? '已达到参考图上限，可删除后添加' : '＋ 选择或拖入参考图，按顺序追加';
     update();
+  }
+  function removeReference(reference) {
+    const index = references.indexOf(reference);
+    if (index < 0) return;
+    references.splice(index, 1);
+    if (reference.url) URL.revokeObjectURL(reference.url);
+    reference.file = null;
+    renderReferences();
+  }
+  function clearReferences() {
+    ++referenceVersion;
+    for (const reference of references) {
+      if (reference.url) URL.revokeObjectURL(reference.url);
+      reference.file = null;
+    }
+    references = [];
+    $('file').value = '';
+    renderReferences();
+  }
+  function checkReferenceBytes(blob) {
+    if (blob.size > config.maximum_reference_image_bytes) {
+      throw new Error(`每张 PNG 不能超过 ${(config.maximum_reference_image_bytes / 1048576).toFixed(1)} MB。`);
+    }
+  }
+  function setReference(blob, name) {
+    checkReferenceBytes(blob);
+    const reference = { blob, name, url: URL.createObjectURL(blob), loading: false, file: null };
+    clearReferences();
+    references.push(reference);
+    renderReferences();
+  }
+  async function readReference(reference, current) {
+    const file = reference.file;
+    checkReferenceBytes(file);
+    const signature = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+    if (!current()) return null;
+    if (PNG.every((byte, i) => signature[i] === byte)) return { blob: file, name: file.name };
+    if (signature[0] !== 255 || signature[1] !== 216 || signature[2] !== 255) throw new Error('请选择 PNG 或 JPG 图片；实际上传格式必须为 PNG。');
+    const bitmap = await createImageBitmap(file);
+    const canvas = document.createElement('canvas');
     try {
-      const signature = new Uint8Array(await file.slice(0, 8).arrayBuffer());
-      if (PNG.every((byte, i) => signature[i] === byte)) {
-        if (version === referenceVersion) setReference(file, file.name);
-      } else if (signature[0] === 255 && signature[1] === 216 && signature[2] === 255) {
-        const bitmap = await createImageBitmap(file);
-        const canvas = document.createElement('canvas');
+      if (!current()) return null;
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('浏览器无法转换这张图片，请直接上传 PNG。');
+      context.drawImage(bitmap, 0, 0);
+      const png = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      if (!current()) return null;
+      if (!png) throw new Error('JPG 转换失败，请直接上传 PNG。');
+      checkReferenceBytes(png);
+      return { blob: png, name: file.name.replace(/\.[^.]*$/, '') + '.png' };
+    } finally { bitmap.close(); canvas.width = 0; canvas.height = 0; }
+  }
+  function selectFiles(files) {
+    if (!config?.supports_edits || !files.length) return;
+    const available = referenceLimit() - references.length;
+    if (available <= 0) { notice(`最多添加 ${referenceLimit()} 张参考图，请先删除或清空。`); return; }
+    const version = referenceVersion;
+    const entries = Array.from(files).slice(0, available).map(file => ({ file, name: file.name, blob: null, url: null, loading: true }));
+    const overflow = files.length > available ? `最多 ${referenceLimit()} 张，本次仅添加前 ${available} 张。` : '';
+    references.push(...entries);
+    renderReferences();
+    notice(overflow || '正在读取参考图…');
+    // Reserve ordered slots immediately; decode JPEGs serially, including across drops.
+    referenceQueue = referenceQueue.then(async () => {
+      const errors = [];
+      for (const reference of entries) {
+        const current = () => version === referenceVersion && references.includes(reference);
+        if (!current()) continue;
         try {
-          canvas.width = bitmap.width;
-          canvas.height = bitmap.height;
-          const context = canvas.getContext('2d');
-          if (!context) throw new Error('浏览器无法转换这张图片，请直接上传 PNG。');
-          context.drawImage(bitmap, 0, 0);
-          const png = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
-          if (!png) throw new Error('JPG 转换失败，请直接上传 PNG。');
-          if (version === referenceVersion) setReference(png, file.name.replace(/\.[^.]*$/, '') + '.png');
-        } finally { bitmap.close(); canvas.width = 0; canvas.height = 0; }
-      } else throw new Error('请选择 PNG 或 JPG 图片；实际上传格式必须为 PNG。');
-      if (version === referenceVersion) notice('参考图已准备好。', true);
-    } catch (error) { if (version === referenceVersion) notice(error.message || '读取图片失败。'); }
-    finally { if (version === referenceVersion) { loadingReference = false; update(); } $('file').value = ''; }
+          const result = await readReference(reference, current);
+          if (result && current()) {
+            reference.url = URL.createObjectURL(result.blob);
+            reference.blob = result.blob; reference.name = result.name;
+          }
+        } catch (error) {
+          if (current()) {
+            errors.push(`${reference.name}：${error.message || '读取图片失败。'}`);
+            removeReference(reference);
+          }
+        } finally {
+          reference.loading = false; reference.file = null;
+          if (version === referenceVersion) renderReferences();
+        }
+      }
+      if (version === referenceVersion && (errors.length || entries.some(reference => references.includes(reference)))) {
+        notice([overflow, ...errors].filter(Boolean).join(' ') || '参考图已按编号准备好。', !errors.length && !overflow);
+      }
+    }).catch(error => { if (version === referenceVersion) notice(error.message || '读取图片失败。'); });
   }
   async function copy(text) {
     try {
@@ -116,12 +198,12 @@
     if (!config || $('submit').disabled) return;
     const prompt = $('prompt').value.trim();
     if (!prompt) { notice('先写下画面描述。'); $('prompt').focus(); return; }
-    if (mode === 'edit' && !reference) { notice('请先选择一张参考图。'); return; }
+    if (mode === 'edit' && !references.length) { notice('请先选择参考图。'); return; }
     let seed;
     try { seed = seedValue(); } catch (error) { notice(error.message); return; }
     const request = { model: config.model, prompt, seed, size: $('size').value, n: 1, response_format: 'b64_json' };
     const editing = mode === 'edit';
-    const original = reference?.blob;
+    const originals = references.map(reference => reference.blob);
     const controller = new AbortController();
     const id = ++serial;
     const node = element('article', 'card');
@@ -152,7 +234,7 @@
       if (editing) {
         const data = new FormData();
         for (const [key, value] of Object.entries(request)) data.append(key, String(value));
-        data.append('image', original, 'reference.png');
+        originals.forEach((blob, index) => data.append('image[]', blob, `reference-${index + 1}.png`));
         response = await fetch('/v1/images/edits', { method: 'POST', body: data, signal: controller.signal });
       } else response = await fetch('/v1/images/generations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request), signal: controller.signal });
       let payload;
@@ -173,7 +255,8 @@
       const download = element('a', 'small-button', '下载 PNG');
       download.href = card.url; download.download = `ferrum-${seed}-${request.size}.png`; actions.prepend(download);
       if (config.supports_edits) action(actions, '继续编辑', () => {
-        ++referenceVersion; loadingReference = false; setReference(blob, `生成结果 · Seed ${seed}`); setMode('edit');
+        try { setReference(blob, `生成结果 · Seed ${seed}`); } catch (error) { notice(error.message); return; }
+        setMode('edit');
         $('prompt').value = ''; $('prompt').focus(); notice('已将这张结果设为参考图。', true);
         $('form').scrollIntoView({ behavior: 'smooth', block: 'start' });
       });
@@ -190,16 +273,29 @@
   $('mode-generate').addEventListener('click', () => setMode('generate'));
   $('mode-edit').addEventListener('click', () => setMode('edit'));
   $('random').addEventListener('change', update);
-  $('drop-zone').addEventListener('click', () => $('file').click());
-  $('file').addEventListener('change', () => selectFile($('file').files[0]));
+  $('drop-zone').addEventListener('click', () => {
+    if (references.length >= referenceLimit()) { notice(`最多添加 ${referenceLimit()} 张参考图，请先删除或清空。`); return; }
+    $('file').click();
+  });
+  $('file').addEventListener('change', () => {
+    const files = Array.from($('file').files);
+    $('file').value = '';
+    selectFiles(files);
+  });
+  $('clear-references').addEventListener('click', () => { clearReferences(); notice('参考图已清空。', true); });
   for (const name of ['dragenter', 'dragover']) $('drop-zone').addEventListener(name, event => { event.preventDefault(); $('drop-zone').classList.add('dragover'); });
   $('drop-zone').addEventListener('dragleave', () => $('drop-zone').classList.remove('dragover'));
-  $('drop-zone').addEventListener('drop', event => { event.preventDefault(); $('drop-zone').classList.remove('dragover'); selectFile(event.dataTransfer.files[0]); });
-  window.addEventListener('beforeunload', () => { for (const controller of active.values()) controller.abort(); });
+  $('drop-zone').addEventListener('drop', event => { event.preventDefault(); $('drop-zone').classList.remove('dragover'); selectFiles(event.dataTransfer.files); });
+  window.addEventListener('beforeunload', () => {
+    clearReferences();
+    for (const controller of active.values()) controller.abort();
+    for (const card of cards) if (card.url) URL.revokeObjectURL(card.url);
+  });
   fetch('/playground/config', { cache: 'no-store' }).then(async response => {
     const value = await response.json();
     if (!response.ok) throw new Error(value?.error?.message || '图像服务暂不可用。');
     if (typeof value.model !== 'string' || !Array.isArray(value.sizes) || !value.sizes.length) throw new Error('服务配置缺少可用模型或尺寸。');
+    if (!Number.isSafeInteger(value.maximum_reference_images) || value.maximum_reference_images < 0 || (value.supports_edits && value.maximum_reference_images === 0) || !Number.isSafeInteger(value.maximum_reference_image_bytes) || value.maximum_reference_image_bytes <= 0) throw new Error('服务配置缺少有效的参考图限制。');
     config = value; $('model').textContent = config.model; $('model').title = config.model;
     $('size').replaceChildren();
     for (const size of config.sizes) {
@@ -211,6 +307,6 @@
     $('size').disabled = false; $('mode-edit').disabled = !config.supports_edits;
     if (Number.isSafeInteger(config.default_seed) && config.default_seed >= 0) $('seed').value = String(config.default_seed);
     else notice('服务默认 Seed 超出浏览器安全范围，请使用随机 Seed 或输入安全范围内的整数。');
-    update();
+    renderReferences();
   }).catch(error => { config = null; $('model').textContent = '服务未就绪'; notice(error.message || '无法连接图像服务，请刷新页面重试。'); update(); });
 })();

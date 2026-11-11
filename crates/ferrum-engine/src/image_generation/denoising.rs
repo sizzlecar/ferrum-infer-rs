@@ -49,7 +49,7 @@ impl FullGenerationDenoising {
     ) -> anyhow::Result<Self> {
         let batch = usize::try_from(config.layout().batch())?;
         ensure!(
-            config.layout().reference_image().is_none()
+            config.layout().reference_images().is_empty()
                 && config.execution_phase()
                     == ferrum_models::qwen_image21::QwenImage21TransformerPhase::Full,
             "request-owned denoising requires full text-to-image execution"

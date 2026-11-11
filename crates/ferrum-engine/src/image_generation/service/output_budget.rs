@@ -6,7 +6,10 @@ use ferrum_models::{
     normal_noise::NormalNoiseConfig,
     qwen3_vl_text::{Qwen3VLTextConfig, Qwen3VLTextEncoderFamily},
     qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionFamily, Qwen3VLVisionGrid},
-    qwen_image21::pipeline_adapters::{QwenImage21LatentLayout, QwenImage21LatentShape},
+    qwen_image21::{
+        pipeline_adapters::{QwenImage21LatentLayout, QwenImage21LatentShape},
+        t2i_prompt::QwenImage21EditImageGrid,
+    },
 };
 use ferrum_runtime::{ElementType, ProgramValueId, ResolvedTensorLayout, ResolvedTensorSpec};
 
@@ -56,55 +59,80 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 .editing
                 .as_ref()
                 .context("editing assets are missing")?;
-            let mut geometry = None;
+            let mut geometry: Option<Vec<(u32, u32)>> = None;
             for request in requests {
                 let ImageRequestRef::Edit(request) = request else {
                     unreachable!()
                 };
-                let (w, h) =
-                    png_dimensions_hint(request.image.bytes(), ImageInputLimits::default())
-                        .context("invalid bounded reference PNG header")?;
-                // This shares the processor's complete metadata validation,
-                // including pixel bounds; it performs no backing allocation.
-                assets
-                    .processor
-                    .prepared_backing_bytes(&self.execution.host, w, h)?;
-                let current = QwenImage21ImageProcessor::condition_dimensions(w, h)?;
                 ensure!(
-                    geometry.is_none_or(|previous| previous == current),
-                    "edit reference geometries differ"
+                    (1..=self.maximum_reference_images()).contains(&request.image_count()),
+                    "reference image count exceeds the model capability"
+                );
+                let current = request
+                    .images()
+                    .map(|image| {
+                        let (w, h) =
+                            png_dimensions_hint(image.bytes(), ImageInputLimits::default())
+                                .context("invalid bounded reference PNG header")?;
+                        // Validate every reference without allocating its backing.
+                        assets
+                            .processor
+                            .prepared_backing_bytes(&self.execution.host, w, h)?;
+                        Ok(QwenImage21ImageProcessor::condition_dimensions(w, h)?)
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                ensure!(
+                    geometry
+                        .as_ref()
+                        .is_none_or(|previous| previous == &current),
+                    "ordered edit reference geometries differ"
                 );
                 geometry = Some(current);
             }
-            let (w, h) = geometry.context("missing edit reference geometry")?;
+            let geometry = geometry.context("missing edit reference geometry")?;
             let patch = u32::try_from(assets.processor.patch_size())?;
-            let grid = Qwen3VLVisionGrid::new(1, u64::from(h / patch), u64::from(w / patch))?;
-            let vision = Qwen3VLVisionConfig::new(assets.vision.clone(), vec![grid])?;
-            let merged = ResolvedTensorSpec::new(
-                vec![vision.merged_rows()?, assets.vision.output_size()],
-                ElementType::Bf16,
-                ResolvedTensorLayout::Contiguous,
-            )?;
-            // Main merger and three DeepStack outputs are separate readbacks
-            // for every reference, all retained until the text bridge copies.
-            edit_output = physical(&self.execution.host, &merged)?
-                .checked_mul(1 + Qwen3VLVisionFamily::DEEPSTACK_IDS.len())
-                .and_then(|bytes| bytes.checked_mul(batch))
-                .context("vision output peak overflows")?;
-            edit_output = edit_output.max(physical(
-                &self.execution.host,
-                &assets.encoder_config(h, w)?.output_tensor()?,
-            )?);
+            let mut grids = Vec::with_capacity(geometry.len());
+            let mut vision_outputs = 0usize;
+            let mut encoder_output = 0usize;
+            for (w, h) in geometry {
+                let grid = Qwen3VLVisionGrid::new(1, u64::from(h / patch), u64::from(w / patch))?;
+                let vision = Qwen3VLVisionConfig::new(assets.vision.clone(), vec![grid])?;
+                let merged = ResolvedTensorSpec::new(
+                    vec![vision.merged_rows()?, assets.vision.output_size()],
+                    ElementType::Bf16,
+                    ResolvedTensorLayout::Contiguous,
+                )?;
+                // Each reference has four independently padded readbacks.
+                // All vision outputs remain live until the text bridge copies.
+                let bytes = physical(&self.execution.host, &merged)?
+                    .checked_mul(1 + Qwen3VLVisionFamily::DEEPSTACK_IDS.len())
+                    .context("vision output peak overflows")?;
+                vision_outputs = vision_outputs
+                    .checked_add(bytes)
+                    .context("vision output peak overflows")?;
+                // VAE encoders execute and copy one reference at a time.
+                encoder_output = encoder_output.max(physical(
+                    &self.execution.host,
+                    &assets.encoder_config(h, w)?.output_tensor()?,
+                )?);
+                grids.push(QwenImage21EditImageGrid::new(
+                    u64::from(h / patch),
+                    u64::from(w / patch),
+                    assets.vision.merge_size(),
+                )?);
+            }
+            edit_output = vision_outputs
+                .checked_mul(batch)
+                .context("vision output peak overflows")?
+                .max(encoder_output);
             self.execution
                 .sources
                 .assets
                 .tokenizer
-                .prepare_edit_batch(
+                .prepare_edit_batch_multi(
                     &prompts,
                     self.execution.config.maximum_user_tokens,
-                    u64::from(h / patch),
-                    u64::from(w / patch),
-                    assets.vision.merge_size(),
+                    &grids,
                 )?
                 .text_config(&self.execution.sources.assets.text)?
         } else {

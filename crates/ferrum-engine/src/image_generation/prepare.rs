@@ -116,7 +116,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map(|r| r.prompt.as_str())
             .collect::<Vec<_>>();
         let (prompts, order) = if let Some(edit) = &edit {
-            edit.dimensions(batch)?;
+            edit.geometries(batch)?;
             // Reference inputs and vision outputs use caller order. Do not
             // apply generation's prompt-length canonicalization to edits.
             (edit.prompt.prompts().clone(), (0..batch).collect())
@@ -153,13 +153,24 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         )?
         .with_weight_encodings(self.execution.sources.assets.transformer_encodings.clone())?;
         if let Some(edit) = &edit {
-            let (reference_height, reference_width) = edit.dimensions(batch)?;
-            transformer = transformer.with_reference_image(
-                edit.prompt.image_slot_start(),
-                edit.prompt.image_slots(),
-                reference_height / 16,
-                reference_width / 16,
-            )?;
+            let geometries = edit.geometries(batch)?;
+            ensure!(
+                geometries.len() == edit.prompt.image_slot_ranges().len(),
+                "reference slot and geometry counts differ"
+            );
+            let references = geometries
+                .into_iter()
+                .zip(edit.prompt.image_slot_ranges())
+                .map(|((height, width), slots)| {
+                    ferrum_models::qwen_image21::QwenImage21ReferenceImage::new(
+                        slots.image_slot_start(),
+                        slots.image_slots(),
+                        height / 16,
+                        width / 16,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            transformer = transformer.with_reference_images(references)?;
         }
         let prefix_decode_config = if edit.is_some()
             && self.execution.config.edit_prefix_policy == ImageEditPrefixPolicy::RequestCache
@@ -268,7 +279,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let edit = edit.map(|edit| edit.compile(self)).transpose()?;
         let mut all_stages = vec![&text_stage, &noise_stage, &denoise_stage, &decode_stage];
         if let Some(edit) = &edit {
-            all_stages.extend([&edit.vision_stage, &edit.encoder_stage]);
+            all_stages.extend(edit.stages());
         }
         if let Some(prefix) = &prefix_decode {
             all_stages.push(&prefix.stage);

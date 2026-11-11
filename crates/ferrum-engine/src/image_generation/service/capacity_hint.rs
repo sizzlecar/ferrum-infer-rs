@@ -1,5 +1,6 @@
 //! Metadata-only reuse of a verified capacity search, never an admission grant.
 use super::*;
+use ferrum_models::qwen_image21::t2i_prompt::QwenImage21EditImageGrid;
 use sha2::{Digest, Sha256};
 
 /// The generator's capacity shape for each homogeneous row, independent of
@@ -256,36 +257,68 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 let Some(assets) = &self.execution.sources.assets.editing else {
                     return Ok(None);
                 };
-                let mut geometry = None;
+                let mut geometry: Option<Vec<(u32, u32)>> = None;
                 for request in requests {
                     let ImageRequestRef::Edit(request) = request else {
                         return Ok(None);
                     };
-                    let Some((width, height)) =
-                        png_dimensions_hint(request.image.bytes(), ImageInputLimits::default())
-                    else {
+                    if !(1..=self.maximum_reference_images()).contains(&request.image_count()) {
                         return Ok(None);
-                    };
-                    let current = QwenImage21ImageProcessor::condition_dimensions(width, height)?;
-                    if geometry.is_some_and(|previous| previous != current) {
+                    }
+                    let mut current = Vec::with_capacity(request.image_count());
+                    for image in request.images() {
+                        let Some((width, height)) =
+                            png_dimensions_hint(image.bytes(), ImageInputLimits::default())
+                        else {
+                            return Ok(None);
+                        };
+                        assets.processor.prepared_backing_bytes(
+                            &self.execution.host,
+                            width,
+                            height,
+                        )?;
+                        current.push(QwenImage21ImageProcessor::condition_dimensions(
+                            width, height,
+                        )?);
+                    }
+                    if geometry
+                        .as_ref()
+                        .is_some_and(|previous| previous != &current)
+                    {
                         return Ok(None);
                     }
                     geometry = Some(current);
                 }
-                let (width, height) = geometry.expect("nonempty edit requests");
+                let geometry = geometry.expect("nonempty edit requests");
                 let patch = u64::try_from(assets.processor.patch_size())?;
-                let prompt = self.execution.sources.assets.tokenizer.prepare_edit_batch(
-                    &prompts,
-                    self.execution.config.maximum_user_tokens,
-                    u64::from(height) / patch,
-                    u64::from(width) / patch,
-                    assets.vision.merge_size(),
-                )?;
+                let grids = geometry
+                    .iter()
+                    .map(|&(width, height)| {
+                        QwenImage21EditImageGrid::new(
+                            u64::from(height) / patch,
+                            u64::from(width) / patch,
+                            assets.vision.merge_size(),
+                        )
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let prompt = self
+                    .execution
+                    .sources
+                    .assets
+                    .tokenizer
+                    .prepare_edit_batch_multi(
+                        &prompts,
+                        self.execution.config.maximum_user_tokens,
+                        &grids,
+                    )?;
                 shape.update(b"edit");
-                shape.update(width.to_le_bytes());
-                shape.update(height.to_le_bytes());
-                shape.update(prompt.image_slot_start().to_le_bytes());
-                shape.update(prompt.image_slots().to_le_bytes());
+                shape.update(u64::try_from(geometry.len())?.to_le_bytes());
+                for ((width, height), slots) in geometry.iter().zip(prompt.image_slot_ranges()) {
+                    shape.update(width.to_le_bytes());
+                    shape.update(height.to_le_bytes());
+                    shape.update(slots.image_slot_start().to_le_bytes());
+                    shape.update(slots.image_slots().to_le_bytes());
+                }
                 prompt.prompts().clone()
             }
         };

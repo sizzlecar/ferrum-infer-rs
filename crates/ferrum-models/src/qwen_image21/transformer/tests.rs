@@ -2,6 +2,9 @@ use super::*;
 use serde_json::json;
 type F = QwenImage21TransformerFamily;
 
+#[path = "multi_reference_tests.rs"]
+mod multi_reference;
+
 #[test]
 fn native_archive_profiles_preserve_mixed_blocks_and_prefix_storage_identity() {
     let architecture = transformer(1, true, true);

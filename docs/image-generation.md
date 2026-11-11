@@ -1,6 +1,6 @@
 # Image generation and editing
 
-Ferrum supports Qwen-Image-2.1-Turbo on Linux CUDA and Apple Silicon Metal, and P-H3-Image on Linux CUDA SM89/SM120. Qwen editing accepts one static 8-bit RGB/RGBA PNG; P-H3 accepts up to eight ordered references. Masks are unsupported. Editing can redraw background and details.
+Ferrum supports Qwen-Image-2.1-Turbo on Linux CUDA and Apple Silicon Metal, and P-H3-Image on Linux CUDA SM89/SM120. On main/development, Qwen editing accepts up to ten ordered references; P-H3 accepts up to eight. **Released v0.19.0 still supports only one Qwen reference.** Each reference must be a static 8-bit RGB/RGBA PNG. Masks are unsupported. Editing can redraw background and details.
 
 ## P-H3 setup
 
@@ -103,6 +103,26 @@ curl http://127.0.0.1:8000/v1/images/edits \
 
 For Metal, replace `qwen-image` with `qwen-image-turbo-metal`.
 
+On main/development, Qwen accepts up to ten images in one edit, with the same
+reference order in `run` and `serve`. Repeat multipart `image[]` fields (`image`
+is also accepted), or repeat CLI `--image`; refer to image 1, image 2, and so on
+in the prompt. These Qwen multi-reference examples require a development build,
+not the v0.19.0 release:
+
+```sh
+curl http://127.0.0.1:8000/v1/images/edits \
+  -F model=qwen-image \
+  -F 'image[]=@person.png' -F 'image[]=@pose.png' \
+  -F 'prompt=Keep the person, face and clothing from image 1. Use the pose from image 2.' \
+  -F size=1024x1024
+
+ferrum run /path/to/Qwen-Image-2.1-Turbo --backend cuda \
+  --image-precision fp8_linear_experimental_v1 \
+  --image person.png --image pose.png \
+  --prompt 'Keep the person from image 1 and adopt the pose from image 2.' \
+  --width 1024 --height 1024 --output edited.png
+```
+
 P-H3 accepts up to eight ordered input images per edit. The first is Picture 1,
 the image being edited; subsequent inputs are Picture 2 through Picture 8.
 Repeat `image[]` in the OpenAI-compatible multipart request (`image` is also
@@ -122,8 +142,8 @@ ferrum run --image-config ph3.json \
 ```
 
 The `/health` image capabilities report `maximum_reference_images` separately
-from the concurrent edit request capacity. Qwen's current pipeline accepts one
-input image. Each file must be a static RGB/RGBA8 PNG within the encoded image
+from the concurrent edit request capacity; use the running server's declaration
+when choosing how many images to send. Each file must be a static RGB/RGBA8 PNG within the encoded image
 limit; all input backings, decoded pixels and visual outputs must also fit the
 configured Host and device budgets. Multiple images increase those requirements.
 The optional H3 main-vision cohort cache currently applies to single-image edits;

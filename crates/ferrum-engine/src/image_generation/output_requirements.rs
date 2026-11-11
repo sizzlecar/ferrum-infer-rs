@@ -55,7 +55,7 @@ impl QwenImage21Assets {
             .max(physical(
                 &NormalNoiseConfig::new(64, height.into(), width.into())?.output_tensor()?,
             )?);
-        let mut visual_tokens = 0;
+        let mut reference_visual_tokens = Vec::new();
         if let Some(edit) = &self.editing {
             let pixels = edit.processor.maximum_condition_pixels();
             let factor = edit
@@ -63,7 +63,7 @@ impl QwenImage21Assets {
                 .patch_size()
                 .checked_mul(edit.processor.merge_size())
                 .context("vision merge factor overflows")?;
-            visual_tokens = pixels
+            let visual_tokens = pixels
                 / factor
                     .checked_mul(factor)
                     .context("vision patch area overflows")?;
@@ -72,11 +72,14 @@ impl QwenImage21Assets {
                 ElementType::Bf16,
                 ResolvedTensorLayout::Contiguous,
             )?;
-            // Main merger plus every DeepStack readback remains until the text
-            // bridge has copied every reference in the request batch.
+            // Ten ordered references are supported. Each main merger and
+            // DeepStack readback has its own padded backing and remains live
+            // until the text bridge has copied the complete request batch.
+            reference_visual_tokens = vec![visual_tokens; 10];
             peak = peak.max(
                 physical(&merged)?
                     .checked_mul(1 + Qwen3VLVisionFamily::DEEPSTACK_IDS.len())
+                    .and_then(|n| n.checked_mul(reference_visual_tokens.len()))
                     .and_then(|n| n.checked_mul(batch))
                     .context("vision readback bound overflows")?,
             );
@@ -92,9 +95,15 @@ impl QwenImage21Assets {
             )?;
             peak = peak.max(physical(&reference)?);
         }
-        let sequence = self
-            .tokenizer
-            .maximum_sequence_length(limits.maximum_user_tokens, visual_tokens)?;
+        let sequence = if reference_visual_tokens.is_empty() {
+            self.tokenizer
+                .maximum_sequence_length(limits.maximum_user_tokens, 0)?
+        } else {
+            self.tokenizer.maximum_sequence_length_multi(
+                limits.maximum_user_tokens,
+                &reference_visual_tokens,
+            )?
+        };
         let hidden = ResolvedTensorSpec::new(
             vec![
                 u64::try_from(batch)?,

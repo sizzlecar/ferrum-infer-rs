@@ -67,17 +67,6 @@ pub fn execute_run_source_with_images(
         use ferrum_output::png::{PngDimensions, PngLimits};
 
         let product = source.prepare_for_run()?;
-        // Reject absent/oversized input before device construction. Keep this
-        // open handle and recheck the read extent rather than trusting a path.
-        if images.len() > 8 {
-            return Err(
-                anyhow::anyhow!("image run supports at most eight ordered image inputs").into(),
-            );
-        }
-        let image_files = images
-            .iter()
-            .map(|image| open_image(image))
-            .collect::<anyhow::Result<Vec<_>>>()?;
         if width == 0
             || height == 0
             || width > product.backend.limits().maximum_width
@@ -107,6 +96,23 @@ pub fn execute_run_source_with_images(
             .map_err(anyhow::Error::from)?;
         // Opening archives and validating metadata precedes either device runtime.
         let (mut pipeline, composition) = product.backend.create(product.assets)?;
+        // Use the same declared capability as serve before opening any input
+        // files. Runtime construction precedes this check, so retire that owner
+        // explicitly on both count and file-admission failures.
+        let maximum_references = if pipeline.supports_edits() {
+            pipeline.maximum_reference_images()
+        } else {
+            0
+        };
+        let image_files = match open_images(images, maximum_references) {
+            Ok(files) => files,
+            Err(error) => {
+                if let Err(failure) = pipeline.shutdown() {
+                    return Err(ImageProductError::generation_pipeline(failure, pipeline));
+                }
+                return Err(error.into());
+            }
+        };
         let model = super::composed_model_name(&product.model, &composition)?;
         let trace = if let Some(prepared) = product.continuous_trace {
             let context = serde_json::json!({"entrypoint":"run", "composition":&composition});
@@ -260,6 +266,18 @@ fn execute_pipeline(
         .map_err(anyhow::Error::from)?
     );
     Ok(())
+}
+
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos"), test))]
+pub(super) fn open_images(
+    paths: &[std::path::PathBuf],
+    maximum_references: usize,
+) -> anyhow::Result<Vec<(std::fs::File, usize)>> {
+    anyhow::ensure!(
+        paths.len() <= maximum_references,
+        "image run accepts at most {maximum_references} ordered reference images for this pipeline"
+    );
+    paths.iter().map(|path| open_image(path)).collect()
 }
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos"), test))]
