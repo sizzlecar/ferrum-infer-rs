@@ -13,22 +13,6 @@ __device__ __forceinline__ float ferrum_comfy_h4(
     }
 }
 
-// The first two H4 stages never cross a 16-lane group. Preserve the original
-// RN32 arithmetic and half scaling while exchanging values in registers.
-// Every caller launches complete 256-thread blocks and all lanes participate.
-__device__ __forceinline__ float ferrum_comfy_h4_warp_prefix(float value, unsigned i) {
-    for (unsigned stride = 1; stride < 16; stride *= 4) {
-        const unsigned digit = (i / stride) & 3;
-        const unsigned base = (i - digit * stride) & 31;
-        const float a = __shfl_sync(0xffffffffu, value, base);
-        const float b = __shfl_sync(0xffffffffu, value, base + stride);
-        const float c = __shfl_sync(0xffffffffu, value, base + 2 * stride);
-        const float d = __shfl_sync(0xffffffffu, value, base + 3 * stride);
-        value = __fmul_rn(0.5f, ferrum_comfy_h4(digit, a, b, c, d));
-    }
-    return value;
-}
-
 // Each block rotates a complete 256-element group, with a 1/2 multiplication
 // after every H4 stage. This is the regular Kronecker H4, not Sylvester H256.
 extern "C" __global__ void ferrum_comfy_convrot_bf16_f32(
@@ -37,12 +21,11 @@ extern "C" __global__ void ferrum_comfy_convrot_bf16_f32(
     __shared__ float right[256];
     const unsigned i = threadIdx.x;
     for (uint64_t group = blockIdx.x; group < groups; group += gridDim.x) {
-        left[i] = ferrum_comfy_h4_warp_prefix(
-            ferrum_bf16_decode(input[group * 256 + i]), i);
+        left[i] = ferrum_bf16_decode(input[group * 256 + i]);
         __syncthreads();
         float* source = left;
         float* destination = right;
-        for (unsigned stride = 16; stride < 256; stride *= 4) {
+        for (unsigned stride = 1; stride < 256; stride *= 4) {
             const unsigned digit = (i / stride) & 3;
             const unsigned base = i - digit * stride;
             destination[i] = __fmul_rn(0.5f, ferrum_comfy_h4(
@@ -73,11 +56,11 @@ extern "C" __global__ void ferrum_comfy_swiglu_convrot_bf16_f32(
         const float gate = ferrum_bf16_decode(gate_up[row * (2 * k) + column]);
         const float up = ferrum_bf16_decode(gate_up[row * (2 * k) + k + column]);
         const float silu = __fdiv_rn(gate, __fadd_rn(1.0f, expf(-gate)));
-        left[i] = ferrum_comfy_h4_warp_prefix(__fmul_rn(silu, up), i);
+        left[i] = __fmul_rn(silu, up);
         __syncthreads();
         float* source = left;
         float* destination = right;
-        for (unsigned stride = 16; stride < 256; stride *= 4) {
+        for (unsigned stride = 1; stride < 256; stride *= 4) {
             const unsigned digit = (i / stride) & 3;
             const unsigned base = i - digit * stride;
             destination[i] = __fmul_rn(0.5f, ferrum_comfy_h4(
@@ -98,10 +81,10 @@ extern "C" __global__ void ferrum_comfy_convrot_f32_f32(
     __shared__ float right[256];
     const unsigned i=threadIdx.x;
     for(uint64_t group=blockIdx.x;group<groups;group+=gridDim.x) {
-        left[i]=ferrum_comfy_h4_warp_prefix(input[group*256+i],i);
+        left[i]=input[group*256+i];
         __syncthreads();
         float* source=left;float* destination=right;
-        for(unsigned stride=16;stride<256;stride*=4) {
+        for(unsigned stride=1;stride<256;stride*=4) {
             const unsigned digit=(i/stride)&3;
             const unsigned base=i-digit*stride;
             destination[i]=__fmul_rn(0.5f,ferrum_comfy_h4(digit,source[base],source[base+stride],source[base+2*stride],source[base+3*stride]));
