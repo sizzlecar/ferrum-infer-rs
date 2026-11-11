@@ -69,7 +69,8 @@ jobs:
       - name: Resolve the approved source-only publication input
         id: source
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Draft release assets require the publisher's access, as in the normal recovery path.
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
           SOURCE_RUN: ${{ inputs.source_run_id }}
           MANIFEST_ASSET: ${{ inputs.cargo_manifest_asset_id }}
           MANIFEST_SHA: ${{ inputs.cargo_manifest_sha256 }}
