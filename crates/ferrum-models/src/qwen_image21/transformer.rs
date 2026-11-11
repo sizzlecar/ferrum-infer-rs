@@ -3,7 +3,7 @@
 //! Timestep sinusoidal features and joint rotary frequencies are explicit
 //! inputs. The adapter must compute them from the actual timestep/grid; this
 //! family does not claim a completed conditioning or image-generation pipeline.
-//! Optional single-reference editing replaces VLM image slots by VAE rows,
+//! Optional ordered-reference editing replaces VLM image slots by VAE rows,
 //! retaining the interleaved text/image attention and rotary geometry. All
 //! layers run in one tensor program, with only target velocity retained.
 

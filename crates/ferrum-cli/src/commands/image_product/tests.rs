@@ -1301,6 +1301,33 @@ fn repeated_image_cli_arguments_preserve_picture_order() {
             .collect::<Vec<_>>(),
         [PathBuf::from("person.png"), PathBuf::from("pose.png")]
     );
+    let paths = (1..=10)
+        .map(|number| format!("reference-{number}.png"))
+        .collect::<Vec<_>>();
+    let mut arguments = vec![
+        "ferrum",
+        "run",
+        "--image-config",
+        "qwen.json",
+        "--prompt",
+        "Combine references",
+        "--output",
+        "edited.png",
+    ];
+    for path in &paths {
+        arguments.extend(["--image", path.as_str()]);
+    }
+    let matches = TestCli::command().try_get_matches_from(arguments).unwrap();
+    assert_eq!(
+        matches
+            .subcommand_matches("run")
+            .unwrap()
+            .get_many::<PathBuf>("image")
+            .unwrap()
+            .cloned()
+            .collect::<Vec<_>>(),
+        paths.iter().map(PathBuf::from).collect::<Vec<_>>()
+    );
 }
 #[derive(Subcommand)]
 enum TestCommand {

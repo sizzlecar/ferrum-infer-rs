@@ -453,6 +453,12 @@ impl AxumServer {
     }
 
     fn build_router_with_state(&self, app_state: AppState) -> Router {
+        let edit_body_limit = images::edit_body_limit(
+            app_state
+                .images
+                .as_ref()
+                .map_or(0, |images| images.service().maximum_reference_images()),
+        );
         Router::new()
             // OpenAI API routes
             .route("/v1/chat/completions", post(chat_completions_handler))
@@ -461,9 +467,8 @@ impl AxumServer {
             .route("/v1/images/generations", post(images::generations_handler))
             .route(
                 "/v1/images/edits",
-                post(images::edits_handler).layer(axum::extract::DefaultBodyLimit::max(
-                    images::EDIT_BODY_LIMIT,
-                )),
+                post(images::edits_handler)
+                    .layer(axum::extract::DefaultBodyLimit::max(edit_body_limit)),
             )
             .route("/playground", get(images::playground::page))
             .route("/playground/config", get(images::playground::config))

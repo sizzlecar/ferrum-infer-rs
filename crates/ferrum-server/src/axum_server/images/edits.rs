@@ -1,6 +1,7 @@
 //! Ordered-image OpenAI multipart adapter. Transport/parser buffers are bounded
-//! by EDIT_BODY_LIMIT. Uploaded PNG storage grows under Host admission and is
-//! compacted to its actual encoded length before entering the worker queue.
+//! by the generator's reference count and per-file cap. Uploaded PNG storage
+//! grows under Host admission and is compacted to its actual encoded length
+//! before entering the worker queue.
 
 use super::*;
 use axum::extract::{
@@ -12,8 +13,11 @@ use ferrum_models::qwen_image21::image_input::ImageInputLimits;
 use ferrum_runtime::{HostMemoryAccount, HostMemoryClass, ManagedHostBytes};
 use std::collections::BTreeSet;
 
-pub(in crate::axum_server) const EDIT_BODY_LIMIT: usize =
-    8 * ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES + 2 * 1024 * 1024;
+pub(in crate::axum_server) fn edit_body_limit(maximum_images: usize) -> usize {
+    maximum_images
+        .saturating_mul(ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES)
+        .saturating_add(2 * 1024 * 1024)
+}
 const PROMPT_LIMIT: usize = 1024 * 1024;
 
 pub(in crate::axum_server) async fn edits_handler(

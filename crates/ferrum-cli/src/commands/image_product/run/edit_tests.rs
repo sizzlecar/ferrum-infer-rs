@@ -18,6 +18,34 @@ fn host(bytes: usize) -> HostMemoryAccount {
 }
 
 #[test]
+fn edit_cli_uses_declared_reference_capacity_before_opening_files_and_preserves_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = (0..10)
+        .map(|index| dir.path().join(format!("reference-{index}.png")))
+        .collect::<Vec<_>>();
+    // No path exists yet: capability rejection must precede opening even the
+    // first file. The limit is supplied by the selected pipeline, not its name.
+    for maximum in [0, 1, 8, 9] {
+        let error = open_images(&paths, maximum).unwrap_err();
+        assert!(error.to_string().contains(&format!("at most {maximum}")));
+    }
+    assert!(open_images(&[], 0).unwrap().is_empty());
+    for (index, path) in paths.iter().enumerate() {
+        let mut wire = b"\x89PNG\r\n\x1a\n".to_vec();
+        wire.push(index as u8);
+        fs::write(path, wire).unwrap();
+    }
+    let files = open_images(&paths, 10).unwrap();
+    let account = host(90);
+    for (index, (file, length)) in files.into_iter().enumerate() {
+        let bytes = read_image(&account, file, length).unwrap();
+        assert_eq!(bytes.bytes()[8], index as u8);
+    }
+    assert_eq!(account.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(open_images(&paths[..8], 8).unwrap().len(), 8);
+}
+
+#[test]
 fn edit_cli_input_is_read_into_one_admitted_backing_and_retires() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("input.png");

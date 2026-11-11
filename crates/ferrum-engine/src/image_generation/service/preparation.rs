@@ -90,7 +90,7 @@ impl<T, I: PartialEq> BoundPreparation<T, I> {
 
 type GenerationPreparation<R> = BoundPreparation<PreparedRequest<R>, GenerationIdentity>;
 type EditBatchPreparation<R> = BoundPreparation<PreparedRequest<R>, EditIdentity>;
-type EditInputPreparation = BoundPreparation<QwenImage21ConditionInputs, EditIdentity>;
+type EditInputPreparation = BoundPreparation<Vec<QwenImage21ConditionInputs>, EditIdentity>;
 
 fn validate_output_budget(expected: usize, actual: usize) -> Result<(), ImageBatchError> {
     if expected != actual {
@@ -116,7 +116,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             &prepared.decode_stage,
         ];
         if let Some(edit) = &prepared.edit {
-            stages.extend([&edit.vision_stage, &edit.encoder_stage]);
+            stages.extend(edit.stages());
         }
         if let Some(prefix) = &prepared.prefix_decode {
             stages.push(&prefix.stage);
@@ -178,10 +178,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         &self,
         request: &ImageEditRequest,
     ) -> Result<usize, ImageBatchError> {
-        let (width, height) =
-            png_dimensions_hint(request.image.bytes(), ImageInputLimits::default()).ok_or_else(
-                || ImageBatchError::InvalidInput("invalid bounded PNG header".into()),
-            )?;
+        if request.image_count() > self.maximum_reference_images() {
+            return Err(ImageBatchError::InvalidInput(
+                "reference image count exceeds the model capability".into(),
+            ));
+        }
         let assets = self
             .execution
             .sources
@@ -189,10 +190,19 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .editing
             .as_ref()
             .ok_or_else(|| ImageBatchError::Rejected("editing assets are missing".into()))?;
-        assets
-            .processor
-            .prepared_backing_bytes(&self.execution.host, width, height)
-            .map_err(|error| preparation_error(error.into()))
+        request.images().try_fold(0usize, |bytes, image| {
+            let (width, height) = png_dimensions_hint(image.bytes(), ImageInputLimits::default())
+                .ok_or_else(|| {
+                ImageBatchError::InvalidInput("invalid bounded PNG header".into())
+            })?;
+            let reference_bytes = assets
+                .processor
+                .prepared_backing_bytes(&self.execution.host, width, height)
+                .map_err(|error| preparation_error(error.into()))?;
+            bytes.checked_add(reference_bytes).ok_or_else(|| {
+                ImageBatchError::InvalidInput("edit preparation bytes overflow".into())
+            })
+        })
     }
 
     pub(super) fn preprocess_service_edit(
@@ -202,14 +212,17 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         self.validate_service_availability()?;
         let input =
             QwenImage21Pipeline::preprocess_edit(self, request).map_err(preparation_error)?;
-        let retained_host_bytes = (|| -> anyhow::Result<usize> {
-            let patches = input.vision_patches().bytes().backing_bytes();
-            let vae = input.vae_rgba().bytes().backing_bytes();
-            patches
-                .checked_add(vae)
-                .ok_or_else(|| anyhow::anyhow!("edit input retained bytes overflow"))
-        })()
-        .map_err(preparation_error)?;
+        let retained_host_bytes = input
+            .iter()
+            .try_fold(0usize, |bytes, input| -> anyhow::Result<usize> {
+                let patches = input.vision_patches().bytes().backing_bytes();
+                let vae = input.vae_rgba().bytes().backing_bytes();
+                bytes
+                    .checked_add(patches)
+                    .and_then(|bytes| bytes.checked_add(vae))
+                    .ok_or_else(|| anyhow::anyhow!("edit input retained bytes overflow"))
+            })
+            .map_err(preparation_error)?;
         Ok(ImageEditPreparation::new(
             BoundPreparation::new(
                 &self.execution.service_preparation_identity,
@@ -337,7 +350,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             &payload.decode_stage,
         ];
         if let Some(edit) = &payload.edit {
-            stages.extend([&edit.vision_stage, &edit.encoder_stage]);
+            stages.extend(edit.stages());
         }
         if let Some(prefix) = &payload.prefix_decode {
             stages.push(&prefix.stage);

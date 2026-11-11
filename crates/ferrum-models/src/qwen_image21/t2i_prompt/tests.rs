@@ -5,6 +5,8 @@ use ferrum_runtime::*;
 use half::bf16;
 use serde_json::json;
 
+mod multi_edit;
+
 // Synthetic tokenizer and a deliberately different implementation of the same
 // system-only Jinja semantics. Neither fixture is a deployed tokenizer oracle.
 fn tokenizer_sources() -> (Vec<u8>, Vec<u8>, Vec<u8>) {

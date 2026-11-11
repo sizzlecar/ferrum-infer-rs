@@ -15,7 +15,7 @@
   </header>
   <main class="workspace">
     <aside class="controls">
-      <div class="intro"><span class="eyebrow">IMAGE STUDIO</span><h1>让想法成为画面。</h1><p>描述想象，或上传一张图片继续创作。</p></div>
+      <div class="intro"><span class="eyebrow">IMAGE STUDIO</span><h1>让想法成为画面。</h1><p>描述想象，或添加参考图继续创作。</p></div>
       <form id="form" novalidate>
         <div class="mode-switch" aria-label="创作方式">
           <button id="mode-generate" class="mode active" type="button" aria-pressed="true">文生图</button>
@@ -23,15 +23,16 @@
         </div>
         <section id="reference-panel" hidden>
           <button id="drop-zone" class="drop-zone" type="button">
-            <img id="reference-preview" alt="待编辑的参考图" hidden>
-            <span id="reference-label">＋ 选择或拖入参考图</span>
+            <span id="reference-label">＋ 选择或拖入参考图，按顺序追加</span>
           </button>
-          <input id="file" type="file" accept="image/png,image/jpeg" hidden>
+          <input id="file" type="file" accept="image/png,image/jpeg" multiple hidden>
+          <div class="reference-toolbar"><span id="reference-count" class="hint" role="status" aria-live="polite"></span><button id="clear-references" class="small-button" type="button" disabled>清空参考图</button></div>
+          <ol id="reference-list" class="reference-list" aria-label="按提交顺序排列的参考图"></ol>
           <p class="hint">上传 PNG；选择 JPG 时由浏览器转为 PNG。文件与尺寸仍需通过服务校验。</p>
         </section>
         <label class="field-label" for="prompt">画面描述</label>
         <textarea id="prompt" rows="7" placeholder="描述主体、场景、光线和风格…" required></textarea>
-        <p id="edit-hint" class="hint" hidden>写下希望修改的部分，以及希望保留的内容。</p>
+        <p id="edit-hint" class="hint" hidden>按 Picture 1、Picture 2 等编号说明各参考图的作用，以及希望修改和保留的内容。</p>
         <div class="field-grid">
           <div><label class="field-label" for="size">画面尺寸</label><select id="size" disabled><option>加载中…</option></select></div>
           <div><label class="field-label" for="seed">Seed</label><input id="seed" type="text" inputmode="numeric" value="42" disabled></div>

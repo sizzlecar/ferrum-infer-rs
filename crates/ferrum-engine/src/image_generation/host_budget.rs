@@ -112,44 +112,58 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             &p.decode_stage,
         ];
         if let Some(edit) = &p.edit {
-            let vision = ports(&edit.vision_stage)?;
-            budget.input = budget.input.max(sum_ports(
-                host,
-                vision
-                    .inputs()
-                    .iter()
-                    .filter(|port| port.value_id().as_str() != Qwen3VLVisionFamily::PATCHES_ID),
-            )?);
-            // All vision samples coexist until the batched text bridge copies
-            // them. Encoder outputs are normalized and retired one at a time.
-            budget.output = budget
-                .output
-                .max(multiply(sum_ports(host, vision.outputs().iter())?, batch)?)
-                .max(sum_ports(
+            let mut vision_outputs = 0usize;
+            let mut largest_reference = 0usize;
+            for reference_plan in &edit.references {
+                let vision = ports(&reference_plan.vision_stage)?;
+                budget.input = budget.input.max(sum_ports(
                     host,
-                    ports(&edit.encoder_stage)?.outputs().iter(),
+                    vision
+                        .inputs()
+                        .iter()
+                        .filter(|port| port.value_id().as_str() != Qwen3VLVisionFamily::PATCHES_ID),
                 )?);
-            if batch > 1 {
-                let per_reference = input_logical_bytes(
-                    denoise,
-                    QwenImage21TransformerFamily::REFERENCE_LATENTS_ID,
-                )? / batch;
-                budget.input =
-                    budget
-                        .input
-                        .max(add(&[text, reference, host.backing_bytes(per_reference)?])?);
+                // All vision samples coexist until the batched text bridge copies
+                // them. Encoder outputs are normalized and retired one at a time.
+                vision_outputs = add(&[
+                    vision_outputs,
+                    multiply(sum_ports(host, vision.outputs().iter())?, batch)?,
+                ])?;
+                budget.output = budget.output.max(sum_ports(
+                    host,
+                    ports(&reference_plan.encoder_stage)?.outputs().iter(),
+                )?);
+                let scale = reference_plan.encoder.spatial_scale();
+                let shape = QwenImage21LatentShape::new(
+                    1,
+                    (reference_plan.encoder.height() / scale) as usize,
+                    (reference_plan.encoder.width() / scale) as usize,
+                )?;
+                largest_reference = largest_reference.max(host.backing_bytes(shape.byte_len())?);
             }
-            stages.extend([&edit.vision_stage, &edit.encoder_stage]);
+            budget.output = budget.output.max(vision_outputs);
+            if batch > 1 || edit.references.len() > 1 {
+                budget.input = budget
+                    .input
+                    .max(add(&[text, reference, largest_reference])?);
+            }
+            stages.extend(edit.stages());
         }
         // Prefix plans share one materializer and identical weights. They must
         // not count cache fill twice. Other stages can retain converted cache
         // entries across one another, so their incremental bounds add.
-        let mut backing = Vec::new();
+        let mut backing_by_owner = std::collections::BTreeMap::new();
         for stage in stages {
             if self.stage_needs_weight_initialization(stage) {
                 let (bytes, retention) = self.stage_host_backing(stage)?;
-                budget.weights = add(&[budget.weights, bytes])?;
-                backing.push(retention);
+                // Reference geometries share each stage's source weight owner.
+                // Count its conversion/backing once, as device admission does.
+                let owner = stage.declaration().weight_owner;
+                let key = (owner, owner.is_none().then_some(stage.plan.stage));
+                let entry = backing_by_owner.entry(key).or_insert((0usize, None));
+                if entry.1.is_none() || bytes > entry.0 {
+                    *entry = (bytes, Some(retention));
+                }
                 if self.execution.runtime.requires_managed_static_staging() {
                     budget.staging = budget.staging.max(staging_bytes(
                         host,
@@ -158,6 +172,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                     )?);
                 }
             }
+        }
+        let mut backing = Vec::with_capacity(backing_by_owner.len());
+        for (bytes, retention) in backing_by_owner.into_values() {
+            budget.weights = add(&[budget.weights, bytes])?;
+            backing.push(retention.context("missing stage backing preparation")?);
         }
         Ok((budget, backing))
     }

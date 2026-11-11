@@ -298,6 +298,16 @@ impl PreparedPipeline {
             Self::Metal(pipeline) => pipeline.supports_edits(),
         }
     }
+    pub(super) fn maximum_reference_images(&self) -> usize {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(pipeline) => ImageGenerator::maximum_reference_images(&**pipeline),
+            #[cfg(feature = "cuda")]
+            Self::PH3Cuda(pipeline) => ImageGenerator::maximum_reference_images(&**pipeline),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(pipeline) => ImageGenerator::maximum_reference_images(&**pipeline),
+        }
+    }
     pub(super) fn generate(
         &mut self,
         request: ImageGenerationRequest,

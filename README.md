@@ -69,7 +69,7 @@ Execution and capacity defaults adapt to hardware and available memory; explicit
 
 ## Image generation and editing
 
-Supports **Qwen-Image-2.1-Turbo** and **P-H3-Image**. P-H3 adds ordered multi-reference editing and continuous batching on Linux CUDA SM89/SM120.
+Supports **Qwen-Image-2.1-Turbo** and **P-H3-Image**. The main/development version supports ordered multi-reference editing: up to ten images for Qwen and eight for P-H3. Released **v0.19.0 still accepts only one Qwen reference**. P-H3 also supports continuous batching on Linux CUDA SM89/SM120.
 
 Use a local [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) model directory. Linux CUDA example with FP8 text encoder/DiT:
 
@@ -82,7 +82,7 @@ ferrum serve /path/to/Qwen-Image-2.1-Turbo --backend cuda \
 | API | Input |
 |---|---|
 | `POST /v1/images/generations` | JSON text prompt |
-| `POST /v1/images/edits` | Multipart prompt + PNG: one reference for Qwen; up to eight ordered references for P-H3 |
+| `POST /v1/images/edits` | Multipart prompt + ordered PNG references: up to ten for Qwen on main/development (one in v0.19.0); up to eight for P-H3 |
 
 Both return PNG in `b64_json`. CUDA batches compatible requests automatically within capacity limits. Validated on L20 (SM89) and RTX 5090 (SM120); cuDNN 9 is required. Qwen also supports Metal generation and editing with a GGUF DiT, validated at 1024×1024 on an M4 Mac mini with 16 GiB memory.
 
@@ -92,7 +92,7 @@ For P-H3, copy the [CUDA configuration](crates/ferrum-cli/examples/config/p-h3-i
 ferrum serve --image-config p-h3-image-cuda.json --served-model-name P-H3-Image --port 8000
 ```
 
-P-H3 uses the Comfy W4A8 text encoder/DiT, INT8 VAE and native prompt expansion. Use repeated `image[]` fields for references (for example, a character and a pose), and `size=2720x1536` for a landscape edit. See the [image guide](docs/image-generation.md) for setup, reference order, capacity limits, Metal and Qwen CUDA LoRA.
+P-H3 uses the Comfy W4A8 text encoder/DiT, INT8 VAE and native prompt expansion. For either model, repeat multipart `image[]` fields or CLI `--image` arguments in the intended reference order (for example, a character followed by a pose). P-H3 accepts `size=2720x1536` for a landscape edit. See the [image guide](docs/image-generation.md) for examples, capacity limits, Metal and Qwen CUDA LoRA.
 
 ## Supported scope
 
@@ -103,7 +103,7 @@ P-H3 uses the Comfy W4A8 text encoder/DiT, INT8 VAE and native prompt expansion.
 | CUDA quantization | Selected model paths: GPTQ INT4, compressed-tensors INT4, block-FP8 |
 | Specific CUDA models | Gemma 4 compressed-tensors W4A16; GPT-OSS MXFP4 |
 | PQ2_0 | Complete-model validation on Metal; CUDA operator coverage only |
-| Images | Qwen-Image-2.1-Turbo generation/single-PNG editing on Linux CUDA and Metal; P-H3-Image generation/multi-reference editing on Linux CUDA SM89/SM120. P-H3 Metal is not supported |
+| Images | Qwen-Image-2.1-Turbo generation/editing on Linux CUDA and Metal (main/development: up to ten references; v0.19.0: one); P-H3-Image generation/editing with up to eight references on Linux CUDA SM89/SM120. P-H3 Metal is not supported |
 
 Support depends on the architecture, format and backend combination; text support does not imply vision support. CPU is a compatibility backend. See the [validation catalog](docs/release-regression-catalog.md) for tested combinations and coverage.
 

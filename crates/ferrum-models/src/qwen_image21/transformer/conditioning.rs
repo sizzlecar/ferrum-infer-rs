@@ -156,8 +156,8 @@ impl QwenImage21RotaryFrequencies {
         checked_elements::<f32>(layout.sequence_length(), u64::from(self.width))
     }
 
-    /// Uses padded text positions, including invalid text keys. Target frame
-    /// position is padded T; centered height/width are independent of T.
+    /// Uses interleaved layout positions, including invalid padded text keys.
+    /// Every image has its own frame and independently centered spatial axes.
     /// All length/geometry checks precede writes; no input-sized scratch exists.
     pub fn write_into(
         self,

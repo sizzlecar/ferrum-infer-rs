@@ -1,21 +1,46 @@
 use super::*;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[path = "edit.rs"]
 mod edit;
 pub use edit::QwenImage21ReferenceImage;
 
 /// Homogeneous single-frame geometry. `text_tokens` is the cropped VLM length,
-/// including visual slots when a reference image is configured. All samples
+/// including visual slots when reference images are configured. All samples
 /// share slot positions and grids; right-padding validity may differ.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QwenImage21T2iLayout {
     text_tokens: u32,
     latent_height: u32,
     latent_width: u32,
     valid_text_lengths: Vec<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    reference_image: Option<QwenImage21ReferenceImage>,
+    reference_images: Vec<QwenImage21ReferenceImage>,
+}
+impl Serialize for QwenImage21T2iLayout {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Keep the established zero/single-image wire format and fingerprints.
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            text_tokens: u32,
+            latent_height: u32,
+            latent_width: u32,
+            valid_text_lengths: &'a [u32],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reference_image: Option<&'a QwenImage21ReferenceImage>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reference_images: Option<&'a [QwenImage21ReferenceImage]>,
+        }
+        Wire {
+            text_tokens: self.text_tokens,
+            latent_height: self.latent_height,
+            latent_width: self.latent_width,
+            valid_text_lengths: &self.valid_text_lengths,
+            reference_image: self.reference_image(),
+            reference_images: (self.reference_images.len() > 1)
+                .then_some(self.reference_images.as_slice()),
+        }
+        .serialize(serializer)
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,23 +51,31 @@ struct LayoutWire {
     valid_text_lengths: Vec<u32>,
     #[serde(default)]
     reference_image: Option<QwenImage21ReferenceImage>,
+    #[serde(default)]
+    reference_images: Option<Vec<QwenImage21ReferenceImage>>,
 }
 impl<'de> Deserialize<'de> for QwenImage21T2iLayout {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let wire = LayoutWire::deserialize(d)?;
-        let mut layout = Self::new(
+        let layout = Self::new(
             wire.text_tokens,
             wire.latent_height,
             wire.latent_width,
             wire.valid_text_lengths,
         )
         .map_err(serde::de::Error::custom)?;
-        if let Some(reference) = wire.reference_image {
-            layout = layout
-                .with_reference(reference)
-                .map_err(serde::de::Error::custom)?;
-        }
-        Ok(layout)
+        let references = match (wire.reference_image, wire.reference_images) {
+            (Some(_), Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "reference_image and reference_images are mutually exclusive",
+                ));
+            }
+            (Some(reference), None) => vec![reference],
+            (None, references) => references.unwrap_or_default(),
+        };
+        layout
+            .with_reference_images(references)
+            .map_err(serde::de::Error::custom)
     }
 }
 impl QwenImage21T2iLayout {
@@ -75,7 +108,7 @@ impl QwenImage21T2iLayout {
             latent_height,
             latent_width,
             valid_text_lengths,
-            reference_image: None,
+            reference_images: Vec::new(),
         };
         layout
             .target_tokens()
@@ -107,17 +140,19 @@ impl QwenImage21T2iLayout {
         u64::from(self.text_tokens)
             + self.target_tokens()
             + self
-                .reference_image
-                .as_ref()
-                .map_or(0, |r| r.latent_tokens() - u64::from(r.image_slots()))
+                .reference_images
+                .iter()
+                .map(|r| r.latent_tokens() - u64::from(r.image_slots()))
+                .sum::<u64>()
     }
     pub fn rows(&self) -> u64 {
         self.batch() * self.sequence_length()
     }
     /// Axis order matches adjacent complex pairs: frame, height, width. Padding
-    /// still occupies text positions; target frame uses padded T for all samples.
+    /// occupies text positions; each image advances the frame by its larger
+    /// latent axis. All samples share these positions despite differing padding.
     pub fn rotary_position(&self, row: u64) -> Option<[i32; 3]> {
-        if self.reference_image.is_some() {
+        if !self.reference_images.is_empty() {
             return self.edit_rotary_position(row);
         }
         if row >= self.sequence_length() {
@@ -136,7 +171,7 @@ impl QwenImage21T2iLayout {
         ])
     }
     pub fn attention_layout(&self) -> Result<QwenImage21AttentionLayout, VNextError> {
-        if self.reference_image.is_some() {
+        if !self.reference_images.is_empty() {
             return self.edit_attention_layout();
         }
         let image = u32::try_from(self.target_tokens())
@@ -303,9 +338,9 @@ impl QwenImage21TransformerConfig {
             .collect::<Result<BTreeMap<_, _>, VNextError>>()?;
         if self.is_decode() {
             specs.remove(&ProgramValueId::new(F::TEXT_ID)?);
-        } else if let Some(reference) = l.reference_image() {
+        } else if !l.reference_images().is_empty() {
             let reference_spec = ProgramTensorSpec {
-                dimensions: vec![l.batch() * reference.latent_tokens(), t.in_channels()],
+                dimensions: vec![l.batch() * l.reference_latent_tokens(), t.in_channels()],
                 element_type: ElementType::Bf16,
                 layout: ResolvedTensorLayout::Contiguous,
             };
@@ -325,18 +360,18 @@ impl QwenImage21TransformerConfig {
         let mut options = ProgramPlanCompileOptions::new(self.input_tensor_specs()?)?;
         let l = &self.layout;
         let h = self.transformer.hidden_size();
-        if let Some(reference) = l.reference_image().filter(|_| !self.is_decode()) {
+        if !l.reference_images().is_empty() && !self.is_decode() {
             for (name, rows, columns) in [
                 (
                     program::COMBINED_LATENTS,
-                    l.batch() * (reference.latent_tokens() + l.target_tokens()),
+                    l.batch() * (l.reference_latent_tokens() + l.target_tokens()),
                     self.transformer.in_channels(),
                 ),
                 (
                     program::UNORDERED_JOINT,
                     l.batch()
                         * (u64::from(l.text_tokens())
-                            + reference.latent_tokens()
+                            + l.reference_latent_tokens()
                             + l.target_tokens()),
                     h,
                 ),

@@ -125,6 +125,49 @@ impl QwenImage21T2iTokenizer {
             .and_then(|n| n.checked_add(visual_tokens.saturating_sub(1)))
             .ok_or_else(|| anyhow::anyhow!("maximum image text sequence overflows"))
     }
+    /// Full hidden sequence bound for ordered references. Additional numbered
+    /// markers use this processor's actual token lengths; they do not consume
+    /// the single-reference user budget. One reference preserves the old bound.
+    pub fn maximum_sequence_length_multi(
+        &self,
+        maximum_user_tokens: usize,
+        per_reference_merged_rows: &[usize],
+    ) -> Result<usize> {
+        ensure!(
+            (1..=8192).contains(&maximum_user_tokens)
+                && (1..=10).contains(&per_reference_merged_rows.len())
+                && per_reference_merged_rows.iter().all(|&rows| rows > 0),
+            "invalid edit token budget or reference rows"
+        );
+        let expansion = per_reference_merged_rows
+            .iter()
+            .try_fold(0usize, |n, &rows| {
+                n.checked_add(rows - 1)
+                    .ok_or_else(|| anyhow::anyhow!("visual expansion overflows"))
+            })?;
+        let template_tokens =
+            self.additional_image_template_tokens(per_reference_merged_rows.len())?;
+        self.baseline
+            .checked_add(maximum_user_tokens)
+            .and_then(|n| n.checked_add(template_tokens))
+            .and_then(|n| n.checked_add(expansion))
+            .ok_or_else(|| anyhow::anyhow!("maximum image text sequence overflows"))
+    }
+
+    fn additional_image_template_tokens(&self, references: usize) -> Result<usize> {
+        ensure!(
+            (1..=10).contains(&references),
+            "editing requires 1..=10 references"
+        );
+        if references == 1 {
+            return Ok(0);
+        }
+        let single = encode(&self.engine, &render_edit("", 1), true)?.len();
+        let multiple = encode(&self.engine, &render_edit("", references), true)?.len();
+        multiple.checked_sub(single).ok_or_else(|| {
+            anyhow::anyhow!("additional image markers shorten the processor template")
+        })
+    }
     /// Encode the raw image-conditioned template, checking the user contribution
     /// before expanding the single image placeholder to the merged visual grid.
     pub fn prepare_edit(
@@ -155,12 +198,31 @@ impl QwenImage21T2iTokenizer {
         grid_width: u64,
         merge: u64,
     ) -> Result<QwenImage21EditPrompt> {
-        use crate::qwen3_vl_text::Qwen3VLTextImageSpan;
+        self.prepare_edit_batch_multi(
+            prompts,
+            maximum_user_tokens,
+            &[QwenImage21EditImageGrid::new(
+                grid_height,
+                grid_width,
+                merge,
+            )?],
+        )
+    }
+
+    /// Every sample uses the same ordered reference geometries, but may supply
+    /// independent image pixels and text. Spans are sample-major/reference-major.
+    pub fn prepare_edit_batch_multi(
+        &self,
+        prompts: &[&str],
+        maximum_user_tokens: usize,
+        image_grids: &[QwenImage21EditImageGrid],
+    ) -> Result<QwenImage21EditPrompt> {
         ensure!(
             !prompts.is_empty()
                 && prompts.len() <= ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH,
             "edit batch requires nonempty prompts within the structured-attention bound"
         );
+        let template_tokens = self.additional_image_template_tokens(image_grids.len())?;
         let bytes = prompts
             .iter()
             .try_fold(0usize, |n, prompt| n.checked_add(prompt.len()))
@@ -172,7 +234,7 @@ impl QwenImage21T2iTokenizer {
         let (samples, starts): (Vec<_>, Vec<_>) = prompts
             .iter()
             .map(|prompt| {
-                self.encode_edit_sample(prompt, maximum_user_tokens, grid_height, grid_width, merge)
+                self.encode_edit_sample(prompt, maximum_user_tokens, image_grids, template_tokens)
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -181,27 +243,50 @@ impl QwenImage21T2iTokenizer {
             starts.iter().all(|start| *start == starts[0]),
             "edit batch requires a common cropped image slot location"
         );
-        let image_slot_start = u32::try_from(starts[0] - self.prefix.len())?;
-        let batch = QwenImage21T2iPromptBatch::from_encoded(samples, self.prefix.len(), self.pad)?;
-        let spans = starts
-            .into_iter()
-            .zip(batch.valid_input_lengths())
-            .enumerate()
-            .map(|(sample, (start, length))| {
-                let absolute = sample
-                    .checked_mul(batch.sequence_length())
-                    .and_then(|n| n.checked_add(batch.sequence_length() - length))
-                    .and_then(|n| n.checked_add(start))
-                    .ok_or_else(|| anyhow::anyhow!("edit image span offset overflows"))?;
-                Qwen3VLTextImageSpan::new(u64::try_from(absolute)?, grid_height, grid_width, merge)
+        let image_slot_ranges = starts[0]
+            .iter()
+            .zip(image_grids)
+            .map(|(&start, grid)| {
+                Ok(QwenImage21EditImageSlots {
+                    start: u32::try_from(start - self.prefix.len())?,
+                    slots: grid.image_slots(),
+                })
             })
             .collect::<Result<Vec<_>>>()?;
-        let image_slots = u32::try_from(spans[0].visual_run().length())?;
+        let total_image_slots = image_grids.iter().try_fold(0u32, |n, grid| {
+            n.checked_add(grid.image_slots())
+                .ok_or_else(|| anyhow::anyhow!("total image slots overflow"))
+        })?;
+        let batch = QwenImage21T2iPromptBatch::from_encoded(samples, self.prefix.len(), self.pad)?;
+        let spans =
+            starts
+                .into_iter()
+                .zip(batch.valid_input_lengths())
+                .enumerate()
+                .map(|(sample, (starts, length))| {
+                    let base = sample
+                        .checked_mul(batch.sequence_length())
+                        .and_then(|n| n.checked_add(batch.sequence_length() - length))
+                        .ok_or_else(|| anyhow::anyhow!("edit image span offset overflows"))?;
+                    starts
+                        .into_iter()
+                        .zip(image_grids)
+                        .map(|(start, grid)| {
+                            grid.span(base.checked_add(start).ok_or_else(|| {
+                                anyhow::anyhow!("edit image span offset overflows")
+                            })?)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
         Ok(QwenImage21EditPrompt {
             batch,
             spans,
-            image_slot_start,
-            image_slots,
+            image_slot_ranges,
+            total_image_slots,
         })
     }
 
@@ -209,11 +294,9 @@ impl QwenImage21T2iTokenizer {
         &self,
         prompt: &str,
         maximum_user_tokens: usize,
-        grid_height: u64,
-        grid_width: u64,
-        merge: u64,
-    ) -> Result<(Vec<u32>, usize)> {
-        use crate::qwen3_vl_text::Qwen3VLTextImageSpan;
+        image_grids: &[QwenImage21EditImageGrid],
+        template_tokens: usize,
+    ) -> Result<(Vec<u32>, Vec<usize>)> {
         ensure!(
             (1..=8192).contains(&maximum_user_tokens) && prompt.len() <= MAX_TOTAL_PROMPT_BYTES,
             "edit prompt exceeds declared input limits"
@@ -237,40 +320,54 @@ impl QwenImage21T2iTokenizer {
             .engine
             .token_to_id("<|image_pad|>")
             .ok_or_else(|| anyhow::anyhow!("processor has no image placeholder"))?;
-        let rendered = render(&format!(
-            "<image1><|vision_start|><|image_pad|><|vision_end|>{}",
-            if prompt.is_empty() { " " } else { prompt }
-        ));
+        let rendered = render_edit(prompt, image_grids.len());
         let mut ids = encode(&self.engine, &rendered, true)?;
         ensure!(
             ids.starts_with(&self.prefix)
-                && ids.len().saturating_sub(self.baseline) <= maximum_user_tokens,
+                && ids.len().saturating_sub(self.baseline + template_tokens) <= maximum_user_tokens,
             "edit prompt changes the system prefix or exceeds user-token budget"
         );
-        let mut positions = ids
+        let positions = ids
             .iter()
             .enumerate()
-            .filter_map(|(i, &id)| (id == image_id).then_some(i));
-        let start = positions
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("edit template has no image slot"))?;
+            .filter_map(|(i, &id)| (id == image_id).then_some(i))
+            .collect::<Vec<_>>();
         ensure!(
-            positions.next().is_none() && start >= self.prefix.len(),
-            "edit template must have exactly one image slot after system prefix"
+            positions.len() == image_grids.len() && positions[0] >= self.prefix.len(),
+            "edit template must have one image slot per reference after system prefix"
         );
-        let span = Qwen3VLTextImageSpan::new(start as u64, grid_height, grid_width, merge)?;
-        let slots = usize::try_from(span.visual_run().length())?;
+        let extra = image_grids.iter().try_fold(0usize, |n, grid| {
+            n.checked_add(grid.image_slots() as usize - 1)
+                .ok_or_else(|| anyhow::anyhow!("expanded edit prompt overflows"))
+        })?;
         let expanded = ids
             .len()
-            .checked_add(slots - 1)
+            .checked_add(extra)
             .ok_or_else(|| anyhow::anyhow!("expanded edit prompt overflows"))?;
         ensure!(
             expanded < 8192 + self.prefix.len(),
             "expanded edit prompt exceeds the declared DiT text capacity"
         );
-        ids.try_reserve_exact(slots - 1)?;
-        ids.splice(start..start + 1, std::iter::repeat_n(image_id, slots));
-        Ok((ids, start))
+        ids.try_reserve_exact(extra)?;
+        // Reverse splicing preserves original placeholder indices. Record the
+        // final locations separately, including every preceding image expansion.
+        let mut shift = 0usize;
+        let starts = positions
+            .iter()
+            .zip(image_grids)
+            .map(|(&start, grid)| {
+                let expanded_start = start + shift;
+                shift += grid.image_slots() as usize - 1;
+                expanded_start
+            })
+            .collect();
+        for (&start, grid) in positions.iter().zip(image_grids).rev() {
+            ids.splice(
+                start..start + 1,
+                std::iter::repeat_n(image_id, grid.image_slots() as usize),
+            );
+        }
+        Ok((ids, starts))
     }
     /// Mirrors Omni's user-token budget: max(full_tokens - empty_template, 0).
     /// Empty strings become one space. No truncation occurs. Raw prompt bytes
@@ -375,6 +472,22 @@ fn render(prompt: &str) -> String {
         "{}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
         system_message()
     )
+}
+
+// Diffusers QwenImage21Pipeline._get_qwen_prompt_embeds: the numbered image
+// blocks have one separating space; no space is inserted before user text.
+pub(super) fn render_edit(prompt: &str, references: usize) -> String {
+    let mut body = String::new();
+    for image in 1..=references {
+        if image > 1 {
+            body.push(' ');
+        }
+        body.push_str(&format!(
+            "<image{image}><|vision_start|><|image_pad|><|vision_end|>"
+        ));
+    }
+    body.push_str(if prompt.is_empty() { " " } else { prompt });
+    render(&body)
 }
 
 fn render_system_template(source: &str) -> Result<String> {

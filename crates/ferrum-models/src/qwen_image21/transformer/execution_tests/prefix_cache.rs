@@ -90,7 +90,56 @@ fn close(session: TensorComponentSession<ReferenceDeviceRuntime>) {
 
 #[test]
 fn prefix_phases_share_full_weight_installation_and_match_two_full_steps() {
-    let fixture = Fixture::new();
+    check_prefix_phases(Fixture::new());
+}
+
+#[test]
+fn multiple_reference_prefix_cache_matches_full_steps_with_padding() {
+    let mut fixture = Fixture::new();
+    fixture.config = QwenImage21TransformerConfig::new(
+        fixture.config.transformer().clone(),
+        QwenImage21T2iLayout::new(9, 2, 2, vec![9, 7]).unwrap(),
+    )
+    .unwrap()
+    .with_reference_images(vec![
+        QwenImage21ReferenceImage::new(1, 1, 2, 2).unwrap(),
+        QwenImage21ReferenceImage::new(4, 2, 2, 4).unwrap(),
+    ])
+    .unwrap();
+    fixture.input.insert(
+        id(F::TEXT_ID),
+        bytes(
+            &(0..BATCH * 9 * H)
+                .map(|i| bits(if i % 3 == 0 { 0.5 } else { -0.5 }))
+                .collect::<Vec<_>>(),
+        ),
+    );
+    fixture.input.insert(
+        id(F::REFERENCE_LATENTS_ID),
+        bytes(
+            &(0..BATCH * 12 * H)
+                .map(|i| bits((i % 7) as f32 * 0.125))
+                .collect::<Vec<_>>(),
+        ),
+    );
+    let frequencies = fixture.config.rotary_frequencies().unwrap();
+    let mut rotary = vec![
+        0.0;
+        frequencies
+            .output_elements(fixture.config.layout())
+            .unwrap()
+    ];
+    frequencies
+        .write_into(fixture.config.layout(), &mut rotary)
+        .unwrap();
+    fixture.input.insert(
+        id(F::FREQUENCIES_ID),
+        rotary.into_iter().flat_map(f32::to_le_bytes).collect(),
+    );
+    check_prefix_phases(fixture);
+}
+
+fn check_prefix_phases(fixture: Fixture) {
     let prefill_config = fixture
         .config
         .clone()
@@ -198,8 +247,9 @@ fn prefix_phases_share_full_weight_installation_and_match_two_full_steps() {
 
     let as_decode = |mut raw: BTreeMap<ProgramValueId, Vec<u8>>| {
         raw.remove(&id(F::TEXT_ID));
+        raw.remove(&id(F::REFERENCE_LATENTS_ID));
         let full = raw.get_mut(&id(F::FREQUENCIES_ID)).unwrap();
-        full.drain(..TEXT * H * 4);
+        full.drain(..fixture.config.layout().target_start() as usize * H * 4);
         raw
     };
     let first_decode = as_decode(fixture.input.clone());

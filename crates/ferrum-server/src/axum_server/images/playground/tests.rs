@@ -17,6 +17,7 @@ use tower::ServiceExt;
 struct MetadataGenerator {
     host: HostMemoryAccount,
     edits: bool,
+    maximum_reference_images: usize,
     calls: Arc<AtomicUsize>,
 }
 
@@ -26,6 +27,9 @@ impl ImageGenerator for MetadataGenerator {
     }
     fn supports_edits(&self) -> bool {
         self.edits
+    }
+    fn maximum_reference_images(&self) -> usize {
+        self.maximum_reference_images
     }
     fn capabilities(
         &self,
@@ -83,7 +87,8 @@ async fn playground_routes_require_a_real_configured_image_service() {
 
 #[tokio::test]
 async fn playground_config_uses_declared_capabilities_without_queueing_inference() {
-    for edits in [false, true] {
+    for maximum_reference_images in [0, 1, 3, 8, 10] {
+        let edits = maximum_reference_images != 0;
         let host = HostMemoryAccount::new(
             HostMemoryLimits::new(
                 4096,
@@ -101,6 +106,7 @@ async fn playground_config_uses_declared_capabilities_without_queueing_inference
             MetadataGenerator {
                 host: host.clone(),
                 edits,
+                maximum_reference_images,
                 calls: calls.clone(),
             },
             ImageServiceConfig {
@@ -131,6 +137,11 @@ async fn playground_config_uses_declared_capabilities_without_queueing_inference
         assert_eq!(value["default_height"], 512);
         assert_eq!(value["default_seed"].as_u64(), Some(u64::MAX));
         assert_eq!(value["supports_edits"], edits);
+        assert_eq!(value["maximum_reference_images"], maximum_reference_images);
+        assert_eq!(
+            value["maximum_reference_image_bytes"],
+            ImageInputLimits::default().maximum_encoded_bytes()
+        );
         let sizes = value["sizes"].as_array().unwrap();
         let dimensions: Vec<(u32, u32)> = sizes
             .iter()

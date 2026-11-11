@@ -27,7 +27,7 @@ mod correlation;
 mod edits;
 pub(super) mod playground;
 mod response;
-pub(super) use edits::{edits_handler, EDIT_BODY_LIMIT};
+pub(super) use edits::{edit_body_limit, edits_handler};
 
 /// Explicit image response limits, independent of the text engine's output
 /// budget. `max_event_bytes` bounds the complete JSON/base64 response here.

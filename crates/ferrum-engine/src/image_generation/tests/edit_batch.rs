@@ -107,6 +107,48 @@ fn packed_reference_batch_preserves_independent_normalized_samples_and_host_clai
 }
 
 #[test]
+fn multiple_reference_batch_packs_sample_major_with_distinct_geometries() {
+    let shapes = [
+        QwenImage21LatentShape::new(1, 2, 2).unwrap(),
+        QwenImage21LatentShape::new(1, 2, 4).unwrap(),
+    ];
+    let sample_bytes = shapes.iter().map(|shape| shape.byte_len()).sum::<usize>();
+    let host = host(sample_bytes * 3);
+    let mut batch = ReferenceLatentBatch::multiple(&host, 2, &shapes).unwrap();
+    for (index, shape) in shapes.iter().enumerate() {
+        for sample in 0..2 {
+            batch
+                .push(packed(&host, *shape, (index * 10 + sample + 1) as u16))
+                .unwrap();
+        }
+    }
+    let output = batch.finish().unwrap();
+    assert_eq!(output.tensor().dimensions(), [24, 64]);
+    let actual: Vec<_> = output
+        .bytes()
+        .bytes()
+        .chunks_exact(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect();
+    let mut expected = Vec::new();
+    for sample in 0..2 {
+        for (index, shape) in shapes.iter().enumerate() {
+            expected.extend(std::iter::repeat_n(
+                (index * 10 + sample + 1) as u16,
+                shape.byte_len() / 2,
+            ));
+        }
+    }
+    assert_eq!(actual, expected);
+    assert_eq!(host.usage().unwrap().committed_bytes(), sample_bytes * 2);
+    drop(output);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    let bounded = self::host(sample_bytes * 2 - 1);
+    assert!(ReferenceLatentBatch::multiple(&bounded, 2, &shapes).is_err());
+    assert_eq!(bounded.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
 fn one_reference_reuses_original_normalized_owner_without_an_extra_allocation() {
     let shape = QwenImage21LatentShape::new(1, 2, 2).unwrap();
     let host = host(shape.byte_len());
