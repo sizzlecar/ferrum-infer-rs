@@ -348,9 +348,9 @@ fn spatial_decoder_batch_is_explicit_and_independent_of_request_capacity() {
     let mut wire = document();
     let default = load(directory.path(), &wire).unwrap();
     assert_eq!(default.vae_decoder_tile_batch.maximum_tiles(), 1);
-    wire["vae_decoder_tile_batch"] = json!(8);
+    wire["vae_decoder_tile_batch"] = json!(4);
     let config = load(directory.path(), &wire).unwrap();
-    assert_eq!(config.vae_decoder_tile_batch.maximum_tiles(), 8);
+    assert_eq!(config.vae_decoder_tile_batch.maximum_tiles(), 4);
     let PH3ImageBackendConfig::Cuda(backend) = &config.backend;
     assert_eq!(backend.pipeline.maximum_batch_size, 1);
     assert_eq!(config.preset, default.preset);
@@ -364,9 +364,9 @@ fn spatial_decoder_batch_is_explicit_and_independent_of_request_capacity() {
         let resolved = backend
             .resolved(config.vae_spatial_policy, config.vae_decoder_tile_batch)
             .unwrap();
-        assert_eq!(resolved.options.vae_decoder_tile_batch.maximum_tiles(), 8);
+        assert_eq!(resolved.options.vae_decoder_tile_batch.maximum_tiles(), 4);
     }
-    for invalid in [json!(0), json!(9), json!(-1), json!(1.5), json!("8")] {
+    for invalid in [json!(0), json!(5), json!(-1), json!(1.5), json!("4")] {
         wire["vae_decoder_tile_batch"] = invalid;
         assert!(load(directory.path(), &wire).is_err());
     }

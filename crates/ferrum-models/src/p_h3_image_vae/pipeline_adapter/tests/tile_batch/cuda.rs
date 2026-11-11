@@ -63,7 +63,7 @@ fn run(
     let p = adapter
         .prepare_decoder_with_tile_batch(
             1,
-            160,
+            96,
             64,
             PH3ImageVaeSpatialPolicy::Tiled {
                 tile_pixels: 32,
@@ -101,9 +101,9 @@ fn run(
     let n = spec.minimum_storage_bytes().unwrap() as usize / 4;
     let values = (0..n)
         .map(|i| {
-            ((i * 7 + i / 40) % 59) as f32 / 32. - 0.75
+            ((i * 7 + i / 24) % 59) as f32 / 32. - 0.75
                 + 0.000123
-                + if perturb && i % 40 == 39 { 0.75 } else { 0. }
+                + if perturb && i % 24 == 23 { 0.75 } else { 0. }
         })
         .collect::<Vec<_>>();
     let sample = input(&parent, spec, &values, "value.grouped.cuda.sample");
@@ -214,11 +214,11 @@ fn run(
             Err(e) => panic!("CUDA tile group execution failed: {e:?}"),
         }
     }
-    assert_eq!(consumer.completed_tiles(), 27);
-    assert_eq!(consumer.executed_tiles(), 27);
+    assert_eq!(consumer.completed_tiles(), 15);
+    assert_eq!(consumer.executed_tiles(), 15);
     assert_eq!(consumer.executed_groups(), submitted_groups);
-    assert_eq!(submitted_groups, 27_usize.div_ceil(maximum));
-    if maximum > 1 {
+    assert_eq!(submitted_groups, if maximum == 1 { 15 } else { 4 });
+    if maximum == 4 {
         assert_eq!(attachments, 1);
     } else {
         assert_eq!(attachments, 0);
@@ -228,7 +228,7 @@ fn run(
     }
     assert_eq!(source.calls.load(Ordering::SeqCst), initial_calls);
     let pixels = consumer.finish().unwrap();
-    assert_eq!(pixels.tensor().dimensions(), [1, 3, 64, 160]);
+    assert_eq!(pixels.tensor().dimensions(), [1, 3, 64, 96]);
     close(session.take().unwrap());
     drop(actor);
     assert!(matches!(
@@ -254,7 +254,7 @@ fn run(
     out
 }
 #[test]
-#[ignore = "requires CUDA; complete raw-W8 decoder with cross-row 4/3 and 8/3 tail sessions and one original shared installation"]
+#[ignore = "requires CUDA; complete raw-W8 decoder with cross-row4/3 tail sessions and one original shared installation"]
 fn actual_cuda_spatial_tile_batches_share_one_installation_and_match_ordered_single_tiles() {
     let _guard = GPU.lock().unwrap_or_else(|p| p.into_inner());
     let f = Execution::new();
@@ -262,34 +262,32 @@ fn actual_cuda_spatial_tile_batches_share_one_installation_and_match_ordered_sin
     let (_dir, source, _, _) = fixture();
     let adapter = PH3ImageVaeAdapter::new(source, &metadata(), limits()).unwrap();
     let serial = run(&f, &adapter, 1, false, false);
-    for batch in [4, 8] {
-        let grouped = run(&f, &adapter, batch, false, true);
-        let mut maximum = 0.0_f32;
-        for (&a, &b) in serial.iter().zip(&grouped) {
-            let delta = (a - b).abs();
-            maximum = maximum.max(delta);
-            assert!(
-                a.is_finite() && b.is_finite() && delta <= 1e-4 * (1. + a.abs()),
-                "serial={a}, grouped={b}, delta={delta}"
+    let grouped = run(&f, &adapter, 4, false, true);
+    let mut maximum = 0.0_f32;
+    for (&a, &b) in serial.iter().zip(&grouped) {
+        let delta = (a - b).abs();
+        maximum = maximum.max(delta);
+        assert!(
+            a.is_finite() && b.is_finite() && delta <= 1e-4 * (1. + a.abs()),
+            "serial={a}, grouped={b}, delta={delta}"
+        );
+    }
+    eprintln!("spatial4/3 vs serial1 maximum normalized F32 pixel delta={maximum}");
+    // Only the bottom-right normalized latent position changes (each channel
+    // has24 spatial values). No other physical lane in the first row may see it.
+    let perturbed = run(&f, &adapter, 4, true, false);
+    assert!(grouped
+        .iter()
+        .zip(&perturbed)
+        .any(|(a, b)| a.to_bits() != b.to_bits()));
+    for channel in 0..3 {
+        for y in 0..16 {
+            let start = (channel * 64 + y) * 96;
+            assert_eq!(
+                &grouped[start..start + 96],
+                &perturbed[start..start + 96],
+                "unrelated top-row tiles must remain isolated"
             );
-        }
-        eprintln!("spatial{batch}/3 vs serial1 maximum normalized F32 pixel delta={maximum}");
-        // Only the bottom-right normalized latent position changes (each channel
-        // has 40 spatial values). No other physical lane in the first row may see it.
-        let perturbed = run(&f, &adapter, batch, true, false);
-        assert!(grouped
-            .iter()
-            .zip(&perturbed)
-            .any(|(a, b)| a.to_bits() != b.to_bits()));
-        for channel in 0..3 {
-            for y in 0..16 {
-                let start = (channel * 64 + y) * 160;
-                assert_eq!(
-                    &grouped[start..start + 160],
-                    &perturbed[start..start + 160],
-                    "unrelated top-row tiles must remain isolated"
-                );
-            }
         }
     }
     drop(f);

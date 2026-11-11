@@ -5,13 +5,13 @@ use super::*;
 use ferrum_models::p_h3_image_vae::PH3ImageVaeTileBatch;
 
 #[test]
-#[ignore = "requires CUDA, pinned native set and explicit cuDNN9 paths; actual product decoder cross-row 4/3 and 8/3 tail transitions"]
+#[ignore = "requires CUDA, pinned native set and explicit cuDNN9 paths; actual product decoder cross-row4/3 tail transition"]
 fn cuda_h3_decoder_tile_batches_cross_rows_and_retire_cold_shared_weights() -> Result<()> {
     let fixture = CompleteFixture::new()?;
     let mut baseline = None;
-    for maximum in [1, 4, 8] {
+    for maximum in [1, 4] {
         let mut configured = config()?;
-        configured.pipeline.maximum_width = 160;
+        configured.pipeline.maximum_width = 96;
         configured.pipeline.maximum_height = 64;
         configured.pipeline.residency = ImageResidencyPolicy::Cold;
         configured.pipeline.executor.device_timing_mode = ferrum_runtime::DeviceTimingMode::Kernel;
@@ -25,17 +25,17 @@ fn cuda_h3_decoder_tile_batches_cross_rows_and_retire_cold_shared_weights() -> R
             configured.create_pipeline_with_receipt(fixture.assets()?)?;
         assert_eq!(composition.vae_decoder_tile_batch.maximum_tiles(), maximum);
         // The service's image capacity remains B1 while a decoder invocation
-        // has physical batch 4 or 8. No device/account identity is substituted.
+        // has physical batch4. No device/account identity is substituted.
         assert_eq!(pipeline.execution.config.maximum_batch_size, 1);
         let host = pipeline.host_account().clone();
         let runtime = Arc::downgrade(pipeline.runtime());
         let mut input = request(17);
-        input.width = 160;
+        input.width = 96;
         input.height = 64;
         let output = pipeline
             .generate(input)
             .unwrap_or_else(|e| panic!("product tile batch{maximum}: {e}"));
-        assert_eq!(output.rgba.tensor().dimensions(), &[1, 3, 64, 160]);
+        assert_eq!(output.rgba.tensor().dimensions(), &[1, 3, 64, 96]);
         assert_eq!(
             output.receipt.decoder_batch_policy,
             ImageDecoderBatchPolicy::SingleImage
@@ -53,24 +53,13 @@ fn cuda_h3_decoder_tile_batches_cross_rows_and_retire_cold_shared_weights() -> R
             .iter()
             .map(|s| s.execution.plan.batch_size)
             .collect::<Vec<_>>();
-        assert_eq!(
-            batches,
-            if maximum == 1 {
-                vec![1]
-            } else {
-                vec![maximum, 3]
-            }
-        );
+        assert_eq!(batches, if maximum == 1 { vec![1] } else { vec![4, 3] });
         assert_eq!(
             decoder
                 .iter()
                 .map(|s| s.execution.completed_executions)
                 .collect::<Vec<_>>(),
-            if maximum == 1 {
-                vec![27]
-            } else {
-                vec![27 / maximum, 1]
-            }
+            if maximum == 1 { vec![15] } else { vec![3, 1] }
         );
         for (index, stage) in decoder.iter().enumerate() {
             assert_eq!(
@@ -87,7 +76,7 @@ fn cuda_h3_decoder_tile_batches_cross_rows_and_retire_cold_shared_weights() -> R
                 .has_weights(ImageStage::Decoder),
             "Cold must release the shared decoder installation after the last real tail"
         );
-        if maximum > 1 {
+        if maximum == 4 {
             assert!(output.receipt.stages.iter().any(|s| {
                 s.execution.plan.stage == ImageStage::Decoder
                     && matches!(
