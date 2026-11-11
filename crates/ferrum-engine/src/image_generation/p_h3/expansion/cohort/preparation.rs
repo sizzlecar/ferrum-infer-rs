@@ -79,6 +79,7 @@ impl NativeTextExpansion {
 
     /// Compare borrowed preparation metadata before taking any request tokens
     /// into a finite cohort. This neither reserves capacity nor admits work.
+    #[cfg(test)]
     pub(crate) fn text_cohort_compatible(
         &self,
         first: &PreparedTextExpansion,
@@ -114,6 +115,7 @@ impl NativeTextExpansion {
     /// Freeze compatible text requests into one bounded execution plan. This
     /// grants neither Host capacity nor native sequence admission. Visual
     /// requests retain their existing independent single-request path.
+    #[cfg(test)]
     pub(crate) fn prepare_text_cohort(
         &self,
         requests: Vec<PreparedTextExpansion>,

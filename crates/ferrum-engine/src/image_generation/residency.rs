@@ -379,18 +379,6 @@ impl<R: DeviceRuntime, S: ImagePipelineSourceAdapter> ImagePipelineExecution<R, 
             .minimum_runnable_request_bytes())
     }
 
-    /// Batch planning evidence, not an allocation permit. All retained model
-    /// installations coexist; only one stage's dynamic pools execute at once.
-    /// Explicitly retained idle pools coexist with every other active stage.
-    /// The shared device ledger remains authoritative under outside contention.
-    #[cfg(test)]
-    pub(super) fn validate_resident_capacity(
-        &self,
-        stages: &[&PreparedStage<R>],
-    ) -> anyhow::Result<()> {
-        self.validate_capacity_with_prefix(stages, None)
-    }
-
     pub(super) fn validate_capacity_with_prefix(
         &self,
         stages: &[&PreparedStage<R>],

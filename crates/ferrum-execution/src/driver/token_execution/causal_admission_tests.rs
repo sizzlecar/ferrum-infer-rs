@@ -57,7 +57,6 @@ fn causal_admission_retry_binds_the_original_immutable_request_owner() {
     assert!(!binding.matches(admission, Some(&foreign)));
     assert!(!binding.matches(admission, None));
     drop((binding, original, foreign));
-    drop(input);
     drop(source);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

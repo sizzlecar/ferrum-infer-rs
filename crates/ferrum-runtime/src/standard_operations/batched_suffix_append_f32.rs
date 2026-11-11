@@ -1,6 +1,6 @@
 //! Exact F32 row transport with shared suffix rows and explicit positive zero.
 use super::*;
-use crate::{ResolvedTensorLayout, ResolvedTensorSpec, SemanticValue};
+use crate::{ResolvedTensorLayout, ResolvedTensorSpec};
 pub const BATCHED_SUFFIX_APPEND_F32_OPERATION_ID: &str = "operation.batched_suffix_append.f32";
 pub const BATCHED_SUFFIX_APPEND_F32_CAPABILITY_ID: &str =
     "capability.operation.batched_suffix_append.f32";

@@ -1,4 +1,5 @@
 //! Shared run/serve selection of the ConvRot GEMM output implementation.
+#[cfg(any(feature = "cuda", test))]
 use anyhow::{ensure, Result};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -23,6 +24,7 @@ impl PH3ImageConvRotOutputPolicy {
             0
         }
     }
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn resolve(self, available: bool) -> Result<bool> {
         match self {
             Self::Separate => Ok(false),

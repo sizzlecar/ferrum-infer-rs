@@ -1,5 +1,6 @@
 //! Explicit numerical selection shared by image run and serve. Availability
 //! means an advertised native capability, not a model-name guess.
+#[cfg(any(feature = "cuda", test))]
 use anyhow::{ensure, Result};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -25,6 +26,7 @@ impl PH3ImageF32AttentionPolicy {
         }
     }
 
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn resolve(self, available: bool) -> Result<bool> {
         match self {
             Self::Sequential => Ok(false),
@@ -40,6 +42,7 @@ impl PH3ImageF32AttentionPolicy {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl super::PH3ImageAssets {
     pub(super) fn configure_f32_attention(&mut self, fused: bool) -> Result<()> {
         use ferrum_models::qwen3_vl_vision::{

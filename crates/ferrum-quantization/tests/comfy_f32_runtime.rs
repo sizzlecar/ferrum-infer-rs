@@ -1,6 +1,7 @@
 //! Small typed canonical checkpoints exercise actual Stored component loading.
 //! Numeric fixtures establish this declared RN32 profile, not upstream binary
 //! parity or full text-encoder support. No model payload is checked into Git.
+#[cfg(feature = "cuda")]
 use ferrum_execution::{
     component::{
         CompiledTensorComponent, ComponentInitializationConfig, ComponentWeightSource,
@@ -21,9 +22,11 @@ use safetensors::{
     Dtype,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, OnceLock},
+    sync::OnceLock,
 };
 
 const X: &str = "value.fixture.comfy_f32.input";

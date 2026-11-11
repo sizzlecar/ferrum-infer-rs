@@ -18,6 +18,7 @@ pub const OPERATION_IDS: [&str; 4] = [
 
 /// Exact geometry decision used before scratch admission. F32 output and
 /// unsupported vector/accumulator boundaries keep the existing implementation.
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn native_shape(
     output: ElementType,
     rows: u64,

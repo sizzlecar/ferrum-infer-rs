@@ -140,13 +140,6 @@ pub(super) fn request_identity(input: ImageRequestRef<'_>) -> [u8; 32] {
 }
 
 impl<R: DeviceRuntime> PH3ImagePipeline<R> {
-    pub(in crate::image_generation) fn prepare_continuous_request(
-        &mut self,
-        request: &ImageGenerationRequest,
-    ) -> Result<PreparedContinuousRequest<R>> {
-        self.prepare_continuous_image_request(ImageRequestRef::Generate(request))
-    }
-
     pub(in crate::image_generation) fn prepare_continuous_image_request(
         &mut self,
         input: ImageRequestRef<'_>,
@@ -334,14 +327,6 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
         prepared.persistent = Some(persistent);
         prepared.work = Some(work);
         Ok(true)
-    }
-
-    pub(in crate::image_generation) fn start_continuous_request(
-        &mut self,
-        prepared: PreparedContinuousRequest<R>,
-        request: &ImageGenerationRequest,
-    ) -> std::result::Result<ContinuousRequest<R>, ImageGenerationError<R>> {
-        self.start_continuous_image_request(prepared, ImageRequestRef::Generate(request))
     }
 
     pub(in crate::image_generation) fn start_continuous_image_request(

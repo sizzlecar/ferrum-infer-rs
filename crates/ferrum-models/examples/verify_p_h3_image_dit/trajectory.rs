@@ -2,13 +2,16 @@
 //! per-step bases are required; a model's BF16 ingress is not a solver state.
 use super::{artifacts, data, InputBoundary, OverrideGroup, Trajectory};
 use anyhow::{ensure, Context, Result};
+#[cfg(feature = "cuda")]
 use ferrum_execution::TensorExecutionOutput;
+#[cfg(feature = "cuda")]
 use ferrum_models::p_h3_image::PH3ImageFinalLayerFamily;
 use ferrum_quantization::{SafetensorsArchive, SafetensorsTensor};
 use ferrum_runtime::{HostMemoryAccount, HostMemoryClass, ManagedHostBytes, ManagedHostTensor};
 use half::bf16;
 use serde::Deserialize;
 use serde_json::json;
+#[cfg(feature = "cuda")]
 use std::{fs::OpenOptions, io::Write};
 
 pub(super) fn validate_options(
@@ -141,7 +144,9 @@ pub(super) struct EulerRun<'a> {
     audio_shape: [u64; 4],
     layout: ImageLayout,
     basis_bytes: usize,
+    #[cfg(feature = "cuda")]
     sigmas: [f32; 9],
+    #[cfg(feature = "cuda")]
     final_state: Option<(ManagedHostBytes, ManagedHostBytes)>,
     steps: Vec<serde_json::Value>,
     input_override: Option<OverrideInputs>,
@@ -285,7 +290,9 @@ impl<'a> EulerRun<'a> {
             audio_shape: capture.audio_shape,
             layout,
             basis_bytes,
+            #[cfg(feature = "cuda")]
             sigmas,
+            #[cfg(feature = "cuda")]
             final_state: None,
             steps: Vec::with_capacity(8),
             input_override: None,
@@ -576,6 +583,7 @@ impl<'a> EulerRun<'a> {
         Ok(ports)
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn run(
         &mut self,
         templates: Vec<ManagedHostTensor>,
@@ -653,6 +661,7 @@ impl<'a> EulerRun<'a> {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn finish(
         mut self,
         artifacts: &artifacts::Artifacts,

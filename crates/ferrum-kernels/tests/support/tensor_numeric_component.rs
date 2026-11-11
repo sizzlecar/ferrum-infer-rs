@@ -21,6 +21,7 @@ pub const BIAS: &str = "value.fixture.bias";
 pub const COSINE: &str = "value.fixture.cosine";
 pub const SINE: &str = "value.fixture.sine";
 pub const OUTPUT: &str = "value.fixture.output";
+#[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 pub const F32_EXPECTED: [f32; 6] = [
     0.000244140625,
     0.7501220703125,
@@ -518,6 +519,7 @@ pub fn host() -> HostMemoryAccount {
         .unwrap(),
     )
 }
+#[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 pub fn f32_config() -> Config {
     Config {
         rows: 3,
@@ -526,12 +528,14 @@ pub fn f32_config() -> Config {
         kind: Kind::F32Dense,
     }
 }
+#[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 pub fn execute_f32<R: DeviceRuntime>(
     session: &mut TensorComponentSession<R>,
     host: &HostMemoryAccount,
 ) -> Vec<TensorExecutionOutput> {
     execute_f32_kind(session, host, Kind::F32Dense, 0)
 }
+#[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 pub fn affine_f32_config() -> Config {
     Config {
         kind: Kind::F32Affine,
@@ -539,6 +543,7 @@ pub fn affine_f32_config() -> Config {
     }
 }
 
+#[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 pub fn cast_f32_to_bf16_config() -> Config {
     Config {
         rows: 2,
@@ -547,6 +552,7 @@ pub fn cast_f32_to_bf16_config() -> Config {
         kind: Kind::F32ToBf16,
     }
 }
+#[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 pub fn execute_cast_f32_to_bf16<R: DeviceRuntime>(
     session: &mut TensorComponentSession<R>,
     host: &HostMemoryAccount,
@@ -593,6 +599,7 @@ pub fn execute_cast_f32_to_bf16<R: DeviceRuntime>(
     }
     output
 }
+#[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 pub fn execute_affine_f32<R: DeviceRuntime>(
     session: &mut TensorComponentSession<R>,
     host: &HostMemoryAccount,
@@ -600,6 +607,7 @@ pub fn execute_affine_f32<R: DeviceRuntime>(
 ) -> Vec<TensorExecutionOutput> {
     execute_f32_kind(session, host, Kind::F32Affine, trial)
 }
+#[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 fn execute_f32_kind<R: DeviceRuntime>(
     session: &mut TensorComponentSession<R>,
     host: &HostMemoryAccount,

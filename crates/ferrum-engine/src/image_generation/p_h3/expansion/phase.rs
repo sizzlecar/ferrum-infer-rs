@@ -2,14 +2,19 @@
 //! input continues through its original one-request prepared graph and phase.
 #[cfg(test)]
 use super::cohort::{CohortState, ParticipantState as State};
+#[cfg(test)]
 use super::cohort::{ExpansionCohortProgress, ExpansionParticipantResult, NativeExpansionCohort};
+#[cfg(test)]
 use super::*;
+#[cfg(test)]
 use ferrum_execution::executor_lifecycle::ExecutorShutdownObserver;
 #[cfg(test)]
 use ferrum_execution::executor_lifecycle::ExecutorShutdownPhase;
+#[cfg(test)]
 use ferrum_runtime::HostMemoryScope;
 #[cfg(test)]
 use std::task::Poll;
+#[cfg(test)]
 use std::task::Waker;
 #[cfg(test)]
 mod tests;
@@ -20,10 +25,12 @@ pub(crate) enum ExpansionPhaseProgress {
     Cancelled,
 }
 
+#[cfg(test)]
 pub(crate) struct NativeExpansionPhase {
     cohort: NativeExpansionCohort,
 }
 
+#[cfg(test)]
 impl NativeExpansionPhase {
     pub(crate) fn initialize<R: DeviceRuntime>(
         assets: Arc<NativeTextExpansion>,

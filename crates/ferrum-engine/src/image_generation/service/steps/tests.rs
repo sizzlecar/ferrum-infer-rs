@@ -396,7 +396,7 @@ async fn service_actual_native_b2_pool_pressure_rolls_back_then_b1_keeps_advanci
         Ok(assets) => assets,
         Err(_) => panic!("fresh fixture has one immutable asset owner"),
     };
-    let mut pipeline = QwenImage21Pipeline::new(
+    let pipeline = QwenImage21Pipeline::new(
         c.runtime().clone(),
         host,
         reference_vnext_operation_registry(c.runtime()).unwrap(),

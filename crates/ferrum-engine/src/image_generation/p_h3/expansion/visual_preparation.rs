@@ -39,6 +39,7 @@ impl NativeTextExpansion {
         self.visual_assets.as_ref()
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn configure_visual_profile(
         &mut self,
         profile: ferrum_runtime::NumericalProfileId,
@@ -71,18 +72,21 @@ impl NativeTextExpansion {
         Ok(())
     }
 
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn visual_causal_family(&self) -> Option<&ferrum_runtime::PreparedModelFamily> {
         self.visual_model
             .as_ref()
             .map(|model| model.prepared().family())
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn vision_family(&self) -> Option<&ferrum_runtime::PreparedModelFamily> {
         self.visual_assets
             .as_ref()
             .map(|assets| assets.minimal_family())
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_edit(
         &self,
         prompt: &str,

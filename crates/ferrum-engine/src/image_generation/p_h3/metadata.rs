@@ -148,6 +148,7 @@ impl ComponentDeclarations {
         Ok(result)
     }
     /// Declaration availability does not claim that a prompt model is loaded.
+    #[cfg(test)]
     pub fn declares_prompt_expansion(&self) -> bool {
         self.prompt_upsampler.is_some()
     }

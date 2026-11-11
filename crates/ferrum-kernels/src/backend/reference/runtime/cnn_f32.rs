@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_runtime::{F32CnnGeometry, F32CnnOp};
+use ferrum_runtime::F32CnnGeometry;
 pub(crate) struct ReferenceCnnF32Launch {
     pub inputs: Vec<ReferenceBufferRegion>,
     pub output: ReferenceBufferRegion,

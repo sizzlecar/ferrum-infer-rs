@@ -373,16 +373,16 @@ async fn unknown_held_pauses_all_shared_submission_without_losing_original_outco
     let reference = failure.wave_observation.unwrap();
     let retained = &cohort.retained_waves[reference.wave];
     assert_eq!(reference.input_index, 0);
-    assert_eq!(retained.requests[0], cohort.participants[0].request);
+    assert_eq!(retained._requests[0], cohort.participants[0].request);
     assert_eq!(
-        &retained.input_frontiers[0],
+        &retained._input_frontiers[0],
         failure.frontier.as_ref().unwrap()
     );
     assert!(failure
         .error
         .to_string()
         .contains("original unknown submission"));
-    let ExecutionBatchOutcome::Interrupted(outcome) = &retained.outcome else {
+    let ExecutionBatchOutcome::Interrupted(outcome) = &retained._outcome else {
         panic!("original interruption missing")
     };
     assert_eq!(outcome.remaining()[0].input_index(), 0);
@@ -443,15 +443,15 @@ async fn contract_violation_retains_original_ledger_and_phase_until_owner_retire
         let reference = failure.wave_observation.unwrap();
         assert_eq!(reference.input_index, index);
         assert_eq!(
-            cohort.retained_waves[reference.wave].requests[index],
+            cohort.retained_waves[reference.wave]._requests[index],
             participant.request
         );
         assert_eq!(
-            &cohort.retained_waves[reference.wave].input_frontiers[index],
+            &cohort.retained_waves[reference.wave]._input_frontiers[index],
             failure.frontier.as_ref().unwrap()
         );
     }
-    let ExecutionBatchOutcome::ContractViolation(original) = &cohort.retained_waves[0].outcome
+    let ExecutionBatchOutcome::ContractViolation(original) = &cohort.retained_waves[0]._outcome
     else {
         panic!("original contract violation must retain its observations")
     };

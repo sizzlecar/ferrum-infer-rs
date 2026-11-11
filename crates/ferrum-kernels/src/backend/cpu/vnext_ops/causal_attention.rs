@@ -263,6 +263,7 @@ fn normalized_rotary(
     }
 }
 
+#[cfg(test)]
 pub(super) fn step<K: CpuKvStorage + ?Sized>(
     shape: CausalShape,
     position: usize,

@@ -1,6 +1,31 @@
 # Image generation and editing
 
-Ferrum supports Qwen-Image-2.1-Turbo on Linux CUDA and Apple Silicon Metal. Generation uses text; editing accepts one static 8-bit RGB/RGBA PNG without a mask. Editing can redraw background and details.
+Ferrum supports Qwen-Image-2.1-Turbo on Linux CUDA and Apple Silicon Metal, and P-H3-Image on Linux CUDA SM89/SM120. Qwen editing accepts one static 8-bit RGB/RGBA PNG; P-H3 accepts up to eight ordered references. Masks are unsupported. Editing can redraw background and details.
+
+## P-H3 setup
+
+Copy the [P-H3 CUDA configuration](../crates/ferrum-cli/examples/config/p-h3-image-cuda.json)
+beside your `models/` directory. It expects P-H3 metadata and prompt-upsample
+sources in `models/P-H3-Image/`, and the Comfy W4A8 text encoder/DiT and INT8 VAE
+archives in `models/P-H3-Image-Comfy/`. Set the CUDA/cuDNN absolute library paths
+to the installed libraries. The example uses the tested CUDA 13 cuDNN dependency
+family alongside the CUDA release binary; these libraries are not bundled.
+
+The example targets a 32 GB GPU with a 29 GiB managed device ceiling and 48 GB
+system-memory limit. Its opaque module allowances are explicit reservations,
+not certified measurements for every driver/library version. Smaller GPUs need
+their own capacity configuration. P-H3 currently requires this typed JSON;
+passing only a model-directory name does not select the P-H3 pipeline.
+
+```sh
+ferrum serve --image-config p-h3-image-cuda.json --served-model-name P-H3-Image --port 8000
+ferrum run --image-config p-h3-image-cuda.json --prompt "A red teapot on a wooden table" --width 2720 --height 1536 --output teapot.png
+```
+
+Prompt expansion is enabled, MTP and reference-result reuse are off, and compatible
+requests batch automatically within the configured capacity. The image sampler
+retains the model's eight-step schedule. [RTX 5090 measurements](performance-rtx5090-p-h3-20261111.md)
+describe the measured configuration and its limits.
 
 ## CUDA
 

@@ -30,6 +30,7 @@ pub(super) struct VisualExpansionInputs {
 }
 
 impl VisualExpansionInputs {
+    #[cfg(test)]
     pub(super) fn new(
         tokens: PH3ImagePromptExpansionImageTokens,
         text: &Qwen35TextConfig,

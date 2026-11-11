@@ -38,9 +38,6 @@ impl<R: DeviceRuntime> ContinuousRequest<R> {
     pub(crate) fn is_complete(&self) -> bool {
         self.state.solver.is_complete()
     }
-    pub(crate) fn job(&self) -> u64 {
-        self.state.id.job
-    }
 }
 /// A compiled/admitted exact membership. It cannot be rebound to other request
 /// objects, even when their physical shapes or parent account happen to match.
@@ -666,7 +663,7 @@ impl<R: DeviceRuntime> ContinuousBatch<R> {
         };
         let inputs = (|| -> anyhow::Result<_> {
             let specs = self.config.input_tensor_specs()?;
-            let mut gather = |name: &str| -> anyhow::Result<ManagedHostTensor> {
+            let gather = |name: &str| -> anyhow::Result<ManagedHostTensor> {
                 let spec = resolved(
                     specs
                         .get(&id::<ProgramValueId>(name)?)

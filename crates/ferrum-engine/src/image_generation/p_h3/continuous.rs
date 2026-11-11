@@ -184,12 +184,6 @@ impl<R: DeviceRuntime> ContinuousRequest<R> {
             .as_ref()
             .map_or(self.steps.len(), PH3ImageManagedSampling::step_index)
     }
-    pub fn image(&self) -> &ManagedHostTensor {
-        &self.image
-    }
-    pub fn persistent_scope(&self) -> &HostMemoryScope {
-        &self.persistent
-    }
     fn weights(&self) -> Result<&ImageWeightOwnerPin<R>> {
         self.weights
             .as_ref()

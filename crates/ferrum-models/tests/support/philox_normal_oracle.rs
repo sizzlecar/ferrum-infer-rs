@@ -74,6 +74,7 @@ pub(super) fn normal4(state: PhiloxSeedOffset, subsequence: u64, round: u64) -> 
     output
 }
 
+#[cfg(test)]
 pub(super) fn check(state: PhiloxSeedOffset, blocks: u32, actual: &[f32]) {
     let stride = u64::from(blocks) * 256;
     assert!(stride > 0);

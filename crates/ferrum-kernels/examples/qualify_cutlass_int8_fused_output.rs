@@ -1,4 +1,5 @@
 //! Independent true-shape INT8 output qualification; never changes model routing.
+#[cfg(any(feature = "cuda", test))]
 #[path = "qualify_cutlass_int8_fused_output/fixture.rs"]
 mod fixture;
 #[cfg(feature = "cuda")]

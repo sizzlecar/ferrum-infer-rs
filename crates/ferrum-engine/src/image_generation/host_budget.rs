@@ -5,7 +5,7 @@ use super::*;
 use ferrum_models::qwen3_vl_vision::Qwen3VLVisionFamily;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ExecutionHostBudget {
+pub(crate) struct ExecutionHostBudget {
     pub input: usize,
     pub output: usize,
     pub staging: usize,

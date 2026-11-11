@@ -42,6 +42,7 @@ impl PreparedPrompts {
 impl PH3ImageAssets {
     /// Validate the prompt and all component identities before granting device
     /// or tensor memory. No chat wrapping, silent token truncation or resizing.
+    #[cfg(test)]
     pub(super) fn prepare_text_conditioning(
         &self,
         request: &ImageGenerationRequest,
@@ -90,6 +91,7 @@ impl PH3ImageAssets {
     /// This supplies actual visual conditioning and Image tags; it does not
     /// create or stand in for the reference latent payload.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn prepare_image_conditioning(
         &self,
         request: &ImageGenerationRequest,
@@ -114,6 +116,7 @@ impl PH3ImageAssets {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn prepare_image_conditioning_with_family(
         &self,
         request: &ImageGenerationRequest,
@@ -236,6 +239,7 @@ impl PH3ImageAssets {
     }
 }
 
+#[cfg(test)]
 fn prepare_uncached<P: ModelFamilyProvider>(
     provider: P,
     config: &P::Config,

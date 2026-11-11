@@ -139,7 +139,7 @@ fn start_ready(first_cohort_refused: bool) -> Fixture {
     } = execution;
     let assets =
         Arc::try_unwrap(sources.assets).unwrap_or_else(|_| panic!("one fresh fixture asset owner"));
-    let mut pipeline = QwenImage21Pipeline::new(
+    let pipeline = QwenImage21Pipeline::new(
         composition.runtime().clone(),
         host,
         reference_vnext_operation_registry(composition.runtime()).unwrap(),

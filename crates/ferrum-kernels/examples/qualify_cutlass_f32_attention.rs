@@ -1,5 +1,6 @@
 //! Independent native qualification, not a model/backend capability declaration.
 //! Build the locked native source separately; pass its library explicitly.
+#[cfg(any(feature = "cuda", test))]
 #[path = "qualify_cutlass_f32_attention/fixture.rs"]
 mod fixture;
 #[cfg(feature = "cuda")]

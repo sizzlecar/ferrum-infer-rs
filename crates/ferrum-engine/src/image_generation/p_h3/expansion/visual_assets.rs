@@ -1,12 +1,13 @@
 //! Immutable visual assets for the original prompt-upsampler source. Validate
 //! the source once; request dimensions only rebuild plan/activation metadata.
 use anyhow::{ensure, Result};
+#[cfg(test)]
+use ferrum_models::qwen3_vl_vision::hf::Qwen3VLVisionHfProcessorLimits;
 use ferrum_models::{
     qwen3_vl_vision::{
         hf::{
             Qwen3VLVisionHfConfig, Qwen3VLVisionHfFamily, Qwen3VLVisionHfImagePlan,
-            Qwen3VLVisionHfLimits, Qwen3VLVisionHfProcessor, Qwen3VLVisionHfProcessorLimits,
-            Qwen3VLVisionHfWeightAdapter,
+            Qwen3VLVisionHfLimits, Qwen3VLVisionHfProcessor, Qwen3VLVisionHfWeightAdapter,
         },
         Qwen3VLVisionArchitecture, Qwen3VLVisionGrid,
     },
@@ -36,23 +37,13 @@ pub(crate) struct ExpansionVisualAssets {
     weights: Arc<Qwen3VLVisionHfWeightAdapter>,
     limits: Qwen3VLVisionHfLimits,
     profile: NumericalProfileId,
-    minimal_family: PreparedModelFamily,
+    // Retain the validated family even when this build does not run CUDA preflight.
+    _minimal_family: PreparedModelFamily,
     identity: ExpansionVisualSourceIdentity,
     fingerprint: String,
 }
 impl ExpansionVisualAssets {
-    pub(crate) fn from_source_bytes(
-        model: &ManagedProductionModel,
-        processor_bytes: &[u8],
-        processor_limits: Qwen3VLVisionHfProcessorLimits,
-        limits: Qwen3VLVisionHfLimits,
-    ) -> Result<Self> {
-        Self::from_processor(
-            model,
-            Qwen3VLVisionHfProcessor::from_source_bytes(processor_bytes, processor_limits)?,
-            limits,
-        )
-    }
+    #[cfg(test)]
     pub(crate) fn from_processor(
         model: &ManagedProductionModel,
         processor: Qwen3VLVisionHfProcessor,
@@ -107,7 +98,7 @@ impl ExpansionVisualAssets {
             weights,
             limits,
             profile,
-            minimal_family,
+            _minimal_family: minimal_family,
             identity,
             fingerprint,
         })
@@ -115,6 +106,7 @@ impl ExpansionVisualAssets {
     pub(crate) fn processor(&self) -> &Qwen3VLVisionHfProcessor {
         &self.processor
     }
+    #[cfg(test)]
     pub(crate) fn architecture(&self) -> &Qwen3VLVisionArchitecture {
         &self.architecture
     }
@@ -133,6 +125,7 @@ impl ExpansionVisualAssets {
     pub(super) fn weights(&self) -> &Arc<Qwen3VLVisionHfWeightAdapter> {
         &self.weights
     }
+    #[cfg(test)]
     pub(crate) fn stored_bytes(&self) -> Result<u64> {
         self.weights.stored_bytes()
     }
@@ -150,8 +143,9 @@ impl ExpansionVisualAssets {
     }
     /// Actual complete main-only program and original Stored schema at one
     /// merge cell. This is for provider preflight, not an execution receipt.
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn minimal_family(&self) -> &PreparedModelFamily {
-        &self.minimal_family
+        &self._minimal_family
     }
 }
 

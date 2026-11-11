@@ -1,30 +1,41 @@
 //! One original-weight DiT evaluation with externally captured, already prepared
 //! ports. This deliberately bypasses native RNG/TE/input preparation; it is not
 //! an image pipeline, serving qualification, or performance benchmark.
+#[cfg(any(feature = "cuda", test))]
 #[path = "verify_qwen_image21_projection/artifacts.rs"]
 mod artifacts;
+#[cfg(any(feature = "cuda", test))]
 #[path = "verify_qwen_image21_projection/arguments.rs"]
 mod backend;
+#[cfg(any(feature = "cuda", test))]
 #[path = "verify_p_h3_image_dit/data.rs"]
 mod data;
 #[cfg(feature = "cuda")]
 #[path = "verify_p_h3_image_dit/execution.rs"]
 mod execution;
+#[cfg(feature = "cuda")]
 #[path = "support/tensor_component.rs"]
 mod shared;
+#[cfg(any(feature = "cuda", test))]
 #[path = "verify_p_h3_image_dit/source.rs"]
 mod source;
+#[cfg(any(feature = "cuda", test))]
 #[path = "verify_p_h3_image_dit/trajectory.rs"]
 mod trajectory;
-use anyhow::{bail, ensure, Context, Result};
+#[cfg(any(feature = "cuda", test))]
+use anyhow::Context;
+use anyhow::{bail, ensure, Result};
+#[cfg(any(feature = "cuda", test))]
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
 const USAGE: &str = "verify_p_h3_image_dit --config HF_TRANSFORMER_JSON --model-dir DIR --checkpoint-file ORIGINAL_SAFETENSORS --input-bundle CAPTURE.safetensors --input-metadata CAPTURE.json --artifact-dir NEW_EXTERNAL_DIR --host-memory-bytes N --attention cudnn_sdpa|sequential --backend cuda [--input-boundary prepared|packed|mod1] [--dense-linear-source archive|bf16-roundtrip] [--trajectory single|original-euler (prepared, no taps)] [--override-bundle PRODUCTION_STEP0.safetensors --override-group reference|text|initial-state (original-euler only; max-input-bytes covers both complete bundles)] [--capture-first-block true|false] [--first-block-taps boundaries|attention|attention-output|qkv|attention-core (requires capture=true)] [--max-input-bytes N] [--max-output-bytes N] [--max-metadata-bytes N] [--max-plan-nodes N] [--cudnn-library ABSOLUTE_SO --cudnn-opaque-memory-bytes N --cudnn-workspace-bytes N --sdpa-opaque-memory-bytes N] and existing CUDA budget options";
+#[cfg(any(feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Attention {
     Sequential,
     CudnnSdpa,
 }
+#[cfg(any(feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum InputBoundary {
@@ -32,12 +43,14 @@ enum InputBoundary {
     Packed,
     Mod1,
 }
+#[cfg(any(feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DenseLinearSource {
     Archive,
     Bf16Roundtrip,
 }
+#[cfg(any(feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Trajectory {
@@ -45,6 +58,7 @@ enum Trajectory {
     Single,
     OriginalEuler,
 }
+#[cfg(any(feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum OverrideGroup {
@@ -52,10 +66,14 @@ enum OverrideGroup {
     Text,
     InitialState,
 }
+#[cfg(any(feature = "cuda", test))]
+// CPU tests validate option contracts; CUDA execution consumes the parsed payload.
+#[cfg_attr(all(test, not(feature = "cuda")), allow(dead_code))]
 struct InputOverride {
     bundle: PathBuf,
     group: OverrideGroup,
 }
+#[cfg(any(feature = "cuda", test))]
 impl InputOverride {
     fn parse(
         bundle: Option<OsString>,
@@ -85,6 +103,7 @@ impl InputOverride {
         }))
     }
 }
+#[cfg(any(feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum FirstBlockTaps {
@@ -95,11 +114,15 @@ enum FirstBlockTaps {
     Qkv,
     AttentionCore,
 }
+#[cfg(any(feature = "cuda", test))]
 impl FirstBlockTaps {
     fn is_boundaries(&self) -> bool {
         *self == Self::Boundaries
     }
 }
+#[cfg(any(feature = "cuda", test))]
+// CPU tests validate parsing; file paths and execution budgets are consumed on CUDA.
+#[cfg_attr(all(test, not(feature = "cuda")), allow(dead_code))]
 struct Arguments {
     config: PathBuf,
     model_dir: PathBuf,
@@ -125,6 +148,7 @@ struct Arguments {
     sdpa_opaque_bytes: u64,
     cuda: backend::CudaOptions,
 }
+#[cfg(any(feature = "cuda", test))]
 impl Arguments {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Self>> {
         let mut args = args.into_iter().peekable();
@@ -294,20 +318,27 @@ impl Arguments {
         }))
     }
 }
+#[cfg(feature = "cuda")]
 fn main() -> Result<()> {
     let Some(args) = Arguments::parse(std::env::args_os().skip(1))? else {
         println!("{USAGE}\n{}", backend::USAGE);
         return Ok(());
     };
-    #[cfg(feature = "cuda")]
+    execution::run(args)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn main() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    if args
+        .next()
+        .is_some_and(|arg| arg == "--help" || arg == "-h")
     {
-        execution::run(args)
+        ensure!(args.next().is_none(), "--help takes no other arguments");
+        println!("{USAGE}");
+        return Ok(());
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = args;
-        bail!("requires --features cuda with the locked native operator set")
-    }
+    bail!("requires --features cuda with the locked native operator set")
 }
 #[cfg(test)]
 #[path = "verify_p_h3_image_dit/tests.rs"]

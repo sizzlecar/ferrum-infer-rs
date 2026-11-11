@@ -178,6 +178,7 @@ pub(super) struct RoundtripSource<'a> {
     progress: Mutex<BTreeMap<WeightId, Progress>>,
 }
 impl<'a> RoundtripSource<'a> {
+    #[cfg(feature = "cuda")]
     pub fn new(
         original: &'a ComfyCanonicalWeightSource,
         selection: &'a Selection,

@@ -93,6 +93,7 @@ impl ManagedTokenHistory {
         let (_, words, _) = unsafe { self.buffer.as_ref().align_to::<u32>() };
         &words[..self.length]
     }
+    #[cfg(test)]
     pub(super) fn backing_bytes(&self) -> usize {
         self.backing_bytes
     }
@@ -582,6 +583,7 @@ impl ExpansionAdmission {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn begin<F: Fn() -> bool + Sync + ?Sized>(
     scope: &ExecutorScope,
     request: &RequestId,
@@ -827,6 +829,7 @@ impl ExpansionCursor {
         }))
     }
 }
+#[cfg(test)]
 pub(super) async fn execute<F: Fn() -> bool + Sync + ?Sized>(
     scope: &ExecutorScope,
     request: &RequestId,

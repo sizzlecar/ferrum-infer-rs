@@ -69,6 +69,8 @@ ferrum serve --model qwen3.5:4b-q4_k_m \
 
 ## 图像生成与编辑
 
+支持 **Qwen-Image-2.1-Turbo** 和 **P-H3-Image**。P-H3 在 Linux CUDA SM89/SM120 上支持有序多参考图编辑和连续批处理。
+
 使用本地 [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) 模型目录。Linux CUDA 示例，文本编码器和 DiT 使用 FP8：
 
 ```sh
@@ -80,11 +82,17 @@ ferrum serve /path/to/Qwen-Image-2.1-Turbo --backend cuda \
 | API | 输入 |
 |---|---|
 | `POST /v1/images/generations` | JSON 文本提示词 |
-| `POST /v1/images/edits` | Multipart 提示词 + 单张 8 位 RGB/RGBA PNG |
+| `POST /v1/images/edits` | Multipart 提示词 + PNG：Qwen 单参考图，P-H3 最多八张有序参考图 |
 
-均返回 PNG 的 `b64_json`。CUDA 在容量允许时自动合批，已验证 L20（SM89）和 RTX 5090（SM120），需要 cuDNN 9。Metal 使用 GGUF DiT，已在 M4 Mac mini、16 GiB 内存上验证 1024×1024 生图与编辑。
+均返回 PNG 的 `b64_json`。CUDA 在容量允许时自动合批，已验证 L20（SM89）和 RTX 5090（SM120），需要 cuDNN 9。Qwen 还支持 Metal，使用 GGUF DiT，已在 M4 Mac mini、16 GiB 内存上验证 1024×1024 生图与编辑。
 
-CLI 示例、Metal 配置和 CUDA LoRA 见[图像使用指南](docs/image-generation.md)。
+P-H3 使用独立配置。复制 [CUDA 配置](crates/ferrum-cli/examples/config/p-h3-image-cuda.json)，调整模型及 CUDA/cuDNN 路径后启动：
+
+```sh
+ferrum serve --image-config p-h3-image-cuda.json --served-model-name P-H3-Image --port 8000
+```
+
+P-H3 使用 Comfy W4A8 文本编码器/DiT、INT8 VAE 和原生提示词扩写。重复传入 `image[]` 字段可提供人物图、姿势图等有序参考图；`size=2720x1536` 可设置横向画布。配置、参考图顺序、容量限制、Metal 和 Qwen CUDA LoRA 见[图像使用指南](docs/image-generation.md)。
 
 ## 支持范围
 
@@ -95,13 +103,22 @@ CLI 示例、Metal 配置和 CUDA LoRA 见[图像使用指南](docs/image-genera
 | CUDA 量化 | 部分模型路径支持 GPTQ INT4、compressed-tensors INT4、block-FP8 |
 | CUDA 专用模型 | Gemma 4 compressed-tensors W4A16；GPT-OSS MXFP4 |
 | PQ2_0 | Metal 已验证完整模型；CUDA 仅有算子覆盖 |
-| 图像 | Qwen-Image-2.1-Turbo 生图与单张 PNG 编辑；Linux CUDA SM89/SM120、Metal。M4 Metal 已验证 1024×1024 |
+| 图像 | Qwen-Image-2.1-Turbo 生图/单 PNG 编辑：Linux CUDA、Metal；P-H3-Image 生图/多参考图编辑：Linux CUDA SM89/SM120。P-H3 暂不支持 Metal |
 
 支持范围取决于架构、格式和后端组合；文本支持不代表视觉支持。CPU 为兼容后端。已验证组合与覆盖范围见[回归目录](docs/release-regression-catalog.md)。
 
 Embedding、ASR、TTS 入口和旧执行 API 已退役，见[迁移说明](https://github.com/sizzlecar/ferrum-infer-rs/pull/441)。
 
 ## 性能
+
+**P-H3-Image · RTX 5090 · 2720×1536 编辑：**
+
+| 负载 | 两轮端到端耗时 | 输出吞吐 | 请求延迟 P50 / P99 |
+|---|---:|---:|---:|
+| 单参考图，C1 | 26.94 / 23.65 秒 | — | 等于请求耗时（每轮一个样本） |
+| 八个不同参考图任务，C8 | 119.13 / 118.40 秒 | 4.03 / 4.05 张/分钟 | 87.24 / 118.76 秒；86.38 / 118.08 秒 |
+
+Linux/WSL，系统内存上限 48 GB；W4A8 DiT/文本编码器、INT8 VAE、F16 提示词扩写开启、8 步、服务容量固定为 8。两轮均成功 8/8、零错误，实测 P99 ≤120 秒；小样本不能证明生产环境长期达标。数据来自最终安装包发布前的候选版本。C8 采样峰值 RSS 为 38.71 / 39.33 GiB，未采集显存峰值。[配置、负载与证据](docs/performance-rtx5090-p-h3-20261111.md)。
 
 **RTX 5090：所有已测热门模型的最新记录。** 吞吐单位 tok/s，每格为 **Ferrum / 对照**；C8、C16 表示客户端并发。版本逐行标注，未将旧版本数据冒充新版复测。
 

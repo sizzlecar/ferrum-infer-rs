@@ -1,7 +1,8 @@
 use super::super::tests::{buffer, config};
 use super::*;
 use ferrum_runtime::{
-    AttributeId, CanonicalRational, ResolvedTensorLayout, ResolvedTensorSpec, SemanticValue,
+    AttributeId, CanonicalRational, F32CnnOp, ResolvedTensorLayout, ResolvedTensorSpec,
+    SemanticValue,
 };
 use std::collections::BTreeMap;
 fn launch(runtime: &ReferenceDeviceRuntime, kind: F32CnnOp) -> ReferenceCnnF32Launch {

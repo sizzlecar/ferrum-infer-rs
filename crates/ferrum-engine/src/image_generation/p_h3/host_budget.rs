@@ -11,11 +11,7 @@ use crate::image_generation::{
 use anyhow::{ensure, Context, Result};
 use ferrum_models::{
     normal_noise::NormalNoiseConfig,
-    p_h3_image::{
-        PH3ImageConditioningPrecision, PH3ImageRefinementHostRequirements,
-        PH3ImageTextConditioningHostRequirements,
-    },
-    p_h3_image_vae::PH3ImageVaeDecoderHostRequirements,
+    p_h3_image::{PH3ImageConditioningPrecision, PH3ImageTextConditioningHostRequirements},
 };
 use ferrum_runtime::*;
 
@@ -31,10 +27,9 @@ pub(super) struct GenerationHostRequirements {
     pub decoder: ExecutionHostBudget,
     pub conditioning: PH3ImageTextConditioningHostRequirements,
     pub visual: Option<VisionHostRequirements>,
-    pub refinement: PH3ImageRefinementHostRequirements,
-    pub decoder_detail: PH3ImageVaeDecoderHostRequirements,
     pub initialization_backing: Vec<HostBackingPreparation>,
-    pub decoder_backing: Vec<HostBackingPreparation>,
+    // Keep decoder materializer leases alive through admission.
+    _decoder_backing: Vec<HostBackingPreparation>,
 }
 
 /// Per-stage newly allocated payloads. The original decoded owner is borrowed
@@ -100,12 +95,6 @@ impl GenerationHostRequirements {
                 .checked_add(self.decoder.weights)
                 .context("H3 complete request WeightBacking overflows")?,
         })
-    }
-
-    pub fn into_backing(mut self) -> Vec<HostBackingPreparation> {
-        self.initialization_backing
-            .append(&mut self.decoder_backing);
-        self.initialization_backing
     }
 
     pub fn persistent_claims(&self) -> [(HostMemoryClass, usize); 1] {
@@ -215,10 +204,8 @@ impl<R: DeviceRuntime> PH3ImagePipeline<R> {
             decoder,
             conditioning,
             visual,
-            refinement,
-            decoder_detail,
             initialization_backing,
-            decoder_backing,
+            _decoder_backing: decoder_backing,
         })
     }
 

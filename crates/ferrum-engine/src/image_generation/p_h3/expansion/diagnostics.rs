@@ -92,7 +92,7 @@ impl PH3ImagePromptExpansionDiagnosticPolicy {
 }
 
 #[derive(Clone)]
-pub(in crate::image_generation::p_h3) struct DiagnosticContext {
+pub(crate) struct DiagnosticContext {
     pub policy: PH3ImagePromptExpansionDiagnosticPolicy,
     pub trace: ImageContinuousTraceHandle,
     pub job: u64,

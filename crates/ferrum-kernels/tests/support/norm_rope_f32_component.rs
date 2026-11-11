@@ -194,7 +194,7 @@ fn rms_data(d: usize, trial: usize) -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>, Ve
             let inv = (1.0_f64 / (sum / d as f64 + 0.25).sqrt()) as f32;
             head.iter()
                 .zip(&gamma)
-                .map(move |(x, g)| ((*x * inv) * g))
+                .map(move |(x, g)| (*x * inv) * g)
                 .collect::<Vec<_>>()
         })
         .collect();

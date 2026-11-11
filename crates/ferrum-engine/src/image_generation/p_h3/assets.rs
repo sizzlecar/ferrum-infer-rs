@@ -117,7 +117,7 @@ pub struct PH3ImageAssets {
     pub(super) denoiser: PH3ImageDenoiserAdapter,
     pub(super) vae: PH3ImageVaeAdapter,
     pub(super) schedule: PH3ImageSamplingSchedule,
-    pub(super) declarations: ComponentDeclarations,
+    _declarations: ComponentDeclarations,
     pub(super) limits: PH3ImageAssetLimits,
     receipt: ImageAssetReceipt,
 }
@@ -266,7 +266,7 @@ impl PH3ImageAssets {
             main_vision_profile:
                 ferrum_models::qwen3_vl_vision::comfy::Qwen3VLVisionComfyFamily::CUDA_PROFILE_ID,
             expansion: None,
-            sources, text, text_weights, vision, vision_weights, connector, tokenizer, denoiser, vae, schedule, declarations, limits,
+            sources, text, text_weights, vision, vision_weights, connector, tokenizer, denoiser, vae, schedule, _declarations: declarations, limits,
             receipt: ImageAssetReceipt {
                 metadata_sha256, required_weight_bytes,
                 payload_verification: "canonical_quantization_and_physical_schema_checked; source_hashes_require_external_lock",
@@ -471,11 +471,13 @@ impl PH3ImageAssets {
             .as_ref()
             .is_some_and(|configured| configured.assets.visual_assets().is_some())
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn prompt_expansion_family(&self) -> Option<&ferrum_runtime::PreparedModelFamily> {
         self.expansion
             .as_ref()
             .map(|configured| configured.assets.family())
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn prompt_expansion_visual_causal_family(
         &self,
     ) -> Option<&ferrum_runtime::PreparedModelFamily> {
@@ -483,6 +485,7 @@ impl PH3ImageAssets {
             .as_ref()
             .and_then(|configured| configured.assets.visual_causal_family())
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn prompt_expansion_vision_family(
         &self,
     ) -> Option<&ferrum_runtime::PreparedModelFamily> {

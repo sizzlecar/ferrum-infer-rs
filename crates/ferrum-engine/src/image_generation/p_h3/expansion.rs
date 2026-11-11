@@ -23,9 +23,11 @@ mod visual_assets;
 mod visual_inputs;
 mod visual_preparation;
 
+#[cfg(test)]
+use ferrum_execution::ProgramExecutor;
 use ferrum_execution::{
-    CompiledProgram, ExecutorBuildResult, ManagedCausalIoProfile, ProgramExecutor,
-    ProgramExecutorConfig, RuntimeComposition,
+    CompiledProgram, ExecutorBuildResult, ManagedCausalIoProfile, ProgramExecutorConfig,
+    RuntimeComposition,
 };
 use ferrum_models::{
     p_h3_image::{
@@ -246,9 +248,11 @@ impl NativeTextExpansion {
                 .map(|model| model.prepared().family().fingerprint()).transpose()?,
         }))
     }
+    #[cfg(any(feature = "cuda", test))]
     pub(super) fn family(&self) -> &ferrum_runtime::PreparedModelFamily {
         self.model.prepared().family()
     }
+    #[cfg(test)]
     pub(crate) fn from_sources(
         sources: Arc<ProductionModelSourceBundle>,
         limits: PH3ImagePromptExpansionLimits,
@@ -433,6 +437,7 @@ impl NativeTextExpansion {
         }
     }
 
+    #[cfg(test)]
     fn compile<'a, R: DeviceRuntime>(
         &'a self,
         composition: &'a RuntimeComposition<R>,
@@ -486,6 +491,7 @@ impl NativeTextExpansion {
     /// The caller must supply the actual admitted phase account and retain its
     /// scope plus construction cleanup until the original executor has retired.
     /// No scope, runtime, second ledger, or hidden model cache is created here.
+    #[cfg(test)]
     pub(crate) fn initialize<R: DeviceRuntime>(
         &self,
         composition: &RuntimeComposition<R>,
@@ -509,6 +515,7 @@ impl NativeTextExpansion {
 
     /// Transfer the actual phase and materializer lease before the original
     /// constructor can acquire native resources. Its own cleanup owns them.
+    #[cfg(test)]
     pub(crate) fn initialize_owned<R: DeviceRuntime>(
         &self,
         composition: &RuntimeComposition<R>,
@@ -546,6 +553,7 @@ impl NativeTextExpansion {
         Ok(owner)
     }
 
+    #[cfg(test)]
     fn resolve(
         &self,
         prepared: &PreparedTextExpansion,

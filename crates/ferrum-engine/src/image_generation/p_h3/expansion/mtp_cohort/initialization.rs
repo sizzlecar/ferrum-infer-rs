@@ -6,7 +6,9 @@ use super::*;
 use crate::image_generation::host_budget::ExecutionHostBudget;
 use ferrum_execution::{executor_lifecycle::ExecutorShutdownPhase, ExecutorBuildError};
 use ferrum_models::vnext::qwen35::mtp::{self as model, Qwen35MtpRole as Role};
-use ferrum_runtime::{HostBackingPreparation, HostMemoryClass, HostMemoryScope, ProgramValueId};
+#[cfg(test)]
+use ferrum_runtime::HostMemoryClass;
+use ferrum_runtime::{HostBackingPreparation, HostMemoryScope, ProgramValueId};
 
 pub(crate) struct MtpHostRequirements {
     budget: ExecutionHostBudget,
@@ -24,6 +26,7 @@ impl MtpHostRequirements {
     pub(crate) fn materializer_additional_bytes(&self) -> usize {
         self.backing.additional_bytes()
     }
+    #[cfg(test)]
     pub(crate) fn claims(&self) -> [(HostMemoryClass, usize); 4] {
         self.budget.claims()
     }
@@ -31,6 +34,7 @@ impl MtpHostRequirements {
 
 /// An explicit MTP preparation step, not a change to server request capacity.
 /// The main verifier can consume two rows per participant in one real wave.
+#[cfg(test)]
 pub(crate) fn prepare_engine(prepared: &mut PreparedExpansionCohort) -> Result<()> {
     let verify_tokens = verify_tokens(prepared.requests.len())?;
     prepared.engine.batching.max_num_batched_tokens = prepared
@@ -216,6 +220,7 @@ impl<R: DeviceRuntime> MtpInitialization<R> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn failure(&self) -> Option<&ExecutorBuildError> {
         self.failure.as_ref()
     }

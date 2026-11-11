@@ -5,6 +5,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     pub fn residency_policy(&self) -> ImageResidencyPolicy {
         self.execution.residency_policy()
     }
+    #[cfg(test)]
     pub(in crate::image_generation) fn validate_resident_capacity(
         &self,
         stages: &[&PreparedStage<R>],
@@ -18,6 +19,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     ) -> anyhow::Result<()> {
         self.execution.validate_capacity_with_prefix(stages, prefix)
     }
+    #[cfg(test)]
     pub(in crate::image_generation) fn capacity_with_prefix(
         &self,
         stages: &[&PreparedStage<R>],

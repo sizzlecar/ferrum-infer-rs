@@ -218,6 +218,7 @@ impl CudaVariant {
                     &["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2", "cuda-cutlass-fp8"],
                     &["cuda", "cuda-production"],
                     &["cuda", "cuda-production", "cuda-cutlass-fp8"],
+                    &["cuda", "cuda-production", "cuda-cutlass-fp8", "cuda-cutlass-fused-f32-attention", "cuda-cutlass-int8-fused-output"],
                 ],
             ),
             Self::Sm120 => (
@@ -227,6 +228,7 @@ impl CudaVariant {
                     // Keep previously published production packages inspectable.
                     &["cuda", "cuda-production"],
                     &["cuda", "cuda-production", "cuda-cutlass-fp8"],
+                    &["cuda", "cuda-production", "cuda-cutlass-fp8", "cuda-cutlass-fused-f32-attention", "cuda-cutlass-int8-fused-output"],
                 ],
             ),
         };
@@ -330,6 +332,16 @@ mod tests {
             ),
             (vec!["cuda", "cuda-production"], true),
             (vec!["cuda", "cuda-production", "cuda-cutlass-fp8"], true),
+            (
+                vec![
+                    "cuda",
+                    "cuda-production",
+                    "cuda-cutlass-fp8",
+                    "cuda-cutlass-fused-f32-attention",
+                    "cuda-cutlass-int8-fused-output",
+                ],
+                true,
+            ),
         ] {
             let abi = AbiInput {
                 backend: Backend::Cuda,

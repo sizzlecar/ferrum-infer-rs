@@ -126,6 +126,7 @@ impl ManagedCausalIo {
     }
 }
 
+#[cfg(test)]
 pub(super) fn requirements(
     host: &HostMemoryAccount,
     vocabulary: usize,
@@ -333,15 +334,6 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             }
         }
         Ok(())
-    }
-
-    pub(super) fn prepare_managed_wave(
-        &self,
-        tokens: &[Vec<u32>],
-        work: &[crate::token_execution::ExecutedTokenWork],
-        kind: VNextExecutionWaveKind,
-    ) -> Result<Option<ManagedWaveIo>> {
-        self.prepare_managed_wave_with_inputs(tokens, work, kind, &vec![None; work.len()])
     }
 
     pub(super) fn prepare_managed_wave_with_inputs(

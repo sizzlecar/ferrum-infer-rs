@@ -3,7 +3,9 @@
 use super::*;
 use crate::image_generation::host_budget::{stored_staging_bytes, ExecutionHostBudget};
 use ferrum_execution::{ManagedCausalIoWork, ManagedCausalReadback};
-use ferrum_runtime::{ExecutablePlanView, HostBackingPreparation, HostMemoryClass};
+#[cfg(test)]
+use ferrum_runtime::HostMemoryClass;
+use ferrum_runtime::{ExecutablePlanView, HostBackingPreparation};
 
 pub(crate) struct ExpansionHostRequirements {
     pub(crate) budget: ExecutionHostBudget,
@@ -25,6 +27,7 @@ impl ExpansionHostRequirements {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn claims(&self) -> [(HostMemoryClass, usize); 4] {
         self.budget.claims()
     }

@@ -83,12 +83,13 @@ pub(crate) struct NativeExpansionCohort {
 }
 
 struct RetainedExpansionWave {
-    requests: Vec<RequestId>,
-    input_frontiers: Vec<ExecutionFrontier>,
-    outcome: ExecutionBatchOutcome,
+    _requests: Vec<RequestId>,
+    _input_frontiers: Vec<ExecutionFrontier>,
+    _outcome: ExecutionBatchOutcome,
 }
 
 impl NativeExpansionCohort {
+    #[cfg(test)]
     pub(crate) fn initialize<R: DeviceRuntime>(
         assets: Arc<NativeTextExpansion>,
         composition: &RuntimeComposition<R>,
@@ -109,6 +110,7 @@ impl NativeExpansionCohort {
         Self::initialize_prepared(assets, composition, prepared, phase, diagnostics)
     }
 
+    #[cfg(test)]
     pub(super) fn initialize_single<R: DeviceRuntime>(
         assets: Arc<NativeTextExpansion>,
         composition: &RuntimeComposition<R>,
@@ -441,12 +443,12 @@ impl NativeExpansionCohort {
         let retained_index = retained.map(|outcome| {
             let index = self.retained_waves.len();
             self.retained_waves.push(RetainedExpansionWave {
-                requests: indices
+                _requests: indices
                     .iter()
                     .map(|&i| self.participants[i].request.clone())
                     .collect(),
-                input_frontiers,
-                outcome,
+                _input_frontiers: input_frontiers,
+                _outcome: outcome,
             });
             index
         });

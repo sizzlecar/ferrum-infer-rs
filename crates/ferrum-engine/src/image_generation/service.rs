@@ -1725,12 +1725,15 @@ impl<O: Send + 'static> ServiceCore<O> {
             max_num_seqs: self.shared.config.max_num_seqs,
         }
     }
+    #[cfg(test)]
     fn try_submit(&self, request: ImageGenerationRequest) -> Result<Job<O>, ImageServiceError> {
         self.try_submit_request(QueuedRequest::Generate(request))
     }
+    #[cfg(test)]
     fn try_submit_request(&self, request: QueuedRequest) -> Result<Job<O>, ImageServiceError> {
         self.try_submit_request_with_output(request, None)
     }
+    #[cfg(test)]
     fn try_submit_request_with_output(
         &self,
         request: QueuedRequest,

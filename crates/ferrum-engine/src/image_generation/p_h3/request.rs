@@ -198,6 +198,7 @@ impl<'a> BatchGeometry<'a> {
             basis_rows,
         })
     }
+    #[cfg(test)]
     pub fn prepare(
         &self,
         adapter: &PH3ImageDenoiserAdapter,

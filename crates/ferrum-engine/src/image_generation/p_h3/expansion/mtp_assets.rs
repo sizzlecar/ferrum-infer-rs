@@ -148,30 +148,6 @@ impl MtpExpansionAssets {
         })
     }
 
-    pub(crate) fn family(&self, role: Qwen35MtpRole) -> Result<&PreparedModelFamily> {
-        Ok(self.role(role)?.model.prepared().family())
-    }
-
-    pub(crate) fn trace_identity(&self) -> Result<serde_json::Value> {
-        let role = |r| -> Result<_> {
-            let a = self.role(r)?;
-            Ok(serde_json::json!({
-                "role": r,
-                "family_fingerprint": a.model.prepared().family().fingerprint().map_err(model_error)?,
-                "profile": r.numerical_profile(),
-            }))
-        };
-        Ok(serde_json::json!({
-            "sources": self.union.model.prepared().sources().resolved_sources(),
-            "roles": [role(Qwen35MtpRole::InstallUnion)?, role(Qwen35MtpRole::MainVerify)?,
-                role(Qwen35MtpRole::OneDraft)?],
-            "source_backing": self.source_backing,
-            "source_conversion_workers": self.conversion.maximum_workers().get(),
-            "process_mapped_execution_weights": self.union.model.process_mapped_weights_enabled(),
-            "process_mapped_upload_policy": self.union.model.process_mapped_upload_policy(),
-        }))
-    }
-
     fn resolve(
         &self,
         role: Qwen35MtpRole,

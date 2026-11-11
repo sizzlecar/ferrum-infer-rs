@@ -299,7 +299,7 @@ pub struct CausalProgramSession<R: DeviceRuntime> {
     host: HostMemoryAccount,
     terminal: Option<ResolvedCausalTerminal>,
     shared_receipt: Option<ProgramSharedWeightsReceipt>,
-    static_attribution: Option<StaticProviderAttributionWitness>,
+    _static_attribution: Option<StaticProviderAttributionWitness>,
     vocabulary_size: usize,
     replay: Option<replay::CausalReplay<R>>,
 }
@@ -434,7 +434,7 @@ impl<'a, R: DeviceRuntime> CompiledCausalProgram<'a, R> {
                 host: host.clone(),
                 terminal,
                 shared_receipt: initialized.shared_weights_receipt,
-                static_attribution: initialized.static_provider_attribution,
+                _static_attribution: initialized.static_provider_attribution,
                 vocabulary_size: self.prepared.facts().vocabulary_size(),
                 replay,
             };

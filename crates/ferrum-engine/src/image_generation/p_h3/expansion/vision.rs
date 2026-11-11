@@ -15,14 +15,10 @@ use ferrum_execution::{
 };
 use ferrum_models::{
     qwen3_vl_vision::{
-        hf::{
-            Qwen3VLVisionHfFamily, Qwen3VLVisionHfImagePlan, Qwen3VLVisionHfLimits,
-            Qwen3VLVisionHfProcessor,
-        },
+        hf::{Qwen3VLVisionHfFamily, Qwen3VLVisionHfImagePlan, Qwen3VLVisionHfLimits},
         Qwen3VLVisionFamily,
     },
     qwen_image21::image_input::ManagedRgba8Image,
-    vnext::ManagedProductionModel,
 };
 use ferrum_quantization::TensorArchive;
 use ferrum_runtime::*;
@@ -49,7 +45,7 @@ pub(crate) struct PreparedExpansionVision<R: DeviceRuntime> {
 /// and the later causal F16 bridge. The original materializer assumption must
 /// remain alive through static initialization, just like the causal query.
 pub(crate) struct ExpansionVisionHostRequirements {
-    pub budget: ExecutionHostBudget,
+    pub(in crate::image_generation::p_h3) budget: ExecutionHostBudget,
     pub startup_device_bytes: u64,
     _materializer: HostBackingPreparation,
     source: Arc<ExpansionVisualAssets>,
@@ -94,14 +90,16 @@ pub(crate) struct CompletedExpansionVision {
     output: TensorExecutionOutput,
     phase: HostMemoryScope,
     close: PlanRuntimeCloseReceipt,
-    request: RequestIdentity,
+    _request: RequestIdentity,
 }
 impl CompletedExpansionVision {
+    #[cfg(test)]
     pub(crate) fn output(&self) -> &TensorExecutionOutput {
         &self.output
     }
+    #[cfg(test)]
     pub(crate) fn request(&self) -> &RequestIdentity {
-        &self.request
+        &self._request
     }
     pub(crate) fn into_parts(
         self,
@@ -128,16 +126,16 @@ pub(crate) enum ExpansionVisionFailure<R: DeviceRuntime> {
     },
     Execution {
         source: TensorExecutionError<R>,
-        session: RetainedTensorComponentSession<R, ExpansionVisionOwnedPhase>,
+        _session: RetainedTensorComponentSession<R, ExpansionVisionOwnedPhase>,
     },
     Output {
         source: anyhow::Error,
-        session: RetainedTensorComponentSession<R, ExpansionVisionOwnedPhase>,
-        outputs: Vec<TensorExecutionOutput>,
+        _session: RetainedTensorComponentSession<R, ExpansionVisionOwnedPhase>,
+        _outputs: Vec<TensorExecutionOutput>,
     },
     Close {
         source: RetainedComponentCloseError<R, ExpansionVisionOwnedPhase>,
-        output: TensorExecutionOutput,
+        _output: TensorExecutionOutput,
     },
 }
 impl<R: DeviceRuntime> fmt::Display for ExpansionVisionFailure<R> {
@@ -165,24 +163,6 @@ impl<R: DeviceRuntime> std::error::Error for ExpansionVisionFailure<R> {}
 pub(crate) type ExpansionVisionOwnedPhase = (HostMemoryScope, HostBackingPreparation);
 
 impl<R: DeviceRuntime> PreparedExpansionVision<R> {
-    /// All inputs are immutable prepared metadata. The source is the exact
-    /// already-verified mmap: there is deliberately no filesystem path input.
-    pub(crate) fn compile(
-        composition: &RuntimeComposition<R>,
-        model: &ManagedProductionModel,
-        processor: &Qwen3VLVisionHfProcessor,
-        source_width: u32,
-        source_height: u32,
-        options: ExpansionVisionOptions,
-    ) -> Result<Self> {
-        let assets = Arc::new(ExpansionVisualAssets::from_processor_with_profile(
-            model,
-            processor.clone(),
-            options.limits,
-            options.profile.clone(),
-        )?);
-        Self::compile_assets(composition, assets, source_width, source_height, options)
-    }
     /// Reuse one immutable, fully validated source across request dimensions.
     pub(crate) fn compile_assets(
         composition: &RuntimeComposition<R>,
@@ -254,9 +234,6 @@ impl<R: DeviceRuntime> PreparedExpansionVision<R> {
     }
     pub(crate) fn plan(&self) -> &Qwen3VLVisionHfImagePlan {
         &self.plan
-    }
-    pub(crate) fn component(&self) -> &CompiledTensorComponent<R> {
-        &self.component
     }
     /// Pointer identity is deliberately stricter than equal model names or
     /// paths: this binds the original frozen source, processor and profile.
@@ -378,7 +355,12 @@ impl<R: DeviceRuntime> PreparedExpansionVision<R> {
                 .execute_on_actor(actor, run_id, request_id.clone(), inputs)
             {
                 Ok(outputs) => outputs,
-                Err(source) => return Err(ExpansionVisionFailure::Execution { source, session }),
+                Err(source) => {
+                    return Err(ExpansionVisionFailure::Execution {
+                        source,
+                        _session: session,
+                    })
+                }
             };
         let checked = (|| -> Result<()> {
             ensure!(
@@ -400,8 +382,8 @@ impl<R: DeviceRuntime> PreparedExpansionVision<R> {
         if let Err(source) = checked {
             return Err(ExpansionVisionFailure::Output {
                 source,
-                session,
-                outputs,
+                _session: session,
+                _outputs: outputs,
             });
         }
         let output = outputs.pop().unwrap();
@@ -410,9 +392,12 @@ impl<R: DeviceRuntime> PreparedExpansionVision<R> {
                 output,
                 phase,
                 close,
-                request: request_id,
+                _request: request_id,
             }),
-            Err(source) => Err(ExpansionVisionFailure::Close { source, output }),
+            Err(source) => Err(ExpansionVisionFailure::Close {
+                source,
+                _output: output,
+            }),
         }
     }
 }
