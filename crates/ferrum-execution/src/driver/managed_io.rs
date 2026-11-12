@@ -292,7 +292,7 @@ fn managed_product_mode(
         .iter()
         .map(|work| match *work {
             crate::token_execution::ExecutedTokenWork::Prefill { chunk, .. } => {
-                VNextParticipantOutputRole::prefill(chunk)
+                VNextParticipantOutputRole::prefill(chunk, LogitsReturnPolicy::FullLogits)
             }
             crate::token_execution::ExecutedTokenWork::Decode { .. } => {
                 VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax {

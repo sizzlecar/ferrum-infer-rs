@@ -1350,6 +1350,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
             ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
             ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
             ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16Prefill,
             ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
             ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
             ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaQ6F16,
@@ -1360,6 +1361,8 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
             if upstream_profile_compiled(profile.prefill() || profile.hybrid())
                 && (!profile.extra() || upstream_extra_profile_compiled(profile.extra_prefill()))
                 && (!profile.q6_f16() || upstream_q6_f16_profile_compiled())
+                && (profile != ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16Prefill
+                    || native_blocks::upstream_linear::q6_f16_prefill_compiled())
                 && (!profile.hybrid()
                     || q8act_g32_profile_compiled(ferrum_runtime::Q8ActSwiGluProfile::Q4KQ5KIq4Xs))
             {
@@ -1693,6 +1696,7 @@ pub fn cuda_vnext_operation_registry(
         ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
         ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
         ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16,
+        ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16Prefill,
         ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
         ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
         ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaQ6F16,
@@ -1741,7 +1745,8 @@ pub fn cuda_vnext_operation_registry(
                 | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraPrefill
                 | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill
                 | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraAllRows
-                | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16 => {
+                | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16
+                | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16Prefill => {
                     providers.push(Box::new(transformer::CudaUpstreamSwiGluProvider::new(
                         runtime, profile,
                     )?))

@@ -5,6 +5,7 @@ use std::mem::{align_of, offset_of, size_of};
 pub const UPSTREAM_Q6_F16_LINEAR_OPERATOR: &str =
     crate::upstream_q6_f32_linear::UPSTREAM_Q6_F32_LINEAR_OPERATOR;
 pub const UPSTREAM_Q6_F16_LINEAR_ABI: u32 = 2;
+pub const UPSTREAM_Q6_F16_PREFILL_PLAN_EXPORT: &str = "ferrum_upstream_q6_f16_prefill_plan_v1";
 pub const UPSTREAM_Q6_F16_LINEAR_EXPORTS: &[&str] = &[
     "ferrum_upstream_q6_f16_plan_v1",
     "ferrum_upstream_q6_f16_pack_v1",
@@ -57,7 +58,7 @@ impl UpstreamQ6F16RequestV1 {
             || self.size as usize != size_of::<Self>()
             || self.format != 14
             || self.layout != 0
-            || !(1..=32).contains(&self.rows)
+            || !(1..=2048).contains(&self.rows)
             || self.inputs == 0
             || self.inputs % 256 != 0
             || self.outputs == 0
@@ -140,6 +141,7 @@ impl UpstreamQ6F16PlanV1 {
             || u64::from(self.padded_inputs) != pk
             || self.padded_outputs != request.outputs
             || !matches!(self.j, 8 | 16 | 24 | 32)
+            || (request.rows > 32 && self.j != 32)
             || self.i != 128
             || self.nthreads != 256
             || self.guard_blocks > 512

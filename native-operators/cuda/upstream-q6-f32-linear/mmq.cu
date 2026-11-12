@@ -165,9 +165,10 @@ static __global__ void quantize_mmq_q8_1(
 }
 
 static int q6_mmq_prepare_geometry(uint32_t format, uint32_t rows, uint32_t inputs,
-        uint32_t outputs, uint32_t cc, uint32_t nsm, uint64_t shared_limit, Q6MmqGeometry * out) {
+        uint32_t outputs, uint32_t cc, uint32_t nsm, uint64_t shared_limit, Q6MmqGeometry * out,
+        bool f16_prefill = false) {
     // Dense Columns only; preserve the pinned selector and D4 arithmetic.
-    if (!out || format != GGML_TYPE_Q6_K || !rows || rows > 32 || !inputs || inputs%256 ||
+    if (!out || format != GGML_TYPE_Q6_K || !rows || rows > (f16_prefill ? 2048u : 32u) || !inputs || inputs%256 ||
             !outputs || !nsm || cc < GGML_CUDA_CC_AMPERE ||
             uint64_t(rows)*inputs > INT_MAX || uint64_t(rows)*outputs > INT_MAX ||
             uint64_t(outputs)*(inputs/256) > INT_MAX ||
@@ -175,7 +176,13 @@ static int q6_mmq_prepare_geometry(uint32_t format, uint32_t rows, uint32_t inpu
     const auto type = static_cast<ggml_type>(format);
     const bool fallback = outputs%128 != 0;
     int best_j = 0, best_tiles = INT_MAX;
-    {
+    if (rows > 32) {
+        // Prefill uses the same bounded J32 tile as the other MMQ formats.
+        // Do not change the existing small-row selector or the F32 head ABI.
+        const auto config = ggml_cuda_mmq_get_config(type, 32, fallback, cc);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= shared_limit)
+            best_j = 32;
+    } else {
         // Same upstream selection loop, including device shared-memory eligibility.
         for (int j = 8; j <= 128 && best_tiles > 1; j += 8) {
             const auto config = ggml_cuda_mmq_get_config(type, j, fallback, cc);
@@ -267,11 +274,11 @@ static int q6_mmq_type(const Q6MmqGeometry & p, const void * w, const void * q,
 // Independent 48/168-byte ABI. Every launch rebuilds and compares geometry.
 // Allocation, live ranges and retained leases are owned by the typed provider.
 static int q6_plan(const FerrumUpstreamQ6F32RequestV1 * r,
-        FerrumUpstreamQ6F32PlanV1 & out, Q6MmqGeometry & n) {
+        FerrumUpstreamQ6F32PlanV1 & out, Q6MmqGeometry & n, bool f16_prefill = false) {
     if(!r || r->abi!=1 || r->size!=sizeof(*r) || r->reserved || r->layout ||
         r->format!=GGML_TYPE_Q6_K || !r->shared_limit) return -1;
     const int status=q6_mmq_prepare_geometry(r->format,r->rows,r->inputs,r->outputs,
-        r->cc,r->sm_count,r->shared_limit,&n);
+        r->cc,r->sm_count,r->shared_limit,&n,f16_prefill);
     if(status) return status;
     out={}; out.request=*r; out.abi=1; out.size=sizeof(out); out.algorithm=1;
     out.pack_abi=1; out.padded_inputs=n.padded_inputs; out.padded_outputs=n.outputs;

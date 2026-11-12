@@ -91,9 +91,9 @@ fn fixed_tensor_attribution_survives_a_real_metal_submission_without_fake_tokens
 
 #[test]
 fn no_copy_upload_retains_aligned_host_charge_and_readback_writes_only_its_piece() {
-    metal::objc::rc::autoreleasepool(|| {
+    let host = account(true);
+    let output = metal::objc::rc::autoreleasepool(|| {
         let runtime = runtime();
-        let host = account(true);
         let mut source = host
             .allocate_zeroed(HostMemoryClass::InputPreprocess, 8)
             .unwrap();
@@ -151,16 +151,27 @@ fn no_copy_upload_retains_aligned_host_charge_and_readback_writes_only_its_piece
         assert_eq!(&output.as_ref()[..2], &[91; 2]);
         assert_eq!(&output.as_ref()[2..10], &[0, 63, 128, 63, 0, 64, 64, 64]);
         assert_eq!(&output.as_ref()[10..], &[91; 6]);
-        drop(fence);
         assert_eq!(
             host.usage()
                 .unwrap()
                 .class_committed_bytes(HostMemoryClass::InputPreprocess),
-            0
+            input_charge
         );
-        drop(output);
-        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+        drop(fence);
+        output
     });
+    // Metal's command buffer also has an autoreleased retain. Completion and
+    // dropping our fence do not require that native retain to be gone yet.
+    // Check final release after draining the pool, while the independent output
+    // allocation still proves that only the input charge was released.
+    assert_eq!(
+        host.usage()
+            .unwrap()
+            .class_committed_bytes(HostMemoryClass::InputPreprocess),
+        0
+    );
+    drop(output);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }
 
 #[test]

@@ -15,6 +15,7 @@
 //! - **Streaming Support**: Server-Sent Events for streaming responses
 //! - **Monitoring**: Built-in metrics and health checks
 
+pub mod api_key;
 pub mod axum_server;
 pub mod chat_template;
 pub mod middleware;
@@ -24,6 +25,7 @@ pub mod traits;
 pub mod types;
 
 // Re-exports
+pub use api_key::ApiKey;
 pub use traits::{
     AuthProvider, HttpServer, MiddlewareStack, RateLimiter as ServerRateLimiter, RequestHandler,
     ResponseBuilder, StreamingHandler,

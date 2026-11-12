@@ -832,7 +832,15 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     }
                     roles.push(match *work {
                         ExecutedTokenWork::Prefill { chunk, .. } => {
-                            VNextParticipantOutputRole::prefill(chunk)
+                            // Managed causal I/O reserves the complete logits
+                            // row before submission. Preserve that declared
+                            // readback even when the caller requests greedy.
+                            let policy = if self.managed_io.is_some() {
+                                LogitsReturnPolicy::FullLogits
+                            } else {
+                                inputs[indices[canonical]].logits_policy().clone()
+                            };
+                            VNextParticipantOutputRole::prefill(chunk, policy)
                         }
                         ExecutedTokenWork::Decode { .. } => VNextParticipantOutputRole::Decode(
                             inputs[indices[canonical]].logits_policy().clone(),

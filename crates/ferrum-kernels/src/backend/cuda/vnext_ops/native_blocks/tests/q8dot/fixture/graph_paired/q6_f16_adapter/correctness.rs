@@ -1,6 +1,6 @@
 use super::*;
 
-fn check_pack(c: &Case, s: &Arc<CudaStream>) {
+pub(super) fn check_pack(c: &Case, s: &Arc<CudaStream>) {
     let packed = c.packed.read(s);
     let converted = floats(&c.converted.read(s));
     assert!(c.row_flags.read(s).iter().all(|b| *b == 0));
@@ -234,7 +234,7 @@ fn q6_f16_adapter_actual_pack_f64_markers_strides_and_bounds() {
 fn invalid_boundaries(ctx: &CudaContext, s: &Arc<CudaStream>, c: &Case) {
     for (m, k, n, abi_tag) in [
         (0, 512, 7, 2),
-        (33, 512, 7, 2),
+        (2049, 512, 7, 2),
         (4, 128, 7, 2),
         (4, 512, 0, 2),
         (4, 512, 7, 1),

@@ -731,7 +731,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             })
             .collect::<Result<Vec<_>>>()?;
         let output_role = match spec.phase {
-            DeterminismPhase::Prefill => VNextParticipantOutputRole::FinalPrefill,
+            DeterminismPhase::Prefill => {
+                VNextParticipantOutputRole::FinalPrefill(LogitsReturnPolicy::FullLogits)
+            }
             DeterminismPhase::Decode => {
                 VNextParticipantOutputRole::Decode(LogitsReturnPolicy::FullLogits)
             }

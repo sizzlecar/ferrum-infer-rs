@@ -22,9 +22,22 @@ pub async fn execute_serve_source(
     port: u16,
     aliases: Vec<String>,
 ) -> Result<(), ImageProductError> {
+    execute_serve_source_with_api_key(source, host, port, aliases, None).await
+}
+
+pub(crate) async fn execute_serve_source_with_api_key(
+    source: ImageProductSource,
+    host: String,
+    port: u16,
+    aliases: Vec<String>,
+    api_key: Option<ferrum_server::ApiKey>,
+) -> Result<(), ImageProductError> {
+    if let Some(key) = &api_key {
+        key.validate().map_err(anyhow::Error::from)?;
+    }
     #[cfg(not(any(feature = "cuda", all(feature = "metal", target_os = "macos"))))]
     {
-        let _ = (source, host, port, aliases);
+        let _ = (source, host, port, aliases, api_key);
         Err(ImageProductError::Unsupported(
             "image serving requires the cuda feature or the metal feature on macOS",
         ))
@@ -44,6 +57,7 @@ pub async fn execute_serve_source(
             AppState::default().with_images(images.clone()),
         ));
         let server_config = ServerConfig {
+            api_key,
             host,
             port,
             ..Default::default()

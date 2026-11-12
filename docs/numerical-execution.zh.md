@@ -36,10 +36,18 @@ Qwen3.5 声明 `qwen3_5.f16` 和 `qwen3_5.f32-master`。F32-master 保持混合�
 模型的状态精度约束。名称不代表每一步都用 FP32。
 
 `Auto` 在模型声明的 GGUF 编码与 recurrent 参数 ABI、完整原生算子能力及实际
-CUDA `sm120` 设备均满足资格时，可优先选择
-`qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1`。该 profile 包含8位激活量化和
+CUDA 设备均满足资格时，可优先选择
+`qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-prefill-v1`。该 profile 包含8位激活量化和
 整数点积，并保留其声明的 F16/F32 阶段边界；它与原参考路径不保证逐位相同。
 固定该 profile 也不保证不同批大小或请求布局下的贪心输出逐 token 相同。
+新路径将满足原有物理矩阵条件的 FFN Q6 投影扩展到 33～2048 行 prefill，
+使用固定 J32 MMQ；原有小批量、输出头、注意力、KV 与状态合同保持不变。
+内核资格由原生包的 prefill 导出声明确认，用户无需额外配置。
+缺少该能力时，`Auto` 仍可选择原来的
+`qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1`；显式指定这个旧 ID 可复现其原有计算路径。
+发布构建使用仓库中锁定的 Q6 prefill 源码，并拒绝缺少该导出的最终原生包。
+当前该扩展的端到端性能与输出抽查来自 RTX 5090 上的 Qwen3.5-4B Q4_K_M；
+这不构成其他模型、硬件或全部输出质量的验证。
 资格或规划容量不满足时，`Auto` 尝试其他完整候选；显式指定
 `--numerical-profile qwen3_5.f32-master` 可保留原有混合精度参考路径。
 这不表示所有 GGUF、SafeTensors 或 CUDA 架构都已支持；Metal 和其他未满足资格的

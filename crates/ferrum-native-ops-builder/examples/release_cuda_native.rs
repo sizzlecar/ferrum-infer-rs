@@ -1,6 +1,7 @@
 //! Release-only orchestration of the existing locked source builder.
-//! The historical production set supplies exact source plans and provider rows;
-//! every source byte is recovered by its locked digest before a fresh build.
+//! The historical production set supplies source plans and provider rows; the
+//! qualified Q6 prefill extension uses its current checked-in source lock.
+//! Every source byte is recovered by its locked digest before a fresh build.
 //! No CUDA runtime, device, publication, or application inference is involved.
 
 use std::{
@@ -183,14 +184,17 @@ fn main() -> Result<()> {
 fn resolve(
     path: &Path,
     architecture: Architecture,
-    fp8: bool,
+    final_set: bool,
 ) -> Result<ResolvedNativeOperatorArtifactSet> {
     let set = NativeOperatorArtifactSetLock::load_and_resolve_for_target(
         path,
         Some(architecture.compute_capability()),
         "x86_64-unknown-linux-gnu",
     )?;
-    ResolvedCudaNativeBuildCoverage::resolve(&set, required_units_for_set(architecture, fp8))?;
+    ResolvedCudaNativeBuildCoverage::resolve(
+        &set,
+        required_units_for_set(architecture, final_set),
+    )?;
     let q6 = set
         .artifacts
         .iter()
@@ -198,15 +202,19 @@ fn resolve(
             artifact.lock.operator == CudaNativeBuildUnit::UpstreamQ6F32Linear.artifact_operator()
         })
         .ok_or("production set is missing the Q6 projection artifact")?;
-    require_q6_f16_exports(&q6.lock.required_exports)?;
+    require_q6_f16_exports(&q6.lock.required_exports, final_set)?;
     Ok(set)
 }
 
-fn require_q6_f16_exports(exports: &[String]) -> Result<()> {
+fn require_q6_f16_exports(exports: &[String], prefill: bool) -> Result<()> {
     for required in ferrum_native_ops::upstream_q6_f16_linear::UPSTREAM_Q6_F16_LINEAR_EXPORTS {
         if !exports.iter().any(|export| export == required) {
             return Err(format!("production Q6 artifact is missing F16 export {required}").into());
         }
+    }
+    let required = ferrum_native_ops::upstream_q6_f16_linear::UPSTREAM_Q6_F16_PREFILL_PLAN_EXPORT;
+    if prefill && !exports.iter().any(|export| export == required) {
+        return Err(format!("release Q6 artifact is missing prefill export {required}").into());
     }
     Ok(())
 }
@@ -383,13 +391,26 @@ fn build(args: &Build) -> Result<()> {
         .ok_or("reference lock has no parent")?;
     let mut prepared = Vec::new();
     for artifact in &reference.artifacts {
-        let plan_path = reference_root.join(&artifact.lock.source_build_plan.path);
+        let unit = CudaNativeBuildUnit::from_artifact_operator(&artifact.lock.operator)
+            .ok_or_else(|| {
+                format!(
+                    "unsupported release native operator {}",
+                    artifact.lock.operator
+                )
+            })?;
+        // This operator has a qualified prefill extension. Recover its current
+        // locked bytes, rather than silently rebuilding the decode-only archive
+        // carried by the historical set. Other operators keep their own plans.
+        let plan_path = if unit == CudaNativeBuildUnit::UpstreamQ6F32Linear {
+            args.workspace
+                .join("native-operators/cuda/source-locks/upstream-q6-f32-linear.plan.json")
+        } else {
+            reference_root.join(&artifact.lock.source_build_plan.path)
+        };
         let plan: NativeOperatorSourceBuildPlan = read_json(&plan_path)?;
         if plan.operator != artifact.lock.operator {
             return Err("reference source plan operator mismatch".into());
         }
-        let unit = CudaNativeBuildUnit::from_artifact_operator(&plan.operator)
-            .ok_or_else(|| format!("unsupported release native operator {}", plan.operator))?;
         if unit == CudaNativeBuildUnit::CutlassFp8ScaledMm {
             return Err("reference unexpectedly already contains FP8".into());
         }
@@ -399,7 +420,19 @@ fn build(args: &Build) -> Result<()> {
         // archive is always freshly compiled below, and packaging verifies the
         // target/toolkit declaration against that actual source-build receipt.
         let reference_spec: NativeOperatorPackageSpec =
-            read_json(&reference_root.join(&artifact.lock.package_spec.path))?;
+            if unit == CudaNativeBuildUnit::UpstreamQ6F32Linear {
+                let declared = args.work.join("upstream-q6.source.package.json");
+                materialize_native_operator_package_spec(&NativeOperatorPackageSpecRequest {
+                    definition_path: args.workspace.join(
+                        "native-operators/cuda/package-definitions/upstream-q6-f32-linear.json",
+                    ),
+                    g03_catalog_path: args.catalog.clone(),
+                    output_path: declared.clone(),
+                })?;
+                read_json(&declared)?
+            } else {
+                read_json(&reference_root.join(&artifact.lock.package_spec.path))?
+            };
         let spec = args
             .work
             .join(format!("{}-target.package.json", unit.as_str()));
@@ -514,15 +547,37 @@ fn build(args: &Build) -> Result<()> {
     })?;
     let completed = resolve(&lock, args.architecture, true)?;
     for old in &reference.artifacts {
+        let mut expected = old.lock.clone();
+        if old.lock.operator == CudaNativeBuildUnit::UpstreamQ6F32Linear.artifact_operator() {
+            let plan_path = args
+                .workspace
+                .join("native-operators/cuda/source-locks/upstream-q6-f32-linear.plan.json");
+            let plan: NativeOperatorSourceBuildPlan = read_json(&plan_path)?;
+            let spec: NativeOperatorPackageSpec =
+                read_json(&args.work.join("upstream-q6.source.package.json"))?;
+            // Permit exactly the selected locked source and its declared export
+            // extension. Existing provider contracts must still match below.
+            if old
+                .lock
+                .required_exports
+                .iter()
+                .any(|export| !spec.required_exports.contains(export))
+            {
+                return Err("Q6 prefill package removed an existing export".into());
+            }
+            expected.source_package_sha256 = plan.source_package.sha256;
+            expected.source_build_plan.sha256 = digest_file(&plan_path)?;
+            expected.required_exports = spec.required_exports;
+        }
         let new = completed
             .artifacts
             .iter()
             .find(|new| new.lock.operator == old.lock.operator)
             .ok_or("a production artifact was lost")?;
-        if new.lock.source_package_sha256 != old.lock.source_package_sha256
-            || new.lock.source_build_plan.sha256 != old.lock.source_build_plan.sha256
-            || new.lock.operation_bindings != old.lock.operation_bindings
-            || new.lock.required_exports != old.lock.required_exports
+        if new.lock.source_package_sha256 != expected.source_package_sha256
+            || new.lock.source_build_plan.sha256 != expected.source_build_plan.sha256
+            || new.lock.operation_bindings != expected.operation_bindings
+            || new.lock.required_exports != expected.required_exports
         {
             return Err(format!(
                 "production source/contract changed for {}",

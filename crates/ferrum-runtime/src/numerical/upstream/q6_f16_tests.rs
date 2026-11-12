@@ -68,7 +68,7 @@ fn q6_f16_arithmetic_is_an_independent_boundary_with_explicit_marker_support() {
     invalid = q6_policy();
     invalid.routes[0].prefill_rows = Some(UpstreamPrefillRows {
         first: 33,
-        last: 64,
+        last: 2049,
     });
     assert!(invalid.validate().is_err());
 }
@@ -393,4 +393,52 @@ fn q6_f16_small_output_fallback_needs_no_native_plan_but_eligible_rows_do() {
             ));
         }
     }
+}
+
+#[test]
+fn q6_f16_prefill_requires_large_row_resources_and_keeps_the_old_profile() {
+    let (_, values, old) = joined_ffn();
+    let contract = UpstreamMarkerV2Profile::SwiGluQ6F16Prefill.arithmetic();
+    let prepared = PreparedProjectionNumerics::prepare(&contract, &values).unwrap();
+    for rows in [33, 65, 513, 2048] {
+        let facts = joined_facts(rows);
+        assert!(matches!(
+            PreparedUpstreamProjectionWave::prepare(&old, &facts, None)
+                .unwrap()
+                .route(),
+            PreparedUpstreamProjectionRoute::StrictBase { .. }
+        ));
+        assert!(PreparedUpstreamProjectionWave::prepare(&prepared, &facts, None).is_err());
+        let mut native = joined_native(rows);
+        native.geometry = UpstreamNativeGeometry::Mmq {
+            padded_inputs: 5120,
+            row_tile: 32,
+            column_tile: 128,
+            threads: 256,
+            shared_bytes: 32768,
+            packed_guard_blocks: 512,
+            blocks: native.multiprocessors,
+            fixup: true,
+        };
+        let wave =
+            PreparedUpstreamProjectionWave::prepare(&prepared, &facts, Some(&native)).unwrap();
+        assert!(matches!(
+            wave.route(),
+            PreparedUpstreamProjectionRoute::Selected {
+                arithmetic: UpstreamProjectionArithmetic::MmqD4Q6F16MarkerV1,
+                ..
+            }
+        ));
+        wave.validate_reconstructed(&contract, &values, &facts, Some(&native))
+            .unwrap();
+        let mut short = facts.clone();
+        short.output_available_bytes = u64::from(rows - 1) * short.output_stride * 2;
+        assert!(PreparedUpstreamProjectionWave::prepare(&prepared, &short, Some(&native)).is_err());
+    }
+    assert!(matches!(
+        PreparedUpstreamProjectionWave::prepare(&prepared, &joined_facts(2049), None)
+            .unwrap()
+            .route(),
+        PreparedUpstreamProjectionRoute::StrictBase { .. }
+    ));
 }

@@ -65,6 +65,9 @@ pub struct SchedulerCliConfig {
 /// Server CLI configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerCliConfig {
+    /// Optional bearer API key. Exported configurations redact this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<ferrum_server::ApiKey>,
     /// Default host
     pub host: String,
 
@@ -858,6 +861,7 @@ fn parse_interleaved_system_coalescing(content: &str) -> Result<bool> {
 impl Default for ServerCliConfig {
     fn default() -> Self {
         Self {
+            api_key: None,
             host: "127.0.0.1".to_string(),
             port: 8000,
             config_path: "server.toml".to_string(),

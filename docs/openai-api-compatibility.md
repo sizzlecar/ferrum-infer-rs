@@ -13,6 +13,25 @@ task traits, and dedicated model loaders from the Rust API. Text generation
 continues through `run`, `serve`, and the LLM engine interfaces; future tasks
 will define their own contracts at the model registration and assembly boundary.
 
+## API key authentication
+
+Development builds support `ferrum serve --api-key KEY`, `FERRUM_API_KEY`, or
+`[server] api_key = "KEY"` in `ferrum.toml`. CLI/environment overrides the
+configuration file. An empty or malformed configured key is rejected at startup.
+The published v0.19.0 binaries do not include this feature.
+
+When configured, send `Authorization: Bearer KEY` on text, image, model-list,
+metrics and Playground configuration requests. Missing, incorrect, duplicate
+or malformed credentials receive HTTP 401 with an OpenAI-shaped error and
+`WWW-Authenticate: Bearer`. Query parameters and cookies do not authenticate.
+Requests are authenticated before parsing an inference body or reading an upload.
+`/health`, static Playground files and CORS preflight remain public.
+
+Configuration exports redact the secret. Use a server environment variable to
+avoid putting a key in shell history or process arguments. With no configured
+key, existing open-server behavior is preserved. `ferrum run` performs no HTTP
+serving and is unaffected.
+
 ## Endpoints
 
 | Endpoint | Status | Notes |

@@ -44,7 +44,8 @@ static_assert(sizeof(FerrumUpstreamQ6F16RequestV1)==48, "F16 request ABI drift")
 static_assert(sizeof(FerrumUpstreamQ6F16PlanV1)==168, "F16 plan ABI drift");
 static_assert(offsetof(FerrumUpstreamQ6F16PlanV1, weight_bytes)==128, "F16 plan field drift");
 // Fixed request/plan abi2, format14/layout0/algorithm1/pack1. Actual M1..32,
-// K multiple256. Input/output strides count F16 elements, permitting an aligned
+// K multiple256. Additionally, M33..2048 uses fixed J32 prefill geometry.
+// Input/output strides count F16 elements, permitting an aligned
 // sub-leaf base within a wider row. converted_bytes/output_bytes describe F32
 // scratch, NOT the final F16 output span. The caller validates all live spans.
 // pack clears row flags and the owned packed guard, converts F16 exactly to F32,
@@ -52,6 +53,8 @@ static_assert(offsetof(FerrumUpstreamQ6F16PlanV1, weight_bytes)==128, "F16 plan 
 // cast rounds finite raw F32 to F16 RN; invalid row/leaf, nonfinite raw or F16
 // overflow publishes canonical F16 NaN 0x7e00. No allocation or synchronization.
 extern "C" int ferrum_upstream_q6_f16_plan_v1(const FerrumUpstreamQ6F16RequestV1 *, FerrumUpstreamQ6F16PlanV1 *) noexcept;
+// Capability entrypoint for the additional M33..2048 / fixed-J32 domain.
+extern "C" int ferrum_upstream_q6_f16_prefill_plan_v1(const FerrumUpstreamQ6F16RequestV1 *, FerrumUpstreamQ6F16PlanV1 *) noexcept;
 extern "C" int ferrum_upstream_q6_f16_pack_v1(const FerrumUpstreamQ6F16PlanV1 *, const void *, uint32_t, void *, void *, void *, void *) noexcept;
 extern "C" int ferrum_upstream_q6_f16_dot_v1(const FerrumUpstreamQ6F16PlanV1 *, const void *, const void *, void *, void *, void *) noexcept;
 extern "C" int ferrum_upstream_q6_f16_check_weights_v1(const FerrumUpstreamQ6F16PlanV1 *, const void *, void *, void *) noexcept;

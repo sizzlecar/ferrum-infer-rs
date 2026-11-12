@@ -14,7 +14,7 @@ static int q6_f16_plan(const FerrumUpstreamQ6F16RequestV1 * r,
     // public F32 request and launch validators remain closed to abi2.
     const auto geometry_request=q6_f16_geometry_request(*r);
     FerrumUpstreamQ6F32PlanV1 geometry{};
-    const int status=q6_plan(&geometry_request,geometry,n);
+    const int status=q6_plan(&geometry_request,geometry,n,true);
     if (status) return status;
     out={}; out.request=*r; out.abi=2; out.size=sizeof(out);
 #define FERRUM_Q6_COPY_GEOMETRY(field) out.field=geometry.field
@@ -108,6 +108,11 @@ extern "C" int ferrum_upstream_q6_f16_pack_v1(const FerrumUpstreamQ6F16PlanV1 * 
             static_cast<uint32_t *>(rows));
         return cudaGetLastError();
     });
+}
+extern "C" int ferrum_upstream_q6_f16_prefill_plan_v1(const FerrumUpstreamQ6F16RequestV1 * r,
+        FerrumUpstreamQ6F16PlanV1 * out) noexcept {
+    if (!r || r->rows < 33 || r->rows > 2048) return -1;
+    return ferrum_upstream_q6_f16_plan_v1(r,out);
 }
 extern "C" int ferrum_upstream_q6_f16_dot_v1(const FerrumUpstreamQ6F16PlanV1 * p,
         const void * weights,const void * packed,void * raw,void * fixup,void * s) noexcept {
