@@ -128,11 +128,10 @@ impl EngineInner {
                             sequence.prefill_context_len(),
                         )?)
                     };
-                    let policy = if sequence.prefill_complete {
-                        sequence.model_decode_logits_policy()
-                    } else {
-                        LogitsReturnPolicy::FullLogits
-                    };
+                    // The final prefill samples the first token using the same
+                    // policy as decode, including the initial-only token mask.
+                    // Intermediate chunks never publish a sampling product.
+                    let policy = sequence.model_decode_logits_policy();
                     Ok((
                         sequence.prefill_context_len(),
                         sequence.generated_tokens.is_empty(),

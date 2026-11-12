@@ -1631,14 +1631,14 @@ enum VNextProductOutputMode {
 #[derive(Debug, Clone)]
 enum VNextParticipantOutputRole {
     IntermediatePrefill,
-    FinalPrefill,
+    FinalPrefill(LogitsReturnPolicy),
     Decode(LogitsReturnPolicy),
 }
 
 impl VNextParticipantOutputRole {
-    fn prefill(chunk: PrefillChunk) -> Self {
+    fn prefill(chunk: PrefillChunk, policy: LogitsReturnPolicy) -> Self {
         if chunk.is_final() {
-            Self::FinalPrefill
+            Self::FinalPrefill(policy)
         } else {
             Self::IntermediatePrefill
         }
@@ -1646,8 +1646,8 @@ impl VNextParticipantOutputRole {
 
     fn logits_policy(&self) -> Option<&LogitsReturnPolicy> {
         match self {
-            Self::Decode(policy) => Some(policy),
-            Self::IntermediatePrefill | Self::FinalPrefill => None,
+            Self::Decode(policy) | Self::FinalPrefill(policy) => Some(policy),
+            Self::IntermediatePrefill => None,
         }
     }
 
@@ -1662,7 +1662,7 @@ impl VNextParticipantOutputRole {
             Self::IntermediatePrefill => {
                 kind != VNextExecutionWaveKind::Decode && end < token_count as u64
             }
-            Self::FinalPrefill => {
+            Self::FinalPrefill(_) => {
                 kind != VNextExecutionWaveKind::Decode && end == token_count as u64
             }
             Self::Decode(_) => {
@@ -2047,21 +2047,25 @@ fn product_output_mode_for_roles<'a>(
     kind: VNextExecutionWaveKind,
     roles: impl IntoIterator<Item = &'a VNextParticipantOutputRole>,
 ) -> VNextProductOutputMode {
-    if kind == VNextExecutionWaveKind::Prefill {
-        return VNextProductOutputMode::FullLogits;
-    }
-    let mut has_decode = false;
+    let mut has_sampling = false;
     for role in roles {
         match role {
             VNextParticipantOutputRole::IntermediatePrefill
-                if kind == VNextExecutionWaveKind::Mixed => {}
-            VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax { .. }) => {
-                has_decode = true;
+                if kind != VNextExecutionWaveKind::Decode => {}
+            VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax { .. })
+                if kind != VNextExecutionWaveKind::Prefill =>
+            {
+                has_sampling = true;
+            }
+            VNextParticipantOutputRole::FinalPrefill(LogitsReturnPolicy::GreedyArgmax {
+                ..
+            }) if kind != VNextExecutionWaveKind::Decode => {
+                has_sampling = true;
             }
             _ => return VNextProductOutputMode::FullLogits,
         }
     }
-    if has_decode {
+    if has_sampling {
         VNextProductOutputMode::GreedyToken
     } else {
         VNextProductOutputMode::FullLogits

@@ -832,7 +832,10 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     }
                     roles.push(match *work {
                         ExecutedTokenWork::Prefill { chunk, .. } => {
-                            VNextParticipantOutputRole::prefill(chunk)
+                            VNextParticipantOutputRole::prefill(
+                                chunk,
+                                inputs[indices[canonical]].logits_policy().clone(),
+                            )
                         }
                         ExecutedTokenWork::Decode { .. } => VNextParticipantOutputRole::Decode(
                             inputs[indices[canonical]].logits_policy().clone(),

@@ -206,6 +206,42 @@ async fn fixture(
 }
 
 #[tokio::test]
+async fn token_preparation_final_prefill_retains_greedy_and_host_sampling_policies() {
+    let (engine, _, batch, identities) = fixture(&[3, 4]).await;
+    let inner = engine.active_inner().unwrap();
+    for (index, (request_id, _)) in identities.iter().enumerate() {
+        let handle = inner.sequences.get(request_id).unwrap();
+        let mut state = handle.lock();
+        let state = state.as_mut().unwrap();
+        state.sampling_params.top_p = 1.0;
+        state.sampling_params.top_k = None;
+        state.sampling_params.temperature = if index == 0 { 0.0 } else { 0.8 };
+    }
+    let prepared = inner.prepare_token_batch(&batch, PrefillShapePolicy::Identity, false);
+    assert!(prepared.failures.is_empty());
+    for input in prepared.inputs {
+        assert!(matches!(input.work, TokenWork::Prefill(chunk) if chunk.is_final()));
+        let state = input.handle.lock();
+        assert!(!state.as_ref().unwrap().prefill_complete);
+        if input.request_id == identities[0].0 {
+            assert!(matches!(
+                input.logits_policy,
+                LogitsReturnPolicy::GreedyArgmax { .. }
+            ));
+        } else {
+            assert!(matches!(
+                input.logits_policy,
+                LogitsReturnPolicy::FullLogits
+            ));
+        }
+    }
+    drop(inner);
+    drop(prepared.failures);
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
+}
+
+#[tokio::test]
 async fn token_preparation_stale_range_commits_healthy_cpu_peer_before_closing_failure() {
     let (engine, executor, mut batch, identities) = fixture(&[3, 4]).await;
     let (bad, bad_frontier) = &identities[0];
