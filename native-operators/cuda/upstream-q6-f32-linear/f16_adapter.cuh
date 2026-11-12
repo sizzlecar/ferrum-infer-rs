@@ -14,7 +14,7 @@ static int q6_f16_plan(const FerrumUpstreamQ6F16RequestV1 * r,
     // public F32 request and launch validators remain closed to abi2.
     const auto geometry_request=q6_f16_geometry_request(*r);
     FerrumUpstreamQ6F32PlanV1 geometry{};
-    const int status=q6_plan(&geometry_request,geometry,n);
+    const int status=q6_plan(&geometry_request,geometry,n,true);
     if (status) return status;
     out={}; out.request=*r; out.abi=2; out.size=sizeof(out);
 #define FERRUM_Q6_COPY_GEOMETRY(field) out.field=geometry.field

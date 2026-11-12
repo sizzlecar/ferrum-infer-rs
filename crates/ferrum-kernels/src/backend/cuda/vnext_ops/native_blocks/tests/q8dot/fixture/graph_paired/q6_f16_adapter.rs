@@ -13,6 +13,7 @@ mod abi;
 mod case;
 mod correctness;
 mod paired;
+mod prefill;
 use abi::{Plan, Request};
 use case::Case;
 

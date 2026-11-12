@@ -57,7 +57,7 @@ impl UpstreamQ6F16RequestV1 {
             || self.size as usize != size_of::<Self>()
             || self.format != 14
             || self.layout != 0
-            || !(1..=32).contains(&self.rows)
+            || !(1..=2048).contains(&self.rows)
             || self.inputs == 0
             || self.inputs % 256 != 0
             || self.outputs == 0
@@ -140,6 +140,7 @@ impl UpstreamQ6F16PlanV1 {
             || u64::from(self.padded_inputs) != pk
             || self.padded_outputs != request.outputs
             || !matches!(self.j, 8 | 16 | 24 | 32)
+            || (request.rows > 32 && self.j != 32)
             || self.i != 128
             || self.nthreads != 256
             || self.guard_blocks > 512
@@ -188,6 +189,32 @@ const _: () = {
     assert!(offset_of!(UpstreamQ6F16PlanV1, abi) == 48);
     assert!(offset_of!(UpstreamQ6F16PlanV1, weight_bytes) == 128);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_prefill_extent_does_not_expand_the_f32_head_domain() {
+        let device = UpstreamLinearDevice {
+            architecture: 890,
+            multiprocessors: 60,
+            maximum_dynamic_shared_bytes: 98304,
+        };
+        for rows in [1, 32, 33, 513, 2048] {
+            assert!(UpstreamQ6F16RequestV1::new(rows, 768, 129, device).is_ok());
+            assert_eq!(
+                crate::upstream_q6_f32_linear::UpstreamQ6F32RequestV1::new(rows, 768, 129, device)
+                    .is_ok(),
+                rows <= 32
+            );
+        }
+        for rows in [0, 2049, u32::MAX] {
+            assert!(UpstreamQ6F16RequestV1::new(rows, 768, 129, device).is_err());
+        }
+        assert!(UpstreamQ6F16RequestV1::new(2048, 1 << 24, 129, device).is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests;

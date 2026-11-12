@@ -5,6 +5,12 @@ output. It uses pinned llama.cpp Q6_K MMQ with D4 activation scales for actual
 rows 1 through 32, input width divisible by 256, and positive output width.
 It does not extend the original F16 linear ABI or enable an automatic route.
 
+The independent F16 boundary also accepts prefill rows 33 through 2048 using
+fixed J32 tiles. Rows 1 through 32 retain their original selector. The F32 head
+boundary still rejects rows above 32. The F16 extension preserves D4 packing,
+marker propagation, strided publication and the complete cooperative-load guard;
+product numerical profiles must explicitly declare the larger row domain.
+
 The pack preserves the prototype's fast-math expressions. Zero groups and
 padding become positive zero. Nonfinite input, a nonzero group flushed to zero,
 or a zero/nonfinite reciprocal quantization factor poisons that row. In the
