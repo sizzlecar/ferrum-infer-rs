@@ -433,6 +433,13 @@ fn build(args: &Build) -> Result<()> {
             } else {
                 read_json(&reference_root.join(&artifact.lock.package_spec.path))?
             };
+        if unit == CudaNativeBuildUnit::UpstreamQ6F32Linear {
+            q6_prefill_export_contract(
+                &artifact.lock.required_exports,
+                &artifact.lock.descriptor_export,
+                &reference_spec.required_exports,
+            )?;
+        }
         let spec = args
             .work
             .join(format!("{}-target.package.json", unit.as_str()));
@@ -557,17 +564,14 @@ fn build(args: &Build) -> Result<()> {
                 read_json(&args.work.join("upstream-q6.source.package.json"))?;
             // Permit exactly the selected locked source and its declared export
             // extension. Existing provider contracts must still match below.
-            if old
-                .lock
-                .required_exports
-                .iter()
-                .any(|export| !spec.required_exports.contains(export))
-            {
-                return Err("Q6 prefill package removed an existing export".into());
-            }
+            let exports = q6_prefill_export_contract(
+                &old.lock.required_exports,
+                &old.lock.descriptor_export,
+                &spec.required_exports,
+            )?;
             expected.source_package_sha256 = plan.source_package.sha256;
             expected.source_build_plan.sha256 = digest_file(&plan_path)?;
-            expected.required_exports = spec.required_exports;
+            expected.required_exports = exports;
         }
         let new = completed
             .artifacts
@@ -592,6 +596,22 @@ fn build(args: &Build) -> Result<()> {
         digest_file(&lock)?
     );
     Ok(())
+}
+
+fn q6_prefill_export_contract(
+    previous: &[String],
+    descriptor: &str,
+    declared: &[String],
+) -> Result<Vec<String>> {
+    // Package assembly adds the ABI descriptor to the declared kernel exports.
+    // Compare complete artifact contracts, keeping that descriptor required.
+    let mut exports = declared.to_vec();
+    exports.push(descriptor.to_owned());
+    exports.sort();
+    if let Some(missing) = previous.iter().find(|export| !exports.contains(export)) {
+        return Err(format!("Q6 prefill package removed existing export {missing}").into());
+    }
+    Ok(exports)
 }
 
 fn package_spec_for_target(

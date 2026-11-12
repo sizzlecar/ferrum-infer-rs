@@ -91,6 +91,30 @@ fn f32_only_q6_package_cannot_satisfy_the_production_f16_boundary() {
 }
 
 #[test]
+fn q6_prefill_extension_preserves_the_packaged_descriptor_and_prior_kernels() {
+    let descriptor = "ferrum_native_q6_descriptor_v2";
+    let decode = "ferrum_upstream_q6_f16_plan_v1".to_owned();
+    let prefill =
+        ferrum_native_ops::upstream_q6_f16_linear::UPSTREAM_Q6_F16_PREFILL_PLAN_EXPORT.to_owned();
+    let previous = vec![descriptor.to_owned(), decode.clone()];
+    let declared = vec![decode.clone(), prefill.clone()];
+    assert_eq!(
+        q6_prefill_export_contract(&previous, descriptor, &declared).unwrap(),
+        vec![descriptor.to_owned(), decode.clone(), prefill.clone()]
+    );
+    let removed_decode = q6_prefill_export_contract(&previous, descriptor, &[prefill])
+        .unwrap_err()
+        .to_string();
+    assert!(removed_decode.contains(&decode));
+    assert!(
+        q6_prefill_export_contract(&previous, "different_descriptor", &declared)
+            .unwrap_err()
+            .to_string()
+            .contains(descriptor)
+    );
+}
+
+#[test]
 fn final_image_release_rejects_missing_fused_native_artifacts() {
     let set = ResolvedNativeOperatorArtifactSet {
         lock_path: PathBuf::from("fixture.lock.json"),
