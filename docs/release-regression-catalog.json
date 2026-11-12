@@ -554,8 +554,8 @@
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "7a2504e4a4234e5c444ca999a55da23565014ca9aaed1f1b1aec6cedc21424ca",
-      "after_sha256": "095bf2ba33d8874090f28f53fb5ff79f41865d2a490b64d72976d7066193f67b",
+      "before_sha256": "095bf2ba33d8874090f28f53fb5ff79f41865d2a490b64d72976d7066193f67b",
+      "after_sha256": "899c941f46f9f1c7b46f5e6dbd427b208cbc2821987ada58cd36018756f2bdcd",
       "areas": [
         "build",
         "backend_submission",
@@ -566,7 +566,7 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the full README change since v0.18.5: add Linux CUDA P-H3 generation and ordered multi-reference editing, typed configuration setup, continuous batching, and explicitly candidate-scoped RTX5090 C1/C8 measurements. Preserve Qwen Image2.1 Turbo and all previous text/backend contracts. Image data discloses WSL48GB, precision,8steps,distinct references,n8/two repetitions,latency thresholds and unmeasured VRAM; it does not claim a final-release or current ComfyUI comparison. Retain build, backend, protocol, scheduler, KV, capacity and model obligations. P-H3 and Qwen image generation/editing receive separate real-model release checks in addition to the existing selected text models. This content review is not execution or performance evidence."
+      "rationale": "Reviewed the full README change since v0.19.0: optional bearer API keys for text and image serving, authentication off without a configured key, public health/static assets, CLI/environment/config precedence, and ordered Qwen image editing with up to ten references from v0.19.1. Reviewed the Qwen3.5-4B Q4_K_M RTX5090 ShareGPT comparison: same-session llama.cpp, fixed capacity, two repetitions, TTFT/TPOT/visible SSE ITL thresholds, zero errors, and an explicit development-candidate label rather than a final-archive or RTX4070Ti claim. Preserve distribution, protocol, backend submission, scheduler, KV, capacity and model obligations; changed native kernels retain their separately mapped source obligations. Final archive authentication, text inference and image generation/editing still require runtime validation. This content review does not certify execution, image quality or performance."
     },
     {
       "path": "README_zh.md",
