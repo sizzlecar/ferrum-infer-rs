@@ -72,12 +72,12 @@ and send `Authorization: Bearer $FERRUM_API_KEY` from clients. The same setting
 protects text and image APIs; `/health` and static Playground assets remain
 public. `--api-key KEY` and `[server] api_key = "KEY"` are also supported,
 with CLI/environment taking precedence over the config file. Without a key,
-serving retains its existing unauthenticated behavior. This feature is in
-main/development builds; it is not included in the published v0.19.0 binaries.
+serving retains its existing unauthenticated behavior. Available from v0.19.1;
+v0.19.0 binaries do not include API key authentication.
 
 ## Image generation and editing
 
-Supports **Qwen-Image-2.1-Turbo** and **P-H3-Image**. The main/development version supports ordered multi-reference editing: up to ten images for Qwen and eight for P-H3. Released **v0.19.0 still accepts only one Qwen reference**. P-H3 also supports continuous batching on Linux CUDA SM89/SM120.
+Supports **Qwen-Image-2.1-Turbo** and **P-H3-Image** with ordered multi-reference editing: up to ten images for Qwen from v0.19.1 and eight for P-H3. v0.19.0 accepts only one Qwen reference. P-H3 also supports continuous batching on Linux CUDA SM89/SM120.
 
 Use a local [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) model directory. Linux CUDA example with FP8 text encoder/DiT:
 
@@ -90,7 +90,7 @@ ferrum serve /path/to/Qwen-Image-2.1-Turbo --backend cuda \
 | API | Input |
 |---|---|
 | `POST /v1/images/generations` | JSON text prompt |
-| `POST /v1/images/edits` | Multipart prompt + ordered PNG references: up to ten for Qwen on main/development (one in v0.19.0); up to eight for P-H3 |
+| `POST /v1/images/edits` | Multipart prompt + ordered PNG references: up to ten for Qwen from v0.19.1 (one in v0.19.0); up to eight for P-H3 |
 
 Both return PNG in `b64_json`. CUDA batches compatible requests automatically within capacity limits. Validated on L20 (SM89) and RTX 5090 (SM120); cuDNN 9 is required. Qwen also supports Metal generation and editing with a GGUF DiT, validated at 1024×1024 on an M4 Mac mini with 16 GiB memory.
 
@@ -111,7 +111,7 @@ P-H3 uses the Comfy W4A8 text encoder/DiT, INT8 VAE and native prompt expansion.
 | CUDA quantization | Selected model paths: GPTQ INT4, compressed-tensors INT4, block-FP8 |
 | Specific CUDA models | Gemma 4 compressed-tensors W4A16; GPT-OSS MXFP4 |
 | PQ2_0 | Complete-model validation on Metal; CUDA operator coverage only |
-| Images | Qwen-Image-2.1-Turbo generation/editing on Linux CUDA and Metal (main/development: up to ten references; v0.19.0: one); P-H3-Image generation/editing with up to eight references on Linux CUDA SM89/SM120. P-H3 Metal is not supported |
+| Images | Qwen-Image-2.1-Turbo generation/editing on Linux CUDA and Metal (v0.19.1: up to ten references; v0.19.0: one); P-H3-Image generation/editing with up to eight references on Linux CUDA SM89/SM120. P-H3 Metal is not supported |
 
 Support depends on the architecture, format and backend combination; text support does not imply vision support. CPU is a compatibility backend. See the [validation catalog](docs/release-regression-catalog.md) for tested combinations and coverage.
 
@@ -128,7 +128,16 @@ Embedding, ASR, TTS and legacy execution APIs are retired. See [migration notes]
 
 Linux/WSL, 48 GB guest-memory limit, W4A8 DiT/text encoder, INT8 VAE, F16 prompt expansion enabled, 8 steps, fixed server capacity 8. Both runs completed 8/8 requests without errors and met the measured P99 ≤120 s threshold; two small runs do not establish a stable production SLO. Candidate measurements precede the final release package. C8 sampled peak RSS: 38.71 / 39.33 GiB; peak VRAM was not collected. [Configuration, workload and evidence](docs/performance-rtx5090-p-h3-20261111.md).
 
-**RTX 5090: latest recorded results for all benchmarked popular models.** Throughput is tok/s, shown as **Ferrum / reference**. C8/C16 are client concurrency; each row identifies the measured Ferrum version.
+**Qwen3.5-4B Q4_K_M · RTX 5090 · v0.19.1 development candidate:** Q6 prefill acceleration is selected automatically when the native operators qualify. Same-session ShareGPT comparison with llama.cpp b12069:
+
+| Concurrency | TTFT P50: Ferrum / llama.cpp | TTFT P99: Ferrum / llama.cpp | Output tok/s: Ferrum / llama.cpp |
+|---|---:|---:|---:|
+| 8 | 47.23 / 56.70 ms | 153.78 / 196.50 ms | 1044.50 / 713.66 |
+| 16 | 50.31 / 71.05 ms | 217.37 / 378.88 ms | 1524.61 / 824.84 |
+
+64 requests × 2 repetitions per cell, fixed server capacity 32, context/batch 2048, F16 KV, thinking and prefix caching disabled. Both engines had zero request/protocol errors and passed P99 limits of TTFT 500 ms, TPOT 50 ms and client-visible SSE text-event ITL 100 ms. Values average the per-repeat metrics; the small sample does not establish a production P99 guarantee. These measurements precede the final archive and do not establish an RTX 4070 Ti result. [Full TPOT/ITL, memory, commands, output checks and limitations](https://github.com/sizzlecar/ferrum-infer-rs/pull/514).
+
+**Earlier RTX 5090 model comparisons.** Throughput is tok/s, shown as **Ferrum / reference**. C8/C16 are client concurrency; each row identifies the measured Ferrum version.
 
 | Model / source weights | Measured version | Reference | C8 tok/s | C16 tok/s | SLO: C8 / C16 |
 |---|---|---|---:|---:|---|

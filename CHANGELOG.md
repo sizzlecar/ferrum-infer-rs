@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-11-12
+
+### Added
+
+- Optional bearer API key authentication for text and image serving, through `--api-key`, `FERRUM_API_KEY`, or `[server] api_key`. Authentication remains off when no key is configured; health checks and static assets remain public. Credentials are excluded from runtime diagnostics and benchmark environment snapshots.
+- Ordered multi-reference Qwen-Image-2.1-Turbo editing through the API and CLI, with up to ten reference images.
+
+### Changed
+
+- Automatically select the qualified Q6 F16 prefill path for compatible Qwen3.5 GGUF models. FFN projections with 33–2048 rows can use native MMQ instead of the generic Q6 fallback; the previous numerical profile remains explicitly selectable.
+- Use device sampling for eligible greedy first tokens, avoiding full-vocabulary host readback. Stochastic and structured sampling retain their declared output requirements.
+
+### Fixed
+
+- Build Linux release Q6 operators from the current locked source and require the prefill capability export, preventing a release from silently shipping the older implementation.
+- Preserve full-logit output reservations for managed causal execution.
+
 ## [0.12.2] - 2026-09-20
 
 ### Changed
