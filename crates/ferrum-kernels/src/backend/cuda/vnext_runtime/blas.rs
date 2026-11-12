@@ -147,7 +147,12 @@ impl CudaDeviceStream {
                 "non-transfer CUDA command lacks its cuBLAS dependency",
             )
         })?;
-        blas.bind_workspace()?;
+        // Conditional Plan dependencies receive only the stream and retained
+        // regions; they do not use or change the cuBLAS workspace. Restore it
+        // before the next compute command, rather than before every flag wait.
+        if command.work_declaration() != CudaWorkDeclaration::ConditionalDependency {
+            blas.bind_workspace()?;
+        }
         command.enqueue(&self.stream, blas)
     }
 }
