@@ -22,7 +22,7 @@ fn q6_f16_request_is_independent_and_rejects_wrong_boundary() {
     let good = request(1, 256, 7);
     for (m, k, n) in [
         (0, 256, 7),
-        (33, 256, 7),
+        (2049, 256, 7),
         (1, 0, 7),
         (1, 32, 7),
         (1, 256, 0),
@@ -125,4 +125,25 @@ fn q6_f16_and_f32_request_tags_are_mutually_exclusive() {
     f32.abi = UPSTREAM_Q6_F16_LINEAR_ABI;
     assert!(f16.validate().is_err());
     assert!(f32.validate().is_err());
+}
+
+#[test]
+fn f16_prefill_extent_does_not_expand_the_f32_head_domain() {
+    let device = UpstreamLinearDevice {
+        architecture: 890,
+        multiprocessors: 60,
+        maximum_dynamic_shared_bytes: 98304,
+    };
+    for rows in [1, 32, 33, 513, 2048] {
+        assert!(UpstreamQ6F16RequestV1::new(rows, 768, 129, device).is_ok());
+        assert_eq!(
+            crate::upstream_q6_f32_linear::UpstreamQ6F32RequestV1::new(rows, 768, 129, device)
+                .is_ok(),
+            rows <= 32
+        );
+    }
+    for rows in [0, 2049, u32::MAX] {
+        assert!(UpstreamQ6F16RequestV1::new(rows, 768, 129, device).is_err());
+    }
+    assert!(UpstreamQ6F16RequestV1::new(2048, 1 << 24, 129, device).is_err());
 }

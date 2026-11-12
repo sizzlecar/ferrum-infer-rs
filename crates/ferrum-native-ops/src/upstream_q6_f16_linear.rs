@@ -191,30 +191,4 @@ const _: () = {
 };
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn f16_prefill_extent_does_not_expand_the_f32_head_domain() {
-        let device = UpstreamLinearDevice {
-            architecture: 890,
-            multiprocessors: 60,
-            maximum_dynamic_shared_bytes: 98304,
-        };
-        for rows in [1, 32, 33, 513, 2048] {
-            assert!(UpstreamQ6F16RequestV1::new(rows, 768, 129, device).is_ok());
-            assert_eq!(
-                crate::upstream_q6_f32_linear::UpstreamQ6F32RequestV1::new(rows, 768, 129, device)
-                    .is_ok(),
-                rows <= 32
-            );
-        }
-        for rows in [0, 2049, u32::MAX] {
-            assert!(UpstreamQ6F16RequestV1::new(rows, 768, 129, device).is_err());
-        }
-        assert!(UpstreamQ6F16RequestV1::new(2048, 1 << 24, 129, device).is_err());
-    }
-}
-
-#[cfg(test)]
 mod tests;
