@@ -276,10 +276,13 @@ pub fn detect_rust_version() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Snapshot all `FERRUM_*` env vars in the current process, sorted.
+/// Snapshot non-secret `FERRUM_*` runtime overrides, sorted. Share the health
+/// snapshot policy so HTTP credentials cannot leak into benchmark artifacts.
 pub fn capture_ferrum_env() -> BTreeMap<String, String> {
-    std::env::vars()
-        .filter(|(k, _)| k.starts_with("FERRUM_"))
+    RuntimeConfigSnapshot::capture_current()
+        .entries
+        .into_iter()
+        .map(|entry| (entry.key, entry.effective_value))
         .collect()
 }
 

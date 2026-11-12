@@ -96,7 +96,8 @@ impl RuntimeConfigSnapshot {
         Ok(())
     }
 
-    /// Capture all currently set `FERRUM_*` env overrides.
+    /// Capture non-secret `FERRUM_*` runtime overrides. HTTP credentials are
+    /// consumed by the server and must never enter health, profile or bench data.
     pub fn capture_current() -> Self {
         Self::from_os_env_vars(std::env::vars_os())
     }
@@ -104,7 +105,7 @@ impl RuntimeConfigSnapshot {
     fn from_os_env_vars(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
         Self::from_env_vars(vars.into_iter().filter_map(|(key, value)| {
             let key = key.into_string().ok()?;
-            if !key.starts_with("FERRUM_") {
+            if !is_runtime_override(&key) {
                 return None;
             }
             // Unrelated OS values need not be Unicode. Ferrum overrides retain
@@ -126,7 +127,7 @@ impl RuntimeConfigSnapshot {
         let mut sorted = BTreeMap::new();
         for (key, value) in vars {
             let key = key.into();
-            if key.starts_with("FERRUM_") {
+            if is_runtime_override(&key) {
                 sorted.insert(key, value.into());
             }
         }
@@ -152,6 +153,9 @@ impl RuntimeConfigSnapshot {
     {
         let mut sorted = BTreeMap::new();
         for entry in entries {
+            if entry.key == "FERRUM_API_KEY" {
+                continue;
+            }
             sorted.insert(entry.key.clone(), entry);
         }
         Self {
@@ -187,6 +191,10 @@ impl RuntimeConfigSnapshot {
         self.upsert(key, effective_value, source);
         self
     }
+}
+
+fn is_runtime_override(key: &str) -> bool {
+    key.starts_with("FERRUM_") && key != "FERRUM_API_KEY"
 }
 
 /// One effective config value in a runtime snapshot.
@@ -409,6 +417,33 @@ mod tests {
             EnvTriState::ForcedOn
         );
         assert!(parse_tri_state_env_value(Some("auto")).is_err());
+    }
+
+    #[test]
+    fn api_key_is_excluded_from_runtime_diagnostics_and_replay() {
+        let secret = "private-server-key";
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([
+            ("FERRUM_API_KEY", secret),
+            ("FERRUM_MAX_MODEL_LEN", "2048"),
+        ]);
+        let os_snapshot = RuntimeConfigSnapshot::from_os_env_vars([
+            (OsString::from("FERRUM_API_KEY"), OsString::from(secret)),
+            (
+                OsString::from("FERRUM_MAX_MODEL_LEN"),
+                OsString::from("2048"),
+            ),
+        ]);
+        let explicit =
+            snapshot
+                .clone()
+                .with_entry("FERRUM_API_KEY", secret, RuntimeConfigSource::Cli);
+        for value in [snapshot, os_snapshot, explicit] {
+            assert_eq!(value.entries.len(), 1);
+            assert_eq!(value.entries[0].key, "FERRUM_MAX_MODEL_LEN");
+            assert_eq!(value.entries[0].effective_value, "2048");
+            assert!(!serde_json::to_string(&value).unwrap().contains(secret));
+            assert!(!format!("{value:?}").contains(secret));
+        }
     }
 
     #[test]
