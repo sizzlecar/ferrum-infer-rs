@@ -40,6 +40,14 @@ fn q6_f16_prefill_changes_only_the_declared_ffn_operation() {
     let new_id =
         NumericalProfileId::new(F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1_NUMERICAL_PROFILE_ID).unwrap();
     let new = catalog.resolve(&new_id).unwrap();
+    let program = provider.semantic_program(&source(), new).unwrap();
+    new.validate_program(&program).unwrap();
+    assert!(program
+        .blocks()
+        .iter()
+        .flat_map(|block| &block.nodes)
+        .any(|node| node.operation_id.as_str()
+            == UpstreamMarkerV2Profile::SwiGluQ6F16Prefill.operation_id()));
     let mut restored = new.clone();
     restored.id = old.id.clone();
     let original_ffn = old

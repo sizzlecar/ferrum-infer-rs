@@ -94,6 +94,7 @@ pub use numerical::{
     F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID,
     F32_MASTER_GGUF_Q8_HEAD_V1_NUMERICAL_PROFILE_ID, F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID,
     F32_MASTER_NUMERICAL_PROFILE_ID, F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1_NUMERICAL_PROFILE_ID,
+    F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1_NUMERICAL_PROFILE_ID,
 };
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
 
@@ -507,6 +508,15 @@ impl Qwen35OperationProfile {
         ..Self::F32_MASTER_GGUF_Q8_HEAD_V1
     };
 
+    const F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1: Self = Self {
+        dense_feed_forward: OperationSelection::new(
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16Prefill.operation_id(),
+            1,
+            0,
+        ),
+        ..Self::F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1
+    };
+
     const F32_MASTER_G32_MMQ_PREFILL_MARKER_V1: Self = Self {
         dense_feed_forward: OperationSelection::new(ferrum_runtime::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,1,0),
         linear_attention: OperationSelection::new(ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,1,0),
@@ -544,6 +554,9 @@ impl Qwen35OperationProfile {
             }),
             F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1_NUMERICAL_PROFILE_ID => {
                 Ok(Self::F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1)
+            }
+            F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1_NUMERICAL_PROFILE_ID => {
+                Ok(Self::F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1)
             }
             F32_MASTER_GGUF_Q8_HEAD_V1_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER_GGUF_Q8_HEAD_V1),
             F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_NUMERICAL_PROFILE_ID => {
@@ -1059,6 +1072,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             profile.id.as_str(),
             F32_MASTER_GGUF_Q8_HEAD_V1_NUMERICAL_PROFILE_ID
                 | F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1_NUMERICAL_PROFILE_ID
+                | F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1_NUMERICAL_PROFILE_ID
         ) && (!numerical::q6_head_eligible(config, &text)
             || profile
                 .kv_storage
