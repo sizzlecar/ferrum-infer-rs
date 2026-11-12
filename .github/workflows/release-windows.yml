@@ -348,11 +348,10 @@ jobs:
           . './.github/ci/windows-production-native.ps1'
           $llamaSource = Join-Path $work 'llama'
           $llamaRevision = 'd81235049384534c167caea52b85a694f6103d14'
-          git init $llamaSource
-          git -C $llamaSource remote add origin https://github.com/ggml-org/llama.cpp.git
-          git -C $llamaSource fetch --depth 1 origin $llamaRevision
-          git -C $llamaSource checkout --detach FETCH_HEAD
-          if ((git -C $llamaSource rev-parse HEAD) -ne $llamaRevision) { throw 'Upstream projection source revision mismatch' }
+          $llamaArchive = Join-Path $work 'llama.tar.gz'
+          & './target/release-tools/release_delivery.exe' fetch-verified --url "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/$llamaRevision" --sha256 '6b58785f0a82898f4c3442417ff962e2d4b231b1bee5d033902ad90b27901e14' --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $llamaArchive
+          New-Item -ItemType Directory $llamaSource | Out-Null
+          tar.exe -xzf $llamaArchive --strip-components=1 -C $llamaSource
           $cutlassArchive = Join-Path $work 'cutlass.tar.gz'
           & './target/release-tools/release_delivery.exe' fetch-verified --url 'https://codeload.github.com/NVIDIA/cutlass/tar.gz/cb4247394dd82148787aed73e5dc7cef33cbf862' --sha256 '7a37329b43a47aaf9ef142be99baff3e71dbeea007b975891350cc0e50bc598b' --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $cutlassArchive
           $fp8Source = Join-Path $work 'fp8-source'
