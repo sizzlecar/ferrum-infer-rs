@@ -1,5 +1,7 @@
 //! Serve command - Start the HTTP inference server
 
+#[cfg(test)]
+mod api_key_tests;
 mod lifecycle;
 #[cfg(test)]
 #[path = "serve/lifecycle_tests.rs"]
@@ -35,6 +37,15 @@ use tokio::signal;
 
 #[derive(Args)]
 pub struct ServeCommand {
+    /// Require this bearer API key on HTTP APIs. Also accepts FERRUM_API_KEY;
+    /// CLI/environment overrides server.api_key in ferrum.toml. Health remains public.
+    #[arg(
+        long,
+        env = "FERRUM_API_KEY",
+        hide_env_values = true,
+        value_name = "KEY"
+    )]
+    pub api_key: Option<String>,
     /// Model alias, owner/repository[:QUANT], or local text/image pipeline path (default: from config)
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
@@ -426,6 +437,20 @@ pub async fn execute(
     execute_with_compatibility(cmd, config, false, false, true, None).await
 }
 
+fn resolve_api_key(
+    explicit: Option<String>,
+    configured: Option<ferrum_server::ApiKey>,
+) -> Result<Option<ferrum_server::ApiKey>> {
+    let key = match explicit {
+        Some(value) => Some(ferrum_server::ApiKey::new(value)?),
+        None => configured,
+    };
+    if let Some(key) = &key {
+        key.validate()?;
+    }
+    Ok(key)
+}
+
 pub async fn execute_cli(
     cmd: ServeCliCommand,
     config: CliConfig,
@@ -446,11 +471,13 @@ pub async fn execute_cli(
         )
         .map_err(super::image_product::ImageProductError::from)?;
     if let Some(source) = source {
-        return super::image_product::execute_serve_source(
+        let api_key = resolve_api_key(cmd.command.api_key, config.server.api_key.clone())?;
+        return super::image_product::execute_serve_source_with_api_key(
             source,
             cmd.command.host.unwrap_or(config.server.host),
             cmd.command.port.unwrap_or(config.server.port),
             cmd.command.served_model_name,
+            api_key,
         )
         .await
         .map_err(Into::into);
@@ -504,6 +531,7 @@ async fn run_serve_lifecycle(
     config.profile_journal.validate()?;
     let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
     let ServeCommand {
+        api_key,
         model,
         model_option,
         product_sources,
@@ -584,6 +612,7 @@ async fn run_serve_lifecycle(
         lora_model_id_template,
     } = cmd;
 
+    let api_key = resolve_api_key(api_key, config.server.api_key.clone())?;
     let scheduler_slo = config.resolve_scheduler_slo(scheduler_slo)?;
     let default_enable_thinking = if enable_thinking {
         Some(true)
@@ -1288,6 +1317,7 @@ async fn run_serve_lifecycle(
 
     // Create server config
     let server_config = ServerConfig {
+        api_key,
         host: host.clone(),
         port,
         request_dump_dir: request_dump_dir.clone(),

@@ -105,7 +105,8 @@ impl AxumServer {
                 .with_profile_journal(config.profile_journal.clone())
                 .with_memory_profile_jsonl(config.memory_profile_jsonl.clone()),
         )?;
-        let app = self.build_router_with_state(state);
+        let app =
+            crate::api_key::protect(self.build_router_with_state(state), config.api_key.as_ref())?;
         let listener = match listener {
             Some(listener) => listener,
             None => BoundHttpListener::bind(&config.host, config.port).await?,

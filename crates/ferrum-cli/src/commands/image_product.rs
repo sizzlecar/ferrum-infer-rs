@@ -54,6 +54,7 @@ pub use run::execute_run_source;
 pub use run::{execute_run_source_with_image, execute_run_source_with_images};
 pub use serve::execute_serve;
 pub use serve::execute_serve_source;
+pub(crate) use serve::execute_serve_source_with_api_key;
 
 use clap::{parser::ValueSource, ArgMatches, Args};
 use std::{fmt, path::PathBuf};

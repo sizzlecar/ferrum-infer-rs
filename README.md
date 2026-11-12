@@ -67,6 +67,14 @@ Weights download on first use. Set your client's base URL to **`http://127.0.0.1
 
 Execution and capacity defaults adapt to hardware and available memory; explicit settings take precedence. Supports Chat Completions, stateless Responses, SSE, tools and structured output. See [API compatibility](docs/openai-api-compatibility.md) for supported fields.
 
+To require authentication, set `FERRUM_API_KEY` before starting `ferrum serve`
+and send `Authorization: Bearer $FERRUM_API_KEY` from clients. The same setting
+protects text and image APIs; `/health` and static Playground assets remain
+public. `--api-key KEY` and `[server] api_key = "KEY"` are also supported,
+with CLI/environment taking precedence over the config file. Without a key,
+serving retains its existing unauthenticated behavior. This feature is in
+main/development builds; it is not included in the published v0.19.0 binaries.
+
 ## Image generation and editing
 
 Supports **Qwen-Image-2.1-Turbo** and **P-H3-Image**. The main/development version supports ordered multi-reference editing: up to ten images for Qwen and eight for P-H3. Released **v0.19.0 still accepts only one Qwen reference**. P-H3 also supports continuous batching on Linux CUDA SM89/SM120.

@@ -154,6 +154,10 @@ pub struct ServerConfig {
     /// Authentication configuration
     pub auth: Option<AuthConfig>,
 
+    /// Optional bearer credential for HTTP data and inference routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<crate::ApiKey>,
+
     /// API versioning
     pub api_version: ApiVersion,
 
@@ -421,6 +425,7 @@ impl Default for ServerConfig {
             cors: None,
             compression: None,
             auth: None,
+            api_key: None,
             api_version: ApiVersion::V1,
             request_dump_dir: None,
             profile_jsonl: None,
