@@ -324,6 +324,7 @@ impl UpstreamProjectionPolicy {
                         UpstreamProjectionArithmetic::MmqD4MarkerV2
                             | UpstreamProjectionArithmetic::MmqDs4MarkerV2
                             | UpstreamProjectionArithmetic::MmqD4ExtraMarkerV2
+                            | UpstreamProjectionArithmetic::MmqD4Q6F16MarkerV1
                     )
                 {
                     return Err(

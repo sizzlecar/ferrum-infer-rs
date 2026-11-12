@@ -40,6 +40,7 @@ impl CudaUpstreamSwiGluProvider {
                 | UpstreamMarkerV2Profile::SwiGluExtraLargePrefill
                 | UpstreamMarkerV2Profile::SwiGluExtraAllRows
                 | UpstreamMarkerV2Profile::SwiGluQ6F16
+                | UpstreamMarkerV2Profile::SwiGluQ6F16Prefill
         ) {
             return Err(CudaDeviceRuntimeError::contract("not a SwiGLU profile"));
         }

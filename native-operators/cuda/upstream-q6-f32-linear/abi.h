@@ -53,6 +53,8 @@ static_assert(offsetof(FerrumUpstreamQ6F16PlanV1, weight_bytes)==128, "F16 plan 
 // cast rounds finite raw F32 to F16 RN; invalid row/leaf, nonfinite raw or F16
 // overflow publishes canonical F16 NaN 0x7e00. No allocation or synchronization.
 extern "C" int ferrum_upstream_q6_f16_plan_v1(const FerrumUpstreamQ6F16RequestV1 *, FerrumUpstreamQ6F16PlanV1 *) noexcept;
+// Capability entrypoint for the additional M33..2048 / fixed-J32 domain.
+extern "C" int ferrum_upstream_q6_f16_prefill_plan_v1(const FerrumUpstreamQ6F16RequestV1 *, FerrumUpstreamQ6F16PlanV1 *) noexcept;
 extern "C" int ferrum_upstream_q6_f16_pack_v1(const FerrumUpstreamQ6F16PlanV1 *, const void *, uint32_t, void *, void *, void *, void *) noexcept;
 extern "C" int ferrum_upstream_q6_f16_dot_v1(const FerrumUpstreamQ6F16PlanV1 *, const void *, const void *, void *, void *, void *) noexcept;
 extern "C" int ferrum_upstream_q6_f16_check_weights_v1(const FerrumUpstreamQ6F16PlanV1 *, const void *, void *, void *) noexcept;

@@ -23,6 +23,8 @@ pub const F32_MASTER_GGUF_Q8_HEAD_V1_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.gguf-q8-head-v1";
 pub const F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1";
+pub const F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1_NUMERICAL_PROFILE_ID: &str =
+    "qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-prefill-v1";
 pub const F32_MASTER_FFN_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.ffn-iq4xs-q8act-g32";
 pub const F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID: &str =
@@ -105,6 +107,9 @@ pub(super) fn profiles(
     let q6_f16 = q6_head_eligible(config, &text)
         .then(|| q6_f16::profile(&f32))
         .transpose()?;
+    let q6_prefill = q6_head_eligible(config, &text)
+        .then(|| q6_f16::prefill_profile(&f32))
+        .transpose()?;
     // Qualification covers both physical encoding and recurrent parameter ABI.
     // In particular, an unquantized negative-rate source must not silently
     // acquire the as-yet unqualified F16 behavior merely because it has no blocks.
@@ -162,6 +167,7 @@ pub(super) fn profiles(
     profiles.extend(upstream_extra_all_rows);
     profiles.extend(q6_head);
     profiles.extend(q6_f16);
+    profiles.extend(q6_prefill);
     FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 3), profiles, automatic)
 }
 

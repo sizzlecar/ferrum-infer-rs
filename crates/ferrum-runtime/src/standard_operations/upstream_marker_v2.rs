@@ -114,6 +114,7 @@ pub enum UpstreamMarkerV2Profile {
     GatedDeltaExtraAllRows,
     CausalExtraAllRows,
     SwiGluQ6F16,
+    SwiGluQ6F16Prefill,
     GatedDeltaQ6F16,
     CausalQ6F16,
 }
@@ -122,7 +123,10 @@ impl UpstreamMarkerV2Profile {
     pub const fn q6_f16(self) -> bool {
         matches!(
             self,
-            Self::SwiGluQ6F16 | Self::GatedDeltaQ6F16 | Self::CausalQ6F16
+            Self::SwiGluQ6F16
+                | Self::SwiGluQ6F16Prefill
+                | Self::GatedDeltaQ6F16
+                | Self::CausalQ6F16
         )
     }
 
@@ -142,6 +146,7 @@ impl UpstreamMarkerV2Profile {
             Self::SwiGluExtraLargePrefill
                 | Self::SwiGluExtraAllRows
                 | Self::SwiGluQ6F16
+                | Self::SwiGluQ6F16Prefill
                 | Self::GatedDeltaExtraLargePrefill
                 | Self::GatedDeltaExtraAllRows
                 | Self::GatedDeltaQ6F16
@@ -175,6 +180,7 @@ impl UpstreamMarkerV2Profile {
                 | Self::SwiGluExtraLargePrefill
                 | Self::SwiGluExtraAllRows
                 | Self::SwiGluQ6F16
+                | Self::SwiGluQ6F16Prefill
                 | Self::SwiGluExtraPrefill
                 | Self::GatedDeltaExtraLargePrefill
                 | Self::GatedDeltaExtraAllRows
@@ -200,6 +206,7 @@ impl UpstreamMarkerV2Profile {
             Self::CausalQ6F16 => CAUSAL_PAGED_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_OPERATION_ID,
             Self::GatedDeltaQ6F16 => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_OPERATION_ID,
             Self::SwiGluQ6F16 => DENSE_SWIGLU_Q6_F16_MARKER_V1_OPERATION_ID,
+            Self::SwiGluQ6F16Prefill => "operation.dense_swiglu.upstream-q6-f16-prefill-marker-v1",
             Self::SwiGlu => DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,
             Self::SwiGluPrefill => DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,
             Self::SwiGluExtraPrefill => DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,
@@ -225,6 +232,7 @@ impl UpstreamMarkerV2Profile {
             Self::CausalQ6F16 => CAUSAL_PAGED_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_CAPABILITY_ID,
             Self::GatedDeltaQ6F16 => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_CAPABILITY_ID,
             Self::SwiGluQ6F16 => DENSE_SWIGLU_Q6_F16_MARKER_V1_CAPABILITY_ID,
+            Self::SwiGluQ6F16Prefill => "capability.operation.dense_swiglu.upstream-q6-f16-prefill-marker-v1",
             Self::SwiGlu => DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_CAPABILITY_ID,
             Self::SwiGluPrefill => DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_CAPABILITY_ID,
             Self::SwiGluExtraPrefill => DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_CAPABILITY_ID,
@@ -253,6 +261,7 @@ impl UpstreamMarkerV2Profile {
             | Self::SwiGluExtraLargePrefill
             | Self::SwiGluExtraAllRows
             | Self::SwiGluQ6F16
+            | Self::SwiGluQ6F16Prefill
             | Self::SwiGluExtraPrefill => DENSE_SWIGLU_OPERATION_ID,
             Self::GatedDelta
             | Self::GatedDeltaPrefill
@@ -280,6 +289,7 @@ impl UpstreamMarkerV2Profile {
             | Self::SwiGluExtraLargePrefill
             | Self::SwiGluExtraAllRows
             | Self::SwiGluQ6F16
+            | Self::SwiGluQ6F16Prefill
             | Self::SwiGluExtraPrefill => dense_swiglu_contract(),
             Self::GatedDelta
             | Self::GatedDeltaPrefill
@@ -318,6 +328,7 @@ impl UpstreamMarkerV2Profile {
             | Self::SwiGluExtraLargePrefill
             | Self::SwiGluExtraAllRows
             | Self::SwiGluQ6F16
+            | Self::SwiGluQ6F16Prefill
             | Self::SwiGluExtraPrefill => &[
                 (ProjectionRole::SwiGluGateUp, 1),
                 (ProjectionRole::SwiGluDown, 2),

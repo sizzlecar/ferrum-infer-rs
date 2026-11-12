@@ -64,6 +64,22 @@ pub(crate) fn q6_f16_compiled() -> bool {
             })
 }
 
+/// The extra planning export proves the linked artifact accepts large F16
+/// matrices; older decode-only artifacts retain the original profile.
+pub(crate) fn q6_f16_prefill_compiled() -> bool {
+    q6_f16_compiled()
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator
+                    == ferrum_native_ops::upstream_q6_f16_linear::UPSTREAM_Q6_F16_LINEAR_OPERATOR
+                    && artifact
+                        .exports
+                        .iter()
+                        .any(|name| name == "ferrum_upstream_q6_f16_prefill_plan_v1")
+            })
+}
+
 /// Retained matrix validation follows this explicit profile's format family;
 /// the original G32 validator remains restricted to its own three formats.
 pub(in crate::backend::cuda::vnext_ops) fn validate_parts(

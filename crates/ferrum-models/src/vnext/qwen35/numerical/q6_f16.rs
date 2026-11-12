@@ -5,6 +5,29 @@ use ferrum_runtime::UpstreamMarkerV2Profile;
 #[cfg(test)]
 mod tests;
 
+pub(super) fn prefill_profile(
+    master: &NumericalExecutionProfile,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    let mut result = profile(master)?;
+    result.id = NumericalProfileId::new(F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1_NUMERICAL_PROFILE_ID)
+        .map_err(|reason| invalid_config("numerical_profile.id", reason))?;
+    let old = UpstreamMarkerV2Profile::SwiGluQ6F16;
+    let new = UpstreamMarkerV2Profile::SwiGluQ6F16Prefill;
+    if let Some(operation) = result
+        .operations
+        .iter_mut()
+        .find(|operation| operation.operation_id.as_str() == old.operation_id())
+    {
+        operation.operation_id = operation_id(new.operation_id())?;
+        operation.composite_arithmetic = Some(new.arithmetic());
+    }
+    result
+        .operations
+        .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    result.validate()?;
+    Ok(result)
+}
+
 pub(super) fn profile(
     master: &NumericalExecutionProfile,
 ) -> Result<NumericalExecutionProfile, VNextError> {

@@ -33,6 +33,38 @@ fn id() -> NumericalProfileId {
 }
 
 #[test]
+fn q6_f16_prefill_changes_only_the_declared_ffn_operation() {
+    let provider = Qwen35FamilyProvider::new().unwrap();
+    let catalog = provider.numerical_profiles(&source()).unwrap();
+    let old = catalog.resolve(&id()).unwrap();
+    let new_id =
+        NumericalProfileId::new(F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1_NUMERICAL_PROFILE_ID).unwrap();
+    let new = catalog.resolve(&new_id).unwrap();
+    let mut restored = new.clone();
+    restored.id = old.id.clone();
+    let original_ffn = old
+        .operations
+        .iter()
+        .find(|operation| {
+            operation.operation_id.as_str() == UpstreamMarkerV2Profile::SwiGluQ6F16.operation_id()
+        })
+        .unwrap();
+    let prefill_ffn = restored
+        .operations
+        .iter_mut()
+        .find(|operation| {
+            operation.operation_id.as_str()
+                == UpstreamMarkerV2Profile::SwiGluQ6F16Prefill.operation_id()
+        })
+        .unwrap();
+    *prefill_ffn = original_ffn.clone();
+    restored
+        .operations
+        .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    assert_eq!(&restored, old);
+}
+
+#[test]
 fn q6_f16_auto_prefers_qualified_source_and_require_preserves_program_structure() {
     let registration = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap());
     let config = source();

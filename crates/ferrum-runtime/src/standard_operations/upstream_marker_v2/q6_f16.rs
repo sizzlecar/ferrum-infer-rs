@@ -8,7 +8,9 @@ use crate::{
 
 pub(super) fn arithmetic(profile: UpstreamMarkerV2Profile) -> CompositeNumericalArithmetic {
     let inherited = match profile {
-        UpstreamMarkerV2Profile::SwiGluQ6F16 => UpstreamMarkerV2Profile::SwiGluExtraAllRows,
+        UpstreamMarkerV2Profile::SwiGluQ6F16 | UpstreamMarkerV2Profile::SwiGluQ6F16Prefill => {
+            UpstreamMarkerV2Profile::SwiGluExtraAllRows
+        }
         UpstreamMarkerV2Profile::GatedDeltaQ6F16 => UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
         UpstreamMarkerV2Profile::CausalQ6F16 => UpstreamMarkerV2Profile::CausalExtraAllRows,
         _ => unreachable!("closed Q6 F16 profile"),
@@ -29,7 +31,11 @@ pub(super) fn arithmetic(profile: UpstreamMarkerV2Profile) -> CompositeNumerical
                     arithmetic: UpstreamProjectionArithmetic::MmqD4Q6F16MarkerV1,
                     layout: UpstreamProjectionLayout::Columns,
                     local_rows: (4..=32).collect(),
-                    prefill_rows: None,
+                    prefill_rows: (profile == UpstreamMarkerV2Profile::SwiGluQ6F16Prefill)
+                        .then_some(UpstreamPrefillRows {
+                            first: 33,
+                            last: 2048,
+                        }),
                 }],
                 geometry_selection: Some(UpstreamProjectionGeometrySelection::Q6F16Mmq {
                     minimum_input_features: 5120,

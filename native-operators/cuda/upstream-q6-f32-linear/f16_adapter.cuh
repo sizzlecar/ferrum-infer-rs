@@ -109,6 +109,11 @@ extern "C" int ferrum_upstream_q6_f16_pack_v1(const FerrumUpstreamQ6F16PlanV1 * 
         return cudaGetLastError();
     });
 }
+extern "C" int ferrum_upstream_q6_f16_prefill_plan_v1(const FerrumUpstreamQ6F16RequestV1 * r,
+        FerrumUpstreamQ6F16PlanV1 * out) noexcept {
+    if (!r || r->rows < 33 || r->rows > 2048) return -1;
+    return ferrum_upstream_q6_f16_plan_v1(r,out);
+}
 extern "C" int ferrum_upstream_q6_f16_dot_v1(const FerrumUpstreamQ6F16PlanV1 * p,
         const void * weights,const void * packed,void * raw,void * fixup,void * s) noexcept {
     return ferrum_upstream_q6_f32_boundary([&]() -> int {
