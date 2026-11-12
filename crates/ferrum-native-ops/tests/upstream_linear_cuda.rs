@@ -12,8 +12,6 @@ use std::{
 mod ffi;
 #[path = "upstream_linear_cuda/oracle.rs"]
 mod oracle;
-#[path = "upstream_linear_cuda/plan_validation.rs"]
-mod plan_validation;
 #[path = "upstream_linear_cuda/prefill.rs"]
 mod prefill;
 #[path = "upstream_linear_cuda/timing.rs"]

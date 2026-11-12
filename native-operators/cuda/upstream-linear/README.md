@@ -15,10 +15,8 @@ explicit package metadata. Provider bindings must match the real live G03
 catalog; a successful raw ABI test is not provider qualification.
 
 `plan_v1` verifies current device facts, reconstructs all geometry and configures
-MMQ shared memory outside capture. Every launch validates the complete plan;
-MMQ reuses a bounded thread-local cache of byte-identical, previously re-derived
-values, and re-derives cache misses. Modified plans still undergo full validation.
-Rust checks byte extents, alignment and aliasing. The caller retains
+MMQ shared memory outside capture. Every launch re-derives the plan and rejects
+changes. Rust checks byte extents, alignment and aliasing. The caller retains
 same-device leases and stream ordering; the ABI performs no device allocation
 or synchronization. Positive status is the CUDA runtime error, negative status
 is a typed contract/invariant rejection. Upstream host assertions are caught at

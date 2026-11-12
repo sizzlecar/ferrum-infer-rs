@@ -385,31 +385,8 @@ static int upstream_mmq_plan(const FerrumUpstreamLinearRequestV1 * r,
     return 0;
 }
 static bool upstream_mmq_valid(const FerrumUpstreamLinearPlanV1 * p, TestMmqPlan & native) {
-    if (!p) return false;
-    // Geometry is a pure function of the complete public plan, including its
-    // device facts. Reuse only previously reconstructed, byte-equal values;
-    // pointer identity must never authorize a caller-mutated plan. This bounded
-    // per-thread cache owns no CUDA resources and performs no allocation.
-    struct Entry {
-        FerrumUpstreamLinearPlanV1 plan{};
-        TestMmqPlan native{};
-        bool valid = false;
-    };
-    static thread_local Entry entries[8];
-    static thread_local unsigned next = 0;
-    for (const auto & entry : entries) {
-        if (entry.valid && ferrum_upstream_same(*p, entry.plan)) {
-            native = entry.native;
-            return true;
-        }
-    }
     FerrumUpstreamLinearPlanV1 expected{};
-    if (upstream_mmq_plan(&p->request,expected,native) || !ferrum_upstream_same(*p,expected)) {
-        return false;
-    }
-    entries[next] = {*p, native, true};
-    next = (next + 1) % (sizeof(entries) / sizeof(entries[0]));
-    return true;
+    return p && !upstream_mmq_plan(&p->request,expected,native) && ferrum_upstream_same(*p,expected);
 }
 extern "C" int ferrum_upstream_mmq_plan_v1(const FerrumUpstreamLinearRequestV1 * r,
         FerrumUpstreamLinearPlanV1 * out) noexcept {
