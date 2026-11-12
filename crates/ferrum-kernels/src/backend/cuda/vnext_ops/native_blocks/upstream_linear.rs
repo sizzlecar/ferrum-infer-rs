@@ -76,7 +76,7 @@ pub(crate) fn q6_f16_prefill_compiled() -> bool {
                     && artifact
                         .exports
                         .iter()
-                        .any(|name| name == "ferrum_upstream_q6_f16_prefill_plan_v1")
+                    .any(|name| name == ferrum_native_ops::upstream_q6_f16_linear::UPSTREAM_Q6_F16_PREFILL_PLAN_EXPORT)
             })
 }
 

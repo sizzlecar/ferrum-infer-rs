@@ -133,9 +133,13 @@ pub(super) fn profiles(
     };
     // Source qualification is necessary but not sufficient: product
     // composition checks the actual CUDA device and complete native
-    // capabilities before accepting this candidate. Strict F32 stays next.
+    // capabilities before accepting a candidate. The original Q6 F16 and
+    // strict F32 profiles remain available as fallbacks.
     if native {
         if let Some(profile) = &q6_f16 {
+            automatic.insert(0, profile.id.clone());
+        }
+        if let Some(profile) = &q6_prefill {
             automatic.insert(0, profile.id.clone());
         }
     }

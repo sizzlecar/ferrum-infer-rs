@@ -3,8 +3,8 @@
   "operator": "ferrum.cuda.upstream-q6-f32-linear",
   "source_package": {
     "kind": "ferrum-native-upstream-q6-f32-linear",
-    "revision": "q6-f32-d4-mmq-v1+f16-adapter-probe-v1+d81235049384534c167caea52b85a694f6103d14",
-    "sha256": "81279aec2ec43dcff9fde908a5e2c3849c8c28d89240239d2865844da3bbbee1"
+    "revision": "q6-f32-d4-mmq-v1+f16-prefill-j32-v1+d81235049384534c167caea52b85a694f6103d14",
+    "sha256": "e360a146206aa55b2b5b50791aecc33fb663cabfc00212353705e970400ae255"
   },
   "upstream_sources": [
     {
@@ -20,13 +20,13 @@
     },
     {
       "path": "kernels/mmq.cu",
-      "sha256": "1b9814bc72536c3a014f6cda60a221ebcacb0df3627b314385516a2ba3b192b3"
+      "sha256": "23903bb8b2cfa38f741b954676f0624eb2c274579a6a4d351d69f43fb3abc34e"
     }
   ],
   "headers": [
     {
       "path": "kernels/abi.h",
-      "sha256": "191333462d9d6741c2a7a7c6609fbcdf4cab9895a90c71142bbd625d03761c9e"
+      "sha256": "b8b4e6f6585ef5ff880c0754fde49904789ff7afc721ec5a1f685810c3a6c262"
     },
     {
       "path": "kernels/boundary.h",
@@ -34,7 +34,7 @@
     },
     {
       "path": "kernels/f16_adapter.cuh",
-      "sha256": "5cfae151075709a3290926f89d9e6d48fd0790d23a2d25f21a9ef034dcb184e6"
+      "sha256": "fec3a09b167e98a205bf7d0b91db259a61e8493b21155e4800948008171097c1"
     },
     {
       "path": "kernels/marker.cuh",
@@ -147,21 +147,21 @@
       "headers": [
         {
           "path": "kernels/abi.h",
-          "sha256": "191333462d9d6741c2a7a7c6609fbcdf4cab9895a90c71142bbd625d03761c9e"
+          "sha256": "b8b4e6f6585ef5ff880c0754fde49904789ff7afc721ec5a1f685810c3a6c262"
         },
         {
           "path": "kernels/boundary.h",
           "sha256": "ca1ac6266a6ec7b803f509479c50b11f74926c48e9be02b82b9d7b2c382575a7"
         }
       ],
-      "closure_sha256": "c6eefe7136d4f44609886e226418303844782a97f0ab1866336753df4a386ef3"
+      "closure_sha256": "d017866609fe882f41d0abed02cdb6aba01aafd7335eb266ce6295385b3519e9"
     },
     {
       "translation_unit": "kernels/mmq.cu",
       "headers": [
         {
           "path": "kernels/abi.h",
-          "sha256": "191333462d9d6741c2a7a7c6609fbcdf4cab9895a90c71142bbd625d03761c9e"
+          "sha256": "b8b4e6f6585ef5ff880c0754fde49904789ff7afc721ec5a1f685810c3a6c262"
         },
         {
           "path": "kernels/boundary.h",
@@ -169,7 +169,7 @@
         },
         {
           "path": "kernels/f16_adapter.cuh",
-          "sha256": "5cfae151075709a3290926f89d9e6d48fd0790d23a2d25f21a9ef034dcb184e6"
+          "sha256": "fec3a09b167e98a205bf7d0b91db259a61e8493b21155e4800948008171097c1"
         },
         {
           "path": "kernels/marker.cuh",
@@ -276,7 +276,7 @@
           "sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3"
         }
       ],
-      "closure_sha256": "f266ab1a53218402df71e183a28fb4f4a4a29626b305a928d1702b89d0980eb7"
+      "closure_sha256": "6c42a1a60b2e58c0ef4cdc3a4ba4b4b0d32e4ecfc5eb6550b03a93b25a54c0f5"
     }
   ],
   "include_dirs": [

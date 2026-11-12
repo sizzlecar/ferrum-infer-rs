@@ -93,6 +93,14 @@ fn q6_f16_auto_prefers_qualified_source_and_require_preserves_program_structure(
             .candidates(&NumericalExecutionPolicy::Auto, KvStorageFormat::F16)
             .unwrap(),
         [
+            catalog
+                .resolve(
+                    &NumericalProfileId::new(
+                        F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1_NUMERICAL_PROFILE_ID,
+                    )
+                    .unwrap()
+                )
+                .unwrap(),
             new,
             catalog
                 .resolve(&NumericalProfileId::new(F32_MASTER_NUMERICAL_PROFILE_ID).unwrap())
@@ -200,7 +208,7 @@ fn q6_f16_auto_requires_native_source_abi_consumed_head_and_projection_geometry(
             .numerical_profiles(&valid)
             .unwrap()
             .auto_preference()[0],
-        id()
+        NumericalProfileId::new(F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1_NUMERICAL_PROFILE_ID).unwrap()
     );
     let head = valid
         .weights

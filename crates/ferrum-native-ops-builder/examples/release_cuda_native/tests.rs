@@ -64,20 +64,26 @@ fn f32_only_q6_package_cannot_satisfy_the_production_f16_boundary() {
         .iter()
         .map(|export| (*export).to_owned())
         .collect::<Vec<_>>();
-    assert!(require_q6_f16_exports(&f32).is_err());
+    assert!(require_q6_f16_exports(&f32, false).is_err());
     let f16 = ferrum_native_ops::upstream_q6_f16_linear::UPSTREAM_Q6_F16_LINEAR_EXPORTS;
     let complete = f32
         .into_iter()
         .chain(f16.iter().map(|export| (*export).to_owned()))
         .collect::<Vec<_>>();
-    require_q6_f16_exports(&complete).unwrap();
+    require_q6_f16_exports(&complete, false).unwrap();
+    assert!(require_q6_f16_exports(&complete, true).is_err());
+    let mut prefill = complete.clone();
+    prefill.push(
+        ferrum_native_ops::upstream_q6_f16_linear::UPSTREAM_Q6_F16_PREFILL_PLAN_EXPORT.into(),
+    );
+    require_q6_f16_exports(&prefill, true).unwrap();
     for missing in f16 {
         let incomplete = complete
             .iter()
             .filter(|export| *export != missing)
             .cloned()
             .collect::<Vec<_>>();
-        assert!(require_q6_f16_exports(&incomplete)
+        assert!(require_q6_f16_exports(&incomplete, false)
             .unwrap_err()
             .to_string()
             .contains(missing));

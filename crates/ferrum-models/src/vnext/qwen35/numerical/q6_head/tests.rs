@@ -47,6 +47,9 @@ fn q6_head_profile_require_changes_only_head_and_keeps_body_and_kv_exact() {
             .candidates(&NumericalExecutionPolicy::Auto, KvStorageFormat::F16)
             .unwrap(),
         [
+            catalog.resolve(&NumericalProfileId::new(
+                F32_MASTER_Q6_HEAD_Q6_F16_PREFILL_V1_NUMERICAL_PROFILE_ID,
+            ).unwrap()).unwrap(),
             catalog
                 .resolve(&NumericalProfileId::new(
                     F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1_NUMERICAL_PROFILE_ID,

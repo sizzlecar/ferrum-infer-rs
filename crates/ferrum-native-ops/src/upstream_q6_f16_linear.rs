@@ -5,6 +5,7 @@ use std::mem::{align_of, offset_of, size_of};
 pub const UPSTREAM_Q6_F16_LINEAR_OPERATOR: &str =
     crate::upstream_q6_f32_linear::UPSTREAM_Q6_F32_LINEAR_OPERATOR;
 pub const UPSTREAM_Q6_F16_LINEAR_ABI: u32 = 2;
+pub const UPSTREAM_Q6_F16_PREFILL_PLAN_EXPORT: &str = "ferrum_upstream_q6_f16_prefill_plan_v1";
 pub const UPSTREAM_Q6_F16_LINEAR_EXPORTS: &[&str] = &[
     "ferrum_upstream_q6_f16_plan_v1",
     "ferrum_upstream_q6_f16_pack_v1",
