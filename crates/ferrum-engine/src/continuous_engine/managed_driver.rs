@@ -584,7 +584,12 @@ pub(super) async fn wait_for_iteration_wake(
     tokio::select! {
         _ = wait_for_deadline(deadline) => {}
         _ = inner.shutdown_notify.notified() => {}
-        _ = inner.work_notify.notified() => {}
+        _ = inner.work_notify.notified() => {
+            // Let already-runnable submitters publish their work before an
+            // idle driver begins the next synchronous CUDA submission.
+            // This adds no timer or delay to an active decode iteration.
+            tokio::task::yield_now().await;
+        }
         _ = wait_for_prediction_update(prediction_updates) => {}
         result = async {
             match capacity {
