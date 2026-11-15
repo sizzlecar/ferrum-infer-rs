@@ -13,6 +13,13 @@ pub struct TensorRequestSession<R: DeviceRuntime> {
     failed: bool,
 }
 
+/// One independently admitted consumer of a producer's completed output.
+/// The mutable borrow prevents reuse until its producer call has terminated.
+pub struct TensorRequestInitialization<'a, R: DeviceRuntime> {
+    pub request: &'a mut TensorRequestSession<R>,
+    pub mappings: &'a [TensorRequestStateMapping],
+}
+
 impl<R: DeviceRuntime> fmt::Debug for TensorRequestSession<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TensorRequestSession")
@@ -108,20 +115,62 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         mappings: &[TensorRequestStateMapping],
         lane: Option<&Arc<ExecutionLane<R>>>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
-        if destination.failed || destination.session.is_none() {
+        self.execute_initializing_requests_with_lane(
+            run_id,
+            request_id,
+            inputs,
+            &mut [TensorRequestInitialization {
+                request: destination,
+                mappings,
+            }],
+            lane,
+        )
+    }
+
+    pub fn execute_initializing_requests_on_actor(
+        &mut self,
+        actor: &mut TensorSerialActor<R>,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        inputs: Vec<ManagedHostTensor>,
+        destinations: &mut [TensorRequestInitialization<'_, R>],
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        actor.execute(|lane| {
+            self.execute_initializing_requests_with_lane(
+                run_id,
+                request_id,
+                inputs,
+                destinations,
+                Some(lane),
+            )
+        })
+    }
+
+    fn execute_initializing_requests_with_lane(
+        &mut self,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        inputs: Vec<ManagedHostTensor>,
+        destinations: &mut [TensorRequestInitialization<'_, R>],
+        lane: Option<&Arc<ExecutionLane<R>>>,
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        if destinations.is_empty()
+            || destinations
+                .iter()
+                .any(|d| d.request.failed || d.request.session.is_none())
+        {
             return Err(invalid("cannot initialize a failed or closed tensor request").into());
         }
         let work = self.binding.bind_inputs(inputs)?;
-        let result = self.execute_bound(
-            run_id,
-            request_id,
-            work,
-            None,
-            Some((&destination.target, mappings)),
-            lane,
-        );
+        let targets = destinations
+            .iter()
+            .map(|d| (&d.request.target, d.mappings))
+            .collect::<Vec<_>>();
+        let result = self.execute_bound(run_id, request_id, work, None, Some(&targets), lane);
         if result.is_err() {
-            destination.failed = true;
+            for destination in destinations {
+                destination.request.failed = true;
+            }
         }
         result
     }

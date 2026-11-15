@@ -62,11 +62,38 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             AdmissionPressureAction::WaitForRelease,
         )?;
         for pass in 0..=self.config.maximum_backing_maintenance_passes {
-            match batch.try_begin_step(request.clone(), lane)? {
+            let decision = if tracing::enabled!(target: "ferrum_execution::tensor::admission", tracing::Level::DEBUG)
+            {
+                let mut elapsed = [0u64; 6];
+                let result = batch.try_begin_step_profiled(request.clone(), lane, |phase, time| {
+                    use StepResourceAdmissionProfilePhase::*;
+                    let index = match phase {
+                        AuthorityAndPolicyValidate => 0,
+                        DemandEvaluate => 1,
+                        BackingClaim => 2,
+                        LogicalCapacityClaim => 3,
+                        TransactionValidateAndFingerprint => 4,
+                        FrameCaptureAndLease => 5,
+                    };
+                    elapsed[index] = elapsed[index]
+                        .saturating_add(u64::try_from(time.as_micros()).unwrap_or(u64::MAX));
+                });
+                // Emit after the original admission returns, outside its locks.
+                tracing::debug!(target: "ferrum_execution::tensor::admission",
+                    pass, authority_us=elapsed[0], demand_us=elapsed[1],
+                    backing_us=elapsed[2], logical_us=elapsed[3],
+                    transaction_us=elapsed[4], frame_us=elapsed[5],
+                    "tensor step admission host timing");
+                result
+            } else {
+                batch.try_begin_step(request.clone(), lane)
+            }?;
+            match decision {
                 StepResourceAdmissionDecision::Admitted(step) => return Ok(step),
                 StepResourceAdmissionDecision::BackingDeferred(deferred) => {
                     self.check_maintenance_limit(TensorAdmissionStage::Step, pass)?;
-                    deferred.maintain()?;
+                    let outcome = deferred.maintain()?;
+                    tracing::debug!(pass, ?outcome, "tensor step backing maintenance outcome");
                 }
                 StepResourceAdmissionDecision::Deferred(reason) => {
                     return Err(admission(

@@ -9,6 +9,8 @@ pub struct CudaTensorRuntimeOptions {
     pub native_lane_reuse: CudaNativeLaneReuse,
     pub native_allocation_reuse: CudaNativeAllocationReuse,
     /// In-place registration policy fixed before device capacity admission.
+    /// Its single bound is shared by static weights and explicit checked Host
+    /// metadata providers; both retain their original charged allocations.
     pub pinned_weight_upload: Option<CudaPinnedWeightUploadConfig>,
 }
 

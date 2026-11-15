@@ -36,6 +36,21 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
         Self { archive, host }
     }
 
+    /// Consume this temporary adapter while preserving the actual archive
+    /// lifetime. Borrowed payloads still reference the original immutable
+    /// archive; converted payloads own their admitted Host backing.
+    pub fn into_component(
+        self,
+        component: &WeightComponentSpec,
+    ) -> std::result::Result<WeightComponentPayload<'archive>, VNextError> {
+        self.component_inner::<false>(
+            component,
+            DenseArchiveSourceTouch::AsMapped,
+            &mut DenseArchiveMaterializationReport::default(),
+            None,
+        )
+    }
+
     /// Explicit single-installation reuse, bounded by the caller's selected
     /// maximum converted component extent. Allocates and charges the original
     /// Host account once, including alignment padding. This does not validate
@@ -76,13 +91,13 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
         result
     }
 
-    fn composite<'source, const DIAGNOSTICS: bool>(
-        &'source self,
+    fn composite<const DIAGNOSTICS: bool>(
+        &self,
         component: &WeightComponentSpec,
         source_touch: DenseArchiveSourceTouch,
         report: &mut DenseArchiveMaterializationReport,
         reuse: Option<&ReusableBacking>,
-    ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+    ) -> std::result::Result<WeightComponentPayload<'archive>, VNextError> {
         let metadata_started = diagnostics::start::<DIAGNOSTICS>();
         let invalid = |reason: &str| VNextError::InvalidExecutionPlan {
             reason: format!("managed archive component `{}`: {reason}", component.id),
@@ -229,13 +244,13 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
         payload
     }
 
-    fn component_inner<'source, const DIAGNOSTICS: bool>(
-        &'source self,
+    fn component_inner<const DIAGNOSTICS: bool>(
+        &self,
         component: &WeightComponentSpec,
         source_touch: DenseArchiveSourceTouch,
         report: &mut DenseArchiveMaterializationReport,
         reuse: Option<&ReusableBacking>,
-    ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+    ) -> std::result::Result<WeightComponentPayload<'archive>, VNextError> {
         let invalid = |reason: &str| VNextError::InvalidExecutionPlan {
             reason: format!("managed archive component `{}`: {reason}", component.id),
         };
@@ -351,11 +366,11 @@ impl<'archive> ManagedDenseArchiveSource<'archive> {
         payload
     }
 
-    fn borrowed<'source, const DIAGNOSTICS: bool>(
-        &'source self,
+    fn borrowed<const DIAGNOSTICS: bool>(
+        &self,
         component: &WeightComponentSpec,
         report: &mut DenseArchiveMaterializationReport,
-    ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+    ) -> std::result::Result<WeightComponentPayload<'archive>, VNextError> {
         let started = diagnostics::start::<DIAGNOSTICS>();
         let payload = self.archive.component(component);
         diagnostics::finish(started, &mut report.payload_assembly);

@@ -310,7 +310,7 @@ fn no_alias_contract_rejects_output_overlap_with_each_read_operand() {
 }
 
 #[test]
-fn read_only_storage_reuse_requires_the_same_logical_value_and_never_allows_output_alias() {
+fn read_only_storage_reuse_accepts_exact_views_and_never_allows_output_alias() {
     for (contract, has_update, reused_ordinal) in [
         (modulation_scale_bf16_contract().unwrap(), false, 1),
         (gated_residual_bf16_contract().unwrap(), true, 2),
@@ -335,6 +335,19 @@ fn read_only_storage_reuse_requires_the_same_logical_value_and_never_allows_outp
             tensor(&[2, 3], ElementType::Bf16),
             "resource.x",
             0,
+        );
+        // Exact read-only overlaps are locally safe. The execution plan must
+        // separately prove that distinct values belong to a declared alias class.
+        descriptor
+            .validate_resolved_bindings(&different_value)
+            .unwrap();
+        different_value[reused_ordinal] = binding(
+            "value.other",
+            ResolvedValueRole::Input,
+            reused_ordinal as u32,
+            tensor(&[2, 3], ElementType::Bf16),
+            "resource.x",
+            2,
         );
         assert!(descriptor
             .validate_resolved_bindings(&different_value)

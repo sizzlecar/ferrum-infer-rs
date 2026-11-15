@@ -11,6 +11,8 @@ pub const REFERENCE_ROW_SELECTED_MODULATION_BF16_NUMERICAL_PROFILE_ID: &str =
     "reference.row_selected_modulation.bf16.staged_rne.gradual.v1";
 pub const REFERENCE_ROW_SELECTED_ADDCMUL_BF16_NUMERICAL_PROFILE_ID: &str =
     "reference.row_selected_addcmul.bf16.separate_rne.gradual.v1";
+pub const REFERENCE_ROW_SELECTED_ADDCMUL_FMA_BF16_NUMERICAL_PROFILE_ID: &str =
+    "reference.row_selected_addcmul_fma.bf16.fma_rne.gradual.v1";
 pub fn reference_vnext_row_selected_bf16_provider(
     runtime: &ReferenceDeviceRuntime,
     kind: RowSelectedBf16Kind,
@@ -18,6 +20,7 @@ pub fn reference_vnext_row_selected_bf16_provider(
     let contract = match kind {
         RowSelectedBf16Kind::Modulation => row_selected_modulation_bf16_contract(),
         RowSelectedBf16Kind::Addcmul => row_selected_addcmul_bf16_contract(),
+        RowSelectedBf16Kind::AddcmulFma => row_selected_addcmul_fma_bf16_contract(),
     }
     .map_err(error)?;
     let cap = CapabilityId::new(kind.capability_id()).map_err(error)?;
@@ -34,6 +37,10 @@ pub fn reference_vnext_row_selected_bf16_provider(
         RowSelectedBf16Kind::Addcmul => (
             "addcmul",
             REFERENCE_ROW_SELECTED_ADDCMUL_BF16_NUMERICAL_PROFILE_ID,
+        ),
+        RowSelectedBf16Kind::AddcmulFma => (
+            "addcmul_fma",
+            REFERENCE_ROW_SELECTED_ADDCMUL_FMA_BF16_NUMERICAL_PROFILE_ID,
         ),
     };
     let fingerprint = implementation_fingerprint(&[
@@ -147,7 +154,7 @@ impl Provider {
         ReferenceDeviceCommand::row_selected_bf16_tensor(ReferenceRowSelectedBf16Launch {
             input: region(0)?,
             parameters: region(1)?,
-            update: if self.kind == RowSelectedBf16Kind::Addcmul {
+            update: if self.kind.input_count() == 3 {
                 Some(region(2)?)
             } else {
                 None

@@ -104,7 +104,12 @@ impl NativeMask {
     /// Local contiguous segment, used after rebasing Q/K/V to its first row.
     /// The pack kernel cannot address any preceding or following segment.
     pub(super) fn isolated_sequence(rows: u32) -> Result<Self, String> {
-        if rows == 0 || rows > i32::MAX as u32 {
+        Self::isolated_sequences(rows, 1)
+    }
+
+    /// Equal-length independent sequences, each with its own valid-key count.
+    pub(super) fn isolated_sequences(rows: u32, batches: usize) -> Result<Self, String> {
+        if rows == 0 || rows > i32::MAX as u32 || !(1..=MASK_BATCH_TILE).contains(&batches) {
             return Err("isolated attention sequence must fit positive i32".into());
         }
         let mut native = Self {
@@ -116,9 +121,11 @@ impl NativeMask {
             key_valid_masks: [0; 16],
         };
         native.segment_ends[0] = rows;
-        native.key_run_counts[0] = 1;
-        native.key_run_ends[0] = rows;
-        native.key_valid_masks[0] = 1;
+        for batch in 0..batches {
+            native.key_run_counts[batch] = 1;
+            native.key_run_ends[batch * 32] = rows;
+            native.key_valid_masks[batch] = 1;
+        }
         Ok(native)
     }
 

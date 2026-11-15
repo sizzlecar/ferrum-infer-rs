@@ -1,6 +1,6 @@
 //! Locked static native code; two dimension-specific preparations per provider.
 use super::*;
-use crate::backend::cuda::vnext_runtime::CudaTensorFusedF32Retention;
+use crate::backend::cuda::vnext_runtime::{CudaTensorNativeModuleRetention, StaticNativeModule};
 pub(super) use ferrum_native_ops::cutlass_fused_f32_attention::{
     CutlassFusedF32AttentionBindingsV1 as Bindings, CutlassFusedF32AttentionInfoV1 as Info,
     CutlassFusedF32AttentionRequestV1 as Request, CutlassFusedF32AttentionSpanV1 as Span,
@@ -27,12 +27,13 @@ pub(crate) fn source_fingerprint() -> Result<String, String> {
         &identity,
         CUTLASS_FUSED_F32_ATTENTION_NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("native.rs"),
-        include_bytes!("../../../vnext_runtime/tensor_eager/fused_f32_owner.rs"),
+        include_bytes!("../../../vnext_runtime/tensor_eager/native_module_owner.rs"),
+        include_bytes!("../../../vnext_runtime/tensor_eager/native_module_capacity.rs"),
     ]))
 }
 
 pub(super) struct Native {
-    pub(super) owner: Arc<CudaTensorFusedF32Retention>,
+    pub(super) owner: Arc<CudaTensorNativeModuleRetention>,
     pub(super) infos: [Info; 2],
     pub(super) artifact_identity: String,
 }
@@ -50,8 +51,11 @@ impl Native {
         ]);
         // Claim before any CUDART call, including failed preparation. Its static
         // fatbin has no acknowledged unload, so the quota remains process-owned.
-        let owner =
-            runtime.reserve_tensor_fused_f32_module(&identity, config.opaque_memory_bytes)?;
+        let owner = runtime.reserve_tensor_native_module(
+            StaticNativeModule::CutlassFusedF32Attention,
+            &identity,
+            config.opaque_memory_bytes,
+        )?;
         owner
             .context()
             .bind_to_thread()

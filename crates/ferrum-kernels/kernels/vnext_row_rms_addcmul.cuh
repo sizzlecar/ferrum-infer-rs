@@ -24,3 +24,16 @@ extern "C" __global__ void ferrum_vnext_addcmul_bf16(
         output[i]=ferrum_bf16_rne(__fadd_rn(x,__fmul_rn(g,u)));
     }
 }
+
+extern "C" __global__ void ferrum_vnext_addcmul_fma_bf16(
+    const uint16_t* input, const uint16_t* multiplier, const uint16_t* update,
+    uint16_t* output, uint64_t elements, uint64_t width, uint32_t broadcast) {
+    for (uint64_t i=static_cast<uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+         i<elements; i+=static_cast<uint64_t>(gridDim.x)*blockDim.x) {
+        const uint64_t p=broadcast ? i%width : i;
+        const float x=ferrum_bf16_decode(input[i]);
+        const float g=ferrum_bf16_decode(multiplier[p]);
+        const float u=ferrum_bf16_decode(update[i]);
+        output[i]=ferrum_bf16_rne(__fmaf_rn(g,u,x));
+    }
+}

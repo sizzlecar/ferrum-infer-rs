@@ -10,8 +10,10 @@ pub(super) fn upload(
     offset: u64,
 ) -> Result<Option<MetalDeviceCommand>, MetalDeviceRuntimeError> {
     runtime.validate_buffer(destination)?;
-    if source.class() != HostMemoryClass::InputPreprocess
-        || destination.descriptor.usage != BufferUsage::Activations
+    if !matches!(
+        source.class(),
+        HostMemoryClass::InputPreprocess | HostMemoryClass::Output
+    ) || destination.descriptor.usage != BufferUsage::Activations
         || layout.element_type() != destination.descriptor.element_type
     {
         return Err(MetalDeviceRuntimeError::contract(

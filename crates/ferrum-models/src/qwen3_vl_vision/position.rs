@@ -104,6 +104,7 @@ impl Qwen3VLVisionConfig {
             let height = usize::try_from(grid.height())?;
             let width = usize::try_from(grid.width())?;
             for local in 0..usize::try_from(grid.rows()?)? {
+                let local = local % (height * width);
                 let row =
                     local / (merge * merge * (width / merge)) * merge + (local / merge) % merge;
                 let col = (local / (merge * merge)) % (width / merge) * merge + local % merge;

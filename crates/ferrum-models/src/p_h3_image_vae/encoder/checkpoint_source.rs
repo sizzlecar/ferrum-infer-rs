@@ -11,7 +11,7 @@ pub(in crate::p_h3_image_vae) fn component<'s>(
     c: &WeightComponentSpec,
 ) -> Result<WeightComponentPayload<'s>, VNextError> {
     let e = entry(config, c)?;
-    let name = &e.name;
+    let name = &config.external_name(&e.name);
     let t = source.tensor(name).map_err(|e| invalid(e.to_string()))?;
     if t.element_type() != Some(ElementType::F32) || t.shape() != e.original {
         return Err(invalid("original full encoder F32 shape changed"));
@@ -73,7 +73,7 @@ pub(in crate::p_h3_image_vae) fn validate(
 ) -> anyhow::Result<()> {
     PH3ImageVaeEncoderFamily::new(limits)?.check(config)?;
     for e in weights::entries(config)? {
-        let t = source.tensor(&e.name)?;
+        let t = source.tensor(&config.external_name(&e.name))?;
         ensure!(
             t.element_type() == Some(ElementType::F32) && t.shape() == e.original,
             "full encoder source {} requires its original F32 shape",
@@ -99,7 +99,7 @@ fn entry(
     };
     let e = weights::entries(config)?
         .into_iter()
-        .find(|e| &e.name == name)
+        .find(|e| &config.external_name(&e.name) == name)
         .ok_or_else(|| invalid("unknown full encoder source"))?;
     if c.dimensions != e.physical
         || c.encoding

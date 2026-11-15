@@ -125,3 +125,24 @@ fn rejected_extents_leave_outputs_and_state_untouched() {
         assert!(scratch.iter().all(|&byte| byte == 0xcc));
     }
 }
+
+#[test]
+fn single_reference_stream_reseeds_without_consuming_request_audio_draws() {
+    let mut single = [0_u8; 17 * 4];
+    let mut image = [0_u8; 17 * 4];
+    let mut audio = [0_u8; 16 * 4];
+    let mut state = [0_u8; SCRATCH_BYTES];
+    fill_normal_noise(42, &mut single, &mut state).unwrap();
+    fill_initial_noise(42, &mut image, &mut audio, &mut state).unwrap();
+    assert_eq!(single, image);
+    // Reuse of caller-owned scratch never carries state into another reference.
+    fill_normal_noise(42, &mut single, &mut state).unwrap();
+    assert_eq!(single, image);
+    for (bytes, scratch) in [(63, SCRATCH_BYTES), (68, SCRATCH_BYTES - 1)] {
+        let mut output = vec![0xa5; bytes];
+        let mut state = vec![0xcc; scratch];
+        assert!(fill_normal_noise(42, &mut output, &mut state).is_err());
+        assert!(output.iter().all(|&x| x == 0xa5));
+        assert!(state.iter().all(|&x| x == 0xcc));
+    }
+}

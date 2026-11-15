@@ -123,13 +123,13 @@ pub(super) fn build(c: &PH3ImageDiTConfig) -> Result<fragment::Fragment, VNextEr
     })
     .collect::<Result<_, VNextError>>()?;
     Ok(fragment::Fragment {
-        schema: WeightSchema {
+        schema: Some(WeightSchema {
             format_id: WeightFormatId::new("weight-format.safetensors.dense")?,
             layout_id: WeightLayoutId::new("weight-layout.p_h3_image.dit_forward.patch_f32.v1")?,
             version: ContractVersion::new(1, 0),
             components,
             tensors,
-        },
+        }),
         nodes,
         weights,
         specs,

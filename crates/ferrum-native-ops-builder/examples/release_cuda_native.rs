@@ -699,6 +699,12 @@ fn materialize_source(
         CudaNativeBuildUnit::CutlassFp8ScaledMm => {
             return Err("FP8 uses its observed source closure".into())
         }
+        CudaNativeBuildUnit::CutlassNvfp4Matmul => {
+            return Err("NVFP4 uses its observed source closure".into())
+        }
+        CudaNativeBuildUnit::SageVsaFp4CpuLists => {
+            return Err("VSA FP4 uses its observed deployed CUTLASS 4.3 source closure".into())
+        }
         CudaNativeBuildUnit::CutlassFusedF32Attention => {
             return Err("fused F32 attention uses its observed source closure".into())
         }

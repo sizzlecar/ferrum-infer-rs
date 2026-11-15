@@ -27,6 +27,102 @@ fn close_weights(
 }
 
 #[test]
+fn shared_weight_forecast_preserves_exact_execution_capacity_boundary() {
+    use ferrum_execution::{TensorDynamicPreparationOutcome, TensorSerialActor};
+
+    let fixture = Fixture::new("device.component.shared-forecast");
+    let single = fixture.compile_rows(1, &fixture.family);
+    let batch = fixture.compile_rows(2, &fixture.family);
+    let runtime = fixture.composition.runtime().clone();
+    let (mut first, weights) = single
+        .initialize_shared_weights(
+            runtime.clone(),
+            fixture.host.clone(),
+            ComponentWeightSource::Stored(&fixture.source),
+            Fixture::init_config("forecast-single"),
+        )
+        .unwrap();
+    let installed = runtime.snapshot();
+    let cold = batch
+        .minimum_additional_execution_bytes(&runtime, None)
+        .unwrap();
+    let attached = batch
+        .minimum_additional_execution_bytes(&runtime, Some(&weights))
+        .unwrap();
+    assert_eq!(cold - attached, weights.evidence().physical_bytes());
+    // Leave exactly the forecast additional bytes. Counting the live matrix
+    // a second time would reject this otherwise executable attachment.
+    let pressure = fixture
+        .capacity
+        .reserve(
+            DeviceOpaqueMemoryKind::Bootstrap,
+            DEVICE_BYTES - weights.evidence().physical_bytes() - attached,
+        )
+        .unwrap();
+    assert!(fixture.capacity.check_available_bytes(attached).is_err());
+    // Cold B1 admission owns idle dynamic buffers before any model forward.
+    // Retiring that backing must free the forecast space without retiring the
+    // original session, its shared weights, or any continuation.
+    assert!(matches!(
+        first.try_release_idle_dynamic_backing().unwrap(),
+        IdleDynamicReleaseOutcome::Released(_)
+    ));
+    fixture.capacity.check_available_bytes(attached).unwrap();
+    assert!(fixture.capacity.check_available_bytes(cold).is_err());
+    let mut session = batch
+        .initialize_with_shared_weights(
+            runtime.clone(),
+            fixture.host.clone(),
+            &weights,
+            Fixture::init_config("forecast-batch"),
+        )
+        .unwrap();
+    let mut actor = TensorSerialActor::new(runtime.clone()).unwrap();
+    let one_byte = fixture
+        .capacity
+        .reserve(DeviceOpaqueMemoryKind::Bootstrap, 1)
+        .unwrap();
+    assert!(fixture.capacity.check_available_bytes(attached).is_err());
+    let outcome = session
+        .try_prepare_dynamic_backing_on_actor(
+            &mut actor,
+            id("run.shared.forecast.blocked"),
+            id("request.shared.forecast.blocked"),
+            vec![fixture.input(1.)],
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        TensorDynamicPreparationOutcome::Capacity { .. }
+    ));
+    drop(outcome);
+    assert_eq!(runtime.snapshot().uploaded_bytes, installed.uploaded_bytes);
+    assert_eq!(runtime.snapshot().dense_linear_launches, 0);
+    drop(one_byte);
+    let output = session
+        .execute_on_actor(
+            &mut actor,
+            id("run.shared.forecast.exact"),
+            id("request.shared.forecast.exact"),
+            vec![fixture.input(1.)],
+        )
+        .unwrap();
+    assert_eq!(output[0].bytes().bytes(), bytes(&EXPECTED));
+    assert_eq!(
+        runtime.snapshot().uploaded_bytes - installed.uploaded_bytes,
+        INPUT_BYTES as u64
+    );
+    closed(session);
+    closed(first);
+    drop(actor);
+    close_weights(weights);
+    drop(pressure);
+    fixture.assert_device_reusable();
+    drop(output);
+    assert_eq!(fixture.host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
 fn shared_weights_survive_changed_plan_without_reupload_or_second_claim() {
     let fixture = Fixture::new("device.component.shared-shape");
     let full = fixture.compile_rows(2, &fixture.family);
@@ -164,6 +260,9 @@ fn shared_weights_reject_different_runtime_and_weight_contract_before_allocation
     assert!(weights
         .validate_for(compiled.executable().execution_plan(), other.runtime())
         .is_err());
+    assert!(compiled
+        .minimum_additional_execution_bytes(other.runtime(), Some(&weights))
+        .is_err());
     let mut config = fixture.family.canonical_config().clone();
     config["in_channels"] = json!(4);
     let different = TypedFamilyRegistration::new(QwenImage21ImageProjectionFamily::new().unwrap())
@@ -174,6 +273,9 @@ fn shared_weights_reject_different_runtime_and_weight_contract_before_allocation
         .unwrap();
     let different = fixture.compile_rows(1, &different);
     let before = fixture.composition.runtime().snapshot();
+    assert!(different
+        .minimum_additional_execution_bytes(fixture.composition.runtime(), Some(&weights))
+        .is_err());
     assert!(different
         .initialize_with_shared_weights(
             fixture.composition.runtime().clone(),
@@ -216,6 +318,9 @@ fn snapshot_close_retains_live_plan_and_later_last_session_releases_once() {
             compiled.executable().execution_plan(),
             fixture.composition.runtime()
         )
+        .is_err());
+    assert!(compiled
+        .minimum_additional_execution_bytes(fixture.composition.runtime(), Some(&weights))
         .is_err());
     // Closing the cache does not revoke a previously admitted plan's reads.
     let output = execute(&mut session, &fixture, "closing-cache", 1.);

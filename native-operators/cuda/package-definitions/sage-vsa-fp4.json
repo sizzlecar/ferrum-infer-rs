@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.sage_vsa_fp4_cpu_lists",
+  "operator_abi_version": "1",
+  "backend": "cuda",
+  "compute_capabilities": [
+    "sm_120"
+  ],
+  "provider_bindings": [
+    {
+      "operation_id": "operation.sparse_fp4_attention.checked_host.bf16",
+      "provider_id": "provider.cuda.sparse_fp4_attention.checked_host.bf16.sage.sm120",
+      "entrypoints": [
+        "ferrum_sage_vsa_fp4_plan_v1",
+        "ferrum_sage_vsa_fp4_run_v1",
+        "ferrum_sage_vsa_fp4_validate_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.sparse_fp4_attention.region_topk.bf16",
+      "provider_id": "provider.cuda.sparse_fp4_attention.region_topk.bf16.sage.sm120",
+      "entrypoints": [
+        "ferrum_sage_vsa_fp4_region_kernel_plan_v1",
+        "ferrum_sage_vsa_fp4_region_kernel_run_v1",
+        "ferrum_sage_vsa_fp4_region_kernel_validate_v1",
+        "ferrum_sage_vsa_fp4_region_plan_v1",
+        "ferrum_sage_vsa_fp4_region_run_v1",
+        "ferrum_sage_vsa_fp4_region_validate_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.sparse_fp4_qkv_quantize.bf16",
+      "provider_id": "provider.cuda.sparse_fp4_qkv_quantize.bf16.sage.sm120",
+      "entrypoints": [
+        "ferrum_sage_vsa_fp4_quantize_plan_v1",
+        "ferrum_sage_vsa_fp4_quantize_run_v1",
+        "ferrum_sage_vsa_fp4_quantize_validate_v1"
+      ]
+    }
+  ],
+  "required_exports": [
+    "ferrum_sage_vsa_fp4_plan_v1",
+    "ferrum_sage_vsa_fp4_quantize_plan_v1",
+    "ferrum_sage_vsa_fp4_quantize_run_v1",
+    "ferrum_sage_vsa_fp4_quantize_validate_v1",
+    "ferrum_sage_vsa_fp4_region_kernel_plan_v1",
+    "ferrum_sage_vsa_fp4_region_kernel_run_v1",
+    "ferrum_sage_vsa_fp4_region_kernel_validate_v1",
+    "ferrum_sage_vsa_fp4_region_plan_v1",
+    "ferrum_sage_vsa_fp4_region_run_v1",
+    "ferrum_sage_vsa_fp4_region_validate_v1",
+    "ferrum_sage_vsa_fp4_run_v1",
+    "ferrum_sage_vsa_fp4_validate_v1"
+  ],
+  "license_files": [
+    {
+      "source_path": "native-operators/cuda/sage-vsa-fp4/Apache-2.0.txt",
+      "output_path": "licenses/Apache-2.0.txt"
+    },
+    {
+      "source_path": "native-operators/cuda/sage-vsa-fp4/CUTLASS-BSD-3-Clause.txt",
+      "output_path": "licenses/CUTLASS-BSD-3-Clause.txt"
+    },
+    {
+      "source_path": "LICENSE",
+      "output_path": "licenses/Ferrum-MIT.txt"
+    },
+    {
+      "source_path": "native-operators/cuda/sage-vsa-fp4/NOTICE.txt",
+      "output_path": "licenses/NOTICE.txt"
+    }
+  ],
+  "cuda_toolkit": "12.8",
+  "cuda_runtime_min": "12.8",
+  "system_libraries": [
+    "cuda_driver",
+    "cuda_runtime",
+    "std_cxx"
+  ]
+}

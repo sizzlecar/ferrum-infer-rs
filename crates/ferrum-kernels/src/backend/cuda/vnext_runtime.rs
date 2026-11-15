@@ -79,7 +79,10 @@ mod tensor_io;
 mod terminal_readback;
 pub use cudnn::CudaCudnnConfig;
 pub use cudnn::CudnnSdpaPlanPolicy;
-pub(crate) use cudnn::{CudaCudnnOwner, CudnnConv2dDescriptor, CudnnConvScalar, PreparedConv};
+pub(crate) use cudnn::{
+    ConvolutionDimensions, CudaCudnnOwner, CudnnConv2dDescriptor, CudnnConv3dDescriptor,
+    CudnnConvScalar, PreparedConv,
+};
 pub(crate) use cudnn::{
     CudaCudnnSdpaCache, CudnnSdpaBindings, CudnnSdpaExecution, CudnnSdpaPlan, CudnnSdpaSignature,
 };
@@ -95,13 +98,12 @@ pub(crate) use tensor_eager::{CudaCausalProviderRetention, TensorLaneRetention};
 pub use tensor_eager::{
     CudaDenseCausalProfile, CudaDenseF16CausalProfile, CudaMemoryUtilization,
     CudaTensorAndCausalRuntimeAutoConfig, CudaTensorAndCausalRuntimeConfig,
-    CudaTensorExecutionProfile, CudaTensorMemoryObservation, CudaTensorRuntimeAutoConfig,
-    CudaTensorRuntimeConfig, CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
+    CudaTensorCachePreparation, CudaTensorExecutionProfile, CudaTensorMemoryObservation,
+    CudaTensorRuntimeAutoConfig, CudaTensorRuntimeConfig, CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
     CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION,
 };
 pub(crate) use tensor_eager::{
-    CudaTensorConvRotFusedRetention, CudaTensorCutlassRetention, CudaTensorFusedF32Retention,
-    CudaTensorProviderRetention,
+    CudaTensorNativeModuleRetention, CudaTensorProviderRetention, StaticNativeModule,
 };
 use tensor_io::validate_tensor_command;
 
@@ -232,6 +234,7 @@ enum CudaRuntimePurpose {
 pub enum CudaDeviceRuntimeError {
     Contract(String),
     Capacity(VNextError),
+    Allocation(DriverError),
     Driver {
         operation: &'static str,
         source: DriverError,
@@ -261,8 +264,19 @@ impl CudaDeviceRuntimeError {
     fn driver_code(&self) -> Option<cudarc::driver::sys::CUresult> {
         match self {
             Self::Contract(_) | Self::Capacity(_) => None,
-            Self::Driver { source, .. } => Some(source.0),
+            Self::Allocation(source) | Self::Driver { source, .. } => Some(source.0),
             Self::Blas { .. } => None,
+        }
+    }
+
+    fn allocation_failure_kind(&self) -> ferrum_runtime::DeviceAllocationFailureKind {
+        match self {
+            Self::Allocation(error)
+                if error.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY =>
+            {
+                ferrum_runtime::DeviceAllocationFailureKind::Capacity
+            }
+            _ => ferrum_runtime::DeviceAllocationFailureKind::Unrecoverable,
         }
     }
 }
@@ -272,6 +286,7 @@ impl fmt::Display for CudaDeviceRuntimeError {
         match self {
             Self::Contract(message) => formatter.write_str(message),
             Self::Capacity(error) => write!(formatter, "{error}"),
+            Self::Allocation(source) => write!(formatter, "CUDA allocation failed: {source:?}"),
             Self::Driver { operation, source } => {
                 write!(formatter, "CUDA {operation} failed: {source:?}")
             }
@@ -287,7 +302,7 @@ impl Error for CudaDeviceRuntimeError {
         match self {
             Self::Contract(_) => None,
             Self::Capacity(error) => Some(error),
-            Self::Driver { .. } => None,
+            Self::Allocation(_) | Self::Driver { .. } => None,
             Self::Blas { source, .. } => Some(source),
         }
     }
@@ -3428,7 +3443,10 @@ pub struct CudaDeviceRuntime {
     program_binding_upload_counters: Arc<ProgramBindingUploadCounters>,
     binding_scatter: Option<binding_scatter::BindingScatter>,
     input_upload_scatter: binding_scatter::BindingScatter,
-    pinned_weight_upload: Option<(pinned_host::CudaPinnedHostRegistry, usize)>,
+    pinned_weight_upload: Option<(
+        pinned_host::CudaPinnedHostRegistry,
+        CudaPinnedWeightUploadConfig,
+    )>,
     segment_binding_oracle: ferrum_runtime::SegmentBindingOracleMode,
     segment_binding_oracle_audited_nodes: AtomicU64,
     segment_binding_owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
@@ -4992,7 +5010,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 error = ?error,
                 "CUDA allocation failed; native memory snapshot (not a reservation)"
             );
-            CudaDeviceRuntimeError::driver("allocation", error)
+            error
         })?;
         let native_allocation_path_us = native_allocation_started.map_or(0, |started| {
             u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
@@ -5061,6 +5079,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 _tensor_owner: self.tensor_eager.clone(),
             }),
         })
+    }
+
+    fn allocation_failure_kind(
+        &self,
+        error: &Self::Error,
+    ) -> ferrum_runtime::DeviceAllocationFailureKind {
+        error.allocation_failure_kind()
     }
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {
@@ -5786,8 +5811,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
             region,
         )?;
         if destination.descriptor.usage == ferrum_runtime::BufferUsage::Weights {
-            if let Some((registry, maximum_allocation_bytes)) = &self.pinned_weight_upload {
-                if source.backing_bytes() <= *maximum_allocation_bytes {
+            if let Some((registry, policy)) = &self.pinned_weight_upload {
+                if policy.registers_weight_backing(source.backing_bytes()) {
                     registry.register(&source)?;
                 }
             }

@@ -2576,6 +2576,16 @@ pub struct DeviceErrorReport {
     failure: FailureEnvelope,
 }
 
+/// Classification of a failed `DeviceRuntime::allocate` call only. Capacity
+/// proves that this call created no live buffer and submitted no inference
+/// work. A generic retryable error or a failure during synchronization is not
+/// sufficient evidence; backends must opt in using their native error type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceAllocationFailureKind {
+    Capacity,
+    Unrecoverable,
+}
+
 impl DeviceErrorReport {
     pub fn new(
         code: impl Into<String>,
@@ -3213,7 +3223,7 @@ pub struct EncodedDeviceOperation<C> {
     retained_plan_dependencies: Vec<EncodedRetainedPlanDependency<C>>,
     program_bindings: Vec<C>,
     dynamic_bindings: Vec<C>,
-    compute: C,
+    compute: Option<C>,
     result_bindings: Vec<C>,
 }
 
@@ -3239,9 +3249,67 @@ impl<C> EncodedDeviceOperation<C> {
             retained_plan_dependencies: Vec::new(),
             program_bindings: Vec::new(),
             dynamic_bindings: Vec::new(),
-            compute: command,
+            compute: Some(command),
             result_bindings: Vec::new(),
         }
+    }
+
+    /// A proven read-only storage view has no device work. It remains a plan
+    /// node for dependency/lifetime analysis; submission does not invent a
+    /// kernel or transfer for this metadata operation.
+    pub fn read_only_view(bindings: &[crate::ResolvedValueBinding]) -> Result<Self, VNextError> {
+        let operation = Self {
+            retained_plan_dependencies: Vec::new(),
+            program_bindings: Vec::new(),
+            dynamic_bindings: Vec::new(),
+            compute: None,
+            result_bindings: Vec::new(),
+        };
+        operation.validate_compute_bindings(bindings, true)?;
+        Ok(operation)
+    }
+
+    pub const fn compute_command_count(&self) -> usize {
+        self.compute.is_some() as usize
+    }
+
+    pub(crate) fn validate_compute_bindings(
+        &self,
+        bindings: &[crate::ResolvedValueBinding],
+        fixed_tensor: bool,
+    ) -> Result<(), VNextError> {
+        if self.compute.is_some() {
+            return Ok(());
+        }
+        let outputs = bindings
+            .iter()
+            .filter(|b| b.role() == crate::ResolvedValueRole::Output);
+        if !fixed_tensor
+            || !self.retained_plan_dependencies.is_empty()
+            || !self.program_bindings.is_empty()
+            || !self.dynamic_bindings.is_empty()
+            || !self.result_bindings.is_empty()
+            || bindings
+                .iter()
+                .any(|b| b.access() != crate::TensorAccess::Read)
+            || outputs.clone().count() == 0
+            || outputs.into_iter().any(|output| {
+                let crate::AliasPolicy::ReadOnlyView { tensor_index } = output.alias() else {
+                    return true;
+                };
+                !bindings.iter().any(|input| {
+                    input.role() == crate::ResolvedValueRole::Input
+                        && input.ordinal() == *tensor_index
+                        && input.storage() == output.storage()
+                })
+            })
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "command-free encoding requires only fixed read-only exact storage views"
+                    .into(),
+            });
+        }
+        Ok(())
     }
 
     /// Adds a binding that may execute in the wave-level program prelude.
@@ -3276,7 +3344,7 @@ impl<C> EncodedDeviceOperation<C> {
         self.result_bindings.len()
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<C>, Vec<C>, C, Vec<C>) {
+    pub(crate) fn into_parts(self) -> (Vec<C>, Vec<C>, Option<C>, Vec<C>) {
         assert!(
             self.retained_plan_dependencies.is_empty(),
             "retained dependency channel was not consumed by core"
@@ -3619,7 +3687,7 @@ impl<C> DeviceCommandBatch<C> {
         &mut self,
         node_index: u32,
         dynamic_bindings: Vec<C>,
-        compute: C,
+        compute: Option<C>,
         result_bindings: Vec<C>,
     ) {
         for command in dynamic_bindings {
@@ -3630,12 +3698,14 @@ impl<C> DeviceCommandBatch<C> {
                 command,
             });
         }
-        self.commands.push(DeviceCommandEntry {
-            phase: DeviceCommandPhase::Compute,
-            node_index: Some(node_index),
-            logical_work: None,
-            command: compute,
-        });
+        if let Some(command) = compute {
+            self.commands.push(DeviceCommandEntry {
+                phase: DeviceCommandPhase::Compute,
+                node_index: Some(node_index),
+                logical_work: None,
+                command,
+            });
+        }
         for command in result_bindings {
             self.commands.push(DeviceCommandEntry {
                 phase: DeviceCommandPhase::ResultBinding,
@@ -3974,6 +4044,10 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     /// the live transaction context, so raw device allocation cannot bypass
     /// admission or outlive the transaction action that authorized it.
     fn allocate(&self, permit: DeviceAllocationPermit<'_>) -> Result<Self::Buffer, Self::Error>;
+
+    fn allocation_failure_kind(&self, _error: &Self::Error) -> DeviceAllocationFailureKind {
+        DeviceAllocationFailureKind::Unrecoverable
+    }
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor;
 

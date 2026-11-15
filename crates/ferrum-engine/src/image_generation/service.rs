@@ -10,81 +10,29 @@ use super::{ImageEditRequest, ImageGenerationOutput, ImageGenerationRequest, Qwe
 use ferrum_models::qwen_image21::image_input::{
     png_dimensions_hint, ImageInputLimits, QwenImage21ImageProcessor,
 };
-use ferrum_runtime::{
-    DeviceRuntime, HostMemoryAccount, HostMemoryClass, HostMemoryReservation, ManagedHostBytes,
-};
+#[cfg(test)]
+use ferrum_runtime::HostMemoryReservation;
+use ferrum_runtime::{DeviceRuntime, HostMemoryAccount, HostMemoryClass, ManagedHostBytes};
 use ferrum_types::image_trace::ImageRequestCorrelation;
 use ferrum_types::ImageBatchPolicy;
 use serde::Serialize;
 use std::{
     any::Any,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+#[cfg(test)]
+use std::{
     collections::VecDeque,
     error::Error,
     fmt,
-    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex, MutexGuard,
+        Condvar, Mutex,
     },
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
-
-type GeneratorError = Box<dyn Error + Send + 'static>;
-
-/// A batch rejection has no pending device work or recovery owners and leaves
-/// its generator usable. It carries only a diagnostic, not an arbitrary error
-/// whose cleanup obligations could be lost. All other errors are fatal and
-/// retain their original owner until explicit service retirement.
-#[derive(Debug)]
-pub enum ImageBatchError {
-    /// Only preparation may return this variant. No device work was submitted.
-    Capacity {
-        proof: super::ImageDeviceCapacityExceeded,
-        diagnostic: String,
-    },
-    /// Explicit Host admission pressure; distinct from device capacity search.
-    Overloaded(String),
-    /// Completion only: decoder admission did not submit work and every
-    /// allocation rollback/release was acknowledged. A live survivor may
-    /// release a required native pin by advancing; there is no external native
-    /// capacity subscription and an idle worker must reject this finitely.
-    AwaitDenoisingProgress {
-        stage: super::ImageStage,
-        diagnostic: String,
-    },
-    /// Initialization admission only, before any native work/recovery owner.
-    /// Live denoising members may release capacity; idle workers reject this
-    /// finitely because this protocol has no external native-release wake.
-    InitializationAwaitDenoisingProgress {
-        diagnostic: String,
-    },
-    /// Typed request input rejection, with no native work/recovery obligation.
-    InvalidInput(String),
-    Rejected(String),
-    Fatal(GeneratorError),
-}
-impl From<GeneratorError> for ImageBatchError {
-    fn from(error: GeneratorError) -> Self {
-        Self::Fatal(error)
-    }
-}
-impl fmt::Display for ImageBatchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Capacity { diagnostic, .. }
-            | Self::Overloaded(diagnostic)
-            | Self::AwaitDenoisingProgress { diagnostic, .. }
-            | Self::InitializationAwaitDenoisingProgress { diagnostic } => f.write_str(diagnostic),
-            Self::InvalidInput(message) => f.write_str(message),
-            Self::Rejected(message) => f.write_str(message),
-            Self::Fatal(error) => fmt::Display::fmt(error, f),
-        }
-    }
-}
-impl Error for ImageBatchError {}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ImageServiceConfig {
@@ -96,45 +44,63 @@ pub struct ImageServiceConfig {
     pub request_batch_max_wait_ms: u64,
 }
 
-/// A single-use, generator-owned preparation. The default empty owner keeps
-/// existing generators usable; capacity-aware generators retain compiled plans.
-#[derive(Default)]
-pub struct ImageBatchPreparation(
-    Option<Box<dyn Any + Send>>,
-    Option<batch_efficiency::ExecutionContext>,
-    Option<super::ImageDeviceCapacityReport>,
-);
-impl ImageBatchPreparation {
-    pub fn new<T: Any + Send>(prepared: T) -> Self {
-        Self(Some(Box::new(prepared)), None, None)
+use crate::iterative_service::{service_error, GeneratorError};
+pub use crate::iterative_service::{
+    BatchError as ImageBatchError, BatchPreparation as ImageBatchPreparation,
+    PreparationResources as ImagePreparationResources, ServiceError as ImageServiceError,
+    ServiceErrorKind as ImageServiceErrorKind, ServiceSnapshot as ImageServiceSnapshot,
+    WorkerFailure as ImageWorkerFailure,
+};
+type Queued<O> = crate::iterative_service::Queued<QueuedRequest, O>;
+#[cfg(test)]
+type State<O> = crate::iterative_service::State<QueuedRequest, O>;
+#[cfg(test)]
+type Shared<O> = crate::iterative_service::Shared<QueuedRequest, O>;
+type Job<O> = crate::iterative_service::Job<QueuedRequest, O>;
+type ServiceCore<O> = crate::iterative_service::ServiceCore<QueuedRequest, O>;
+type Retirement<O> = crate::iterative_service::Retirement<QueuedRequest, O>;
+impl From<ImageServiceConfig> for crate::iterative_service::ServiceConfig {
+    fn from(c: ImageServiceConfig) -> Self {
+        Self {
+            batching: c.batching,
+            maximum_pending: c.maximum_pending,
+            maximum_pending_bytes: c.maximum_pending_bytes,
+            max_num_seqs: c.max_num_seqs,
+            request_batch_max_wait_ms: c.request_batch_max_wait_ms,
+        }
     }
-    /// Borrow the original typed preparation for nonblocking admission. A
-    /// foreign or already consumed owner is rejected without replacing it.
-    pub fn get_mut<T: Any + Send>(&mut self) -> Result<&mut T, ImageBatchError> {
-        self.0
-            .as_mut()
-            .and_then(|owner| owner.downcast_mut::<T>())
-            .ok_or_else(|| {
-                ImageBatchError::Rejected("image preparation belongs to another generator".into())
-            })
+}
+impl From<ImageGenerationRequest> for QueuedRequest {
+    fn from(request: ImageGenerationRequest) -> Self {
+        Self::Generate(request)
     }
-    /// Optional compiled demand for keeping the workload's weights resident.
-    /// Exceeding this advisory boundary does not make staged execution unsafe.
-    pub fn with_resident_capacity(mut self, report: super::ImageDeviceCapacityReport) -> Self {
-        self.2 = Some(report);
-        self
+}
+impl crate::iterative_service::ServiceRequest for QueuedRequest {
+    fn record_admission(&self, timing: crate::iterative_service::AdmissionTiming) {
+        let request = self.generation();
+        tracing::debug!(target: "ferrum_engine::image_generation::timing",
+            batch_index = timing.batch_index, batch_size = timing.batch_size,
+            seed = request.seed, width = request.width, height = request.height,
+            request_kind = self.kind(), queue_wait_us = timing.queue_wait_us,
+            queue_and_prepare_us = timing.queue_and_prepare_us,
+            preparation_us = timing.preparation_us, "image request admitted to execution");
     }
-    pub fn into_inner<T: Any + Send>(self) -> Result<T, ImageBatchError> {
-        self.0
-            .and_then(|owner| owner.downcast::<T>().ok())
-            .map(|owner| *owner)
-            .ok_or_else(|| {
-                ImageBatchError::Rejected("image preparation belongs to another generator".into())
-            })
+
+    fn pending_bytes(&self) -> usize {
+        self.pending_bytes()
+            .saturating_sub(ImageService::minimum_pending_request_bytes())
+    }
+    fn admission_bytes(&self) -> usize {
+        self.generation().prompt.capacity()
+    }
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Generate(_) => "generate",
+            Self::Edit(..) => "edit",
+        }
     }
 }
 
-/// Preprocessed reference backing survives candidate reduction and requeueing.
 #[derive(Default)]
 pub struct ImageEditPreparation(Option<Box<dyn Any + Send>>, usize);
 impl ImageEditPreparation {
@@ -159,19 +125,12 @@ pub struct ImageGeneratorCapabilities {
     pub dimension_multiple: u32,
 }
 
-/// Immutable startup adapter domain. The effective identity includes adapter
-/// content, target routing and composition semantics; strength stays explicit.
-/// This describes the provider, not a request-level adapter selection API.
+/// Immutable image adapter descriptor. The generic worker receives only its
+/// opaque domain fingerprint; strength and image composition stay here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ImageAdapterBatchIdentity {
     pub effective_identity: String,
     pub strength_bits: u32,
-}
-
-/// Already-held protocol-independent resources that overlap engine execution.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ImagePreparationResources {
-    pub output_credit_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -365,6 +324,12 @@ pub trait ImageGenerator: Send + 'static {
     fn shutdown(&mut self) -> Result<(), GeneratorError> {
         Ok(())
     }
+    /// Receipts from the same native close, for finite entrypoints that publish
+    /// them. Legacy generators keep their original shutdown hook.
+    fn shutdown_receipts(&mut self) -> Result<Vec<super::ImageStageReceipt>, GeneratorError> {
+        self.shutdown()?;
+        Ok(Vec::new())
+    }
 }
 
 impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
@@ -487,6 +452,9 @@ impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
         QwenImage21Pipeline::shutdown(self)
             .map(|_| ())
             .map_err(|error| Box::new(error) as GeneratorError)
+    }
+    fn shutdown_receipts(&mut self) -> Result<Vec<super::ImageStageReceipt>, GeneratorError> {
+        QwenImage21Pipeline::shutdown(self).map_err(|error| Box::new(error) as GeneratorError)
     }
     fn host_account(&self) -> &HostMemoryAccount {
         self.host_account()
@@ -615,64 +583,6 @@ fn qwen_batch_error<R: DeviceRuntime>(
     ImageBatchError::Fatal(Box::new(error))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImageServiceErrorKind {
-    InvalidRequest,
-    QueueFull,
-    Stopped,
-    Cancelled,
-    Generation,
-    WorkerPanic,
-    Shutdown,
-}
-
-#[derive(Debug, Clone)]
-pub struct ImageServiceError {
-    kind: ImageServiceErrorKind,
-    message: String,
-    correlation: Option<ImageRequestCorrelation>,
-}
-impl ImageServiceError {
-    pub fn kind(&self) -> ImageServiceErrorKind {
-        self.kind
-    }
-    pub fn correlation(&self) -> Option<ImageRequestCorrelation> {
-        self.correlation
-    }
-}
-impl fmt::Display for ImageServiceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-impl Error for ImageServiceError {}
-fn service_error(kind: ImageServiceErrorKind, message: impl Into<String>) -> ImageServiceError {
-    ImageServiceError {
-        kind,
-        message: message.into(),
-        correlation: None,
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct ImageServiceSnapshot {
-    pub accepting: bool,
-    pub active_requests: usize,
-    pub pending_requests: usize,
-    pub preparing_requests: usize,
-    pub pending_bytes: usize,
-    pub maximum_pending_bytes: usize,
-    pub rejected_requests: u64,
-    pub executed_batches: u64,
-    pub executed_requests: u64,
-    pub last_batch_size: usize,
-    pub capacity_reductions: u64,
-    pub batching: ImageBatchPolicy,
-    pub maximum_pending: usize,
-    pub max_num_seqs: usize,
-}
-
 /// Only this owner constructs the worker; callers can share it through `Arc`.
 /// Call `shutdown` explicitly and retain its result for error recovery. Dropping
 /// a still-live service joins synchronously; it never detaches active GPU work.
@@ -684,6 +594,9 @@ pub struct ImageService {
     maximum_reference_images: usize,
     maximum_edit_batch_size: usize,
     retained_output_bytes: u64,
+    maximum_prompt_bytes: usize,
+    continuous_trace: Option<ImageContinuousTraceHandle>,
+    adapter: Option<ImageAdapterBatchIdentity>,
 }
 
 impl ImageService {
@@ -698,12 +611,35 @@ impl ImageService {
         generator: P,
         config: ImageServiceConfig,
     ) -> Result<Self, ImageServiceError> {
+        let worker = GeneratorAdapter(Box::new(generator));
+        let service = Self::prepare(&worker, config)?;
+        service.core.start_worker(Box::new(worker))?;
+        Ok(service)
+    }
+
+    /// Shared image ingress and worker metadata, before choosing threaded
+    /// serving or a finite inline drain of the same lifecycle.
+    fn prepare(
+        worker: &GeneratorAdapter,
+        config: ImageServiceConfig,
+    ) -> Result<Self, ImageServiceError> {
+        let generator = &worker.0;
         let capabilities = generator.capabilities().map_err(|error| {
             service_error(ImageServiceErrorKind::InvalidRequest, error.to_string())
         })?;
+        Self::prepare_with_capabilities(worker, config, capabilities)
+    }
+    fn prepare_with_capabilities(
+        worker: &GeneratorAdapter,
+        config: ImageServiceConfig,
+        capabilities: ImageGeneratorCapabilities,
+    ) -> Result<Self, ImageServiceError> {
+        let generator = &worker.0;
         validate_config(config, capabilities)?;
         let host = generator.host_account().clone();
         let retained_output_bytes = generator.retained_output_bytes();
+        let continuous_trace = generator.continuous_trace_handle();
+        let adapter = generator.adapter_batch_identity();
         let supports_edits = generator.supports_edits();
         let maximum_reference_images = generator.maximum_reference_images();
         if supports_edits && maximum_reference_images == 0 {
@@ -720,11 +656,7 @@ impl ImageService {
             ));
         }
         Ok(Self {
-            core: ServiceCore::start_with_host(
-                Box::new(GeneratorAdapter(Box::new(generator))),
-                config,
-                Some(host.clone()),
-            )?,
+            core: ServiceCore::unstarted(worker, config, Some(host.clone())),
             host,
             capabilities,
             supports_edits,
@@ -739,6 +671,9 @@ impl ImageService {
                 0
             },
             retained_output_bytes,
+            maximum_prompt_bytes: config.maximum_prompt_bytes,
+            continuous_trace,
+            adapter,
         })
     }
 
@@ -746,7 +681,7 @@ impl ImageService {
         &self.host
     }
     pub fn continuous_trace_handle(&self) -> Option<ImageContinuousTraceHandle> {
-        self.core.shared.trace.clone()
+        self.continuous_trace.clone()
     }
     /// Original generator-owned Output backing that response admission must
     /// retain when proving that releasing ordinary caller outputs can help.
@@ -754,7 +689,7 @@ impl ImageService {
         self.retained_output_bytes
     }
     pub fn adapter_batch_identity(&self) -> Option<&ImageAdapterBatchIdentity> {
-        self.core.shared.adapter.as_deref()
+        self.adapter.as_ref()
     }
     pub fn capabilities(&self) -> ImageGeneratorCapabilities {
         self.capabilities
@@ -783,7 +718,7 @@ impl ImageService {
     ) -> Result<(), ImageServiceError> {
         let caps = self.capabilities;
         if request.n != 1
-            || request.prompt.len() > self.core.shared.config.maximum_prompt_bytes
+            || request.prompt.len() > self.maximum_prompt_bytes
             || request.width == 0
             || request.height == 0
             || request.width > caps.maximum_width
@@ -942,6 +877,11 @@ impl ImageJob {
     pub fn correlation(&self) -> ImageRequestCorrelation {
         self.inner.correlation
     }
+    /// Keep cancellation authority while another task owns `wait`.
+    /// Dropping this handle does not cancel the image job.
+    pub fn cancellation_handle(&self) -> crate::iterative_service::JobCancellationHandle {
+        self.inner.cancellation_handle()
+    }
     /// Step-capable generators withdraw at a completed denoising boundary.
     /// Whole-batch generators preserve delivery-only cancellation.
     pub fn cancel(&self) {
@@ -972,42 +912,15 @@ impl ImageJob {
 
 /// Original error or unwind payload, not a string replacement. `Generation`
 /// supports downcasting to `ImageGenerationError<R>` for typed retirement.
-pub enum ImageWorkerFailure {
-    Generation(GeneratorError),
-    Panic(Box<dyn Any + Send + 'static>),
-    Concurrent {
-        execution: Box<ImageWorkerFailure>,
-        preparation: Box<ImageWorkerFailure>,
-    },
-}
-impl fmt::Debug for ImageWorkerFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Generation(error) => f.debug_tuple("Generation").field(error).finish(),
-            Self::Concurrent {
-                execution,
-                preparation,
-            } => f
-                .debug_struct("Concurrent")
-                .field("execution", execution)
-                .field("preparation", preparation)
-                .finish(),
-            Self::Panic(_) => f.write_str("Panic(original payload retained)"),
-        }
-    }
-}
-
-impl fmt::Display for ImageWorkerFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
-    }
-}
-impl std::error::Error for ImageWorkerFailure {}
-
 /// Keep this opaque generator owner alive while recovering the original error.
 /// It contains the original runtime, provider registry, assets and Host parent.
 pub struct ImageGeneratorOwner {
-    _worker: Box<dyn BatchWorker<Output = ImageGenerationOutput>>,
+    _worker: Box<
+        dyn crate::iterative_service::BatchWorker<
+            Request = QueuedRequest,
+            Output = ImageGenerationOutput,
+        >,
+    >,
 }
 
 #[must_use = "retain the joined failure owner, or explicitly take it for typed recovery"]
@@ -1015,6 +928,15 @@ pub struct ImageServiceShutdown {
     inner: Retirement<ImageGenerationOutput>,
 }
 impl ImageServiceShutdown {
+    /// Real adapter receipts from normal shutdown, absent when that hook did
+    /// not complete. This metadata does not release a failed native owner.
+    pub fn stage_receipts(&self) -> Option<&[super::ImageStageReceipt]> {
+        self.inner
+            .evidence
+            .as_ref()?
+            .downcast_ref::<Vec<super::ImageStageReceipt>>()
+            .map(Vec::as_slice)
+    }
     pub fn failure(&self) -> Option<&ImageWorkerFailure> {
         self.inner.failure.as_ref()
     }
@@ -1074,9 +996,9 @@ fn validate_config(
     Ok(())
 }
 
-// Generic only inside this module so scheduler tests can use small scalar
-// outputs; production fixes the output to the managed image artifact above.
-trait BatchWorker: Send + 'static {
+// Legacy image adapter surface. Production and existing semantic fixtures
+// are bridged to the single generic worker in iterative_adapter.
+pub(crate) trait BatchWorker: Send + 'static {
     fn continuous_trace_handle(&self) -> Option<ImageContinuousTraceHandle> {
         None
     }
@@ -1186,6 +1108,10 @@ trait BatchWorker: Send + 'static {
     }
     fn shutdown(&mut self) -> Result<(), GeneratorError> {
         Ok(())
+    }
+    fn shutdown_evidence(&mut self) -> Result<Option<Box<dyn Any + Send>>, GeneratorError> {
+        self.shutdown()?;
+        Ok(None)
     }
 }
 struct GeneratorAdapter(Box<dyn ImageGenerator>);
@@ -1360,6 +1286,11 @@ impl BatchWorker for GeneratorAdapter {
     fn shutdown(&mut self) -> Result<(), GeneratorError> {
         self.0.shutdown()
     }
+    fn shutdown_evidence(&mut self) -> Result<Option<Box<dyn Any + Send>>, GeneratorError> {
+        self.0
+            .shutdown_receipts()
+            .map(|receipts| Some(Box::new(receipts) as Box<dyn Any + Send>))
+    }
     fn compatible(&self, a: &ImageGenerationRequest, b: &ImageGenerationRequest) -> bool {
         self.0.compatible(a, b)
     }
@@ -1434,6 +1365,7 @@ fn trace_request_timing(
             let outcome = match error {
                 ImageBatchError::Capacity { .. } => "capacity",
                 ImageBatchError::Overloaded(_) => "overloaded",
+                ImageBatchError::AwaitHostCapacity { .. } => "host_capacity_wait",
                 ImageBatchError::AwaitDenoisingProgress { .. } => "native_completion_capacity",
                 ImageBatchError::InitializationAwaitDenoisingProgress { .. } => {
                     "native_initialization_capacity"
@@ -1454,7 +1386,7 @@ fn trace_request_timing(
     }
 }
 
-enum QueuedRequest {
+pub(crate) enum QueuedRequest {
     Generate(ImageGenerationRequest),
     Edit(ImageEditRequest, Option<ImageEditPreparation>),
 }
@@ -1489,457 +1421,26 @@ impl QueuedRequest {
     }
 }
 
-struct Queued<O> {
-    trace: trace::RequestTrace,
-    request: QueuedRequest,
-    adapter: Option<Arc<ImageAdapterBatchIdentity>>,
-    submitted: Instant,
-    cancelled: Arc<AtomicBool>,
-    response: oneshot::Sender<Result<O, ImageServiceError>>,
-    output: Option<QueuedOutput>,
-    _prompt_reservation: Option<HostMemoryReservation>,
-    preprocessing_bytes: usize,
-    preparation_duration: Duration,
-    /// A reduced FIFO tail must finish before newer arrivals enlarge its batch.
-    preparation_group: Option<Arc<()>>,
-}
-impl<O> Queued<O> {
-    fn pending_bytes(&self) -> usize {
-        self.request
-            .pending_bytes()
-            .saturating_add(self.preprocessing_bytes)
-    }
-}
-struct State<O> {
-    queue: VecDeque<Queued<O>>,
-    // Field order frees the deque before refunding its backing reservation.
-    queue_backing: Option<HostMemoryReservation>,
-    accepting: bool,
-    closing: bool,
-    active: usize,
-    preparing: usize,
-    preparing_bytes: usize,
-    rejected: u64,
-    executed_batches: u64,
-    executed_requests: u64,
-    last_batch_size: usize,
-    capacity_reductions: u64,
-}
-impl<O> State<O> {
-    fn reserve_queue_slot(
-        &mut self,
-        host: Option<&HostMemoryAccount>,
-        maximum_pending: usize,
-    ) -> Result<(), ImageServiceError> {
-        let full = || {
-            service_error(
-                ImageServiceErrorKind::QueueFull,
-                "cannot grow the image request queue within its Host budget",
-            )
-        };
-        // A prepared candidate can return its tail while newer jobs arrive.
-        // Its slots remain available, so requeue never allocates implicitly.
-        let required = self
-            .queue
-            .len()
-            .checked_add(self.preparing)
-            .and_then(|slots| slots.checked_add(1))
-            .ok_or_else(full)?;
-        if required <= self.queue.capacity() {
-            return Ok(());
-        }
-        let mut capacity = self
-            .queue
-            .capacity()
-            .saturating_mul(2)
-            .max(required)
-            .min(maximum_pending);
-        // Reserve the complete replacement while the old allocation remains
-        // charged. This covers allocation/copy peak, not just the net growth.
-        let reserve = |capacity: usize| {
-            let bytes = capacity
-                .checked_mul(std::mem::size_of::<Queued<O>>())
-                .filter(|bytes| *bytes <= isize::MAX as usize)
-                .ok_or_else(full)?;
-            host.map(|host| host.reserve(HostMemoryClass::InputPreprocess, bytes))
-                .transpose()
-                .map_err(|error| {
-                    service_error(
-                        ImageServiceErrorKind::QueueFull,
-                        format!("image queue backing Host admission failed: {error}"),
-                    )
-                })
-        };
-        let reservation = match reserve(capacity) {
-            Ok(reservation) => reservation,
-            Err(_) if capacity > required => {
-                // Amortized growth is optional: admit the actual next slot if
-                // the geometric spare capacity would exceed the Host budget.
-                capacity = required;
-                reserve(capacity)?
-            }
-            Err(error) => return Err(error),
-        };
-        let mut queue = VecDeque::new();
-        queue.try_reserve_exact(capacity).map_err(|_| full())?;
-        // Keep the charged capacity equal to the retained allocation; never
-        // accept an allocator-provided larger deque on the smaller grant.
-        if queue.capacity() != capacity {
-            return Err(full());
-        }
-        queue.extend(self.queue.drain(..));
-        self.queue = queue;
-        self.queue_backing = reservation;
-        Ok(())
-    }
-}
-struct Shared<O> {
-    trace: Option<ImageContinuousTraceHandle>,
-    state: Mutex<State<O>>,
-    changed: Condvar,
-    resources: Arc<ResourceSignal>,
-    config: ImageServiceConfig,
-    host: Option<HostMemoryAccount>,
-    adapter: Option<Arc<ImageAdapterBatchIdentity>>,
-}
-impl<O> Shared<O> {
-    fn lock(&self) -> MutexGuard<'_, State<O>> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-    fn stop(&self) {
-        let mut state = self.lock();
-        state.accepting = false;
-        state.closing = true;
-        self.changed.notify_all();
-        self.resources.notify();
-    }
-}
-struct Job<O> {
-    correlation: ImageRequestCorrelation,
-    receiver: Option<oneshot::Receiver<Result<O, ImageServiceError>>>,
-    cancelled: Arc<AtomicBool>,
-    shared: Arc<Shared<O>>,
-}
-impl<O> Job<O> {
-    fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        // Resource callbacks never acquire the queue mutex. Publish their
-        // wake before synchronizing with the declared collection wait.
-        self.shared.resources.notify();
-        // Pair with the waiter's predicate check and atomic unlock/wait.
-        // Atomic cancellation alone cannot prevent a lost Condvar wake.
-        let _state = self.shared.lock();
-        self.shared.changed.notify_all();
-    }
-    async fn wait(mut self) -> Result<O, ImageServiceError> {
-        match self.receiver.take() {
-            Some(receiver) => receiver.await.unwrap_or_else(|_| {
-                Err(service_error(
-                    ImageServiceErrorKind::Stopped,
-                    "image worker response channel closed",
-                ))
-            }),
-            None => Err(service_error(
-                ImageServiceErrorKind::Stopped,
-                "image response already consumed",
-            )),
-        }
-    }
-}
-impl<O> Drop for Job<O> {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-struct ServiceCore<O: Send + 'static> {
-    shared: Arc<Shared<O>>,
-    join: Mutex<Option<JoinHandle<Retirement<O>>>>,
-}
-impl<O: Send + 'static> ServiceCore<O> {
-    #[cfg(test)]
-    fn start(
-        worker: Box<dyn BatchWorker<Output = O>>,
-        config: ImageServiceConfig,
-    ) -> Result<Self, ImageServiceError> {
-        Self::start_with_host(worker, config, None)
-    }
-    fn start_with_host(
-        worker: Box<dyn BatchWorker<Output = O>>,
-        config: ImageServiceConfig,
-        host: Option<HostMemoryAccount>,
-    ) -> Result<Self, ImageServiceError> {
-        let adapter = worker.adapter_batch_identity().map(Arc::new);
-        let trace = worker.continuous_trace_handle();
-        let shared = Arc::new(Shared {
-            trace,
-            state: Mutex::new(State {
-                queue: VecDeque::new(),
-                queue_backing: None,
-                accepting: true,
-                closing: false,
-                active: 0,
-                preparing: 0,
-                preparing_bytes: 0,
-                rejected: 0,
-                executed_batches: 0,
-                executed_requests: 0,
-                last_batch_size: 0,
-                capacity_reductions: 0,
-            }),
-            changed: Condvar::new(),
-            resources: Arc::new(ResourceSignal::default()),
-            config,
-            host,
-            adapter,
-        });
-        let thread_shared = shared.clone();
-        let join = thread::Builder::new()
-            .name("ferrum-image-worker".into())
-            .spawn(move || worker_loop(worker, thread_shared))
-            .map_err(|e| {
-                service_error(
-                    ImageServiceErrorKind::Stopped,
-                    format!("cannot start image worker: {e}"),
-                )
-            })?;
-        Ok(Self {
-            shared,
-            join: Mutex::new(Some(join)),
-        })
-    }
-
-    fn snapshot(&self) -> ImageServiceSnapshot {
-        let state = self.shared.lock();
-        ImageServiceSnapshot {
-            accepting: state.accepting,
-            active_requests: state.active,
-            pending_requests: state.queue.len() + state.preparing,
-            preparing_requests: state.preparing,
-            pending_bytes: state
-                .queue
-                .iter()
-                .map(|job| job.pending_bytes())
-                .sum::<usize>()
-                + state.preparing_bytes,
-            maximum_pending_bytes: self.shared.config.maximum_pending_bytes,
-            rejected_requests: state.rejected,
-            executed_batches: state.executed_batches,
-            executed_requests: state.executed_requests,
-            last_batch_size: state.last_batch_size,
-            capacity_reductions: state.capacity_reductions,
-            batching: self.shared.config.batching,
-            maximum_pending: self.shared.config.maximum_pending,
-            max_num_seqs: self.shared.config.max_num_seqs,
-        }
-    }
-    #[cfg(test)]
-    fn try_submit(&self, request: ImageGenerationRequest) -> Result<Job<O>, ImageServiceError> {
-        self.try_submit_request(QueuedRequest::Generate(request))
-    }
-    #[cfg(test)]
-    fn try_submit_request(&self, request: QueuedRequest) -> Result<Job<O>, ImageServiceError> {
-        self.try_submit_request_with_output(request, None)
-    }
-    #[cfg(test)]
-    fn try_submit_request_with_output(
-        &self,
-        request: QueuedRequest,
-        output: Option<QueuedOutput>,
-    ) -> Result<Job<O>, ImageServiceError> {
-        self.try_submit_request_with_output_and_correlation(
-            request,
-            output,
-            ImageRequestCorrelation::new(None),
-        )
-    }
-    fn submission_error(
-        &self,
-        correlation: ImageRequestCorrelation,
-        mut error: ImageServiceError,
-    ) -> ImageServiceError {
-        trace::submission_rejected(self.shared.trace.as_ref(), correlation, error.kind());
-        error.correlation = Some(correlation);
-        error
-    }
-    fn try_submit_request_with_output_and_correlation(
-        &self,
-        request: QueuedRequest,
-        output: Option<QueuedOutput>,
-        correlation: ImageRequestCorrelation,
-    ) -> Result<Job<O>, ImageServiceError> {
-        (|| {
-            let mut state = self.shared.lock();
-            prune_cancelled(&mut state.queue);
-            if !state.accepting {
-                return Err(service_error(
-                    ImageServiceErrorKind::Stopped,
-                    "image service is stopped",
-                ));
-            }
-            let queued_bytes = state
-                .queue
-                .iter()
-                .map(|job| job.pending_bytes())
-                .sum::<usize>();
-            if state.queue.len() + state.preparing >= self.shared.config.maximum_pending
-                || queued_bytes
-                    .saturating_add(state.preparing_bytes)
-                    .saturating_add(request.pending_bytes())
-                    > self.shared.config.maximum_pending_bytes
-            {
-                state.rejected = state.rejected.saturating_add(1);
-                return Err(service_error(
-                    ImageServiceErrorKind::QueueFull,
-                    "image pending queue count or Host byte budget is full",
-                ));
-            }
-            let prompt_reservation = self
-                .shared
-                .host
-                .as_ref()
-                .map(|host| {
-                    host.reserve(
-                        HostMemoryClass::InputPreprocess,
-                        request
-                            .generation()
-                            .prompt
-                            .capacity()
-                            .saturating_add(ImageService::minimum_pending_request_bytes()),
-                    )
-                })
-                .transpose()
-                .map_err(|error| {
-                    state.rejected = state.rejected.saturating_add(1);
-                    service_error(
-                        ImageServiceErrorKind::QueueFull,
-                        format!("image queue Host admission failed: {error}"),
-                    )
-                })?;
-            if let Err(error) = state.reserve_queue_slot(
-                self.shared.host.as_ref(),
-                self.shared.config.maximum_pending,
-            ) {
-                state.rejected = state.rejected.saturating_add(1);
-                return Err(error);
-            }
-            let (response, receiver) = oneshot::channel();
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let trace = trace::RequestTrace::new(correlation, self.shared.trace.clone());
-            let submitted = Instant::now();
-            trace.queued(submitted);
-            state.queue.push_back(Queued {
-                trace,
-                request,
-                adapter: self.shared.adapter.clone(),
-                submitted,
-                cancelled: cancelled.clone(),
-                response,
-                output,
-                _prompt_reservation: prompt_reservation,
-                preprocessing_bytes: 0,
-                preparation_duration: Duration::ZERO,
-                preparation_group: None,
-            });
-            self.shared.changed.notify_one();
-            Ok(Job {
-                correlation,
-                receiver: Some(receiver),
-                cancelled,
-                shared: self.shared.clone(),
-            })
-        })()
-        .map_err(|error| self.submission_error(correlation, error))
-    }
-    fn take_join(&self) -> Option<JoinHandle<Retirement<O>>> {
-        self.join.lock().unwrap_or_else(|e| e.into_inner()).take()
-    }
-    async fn shutdown(&self) -> Result<Retirement<O>, ImageServiceError> {
-        self.shared.stop();
-        let join = self.take_join().ok_or_else(|| {
-            service_error(
-                ImageServiceErrorKind::Shutdown,
-                "image worker shutdown already claimed",
-            )
-        })?;
-        tokio::task::spawn_blocking(move || join_worker(join))
-            .await
-            .map_err(|e| {
-                service_error(
-                    ImageServiceErrorKind::Shutdown,
-                    format!("image join task failed: {e}"),
-                )
-            })
-    }
-}
-impl<O: Send + 'static> Drop for ServiceCore<O> {
-    fn drop(&mut self) {
-        self.shared.stop();
-        if let Some(join) = self.take_join() {
-            drop(join_worker(join));
-        }
-    }
-}
-
-struct Retirement<O: Send + 'static> {
-    worker: Option<Box<dyn BatchWorker<Output = O>>>,
-    failure: Option<ImageWorkerFailure>,
-}
-impl<O: Send + 'static> Drop for Retirement<O> {
-    fn drop(&mut self) {
-        if self.failure.is_some() {
-            // No generic backend can prove an opaque failed owner is quiescent.
-            // Explicit recovery consumes these fields; unattended Drop fails closed.
-            std::mem::forget(self.worker.take());
-            std::mem::forget(self.failure.take());
-        }
-    }
-}
-fn join_worker<O: Send + 'static>(join: JoinHandle<Retirement<O>>) -> Retirement<O> {
-    join.join().unwrap_or_else(|panic| Retirement {
-        worker: None,
-        failure: Some(ImageWorkerFailure::Panic(panic)),
-    })
-}
-
-fn prune_cancelled<O>(queue: &mut VecDeque<Queued<O>>) {
-    let mut index = 0;
-    while index < queue.len() {
-        if queue[index].cancelled.load(Ordering::Acquire) {
-            if let Some(job) = queue.remove(index) {
-                let _ = job.response.send(Err(job.trace.error(
-                    ImageServiceErrorKind::Cancelled,
-                    "image request cancelled before execution",
-                )));
-            }
-        } else {
-            index += 1;
-        }
-    }
-}
-fn reject_pending<O>(state: &mut State<O>, kind: ImageServiceErrorKind) {
-    for job in state.queue.drain(..) {
-        let _ = job.response.send(Err(job
-            .trace
-            .error(kind, "image service stopped before execution")));
-    }
-    // Terminal shutdown releases both the retained allocation and its charge.
-    state.queue = VecDeque::new();
-    state.queue_backing.take();
-}
-
-mod capacity_hint;
-mod trace;
+pub(crate) mod capacity_hint;
+#[cfg(test)]
+use crate::iterative_service::trace;
 pub use capacity_hint::ImageCapacitySearchContext;
-mod batch_efficiency;
+pub(crate) mod batch_efficiency;
 pub use batch_efficiency::{ImageBatchExecutionFeedback, ImageBatchStageFeedback};
 mod output_budget;
-mod output_gate;
+use crate::iterative_service::output_gate;
 mod preparation;
-pub use output_gate::{ImageOutputGate, ImageOutputGateError, ImageOutputLease};
-use output_gate::{QueuedOutput, ResourceSignal};
-mod scheduler;
-use scheduler::worker_loop;
+#[cfg(test)]
+use crate::iterative_service::scheduler;
+#[cfg(test)]
+use crate::iterative_service::scheduler::worker_loop;
+use output_gate::QueuedOutput;
+#[cfg(test)]
+use output_gate::ResourceSignal;
+pub use output_gate::{
+    OutputGate as ImageOutputGate, OutputGateError as ImageOutputGateError,
+    OutputLease as ImageOutputLease,
+};
 mod steps;
 pub use steps::{
     ImageDenoisingBatch, ImageDenoisingExitReason, ImageDenoisingGenerator, ImageDenoisingRequest,
@@ -1963,3 +1464,9 @@ mod retained_output_tests;
 mod tests;
 #[cfg(test)]
 mod timing_tests;
+
+mod iterative_adapter;
+
+mod observation;
+mod run_once;
+pub use run_once::ImageServiceRun;

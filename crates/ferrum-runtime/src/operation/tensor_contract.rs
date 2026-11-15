@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::super::VNextError;
 use super::foundation::invalid_operation;
-use super::ElementType;
+use super::{ElementType, ResolvedWeightBinding, WeightComponentRole, WeightEncoding};
 
 fn is_axis_permutation(axis_order: &[u32], rank: usize) -> bool {
     axis_order.len() == rank
@@ -52,8 +52,42 @@ pub enum TensorAccess {
 #[serde(rename_all = "snake_case")]
 pub enum AliasPolicy {
     NoAlias,
-    MayAlias { tensor_index: u32 },
-    MustAlias { tensor_index: u32 },
+    MayAlias {
+        tensor_index: u32,
+    },
+    MustAlias {
+        tensor_index: u32,
+    },
+    /// Exact, contiguous storage reinterpretation without a write. The plan
+    /// keeps every reader alive and forbids mutation of the entire alias class.
+    ReadOnlyView {
+        tensor_index: u32,
+    },
+}
+
+/// Meaning of a Stored weight at this operation port. Ordinary activation
+/// tensors remain governed by the tensor shape/dtype contract.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum StoredWeightInterpretation {
+    #[default]
+    Numerical,
+    PhysicalComponent {
+        role: WeightComponentRole,
+        encoding: WeightEncoding,
+    },
+    /// A numerical operand can also be supplied as one explicitly checked
+    /// physical metadata component. Neither branch changes its interpretation.
+    NumericalOrPhysicalComponent {
+        role: WeightComponentRole,
+        encoding: WeightEncoding,
+    },
+}
+
+impl StoredWeightInterpretation {
+    fn is_numerical(&self) -> bool {
+        matches!(self, Self::Numerical)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -63,6 +97,8 @@ pub struct TensorContract {
     layouts: Vec<LayoutConstraint>,
     access: TensorAccess,
     alias: AliasPolicy,
+    #[serde(skip_serializing_if = "StoredWeightInterpretation::is_numerical")]
+    stored_weight_interpretation: StoredWeightInterpretation,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +109,8 @@ struct TensorContractWire {
     layouts: Vec<LayoutConstraint>,
     access: TensorAccess,
     alias: AliasPolicy,
+    #[serde(default)]
+    stored_weight_interpretation: StoredWeightInterpretation,
 }
 
 impl<'de> Deserialize<'de> for TensorContract {
@@ -81,14 +119,19 @@ impl<'de> Deserialize<'de> for TensorContract {
         D: Deserializer<'de>,
     {
         let wire = TensorContractWire::deserialize(deserializer)?;
-        Self::new(
+        let mut contract = Self::new(
             wire.dimensions,
             wire.element_types,
             wire.layouts,
             wire.access,
             wire.alias,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(serde::de::Error::custom)?;
+        contract.stored_weight_interpretation = wire.stored_weight_interpretation;
+        contract
+            .validate("tensor_contract")
+            .map_err(serde::de::Error::custom)?;
+        Ok(contract)
     }
 }
 
@@ -108,6 +151,7 @@ impl TensorContract {
             layouts,
             access,
             alias,
+            stored_weight_interpretation: StoredWeightInterpretation::Numerical,
         };
         contract.validate("tensor_contract")?;
         Ok(contract)
@@ -115,6 +159,65 @@ impl TensorContract {
 
     pub fn dimensions(&self) -> &[DimensionConstraint] {
         &self.dimensions
+    }
+
+    /// Opt in to the exact raw component role and full encoding. No numerical
+    /// weight representation can satisfy this policy by sharing its dtype.
+    pub fn with_physical_weight_component(
+        mut self,
+        role: WeightComponentRole,
+        encoding: WeightEncoding,
+    ) -> Result<Self, VNextError> {
+        self.stored_weight_interpretation =
+            StoredWeightInterpretation::PhysicalComponent { role, encoding };
+        self.validate("tensor_contract")?;
+        Ok(self)
+    }
+
+    /// Admit ordinary numerical Stored weights as well as the exact declared
+    /// raw component. Use this only when both interpretations are meaningful
+    /// for the operand (for example a numerical constant or stored scale).
+    /// Packed-weight ports should retain the exclusive physical policy.
+    pub fn with_numerical_or_physical_weight_component(
+        mut self,
+        role: WeightComponentRole,
+        encoding: WeightEncoding,
+    ) -> Result<Self, VNextError> {
+        self.stored_weight_interpretation =
+            StoredWeightInterpretation::NumericalOrPhysicalComponent { role, encoding };
+        self.validate("tensor_contract")?;
+        Ok(self)
+    }
+
+    pub fn stored_weight_interpretation(&self) -> &StoredWeightInterpretation {
+        &self.stored_weight_interpretation
+    }
+
+    pub(crate) fn validate_weight_interpretation(
+        &self,
+        weight: Option<&ResolvedWeightBinding>,
+    ) -> Result<(), VNextError> {
+        let Some(weight) = weight else {
+            return Ok(());
+        };
+        match (
+            &self.stored_weight_interpretation,
+            weight.physical_component_view(),
+        ) {
+            (
+                StoredWeightInterpretation::Numerical
+                | StoredWeightInterpretation::NumericalOrPhysicalComponent { .. },
+                None,
+            ) => Ok(()),
+            (
+                StoredWeightInterpretation::PhysicalComponent { role, encoding }
+                | StoredWeightInterpretation::NumericalOrPhysicalComponent { role, encoding },
+                Some(component),
+            ) if component.role() == *role && component.encoding() == encoding => Ok(()),
+            _ => Err(invalid_operation(
+                "stored weight interpretation differs from the operation port contract",
+            )),
+        }
     }
 
     pub fn element_types(&self) -> &BTreeSet<ElementType> {
@@ -134,6 +237,34 @@ impl TensorContract {
     }
 
     pub fn validate(&self, field: &str) -> Result<(), VNextError> {
+        if let StoredWeightInterpretation::PhysicalComponent { encoding, .. }
+        | StoredWeightInterpretation::NumericalOrPhysicalComponent { encoding, .. } =
+            &self.stored_weight_interpretation
+        {
+            let physical_type = match encoding {
+                WeightEncoding::Dense { element_type } => *element_type,
+                WeightEncoding::Quantized(spec) => {
+                    spec.validate()?;
+                    ElementType::U8
+                }
+                WeightEncoding::BlockQuantized(spec) => {
+                    spec.validate()?;
+                    ElementType::U8
+                }
+                WeightEncoding::DenseAffine { .. } => {
+                    return Err(invalid_operation(
+                        "physical component ports cannot apply affine decoding",
+                    ))
+                }
+            };
+            if self.access != TensorAccess::Read
+                || self.alias != AliasPolicy::NoAlias
+                || self.layouts != [LayoutConstraint::Contiguous]
+                || self.element_types != BTreeSet::from([physical_type])
+            {
+                return Err(invalid_operation("physical component ports require read-only contiguous storage with the exact physical dtype"));
+            }
+        }
         if self.element_types.is_empty() {
             return Err(VNextError::InvalidExecutionPlan {
                 reason: format!("{field} has no allowed element type"),

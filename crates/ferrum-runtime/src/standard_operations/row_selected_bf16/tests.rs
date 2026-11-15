@@ -15,7 +15,7 @@ fn attrs(kind: RowSelectedBf16Kind) -> BTreeMap<AttributeId, SemanticValue> {
     ]);
     for (name, value) in match kind {
         RowSelectedBf16Kind::Modulation => vec![("shift_column", 1), ("scale_column", 5)],
-        RowSelectedBf16Kind::Addcmul => vec![("gate_column", 9)],
+        RowSelectedBf16Kind::Addcmul | RowSelectedBf16Kind::AddcmulFma => vec![("gate_column", 9)],
     } {
         a.insert(
             AttributeId::new(name).unwrap(),
@@ -31,6 +31,7 @@ fn row_selected_bf16_geometry_validates_original_table_windows_and_full_routing(
     for kind in [
         RowSelectedBf16Kind::Modulation,
         RowSelectedBf16Kind::Addcmul,
+        RowSelectedBf16Kind::AddcmulFma,
     ] {
         let ports = if kind == RowSelectedBf16Kind::Modulation {
             vec![&x, &p]
@@ -92,7 +93,7 @@ fn row_selected_bf16_geometry_validates_original_table_windows_and_full_routing(
             vec![&x, &wrong, &x]
         };
         assert!(RowSelectedBf16Geometry::new(kind, &bad_ports, &x, &a).is_err());
-        for count in [ROW_SELECTED_BF16_MAX_RUNS, ROW_SELECTED_BF16_MAX_RUNS + 1] {
+        for count in [31, 32, 33, 65] {
             let x = t(&[count as u64, 3], ElementType::Bf16);
             let ports = if kind == RowSelectedBf16Kind::Modulation {
                 vec![&x, &p]
@@ -106,12 +107,12 @@ fn row_selected_bf16_geometry_validates_original_table_windows_and_full_routing(
             );
             routed.insert(
                 AttributeId::new("parameter_rows").unwrap(),
-                SemanticValue::Integers(vec![1; count]),
+                SemanticValue::Integers((0..count).map(|i| (i % 2) as i64).collect()),
             );
-            assert_eq!(
-                RowSelectedBf16Geometry::new(kind, &ports, &x, &routed).is_ok(),
-                count == ROW_SELECTED_BF16_MAX_RUNS
-            );
+            let geometry = RowSelectedBf16Geometry::new(kind, &ports, &x, &routed).unwrap();
+            for row in 0..count as u64 {
+                assert_eq!(geometry.parameter_row(row), Some(row % 2));
+            }
         }
     }
 }

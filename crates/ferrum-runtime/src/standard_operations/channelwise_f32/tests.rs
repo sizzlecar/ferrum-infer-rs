@@ -110,3 +110,38 @@ fn channel_vectors_and_arithmetic_are_exactly_typed_without_numel_broadcast_shor
         F32ChannelwiseGeometry::new(F32ChannelwiseOp::NanToNum, &[&half], &half, &empty).is_err()
     );
 }
+
+#[test]
+fn separate_residual_has_independent_identity_with_the_same_exact_shape_boundary() {
+    let original = channel_scaled_residual_f32_contract().unwrap();
+    let separate = channel_scaled_residual_separate_f32_contract().unwrap();
+    assert_ne!(original.descriptor().id, separate.descriptor().id);
+    assert_ne!(
+        original.descriptor().fingerprint().unwrap(),
+        separate.descriptor().fingerprint().unwrap()
+    );
+    let x = spec(&[2, 4], ElementType::F32);
+    let scale = spec(&[4], ElementType::F32);
+    let g = F32ChannelwiseGeometry::new(
+        F32ChannelwiseOp::ScaledResidualSeparate,
+        &[&x, &x, &scale],
+        &x,
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            g.input_elements(1),
+            g.input_elements(2),
+            g.logical_arithmetic_operations()
+        ),
+        (Some(8), Some(4), 16)
+    );
+    assert!(F32ChannelwiseGeometry::new(
+        F32ChannelwiseOp::ScaledResidualSeparate,
+        &[&x, &x, &spec(&[1, 4], ElementType::F32)],
+        &x,
+        &BTreeMap::new()
+    )
+    .is_err());
+}

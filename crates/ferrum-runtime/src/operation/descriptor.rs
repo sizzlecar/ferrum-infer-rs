@@ -126,21 +126,30 @@ impl OperationDescriptor {
         }
         for (index, output) in self.outputs.iter().enumerate() {
             output.validate(&format!("operation.{}.outputs[{index}]", self.id))?;
-            if !matches!(
-                output.access(),
-                TensorAccess::Write | TensorAccess::ReadWrite
-            ) {
+            let read_only_view = matches!(output.alias(), AliasPolicy::ReadOnlyView { .. });
+            if (output.access() == TensorAccess::Read) != read_only_view {
                 return Err(VNextError::InvalidExecutionPlan {
-                    reason: format!("operation `{}` output {index} is not writable", self.id),
+                    reason: format!(
+                        "operation `{}` output {index} has inconsistent view access",
+                        self.id
+                    ),
                 });
             }
             if let AliasPolicy::MayAlias { tensor_index }
-            | AliasPolicy::MustAlias { tensor_index } = output.alias()
+            | AliasPolicy::MustAlias { tensor_index }
+            | AliasPolicy::ReadOnlyView { tensor_index } = output.alias()
             {
                 if *tensor_index as usize >= self.inputs.len() {
                     return Err(VNextError::InvalidExecutionPlan {
                         reason: format!("operation `{}` output {index} aliases no input", self.id),
                     });
+                }
+                if read_only_view
+                    && self.inputs[*tensor_index as usize].access() != TensorAccess::Read
+                {
+                    return Err(invalid_operation(
+                        "a read-only view requires a read-only source",
+                    ));
                 }
             }
         }
@@ -283,6 +292,7 @@ impl OperationDescriptor {
                     self.id
                 )));
             }
+            contract.validate_weight_interpretation(binding.weight())?;
             Self::validate_resolved_tensor(
                 &self.id,
                 contract,
@@ -296,7 +306,7 @@ impl OperationDescriptor {
         for (index, input) in inputs.iter().enumerate() {
             for previous in &inputs[..index] {
                 if storage_overlaps(input.storage(), previous.storage())
-                    && (input.value_id() != previous.value_id()
+                    && (input.storage() != previous.storage()
                         || input.access() != TensorAccess::Read
                         || previous.access() != TensorAccess::Read)
                     && !shares_only_readonly_transform_signs(input, previous)
@@ -334,6 +344,7 @@ impl OperationDescriptor {
                     }
                 }
                 AliasPolicy::MustAlias { tensor_index }
+                | AliasPolicy::ReadOnlyView { tensor_index }
                     if aliased_inputs != [*tensor_index]
                         || output.storage() != inputs[*tensor_index as usize].storage() =>
                 {
@@ -343,6 +354,22 @@ impl OperationDescriptor {
                     )));
                 }
                 _ => {}
+            }
+            if let AliasPolicy::ReadOnlyView { tensor_index } = output.alias() {
+                let input = &inputs[*tensor_index as usize];
+                if input.tensor().layout() != &ResolvedTensorLayout::Contiguous
+                    || output.tensor().layout() != &ResolvedTensorLayout::Contiguous
+                    || input.tensor().element_type() != output.tensor().element_type()
+                    || input.tensor().minimum_storage_bytes()?
+                        != output.tensor().minimum_storage_bytes()?
+                    || output.storage().components().len() != 1
+                    || output.storage().components()[0].length_bytes()
+                        != output.tensor().minimum_storage_bytes()?
+                {
+                    return Err(invalid_operation(
+                        "read-only views require identical full contiguous byte extents and dtype",
+                    ));
+                }
             }
             if outputs[..index]
                 .iter()

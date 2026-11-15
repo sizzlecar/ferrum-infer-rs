@@ -31,10 +31,24 @@ const MOD: &str = "value.compact.fixture.modulation";
 const EXP_MOD: &str = "value.compact.fixture.expanded_modulation";
 const ADD: &str = "value.compact.fixture.addcmul";
 const EXP_ADD: &str = "value.compact.fixture.expanded_addcmul";
+const FMA: &str = "value.compact.fixture.fma";
+const EXP_FMA: &str = "value.compact.fixture.expanded_fma";
+const TAIL: &str = "value.compact.fixture.retained_tail";
 const PROFILE: &str = "fixture.row_selected_bf16.expanded_equivalence.v1";
-const ROWS: u64 = 7;
+// Repeat nonuniform runs across two full native argument packets and a tail.
+const ROUTE_REPEATS: usize = 17;
+const ROWS: u64 = 7 * ROUTE_REPEATS as u64;
 const PARAMETERS: u64 = 4;
-const SELECTED: [usize; 7] = [3, 3, 1, 3, 3, 0, 0];
+const SELECTED: [usize; ROWS as usize] = {
+    let pattern = [3, 3, 1, 3, 3, 0, 0];
+    let mut selected = [0; ROWS as usize];
+    let mut i = 0;
+    while i < selected.len() {
+        selected[i] = pattern[i % pattern.len()];
+        i += 1;
+    }
+    selected
+};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -70,10 +84,13 @@ impl Config {
     }
     fn attrs(&self, kind: RowSelectedBf16Kind) -> BTreeMap<AttributeId, SemanticValue> {
         let mut attrs = BTreeMap::from([
-            (id("run_lengths"), SemanticValue::Integers(vec![2, 1, 2, 2])),
+            (
+                id("run_lengths"),
+                SemanticValue::Integers([2, 1, 2, 2].repeat(ROUTE_REPEATS)),
+            ),
             (
                 id("parameter_rows"),
-                SemanticValue::Integers(vec![3, 1, 3, 0]),
+                SemanticValue::Integers([3, 1, 3, 0].repeat(ROUTE_REPEATS)),
             ),
         ]);
         match kind {
@@ -81,7 +98,7 @@ impl Config {
                 (id("shift_column"), SemanticValue::Unsigned(self.shift())),
                 (id("scale_column"), SemanticValue::Unsigned(self.scale())),
             ]),
-            RowSelectedBf16Kind::Addcmul => {
+            RowSelectedBf16Kind::Addcmul | RowSelectedBf16Kind::AddcmulFma => {
                 attrs.insert(id("gate_column"), SemanticValue::Unsigned(self.gate()));
             }
         }
@@ -141,7 +158,7 @@ impl ModelFamilyProvider for Family {
                 family_id: self.family_id().clone(),
                 version: ContractVersion::new(1, 0),
                 primary_activation: id(MOD),
-                boundaries: [SCALED, MOD, EXP_MOD, ADD, EXP_ADD]
+                boundaries: [SCALED, MOD, EXP_MOD, ADD, EXP_ADD, FMA, EXP_FMA, TAIL]
                     .into_iter()
                     .map(|v| (id(v), ElementType::Bf16))
                     .collect(),
@@ -153,6 +170,8 @@ impl ModelFamilyProvider for Family {
                     MODULATION_SCALE_BF16_OPERATION_ID,
                     PLAIN_RESIDUAL_ADD_BF16_OPERATION_ID,
                     ADDCMUL_BF16_OPERATION_ID,
+                    ROW_SELECTED_ADDCMUL_FMA_BF16_OPERATION_ID,
+                    ADDCMUL_FMA_BF16_OPERATION_ID,
                 ]
                 .into_iter()
                 .map(|op| NumericalOperationContract {
@@ -229,11 +248,35 @@ impl ModelFamilyProvider for Family {
                         EXP_ADD,
                         broadcast(),
                     ),
+                    node(
+                        "node.compact.fma",
+                        ROW_SELECTED_ADDCMUL_FMA_BF16_OPERATION_ID,
+                        &[X, TABLE, U],
+                        FMA,
+                        c.attrs(RowSelectedBf16Kind::AddcmulFma),
+                    ),
+                    node(
+                        "node.expanded.fma",
+                        ADDCMUL_FMA_BF16_OPERATION_ID,
+                        &[X, GATE, U],
+                        EXP_FMA,
+                        broadcast(),
+                    ),
+                    node(
+                        "node.retained.tail",
+                        PLAIN_RESIDUAL_ADD_BF16_OPERATION_ID,
+                        &[EXP_MOD, SHIFT],
+                        TAIL,
+                        BTreeMap::new(),
+                    ),
                 ],
             }],
             vec![],
             vec![],
-            [MOD, EXP_MOD, ADD, EXP_ADD].into_iter().map(id).collect(),
+            [MOD, EXP_MOD, ADD, EXP_ADD, FMA, EXP_FMA, TAIL]
+                .into_iter()
+                .map(id)
+                .collect(),
         )?
         .with_input_tensor_specs(c.specs())
     }
@@ -274,6 +317,7 @@ struct Data {
     inputs: BTreeMap<&'static str, Vec<u16>>,
     modulation: Vec<u16>,
     addcmul: Vec<u16>,
+    fma: Vec<u16>,
 }
 fn data(c: &Config, trial: usize) -> Data {
     let h = c.width as usize;
@@ -349,6 +393,7 @@ fn data(c: &Config, trial: usize) -> Data {
     let mut gate = Vec::new();
     let mut modulation = Vec::new();
     let mut addcmul = Vec::new();
+    let mut fma = Vec::new();
     for (row, &p) in SELECTED.iter().enumerate() {
         for col in 0..h {
             let i = row * h + col;
@@ -362,6 +407,11 @@ fn data(c: &Config, trial: usize) -> Data {
             let product = decode(round(mul(decode(x[i]), factor)));
             modulation.push(round(add(product, decode(s))));
             addcmul.push(round(add(decode(x[i]), mul(decode(g), decode(u[i])))));
+            // In this fixture each finite exact product/cancellation fits F64.
+            // Round once to F32 before the separately defined BF16 conversion.
+            fma.push(round(
+                (f64::from(decode(g)) * f64::from(decode(u[i])) + f64::from(decode(x[i]))) as f32,
+            ));
         }
     }
     assert_eq!(
@@ -390,6 +440,7 @@ fn data(c: &Config, trial: usize) -> Data {
         let fused =
             decode(table[at(c.gate(), 2)]).mul_add(decode(u[3 * h + 2]), decode(x[3 * h + 2]));
         assert!(fused.is_finite(), "single FMA would cancel before overflow");
+        assert_eq!(fma[3 * h + 2], 0x7f7f, "FMA must cancel before overflow");
     }
     Data {
         inputs: BTreeMap::from([
@@ -402,6 +453,7 @@ fn data(c: &Config, trial: usize) -> Data {
         ]),
         modulation,
         addcmul,
+        fma,
     }
 }
 
@@ -411,7 +463,13 @@ pub fn run<R: DeviceRuntime>(
     catalog: &CapabilityCatalog,
     materializers: &WeightMaterializerRegistry,
 ) {
-    for width in [1u64, 7, 5376] {
+    for (width, execution_order) in [1u64, 7, 5376].into_iter().flat_map(|width| {
+        [
+            PlanExecutionOrder::DataDependencies,
+            PlanExecutionOrder::Serial,
+        ]
+        .map(move |order| (width, order))
+    }) {
         let c = Config { width };
         let raw = serde_json::to_value(&c).unwrap();
         let family = TypedFamilyRegistration::new(Family {
@@ -420,7 +478,7 @@ pub fn run<R: DeviceRuntime>(
         .prepare_with_profile(&raw, &id(PROFILE))
         .unwrap();
         let mut options = ProgramPlanCompileOptions::new(c.specs()).unwrap();
-        for value in [SCALED, MOD, EXP_MOD, ADD, EXP_ADD] {
+        for value in [SCALED, MOD, EXP_MOD, ADD, EXP_ADD, FMA, EXP_FMA, TAIL] {
             options
                 .insert_tensor_spec(id(value), tensor(vec![ROWS, width]))
                 .unwrap();
@@ -438,18 +496,59 @@ pub fn run<R: DeviceRuntime>(
                     .copied()
                     .collect(),
             )
-            .unwrap(),
+            .unwrap()
+            .with_execution_order(execution_order),
             materializers,
             &options,
         )
         .unwrap();
+        // The late retained result may reuse the now-dead scale intermediate;
+        // all earlier retained outputs must remain separately readable.
+        let payload = component.executable().execution_plan().payload();
+        let resource = |name: &str| {
+            payload
+                .nodes()
+                .iter()
+                .flat_map(|node| node.values())
+                .find(|value| value.value_id() == &id(name))
+                .unwrap()
+                .storage()
+                .components()[0]
+                .resource_id()
+                .clone()
+        };
+        let early = resource(SCALED);
+        let late = resource(TAIL);
+        let slots = payload
+            .memory()
+            .dynamic_pools()
+            .iter()
+            .flat_map(|pool| pool.step_resource_slots())
+            .collect::<Vec<_>>();
+        if execution_order == PlanExecutionOrder::DataDependencies {
+            assert!(slots.iter().any(|slot| {
+                slot.resource_ids().contains(&early) && slot.resource_ids().contains(&late)
+            }));
+        } else {
+            // SCALE is read only by the early scale operation. Its uploaded
+            // device copy may be overwritten later, while the immutable Host
+            // input and the late SHIFT input must remain intact.
+            let scale = resource(SCALE);
+            let shift = resource(SHIFT);
+            assert!(slots.iter().any(|slot| {
+                slot.resource_ids().contains(&scale) && slot.resource_ids().len() > 1
+            }));
+            assert!(slots
+                .iter()
+                .any(|slot| slot.resource_ids() == &[shift.clone()]));
+        }
         let host = HostMemoryAccount::with_allocation_alignment(
             HostMemoryLimits::new(
-                16 << 20,
+                32 << 20,
                 HostMemoryClassLimits {
                     input_preprocess_bytes: 8 << 20,
                     transfer_staging_bytes: 1 << 20,
-                    output_bytes: 4 << 20,
+                    output_bytes: 16 << 20,
                     weight_backing_bytes: 1 << 20,
                 },
             )
@@ -492,7 +591,8 @@ pub fn run<R: DeviceRuntime>(
                     )
                     .unwrap()
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let originals = inputs.clone();
             let outputs = session
                 .execute(
                     id(format!("run.compact.{width}.{trial}")),
@@ -500,6 +600,15 @@ pub fn run<R: DeviceRuntime>(
                     inputs,
                 )
                 .unwrap();
+            for input in &originals {
+                let expected = &expected.inputs[input.value_id().as_str()];
+                let bytes = expected
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect::<Vec<_>>();
+                assert_eq!(input.bytes().bytes(), bytes);
+            }
+            drop(originals);
             let words = |name: &str| {
                 let output = outputs.iter().find(|o| o.value_id() == &id(name)).unwrap();
                 assert_eq!(output.tensor().dimensions(), &[ROWS, width]);
@@ -515,6 +624,7 @@ pub fn run<R: DeviceRuntime>(
             for (new, old, oracle) in [
                 (MOD, EXP_MOD, &expected.modulation),
                 (ADD, EXP_ADD, &expected.addcmul),
+                (FMA, EXP_FMA, &expected.fma),
             ] {
                 let actual = words(new);
                 let expanded = words(old);
@@ -522,6 +632,19 @@ pub fn run<R: DeviceRuntime>(
                     exact_equal(a, o, new, i);
                     exact_equal(a, b, "compact vs actual expanded graph", i);
                 }
+            }
+            for (i, ((actual, &modulated), &shift)) in words(TAIL)
+                .into_iter()
+                .zip(&expected.modulation)
+                .zip(&expected.inputs[SHIFT])
+                .enumerate()
+            {
+                exact_equal(
+                    actual,
+                    round(add(decode(modulated), decode(shift))),
+                    "retained output after reused intermediate",
+                    i,
+                );
             }
             let actual = words(ADD);
             if let Some(previous) = previous.as_ref() {

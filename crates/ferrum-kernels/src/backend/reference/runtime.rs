@@ -18,8 +18,28 @@ use half::{bf16, f16};
 
 mod affine_f32;
 pub(crate) use affine_f32::ReferenceAffineF32Launch;
-mod cast_f32_to_bf16;
-pub(crate) use cast_f32_to_bf16::ReferenceCastF32ToBf16Launch;
+mod head_axis_pack;
+pub(crate) use head_axis_pack::ReferenceHeadAxisPackLaunch;
+mod head_fp8_roundtrip_bf16;
+pub(crate) use head_fp8_roundtrip_bf16::ReferenceHeadFp8RoundtripBf16Launch;
+mod float_cast;
+pub(crate) use float_cast::ReferenceFloatCastLaunch;
+mod batched_f32;
+pub(crate) use batched_f32::ReferenceBatchedF32Launch;
+mod channel_bias_add_bf16;
+pub(crate) use channel_bias_add_bf16::ReferenceChannelBiasAddBf16Launch;
+mod row_center_bf16;
+pub(crate) use row_center_bf16::ReferenceRowCenterBf16Launch;
+mod masked_tile_mean;
+pub(crate) use masked_tile_mean::ReferenceMaskedTileMeanLaunch;
+mod signal_f32;
+pub(crate) use signal_f32::ReferenceSignalF32Launch;
+mod head_rms_partial_rope_single_round_bf16;
+mod packed_swiglu_bf16;
+pub(crate) use head_rms_partial_rope_single_round_bf16::ReferenceHeadRmsPartialRopeSingleRoundLaunch;
+pub(crate) use packed_swiglu_bf16::ReferencePackedSwiGluBf16Launch;
+mod row_selected_rms_modulation_bf16;
+pub(crate) use row_selected_rms_modulation_bf16::ReferenceRowSelectedRmsModulationLaunch;
 mod pointwise_f32;
 pub(crate) use pointwise_f32::ReferenceF32PointwiseLaunch;
 mod gelu_f32;
@@ -39,14 +59,16 @@ pub(crate) use batched_suffix_append_f32::ReferenceBatchedSuffixAppendF32Launch;
 mod layer_norm_f32;
 pub(crate) use layer_norm_f32::ReferenceLayerNormF32Launch;
 mod cnn_f32;
+mod conv_transpose2d_f32;
 pub(crate) use cnn_f32::ReferenceCnnF32Launch;
+pub(crate) use conv_transpose2d_f32::ReferenceConvTranspose2dF32Launch;
 mod norm_rope_f32;
 pub(crate) use norm_rope_f32::{ReferenceF32NormRopeGeometry, ReferenceF32NormRopeLaunch};
 
 mod row_transport;
 pub(crate) use row_transport::{
     checked_concat_bytes, checked_gather_bytes, ReferenceBatchedRowConcatLaunch,
-    ReferenceRowGatherLaunch,
+    ReferenceRowGatherLaunch, ReferenceRowIndexGatherLaunch, ReferenceRowWriteLaunch,
 };
 mod layer_norm;
 pub(crate) use layer_norm::ReferenceLayerNormLaunch;
@@ -338,21 +360,37 @@ pub(crate) struct ReferenceDenseLinearLaunch {
 
 impl ReferenceDenseLinearLaunch {
     pub(crate) fn validate(&self) -> Result<(), ReferenceDeviceRuntimeError> {
+        self.validate_with_output_type(self.scalar.element_type())
+    }
+    pub(crate) fn validate_with_output_type(
+        &self,
+        output_type: ElementType,
+    ) -> Result<(), ReferenceDeviceRuntimeError> {
         if self.rows == 0 || self.in_features == 0 || self.out_features == 0 {
             return Err(ReferenceDeviceRuntimeError::contract(
                 "reference dense-linear dimensions must be positive",
             ));
         }
-        for (region, left, right) in [
-            (&self.input, self.rows, self.in_features),
-            (&self.weight, self.out_features, self.in_features),
-            (&self.output, self.rows, self.out_features),
+        for (region, left, right, dtype) in [
+            (
+                &self.input,
+                self.rows,
+                self.in_features,
+                self.scalar.element_type(),
+            ),
+            (
+                &self.weight,
+                self.out_features,
+                self.in_features,
+                self.scalar.element_type(),
+            ),
+            (&self.output, self.rows, self.out_features, output_type),
         ] {
             region.validate_range()?;
-            let width = self.scalar.element_type().size_bytes() as usize;
+            let width = dtype.size_bytes() as usize;
             let expected = left.checked_mul(right).and_then(|n| n.checked_mul(width));
             if expected != Some(region.length_bytes)
-                || region.element_type != self.scalar.element_type()
+                || region.element_type != dtype
                 || (region.offset_bytes - region.allocation.logical_offset_bytes) % width != 0
             {
                 return Err(ReferenceDeviceRuntimeError::contract(
@@ -370,6 +408,9 @@ impl ReferenceDenseLinearLaunch {
 }
 
 enum ReferenceCommandKind {
+    HeadRmsPartialRopeSingleRound {
+        launch: ReferenceHeadRmsPartialRopeSingleRoundLaunch,
+    },
     SpatialDecoder {
         launch: ReferenceSpatialDecoderLaunch,
     },
@@ -400,8 +441,35 @@ enum ReferenceCommandKind {
     AffineF32 {
         launch: ReferenceAffineF32Launch,
     },
-    CastF32ToBf16 {
-        launch: ReferenceCastF32ToBf16Launch,
+    HeadAxisPack {
+        launch: ReferenceHeadAxisPackLaunch,
+    },
+    HeadFp8RoundtripBf16 {
+        launch: ReferenceHeadFp8RoundtripBf16Launch,
+    },
+    FloatCast {
+        launch: ReferenceFloatCastLaunch,
+    },
+    BatchedF32 {
+        launch: ReferenceBatchedF32Launch,
+    },
+    ChannelBiasAddBf16 {
+        launch: ReferenceChannelBiasAddBf16Launch,
+    },
+    RowCenterBf16 {
+        launch: ReferenceRowCenterBf16Launch,
+    },
+    MaskedTileMean {
+        launch: ReferenceMaskedTileMeanLaunch,
+    },
+    SignalF32 {
+        launch: ReferenceSignalF32Launch,
+    },
+    PackedSwiGluBf16 {
+        launch: ReferencePackedSwiGluBf16Launch,
+    },
+    RowSelectedRmsModulation {
+        launch: ReferenceRowSelectedRmsModulationLaunch,
     },
     F32Pointwise {
         launch: ReferenceF32PointwiseLaunch,
@@ -430,6 +498,9 @@ enum ReferenceCommandKind {
     LayerNormF32 {
         launch: ReferenceLayerNormF32Launch,
     },
+    ConvTranspose2dF32 {
+        launch: ReferenceConvTranspose2dF32Launch,
+    },
     CnnF32 {
         launch: ReferenceCnnF32Launch,
     },
@@ -442,8 +513,14 @@ enum ReferenceCommandKind {
     ZeroCenteredRmsNorm {
         launch: ReferenceZeroCenteredRmsNormLaunch,
     },
+    RowWrite {
+        launch: ReferenceRowWriteLaunch,
+    },
     RowGather {
         launch: ReferenceRowGatherLaunch,
+    },
+    RowIndexGather {
+        launch: ReferenceRowIndexGatherLaunch,
     },
     BatchedRowConcat {
         launch: ReferenceBatchedRowConcatLaunch,
@@ -510,6 +587,9 @@ pub struct ReferenceDeviceCommand {
 impl fmt::Debug for ReferenceDeviceCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match &self.kind {
+            ReferenceCommandKind::HeadRmsPartialRopeSingleRound { .. } => {
+                "head_rms_partial_rope_single_round_bf16"
+            }
             ReferenceCommandKind::SpatialDecoder { .. } => "spatial_decoder",
             ReferenceCommandKind::SpatialGroupMean { .. } => "spatial_group_mean",
             ReferenceCommandKind::TensorPrimitive { .. } => "tensor_primitive",
@@ -518,11 +598,30 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::ManagedUpload { .. } => "managed_upload",
             ReferenceCommandKind::Zero { .. } => "zero",
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
-            ReferenceCommandKind::AffineF32 { .. } => "affine_linear_f32",
-            ReferenceCommandKind::CastF32ToBf16 { .. } => "cast_f32_to_bf16",
+            ReferenceCommandKind::AffineF32 { launch } => {
+                if launch.rounded_bf16 {
+                    "affine_linear_f32_to_bf16"
+                } else {
+                    "affine_linear_f32"
+                }
+            }
+            ReferenceCommandKind::HeadAxisPack { launch } => launch.geometry.kind().operation_id(),
+            ReferenceCommandKind::FloatCast { .. } => "float_cast",
+            ReferenceCommandKind::BatchedF32 { launch } => launch.geometry.op().operation_id(),
+            ReferenceCommandKind::ChannelBiasAddBf16 { .. } => "channel_bias_add_bf16",
+            ReferenceCommandKind::RowCenterBf16 { .. } => "row_center_bf16",
+            ReferenceCommandKind::HeadFp8RoundtripBf16 { .. } => "head_fp8_roundtrip_bf16",
+            ReferenceCommandKind::MaskedTileMean { .. } => "masked_tile_mean",
+            ReferenceCommandKind::SignalF32 { .. } => "signal_f32",
+            ReferenceCommandKind::PackedSwiGluBf16 { .. } => "packed_swiglu_bf16",
+            ReferenceCommandKind::RowSelectedRmsModulation { .. } => {
+                "row_selected_rms_modulation_bf16"
+            }
             ReferenceCommandKind::F32Pointwise { launch } => match launch.kind {
                 ferrum_runtime::F32PointwiseOp::ResidualAdd => "plain_residual_add_f32",
                 ferrum_runtime::F32PointwiseOp::SiluMul => "silu_mul_f32",
+                ferrum_runtime::F32PointwiseOp::Silu => "silu_f32",
+                ferrum_runtime::F32PointwiseOp::Multiply => "multiply_f32",
             },
             ReferenceCommandKind::GeluF32 { launch } => launch.name(),
             ReferenceCommandKind::RowScatterF32 { launch } => launch.name(),
@@ -538,9 +637,14 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::BatchedSuffixAppendF32 { .. } => "batched_suffix_append_f32",
             ReferenceCommandKind::LayerNormF32 { .. } => "layer_norm_f32",
             ReferenceCommandKind::CnnF32 { launch } => launch.geometry.kind().operation_id(),
+            ReferenceCommandKind::ConvTranspose2dF32 { .. } => {
+                ferrum_runtime::CONV_TRANSPOSE2D_F32_OPERATION_ID
+            }
             ReferenceCommandKind::LayerNorm { .. } => "layer_norm",
             ReferenceCommandKind::ZeroCenteredRmsNorm { .. } => "zero_centered_rms_norm",
+            ReferenceCommandKind::RowWrite { .. } => "row_write",
             ReferenceCommandKind::RowGather { .. } => "row_gather",
+            ReferenceCommandKind::RowIndexGather { .. } => "row_index_gather_or_zero",
             ReferenceCommandKind::BatchedRowConcat { .. } => "batched_row_concat",
             ReferenceCommandKind::HeadRmsNorm { .. } => "head_rms_norm",
             ReferenceCommandKind::Conv2d { .. } => "conv2d",
@@ -575,6 +679,24 @@ impl fmt::Debug for ReferenceDeviceCommand {
 }
 
 impl ReferenceDeviceCommand {
+    pub(crate) fn head_fp8_roundtrip_bf16_tensor(
+        launch: ReferenceHeadFp8RoundtripBf16Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: launch.geometry.operation_id(),
+            logical_work: Some(
+                DeviceCommandLogicalWork::tensor(
+                    launch.geometry.elements(),
+                    launch.geometry.arithmetic(),
+                )
+                .map_err(|e| ReferenceDeviceRuntimeError::contract(e.to_string()))?,
+            ),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::HeadFp8RoundtripBf16 { launch },
+        })
+    }
     pub(crate) fn dense_linear(
         launches: Vec<ReferenceDenseLinearLaunch>,
         batching_form: DeviceBatchingForm,
@@ -657,29 +779,51 @@ impl ReferenceDeviceCommand {
             })?;
         let operations = (launch.dense.in_features as u64)
             .checked_mul(2)
-            .and_then(|dot| dot.checked_add(1))
+            .and_then(|dot| dot.checked_add(1 + u64::from(launch.rounded_bf16)))
             .and_then(|per_output| count.checked_mul(per_output))
             .ok_or_else(|| {
                 ReferenceDeviceRuntimeError::contract("F32 affine logical work overflows")
             })?;
         Ok(Self {
-            operation: "vnext_affine_linear_f32",
+            operation: if launch.rounded_bf16 {
+                "vnext_affine_linear_f32_to_bf16"
+            } else {
+                "vnext_affine_linear_f32"
+            },
             logical_work: Some(
                 DeviceCommandLogicalWork::tensor(count, operations)
                     .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?,
             ),
-            compute_dispatch_count: 2,
+            compute_dispatch_count: if launch.rounded_bf16 { 1 } else { 2 },
             transfer_command_count: 0,
             kind: ReferenceCommandKind::AffineF32 { launch },
         })
     }
 
-    pub(crate) fn cast_f32_to_bf16_tensor(
-        launch: ReferenceCastF32ToBf16Launch,
+    pub(crate) fn head_axis_pack_tensor(
+        launch: ReferenceHeadAxisPackLaunch,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
         launch.validate()?;
         Ok(Self {
-            operation: "vnext_cast_f32_to_bf16",
+            operation: launch.geometry.kind().operation_id(),
+            logical_work: Some(
+                DeviceCommandLogicalWork::tensor(
+                    launch.geometry.elements(),
+                    launch.geometry.arithmetic_operations(),
+                )
+                .map_err(|e| ReferenceDeviceRuntimeError::contract(e.to_string()))?,
+            ),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::HeadAxisPack { launch },
+        })
+    }
+    pub(crate) fn float_cast_tensor(
+        launch: ReferenceFloatCastLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: launch.geometry.kind().operation_id(),
             logical_work: Some(
                 DeviceCommandLogicalWork::tensor(
                     launch.geometry.elements(),
@@ -689,10 +833,150 @@ impl ReferenceDeviceCommand {
             ),
             compute_dispatch_count: 1,
             transfer_command_count: 0,
-            kind: ReferenceCommandKind::CastF32ToBf16 { launch },
+            kind: ReferenceCommandKind::FloatCast { launch },
         })
     }
 
+    pub(crate) fn batched_f32_tensor(
+        launch: ReferenceBatchedF32Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: launch.geometry.op().operation_id(),
+            logical_work: Some(
+                DeviceCommandLogicalWork::tensor(
+                    launch.geometry.output_elements(),
+                    launch
+                        .geometry
+                        .arithmetic_operations()
+                        .map_err(|e| ReferenceDeviceRuntimeError::contract(e.to_string()))?,
+                )
+                .map_err(|e| ReferenceDeviceRuntimeError::contract(e.to_string()))?,
+            ),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::BatchedF32 { launch },
+        })
+    }
+
+    pub(crate) fn channel_bias_add_bf16_tensor(
+        launch: ReferenceChannelBiasAddBf16Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: ferrum_runtime::CHANNEL_BIAS_ADD_BF16_OPERATION_ID,
+            logical_work: Some(
+                DeviceCommandLogicalWork::tensor(
+                    launch.geometry.elements(),
+                    launch.geometry.elements(),
+                )
+                .map_err(|e| ReferenceDeviceRuntimeError::contract(e.to_string()))?,
+            ),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::ChannelBiasAddBf16 { launch },
+        })
+    }
+    pub(crate) fn row_center_bf16_tensor(
+        launch: ReferenceRowCenterBf16Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: ferrum_runtime::ROW_CENTER_BF16_OPERATION_ID,
+            logical_work: Some(
+                DeviceCommandLogicalWork::tensor(
+                    launch.geometry.elements() + launch.geometry.mean_elements(),
+                    launch.geometry.arithmetic(),
+                )
+                .map_err(|e| ReferenceDeviceRuntimeError::contract(e.to_string()))?,
+            ),
+            compute_dispatch_count: 2,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::RowCenterBf16 { launch },
+        })
+    }
+    pub(crate) fn masked_tile_mean_tensor(
+        launch: ReferenceMaskedTileMeanLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: ferrum_runtime::MASKED_TILE_MEAN_BF16_F32_OPERATION_ID,
+            logical_work: Some(
+                DeviceCommandLogicalWork::tensor(
+                    launch.geometry.output_elements(),
+                    launch.geometry.arithmetic_operations(),
+                )
+                .map_err(|e| ReferenceDeviceRuntimeError::contract(e.to_string()))?,
+            ),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::MaskedTileMean { launch },
+        })
+    }
+
+    pub(crate) fn signal_f32_tensor(
+        launch: ReferenceSignalF32Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: launch.geometry.kind.operation_id(),
+            logical_work: Some(
+                DeviceCommandLogicalWork::tensor(
+                    launch.geometry.output_elements(),
+                    launch.geometry.logical_arithmetic_operations(),
+                )
+                .map_err(|e| ReferenceDeviceRuntimeError::contract(e.to_string()))?,
+            ),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::SignalF32 { launch },
+        })
+    }
+
+    pub(crate) fn packed_swiglu_bf16_tensor(
+        launch: ReferencePackedSwiGluBf16Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_packed_swiglu_bf16",
+            logical_work: Some(
+                DeviceCommandLogicalWork::tensor(
+                    launch.geometry.elements(),
+                    launch.geometry.arithmetic_operations(launch.profile),
+                )
+                .map_err(|e| ReferenceDeviceRuntimeError::contract(e.to_string()))?,
+            ),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::PackedSwiGluBf16 { launch },
+        })
+    }
+
+    pub(crate) fn head_rms_partial_rope_single_round_tensor(
+        launch: ReferenceHeadRmsPartialRopeSingleRoundLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_head_rms_partial_rope_single_round_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::HeadRmsPartialRopeSingleRound { launch },
+        })
+    }
+
+    pub(crate) fn row_selected_rms_modulation_tensor(
+        launch: ReferenceRowSelectedRmsModulationLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_row_selected_rms_modulation_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::RowSelectedRmsModulation { launch },
+        })
+    }
     pub(crate) fn f32_pointwise_tensor(
         launch: ReferenceF32PointwiseLaunch,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
@@ -700,6 +984,8 @@ impl ReferenceDeviceCommand {
         let (operation, per_element) = match launch.kind {
             ferrum_runtime::F32PointwiseOp::ResidualAdd => ("vnext_plain_residual_add_f32", 1u64),
             ferrum_runtime::F32PointwiseOp::SiluMul => ("vnext_silu_mul_f32", 5),
+            ferrum_runtime::F32PointwiseOp::Silu => ("vnext_silu_f32", 4),
+            ferrum_runtime::F32PointwiseOp::Multiply => ("vnext_multiply_f32", 1),
         };
         let work = launch
             .geometry
@@ -820,6 +1106,19 @@ impl ReferenceDeviceCommand {
         })
     }
 
+    pub(crate) fn conv_transpose2d_f32_tensor(
+        launch: ReferenceConvTranspose2dF32Launch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: ferrum_runtime::CONV_TRANSPOSE2D_F32_OPERATION_ID,
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::ConvTranspose2dF32 { launch },
+        })
+    }
+
     pub(crate) fn half_split_rope_tensor(
         launch: ReferenceHalfSplitRopeLaunch,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
@@ -936,6 +1235,19 @@ impl ReferenceDeviceCommand {
         })
     }
 
+    pub(crate) fn row_write_tensor(
+        launch: ReferenceRowWriteLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_row_write_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::RowWrite { launch },
+        })
+    }
+
     pub(crate) fn row_gather_tensor(
         launch: ReferenceRowGatherLaunch,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
@@ -946,6 +1258,18 @@ impl ReferenceDeviceCommand {
             compute_dispatch_count: 1,
             transfer_command_count: 0,
             kind: ReferenceCommandKind::RowGather { launch },
+        })
+    }
+    pub(crate) fn row_index_gather_tensor(
+        launch: ReferenceRowIndexGatherLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_row_index_gather_or_zero_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::RowIndexGather { launch },
         })
     }
     pub(crate) fn batched_row_concat_tensor(
@@ -1197,7 +1521,33 @@ impl ReferenceDeviceCommand {
                 Ok(())
             }
             ReferenceCommandKind::AffineF32 { launch } => launch.validate_runtime(runtime_instance),
-            ReferenceCommandKind::CastF32ToBf16 { launch } => {
+            ReferenceCommandKind::HeadAxisPack { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::HeadFp8RoundtripBf16 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::FloatCast { launch } => launch.validate_runtime(runtime_instance),
+            ReferenceCommandKind::BatchedF32 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::ChannelBiasAddBf16 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::RowCenterBf16 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::MaskedTileMean { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::SignalF32 { launch } => launch.validate_runtime(runtime_instance),
+            ReferenceCommandKind::PackedSwiGluBf16 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::HeadRmsPartialRopeSingleRound { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::RowSelectedRmsModulation { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
             ReferenceCommandKind::F32Pointwise { launch } => {
@@ -1229,10 +1579,17 @@ impl ReferenceDeviceCommand {
                 launch.validate_runtime(runtime_instance)
             }
             ReferenceCommandKind::CnnF32 { launch } => launch.validate_runtime(runtime_instance),
+            ReferenceCommandKind::ConvTranspose2dF32 { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::ZeroCenteredRmsNorm { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::RowWrite { launch } => launch.validate_runtime(runtime_instance),
             ReferenceCommandKind::RowGather { launch } => launch.validate_runtime(runtime_instance),
+            ReferenceCommandKind::RowIndexGather { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::BatchedRowConcat { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
@@ -1340,7 +1697,27 @@ impl ReferenceDeviceCommand {
                     .dense_linear_launches
                     .fetch_add(1, Ordering::Relaxed);
             }
-            ReferenceCommandKind::CastF32ToBf16 { launch } => cast_f32_to_bf16::execute(launch),
+            ReferenceCommandKind::HeadAxisPack { launch } => head_axis_pack::execute(launch),
+            ReferenceCommandKind::HeadFp8RoundtripBf16 { launch } => {
+                head_fp8_roundtrip_bf16::execute(launch)
+            }
+            ReferenceCommandKind::FloatCast { launch } => float_cast::execute(launch),
+            ReferenceCommandKind::BatchedF32 { launch } => batched_f32::execute(launch),
+            ReferenceCommandKind::ChannelBiasAddBf16 { launch } => {
+                channel_bias_add_bf16::execute(launch)
+            }
+            ReferenceCommandKind::RowCenterBf16 { launch } => row_center_bf16::execute(launch),
+            ReferenceCommandKind::MaskedTileMean { launch } => masked_tile_mean::execute(launch),
+            ReferenceCommandKind::SignalF32 { launch } => signal_f32::execute(launch),
+            ReferenceCommandKind::PackedSwiGluBf16 { launch } => {
+                packed_swiglu_bf16::execute(launch)
+            }
+            ReferenceCommandKind::HeadRmsPartialRopeSingleRound { launch } => {
+                head_rms_partial_rope_single_round_bf16::execute(launch)
+            }
+            ReferenceCommandKind::RowSelectedRmsModulation { launch } => {
+                row_selected_rms_modulation_bf16::execute(launch)
+            }
             ReferenceCommandKind::F32Pointwise { launch } => pointwise_f32::execute(launch),
             ReferenceCommandKind::GeluF32 { launch } => gelu_f32::execute(launch),
             ReferenceCommandKind::RowScatterF32 { launch } => row_scatter_f32::execute(launch),
@@ -1356,6 +1733,9 @@ impl ReferenceDeviceCommand {
             }
             ReferenceCommandKind::LayerNormF32 { launch } => layer_norm_f32::execute(launch),
             ReferenceCommandKind::CnnF32 { launch } => cnn_f32::execute(launch),
+            ReferenceCommandKind::ConvTranspose2dF32 { launch } => {
+                conv_transpose2d_f32::execute(launch)
+            }
             ReferenceCommandKind::LayerNorm { launch } => {
                 layer_norm::execute(launch);
                 counters.layer_norm_launches.fetch_add(1, Ordering::Relaxed);
@@ -1366,9 +1746,13 @@ impl ReferenceDeviceCommand {
                     .zero_centered_rms_norm_launches
                     .fetch_add(1, Ordering::Relaxed);
             }
+            ReferenceCommandKind::RowWrite { launch } => row_transport::execute_write(launch),
             ReferenceCommandKind::RowGather { launch } => {
                 row_transport::execute_gather(launch);
                 counters.row_gather_launches.fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::RowIndexGather { launch } => {
+                row_transport::execute_index_gather(launch)
             }
             ReferenceCommandKind::BatchedRowConcat { launch } => {
                 row_transport::execute_concat(launch);
@@ -1432,7 +1816,8 @@ impl ReferenceDeviceCommand {
                     ReferenceRowRmsAddcmulGeometry::RowRms(_) => {
                         &counters.row_rms_single_round_launches
                     }
-                    ReferenceRowRmsAddcmulGeometry::Addcmul(_) => &counters.addcmul_launches,
+                    ReferenceRowRmsAddcmulGeometry::Addcmul(_)
+                    | ReferenceRowRmsAddcmulGeometry::AddcmulFma(_) => &counters.addcmul_launches,
                 };
                 count.fetch_add(1, Ordering::Relaxed);
             }
@@ -1581,6 +1966,15 @@ impl<'a, const N: usize> AllocationLocks<'a, N> {
         ])
     }
 
+    fn read_i32(&self, role: usize, index: usize) -> i32 {
+        let bytes = self.guards[self.slots[role]].as_ref().unwrap();
+        let offset = self.offsets[role] + index * 4;
+        i32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("checked I32 region"),
+        )
+    }
     fn write_bits(&mut self, role: usize, index: usize, bits: u16) {
         let bytes = self.guards[self.slots[role]].as_mut().unwrap();
         let offset = self.offsets[role] + index * 2;

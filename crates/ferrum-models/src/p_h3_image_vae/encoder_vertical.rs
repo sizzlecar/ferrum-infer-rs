@@ -118,7 +118,7 @@ impl ModelFamilyProvider for PH3ImageVaeEncoderVerticalFamily {
             .flat_map(|n| &n.outputs)
             .map(|v| (v.clone(), ElementType::F32))
             .collect();
-        let operations = F32CnnOp::ALL
+        let operations = F32CnnOp::NCHW
             .into_iter()
             .map(|kind| NumericalOperationContract {
                 operation_id: OperationId::new(kind.operation_id()).unwrap(),

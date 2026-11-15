@@ -16,7 +16,10 @@ fn launch(
 ) -> ReferenceF32ChannelwiseLaunch {
     let x = spec(&[
         2,
-        if kind == F32ChannelwiseOp::GroupedColumnSlice {
+        if matches!(
+            kind,
+            F32ChannelwiseOp::GroupedColumnSlice | F32ChannelwiseOp::GroupedColumnMean
+        ) {
             12
         } else {
             4
@@ -29,11 +32,18 @@ fn launch(
             .into_iter()
             .map(|(k, v)| (AttributeId::new(k).unwrap(), SemanticValue::Unsigned(v)))
             .collect()
+    } else if kind == F32ChannelwiseOp::GroupedColumnMean {
+        BTreeMap::from([(
+            AttributeId::new("group_width").unwrap(),
+            SemanticValue::Unsigned(4),
+        )])
     } else {
         BTreeMap::new()
     };
     let inputs = match kind {
-        F32ChannelwiseOp::ScaledResidual => vec![&x, &x, &vector],
+        F32ChannelwiseOp::ScaledResidual | F32ChannelwiseOp::ScaledResidualSeparate => {
+            vec![&x, &x, &vector]
+        }
         F32ChannelwiseOp::BiasAdd => vec![&x, &vector],
         _ => vec![&x],
     };
@@ -125,6 +135,84 @@ fn grouped_columns_preserve_raw_payload_bits_across_rows_and_heads() {
     assert_eq!(runtime.snapshot().live_allocations, 0);
 }
 #[test]
+fn grouped_mean_and_adaptive_bins_preserve_rows_and_two_distinct_reductions() {
+    let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+    let l = launch(&runtime, F32ChannelwiseOp::GroupedColumnMean);
+    let output = l.output.clone();
+    submit(
+        &runtime,
+        ReferenceDeviceCommand::channelwise_f32_tensor(l).unwrap(),
+    );
+    let got: Vec<f32> = output
+        .read()
+        .chunks_exact(4)
+        .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+        .collect();
+    assert_eq!(got, [4., 5., 6., 7., 16., 17., 18., 19.]);
+    // Non-divisible bins overlap; upsampling repeats or averages adjacent
+    // values. These are independent expected values, not the index formula.
+    for (columns, expected) in [
+        (3, vec![2., 6., 10., -2., -6., -10.]),
+        (
+            7,
+            vec![
+                0., 2., 4., 6., 8., 10., 12., 0., -2., -4., -6., -8., -10., -12.,
+            ],
+        ),
+    ] {
+        let data: Vec<u8> = [0f32, 4., 8., 12., 0., -4., -8., -12.]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let input = buffer(&runtime, "resource.pool.x", &data, 16, ElementType::F32)
+            .region(0..data.len() as u64)
+            .unwrap();
+        let out = buffer(
+            &runtime,
+            "resource.pool.y",
+            &vec![0; expected.len() * 4],
+            16,
+            ElementType::F32,
+        )
+        .region(0..expected.len() as u64 * 4)
+        .unwrap();
+        let geometry = F32ChannelwiseGeometry::new(
+            F32ChannelwiseOp::AdaptiveAvgPool,
+            &[&spec(&[2, 4])],
+            &spec(&[2, columns]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        submit(
+            &runtime,
+            ReferenceDeviceCommand::channelwise_f32_tensor(ReferenceF32ChannelwiseLaunch {
+                inputs: vec![input],
+                output: out.clone(),
+                geometry,
+            })
+            .unwrap(),
+        );
+        let values: Vec<f32> = out
+            .read()
+            .chunks_exact(4)
+            .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, expected);
+    }
+    assert!(F32ChannelwiseGeometry::new(
+        F32ChannelwiseOp::GroupedColumnMean,
+        &[&spec(&[2, 13])],
+        &spec(&[2, 4]),
+        &BTreeMap::from([(
+            AttributeId::new("group_width").unwrap(),
+            SemanticValue::Unsigned(4)
+        )])
+    )
+    .is_err());
+    drop(output);
+    assert_eq!(runtime.snapshot().live_allocations, 0);
+}
+#[test]
 fn exact_ranges_aliases_and_foreign_late_scale_fail_before_any_output_write() {
     let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
     for kind in F32ChannelwiseOp::ALL {
@@ -187,4 +275,77 @@ fn exact_ranges_aliases_and_foreign_late_scale_fail_before_any_output_write() {
     drop(output);
     assert_eq!(runtime.snapshot().live_allocations, 0);
     assert_eq!(foreign.snapshot().live_allocations, 0);
+}
+
+#[test]
+fn separate_residual_rounds_product_before_addition_including_overflow_and_underflow() {
+    let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+    let base = [
+        -f32::MAX,
+        -1.0,
+        -0.0,
+        f32::from_bits(1),
+        -f32::MAX,
+        -1.0,
+        -0.0,
+        f32::from_bits(1),
+    ];
+    let branch = [
+        f32::MAX,
+        f32::from_bits(0x3f800001),
+        -0.0,
+        f32::from_bits(1),
+        f32::MAX,
+        f32::from_bits(0x3f800001),
+        -0.0,
+        f32::from_bits(1),
+    ];
+    let scale = [2.0, f32::from_bits(0x3f7ffffe), 1.0, 0.5];
+    let mut outputs = Vec::new();
+    for kind in [
+        F32ChannelwiseOp::ScaledResidualSeparate,
+        F32ChannelwiseOp::ScaledResidual,
+    ] {
+        let mut l = launch(&runtime, kind);
+        for (i, values) in [&base[..], &branch[..], &scale[..]].into_iter().enumerate() {
+            let bytes: Vec<_> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            l.inputs[i] = buffer(
+                &runtime,
+                &format!("resource.channelwise.witness{i}"),
+                &bytes,
+                16,
+                ElementType::F32,
+            )
+            .region(0..bytes.len() as u64)
+            .unwrap();
+        }
+        let output = l.output.clone();
+        submit(
+            &runtime,
+            ReferenceDeviceCommand::channelwise_f32_tensor(l).unwrap(),
+        );
+        outputs.push(
+            output
+                .read()
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let expected: Vec<_> = (0..8)
+        .map(|i| {
+            let product = (f64::from(branch[i]) * f64::from(scale[i % 4])) as f32;
+            (f64::from(base[i]) + f64::from(product)) as f32
+        })
+        .map(f32::to_bits)
+        .collect();
+    assert_eq!(outputs[0], expected);
+    assert_eq!(
+        outputs[0][..4],
+        [f32::INFINITY.to_bits(), 0, (-0.0f32).to_bits(), 1]
+    );
+    assert_eq!(outputs[1][0], f32::MAX.to_bits());
+    assert_ne!(outputs[1][1], outputs[0][1]);
+    assert_eq!(outputs[1][3], 2);
+    assert_eq!(runtime.snapshot().live_allocations, 0);
 }

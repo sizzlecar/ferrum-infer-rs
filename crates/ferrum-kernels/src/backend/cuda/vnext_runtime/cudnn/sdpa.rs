@@ -16,6 +16,9 @@ mod tests;
 pub(crate) struct CudnnSdpaSignature {
     pub batch: i64,
     pub heads: i64,
+    pub key_value_heads: i64,
+    /// Top-left, inclusive causal mask; equal Q/KV lengths only.
+    pub causal: bool,
     pub query_length: i64,
     pub key_value_length: i64,
     pub head_dim: i64,
@@ -26,10 +29,15 @@ pub(crate) struct CudnnSdpaSignature {
 }
 
 impl CudnnSdpaSignature {
+    pub(crate) const MAX_BATCH: i64 = 16;
+
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if !(1..=16).contains(&self.batch)
+        if !(1..=Self::MAX_BATCH).contains(&self.batch)
             || self.heads <= 0
-            || !matches!(self.head_dim, 72 | 128)
+            || self.key_value_heads <= 0
+            || self.heads % self.key_value_heads != 0
+            || (self.causal && self.query_length != self.key_value_length)
+            || !matches!(self.head_dim, 64 | 72 | 128)
             || self.query_length <= 0
             || self.key_value_length <= 0
             || self.query_length > i32::MAX as i64
@@ -37,17 +45,26 @@ impl CudnnSdpaSignature {
             || !f32::from_bits(self.scale_bits).is_finite()
             || f32::from_bits(self.scale_bits) <= 0.0
         {
-            return Err("cuDNN SDPA requires B=1..16, positive bounded lengths/heads, D72 or D128 and finite positive scale".into());
+            return Err("cuDNN SDPA requires B=1..16, positive bounded lengths/heads, D64, D72 or D128 and finite positive scale".into());
         }
         self.extent(self.query_length, self.query_batch_stride)?;
-        self.extent(self.key_value_length, self.key_value_batch_stride)?;
+        self.kv_extent()?;
         self.extent(self.query_length, self.output_batch_stride)?;
         Ok(())
     }
 
     fn extent(&self, length: i64, batch_stride: i64) -> Result<u64, String> {
-        let row = self
-            .heads
+        self.head_extent(self.heads, length, batch_stride)
+    }
+    fn kv_extent(&self) -> Result<u64, String> {
+        self.head_extent(
+            self.key_value_heads,
+            self.key_value_length,
+            self.key_value_batch_stride,
+        )
+    }
+    fn head_extent(&self, heads: i64, length: i64, batch_stride: i64) -> Result<u64, String> {
+        let row = heads
             .checked_mul(self.head_dim)
             .ok_or("SDPA row extent overflows")?;
         let one = row
@@ -79,6 +96,12 @@ impl CudnnSdpaSignature {
             digest.update(value.to_le_bytes());
         }
         digest.update(self.scale_bits.to_le_bytes());
+        // Preserve identities of the original equal-head noncausal plans.
+        if self.causal || self.key_value_heads != self.heads {
+            digest.update(b"compact-gqa-causal-v1");
+            digest.update(self.key_value_heads.to_le_bytes());
+            digest.update([u8::from(self.causal)]);
+        }
     }
 }
 
@@ -92,7 +115,7 @@ pub struct CudnnSdpaPlanPolicy {
     pub workspace_limit_bytes: u64,
 }
 impl CudnnSdpaPlanPolicy {
-    fn validate(self) -> Result<(), String> {
+    pub(crate) fn validate(self) -> Result<(), String> {
         if self.maximum_plans == 0
             || self.maximum_live_bindings == 0
             || self.opaque_memory_bytes == 0
@@ -392,7 +415,12 @@ impl CudnnSdpaPlan {
             .map_err(|e| CudaDeviceRuntimeError::driver("SDPA binding context bind", e))?;
         owner.failed = true;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            native::VariantPack::build(&owner.api.graph, bindings, &self.scale)
+            native::VariantPack::build(
+                &owner.api.graph,
+                bindings,
+                &self.scale,
+                self.signature.causal,
+            )
         }));
         match result {
             Ok(Ok(pack)) => {
@@ -546,16 +574,8 @@ fn validate_bindings(
     }
     let spans = [
         (b.q, s.extent(s.query_length, s.query_batch_stride)?, 16),
-        (
-            b.k,
-            s.extent(s.key_value_length, s.key_value_batch_stride)?,
-            16,
-        ),
-        (
-            b.v,
-            s.extent(s.key_value_length, s.key_value_batch_stride)?,
-            16,
-        ),
+        (b.k, s.kv_extent()?, 16),
+        (b.v, s.kv_extent()?, 16),
         (b.o, s.extent(s.query_length, s.output_batch_stride)?, 16),
         (b.seq_len_q, s.batch as u64 * 4, 4),
         (b.seq_len_kv, s.batch as u64 * 4, 4),

@@ -1,0 +1,27 @@
+{
+  "_class_name": "MiniMaxH3Transformer3DModel",
+  "_diffusers_version": "0.36.0.dev0",
+  "attention_head_dim": 128,
+  "audio_in_channels": 32,
+  "ffn_dim": 14336,
+  "final_norm_eps": 1e-05,
+  "freq_dim": 256,
+  "hidden_size": 5376,
+  "in_channels": 24,
+  "norm_eps": 1e-05,
+  "num_attention_heads": 56,
+  "num_layers": 50,
+  "num_refiner_layers": 2,
+  "patch_size": [
+    1,
+    2,
+    2
+  ],
+  "pdd_steps": 32,
+  "qk_norm_eps": 1e-05,
+  "rope_freq_dim": 16,
+  "rope_theta": 10000.0,
+  "text_dim": 5120,
+  "time_embed_dim": 2688,
+  "time_embed_hidden_dim": 5376
+}

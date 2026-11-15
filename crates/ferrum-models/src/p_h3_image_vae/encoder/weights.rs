@@ -97,7 +97,7 @@ pub(super) fn schema(
         components.push(WeightComponentSpec {
             id: component_id.clone(),
             role: WeightComponentRole::Values,
-            external_names: vec![e.name.clone()],
+            external_names: vec![c.external_name(&e.name)],
             dimensions: e.physical.clone(),
             encoding: WeightEncoding::Dense {
                 element_type: ElementType::F32,

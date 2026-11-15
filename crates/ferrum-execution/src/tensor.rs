@@ -9,13 +9,15 @@ use std::{fmt, sync::Arc, time::Instant};
 use ferrum_runtime::*;
 
 mod admission;
+mod dynamic_preparation;
+pub use dynamic_preparation::TensorDynamicPreparationOutcome;
 mod profile;
 mod request;
 mod serial_actor;
 mod wave_identity;
 pub use ferrum_runtime::TensorRequestStateMapping;
 pub use profile::{TensorExecutionProfile, TensorHostWallTimings};
-pub use request::{TensorRequestCloseFailure, TensorRequestSession};
+pub use request::{TensorRequestCloseFailure, TensorRequestInitialization, TensorRequestSession};
 pub use serial_actor::{TensorSerialActor, TensorSerialActorStreamRequirements};
 #[cfg(test)]
 mod output_slices;
@@ -354,7 +356,7 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         request_id: RequestIdentity,
         work: ResourceWorkShape,
         request_session: Option<Arc<SequenceSession<R>>>,
-        initialize: Option<(&TensorRequestStateTarget<R>, &[TensorRequestStateMapping])>,
+        initialize: Option<&[(&TensorRequestStateTarget<R>, &[TensorRequestStateMapping])]>,
         execution_lane: Option<&Arc<ExecutionLane<R>>>,
     ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
         // Device timing is explicit and defaults to Off. Host tracing alone
@@ -374,13 +376,15 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             .outputs
             .iter()
             .filter(|(port, _)| {
-                !initialize.is_some_and(|(_, mappings)| {
-                    mappings.iter().any(|m| &m.source_output == port.value_id())
+                !initialize.is_some_and(|destinations| {
+                    destinations.iter().any(|(_, mappings)| {
+                        mappings.iter().any(|m| &m.source_output == port.value_id())
+                    })
                 })
             })
             .cloned()
             .collect::<Vec<_>>();
-        if outputs.is_empty() {
+        if outputs.is_empty() && initialize.is_none() {
             return Err(
                 invalid("tensor execution requires at least one Host completion output").into(),
             );
@@ -395,7 +399,11 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                 Ok((HostMemoryClass::Output, bytes))
             })
             .collect::<Result<Vec<_>, VNextError>>()?;
-        let claims = self.output_host.reserve_many(&demand)?;
+        let claims = if demand.is_empty() {
+            Vec::new()
+        } else {
+            self.output_host.reserve_many(&demand)?
+        };
         let readbacks = outputs
             .iter()
             .zip(claims)
@@ -432,12 +440,8 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         let step_admission_us = host_wall_us(admission_started);
         let wave_started = trace_enabled.then(Instant::now);
         let mut wave = self.prepare_wave(&step)?;
-        if let Some((target, mappings)) = initialize {
-            wave.initialize_tensor_request_state(
-                self.executable.execution_plan(),
-                target,
-                mappings,
-            )?;
+        if let Some(destinations) = initialize {
+            wave.initialize_tensor_request_states(self.executable.execution_plan(), destinations)?;
         }
         drop(step);
         let wave_prepare_us = host_wall_us(wave_started);
@@ -460,19 +464,40 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
         let admission_wave_us =
             initial_admission_us.saturating_add(host_wall_us(admission_started));
         let encode_started = trace_enabled.then(Instant::now);
-        let dispatch = OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
-            self.providers.providers(),
-            &self.executable,
-            &identity,
-            std::iter::once(&active),
-            self.config.device_timing_mode,
-            &uploads,
-            SubmissionExecutionPolicy::adaptive(),
-            &profile::NoHostDispatchTiming,
-            wave,
-            &lane,
-            &self.reaper,
-        );
+        let host_dispatch = profile::HostDispatchTiming::default();
+        let dispatch = if tracing::enabled!(tracing::Level::DEBUG) {
+            OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
+                self.providers.providers(),
+                &self.executable,
+                &identity,
+                std::iter::once(&active),
+                self.config.device_timing_mode,
+                &uploads,
+                SubmissionExecutionPolicy::adaptive(),
+                &host_dispatch,
+                wave,
+                &lane,
+                &self.reaper,
+            )
+        } else {
+            OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
+                self.providers.providers(),
+                &self.executable,
+                &identity,
+                std::iter::once(&active),
+                self.config.device_timing_mode,
+                &uploads,
+                SubmissionExecutionPolicy::adaptive(),
+                &profile::NoHostDispatchTiming,
+                wave,
+                &lane,
+                &self.reaper,
+            )
+        };
+        let encode_submit_us = host_wall_us(encode_started);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            host_dispatch.trace(dispatch.is_ok());
+        }
         let handle = match dispatch {
             Ok(handle) => handle,
             Err(source) => {
@@ -484,9 +509,20 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
             }
         };
         let (handle, submission_observation) = handle.into_parts();
-        let encode_submit_us = host_wall_us(encode_started);
         let wait_started = trace_enabled.then(Instant::now);
-        let observed = match handle.wait_with_managed_readbacks(readbacks) {
+        let completion = if readbacks.is_empty() {
+            // All outputs have explicit admitted Device destinations. The
+            // ordinary terminal transition still publishes their states and
+            // retires the producer; no dummy Host output or readback is needed.
+            handle
+                .wait()
+                .map(|observation| (observation, Some(Ok(Vec::new()))))
+        } else {
+            handle
+                .wait_with_managed_readbacks(readbacks)
+                .map(|observed| observed.into_parts())
+        };
+        let (observation, output) = match completion {
             Ok(observed) => observed,
             Err(source) => {
                 return Err(TensorExecutionError::Completion {
@@ -497,7 +533,6 @@ impl<R: DeviceRuntime> PreparedTensorExecutor<R> {
                 })
             }
         };
-        let (observation, output) = observed.into_parts();
         let receipt = match observation {
             CompletionObservation::Terminal(receipt) => receipt,
             observation => {

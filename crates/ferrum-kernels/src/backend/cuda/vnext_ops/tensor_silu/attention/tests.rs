@@ -7,6 +7,21 @@ use ferrum_runtime::{
     ResolvedValueStorage, ResourceId, TensorAccess,
 };
 
+#[test]
+fn isolated_native_batch_initializes_every_members_valid_key_lengths() {
+    for batches in [1, 2, MASK_BATCH_TILE] {
+        let mask = NativeMask::isolated_sequences(129, batches).unwrap();
+        for batch in 0..MASK_BATCH_TILE {
+            let active = batch < batches;
+            assert_eq!(mask.key_run_counts[batch], u32::from(active));
+            assert_eq!(mask.key_valid_masks[batch], u32::from(active));
+            assert_eq!(mask.key_run_ends[batch * 32], if active { 129 } else { 0 });
+        }
+    }
+    assert!(NativeMask::isolated_sequences(129, 0).is_err());
+    assert!(NativeMask::isolated_sequences(129, MASK_BATCH_TILE + 1).is_err());
+}
+
 fn spec(rows: u64, columns: u64) -> ResolvedTensorSpec {
     ResolvedTensorSpec::new(
         vec![rows, columns],

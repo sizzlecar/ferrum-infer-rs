@@ -241,7 +241,7 @@ fn output_no_alias_rejects_full_and_partial_overlap_with_every_input() {
 }
 
 #[test]
-fn silu_mul_read_reuse_requires_the_same_logical_value() {
+fn silu_mul_read_reuse_accepts_exact_views_but_rejects_partial_overlap() {
     let contract = silu_mul_bf16_contract().unwrap();
     let mut values = bindings(2);
     values[1] = binding(
@@ -263,6 +263,18 @@ fn silu_mul_read_reuse_requires_the_same_logical_value() {
         tensor(&[2, 3], ElementType::Bf16),
         "resource.input0",
         0,
+    );
+    contract
+        .descriptor()
+        .validate_resolved_bindings(&values)
+        .unwrap();
+    values[1] = binding(
+        "value.distinct",
+        ResolvedValueRole::Input,
+        1,
+        tensor(&[2, 3], ElementType::Bf16),
+        "resource.input0",
+        2,
     );
     assert!(contract
         .descriptor()

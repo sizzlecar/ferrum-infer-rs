@@ -691,12 +691,53 @@ pub struct RunCliCommand {
     command: RunCommand,
     #[command(flatten)]
     image: super::image_product::ImageRunArgs,
+    #[command(flatten)]
+    video: super::video_product::VideoRunArgs,
 }
 
 pub async fn execute_cli(
     cmd: RunCliCommand,
     config: CliConfig,
 ) -> std::result::Result<(), super::image_product::CommandError> {
+    if let Some(path) = cmd.video.product.video_config {
+        use super::video_product::{VideoProductError, VideoReferencePath, VideoRunRequest};
+        use ferrum_engine::video_generation::{VideoFrameRate, VideoGenerationParameters};
+        let prompt = cmd.command.prompt.ok_or_else(|| {
+            VideoProductError::from(anyhow::anyhow!("video run requires --prompt"))
+        })?;
+        let destination = cmd.image.output.ok_or_else(|| {
+            VideoProductError::from(anyhow::anyhow!("video run requires --output"))
+        })?;
+        return super::video_product::execute_run(VideoRunRequest {
+            config: path,
+            parameters: VideoGenerationParameters {
+                prompt,
+                width: cmd.image.width.unwrap_or(832),
+                height: cmd.image.height.unwrap_or(480),
+                num_frames: cmd.video.num_frames.unwrap_or(124),
+                frame_rate: VideoFrameRate {
+                    numerator: cmd.video.fps.unwrap_or(24),
+                    denominator: 1,
+                },
+                seed: cmd.command.seed.unwrap_or(0),
+            },
+            references: if cmd.video.references.is_empty() {
+                cmd.image
+                    .image
+                    .into_iter()
+                    .map(|path| VideoReferencePath {
+                        kind: ferrum_engine::video_generation::VideoReferenceKind::Image,
+                        path,
+                    })
+                    .collect()
+            } else {
+                cmd.video.references
+            },
+            destination,
+        })
+        .await
+        .map_err(Into::into);
+    }
     let source = cmd
         .image
         .product

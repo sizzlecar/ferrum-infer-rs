@@ -63,8 +63,21 @@ impl RuntimeWorkLimits {
     }
 }
 
-/// Typed policy selected before planning. Memory capacity is part of the
-/// public policy contract so a plan cannot depend on an undocumented env var.
+/// Physical node ordering selected before deriving resource lifetimes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanExecutionOrder {
+    /// Preserve independent branches and derive ordering only from values/state.
+    #[default]
+    DataDependencies,
+    /// Add completion dependencies between consecutive program nodes. This
+    /// trades branch parallelism for provable reuse of their temporary storage.
+    /// It is an executable ordering constraint, not an assumed traversal order.
+    Serial,
+}
+
+/// Typed policy selected before planning. All scheduling choices must be
+/// represented in the serialized policy and the resulting plan identity.
 pub trait RuntimePolicy:
     Clone + Send + Sync + Serialize + serde::de::DeserializeOwned + std::fmt::Debug + 'static
 {
@@ -84,6 +97,10 @@ pub trait RuntimePolicy:
     /// installed capacity; tensor extents come from compiled ports. Admission
     /// evaluates the exact step against live backing before provider encoding.
     fn work_limits(&self) -> RuntimeWorkLimits;
+
+    fn execution_order(&self) -> PlanExecutionOrder {
+        PlanExecutionOrder::DataDependencies
+    }
 
     fn maximum_scheduled_tokens(&self) -> Result<u64, VNextError> {
         self.work_limits().maximum_scheduled_tokens()

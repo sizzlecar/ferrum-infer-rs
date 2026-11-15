@@ -1,59 +1,39 @@
 //! Compact row routing keeps the existing expanded BF16 arithmetic boundaries.
 use super::*;
 use ferrum_runtime::{
-    row_selected_addcmul_bf16_contract, row_selected_modulation_bf16_contract,
-    PhysicalWeightLayout, RowSelectedBf16Geometry, RowSelectedBf16Kind, WeightFormatId,
-    ROW_SELECTED_ADDCMUL_BF16_CAPABILITY_ID, ROW_SELECTED_BF16_MAX_RUNS,
-    ROW_SELECTED_MODULATION_BF16_CAPABILITY_ID,
+    row_selected_addcmul_bf16_contract, row_selected_addcmul_fma_bf16_contract,
+    row_selected_modulation_bf16_contract, PhysicalWeightLayout, RowSelectedBf16Geometry,
+    RowSelectedBf16Kind, WeightFormatId, ROW_SELECTED_ADDCMUL_BF16_CAPABILITY_ID,
+    ROW_SELECTED_ADDCMUL_FMA_BF16_CAPABILITY_ID, ROW_SELECTED_MODULATION_BF16_CAPABILITY_ID,
 };
 
 pub const MODULATION_PROFILE: &str = "cuda.row_selected_modulation.bf16.staged_rne.gradual.v1";
 pub const ADDCMUL_PROFILE: &str = "cuda.row_selected_addcmul.bf16.separate_rne.gradual.v1";
-pub(super) const FUNCTIONS: [&str; 2] = [
+pub const ADDCMUL_FMA_PROFILE: &str = "cuda.row_selected_addcmul_fma.bf16.fma_rne.gradual.v1";
+pub(super) const FUNCTIONS: [&str; 3] = [
     "ferrum_vnext_row_selected_modulation_bf16",
     "ferrum_vnext_row_selected_addcmul_bf16",
+    "ferrum_vnext_row_selected_addcmul_fma_bf16",
 ];
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Routing {
-    ends: [u64; ROW_SELECTED_BF16_MAX_RUNS],
-    rows: [u64; ROW_SELECTED_BF16_MAX_RUNS],
-    count: u64,
-}
-// SAFETY: repr(C), initialized fixed-width integers and no pointers/padding;
-// this matches FerrumRowSelectedBf16Routing's checked CUDA ABI exactly.
-unsafe impl cudarc::driver::DeviceRepr for Routing {}
-const _: [(); 520] = [(); std::mem::size_of::<Routing>()];
-const _: [(); 8] = [(); std::mem::align_of::<Routing>()];
-impl Routing {
-    fn new(g: &RowSelectedBf16Geometry) -> Self {
-        let mut result = Self {
-            ends: [0; ROW_SELECTED_BF16_MAX_RUNS],
-            rows: [0; ROW_SELECTED_BF16_MAX_RUNS],
-            count: g.run_ends().len() as u64,
-        };
-        result.ends[..g.run_ends().len()].copy_from_slice(g.run_ends());
-        result.rows[..g.parameter_rows().len()].copy_from_slice(g.parameter_rows());
-        result
-    }
-}
 fn name(kind: RowSelectedBf16Kind) -> &'static str {
     match kind {
         RowSelectedBf16Kind::Modulation => "row_selected_modulation",
         RowSelectedBf16Kind::Addcmul => "row_selected_addcmul",
+        RowSelectedBf16Kind::AddcmulFma => "row_selected_addcmul_fma",
     }
 }
 fn input_count(kind: RowSelectedBf16Kind) -> u32 {
     match kind {
         RowSelectedBf16Kind::Modulation => 2,
-        RowSelectedBf16Kind::Addcmul => 3,
+        RowSelectedBf16Kind::Addcmul | RowSelectedBf16Kind::AddcmulFma => 3,
     }
 }
 pub(super) fn index(kind: RowSelectedBf16Kind) -> usize {
     match kind {
         RowSelectedBf16Kind::Modulation => 0,
         RowSelectedBf16Kind::Addcmul => 1,
+        RowSelectedBf16Kind::AddcmulFma => 2,
     }
 }
 pub(super) fn descriptor(
@@ -71,6 +51,11 @@ pub(super) fn descriptor(
             ROW_SELECTED_ADDCMUL_BF16_CAPABILITY_ID,
             ADDCMUL_PROFILE,
         ),
+        RowSelectedBf16Kind::AddcmulFma => (
+            row_selected_addcmul_fma_bf16_contract(),
+            ROW_SELECTED_ADDCMUL_FMA_BF16_CAPABILITY_ID,
+            ADDCMUL_FMA_PROFILE,
+        ),
     };
     let cap = CapabilityId::new(capability).map_err(contract_error)?;
     if !device.capabilities.contains(&cap) {
@@ -83,6 +68,7 @@ pub(super) fn descriptor(
         profile.as_bytes(),
         numerical_fingerprint().as_bytes(),
         include_bytes!("row_selected_bf16.rs"),
+        include_bytes!("row_routing.rs"),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/kernels/vnext_row_selected_bf16.cuh"
@@ -233,7 +219,7 @@ impl Provider {
             )?;
         }
         regions.push(output);
-        let routing = Routing::new(&g);
+        let launches = row_routing::chunks(&g).len() as u64;
         let kernels = Arc::clone(&self.kernels);
         let kind = self.kind;
         let (elements, columns, parameter_columns) =
@@ -241,49 +227,54 @@ impl Provider {
         let (shift, scale, gate) = (g.shift_column(), g.scale_column(), g.gate_column());
         let work = g.logical_arithmetic_operations();
         CudaDeviceCommand::operation(FUNCTIONS[index(kind)], regions, move |stream, regions| {
-            let x = regions[0].device_ptr();
-            let table = regions[1].device_ptr();
-            let output = regions[input_count(kind) as usize].device_ptr();
-            let mut launch = stream.launch_builder(kernels.row_selected_bf16_function(kind));
-            let config = LaunchConfig {
-                grid_dim: (elements.div_ceil(256).min(MAX_BLOCKS) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let launched = match kind {
-                RowSelectedBf16Kind::Modulation => {
-                    launch
-                        .arg(&x)
-                        .arg(&table)
-                        .arg(&output)
-                        .arg(&elements)
-                        .arg(&columns)
-                        .arg(&parameter_columns)
-                        .arg(&shift)
-                        .arg(&scale)
-                        .arg(&routing);
-                    unsafe { launch.launch(config) }
-                }
-                RowSelectedBf16Kind::Addcmul => {
-                    let update = regions[2].device_ptr();
-                    launch
-                        .arg(&x)
-                        .arg(&table)
-                        .arg(&update)
-                        .arg(&output)
-                        .arg(&elements)
-                        .arg(&columns)
-                        .arg(&parameter_columns)
-                        .arg(&gate)
-                        .arg(&routing);
-                    unsafe { launch.launch(config) }
-                }
-            };
-            launched
-                .map(|_| ())
-                .map_err(|error| CudaDeviceRuntimeError::driver("compact BF16 row launch", error))
+            for chunk in row_routing::chunks(&g) {
+                let routing = chunk.routing;
+                let elements = chunk.rows * columns;
+                let x = regions[0].device_ptr() + chunk.byte_offset;
+                let table = regions[1].device_ptr();
+                let output = regions[input_count(kind) as usize].device_ptr() + chunk.byte_offset;
+                let mut launch = stream.launch_builder(kernels.row_selected_bf16_function(kind));
+                let config = LaunchConfig {
+                    grid_dim: (elements.div_ceil(256).min(MAX_BLOCKS) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let launched = match kind {
+                    RowSelectedBf16Kind::Modulation => {
+                        launch
+                            .arg(&x)
+                            .arg(&table)
+                            .arg(&output)
+                            .arg(&elements)
+                            .arg(&columns)
+                            .arg(&parameter_columns)
+                            .arg(&shift)
+                            .arg(&scale)
+                            .arg(&routing);
+                        unsafe { launch.launch(config) }
+                    }
+                    RowSelectedBf16Kind::Addcmul | RowSelectedBf16Kind::AddcmulFma => {
+                        let update = regions[2].device_ptr() + chunk.byte_offset;
+                        launch
+                            .arg(&x)
+                            .arg(&table)
+                            .arg(&update)
+                            .arg(&output)
+                            .arg(&elements)
+                            .arg(&columns)
+                            .arg(&parameter_columns)
+                            .arg(&gate)
+                            .arg(&routing);
+                        unsafe { launch.launch(config) }
+                    }
+                };
+                launched.map(|_| ()).map_err(|error| {
+                    CudaDeviceRuntimeError::driver("compact BF16 row launch", error)
+                })?;
+            }
+            Ok(())
         })
-        .and_then(|command| command.with_tensor_work(elements, work, 1, 0))
+        .and_then(|command| command.with_tensor_work(elements, work, launches, 0))
         .map_err(|e| e.to_string())
     }
 }

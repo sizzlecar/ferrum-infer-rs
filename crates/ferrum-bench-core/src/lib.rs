@@ -33,6 +33,7 @@ pub use ferrum_journal::jsonl_journal;
 pub mod profile;
 pub mod release_regression;
 pub mod report;
+pub mod resource_usage;
 pub mod sse_text_event_gap;
 pub mod stats;
 

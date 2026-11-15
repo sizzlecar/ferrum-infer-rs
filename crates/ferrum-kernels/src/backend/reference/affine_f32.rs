@@ -16,14 +16,40 @@ const PROVIDER: &str = "provider.reference.affine_linear.f32";
 const ESTIMATOR: &str = "resource-estimator.reference.affine_linear.f32";
 pub(super) struct ReferenceAffineF32Provider {
     descriptor: OperationProviderDescriptor,
+    rounded_bf16: bool,
 }
 impl ReferenceAffineF32Provider {
     pub(super) fn new(
         runtime: &ReferenceDeviceRuntime,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
-        let contract = affine_linear_f32_contract().map_err(contract_error)?;
-        let capability =
-            CapabilityId::new(AFFINE_LINEAR_F32_CAPABILITY_ID).map_err(contract_error)?;
+        Self::new_for(runtime, false)
+    }
+    pub(super) fn new_for(
+        runtime: &ReferenceDeviceRuntime,
+        rounded_bf16: bool,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        let contract = if rounded_bf16 {
+            affine_linear_f32_to_bf16_contract()
+        } else {
+            affine_linear_f32_contract()
+        }
+        .map_err(contract_error)?;
+        let capability = CapabilityId::new(if rounded_bf16 {
+            AFFINE_LINEAR_F32_TO_BF16_CAPABILITY_ID
+        } else {
+            AFFINE_LINEAR_F32_CAPABILITY_ID
+        })
+        .map_err(contract_error)?;
+        let provider = if rounded_bf16 {
+            "provider.reference.affine_linear.f32_to_bf16"
+        } else {
+            PROVIDER
+        };
+        let estimator_id = if rounded_bf16 {
+            "resource-estimator.reference.affine_linear.f32_to_bf16"
+        } else {
+            ESTIMATOR
+        };
         if !runtime.descriptor().capabilities.contains(&capability) {
             return Err(ReferenceDeviceRuntimeError::contract(
                 "Reference runtime lacks F32 affine capability",
@@ -34,11 +60,12 @@ impl ReferenceAffineF32Provider {
             include_bytes!("runtime/affine_f32.rs"),
             include_bytes!("runtime.rs"),
             REFERENCE_AFFINE_LINEAR_F32_NUMERICAL_PROFILE_ID.as_bytes(),
+            provider.as_bytes(),
         ]);
         let estimator =
-            implementation_fingerprint(&[ESTIMATOR.as_bytes(), implementation.as_bytes()]);
+            implementation_fingerprint(&[estimator_id.as_bytes(), implementation.as_bytes()]);
         let descriptor = OperationProviderDescriptor::new(
-            ProviderId::new(PROVIDER).map_err(contract_error)?,
+            ProviderId::new(provider).map_err(contract_error)?,
             contract.descriptor().id.clone(),
             contract
                 .descriptor()
@@ -57,13 +84,16 @@ impl ReferenceAffineF32Provider {
             ]),
             BTreeSet::new(),
             contiguous_bindings(3),
-            ESTIMATOR,
+            estimator_id,
             ContractVersion::new(1, 0),
             estimator,
         )
         .map_err(contract_error)?
         .with_fixed_tensor_work(true);
-        Ok(Self { descriptor })
+        Ok(Self {
+            descriptor,
+            rounded_bf16,
+        })
     }
 }
 impl OperationResourceEstimator for ReferenceAffineF32Provider {
@@ -79,7 +109,7 @@ impl OperationResourceEstimator for ReferenceAffineF32Provider {
         {
             return Err(invalid("F32 affine estimator received another operation"));
         }
-        geometry(request.values(), request.attributes()).map_err(invalid)?;
+        geometry(request.values(), request.attributes(), self.rounded_bf16).map_err(invalid)?;
         Ok(OperationResourceEstimate::new(
             self.descriptor.resource_estimator_id(),
             self.descriptor.resource_estimator_version(),
@@ -113,7 +143,7 @@ impl OperationProvider<ReferenceDeviceRuntime> for ReferenceAffineF32Provider {
         invocation: TensorOperationInvocation<'_, ReferenceDeviceBuffer>,
     ) -> Result<Option<EncodedDeviceOperation<ReferenceDeviceCommand>>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode(invocation)
+        encode(invocation, self.rounded_bf16)
             .map(EncodedDeviceOperation::compute)
             .map(Some)
             .map_err(|error| failure(identity, error))
@@ -121,25 +151,40 @@ impl OperationProvider<ReferenceDeviceRuntime> for ReferenceAffineF32Provider {
 }
 fn encode(
     invocation: TensorOperationInvocation<'_, ReferenceDeviceBuffer>,
+    rounded_bf16: bool,
 ) -> Result<ReferenceDeviceCommand, String> {
     let [participant] = invocation.participants() else {
         return Err("F32 affine requires one participant".into());
     };
-    if invocation.operation().id.as_str() != AFFINE_LINEAR_F32_OPERATION_ID
+    if invocation.operation().id.as_str()
+        != if rounded_bf16 {
+            AFFINE_LINEAR_F32_TO_BF16_OPERATION_ID
+        } else {
+            AFFINE_LINEAR_F32_OPERATION_ID
+        }
         || !matches!(participant.work(), NodeWorkContract::Fixed)
         || !invocation.resource_work_shape().resource_work().is_tensor()
     {
         return Err("F32 affine requires its fixed tensor contract".into());
     }
-    let shape = geometry(participant.bindings(), participant.attributes())?;
+    let shape = geometry(
+        participant.bindings(),
+        participant.attributes(),
+        rounded_bf16,
+    )?;
     let region = |role, ordinal| {
         contiguous_region(
             participant,
             binding(participant.bindings(), role, ordinal)?,
-            ElementType::F32,
+            if rounded_bf16 && role == ResolvedValueRole::Output {
+                ElementType::Bf16
+            } else {
+                ElementType::F32
+            },
         )
     };
     ReferenceDeviceCommand::affine_f32_tensor(ReferenceAffineF32Launch {
+        rounded_bf16,
         dense: ReferenceDenseLinearLaunch {
             input: region(ResolvedValueRole::Input, 0)?,
             weight: region(ResolvedValueRole::Input, 1)?,
@@ -156,6 +201,7 @@ fn encode(
 fn geometry(
     bindings: &[ResolvedValueBinding],
     attributes: &BTreeMap<AttributeId, SemanticValue>,
+    rounded_bf16: bool,
 ) -> Result<AffineLinearF32Geometry, String> {
     if bindings.len() != 4
         || attributes.len() != 2
@@ -180,7 +226,12 @@ fn geometry(
             _ => Err(format!("F32 affine lacks {name}")),
         }
     };
-    AffineLinearF32Geometry::new(
+    let constructor = if rounded_bf16 {
+        AffineLinearF32Geometry::rounded_bf16
+    } else {
+        AffineLinearF32Geometry::new
+    };
+    constructor(
         binding(bindings, ResolvedValueRole::Input, 0)?.tensor(),
         binding(bindings, ResolvedValueRole::Input, 1)?.tensor(),
         binding(bindings, ResolvedValueRole::Input, 2)?.tensor(),

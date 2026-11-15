@@ -114,6 +114,33 @@ impl TensorAllocationPool {
         // unused pages; every live model/request allocation stays untouched.
         unsafe { result::mem_pool::trim_to(self.pool, 0) }
     }
+
+    /// The caller must retain this pool and the full temporary capacity claim
+    /// on every error or unwind. Only allocation OOM proves that no backing was
+    /// created. A successful return proves both the write and free completed.
+    pub(in crate::backend::cuda::vnext_runtime) fn prepare_cache(
+        &self,
+        bytes: usize,
+    ) -> Result<bool, DriverError> {
+        self.stream.context().bind_to_thread()?;
+        // SAFETY: the caller admitted all bytes before entering this method.
+        // The private pointer never escapes or aliases a tensor allocation.
+        unsafe {
+            let pointer =
+                match result::mem_pool::alloc_async(self.pool, bytes, self.stream.cu_stream()) {
+                    Ok(pointer) => pointer,
+                    Err(error) if error.0 == sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY => {
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                };
+            result::memset_d8_async(pointer, 0, bytes, self.stream.cu_stream())?;
+            self.stream.synchronize()?;
+            result::free_async(pointer, self.stream.cu_stream())?;
+            self.stream.synchronize()?;
+        }
+        Ok(true)
+    }
 }
 
 impl Drop for TensorAllocationPool {
@@ -141,3 +168,7 @@ impl Drop for TensorAllocationPool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "pool/pressure_tests.rs"]
+mod pressure_tests;

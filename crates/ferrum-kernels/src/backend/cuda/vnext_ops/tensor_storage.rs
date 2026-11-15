@@ -2,6 +2,29 @@
 use super::*;
 use ferrum_runtime::{InvocationWorkProjection, OperationInvocation, ResolvedStorageComponent};
 
+/// One exact tensor port backed by a checked single physical component.
+/// Descriptor validation retains the original stored encoding/role; this
+/// binding helper only verifies the dtype, extent and admitted resource view.
+pub(super) fn single_component<'a, W: InvocationWorkProjection<'a>>(
+    participant: &OperationInvocation<'a, CudaDeviceBuffer, W>,
+    value: &ResolvedValueBinding,
+    alignment: u64,
+) -> Result<CudaBufferRegion, String> {
+    let [stored] = value.storage().components() else {
+        return Err("exact tensor port requires one physical component".into());
+    };
+    if stored.element_type() != value.tensor().element_type()
+        || stored.length_bytes()
+            != value
+                .tensor()
+                .minimum_storage_bytes()
+                .map_err(|e| e.to_string())?
+    {
+        return Err("physical component dtype/extent differs from exact tensor port".into());
+    }
+    component(participant, stored, alignment)
+}
+
 pub(super) fn component<'a, W: InvocationWorkProjection<'a>>(
     participant: &OperationInvocation<'a, CudaDeviceBuffer, W>,
     stored: &ResolvedStorageComponent,

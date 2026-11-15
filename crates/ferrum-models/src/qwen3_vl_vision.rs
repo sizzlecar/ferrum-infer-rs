@@ -1,10 +1,22 @@
-//! Qwen3-VL image vision graph: patch projection, encoder, main and DeepStack mergers.
+//! Qwen3-VL visual graph: temporal patch projection, frame-local attention,
+//! main and DeepStack mergers.
 //!
 //! Inputs are processor-ordered patch rows, interpolated learned positions and
 //! explicit FP32 axial rotary tables. Image preprocessing and position-table
 //! lookup are governed caller adapters; no HWC reinterpretation occurs here.
+mod checkpoint;
 pub mod comfy;
+pub use checkpoint::{
+    PreparedQwen3VLVisionCheckpoint, Qwen3VLVisionCheckpointLimits, Qwen3VLVisionCheckpointSource,
+};
 mod config;
+mod image_resize;
+mod processor;
+pub use processor::{
+    Qwen3VLVisionImagePlan, Qwen3VLVisionImageProcessor, Qwen3VLVisionProcessorLimits,
+    Qwen3VLVisionVideoPlan, Qwen3VLVisionVideoProcessor, QWEN3_VL_IMAGE_PREPROCESS_PROFILE,
+    QWEN3_VL_VIDEO_PREPROCESS_PROFILE,
+};
 pub mod hf;
 mod position;
 mod program;

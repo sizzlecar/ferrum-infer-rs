@@ -218,7 +218,8 @@ impl Qwen3VLVisionArchitecture {
     }
 }
 
-/// One static image grid. Video/frame semantics are deliberately not inferred.
+/// One declared visual grid. Temporal blocks are separate attention segments;
+/// each block has the same spatial positions and patch-merge ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Qwen3VLVisionGrid {
@@ -233,10 +234,10 @@ impl Qwen3VLVisionGrid {
             height,
             width,
         };
-        if temporal != 1 || height == 0 || width == 0 {
+        if temporal == 0 || height == 0 || width == 0 {
             return Err(invalid(
                 "grid",
-                "first image profile requires temporal=1 and positive spatial dimensions",
+                "visual grid requires positive temporal and spatial dimensions",
             ));
         }
         g.rows()?;
@@ -343,8 +344,17 @@ impl Qwen3VLVisionConfig {
         super::weights::expected(self)
     }
     pub(super) fn validate(&self) -> Result<(), VNextError> {
-        if self.grids.is_empty() || self.grids.len() > 32 {
-            return Err(invalid("grids", "requires 1..=32 image grids"));
+        if self.grids.is_empty()
+            || self
+                .grids
+                .iter()
+                .try_fold(0u64, |n, g| n.checked_add(g.temporal))
+                .is_none_or(|n| n > 32)
+        {
+            return Err(invalid(
+                "grids",
+                "requires 1..=32 temporal attention segments",
+            ));
         }
         for g in &self.grids {
             Qwen3VLVisionGrid::new(g.temporal, g.height, g.width)?;

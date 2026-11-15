@@ -20,6 +20,8 @@ use half::bf16;
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use serde_json::json;
 
+#[path = "vnext_component_session/dynamic_capacity.rs"]
+mod dynamic_capacity;
 #[path = "vnext_component_session/output_host.rs"]
 mod output_host;
 #[path = "vnext_component_session/request_state.rs"]
@@ -393,5 +395,88 @@ fn stored_component_trims_dynamic_backing_and_regrows_without_reuploading_weight
     fixture.assert_device_reusable();
     assert_eq!(second[0].bytes().bytes(), bytes(&EXPECTED.map(|x| x * 2.)));
     drop((first, second));
+    assert_eq!(fixture.host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn completed_phase_yields_capacity_to_a_successor_while_host_output_and_weights_survive() {
+    let fixture = Fixture::new("device.component.phase-handoff");
+    let mut first = fixture.initialize("phase-first");
+    let hidden = execute(&mut first, &fixture, "phase-first", 1.);
+    let static_bytes = first
+        .executable()
+        .execution_plan()
+        .payload()
+        .memory()
+        .static_bytes();
+    let dynamic_bytes = first
+        .minimum_runnable_dynamic_bytes_with_residency()
+        .unwrap();
+    let next_bytes = static_bytes + dynamic_bytes;
+    // The process can hold both installations and one phase workspace, exactly.
+    // This is real pressure on the original device ledger, not a mocked error.
+    let pressure = fixture
+        .capacity
+        .reserve(
+            DeviceOpaqueMemoryKind::Bootstrap,
+            DEVICE_BYTES - static_bytes - next_bytes,
+        )
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .capacity
+            .reserve(DeviceOpaqueMemoryKind::Bootstrap, next_bytes),
+        Err(VNextError::DeviceCapacityUnavailable(_))
+    ));
+    let IdleDynamicReleaseOutcome::Released(released) =
+        first.try_release_idle_dynamic_backing().unwrap()
+    else {
+        panic!("completed Host readback must leave an idle plan")
+    };
+    assert_eq!(released.reclaimed_bytes(), dynamic_bytes);
+    assert!(matches!(
+        fixture
+            .capacity
+            .reserve(DeviceOpaqueMemoryKind::Bootstrap, next_bytes + 1),
+        Err(VNextError::DeviceCapacityUnavailable(_))
+    ));
+    drop(
+        fixture
+            .capacity
+            .reserve(DeviceOpaqueMemoryKind::Bootstrap, next_bytes)
+            .unwrap(),
+    );
+    let mut next = fixture
+        .compile_rows(2, &fixture.family)
+        .initialize(
+            fixture.composition.runtime().clone(),
+            fixture.host.clone(),
+            ComponentWeightSource::Stored(&fixture.source),
+            Fixture::init_config("phase-next"),
+        )
+        .unwrap();
+    let prediction = execute(&mut next, &fixture, "phase-next", 2.);
+    assert!(matches!(
+        next.close()
+            .unwrap_or_else(|error| panic!("successor close failed: {:?}", error.failure())),
+        PlanRuntimeCloseOutcome::Closed(_)
+    ));
+    assert_eq!(hidden[0].bytes().bytes(), bytes(&EXPECTED));
+    drop(prediction);
+    let uploads_before_resume = fixture.composition.runtime().snapshot().uploaded_bytes;
+    let resumed = execute(&mut first, &fixture, "phase-resume", 3.);
+    assert_eq!(
+        fixture.composition.runtime().snapshot().uploaded_bytes - uploads_before_resume,
+        INPUT_BYTES as u64,
+        "resuming the first phase uploads only its next input"
+    );
+    assert!(matches!(
+        first
+            .close()
+            .unwrap_or_else(|error| panic!("resumed close failed: {:?}", error.failure())),
+        PlanRuntimeCloseOutcome::Closed(_)
+    ));
+    drop((pressure, hidden, resumed));
+    fixture.assert_device_reusable();
     assert_eq!(fixture.host.usage().unwrap().committed_bytes(), 0);
 }

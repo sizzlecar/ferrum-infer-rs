@@ -401,6 +401,8 @@ pub struct ServeCliCommand {
     command: ServeCommand,
     #[command(flatten)]
     image: super::image_product::ImageProductArgs,
+    #[command(flatten)]
+    video: super::video_product::VideoProductArgs,
     /// Wait at most this long for another request's exact in-flight prefix.
     #[arg(long, value_name = "MS")]
     prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
@@ -456,6 +458,18 @@ pub async fn execute_cli(
     config: CliConfig,
     configured_interleaved_system_coalescing: bool,
 ) -> std::result::Result<(), super::image_product::CommandError> {
+    if let Some(path) = cmd.video.video_config {
+        let api_key = resolve_api_key(cmd.command.api_key, config.server.api_key.clone())?;
+        return super::video_product::execute_serve(
+            path,
+            cmd.command.host.unwrap_or(config.server.host),
+            cmd.command.port.unwrap_or(config.server.port),
+            cmd.command.served_model_name,
+            api_key,
+        )
+        .await
+        .map_err(Into::into);
+    }
     let source = cmd
         .image
         .source(

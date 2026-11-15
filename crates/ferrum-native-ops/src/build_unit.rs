@@ -10,6 +10,8 @@ use crate::ResolvedNativeOperatorArtifactSet;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CudaNativeBuildUnit {
     CutlassFp8ScaledMm,
+    CutlassNvfp4Matmul,
+    SageVsaFp4CpuLists,
     CutlassFusedF32Attention,
     CutlassInt8FusedOutput,
     FlashinferXqa,
@@ -24,8 +26,10 @@ pub enum CudaNativeBuildUnit {
 }
 
 impl CudaNativeBuildUnit {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::CutlassFp8ScaledMm,
+        Self::CutlassNvfp4Matmul,
+        Self::SageVsaFp4CpuLists,
         Self::CutlassFusedF32Attention,
         Self::CutlassInt8FusedOutput,
         Self::FlashinferXqa,
@@ -42,6 +46,8 @@ impl CudaNativeBuildUnit {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CutlassFp8ScaledMm => "cutlass_fp8_scaled_mm",
+            Self::CutlassNvfp4Matmul => "cutlass_nvfp4_matmul",
+            Self::SageVsaFp4CpuLists => "sage_vsa_fp4_cpu_lists",
             Self::CutlassFusedF32Attention => "cutlass_fused_f32_attention",
             Self::CutlassInt8FusedOutput => "cutlass_int8_fused_output",
             Self::FlashinferXqa => "flashinfer_xqa",
@@ -59,6 +65,8 @@ impl CudaNativeBuildUnit {
     pub const fn artifact_operator(self) -> &'static str {
         match self {
             Self::CutlassFp8ScaledMm => crate::cutlass_fp8::CUTLASS_FP8_OPERATOR,
+            Self::CutlassNvfp4Matmul => crate::cutlass_nvfp4::CUTLASS_NVFP4_OPERATOR,
+            Self::SageVsaFp4CpuLists => crate::sage_vsa_fp4::SAGE_VSA_FP4_OPERATOR,
             Self::CutlassFusedF32Attention => {
                 crate::cutlass_fused_f32_attention::CUTLASS_FUSED_F32_ATTENTION_OPERATOR
             }
@@ -91,6 +99,8 @@ impl CudaNativeBuildUnit {
     pub const fn required_operator_abi_version(self) -> Option<&'static str> {
         match self {
             Self::CutlassFp8ScaledMm
+            | Self::CutlassNvfp4Matmul
+            | Self::SageVsaFp4CpuLists
             | Self::CutlassFusedF32Attention
             | Self::CutlassInt8FusedOutput
             | Self::FlashinferXqa => Some("1"),
@@ -157,6 +167,8 @@ impl CudaNativeBuildUnit {
     pub const fn required_exports(self) -> &'static [&'static str] {
         match self {
             Self::CutlassFp8ScaledMm => &crate::cutlass_fp8::CUTLASS_FP8_EXPORTS,
+            Self::CutlassNvfp4Matmul => &crate::cutlass_nvfp4::CUTLASS_NVFP4_EXPORTS,
+            Self::SageVsaFp4CpuLists => &crate::sage_vsa_fp4::SAGE_VSA_FP4_EXPORTS,
             Self::CutlassFusedF32Attention => {
                 &crate::cutlass_fused_f32_attention::CUTLASS_FUSED_F32_ATTENTION_EXPORTS
             }

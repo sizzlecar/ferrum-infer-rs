@@ -531,6 +531,52 @@ impl From<DynamicPoolResidentPressure> for DynamicBackingPressure {
     }
 }
 
+/// Native allocation pressure observed after logical admission. This is not a
+/// reservation or a promise that a later attempt will fit. Core must retire
+/// any earlier allocations in the same candidate before allowing fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceAllocationPressure {
+    resource_id: crate::ResourceId,
+    requested_bytes: u64,
+    report: crate::DeviceErrorReport,
+}
+
+impl DeviceAllocationPressure {
+    pub(crate) fn new(
+        resource_id: crate::ResourceId,
+        requested_bytes: u64,
+        report: crate::DeviceErrorReport,
+    ) -> Self {
+        Self {
+            resource_id,
+            requested_bytes,
+            report,
+        }
+    }
+
+    pub fn resource_id(&self) -> &crate::ResourceId {
+        &self.resource_id
+    }
+    pub fn requested_bytes(&self) -> u64 {
+        self.requested_bytes
+    }
+    pub fn report(&self) -> &crate::DeviceErrorReport {
+        &self.report
+    }
+}
+
+impl fmt::Display for DeviceAllocationPressure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "device allocation of {} bytes for `{}` has insufficient capacity: {}",
+            self.requested_bytes,
+            self.resource_id,
+            self.report.message()
+        )
+    }
+}
+
 /// Structured, fail-closed errors produced by the vNext contracts.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum VNextError {
@@ -583,6 +629,13 @@ pub enum VNextError {
     },
     #[error("invalid execution plan: {reason}")]
     InvalidExecutionPlan { reason: String },
+    /// Fresh model composition exceeded its declared metadata work bound.
+    /// No executable plan, device submission, or recovery owner exists yet.
+    #[error("model program needs at least {required_nodes} nodes, exceeding declared capacity {maximum_nodes}")]
+    ModelProgramNodeCapacityExceeded {
+        required_nodes: u64,
+        maximum_nodes: u64,
+    },
     /// Capacity rejection while constructing a fresh, otherwise valid plan.
     /// Deserialized-plan validation and allocator failures never use this case.
     #[error("compiled plan requires {required_bytes} bytes, exceeding usable capacity {usable_capacity_bytes}")]
@@ -599,6 +652,8 @@ pub enum VNextError {
     },
     #[error("{0}")]
     DeviceCapacityUnavailable(DeviceCapacityPressure),
+    #[error("{0}")]
+    DeviceAllocationUnavailable(DeviceAllocationPressure),
     #[error("{0}")]
     DynamicPoolResidentUnavailable(DynamicPoolResidentPressure),
     #[error(

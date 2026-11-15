@@ -4,6 +4,12 @@ use crate::{ResolvedTensorLayout, ResolvedTensorSpec, SemanticValue};
 pub const GROUPED_COLUMN_SLICE_F32_OPERATION_ID: &str = "operation.grouped_column_slice.f32";
 pub const GROUPED_COLUMN_SLICE_F32_CAPABILITY_ID: &str =
     "capability.operation.grouped_column_slice.f32";
+pub const GROUPED_COLUMN_MEAN_F32_OPERATION_ID: &str = "operation.grouped_column_mean.f32";
+pub const GROUPED_COLUMN_MEAN_F32_CAPABILITY_ID: &str =
+    "capability.operation.grouped_column_mean.f32";
+pub const ADAPTIVE_AVG_POOL_ROWS_F32_OPERATION_ID: &str = "operation.adaptive_avg_pool_rows.f32";
+pub const ADAPTIVE_AVG_POOL_ROWS_F32_CAPABILITY_ID: &str =
+    "capability.operation.adaptive_avg_pool_rows.f32";
 pub const CHANNEL_BIAS_ADD_F32_OPERATION_ID: &str = "operation.channel_bias_add.f32";
 pub const CHANNEL_BIAS_ADD_F32_CAPABILITY_ID: &str = "capability.operation.channel_bias_add.f32";
 pub const CHANNEL_SCALED_RESIDUAL_F32_OPERATION_ID: &str = "operation.channel_scaled_residual.f32";
@@ -11,42 +17,61 @@ pub const CHANNEL_SCALED_RESIDUAL_F32_CAPABILITY_ID: &str =
     "capability.operation.channel_scaled_residual.f32";
 pub const NAN_TO_NUM_F32_OPERATION_ID: &str = "operation.nan_to_num.f32";
 pub const NAN_TO_NUM_F32_CAPABILITY_ID: &str = "capability.operation.nan_to_num.f32";
+pub const CHANNEL_SCALED_RESIDUAL_SEPARATE_F32_OPERATION_ID: &str =
+    "operation.channel_scaled_residual.separate.f32";
+pub const CHANNEL_SCALED_RESIDUAL_SEPARATE_F32_CAPABILITY_ID: &str =
+    "capability.operation.channel_scaled_residual.separate.f32";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum F32ChannelwiseOp {
     GroupedColumnSlice,
+    GroupedColumnMean,
+    AdaptiveAvgPool,
     BiasAdd,
     ScaledResidual,
     NanToNum,
+    ScaledResidualSeparate,
 }
 impl F32ChannelwiseOp {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 7] = [
         Self::GroupedColumnSlice,
+        Self::GroupedColumnMean,
+        Self::AdaptiveAvgPool,
         Self::BiasAdd,
         Self::ScaledResidual,
         Self::NanToNum,
+        Self::ScaledResidualSeparate,
     ];
     pub const fn operation_id(self) -> &'static str {
         match self {
             Self::GroupedColumnSlice => GROUPED_COLUMN_SLICE_F32_OPERATION_ID,
+            Self::GroupedColumnMean => GROUPED_COLUMN_MEAN_F32_OPERATION_ID,
+            Self::AdaptiveAvgPool => ADAPTIVE_AVG_POOL_ROWS_F32_OPERATION_ID,
             Self::BiasAdd => CHANNEL_BIAS_ADD_F32_OPERATION_ID,
             Self::ScaledResidual => CHANNEL_SCALED_RESIDUAL_F32_OPERATION_ID,
             Self::NanToNum => NAN_TO_NUM_F32_OPERATION_ID,
+            Self::ScaledResidualSeparate => CHANNEL_SCALED_RESIDUAL_SEPARATE_F32_OPERATION_ID,
         }
     }
     pub const fn capability_id(self) -> &'static str {
         match self {
             Self::GroupedColumnSlice => GROUPED_COLUMN_SLICE_F32_CAPABILITY_ID,
+            Self::GroupedColumnMean => GROUPED_COLUMN_MEAN_F32_CAPABILITY_ID,
+            Self::AdaptiveAvgPool => ADAPTIVE_AVG_POOL_ROWS_F32_CAPABILITY_ID,
             Self::BiasAdd => CHANNEL_BIAS_ADD_F32_CAPABILITY_ID,
             Self::ScaledResidual => CHANNEL_SCALED_RESIDUAL_F32_CAPABILITY_ID,
             Self::NanToNum => NAN_TO_NUM_F32_CAPABILITY_ID,
+            Self::ScaledResidualSeparate => CHANNEL_SCALED_RESIDUAL_SEPARATE_F32_CAPABILITY_ID,
         }
     }
     pub const fn input_count(self) -> usize {
         match self {
-            Self::GroupedColumnSlice | Self::NanToNum => 1,
+            Self::GroupedColumnSlice
+            | Self::GroupedColumnMean
+            | Self::AdaptiveAvgPool
+            | Self::NanToNum => 1,
             Self::BiasAdd => 2,
-            Self::ScaledResidual => 3,
+            Self::ScaledResidual | Self::ScaledResidualSeparate => 3,
         }
     }
     pub fn contract(self) -> Result<StandardOperationContract, VNextError> {
@@ -58,6 +83,18 @@ impl F32ChannelwiseOp {
 /// Row/group order, signed zeros, subnormals and all NaN payload bits survive.
 pub fn grouped_column_slice_f32_contract() -> Result<StandardOperationContract, VNextError> {
     contract(F32ChannelwiseOp::GroupedColumnSlice)
+}
+/// F32 X[R,G*W] -> Y[R,W]. Sum corresponding columns across groups in
+/// increasing group order, starting at +0 with separate RN32 adds, then
+/// RN32(sum/F32(G)). This is a distinct reduction boundary, not a linear layer.
+pub fn grouped_column_mean_f32_contract() -> Result<StandardOperationContract, VNextError> {
+    contract(F32ChannelwiseOp::GroupedColumnMean)
+}
+/// F32 X[R,N] -> Y[R,M]. Bin j spans [floor(j*N/M), ceil((j+1)*N/M)).
+/// Sum in increasing column order from +0 with RN32 adds, then divide by
+/// the F32 bin width. Overlapping bins and upsampling are explicit semantics.
+pub fn adaptive_avg_pool_rows_f32_contract() -> Result<StandardOperationContract, VNextError> {
+    contract(F32ChannelwiseOp::AdaptiveAvgPool)
 }
 /// F32 X/Y[R,C], bias[C]. Y[r,c]=RN32(X[r,c]+bias[c]); no scalar, row,
 /// leading-axis or rank-two vector broadcast is inferred.
@@ -71,6 +108,13 @@ pub fn channel_bias_add_f32_contract() -> Result<StandardOperationContract, VNex
 pub fn channel_scaled_residual_f32_contract() -> Result<StandardOperationContract, VNextError> {
     contract(F32ChannelwiseOp::ScaledResidual)
 }
+/// F32 base/branch/Y[R,C], scale[C]. Y=RN32(base+RN32(branch*scale)).
+/// The product is rounded before addition, including overflow and gradual
+/// underflow. This is a separate contract from the existing single-FMA op.
+pub fn channel_scaled_residual_separate_f32_contract(
+) -> Result<StandardOperationContract, VNextError> {
+    contract(F32ChannelwiseOp::ScaledResidualSeparate)
+}
 /// F32 X/Y[R,C]. NaN -> positive zero, +Inf -> F32_MAX, -Inf -> -F32_MAX.
 /// All finite input bits, including signed zero and subnormals, survive exactly.
 pub fn nan_to_num_f32_contract() -> Result<StandardOperationContract, VNextError> {
@@ -79,11 +123,18 @@ pub fn nan_to_num_f32_contract() -> Result<StandardOperationContract, VNextError
 fn contract(kind: F32ChannelwiseOp) -> Result<StandardOperationContract, VNextError> {
     let x = vec![
         symbol("rows"),
-        symbol(if kind == F32ChannelwiseOp::GroupedColumnSlice {
-            "source_columns"
-        } else {
-            "columns"
-        }),
+        symbol(
+            if matches!(
+                kind,
+                F32ChannelwiseOp::GroupedColumnSlice
+                    | F32ChannelwiseOp::GroupedColumnMean
+                    | F32ChannelwiseOp::AdaptiveAvgPool
+            ) {
+                "source_columns"
+            } else {
+                "columns"
+            },
+        ),
     ];
     let y = vec![symbol("rows"), symbol("columns")];
     let mut inputs = vec![contiguous_tensor(
@@ -91,7 +142,10 @@ fn contract(kind: F32ChannelwiseOp) -> Result<StandardOperationContract, VNextEr
         [ElementType::F32],
         TensorAccess::Read,
     )?];
-    if kind == F32ChannelwiseOp::ScaledResidual {
+    if matches!(
+        kind,
+        F32ChannelwiseOp::ScaledResidual | F32ChannelwiseOp::ScaledResidualSeparate
+    ) {
         inputs.push(contiguous_tensor(
             y.clone(),
             [ElementType::F32],
@@ -100,7 +154,9 @@ fn contract(kind: F32ChannelwiseOp) -> Result<StandardOperationContract, VNextEr
     }
     if matches!(
         kind,
-        F32ChannelwiseOp::BiasAdd | F32ChannelwiseOp::ScaledResidual
+        F32ChannelwiseOp::BiasAdd
+            | F32ChannelwiseOp::ScaledResidual
+            | F32ChannelwiseOp::ScaledResidualSeparate
     ) {
         inputs.push(contiguous_tensor(
             vec![symbol("columns")],
@@ -124,6 +180,8 @@ fn contract(kind: F32ChannelwiseOp) -> Result<StandardOperationContract, VNextEr
                 },
             ),
         ]))?
+    } else if kind == F32ChannelwiseOp::GroupedColumnMean {
+        AttributeSchema::new(BTreeMap::from([unsigned_attribute("group_width")?]))?
     } else {
         AttributeSchema::empty()
     };
@@ -195,57 +253,95 @@ impl F32ChannelwiseGeometry {
         if rows != out_rows {
             return Err(invalid("output row count differs"));
         }
-        let (group_width, column_start, column_count) =
-            if kind == F32ChannelwiseOp::GroupedColumnSlice {
-                let read = |name: &str| match attrs.get(&AttributeId::new(name)?) {
-                    Some(SemanticValue::Unsigned(v)) => Ok(*v),
-                    _ => Err(invalid("slice attribute must be unsigned")),
-                };
-                let width = read("group_width")?;
-                let start = read("column_start")?;
-                let count = read("column_count")?;
-                if width == 0
-                    || count == 0
-                    || source_columns % width != 0
-                    || start.checked_add(count).is_none_or(|n| n > width)
-                    || (source_columns / width).checked_mul(count) != Some(*columns)
-                {
-                    return Err(invalid(
-                        "slice window/group count must exactly fit original and output columns",
-                    ));
-                }
-                (width, start, count)
-            } else {
-                if inputs[0] != output {
-                    return Err(invalid("output must exactly match the first matrix"));
-                }
-                match kind {
-                    F32ChannelwiseOp::BiasAdd => {
-                        if inputs[1].dimensions() != [*columns] {
-                            return Err(invalid("bias must be a rank-one vector matching columns"));
-                        }
-                    }
-                    F32ChannelwiseOp::ScaledResidual => {
-                        if inputs[1] != inputs[0] || inputs[2].dimensions() != [*columns] {
-                            return Err(invalid(
-                                "requires an identical branch matrix and rank-one channel scale",
-                            ));
-                        }
-                    }
-                    _ => {}
-                }
-                (*columns, 0, *columns)
+        let (group_width, column_start, column_count) = if kind
+            == F32ChannelwiseOp::GroupedColumnSlice
+        {
+            let read = |name: &str| match attrs.get(&AttributeId::new(name)?) {
+                Some(SemanticValue::Unsigned(v)) => Ok(*v),
+                _ => Err(invalid("slice attribute must be unsigned")),
             };
+            let width = read("group_width")?;
+            let start = read("column_start")?;
+            let count = read("column_count")?;
+            if width == 0
+                || count == 0
+                || source_columns % width != 0
+                || start.checked_add(count).is_none_or(|n| n > width)
+                || (source_columns / width).checked_mul(count) != Some(*columns)
+            {
+                return Err(invalid(
+                    "slice window/group count must exactly fit original and output columns",
+                ));
+            }
+            (width, start, count)
+        } else if kind == F32ChannelwiseOp::GroupedColumnMean {
+            let Some(SemanticValue::Unsigned(width)) = attrs.get(&AttributeId::new("group_width")?)
+            else {
+                return Err(invalid("mean requires group_width"));
+            };
+            if *width == 0 || source_columns % width != 0 || columns != width {
+                return Err(invalid("mean output must match each complete group width"));
+            }
+            (*width, 0, *width)
+        } else if kind == F32ChannelwiseOp::AdaptiveAvgPool {
+            source_columns
+                .checked_mul(*columns)
+                .ok_or_else(|| invalid("adaptive pooling index product overflows"))?;
+            (*columns, 0, *columns)
+        } else {
+            if inputs[0] != output {
+                return Err(invalid("output must exactly match the first matrix"));
+            }
+            match kind {
+                F32ChannelwiseOp::BiasAdd => {
+                    if inputs[1].dimensions() != [*columns] {
+                        return Err(invalid("bias must be a rank-one vector matching columns"));
+                    }
+                }
+                F32ChannelwiseOp::ScaledResidual | F32ChannelwiseOp::ScaledResidualSeparate => {
+                    if inputs[1] != inputs[0] || inputs[2].dimensions() != [*columns] {
+                        return Err(invalid(
+                            "requires an identical branch matrix and rank-one channel scale",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            (*columns, 0, *columns)
+        };
         let elements = rows
             .checked_mul(*columns)
             .ok_or_else(|| invalid("output element count overflows"))?;
-        let arithmetic = elements
-            .checked_mul(match kind {
-                F32ChannelwiseOp::BiasAdd => 1,
-                F32ChannelwiseOp::ScaledResidual => 2,
-                _ => 0,
-            })
-            .ok_or_else(|| invalid("logical arithmetic overflows"))?;
+        let arithmetic = if matches!(
+            kind,
+            F32ChannelwiseOp::GroupedColumnMean | F32ChannelwiseOp::AdaptiveAvgPool
+        ) {
+            let per_row = if kind == F32ChannelwiseOp::GroupedColumnMean {
+                source_columns.checked_add(*columns)
+            } else {
+                let (mut a, mut b) = (*source_columns, *columns);
+                while b != 0 {
+                    (a, b) = (b, a % b);
+                }
+                columns
+                    .checked_mul(2)
+                    .and_then(|m| source_columns.checked_add(m))
+                    .and_then(|n| n.checked_sub(a))
+            }
+            .ok_or_else(|| invalid("reduction arithmetic overflows"))?;
+            rows.checked_mul(per_row)
+                .ok_or_else(|| invalid("reduction arithmetic overflows"))?
+        } else {
+            elements
+                .checked_mul(match kind {
+                    F32ChannelwiseOp::BiasAdd => 1,
+                    F32ChannelwiseOp::ScaledResidual | F32ChannelwiseOp::ScaledResidualSeparate => {
+                        2
+                    }
+                    _ => 0,
+                })
+                .ok_or_else(|| invalid("logical arithmetic overflows"))?
+        };
         Ok(Self {
             kind,
             rows: *rows,
@@ -288,10 +384,12 @@ impl F32ChannelwiseGeometry {
     pub fn input_elements(self, index: usize) -> Option<u64> {
         match (self.kind, index) {
             (_, 0) => self.rows.checked_mul(self.source_columns),
-            (F32ChannelwiseOp::BiasAdd, 1) | (F32ChannelwiseOp::ScaledResidual, 2) => {
-                Some(self.columns)
+            (F32ChannelwiseOp::BiasAdd, 1)
+            | (F32ChannelwiseOp::ScaledResidual, 2)
+            | (F32ChannelwiseOp::ScaledResidualSeparate, 2) => Some(self.columns),
+            (F32ChannelwiseOp::ScaledResidual | F32ChannelwiseOp::ScaledResidualSeparate, 1) => {
+                Some(self.elements)
             }
-            (F32ChannelwiseOp::ScaledResidual, 1) => Some(self.elements),
             _ => None,
         }
     }

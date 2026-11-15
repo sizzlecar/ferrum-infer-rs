@@ -7,11 +7,20 @@ pub const FUNCTION: &str = "ferrum_vnext_channelwise_f32";
 pub fn numerical_profile(kind: F32ChannelwiseOp) -> &'static str {
     match kind {
         F32ChannelwiseOp::GroupedColumnSlice => "cuda.grouped_column_slice.f32.exact_bits.v1",
+        F32ChannelwiseOp::GroupedColumnMean => {
+            "cuda.grouped_column_mean.f32.ascending_add_divide.v1"
+        }
+        F32ChannelwiseOp::AdaptiveAvgPool => {
+            "cuda.adaptive_avg_pool_rows.f32.ascending_add_divide.v1"
+        }
         F32ChannelwiseOp::BiasAdd => "cuda.channel_bias_add.f32.rne.gradual.v1",
         F32ChannelwiseOp::ScaledResidual => {
             "cuda.channel_scaled_residual.f32.single_fma.gradual.v1"
         }
         F32ChannelwiseOp::NanToNum => "cuda.nan_to_num.f32.exact_finite_bits.v1",
+        F32ChannelwiseOp::ScaledResidualSeparate => {
+            "cuda.channel_scaled_residual.f32.separate_rn.gradual.v1"
+        }
     }
 }
 pub(super) fn descriptor(
@@ -203,6 +212,9 @@ impl Provider {
                 F32ChannelwiseOp::BiasAdd => 1,
                 F32ChannelwiseOp::ScaledResidual => 2,
                 F32ChannelwiseOp::NanToNum => 3,
+                F32ChannelwiseOp::ScaledResidualSeparate => 4,
+                F32ChannelwiseOp::GroupedColumnMean => 5,
+                F32ChannelwiseOp::AdaptiveAvgPool => 6,
             };
             let mut launch = stream.launch_builder(kernels.channelwise_f32_function());
             launch

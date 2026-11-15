@@ -183,8 +183,8 @@ impl ImageProductArgs {
 pub struct ImageRunArgs {
     #[command(flatten)]
     pub product: ImageProductArgs,
-    /// PNG destination, created exclusively. Required for image generation.
-    #[arg(long, value_name = "PNG")]
+    /// PNG or MP4 destination, created exclusively. Required for media generation.
+    #[arg(long, value_name = "FILE")]
     pub output: Option<PathBuf>,
     /// Ordered RGB/RGBA PNG inputs. Repeat --image for additional references.
     #[arg(long, value_name = "PNG")]
@@ -208,6 +208,9 @@ pub fn validate_cli_matches(
         return Ok(());
     };
     if !matches!(command, "run" | "serve") {
+        return Ok(());
+    }
+    if super::video_product::validate_cli_matches(definition, matches)? {
         return Ok(());
     }
     let explicit = args
@@ -350,6 +353,11 @@ pub enum ImageProductError {
         pipeline: Box<dyn ferrum_engine::image_generation::service::ImageGenerator>,
     },
     #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    Run {
+        source: anyhow::Error,
+        shutdown: ferrum_engine::image_generation::service::ImageServiceShutdown,
+    },
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     Server {
         source: anyhow::Error,
         service: ferrum_server::ImageHttpService,
@@ -389,7 +397,15 @@ fn image_server_error_message(
     source: &anyhow::Error,
     shutdown: Option<&ferrum_engine::image_generation::service::ImageServiceShutdown>,
 ) -> String {
-    let mut message = format!("image server: {source:#}");
+    image_worker_error_message("server", source, shutdown)
+}
+#[cfg(any(test, feature = "cuda", all(feature = "metal", target_os = "macos")))]
+fn image_worker_error_message(
+    entrypoint: &str,
+    source: &anyhow::Error,
+    shutdown: Option<&ferrum_engine::image_generation::service::ImageServiceShutdown>,
+) -> String {
+    let mut message = format!("image {entrypoint}: {source:#}");
     if let Some(failure) = shutdown.and_then(|shutdown| shutdown.failure()) {
         // Observe the retained failure without moving its original recovery
         // owner. A failing formatter cannot unwind that owner out of the report.
@@ -406,6 +422,10 @@ impl fmt::Display for ImageProductError {
             Self::Unsupported(reason) => f.write_str(reason),
             #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
             Self::Generation { source, .. } => write!(f, "{source}"),
+            #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+            Self::Run { source, shutdown } => {
+                f.write_str(&image_worker_error_message("run", source, Some(shutdown)))
+            }
             #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
             Self::Server {
                 source, shutdown, ..
@@ -426,6 +446,11 @@ impl std::error::Error for ImageProductError {
             #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
             Self::Generation { source, .. } => Some(source.as_ref()),
             #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+            Self::Run { source, shutdown } => match shutdown.failure() {
+                Some(failure) => Some(failure),
+                None => Some(source.as_ref()),
+            },
+            #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
             Self::Server {
                 source, shutdown, ..
             } => match shutdown.as_ref().and_then(|shutdown| shutdown.failure()) {
@@ -440,12 +465,13 @@ impl std::error::Error for ImageProductError {
 pub enum CommandError {
     Text(ferrum_execution::ExecutorBuildError),
     Image(ImageProductError),
+    Video(super::video_product::VideoProductError),
 }
 impl CommandError {
     pub fn cleanup(&self) -> Option<&ferrum_execution::ExecutorShutdownObserver> {
         match self {
             Self::Text(e) => e.cleanup(),
-            Self::Image(_) => None,
+            Self::Image(_) | Self::Video(_) => None,
         }
     }
 }
@@ -464,11 +490,17 @@ impl From<ImageProductError> for CommandError {
         Self::Image(e)
     }
 }
+impl From<super::video_product::VideoProductError> for CommandError {
+    fn from(error: super::video_product::VideoProductError) -> Self {
+        Self::Video(error)
+    }
+}
 impl fmt::Display for CommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Text(e) => fmt::Display::fmt(e, f),
             Self::Image(e) => fmt::Display::fmt(e, f),
+            Self::Video(e) => fmt::Display::fmt(e, f),
         }
     }
 }

@@ -13,7 +13,7 @@ use super::{
     BackingPrepareDecision, BackingSegment, BufferRequest, CapacityAvailabilityEpoch,
     CapacityDomainId, CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector,
     DeviceAllocationPermit, DeviceBufferRetention, DeviceCapacityAvailabilitySnapshot,
-    DeviceCapacityBudget, DeviceCapacityReservation, DeviceRuntime, Digest, DynamicBackingBlocker,
+    DeviceCapacityBudget, DeviceCapacityReservation, DeviceRuntime, DynamicBackingBlocker,
     DynamicBackingClaimOccupancy, DynamicBackingClaimResidency, DynamicBackingClaimScope,
     DynamicBackingDeferralReason, DynamicBackingDeferred, DynamicBackingPackingEnvelope,
     DynamicBackingPool, DynamicBackingPoolId, DynamicBackingPoolState,
@@ -32,7 +32,7 @@ use super::{
     PreparedLaneBackingClaim, ProgramBindingLayout, QuarantinedDynamicChunk,
     RequestStateHazardCoordinator, ResidentChunkBacking, ResidentChunkState, ResourceId,
     ResourceReservation, ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Serialize,
-    Sha256, StateInitialization, StaticProvisioningBinding, StepResourceSlotKind,
+    StateInitialization, StaticProvisioningBinding, StepResourceSlotKind,
     SubmissionWaveDomainCapacityLayout, SubmissionWaveDomainLayout, TransactionId, VNextError,
     DYNAMIC_POOL_MAINTENANCE_BOUNDARY_SCHEMA_VERSION, NEXT_DYNAMIC_POOL_INSTANCE_ID,
 };
@@ -1064,6 +1064,20 @@ where
                     seal: AllocationSeal,
                 })
                 .map_err(|error| {
+                    if self.runtime.allocation_failure_kind(&error)
+                        == crate::DeviceAllocationFailureKind::Capacity
+                    {
+                        return match self.runtime.describe_error(&error) {
+                            Ok(report) => VNextError::DeviceAllocationUnavailable(
+                                crate::DeviceAllocationPressure::new(
+                                    growth.expected_resource_id.clone(),
+                                    growth.chunk_bytes,
+                                    report,
+                                ),
+                            ),
+                            Err(description_error) => description_error,
+                        };
+                    }
                     invalid_resource(format!("dynamic pool device allocation failed: {error}"))
                 })?;
             let actual_descriptor = self.runtime.buffer_descriptor(&buffer);
@@ -2356,12 +2370,7 @@ where
                                 initialization: projection.descriptor.initialization(),
                                 fingerprint: String::new(),
                             };
-                            let bytes = serde_json::to_vec(&allocation).map_err(|error| {
-                                invalid_resource(format!(
-                                    "logical backing allocation evidence encode failed: {error}"
-                                ))
-                            })?;
-                            allocation.fingerprint = format!("sha256/{:x}", Sha256::digest(bytes));
+                            allocation.fingerprint = allocation.compute_fingerprint()?;
                             Ok(LogicalBackingSliceEvidence {
                                 allocation: Arc::new(allocation),
                                 logical_size_bytes: projection.logical_size_bytes,

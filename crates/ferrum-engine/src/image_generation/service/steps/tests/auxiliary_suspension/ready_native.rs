@@ -105,7 +105,8 @@ fn ready_fifo_waiter_allows_original_native_blocker_to_retire_and_restore_real_f
             maximum_prompt_bytes: 1024,
             max_num_seqs: 3,
             request_batch_max_wait_ms: 0,
-        },
+        }
+        .into(),
         host: Some(host.clone()),
         adapter: None,
     };

@@ -104,8 +104,18 @@ const CORE_PTX_HEADERS: &[&str] = &[
     "kernels/vnext_comfy_convrot.cuh",
     "kernels/vnext_comfy_convrot_embedding.cuh",
     "kernels/vnext_fused_head_rms_partial_rope.cuh",
+    "kernels/vnext_head_rms_partial_rope_single_round_bf16.cuh",
     "kernels/vnext_row_rms_addcmul.cuh",
-    "kernels/vnext_cast_f32_to_bf16.cuh",
+    "kernels/vnext_head_axis_pack.cuh",
+    "kernels/vnext_head_fp8_roundtrip_bf16.cuh",
+    "kernels/vnext_float_cast.cuh",
+    "kernels/vnext_channel_bias_add_bf16.cuh",
+    "kernels/vnext_row_center_bf16.cuh",
+    "kernels/vnext_masked_tile_mean_bf16_f32.cuh",
+    "kernels/vnext_signal_f32.cuh",
+    "kernels/vnext_batched_f32.cuh",
+    "kernels/vnext_packed_swiglu_bf16.cuh",
+    "kernels/vnext_row_selected_rms_modulation_bf16.cuh",
     "kernels/vnext_pointwise_f32.cuh",
     "kernels/vnext_gelu_f32.cuh",
     "kernels/vnext_reshape_copy_f32.cuh",
@@ -587,6 +597,14 @@ fn native_dynamic_link_name(path: &Path) -> String {
 fn required_cuda_native_build_units() -> Vec<CudaNativeBuildUnit> {
     [
         (
+            "CARGO_FEATURE_CUDA_SAGE_VSA_FP4",
+            CudaNativeBuildUnit::SageVsaFp4CpuLists,
+        ),
+        (
+            "CARGO_FEATURE_CUDA_CUTLASS_NVFP4",
+            CudaNativeBuildUnit::CutlassNvfp4Matmul,
+        ),
+        (
             "CARGO_FEATURE_CUDA_CUTLASS_FP8",
             CudaNativeBuildUnit::CutlassFp8ScaledMm,
         ),
@@ -853,6 +871,8 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
 fn emit_native_artifact_build_unit(unit: CudaNativeBuildUnit) {
     let summary_artifact = match unit {
         CudaNativeBuildUnit::CutlassFp8ScaledMm => "cutlass_fp8_scaled_mm",
+        CudaNativeBuildUnit::CutlassNvfp4Matmul => "cutlass_nvfp4_matmul",
+        CudaNativeBuildUnit::SageVsaFp4CpuLists => "sage_vsa_fp4_cpu_lists",
         CudaNativeBuildUnit::CutlassFusedF32Attention => "cutlass_fused_f32_attention",
         CudaNativeBuildUnit::CutlassInt8FusedOutput => "cutlass_int8_fused_output",
         CudaNativeBuildUnit::FlashinferXqa => "flashinfer_xqa",

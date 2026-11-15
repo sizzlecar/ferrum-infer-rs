@@ -1,7 +1,7 @@
-//! Bounded page registration of existing, accounted static-upload allocations.
+//! Bounded page registration of existing, accounted upload allocations.
 //! No private staging payload or checkpoint mapping is allocated or registered.
 
-use super::{CudaContext, CudaDeviceRuntimeError, ManagedHostBytes};
+use super::{CudaContext, CudaDeviceRuntime, CudaDeviceRuntimeError, ManagedHostBytes};
 use ferrum_runtime::{HostMemoryClass, NativeHostMemoryRegistration};
 use std::{
     ops::Range,
@@ -11,15 +11,48 @@ use std::{
     },
 };
 
+impl CudaDeviceRuntime {
+    /// Register existing charged immutable metadata through the runtime's one
+    /// bounded Host registration policy. No new backing or quota is created.
+    /// Commands retain original allocations through completion/quarantine.
+    pub(crate) fn register_tensor_metadata_host(
+        &self,
+        sources: &[ManagedHostBytes],
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        let (registry, policy) = self.pinned_weight_upload.as_ref().ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "checked Host metadata requires explicit bounded pinned upload policy",
+            )
+        })?;
+        if sources.iter().any(|source| {
+            source.class() != HostMemoryClass::TransferStaging
+                || source.backing_bytes() > policy.maximum_allocation_bytes.get()
+        }) {
+            return Err(CudaDeviceRuntimeError::contract(
+                "Host metadata class or physical allocation exceeds pinned upload policy",
+            ));
+        }
+        for source in sources {
+            registry.register(source)?;
+        }
+        Ok(())
+    }
+}
+
 /// Construction-time bounds; these enter runtime identity before capacity admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CudaPinnedWeightUploadConfig {
+    /// Register optional weight uploads only above this physical backing size.
+    /// Smaller owners keep the same fenced copy path with pageable Host pages.
+    /// Required native metadata registration is independent of this threshold.
+    pub minimum_allocation_bytes: usize,
     pub maximum_allocation_bytes: std::num::NonZeroUsize,
     pub maximum_registered_bytes: std::num::NonZeroUsize,
 }
 impl CudaPinnedWeightUploadConfig {
     pub(super) fn validate(self) -> Result<(), CudaDeviceRuntimeError> {
-        if self.maximum_allocation_bytes > self.maximum_registered_bytes
+        if self.minimum_allocation_bytes > self.maximum_allocation_bytes.get()
+            || self.maximum_allocation_bytes > self.maximum_registered_bytes
             || self.maximum_registered_bytes.get() > isize::MAX as usize
         {
             return Err(CudaDeviceRuntimeError::contract(
@@ -27,6 +60,10 @@ impl CudaPinnedWeightUploadConfig {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn registers_weight_backing(self, bytes: usize) -> bool {
+        (self.minimum_allocation_bytes..=self.maximum_allocation_bytes.get()).contains(&bytes)
     }
 }
 
@@ -83,13 +120,15 @@ impl CudaPinnedHostRegistry {
             HostMemoryClass::WeightBacking | HostMemoryClass::TransferStaging
         ) {
             return Err(CudaDeviceRuntimeError::contract(
-                "CUDA bounded pinned upload requires accounted static weight storage",
+                "CUDA bounded pinned upload requires accounted weight or transfer staging storage",
             ));
         }
         // This Arc is retained by every successful attachment. Its address
         // cannot be reused while the allocation still has that registration.
         let key = Arc::as_ptr(&self.0) as usize as u64;
+        let started = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
         source.try_register_native(key, |owner, logical| {
+            let registration_lock_us = started.map(|t| t.elapsed().as_micros() as u64);
             let range = registration_range(
                 owner.as_ptr() as usize,
                 owner.len(),
@@ -98,9 +137,12 @@ impl CudaPinnedHostRegistry {
             )?;
             self.0.reserve(owner.len())?;
             let registration = (|| {
+                let bind_started = started.map(|_| std::time::Instant::now());
                 self.0.context.bind_to_thread().map_err(|error| {
                     CudaDeviceRuntimeError::driver("bind pinned Host registration context", error)
                 })?;
+                let context_bind_us = bind_started.map(|t| t.elapsed().as_micros() as u64);
+                let native_started = started.map(|_| std::time::Instant::now());
                 // SAFETY: range encloses the original logical buffer and lies
                 // wholly inside its accounted, stable allocation. The attachment
                 // retires before allocation release; commands retain that same
@@ -116,6 +158,17 @@ impl CudaPinnedHostRegistry {
                 .map_err(|error| {
                     CudaDeviceRuntimeError::driver("register accounted pinned Host memory", error)
                 })?;
+                if let Some(native_started) = native_started {
+                    tracing::debug!(
+                        physical_bytes = owner.len(),
+                        registered_bytes = range.len(),
+                        class = ?source.class(),
+                        registration_lock_us,
+                        context_bind_us,
+                        native_register_us = native_started.elapsed().as_micros() as u64,
+                        "CUDA accounted Host registration timing"
+                    );
+                }
                 Ok(CudaHostRegistration {
                     registry: Arc::clone(&self.0),
                     pointer: range.start,
@@ -228,6 +281,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optional_weight_registration_threshold_respects_physical_bounds() {
+        let mut policy = CudaPinnedWeightUploadConfig {
+            minimum_allocation_bytes: 4096,
+            maximum_allocation_bytes: std::num::NonZeroUsize::new(8192).unwrap(),
+            maximum_registered_bytes: std::num::NonZeroUsize::new(16384).unwrap(),
+        };
+        policy.validate().unwrap();
+        assert!(!policy.registers_weight_backing(4095));
+        assert!(policy.registers_weight_backing(4096));
+        assert!(policy.registers_weight_backing(8192));
+        assert!(!policy.registers_weight_backing(8193));
+        policy.minimum_allocation_bytes = 0;
+        policy.validate().unwrap();
+        assert!(policy.registers_weight_backing(1));
+        policy.minimum_allocation_bytes = 8193;
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
     #[ignore = "requires CUDA runtime construction and Core capacity admission"]
     fn pinned_runtime_identity_is_final_before_core_capacity_registration() {
         use crate::backend::cuda::vnext_runtime::{
@@ -235,38 +307,49 @@ mod tests {
         };
         use ferrum_runtime::{DeviceCapacityOwner, DeviceId, DeviceRuntime};
         use std::num::NonZeroUsize;
-        let capacity = 1 << 30;
-        let runtime = CudaDeviceRuntime::new_tensor_eager_with_options(
-            CudaTensorRuntimeConfig {
-                device: crate::backend::cuda::vnext_ops::cuda_tensor_runtime_config(
-                    0,
-                    DeviceId::new("device.cuda.0").unwrap(),
-                )
-                .unwrap(),
-                usable_memory_bytes: capacity,
-                bootstrap_memory_bytes: 256 << 20,
-                stream_memory_bytes: 16 << 20,
-                maximum_streams: 1,
-                maximum_in_flight_per_stream: 1,
-                maximum_commands_per_submission: 8,
-                opaque_memory_profile: "unqualified-pinned-capacity-lifecycle-fixture".into(),
-            },
-            CudaTensorRuntimeOptions {
-                pinned_weight_upload: Some(CudaPinnedWeightUploadConfig {
-                    maximum_allocation_bytes: NonZeroUsize::new(1 << 20).unwrap(),
-                    maximum_registered_bytes: NonZeroUsize::new(4 << 20).unwrap(),
-                }),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        runtime.descriptor().validate().unwrap();
-        // Static installation opens the same owner after construction. A late
-        // descriptor mutation would conflict with the already registered owner.
-        let owner = DeviceCapacityOwner::open(runtime.descriptor(), capacity).unwrap();
-        assert!(runtime.pinned_weight_upload.is_some());
-        drop(owner);
-        drop(runtime);
+        let mut identities = Vec::new();
+        for minimum_allocation_bytes in [0, 4096] {
+            let capacity = 1 << 30;
+            let runtime = CudaDeviceRuntime::new_tensor_eager_with_options(
+                CudaTensorRuntimeConfig {
+                    device: crate::backend::cuda::vnext_ops::cuda_tensor_runtime_config(
+                        0,
+                        DeviceId::new("device.cuda.0").unwrap(),
+                    )
+                    .unwrap(),
+                    usable_memory_bytes: capacity,
+                    bootstrap_memory_bytes: 256 << 20,
+                    stream_memory_bytes: 16 << 20,
+                    maximum_streams: 1,
+                    maximum_in_flight_per_stream: 1,
+                    maximum_commands_per_submission: 8,
+                    opaque_memory_profile: "unqualified-pinned-capacity-lifecycle-fixture".into(),
+                },
+                CudaTensorRuntimeOptions {
+                    pinned_weight_upload: Some(CudaPinnedWeightUploadConfig {
+                        minimum_allocation_bytes,
+                        maximum_allocation_bytes: NonZeroUsize::new(1 << 20).unwrap(),
+                        maximum_registered_bytes: NonZeroUsize::new(4 << 20).unwrap(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            runtime.descriptor().validate().unwrap();
+            identities.push(
+                runtime
+                    .descriptor()
+                    .runtime_implementation_fingerprint
+                    .clone(),
+            );
+            // Static installation opens the same owner after construction. A late
+            // descriptor mutation would conflict with the already registered owner.
+            let owner = DeviceCapacityOwner::open(runtime.descriptor(), capacity).unwrap();
+            assert!(runtime.pinned_weight_upload.is_some());
+            drop(owner);
+            drop(runtime);
+        }
+        assert_ne!(identities[0], identities[1]);
     }
 
     #[test]

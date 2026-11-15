@@ -26,6 +26,7 @@ pub use custody::{
 pub struct TensorComponentPolicy {
     capacity_bytes: u64,
     storage_profiles: Vec<DynamicStorageProfile>,
+    execution_order: PlanExecutionOrder,
 }
 
 impl<'de> Deserialize<'de> for TensorComponentPolicy {
@@ -35,9 +36,13 @@ impl<'de> Deserialize<'de> for TensorComponentPolicy {
         struct Wire {
             capacity_bytes: u64,
             storage_profiles: Vec<DynamicStorageProfile>,
+            #[serde(default)]
+            execution_order: PlanExecutionOrder,
         }
         let wire = Wire::deserialize(deserializer)?;
-        Self::new(wire.capacity_bytes, wire.storage_profiles).map_err(serde::de::Error::custom)
+        Self::new(wire.capacity_bytes, wire.storage_profiles)
+            .map(|policy| policy.with_execution_order(wire.execution_order))
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -49,9 +54,15 @@ impl TensorComponentPolicy {
         let result = Self {
             capacity_bytes,
             storage_profiles,
+            execution_order: PlanExecutionOrder::DataDependencies,
         };
         result.validate()?;
         Ok(result)
+    }
+
+    pub fn with_execution_order(mut self, order: PlanExecutionOrder) -> Self {
+        self.execution_order = order;
+        self
     }
 }
 
@@ -70,6 +81,9 @@ impl RuntimePolicy for TensorComponentPolicy {
     }
     fn work_limits(&self) -> RuntimeWorkLimits {
         RuntimeWorkLimits::FixedTensor
+    }
+    fn execution_order(&self) -> PlanExecutionOrder {
+        self.execution_order
     }
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
         ferrum_types::AttentionExecutionPolicy::Portable
@@ -125,6 +139,20 @@ pub struct ComponentInitializationConfig {
     pub transaction_id: TransactionId,
     pub static_policy: StaticInitializationPolicy,
     pub executor: TensorExecutorConfig,
+}
+
+/// When a cold static installation acquires its declared initial dynamic pools.
+/// This does not replace request/step admission or change the capacity ledger.
+/// Weightless plans without static resources and shared-weight attachments
+/// already acquire dynamic backing through ordinary execution admission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ColdPoolInitializationPolicy {
+    /// Preserve the cold-start capacity boundary before any static upload.
+    #[default]
+    BeforeStaticUpload,
+    /// Install immutable resources first. The consumer must handle a clean
+    /// dynamic-admission refusal before publishing runnable work.
+    OnExecutionAdmission,
 }
 
 /// A receipt for completed initialization, separate from eventual plan close.
@@ -194,6 +222,31 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
         &self.executable
     }
 
+    /// Forecast the plan bytes still needed for one runnable execution. A
+    /// borrowed live installation excludes only its compatible static weights;
+    /// a receipt or matching source name cannot establish that residency.
+    /// This neither reserves capacity nor assumes any reusable dynamic backing.
+    /// Callers must account for additional initialization/native temporaries and
+    /// still use ordinary admission when initializing or executing the plan.
+    pub fn minimum_additional_execution_bytes(
+        &self,
+        runtime: &Arc<R>,
+        weights: Option<&SharedComponentWeights<R>>,
+    ) -> Result<u64, VNextError> {
+        let plan = self.executable.execution_plan();
+        let memory = plan.payload().memory();
+        let static_bytes = match weights {
+            Some(weights) => {
+                weights.validate_for(plan, runtime)?;
+                0
+            }
+            None => memory.static_bytes(),
+        };
+        static_bytes
+            .checked_add(memory.minimum_runnable_request_bytes())
+            .ok_or_else(|| invalid("additional execution memory overflow"))
+    }
+
     /// Stored weights use managed TransferStaging bytes from `host`. Source
     /// mmap/materializer backing remains owned by its source, and is not a
     /// claim that this staging account bounds total process RSS.
@@ -204,6 +257,25 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
         source: ComponentWeightSource<'_>,
         config: ComponentInitializationConfig,
     ) -> Result<TensorComponentSession<R>, ComponentInitializationError<R>> {
+        self.initialize_with_pool_policy(
+            runtime,
+            host,
+            source,
+            config,
+            ColdPoolInitializationPolicy::default(),
+        )
+    }
+
+    /// Explicitly choose the cold dynamic-pool boundary. Deferred consumers
+    /// use ordinary execution preflight and retain the installation on refusal.
+    pub fn initialize_with_pool_policy(
+        &self,
+        runtime: Arc<R>,
+        host: HostMemoryAccount,
+        source: ComponentWeightSource<'_>,
+        config: ComponentInitializationConfig,
+        pools: ColdPoolInitializationPolicy,
+    ) -> Result<TensorComponentSession<R>, ComponentInitializationError<R>> {
         let (resources, receipt, _) = initialize_resources(
             runtime,
             &self.family,
@@ -211,6 +283,7 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
             source,
             &host,
             &config,
+            pools,
             false,
             None,
         )?;
@@ -229,6 +302,28 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
         (TensorComponentSession<R>, SharedComponentWeights<R>),
         ComponentInitializationError<R>,
     > {
+        self.initialize_shared_weights_with_pool_policy(
+            runtime,
+            host,
+            source,
+            config,
+            ColdPoolInitializationPolicy::default(),
+        )
+    }
+
+    /// Install the same shareable static owner with an explicit cold pool
+    /// policy. Attachments continue to use their own execution admission.
+    pub fn initialize_shared_weights_with_pool_policy(
+        &self,
+        runtime: Arc<R>,
+        host: HostMemoryAccount,
+        source: ComponentWeightSource<'_>,
+        config: ComponentInitializationConfig,
+        pools: ColdPoolInitializationPolicy,
+    ) -> Result<
+        (TensorComponentSession<R>, SharedComponentWeights<R>),
+        ComponentInitializationError<R>,
+    > {
         SharedComponentWeights::<R>::validate_plan(self.executable.execution_plan())?;
         let (resources, receipt, weights) = initialize_resources(
             runtime,
@@ -237,6 +332,7 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
             source,
             &host,
             &config,
+            pools,
             true,
             None,
         )?;
@@ -359,6 +455,7 @@ fn initialize_resources<R: DeviceRuntime>(
     source: ComponentWeightSource<'_>,
     host: &HostMemoryAccount,
     config: &ComponentInitializationConfig,
+    pools: ColdPoolInitializationPolicy,
     share_weights: bool,
     native_started: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<
@@ -398,18 +495,20 @@ fn initialize_resources<R: DeviceRuntime>(
     let committed = reserved
         .commit()
         .map_err(ComponentInitializationError::Commit)?;
-    let pools = committed
-        .maintenance_controller()
-        .pool_ids()
-        .cloned()
-        .collect::<Vec<_>>();
-    for pool in pools {
-        if let Err(source) = committed.maintenance_controller().initialize_pool(&pool) {
-            return Err(ComponentInitializationError::Pool {
-                source,
-                pool_id: pool,
-                transaction: committed,
-            });
+    if pools == ColdPoolInitializationPolicy::BeforeStaticUpload {
+        let pool_ids = committed
+            .maintenance_controller()
+            .pool_ids()
+            .cloned()
+            .collect::<Vec<_>>();
+        for pool in pool_ids {
+            if let Err(source) = committed.maintenance_controller().initialize_pool(&pool) {
+                return Err(ComponentInitializationError::Pool {
+                    source,
+                    pool_id: pool,
+                    transaction: committed,
+                });
+            }
         }
     }
     let initialized = match source {
@@ -526,6 +625,21 @@ impl<R: DeviceRuntime> TensorComponentSession<R> {
                 mappings,
             )
     }
+    /// Publish one joint output to independently admitted consumer requests.
+    pub fn execute_initializing_requests_on_actor(
+        &mut self,
+        actor: &mut crate::TensorSerialActor<R>,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        inputs: Vec<ManagedHostTensor>,
+        destinations: &mut [crate::TensorRequestInitialization<'_, R>],
+    ) -> Result<Vec<TensorExecutionOutput>, TensorExecutionError<R>> {
+        self.executor
+            .as_mut()
+            .expect("live session owns executor")
+            .execute_initializing_requests_on_actor(actor, run_id, request_id, inputs, destinations)
+    }
+
     pub fn executable(&self) -> &ExecutablePlan {
         &self.executable
     }
@@ -591,6 +705,23 @@ impl<R: DeviceRuntime> TensorComponentSession<R> {
             .as_ref()
             .expect("live session owns resource root")
             .try_release_idle_dynamic_backing()
+    }
+
+    /// Perform original request/step/wave admission without submitting any
+    /// command. Capacity refusal retires logical authority and releases all
+    /// candidate dynamic backing. Success retains the same physical pools;
+    /// the later execution must still pass ordinary admission.
+    pub fn try_prepare_dynamic_backing_on_actor(
+        &mut self,
+        actor: &mut crate::TensorSerialActor<R>,
+        run_id: RunId,
+        request_id: RequestIdentity,
+        inputs: Vec<ManagedHostTensor>,
+    ) -> Result<crate::TensorDynamicPreparationOutcome<R>, TensorExecutionError<R>> {
+        self.executor
+            .as_mut()
+            .expect("live session owns executor")
+            .try_prepare_dynamic_backing_on_actor(actor, run_id, request_id, inputs)
     }
 
     /// Pool-aware planning evidence for this session's exact compiled plan.

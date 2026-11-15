@@ -14,11 +14,12 @@ const PROFILE: &str = "profile.request.d2d.bf16";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Config {
     producer: bool,
+    rows: u64,
 }
 struct Family;
-fn spec() -> ProgramTensorSpec {
+fn spec_with_rows(rows: u64) -> ProgramTensorSpec {
     ProgramTensorSpec {
-        dimensions: vec![2, 2],
+        dimensions: vec![rows, 2],
         element_type: ElementType::Bf16,
         layout: ResolvedTensorLayout::Contiguous,
     }
@@ -30,7 +31,7 @@ fn states(config: &Config) -> Vec<StateSpec> {
         vec![StateSpec {
             id: id("state.request.cache"),
             value_id: id(CACHE),
-            tensor: spec(),
+            tensor: spec_with_rows(config.rows),
             lifetime: StateLifetime::Request,
             capacity_demand: StateCapacityDemand::FixedPerScope,
             initialization: StateInitialization::None,
@@ -136,7 +137,7 @@ impl ModelFamilyProvider for Family {
                 vec![id(Y)]
             },
         )?
-        .with_input_tensor_specs(BTreeMap::from([(id(X), spec())]))
+        .with_input_tensor_specs(BTreeMap::from([(id(X), spec_with_rows(config.rows))]))
     }
     fn semantic_metadata(&self, _: &Config) -> Result<ModelSemanticMetadata, VNextError> {
         Ok(ModelSemanticMetadata::TensorComponent)
@@ -179,9 +180,17 @@ fn component(
     host: &HostMemoryAccount,
     producer: bool,
 ) -> TensorComponentSession<ReferenceDeviceRuntime> {
+    component_with_rows(c, host, producer, 2)
+}
+fn component_with_rows(
+    c: &ReferenceVNextComposition,
+    host: &HostMemoryAccount,
+    producer: bool,
+    rows: u64,
+) -> TensorComponentSession<ReferenceDeviceRuntime> {
     let family = TypedFamilyRegistration::new(Family)
         .prepare_with_profile(
-            &serde_json::to_value(Config { producer }).unwrap(),
+            &serde_json::to_value(Config { producer, rows }).unwrap(),
             &NumericalProfileId::new(PROFILE).unwrap(),
         )
         .unwrap();
@@ -195,7 +204,8 @@ fn component(
             .collect(),
     )
     .unwrap();
-    let options = ProgramPlanCompileOptions::new(BTreeMap::from([(id(X), spec())])).unwrap();
+    let options =
+        ProgramPlanCompileOptions::new(BTreeMap::from([(id(X), spec_with_rows(rows))])).unwrap();
     let compiled = CompiledTensorComponent::compile(
         family,
         c.registry(),
@@ -225,8 +235,12 @@ fn mappings() -> Vec<TensorRequestStateMapping> {
     vec![TensorRequestStateMapping {
         source_output: id(CACHE),
         destination_state: id(CACHE),
+        selection: TensorOutputSelection::Whole,
     }]
 }
+
+#[path = "request_state/partition.rs"]
+mod partition;
 
 #[test]
 fn fixed_request_inherits_output_scope_and_can_rebind_after_scope_close() {

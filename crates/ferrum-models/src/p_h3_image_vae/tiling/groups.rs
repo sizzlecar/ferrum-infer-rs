@@ -33,46 +33,28 @@ impl From<PH3ImageVaeTileBatch> for usize {
     }
 }
 
-/// Consecutive tiles in row-major order, without padding. A group may cross a
-/// row boundary; callers select the admitted recipe with this exact tile count.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PH3ImageVaeTileGroup {
-    first_tile: usize,
-    tile_count: usize,
-}
-impl PH3ImageVaeTileGroup {
-    pub const fn first_tile(self) -> usize {
-        self.first_tile
-    }
-    pub const fn tile_count(self) -> usize {
-        self.tile_count
-    }
-}
+/// Shared real spatial group; image grouping retains its existing column cap.
+pub use crate::spatial_tiles::SpatialTileGroup as PH3ImageVaeTileGroup;
+
 impl PH3ImageVaeTilePlan {
+    fn groups(
+        &self,
+        batch: PH3ImageVaeTileBatch,
+    ) -> Result<crate::spatial_tiles::SpatialTileGroups> {
+        crate::spatial_tiles::SpatialTileBatch::new(batch.0.min(self.x.starts.len()))?
+            .groups(self.tile_count())
+    }
     pub fn group(
         &self,
         first_tile: usize,
         batch: PH3ImageVaeTileBatch,
     ) -> Result<PH3ImageVaeTileGroup> {
-        self.tile(first_tile)?;
-        let largest = batch.0.min(self.x.starts.len());
-        ensure!(
-            first_tile % largest == 0,
-            "VAE group must start at its declared traversal boundary"
-        );
-        Ok(PH3ImageVaeTileGroup {
-            first_tile,
-            tile_count: largest.min(self.tile_count() - first_tile),
-        })
+        self.groups(batch)?.group(first_tile)
     }
     pub fn group_shapes(&self, batch: PH3ImageVaeTileBatch) -> Vec<usize> {
-        let largest = batch.0.min(self.x.starts.len());
-        let tail = self.tile_count() % largest;
-        if tail == 0 {
-            vec![largest]
-        } else {
-            vec![largest, tail]
-        }
+        self.groups(batch)
+            .expect("validated nonempty image tile plan")
+            .shapes()
     }
 }
 

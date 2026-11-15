@@ -135,7 +135,7 @@ impl ImageDenoisingGenerator for NativeCompletion {
                     Ok(()) => {
                         self.denied.store(true, Ordering::Release);
                         Err(ImageBatchError::AwaitDenoisingProgress {
-                            stage: ImageStage::Decoder,
+                            stage: ImageStage::Decoder.into(),
                             diagnostic,
                         })
                     }

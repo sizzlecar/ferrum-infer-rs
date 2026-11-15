@@ -25,7 +25,7 @@ pub(super) fn compose(
         &refiner,
         &c.refiner,
         PH3ImageTokenRefinerFamily::CUDA_PROFILE_ID,
-        c.refiner.compile_options()?,
+        c.refiner.compile_options()?.tensor_specs(),
         fragment::mapping(&[(
             PH3ImageTokenRefinerFamily::INPUT_ID,
             PH3ImageDiTFamily::RAW_TEXT_ID,
@@ -35,7 +35,7 @@ pub(super) fn compose(
         &stack,
         &c.stack,
         PH3ImageCurveStackFamily::cuda_profile_id(&c.stack),
-        stack.compile_options(&c.stack)?,
+        stack.compile_options(&c.stack)?.tensor_specs(),
         fragment::mapping(&[
             (PH3ImageCurveStackFamily::INPUT_ID, PACKED),
             (
@@ -56,7 +56,7 @@ pub(super) fn compose(
         &final_layer,
         &c.final_layer,
         PH3ImageFinalLayerFamily::CUDA_PROFILE_ID,
-        c.final_layer.compile_options()?,
+        c.final_layer.compile_options()?.tensor_specs(),
         fragment::mapping(&[
             (
                 PH3ImageFinalLayerFamily::INPUT_ID,
@@ -94,8 +94,10 @@ pub(super) fn compose(
     ] {
         // The complete immutable weight declaration deliberately survives the
         // steady phase. SharedComponentWeights validates its physical plan.
-        schema.components.extend(fragment.schema.components);
-        schema.tensors.extend(fragment.schema.tensors);
+        if let Some(part) = fragment.schema {
+            schema.components.extend(part.components);
+            schema.tensors.extend(part.tensors);
+        }
         weights.extend(fragment.weights);
         if !active {
             continue;
@@ -370,13 +372,7 @@ fn pack(c: &PH3ImageDiTConfig) -> Result<fragment::Fragment, VNextError> {
     })
     .collect::<Result<_, VNextError>>()?;
     Ok(fragment::Fragment {
-        schema: WeightSchema {
-            format_id: WeightFormatId::new("weight-format.safetensors.dense")?,
-            layout_id: WeightLayoutId::new("weight-layout.p_h3_image.dit_forward.transport.v1")?,
-            version: ContractVersion::new(1, 0),
-            components: vec![],
-            tensors: vec![],
-        },
+        schema: None,
         nodes,
         weights: vec![],
         specs,

@@ -10,6 +10,7 @@
 mod config;
 mod edit;
 mod mrope;
+mod nvfp4;
 mod program;
 mod quantized;
 mod weights;
@@ -18,6 +19,10 @@ pub use config::{
 };
 pub use edit::{Qwen3VLTextDeepStack, Qwen3VLTextVisualRun};
 pub use mrope::{Qwen3VLTextImageSpan, QWEN3_VL_EDIT_MROPE_PROFILE};
+pub use nvfp4::{
+    Qwen3VLTextNvfp4Attention, Qwen3VLTextNvfp4Checkpoint, Qwen3VLTextNvfp4Config,
+    Qwen3VLTextNvfp4Family, Qwen3VLTextNvfp4Limits, Qwen3VLTextNvfp4Source,
+};
 pub use quantized::{
     Qwen3VLTextComfyCheckpoint, Qwen3VLTextComfyConfig, Qwen3VLTextComfyFamily,
     Qwen3VLTextComfyInputMode, Qwen3VLTextComfyLimits, Qwen3VLTextComfyProjectionQuantization,

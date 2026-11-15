@@ -856,6 +856,16 @@ where
         contracts: Vec<Box<dyn OperationContract>>,
         providers: Vec<Box<dyn OperationProvider<R>>>,
     ) -> Result<Self, VNextError> {
+        Self::from_shared_providers(contracts, providers.into_iter().map(Arc::from).collect())
+    }
+
+    /// Compose another checked registry from the original provider owners.
+    /// This neither clones native resources nor changes runtime/dispatch
+    /// validation; shape-specific providers may accompany shared providers.
+    pub fn from_shared_providers(
+        contracts: Vec<Box<dyn OperationContract>>,
+        providers: Vec<Arc<dyn OperationProvider<R>>>,
+    ) -> Result<Self, VNextError> {
         if contracts.is_empty() || providers.is_empty() {
             return Err(invalid_operation(
                 "operation runtime registry requires contracts and providers",
@@ -891,10 +901,7 @@ where
                 )));
             }
             let provider_id = descriptor.provider_id().clone();
-            if provider_map
-                .insert(provider_id.clone(), Arc::from(provider))
-                .is_some()
-            {
+            if provider_map.insert(provider_id.clone(), provider).is_some() {
                 return Err(invalid_operation(format!(
                     "operation runtime registry has duplicate or byte-identical provider `{provider_id}`"
                 )));

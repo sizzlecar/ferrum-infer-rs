@@ -1275,6 +1275,7 @@ dependencies = [
  "png",
  "quote",
  "rand 0.9.2",
+ "reqwest",
  "semver",
  "serde",
  "serde_json",
@@ -1282,6 +1283,7 @@ dependencies = [
  "sha2",
  "syn 2.0.108",
  "tempfile",
+ "tokio",
  "toml_edit 0.22.27",
  "uuid",
 ]
@@ -1634,7 +1636,9 @@ dependencies = [
  "png",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

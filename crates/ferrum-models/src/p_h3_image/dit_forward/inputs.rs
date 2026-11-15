@@ -343,22 +343,10 @@ fn patchify(
     let [height, width, ph, pw, channels] =
         [e.height, e.width, c.patch_h, c.patch_w, c.channels].map(usize::try_from);
     let (height, width, ph, pw, channels) = (height?, width?, ph?, pw?, channels?);
-    let mut index = 0;
-    // Official rearrange: b c (t pt) (h ph) (w pw) -> b (t h w) (c pt ph pw), pt=1.
-    for y in 0..height / ph {
-        for x in 0..width / pw {
-            for channel in 0..channels {
-                for dy in 0..ph {
-                    for dx in 0..pw {
-                        write(
-                            index,
-                            read(t, (channel * height + y * ph + dy) * width + x * pw + dx),
-                        );
-                        index += 1;
-                    }
-                }
-            }
-        }
-    }
+    let shape = ferrum_diffusion::SpatiotemporalLatentShape::new(
+        [1, channels, 1, height, width],
+        [1, ph, pw],
+    )?;
+    shape.for_each_packed_index(|packed, dense| write(packed, read(t, dense)));
     Ok(())
 }

@@ -190,6 +190,104 @@ fn near(actual: &[f32], expected: &[f32], label: &str) {
         );
     }
 }
+#[test]
+fn diffusers_keyframe_encoder_runs_original_t1_cnn_without_relabeling_vae_class() {
+    use crate::fast_h3::video_vae::{
+        FastH3ImageEncoderLimits, FastH3ImageEncoderProfile, FastH3VideoVaeConfig,
+        PreparedFastH3ImageEncoder,
+    };
+    let comfy = config(1);
+    let tensors = originals(&comfy);
+    // Construct the released Diffusers module tree independently of importer
+    // string substitutions, preserving the complete original temporal weights.
+    let original_name = |name: &str| {
+        let parts: Vec<_> = name.split('.').collect();
+        match parts.as_slice() {
+            ["encoder", "down", level, "block", block, module, parameter] => format!(
+                "encoder.down_blocks.{level}.resnets.{block}.{}.{parameter}",
+                if *module == "nin_shortcut" {
+                    "conv_shortcut"
+                } else {
+                    module
+                }
+            ),
+            ["encoder", "down", level, "downsample", "conv", parameter] => {
+                format!("encoder.down_blocks.{level}.downsamplers.0.conv.{parameter}")
+            }
+            _ => name.to_owned(),
+        }
+    };
+    let converted = tensors
+        .iter()
+        .map(|(name, value)| (original_name(name), value.clone()))
+        .collect();
+    let (_comfy_dir, comfy_source) = archive(&tensors);
+    let (_hf_dir, hf_source) = archive(&converted);
+    let source = Arc::new(hf_source);
+    let metadata = serde_json::json!({
+        "_class_name":"AutoencoderKLMiniMaxH3", "_diffusers_version":"0.36.0.dev0",
+        "in_channels":3, "out_channels":3, "latent_channels":24,
+        "block_out_channels":[4,8,8,16,16,32], "layers_per_block":2,
+        "spatial_downsample_factors":[2,2,2,2,1,1],
+        "temporal_downsample_factors":[1,2,2,1,1,1],
+        "norm_num_groups":2, "norm_eps":1e-6, "spatial_padding_mode":"reflect",
+        "decoder_num_layers":1, "decoder_num_attention_heads":2,
+        "decoder_attention_head_dim":64, "decoder_num_register_tokens":4,
+        "decoder_ffn_mult":2, "decoder_rope_theta":100.0,
+        "decoder_rope_dim_ratio":0.75, "decoder_norm_eps":1e-5,
+        "clip_length":17, "token_drop":3,
+        "latents_mean":vec![0.;24], "latents_std":vec![1.;24]
+    });
+    let vae = FastH3VideoVaeConfig::parse(&serde_json::to_vec(&metadata).unwrap(), 4096).unwrap();
+    let host = host();
+    let prepared = PreparedFastH3ImageEncoder::prepare(
+        &vae,
+        source.clone(),
+        1,
+        32,
+        48,
+        FastH3ImageEncoderLimits {
+            maximum_metadata_bytes: 1 << 20,
+            maximum_stored_bytes: 1 << 30,
+            maximum_plan_nodes: 4096,
+            maximum_input_bytes: 1 << 20,
+            maximum_output_bytes: 1 << 20,
+        },
+        FastH3ImageEncoderProfile::Reference,
+        &host,
+    )
+    .unwrap();
+    assert_eq!(prepared.input_spec().dimensions(), [1, 3, 32, 48]);
+    assert_eq!(prepared.output_spec().dimensions(), [1, 48, 2, 3]);
+    let importer = prepared.weight_source(host.clone());
+    for component in &prepared.family().stored_weight_schema().unwrap().components {
+        let payload = importer.component(component).unwrap();
+        assert_eq!(payload.external_names(), component.external_names);
+    }
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    let hf = comfy
+        .clone()
+        .with_source_layout(CausalVaeEncoderSourceLayout::Diffusers);
+    let composition =
+        ReferenceVNextComposition::create(id("device.reference.hf_keyframe")).unwrap();
+    let x = input(&hf, false);
+    let actual = run(
+        composition.runtime().clone(),
+        composition.registry(),
+        composition.catalog(),
+        &hf,
+        &source,
+        &x,
+        Family::REFERENCE_PROFILE_ID,
+        false,
+    );
+    let expected = oracle::capture(&comfy, &comfy_source, &x);
+    near(
+        &actual[&id(Family::OUTPUT_ID)],
+        &expected[&id(Family::OUTPUT_ID)],
+        "HF keyframe",
+    );
+}
 fn verify<R: DeviceRuntime>(
     runtime: Arc<R>,
     registry: &OperationRuntimeRegistry<R>,
@@ -314,7 +412,7 @@ fn actual_stored_full_six_level_cuda_encoder_uses_f32_fma_cudnn_and_matches_orac
         opaque_memory_profile: "unqualified-full-encoder-cudnn9-fma-v1".into(),
     };
     let registry = OperationRuntimeRegistry::new(
-        F32CnnOp::ALL
+        F32CnnOp::NCHW
             .into_iter()
             .map(|kind| Box::new(kind.contract().unwrap()) as Box<dyn OperationContract>)
             .collect(),

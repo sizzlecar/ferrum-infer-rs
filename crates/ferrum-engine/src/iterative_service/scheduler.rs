@@ -1,0 +1,1195 @@
+use super::*;
+
+pub(crate) fn take_batch<R: ServiceRequest, O: Send + 'static>(
+    worker: &dyn BatchWorker<Request = R, Output = O>,
+    shared: &Shared<R, O>,
+    stop: Option<&AtomicBool>,
+) -> Option<Vec<Queued<R, O>>> {
+    let mut state = shared.lock();
+    loop {
+        if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+            return None;
+        }
+        prune_cancelled(&mut state.queue);
+        if state.closing {
+            reject_pending(&mut state, ServiceErrorKind::Shutdown);
+            return None;
+        }
+        let Some(first) = state.queue.front() else {
+            if !state.accepting {
+                return None;
+            }
+            state = shared
+                .changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+            continue;
+        };
+        let maximum_batch = worker.maximum_batch_size(&first.request, shared.config.max_num_seqs);
+        let mut count = 1;
+        let mut incompatible = false;
+        for job in state
+            .queue
+            .iter()
+            .skip(1)
+            .take(maximum_batch.saturating_sub(1))
+        {
+            let compatible = compatible_queued(worker, first, job);
+            if !compatible {
+                incompatible = true;
+                break;
+            }
+            count += 1;
+        }
+        let remaining = first
+            .submitted
+            .checked_add(Duration::from_millis(
+                shared.config.request_batch_max_wait_ms,
+            ))
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+        if shared.config.batching == BatchPolicy::Auto
+            || !state.accepting
+            || count == maximum_batch
+            || incompatible
+            || remaining.is_none()
+            || remaining == Some(Duration::ZERO)
+        {
+            let batch: Vec<_> = state.queue.drain(..count).collect();
+            for job in &batch {
+                job.trace.dequeued();
+            }
+            state.preparing = count;
+            state.preparing_bytes = batch.iter().map(Queued::pending_bytes).sum();
+            return Some(batch);
+        }
+        state = shared
+            .changed
+            .wait_timeout(state, remaining.unwrap_or(Duration::ZERO))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+}
+
+/// Candidate ownership remains charged as waiting until device execution starts.
+/// Requeue uses the original owners and arrival times, ahead of newer arrivals.
+fn return_tail<R: ServiceRequest, O>(
+    batch: &mut Vec<Queued<R, O>>,
+    keep: usize,
+    shared: &Shared<R, O>,
+    device_capacity: bool,
+) {
+    let mut state = shared.lock();
+    let group = (shared.config.batching == BatchPolicy::Auto && keep > 0 && keep < batch.len())
+        .then(|| Arc::new(()));
+    for mut job in batch.drain(keep..).rev() {
+        if job.preparation_group.is_none() {
+            job.preparation_group = group.clone();
+        }
+        // A waiting job must not hold output credit ahead of the FIFO head.
+        if let Some(output) = &mut job.output {
+            output.lease.take();
+        }
+        state.preparing -= 1;
+        state.preparing_bytes -= job.pending_bytes();
+        job.trace.requeued();
+        state.queue.push_front(job);
+    }
+    if device_capacity {
+        state.capacity_reductions = state.capacity_reductions.saturating_add(1);
+    }
+}
+
+/// Acquire only the compatible FIFO prefix that currently has output credit.
+/// A resource-blocked tail cannot stop an already authorized prefix executing.
+fn admit_output_prefix<R: ServiceRequest, O: Send + 'static>(
+    worker: &dyn BatchWorker<Request = R, Output = O>,
+    batch: &mut Vec<Queued<R, O>>,
+    shared: &Shared<R, O>,
+) -> Result<bool, WorkerFailure> {
+    'retry: loop {
+        remove_cancelled(batch, &mut shared.lock());
+        if batch.is_empty() {
+            return Ok(false);
+        }
+        for index in 0..batch.len() {
+            if batch[index]
+                .output
+                .as_ref()
+                .is_some_and(|output| output.lease.is_some())
+            {
+                continue;
+            }
+            let gate = batch[index]
+                .output
+                .as_ref()
+                .map(|output| output.gate.clone());
+            let _subscription = gate
+                .as_ref()
+                .map(|gate| gate.subscribe_capacity(shared.resources.waker()));
+            let observed = shared.resources.epoch();
+            // This is initial candidate construction, before any compiled plan.
+            // Current committed bytes already include preceding jobs' grants;
+            // demand adds only the growing engine peak and this next grant.
+            let outcome =
+                output_prefix_available(worker, batch, index, shared).and_then(|available| {
+                    if !available {
+                        return Ok(false);
+                    }
+                    match gate.as_ref().map(|gate| gate.try_acquire()).transpose() {
+                        Ok(Some(Some(lease))) => {
+                            batch[index].output.as_mut().unwrap().lease = Some(lease);
+                            Ok(true)
+                        }
+                        Ok(None) => Ok(true),
+                        Ok(Some(None)) => Ok(false),
+                        Err(OutputGateError::Capacity(message)) => {
+                            Err(BatchError::Overloaded(message))
+                        }
+                        Err(OutputGateError::Failed(message)) => Err(BatchError::Rejected(message)),
+                    }
+                });
+            match outcome {
+                Ok(true) => (),
+                Err(BatchError::Fatal(error)) => return Err(WorkerFailure::Generation(error)),
+                Ok(false) | Err(_) if index > 0 => {
+                    return_tail(batch, index, shared, false);
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    // No prefix has acquired credit yet. Retain the compatible
+                    // candidate so a capacity wake can admit all now-ready jobs,
+                    // rather than permanently reducing this wait to one image.
+                    if shared.lock().closing || batch[0].cancelled.load(Ordering::Acquire) {
+                        continue 'retry;
+                    }
+                    shared.resources.wait(observed);
+                    continue 'retry;
+                }
+                Err(error) => {
+                    return_tail(batch, 1, shared, false);
+                    let (kind, message) = rejection(error)?;
+                    reject_candidate(std::mem::take(batch), shared, kind, &message);
+                    return Ok(false);
+                }
+            }
+        }
+        return Ok(true);
+    }
+}
+
+pub(crate) fn output_prefix_available<R: ServiceRequest, O: Send + 'static>(
+    worker: &dyn BatchWorker<Request = R, Output = O>,
+    batch: &[Queued<R, O>],
+    index: usize,
+    shared: &Shared<R, O>,
+) -> Result<bool, BatchError> {
+    let Some(host) = &shared.host else {
+        return Ok(true);
+    };
+    let requests: Vec<_> = batch[..=index].iter().map(|job| &job.request).collect();
+    let engine_bytes = worker.execution_output_bytes(&requests)?;
+    let fixed = usize::try_from(worker.retained_output_bytes()).map_err(|_| {
+        BatchError::Overloaded("retained generator Output exceeds the Host address range".into())
+    })?;
+    if engine_bytes.is_none() && fixed == 0 {
+        return Ok(true);
+    }
+    let held = batch
+        .iter()
+        .filter_map(|job| job.output.as_ref())
+        .filter(|output| output.lease.is_some())
+        .map(|output| output.gate.host_output_bytes(host))
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| BatchError::Overloaded("held output credit overflows".into()))?;
+    // The fixed owner is already charged. Include it only in the hypothetical
+    // release proof; adding it to actual demand would charge it twice.
+    let retained = held
+        .checked_add(fixed)
+        .ok_or_else(|| BatchError::Overloaded("retained Output baseline overflows".into()))?;
+    let next = batch[index]
+        .output
+        .as_ref()
+        .map_or(0, |output| output.gate.host_output_bytes(host));
+    let demand = engine_bytes
+        .unwrap_or(0)
+        .checked_add(next)
+        .ok_or_else(|| BatchError::Overloaded("combined output demand overflows".into()))?;
+    let claims = [(HostMemoryClass::Output, demand)];
+    host.check_scope_after_output_release(&claims, retained)
+        .map_err(|error| host_admission_error(error))?;
+    match host.check_scope_admission(&claims) {
+        Ok(()) => Ok(true),
+        Err(error) if error.is_temporary_capacity() => {
+            host.check_scope_after_output_release(&claims, retained)
+                .map_err(|error| host_admission_error(error))?;
+            Ok(false)
+        }
+        Err(error) => Err(host_admission_error(error)),
+    }
+}
+
+fn remove_cancelled<R: ServiceRequest, O>(
+    batch: &mut Vec<Queued<R, O>>,
+    state: &mut State<R, O>,
+) -> bool {
+    let before = batch.len();
+    let mut index = 0;
+    while index < batch.len() {
+        if state.closing || batch[index].cancelled.load(Ordering::Acquire) {
+            let job = batch.remove(index);
+            state.preparing -= 1;
+            state.preparing_bytes -= job.pending_bytes();
+            let kind = if state.closing {
+                ServiceErrorKind::Shutdown
+            } else {
+                ServiceErrorKind::Cancelled
+            };
+            let _ = job.response.send(Err(job
+                .trace
+                .error(kind, "image request withdrawn before execution")));
+        } else {
+            index += 1;
+        }
+    }
+    before != batch.len()
+}
+
+pub(crate) fn rejection(error: BatchError) -> Result<(ServiceErrorKind, String), WorkerFailure> {
+    match error {
+        BatchError::InvalidInput(message) => Ok((ServiceErrorKind::InvalidRequest, message)),
+        BatchError::Rejected(message) => Ok((ServiceErrorKind::Generation, message)),
+        BatchError::Capacity { diagnostic, .. } => Ok((ServiceErrorKind::Generation, diagnostic)),
+        BatchError::Overloaded(message) => Ok((ServiceErrorKind::QueueFull, message)),
+        BatchError::InitializationAwaitDenoisingProgress { diagnostic } => {
+            Ok((ServiceErrorKind::QueueFull, diagnostic))
+        }
+        error @ (BatchError::AwaitDenoisingProgress { .. }
+        | BatchError::AwaitHostCapacity { .. }) => Err(WorkerFailure::Generation(Box::new(error))),
+        BatchError::Fatal(error) => Err(WorkerFailure::Generation(error)),
+    }
+}
+
+fn reject_candidate<R: ServiceRequest, O>(
+    batch: Vec<Queued<R, O>>,
+    shared: &Shared<R, O>,
+    kind: ServiceErrorKind,
+    message: &str,
+) {
+    {
+        let mut state = shared.lock();
+        state.preparing = 0;
+        state.preparing_bytes = 0;
+        state.active = 0;
+        if kind == ServiceErrorKind::QueueFull {
+            state.rejected = state.rejected.saturating_add(batch.len() as u64);
+        }
+    }
+    for job in batch {
+        let kind = if job.cancelled.load(Ordering::Acquire) {
+            ServiceErrorKind::Cancelled
+        } else {
+            kind
+        };
+        let _ = job.response.send(Err(job.trace.error(kind, message)));
+    }
+}
+
+/// Select a FIFO prefix whose retained preprocessing fits live Host capacity.
+/// The waiting quota bounds queued ownership; preparation can use the separate
+/// input headroom kept for active work. Every real allocation remains admitted
+/// by the shared account, including decode/resize scratch.
+fn reserve_preprocessing<R: ServiceRequest, O: Send + 'static>(
+    worker: &dyn BatchWorker<Request = R, Output = O>,
+    batch: &mut Vec<Queued<R, O>>,
+    shared: &Shared<R, O>,
+) -> Result<bool, BatchError> {
+    let bounds = batch
+        .iter()
+        .map(|job| worker.preparation_bytes(&job.request))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut state = shared.lock();
+    let queued = state.queue.iter().map(Queued::pending_bytes).sum::<usize>();
+    let mut extra = 0usize;
+    let mut keep = 0usize;
+    for (job, &bound) in batch.iter().zip(&bounds) {
+        let next = extra
+            .checked_add(bound.saturating_sub(job.preprocessing_bytes))
+            .ok_or_else(|| {
+                BatchError::Overloaded("image prepared-input byte bound overflows".into())
+            })?;
+        let admission = match &shared.host {
+            Some(host) => host
+                .check_scope_admission(&[(HostMemoryClass::InputPreprocess, next)])
+                .map_err(|error| host_admission_error(error)),
+            None if queued
+                .saturating_add(state.preparing_bytes)
+                .saturating_add(next)
+                <= shared.config.maximum_pending_bytes =>
+            {
+                Ok(())
+            }
+            None => Err(BatchError::Overloaded(
+                "image prepared inputs exceed waiting Host byte budget".into(),
+            )),
+        };
+        if let Err(error) = admission {
+            if keep > 0 {
+                break;
+            }
+            let wait_for_output = if let Some(host) = &shared.host {
+                let held = batch
+                    .iter()
+                    .filter_map(|job| job.output.as_ref())
+                    .filter(|output| output.lease.is_some())
+                    .try_fold(0usize, |total, output| {
+                        total.checked_add(output.gate.host_output_bytes(host))
+                    })
+                    .ok_or_else(|| BatchError::Overloaded("held output credit overflows".into()))?;
+                let fixed = usize::try_from(worker.retained_output_bytes()).map_err(|_| {
+                    BatchError::Overloaded(
+                        "retained generator Output exceeds the Host address range".into(),
+                    )
+                })?;
+                let retained = held.checked_add(fixed).ok_or_else(|| {
+                    BatchError::Overloaded("retained Output baseline overflows".into())
+                })?;
+                host.check_scope_after_output_release(
+                    &[(HostMemoryClass::InputPreprocess, next)],
+                    retained,
+                )
+                .is_ok()
+            } else {
+                false
+            };
+            drop(state);
+            // A request that cannot fit must not discard later FIFO jobs.
+            return_tail(batch, 1, shared, false);
+            return if wait_for_output {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        extra = next;
+        keep += 1;
+    }
+    for (job, bound) in batch.iter_mut().take(keep).zip(bounds) {
+        job.preprocessing_bytes = job.preprocessing_bytes.max(bound);
+    }
+    state.preparing_bytes += extra;
+    drop(state);
+    return_tail(batch, keep, shared, false);
+    Ok(true)
+}
+
+/// Select an already-owned FIFO prefix using completed execution observations,
+/// then search its capacity without submitting speculative device work. Only
+/// a typed fresh-plan capacity failure permits a smaller capacity-search bound.
+#[cfg(test)]
+pub(crate) fn prepare_capacity_prefix<R: ServiceRequest, O: Send + 'static>(
+    worker: &mut dyn BatchWorker<Request = R, Output = O>,
+    batch: &mut Vec<Queued<R, O>>,
+    shared: &Shared<R, O>,
+    hint: &mut capacity_hint::CapacitySearchHint,
+    efficiency: &mut batch_efficiency::BatchEfficiency,
+) -> Result<BatchPreparation, BatchError> {
+    prepare_capacity_prefix_using(worker, batch, shared, hint, efficiency, false)
+}
+
+pub(crate) fn prepare_capacity_prefix_using<R: ServiceRequest, O: Send + 'static>(
+    worker: &mut dyn BatchWorker<Request = R, Output = O>,
+    batch: &mut Vec<Queued<R, O>>,
+    shared: &Shared<R, O>,
+    hint: &mut capacity_hint::CapacitySearchHint,
+    efficiency: &mut batch_efficiency::BatchEfficiency,
+    progressive: bool,
+) -> Result<BatchPreparation, BatchError> {
+    let context = (shared.config.batching == BatchPolicy::Auto)
+        .then(|| {
+            worker
+                .capacity_search_context(&batch.iter().map(|job| &job.request).collect::<Vec<_>>())
+        })
+        .flatten();
+    let adapter = batch[0].adapter.clone();
+    let capacity_upper = hint.upper(context, &adapter, shared.config.max_num_seqs);
+    let mut upper = batch.len().min(capacity_upper);
+    if upper < batch.len() {
+        tracing::debug!(
+            target: "ferrum_engine::image_generation::timing",
+            queued_batch = batch.len(),
+            candidate_batch = upper,
+            "image capacity search reuses a verified shape boundary"
+        );
+    }
+    upper = efficiency.select(context, &adapter, upper, capacity_upper);
+    let resident_upper = hint.resident_upper(context, &adapter, upper);
+    if progressive && resident_upper > 0 && resident_upper < upper {
+        let next = resident_upper.saturating_add(1).min(upper);
+        let known = efficiency
+            .warm_start(context, &adapter, upper, capacity_upper)
+            .unwrap_or(1);
+        let proposal = next.max(known).min(upper);
+        upper = if efficiency.allow_spilling_candidate(context, &adapter, proposal, resident_upper)
+        {
+            proposal
+        } else {
+            resident_upper
+        };
+        // The resident preference changed the cohort we can execute. Rank
+        // that fitting prefix too, before compiling a plan to reconsider.
+        upper = efficiency.select(context, &adapter, upper, capacity_upper);
+    }
+    let bind_feedback =
+        |mut prepared: BatchPreparation, count: usize, hint: &capacity_hint::CapacitySearchHint| {
+            prepared.1 = context.map(|context| batch_efficiency::ExecutionContext {
+                context,
+                adapter: adapter.clone(),
+                capacity_upper: hint.upper(Some(context), &adapter, shared.config.max_num_seqs),
+                batch_size: count,
+                exploration: false,
+            });
+            prepared
+        };
+    let mut candidate = if progressive {
+        hint.next_probe(context, &adapter, upper)
+    } else {
+        upper
+    };
+    if progressive && candidate < upper {
+        tracing::debug!(target: "ferrum_engine::image_generation::timing",
+            candidate_batch = candidate, queued_batch = batch.len(), expansion_upper = upper,
+            "image preparation probes expansion before starting fitting work");
+    }
+    let mut best: Option<(usize, BatchPreparation)> = None;
+    let mut resident_search = false;
+    let mut staged_fallback: Option<(usize, BatchPreparation)> = None;
+    loop {
+        let mut requests = batch[..candidate]
+            .iter_mut()
+            .map(|job| &mut job.request)
+            .collect::<Vec<_>>();
+        let outcome = worker.prepare(&mut requests);
+        let outcome = match outcome {
+            Ok(prepared) if progressive && prepared.2.is_some_and(|r| !r.fits()) => {
+                let report = prepared.2.unwrap();
+                hint.remember_residency(context, &adapter, candidate, report);
+                let resident_upper = hint.resident_upper(context, &adapter, capacity_upper);
+                if resident_upper == 0 || candidate == 1 {
+                    // This hardware cannot keep even a singleton's required
+                    // weights together. The staged plan remains legal, and a
+                    // larger already-prepared batch amortizes required swaps.
+                    let (count, prepared) = staged_fallback.take().unwrap_or((candidate, prepared));
+                    hint.remember_fit(context, &adapter, count);
+                    return_tail(batch, count, shared, false);
+                    return Ok(bind_feedback(prepared, count, hint));
+                }
+                if !efficiency.allow_spilling_candidate(
+                    context,
+                    &adapter,
+                    candidate,
+                    resident_upper,
+                ) {
+                    tracing::debug!(target: "ferrum_engine::image_generation::timing",
+                        candidate_batch=candidate, resident_required_bytes=report.required_bytes,
+                        capacity_bytes=report.capacity_bytes,
+                        "image execution defers an unfunded weight-swapping candidate");
+                    if staged_fallback
+                        .as_ref()
+                        .is_none_or(|(count, _)| candidate > *count)
+                    {
+                        staged_fallback = Some((candidate, prepared));
+                    }
+                    upper = candidate - 1;
+                    resident_search = true;
+                    let lower = best.as_ref().map_or(0, |(count, _)| *count);
+                    if lower == upper {
+                        let (count, prepared) =
+                            best.take().expect("resident fitting prefix retained");
+                        return_tail(batch, count, shared, false);
+                        return Ok(bind_feedback(prepared, count, hint));
+                    }
+                    candidate = lower + (upper - lower).div_ceil(2);
+                    continue;
+                }
+                Ok(prepared)
+            }
+            outcome => outcome,
+        };
+        match outcome {
+            Ok(prepared) if candidate == upper || (progressive && !resident_search) => {
+                hint.remember_fit(context, &adapter, candidate);
+                return_tail(batch, candidate, shared, false);
+                return Ok(bind_feedback(prepared, candidate, hint));
+            }
+            Ok(prepared) => {
+                hint.remember_fit(context, &adapter, candidate);
+                best = Some((candidate, prepared));
+            }
+            Err(BatchError::Capacity { proof, .. })
+                if shared.config.batching == BatchPolicy::Auto && candidate > 1 =>
+            {
+                upper = candidate - 1;
+                hint.remember(
+                    context,
+                    &adapter,
+                    candidate,
+                    proof.report,
+                    shared.config.max_num_seqs,
+                );
+                {
+                    let mut state = shared.lock();
+                    state.capacity_reductions = state.capacity_reductions.saturating_add(1);
+                }
+                tracing::debug!(
+                    target: "ferrum_engine::image_generation::timing",
+                    candidate_batch = candidate,
+                    required_bytes = proof.report.required_bytes,
+                    capacity_bytes = proof.report.capacity_bytes,
+                    "image candidate exceeds compiled capacity; searching a smaller FIFO prefix"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        let lower = best.as_ref().map_or(0, |(count, _)| *count);
+        if lower == upper {
+            let (count, prepared) = best.expect("a positive fitting prefix was retained");
+            return_tail(batch, count, shared, false);
+            return Ok(bind_feedback(prepared, count, hint));
+        }
+        candidate = if progressive && !resident_search {
+            let midpoint = upper.div_ceil(2);
+            hint.known_fit(context, &adapter)
+                .filter(|count| *count <= upper)
+                .map_or(midpoint, |known| known.max(midpoint))
+        } else {
+            lower + (upper - lower).div_ceil(2)
+        };
+    }
+}
+
+pub(crate) fn worker_loop<R: ServiceRequest, O: Send + 'static>(
+    mut worker: Box<dyn BatchWorker<Request = R, Output = O>>,
+    shared: Arc<Shared<R, O>>,
+) -> Retirement<R, O> {
+    let _host_subscription = shared
+        .host
+        .as_ref()
+        .map(|host| host.subscribe_capacity(shared.resources.waker()));
+    let mut capacity_hint = capacity_hint::CapacitySearchHint::default();
+    let mut efficiency = batch_efficiency::BatchEfficiency::default();
+    let mut prefetched: Option<Prefetched<R, O>> = None;
+    let run = catch_unwind(AssertUnwindSafe(|| {
+        let overlap_enabled =
+            shared.config.batching == BatchPolicy::Auto && worker.preparation_worker().is_some();
+        'batches: while let Some((mut batch, mut prepared_ahead)) = prefetched
+            .take()
+            .map(|p| (p.batch, Some(p.outcome)))
+            .or_else(|| take_batch(worker.as_ref(), &shared, None).map(|b| (b, None)))
+        {
+            if prepared_ahead
+                .as_ref()
+                .is_some_and(|outcome| matches!(outcome, Err(_) | Ok(Err(BatchError::Fatal(_)))))
+            {
+                let failure = Prefetched::<R, O> {
+                    batch: Vec::new(),
+                    outcome: prepared_ahead.take().unwrap(),
+                }
+                .failure();
+                reject_candidate(
+                    batch,
+                    &shared,
+                    ServiceErrorKind::Generation,
+                    "image preparation failed; original recovery owners retained",
+                );
+                return failure;
+            }
+            let step_supported = batch.first().is_some_and(|job| {
+                worker
+                    .denoising_generator()
+                    .is_some_and(|generator| generator.supports_request(&job.request))
+            });
+            if step_supported {
+                // A plan-only prefetch has submitted no work. The step
+                // protocol prepares each joining request and current cohort
+                // afresh, rather than retargeting a whole-batch token.
+                drop(prepared_ahead.take());
+                if let Err(failure) = steps::execute(worker.as_mut(), &shared, batch) {
+                    return Some(failure);
+                }
+                continue 'batches;
+            }
+            if let Some(Ok(Ok(Some(prepared)))) = &prepared_ahead {
+                if let Some(context) = &prepared.1 {
+                    if let Some(chosen) = efficiency.reconsider_ready(
+                        context.context,
+                        &batch[0].adapter,
+                        batch.len(),
+                        context.capacity_upper,
+                    ) {
+                        prepared_ahead = None;
+                        return_tail(&mut batch, chosen, &shared, false);
+                        tracing::debug!(target: "ferrum_engine::image_generation::timing", batch_size=chosen,
+                            reason="completed_execution_feedback", "image preparation pipeline reconsidered ready batch");
+                    }
+                }
+            }
+            let prepared = 'prepare: loop {
+                let changed = remove_cancelled(&mut batch, &mut shared.lock());
+                if changed || batch.is_empty() || shared.lock().closing {
+                    if let Some(failure) = prepared_ahead.take().and_then(|outcome| {
+                        Prefetched::<R, O> {
+                            batch: Vec::new(),
+                            outcome,
+                        }
+                        .failure()
+                    }) {
+                        return Some(failure);
+                    }
+                }
+                if shared.lock().closing {
+                    reject_candidate(
+                        batch,
+                        &shared,
+                        ServiceErrorKind::Shutdown,
+                        "image service is shutting down",
+                    );
+                    return None;
+                }
+                if batch.is_empty() {
+                    continue 'batches;
+                }
+                if overlap_enabled && prepared_ahead.is_none() {
+                    start_observed_prefix(
+                        worker.as_ref(),
+                        &mut batch,
+                        &shared,
+                        &capacity_hint,
+                        &efficiency,
+                    );
+                }
+                match admit_output_prefix(worker.as_ref(), &mut batch, &shared) {
+                    Ok(true) => (),
+                    Ok(false) => continue 'batches,
+                    Err(failure) => break Err(failure),
+                }
+                let preparation_started = Instant::now();
+                let observed = shared.resources.epoch();
+                let outcome = prepared_ahead.take().unwrap_or_else(|| {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        if !reserve_preprocessing(worker.as_ref(), &mut batch, &shared)? {
+                            return Ok(None);
+                        }
+                        prepare_capacity_prefix_using(
+                            worker.as_mut(),
+                            &mut batch,
+                            &shared,
+                            &mut capacity_hint,
+                            &mut efficiency,
+                            overlap_enabled,
+                        )
+                        .map(Some)
+                    }))
+                });
+                let elapsed = preparation_started.elapsed();
+                for job in &mut batch {
+                    job.preparation_duration = job.preparation_duration.saturating_add(elapsed);
+                }
+                match outcome {
+                    Ok(Ok(None)) => {
+                        if !shared.lock().closing
+                            && !batch
+                                .iter()
+                                .any(|job| job.cancelled.load(Ordering::Acquire))
+                        {
+                            shared.resources.wait(observed);
+                        }
+                        continue 'prepare;
+                    }
+                    Ok(Ok(Some(mut prepared))) => {
+                        loop {
+                            let observed = shared.resources.epoch();
+                            if remove_cancelled(&mut batch, &mut shared.lock()) {
+                                drop(prepared);
+                                continue 'prepare;
+                            }
+                            let output_credit_bytes = batch
+                                .iter()
+                                .filter_map(|job| job.output.as_ref())
+                                .map(|output| {
+                                    shared
+                                        .host
+                                        .as_ref()
+                                        .map_or(0, |host| output.gate.host_output_bytes(host))
+                                })
+                                .try_fold(0usize, |total, bytes| total.checked_add(bytes));
+                            let resources = match output_credit_bytes {
+                                Some(output_credit_bytes) => PreparationResources {
+                                    output_credit_bytes,
+                                },
+                                None => {
+                                    drop(prepared);
+                                    reject_candidate(
+                                        batch,
+                                        &shared,
+                                        ServiceErrorKind::QueueFull,
+                                        "combined output grants exceed addressable Host memory",
+                                    );
+                                    continue 'batches;
+                                }
+                            };
+                            let admission = match catch_unwind(AssertUnwindSafe(|| {
+                                worker.try_admit_prepared(&mut prepared, resources)
+                            })) {
+                                Ok(admission) => admission,
+                                Err(panic) => break 'prepare Err(WorkerFailure::Panic(panic)),
+                            };
+                            match admission {
+                                Ok(true) => break,
+                                Ok(false) => {
+                                    // This token has submitted no device work.
+                                    // Keep its plans and edit owners while an
+                                    // independently held output is consumed.
+                                    if shared.lock().closing
+                                        || batch
+                                            .iter()
+                                            .any(|job| job.cancelled.load(Ordering::Acquire))
+                                    {
+                                        continue;
+                                    }
+                                    shared.resources.wait(observed);
+                                }
+                                Err(BatchError::Capacity { proof, .. }) if batch.len() > 1 => {
+                                    let context = prepared.1.as_ref().map(|e| e.context);
+                                    capacity_hint.remember(
+                                        context,
+                                        &batch[0].adapter,
+                                        batch.len(),
+                                        proof.report,
+                                        shared.config.max_num_seqs,
+                                    );
+                                    drop(prepared);
+                                    continue 'prepare;
+                                }
+                                Err(error) => match rejection(error) {
+                                    Ok((kind, message)) => {
+                                        drop(prepared);
+                                        reject_candidate(batch, &shared, kind, &message);
+                                        continue 'batches;
+                                    }
+                                    Err(failure) => break 'prepare Err(failure),
+                                },
+                            }
+                        }
+                        let mut state = shared.lock();
+                        // A cancellation invalidates the compiled batch geometry.
+                        // Dropping this unused preparation is safe; no work exists.
+                        if remove_cancelled(&mut batch, &mut state) {
+                            drop(state);
+                            drop(prepared);
+                            continue;
+                        }
+                        state.preparing = 0;
+                        state.preparing_bytes = 0;
+                        state.active = batch.len();
+                        state.executed_batches = state.executed_batches.saturating_add(1);
+                        state.executed_requests =
+                            state.executed_requests.saturating_add(batch.len() as u64);
+                        state.last_batch_size = batch.len();
+                        break Ok((prepared, state.executed_batches));
+                    }
+                    Ok(Err(error)) => match rejection(error) {
+                        Ok((kind, message)) => {
+                            reject_candidate(batch, &shared, kind, &message);
+                            continue 'batches;
+                        }
+                        Err(failure) => break Err(failure),
+                    },
+                    Err(panic) => break Err(WorkerFailure::Panic(panic)),
+                }
+            };
+            // Scope all request and nested generator/stage events to one actual
+            // dispatch. Failed preparations never receive an execution identity.
+            let dispatch_span = prepared.as_ref().ok().map(|(_, dispatch_id)| {
+                tracing::debug_span!(
+                    target: "ferrum_engine::image_generation::timing",
+                    "image_dispatch",
+                    dispatch_id = *dispatch_id,
+                )
+            });
+            let _dispatch = dispatch_span.as_ref().map(tracing::Span::enter);
+            let mut responses = Vec::with_capacity(batch.len());
+            let mut requests = Vec::with_capacity(batch.len());
+            let now = Instant::now();
+            let batch_size = batch.len();
+            for (batch_index, job) in batch.into_iter().enumerate() {
+                if prepared.is_ok() {
+                    job.request.record_admission(AdmissionTiming {
+                        batch_index,
+                        batch_size,
+                        queue_wait_us: u64::try_from(
+                            now.duration_since(job.submitted)
+                                .saturating_sub(job.preparation_duration)
+                                .as_micros(),
+                        )
+                        .unwrap_or(u64::MAX),
+                        queue_and_prepare_us: u64::try_from(
+                            now.duration_since(job.submitted).as_micros(),
+                        )
+                        .unwrap_or(u64::MAX),
+                        preparation_us: u64::try_from(job.preparation_duration.as_micros())
+                            .unwrap_or(u64::MAX),
+                    });
+                }
+                requests.push(job.request);
+                responses.push((
+                    job.cancelled,
+                    job.response,
+                    job._prompt_reservation,
+                    job.output,
+                    job.trace,
+                ));
+            }
+            let outcome = prepared.and_then(|(mut prepared, _)| {
+                let feedback_context = prepared.1.take().map(|mut context| {
+                    context.exploration = prepared.2.is_some_and(|r| !r.fits())
+                        && capacity_hint.resident_upper(Some(context.context), &context.adapter, context.capacity_upper) > 0
+                        && efficiency.warm_start(Some(context.context), &context.adapter,
+                            context.batch_size, context.capacity_upper) != Some(context.batch_size);
+                    context
+                });
+                match catch_unwind(AssertUnwindSafe(|| {
+                    let started = Instant::now();
+                    let preparer = (shared.config.batching == BatchPolicy::Auto)
+                        .then(|| worker.preparation_worker())
+                        .flatten();
+                    let stop = AtomicBool::new(false);
+                    let (outcome, elapsed, ahead, feedback) = thread::scope(|scope| {
+                        let handle = preparer.and_then(|mut preparer| {
+                            let hint = &mut capacity_hint;
+                            let efficiency = &mut efficiency;
+                            let shared = &shared;
+                            let stop = &stop;
+                            thread::Builder::new()
+                                .name("ferrum-image-prepare".into())
+                                .spawn_scoped(scope, move || {
+                                    prepare_ahead(preparer.as_mut(), shared, stop, hint, efficiency)
+                                })
+                                .ok()
+                        });
+                        let execution =
+                            catch_unwind(AssertUnwindSafe(|| worker.execute(prepared, requests)));
+                        let elapsed = started.elapsed();
+                        let feedback = match &execution {
+                            Ok(Ok(outputs)) if outputs.len() == responses.len() => {
+                                worker.batch_execution_feedback(outputs)
+                            }
+                            _ => None,
+                        };
+                        // Completed outputs must not wait for background compilation.
+                        let execution = match execution {
+                            Ok(Ok(outputs)) if outputs.len() == responses.len() => {
+                                deliver_outputs(&shared, &mut responses, outputs);
+                                Ok(Ok(Vec::new()))
+                            }
+                            other => other,
+                        };
+                        {
+                            let _state = shared.lock();
+                            stop.store(true, Ordering::Release);
+                            shared.changed.notify_all();
+                        }
+                        let wait_started = Instant::now();
+                        let ahead = handle.and_then(|handle| match handle.join() {
+                            Ok(prepared) => prepared,
+                            Err(panic) => Some(Prefetched {
+                                batch: Vec::new(),
+                                outcome: Err(panic),
+                            }),
+                        });
+                        if let Some(next) = &ahead {
+                            tracing::debug!(target: "ferrum_engine::image_generation::timing",
+                                next_batch_size = next.batch.len(), execution_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                                preparation_tail_wait_us = u64::try_from(wait_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                                "image preparation pipeline execution completed");
+                        }
+                        (execution, elapsed, ahead, feedback)
+                    });
+                    prefetched = ahead;
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    };
+                    if let (Some(context), Some(feedback)) = (feedback_context, feedback) {
+                        efficiency.observe(context, elapsed, feedback, shared.config.max_num_seqs);
+                    }
+                    outcome
+                })) {
+                    Ok(Ok(outputs)) if outputs.len() == responses.len() => Ok(outputs),
+                    Ok(Ok(_)) => Err(WorkerFailure::Generation(Box::new(service_error(
+                        ServiceErrorKind::Generation,
+                        "generator returned a different number of outputs than batch requests",
+                    )))),
+                    // Capacity at execution time is never a retry signal.
+                    Ok(Err(error @ BatchError::Capacity { .. })) => {
+                        Err(WorkerFailure::Generation(Box::new(error)))
+                    }
+                    Ok(Err(error)) => match rejection(error) {
+                        Ok((kind, message)) => {
+                            {
+                                let mut state = shared.lock();
+                                state.active = 0;
+                                if kind == ServiceErrorKind::QueueFull {
+                                    state.rejected =
+                                        state.rejected.saturating_add(responses.len() as u64);
+                                }
+                            }
+                            for (cancelled, response, prompt_reservation, output, trace) in
+                                responses.drain(..)
+                            {
+                                let kind = if cancelled.load(Ordering::Acquire) {
+                                    ServiceErrorKind::Cancelled
+                                } else {
+                                    kind
+                                };
+                                // A terminal rejection makes capacity reusable before
+                                // the waiter can submit its next request.
+                                drop(output);
+                                drop(prompt_reservation);
+                                let _ = response.send(Err(trace.error(kind, &message)));
+                            }
+                            Ok(Vec::new())
+                        }
+                        Err(failure) => Err(failure),
+                    },
+                    Err(panic) => Err(WorkerFailure::Panic(panic)),
+                }
+            });
+            match outcome {
+                Ok(outputs) => {
+                    deliver_outputs(&shared, &mut responses, outputs);
+                }
+                Err(mut failure) => {
+                    if let Some(secondary) = prefetched.take().and_then(Prefetched::failure) {
+                        failure = WorkerFailure::Concurrent {
+                            execution: Box::new(failure),
+                            preparation: Box::new(secondary),
+                        };
+                    }
+                    let (kind, message) = match &failure {
+                        WorkerFailure::Generation(error) => (ServiceErrorKind::Generation,
+                            catch_unwind(AssertUnwindSafe(|| error.to_string())).unwrap_or_else(|_| "image generation failed; error formatter panicked, original owner retained".to_owned())),
+                        WorkerFailure::Concurrent { .. } => (ServiceErrorKind::Generation, "execution and preparation failed; original owners retained".to_owned()),
+                        WorkerFailure::Panic(_) => (ServiceErrorKind::WorkerPanic, "image worker panicked; original owners retained".to_owned()),
+                    };
+                    let mut state = shared.lock();
+                    state.accepting = false;
+                    state.closing = true;
+                    state.active = 0;
+                    state.preparing = 0;
+                    state.preparing_bytes = 0;
+                    reject_pending(&mut state, ServiceErrorKind::Stopped);
+                    for (_, response, _, _, trace) in responses {
+                        let _ = response.send(Err(trace.error(kind, &message)));
+                    }
+                    return Some(failure);
+                }
+            }
+        }
+        prefetched.take().and_then(Prefetched::failure)
+    }));
+    let failure = match run {
+        Ok(failure) => failure,
+        Err(panic) => Some(WorkerFailure::Panic(panic)),
+    };
+    let retired = retire_worker(worker, failure);
+    {
+        let mut state = shared.lock();
+        state.accepting = false;
+        state.closing = true;
+        state.active = 0;
+        state.preparing = 0;
+        state.preparing_bytes = 0;
+        reject_pending(&mut state, ServiceErrorKind::Stopped);
+    }
+    retired
+}
+
+/// Normal close and fatal custody have one owner, including an ingress
+/// rejection before the first job. A fatal execution never invokes close.
+pub(crate) fn retire_worker<R: ServiceRequest, O: Send + 'static>(
+    mut worker: Box<dyn BatchWorker<Request = R, Output = O>>,
+    mut failure: Option<WorkerFailure>,
+) -> Retirement<R, O> {
+    let mut evidence = None;
+    if failure.is_none() {
+        match catch_unwind(AssertUnwindSafe(|| worker.shutdown_evidence())) {
+            Ok(Ok(receipt)) => evidence = receipt,
+            Ok(Err(error)) => failure = Some(WorkerFailure::Generation(error)),
+            Err(panic) => failure = Some(WorkerFailure::Panic(panic)),
+        }
+    }
+    if let Some(original) = &failure {
+        // Diagnostics only borrow custody. A third-party error formatter must
+        // neither discard the native recovery owner nor replace its failure.
+        let diagnostic = catch_unwind(AssertUnwindSafe(|| original.to_string()))
+            .unwrap_or_else(|_| "error formatter panicked; original owner retained".to_owned());
+        tracing::error!(failure = %diagnostic,
+            "iterative worker stopped; original failure and recovery owners retained");
+    }
+    Retirement {
+        worker: Some(worker),
+        failure,
+        evidence,
+    }
+}
+
+// The queue, preprocessing owners and result move together. There is never
+// more than one future batch, and only the execution worker admits it.
+type PreparationAttempt = std::thread::Result<Result<Option<BatchPreparation>, BatchError>>;
+struct Prefetched<R: ServiceRequest, O> {
+    batch: Vec<Queued<R, O>>,
+    outcome: PreparationAttempt,
+}
+impl<R: ServiceRequest, O> Prefetched<R, O> {
+    fn failure(self) -> Option<WorkerFailure> {
+        match self.outcome {
+            Err(panic) => Some(WorkerFailure::Panic(panic)),
+            Ok(Err(BatchError::Fatal(error))) => Some(WorkerFailure::Generation(error)),
+            _ => None,
+        }
+    }
+}
+fn prepare_ahead<R: ServiceRequest, O: Send + 'static>(
+    worker: &mut dyn BatchWorker<Request = R, Output = O>,
+    shared: &Shared<R, O>,
+    stop: &AtomicBool,
+    hint: &mut capacity_hint::CapacitySearchHint,
+    efficiency: &mut batch_efficiency::BatchEfficiency,
+) -> Option<Prefetched<R, O>> {
+    let mut batch = take_batch(worker, shared, Some(stop))?;
+    let started = Instant::now();
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let admitted = match admit_output_prefix(worker, &mut batch, shared) {
+            Ok(admitted) => admitted,
+            Err(WorkerFailure::Generation(error)) => return Err(BatchError::Fatal(error)),
+            Err(WorkerFailure::Panic(panic)) => std::panic::resume_unwind(panic),
+            Err(other) => return Err(BatchError::Fatal(Box::new(other))),
+        };
+        if !admitted || !reserve_preprocessing(worker, &mut batch, shared)? {
+            return Ok(None);
+        }
+        prepare_capacity_prefix_using(worker, &mut batch, shared, hint, efficiency, true).map(Some)
+    }));
+    let elapsed = started.elapsed();
+    for job in &mut batch {
+        job.preparation_duration = job.preparation_duration.saturating_add(elapsed);
+    }
+    tracing::debug!(target: "ferrum_engine::image_generation::timing", batch_size = batch.len(), preparation_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX), "image preparation overlapped preceding execution");
+    if matches!(outcome, Ok(Ok(None)) | Ok(Err(BatchError::Overloaded(_)))) {
+        return_tail(&mut batch, 0, shared, false);
+        return None;
+    }
+    Some(Prefetched { batch, outcome })
+}
+
+type Response<O> = (
+    Arc<AtomicBool>,
+    oneshot::Sender<Result<O, ServiceError>>,
+    Option<HostMemoryReservation>,
+    Option<QueuedOutput>,
+    trace::RequestTrace,
+);
+fn deliver_outputs<R: ServiceRequest, O>(
+    shared: &Shared<R, O>,
+    responses: &mut Vec<Response<O>>,
+    outputs: Vec<O>,
+) {
+    for ((cancelled, response, _, gate, trace), output) in responses.drain(..).zip(outputs) {
+        let result = if cancelled.load(Ordering::Acquire) {
+            Err(trace.error(
+                ServiceErrorKind::Cancelled,
+                "image response cancelled; active execution completed",
+            ))
+        } else {
+            if let Some(QueuedOutput {
+                lease: Some(lease),
+                response,
+                ..
+            }) = gate
+            {
+                let _ = response.send(lease);
+            }
+            Ok(output)
+        };
+        let completed = result.is_ok();
+        let delivered = response.send(result).is_ok();
+        if completed {
+            trace.finished(if delivered {
+                trace::RequestOutcome::Completed
+            } else {
+                trace::RequestOutcome::Cancelled
+            });
+        }
+    }
+    shared.lock().active = 0;
+}
+
+pub(crate) fn compatible_queued<R: ServiceRequest, O: Send + 'static>(
+    worker: &dyn BatchWorker<Request = R, Output = O>,
+    first: &Queued<R, O>,
+    other: &Queued<R, O>,
+) -> bool {
+    (match (&first.preparation_group, &other.preparation_group) {
+        (Some(a), Some(b)) if Arc::ptr_eq(a, b) => true,
+        (None, None) => true,
+        _ => false,
+    }) && other.adapter == first.adapter
+        && worker.compatible(&first.request, &other.request)
+}
+
+fn start_observed_prefix<R: ServiceRequest, O: Send + 'static>(
+    worker: &dyn BatchWorker<Request = R, Output = O>,
+    batch: &mut Vec<Queued<R, O>>,
+    shared: &Shared<R, O>,
+    hint: &capacity_hint::CapacitySearchHint,
+    efficiency: &batch_efficiency::BatchEfficiency,
+) {
+    let mut state = shared.lock();
+    let maximum = worker.maximum_batch_size(&batch[0].request, shared.config.max_num_seqs);
+    let extra = state
+        .queue
+        .iter()
+        .take(maximum.saturating_sub(batch.len()))
+        .take_while(|job| compatible_queued(worker, &batch[0], job))
+        .count();
+    let requests = batch
+        .iter()
+        .chain(state.queue.iter().take(extra))
+        .map(|job| &job.request)
+        .collect::<Vec<_>>();
+    let context = worker.capacity_search_context(&requests);
+    let upper = hint.upper(context, &batch[0].adapter, maximum);
+    let Some(chosen) = efficiency
+        .warm_start(context, &batch[0].adapter, requests.len(), upper)
+        // Start a newly observed shape with its smallest real request while
+        // the preparation lane explores the backlog. An unpriced larger plan
+        // must not delay the first response or occupy the GPU by default.
+        .or_else(|| context.map(|_| 1))
+    else {
+        return;
+    };
+    drop(requests);
+    if chosen > batch.len() {
+        let added = state
+            .queue
+            .drain(..chosen - batch.len())
+            .collect::<Vec<_>>();
+        state.preparing += added.len();
+        state.preparing_bytes += added.iter().map(Queued::pending_bytes).sum::<usize>();
+        batch.extend(added);
+    }
+    drop(state);
+    return_tail(batch, chosen, shared, false);
+    tracing::debug!(target: "ferrum_engine::image_generation::timing", batch_size=chosen,
+        reason="observed_shape_primes_execution_lane", "image preparation pipeline warm start");
+}

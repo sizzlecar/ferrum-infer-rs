@@ -306,6 +306,7 @@ pub mod replay_bundle;
 pub mod run;
 pub mod serve;
 pub mod stop;
+pub mod video_product;
 pub mod vnext_checkpoint;
 pub mod vnext_determinism;
 

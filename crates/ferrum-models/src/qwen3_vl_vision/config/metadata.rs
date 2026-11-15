@@ -22,12 +22,14 @@ pub(super) fn check_vision_declaration(v: &Value) -> Result<(), VNextError> {
     if !matches!(
         v.get("model_type").and_then(Value::as_str),
         Some("qwen3_vl" | "qwen3_vl_vision")
-    ) || v.get("dtype").and_then(Value::as_str) != Some("bfloat16")
+    ) || v
+        .get("dtype")
+        .is_some_and(|dtype| dtype.as_str() != Some("bfloat16"))
         || v.get("hidden_act").and_then(Value::as_str) != Some("gelu_pytorch_tanh")
     {
         return Err(invalid(
             "vision_config",
-            "requires declared BF16 Qwen3VL vision with tanh-GELU blocks",
+            "requires Qwen3VL vision with tanh-GELU blocks and no conflicting dtype declaration",
         ));
     }
     check_axial_declaration(v)

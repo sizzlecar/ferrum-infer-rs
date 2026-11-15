@@ -297,7 +297,7 @@ impl<R: DeviceRuntime> ImageDenoisingGenerator for PH3ImagePipeline<R> {
                 let diagnostic = source.to_string();
                 match super::native_completion::clean_decoder_admission(source) {
                     Ok(()) => Err(ImageBatchError::AwaitDenoisingProgress {
-                        stage: crate::image_generation::ImageStage::Decoder,
+                        stage: crate::image_generation::ImageStage::Decoder.into(),
                         diagnostic,
                     }),
                     Err(source) => Err(self.h3_step_error(source)),
@@ -394,6 +394,11 @@ impl<R: DeviceRuntime> ImageGenerator for PH3ImagePipeline<R> {
         PH3ImagePipeline::shutdown(self)
             .map(|_| ())
             .map_err(|source| Box::new(source) as GeneratorError)
+    }
+    fn shutdown_receipts(
+        &mut self,
+    ) -> Result<Vec<crate::image_generation::ImageStageReceipt>, GeneratorError> {
+        PH3ImagePipeline::shutdown(self).map_err(|source| Box::new(source) as GeneratorError)
     }
 }
 

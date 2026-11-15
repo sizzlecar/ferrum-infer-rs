@@ -118,6 +118,7 @@ struct TestRuntime {
     descriptor_mismatch_buffer: std::sync::atomic::AtomicUsize,
     allocate_calls: AtomicU64,
     fail_on_call: AtomicU64,
+    allocation_capacity_failure: AtomicBool,
     panic_on_call: AtomicU64,
     mismatch_on_call: AtomicU64,
     backend_alive: Arc<AtomicBool>,
@@ -186,6 +187,7 @@ impl TestRuntime {
             descriptor_mismatch_buffer: std::sync::atomic::AtomicUsize::new(0),
             allocate_calls: AtomicU64::new(0),
             fail_on_call: AtomicU64::new(0),
+            allocation_capacity_failure: AtomicBool::new(false),
             panic_on_call: AtomicU64::new(0),
             mismatch_on_call: AtomicU64::new(0),
             backend_alive: Arc::new(AtomicBool::new(true)),
@@ -358,6 +360,14 @@ impl DeviceRuntime for TestRuntime {
             backend_alive: Arc::downgrade(&self.backend_alive),
             dropped_after_backend: Arc::clone(&self.dropped_after_backend),
         })
+    }
+
+    fn allocation_failure_kind(&self, _error: &Self::Error) -> crate::DeviceAllocationFailureKind {
+        if self.allocation_capacity_failure.load(Ordering::Acquire) {
+            crate::DeviceAllocationFailureKind::Capacity
+        } else {
+            crate::DeviceAllocationFailureKind::Unrecoverable
+        }
     }
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {
@@ -4782,83 +4792,98 @@ fn multi_pool_batch_publishes_one_capacity_epoch() {
 
 #[test]
 fn multi_pool_nth_allocation_failure_has_zero_partial_publication() {
-    let combined = combine_catalogs(&[
-        pool_catalog(
-            linear_profile(),
-            AllocationLifetime::Request,
-            'a',
-            1,
-            256,
-            TestDemand::Fixed,
-        ),
-        pool_catalog(
-            linear_profile(),
-            AllocationLifetime::Request,
-            'b',
-            1,
-            256,
-            TestDemand::Fixed,
-        ),
-    ]);
-    let runtime = new_runtime(&combined, 512);
-    runtime.fail_on_call(2);
-    let harness = harness(Arc::clone(&runtime), combined, 512, false);
-    let requests = harness
-        .pool_ids
-        .iter()
-        .cloned()
-        .map(|pool_id| DynamicPoolGrowthRequest::new(pool_id, 64).unwrap())
-        .collect::<Vec<_>>();
-    let before = harness
-        .root
-        .dynamic_pools
-        .logical_admission
-        .snapshot()
-        .unwrap();
-    assert!(harness
-        .root
-        .maintenance_controller
-        .grow_pools(requests.clone())
-        .is_err());
-    let after = harness
-        .root
-        .dynamic_pools
-        .logical_admission
-        .snapshot()
-        .unwrap();
-    assert_eq!(after.capacity_epoch(), before.capacity_epoch());
-    assert!(after
-        .domains()
-        .iter()
-        .all(|domain| domain.total() == CapacityUnits::ZERO));
-    for pool in harness.root.dynamic_pools.pools.values() {
-        let state = pool.state.lock().unwrap();
-        assert_eq!(state.pending_growth_bytes, 0);
-        assert!(state.chunks.is_empty());
-    }
-    assert_eq!(
-        harness
+    for capacity in [false, true] {
+        let combined = combine_catalogs(&[
+            pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Request,
+                'a',
+                1,
+                256,
+                TestDemand::Fixed,
+            ),
+            pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Request,
+                'b',
+                1,
+                256,
+                TestDemand::Fixed,
+            ),
+        ]);
+        let runtime = new_runtime(&combined, 512);
+        runtime.fail_on_call(2);
+        runtime
+            .allocation_capacity_failure
+            .store(capacity, Ordering::Release);
+        let harness = harness(Arc::clone(&runtime), combined, 512, false);
+        let requests = harness
+            .pool_ids
+            .iter()
+            .cloned()
+            .map(|pool_id| DynamicPoolGrowthRequest::new(pool_id, 64).unwrap())
+            .collect::<Vec<_>>();
+        let before = harness
             .root
             .dynamic_pools
-            .budget
-            .account
-            .state
-            .lock()
-            .unwrap()
-            .claimed_bytes,
-        0
-    );
-    runtime.fail_on_call(0);
-    assert_eq!(
-        harness
+            .logical_admission
+            .snapshot()
+            .unwrap();
+        let error = harness
             .root
             .maintenance_controller
-            .grow_pools(requests)
-            .unwrap()
-            .growths()
-            .len(),
-        2
-    );
+            .grow_pools(requests.clone())
+            .unwrap_err();
+        match error {
+            VNextError::DeviceAllocationUnavailable(pressure) if capacity => {
+                assert_eq!(pressure.requested_bytes(), 64);
+                assert_eq!(pressure.report().code(), "dynamic_pool_test");
+                assert_eq!(pressure.report().message(), "injected failure");
+                assert!(!pressure.resource_id().as_str().is_empty());
+            }
+            VNextError::InvalidExecutionPlan { .. } if !capacity => (),
+            other => panic!("allocation failure classification changed: {other:?}"),
+        }
+        let after = harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .snapshot()
+            .unwrap();
+        assert_eq!(after.capacity_epoch(), before.capacity_epoch());
+        assert!(after
+            .domains()
+            .iter()
+            .all(|domain| domain.total() == CapacityUnits::ZERO));
+        for pool in harness.root.dynamic_pools.pools.values() {
+            let state = pool.state.lock().unwrap();
+            assert_eq!(state.pending_growth_bytes, 0);
+            assert!(state.chunks.is_empty());
+        }
+        assert_eq!(
+            harness
+                .root
+                .dynamic_pools
+                .budget
+                .account
+                .state
+                .lock()
+                .unwrap()
+                .claimed_bytes,
+            0
+        );
+        runtime.fail_on_call(0);
+        assert_eq!(
+            harness
+                .root
+                .maintenance_controller
+                .grow_pools(requests)
+                .unwrap()
+                .growths()
+                .len(),
+            2
+        );
+    }
 }
 
 #[test]

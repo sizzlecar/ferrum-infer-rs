@@ -11,17 +11,18 @@ mod decoder;
 mod decoder_block;
 mod encode_layout;
 mod encode_tiles;
-mod encoder;
+pub(crate) mod encoder;
 mod encoder_vertical;
 mod image_layout;
 mod latent_statistics;
 mod pipeline_adapter;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_support;
-mod tiling;
+pub(crate) mod tiling;
 mod weights;
 
 pub use config::PH3ImageVaeDecoderConfig;
+pub(crate) use encoder_vertical::PH3ImageVaeEncoderArchitecture;
 pub use pipeline_adapter::{
     PH3ImageVaeAdapter, PH3ImageVaeAdapterLimits, PH3ImageVaeDecoderConsumer,
     PH3ImageVaeDecoderHostPhase, PH3ImageVaeDecoderHostPhaseBudget,

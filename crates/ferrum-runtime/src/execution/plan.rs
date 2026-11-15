@@ -89,6 +89,13 @@ impl ExecutionPlan {
     }
 
     pub fn build<P: RuntimePolicy>(request: PlanBuildRequest<'_, P>) -> Result<Self, VNextError> {
+        let profile_started =
+            tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+        let elapsed_us = || {
+            profile_started.as_ref().map_or(0, |started| {
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+            })
+        };
         request.policy.validate()?;
         let maximum_active_sequences = request.policy.maximum_active_sequences();
         validate_active_sequence_ceiling(maximum_active_sequences)?;
@@ -154,12 +161,14 @@ impl ExecutionPlan {
             .iter()
             .flat_map(|block| &block.nodes)
             .collect::<Vec<_>>();
+        let metadata_end_us = elapsed_us();
         let joint_storage = Self::select_joint_provider_storage(
             &program_nodes,
             &resolutions,
             request.capabilities,
             request.policy,
         )?;
+        let selection_end_us = elapsed_us();
         let mut selected_node_resources = joint_storage.node_resources;
         let selected_resource_profiles = joint_storage.resource_profiles;
         let mut storage_rejections = joint_storage.storage_rejections;
@@ -213,6 +222,7 @@ impl ExecutionPlan {
             )?;
             nodes.push(node);
         }
+        Self::apply_execution_order(&mut nodes, request.policy.execution_order());
         if !resolutions.is_empty() {
             return Err(invalid_plan(format!(
                 "physical resolutions contain unknown nodes: {:?}",
@@ -229,6 +239,7 @@ impl ExecutionPlan {
                 "joint solver returned storage rejections for unknown program nodes",
             ));
         }
+        let nodes_end_us = elapsed_us();
         Self::validate_semantic_coverage(family, &bound_values)?;
         Self::validate_global_storage_aliasing(&canonical_values, &nodes)?;
         let tensor_ports = if work_limits.is_tensor() {
@@ -281,6 +292,7 @@ impl ExecutionPlan {
             .map(|value| value.resource_id().clone())
             .chain(terminal_output_resources.iter().cloned())
             .collect::<BTreeSet<_>>();
+        let contracts_end_us = elapsed_us();
         let memory = Self::build_memory_plan(
             family,
             &request.execution_weights.declaration(),
@@ -294,6 +306,7 @@ impl ExecutionPlan {
             request.policy.reusable_execution_policy(),
             &retained_completion_resources,
         )?;
+        let memory_end_us = elapsed_us();
 
         if let Some(layout) = &candidate_state_layout {
             layout.validate_memory(&memory)?;
@@ -346,8 +359,35 @@ impl ExecutionPlan {
             trusted_execution_weights: request.execution_weights,
             checkpoint_unsupported_reasons,
         };
+        let identity_end_us = elapsed_us();
         plan.validate_internal()?;
+        tracing::debug!(
+            plan_id = %plan.payload.plan_id,
+            node_count = plan.payload.nodes.len(),
+            metadata_us = metadata_end_us,
+            storage_selection_us = selection_end_us.saturating_sub(metadata_end_us),
+            node_construction_us = nodes_end_us.saturating_sub(selection_end_us),
+            graph_contracts_us = contracts_end_us.saturating_sub(nodes_end_us),
+            memory_planning_us = memory_end_us.saturating_sub(contracts_end_us),
+            checkpoint_and_identity_us = identity_end_us.saturating_sub(memory_end_us),
+            validation_us = elapsed_us().saturating_sub(identity_end_us),
+            "execution plan construction host timing; excludes program resolution"
+        );
         Ok(plan)
+    }
+
+    /// These edges are consumed by execution and by the existing completion
+    /// proof. Memory planning never infers order merely from vector positions.
+    pub(super) fn apply_execution_order(nodes: &mut [PlanNode], order: super::PlanExecutionOrder) {
+        if order == super::PlanExecutionOrder::Serial {
+            for index in 1..nodes.len() {
+                let predecessor = nodes[index - 1].id.clone();
+                let dependencies = &mut nodes[index].dependencies;
+                if let Err(position) = dependencies.binary_search(&predecessor) {
+                    dependencies.insert(position, predecessor);
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -760,6 +800,9 @@ impl ExecutionPlan {
                 AliasPolicy::MustAlias { tensor_index } => {
                     (*tensor_index, PlanExactAliasKind::MustAlias)
                 }
+                AliasPolicy::ReadOnlyView { tensor_index } => {
+                    (*tensor_index, PlanExactAliasKind::ReadOnlyView)
+                }
             };
             let input = inputs.get(input_ordinal as usize).ok_or_else(|| {
                 invalid_plan(format!(
@@ -775,7 +818,7 @@ impl ExecutionPlan {
                     input_ordinal,
                     kind,
                 });
-            } else if kind == PlanExactAliasKind::MustAlias {
+            } else if kind != PlanExactAliasKind::MayAlias {
                 return Err(invalid_plan(format!(
                     "operation `{}` lost its mandatory exact alias proof",
                     operation.id
@@ -816,8 +859,9 @@ impl ExecutionPlan {
                 )));
             }
             if input.usage() != BufferUsage::Activations
-                || last_consumers.get(&alias.input_value_id) != Some(&node_index)
-                || program_outputs.contains(&alias.input_value_id)
+                || (alias.kind != PlanExactAliasKind::ReadOnlyView
+                    && (last_consumers.get(&alias.input_value_id) != Some(&node_index)
+                        || program_outputs.contains(&alias.input_value_id)))
             {
                 return Err(invalid_plan(format!(
                     "node `{}` aliases activation `{}` before its final legal consumer",
@@ -956,6 +1000,7 @@ impl ExecutionPlan {
         nodes: &[PlanNode],
     ) -> Result<(), VNextError> {
         let alias_classes = Self::alias_classes(nodes)?;
+        Self::validate_read_only_alias_classes(nodes, &alias_classes)?;
         let mut by_resource = BTreeMap::<ResourceId, Vec<GlobalValueRange>>::new();
         for (value_id, binding) in values {
             for component in binding.storage.components() {
@@ -1062,6 +1107,12 @@ impl ExecutionPlan {
                         AliasPolicy::MustAlias { tensor_index },
                         PlanExactAliasKind::MustAlias
                     ) if *tensor_index == alias.input_ordinal
+                ) || matches!(
+                    (output.alias(), alias.kind),
+                    (
+                        AliasPolicy::ReadOnlyView { tensor_index },
+                        PlanExactAliasKind::ReadOnlyView
+                    ) if *tensor_index == alias.input_ordinal
                 );
                 if !policy_matches
                     || input.storage() != output.storage()
@@ -1110,6 +1161,55 @@ impl ExecutionPlan {
             }
         }
         Ok(classes)
+    }
+
+    /// A view may fork and outlive its logical source. Until mutable borrows
+    /// have their own ordering proof, prohibit every write to such a class
+    /// except its unique original producer. This checks all values, including
+    /// later writes through the source or another transitive alias.
+    fn validate_read_only_alias_classes(
+        nodes: &[PlanNode],
+        classes: &BTreeMap<ProgramValueId, ProgramValueId>,
+    ) -> Result<(), VNextError> {
+        let readonly = nodes
+            .iter()
+            .flat_map(|node| &node.exact_aliases)
+            .filter(|alias| alias.kind == PlanExactAliasKind::ReadOnlyView)
+            .map(|alias| classes[&alias.output_value_id].clone())
+            .collect::<BTreeSet<_>>();
+        let mut producers = BTreeSet::new();
+        for node in nodes {
+            if node
+                .exact_aliases
+                .iter()
+                .any(|alias| alias.kind == PlanExactAliasKind::ReadOnlyView)
+                && !matches!(node.work, NodeWorkContract::Fixed)
+            {
+                return Err(invalid_plan("read-only views require fixed tensor work"));
+            }
+            for binding in &node.values {
+                let Some(class) = classes
+                    .get(binding.value_id())
+                    .filter(|class| readonly.contains(*class))
+                else {
+                    continue;
+                };
+                if binding.access() == TensorAccess::Read {
+                    continue;
+                }
+                if binding.role() != ResolvedValueRole::Output
+                    || binding.alias() != &AliasPolicy::NoAlias
+                    || !producers.insert(class.clone())
+                {
+                    return Err(invalid_plan(format!(
+                        "node `{}` mutates read-only view storage through `{}`",
+                        node.id,
+                        binding.value_id()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn validate_semantic_coverage(
@@ -1420,9 +1520,18 @@ impl ExecutionPlan {
                 BTreeMap<ResourceId, BTreeSet<DynamicStorageProfile>>,
                 JointPartialSelection,
             >::new();
-            for (constraints, partial) in frontier {
-                for candidate in &candidate_sets[*node_index] {
-                    let mut next_constraints = constraints.clone();
+            for (mut constraints, mut partial) in frontier {
+                let candidates = &candidate_sets[*node_index];
+                for (index, candidate) in candidates.iter().enumerate() {
+                    // The last branch owns the consumed frontier state. In
+                    // particular, a forced choice need not copy the entire
+                    // accumulated assignment at every node.
+                    let last = index + 1 == candidates.len();
+                    let mut next_constraints = if last {
+                        std::mem::take(&mut constraints)
+                    } else {
+                        constraints.clone()
+                    };
                     if candidate
                         .allowed_profiles
                         .iter()
@@ -1436,7 +1545,11 @@ impl ExecutionPlan {
                     {
                         continue;
                     }
-                    let mut next_partial = partial.clone();
+                    let mut next_partial = if last {
+                        std::mem::take(&mut partial)
+                    } else {
+                        partial.clone()
+                    };
                     next_partial.chosen.push(candidate.resources.clone());
                     next_partial.preferred.push(candidate.is_preferred);
                     match next.entry(next_constraints) {
@@ -2034,19 +2147,10 @@ impl ExecutionPlan {
         work_limits: super::RuntimeWorkLimits,
         is_product_io_resource: bool,
     ) -> Result<ValueResourceDemand, VNextError> {
-        if family
-            .program()
-            .weights()
-            .iter()
-            .any(|weight| &weight.value_id == value_id)
-        {
+        if family.program().weight_for_value(value_id).is_some() {
             return Ok(ValueResourceDemand::PlanStatic);
         }
-        let state = family
-            .program()
-            .states()
-            .iter()
-            .find(|state| &state.value_id == value_id);
+        let state = family.program().state_for_value(value_id);
         let Some(state) = state else {
             if usage != BufferUsage::Activations {
                 return Err(invalid_plan(format!(

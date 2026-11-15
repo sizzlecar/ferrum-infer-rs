@@ -78,9 +78,32 @@ fn execute_regions<const N: usize>(
                 storage.read_f32(0, source)
             }
             F32ChannelwiseOp::BiasAdd => storage.read_f32(0, i) + storage.read_f32(1, column),
+            F32ChannelwiseOp::GroupedColumnMean => {
+                let base = (i / columns) * g.source_columns() as usize;
+                let groups = g.source_columns() / g.group_width();
+                let mut sum = 0f32;
+                for group in 0..groups {
+                    sum += storage.read_f32(0, base + group as usize * columns + column);
+                }
+                sum / groups as f32
+            }
+            F32ChannelwiseOp::AdaptiveAvgPool => {
+                let base = (i / columns) * g.source_columns() as usize;
+                let start = column as u64 * g.source_columns() / g.columns();
+                let end = ((column as u64 + 1) * g.source_columns()).div_ceil(g.columns());
+                let mut sum = 0f32;
+                for j in start..end {
+                    sum += storage.read_f32(0, base + j as usize);
+                }
+                sum / (end - start) as f32
+            }
             F32ChannelwiseOp::ScaledResidual => storage
                 .read_f32(1, i)
                 .mul_add(storage.read_f32(2, column), storage.read_f32(0, i)),
+            F32ChannelwiseOp::ScaledResidualSeparate => {
+                let product = storage.read_f32(1, i) * storage.read_f32(2, column);
+                storage.read_f32(0, i) + product
+            }
             F32ChannelwiseOp::NanToNum => {
                 let bits = storage.read_f32(0, i).to_bits();
                 let magnitude = bits & 0x7fffffff;

@@ -91,6 +91,16 @@ fn legacy_implicit_and_current_explicit_axial_declarations_normalize_identically
         Qwen3VLVisionArchitecture::from_hf_value(&legacy).unwrap(),
         expected
     );
+    // The QAD export omits this optional architecture annotation. The selected
+    // source adapter must still validate actual BF16 storage independently.
+    legacy["vision_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("dtype");
+    assert_eq!(
+        Qwen3VLVisionArchitecture::from_hf_value(&legacy).unwrap(),
+        expected
+    );
     legacy["vision_config"]["rope_parameters"] = json!({"rope_type": "axial", "rope_theta": 10000});
     assert_eq!(
         Qwen3VLVisionArchitecture::from_hf_value(&legacy).unwrap(),

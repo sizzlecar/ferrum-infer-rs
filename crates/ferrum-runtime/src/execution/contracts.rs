@@ -128,6 +128,7 @@ impl ProviderSelection {
 pub enum PlanExactAliasKind {
     MayAlias,
     MustAlias,
+    ReadOnlyView,
 }
 
 /// Core-proven exact storage equality between one output and its declared

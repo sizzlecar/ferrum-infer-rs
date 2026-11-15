@@ -776,7 +776,7 @@ impl OperationDispatch {
             commands.push_operation_parts(
                 segment.start_node_index(),
                 Vec::new(),
-                command,
+                Some(command),
                 Vec::new(),
             );
         }

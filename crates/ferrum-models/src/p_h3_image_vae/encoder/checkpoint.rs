@@ -23,7 +23,7 @@ impl<'a> PH3ImageVaeEncoderCheckpoint<'a> {
     /// Internal projection of an immutable adapter source already validated
     /// once and checked against the prepared physical Stored schema. This is
     /// not an alternative public source-validation entrypoint.
-    pub(in crate::p_h3_image_vae) fn view_validated(
+    pub(crate) fn view_validated(
         config: &'a PH3ImageVaeEncoderConfig,
         source: &'a SafetensorsArchive,
         host: HostMemoryAccount,

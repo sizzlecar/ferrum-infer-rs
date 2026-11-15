@@ -286,6 +286,13 @@ impl ProgramPlanCompiler {
         options: &ProgramPlanCompileOptions,
         execution_weights: TrustedExecutionWeights,
     ) -> Result<ProgramPlanCompilation, VNextError> {
+        let profile_started =
+            tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+        let elapsed_us = || {
+            profile_started.as_ref().map_or(0, |started| {
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+            })
+        };
         validate_compile_options(family, options)?;
         let value_tensors = infer_value_tensors(family, catalog, options)?;
         family
@@ -295,6 +302,7 @@ impl ProgramPlanCompiler {
         execution_weights.validate_against_catalog(family, catalog)?;
         let execution_weight_fingerprint = execution_weights.declaration().fingerprint()?;
         let execution_weight_schema = execution_weights.schema();
+        let metadata_end_us = elapsed_us();
 
         let probe_locations = dedicated_weight_locations(
             family,
@@ -321,6 +329,7 @@ impl ProgramPlanCompiler {
             &probe_storages,
         )?;
         let mut value_alignment_bytes = maximum_value_alignment(&probe_resolutions)?;
+        let probe_end_us = elapsed_us();
         if !value_alignment_bytes.is_power_of_two() {
             return Err(invalid_plan(
                 "provider value-alignment evidence is not a power of two",
@@ -365,12 +374,24 @@ impl ProgramPlanCompiler {
         let node_resolutions = final_resolution.ok_or_else(|| {
             invalid_plan("provider value alignment did not reach a bounded monotonic fixed point")
         })?;
+        let resolution_end_us = elapsed_us();
         let plan = ExecutionPlan::build(
             PlanBuildRequest::new(family, catalog, policy, node_resolutions.clone())?
                 .with_execution_weights(execution_weights)?
                 .with_completion_retention(options.completion_retention.clone())?,
         )?;
+        let plan_end_us = elapsed_us();
         let executable = ExecutablePlan::new(plan, catalog.clone())?;
+        tracing::debug!(
+            family_id = %family.family_id(),
+            node_count = node_resolutions.len(),
+            metadata_us = metadata_end_us,
+            probe_resolution_us = probe_end_us.saturating_sub(metadata_end_us),
+            final_resolution_us = resolution_end_us.saturating_sub(probe_end_us),
+            plan_build_us = plan_end_us.saturating_sub(resolution_end_us),
+            executable_binding_us = elapsed_us().saturating_sub(plan_end_us),
+            "program compilation host timing; includes nested provider preparation"
+        );
         Ok(ProgramPlanCompilation {
             executable,
             node_resolutions,
@@ -1013,7 +1034,8 @@ fn build_value_storages(
         let operation = catalog.operation_for_node(&node.id, &node.operation_id)?;
         for (value_id, contract) in node.outputs.iter().zip(&operation.outputs) {
             let storage = match contract.alias() {
-                AliasPolicy::MustAlias { tensor_index } => {
+                AliasPolicy::MustAlias { tensor_index }
+                | AliasPolicy::ReadOnlyView { tensor_index } => {
                     let input = node.inputs.get(*tensor_index as usize).ok_or_else(|| {
                         invalid_plan(format!("node `{}` aliases an absent input", node.id))
                     })?;
@@ -1131,19 +1153,10 @@ fn resolved_binding(
     tensors: &BTreeMap<ProgramValueId, ResolvedTensorSpec>,
     storages: &BTreeMap<ProgramValueId, ResolvedValueStorage>,
 ) -> Result<ResolvedValueBinding, VNextError> {
-    let program_weight = family
-        .program()
-        .weights()
-        .iter()
-        .find(|weight| weight.value_id == *value_id);
+    let program_weight = family.program().weight_for_value(value_id);
     let usage = if program_weight.is_some() {
         BufferUsage::Weights
-    } else if family
-        .program()
-        .states()
-        .iter()
-        .any(|state| state.value_id == *value_id)
-    {
+    } else if family.program().state_for_value(value_id).is_some() {
         BufferUsage::State
     } else {
         BufferUsage::Activations

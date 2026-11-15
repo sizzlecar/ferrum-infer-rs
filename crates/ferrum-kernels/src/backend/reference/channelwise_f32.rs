@@ -11,11 +11,20 @@ use std::collections::{BTreeMap, BTreeSet};
 pub fn reference_channelwise_f32_numerical_profile(kind: F32ChannelwiseOp) -> &'static str {
     match kind {
         F32ChannelwiseOp::GroupedColumnSlice => "reference.grouped_column_slice.f32.exact_bits.v1",
+        F32ChannelwiseOp::GroupedColumnMean => {
+            "reference.grouped_column_mean.f32.ascending_add_divide.v1"
+        }
+        F32ChannelwiseOp::AdaptiveAvgPool => {
+            "reference.adaptive_avg_pool_rows.f32.ascending_add_divide.v1"
+        }
         F32ChannelwiseOp::BiasAdd => "reference.channel_bias_add.f32.rne.gradual.v1",
         F32ChannelwiseOp::ScaledResidual => {
             "reference.channel_scaled_residual.f32.single_fma.gradual.v1"
         }
         F32ChannelwiseOp::NanToNum => "reference.nan_to_num.f32.exact_finite_bits.v1",
+        F32ChannelwiseOp::ScaledResidualSeparate => {
+            "reference.channel_scaled_residual.f32.separate_rn.gradual.v1"
+        }
     }
 }
 pub fn reference_vnext_channelwise_f32_provider(

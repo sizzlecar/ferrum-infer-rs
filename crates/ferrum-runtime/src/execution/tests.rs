@@ -8,6 +8,12 @@ use crate::{
 #[path = "fixed_tensor_liveness_tests.rs"]
 mod fixed_tensor_liveness;
 
+#[path = "read_only_view_tests.rs"]
+mod read_only_view;
+
+#[path = "step_slot_placement_tests.rs"]
+mod step_slot_placement;
+
 #[path = "completion_order_cache_tests.rs"]
 mod completion_order_cache;
 
@@ -16,6 +22,9 @@ mod invocation_chain;
 
 #[path = "unused_weight_tests.rs"]
 mod unused_weights;
+
+#[path = "joint_storage_tests.rs"]
+mod joint_storage;
 
 #[test]
 fn execution_plan_wire_limit_is_symmetric() {

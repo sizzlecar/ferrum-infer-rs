@@ -373,7 +373,7 @@ impl ImageDenoisingGenerator for Phased {
                     Ok(()) => {
                         self.control.state.lock().unwrap().native_finish_waited = true;
                         Err(ImageBatchError::AwaitDenoisingProgress {
-                            stage: crate::image_generation::ImageStage::Decoder,
+                            stage: crate::image_generation::ImageStage::Decoder.into(),
                             diagnostic,
                         })
                     }

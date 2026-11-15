@@ -31,6 +31,8 @@ fn compact_bf16_routing_matches_expanded_graphs_and_preserves_request_isolation(
     let contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(row_selected_modulation_bf16_contract().unwrap()),
         Box::new(row_selected_addcmul_bf16_contract().unwrap()),
+        Box::new(row_selected_addcmul_fma_bf16_contract().unwrap()),
+        Box::new(addcmul_fma_bf16_contract().unwrap()),
         Box::new(modulation_scale_bf16_contract().unwrap()),
         Box::new(plain_residual_add_bf16_contract().unwrap()),
         Box::new(addcmul_bf16_contract().unwrap()),
@@ -42,6 +44,8 @@ fn compact_bf16_routing_matches_expanded_graphs_and_preserves_request_isolation(
             &[
                 CudaTensorOperation::RowSelectedModulationBf16,
                 CudaTensorOperation::RowSelectedAddcmulBf16,
+                CudaTensorOperation::RowSelectedAddcmulFmaBf16,
+                CudaTensorOperation::AddcmulFma,
                 CudaTensorOperation::ModulationScale,
                 CudaTensorOperation::PlainResidualAdd,
                 CudaTensorOperation::Addcmul,

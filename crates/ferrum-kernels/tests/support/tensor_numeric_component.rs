@@ -49,12 +49,16 @@ fn spec(shape: &[u64], dtype: ElementType) -> ProgramTensorSpec {
 pub enum Kind {
     F32Dense,
     F32Affine,
+    F32AffineToBf16,
     /// Original rank5 patch storage; flattened metadata never replaces its port.
     F32Patch,
     F32ToBf16,
+    Bf16ToF32,
     F32ResidualAdd,
     F32SiluMul,
+    F32Silu,
     HeadRmsF32,
+    HeadRmsBf16,
     HalfSplitRopeF32,
     UnitHeadRmsPartialRopeF32,
     ComfyW4A8,
@@ -65,21 +69,43 @@ pub enum Kind {
     GeluErfF32,
     RowScatterReplaceF32,
     RowScatterAddF32,
+    Nvfp4Matmul,
+    ChannelBiasAddBf16,
+    AddcmulFmaBf16,
+    LeadingBatchMerge,
+    LeadingBatchSplit,
+    LeadingBatchMergeView,
+    LeadingBatchSplitView,
+    RowIndexGather {
+        output_rows: u64,
+    },
 }
 impl Kind {
     fn operation(self) -> &'static str {
         match self {
+            Self::RowIndexGather { .. } => ROW_INDEX_GATHER_OR_ZERO_BF16_OPERATION_ID,
+            Self::LeadingBatchMerge => MERGE_LEADING_BATCH_BF16_OPERATION_ID,
+            Self::LeadingBatchMergeView => MERGE_LEADING_BATCH_BF16_VIEW_OPERATION_ID,
+            Self::LeadingBatchSplit => SPLIT_LEADING_BATCH_BF16_OPERATION_ID,
+            Self::LeadingBatchSplitView => SPLIT_LEADING_BATCH_BF16_VIEW_OPERATION_ID,
+            Self::Nvfp4Matmul => NVFP4_MATMUL_BF16_OPERATION_ID,
+            Self::ChannelBiasAddBf16 => CHANNEL_BIAS_ADD_BF16_OPERATION_ID,
+            Self::AddcmulFmaBf16 => ADDCMUL_FMA_BF16_OPERATION_ID,
             Self::F32Dense => DENSE_LINEAR_F32_OPERATION_ID,
             Self::F32Affine => AFFINE_LINEAR_F32_OPERATION_ID,
+            Self::F32AffineToBf16 => AFFINE_LINEAR_F32_TO_BF16_OPERATION_ID,
             Self::F32Patch => PATCH_PROJECTION_F32_OPERATION_ID,
             Self::F32ToBf16 => CAST_F32_TO_BF16_OPERATION_ID,
+            Self::Bf16ToF32 => CAST_BF16_TO_F32_OPERATION_ID,
             Self::F32ResidualAdd => PLAIN_RESIDUAL_ADD_F32_OPERATION_ID,
             Self::F32SiluMul => SILU_MUL_F32_OPERATION_ID,
+            Self::F32Silu => SILU_F32_OPERATION_ID,
             Self::GeluTanhF32 => GELU_TANH_F32_OPERATION_ID,
             Self::GeluErfF32 => GELU_ERF_F32_OPERATION_ID,
             Self::RowScatterReplaceF32 => ROW_SCATTER_REPLACE_F32_OPERATION_ID,
             Self::RowScatterAddF32 => ROW_SCATTER_ADD_F32_OPERATION_ID,
             Self::HeadRmsF32 => HEAD_RMS_NORM_F32_OPERATION_ID,
+            Self::HeadRmsBf16 => HEAD_RMS_NORM_BF16_OPERATION_ID,
             Self::HalfSplitRopeF32 => HALF_SPLIT_ROPE_F32_OPERATION_ID,
             Self::UnitHeadRmsPartialRopeF32 => UNIT_HEAD_RMS_PARTIAL_ROPE_F32_OPERATION_ID,
             Self::ComfyW4A8 => COMFY_CONVROT_W4A8_BF16_OPERATION_ID,
@@ -91,10 +117,12 @@ impl Kind {
     fn dtype(self) -> ElementType {
         match self {
             Self::F32Dense
+            | Self::Bf16ToF32
             | Self::F32Affine
             | Self::F32Patch
             | Self::F32ResidualAdd
             | Self::F32SiluMul
+            | Self::F32Silu
             | Self::GeluTanhF32
             | Self::GeluErfF32
             | Self::RowScatterReplaceF32
@@ -102,7 +130,17 @@ impl Kind {
             | Self::HeadRmsF32
             | Self::HalfSplitRopeF32
             | Self::UnitHeadRmsPartialRopeF32 => ElementType::F32,
-            Self::ComfyW4A8
+            Self::F32AffineToBf16
+            | Self::ComfyW4A8
+            | Self::RowIndexGather { .. }
+            | Self::HeadRmsBf16
+            | Self::Nvfp4Matmul
+            | Self::ChannelBiasAddBf16
+            | Self::AddcmulFmaBf16
+            | Self::LeadingBatchMerge
+            | Self::LeadingBatchSplit
+            | Self::LeadingBatchMergeView
+            | Self::LeadingBatchSplitView
             | Self::F32ToBf16
             | Self::ComfyW8A8
             | Self::ComfySwiGluF32W4A8
@@ -111,17 +149,29 @@ impl Kind {
     }
     fn profile(self) -> &'static str {
         match self {
+            Self::RowIndexGather { .. } => "test.tensor_component.row_index_gather",
+            Self::LeadingBatchMerge => "test.tensor_component.leading_batch_merge",
+            Self::LeadingBatchMergeView => "test.tensor_component.leading_batch_merge_view",
+            Self::LeadingBatchSplit => "test.tensor_component.leading_batch_split",
+            Self::LeadingBatchSplitView => "test.tensor_component.leading_batch_split_view",
+            Self::Nvfp4Matmul => "test.tensor_component.nvfp4_matmul",
+            Self::ChannelBiasAddBf16 => "test.tensor_component.channel_bias_add_bf16",
+            Self::AddcmulFmaBf16 => "test.tensor_component.addcmul_fma_bf16",
             Self::F32Dense => "test.tensor_component.f32",
             Self::F32Affine => "test.tensor_component.affine_f32",
+            Self::F32AffineToBf16 => "test.tensor_component.affine_f32_to_bf16",
             Self::F32Patch => "test.tensor_component.patch_f32",
             Self::F32ToBf16 => "test.tensor_component.cast_f32_to_bf16",
+            Self::Bf16ToF32 => "test.tensor_component.cast_bf16_to_f32",
             Self::F32ResidualAdd => "test.tensor_component.residual_add_f32",
             Self::F32SiluMul => "test.tensor_component.silu_mul_f32",
+            Self::F32Silu => "test.tensor_component.silu_f32",
             Self::GeluTanhF32 => "test.tensor_component.gelu_tanh_f32",
             Self::GeluErfF32 => "test.tensor_component.gelu_erf_f32",
             Self::RowScatterReplaceF32 => "test.tensor_component.row_scatter_replace_f32",
             Self::RowScatterAddF32 => "test.tensor_component.row_scatter_add_f32",
             Self::HeadRmsF32 => "test.tensor_component.head_rms_f32",
+            Self::HeadRmsBf16 => "test.tensor_component.head_rms_bf16",
             Self::HalfSplitRopeF32 => "test.tensor_component.half_split_rope_f32",
             Self::UnitHeadRmsPartialRopeF32 => {
                 "test.tensor_component.unit_head_rms_partial_rope_f32"
@@ -143,9 +193,41 @@ pub struct Config {
 }
 impl Config {
     pub fn input_specs(self) -> BTreeMap<ProgramValueId, ProgramTensorSpec> {
-        let width = if matches!(
+        if let Kind::RowIndexGather { output_rows } = self.kind {
+            return BTreeMap::from([
+                (
+                    id(INPUT),
+                    spec(&[self.rows, self.inputs, self.outputs], ElementType::Bf16),
+                ),
+                (id(RELATIVE), spec(&[output_rows], ElementType::I32)),
+            ]);
+        }
+        // For the rank bridge, the three explicit fixture axes are B, S, C.
+        if matches!(
             self.kind,
-            Kind::HeadRmsF32 | Kind::HalfSplitRopeF32 | Kind::UnitHeadRmsPartialRopeF32
+            Kind::LeadingBatchMerge
+                | Kind::LeadingBatchSplit
+                | Kind::LeadingBatchMergeView
+                | Kind::LeadingBatchSplitView
+        ) {
+            let shape = if matches!(
+                self.kind,
+                Kind::LeadingBatchMerge | Kind::LeadingBatchMergeView
+            ) {
+                vec![self.rows, self.inputs, self.outputs]
+            } else {
+                vec![self.rows.checked_mul(self.inputs).unwrap(), self.outputs]
+            };
+            return BTreeMap::from([(id(INPUT), spec(&shape, ElementType::Bf16))]);
+        }
+        let width = if matches!(self.kind, Kind::Nvfp4Matmul) {
+            self.inputs / 2
+        } else if matches!(
+            self.kind,
+            Kind::HeadRmsF32
+                | Kind::HeadRmsBf16
+                | Kind::HalfSplitRopeF32
+                | Kind::UnitHeadRmsPartialRopeF32
         ) {
             self.outputs
         } else if matches!(
@@ -156,18 +238,45 @@ impl Config {
         } else {
             self.inputs
         };
-        let input_type = if matches!(self.kind, Kind::F32ToBf16) {
+        let input_type = if matches!(self.kind, Kind::Nvfp4Matmul) {
+            ElementType::U8
+        } else if matches!(self.kind, Kind::Bf16ToF32) {
+            ElementType::Bf16
+        } else if matches!(self.kind, Kind::F32ToBf16 | Kind::F32AffineToBf16) {
             ElementType::F32
         } else {
             self.kind.dtype()
         };
         let mut result = BTreeMap::from([(id(INPUT), spec(&[self.rows, width], input_type))]);
         match self.kind {
+            Kind::RowIndexGather { .. } => unreachable!("handled above"),
+            Kind::LeadingBatchMerge
+            | Kind::LeadingBatchSplit
+            | Kind::LeadingBatchMergeView
+            | Kind::LeadingBatchSplitView => unreachable!("handled above"),
+            Kind::ChannelBiasAddBf16 => {
+                result.insert(id(BIAS), spec(&[self.inputs], ElementType::Bf16));
+            }
+            Kind::AddcmulFmaBf16 => {
+                for name in [WEIGHT, RELATIVE] {
+                    result.insert(id(name), spec(&[self.rows, self.inputs], ElementType::Bf16));
+                }
+            }
+            Kind::Nvfp4Matmul => {
+                let a = Nvfp4MatrixLayout::new(self.rows, self.inputs).unwrap();
+                let b = Nvfp4MatrixLayout::new(self.outputs, self.inputs).unwrap();
+                result.extend([
+                    (id(WEIGHT), spec(&b.packed_shape(), ElementType::U8)),
+                    (id(RELATIVE), spec(&a.scale_shape(), ElementType::U8)),
+                    (id(CHANNEL), spec(&b.scale_shape(), ElementType::U8)),
+                    (id(BIAS), spec(&[1], ElementType::F32)),
+                ]);
+            }
             Kind::RowScatterReplaceF32 | Kind::RowScatterAddF32 => {
                 result.insert(id(WEIGHT), spec(&[3, self.inputs], ElementType::F32));
             }
-            Kind::HeadRmsF32 => {
-                result.insert(id(WEIGHT), spec(&[self.inputs], ElementType::F32));
+            Kind::HeadRmsF32 | Kind::HeadRmsBf16 => {
+                result.insert(id(WEIGHT), spec(&[self.inputs], self.kind.dtype()));
             }
             Kind::HalfSplitRopeF32 | Kind::UnitHeadRmsPartialRopeF32 => {
                 let frequency = if matches!(self.kind, Kind::UnitHeadRmsPartialRopeF32) {
@@ -180,7 +289,11 @@ impl Config {
                     (id(SINE), spec(&[self.rows, frequency], ElementType::F32)),
                 ]);
             }
-            Kind::F32ToBf16 | Kind::GeluTanhF32 | Kind::GeluErfF32 => {}
+            Kind::F32ToBf16
+            | Kind::Bf16ToF32
+            | Kind::F32Silu
+            | Kind::GeluTanhF32
+            | Kind::GeluErfF32 => {}
             Kind::F32ResidualAdd | Kind::F32SiluMul => {
                 result.insert(
                     id(WEIGHT),
@@ -196,12 +309,12 @@ impl Config {
                 result.insert(id(WEIGHT), spec(&shape, ElementType::F32));
                 result.insert(id(BIAS), spec(&[self.outputs], ElementType::F32));
             }
-            Kind::F32Dense | Kind::F32Affine => {
+            Kind::F32Dense | Kind::F32Affine | Kind::F32AffineToBf16 => {
                 result.insert(
                     id(WEIGHT),
                     spec(&[self.outputs, self.inputs], ElementType::F32),
                 );
-                if matches!(self.kind, Kind::F32Affine) {
+                if matches!(self.kind, Kind::F32Affine | Kind::F32AffineToBf16) {
                     result.insert(id(BIAS), spec(&[self.outputs], ElementType::F32));
                 }
             }
@@ -277,13 +390,37 @@ impl Config {
                 .collect(),
         )
         .unwrap();
+        let mut geometry = self.input_specs();
+        if let Kind::RowIndexGather { output_rows } = self.kind {
+            geometry.insert(
+                id(OUTPUT),
+                spec(&[self.rows, output_rows, self.outputs], ElementType::Bf16),
+            );
+        }
+        if matches!(
+            self.kind,
+            Kind::LeadingBatchMerge
+                | Kind::LeadingBatchSplit
+                | Kind::LeadingBatchMergeView
+                | Kind::LeadingBatchSplitView
+        ) {
+            let shape = if matches!(
+                self.kind,
+                Kind::LeadingBatchMerge | Kind::LeadingBatchMergeView
+            ) {
+                vec![self.rows.checked_mul(self.inputs).unwrap(), self.outputs]
+            } else {
+                vec![self.rows, self.inputs, self.outputs]
+            };
+            geometry.insert(id(OUTPUT), spec(&shape, ElementType::Bf16));
+        }
         CompiledTensorComponent::compile(
             family,
             registry,
             catalog,
             &policy,
             materializers,
-            &ProgramPlanCompileOptions::new(self.input_specs()).unwrap(),
+            &ProgramPlanCompileOptions::new(geometry).unwrap(),
         )
     }
 }
@@ -307,9 +444,13 @@ impl ModelFamilyProvider for Family {
             || [config.rows, config.inputs, config.outputs].contains(&0)
             || (matches!(
                 config.kind,
-                Kind::F32ToBf16
+                Kind::ChannelBiasAddBf16
+                    | Kind::AddcmulFmaBf16
+                    | Kind::F32ToBf16
+                    | Kind::Bf16ToF32
                     | Kind::F32ResidualAdd
                     | Kind::F32SiluMul
+                    | Kind::F32Silu
                     | Kind::GeluTanhF32
                     | Kind::GeluErfF32
                     | Kind::RowScatterReplaceF32
@@ -345,14 +486,19 @@ impl ModelFamilyProvider for Family {
     fn numerical_profiles(&self, config: &Config) -> Result<FamilyNumericalProfiles, VNextError> {
         let dense = matches!(
             config.kind,
-            Kind::F32Dense
+            Kind::ChannelBiasAddBf16
+                | Kind::AddcmulFmaBf16
+                | Kind::F32Dense
                 | Kind::F32Affine
+                | Kind::F32AffineToBf16
                 | Kind::F32Patch
                 | Kind::F32ResidualAdd
                 | Kind::F32SiluMul
+                | Kind::F32Silu
                 | Kind::GeluTanhF32
                 | Kind::GeluErfF32
                 | Kind::HeadRmsF32
+                | Kind::HeadRmsBf16
                 | Kind::HalfSplitRopeF32
                 | Kind::UnitHeadRmsPartialRopeF32
         );
@@ -371,19 +517,30 @@ impl ModelFamilyProvider for Family {
                     operation_id: id(config.kind.operation()),
                     version: ContractVersion::new(1, 0),
                     multiplication_type: dense.then_some(ElementType::F32),
-                    accumulation_type: (dense || matches!(config.kind, Kind::RowScatterAddF32))
-                        .then_some(ElementType::F32),
+                    accumulation_type: (dense
+                        || matches!(config.kind, Kind::RowScatterAddF32 | Kind::Nvfp4Matmul))
+                    .then_some(ElementType::F32),
                     staged_arithmetic: match config.kind {
+                        Kind::RowIndexGather { .. } => None,
+                        Kind::LeadingBatchMerge
+                        | Kind::LeadingBatchSplit
+                        | Kind::LeadingBatchMergeView
+                        | Kind::LeadingBatchSplitView => None,
+                        Kind::ChannelBiasAddBf16 | Kind::Nvfp4Matmul | Kind::AddcmulFmaBf16 => None,
                         Kind::F32Dense
                         | Kind::F32Affine
+                        | Kind::F32AffineToBf16
                         | Kind::F32Patch
                         | Kind::F32ToBf16
+                        | Kind::Bf16ToF32
                         | Kind::F32ResidualAdd
                         | Kind::F32SiluMul
+                        | Kind::F32Silu
                         | Kind::GeluTanhF32
                         | Kind::GeluErfF32 => None,
                         Kind::RowScatterReplaceF32 | Kind::RowScatterAddF32 => None,
                         Kind::HeadRmsF32
+                        | Kind::HeadRmsBf16
                         | Kind::HalfSplitRopeF32
                         | Kind::UnitHeadRmsPartialRopeF32 => None,
                         Kind::ComfyW4A8 => {
@@ -412,13 +569,32 @@ impl ModelFamilyProvider for Family {
     ) -> Result<ModelProgram, VNextError> {
         let input_specs = config.input_specs();
         let ports = match config.kind {
-            Kind::HeadRmsF32 => vec![id(INPUT), id(WEIGHT)],
+            Kind::RowIndexGather { .. } => vec![id(INPUT), id(RELATIVE)],
+            Kind::LeadingBatchMerge
+            | Kind::LeadingBatchSplit
+            | Kind::LeadingBatchMergeView
+            | Kind::LeadingBatchSplitView => vec![id(INPUT)],
+            Kind::ChannelBiasAddBf16 => vec![id(INPUT), id(BIAS)],
+            Kind::AddcmulFmaBf16 => vec![id(INPUT), id(WEIGHT), id(RELATIVE)],
+            Kind::Nvfp4Matmul => [INPUT, WEIGHT, RELATIVE, CHANNEL, BIAS]
+                .into_iter()
+                .map(id)
+                .collect(),
+            Kind::HeadRmsF32 | Kind::HeadRmsBf16 => vec![id(INPUT), id(WEIGHT)],
             Kind::HalfSplitRopeF32 | Kind::UnitHeadRmsPartialRopeF32 => {
                 vec![id(INPUT), id(COSINE), id(SINE)]
             }
             Kind::F32Dense => vec![id(INPUT), id(WEIGHT)],
-            Kind::F32Affine | Kind::F32Patch => vec![id(INPUT), id(WEIGHT), id(BIAS)],
-            Kind::F32ToBf16 | Kind::GeluTanhF32 | Kind::GeluErfF32 => vec![id(INPUT)],
+            Kind::F32Affine | Kind::F32AffineToBf16 | Kind::F32Patch => {
+                vec![id(INPUT), id(WEIGHT), id(BIAS)]
+            }
+            Kind::F32ToBf16
+            | Kind::Bf16ToF32
+            | Kind::F32Silu
+            | Kind::GeluTanhF32
+            | Kind::GeluErfF32 => {
+                vec![id(INPUT)]
+            }
             Kind::F32ResidualAdd | Kind::F32SiluMul => vec![id(INPUT), id(WEIGHT)],
             Kind::RowScatterReplaceF32 | Kind::RowScatterAddF32 => vec![id(INPUT), id(WEIGHT)],
             Kind::ComfyW4A8 | Kind::ComfySwiGluF32W4A8 => {
@@ -443,7 +619,12 @@ impl ModelFamilyProvider for Family {
                     work: ProgramNodeWorkSpec::Fixed,
                     inputs: ports,
                     outputs: vec![id(OUTPUT)],
-                    attributes: if matches!(
+                    attributes: if matches!(config.kind, Kind::AddcmulFmaBf16) {
+                        BTreeMap::from([(
+                            id("broadcast"),
+                            SemanticValue::Text("elementwise".into()),
+                        )])
+                    } else if matches!(
                         config.kind,
                         Kind::RowScatterReplaceF32 | Kind::RowScatterAddF32
                     ) {
@@ -466,22 +647,38 @@ impl ModelFamilyProvider for Family {
                                 SemanticValue::Rational(CanonicalRational::new(1, 4)?),
                             ),
                         ])
-                    } else if matches!(config.kind, Kind::HeadRmsF32) {
+                    } else if matches!(config.kind, Kind::HeadRmsF32 | Kind::HeadRmsBf16) {
                         BTreeMap::from([
                             (id("head_dim"), SemanticValue::Unsigned(config.inputs)),
                             (
                                 id("epsilon"),
-                                SemanticValue::Rational(CanonicalRational::new(1, 4)?),
+                                SemanticValue::Rational(CanonicalRational::new(
+                                    1,
+                                    if matches!(config.kind, Kind::HeadRmsBf16) {
+                                        1_000_000
+                                    } else {
+                                        4
+                                    },
+                                )?),
                             ),
                         ])
                     } else if matches!(config.kind, Kind::HalfSplitRopeF32) {
                         BTreeMap::from([(id("head_dim"), SemanticValue::Unsigned(config.inputs))])
                     } else if matches!(
                         config.kind,
-                        Kind::F32ToBf16
+                        Kind::ChannelBiasAddBf16
+                            | Kind::RowIndexGather { .. }
+                            | Kind::F32ToBf16
+                            | Kind::LeadingBatchMerge
+                            | Kind::LeadingBatchSplit
+                            | Kind::LeadingBatchMergeView
+                            | Kind::LeadingBatchSplitView
+                            | Kind::Bf16ToF32
+                            | Kind::Nvfp4Matmul
                             | Kind::F32Patch
                             | Kind::F32ResidualAdd
                             | Kind::F32SiluMul
+                            | Kind::F32Silu
                             | Kind::GeluTanhF32
                             | Kind::GeluErfF32
                     ) {
@@ -552,6 +749,42 @@ pub fn cast_f32_to_bf16_config() -> Config {
         kind: Kind::F32ToBf16,
     }
 }
+
+#[allow(dead_code)]
+pub fn cast_bf16_to_f32_config() -> Config {
+    Config {
+        rows: 256,
+        inputs: 256,
+        outputs: 256,
+        kind: Kind::Bf16ToF32,
+    }
+}
+#[allow(dead_code)]
+pub fn execute_cast_bf16_to_f32<R: DeviceRuntime>(
+    session: &mut TensorComponentSession<R>,
+    host: &HostMemoryAccount,
+    trial: usize,
+) -> Vec<TensorExecutionOutput> {
+    // Exhaust the actual source encoding space, including signaling NaNs,
+    // signed zero, the normal/subnormal boundary and both infinities.
+    let bytes: Vec<_> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+    let outputs = session
+        .execute(
+            id(format!("run.test.cast_bf16_to_f32.{trial}")),
+            id(format!("request.test.cast_bf16_to_f32.{trial}")),
+            vec![cast_bf16_to_f32_config().managed(host, INPUT, &bytes)],
+        )
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].tensor().dimensions(), [256, 256]);
+    assert_eq!(outputs[0].tensor().element_type(), ElementType::F32);
+    for (source, actual) in (0..=u16::MAX).zip(outputs[0].bytes().bytes().chunks_exact(4)) {
+        // F32's low two bytes must be zero and its upper two bytes must be
+        // the original BF16 encoding; no floating conversion in this oracle.
+        assert_eq!(actual, [0, 0, source as u8, (source >> 8) as u8]);
+    }
+    outputs
+}
 #[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 pub fn execute_cast_f32_to_bf16<R: DeviceRuntime>(
     session: &mut TensorComponentSession<R>,
@@ -606,6 +839,55 @@ pub fn execute_affine_f32<R: DeviceRuntime>(
     trial: usize,
 ) -> Vec<TensorExecutionOutput> {
     execute_f32_kind(session, host, Kind::F32Affine, trial)
+}
+
+/// Exact dyadic domain, independent F64 dot oracle with explicit F32 bias and
+/// BF16 boundaries. Rows vary across multiple CUDA chunks and their tail.
+pub fn rounded_affine_data(c: Config, trial: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    assert!(matches!(c.kind, Kind::F32AffineToBf16));
+    assert_eq!(c.inputs, 3);
+    let x: Vec<f32> = (0..c.rows)
+        .flat_map(|row| {
+            [
+                1.00390625 - 2.0_f32.powi(-20),
+                ((row as usize + trial) % 19) as f32 / 32.0,
+                -(((row as usize * 3 + trial) % 13) as f32) / 16.0,
+            ]
+        })
+        .collect();
+    let w: Vec<f32> = (0..c.outputs)
+        .flat_map(|column| {
+            if column == 0 {
+                [1.0, 0.0, 0.0]
+            } else {
+                [0.5, (column % 7) as f32 / 8.0, -0.25]
+            }
+        })
+        .collect();
+    let bias: Vec<f32> = (0..c.outputs)
+        .map(|column| {
+            if column == 0 {
+                2.0_f32.powi(-19)
+            } else {
+                (column % 5) as f32 / 64.0
+            }
+        })
+        .collect();
+    let mut expected = Vec::new();
+    for row in 0..c.rows as usize {
+        for column in 0..c.outputs as usize {
+            let dot: f64 = (0..3)
+                .map(|k| f64::from(x[row * 3 + k]) * f64::from(w[column * 3 + k]))
+                .sum();
+            expected.push(half::bf16::from_f32(dot as f32 + bias[column]).to_f32());
+        }
+    }
+    // A conversion before bias loses this boundary; it must stay distinguishable.
+    assert_ne!(
+        expected[0],
+        half::bf16::from_f32(half::bf16::from_f32(x[0]).to_f32() + bias[0]).to_f32()
+    );
+    (x, w, bias, expected)
 }
 #[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 fn execute_f32_kind<R: DeviceRuntime>(

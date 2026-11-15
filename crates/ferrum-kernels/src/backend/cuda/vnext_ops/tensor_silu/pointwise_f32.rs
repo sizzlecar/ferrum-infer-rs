@@ -1,4 +1,4 @@
-//! Two ordinary F32 boundaries over admitted storage; no quantization or half
+//! Ordinary F32 boundaries over admitted storage; no quantization or half
 //! conversion. The libdevice exponential profile is qualified independently.
 use super::super::{tensor_dense_bf16 as dense, tensor_storage};
 use super::*;
@@ -7,6 +7,7 @@ use ferrum_runtime::{F32PointwiseOp, F32SameShapeGeometry, PhysicalWeightLayout,
 pub const RESIDUAL_NUMERICAL_PROFILE: &str = "cuda.plain_residual_add.f32.rne.gradual.v1";
 pub const SILU_MUL_NUMERICAL_PROFILE: &str =
     "cuda.silu_mul.f32.libdevice_precise.separate.gradual.v1";
+pub const SILU_NUMERICAL_PROFILE: &str = "cuda.silu.f32.libdevice_precise.gradual.v1";
 const ESTIMATOR: &str = "resource-estimator.cuda.pointwise_f32";
 
 pub(super) fn descriptor(
@@ -23,6 +24,8 @@ pub(super) fn descriptor(
     let profile = match kind {
         F32PointwiseOp::ResidualAdd => RESIDUAL_NUMERICAL_PROFILE,
         F32PointwiseOp::SiluMul => SILU_MUL_NUMERICAL_PROFILE,
+        F32PointwiseOp::Silu => SILU_NUMERICAL_PROFILE,
+        F32PointwiseOp::Multiply => "cuda.multiply.f32.rne.gradual.v1",
     };
     let fingerprint = implementation_fingerprint(&[
         profile.as_bytes(),
@@ -52,7 +55,7 @@ pub(super) fn descriptor(
                 .map_err(contract_error)?,
         ]),
         BTreeSet::new(),
-        super::super::transformer::contiguous_bindings(2),
+        super::super::transformer::contiguous_bindings(kind.input_count() as u32),
         ESTIMATOR,
         ContractVersion::new(1, 0),
         estimator,
@@ -91,7 +94,7 @@ impl OperationResourceEstimator for Provider {
                 "F32 pointwise estimator received another operation",
             ));
         }
-        geometry(r.values(), r.attributes()).map_err(invalid_plan)?;
+        geometry(self.kind, r.values(), r.attributes()).map_err(invalid_plan)?;
         Ok(OperationResourceEstimate::new(
             self.descriptor.resource_estimator_id(),
             self.descriptor.resource_estimator_version(),
@@ -146,14 +149,14 @@ impl Provider {
         {
             return Err("F32 pointwise requires its selected fixed tensor contract".into());
         }
-        let g = geometry(p.bindings(), p.attributes())?;
-        let mut regions = Vec::with_capacity(3);
-        for (role, index) in [
-            (ResolvedValueRole::Input, 0),
-            (ResolvedValueRole::Input, 1),
-            (ResolvedValueRole::Output, 0),
-        ] {
-            let b = binding(p.bindings(), role, index)?;
+        let g = geometry(self.kind, p.bindings(), p.attributes())?;
+        let inputs = self.kind.input_count();
+        let mut regions = Vec::with_capacity(inputs + 1);
+        for (role, index) in (0..inputs)
+            .map(|index| (ResolvedValueRole::Input, index))
+            .chain([(ResolvedValueRole::Output, 0)])
+        {
+            let b = binding(p.bindings(), role, index as u32)?;
             let [component] = b.storage().components() else {
                 return Err("F32 pointwise requires one physical component per port".into());
             };
@@ -164,12 +167,12 @@ impl Provider {
             }
             regions.push(tensor_storage::component(p, component, 16)?);
         }
-        for input in &regions[..2] {
+        for input in &regions[..inputs] {
             dense::disjoint(
                 input.device_ptr(),
                 input.length_bytes(),
-                regions[2].device_ptr(),
-                regions[2].length_bytes(),
+                regions[inputs].device_ptr(),
+                regions[inputs].length_bytes(),
             )?;
         }
         let kernels = Arc::clone(&self.kernels);
@@ -177,6 +180,8 @@ impl Provider {
         let (name, operations) = match kind {
             F32PointwiseOp::ResidualAdd => ("vnext_plain_residual_add_f32", 1u64),
             F32PointwiseOp::SiluMul => ("vnext_silu_mul_f32", 5),
+            F32PointwiseOp::Silu => ("vnext_silu_f32", 4),
+            F32PointwiseOp::Multiply => ("vnext_multiply_f32", 1),
         };
         let work = g
             .elements()
@@ -184,12 +189,19 @@ impl Provider {
             .ok_or("F32 pointwise logical work overflows")?;
         CudaDeviceCommand::operation(name, regions, move |stream, regions| {
             let x = regions[0].device_ptr();
-            let update = regions[1].device_ptr();
-            let output = regions[2].device_ptr();
+            // The unary kernel branch never dereferences its absent operand.
+            let update = if inputs == 2 {
+                regions[1].device_ptr()
+            } else {
+                0
+            };
+            let output = regions[inputs].device_ptr();
             let elements = g.elements();
             let kind = match kind {
                 F32PointwiseOp::ResidualAdd => 0i32,
                 F32PointwiseOp::SiluMul => 1,
+                F32PointwiseOp::Silu => 2,
+                F32PointwiseOp::Multiply => 3,
             };
             let mut builder = stream.launch_builder(kernels.pointwise_f32_function());
             builder
@@ -213,17 +225,25 @@ impl Provider {
     }
 }
 fn geometry(
+    kind: F32PointwiseOp,
     b: &[ResolvedValueBinding],
     attrs: &BTreeMap<AttributeId, SemanticValue>,
 ) -> Result<F32SameShapeGeometry, String> {
-    if b.len() != 3
+    if b.len() != kind.input_count() + 1
         || !attrs.is_empty()
         || b.iter().any(|v| {
             v.weight()
                 .is_some_and(|w| !matches!(w.physical_layout(), PhysicalWeightLayout::Dense { .. }))
         })
     {
-        return Err("F32 pointwise requires three dense ports and no attributes".into());
+        return Err("F32 pointwise requires its exact dense ports and no attributes".into());
+    }
+    if kind == F32PointwiseOp::Silu {
+        return F32SameShapeGeometry::unary(
+            binding(b, ResolvedValueRole::Input, 0)?.tensor(),
+            binding(b, ResolvedValueRole::Output, 0)?.tensor(),
+        )
+        .map_err(|e| e.to_string());
     }
     F32SameShapeGeometry::new(
         binding(b, ResolvedValueRole::Input, 0)?.tensor(),

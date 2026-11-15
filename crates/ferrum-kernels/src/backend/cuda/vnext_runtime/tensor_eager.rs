@@ -13,13 +13,12 @@ pub use crate::backend::cuda_tensor_memory_policy::{
 use ferrum_runtime::{DeviceCapacityOwner, DeviceCapacityRetention, DeviceOpaqueMemoryKind};
 
 use super::*;
+mod cache_preparation;
+pub use cache_preparation::CudaTensorCachePreparation;
 mod causal_commands;
-mod convrot_fused_owner;
-mod cutlass_owner;
-mod fused_f32_owner;
-pub(crate) use convrot_fused_owner::CudaTensorConvRotFusedRetention;
-pub(crate) use cutlass_owner::CudaTensorCutlassRetention;
-pub(crate) use fused_f32_owner::CudaTensorFusedF32Retention;
+mod native_module_owner;
+use crate::backend::cuda_static_native_module_capacity::StaticNativeModuleCapacity;
+pub(crate) use native_module_owner::{CudaTensorNativeModuleRetention, StaticNativeModule};
 
 /// Default bound, including uploads, initialization and compute commands.
 /// The actual bound is explicitly configured and enters runtime identity.
@@ -83,12 +82,7 @@ pub(super) struct TensorEagerState {
     maximum_commands: usize,
     streams: AtomicUsize,
     provider_live: AtomicBool,
-    cutlass_module: Mutex<Option<cutlass_owner::ContextModuleQuota>>,
-    cutlass_provider_live: AtomicBool,
-    fused_f32_module: Mutex<Option<fused_f32_owner::FusedF32ModuleQuota>>,
-    fused_f32_provider_live: AtomicBool,
-    convrot_fused_module: Mutex<Option<convrot_fused_owner::ConvRotFusedModuleQuota>>,
-    convrot_fused_provider_live: AtomicBool,
+    native_modules: StaticNativeModuleCapacity,
     causal_profile: Option<CudaDenseF16CausalProfile>,
     causal_modules: Mutex<std::sync::Weak<CudaCausalProviderRetention>>,
 }
@@ -619,6 +613,7 @@ impl CudaDeviceRuntime {
         }
         if let Some(policy) = options.pinned_weight_upload {
             hash.update(b"cuda.pinned-managed-weights.v1\0");
+            hash.update((policy.minimum_allocation_bytes as u64).to_le_bytes());
             hash.update((policy.maximum_allocation_bytes.get() as u64).to_le_bytes());
             hash.update((policy.maximum_registered_bytes.get() as u64).to_le_bytes());
             hash.update(include_bytes!("pinned_host.rs"));
@@ -628,6 +623,7 @@ impl CudaDeviceRuntime {
         for implementation in [
             include_bytes!("allocation.rs").as_slice(),
             include_bytes!("allocation/pool.rs").as_slice(),
+            include_bytes!("tensor_eager/cache_preparation.rs").as_slice(),
         ] {
             hash.update((implementation.len() as u64).to_le_bytes());
             hash.update(implementation);
@@ -705,12 +701,7 @@ impl CudaDeviceRuntime {
             maximum_commands: config.maximum_commands_per_submission,
             streams: AtomicUsize::new(0),
             provider_live: AtomicBool::new(false),
-            cutlass_module: Mutex::new(None),
-            cutlass_provider_live: AtomicBool::new(false),
-            fused_f32_module: Mutex::new(None),
-            fused_f32_provider_live: AtomicBool::new(false),
-            convrot_fused_module: Mutex::new(None),
-            convrot_fused_provider_live: AtomicBool::new(false),
+            native_modules: StaticNativeModuleCapacity::default(),
             causal_profile: causal,
             causal_modules: Mutex::new(std::sync::Weak::new()),
         });
@@ -795,7 +786,7 @@ impl CudaDeviceRuntime {
                     Arc::clone(&runtime.context),
                     policy.maximum_registered_bytes.get(),
                 )?,
-                policy.maximum_allocation_bytes.get(),
+                policy,
             ));
         }
         runtime.idle_native_lanes = idle_lanes::IdleNativeLanes::new(options.native_lane_reuse);
@@ -1011,12 +1002,7 @@ mod tests {
             maximum_commands: CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION,
             streams: AtomicUsize::new(0),
             provider_live: AtomicBool::new(false),
-            cutlass_module: Mutex::new(None),
-            cutlass_provider_live: AtomicBool::new(false),
-            fused_f32_module: Mutex::new(None),
-            fused_f32_provider_live: AtomicBool::new(false),
-            convrot_fused_module: Mutex::new(None),
-            convrot_fused_provider_live: AtomicBool::new(false),
+            native_modules: StaticNativeModuleCapacity::default(),
             causal_profile: None,
             causal_modules: Mutex::new(std::sync::Weak::new()),
         });
@@ -1072,12 +1058,7 @@ mod tests {
             maximum_commands: 8,
             streams: AtomicUsize::new(0),
             provider_live: AtomicBool::new(false),
-            cutlass_module: Mutex::new(None),
-            cutlass_provider_live: AtomicBool::new(false),
-            fused_f32_module: Mutex::new(None),
-            fused_f32_provider_live: AtomicBool::new(false),
-            convrot_fused_module: Mutex::new(None),
-            convrot_fused_provider_live: AtomicBool::new(false),
+            native_modules: StaticNativeModuleCapacity::default(),
             causal_profile: Some(
                 CudaDenseF16CausalProfile::new(32, "test-declaration-v1").unwrap(),
             ),

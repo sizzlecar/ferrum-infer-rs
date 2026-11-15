@@ -15,6 +15,9 @@ pub enum CudaTensorOperation {
     BlockLinear,
     Silu,
     SiluMul,
+    PackedSwiGlu,
+    RowSelectedRmsModulation,
+    RowSelectedResidualRmsModulation,
     Tanh,
     ModulationScale,
     GatedResidual,
@@ -25,7 +28,13 @@ pub enum CudaTensorOperation {
     ZeroCenteredRmsNorm,
     GeluTanh,
     RowGather,
+    RowWrite,
     BatchedRowConcat,
+    RowIndexGather,
+    MergeLeadingBatch,
+    SplitLeadingBatch,
+    MergeLeadingBatchView,
+    SplitLeadingBatchView,
     PlainResidualAdd,
     HalfSplitRope,
     PartialHalfSplitRope,
@@ -53,12 +62,29 @@ pub enum CudaTensorOperation {
     /// Already-rotated signed INT8 weights and per-output [N,1] scales.
     ComfyConvRotW8A8,
     FusedHeadRmsPartialRope,
+    HeadRmsPartialRopeSingleRound,
     RowRmsNormSingleRound,
     Addcmul,
+    AddcmulFma,
     /// F32 SiLU(gate)*up retained through ConvRot; no M-dependent rounding.
     ComfyConvRotSwiGluF32W4A8,
     ComfyConvRotSwiGluF32W8A8,
     CastF32ToBf16,
+    CastBf16ToF32,
+    BatchedMatmulF32,
+    ScaleRank4F32,
+    RowSoftmaxRank4F32,
+    PackHeadAxisBf16,
+    PackHeadAxisF32ToBf16,
+    ChannelBiasAddBf16,
+    RowCenterBf16,
+    HeadFp8RoundtripBf16,
+    IndexedHeadFp8RoundtripBf16,
+    MaskedTileMean,
+    FirResample1dF32,
+    SnakeBetaLogNchwF32,
+    SnakeAlphaNchwF32,
+    ClampRank4F32,
     ComfyConvRotW4A8F32,
     ComfyConvRotW8A8F32,
     ComfyConvRotInt8EmbeddingF32,
@@ -69,16 +95,23 @@ pub enum CudaTensorOperation {
     HalfSplitRopeF32,
     PlainResidualAddF32,
     SiluMulF32,
+    SiluF32,
     GroupedColumnSliceF32,
+    GroupedColumnMeanF32,
+    AdaptiveAvgPoolRowsF32,
+    MultiplyF32,
     ChannelBiasAddF32,
     ChannelScaledResidualF32,
+    ChannelScaledResidualSeparateF32,
     NanToNumF32,
     UnitHeadRmsPartialRopeF32,
     RowSelectedModulationBf16F32,
     BatchedSuffixAppendF32,
     LayerNormF32,
     GroupNormSiluNchwF32,
+    FrameGroupNormSiluNcthwF32,
     PlainResidualAddNchwF32,
+    PlainResidualAddNcthwF32,
     /// Direct native F32 draws; shares explicit seed/offset and launch mapping.
     PhiloxNormalF32,
     GeluTanhF32,
@@ -88,8 +121,10 @@ pub enum CudaTensorOperation {
     RowScatterAddF32,
     RowSelectedModulationBf16,
     RowSelectedAddcmulBf16,
+    RowSelectedAddcmulFmaBf16,
     /// Pedantic SGEMM dot-store followed by one retained F32 row broadcast.
     AffineLinearF32,
+    AffineLinearF32ToBf16,
     /// Original rank5 patch weights, SGEMM then the same F32 row broadcast.
     PatchProjectionF32,
 }
@@ -117,7 +152,7 @@ impl CudaTensorOperation {
 
     // Legacy factories select the original leading operation subsets.
     // Append new capabilities so those callers never acquire a new dependency.
-    pub const ALL: [Self; 70] = [
+    pub const ALL: [Self; 105] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -130,6 +165,7 @@ impl CudaTensorOperation {
         Self::ZeroCenteredRmsNorm,
         Self::GeluTanh,
         Self::RowGather,
+        Self::RowWrite,
         Self::BatchedRowConcat,
         Self::PlainResidualAdd,
         Self::HalfSplitRope,
@@ -160,6 +196,7 @@ impl CudaTensorOperation {
         Self::ComfyConvRotSwiGluF32W4A8,
         Self::ComfyConvRotSwiGluF32W8A8,
         Self::CastF32ToBf16,
+        Self::CastBf16ToF32,
         Self::ComfyConvRotW4A8F32,
         Self::ComfyConvRotW8A8F32,
         Self::ComfyConvRotInt8EmbeddingF32,
@@ -169,15 +206,21 @@ impl CudaTensorOperation {
         Self::PlainResidualAddF32,
         Self::SiluMulF32,
         Self::GroupedColumnSliceF32,
+        Self::GroupedColumnMeanF32,
+        Self::AdaptiveAvgPoolRowsF32,
+        Self::MultiplyF32,
         Self::ChannelBiasAddF32,
         Self::ChannelScaledResidualF32,
+        Self::ChannelScaledResidualSeparateF32,
         Self::NanToNumF32,
         Self::UnitHeadRmsPartialRopeF32,
         Self::RowSelectedModulationBf16F32,
         Self::BatchedSuffixAppendF32,
         Self::LayerNormF32,
         Self::GroupNormSiluNchwF32,
+        Self::FrameGroupNormSiluNcthwF32,
         Self::PlainResidualAddNchwF32,
+        Self::PlainResidualAddNcthwF32,
         Self::PhiloxNormalF32,
         Self::GeluTanhF32,
         Self::GeluErfF32,
@@ -186,8 +229,35 @@ impl CudaTensorOperation {
         Self::RowScatterAddF32,
         Self::RowSelectedModulationBf16,
         Self::RowSelectedAddcmulBf16,
+        Self::RowSelectedAddcmulFmaBf16,
         Self::AffineLinearF32,
         Self::PatchProjectionF32,
+        Self::SiluF32,
+        Self::PackedSwiGlu,
+        Self::RowSelectedRmsModulation,
+        Self::RowSelectedResidualRmsModulation,
+        Self::HeadRmsPartialRopeSingleRound,
+        Self::RowIndexGather,
+        Self::AddcmulFma,
+        Self::BatchedMatmulF32,
+        Self::ScaleRank4F32,
+        Self::RowSoftmaxRank4F32,
+        Self::PackHeadAxisBf16,
+        Self::PackHeadAxisF32ToBf16,
+        Self::ChannelBiasAddBf16,
+        Self::RowCenterBf16,
+        Self::HeadFp8RoundtripBf16,
+        Self::MaskedTileMean,
+        Self::FirResample1dF32,
+        Self::SnakeBetaLogNchwF32,
+        Self::SnakeAlphaNchwF32,
+        Self::ClampRank4F32,
+        Self::MergeLeadingBatch,
+        Self::SplitLeadingBatch,
+        Self::MergeLeadingBatchView,
+        Self::SplitLeadingBatchView,
+        Self::AffineLinearF32ToBf16,
+        Self::IndexedHeadFp8RoundtripBf16,
     ];
 
     fn primitive(self) -> Option<TensorPrimitiveBf16> {
@@ -246,9 +316,13 @@ impl CudaTensorOperation {
             Self::SiluMulF32 => {
                 pointwise_f32::descriptor(device, ferrum_runtime::F32PointwiseOp::SiluMul)
             }
+            Self::SiluF32 => {
+                pointwise_f32::descriptor(device, ferrum_runtime::F32PointwiseOp::Silu)
+            }
             Self::GeluTanhF32 => gelu_f32::descriptor(device, ferrum_runtime::GeluF32Variant::Tanh),
             Self::GeluErfF32 => gelu_f32::descriptor(device, ferrum_runtime::GeluF32Variant::Erf),
             Self::ReshapeCopyF32 => reshape_copy_f32::descriptor(device),
+            Self::AffineLinearF32ToBf16 => dense::rounded_descriptor(device),
             Self::AffineLinearF32 => dense::row_bias_descriptor(device, RowBiasProjection::Affine),
             Self::PatchProjectionF32 => {
                 dense::row_bias_descriptor(device, RowBiasProjection::Patch)
@@ -264,7 +338,58 @@ impl CudaTensorOperation {
             Self::ComfyConvRotW8A8 => comfy_convrot::int8_descriptor(device),
             Self::ComfyConvRotSwiGluF32W4A8 => comfy_convrot::swiglu_w4_descriptor(device),
             Self::ComfyConvRotSwiGluF32W8A8 => comfy_convrot::swiglu_w8_descriptor(device),
-            Self::CastF32ToBf16 => cast_f32_to_bf16::descriptor(device),
+            Self::CastF32ToBf16 => {
+                float_cast::descriptor(device, ferrum_runtime::F32Bf16CastKind::Narrow)
+            }
+            Self::CastBf16ToF32 => {
+                float_cast::descriptor(device, ferrum_runtime::F32Bf16CastKind::Widen)
+            }
+            Self::BatchedMatmulF32 => {
+                batched_f32::descriptor(device, ferrum_runtime::BatchedF32Op::Matmul)
+            }
+            Self::ScaleRank4F32 => {
+                batched_f32::descriptor(device, ferrum_runtime::BatchedF32Op::Scale)
+            }
+            Self::RowSoftmaxRank4F32 => {
+                batched_f32::descriptor(device, ferrum_runtime::BatchedF32Op::Softmax)
+            }
+            Self::PackHeadAxisBf16 => {
+                head_axis_pack::descriptor(device, ferrum_runtime::HeadAxisPackKind::Bf16)
+            }
+            Self::PackHeadAxisF32ToBf16 => {
+                head_axis_pack::descriptor(device, ferrum_runtime::HeadAxisPackKind::F32ToBf16)
+            }
+            Self::ChannelBiasAddBf16 => channel_bias_add_bf16::descriptor(device),
+            Self::RowCenterBf16 => row_center_bf16::descriptor(device),
+            Self::HeadFp8RoundtripBf16 => head_fp8_roundtrip_bf16::descriptor(device),
+            Self::IndexedHeadFp8RoundtripBf16 => {
+                head_fp8_roundtrip_bf16::descriptor_for(device, true)
+            }
+            Self::MaskedTileMean => masked_tile_mean::descriptor(device),
+            Self::FirResample1dF32 => {
+                signal_f32::descriptor(device, ferrum_runtime::SignalF32Op::FirResample)
+            }
+            Self::SnakeBetaLogNchwF32 => {
+                signal_f32::descriptor(device, ferrum_runtime::SignalF32Op::SnakeBetaLog)
+            }
+            Self::SnakeAlphaNchwF32 => {
+                signal_f32::descriptor(device, ferrum_runtime::SignalF32Op::SnakeAlpha)
+            }
+            Self::ClampRank4F32 => {
+                signal_f32::descriptor(device, ferrum_runtime::SignalF32Op::Clamp)
+            }
+            Self::PackedSwiGlu => packed_swiglu_bf16::descriptor(device),
+            Self::HeadRmsPartialRopeSingleRound => {
+                head_rms_partial_rope_single_round_bf16::descriptor(device)
+            }
+            Self::RowSelectedRmsModulation => row_selected_rms_modulation_bf16::descriptor(
+                device,
+                ferrum_runtime::RowSelectedRmsModulationKind::Normalize,
+            ),
+            Self::RowSelectedResidualRmsModulation => row_selected_rms_modulation_bf16::descriptor(
+                device,
+                ferrum_runtime::RowSelectedRmsModulationKind::Residual,
+            ),
             Self::ComfyConvRotW4A8F32 => comfy_convrot::f32_w4_descriptor(device),
             Self::ComfyConvRotW8A8F32 => comfy_convrot::f32_w8_descriptor(device),
             Self::ComfyConvRotInt8EmbeddingF32 => comfy_embedding::descriptor(device),
@@ -273,6 +398,9 @@ impl CudaTensorOperation {
                 row_rms_addcmul::descriptor(device, row_rms_addcmul::Kind::RowRms)
             }
             Self::Addcmul => row_rms_addcmul::descriptor(device, row_rms_addcmul::Kind::Addcmul),
+            Self::AddcmulFma => {
+                row_rms_addcmul::descriptor(device, row_rms_addcmul::Kind::AddcmulFma)
+            }
             Self::ChannelL2NormImage => {
                 spatial::descriptor(device, spatial::SpatialKind::ChannelL2Image)
             }
@@ -301,12 +429,27 @@ impl CudaTensorOperation {
                 device,
                 ferrum_runtime::F32ChannelwiseOp::GroupedColumnSlice,
             ),
+            Self::GroupedColumnMeanF32 => channelwise_f32::descriptor(
+                device,
+                ferrum_runtime::F32ChannelwiseOp::GroupedColumnMean,
+            ),
+            Self::AdaptiveAvgPoolRowsF32 => channelwise_f32::descriptor(
+                device,
+                ferrum_runtime::F32ChannelwiseOp::AdaptiveAvgPool,
+            ),
+            Self::MultiplyF32 => {
+                pointwise_f32::descriptor(device, ferrum_runtime::F32PointwiseOp::Multiply)
+            }
             Self::ChannelBiasAddF32 => {
                 channelwise_f32::descriptor(device, ferrum_runtime::F32ChannelwiseOp::BiasAdd)
             }
             Self::ChannelScaledResidualF32 => channelwise_f32::descriptor(
                 device,
                 ferrum_runtime::F32ChannelwiseOp::ScaledResidual,
+            ),
+            Self::ChannelScaledResidualSeparateF32 => channelwise_f32::descriptor(
+                device,
+                ferrum_runtime::F32ChannelwiseOp::ScaledResidualSeparate,
             ),
             Self::NanToNumF32 => {
                 channelwise_f32::descriptor(device, ferrum_runtime::F32ChannelwiseOp::NanToNum)
@@ -323,18 +466,42 @@ impl CudaTensorOperation {
             Self::RowSelectedAddcmulBf16 => {
                 row_selected_bf16::descriptor(device, ferrum_runtime::RowSelectedBf16Kind::Addcmul)
             }
+            Self::RowSelectedAddcmulFmaBf16 => row_selected_bf16::descriptor(
+                device,
+                ferrum_runtime::RowSelectedBf16Kind::AddcmulFma,
+            ),
             Self::BatchedSuffixAppendF32 => batched_suffix_append_f32::descriptor(device),
             Self::LayerNormF32 => layer_norm_f32::descriptor(device),
             Self::GroupNormSiluNchwF32 => {
                 cnn_f32::descriptor(device, ferrum_runtime::F32CnnOp::GroupNormSilu)
             }
+            Self::FrameGroupNormSiluNcthwF32 => {
+                cnn_f32::descriptor(device, ferrum_runtime::F32CnnOp::FrameGroupNormSilu)
+            }
             Self::PlainResidualAddNchwF32 => {
                 cnn_f32::descriptor(device, ferrum_runtime::F32CnnOp::ResidualAdd)
+            }
+            Self::PlainResidualAddNcthwF32 => {
+                cnn_f32::descriptor(device, ferrum_runtime::F32CnnOp::VolumeResidualAdd)
             }
             Self::HalfSplitRopeF32 => {
                 norm_rope_f32::descriptor(device, norm_rope_f32::Kind::HalfSplitRope)
             }
             Self::RowGather => transport::descriptor(device, transport::Kind::RowGather),
+            Self::RowWrite => transport::descriptor(device, transport::Kind::RowWrite),
+            Self::RowIndexGather => transport::descriptor(device, transport::Kind::RowIndexGather),
+            Self::MergeLeadingBatch => {
+                transport::descriptor(device, transport::Kind::MergeLeadingBatch)
+            }
+            Self::MergeLeadingBatchView => {
+                transport::descriptor(device, transport::Kind::MergeLeadingBatchView)
+            }
+            Self::SplitLeadingBatch => {
+                transport::descriptor(device, transport::Kind::SplitLeadingBatch)
+            }
+            Self::SplitLeadingBatchView => {
+                transport::descriptor(device, transport::Kind::SplitLeadingBatchView)
+            }
             Self::BatchedRowConcat => {
                 transport::descriptor(device, transport::Kind::BatchedRowConcat)
             }
@@ -373,6 +540,9 @@ impl CudaTensorOperation {
                 kernels,
                 ferrum_runtime::F32PointwiseOp::SiluMul,
             ),
+            Self::SiluF32 => {
+                pointwise_f32::provider(descriptor, kernels, ferrum_runtime::F32PointwiseOp::Silu)
+            }
             Self::GeluTanhF32 => {
                 gelu_f32::provider(descriptor, kernels, ferrum_runtime::GeluF32Variant::Tanh)
             }
@@ -380,6 +550,9 @@ impl CudaTensorOperation {
                 gelu_f32::provider(descriptor, kernels, ferrum_runtime::GeluF32Variant::Erf)
             }
             Self::ReshapeCopyF32 => reshape_copy_f32::provider(descriptor, kernels),
+            Self::AffineLinearF32ToBf16 => {
+                dense::rounded_provider(descriptor, RetainedF32RowBias::new(kernels))
+            }
             Self::AffineLinearF32 => dense::row_bias_provider(
                 descriptor,
                 RetainedF32RowBias::new(kernels),
@@ -407,7 +580,67 @@ impl CudaTensorOperation {
             Self::ComfyConvRotSwiGluF32W8A8 => {
                 comfy_convrot::swiglu_w8_provider(descriptor, kernels)
             }
-            Self::CastF32ToBf16 => cast_f32_to_bf16::provider(descriptor, kernels),
+            Self::CastF32ToBf16 => {
+                float_cast::provider(descriptor, kernels, ferrum_runtime::F32Bf16CastKind::Narrow)
+            }
+            Self::CastBf16ToF32 => {
+                float_cast::provider(descriptor, kernels, ferrum_runtime::F32Bf16CastKind::Widen)
+            }
+            Self::BatchedMatmulF32 => {
+                batched_f32::provider(descriptor, kernels, ferrum_runtime::BatchedF32Op::Matmul)
+            }
+            Self::ScaleRank4F32 => {
+                batched_f32::provider(descriptor, kernels, ferrum_runtime::BatchedF32Op::Scale)
+            }
+            Self::RowSoftmaxRank4F32 => {
+                batched_f32::provider(descriptor, kernels, ferrum_runtime::BatchedF32Op::Softmax)
+            }
+            Self::PackHeadAxisBf16 => head_axis_pack::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::HeadAxisPackKind::Bf16,
+            ),
+            Self::PackHeadAxisF32ToBf16 => head_axis_pack::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::HeadAxisPackKind::F32ToBf16,
+            ),
+            Self::ChannelBiasAddBf16 => channel_bias_add_bf16::provider(descriptor, kernels),
+            Self::RowCenterBf16 => row_center_bf16::provider(descriptor, kernels),
+            Self::HeadFp8RoundtripBf16 | Self::IndexedHeadFp8RoundtripBf16 => {
+                head_fp8_roundtrip_bf16::provider(descriptor, kernels)
+            }
+            Self::MaskedTileMean => masked_tile_mean::provider(descriptor, kernels),
+            Self::FirResample1dF32 => signal_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::SignalF32Op::FirResample,
+            ),
+            Self::SnakeBetaLogNchwF32 => signal_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::SignalF32Op::SnakeBetaLog,
+            ),
+            Self::SnakeAlphaNchwF32 => {
+                signal_f32::provider(descriptor, kernels, ferrum_runtime::SignalF32Op::SnakeAlpha)
+            }
+            Self::ClampRank4F32 => {
+                signal_f32::provider(descriptor, kernels, ferrum_runtime::SignalF32Op::Clamp)
+            }
+            Self::PackedSwiGlu => packed_swiglu_bf16::provider(descriptor, kernels),
+            Self::HeadRmsPartialRopeSingleRound => {
+                head_rms_partial_rope_single_round_bf16::provider(descriptor, kernels)
+            }
+            Self::RowSelectedRmsModulation => row_selected_rms_modulation_bf16::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::RowSelectedRmsModulationKind::Normalize,
+            ),
+            Self::RowSelectedResidualRmsModulation => row_selected_rms_modulation_bf16::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::RowSelectedRmsModulationKind::Residual,
+            ),
             Self::ComfyConvRotW4A8F32 => comfy_convrot::f32_w4_provider(descriptor, kernels),
             Self::ComfyConvRotW8A8F32 => comfy_convrot::f32_w8_provider(descriptor, kernels),
             Self::ComfyConvRotInt8EmbeddingF32 => comfy_embedding::provider(descriptor, kernels),
@@ -416,6 +649,9 @@ impl CudaTensorOperation {
             }
             Self::Addcmul => {
                 row_rms_addcmul::provider(row_rms_addcmul::Kind::Addcmul, descriptor, kernels)
+            }
+            Self::AddcmulFma => {
+                row_rms_addcmul::provider(row_rms_addcmul::Kind::AddcmulFma, descriptor, kernels)
             }
             Self::FusedHeadRmsPartialRope => {
                 fused_head_rms_partial_rope::provider(descriptor, kernels)
@@ -450,6 +686,21 @@ impl CudaTensorOperation {
                 kernels,
                 ferrum_runtime::F32ChannelwiseOp::GroupedColumnSlice,
             ),
+            Self::GroupedColumnMeanF32 => channelwise_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32ChannelwiseOp::GroupedColumnMean,
+            ),
+            Self::AdaptiveAvgPoolRowsF32 => channelwise_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32ChannelwiseOp::AdaptiveAvgPool,
+            ),
+            Self::MultiplyF32 => pointwise_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32PointwiseOp::Multiply,
+            ),
             Self::ChannelBiasAddF32 => channelwise_f32::provider(
                 descriptor,
                 kernels,
@@ -459,6 +710,11 @@ impl CudaTensorOperation {
                 descriptor,
                 kernels,
                 ferrum_runtime::F32ChannelwiseOp::ScaledResidual,
+            ),
+            Self::ChannelScaledResidualSeparateF32 => channelwise_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32ChannelwiseOp::ScaledResidualSeparate,
             ),
             Self::NanToNumF32 => channelwise_f32::provider(
                 descriptor,
@@ -486,6 +742,11 @@ impl CudaTensorOperation {
                 kernels,
                 ferrum_runtime::RowSelectedBf16Kind::Addcmul,
             ),
+            Self::RowSelectedAddcmulFmaBf16 => row_selected_bf16::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::RowSelectedBf16Kind::AddcmulFma,
+            ),
             Self::BatchedSuffixAppendF32 => {
                 batched_suffix_append_f32::provider(descriptor, kernels)
             }
@@ -493,13 +754,39 @@ impl CudaTensorOperation {
             Self::GroupNormSiluNchwF32 => {
                 cnn_f32::provider(descriptor, kernels, ferrum_runtime::F32CnnOp::GroupNormSilu)
             }
+            Self::FrameGroupNormSiluNcthwF32 => cnn_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32CnnOp::FrameGroupNormSilu,
+            ),
             Self::PlainResidualAddNchwF32 => {
                 cnn_f32::provider(descriptor, kernels, ferrum_runtime::F32CnnOp::ResidualAdd)
             }
+            Self::PlainResidualAddNcthwF32 => cnn_f32::provider(
+                descriptor,
+                kernels,
+                ferrum_runtime::F32CnnOp::VolumeResidualAdd,
+            ),
             Self::HalfSplitRopeF32 => {
                 norm_rope_f32::provider(norm_rope_f32::Kind::HalfSplitRope, descriptor, kernels)
             }
             Self::RowGather => transport::provider(transport::Kind::RowGather, descriptor, kernels),
+            Self::RowWrite => transport::provider(transport::Kind::RowWrite, descriptor, kernels),
+            Self::RowIndexGather => {
+                transport::provider(transport::Kind::RowIndexGather, descriptor, kernels)
+            }
+            Self::MergeLeadingBatch => {
+                transport::provider(transport::Kind::MergeLeadingBatch, descriptor, kernels)
+            }
+            Self::MergeLeadingBatchView => {
+                transport::provider(transport::Kind::MergeLeadingBatchView, descriptor, kernels)
+            }
+            Self::SplitLeadingBatch => {
+                transport::provider(transport::Kind::SplitLeadingBatch, descriptor, kernels)
+            }
+            Self::SplitLeadingBatchView => {
+                transport::provider(transport::Kind::SplitLeadingBatchView, descriptor, kernels)
+            }
             Self::BatchedRowConcat => {
                 transport::provider(transport::Kind::BatchedRowConcat, descriptor, kernels)
             }

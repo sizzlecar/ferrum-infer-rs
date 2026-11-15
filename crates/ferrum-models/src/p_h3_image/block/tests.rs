@@ -18,6 +18,7 @@ fn transformer() -> PH3ImageTransformerConfig {
 }
 struct Scene {
     config: PH3ImageCurveBlockConfig,
+    parameter_rows: Vec<i64>,
     times: Vec<f32>,
     x: Vec<u16>,
     cos: Vec<u16>,
@@ -51,6 +52,20 @@ fn scene(alternating_prefix: bool) -> Scene {
         PH3ImageRequestLayout::new(&t, &second_tags, target, &refs).unwrap(),
     ];
     let times = vec![0.125, 0.625, 0.9999];
+    let parameter_rows = requests
+        .iter()
+        .enumerate()
+        .flat_map(|(index, layout)| {
+            (0..layout.rows()).map(move |row| {
+                let time = if layout.reference_rows().contains(&row) {
+                    2
+                } else {
+                    index
+                };
+                (3 * time + layout.modality(row).unwrap() as usize) as i64
+            })
+        })
+        .collect();
     let plans = requests
         .iter()
         .enumerate()
@@ -89,6 +104,7 @@ fn scene(alternating_prefix: bool) -> Scene {
     assert!(requests.iter().all(|r| r.rows() >= 512));
     Scene {
         config,
+        parameter_rows,
         times,
         x,
         cos: cos
@@ -251,7 +267,7 @@ fn archive(payloads: &Payloads) -> ArchiveFixture {
     }
 }
 #[test]
-fn complete_program_prepares_for_single_and_multiple_routing_chunks() {
+fn complete_program_preserves_geometry_and_parameter_routing() {
     for alternating in [false, true] {
         let s = scene(alternating);
         assert_ne!(s.config.hidden_size(), s.config.attention_inner_dim());
@@ -338,10 +354,38 @@ fn complete_program_prepares_for_single_and_multiple_routing_chunks() {
                     ADDCMUL_BF16_OPERATION_ID
                 })
         );
-        assert_eq!(
-            operations.contains(BATCHED_ROW_CONCAT_BF16_OPERATION_ID),
-            alternating
-        );
+        let routed: Vec<_> = program
+            .blocks()
+            .iter()
+            .flat_map(|b| &b.nodes)
+            .filter(|n| {
+                n.attributes
+                    .contains_key(&AttributeId::new("parameter_rows").unwrap())
+            })
+            .collect();
+        assert!(!routed.is_empty());
+        for node in routed {
+            let SemanticValue::Integers(lengths) =
+                &node.attributes[&AttributeId::new("run_lengths").unwrap()]
+            else {
+                panic!("integer run lengths")
+            };
+            let SemanticValue::Integers(rows) =
+                &node.attributes[&AttributeId::new("parameter_rows").unwrap()]
+            else {
+                panic!("integer parameter rows")
+            };
+            assert_eq!(lengths.len(), rows.len());
+            let actual: Vec<_> = lengths
+                .iter()
+                .zip(rows)
+                .flat_map(|(&length, &row)| {
+                    assert!(length > 0);
+                    std::iter::repeat_n(row, usize::try_from(length).unwrap())
+                })
+                .collect();
+            assert_eq!(actual, s.parameter_rows);
+        }
     }
 }
 #[test]

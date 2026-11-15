@@ -14,6 +14,8 @@ use super::{
     MAX_EXECUTION_PLAN_RESOURCE_ROWS,
 };
 
+mod alignment_coalescing;
+mod capacity_diagnostics;
 mod legacy_invocation;
 mod startup;
 
@@ -136,6 +138,11 @@ impl MemoryPlan {
             }
             error => error,
         };
+        alignment_coalescing::coalesce(
+            &mut dynamic_descriptors,
+            nodes,
+            retained_completion_resources,
+        )?;
         let base_dynamic_pools = Self::derive_dynamic_pools_with_completion_retention(
             &dynamic_descriptors,
             nodes,
@@ -215,7 +222,23 @@ impl MemoryPlan {
         let minimum_runnable_bytes = static_bytes
             .checked_add(minimum_runnable_request_bytes)
             .ok_or_else(|| invalid_plan("minimum runnable plan bytes overflow u64"))?;
+        tracing::debug!(
+            node_count = nodes.len(),
+            static_bytes,
+            minimum_step_bytes,
+            minimum_invocation_peak_bytes,
+            minimum_runnable_bytes,
+            usable_capacity_bytes,
+            "execution plan memory requirements"
+        );
+        capacity_diagnostics::trace_step_liveness(
+            &dynamic_pools,
+            &dynamic_descriptors,
+            nodes,
+            retained_completion_resources,
+        );
         if minimum_runnable_bytes > usable_capacity_bytes {
+            capacity_diagnostics::trace_shortfall(&dynamic_pools, &dynamic_descriptors, nodes);
             return Err(VNextError::PlanCapacityExceeded {
                 required_bytes: minimum_runnable_bytes,
                 usable_capacity_bytes,
@@ -751,19 +774,48 @@ impl MemoryPlan {
         retained_completion_resources: &BTreeSet<ResourceId>,
         mut precedes: impl FnMut(&NodeId, &NodeId) -> Result<bool, VNextError>,
     ) -> Result<Vec<StepResourceSlot>, VNextError> {
+        #[derive(Clone)]
         struct Interval<'a> {
             resource_id: &'a ResourceId,
+            minimum_bytes: u64,
             first_user: usize,
             last_user: usize,
             reusable: bool,
+            ordered_users: bool,
+            retained_through_completion: bool,
+        }
+        struct Slot<'a> {
+            minimum_bytes: u64,
+            members: Vec<Interval<'a>>,
+            chronological_members: Vec<usize>,
+            completion_chain: bool,
+        }
+        impl<'a> Slot<'a> {
+            fn new(interval: Interval<'a>) -> Self {
+                Self {
+                    minimum_bytes: interval.minimum_bytes,
+                    completion_chain: interval.ordered_users,
+                    members: vec![interval],
+                    chronological_members: vec![0],
+                }
+            }
+
+            fn insert(&mut self, interval: Interval<'a>) {
+                let position = self
+                    .chronological_members
+                    .partition_point(|&index| self.members[index].first_user < interval.first_user);
+                self.chronological_members
+                    .insert(position, self.members.len());
+                self.completion_chain &= interval.ordered_users;
+                self.members.push(interval);
+            }
         }
 
-        // External tensor inputs are uploaded before the whole submission wave,
-        // even when their first consumer is much later. Only node-produced
-        // values may therefore use the first/last-user liveness intervals.
-        // Semantic plan validation guarantees SSA producer-before-consumer
-        // bindings. Exclude an entire physical resource if any binding on it
-        // is externally supplied, including aliases with an internal output.
+        // Managed fixed tensor inputs are uploaded before the submission wave.
+        // Their lifetime therefore starts at wave entry, never at a late first
+        // consumer. In a proven serial fixed wave, a read-only Step input copy
+        // can be reused after its last read; its immutable Host owner survives.
+        // Token/mixed work and externally aliased writes retain dedicated slots.
         let produced_values = nodes
             .iter()
             .flat_map(|node| &node.values)
@@ -777,6 +829,19 @@ impl MemoryPlan {
             .flat_map(|value| value.storage().components())
             .map(|component| component.resource_id())
             .collect::<BTreeSet<_>>();
+        let written_resources = nodes
+            .iter()
+            .flat_map(|node| &node.values)
+            .filter(|value| value.access() != super::TensorAccess::Read)
+            .flat_map(|value| value.storage().components())
+            .map(|component| component.resource_id())
+            .collect::<BTreeSet<_>>();
+        let serial_fixed_wave = nodes
+            .iter()
+            .all(|node| matches!(node.work, NodeWorkContract::Fixed))
+            && nodes
+                .windows(2)
+                .all(|pair| matches!(precedes(&pair[0].id, &pair[1].id), Ok(true)));
         let internal_fixed_resources = nodes
             .iter()
             .filter(|node| matches!(node.work, NodeWorkContract::Fixed))
@@ -786,42 +851,61 @@ impl MemoryPlan {
             .map(|component| component.resource_id())
             .filter(|resource| !external_resources.contains(resource))
             .collect::<BTreeSet<_>>();
+        let mut users_by_resource = BTreeMap::new();
+        for (index, node) in nodes.iter().enumerate() {
+            for resource in &node.resources {
+                users_by_resource
+                    .entry(resource)
+                    .and_modify(|users: &mut (usize, usize)| users.1 = index)
+                    .or_insert((index, index));
+            }
+        }
         let mut intervals = descriptors
             .iter()
             .filter(|descriptor| descriptor.lifetime == AllocationLifetime::Step)
             .map(|descriptor| {
-                let users = nodes
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, node)| {
-                        node.resources
-                            .contains(&descriptor.base_resource_id)
-                            .then_some(index)
-                    })
-                    .collect::<Vec<_>>();
-                let first_user = users.first().copied().ok_or_else(|| {
-                    invalid_plan(format!(
-                        "step resource `{}` is not referenced by a plan node",
-                        descriptor.base_resource_id
-                    ))
-                })?;
-                let last_user = users.last().copied().ok_or_else(|| {
-                    invalid_plan(format!(
-                        "step resource `{}` is not referenced by a plan node",
-                        descriptor.base_resource_id
-                    ))
-                })?;
+                let &(first_user, last_user) = users_by_resource
+                    .get(&descriptor.base_resource_id)
+                    .ok_or_else(|| {
+                        invalid_plan(format!(
+                            "step resource `{}` is not referenced by a plan node",
+                            descriptor.base_resource_id
+                        ))
+                    })?;
+                // A retained value may take storage from an earlier completed
+                // value, but nobody may overwrite it before terminal readback.
+                // Retention extends its last use, not its first definition.
+                let uploaded_input = serial_fixed_wave
+                    && matches!(descriptor.demand, DynamicResourceDemand::Fixed { .. })
+                    && external_resources.contains(&descriptor.base_resource_id)
+                    && !written_resources.contains(&descriptor.base_resource_id);
+                let reusable = Self::is_reusable_step_activation(descriptor)
+                    && (uploaded_input
+                        || (!external_resources.contains(&descriptor.base_resource_id)
+                            && (!matches!(
+                                descriptor.demand,
+                                DynamicResourceDemand::Fixed { .. }
+                            ) || internal_fixed_resources
+                                .contains(&descriptor.base_resource_id))));
+                let first_user = if uploaded_input { 0 } else { first_user };
+                // This is an optional transitivity proof, not a replacement
+                // validation pass. If it cannot be established, retain the
+                // original pairwise checks and their error behavior.
+                let ordered_users = reusable
+                    && (first_user == last_user
+                        || matches!(
+                            precedes(&nodes[first_user].id, &nodes[last_user].id),
+                            Ok(true)
+                        ));
                 Ok(Interval {
                     resource_id: &descriptor.base_resource_id,
+                    minimum_bytes: descriptor.minimum_request_bytes()?,
                     first_user,
                     last_user,
-                    // Completion diagnostics read after the terminal fence, so
-                    // a retained activation cannot share a liveness slot.
-                    reusable: Self::is_reusable_step_activation(descriptor)
-                        && !external_resources.contains(&descriptor.base_resource_id)
-                        && (!matches!(descriptor.demand, DynamicResourceDemand::Fixed { .. })
-                            || internal_fixed_resources.contains(&descriptor.base_resource_id))
-                        && !retained_completion_resources.contains(&descriptor.base_resource_id),
+                    reusable,
+                    ordered_users,
+                    retained_through_completion: retained_completion_resources
+                        .contains(&descriptor.base_resource_id),
                 })
             })
             .collect::<Result<Vec<_>, VNextError>>()?;
@@ -834,45 +918,140 @@ impl MemoryPlan {
         });
 
         let mut ordered_without_overlap = |left: &Interval<'_>, right: &Interval<'_>| {
-            let left_before = left.last_user < right.first_user
+            let left_before = !left.retained_through_completion
+                && left.last_user < right.first_user
                 && precedes(&nodes[left.last_user].id, &nodes[right.first_user].id)?;
-            let right_before = right.last_user < left.first_user
+            let right_before = !right.retained_through_completion
+                && right.last_user < left.first_user
                 && precedes(&nodes[right.last_user].id, &nodes[left.first_user].id)?;
             Ok::<bool, VNextError>(left_before || right_before)
         };
 
-        let mut slots = Vec::<Vec<Interval<'_>>>::new();
-        for interval in intervals {
-            if !interval.reusable {
-                slots.push(vec![interval]);
-                continue;
-            }
-            let mut reusable_slot = None;
-            for (index, slot) in slots.iter().enumerate() {
-                let mut reusable = slot.iter().all(|member| member.reusable);
-                if reusable {
-                    for member in slot {
-                        reusable = ordered_without_overlap(member, &interval)?;
-                        if !reusable {
+        let mut place = |order: &[usize], prefer_minimum_growth: bool| {
+            let mut slots = Vec::<Slot<'_>>::new();
+            for &ordinal in order {
+                let interval = intervals[ordinal].clone();
+                if !interval.reusable {
+                    slots.push(Slot::new(interval));
+                    continue;
+                }
+                let mut reusable_slot: Option<(u64, u64, usize)> = None;
+                for (index, slot) in slots.iter().enumerate() {
+                    // Nonreusable intervals always get dedicated slots; they
+                    // never join a slot that already contains another member.
+                    let mut reusable = slot.members[0].reusable;
+                    if reusable {
+                        if slot.completion_chain {
+                            let position = slot.chronological_members.partition_point(|&member| {
+                                slot.members[member].first_user < interval.first_user
+                            });
+                            // Each existing interval has first -> last, and
+                            // adjacent intervals have last -> next first.
+                            // Proving both insertion boundaries therefore
+                            // proves separation from every member by transitivity.
+                            if position != 0 {
+                                reusable = ordered_without_overlap(
+                                    &slot.members[slot.chronological_members[position - 1]],
+                                    &interval,
+                                )?;
+                            }
+                            if reusable && position < slot.chronological_members.len() {
+                                reusable = ordered_without_overlap(
+                                    &interval,
+                                    &slot.members[slot.chronological_members[position]],
+                                )?;
+                            }
+                        } else {
+                            for member in &slot.members {
+                                reusable = ordered_without_overlap(member, &interval)?;
+                                if !reusable {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if reusable {
+                        let expanded = slot.minimum_bytes.max(interval.minimum_bytes);
+                        let candidate = (expanded - slot.minimum_bytes, expanded, index);
+                        if reusable_slot.is_none_or(|previous| candidate < previous) {
+                            reusable_slot = Some(candidate);
+                        }
+                        if !prefer_minimum_growth {
                             break;
                         }
                     }
                 }
-                if reusable {
-                    reusable_slot = Some(index);
-                    break;
+                if let Some((_, expanded, index)) = reusable_slot {
+                    slots[index].minimum_bytes = expanded;
+                    slots[index].insert(interval);
+                } else {
+                    slots.push(Slot::new(interval));
                 }
             }
-            if let Some(index) = reusable_slot {
-                slots[index].push(interval);
-            } else {
-                slots.push(vec![interval]);
+            Ok::<_, VNextError>(slots)
+        };
+        let chronological = (0..intervals.len()).collect::<Vec<_>>();
+        let mut slots = place(&chronological, false)?;
+        // Fixed extents have an exact physical cost. A greedy local choice can
+        // hurt a later, overlapping value, so keep the original whole-domain
+        // placement unless the alternative strictly reduces its total bytes.
+        // Variable-shape domains retain their established placement: scoring
+        // their minimum shape alone cannot prove a saving at other work sizes.
+        if descriptors
+            .iter()
+            .filter(|d| d.lifetime == AllocationLifetime::Step)
+            .all(|d| matches!(d.demand, DynamicResourceDemand::Fixed { .. }))
+        {
+            // Place the largest extents first as a second offline candidate.
+            // Chronological placement can spread large, nonoverlapping values
+            // across many slots because small values occupied them earlier.
+            // The pairwise completion proof is independent of insertion order.
+            let mut largest_first = chronological.clone();
+            largest_first.sort_by(|&left, &right| {
+                intervals[right]
+                    .minimum_bytes
+                    .cmp(&intervals[left].minimum_bytes)
+                    .then_with(|| left.cmp(&right))
+            });
+            let total = |slots: &[Slot<'_>]| {
+                slots
+                    .iter()
+                    .try_fold(0_u64, |sum, slot| sum.checked_add(slot.minimum_bytes))
+            };
+            let original_bytes = total(&slots);
+            let mut candidate_bytes = [None; 3];
+            for (index, (order, minimum_growth)) in [
+                (&chronological, true),
+                (&largest_first, true),
+                (&largest_first, false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let candidate = place(order, minimum_growth)?;
+                candidate_bytes[index] = total(&candidate);
+                if candidate_bytes[index]
+                    .is_some_and(|bytes| total(&slots).is_none_or(|old| bytes < old))
+                {
+                    slots = candidate;
+                }
             }
+            tracing::debug!(
+                element_type = ?descriptors.first().map(|d| d.element_type),
+                step_resources = intervals.len(),
+                ?original_bytes,
+                chronological_minimum_growth_bytes = ?candidate_bytes[0],
+                largest_minimum_growth_bytes = ?candidate_bytes[1],
+                largest_first_fit_bytes = ?candidate_bytes[2],
+                selected_bytes = ?total(&slots),
+                "fixed step storage placement"
+            );
         }
         let mut slots = slots
             .into_iter()
             .map(|slot| {
                 let resource_ids = slot
+                    .members
                     .into_iter()
                     .map(|interval| interval.resource_id.clone())
                     .collect::<Vec<_>>();

@@ -111,7 +111,8 @@ fn prepare(worker: &mut Worker, efficiency: &mut BatchEfficiency) -> (Vec<u64>, 
             maximum_prompt_bytes: 1024,
             max_num_seqs: 4,
             request_batch_max_wait_ms: 0,
-        },
+        }
+        .into(),
         host: None,
         adapter: None,
     };
@@ -159,7 +160,7 @@ fn efficient_prefix_still_prepares_and_shrinks_on_live_capacity_without_reorderi
             Duration::from_millis(milliseconds),
             ImageBatchExecutionFeedback {
                 stages: vec![ImageBatchStageFeedback {
-                    stage: ImageStage::Denoiser,
+                    stage: ImageStage::Denoiser.into(),
                     initialization_us: 0,
                     weights_retained: true,
                 }],

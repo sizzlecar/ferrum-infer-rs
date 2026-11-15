@@ -29,6 +29,30 @@ struct Hf {
     spatial_padding_mode: String,
 }
 impl PH3ImageVaeEncoderArchitecture {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        in_channels: u64,
+        latent_channels: u64,
+        block_out_channels: Vec<u64>,
+        layers_per_block: u64,
+        spatial_downsample_factors: Vec<u64>,
+        temporal_downsample_factors: Vec<u64>,
+        norm_num_groups: u64,
+        norm_epsilon: CanonicalRational,
+    ) -> Result<Self, VNextError> {
+        let architecture = Self {
+            in_channels,
+            latent_channels,
+            block_out_channels,
+            layers_per_block,
+            spatial_downsample_factors,
+            temporal_downsample_factors,
+            norm_num_groups,
+            norm_epsilon,
+        };
+        architecture.validate()?;
+        Ok(architecture)
+    }
     pub fn from_hf_json(bytes: &[u8]) -> Result<Self, VNextError> {
         if bytes.is_empty() || bytes.len() > 4 << 20 {
             return Err(invalid("bounded nonempty metadata required"));

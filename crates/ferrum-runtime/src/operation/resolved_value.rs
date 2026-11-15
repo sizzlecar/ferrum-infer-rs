@@ -341,7 +341,8 @@ impl ResolvedValueBinding {
         if (role == ResolvedValueRole::Input
             && !matches!(access, TensorAccess::Read | TensorAccess::ReadWrite))
             || (role == ResolvedValueRole::Output
-                && !matches!(access, TensorAccess::Write | TensorAccess::ReadWrite))
+                && ((access == TensorAccess::Read)
+                    != matches!(alias, AliasPolicy::ReadOnlyView { .. })))
             || (role == ResolvedValueRole::Input && !matches!(alias, AliasPolicy::NoAlias))
         {
             return Err(invalid_operation(
@@ -370,6 +371,16 @@ impl ResolvedValueBinding {
         }
         match (usage, weight.as_ref()) {
             (BufferUsage::Weights, Some(weight)) => {
+                if weight.physical_component_view().is_some()
+                    && (role != ResolvedValueRole::Input
+                        || access != TensorAccess::Read
+                        || alias != AliasPolicy::NoAlias
+                        || !matches!(tensor.layout(), super::ResolvedTensorLayout::Contiguous))
+                {
+                    return Err(invalid_operation(
+                        "physical weight component views must be read-only contiguous inputs",
+                    ));
+                }
                 ResolvedWeightLogicalValidation::validate_logical_contract(
                     weight,
                     tensor.dimensions(),

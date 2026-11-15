@@ -15,7 +15,7 @@ use fixture::{host, id, Kind};
 fn ordinary_f32_pointwise_executes_all_rows_and_retires_its_managed_owners() {
     let composition =
         ReferenceVNextComposition::create(id("device.reference.pointwise_f32.fixture")).unwrap();
-    for kind in [Kind::F32ResidualAdd, Kind::F32SiluMul] {
+    for kind in [Kind::F32ResidualAdd, Kind::F32SiluMul, Kind::F32Silu] {
         let component = pointwise::config(kind).compile(
             composition.runtime().as_ref(),
             composition.registry(),
@@ -58,7 +58,7 @@ fn f32_pointwise_rejects_a_device_budget_smaller_than_one_input_before_allocatio
         3 * 8 * 4 - 1,
     )
     .unwrap();
-    for kind in [Kind::F32ResidualAdd, Kind::F32SiluMul] {
+    for kind in [Kind::F32ResidualAdd, Kind::F32SiluMul, Kind::F32Silu] {
         assert!(pointwise::config(kind)
             .try_compile(
                 composition.runtime().as_ref(),

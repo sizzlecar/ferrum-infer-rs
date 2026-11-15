@@ -9,9 +9,41 @@ fn launch(runtime: &ReferenceDeviceRuntime, kind: F32CnnOp) -> ReferenceCnnF32La
     let t = |shape: Vec<u64>| {
         ResolvedTensorSpec::new(shape, ElementType::F32, ResolvedTensorLayout::Contiguous).unwrap()
     };
-    let x = t(vec![2, 4, 3, 5]);
+    let x = if matches!(
+        kind,
+        F32CnnOp::Conv3d | F32CnnOp::FrameGroupNormSilu | F32CnnOp::VolumeResidualAdd
+    ) {
+        t(vec![2, 4, 2, 3, 5])
+    } else {
+        t(vec![2, 4, 3, 5])
+    };
     let output = x.clone();
     let (specs, attrs) = match kind {
+        F32CnnOp::Conv3d => (
+            vec![x, t(vec![4, 4, 1, 1, 1]), t(vec![4])],
+            BTreeMap::from([
+                (
+                    AttributeId::new("padding").unwrap(),
+                    SemanticValue::Integers(vec![0; 6]),
+                ),
+                (
+                    AttributeId::new("stride").unwrap(),
+                    SemanticValue::Integers(vec![1; 3]),
+                ),
+                (
+                    AttributeId::new("dilation").unwrap(),
+                    SemanticValue::Integers(vec![1; 3]),
+                ),
+                (
+                    AttributeId::new("padding_modes").unwrap(),
+                    SemanticValue::Integers(vec![0, 1, 1]),
+                ),
+                (
+                    AttributeId::new("groups").unwrap(),
+                    SemanticValue::Unsigned(1),
+                ),
+            ]),
+        ),
         F32CnnOp::Conv2d => (
             vec![x, t(vec![4, 4, 1, 1]), t(vec![4])],
             BTreeMap::from([
@@ -37,7 +69,7 @@ fn launch(runtime: &ReferenceDeviceRuntime, kind: F32CnnOp) -> ReferenceCnnF32La
                 ),
             ]),
         ),
-        F32CnnOp::GroupNormSilu => (
+        F32CnnOp::GroupNormSilu | F32CnnOp::FrameGroupNormSilu => (
             vec![x, t(vec![4]), t(vec![4])],
             BTreeMap::from([
                 (
@@ -50,7 +82,9 @@ fn launch(runtime: &ReferenceDeviceRuntime, kind: F32CnnOp) -> ReferenceCnnF32La
                 ),
             ]),
         ),
-        F32CnnOp::ResidualAdd => (vec![x.clone(), x], BTreeMap::new()),
+        F32CnnOp::ResidualAdd | F32CnnOp::VolumeResidualAdd => {
+            (vec![x.clone(), x], BTreeMap::new())
+        }
     };
     let geometry =
         F32CnnGeometry::new(kind, &specs.iter().collect::<Vec<_>>(), &output, &attrs).unwrap();

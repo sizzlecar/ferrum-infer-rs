@@ -9,30 +9,40 @@ pub const ROW_SELECTED_MODULATION_BF16_CAPABILITY_ID: &str =
 pub const ROW_SELECTED_ADDCMUL_BF16_OPERATION_ID: &str = "operation.row_selected_addcmul.bf16";
 pub const ROW_SELECTED_ADDCMUL_BF16_CAPABILITY_ID: &str =
     "capability.operation.row_selected_addcmul.bf16";
-pub const ROW_SELECTED_BF16_MAX_RUNS: usize = 32;
+pub const ROW_SELECTED_ADDCMUL_FMA_BF16_OPERATION_ID: &str =
+    "operation.row_selected_addcmul_fma.bf16";
+pub const ROW_SELECTED_ADDCMUL_FMA_BF16_CAPABILITY_ID: &str =
+    "capability.operation.row_selected_addcmul_fma.bf16";
+/// The wire schema's list-length bound, independent of any native argument
+/// packet. Positive runs must cover exactly the tensor rows; model metadata
+/// limits still bound the stored representation. Providers may partition runs.
+pub const ROW_SELECTED_BF16_MAX_RUNS: usize = u32::MAX as usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowSelectedBf16Kind {
     Modulation,
     Addcmul,
+    AddcmulFma,
 }
 impl RowSelectedBf16Kind {
     pub const fn operation_id(self) -> &'static str {
         match self {
             Self::Modulation => ROW_SELECTED_MODULATION_BF16_OPERATION_ID,
             Self::Addcmul => ROW_SELECTED_ADDCMUL_BF16_OPERATION_ID,
+            Self::AddcmulFma => ROW_SELECTED_ADDCMUL_FMA_BF16_OPERATION_ID,
         }
     }
     pub const fn capability_id(self) -> &'static str {
         match self {
             Self::Modulation => ROW_SELECTED_MODULATION_BF16_CAPABILITY_ID,
             Self::Addcmul => ROW_SELECTED_ADDCMUL_BF16_CAPABILITY_ID,
+            Self::AddcmulFma => ROW_SELECTED_ADDCMUL_FMA_BF16_CAPABILITY_ID,
         }
     }
     pub const fn input_count(self) -> usize {
         match self {
             Self::Modulation => 2,
-            Self::Addcmul => 3,
+            Self::Addcmul | Self::AddcmulFma => 3,
         }
     }
 }
@@ -51,6 +61,13 @@ pub fn row_selected_modulation_bf16_contract() -> Result<StandardOperationContra
 pub fn row_selected_addcmul_bf16_contract() -> Result<StandardOperationContract, VNextError> {
     contract(RowSelectedBf16Kind::Addcmul)
 }
+/// X/table/U -> Y with compact row selection and Y=BF16_RNE(FMA32(gate,U,X)).
+/// The F32 multiplication and addition have one rounding, followed by one BF16
+/// conversion. Gradual underflow and non-finite classes follow the expanded FMA
+/// contract. This is independent of the existing separate addcmul operation.
+pub fn row_selected_addcmul_fma_bf16_contract() -> Result<StandardOperationContract, VNextError> {
+    contract(RowSelectedBf16Kind::AddcmulFma)
+}
 fn contract(kind: RowSelectedBf16Kind) -> Result<StandardOperationContract, VNextError> {
     let matrix = vec![symbol("rows"), symbol("columns")];
     let mut inputs = vec![
@@ -61,7 +78,7 @@ fn contract(kind: RowSelectedBf16Kind) -> Result<StandardOperationContract, VNex
             TensorAccess::Read,
         )?,
     ];
-    if kind == RowSelectedBf16Kind::Addcmul {
+    if kind.input_count() == 3 {
         inputs.push(contiguous_tensor(
             matrix.clone(),
             [ElementType::Bf16],
@@ -84,7 +101,7 @@ fn contract(kind: RowSelectedBf16Kind) -> Result<StandardOperationContract, VNex
     }
     for name in match kind {
         RowSelectedBf16Kind::Modulation => &["shift_column", "scale_column"][..],
-        RowSelectedBf16Kind::Addcmul => &["gate_column"][..],
+        RowSelectedBf16Kind::Addcmul | RowSelectedBf16Kind::AddcmulFma => &["gate_column"][..],
     } {
         let (id, spec) = nonnegative_unsigned_attribute(name)?;
         attributes.insert(id, spec);
@@ -153,7 +170,7 @@ impl RowSelectedBf16Geometry {
                     || t.dimensions().contains(&0)
             })
             || output != inputs[0]
-            || (kind == RowSelectedBf16Kind::Addcmul && inputs[2] != inputs[0])
+            || (kind.input_count() == 3 && inputs[2] != inputs[0])
         {
             return Err(invalid(
                 "requires contiguous BF16 X/U/Y[M,H] and table[P,W]",
@@ -180,7 +197,9 @@ impl RowSelectedBf16Geometry {
             RowSelectedBf16Kind::Modulation => {
                 (column("shift_column")?, column("scale_column")?, 0)
             }
-            RowSelectedBf16Kind::Addcmul => (0, 0, column("gate_column")?),
+            RowSelectedBf16Kind::Addcmul | RowSelectedBf16Kind::AddcmulFma => {
+                (0, 0, column("gate_column")?)
+            }
         };
         let list = |name: &str| -> Result<&[i64], VNextError> {
             match attrs.get(&AttributeId::new(name)?) {
@@ -190,10 +209,10 @@ impl RowSelectedBf16Geometry {
         };
         let lengths = list("run_lengths")?;
         let indices = list("parameter_rows")?;
-        if lengths.len() != indices.len()
-            || !(1..=ROW_SELECTED_BF16_MAX_RUNS).contains(&lengths.len())
-        {
-            return Err(invalid("routing lists need matching lengths in 1..32"));
+        if lengths.len() != indices.len() || lengths.is_empty() || lengths.len() as u64 > *rows {
+            return Err(invalid(
+                "routing lists need matching positive lengths bounded by tensor rows",
+            ));
         }
         let mut end = 0u64;
         let mut run_ends = Vec::with_capacity(lengths.len());

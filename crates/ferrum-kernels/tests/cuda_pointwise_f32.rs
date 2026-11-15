@@ -37,12 +37,14 @@ fn ordinary_f32_pointwise_preserves_ieee_boundaries_and_retires_real_cuda_work()
         vec![
             Box::new(plain_residual_add_f32_contract().unwrap()),
             Box::new(silu_mul_f32_contract().unwrap()),
+            Box::new(silu_f32_contract().unwrap()),
         ],
         cuda_vnext_tensor_providers(
             &runtime,
             &[
                 CudaTensorOperation::PlainResidualAddF32,
                 CudaTensorOperation::SiluMulF32,
+                CudaTensorOperation::SiluF32,
             ],
         )
         .unwrap(),
@@ -67,7 +69,7 @@ fn ordinary_f32_pointwise_preserves_ieee_boundaries_and_retires_real_cuda_work()
                 .unwrap(),
         )
         .unwrap();
-    for kind in [Kind::F32ResidualAdd, Kind::F32SiluMul] {
+    for kind in [Kind::F32ResidualAdd, Kind::F32SiluMul, Kind::F32Silu] {
         let component =
             pointwise::config(kind).compile(runtime.as_ref(), &registry, &catalog, &materializers);
         let host = host();

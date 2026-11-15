@@ -1621,6 +1621,9 @@ pub struct PhysicalBackingClaimIdentity {
     pool_id: DynamicBackingPoolId,
     resource_ids: Arc<[ResourceId]>,
     shared: bool,
+    // Digest of immutable membership only. Equality and backing authority still
+    // check the actual pool, members, lease, generation and physical range.
+    fingerprint: [u8; 32],
 }
 
 impl PartialEq for PhysicalBackingClaimIdentity {
@@ -1677,10 +1680,25 @@ impl PhysicalBackingClaimIdentity {
             ));
         }
         let shared = resource_ids.len() > 1;
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            pool_id: &'a DynamicBackingPoolId,
+            resource_ids: &'a [ResourceId],
+        }
+        let bytes = serde_json::to_vec(&FingerprintInput {
+            domain: "ferrum.runtime-vnext.physical-backing-claim.v1",
+            pool_id: &pool_id,
+            resource_ids: &resource_ids,
+        })
+        .map_err(|error| {
+            invalid_resource(format!("physical claim identity encode failed: {error}"))
+        })?;
         Ok(Self {
             pool_id,
             resource_ids: resource_ids.into(),
             shared,
+            fingerprint: Sha256::digest(bytes).into(),
         })
     }
 
@@ -2079,6 +2097,59 @@ pub struct LogicalBackingSliceAllocationEvidence {
     pub(in crate::resource) initialization: StateInitialization,
     #[serde(skip)]
     pub(in crate::resource) fingerprint: String,
+}
+
+impl LogicalBackingSliceAllocationEvidence {
+    /// Bind each allocation to its complete immutable claim without encoding
+    /// the same member list once per projection. The nested digest is metadata,
+    /// never a substitute for the live backing checks in the claim certificate.
+    pub(super) fn compute_fingerprint(&self) -> Result<String, VNextError> {
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            domain_id: CapacityDomainId,
+            pool_id: &'a DynamicBackingPoolId,
+            resource_id: &'a ResourceId,
+            pool_instance_id: u64,
+            physical_claim_fingerprint: &'a [u8; 32],
+            reusable_execution_bucket_id: Option<&'a ReusableExecutionBucketId>,
+            segment_generation: u64,
+            segments: &'a [BackingSegment],
+            physical_offset_bytes: u64,
+            capacity_size_bytes: u64,
+            physical_size_bytes: u64,
+            alignment_bytes: u64,
+            usage: BufferUsage,
+            element_type: ElementType,
+            storage_profile: DynamicStorageProfile,
+            initialization: StateInitialization,
+        }
+        let bytes = serde_json::to_vec(&FingerprintInput {
+            domain: "ferrum.runtime-vnext.logical-backing-allocation.v2",
+            domain_id: self.domain_id,
+            pool_id: &self.pool_id,
+            resource_id: &self.resource_id,
+            pool_instance_id: self.pool_instance_id,
+            physical_claim_fingerprint: &self.physical_claim_identity.fingerprint,
+            reusable_execution_bucket_id: self.reusable_execution_bucket_id.as_ref(),
+            segment_generation: self.segment_generation,
+            segments: &self.segments,
+            physical_offset_bytes: self.physical_offset_bytes,
+            capacity_size_bytes: self.capacity_size_bytes,
+            physical_size_bytes: self.physical_size_bytes,
+            alignment_bytes: self.alignment_bytes,
+            usage: self.usage,
+            element_type: self.element_type,
+            storage_profile: self.storage_profile,
+            initialization: self.initialization,
+        })
+        .map_err(|error| {
+            invalid_resource(format!(
+                "logical backing allocation evidence encode failed: {error}"
+            ))
+        })?;
+        Ok(format!("sha256/{:x}", Sha256::digest(bytes)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -33,3 +33,14 @@ extern "C" __global__ void ferrum_vnext_row_selected_addcmul_bf16(
         output[i]=ferrum_bf16_rne(__fadd_rn(ferrum_bf16_decode(input[i]),product));
     }
 }
+// Explicit RN FMA preserves cancellation before F32 rounding and keeps the
+// original table compact. The existing separate multiply/add kernel is intact.
+extern "C" __global__ void ferrum_vnext_row_selected_addcmul_fma_bf16(
+    const uint16_t* input,const uint16_t* table,const uint16_t* update,uint16_t* output,
+    uint64_t elements,uint64_t columns,uint64_t parameter_columns,
+    uint64_t gate_column,FerrumRowSelectedBf16Routing routing) {
+    for(uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<elements;i+=uint64_t(gridDim.x)*blockDim.x) {
+        const uint64_t parameter=ferrum_selected_parameter_bf16(i/columns,routing)*parameter_columns+gate_column+i%columns;
+        output[i]=ferrum_bf16_rne(__fmaf_rn(ferrum_bf16_decode(table[parameter]),ferrum_bf16_decode(update[i]),ferrum_bf16_decode(input[i])));
+    }
+}

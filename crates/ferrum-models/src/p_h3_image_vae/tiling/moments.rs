@@ -3,6 +3,14 @@
 //! retaining at most one raw tile row and one working tile on the same Host.
 use super::*;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MomentBlendArithmetic {
+    DirectDivision,
+    /// Torch eager tensor / CPU scalar: reciprocal in F64, cast to F32, then
+    /// multiply each F32 position. Preserve the existing direct profile above.
+    ScalarReciprocalMultiply,
+}
+
 pub(crate) struct PH3ImageVaeMomentCanvas {
     plan: PH3ImageVaeTilePlan,
     host: HostMemoryAccount,
@@ -11,6 +19,7 @@ pub(crate) struct PH3ImageVaeMomentCanvas {
     next: usize,
     canvas: ManagedHostBuffer,
     raw_row: Vec<Option<ManagedHostBytes>>,
+    arithmetic: MomentBlendArithmetic,
 }
 impl PH3ImageVaeMomentCanvas {
     pub const PROFILE_ID: &'static str =
@@ -20,6 +29,21 @@ impl PH3ImageVaeMomentCanvas {
         host: HostMemoryAccount,
         batch: usize,
         channels: usize,
+    ) -> Result<Self> {
+        Self::with_arithmetic(
+            plan,
+            host,
+            batch,
+            channels,
+            MomentBlendArithmetic::DirectDivision,
+        )
+    }
+    pub fn with_arithmetic(
+        plan: PH3ImageVaeTilePlan,
+        host: HostMemoryAccount,
+        batch: usize,
+        channels: usize,
+        arithmetic: MomentBlendArithmetic,
     ) -> Result<Self> {
         ensure!(
             batch > 0 && channels > 0,
@@ -47,6 +71,7 @@ impl PH3ImageVaeMomentCanvas {
             next: 0,
             canvas,
             raw_row,
+            arithmetic,
         })
     }
     /// Includes the current encoder readback, all retained raw neighbours and
@@ -147,8 +172,13 @@ impl PH3ImageVaeMomentCanvas {
                     for x in 0..width {
                         let a = ((bc * height + height - top + y) * width + x) * 4;
                         let b = ((bc * height + y) * width + x) * 4;
-                        let value =
-                            blend(read(previous.bytes(), a), read(working.as_ref(), b), y, top)?;
+                        let value = blend_with_arithmetic(
+                            read(previous.bytes(), a),
+                            read(working.as_ref(), b),
+                            y,
+                            top,
+                            self.arithmetic,
+                        )?;
                         working.as_mut()[b..b + 4].copy_from_slice(&value.to_le_bytes());
                     }
                 }
@@ -163,11 +193,12 @@ impl PH3ImageVaeMomentCanvas {
                     for x in 0..left {
                         let a = ((bc * height + y) * width + width - left + x) * 4;
                         let b = ((bc * height + y) * width + x) * 4;
-                        let value = blend(
+                        let value = blend_with_arithmetic(
                             read(previous.bytes(), a),
                             read(working.as_ref(), b),
                             x,
                             left,
+                            self.arithmetic,
                         )?;
                         working.as_mut()[b..b + 4].copy_from_slice(&value.to_le_bytes());
                     }
@@ -206,8 +237,19 @@ impl PH3ImageVaeMomentCanvas {
         Ok((tensor, self.canvas.freeze()))
     }
 }
-fn blend(a: f32, b: f32, position: usize, extent: usize) -> Result<f32> {
-    let ratio = position as f32 / extent as f32;
+fn blend_with_arithmetic(
+    a: f32,
+    b: f32,
+    position: usize,
+    extent: usize,
+    arithmetic: MomentBlendArithmetic,
+) -> Result<f32> {
+    let ratio = match arithmetic {
+        MomentBlendArithmetic::DirectDivision => position as f32 / extent as f32,
+        MomentBlendArithmetic::ScalarReciprocalMultiply => {
+            position as f32 * (1.0f64 / extent as f64) as f32
+        }
+    };
     let first = a * (1.0 - ratio);
     let second = b * ratio;
     let result = first + second;

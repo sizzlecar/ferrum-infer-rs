@@ -126,6 +126,8 @@ impl Schedule {
         Ok(CudnnSdpaSignature {
             batch: i64::from(stage.batches),
             heads: checked(self.geometry.heads())?,
+            key_value_heads: checked(self.geometry.heads())?,
+            causal: false,
             query_length: i64::from(stage.query_count),
             key_value_length: i64::from(packed_rows),
             head_dim: 128,

@@ -114,6 +114,57 @@ fn submit(runtime: &ReferenceDeviceRuntime, commands: Vec<ReferenceDeviceCommand
         )
         .unwrap();
 }
+
+#[test]
+fn row_write_keeps_untouched_bits_and_requires_exact_original_alias() {
+    let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+    let initial = [0x8000, 1, 0x7f81, 3, 4, 5, 6, 7, 8, 9, 10, 0xff81];
+    let base = region(&runtime, "resource.row-write.base", &initial);
+    let updates = region(
+        &runtime,
+        "resource.row-write.updates",
+        &[0x7fc1, 0xff80, 0, 0x8000],
+    );
+    let geometry =
+        ferrum_runtime::RowWriteBf16Geometry::new(&tensor(6, 2), &tensor(2, 2), &tensor(6, 2), 4)
+            .unwrap();
+    let launch = ReferenceRowWriteLaunch {
+        base: base.clone(),
+        updates: updates.clone(),
+        output: base.clone(),
+        geometry,
+    };
+    submit(
+        &runtime,
+        vec![ReferenceDeviceCommand::row_write_tensor(launch).unwrap()],
+    );
+    assert_eq!(
+        bits(&base),
+        [0x8000, 1, 0x7f81, 3, 4, 5, 6, 7, 0x7fc1, 0xff80, 0, 0x8000]
+    );
+    let unrelated = region(&runtime, "resource.row-write.unrelated", &initial);
+    assert!(ReferenceRowWriteLaunch {
+        base: base.clone(),
+        updates: updates.clone(),
+        output: unrelated,
+        geometry,
+    }
+    .validate()
+    .is_err());
+    // A valid dtype/extent does not authorize reading the mutable output as updates.
+    let overlapping = ReferenceBufferRegion {
+        length_bytes: updates.length_bytes,
+        ..base.clone()
+    };
+    assert!(ReferenceRowWriteLaunch {
+        base: base.clone(),
+        updates: overlapping,
+        output: base,
+        geometry
+    }
+    .validate()
+    .is_err());
+}
 #[test]
 fn gather_reads_shared_and_per_batch_rows_and_preserves_nonfinite_payload_bits() {
     let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
@@ -296,4 +347,111 @@ fn late_invalid_or_foreign_source_preflight_prevents_all_prior_copies() {
         );
         assert_eq!(bits(&output), [0xa5a5; 12]);
     }
+}
+
+fn indexed(
+    runtime: &ReferenceDeviceRuntime,
+    foreign_map: Option<&ReferenceDeviceRuntime>,
+) -> ReferenceRowIndexGatherLaunch {
+    let source: Vec<u16> = (0u32..131072).map(|i| i as u16).collect();
+    let mut map: Vec<i32> = (0..256).rev().collect();
+    map.extend([i32::MIN, -1, 256, i32::MAX, 0, 255]);
+    let raw: Vec<_> = map.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let shape = |v, ty| ResolvedTensorSpec::new(v, ty, ResolvedTensorLayout::Contiguous).unwrap();
+    ReferenceRowIndexGatherLaunch {
+        source: region(runtime, "resource.indexed.x", &source),
+        indices: buffer(
+            foreign_map.unwrap_or(runtime),
+            "resource.indexed.map",
+            &raw,
+            16,
+            ElementType::I32,
+        )
+        .region(0..raw.len() as u64)
+        .unwrap(),
+        output: region(
+            runtime,
+            "resource.indexed.y",
+            &vec![0xa5a5; 2 * map.len() * 256],
+        ),
+        geometry: RowIndexGatherBf16Geometry::new(
+            &shape(vec![2, 256, 256], ElementType::Bf16),
+            &shape(vec![map.len() as u64], ElementType::I32),
+            &shape(vec![2, map.len() as u64, 256], ElementType::Bf16),
+        )
+        .unwrap(),
+    }
+}
+#[test]
+fn indexed_gather_preserves_every_bf16_encoding_and_zeroes_every_invalid_index_class() {
+    let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+    for _ in 0..2 {
+        let launch = indexed(&runtime, None);
+        let output = launch.output.clone();
+        let before = runtime.snapshot();
+        submit(
+            &runtime,
+            vec![ReferenceDeviceCommand::row_index_gather_tensor(launch).unwrap()],
+        );
+        let actual = bits(&output);
+        for batch in 0..2 {
+            for row in 0..262 {
+                let source = match row {
+                    0..=255 => Some(255 - row),
+                    260 => Some(0),
+                    261 => Some(255),
+                    _ => None,
+                };
+                for column in 0..256 {
+                    assert_eq!(
+                        actual[(batch * 262 + row) * 256 + column],
+                        source.map_or(0, |s| (s * 256 + column) as u16)
+                    );
+                }
+            }
+        }
+        assert_eq!(runtime.snapshot().allocations, before.allocations);
+    }
+}
+#[test]
+fn indexed_gather_rejects_wrong_extent_alignment_alias_and_foreign_indices_before_writes() {
+    let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+    for mutation in 0..5 {
+        let mut launch = indexed(&runtime, None);
+        let output = launch.output.clone();
+        match mutation {
+            0 => launch.indices.element_type = ElementType::F32,
+            1 => launch.indices.length_bytes -= 4,
+            2 => launch.indices.offset_bytes += 1,
+            3 => {
+                // Keep exact extents so alias validation, not an earlier shape
+                // rejection, is exercised on overlapping source/output ranges.
+                launch.source = launch.output.clone();
+                launch.source.length_bytes = launch.geometry.source_bytes() as usize;
+            }
+            4 => {
+                launch.indices = launch.output.clone();
+                launch.indices.element_type = ElementType::I32;
+                launch.indices.length_bytes = launch.geometry.index_bytes() as usize;
+            }
+            _ => unreachable!(),
+        }
+        assert!(ReferenceDeviceCommand::row_index_gather_tensor(launch).is_err());
+        assert!(bits(&output).iter().all(|&v| v == 0xa5a5));
+    }
+    let foreign = ReferenceDeviceRuntime::new(config()).unwrap();
+    let launch = indexed(&runtime, Some(&foreign));
+    let output = launch.output.clone();
+    let command = ReferenceDeviceCommand::row_index_gather_tensor(launch).unwrap();
+    let mut stream = runtime.create_stream().unwrap();
+    let before = runtime.snapshot();
+    assert!(runtime
+        .submit_entries(
+            &mut stream,
+            vec![(DeviceCommandPhase::Compute, Some(0), command)],
+            false
+        )
+        .is_err());
+    assert_eq!(runtime.snapshot().submissions, before.submissions);
+    assert!(bits(&output).iter().all(|&v| v == 0xa5a5));
 }

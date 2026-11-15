@@ -104,13 +104,82 @@ fn direct_segment_scratch_contains_only_disjoint_lengths_and_exact_workspace() {
 }
 
 #[test]
-fn equal_length_segments_share_native_shape_but_keep_distinct_offsets() {
+fn equal_length_segments_keep_independent_native_batch_strides() {
     let s = Schedule::new(&ports(4, 144), &attrs(72, &[2, 2])).unwrap();
-    assert_eq!(s.segments[0].signature, s.segments[1].signature);
-    assert_ne!(s.segments[0].offset_bytes, s.segments[1].offset_bytes);
-    assert!(Schedule::new(&ports(4, 128), &attrs(64, &[2, 2])).is_err());
+    assert_eq!(s.segments.len(), 1);
+    let group = &s.segments[0];
+    assert_eq!(group.signature.batch, 2);
+    assert_eq!(group.signature.query_length, 2);
+    assert_eq!(group.signature.query_batch_stride, 2 * 144);
+    assert_eq!(group.signature.key_value_batch_stride, 2 * 144);
+    assert_eq!(group.signature.output_batch_stride, 2 * 144);
+    assert_eq!(group.bytes, 4 * 144 * 2);
+    assert!(Schedule::new(&ports(4, 64), &attrs(32, &[2, 2])).is_err());
     assert!(Schedule::new(&ports(4, 144), &attrs(72, &[3])).is_err());
     assert!(Schedule::new(&ports(4, 144), &attrs(72, &[0, 4])).is_err());
     assert!(attention::NativeMask::isolated_sequence(0).is_err());
     assert!(logical_work(u64::MAX, 16, 72).is_err());
+}
+
+#[test]
+fn d64_decoder_segments_keep_batches_disjoint_and_share_the_native_plan() {
+    let s = Schedule::new(&ports(232, 2048), &attrs(64, &[116, 116])).unwrap();
+    assert_eq!(s.segments.len(), 1);
+    assert_eq!(s.segments[0].signature.heads, 32);
+    assert_eq!(s.segments[0].signature.head_dim, 64);
+    assert_eq!(s.segments[0].signature.batch, 2);
+    assert_eq!(s.segments[0].signature.scale_bits, 0.125_f32.to_bits());
+    assert_eq!(s.segments[0].offset_bytes, 0);
+    assert_eq!(s.segments[0].signature.query_batch_stride, 116 * 2048);
+    assert_eq!(s.segments[0].bytes, 232 * 2048 * 2);
+    assert_eq!(s.segments[0].bytes, s.geometry.output_bytes);
+    for segment in &s.segments {
+        segment.signature.validate().unwrap();
+    }
+}
+
+#[test]
+fn ragged_runs_and_native_batch_limit_preserve_every_original_segment() {
+    let maximum = CudnnSdpaSignature::MAX_BATCH as usize;
+    let mut lengths = vec![2i64; maximum + 3];
+    lengths.extend([3, 3, 2, 2]);
+    for dim in [64, 72, 128] {
+        let columns = dim * 2;
+        let rows = lengths.iter().sum::<i64>() as u64;
+        let s = Schedule::new(&ports(rows, columns), &attrs(dim, &lengths)).unwrap();
+        assert_eq!(s.segments.len(), 4);
+        let mut reconstructed = Vec::new();
+        for segment in &s.segments {
+            segment.signature.validate().unwrap();
+            assert_eq!(segment.signature.query_length, i64::from(segment.rows));
+            assert_eq!(segment.signature.key_value_length, i64::from(segment.rows));
+            let stride = segment.signature.query_batch_stride as u64 * 2;
+            assert_eq!(segment.bytes, stride * segment.signature.batch as u64);
+            for batch in 0..segment.signature.batch as u64 {
+                reconstructed.push((segment.offset_bytes + batch * stride, segment.rows as u64));
+            }
+            let scratch =
+                ScratchLayout::without_payload(segment.signature.batch as u32, 0).unwrap();
+            assert!(
+                scratch.query_lengths_offset + segment.signature.batch as u64 * 4
+                    <= scratch.key_lengths_offset
+            );
+        }
+        assert_eq!(
+            reconstructed,
+            s.geometry
+                .starts
+                .iter()
+                .zip(&s.geometry.lengths)
+                .map(|(&start, &length)| (start * columns * 2, length))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            s.operations,
+            lengths
+                .iter()
+                .map(|&n| logical_work(n as u64, 2, dim).unwrap())
+                .sum::<u64>()
+        );
+    }
 }

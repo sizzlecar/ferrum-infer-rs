@@ -3,7 +3,129 @@ use super::{
     AllocationLocks, DeviceCommandLogicalWork, ElementType, ReferenceBufferRegion,
     ReferenceDeviceRuntimeError,
 };
+use ferrum_runtime::RowIndexGatherBf16Geometry;
 use ferrum_runtime::{BatchedRowConcatBf16Geometry, RowGatherBf16Geometry};
+
+pub(crate) struct ReferenceRowWriteLaunch {
+    pub(crate) base: ReferenceBufferRegion,
+    pub(crate) updates: ReferenceBufferRegion,
+    pub(crate) output: ReferenceBufferRegion,
+    pub(crate) geometry: ferrum_runtime::RowWriteBf16Geometry,
+}
+impl ReferenceRowWriteLaunch {
+    pub(crate) fn validate(&self) -> Result<(), ReferenceDeviceRuntimeError> {
+        region(&self.base, bytes(Some(self.geometry.base_elements()))?)?;
+        region(&self.output, bytes(Some(self.geometry.base_elements()))?)?;
+        region(&self.updates, bytes(Some(self.geometry.update_elements()))?)?;
+        if !self.base.same_physical_region(&self.output) || self.updates.overlaps(&self.output) {
+            return Err(invalid(
+                "row write requires exact base alias and disjoint updates",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn logical_work(
+        &self,
+    ) -> Result<DeviceCommandLogicalWork, ReferenceDeviceRuntimeError> {
+        DeviceCommandLogicalWork::tensor(self.geometry.update_elements(), 0)
+            .map_err(|e| invalid(e.to_string()))
+    }
+    pub(crate) fn validate_runtime(&self, runtime: u64) -> Result<(), ReferenceDeviceRuntimeError> {
+        for r in [&self.base, &self.updates, &self.output] {
+            r.validate_runtime(runtime)?;
+        }
+        self.validate()
+    }
+}
+pub(super) fn execute_write(launch: &ReferenceRowWriteLaunch) {
+    let mut storage = AllocationLocks::new([&launch.updates, &launch.output]);
+    for i in 0..launch.geometry.update_elements() as usize {
+        let bits = storage.read_bits(0, i);
+        storage.write_bits(1, launch.geometry.offset_elements() as usize + i, bits);
+    }
+}
+
+pub(crate) struct ReferenceRowIndexGatherLaunch {
+    pub(crate) source: ReferenceBufferRegion,
+    pub(crate) indices: ReferenceBufferRegion,
+    pub(crate) output: ReferenceBufferRegion,
+    pub(crate) geometry: RowIndexGatherBf16Geometry,
+}
+impl ReferenceRowIndexGatherLaunch {
+    pub(crate) fn validate(&self) -> Result<(), ReferenceDeviceRuntimeError> {
+        for (r, dtype, bytes, alignment) in [
+            (
+                &self.source,
+                ElementType::Bf16,
+                self.geometry.source_bytes(),
+                2,
+            ),
+            (
+                &self.indices,
+                ElementType::I32,
+                self.geometry.index_bytes(),
+                4,
+            ),
+            (
+                &self.output,
+                ElementType::Bf16,
+                self.geometry.output_bytes(),
+                2,
+            ),
+        ] {
+            r.validate_range()?;
+            if r.element_type != dtype
+                || r.length_bytes as u64 != bytes
+                || (r.offset_bytes - r.allocation.logical_offset_bytes) % alignment != 0
+            {
+                return Err(invalid(
+                    "indexed gather requires exact aligned typed regions",
+                ));
+            }
+        }
+        if self.output.overlaps(&self.source) || self.output.overlaps(&self.indices) {
+            return Err(invalid("indexed gather output aliases a read operand"));
+        }
+        self.logical_work()?;
+        Ok(())
+    }
+    pub(crate) fn logical_work(
+        &self,
+    ) -> Result<DeviceCommandLogicalWork, ReferenceDeviceRuntimeError> {
+        DeviceCommandLogicalWork::tensor(self.geometry.element_count(), 0)
+            .map_err(|e| invalid(e.to_string()))
+    }
+    pub(crate) fn validate_runtime(&self, runtime: u64) -> Result<(), ReferenceDeviceRuntimeError> {
+        for r in [&self.source, &self.indices, &self.output] {
+            r.validate_runtime(runtime)?;
+        }
+        self.validate()
+    }
+}
+pub(super) fn execute_index_gather(launch: &ReferenceRowIndexGatherLaunch) {
+    let g = launch.geometry;
+    let mut storage = AllocationLocks::new([&launch.source, &launch.indices, &launch.output]);
+    for batch in 0..g.batches() {
+        for row in 0..g.output_rows() {
+            let source = storage.read_i32(1, row as usize);
+            for column in 0..g.columns() {
+                let bits = if source >= 0 && (source as u64) < g.source_rows() {
+                    storage.read_bits(
+                        0,
+                        ((batch * g.source_rows() + source as u64) * g.columns() + column) as usize,
+                    )
+                } else {
+                    0
+                };
+                storage.write_bits(
+                    2,
+                    ((batch * g.output_rows() + row) * g.columns() + column) as usize,
+                    bits,
+                );
+            }
+        }
+    }
+}
 
 pub(crate) struct ReferenceRowGatherLaunch {
     pub(crate) source: ReferenceBufferRegion,

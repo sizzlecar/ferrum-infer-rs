@@ -10,11 +10,13 @@
     unused_assignments
 )]
 
+pub mod audio_input;
 mod block_quantized_linear;
 pub mod common;
 pub mod definition;
 pub mod deltanet_s1;
 pub mod executor;
+pub mod fast_h3;
 mod fp8_linear;
 pub mod gguf_config;
 pub mod gguf_engine_loader;
@@ -37,11 +39,15 @@ pub mod qwen3_vl_text;
 pub mod qwen3_vl_vision;
 pub mod qwen_image21;
 pub mod registry;
+pub mod row_chunks;
 pub mod source;
+pub mod spatial_tiles;
+mod tensor_program_fragment;
 pub mod tensor_wrapper;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod tokenizer;
+pub mod video_input;
 pub mod vnext;
 pub mod weight_format;
 
@@ -62,6 +68,7 @@ pub use source::{
     DefaultModelSourceResolver, ModelFormat, ModelSourceConfig, ModelSourceResolver,
     ResolvedModelSource,
 };
+pub use tensor_program_fragment::TensorProgramSchedule;
 pub use tensor_wrapper::CandleTensorWrapper;
 pub use tokenizer::{TokenizerFactory, TokenizerHandle};
 

@@ -1,4 +1,6 @@
 use ferrum_runtime::*;
+#[path = "vnext_model_wire/integer_primary.rs"]
+mod integer_primary;
 mod vnext_numerical_fixture;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

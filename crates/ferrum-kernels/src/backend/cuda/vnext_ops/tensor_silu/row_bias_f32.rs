@@ -74,4 +74,31 @@ impl RetainedF32RowBias {
             .map(|_| ())
             .map_err(|error| CudaDeviceRuntimeError::driver("F32 row bias broadcast", error))
     }
+
+    /// Convert an admitted chunk after its F32 bias addition. The command
+    /// retains both complete regions and checks the destination extent first.
+    pub(in crate::backend::cuda::vnext_ops) fn narrow(
+        &self,
+        stream: &CudaStream,
+        input: u64,
+        output: u64,
+        elements: u64,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        let direction = 0i32;
+        let mut launch = stream.launch_builder(self.kernels.float_cast_function());
+        launch
+            .arg(&input)
+            .arg(&output)
+            .arg(&elements)
+            .arg(&direction);
+        unsafe {
+            launch.launch(LaunchConfig {
+                grid_dim: (elements.div_ceil(256).min(65535) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|error| CudaDeviceRuntimeError::driver("F32 affine BF16 conversion", error))
+    }
 }

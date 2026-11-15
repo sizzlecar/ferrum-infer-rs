@@ -5,6 +5,9 @@
 //! TransformationHelper.h (uniform_real), and cpu/DistributionTemplates.h
 //! (normal_fill and scalar NormalFill16). Comfy 56f179 calls randn for image,
 //! then audio, using the same seeded generator.
+//! The same seed-width, low-24-bit uniform, scalar NormalFill16 and overlapping
+//! tail rules were also checked against the fixed FastVideo deployment's Torch
+//! 2.12 headers, revision `7661cd9c6b841b62b7f411aa52ec51f05457263b`.
 //!
 //! This is the scalar F32/platform-libm numerical profile, NOT a promise of
 //! bitwise equality with Torch's AVX2 log/sincos implementation. Streams shorter
@@ -29,10 +32,19 @@ pub fn fill_initial_noise(
     audio: &mut [u8],
     scratch: &mut [u8],
 ) -> Result<()> {
-    for (name, bytes) in [("image", image.len()), ("audio", audio.len())] {
+    fill_noise_sequence(seed, &mut [image, audio], scratch)
+}
+
+/// Draw consecutive independently shaped normal tensors from one fresh seed.
+/// Tensor boundaries matter: the existing normal-fill tail rule runs separately
+/// for every tensor. All payloads and RNG storage remain caller-owned.
+pub fn fill_noise_sequence(seed: u64, outputs: &mut [&mut [u8]], scratch: &mut [u8]) -> Result<()> {
+    ensure!(!outputs.is_empty(), "CPU MT19937 needs a nonempty sequence");
+    for output in outputs.iter() {
+        let bytes = output.len();
         ensure!(
             bytes >= 16 * 4 && bytes % 4 == 0,
-            "CPU MT19937 {name} noise requires at least 16 complete F32 values"
+            "CPU MT19937 noise requires at least 16 complete F32 values per tensor"
         );
     }
     ensure!(
@@ -40,9 +52,18 @@ pub fn fill_initial_noise(
         "CPU MT19937 scratch requires {SCRATCH_BYTES} bytes"
     );
     let mut generator = Mt19937::seeded(seed, &mut scratch[..SCRATCH_BYTES]);
-    generator.fill_normal(image);
-    generator.fill_normal(audio);
+    for output in outputs {
+        generator.fill_normal(output);
+    }
     Ok(())
+}
+
+/// Fill one contiguous F32 little-endian stream from a freshly seeded generator.
+/// This is the same scalar profile as `fill_initial_noise`, with no discarded
+/// second stream. A reference posterior can therefore reseed independently of
+/// the request's image/audio diffusion-noise sequence.
+pub fn fill_normal_noise(seed: u64, output: &mut [u8], scratch: &mut [u8]) -> Result<()> {
+    fill_noise_sequence(seed, &mut [output], scratch)
 }
 
 struct Mt19937<'a> {

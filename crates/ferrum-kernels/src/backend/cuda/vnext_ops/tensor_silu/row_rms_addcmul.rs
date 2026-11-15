@@ -1,27 +1,31 @@
 //! Managed single-round RowRMS and addcmul, with independent numerical IDs.
 use super::*;
 use ferrum_runtime::{
-    addcmul_bf16_contract, row_rms_norm_single_round_bf16_contract, AddcmulBf16Geometry,
-    PhysicalWeightLayout, RowBroadcast, RowRmsNormSingleRoundBf16Geometry, WeightFormatId,
-    ADDCMUL_BF16_CAPABILITY_ID, ROW_RMS_NORM_SINGLE_ROUND_BF16_CAPABILITY_ID,
+    addcmul_bf16_contract, addcmul_fma_bf16_contract, row_rms_norm_single_round_bf16_contract,
+    AddcmulBf16Geometry, PhysicalWeightLayout, RowBroadcast, RowRmsNormSingleRoundBf16Geometry,
+    WeightFormatId, ADDCMUL_BF16_CAPABILITY_ID, ADDCMUL_FMA_BF16_CAPABILITY_ID,
+    ROW_RMS_NORM_SINGLE_ROUND_BF16_CAPABILITY_ID,
 };
 pub const ROW_RMS_PROFILE_ID: &str = "cuda.ieee.row_rms_norm_single_round.bf16.warp32_precise.v1";
 pub const ADDCMUL_PROFILE_ID: &str = "cuda.ieee.addcmul.bf16.separate_f32_single_round.v1";
-pub(super) const FUNCTIONS: [&str; 2] = [
+pub const ADDCMUL_FMA_PROFILE_ID: &str = "cuda.ieee.addcmul.bf16.fma_f32_single_round.v1";
+pub(super) const FUNCTIONS: [&str; 3] = [
     "ferrum_vnext_row_rms_norm_single_round_bf16",
     "ferrum_vnext_addcmul_bf16",
+    "ferrum_vnext_addcmul_fma_bf16",
 ];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
     RowRms,
     Addcmul,
+    AddcmulFma,
 }
 impl Kind {
     fn index(self) -> usize {
-        if self == Self::RowRms {
-            0
-        } else {
-            1
+        match self {
+            Self::RowRms => 0,
+            Self::Addcmul => 1,
+            Self::AddcmulFma => 2,
         }
     }
     fn inputs(self) -> u32 {
@@ -35,18 +39,21 @@ impl Kind {
         match self {
             Self::RowRms => row_rms_norm_single_round_bf16_contract(),
             Self::Addcmul => addcmul_bf16_contract(),
+            Self::AddcmulFma => addcmul_fma_bf16_contract(),
         }
     }
     fn capability(self) -> &'static str {
         match self {
             Self::RowRms => ROW_RMS_NORM_SINGLE_ROUND_BF16_CAPABILITY_ID,
             Self::Addcmul => ADDCMUL_BF16_CAPABILITY_ID,
+            Self::AddcmulFma => ADDCMUL_FMA_BF16_CAPABILITY_ID,
         }
     }
     fn profile(self) -> &'static str {
         match self {
             Self::RowRms => ROW_RMS_PROFILE_ID,
             Self::Addcmul => ADDCMUL_PROFILE_ID,
+            Self::AddcmulFma => ADDCMUL_FMA_PROFILE_ID,
         }
     }
 }
@@ -61,10 +68,10 @@ pub(super) fn descriptor(
         ));
     }
     let contract = kind.contract().map_err(contract_error)?;
-    let name = if kind == Kind::RowRms {
-        "row_rms_norm_single_round"
-    } else {
-        "addcmul"
+    let name = match kind {
+        Kind::RowRms => "row_rms_norm_single_round",
+        Kind::Addcmul => "addcmul",
+        Kind::AddcmulFma => "addcmul_fma",
     };
     let estimator = format!("resource-estimator.cuda.{name}.bf16");
     let fingerprint=implementation_fingerprint(&[kind.profile().as_bytes(),numerical_fingerprint().as_bytes(),include_bytes!("row_rms_addcmul.rs"),include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),"/kernels/vnext_row_rms_addcmul.cuh")),b"BF16-final-only;RN32-explicit-no-contraction-no-FTZ;RowRMS-warp32-FMA-squares-fixed-tree-sqrt-reciprocal;NoAlias;zero-global-scratch;not-Torch-binary-parity"]);
@@ -338,7 +345,7 @@ fn geometry(
                     .map_err(|e| e.to_string())?,
             ))
         }
-        Kind::Addcmul => {
+        Kind::Addcmul | Kind::AddcmulFma => {
             let Some(SemanticValue::Text(mode)) = get("broadcast") else {
                 return Err("requires explicit broadcast".into());
             };

@@ -127,10 +127,7 @@ impl PlanNodeResolution {
         }
         let program_node = family
             .program()
-            .blocks()
-            .iter()
-            .flat_map(|block| &block.nodes)
-            .find(|node| node.id == node_id)
+            .node(&node_id)
             .ok_or_else(|| invalid_plan(format!("program has no node `{node_id}`")))?;
         let operation = catalog.operation_for_node(&program_node.id, &program_node.operation_id)?;
 

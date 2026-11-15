@@ -116,6 +116,7 @@ fn actual_layer_and_head_geometry_use_bounded_shared_memory_without_expanded_gam
         (96, 128, 256, 512)
     );
     assert_eq!(rms.arithmetic_operations, 96 * (4 * 128 + 3));
+    assert_eq!(rms.reduction, ReductionPlan::AdjacentPowerOfTwo);
     assert_eq!(rms.elements, layer.elements);
     assert_eq!(
         rms.epsilon.to_bits(),
@@ -127,7 +128,39 @@ fn actual_layer_and_head_geometry_use_bounded_shared_memory_without_expanded_gam
         let x = tensor(&[1, width], ElementType::Bf16);
         let g = tensor(&[width], ElementType::Bf16);
         assert!(validate_specs(Kind::Layer, &x, None, &x, width, epsilon).is_err());
-        assert!(validate_specs(Kind::HeadRms, &x, Some(&g), &x, width, epsilon).is_err());
+        assert!(validate_specs(Kind::HeadRms, &x, Some(&g), &x, width, epsilon).is_ok());
+    }
+}
+
+#[test]
+fn head_rms_selects_bounded_carry_without_changing_legacy_reduction_or_affine_extent() {
+    let epsilon = CanonicalRational::new(1, 1_000_000).unwrap();
+    for (width, reduction) in [
+        (1, ReductionPlan::AdjacentPowerOfTwo),
+        (128, ReductionPlan::AdjacentPowerOfTwo),
+        (4096, ReductionPlan::AdjacentPowerOfTwo),
+        (3, ReductionPlan::AdjacentCarry),
+        (4097, ReductionPlan::AdjacentCarry),
+        (5120, ReductionPlan::AdjacentCarry),
+        (8192, ReductionPlan::AdjacentCarry),
+    ] {
+        let x = tensor(&[3, width * 2], ElementType::Bf16);
+        let gamma = tensor(&[width], ElementType::Bf16);
+        let shape = validate_specs(Kind::HeadRms, &x, Some(&gamma), &x, width, epsilon).unwrap();
+        assert_eq!(shape.reduction, reduction);
+        assert_eq!(shape.groups, 6);
+        assert_eq!(u64::from(shape.shared_bytes), width * 4);
+        assert_eq!(shape.gamma_bytes, width * 2);
+        assert_eq!(shape.bytes, 6 * width * 2);
+        assert_eq!(shape.arithmetic_operations, 6 * (4 * width + 3));
+    }
+    for width in [8193, 16384, u32::MAX as u64 + 1] {
+        assert!(Shape::new(Kind::HeadRms, 1, width, width, 1e-6).is_err());
+    }
+    for kind in [Kind::Layer, Kind::ZeroCenteredRms] {
+        for width in [3, 4097, 5120, 8192] {
+            assert!(Shape::new(kind, 1, width, width, 1e-6).is_err());
+        }
     }
 }
 

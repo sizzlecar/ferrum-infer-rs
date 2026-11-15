@@ -2,6 +2,8 @@
 use super::structured_attention_bf16::{attribute, unsigned};
 use super::*;
 use crate::{ResolvedTensorLayout, ResolvedTensorSpec, SemanticValue};
+mod fused;
+pub use fused::*;
 
 pub const STRUCTURED_GQA_ATTENTION_BF16_OPERATION_ID: &str =
     "operation.structured_gqa_attention.bf16";

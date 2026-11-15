@@ -1,4 +1,4 @@
-//! Independent all-F32 single-frame CNN contracts. Only convolution index
+//! Independent all-F32 spatial CNN contracts. Only 2D convolution index
 //! geometry is shared with the existing BF16 contract; no value crosses a
 //! half-precision boundary and no old provider gains a new port dtype.
 use super::*;
@@ -11,39 +11,63 @@ pub const GROUP_NORM_SILU_NCHW_F32_CAPABILITY_ID: &str =
 pub const PLAIN_RESIDUAL_ADD_NCHW_F32_OPERATION_ID: &str = "operation.plain_residual_add.nchw.f32";
 pub const PLAIN_RESIDUAL_ADD_NCHW_F32_CAPABILITY_ID: &str =
     "capability.operation.plain_residual_add.nchw.f32";
+pub const PLAIN_RESIDUAL_ADD_NCTHW_F32_OPERATION_ID: &str =
+    "operation.plain_residual_add.ncthw.f32";
+pub const PLAIN_RESIDUAL_ADD_NCTHW_F32_CAPABILITY_ID: &str =
+    "capability.operation.plain_residual_add.ncthw.f32";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum F32CnnOp {
     Conv2d,
+    Conv3d,
     GroupNormSilu,
+    FrameGroupNormSilu,
     ResidualAdd,
+    VolumeResidualAdd,
 }
 impl F32CnnOp {
-    pub const ALL: [Self; 3] = [Self::Conv2d, Self::GroupNormSilu, Self::ResidualAdd];
+    pub const NCHW: [Self; 3] = [Self::Conv2d, Self::GroupNormSilu, Self::ResidualAdd];
+    pub const ALL: [Self; 6] = [
+        Self::Conv2d,
+        Self::Conv3d,
+        Self::GroupNormSilu,
+        Self::FrameGroupNormSilu,
+        Self::ResidualAdd,
+        Self::VolumeResidualAdd,
+    ];
     pub const fn operation_id(self) -> &'static str {
         match self {
             Self::Conv2d => CONV2D_F32_OPERATION_ID,
+            Self::Conv3d => CONV3D_F32_OPERATION_ID,
             Self::GroupNormSilu => GROUP_NORM_SILU_NCHW_F32_OPERATION_ID,
+            Self::FrameGroupNormSilu => FRAME_GROUP_NORM_SILU_NCTHW_F32_OPERATION_ID,
             Self::ResidualAdd => PLAIN_RESIDUAL_ADD_NCHW_F32_OPERATION_ID,
+            Self::VolumeResidualAdd => PLAIN_RESIDUAL_ADD_NCTHW_F32_OPERATION_ID,
         }
     }
     pub const fn capability_id(self) -> &'static str {
         match self {
             Self::Conv2d => CONV2D_F32_CAPABILITY_ID,
+            Self::Conv3d => CONV3D_F32_CAPABILITY_ID,
             Self::GroupNormSilu => GROUP_NORM_SILU_NCHW_F32_CAPABILITY_ID,
+            Self::FrameGroupNormSilu => FRAME_GROUP_NORM_SILU_NCTHW_F32_CAPABILITY_ID,
             Self::ResidualAdd => PLAIN_RESIDUAL_ADD_NCHW_F32_CAPABILITY_ID,
+            Self::VolumeResidualAdd => PLAIN_RESIDUAL_ADD_NCTHW_F32_CAPABILITY_ID,
         }
     }
     pub const fn input_count(self) -> usize {
         match self {
-            Self::Conv2d | Self::GroupNormSilu => 3,
-            Self::ResidualAdd => 2,
+            Self::Conv2d | Self::Conv3d | Self::GroupNormSilu | Self::FrameGroupNormSilu => 3,
+            Self::ResidualAdd | Self::VolumeResidualAdd => 2,
         }
     }
     pub fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::Conv2d => conv2d_f32_contract(),
+            Self::Conv3d => conv3d_f32_contract(),
             Self::GroupNormSilu => group_norm_silu_nchw_f32_contract(),
+            Self::FrameGroupNormSilu => frame_group_norm_silu_ncthw_f32_contract(),
             Self::ResidualAdd => plain_residual_add_nchw_f32_contract(),
+            Self::VolumeResidualAdd => plain_residual_add_ncthw_f32_contract(),
         }
     }
 }
@@ -290,6 +314,28 @@ pub fn plain_residual_add_nchw_f32_contract() -> Result<StandardOperationContrac
         )?,
     })
 }
+/// RN32(x + residual), preserving the exact contiguous NCTHW shape.
+pub fn plain_residual_add_ncthw_f32_contract() -> Result<StandardOperationContract, VNextError> {
+    let mut d = plain_residual_add_nchw_f32_contract()?.descriptor;
+    d.id = OperationId::new(PLAIN_RESIDUAL_ADD_NCTHW_F32_OPERATION_ID)?;
+    d.provider = provider_requirement(
+        PLAIN_RESIDUAL_ADD_NCTHW_F32_CAPABILITY_ID,
+        ContractVersion::new(1, 0),
+    )?;
+    let dims = vec![
+        symbol("batch"),
+        symbol("channels"),
+        symbol("frames"),
+        symbol("height"),
+        symbol("width"),
+    ];
+    for t in &mut d.inputs {
+        *t = contiguous_tensor(dims.clone(), [ElementType::F32], TensorAccess::Read)?;
+    }
+    d.outputs[0] = contiguous_tensor(dims, [ElementType::F32], TensorAccess::Write)?;
+    d.validate()?;
+    Ok(StandardOperationContract { descriptor: d })
+}
 fn group_template(op: &str, cap: &str, count: usize) -> Result<OperationDescriptor, VNextError> {
     let dims = vec![
         symbol("batch"),
@@ -321,25 +367,27 @@ fn group_template(op: &str, cap: &str, count: usize) -> Result<OperationDescript
     Ok(d)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct F32NchwGeometry {
-    shape: [u64; 4],
+pub struct F32DenseGeometry<const R: usize> {
+    shape: [u64; R],
     elements: u64,
 }
-impl F32NchwGeometry {
+pub type F32NchwGeometry = F32DenseGeometry<4>;
+pub type F32NcthwGeometry = F32DenseGeometry<5>;
+impl<const R: usize> F32DenseGeometry<R> {
     pub fn new(x: &ResolvedTensorSpec, y: &ResolvedTensorSpec) -> Result<Self, VNextError> {
         check_f32(x)?;
         check_f32(y)?;
-        let shape: [u64; 4] = x
+        let shape: [u64; R] = x
             .dimensions()
             .try_into()
-            .map_err(|_| invalid("requires NCHW rank four"))?;
+            .map_err(|_| invalid("tensor rank differs from the declared dense geometry"))?;
         if x != y || shape.contains(&0) {
-            return Err(invalid("requires identical positive F32 NCHW shape"));
+            return Err(invalid("requires identical positive contiguous F32 shape"));
         }
         let elements = x.minimum_storage_bytes()? / 4;
         Ok(Self { shape, elements })
     }
-    pub const fn shape(self) -> [u64; 4] {
+    pub const fn shape(self) -> [u64; R] {
         self.shape
     }
     pub const fn elements(self) -> u64 {
@@ -437,8 +485,11 @@ mod tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum F32CnnGeometry {
     Conv2d(Conv2dF32Geometry),
+    Conv3d(Conv3dF32Geometry),
     GroupNormSilu(GroupNormSiluNchwF32Geometry),
+    FrameGroupNormSilu(FrameGroupNormSiluNcthwF32Geometry),
     ResidualAdd(F32NchwGeometry),
+    VolumeResidualAdd(F32NcthwGeometry),
 }
 impl F32CnnGeometry {
     pub fn new(
@@ -455,7 +506,10 @@ impl F32CnnGeometry {
             F32CnnOp::Conv2d => Self::Conv2d(Conv2dF32Geometry::new(
                 inputs[0], inputs[1], inputs[2], output, attrs,
             )?),
-            F32CnnOp::GroupNormSilu => {
+            F32CnnOp::Conv3d => Self::Conv3d(Conv3dF32Geometry::new(
+                inputs[0], inputs[1], inputs[2], output, attrs,
+            )?),
+            F32CnnOp::GroupNormSilu | F32CnnOp::FrameGroupNormSilu => {
                 let Some(SemanticValue::Unsigned(groups)) = attrs.get(&AttributeId::new("groups")?)
                 else {
                     return Err(invalid("missing groups"));
@@ -465,43 +519,63 @@ impl F32CnnGeometry {
                 else {
                     return Err(invalid("missing epsilon"));
                 };
-                Self::GroupNormSilu(GroupNormSiluNchwF32Geometry::new(
-                    inputs[0], inputs[1], inputs[2], output, *groups, *epsilon,
-                )?)
+                if kind == F32CnnOp::GroupNormSilu {
+                    Self::GroupNormSilu(GroupNormSiluNchwF32Geometry::new(
+                        inputs[0], inputs[1], inputs[2], output, *groups, *epsilon,
+                    )?)
+                } else {
+                    Self::FrameGroupNormSilu(FrameGroupNormSiluNcthwF32Geometry::new(
+                        inputs[0], inputs[1], inputs[2], output, *groups, *epsilon,
+                    )?)
+                }
             }
-            F32CnnOp::ResidualAdd => {
+            F32CnnOp::ResidualAdd | F32CnnOp::VolumeResidualAdd => {
                 if inputs[0] != inputs[1] {
                     return Err(invalid(
                         "residual operands must have identical original shape",
                     ));
                 }
-                Self::ResidualAdd(F32NchwGeometry::new(inputs[0], output)?)
+                if kind == F32CnnOp::ResidualAdd {
+                    Self::ResidualAdd(F32NchwGeometry::new(inputs[0], output)?)
+                } else {
+                    Self::VolumeResidualAdd(F32NcthwGeometry::new(inputs[0], output)?)
+                }
             }
         })
     }
     pub const fn kind(self) -> F32CnnOp {
         match self {
             Self::Conv2d(_) => F32CnnOp::Conv2d,
+            Self::Conv3d(_) => F32CnnOp::Conv3d,
             Self::GroupNormSilu(_) => F32CnnOp::GroupNormSilu,
+            Self::FrameGroupNormSilu(_) => F32CnnOp::FrameGroupNormSilu,
             Self::ResidualAdd(_) => F32CnnOp::ResidualAdd,
+            Self::VolumeResidualAdd(_) => F32CnnOp::VolumeResidualAdd,
         }
     }
     pub const fn elements(self) -> u64 {
         match self {
             Self::Conv2d(g) => g.elements(),
+            Self::Conv3d(g) => g.elements(),
             Self::GroupNormSilu(g) => g.elements(),
+            Self::FrameGroupNormSilu(g) => g.elements(),
             Self::ResidualAdd(g) => g.elements(),
+            Self::VolumeResidualAdd(g) => g.elements(),
         }
     }
     pub const fn logical_arithmetic_operations(self) -> u64 {
         match self {
             Self::Conv2d(g) => g.logical_arithmetic_operations(),
+            Self::Conv3d(g) => g.logical_arithmetic_operations(),
             Self::GroupNormSilu(g) => g.logical_arithmetic_operations(),
+            Self::FrameGroupNormSilu(g) => g.logical_arithmetic_operations(),
             Self::ResidualAdd(g) => g.elements(),
+            Self::VolumeResidualAdd(g) => g.elements(),
         }
     }
     pub fn input_elements(self, index: usize) -> Option<u64> {
         match self {
+            Self::Conv3d(g) => g.input_elements().get(index).copied(),
             Self::Conv2d(g) => match index {
                 0 => Some(g.batch() * g.input_channels() * g.input_height() * g.input_width()),
                 1 => Some(
@@ -518,7 +592,13 @@ impl F32CnnGeometry {
                 1 | 2 => Some(g.shape()[1]),
                 _ => None,
             },
+            Self::FrameGroupNormSilu(g) => match index {
+                0 => Some(g.elements()),
+                1 | 2 => Some(g.shape()[1]),
+                _ => None,
+            },
             Self::ResidualAdd(g) => (index < 2).then_some(g.elements()),
+            Self::VolumeResidualAdd(g) => (index < 2).then_some(g.elements()),
         }
     }
 }
