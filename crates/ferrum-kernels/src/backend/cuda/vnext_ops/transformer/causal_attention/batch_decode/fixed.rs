@@ -138,7 +138,10 @@ impl FixedBatchDecode {
         grouping: CausalDecodeAttentionGrouping,
         shape: CausalAttentionShape,
     ) -> Self {
-        self.paired_query_heads = paired_query_heads_eligible(mode, grouping, shape);
+        // Preserve the single-row arithmetic while sharing the capacity-stable
+        // V1/V2 replay envelope with multi-row decode.
+        self.paired_query_heads =
+            self.participants > 1 && paired_query_heads_eligible(mode, grouping, shape);
         self.unified_v2 = self.paired_query_heads
             && mode == ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2;
         self

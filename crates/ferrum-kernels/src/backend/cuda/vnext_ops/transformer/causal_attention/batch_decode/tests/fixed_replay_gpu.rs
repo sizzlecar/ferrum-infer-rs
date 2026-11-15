@@ -415,6 +415,17 @@ fn fixed_capacity_captured_replay_matches_current_indexed_bits_and_guards_on_cud
 
 #[test]
 #[ignore = "requires CUDA and pinned indexed addressed-vLLM operators"]
+fn singleton_fixed_capacity_replay_preserves_native_switches_and_request_ownership_on_cuda() {
+    captured_capacity_replay(&[
+        (128, 1, false, 2048, None),
+        (256, 1, true, 2048, None),
+        (128, 1, false, 512, None),
+        (256, 1, true, 262_144, Some(2_048)),
+    ]);
+}
+
+#[test]
+#[ignore = "requires CUDA and pinned indexed addressed-vLLM operators"]
 fn fixed_execution_capacity_captured_replay_matches_indexed_bits_and_guards_on_cuda() {
     captured_capacity_replay(&[
         (256, 32, true, 262_144, Some(2_048)),
@@ -535,6 +546,9 @@ fn captured_capacity_replay_candidate(
             }
             let lengths = (0..participants)
                 .map(|row| match wave {
+                    _ if participants == 1 => {
+                        [129, 512, 513, shape.maximum_context_tokens, 1025, 257][wave]
+                    }
                     0 => 129 + row as u64,
                     1 => 512 + (row % 2) as u64,
                     2 => 1023 + (row % 2) as u64,

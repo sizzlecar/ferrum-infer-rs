@@ -310,7 +310,7 @@ impl BatchDecode {
         }
         let can_batch = if indexed {
             packed
-                && launches.len() > 1
+                && !launches.is_empty()
                 && launches.iter().all(|launch| {
                     matches!(
                         launch.path,
