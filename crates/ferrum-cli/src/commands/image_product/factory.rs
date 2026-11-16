@@ -4,10 +4,12 @@ use super::{
     directory::{DirectoryOptions, ImageBackendKind},
 };
 use anyhow::Result;
+#[cfg(feature = "cuda")]
+use ferrum_engine::image_generation::ImageGenerationOutput;
 use ferrum_engine::image_generation::{
     service::{ImageGenerator, ImageService, ImageServiceConfig},
-    ImageEditRequest, ImageGenerationOutput, ImageGenerationRequest, ImagePipelineLimits,
-    ImageStageReceipt, QwenImage21Assets, QwenImage21Pipeline,
+    ImageEditRequest, ImageGenerationRequest, ImagePipelineLimits, ImageStageReceipt,
+    QwenImage21Assets, QwenImage21Pipeline,
 };
 
 pub(super) enum PreparedAssets {
