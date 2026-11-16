@@ -97,7 +97,16 @@ fn no_copy_upload_retains_aligned_host_charge_and_readback_writes_only_its_piece
 }
 
 fn check_no_copy_upload(class: HostMemoryClass) {
+    struct CapacityChanged(std::sync::mpsc::SyncSender<()>);
+    impl std::task::Wake for CapacityChanged {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.try_send(());
+        }
+    }
     let host = account(true);
+    let (changed, refunds) = std::sync::mpsc::sync_channel(1);
+    let _subscription =
+        host.subscribe_capacity(std::task::Waker::from(Arc::new(CapacityChanged(changed))));
     let (output, output_charge) = metal::objc::rc::autoreleasepool(|| {
         let runtime = runtime();
         let mut source = host.allocate_zeroed(class, 8).unwrap();
@@ -170,8 +179,16 @@ fn check_no_copy_upload(class: HostMemoryClass) {
     });
     // Metal's command buffer also has an autoreleased retain. Completion and
     // dropping our fence do not require that native retain to be gone yet.
-    // Check final release after draining the pool, while the independent output
-    // allocation still proves that only the input charge was released.
+    // Native resource disposal can also finish on a Metal driver thread. Wait
+    // for the actual Host refund notification after draining our pool, while
+    // the independent output proves that only the input charge was released.
+    // A retained/leaked owner still fails at this finite deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while host.usage().unwrap().allocated_bytes() > output_charge {
+        refunds
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("Metal did not refund the input backing after native owner release");
+    }
     assert_eq!(host.usage().unwrap().allocated_bytes(), output_charge);
     drop(output);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
