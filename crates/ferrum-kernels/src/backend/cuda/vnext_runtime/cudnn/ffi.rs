@@ -18,6 +18,7 @@ pub(super) const CROSS_CORRELATION: c_int = 1;
 pub(super) const TENSOR_OP_MATH: c_int = 1;
 pub(super) const DETERMINISTIC: c_int = 1;
 pub(super) const ALGORITHMS: usize = 8;
+pub(super) const BACKWARD_DATA_ALGORITHMS: usize = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -30,6 +31,9 @@ pub(super) struct ForwardPerformance {
     pub math_type: c_int,
     pub reserved: [c_int; 3],
 }
+// cudnnConvolutionBwdDataAlgoPerf_t has the same field types/order as the
+// forward v7 performance record, including the integer algorithm discriminant.
+pub(super) type BackwardDataPerformance = ForwardPerformance;
 
 pub(super) struct Api {
     pub graph: GraphApi,
@@ -41,10 +45,13 @@ pub(super) struct Api {
     pub destroy_tensor: unsafe extern "C" fn(Descriptor) -> c_int,
     pub set_tensor:
         unsafe extern "C" fn(Descriptor, c_int, c_int, c_int, c_int, c_int, c_int) -> c_int,
+    pub set_tensor_nd:
+        unsafe extern "C" fn(Descriptor, c_int, c_int, *const c_int, *const c_int) -> c_int,
     pub create_filter: unsafe extern "C" fn(*mut Descriptor) -> c_int,
     pub destroy_filter: unsafe extern "C" fn(Descriptor) -> c_int,
     pub set_filter:
         unsafe extern "C" fn(Descriptor, c_int, c_int, c_int, c_int, c_int, c_int) -> c_int,
+    pub set_filter_nd: unsafe extern "C" fn(Descriptor, c_int, c_int, c_int, *const c_int) -> c_int,
     pub create_convolution: unsafe extern "C" fn(*mut Descriptor) -> c_int,
     pub destroy_convolution: unsafe extern "C" fn(Descriptor) -> c_int,
     pub set_convolution: unsafe extern "C" fn(
@@ -59,6 +66,15 @@ pub(super) struct Api {
         c_int,
     ) -> c_int,
     pub set_groups: unsafe extern "C" fn(Descriptor, c_int) -> c_int,
+    pub set_convolution_nd: unsafe extern "C" fn(
+        Descriptor,
+        c_int,
+        *const c_int,
+        *const c_int,
+        *const c_int,
+        c_int,
+        c_int,
+    ) -> c_int,
     pub set_math: unsafe extern "C" fn(Descriptor, c_int) -> c_int,
     pub algorithms: unsafe extern "C" fn(
         Handle,
@@ -80,6 +96,40 @@ pub(super) struct Api {
         *mut usize,
     ) -> c_int,
     pub forward: unsafe extern "C" fn(
+        Handle,
+        *const c_void,
+        Descriptor,
+        *const c_void,
+        Descriptor,
+        *const c_void,
+        Descriptor,
+        c_int,
+        *mut c_void,
+        usize,
+        *const c_void,
+        Descriptor,
+        *mut c_void,
+    ) -> c_int,
+    pub backward_algorithms: unsafe extern "C" fn(
+        Handle,
+        Descriptor,
+        Descriptor,
+        Descriptor,
+        Descriptor,
+        c_int,
+        *mut c_int,
+        *mut BackwardDataPerformance,
+    ) -> c_int,
+    pub backward_workspace: unsafe extern "C" fn(
+        Handle,
+        Descriptor,
+        Descriptor,
+        Descriptor,
+        Descriptor,
+        c_int,
+        *mut usize,
+    ) -> c_int,
+    pub backward_data: unsafe extern "C" fn(
         Handle,
         *const c_void,
         Descriptor,
@@ -140,17 +190,23 @@ impl Api {
             create_tensor: symbol!("cudnnCreateTensorDescriptor"),
             destroy_tensor: symbol!("cudnnDestroyTensorDescriptor"),
             set_tensor: symbol!("cudnnSetTensor4dDescriptor"),
+            set_tensor_nd: symbol!("cudnnSetTensorNdDescriptor"),
             create_filter: symbol!("cudnnCreateFilterDescriptor"),
             destroy_filter: symbol!("cudnnDestroyFilterDescriptor"),
             set_filter: symbol!("cudnnSetFilter4dDescriptor"),
+            set_filter_nd: symbol!("cudnnSetFilterNdDescriptor"),
             create_convolution: symbol!("cudnnCreateConvolutionDescriptor"),
             destroy_convolution: symbol!("cudnnDestroyConvolutionDescriptor"),
             set_convolution: symbol!("cudnnSetConvolution2dDescriptor"),
+            set_convolution_nd: symbol!("cudnnSetConvolutionNdDescriptor"),
             set_groups: symbol!("cudnnSetConvolutionGroupCount"),
             set_math: symbol!("cudnnSetConvolutionMathType"),
             algorithms: symbol!("cudnnGetConvolutionForwardAlgorithm_v7"),
             workspace: symbol!("cudnnGetConvolutionForwardWorkspaceSize"),
             forward: symbol!("cudnnConvolutionForward"),
+            backward_algorithms: symbol!("cudnnGetConvolutionBackwardDataAlgorithm_v7"),
+            backward_workspace: symbol!("cudnnGetConvolutionBackwardDataWorkspaceSize"),
+            backward_data: symbol!("cudnnConvolutionBackwardData"),
             _library: unsafe { std::mem::ManuallyDrop::take(&mut library) },
             _dependencies: unsafe { std::mem::ManuallyDrop::take(&mut dependencies) },
         })

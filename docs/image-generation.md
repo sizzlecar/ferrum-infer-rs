@@ -1,6 +1,6 @@
 # Image generation and editing
 
-Ferrum supports Qwen-Image-2.1-Turbo on Linux CUDA and Apple Silicon Metal, and P-H3-Image on Linux CUDA SM89/SM120. On main/development, Qwen editing accepts up to ten ordered references; P-H3 accepts up to eight. **Released v0.19.0 still supports only one Qwen reference.** Each reference must be a static 8-bit RGB/RGBA PNG. Masks are unsupported. Editing can redraw background and details.
+Ferrum supports Qwen-Image-2.1-Turbo on Linux CUDA and Apple Silicon Metal, and P-H3-Image on Linux CUDA SM89/SM120. Since v0.19.1, Qwen editing accepts up to ten ordered references; P-H3 accepts up to eight. v0.19.0 accepts only one Qwen reference. Each reference must be a static 8-bit RGB/RGBA PNG. Masks are unsupported. Editing can redraw background and details.
 
 ## P-H3 setup
 
@@ -103,11 +103,10 @@ curl http://127.0.0.1:8000/v1/images/edits \
 
 For Metal, replace `qwen-image` with `qwen-image-turbo-metal`.
 
-On main/development, Qwen accepts up to ten images in one edit, with the same
+Since v0.19.1, Qwen accepts up to ten images in one edit, with the same
 reference order in `run` and `serve`. Repeat multipart `image[]` fields (`image`
 is also accepted), or repeat CLI `--image`; refer to image 1, image 2, and so on
-in the prompt. These Qwen multi-reference examples require a development build,
-not the v0.19.0 release:
+in the prompt. These Qwen multi-reference examples require v0.19.1 or newer:
 
 ```sh
 curl http://127.0.0.1:8000/v1/images/edits \

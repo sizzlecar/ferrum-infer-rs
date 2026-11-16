@@ -14,7 +14,8 @@ use ferrum_runtime::{
 use super::*;
 
 pub const LAYER_NORM_PROFILE_ID: &str = "cuda.ieee.layer_norm.bf16.pairwise_sqrt_div.v1";
-pub const HEAD_RMS_NORM_PROFILE_ID: &str = "cuda.ieee.head_rms_norm.bf16.pairwise_sqrt_div.v1";
+pub const HEAD_RMS_NORM_PROFILE_ID: &str =
+    "cuda.ieee.head_rms_norm.bf16.pairwise_carry_sqrt_div.v2";
 pub const NUMERICAL_IDENTITY: &str = concat!(
     "power-of-two-width-1..4096;adjacent-pair-tree-no-padding-no-initial-zero;",
     "explicit-RN32-add-sub-mul-div-sqrt;separate-sqrt-reciprocal;gradual-underflow;",
@@ -27,6 +28,28 @@ pub const NUMERICAL_IDENTITY: &str = concat!(
     "no-deployment-rsqrt-or-Torch-bitwise-claim;target-validation-required"
 );
 const MAX_WIDTH: u64 = 4096;
+const MAX_HEAD_RMS_WIDTH: u64 = 8192;
+pub(super) const HEAD_RMS_CARRY_FUNCTION: &str = "ferrum_vnext_head_rms_norm_carry_bf16";
+pub const HEAD_RMS_NUMERICAL_IDENTITY: &str = concat!(
+    "HeadRMS-width-1..8192;",
+    "power-of-two-width<=4096-uses-original-export-and-original-adjacent-pair-tree;",
+    "other-widths-use-adjacent-pair-tree-carry-unpaired-left-no-zero-padding;",
+    "explicit-RN32-square-add-div-sqrt-reciprocal;gradual-underflow;",
+    "epsilon=(numerator-as-f64/denominator-as-f64)-as-f32;",
+    "HeadRMS=B(decode(B(x*inverse))*gamma);shared-gamma-per-head;",
+    "zero-global-scratch;dynamic-CTA-shared=4*width;static-CTA-inverse=4-bytes;",
+    "logical-work=groups*(4*width+3);",
+    "separate-sqrt-div-not-deployment-rsqrt;no-Torch-reduction-bitwise-claim;",
+    "NaN-class-only;target-validation-required"
+);
+
+/// The supported reduction topology is selected before launch. Legacy shapes
+/// retain the original native entry point and its exact arithmetic sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReductionPlan {
+    AdjacentPowerOfTwo,
+    AdjacentCarry,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
@@ -84,7 +107,8 @@ impl Kind {
     fn numerical_identity(self) -> &'static str {
         match self {
             Self::ZeroCenteredRms => TEXT_PROJECTION_NUMERICAL_IDENTITY,
-            Self::Layer | Self::HeadRms => NUMERICAL_IDENTITY,
+            Self::Layer => NUMERICAL_IDENTITY,
+            Self::HeadRms => HEAD_RMS_NUMERICAL_IDENTITY,
         }
     }
     fn provider(self) -> &'static str {
@@ -291,11 +315,16 @@ impl NormProvider {
         regions.push(output);
         let kernels = Arc::clone(&self.kernels);
         let kind = self.kind;
-        CudaDeviceCommand::operation(kind.function(), regions, move |stream, regions| {
+        let function = if shape.reduction == ReductionPlan::AdjacentCarry {
+            HEAD_RMS_CARRY_FUNCTION
+        } else {
+            kind.function()
+        };
+        CudaDeviceCommand::operation(function, regions, move |stream, regions| {
             let input = regions[0].device_ptr();
             let gamma = regions[1].device_ptr();
             let output = regions[kind.inputs() as usize].device_ptr();
-            let mut builder = stream.launch_builder(kernels.norm_function(kind));
+            let mut builder = stream.launch_builder(kernels.norm_function(kind, shape.reduction));
             builder.arg(&input);
             if kind != Kind::Layer {
                 builder.arg(&gamma);
@@ -333,6 +362,7 @@ impl NormProvider {
 
 #[derive(Clone, Copy, Debug)]
 struct Shape {
+    reduction: ReductionPlan,
     groups: u64,
     width: u32,
     elements: u64,
@@ -347,15 +377,19 @@ impl Shape {
     fn new(kind: Kind, rows: u64, columns: u64, width: u64, epsilon: f32) -> Result<Self, String> {
         if rows == 0
             || columns == 0
-            || !width.is_power_of_two()
-            || width > MAX_WIDTH
+            || width == 0
+            || if kind == Kind::HeadRms {
+                width > MAX_HEAD_RMS_WIDTH
+            } else {
+                !width.is_power_of_two() || width > MAX_WIDTH
+            }
             || columns % width != 0
             || (kind != Kind::HeadRms && columns != width)
             || !epsilon.is_finite()
             || epsilon <= 0.0
         {
             return Err(
-                "CUDA BF16 normalization requires positive geometry and power-of-two width <=4096"
+                "CUDA BF16 normalization requires positive geometry; HeadRMS width <=8192, other norms power-of-two width <=4096"
                     .into(),
             );
         }
@@ -378,6 +412,11 @@ impl Shape {
             .and_then(|v| v.checked_mul(groups))
             .ok_or("CUDA norm logical arithmetic work overflows")?;
         Ok(Self {
+            reduction: if kind == Kind::HeadRms && (!width.is_power_of_two() || width > MAX_WIDTH) {
+                ReductionPlan::AdjacentCarry
+            } else {
+                ReductionPlan::AdjacentPowerOfTwo
+            },
             groups,
             width: width as u32,
             elements,

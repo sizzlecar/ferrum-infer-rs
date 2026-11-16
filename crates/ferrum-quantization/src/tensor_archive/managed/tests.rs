@@ -86,6 +86,30 @@ fn f16_bytes(values: &[f32]) -> Vec<u8> {
 }
 
 #[test]
+fn consumed_adapter_keeps_original_archive_view_and_charged_conversion() {
+    let (_dir, archive) = archive(&[bf("x", 1, 2, &[1.25, -2.5])]);
+    let h = host();
+    let borrowed_spec = component(&["x"], &[1, 2], ElementType::Bf16);
+    let borrowed = ManagedDenseArchiveSource::new(&archive, &h)
+        .into_component(&borrowed_spec)
+        .unwrap();
+    let original = archive.component(&borrowed_spec).unwrap();
+    assert_eq!(borrowed.bytes().as_ptr(), original.bytes().as_ptr());
+    let widened_spec = component(&["x"], &[1, 2], ElementType::F32);
+    let widened = ManagedDenseArchiveSource::new(&archive, &h)
+        .into_component(&widened_spec)
+        .unwrap();
+    assert_eq!(
+        widened.bytes(),
+        [1.25f32.to_le_bytes(), (-2.5f32).to_le_bytes()].concat()
+    );
+    assert!(widened.retained_host_memory().is_some());
+    assert!(h.usage().unwrap().allocated_bytes() >= widened.bytes().len());
+    drop(widened);
+    assert_eq!(h.usage().unwrap().allocated_bytes(), 0);
+}
+
+#[test]
 fn four_declared_gdn_projection_parts_use_one_exact_managed_backing_and_retry_after_rejection() {
     // Small QKV/Z/B/A row counts retain the real four-part GDN packing rule.
     // Neutral source names demonstrate that only the typed order/shape matters.

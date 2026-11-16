@@ -4,10 +4,15 @@ use super::*;
 pub(crate) struct ReferenceAffineF32Launch {
     pub(crate) dense: ReferenceDenseLinearLaunch,
     pub(crate) bias: ReferenceBufferRegion,
+    pub(crate) rounded_bf16: bool,
 }
 impl ReferenceAffineF32Launch {
     pub(crate) fn validate(&self) -> Result<(), ReferenceDeviceRuntimeError> {
-        self.dense.validate()?;
+        self.dense.validate_with_output_type(if self.rounded_bf16 {
+            ElementType::Bf16
+        } else {
+            ElementType::F32
+        })?;
         self.bias.validate_range()?;
         if self.dense.scalar != ReferenceDenseScalar::F32
             || self.bias.element_type != ElementType::F32
@@ -34,6 +39,27 @@ impl ReferenceAffineF32Launch {
     }
 }
 pub(super) fn execute(launch: &ReferenceAffineF32Launch) {
+    if launch.rounded_bf16 {
+        let d = &launch.dense;
+        let mut storage = AllocationLocks::new([&d.input, &d.weight, &launch.bias, &d.output]);
+        for row in 0..d.rows {
+            for out in 0..d.out_features {
+                let mut sum = 0.0_f32;
+                for k in 0..d.in_features {
+                    sum += storage.read_f32(0, row * d.in_features + k)
+                        * storage.read_f32(1, out * d.in_features + k);
+                }
+                // Complete F32 reduction, then F32 bias, then BF16 RNE.
+                let value = sum + storage.read_f32(2, out);
+                storage.write_bits(
+                    3,
+                    row * d.out_features + out,
+                    bf16::from_f32(value).to_bits(),
+                );
+            }
+        }
+        return;
+    }
     execute_dense_linear(&launch.dense);
     let mut storage = AllocationLocks::new([&launch.dense.output, &launch.bias]);
     for index in 0..launch.dense.rows * launch.dense.out_features {
@@ -84,6 +110,7 @@ mod tests {
             bad_type.region(0..4).unwrap(),
         ] {
             let launch = ReferenceAffineF32Launch {
+                rounded_bf16: false,
                 dense: ReferenceDenseLinearLaunch {
                     input: input.region(0..8).unwrap(),
                     weight: weight.region(0..8).unwrap(),
@@ -140,6 +167,7 @@ mod tests {
             ElementType::F32,
         );
         let launch = ReferenceAffineF32Launch {
+            rounded_bf16: false,
             dense: ReferenceDenseLinearLaunch {
                 input: input.region(0..12).unwrap(),
                 weight: weight.region(0..12).unwrap(),

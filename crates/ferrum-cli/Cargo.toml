@@ -115,6 +115,7 @@ interactive = [] # Enable interactive mode
 accelerate = ["ferrum-engine/accelerate"]  # Use Apple Accelerate BLAS (matches PyTorch precision)
 metal = ["ferrum-engine/metal", "ferrum-kernels/metal", "ferrum-quantization/metal"]  # Apple GPU
 cuda = ["ferrum-engine/cuda", "ferrum-kernels/cuda", "ferrum-quantization/cuda"]    # NVIDIA CUDA
+cuda-fast-h3 = ["cuda", "ferrum-engine/cuda-fast-h3"]
 cuda-cutlass-fp8 = ["cuda", "ferrum-kernels/cuda-cutlass-fp8", "ferrum-models/cuda-cutlass-fp8"]
 cuda-cutlass-fused-f32-attention = ["cuda", "ferrum-engine/cuda-cutlass-fused-f32-attention", "ferrum-kernels/cuda-cutlass-fused-f32-attention"]
 cuda-cutlass-int8-fused-output = ["cuda", "ferrum-engine/cuda-cutlass-int8-fused-output", "ferrum-kernels/cuda-cutlass-int8-fused-output"]

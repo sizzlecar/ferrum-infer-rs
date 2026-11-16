@@ -67,6 +67,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map(|port| TensorRequestStateMapping {
                 source_output: port.value_id().clone(),
                 destination_state: port.value_id().clone(),
+                selection: TensorOutputSelection::Whole,
             })
             .collect::<Vec<_>>();
         let first = solver

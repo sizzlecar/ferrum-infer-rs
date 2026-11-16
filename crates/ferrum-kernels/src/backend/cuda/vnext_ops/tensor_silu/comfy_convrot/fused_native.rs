@@ -1,6 +1,6 @@
 //! Independent native authority; no payload allocation, cache or extra stream.
 use super::*;
-use crate::backend::cuda::vnext_runtime::CudaTensorConvRotFusedRetention;
+use crate::backend::cuda::vnext_runtime::{CudaTensorNativeModuleRetention, StaticNativeModule};
 use ferrum_native_ops::cutlass_int8_fused_output::{
     CutlassInt8FusedOutputBindingsV1 as Bindings, CutlassInt8FusedOutputInfoV1 as Info,
     CutlassInt8FusedOutputShapeV1 as NativeShape, CUTLASS_INT8_FUSED_OUTPUT_NUMERICAL_IDENTITY,
@@ -51,7 +51,7 @@ pub(crate) fn source_fingerprint() -> Result<String, String> {
 }
 
 pub(super) struct Native {
-    _owner: Arc<CudaTensorConvRotFusedRetention>,
+    _owner: Arc<CudaTensorNativeModuleRetention>,
     identity: String,
 }
 impl Native {
@@ -70,8 +70,11 @@ impl Native {
         ]);
         // Claim before this unit's first CUDART call. The static module cannot
         // acknowledge unload, so its opaque quota remains process-owned.
-        let owner =
-            runtime.reserve_tensor_convrot_fused_module(&identity, config.opaque_memory_bytes)?;
+        let owner = runtime.reserve_tensor_native_module(
+            StaticNativeModule::CutlassInt8FusedOutput,
+            &identity,
+            config.opaque_memory_bytes,
+        )?;
         owner
             .context()
             .bind_to_thread()

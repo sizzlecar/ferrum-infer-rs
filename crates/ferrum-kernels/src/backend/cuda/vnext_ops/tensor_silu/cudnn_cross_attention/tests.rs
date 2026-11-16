@@ -68,7 +68,7 @@ fn rectangular_nonempty_batches_share_one_plan_with_independent_q_and_kv_strides
         assert_eq!(native.key_value_batch_stride, 4 * 2 * d as i64);
         assert_eq!(native.output_batch_stride, native.query_batch_stride);
         native.validate().unwrap();
-        let layout = ScratchLayout::new(2, 4, 2 * d, 512).unwrap();
+        let layout = s.scratch(s.stages[0], 512).unwrap();
         assert!(layout.value_offset >= 2 * 4 * 2 * d * 2);
         assert!(layout.query_lengths_offset >= layout.value_offset + 2 * 4 * 2 * d * 2);
         assert_eq!(layout.workspace_offset + 512, layout.bytes);
@@ -104,7 +104,7 @@ fn mixed_empty_keys_split_batches_and_all_empty_never_prepare_native_sdpa() {
 }
 
 #[test]
-fn all_valid_direct_kv_preserves_native_signature_and_conservative_scratch() {
+fn all_valid_direct_kv_preserves_native_signature_without_payload_reservation() {
     for (b, q, k, d) in [(1, 3, 5, 128), (2, 7, 3, 72), (16, 1, 9, 128)] {
         let s = Schedule::new(geometry(
             b,
@@ -140,11 +140,18 @@ fn all_valid_direct_kv_preserves_native_signature_and_conservative_scratch() {
         let signature = s.signature(direct).unwrap();
         assert_eq!(signature, s.signature(packed).unwrap());
         assert_eq!(signature.key_value_batch_stride, (k * 2 * d) as i64);
-        let scratch = ScratchLayout::new(b as u32, k as u32, 2 * d, 512).unwrap();
-        let payload_bytes = b * k * 2 * d * 2;
-        assert!(scratch.value_offset >= payload_bytes);
-        assert!(scratch.query_lengths_offset >= scratch.value_offset + payload_bytes);
-        assert_eq!(scratch.workspace_offset + 512, scratch.bytes);
+        for workspace in [0, 1, 512, 513] {
+            let scratch = s.scratch(direct, workspace).unwrap();
+            let packed_scratch = s.scratch(packed, workspace).unwrap();
+            assert_eq!(scratch.query_lengths_offset, 0);
+            assert!(scratch.key_lengths_offset >= b * 4);
+            assert!(scratch.workspace_offset >= scratch.key_lengths_offset + b * 4);
+            assert_eq!(scratch.workspace_offset + workspace, scratch.bytes);
+            assert_eq!(
+                packed_scratch.bytes - scratch.bytes,
+                2 * packed_scratch.value_offset
+            );
+        }
         // The provider implementation receipt still distinguishes the two
         // execution paths even though their native SDPA fingerprints agree.
         let native = "2".repeat(64);
@@ -153,6 +160,36 @@ fn all_valid_direct_kv_preserves_native_signature_and_conservative_scratch() {
             prepared_stages_fingerprint([(packed, Some(native.as_str()))]).unwrap()
         );
     }
+}
+
+#[test]
+fn all_valid_batches_after_first_mask_tile_bind_their_own_kv() {
+    let b = 19;
+    let s = Schedule::new(geometry(
+        b,
+        3,
+        5,
+        128,
+        &vec![1; b as usize],
+        &vec![5; b as usize],
+        &vec![1; b as usize],
+    ))
+    .unwrap();
+    for stage in &s.stages {
+        assert!(matches!(
+            stage.method,
+            Method::Sdpa {
+                direct_kv: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            s.key_value_byte_offset(*stage).unwrap(),
+            u64::from(stage.first_batch) * 5 * 256 * 2
+        );
+        assert_eq!(s.scratch(*stage, 0).unwrap().query_lengths_offset, 0);
+    }
+    assert!(s.stages.iter().any(|stage| stage.first_batch != 0));
 }
 
 #[test]

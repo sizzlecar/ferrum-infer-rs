@@ -53,7 +53,7 @@ impl Qwen3VLVisionComfyConfig {
     }
     fn from_base(base: Qwen3VLVisionConfig) -> std::result::Result<Self, VNextError> {
         base.validate()?;
-        if base.grids().len() != 1 {
+        if base.grids().len() != 1 || base.grids()[0].temporal() != 1 {
             return Err(invalid("this fixed component invokes one image at a time"));
         }
         Ok(Self { base })

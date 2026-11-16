@@ -26,6 +26,8 @@ const TYPE_DESCRIPTOR: c_int = 15;
 const MAX_CANDIDATES: usize = 16;
 const MAX_KNOBS: usize = 32;
 const UIDS: [i64; 7] = [1, 2, 3, 4, 5, 6, 7];
+#[path = "native/causal.rs"]
+mod causal;
 
 pub(super) struct BuildError {
     pub message: String,
@@ -155,6 +157,18 @@ impl<'a> Builder<'a> {
         alignment: i64,
         by_value: bool,
     ) -> Result<Descriptor, String> {
+        self.tensor_kind(uid, dtype, dims, strides, alignment, by_value, false)
+    }
+    fn tensor_kind(
+        &mut self,
+        uid: i64,
+        dtype: c_int,
+        dims: [i64; 4],
+        strides: [i64; 4],
+        alignment: i64,
+        by_value: bool,
+        virtual_tensor: bool,
+    ) -> Result<Descriptor, String> {
         (|| {
             let d = self.create(TENSOR)?;
             self.set(d, 900, TYPE_I64, &[alignment])?;
@@ -162,7 +176,7 @@ impl<'a> Builder<'a> {
             self.set(d, 902, TYPE_I64, &dims)?;
             self.set(d, 903, TYPE_I64, &strides)?;
             self.set(d, 906, TYPE_I64, &[uid])?;
-            self.set(d, 907, TYPE_BOOL, &[false])?;
+            self.set(d, 907, TYPE_BOOL, &[virtual_tensor])?;
             if by_value {
                 self.set(d, 908, TYPE_BOOL, &[true])?;
             }
@@ -186,65 +200,71 @@ impl NativePlan {
         let mut b = Builder::new(api);
         let built = (|| -> Result<(Descriptor, u64, String), String> {
             s.validate()?;
-            let row = s
-                .heads
-                .checked_mul(s.head_dim)
-                .ok_or("SDPA row overflows")?;
-            let qdim = [s.batch, s.heads, s.query_length, s.head_dim];
-            let kvdim = [s.batch, s.heads, s.key_value_length, s.head_dim];
-            let q = b.tensor(
-                1,
-                9,
-                qdim,
-                [s.query_batch_stride, s.head_dim, row, 1],
-                16,
-                false,
-            )?;
-            let k = b.tensor(
-                2,
-                9,
-                kvdim,
-                [s.key_value_batch_stride, s.head_dim, row, 1],
-                16,
-                false,
-            )?;
-            let v = b.tensor(
-                3,
-                9,
-                kvdim,
-                [s.key_value_batch_stride, s.head_dim, row, 1],
-                16,
-                false,
-            )?;
-            let o = b.tensor(
-                4,
-                9,
-                qdim,
-                [s.output_batch_stride, s.head_dim, row, 1],
-                16,
-                false,
-            )?;
-            let scale = b.tensor(5, 0, [1; 4], [1; 4], 4, true)?;
-            let qlen = b.tensor(6, 4, [s.batch, 1, 1, 1], [1; 4], 4, false)?;
-            let kvlen = b.tensor(7, 4, [s.batch, 1, 1, 1], [1; 4], 4, false)?;
-            let op = b.create(SDPA_FORWARD)?;
-            for (name, value) in [
-                (2800, q),
-                (2801, k),
-                (2802, v),
-                (2803, o),
-                (2805, scale),
-                (2809, qlen),
-                (2810, kvlen),
-            ] {
-                b.set(op, name, TYPE_DESCRIPTOR, &[value])?;
-            }
-            b.finish(op)?;
+            let operations = if s.causal {
+                causal::operations(&mut b, s)?
+            } else {
+                let row = s
+                    .heads
+                    .checked_mul(s.head_dim)
+                    .ok_or("SDPA row overflows")?;
+                let qdim = [s.batch, s.heads, s.query_length, s.head_dim];
+                let kvdim = [s.batch, s.key_value_heads, s.key_value_length, s.head_dim];
+                let kv_row = s.key_value_heads * s.head_dim;
+                let q = b.tensor(
+                    1,
+                    9,
+                    qdim,
+                    [s.query_batch_stride, s.head_dim, row, 1],
+                    16,
+                    false,
+                )?;
+                let k = b.tensor(
+                    2,
+                    9,
+                    kvdim,
+                    [s.key_value_batch_stride, s.head_dim, kv_row, 1],
+                    16,
+                    false,
+                )?;
+                let v = b.tensor(
+                    3,
+                    9,
+                    kvdim,
+                    [s.key_value_batch_stride, s.head_dim, kv_row, 1],
+                    16,
+                    false,
+                )?;
+                let o = b.tensor(
+                    4,
+                    9,
+                    qdim,
+                    [s.output_batch_stride, s.head_dim, row, 1],
+                    16,
+                    false,
+                )?;
+                let scale = b.tensor(5, 0, [1; 4], [1; 4], 4, true)?;
+                let qlen = b.tensor(6, 4, [s.batch, 1, 1, 1], [1; 4], 4, false)?;
+                let kvlen = b.tensor(7, 4, [s.batch, 1, 1, 1], [1; 4], 4, false)?;
+                let op = b.create(SDPA_FORWARD)?;
+                for (name, value) in [
+                    (2800, q),
+                    (2801, k),
+                    (2802, v),
+                    (2803, o),
+                    (2805, scale),
+                    (2809, qlen),
+                    (2810, kvlen),
+                ] {
+                    b.set(op, name, TYPE_DESCRIPTOR, &[value])?;
+                }
+                b.finish(op)?;
+                vec![op]
+            };
             let graph = b.create(GRAPH)?;
             // These attributes are deprecated but still present in the pinned
             // 9.20 ABI. They bind plans to the already-admitted context/handle.
             b.set(graph, 800, TYPE_HANDLE, &[handle])?;
-            b.set(graph, 801, TYPE_DESCRIPTOR, &[op])?;
+            b.set(graph, 801, TYPE_DESCRIPTOR, &operations)?;
             b.finish(graph)?;
             let mut mode_failures = Vec::with_capacity(3);
             // Ranked metadata only; no candidate is executed or timed. The
@@ -411,6 +431,7 @@ impl VariantPack {
         api: &GraphApi,
         v: CudnnSdpaBindings,
         scale: &f32,
+        causal: bool,
     ) -> Result<Self, BuildError> {
         let mut b = Builder::new(api);
         let built = (|| -> Result<Descriptor, String> {
@@ -424,8 +445,15 @@ impl VariantPack {
                 v.seq_len_q as *mut c_void,
                 v.seq_len_kv as *mut c_void,
             ];
-            b.set(d, 1000, TYPE_I64, &UIDS)?;
-            b.set(d, 1001, TYPE_POINTER, &pointers)?;
+            if causal {
+                let mut causal_pointers = pointers[..5].to_vec();
+                causal_pointers.push(std::ptr::from_ref(&causal::MASKED_VALUE).cast_mut().cast());
+                b.set(d, 1000, TYPE_I64, &[1_i64, 2, 3, 4, 5, 8])?;
+                b.set(d, 1001, TYPE_POINTER, &causal_pointers)?;
+            } else {
+                b.set(d, 1000, TYPE_I64, &UIDS)?;
+                b.set(d, 1001, TYPE_POINTER, &pointers)?;
+            }
             b.set(d, 1003, TYPE_POINTER, &[v.workspace as *mut c_void])?;
             b.finish(d)?;
             Ok(d)

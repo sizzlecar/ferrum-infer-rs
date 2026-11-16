@@ -68,6 +68,22 @@ fn component_policy_is_fixed_tensor_and_validates_its_finite_capacity() {
     let wire = serde_json::to_value(&policy).unwrap();
     let restored: TensorComponentPolicy = serde_json::from_value(wire.clone()).unwrap();
     assert_eq!(restored, policy);
+    let serial = policy
+        .clone()
+        .with_execution_order(PlanExecutionOrder::Serial);
+    assert_ne!(
+        canonical_runtime_policy_fingerprint(&policy).unwrap(),
+        canonical_runtime_policy_fingerprint(&serial).unwrap()
+    );
+    let restored: TensorComponentPolicy =
+        serde_json::from_value(serde_json::to_value(&serial).unwrap()).unwrap();
+    assert_eq!(restored.execution_order(), PlanExecutionOrder::Serial);
+    let mut legacy = wire.clone();
+    legacy.as_object_mut().unwrap().remove("execution_order");
+    assert_eq!(
+        serde_json::from_value::<TensorComponentPolicy>(legacy).unwrap(),
+        policy
+    );
     let mut bad = wire;
     bad["capacity_bytes"] = serde_json::json!(0);
     assert!(serde_json::from_value::<TensorComponentPolicy>(bad.clone()).is_err());

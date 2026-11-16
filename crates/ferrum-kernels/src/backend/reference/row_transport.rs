@@ -8,18 +8,28 @@ use super::runtime::{
     ReferenceDeviceBuffer, ReferenceDeviceCommand, ReferenceDeviceRuntime,
     ReferenceDeviceRuntimeError, ReferenceRowGatherLaunch,
 };
+use super::runtime::{ReferenceRowIndexGatherLaunch, ReferenceRowWriteLaunch};
 use ferrum_runtime::{
     batched_row_concat_bf16_contract, row_gather_bf16_contract, AttributeId,
     BatchedOperationInvocation, BatchedRowConcatBf16Geometry, CapabilityId, ContractVersion,
     DeviceRuntime, ElementType, EncodedDeviceOperation, ExecutionIdentityEnvelope,
-    NodeWorkContract, OperationContract, OperationFailure, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, PhysicalWeightLayout, ProfilePhase, ProviderExecutionSemantics,
-    ProviderId, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    LeadingBatchBf16Geometry, LeadingBatchBf16Kind, NodeWorkContract, OperationContract,
+    OperationFailure, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightLayout,
+    ProfilePhase, ProviderExecutionSemantics, ProviderId, ResolvedTensorLayout, ResolvedTensorSpec,
+    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
     ReusableExecutionTopologyRequest, RowGatherBf16Geometry, SemanticValue,
     TensorOperationInvocation, VNextError, WeightFormatId, BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID,
     BATCHED_ROW_CONCAT_BF16_OPERATION_ID, ROW_GATHER_BF16_CAPABILITY_ID,
     ROW_GATHER_BF16_OPERATION_ID,
+};
+use ferrum_runtime::{
+    row_index_gather_or_zero_bf16_contract, RowIndexGatherBf16Geometry,
+    ROW_INDEX_GATHER_OR_ZERO_BF16_CAPABILITY_ID, ROW_INDEX_GATHER_OR_ZERO_BF16_OPERATION_ID,
+};
+use ferrum_runtime::{
+    row_write_bf16_contract, RowWriteBf16Geometry, ROW_WRITE_BF16_CAPABILITY_ID,
+    ROW_WRITE_BF16_OPERATION_ID,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,19 +41,35 @@ pub const REFERENCE_BATCHED_ROW_CONCAT_BF16_NUMERICAL_PROFILE_ID: &str =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReferenceRowTransportKind {
     Gather,
+    RowWrite,
     Concat,
+    IndexGather,
+    MergeLeadingBatch,
+    SplitLeadingBatch,
+    MergeLeadingBatchView,
+    SplitLeadingBatchView,
 }
 impl ReferenceRowTransportKind {
     fn operation_id(self) -> &'static str {
         match self {
+            Self::MergeLeadingBatch => LeadingBatchBf16Kind::Merge.operation_id(),
+            Self::MergeLeadingBatchView => LeadingBatchBf16Kind::Merge.view_operation_id(),
+            Self::SplitLeadingBatch => LeadingBatchBf16Kind::Split.operation_id(),
+            Self::SplitLeadingBatchView => LeadingBatchBf16Kind::Split.view_operation_id(),
             Self::Gather => ROW_GATHER_BF16_OPERATION_ID,
+            Self::RowWrite => ROW_WRITE_BF16_OPERATION_ID,
             Self::Concat => BATCHED_ROW_CONCAT_BF16_OPERATION_ID,
+            Self::IndexGather => ROW_INDEX_GATHER_OR_ZERO_BF16_OPERATION_ID,
         }
     }
     fn input_count(self) -> u32 {
         match self {
-            Self::Gather => 1,
-            Self::Concat => 2,
+            Self::Gather
+            | Self::MergeLeadingBatch
+            | Self::SplitLeadingBatch
+            | Self::MergeLeadingBatchView
+            | Self::SplitLeadingBatchView => 1,
+            Self::Concat | Self::IndexGather | Self::RowWrite => 2,
         }
     }
 }
@@ -57,6 +83,48 @@ impl ReferenceRowTransportProvider {
         kind: ReferenceRowTransportKind,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
         let (contract, capability, provider, estimator, profile) = match kind {
+            ReferenceRowTransportKind::MergeLeadingBatch => (
+                LeadingBatchBf16Kind::Merge.contract(),
+                LeadingBatchBf16Kind::Merge.capability_id(),
+                "provider.reference.merge_leading_batch.bf16",
+                "resource-estimator.reference.merge_leading_batch.bf16",
+                "reference.bitcopy.merge_leading_batch.bf16.v1",
+            ),
+            ReferenceRowTransportKind::MergeLeadingBatchView => (
+                LeadingBatchBf16Kind::Merge.view_contract(),
+                LeadingBatchBf16Kind::Merge.view_capability_id(),
+                "provider.reference.view.merge_leading_batch.bf16",
+                "resource-estimator.reference.view.merge_leading_batch.bf16",
+                "reference.view.bitcopy.merge_leading_batch.bf16.v1",
+            ),
+            ReferenceRowTransportKind::SplitLeadingBatch => (
+                LeadingBatchBf16Kind::Split.contract(),
+                LeadingBatchBf16Kind::Split.capability_id(),
+                "provider.reference.split_leading_batch.bf16",
+                "resource-estimator.reference.split_leading_batch.bf16",
+                "reference.bitcopy.split_leading_batch.bf16.v1",
+            ),
+            ReferenceRowTransportKind::SplitLeadingBatchView => (
+                LeadingBatchBf16Kind::Split.view_contract(),
+                LeadingBatchBf16Kind::Split.view_capability_id(),
+                "provider.reference.view.split_leading_batch.bf16",
+                "resource-estimator.reference.view.split_leading_batch.bf16",
+                "reference.view.bitcopy.split_leading_batch.bf16.v1",
+            ),
+            ReferenceRowTransportKind::IndexGather => (
+                row_index_gather_or_zero_bf16_contract(),
+                ROW_INDEX_GATHER_OR_ZERO_BF16_CAPABILITY_ID,
+                "provider.reference.row_index_gather_or_zero.bf16",
+                "resource-estimator.reference.row_index_gather_or_zero.bf16",
+                "reference.bitcopy.row_index_gather_or_zero.bf16.i32.total.v1",
+            ),
+            ReferenceRowTransportKind::RowWrite => (
+                row_write_bf16_contract(),
+                ROW_WRITE_BF16_CAPABILITY_ID,
+                "provider.reference.row_write.bf16",
+                "resource-estimator.reference.row_write.bf16",
+                "reference.bitcopy.row_write.bf16.v1",
+            ),
             ReferenceRowTransportKind::Gather => (
                 row_gather_bf16_contract(),
                 ROW_GATHER_BF16_CAPABILITY_ID,
@@ -161,6 +229,15 @@ impl OperationProvider<ReferenceDeviceRuntime> for ReferenceRowTransportProvider
         invocation: TensorOperationInvocation<'_, ReferenceDeviceBuffer>,
     ) -> Result<Option<EncodedDeviceOperation<ReferenceDeviceCommand>>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
+        if matches!(
+            self.kind,
+            ReferenceRowTransportKind::MergeLeadingBatchView
+                | ReferenceRowTransportKind::SplitLeadingBatchView
+        ) {
+            return EncodedDeviceOperation::read_only_view(invocation.participants()[0].bindings())
+                .map(Some)
+                .map_err(|e| provider_failure(identity, e.to_string()));
+        }
         encode(self.kind, invocation)
             .map(EncodedDeviceOperation::compute)
             .map(Some)
@@ -168,6 +245,8 @@ impl OperationProvider<ReferenceDeviceRuntime> for ReferenceRowTransportProvider
     }
 }
 enum Geometry {
+    RowWrite(RowWriteBf16Geometry),
+    IndexGather(RowIndexGatherBf16Geometry),
     Gather(RowGatherBf16Geometry),
     Concat(BatchedRowConcatBf16Geometry),
 }
@@ -192,6 +271,86 @@ fn geometry(
     let input = binding(values, ResolvedValueRole::Input, 0)?.tensor();
     let output = binding(values, ResolvedValueRole::Output, 0)?.tensor();
     match kind {
+        ReferenceRowTransportKind::MergeLeadingBatch
+        | ReferenceRowTransportKind::SplitLeadingBatch
+        | ReferenceRowTransportKind::MergeLeadingBatchView
+        | ReferenceRowTransportKind::SplitLeadingBatchView => {
+            if !attributes.is_empty() {
+                return Err("leading batch copy has no attributes".into());
+            }
+            let direction = if matches!(
+                kind,
+                ReferenceRowTransportKind::MergeLeadingBatch
+                    | ReferenceRowTransportKind::MergeLeadingBatchView
+            ) {
+                LeadingBatchBf16Kind::Merge
+            } else {
+                LeadingBatchBf16Kind::Split
+            };
+            let g = LeadingBatchBf16Geometry::new(direction, input, output)
+                .map_err(|e| e.to_string())?;
+            // After proving the public rank-changing contract, lower the byte
+            // transport to the existing identity row-copy implementation.
+            // No model tensor is relabeled and no storage view escapes.
+            let flat = ResolvedTensorSpec::new(
+                vec![g.flat_rows(), g.columns()],
+                ElementType::Bf16,
+                ResolvedTensorLayout::Contiguous,
+            )
+            .map_err(|e| e.to_string())?;
+            let a = [
+                ("batch", SemanticValue::Unsigned(1)),
+                ("column_start", SemanticValue::Unsigned(0)),
+                ("column_count", SemanticValue::Unsigned(g.columns())),
+                (
+                    "run_lengths",
+                    SemanticValue::Integers(vec![g.flat_rows() as i64]),
+                ),
+                ("source_starts", SemanticValue::Integers(vec![0])),
+                ("source_batch_strides", SemanticValue::Integers(vec![0])),
+                ("source_row_strides", SemanticValue::Integers(vec![1])),
+            ]
+            .into_iter()
+            .map(|(k, v)| Ok((AttributeId::new(k).map_err(|e| e.to_string())?, v)))
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+            RowGatherBf16Geometry::new(&flat, &flat, &a)
+                .map(Geometry::Gather)
+                .map_err(|e| e.to_string())
+        }
+        ReferenceRowTransportKind::IndexGather => {
+            if !attributes.is_empty() {
+                return Err("indexed gather has no attributes".into());
+            }
+            RowIndexGatherBf16Geometry::new(
+                input,
+                binding(values, ResolvedValueRole::Input, 1)?.tensor(),
+                output,
+            )
+            .map(Geometry::IndexGather)
+            .map_err(|e| e.to_string())
+        }
+        ReferenceRowTransportKind::RowWrite => {
+            row_write_bf16_contract()
+                .map_err(|e| e.to_string())?
+                .descriptor()
+                .validate_attributes(attributes)
+                .map_err(|e| e.to_string())?;
+            let Some(SemanticValue::Unsigned(start)) = attributes
+                .iter()
+                .find(|(k, _)| k.as_str() == "row_start")
+                .map(|(_, v)| v)
+            else {
+                return Err("row write requires row_start".into());
+            };
+            RowWriteBf16Geometry::new(
+                input,
+                binding(values, ResolvedValueRole::Input, 1)?.tensor(),
+                output,
+                *start,
+            )
+            .map(Geometry::RowWrite)
+            .map_err(|e| e.to_string())
+        }
         ReferenceRowTransportKind::Gather => {
             let g =
                 RowGatherBf16Geometry::new(input, output, attributes).map_err(|e| e.to_string())?;
@@ -245,6 +404,26 @@ fn encode(
         )
     };
     match g {
+        Geometry::RowWrite(geometry) => {
+            ReferenceDeviceCommand::row_write_tensor(ReferenceRowWriteLaunch {
+                base: region(ResolvedValueRole::Input, 0)?,
+                updates: region(ResolvedValueRole::Input, 1)?,
+                output: region(ResolvedValueRole::Output, 0)?,
+                geometry,
+            })
+        }
+        Geometry::IndexGather(geometry) => {
+            ReferenceDeviceCommand::row_index_gather_tensor(ReferenceRowIndexGatherLaunch {
+                source: region(ResolvedValueRole::Input, 0)?,
+                indices: contiguous_region(
+                    participant,
+                    binding(participant.bindings(), ResolvedValueRole::Input, 1)?,
+                    ElementType::I32,
+                )?,
+                output: region(ResolvedValueRole::Output, 0)?,
+                geometry,
+            })
+        }
         Geometry::Gather(geometry) => {
             ReferenceDeviceCommand::row_gather_tensor(ReferenceRowGatherLaunch {
                 source: region(ResolvedValueRole::Input, 0)?,

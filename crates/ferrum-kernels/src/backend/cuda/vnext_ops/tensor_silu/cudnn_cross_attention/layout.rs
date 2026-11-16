@@ -25,6 +25,34 @@ pub(super) struct Schedule {
     pub stages: Vec<Stage>,
 }
 impl Schedule {
+    /// Admission and encoding use the same layout for the selected data path.
+    /// Direct K/V consumes only sequence lengths and the vendor workspace.
+    pub fn scratch(&self, stage: Stage, workspace_bytes: u64) -> Result<ScratchLayout, String> {
+        match stage.method {
+            Method::Sdpa {
+                direct_kv: true, ..
+            } => ScratchLayout::without_payload(stage.batches, workspace_bytes),
+            Method::Sdpa {
+                packed_rows,
+                direct_kv: false,
+            } => ScratchLayout::new(
+                stage.batches,
+                packed_rows,
+                self.geometry.columns(),
+                workspace_bytes,
+            ),
+            Method::Empty => Err("empty cross stage has no native scratch".into()),
+        }
+    }
+
+    pub fn key_value_byte_offset(&self, stage: Stage) -> Result<u64, String> {
+        u64::from(stage.first_batch)
+            .checked_mul(self.geometry.key_value_length())
+            .and_then(|n| n.checked_mul(self.geometry.columns()))
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| "cross K/V offset overflows".into())
+    }
+
     pub fn new(geometry: CrossAttentionBf16Geometry) -> Result<Self, String> {
         if !matches!(geometry.head_dim(), 72 | 128)
             || geometry.query_length() > i32::MAX as u64
@@ -113,6 +141,8 @@ impl Schedule {
         Ok(CudnnSdpaSignature {
             batch: i64::from(stage.batches),
             heads: checked(g.heads())?,
+            key_value_heads: checked(g.heads())?,
+            causal: false,
             query_length: i64::from(stage.query_count),
             key_value_length: i64::from(packed_rows),
             head_dim: checked(g.head_dim())?,

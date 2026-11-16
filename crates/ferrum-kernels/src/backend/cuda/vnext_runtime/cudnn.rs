@@ -19,10 +19,13 @@ use sha2::{Digest, Sha256};
 
 use super::{CudaDeviceRuntime, CudaDeviceRuntimeError};
 
+mod convolution_dimensions;
 mod convolution_scalar;
 mod dependencies;
 mod ffi;
 mod sdpa;
+pub(crate) use convolution_dimensions::ConvolutionDimensions;
+pub(crate) use convolution_dimensions::CudnnConv3dDescriptor;
 pub(crate) use convolution_scalar::CudnnConvScalar;
 use ffi::{check, Api, Descriptor, ForwardPerformance, Handle};
 pub use sdpa::CudnnSdpaPlanPolicy;
@@ -84,6 +87,26 @@ pub(crate) struct CudnnConv2dDescriptor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConvolutionDirection {
+    Forward,
+    BackwardData,
+}
+impl ConvolutionDirection {
+    fn algorithms(self) -> usize {
+        match self {
+            Self::Forward => ffi::ALGORITHMS,
+            Self::BackwardData => ffi::BACKWARD_DATA_ALGORITHMS,
+        }
+    }
+    fn tag(self) -> u8 {
+        match self {
+            Self::Forward => 0,
+            Self::BackwardData => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ConvolutionAlgorithm {
     algo: i32,
     math_type: i32,
@@ -94,7 +117,15 @@ impl ConvolutionAlgorithm {
         self.validate_for(cap, CudnnConvScalar::Bf16)
     }
     fn validate_for(self, cap: usize, scalar: CudnnConvScalar) -> Result<(), String> {
-        if !(0..ffi::ALGORITHMS as i32).contains(&self.algo)
+        self.validate_direction(cap, scalar, ConvolutionDirection::Forward)
+    }
+    fn validate_direction(
+        self,
+        cap: usize,
+        scalar: CudnnConvScalar,
+        direction: ConvolutionDirection,
+    ) -> Result<(), String> {
+        if !(0..direction.algorithms() as i32).contains(&self.algo)
             || !scalar.permits_math(self.math_type)
             || self.required_bytes > cap
         {
@@ -119,7 +150,8 @@ impl ConvolutionAlgorithm {
 /// There is no separate convolution cache or limit on retained shape records.
 pub(crate) struct PreparedConv {
     owner: Arc<CudaCudnnOwner>,
-    shape: CudnnConv2dDescriptor,
+    shape: ConvolutionDimensions,
+    direction: ConvolutionDirection,
     selected: ConvolutionAlgorithm,
     fingerprint: String,
 }
@@ -136,17 +168,50 @@ impl PreparedConv {
     pub(crate) fn validate_invocation(
         &self,
         owner: &Arc<CudaCudnnOwner>,
+        shape: impl Into<ConvolutionDimensions>,
+        fingerprint: Option<&str>,
+    ) -> Result<(), String> {
+        self.validate_direction_invocation(
+            owner,
+            shape.into(),
+            fingerprint,
+            ConvolutionDirection::Forward,
+        )
+    }
+
+    pub(crate) fn validate_transposed_invocation(
+        &self,
+        owner: &Arc<CudaCudnnOwner>,
         shape: CudnnConv2dDescriptor,
         fingerprint: Option<&str>,
     ) -> Result<(), String> {
-        if !Arc::ptr_eq(&self.owner, owner)
+        self.validate_direction_invocation(
+            owner,
+            shape.into(),
+            fingerprint,
+            ConvolutionDirection::BackwardData,
+        )
+    }
+
+    fn validate_direction_invocation(
+        &self,
+        owner: &Arc<CudaCudnnOwner>,
+        shape: ConvolutionDimensions,
+        fingerprint: Option<&str>,
+        direction: ConvolutionDirection,
+    ) -> Result<(), String> {
+        if self.direction != direction
+            || !Arc::ptr_eq(&self.owner, owner)
             || self.shape != shape
             || fingerprint != Some(self.fingerprint())
         {
             return Err("cuDNN convolution owner/shape/prepared identity mismatch".into());
         }
-        self.selected
-            .validate_for(self.owner.workspace_limit_bytes as usize, self.shape.scalar)
+        self.selected.validate_direction(
+            self.owner.workspace_limit_bytes as usize,
+            self.shape.scalar(),
+            direction,
+        )
     }
 
     /// Submission only consumes the admitted selection; it never queries an
@@ -160,8 +225,61 @@ impl PreparedConv {
         workspace: u64,
         workspace_bytes: u64,
     ) -> Result<(), CudaDeviceRuntimeError> {
+        self.execute_convolution(
+            ConvolutionDirection::Forward,
+            stream,
+            input,
+            filter,
+            output,
+            workspace,
+            workspace_bytes,
+        )
+    }
+
+    /// The descriptor is the ordinary convolution's dual: shape.input is dx
+    /// (the transposed output), shape.output is dy (the transposed input), and
+    /// the filter is IOHW. The argument order remains logical input/filter/output.
+    pub(crate) fn transposed_convolution(
+        &self,
+        stream: &CudaStream,
+        input_dy: u64,
+        filter: u64,
+        output_dx: u64,
+        workspace: u64,
+        workspace_bytes: u64,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        self.execute_convolution(
+            ConvolutionDirection::BackwardData,
+            stream,
+            input_dy,
+            filter,
+            output_dx,
+            workspace,
+            workspace_bytes,
+        )
+    }
+
+    fn execute_convolution(
+        &self,
+        direction: ConvolutionDirection,
+        stream: &CudaStream,
+        input: u64,
+        filter: u64,
+        output: u64,
+        workspace: u64,
+        workspace_bytes: u64,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        if self.direction != direction {
+            return Err(CudaDeviceRuntimeError::contract(
+                "cuDNN convolution direction differs from prepared selection",
+            ));
+        }
         self.selected
-            .validate_for(self.owner.workspace_limit_bytes as usize, self.shape.scalar)
+            .validate_direction(
+                self.owner.workspace_limit_bytes as usize,
+                self.shape.scalar(),
+                direction,
+            )
             .map_err(CudaDeviceRuntimeError::contract)?;
         self.selected
             .validate_workspace(workspace, workspace_bytes)
@@ -186,6 +304,7 @@ impl PreparedConv {
         unsafe {
             native.convolution(
                 stream,
+                direction,
                 self.shape,
                 self.selected,
                 input,
@@ -229,9 +348,24 @@ fn prepare_convolution_selection_for(
     scalar: CudnnConvScalar,
     query: impl FnOnce() -> Result<Option<ConvolutionAlgorithm>, String>,
 ) -> Result<ConvolutionAlgorithm, String> {
+    prepare_convolution_selection_direction(
+        failed,
+        workspace_cap,
+        scalar,
+        ConvolutionDirection::Forward,
+        query,
+    )
+}
+fn prepare_convolution_selection_direction(
+    failed: &mut bool,
+    workspace_cap: usize,
+    scalar: CudnnConvScalar,
+    direction: ConvolutionDirection,
+    query: impl FnOnce() -> Result<Option<ConvolutionAlgorithm>, String>,
+) -> Result<ConvolutionAlgorithm, String> {
     let selected = guarded_convolution(failed, query)?
         .ok_or("no deterministic cuDNN convolution fits configured workspace policy")?;
-    selected.validate_for(workspace_cap, scalar)?;
+    selected.validate_direction(workspace_cap, scalar, direction)?;
     Ok(selected)
 }
 
@@ -358,6 +492,7 @@ impl CudaCudnnOwner {
         digest.update(include_bytes!("cudnn/dependencies/linux.rs"));
         digest.update(include_bytes!("cudnn/sdpa.rs"));
         digest.update(include_bytes!("cudnn/sdpa/native.rs"));
+        digest.update(include_bytes!("cudnn/sdpa/native/causal.rs"));
         Ok(Arc::new(Self {
             inner: Mutex::new(Some(native)),
             fingerprint: format!("{:x}", digest.finalize()),
@@ -377,8 +512,28 @@ impl CudaCudnnOwner {
     /// is allocated here, and the selection is not reconstructed during encode.
     pub(crate) fn prepare_convolution(
         self: &Arc<Self>,
+        shape: impl Into<ConvolutionDimensions>,
+    ) -> Result<Arc<PreparedConv>, CudaDeviceRuntimeError> {
+        self.prepare_convolution_direction(shape.into(), ConvolutionDirection::Forward)
+    }
+
+    /// Prepare backward-data as a transposed convolution using the same native
+    /// descriptors and owner. The provider supplies the checked dual geometry.
+    pub(crate) fn prepare_transposed_convolution(
+        self: &Arc<Self>,
         shape: CudnnConv2dDescriptor,
     ) -> Result<Arc<PreparedConv>, CudaDeviceRuntimeError> {
+        self.prepare_convolution_direction(shape.into(), ConvolutionDirection::BackwardData)
+    }
+
+    fn prepare_convolution_direction(
+        self: &Arc<Self>,
+        shape: ConvolutionDimensions,
+        direction: ConvolutionDirection,
+    ) -> Result<Arc<PreparedConv>, CudaDeviceRuntimeError> {
+        if let ConvolutionDimensions::Spatial3(s) = shape {
+            s.validate().map_err(CudaDeviceRuntimeError::contract)?;
+        }
         let mut guard = self
             .inner
             .lock()
@@ -395,18 +550,21 @@ impl CudaCudnnOwner {
             .context
             .bind_to_thread()
             .map_err(|e| CudaDeviceRuntimeError::driver("cuDNN preparation context bind", e))?;
-        let selected =
-            unsafe { native.prepare_convolution(shape, self.workspace_limit_bytes() as usize) }
-                .map_err(CudaDeviceRuntimeError::contract)?;
+        let selected = unsafe {
+            native.prepare_convolution(shape, direction, self.workspace_limit_bytes() as usize)
+        }
+        .map_err(CudaDeviceRuntimeError::contract)?;
         Ok(Arc::new(PreparedConv {
             owner: Arc::clone(self),
             shape,
+            direction,
             selected,
-            fingerprint: convolution_fingerprint(
+            fingerprint: convolution_direction_fingerprint(
                 self.fingerprint(),
                 shape,
                 self.workspace_limit_bytes(),
                 selected,
+                direction,
             ),
         }))
     }
@@ -421,7 +579,11 @@ struct ConvolutionDescriptors {
 }
 
 impl ConvolutionDescriptors {
-    unsafe fn configure(self, a: &Api, s: CudnnConv2dDescriptor) -> Result<(), String> {
+    unsafe fn configure(self, a: &Api, shape: ConvolutionDimensions) -> Result<(), String> {
+        let s = match shape {
+            ConvolutionDimensions::Spatial2(s) => s,
+            ConvolutionDimensions::Spatial3(s) => return self.configure3d(a, s),
+        };
         check(
             (a.set_tensor)(
                 self.input,
@@ -488,17 +650,19 @@ impl NativeOwner {
 
     unsafe fn prepare_convolution(
         &mut self,
-        shape: CudnnConv2dDescriptor,
+        shape: ConvolutionDimensions,
+        direction: ConvolutionDirection,
         workspace_cap: usize,
     ) -> Result<ConvolutionAlgorithm, String> {
         let d = self.convolution_descriptors();
         let a = &self.api;
         let handle = self.handle;
         let started = Instant::now();
-        let selected = prepare_convolution_selection_for(
+        let selected = prepare_convolution_selection_direction(
             &mut self.failed,
             workspace_cap,
-            shape.scalar,
+            shape.scalar(),
+            direction,
             || unsafe {
                 check(
                     (a.set_stream)(handle, std::ptr::null_mut()),
@@ -506,19 +670,31 @@ impl NativeOwner {
                 )?;
                 d.configure(a, shape)?;
                 check(
-                    (a.set_math)(d.convolution, shape.scalar.requested_math()),
+                    (a.set_math)(d.convolution, shape.scalar().requested_math()),
                     "set math policy",
                 )?;
                 let mut candidates = [ForwardPerformance::default(); ffi::ALGORITHMS];
                 let mut count = 0;
-                check(
-                    (a.algorithms)(
-                        handle,
-                        d.input,
+                let (query, workspace_query, first, second, result) = match direction {
+                    ConvolutionDirection::Forward => {
+                        (a.algorithms, a.workspace, d.input, d.filter, d.output)
+                    }
+                    ConvolutionDirection::BackwardData => (
+                        a.backward_algorithms,
+                        a.backward_workspace,
                         d.filter,
-                        d.convolution,
                         d.output,
-                        ffi::ALGORITHMS as i32,
+                        d.input,
+                    ),
+                };
+                check(
+                    query(
+                        handle,
+                        first,
+                        second,
+                        d.convolution,
+                        result,
+                        direction.algorithms() as i32,
                         &mut count,
                         candidates.as_mut_ptr(),
                     ),
@@ -526,11 +702,14 @@ impl NativeOwner {
                 )?;
                 let count = usize::try_from(count)
                     .ok()
-                    .filter(|&n| n > 0 && n <= candidates.len())
+                    .filter(|&n| n > 0 && n <= direction.algorithms())
                     .ok_or("cuDNN returned an invalid algorithm count")?;
-                let Some(candidate) =
-                    choose_algorithm_for(&candidates[..count], workspace_cap, shape.scalar)
-                else {
+                let Some(candidate) = choose_algorithm_direction(
+                    &candidates[..count],
+                    workspace_cap,
+                    shape.scalar(),
+                    direction,
+                ) else {
                     return Ok(None);
                 };
                 check(
@@ -539,12 +718,12 @@ impl NativeOwner {
                 )?;
                 let mut required = 0;
                 check(
-                    (a.workspace)(
+                    workspace_query(
                         handle,
-                        d.input,
-                        d.filter,
+                        first,
+                        second,
                         d.convolution,
-                        d.output,
+                        result,
                         candidate.algo,
                         &mut required,
                     ),
@@ -559,6 +738,7 @@ impl NativeOwner {
         )?;
         tracing::debug!(
             shape = ?shape,
+            direction = ?direction,
             workspace_cap_bytes = workspace_cap,
             algorithm = selected.algo,
             math_type = selected.math_type,
@@ -572,7 +752,8 @@ impl NativeOwner {
     unsafe fn convolution(
         &mut self,
         stream: &CudaStream,
-        shape: CudnnConv2dDescriptor,
+        direction: ConvolutionDirection,
+        shape: ConvolutionDimensions,
         selected: ConvolutionAlgorithm,
         input: u64,
         filter: u64,
@@ -594,23 +775,34 @@ impl NativeOwner {
             )?;
             let alpha = 1.0_f32;
             let beta = 0.0_f32;
+            let (execute, first, first_data, second, second_data, result) = match direction {
+                ConvolutionDirection::Forward => {
+                    (a.forward, d.input, input, d.filter, filter, d.output)
+                }
+                ConvolutionDirection::BackwardData => {
+                    (a.backward_data, d.filter, filter, d.output, input, d.input)
+                }
+            };
             check(
-                (a.forward)(
+                execute(
                     handle,
                     (&alpha as *const f32).cast(),
-                    d.input,
-                    input as *const c_void,
-                    d.filter,
-                    filter as *const c_void,
+                    first,
+                    first_data as *const c_void,
+                    second,
+                    second_data as *const c_void,
                     d.convolution,
                     selected.algo,
                     workspace as *mut c_void,
                     selected.required_bytes,
                     (&beta as *const f32).cast(),
-                    d.output,
+                    result,
                     output as *mut c_void,
                 ),
-                "convolution forward",
+                match direction {
+                    ConvolutionDirection::Forward => "convolution forward",
+                    ConvolutionDirection::BackwardData => "convolution backward data",
+                },
             )?;
             check((a.set_stream)(handle, std::ptr::null_mut()), "clear stream")
         })
@@ -664,11 +856,19 @@ fn choose_algorithm_for(
     cap: usize,
     scalar: CudnnConvScalar,
 ) -> Option<ForwardPerformance> {
+    choose_algorithm_direction(candidates, cap, scalar, ConvolutionDirection::Forward)
+}
+fn choose_algorithm_direction(
+    candidates: &[ForwardPerformance],
+    cap: usize,
+    scalar: CudnnConvScalar,
+    direction: ConvolutionDirection,
+) -> Option<ForwardPerformance> {
     candidates.iter().copied().find(|c| {
         c.status == ffi::SUCCESS
             && c.determinism == ffi::DETERMINISTIC
             && c.memory <= cap
-            && (0..ffi::ALGORITHMS as i32).contains(&c.algo)
+            && (0..direction.algorithms() as i32).contains(&c.algo)
             && scalar.permits_math(c.math_type)
     })
 }
@@ -679,8 +879,30 @@ fn convolution_fingerprint(
     workspace_cap: u64,
     selected: ConvolutionAlgorithm,
 ) -> String {
+    convolution_direction_fingerprint(
+        owner,
+        shape,
+        workspace_cap,
+        selected,
+        ConvolutionDirection::Forward,
+    )
+}
+fn convolution_direction_fingerprint(
+    owner: &str,
+    shape: impl Into<ConvolutionDimensions>,
+    workspace_cap: u64,
+    selected: ConvolutionAlgorithm,
+    direction: ConvolutionDirection,
+) -> String {
+    let shape = match shape.into() {
+        ConvolutionDimensions::Spatial2(s) => s,
+        ConvolutionDimensions::Spatial3(s) => {
+            return s.fingerprint(owner, workspace_cap, selected, direction)
+        }
+    };
     let mut digest = Sha256::new();
-    digest.update(b"cuda.cudnn.conv2d.prepared-actual-workspace.v1");
+    digest.update(b"cuda.cudnn.conv2d.prepared-direction-actual-workspace.v2");
+    digest.update([direction.tag()]);
     digest.update(owner.as_bytes());
     digest.update([shape.scalar.tag()]);
     for dimensions in [shape.input, shape.filter, shape.output] {

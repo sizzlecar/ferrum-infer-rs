@@ -99,16 +99,39 @@ impl ManagedHostTensor {
         tensor: ResolvedTensorSpec,
         bytes: ManagedHostBytes,
     ) -> Result<Self, VNextError> {
+        Self::with_storage_class(value_id, tensor, bytes, HostMemoryClass::InputPreprocess)
+    }
+
+    /// Read immutable output backing as the next component's input without
+    /// copying or reclassifying its allocation. Slices retain the entire
+    /// original Output charge and refund route until the last owner drops.
+    ///
+    /// This is a data view, not proof of producer execution or device admission.
+    /// The ordinary root binding still checks exact ports and Host ownership.
+    pub fn from_retained_output(
+        value_id: ProgramValueId,
+        tensor: ResolvedTensorSpec,
+        bytes: ManagedHostBytes,
+    ) -> Result<Self, VNextError> {
+        Self::with_storage_class(value_id, tensor, bytes, HostMemoryClass::Output)
+    }
+
+    fn with_storage_class(
+        value_id: ProgramValueId,
+        tensor: ResolvedTensorSpec,
+        bytes: ManagedHostBytes,
+        class: HostMemoryClass,
+    ) -> Result<Self, VNextError> {
         if tensor.layout() != &ResolvedTensorLayout::Contiguous
             || tensor.minimum_storage_bytes()?
                 != u64::try_from(bytes.len())
                     .map_err(|_| invalid_plan("host tensor byte length exceeds u64"))?
             || bytes.is_empty()
-            || bytes.class() != HostMemoryClass::InputPreprocess
+            || bytes.class() != class
         {
-            return Err(invalid_plan(
-                "tensor input requires an exact nonempty contiguous InputPreprocess allocation",
-            ));
+            return Err(invalid_plan(format!(
+                "tensor input requires an exact nonempty contiguous {class:?} allocation"
+            )));
         }
         Ok(Self {
             value_id,
@@ -126,6 +149,10 @@ impl ManagedHostTensor {
         &self.bytes
     }
 }
+
+#[cfg(test)]
+#[path = "retained_host_tensor_tests.rs"]
+mod retained_host_tensor_tests;
 
 /// Core-created proof of real owned inputs and planned outputs for one live
 /// root. The root guard and input allocations live at least as long as work.

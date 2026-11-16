@@ -3,6 +3,22 @@ use super::*;
 use crate::ResolvedTensorSpec;
 pub const ADDCMUL_BF16_OPERATION_ID: &str = "operation.addcmul.bf16";
 pub const ADDCMUL_BF16_CAPABILITY_ID: &str = "capability.operation.addcmul.bf16";
+pub const ADDCMUL_FMA_BF16_OPERATION_ID: &str = "operation.addcmul_fma.bf16";
+pub const ADDCMUL_FMA_BF16_CAPABILITY_ID: &str = "capability.operation.addcmul_fma.bf16";
+
+/// X/G/U -> Y=B(fma_rn(decode(G),decode(U),decode(X))), with one F32
+/// fused multiply-add and one BF16 RNE conversion. Gradual underflow and signed
+/// zeros are preserved; NaN payloads are unspecified. No clamp or gate
+/// activation, intermediate product rounding, reassociation or implicit alias.
+/// Shapes and explicit G broadcasting match [`addcmul_bf16_contract`].
+pub fn addcmul_fma_bf16_contract() -> Result<StandardOperationContract, VNextError> {
+    let mut descriptor = addcmul_bf16_contract()?.descriptor;
+    descriptor.id = OperationId::new(ADDCMUL_FMA_BF16_OPERATION_ID)?;
+    descriptor.provider =
+        provider_requirement(ADDCMUL_FMA_BF16_CAPABILITY_ID, ContractVersion::new(1, 0))?;
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
 /// Inputs are residual X, multiplier G, update U; Y=B(RN32(X+RN32(G*U))).
 /// Only the final conversion rounds to BF16. This is fixed-alpha-one addcmul,
 /// not the existing gated residual's B(X+B(G*U)); no gate activation is applied.
@@ -101,6 +117,23 @@ mod tests {
         assert_ne!(
             addcmul_bf16_contract().unwrap().descriptor.id,
             gated_residual_bf16_contract().unwrap().descriptor.id
+        );
+    }
+
+    #[test]
+    fn fused_f32_arithmetic_preserves_underflow_sign_and_avoids_intermediate_overflow() {
+        // All operands are exactly representable BF16. A separately rounded
+        // F32 product loses its sign when added to +0; fused arithmetic does not.
+        let tiny = f32::from_bits(0x0001_0000);
+        let product = -tiny * tiny;
+        assert_eq!((0.0f32 + product).to_bits(), 0.0f32.to_bits());
+        assert_eq!((-tiny).mul_add(tiny, 0.0).to_bits(), (-0.0f32).to_bits());
+        let largest = f32::from_bits(0x7f7f_0000);
+        assert!((largest * 2.0 - largest).is_infinite());
+        assert_eq!(largest.mul_add(2.0, -largest), largest);
+        assert_ne!(
+            addcmul_fma_bf16_contract().unwrap().descriptor.id,
+            addcmul_bf16_contract().unwrap().descriptor.id
         );
     }
 }

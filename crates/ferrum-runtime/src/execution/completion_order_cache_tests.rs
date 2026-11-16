@@ -31,6 +31,17 @@ fn compare_all_queries(nodes: &[PlanNode]) {
             );
         }
     }
+    // Offline placement reverses the query orientation. The descendant cache
+    // must agree with ancestor DFS, including cycles and missing-node errors.
+    for predecessor in ids.iter().chain(ids.iter().rev()) {
+        for successor in ids.iter().chain(ids.iter().rev()) {
+            assert_eq!(
+                query_result(cache.precedes(predecessor, successor)),
+                query_result(node_completion_precedes(&by_id, predecessor, successor)),
+                "{predecessor} -> {successor}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -101,7 +112,7 @@ fn cached_completion_order_preserves_distinct_missing_ids_and_duplicate_edges() 
 }
 
 #[test]
-fn repeated_predecessors_share_one_traversal_and_cache_retains_only_current_successor() {
+fn dependency_chain_queries_need_no_transitive_graph_traversal() {
     let nodes = (0..64)
         .map(|index| {
             let name = format!("node/{index}");
@@ -119,13 +130,37 @@ fn repeated_predecessors_share_one_traversal_and_cache_retains_only_current_succ
     for node in &nodes[..nodes.len() - 1] {
         assert!(cache.precedes(&node.id, last).unwrap());
     }
-    assert_eq!(cache.traversal_count(), 1);
-    assert_eq!(cache.retained_ancestor_count(), nodes.len() - 1);
+    assert_eq!(cache.traversal_count(), 0);
+    assert_eq!(cache.retained_ancestor_count(), 0);
     assert!(!cache.precedes(last, &nodes[0].id).unwrap());
     assert_eq!(cache.retained_ancestor_count(), 0);
-    assert_eq!(cache.traversal_count(), 2);
+    assert_eq!(cache.traversal_count(), 0);
     assert!(cache.precedes(&nodes[0].id, last).unwrap());
-    assert_eq!(cache.traversal_count(), 3);
+    assert_eq!(cache.traversal_count(), 0);
+}
+
+#[test]
+fn indexed_completion_order_matches_independent_dfs_for_every_small_forward_dag() {
+    // Names deliberately do not follow dependency order. Enumerate every
+    // forward-edge subset, including disconnected graphs and merging paths.
+    let names = ["node/z", "node/a", "node/5", "node/c", "node/0"];
+    let edges = (0..names.len())
+        .flat_map(|to| (0..to).map(move |from| (from, to)))
+        .collect::<Vec<_>>();
+    for mask in 0..(1_usize << edges.len()) {
+        let mut nodes = names
+            .iter()
+            .map(|name| plan_node(name, &[], &[]))
+            .collect::<Vec<_>>();
+        for (bit, &(from, to)) in edges.iter().enumerate() {
+            if mask & (1 << bit) != 0 {
+                nodes[to]
+                    .dependencies
+                    .push(NodeId::new(names[from]).unwrap());
+            }
+        }
+        compare_all_queries(&nodes);
+    }
 }
 
 fn descriptor(name: &str, fixed: bool) -> DynamicResourceDescriptor {

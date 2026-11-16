@@ -16,6 +16,14 @@ pub(crate) fn validate(capabilities: &BTreeSet<CapabilityId>) -> Result<(), Stri
         return Err("CUDA tensor eager capabilities must not be empty".into());
     }
     for capability in capabilities {
+        if [
+            ferrum_runtime::LeadingBatchBf16Kind::Merge.view_capability_id(),
+            ferrum_runtime::LeadingBatchBf16Kind::Split.view_capability_id(),
+        ]
+        .contains(&capability.as_str())
+        {
+            continue;
+        }
         if !matches!(
             capability.as_str(),
             ferrum_runtime::SILU_BF16_CAPABILITY_ID
@@ -24,9 +32,31 @@ pub(crate) fn validate(capabilities: &BTreeSet<CapabilityId>) -> Result<(), Stri
                 | ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID
                 | ferrum_runtime::DENSE_LINEAR_F32_CAPABILITY_ID
                 | ferrum_runtime::AFFINE_LINEAR_F32_CAPABILITY_ID
+                | ferrum_runtime::AFFINE_LINEAR_F32_TO_BF16_CAPABILITY_ID
                 | ferrum_runtime::CAST_F32_TO_BF16_CAPABILITY_ID
+                | ferrum_runtime::CAST_BF16_TO_F32_CAPABILITY_ID
+                | ferrum_runtime::BATCHED_MATMUL_F32_CAPABILITY_ID
+                | ferrum_runtime::SCALE_RANK4_F32_CAPABILITY_ID
+                | ferrum_runtime::ROW_SOFTMAX_RANK4_F32_CAPABILITY_ID
+                | ferrum_runtime::PACK_HEAD_AXIS_BF16_CAPABILITY_ID
+                | ferrum_runtime::PACK_HEAD_AXIS_F32_TO_BF16_CAPABILITY_ID
+                | ferrum_runtime::CHANNEL_BIAS_ADD_BF16_CAPABILITY_ID
+                | ferrum_runtime::ROW_CENTER_BF16_CAPABILITY_ID
+                | ferrum_runtime::HEAD_FP8_ROUNDTRIP_BF16_CAPABILITY_ID
+                | ferrum_runtime::INDEXED_HEAD_FP8_ROUNDTRIP_BF16_CAPABILITY_ID
+                | ferrum_runtime::MASKED_TILE_MEAN_BF16_F32_CAPABILITY_ID
+                | ferrum_runtime::FIR_RESAMPLE1D_F32_CAPABILITY_ID
+                | ferrum_runtime::SNAKE_BETA_LOG_NCHW_F32_CAPABILITY_ID
+                | ferrum_runtime::SNAKE_ALPHA_NCHW_F32_CAPABILITY_ID
+                | ferrum_runtime::CLAMP_RANK4_F32_CAPABILITY_ID
+                | ferrum_runtime::PACKED_SWIGLU_BF16_CAPABILITY_ID
+                | ferrum_runtime::HEAD_RMS_PARTIAL_ROPE_SINGLE_ROUND_BF16_CAPABILITY_ID
+                | ferrum_runtime::ROW_SELECTED_RMS_MODULATION_BF16_CAPABILITY_ID
+                | ferrum_runtime::ROW_SELECTED_RESIDUAL_RMS_MODULATION_BF16_CAPABILITY_ID
                 | ferrum_runtime::PLAIN_RESIDUAL_ADD_F32_CAPABILITY_ID
                 | ferrum_runtime::SILU_MUL_F32_CAPABILITY_ID
+                | ferrum_runtime::SILU_F32_CAPABILITY_ID
+                | ferrum_runtime::MULTIPLY_F32_CAPABILITY_ID
                 | ferrum_runtime::GELU_TANH_F32_CAPABILITY_ID
                 | ferrum_runtime::GELU_ERF_F32_CAPABILITY_ID
                 | ferrum_runtime::PATCH_PROJECTION_F32_CAPABILITY_ID
@@ -43,21 +73,39 @@ pub(crate) fn validate(capabilities: &BTreeSet<CapabilityId>) -> Result<(), Stri
                 | ferrum_runtime::HALF_SPLIT_ROPE_F32_CAPABILITY_ID
                 | ferrum_runtime::UNIT_HEAD_RMS_PARTIAL_ROPE_F32_CAPABILITY_ID
                 | ferrum_runtime::GROUPED_COLUMN_SLICE_F32_CAPABILITY_ID
+                | ferrum_runtime::GROUPED_COLUMN_MEAN_F32_CAPABILITY_ID
+                | ferrum_runtime::ADAPTIVE_AVG_POOL_ROWS_F32_CAPABILITY_ID
                 | ferrum_runtime::CHANNEL_BIAS_ADD_F32_CAPABILITY_ID
                 | ferrum_runtime::CHANNEL_SCALED_RESIDUAL_F32_CAPABILITY_ID
+                | ferrum_runtime::CHANNEL_SCALED_RESIDUAL_SEPARATE_F32_CAPABILITY_ID
                 | ferrum_runtime::NAN_TO_NUM_F32_CAPABILITY_ID
                 | ferrum_runtime::ROW_SELECTED_MODULATION_BF16_F32_CAPABILITY_ID
                 | ferrum_runtime::ROW_SELECTED_MODULATION_BF16_CAPABILITY_ID
                 | ferrum_runtime::ROW_SELECTED_ADDCMUL_BF16_CAPABILITY_ID
+                | ferrum_runtime::ROW_SELECTED_ADDCMUL_FMA_BF16_CAPABILITY_ID
                 | ferrum_runtime::BATCHED_SUFFIX_APPEND_F32_CAPABILITY_ID
                 | ferrum_runtime::LAYER_NORM_F32_CAPABILITY_ID
                 | ferrum_runtime::CONV2D_F32_CAPABILITY_ID
+                | ferrum_runtime::CONV3D_F32_CAPABILITY_ID
+                | ferrum_runtime::CONV_TRANSPOSE2D_F32_CAPABILITY_ID
                 | ferrum_runtime::GROUP_NORM_SILU_NCHW_F32_CAPABILITY_ID
+                | ferrum_runtime::FRAME_GROUP_NORM_SILU_NCTHW_F32_CAPABILITY_ID
                 | ferrum_runtime::PLAIN_RESIDUAL_ADD_NCHW_F32_CAPABILITY_ID
+                | ferrum_runtime::PLAIN_RESIDUAL_ADD_NCTHW_F32_CAPABILITY_ID
                 | ferrum_runtime::COMFY_CONVROT_SWIGLU_F32_W4A8_BF16_CAPABILITY_ID
                 | ferrum_runtime::COMFY_CONVROT_SWIGLU_F32_W8A8_BF16_CAPABILITY_ID
                 | ferrum_runtime::DENSE_LINEAR_BLOCK_BF16_CAPABILITY_ID
                 | ferrum_runtime::DENSE_LINEAR_FP8_BF16_CAPABILITY_ID
+                | ferrum_runtime::NVFP4_MATMUL_BF16_CAPABILITY_ID
+                | ferrum_runtime::NVFP4_QUANTIZE_BF16_CAPABILITY_ID
+                | crate::native_ops::cutlass_nvfp4::CAPABILITY_ID
+                | crate::native_ops::cutlass_nvfp4::QUANTIZE_CAPABILITY_ID
+                | ferrum_runtime::SPARSE_FP4_ATTENTION_CHECKED_HOST_CAPABILITY_ID
+                | crate::native_ops::sage_vsa_fp4::CAPABILITY_ID
+                | ferrum_runtime::SPARSE_FP4_ATTENTION_REGION_TOPK_CAPABILITY_ID
+                | ferrum_runtime::SPARSE_FP4_QKV_QUANTIZE_BF16_CAPABILITY_ID
+                | crate::native_ops::sage_vsa_fp4::QUANTIZE_CAPABILITY_ID
+                | crate::native_ops::sage_vsa_fp4::REGION_CAPABILITY_ID
                 | ferrum_runtime::DENSE_LINEAR_FP8_PAIR_BF16_CAPABILITY_ID
                 | ferrum_runtime::DENSE_LINEAR_FP8_TRIPLE_BF16_CAPABILITY_ID
                 | ferrum_runtime::SILU_MUL_BF16_CAPABILITY_ID
@@ -73,6 +121,10 @@ pub(crate) fn validate(capabilities: &BTreeSet<CapabilityId>) -> Result<(), Stri
                 | ferrum_runtime::ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID
                 | ferrum_runtime::GELU_TANH_BF16_CAPABILITY_ID
                 | ferrum_runtime::ROW_GATHER_BF16_CAPABILITY_ID
+                | ferrum_runtime::ROW_WRITE_BF16_CAPABILITY_ID
+                | ferrum_runtime::ROW_INDEX_GATHER_OR_ZERO_BF16_CAPABILITY_ID
+                | ferrum_runtime::MERGE_LEADING_BATCH_BF16_CAPABILITY_ID
+                | ferrum_runtime::SPLIT_LEADING_BATCH_BF16_CAPABILITY_ID
                 | ferrum_runtime::BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID
                 | ferrum_runtime::PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID
                 | ferrum_runtime::HALF_SPLIT_ROPE_BF16_CAPABILITY_ID
@@ -80,7 +132,9 @@ pub(crate) fn validate(capabilities: &BTreeSet<CapabilityId>) -> Result<(), Stri
                 | ferrum_runtime::FUSED_HEAD_RMS_PARTIAL_ROPE_BF16_CAPABILITY_ID
                 | ferrum_runtime::ROW_RMS_NORM_SINGLE_ROUND_BF16_CAPABILITY_ID
                 | ferrum_runtime::ADDCMUL_BF16_CAPABILITY_ID
+                | ferrum_runtime::ADDCMUL_FMA_BF16_CAPABILITY_ID
                 | ferrum_runtime::STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID
+                | ferrum_runtime::STRUCTURED_GQA_ATTENTION_FUSED_BF16_CAPABILITY_ID
                 | ferrum_runtime::STRUCTURED_GQA_ATTENTION_F32_CAPABILITY_ID
                 | ferrum_runtime::STRUCTURED_GQA_ATTENTION_FUSED_F32_CAPABILITY_ID
                 | ferrum_runtime::CONV2D_BF16_CAPABILITY_ID

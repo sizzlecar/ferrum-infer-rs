@@ -404,6 +404,48 @@ pub const CAUSAL_DECODE_KV_REUSE_CONFIG_KEY: &str = "FERRUM_CAUSAL_DECODE_KV_REU
 /// Provenance key for the explicit CLI/config Sequence reservation policy.
 pub const SEQUENCE_BACKING_GROWTH_CONFIG_KEY: &str = "FERRUM_SEQUENCE_BACKING_GROWTH";
 
+pub const RUNTIME_POOL_PREPARATION_CONFIG_KEY: &str = "FERRUM_RUNTIME_POOL_PREPARATION";
+
+/// Optional physical preparation before readiness. Logical admission limits,
+/// exact request claims and the pools' reclaim floors remain unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimePoolPreparation {
+    #[default]
+    OnDemand,
+    /// Prepare the compiled maximum workload if the whole target fits. Capacity
+    /// pressure before native allocation keeps ordinary on-demand operation.
+    WithinBudget,
+}
+
+impl RuntimePoolPreparation {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::OnDemand => "on-demand",
+            Self::WithinBudget => "within-budget",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "on-demand" => Ok(Self::OnDemand),
+            "within-budget" => Ok(Self::WithinBudget),
+            _ => Err(format!("expected on-demand or within-budget; got {raw:?}")),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select runtime pool preparation through CLI or config, not environment".into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SequenceBackingGrowth {
@@ -806,6 +848,8 @@ pub struct RuntimeKnobs {
     /// Opportunistic paged Sequence capacity reservation; Exact is default.
     #[serde(default)]
     pub sequence_backing_growth: SequenceBackingGrowth,
+    #[serde(default)]
+    pub pool_preparation: RuntimePoolPreparation,
     /// Shared weight decoding affects only eligible Q4_K MarkerV2 MMVQ M8 leaves.
     #[serde(default)]
     pub q4_mmvq_weight_decode: Q4MmvqWeightDecode,
@@ -1024,6 +1068,14 @@ impl EngineConfig {
         {
             self.runtime.sequence_backing_growth = SequenceBackingGrowth::parse_config_entry(entry)
                 .map_err(|reason| format!("{SEQUENCE_BACKING_GROWTH_CONFIG_KEY}: {reason}"))?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == RUNTIME_POOL_PREPARATION_CONFIG_KEY)
+        {
+            self.runtime.pool_preparation = RuntimePoolPreparation::parse_config_entry(entry)
+                .map_err(|reason| format!("{RUNTIME_POOL_PREPARATION_CONFIG_KEY}: {reason}"))?;
         }
         if let Some(entry) = snapshot
             .entries
@@ -3191,6 +3243,49 @@ mod tests {
             ("compressed", RuntimeConfigSource::Env),
             ("auto", RuntimeConfigSource::Env),
             ("automatic", RuntimeConfigSource::Cli),
+        ] {
+            assert!(engine
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                    RuntimeConfigEntry::new(key, value, source),
+                ]))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn runtime_pool_preparation_preserves_defaults_and_explicit_sources() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let key = RUNTIME_POOL_PREPARATION_CONFIG_KEY;
+        let mut engine = EngineConfig::default();
+        assert_eq!(
+            engine.runtime.pool_preparation,
+            RuntimePoolPreparation::OnDemand
+        );
+        let mut legacy = serde_json::to_value(&engine.runtime).unwrap();
+        legacy.as_object_mut().unwrap().remove("pool_preparation");
+        assert_eq!(
+            serde_json::from_value::<RuntimeKnobs>(legacy)
+                .unwrap()
+                .pool_preparation,
+            RuntimePoolPreparation::OnDemand
+        );
+        for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
+            for mode in [
+                RuntimePoolPreparation::OnDemand,
+                RuntimePoolPreparation::WithinBudget,
+            ] {
+                engine
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                        RuntimeConfigEntry::new(key, mode.as_runtime_value(), source),
+                    ]))
+                    .unwrap();
+                assert_eq!(engine.runtime.pool_preparation, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+            }
+        }
+        for (value, source) in [
+            ("automatic", RuntimeConfigSource::Cli),
+            ("within-budget", RuntimeConfigSource::Env),
         ] {
             assert!(engine
                 .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([

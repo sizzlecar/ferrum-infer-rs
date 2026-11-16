@@ -321,6 +321,19 @@ impl Qwen3VLTextArchitecture {
     pub const fn layers(&self) -> u64 {
         self.0.layers
     }
+    /// Select an explicit leading decoder prefix, preserving every other
+    /// architectural field. This does not infer a checkpoint's retained layers.
+    pub fn prefix_layers(&self, layers: u64) -> Result<Self, VNextError> {
+        if layers == 0 || layers > self.layers() {
+            return Err(invalid(
+                "layers",
+                "prefix must be nonempty and within the declared architecture",
+            ));
+        }
+        let mut data = self.0.clone();
+        data.layers = layers;
+        Self::checked(data)
+    }
     pub const fn hidden_size(&self) -> u64 {
         self.0.hidden_size
     }

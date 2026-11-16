@@ -284,6 +284,10 @@ fn resolve_layout_node(
         })
     };
     match layout {
+        PhysicalWeightLayout::PhysicalComponent(_) => Err(
+            "Metal numerical weight readers do not interpret raw physical-component views"
+                .to_owned(),
+        ),
         PhysicalWeightLayout::Dense { component_id } => Ok(MetalResolvedWeightLayout::Dense {
             component: component_index(component_id)?,
         }),
@@ -444,6 +448,39 @@ mod tests {
         QuantizationGrouping, QuantizationPacking, QuantizationSpec, WeightComponentRole,
         WeightComponentSpec, WeightFormatId, WeightLayoutId, WeightSchema, WeightTensorSpec,
     };
+
+    #[test]
+    fn raw_quantized_component_cannot_enter_the_numerical_weight_reader() {
+        let component = id("component.nvfp4");
+        let view = id("weight.raw");
+        let schema = WeightSchema {
+            format_id: WeightFormatId::new("weight-format.physical-view").unwrap(),
+            layout_id: WeightLayoutId::new("weight-layout.physical-view").unwrap(),
+            version: ContractVersion::new(1, 0),
+            components: vec![WeightComponentSpec {
+                id: component.clone(),
+                role: WeightComponentRole::PackedValues,
+                external_names: vec!["packed.weight".to_owned()],
+                dimensions: vec![8, 64],
+                encoding: WeightEncoding::Quantized(QuantizationSpec::nvfp4_e2m1_e4m3_128x4()),
+                required: true,
+            }],
+            tensors: vec![WeightTensorSpec {
+                id: view.clone(),
+                dimensions: vec![8, 64],
+                logical_element_type: ElementType::U8,
+                physical_layout: PhysicalWeightLayout::PhysicalComponent(
+                    ferrum_runtime::PhysicalWeightComponentView::new(component),
+                ),
+                required: true,
+            }],
+        };
+        schema
+            .validate(&ModelFamilyId::new("family.test").unwrap())
+            .unwrap();
+        let binding = ResolvedWeightBinding::from_schema(&schema, &view).unwrap();
+        assert!(resolve_layout(&binding).is_err());
+    }
 
     fn id(value: &str) -> WeightId {
         WeightId::new(value).unwrap()

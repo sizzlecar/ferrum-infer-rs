@@ -13,7 +13,14 @@ pub const REFERENCE_PLAIN_RESIDUAL_ADD_F32_NUMERICAL_PROFILE_ID: &str =
     "reference.plain_residual_add.f32.rne.gradual.v1";
 pub const REFERENCE_SILU_MUL_F32_NUMERICAL_PROFILE_ID: &str =
     "reference.silu_mul.f32.libm-0.2.15.separate.gradual.v1";
+pub const REFERENCE_SILU_F32_NUMERICAL_PROFILE_ID: &str =
+    "reference.silu.f32.libm-0.2.15.gradual.v1";
 const ESTIMATOR: &str = "resource-estimator.reference.pointwise_f32";
+pub fn reference_vnext_multiply_f32_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    provider(runtime, F32PointwiseOp::Multiply)
+}
 
 pub fn reference_vnext_plain_residual_add_f32_provider(
     runtime: &ReferenceDeviceRuntime,
@@ -24,6 +31,11 @@ pub fn reference_vnext_silu_mul_f32_provider(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
     provider(runtime, F32PointwiseOp::SiluMul)
+}
+pub fn reference_vnext_silu_f32_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    provider(runtime, F32PointwiseOp::Silu)
 }
 fn provider(
     runtime: &ReferenceDeviceRuntime,
@@ -39,6 +51,8 @@ fn provider(
     let profile = match kind {
         F32PointwiseOp::ResidualAdd => REFERENCE_PLAIN_RESIDUAL_ADD_F32_NUMERICAL_PROFILE_ID,
         F32PointwiseOp::SiluMul => REFERENCE_SILU_MUL_F32_NUMERICAL_PROFILE_ID,
+        F32PointwiseOp::Silu => REFERENCE_SILU_F32_NUMERICAL_PROFILE_ID,
+        F32PointwiseOp::Multiply => "reference.multiply.f32.rne.gradual.v1",
     };
     let fingerprint = implementation_fingerprint(&[
         profile.as_bytes(),
@@ -64,7 +78,7 @@ fn provider(
         )
         .map_err(contract_error)?]),
         BTreeSet::new(),
-        contiguous_bindings(2),
+        contiguous_bindings(kind.input_count() as u32),
         ESTIMATOR,
         ContractVersion::new(1, 0),
         estimator,
@@ -92,7 +106,7 @@ impl OperationResourceEstimator for Provider {
                 "F32 pointwise estimator received another operation",
             ));
         }
-        geometry(r.values(), r.attributes()).map_err(invalid)?;
+        geometry(self.kind, r.values(), r.attributes()).map_err(invalid)?;
         Ok(OperationResourceEstimate::new(
             self.descriptor.resource_estimator_id(),
             self.descriptor.resource_estimator_version(),
@@ -146,18 +160,22 @@ impl Provider {
         {
             return Err("F32 pointwise requires its selected fixed tensor contract".into());
         }
-        let geometry = geometry(p.bindings(), p.attributes())?;
+        let geometry = geometry(self.kind, p.bindings(), p.attributes())?;
         ReferenceDeviceCommand::f32_pointwise_tensor(ReferenceF32PointwiseLaunch {
             input: contiguous_region(
                 p,
                 binding(p.bindings(), ResolvedValueRole::Input, 0)?,
                 ElementType::F32,
             )?,
-            update: contiguous_region(
-                p,
-                binding(p.bindings(), ResolvedValueRole::Input, 1)?,
-                ElementType::F32,
-            )?,
+            update: if self.kind.input_count() == 2 {
+                Some(contiguous_region(
+                    p,
+                    binding(p.bindings(), ResolvedValueRole::Input, 1)?,
+                    ElementType::F32,
+                )?)
+            } else {
+                None
+            },
             output: contiguous_region(
                 p,
                 binding(p.bindings(), ResolvedValueRole::Output, 0)?,
@@ -170,17 +188,25 @@ impl Provider {
     }
 }
 fn geometry(
+    kind: F32PointwiseOp,
     bindings: &[ResolvedValueBinding],
     attrs: &BTreeMap<AttributeId, SemanticValue>,
 ) -> Result<F32SameShapeGeometry, String> {
-    if bindings.len() != 3
+    if bindings.len() != kind.input_count() + 1
         || !attrs.is_empty()
         || bindings.iter().any(|b| {
             b.weight()
                 .is_some_and(|w| !matches!(w.physical_layout(), PhysicalWeightLayout::Dense { .. }))
         })
     {
-        return Err("F32 pointwise requires three dense ports and no attributes".into());
+        return Err("F32 pointwise requires its exact dense ports and no attributes".into());
+    }
+    if kind == F32PointwiseOp::Silu {
+        return F32SameShapeGeometry::unary(
+            binding(bindings, ResolvedValueRole::Input, 0)?.tensor(),
+            binding(bindings, ResolvedValueRole::Output, 0)?.tensor(),
+        )
+        .map_err(|e| e.to_string());
     }
     F32SameShapeGeometry::new(
         binding(bindings, ResolvedValueRole::Input, 0)?.tensor(),

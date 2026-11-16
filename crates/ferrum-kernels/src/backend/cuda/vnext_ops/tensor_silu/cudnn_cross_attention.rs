@@ -23,7 +23,7 @@ pub const NUMERICAL_IDENTITY: &str = concat!(
     "cuDNN9.20-SDPA-forward-inference;F32-byvalue-scale;vendor-intermediate-rounding;",
     "finite-visible-domain;no-sequential-FP32-or-Torch-bitwise-claim;",
     "stable-KV-pack-without-masked-read;empty-samples-zero-without-QKV-read;",
-    "all-valid-direct-KV-same-SDPA-signature;lengths-only-launch-no-payload-read;",
+    "all-valid-direct-KV-same-SDPA-signature;lengths-only-launch-no-payload-read-or-reservation;",
     "all-nonempty-batches-one-plan;exact-i32-sequence-lengths;NoAlias;",
     "admitted-KV-lengths-workspace-scratch;prepare-estimator-lookup-encode;",
     "shared-native-owner-bounded-plan-binding-cache;target-qualification-required"
@@ -190,7 +190,7 @@ impl Provider {
         let mut peak = 0;
         let mut stages = Vec::with_capacity(schedule.stages.len());
         for &stage in &schedule.stages {
-            let sdpa = if let Method::Sdpa { packed_rows, .. } = stage.method {
+            let sdpa = if let Method::Sdpa { .. } = stage.method {
                 let signature = schedule.signature(stage)?;
                 let plan = if prepare {
                     self.cache.prepare(signature)
@@ -198,14 +198,7 @@ impl Provider {
                     self.cache.lookup(&signature)
                 }
                 .map_err(|e| e.to_string())?;
-                let layout = ScratchLayout::new(
-                    stage.batches,
-                    packed_rows,
-                    schedule.geometry.columns(),
-                    plan.workspace_bytes(),
-                )?;
-                // Retain the existing conservative scratch policy even when
-                // direct KV bindings leave its payload region unused.
+                let layout = schedule.scratch(stage, plan.workspace_bytes())?;
                 peak = peak.max(layout.bytes);
                 Some((plan, layout))
             } else {
@@ -405,18 +398,18 @@ impl Provider {
                         ..
                     }
                 );
-                // Schedule only selects direct KV for a single all-valid
-                // full-batch stage. Its original and packed batch strides are
-                // exactly equal; no tensor view or native plan changes.
+                // Each all-valid batch tile keeps the original contiguous
+                // K/V stride, including tiles after the first sixteen samples.
+                let kv_offset = schedule.key_value_byte_offset(stage.stage)?;
                 let bindings = CudnnSdpaBindings {
                     q: address(regions[0].device_ptr(), offset)?,
                     k: if direct_kv {
-                        regions[1].device_ptr()
+                        address(regions[1].device_ptr(), kv_offset)?
                     } else {
                         scratch
                     },
                     v: if direct_kv {
-                        regions[2].device_ptr()
+                        address(regions[2].device_ptr(), kv_offset)?
                     } else {
                         address(scratch, layout.value_offset)?
                     },

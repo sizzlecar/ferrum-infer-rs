@@ -49,6 +49,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 mod checkpoint;
 mod completion_worker;
+mod pool_preparation;
 mod retained_output_capture;
 mod timing;
 
@@ -637,6 +638,7 @@ pub struct ProgramExecutorConfig {
     pub maximum_model_tokens: usize,
     pub weight_arena_packing: ferrum_runtime::WeightArenaPacking,
     pub startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
+    pub pool_preparation: ferrum_types::RuntimePoolPreparation,
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
     pub invocation_preparation_strategy: InvocationPreparationStrategy,
@@ -934,6 +936,7 @@ impl ProgramExecutorConfig {
                 |target_bytes| ferrum_runtime::WeightArenaPacking::Bounded { target_bytes },
             ),
             startup_memory_plan: engine.runtime.startup_memory_plan.clone(),
+            pool_preparation: engine.runtime.pool_preparation,
             static_initialization,
             runtime_policy,
             invocation_preparation_strategy: engine.runtime.invocation_preparation_strategy,
@@ -4667,6 +4670,7 @@ pub struct ProgramExecutor<R: DeviceRuntime> {
     io: VNextIoBinding,
     maximum_model_tokens: usize,
     startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
+    pool_preparation: ferrum_types::RuntimePoolPreparation,
     run_id: RunId,
     family_fingerprint: String,
     program_fingerprint: String,
@@ -5239,6 +5243,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 io,
                 maximum_model_tokens: config.maximum_model_tokens,
                 startup_memory_plan: config.startup_memory_plan,
+                pool_preparation: config.pool_preparation,
                 run_id,
                 family_fingerprint,
                 program_fingerprint,
@@ -9332,13 +9337,23 @@ impl<R: DeviceRuntime> ModelExecutor for ProgramExecutor<R> {
             }
         }
 
-        let preparation = self
-            .prepare_reusable_execution_startup()
-            .await
-            .and_then(|report| {
-                self.reset_request_metrics_after_startup()?;
-                Ok(report)
-            });
+        // Preparation runs while the original executor owns all resources.
+        // Failure follows its existing startup/retirement lifecycle.
+        let preparation: Result<_> = async {
+            pool_preparation::prepare(
+                &self.plan_resources,
+                self.resolved_plan.execution_plan().payload().memory(),
+                self.pool_preparation,
+                self.maximum_model_tokens,
+                self.policy.maximum_scheduled_tokens().map_err(|error| {
+                    FerrumError::config(format!("runtime pool preparation token bound: {error}"))
+                })?,
+            )?;
+            let report = self.prepare_reusable_execution_startup().await?;
+            self.reset_request_metrics_after_startup()?;
+            Ok(report)
+        }
+        .await;
         match preparation {
             Ok(report) => {
                 if let Some(capture) = &self.checkpoint_capture {

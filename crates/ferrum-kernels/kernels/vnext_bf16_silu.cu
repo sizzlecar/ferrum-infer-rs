@@ -7,6 +7,7 @@
 #include <curand_kernel.h>
 #include <math.h>
 #include <stdint.h>
+#include "vnext_batched_f32.cuh"
 #include "vnext_gguf_blocks.cuh"
 
 __device__ __forceinline__ float ferrum_silu_exp(float value) {
@@ -220,6 +221,52 @@ extern "C" __global__ void ferrum_vnext_head_rms_norm_bf16(
         }
         __syncthreads();
         ferrum_norm_pairwise(values, width);
+        if (threadIdx.x == 0) {
+            const float mean_square = __fdiv_rn(values[0], static_cast<float>(width));
+            const float root = __fsqrt_rn(__fadd_rn(mean_square, epsilon));
+            inverse = __fdiv_rn(1.0f, root);
+        }
+        __syncthreads();
+        for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+            const uint16_t normalized = ferrum_bf16_rne(__fmul_rn(
+                ferrum_bf16_decode(input[start + column]), inverse));
+            output[start + column] = ferrum_bf16_rne(__fmul_rn(
+                ferrum_bf16_decode(normalized), ferrum_bf16_decode(gamma[column])));
+        }
+        __syncthreads();
+    }
+}
+
+// General-width adjacent pair tree. Unpaired left subtrees are carried
+// unchanged, not combined with synthetic zeros. It performs width-1 adds.
+// The original power-of-two normalization functions above remain unchanged.
+__device__ __forceinline__ void ferrum_norm_pairwise_carry(float* values, uint32_t width) {
+    for (uint32_t stride = 1; stride < width; stride *= 2) {
+        for (uint32_t left = threadIdx.x * (2 * stride); left < width;
+             left += blockDim.x * (2 * stride)) {
+            if (left + stride < width) {
+                values[left] = __fadd_rn(values[left], values[left + stride]);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Explicit two-BF16-boundary HeadRMS for widths <=8192 selected by the typed
+// carry plan. Dynamic shared storage is exactly 4*width, with no global scratch.
+extern "C" __global__ void ferrum_vnext_head_rms_norm_carry_bf16(
+    const uint16_t* input, const uint16_t* gamma, uint16_t* output,
+    uint64_t groups, uint32_t width, float epsilon) {
+    extern __shared__ float values[];
+    __shared__ float inverse;
+    for (uint64_t group = blockIdx.x; group < groups; group += gridDim.x) {
+        const uint64_t start = group * width;
+        for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+            const float value = ferrum_bf16_decode(input[start + column]);
+            values[column] = __fmul_rn(value, value);
+        }
+        __syncthreads();
+        ferrum_norm_pairwise_carry(values, width);
         if (threadIdx.x == 0) {
             const float mean_square = __fdiv_rn(values[0], static_cast<float>(width));
             const float root = __fsqrt_rn(__fadd_rn(mean_square, epsilon));
@@ -682,6 +729,63 @@ extern "C" __global__ void ferrum_vnext_batched_row_concat_bf16(
     }
 }
 
+// A dynamic I32 map has total semantics: invalid indices produce positive zero.
+// Source bytes are read only after the bounds check; all valid BF16 bits survive.
+// The contract requires an initialized base and exactly aliased output.
+// Only the checked row range is written; updates never overlap this backing.
+extern "C" __global__ void ferrum_vnext_row_write_bf16(
+    const uint16_t* base, const uint16_t* updates, uint16_t* output,
+    uint64_t elements, uint64_t offset) {
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < elements; i += uint64_t(blockDim.x) * gridDim.x) {
+        output[offset + i] = updates[i];
+    }
+}
+
+extern "C" __global__ void ferrum_vnext_transport_copy_bf16(
+    const uint16_t* source, uint16_t* output, uint64_t elements) {
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < elements; i += uint64_t(gridDim.x) * blockDim.x) {
+        output[i] = source[i];
+    }
+}
+
+extern "C" __global__ void ferrum_vnext_row_index_gather_or_zero_bf16(
+    const uint16_t* source, const int32_t* indices, uint16_t* output,
+    uint64_t elements, uint64_t source_rows, uint64_t output_rows, uint64_t columns) {
+    // A CTA copies one row. Hoist the shared index and batch calculation out
+    // of the column loop, and move eight BF16 encodings per transaction.
+    // Test the actual addresses: a contiguous view need not be 16-byte aligned.
+    if (columns % 8 == 0 &&
+        ((reinterpret_cast<uintptr_t>(source) | reinterpret_cast<uintptr_t>(output)) & 15) == 0) {
+        const uint64_t vectors = columns / 8;
+        for (uint64_t row = blockIdx.x; row < elements / columns; row += gridDim.x) {
+            const int32_t s = indices[row % output_rows];
+            auto* destination = reinterpret_cast<uint4*>(output + row * columns);
+            if (s >= 0 && uint64_t(s) < source_rows) {
+                const auto* input = reinterpret_cast<const uint4*>(
+                    source + ((row / output_rows) * source_rows + uint64_t(s)) * columns);
+                for (uint64_t col = threadIdx.x; col < vectors; col += blockDim.x) {
+                    destination[col] = input[col];
+                }
+            } else {
+                for (uint64_t col = threadIdx.x; col < vectors; col += blockDim.x) {
+                    destination[col] = make_uint4(0, 0, 0, 0);
+                }
+            }
+        }
+        return;
+    }
+    // Odd widths and unaligned views retain the same bounded scalar semantics.
+    for (uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x; i<elements; i+=uint64_t(gridDim.x)*blockDim.x) {
+        const uint64_t row=i/columns;
+        const int32_t s=indices[row%output_rows];
+        output[i]=(s>=0 && uint64_t(s)<source_rows)
+            ? source[((row/output_rows)*source_rows+uint64_t(s))*columns+i%columns]
+            : uint16_t(0);
+    }
+}
+
 // Plain residual and half-split BF16 text rotary use the same bounded module.
 extern "C" __global__ void ferrum_vnext_plain_residual_add_bf16(
     const uint16_t* lhs, const uint16_t* rhs, uint16_t* output, uint64_t elements) {
@@ -1041,8 +1145,17 @@ extern "C" __global__ void ferrum_vnext_spatial_upsample_gather_bf16(
 #include "vnext_comfy_convrot.cuh"
 #include "vnext_comfy_convrot_embedding.cuh"
 #include "vnext_fused_head_rms_partial_rope.cuh"
+#include "vnext_head_rms_partial_rope_single_round_bf16.cuh"
 #include "vnext_row_rms_addcmul.cuh"
-#include "vnext_cast_f32_to_bf16.cuh"
+#include "vnext_head_axis_pack.cuh"
+#include "vnext_head_fp8_roundtrip_bf16.cuh"
+#include "vnext_float_cast.cuh"
+#include "vnext_channel_bias_add_bf16.cuh"
+#include "vnext_row_center_bf16.cuh"
+#include "vnext_masked_tile_mean_bf16_f32.cuh"
+#include "vnext_signal_f32.cuh"
+#include "vnext_packed_swiglu_bf16.cuh"
+#include "vnext_row_selected_rms_modulation_bf16.cuh"
 #include "vnext_pointwise_f32.cuh"
 #include "vnext_gelu_f32.cuh"
 #include "vnext_reshape_copy_f32.cuh"

@@ -85,7 +85,7 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
             execution_wall_durations_us: Vec::new(),
             device_profiles: Vec::new(),
         },
-        session,
+        session: Box::new(session),
     };
     let before = composition.runtime().snapshot();
     assert!(before.live_allocations > 0);

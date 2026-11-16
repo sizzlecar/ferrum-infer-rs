@@ -32,7 +32,7 @@ pub enum PH3ImageDenoiserAttentionPolicy {
 }
 mod checkpoint;
 mod config;
-mod fragment;
+use crate::tensor_program_fragment as fragment;
 mod inputs;
 mod program;
 mod projection;

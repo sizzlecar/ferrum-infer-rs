@@ -6,6 +6,7 @@ use std::fmt;
 pub enum ServedModelKind {
     Llm,
     ImageGeneration,
+    VideoGeneration,
 }
 
 impl ServedModelKind {
@@ -13,6 +14,7 @@ impl ServedModelKind {
         match self {
             Self::Llm => &["text"],
             Self::ImageGeneration => &["image"],
+            Self::VideoGeneration => &["video", "audio"],
         }
     }
 }
@@ -110,9 +112,9 @@ impl ServedModelRegistry {
     ) -> Result<Self, ServedModelRegistryError> {
         let engine_model_id = engine_model_id.into();
         validate_identifier("engine model id", &engine_model_id.0)?;
-        if kind == ServedModelKind::ImageGeneration && !adapters.is_empty() {
+        if kind != ServedModelKind::Llm && !adapters.is_empty() {
             return Err(ServedModelRegistryError(
-                "image generation does not support LoRA routing".into(),
+                "media generation does not support LoRA routing".into(),
             ));
         }
         if served_model_names.is_empty() {
@@ -223,9 +225,9 @@ impl ServedModelRegistry {
         let primary = base_entries.first().ok_or_else(|| {
             ServedModelRegistryError("cannot attach LoRA adapters to an empty registry".to_string())
         })?;
-        if primary.kind == ServedModelKind::ImageGeneration {
+        if primary.kind != ServedModelKind::Llm {
             return Err(ServedModelRegistryError(
-                "cannot attach LoRA adapters to an image generator".into(),
+                "cannot attach LoRA adapters to a media generator".into(),
             ));
         }
         require_same_base_model(&base_entries)?;

@@ -68,6 +68,28 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
         owned_phase: P,
     ) -> Result<RetainedTensorComponentSession<R, P>, RetainedComponentInitializationError<R, P>>
     {
+        self.initialize_retained_with_pool_policy(
+            runtime,
+            host,
+            source,
+            config,
+            owned_phase,
+            ColdPoolInitializationPolicy::default(),
+        )
+    }
+
+    /// The caller phase follows the same native custody chain with either
+    /// explicit cold-pool policy; a deferred refusal never discards that phase.
+    pub fn initialize_retained_with_pool_policy<P: Send + 'static>(
+        &self,
+        runtime: Arc<R>,
+        host: HostMemoryAccount,
+        source: ComponentWeightSource<'_>,
+        config: ComponentInitializationConfig,
+        owned_phase: P,
+        pools: ColdPoolInitializationPolicy,
+    ) -> Result<RetainedTensorComponentSession<R, P>, RetainedComponentInitializationError<R, P>>
+    {
         let mut custody = Custody::new(owned_phase);
         let initialized = initialize_resources(
             runtime,
@@ -76,6 +98,7 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
             source,
             &host,
             &config,
+            pools,
             false,
             Some(&custody.native_started),
         );

@@ -1,6 +1,7 @@
 //! Native separable cubic AA: Keys a=-0.5, half-pixel centres, truncated
 //! normalized border support, F64 coefficients and U8 RNE/clamp per axis.
 //! Torchvision may use fixed-point/SIMD kernels; binary equality is unqualified.
+use super::super::image_resize::{axis_sample, smart_resize};
 use super::*;
 use crate::qwen_image21::image_input::{ImageLanczosResizePlan, ManagedRgba8Image};
 
@@ -70,30 +71,13 @@ impl Qwen3VLVisionHfImagePlan {
             p.limits.image,
         )?;
         let (ow, oh) = outer_dimensions;
-        ensure!(
-            f64::from(ow.max(oh)) / f64::from(ow.min(oh)) <= 200.,
-            "HF image aspect ratio exceeds 200"
-        );
-        let factor = p.patch.checked_mul(p.merge).context("HF factor overflow")? as f64;
-        let (w, h) = (f64::from(ow), f64::from(oh));
-        let (mut rw, mut rh) = (
-            (w / factor).round_ties_even() * factor,
-            (h / factor).round_ties_even() * factor,
-        );
-        if rw * rh > p.maximum_pixels as f64 {
-            let beta = (w * h / p.maximum_pixels as f64).sqrt();
-            rw = (w / beta / factor).floor().max(1.) * factor;
-            rh = (h / beta / factor).floor().max(1.) * factor;
-        } else if rw * rh < p.minimum_pixels as f64 {
-            let beta = (p.minimum_pixels as f64 / (w * h)).sqrt();
-            rw = (w * beta / factor).ceil() * factor;
-            rh = (h * beta / factor).ceil() * factor;
-        }
-        ensure!(
-            rw >= factor && rh >= factor && rw <= (1u64 << 24) as f64 && rh <= (1u64 << 24) as f64,
-            "resized coordinates exceed exact F32 integer range"
-        );
-        let (rw, rh) = (rw as usize, rh as usize);
+        let (rw, rh) = smart_resize(
+            ow,
+            oh,
+            p.patch.checked_mul(p.merge).context("HF factor overflow")?,
+            p.minimum_pixels,
+            p.maximum_pixels,
+        )?;
         ensure!(
             rw <= p.limits.image.maximum_width() as usize
                 && rh <= p.limits.image.maximum_height() as usize
@@ -259,35 +243,6 @@ fn upsampler_dimensions(width: u32, height: u32) -> Result<(u32, u32)> {
         "upsampler image dimensions overflow"
     );
     Ok((w as u32, h as u32))
-}
-fn cubic(x: f64) -> f64 {
-    let x = x.abs();
-    if x < 1. {
-        ((1.5 * x - 2.5) * x) * x + 1.
-    } else if x < 2. {
-        ((-0.5 * x + 2.5) * x - 4.) * x + 2.
-    } else {
-        0.
-    }
-}
-fn axis_sample(index: usize, input: usize, output: usize, read: impl Fn(usize) -> u8) -> u8 {
-    if input == output {
-        return read(index);
-    }
-    let scale = input as f64 / output as f64;
-    let filter_scale = scale.max(1.);
-    let center = (index as f64 + 0.5) * scale;
-    let support = 2. * filter_scale;
-    let start = ((center - support + 0.5).floor() as i64).max(0) as usize;
-    let end = ((center + support + 0.5).floor() as usize).min(input);
-    let mut weight = 0.;
-    let mut value = 0.;
-    for source in start..end {
-        let w = cubic((source as f64 - center + 0.5) / filter_scale);
-        weight += w;
-        value += f64::from(read(source)) * w;
-    }
-    (value / weight).round_ties_even().clamp(0., 255.) as u8
 }
 
 #[cfg(test)]

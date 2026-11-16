@@ -7,7 +7,10 @@ use ferrum_execution::{component::TensorComponentSession, TensorExecutionOutput}
 use ferrum_runtime::*;
 
 pub fn config(kind: Kind) -> Config {
-    assert!(matches!(kind, Kind::F32ResidualAdd | Kind::F32SiluMul));
+    assert!(matches!(
+        kind,
+        Kind::F32ResidualAdd | Kind::F32SiluMul | Kind::F32Silu
+    ));
     Config {
         rows: 3,
         inputs: 8,
@@ -71,7 +74,7 @@ fn operands(kind: Kind) -> ([f32; 24], [f32; 24]) {
                 -1.,
             ],
         ),
-        Kind::F32SiluMul => (
+        Kind::F32SiluMul | Kind::F32Silu => (
             [
                 0.,
                 -0.,
@@ -145,14 +148,15 @@ pub fn execute<R: DeviceRuntime>(
     let (x, update) = operands(kind);
     let x_bytes: Vec<_> = x.into_iter().flat_map(f32::to_le_bytes).collect();
     let update_bytes: Vec<_> = update.into_iter().flat_map(f32::to_le_bytes).collect();
+    let mut inputs = vec![config.managed(host, INPUT, &x_bytes)];
+    if !matches!(kind, Kind::F32Silu) {
+        inputs.push(config.managed(host, WEIGHT, &update_bytes));
+    }
     let outputs = session
         .execute(
             id(format!("run.pointwise_f32.{trial}")),
             id(format!("request.pointwise_f32.{trial}")),
-            vec![
-                config.managed(host, INPUT, &x_bytes),
-                config.managed(host, WEIGHT, &update_bytes),
-            ],
+            inputs,
         )
         .unwrap();
     assert_eq!(outputs.len(), 1);
@@ -171,12 +175,17 @@ pub fn execute<R: DeviceRuntime>(
     for (i, ((&gate, &up), &actual)) in x.iter().zip(&update).zip(&actual).enumerate() {
         let expected = match kind {
             Kind::F32ResidualAdd => (f64::from(gate) + f64::from(up)) as f32,
-            Kind::F32SiluMul => {
+            Kind::F32SiluMul | Kind::F32Silu => {
                 // F64 exponential is rounded to the explicit F32 exp boundary
                 // before ordinary F32 add/divide/multiply. Thus -100 correctly
                 // overflows expf to infinity and yields negative zero.
                 let exponent = f64::from(-gate).exp() as f32;
-                (gate / (1.0_f32 + exponent)) * up
+                let silu = gate / (1.0_f32 + exponent);
+                if matches!(kind, Kind::F32Silu) {
+                    silu
+                } else {
+                    silu * up
+                }
             }
             _ => unreachable!(),
         };

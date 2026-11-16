@@ -1,25 +1,36 @@
-//! Explicit cuDNN F32/FMA convolution composition, retaining the native owner
+//! Explicit cuDNN F32/FMA 2D/3D convolution composition, retaining the native owner
 //! and actual prepared workspace. No half or TF32 input conversion is allowed.
 use super::*;
 use crate::backend::cuda::vnext_runtime::{
-    CudaCudnnConfig, CudaCudnnOwner, CudaCudnnSdpaCache, CudnnConv2dDescriptor, CudnnConvScalar,
-    CudnnSdpaBindings, CudnnSdpaPlanPolicy, CudnnSdpaSignature, PreparedConv,
+    ConvolutionDimensions, CudaCudnnConfig, CudaCudnnOwner, CudaCudnnSdpaCache,
+    CudnnConv2dDescriptor, CudnnConv3dDescriptor, CudnnConvScalar, CudnnSdpaBindings,
+    CudnnSdpaPlanPolicy, CudnnSdpaSignature, PreparedConv,
 };
 use ferrum_runtime::{
-    conv2d_f32_contract, Conv2dF32Geometry, Conv2dF32PaddingMode, DynamicStorageRequirement,
+    Conv2dF32Geometry, Conv2dF32PaddingMode, Conv3dF32Geometry, DynamicStorageRequirement,
     F32CnnGeometry, F32CnnOp, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
     ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, WeightFormatId, CONV2D_F32_CAPABILITY_ID,
-    CONV2D_F32_OPERATION_ID,
 };
 pub const NUMERICAL_PROFILE_ID: &str =
     "cuda.cudnn9.conv2d.f32.fma_only.reflect_or_zero.separate_bias.v1";
-const ALIGNMENT: u64 = 256;
+pub const NUMERICAL_PROFILE_3D_ID: &str =
+    "cuda.cudnn9.conv3d.f32.fma_only.per_axis_pad.separate_bias.v1";
+pub(super) const ALIGNMENT: u64 = 256;
 pub(crate) fn providers(
     runtime: &CudaDeviceRuntime,
     config: &CudaCudnnConfig,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, None, None, None)
+    providers_impl(runtime, config, selected, None, None, None, false)
+}
+
+pub(crate) fn providers_with_transpose(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCudnnConfig,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    super::conv_transpose2d_f32::require_capability(runtime.descriptor())?;
+    providers_impl(runtime, config, selected, None, None, None, true)
 }
 
 pub(crate) fn providers_with_segmented_sdpa(
@@ -28,7 +39,7 @@ pub(crate) fn providers_with_segmented_sdpa(
     policy: CudnnSdpaPlanPolicy,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, Some(policy), None, None)
+    providers_impl(runtime, config, selected, Some(policy), None, None, false)
 }
 
 pub(crate) fn providers_with_fused_f32(
@@ -38,7 +49,7 @@ pub(crate) fn providers_with_fused_f32(
     fused: &CudaCutlassFusedF32Config,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, policy, Some(fused), None)
+    providers_impl(runtime, config, selected, policy, Some(fused), None, false)
 }
 
 pub(crate) fn providers_with_native_options(
@@ -49,7 +60,7 @@ pub(crate) fn providers_with_native_options(
     convrot: Option<&CudaConvRotFusedOutputConfig>,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, policy, fused, convrot)
+    providers_impl(runtime, config, selected, policy, fused, convrot, false)
 }
 
 fn providers_impl(
@@ -59,9 +70,15 @@ fn providers_impl(
     policy: Option<CudnnSdpaPlanPolicy>,
     fused: Option<&CudaCutlassFusedF32Config>,
     convrot: Option<&CudaConvRotFusedOutputConfig>,
+    transpose: bool,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    let cap = require_convolution_capability(runtime.descriptor())?;
-    selection::validate_selection(selected)?;
+    require_convolution_capability(runtime.descriptor())?;
+    // The explicit transpose factory is useful without additional pointwise
+    // operators; both convolution providers already form a nonempty registry.
+    // Preserve the existing factories' selection validation unchanged.
+    if !transpose || !selected.is_empty() {
+        selection::validate_selection(selected)?;
+    }
     let wants_fused = selected.contains(&CudaTensorOperation::StructuredGqaAttentionFusedF32);
     if wants_fused != fused.is_some() {
         return Err(CudaDeviceRuntimeError::contract(
@@ -95,39 +112,6 @@ fn providers_impl(
         .map(|policy| CudaCudnnSdpaCache::new(runtime, Arc::clone(&owner), policy).map(Arc::new))
         .transpose()?;
     let kernels = RetainedFunctions::load(runtime)?;
-    let c = conv2d_f32_contract().map_err(contract_error)?;
-    let fingerprint = implementation_fingerprint(&[
-        NUMERICAL_PROFILE_ID.as_bytes(),
-        numerical_fingerprint().as_bytes(),
-        owner.fingerprint().as_bytes(),
-        include_bytes!("conv2d_f32.rs"),
-        include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/kernels/vnext_cnn_f32.cuh"
-        )),
-    ]);
-    let estimator = "resource-estimator.cuda.conv2d.f32.cudnn9_fma";
-    let descriptor = OperationProviderDescriptor::new(
-        ProviderId::new("provider.cuda.conv2d.f32.cudnn9_fma").map_err(contract_error)?,
-        c.descriptor().id.clone(),
-        c.descriptor().fingerprint().map_err(contract_error)?,
-        fingerprint.clone(),
-        ProviderExecutionSemantics::bitwise_eager_only(),
-        ContractVersion::new(1, 0),
-        runtime.descriptor().id.clone(),
-        BTreeSet::from([cap]),
-        BTreeSet::from([
-            WeightFormatId::new(super::super::DENSE_SAFETENSORS_FORMAT_ID)
-                .map_err(contract_error)?,
-        ]),
-        BTreeSet::new(),
-        super::super::transformer::contiguous_bindings(3),
-        estimator,
-        ContractVersion::new(1, 0),
-        implementation_fingerprint(&[estimator.as_bytes(), fingerprint.as_bytes()]),
-    )
-    .map_err(contract_error)?
-    .with_fixed_tensor_work(true);
     let mut providers = selection::providers_from_descriptors(descriptors, &kernels);
     if let (Some(descriptor), Some(config)) = (fused_descriptor, fused) {
         providers.push(gqa_fused_f32::provider(
@@ -148,15 +132,97 @@ fn providers_impl(
             cache,
         )?);
     }
-    providers.push(Box::new(Provider {
-        descriptor,
-        kernels,
-        owner,
-    }));
+    if transpose {
+        providers.push(super::conv_transpose2d_f32::provider(
+            runtime,
+            Arc::clone(&kernels),
+            Arc::clone(&owner),
+        )?);
+    }
+    providers.push(provider(runtime, kernels, owner)?);
     Ok(providers)
 }
 
-fn require_convolution_capability(
+/// Construct only the original F32 provider; ownership and workspace policy
+/// are supplied by the single composition root.
+pub(super) fn provider(
+    runtime: &CudaDeviceRuntime,
+    kernels: Arc<RetainedFunctions>,
+    owner: Arc<CudaCudnnOwner>,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    provider_for(runtime, kernels, owner, F32CnnOp::Conv2d)
+}
+pub(super) fn provider_for(
+    runtime: &CudaDeviceRuntime,
+    kernels: Arc<RetainedFunctions>,
+    owner: Arc<CudaCudnnOwner>,
+    kind: F32CnnOp,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    let (profile, provider, estimator) = match kind {
+        F32CnnOp::Conv2d => (
+            NUMERICAL_PROFILE_ID,
+            "provider.cuda.conv2d.f32.cudnn9_fma",
+            "resource-estimator.cuda.conv2d.f32.cudnn9_fma",
+        ),
+        F32CnnOp::Conv3d => (
+            NUMERICAL_PROFILE_3D_ID,
+            "provider.cuda.conv3d.f32.cudnn9_fma",
+            "resource-estimator.cuda.conv3d.f32.cudnn9_fma",
+        ),
+        _ => {
+            return Err(CudaDeviceRuntimeError::contract(
+                "requires a spatial convolution kind",
+            ))
+        }
+    };
+    let cap = CapabilityId::new(kind.capability_id()).map_err(contract_error)?;
+    if !runtime.descriptor().capabilities.contains(&cap) {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA lacks selected spatial F32 convolution capability",
+        ));
+    }
+    let c = kind.contract().map_err(contract_error)?;
+    let fingerprint = implementation_fingerprint(&[
+        profile.as_bytes(),
+        numerical_fingerprint().as_bytes(),
+        owner.fingerprint().as_bytes(),
+        include_bytes!("conv2d_f32.rs"),
+        include_bytes!("conv2d_f32/spatial.rs"),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/kernels/vnext_cnn_f32.cuh"
+        )),
+    ]);
+    let descriptor = OperationProviderDescriptor::new(
+        ProviderId::new(provider).map_err(contract_error)?,
+        c.descriptor().id.clone(),
+        c.descriptor().fingerprint().map_err(contract_error)?,
+        fingerprint.clone(),
+        ProviderExecutionSemantics::bitwise_eager_only(),
+        ContractVersion::new(1, 0),
+        runtime.descriptor().id.clone(),
+        BTreeSet::from([cap]),
+        BTreeSet::from([
+            WeightFormatId::new(super::super::DENSE_SAFETENSORS_FORMAT_ID)
+                .map_err(contract_error)?,
+        ]),
+        BTreeSet::new(),
+        super::super::transformer::contiguous_bindings(3),
+        estimator,
+        ContractVersion::new(1, 0),
+        implementation_fingerprint(&[estimator.as_bytes(), fingerprint.as_bytes()]),
+    )
+    .map_err(contract_error)?
+    .with_fixed_tensor_work(true);
+    Ok(Box::new(Provider {
+        descriptor,
+        kernels,
+        owner,
+        kind,
+    }))
+}
+
+pub(super) fn require_convolution_capability(
     device: &DeviceDescriptor,
 ) -> Result<CapabilityId, CudaDeviceRuntimeError> {
     let cap = CapabilityId::new(CONV2D_F32_CAPABILITY_ID).map_err(contract_error)?;
@@ -208,6 +274,7 @@ struct Provider {
     descriptor: OperationProviderDescriptor,
     kernels: Arc<RetainedFunctions>,
     owner: Arc<CudaCudnnOwner>,
+    kind: F32CnnOp,
 }
 impl OperationResourceEstimator for Provider {
     fn descriptor(&self) -> &OperationProviderDescriptor {
@@ -224,7 +291,7 @@ impl OperationResourceEstimator for Provider {
                 "F32 convolution estimator received another operation",
             ));
         }
-        let mut shape = geometry(r.values(), r.attributes(), 0).map_err(invalid_plan)?;
+        let mut shape = geometry(self.kind, r.values(), r.attributes(), 0).map_err(invalid_plan)?;
         let prepared = self
             .owner
             .prepare_convolution(shape.native)
@@ -293,7 +360,7 @@ impl Provider {
         let [p] = i.participants() else {
             return Err("F32 convolution requires one participant".into());
         };
-        if i.operation().id.as_str() != CONV2D_F32_OPERATION_ID
+        if i.operation().id.as_str() != self.kind.operation_id()
             || !matches!(p.work(), NodeWorkContract::Fixed)
             || !i.resource_work_shape().resource_work().is_tensor()
         {
@@ -302,76 +369,38 @@ impl Provider {
         let prepared = i
             .prepared_implementation::<PreparedConv>()
             .ok_or("F32 convolution has no retained prepared implementation")?;
-        let shape = geometry(p.bindings(), p.attributes(), prepared.workspace_bytes())?;
+        let shape = geometry(
+            self.kind,
+            p.bindings(),
+            p.attributes(),
+            prepared.workspace_bytes(),
+        )?;
         prepared.validate_invocation(
             &self.owner,
             shape.native,
             i.prepared_implementation_fingerprint(),
         )?;
-        let mut regions = Vec::with_capacity(5);
-        for n in 0..3 {
-            regions.push(retained_typed_region(
-                p,
-                binding(p.bindings(), ResolvedValueRole::Input, n as u32)?,
+        let regions = retain_regions(
+            p,
+            [
                 shape
                     .geometry
-                    .input_elements(n)
-                    .ok_or("missing input extent")?
-                    * 4,
-                ElementType::F32,
-            )?);
-        }
-        let output = retained_typed_region(
-            p,
-            binding(p.bindings(), ResolvedValueRole::Output, 0)?,
-            shape.geometry.elements() * 4,
-            ElementType::F32,
+                    .input_elements(0)
+                    .ok_or("missing input extent")?,
+                shape
+                    .geometry
+                    .input_elements(1)
+                    .ok_or("missing weight extent")?,
+                shape
+                    .geometry
+                    .input_elements(2)
+                    .ok_or("missing bias extent")?,
+            ],
+            shape.geometry.elements(),
+            shape.scratch_bytes,
         )?;
-        for input in &regions {
-            nonoverlapping_ranges(
-                input.device_ptr(),
-                input.length_bytes(),
-                output.device_ptr(),
-                output.length_bytes(),
-            )?;
-        }
-        regions.push(output);
-        if shape.scratch_bytes > 0 {
-            let view = p
-                .scratch_view()
-                .ok_or("F32 convolution missing admitted scratch")?;
-            let translated = view
-                .translate(0, shape.scratch_bytes)
-                .map_err(|e| e.to_string())?;
-            let mut pieces = translated.iter();
-            let piece = pieces.next().ok_or("empty scratch")?;
-            if pieces.next().is_some() {
-                return Err("scratch must be contiguous".into());
-            }
-            let (buffer, range, retention) = piece.buffer_and_physical_range();
-            let scratch = buffer
-                .retained_region(range, retention)
-                .map_err(|e| e.to_string())?;
-            if scratch.element_type() != ElementType::U8
-                || scratch.length_bytes() != shape.scratch_bytes
-                || scratch.device_ptr() % ALIGNMENT != 0
-            {
-                return Err("F32 convolution scratch dtype/extent/alignment mismatch".into());
-            }
-            for r in &regions {
-                nonoverlapping_ranges(
-                    r.device_ptr(),
-                    r.length_bytes(),
-                    scratch.device_ptr(),
-                    scratch.length_bytes(),
-                )?;
-            }
-            regions.push(scratch);
-        } else if p.scratch_view().is_some() {
-            return Err("unexpected F32 convolution scratch".into());
-        }
         let kernels = Arc::clone(&self.kernels);
-        let g = shape.g();
+        let g = shape.geometry;
         let elements = g.elements();
         CudaDeviceCommand::operation(
             "vnext_conv2d_f32_cudnn9_fma",
@@ -384,26 +413,7 @@ impl Provider {
                 };
                 let mut input = regions[0].device_ptr();
                 if shape.padding_bytes > 0 {
-                    let elements = shape.padding_bytes / 4;
-                    let height = g.input_height();
-                    let width = g.input_width();
-                    let [top, _, left, _] = g.padding();
-                    let reflect = u32::from(g.padding_mode() == Conv2dF32PaddingMode::Reflect);
-                    let mut launch = stream.launch_builder(kernels.cnn_f32_function(0));
-                    launch
-                        .arg(&input)
-                        .arg(&scratch)
-                        .arg(&elements)
-                        .arg(&height)
-                        .arg(&width)
-                        .arg(&shape.padded_height)
-                        .arg(&shape.padded_width)
-                        .arg(&top)
-                        .arg(&left)
-                        .arg(&reflect);
-                    unsafe { launch.launch(flat(elements)) }.map_err(|e| {
-                        CudaDeviceRuntimeError::driver("F32 convolution explicit padding", e)
-                    })?;
+                    shape.pad_input(stream, &kernels, input, scratch)?;
                     input = scratch;
                 }
                 let workspace = if shape.workspace_bytes > 0 {
@@ -425,8 +435,7 @@ impl Provider {
                     shape.workspace_bytes,
                 )?;
                 let bias = regions[2].device_ptr();
-                let channels = g.output_channels();
-                let spatial = g.output_height() * g.output_width();
+                let (channels, spatial) = shape.output_axes();
                 let mut launch = stream.launch_builder(kernels.cnn_f32_function(1));
                 launch
                     .arg(&output)
@@ -450,7 +459,74 @@ impl Provider {
         .map_err(|e| e.to_string())
     }
 }
-fn flat(elements: u64) -> LaunchConfig {
+pub(super) fn retain_regions<'a, W: InvocationWorkProjection<'a>>(
+    p: &OperationInvocation<'a, CudaDeviceBuffer, W>,
+    input_elements: [u64; 3],
+    output_elements: u64,
+    scratch_bytes: u64,
+) -> Result<Vec<CudaBufferRegion>, String> {
+    let mut regions = Vec::with_capacity(5);
+    for n in 0..3 {
+        regions.push(retained_typed_region(
+            p,
+            binding(p.bindings(), ResolvedValueRole::Input, n as u32)?,
+            input_elements[n] * 4,
+            ElementType::F32,
+        )?);
+    }
+    let output = retained_typed_region(
+        p,
+        binding(p.bindings(), ResolvedValueRole::Output, 0)?,
+        output_elements * 4,
+        ElementType::F32,
+    )?;
+    for input in &regions {
+        nonoverlapping_ranges(
+            input.device_ptr(),
+            input.length_bytes(),
+            output.device_ptr(),
+            output.length_bytes(),
+        )?;
+    }
+    regions.push(output);
+    if scratch_bytes > 0 {
+        let view = p
+            .scratch_view()
+            .ok_or("F32 convolution missing admitted scratch")?;
+        let translated = view
+            .translate(0, scratch_bytes)
+            .map_err(|e| e.to_string())?;
+        let mut pieces = translated.iter();
+        let piece = pieces.next().ok_or("empty scratch")?;
+        if pieces.next().is_some() {
+            return Err("scratch must be contiguous".into());
+        }
+        let (buffer, range, retention) = piece.buffer_and_physical_range();
+        let scratch = buffer
+            .retained_region(range, retention)
+            .map_err(|e| e.to_string())?;
+        if scratch.element_type() != ElementType::U8
+            || scratch.length_bytes() != scratch_bytes
+            || scratch.device_ptr() % ALIGNMENT != 0
+        {
+            return Err("F32 convolution scratch dtype/extent/alignment mismatch".into());
+        }
+        for r in &regions {
+            nonoverlapping_ranges(
+                r.device_ptr(),
+                r.length_bytes(),
+                scratch.device_ptr(),
+                scratch.length_bytes(),
+            )?;
+        }
+        regions.push(scratch);
+    } else if p.scratch_view().is_some() {
+        return Err("unexpected F32 convolution scratch".into());
+    }
+    Ok(regions)
+}
+
+pub(super) fn flat(elements: u64) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (elements.div_ceil(256).min(MAX_BLOCKS) as u32, 1, 1),
         block_dim: (256, 1, 1),
@@ -459,7 +535,7 @@ fn flat(elements: u64) -> LaunchConfig {
 }
 #[derive(Clone, Copy, Debug)]
 struct Shape {
-    native: CudnnConv2dDescriptor,
+    native: ConvolutionDimensions,
     geometry: F32CnnGeometry,
     padding_bytes: u64,
     padded_height: u64,
@@ -469,11 +545,17 @@ struct Shape {
     scratch_bytes: u64,
 }
 impl Shape {
-    fn g(self) -> Conv2dF32Geometry {
-        let F32CnnGeometry::Conv2d(g) = self.geometry else {
-            unreachable!("convolution shape")
-        };
-        g
+    fn output_axes(self) -> (u64, u64) {
+        match self.geometry {
+            F32CnnGeometry::Conv2d(g) => {
+                (g.output_channels(), g.output_height() * g.output_width())
+            }
+            F32CnnGeometry::Conv3d(g) => {
+                let [_, c, d, h, w] = g.output();
+                (c, d * h * w)
+            }
+            _ => unreachable!("convolution shape"),
+        }
     }
     fn with_workspace(mut self, bytes: u64) -> Result<Self, String> {
         self.workspace_bytes = bytes;
@@ -539,7 +621,7 @@ impl Shape {
                 .ok_or("F32 padding bytes overflow")?
         };
         Self {
-            native,
+            native: native.into(),
             geometry: F32CnnGeometry::Conv2d(g),
             padding_bytes,
             padded_height: ph,
@@ -552,15 +634,19 @@ impl Shape {
     }
 }
 fn geometry(
+    kind: F32CnnOp,
     b: &[ResolvedValueBinding],
     attrs: &BTreeMap<AttributeId, SemanticValue>,
     workspace: u64,
 ) -> Result<Shape, String> {
-    let F32CnnGeometry::Conv2d(g) = cnn_f32::geometry(F32CnnOp::Conv2d, b, attrs)? else {
-        unreachable!()
-    };
-    Shape::new(g, workspace)
+    match cnn_f32::geometry(kind, b, attrs)? {
+        F32CnnGeometry::Conv2d(g) => Shape::new(g, workspace),
+        F32CnnGeometry::Conv3d(g) => Shape::new3d(g, workspace),
+        _ => Err("requires spatial convolution geometry".into()),
+    }
 }
+
+mod spatial;
 
 #[cfg(test)]
 mod tests;

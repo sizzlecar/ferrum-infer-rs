@@ -7804,7 +7804,9 @@ mod tests {
                     collect_block_fp8_source_pairs(expert, pairs);
                 }
             }
-            PhysicalWeightLayout::Dense { .. }
+            // Raw component operands are not complete block-FP8 projections.
+            PhysicalWeightLayout::PhysicalComponent(_)
+            | PhysicalWeightLayout::Dense { .. }
             | PhysicalWeightLayout::Stored { .. }
             | PhysicalWeightLayout::Quantized { .. }
             | PhysicalWeightLayout::QuantizedTensor { .. }
@@ -7845,7 +7847,9 @@ mod tests {
                     collect_marlin_fp8_execution_leaves(expert, leaves, block_grid_count);
                 }
             }
-            PhysicalWeightLayout::Dense { .. }
+            // Raw component operands are not Marlin numerical matrix leaves.
+            PhysicalWeightLayout::PhysicalComponent(_)
+            | PhysicalWeightLayout::Dense { .. }
             | PhysicalWeightLayout::Stored { .. }
             | PhysicalWeightLayout::QuantizedTensor { .. }
             | PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. }

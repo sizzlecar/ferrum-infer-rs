@@ -80,6 +80,23 @@ impl DeviceCapacityOwner {
         })
     }
 
+    /// Observe whether an additional peak fits the live process-wide account.
+    /// This does not claim bytes, advance availability epochs or issue an
+    /// allocation permit. A subsequent acquisition must repeat ordinary
+    /// admission; another owner can consume capacity after this observation.
+    pub fn check_available_bytes(&self, bytes: u64) -> Result<(), VNextError> {
+        let state = self
+            .budget
+            .account
+            .state
+            .lock()
+            .map_err(|_| invalid_resource("device capacity account is poisoned"))?;
+        self.budget
+            .account
+            .checked_claim_totals(&self.budget, &state, bytes)
+            .map(|_| ())
+    }
+
     /// Exact budget-owner identity, not equality of numeric limits or device
     /// descriptors. Independently opened budgets share capacity but not ownership.
     pub fn owns(&self, retention: &DeviceCapacityRetention) -> bool {
@@ -351,6 +368,24 @@ impl DeviceCapacityAccount {
             .state
             .lock()
             .map_err(|_| invalid_resource("device capacity account is poisoned"))?;
+        let (next_budget_claimed, next) = self.checked_claim_totals(budget, &state, bytes)?;
+        state.claimed_bytes = next;
+        state
+            .budgets
+            .get_mut(&budget.budget_id)
+            .expect("validated device budget remains registered")
+            .claimed_bytes = next_budget_claimed;
+        Ok(DeviceCapacityClaim {
+            budget: Some(Arc::clone(budget)),
+            bytes,
+        })
+    }
+    fn checked_claim_totals(
+        &self,
+        budget: &DeviceCapacityBudget,
+        state: &DeviceCapacityState,
+        bytes: u64,
+    ) -> Result<(u64, u64), VNextError> {
         if state.poisoned {
             return Err(capacity_fault(
                 DynamicAdmissionFaultKind::Poisoned,
@@ -394,16 +429,7 @@ impl DeviceCapacityAccount {
                 )?,
             ));
         }
-        state.claimed_bytes = next;
-        state
-            .budgets
-            .get_mut(&budget.budget_id)
-            .expect("validated device budget remains registered")
-            .claimed_bytes = next_budget_claimed;
-        Ok(DeviceCapacityClaim {
-            budget: Some(Arc::clone(budget)),
-            bytes,
-        })
+        Ok((next_budget_claimed, next))
     }
 }
 

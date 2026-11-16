@@ -4,6 +4,8 @@ fn signature() -> CudnnSdpaSignature {
     CudnnSdpaSignature {
         batch: 2,
         heads: 32,
+        key_value_heads: 32,
+        causal: false,
         query_length: 1024,
         key_value_length: 1045,
         head_dim: 128,
@@ -12,6 +14,47 @@ fn signature() -> CudnnSdpaSignature {
         output_batch_stride: 1045 * 4096,
         scale_bits: (1.0_f32 / 128.0_f32.sqrt()).to_bits(),
     }
+}
+
+#[test]
+fn compact_causal_gqa_uses_kv_extents_and_distinct_native_identity() {
+    let s = CudnnSdpaSignature {
+        batch: 2,
+        heads: 64,
+        key_value_heads: 8,
+        causal: true,
+        query_length: 129,
+        key_value_length: 129,
+        head_dim: 128,
+        query_batch_stride: 129 * 8192,
+        key_value_batch_stride: 129 * 1024,
+        output_batch_stride: 129 * 8192,
+        scale_bits: 0.125f32.to_bits(),
+    };
+    s.validate().unwrap();
+    assert_eq!(s.kv_extent().unwrap(), 2 * 129 * 1024 * 2);
+    assert_eq!(
+        s.extent(129, s.query_batch_stride).unwrap(),
+        2 * 129 * 8192 * 2
+    );
+    validate_bindings(s, 256, bindings()).unwrap();
+    assert!(CudnnSdpaSignature {
+        key_value_heads: 7,
+        ..s
+    }
+    .validate()
+    .is_err());
+    assert!(CudnnSdpaSignature {
+        key_value_length: 130,
+        ..s
+    }
+    .validate()
+    .is_err());
+    let mut a = Sha256::new();
+    s.digest(&mut a);
+    let mut b = Sha256::new();
+    CudnnSdpaSignature { causal: false, ..s }.digest(&mut b);
+    assert_ne!(a.finalize(), b.finalize());
 }
 fn bindings() -> CudnnSdpaBindings {
     CudnnSdpaBindings {
@@ -38,7 +81,7 @@ fn sliced_bshd_geometry_preserves_original_batch_stride_without_payload_allocati
     bad.query_batch_stride = 1024 * 4096 - 1;
     assert!(bad.validate().is_err());
     bad = s;
-    bad.head_dim = 64;
+    bad.head_dim = 32;
     assert!(bad.validate().is_err());
     bad = s;
     bad.scale_bits = f32::NAN.to_bits();
@@ -56,6 +99,8 @@ fn d72_bf16_sdpa_has_exact_bshd_extents_and_preserves_alignment() {
     let s = CudnnSdpaSignature {
         batch: 1,
         heads: 16,
+        key_value_heads: 16,
+        causal: false,
         query_length: 4096,
         key_value_length: 4096,
         head_dim: 72,
@@ -73,6 +118,35 @@ fn d72_bf16_sdpa_has_exact_bshd_extents_and_preserves_alignment() {
     for d in [0, 70, 73, 256] {
         assert!(CudnnSdpaSignature { head_dim: d, ..s }.validate().is_err());
     }
+}
+
+#[test]
+fn d64_bf16_sdpa_validates_exact_decoder_extent_and_existing_binding_limits() {
+    let s = CudnnSdpaSignature {
+        batch: 1,
+        heads: 32,
+        key_value_heads: 32,
+        causal: false,
+        query_length: 116,
+        key_value_length: 116,
+        head_dim: 64,
+        query_batch_stride: 116 * 2048,
+        key_value_batch_stride: 116 * 2048,
+        output_batch_stride: 116 * 2048,
+        scale_bits: 0.125_f32.to_bits(),
+    };
+    s.validate().unwrap();
+    assert_eq!(s.extent(116, s.query_batch_stride).unwrap(), 116 * 2048 * 2);
+    validate_bindings(s, 256, bindings()).unwrap();
+    let mut overlapping = bindings();
+    overlapping.o = overlapping.q;
+    assert!(validate_bindings(s, 256, overlapping).is_err());
+    assert!(CudnnSdpaSignature {
+        key_value_batch_stride: 116 * 2048 - 1,
+        ..s
+    }
+    .validate()
+    .is_err());
 }
 
 #[test]
@@ -366,7 +440,7 @@ mod native_abi {
 
         reset(256, false);
         STATE.lock().unwrap().fail_set_attribute = Some(1001);
-        let e = match native::VariantPack::build(&api(), bindings(), &0.125) {
+        let e = match native::VariantPack::build(&api(), bindings(), &0.125, false) {
             Err(e) => e,
             Ok(_) => panic!("failed pointer attribute accepted"),
         };

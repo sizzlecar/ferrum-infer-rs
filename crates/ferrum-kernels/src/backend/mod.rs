@@ -68,6 +68,11 @@ pub mod cuda;
 #[path = "cuda/vnext_runtime/tensor_eager/memory_policy.rs"]
 mod cuda_tensor_memory_policy;
 
+#[cfg(any(feature = "cuda", test))]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[path = "cuda/vnext_runtime/tensor_eager/native_module_capacity.rs"]
+mod cuda_static_native_module_capacity;
+
 // Configuration checks must run in CPU tests as well as CUDA constructors.
 #[cfg(any(feature = "cuda", test))]
 #[path = "cuda/vnext_runtime/tensor_eager/capability_policy.rs"]

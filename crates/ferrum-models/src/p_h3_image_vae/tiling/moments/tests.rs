@@ -1,6 +1,23 @@
 use super::*;
 use ferrum_runtime::{HostMemoryClassLimits, HostMemoryLimits};
 
+#[test]
+fn eager_scalar_division_preserves_its_reciprocal_multiply_boundary() {
+    let direct =
+        blend_with_arithmetic(0., 1., 5, 6, MomentBlendArithmetic::DirectDivision).unwrap();
+    let eager = blend_with_arithmetic(
+        0.,
+        1.,
+        5,
+        6,
+        MomentBlendArithmetic::ScalarReciprocalMultiply,
+    )
+    .unwrap();
+    assert_eq!(direct.to_bits(), (5f32 / 6f32).to_bits());
+    assert_eq!(eager.to_bits(), (5f32 * (1f64 / 6f64) as f32).to_bits());
+    assert_ne!(direct.to_bits(), eager.to_bits());
+}
+
 fn host(capacity: usize) -> HostMemoryAccount {
     HostMemoryAccount::with_allocation_alignment(
         HostMemoryLimits::new(

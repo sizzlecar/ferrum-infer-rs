@@ -1,16 +1,27 @@
 use super::{invalid_plan, BTreeMap, NodeId, PlanNode, VNextError};
 
-/// A bounded, single-successor cache for repeated completion-order queries.
+mod dag_index;
+use dag_index::DagIndex;
+
+/// Bounded reachability caches for repeated completion-order queries.
 ///
 /// Slot derivation visits intervals in first-user order. All candidate slots
 /// for one interval ask about the same successor, so keeping its ancestors
-/// avoids repeating the dependency traversal without retaining an N-by-N
-/// reachability table. This cache changes no ordering or slot selection rule.
+/// avoids repeating the dependency traversal. Offline placement also compares
+/// one earlier interval with many later ones, so it can reuse the descendants
+/// of one predecessor. Both caches retain O(nodes + edges) storage, not an
+/// N-by-N reachability table, and change no ordering or slot selection rule.
 pub(super) struct CompletionOrderCache<'a> {
     indices: BTreeMap<&'a NodeId, usize>,
     dependencies: Vec<Option<Vec<usize>>>,
+    successors: Vec<Vec<usize>>,
     successor: Option<&'a NodeId>,
     ancestors: Vec<bool>,
+    predecessor: Option<usize>,
+    previous_query_predecessor: Option<usize>,
+    descendants: Vec<bool>,
+    complete_graph: bool,
+    dag_index: Option<DagIndex>,
     pending: Vec<usize>,
     missing_dependency: bool,
     #[cfg(test)]
@@ -32,7 +43,7 @@ impl<'a> CompletionOrderCache<'a> {
                 indices.entry(dependency).or_insert(next);
             }
         }
-        let mut dependencies = vec![None; indices.len()];
+        let mut dependencies: Vec<Option<Vec<usize>>> = vec![None; indices.len()];
         for (id, node) in nodes_by_id {
             dependencies[indices[id]] = Some(
                 node.dependencies
@@ -41,11 +52,27 @@ impl<'a> CompletionOrderCache<'a> {
                     .collect(),
             );
         }
+        let complete_graph = dependencies.iter().all(Option::is_some);
+        let mut successors = vec![Vec::new(); indices.len()];
+        for (node, parents) in dependencies.iter().enumerate() {
+            if let Some(parents) = parents {
+                for &parent in parents {
+                    successors[parent].push(node);
+                }
+            }
+        }
+        let dag_index = DagIndex::new(&dependencies, &successors);
         Self {
             ancestors: vec![false; indices.len()],
+            descendants: vec![false; indices.len()],
             indices,
             dependencies,
+            successors,
             successor: None,
+            predecessor: None,
+            previous_query_predecessor: None,
+            complete_graph,
+            dag_index,
             pending: Vec::new(),
             missing_dependency: false,
             #[cfg(test)]
@@ -63,7 +90,34 @@ impl<'a> CompletionOrderCache<'a> {
         if predecessor == successor {
             return Ok(false);
         }
+        let predecessor_index = self.indices.get(predecessor).copied();
+        if let (Some(index), Some(from), Some(&to)) = (
+            &self.dag_index,
+            predecessor_index,
+            self.indices.get(successor),
+        ) {
+            if let Some(precedes) = index.precedes(from, to) {
+                return Ok(precedes);
+            }
+        }
+        let repeated_predecessor =
+            predecessor_index.is_some() && predecessor_index == self.previous_query_predecessor;
+        self.previous_query_predecessor = predecessor_index;
         if self.successor != Some(successor) {
+            // Incomplete graphs must retain the original ancestor DFS's exact
+            // missing-node error/prefix behavior. A reverse traversal cannot
+            // establish that behavior, even if it finds a path.
+            if self.complete_graph {
+                if let (Some(from), Some(&to)) = (predecessor_index, self.indices.get(successor)) {
+                    if self.predecessor == Some(from) {
+                        return Ok(self.descendants[to]);
+                    }
+                    if repeated_predecessor {
+                        self.fill_descendants(from);
+                        return Ok(self.descendants[to]);
+                    }
+                }
+            }
             self.fill(successor)?;
         }
         if self
@@ -77,6 +131,20 @@ impl<'a> CompletionOrderCache<'a> {
             return Err(invalid_plan("completion-order dependency node is missing"));
         }
         Ok(false)
+    }
+
+    fn fill_descendants(&mut self, predecessor: usize) {
+        self.pending.clear();
+        self.pending
+            .extend_from_slice(&self.successors[predecessor]);
+        self.descendants.fill(false);
+        while let Some(index) = self.pending.pop() {
+            if std::mem::replace(&mut self.descendants[index], true) {
+                continue;
+            }
+            self.pending.extend_from_slice(&self.successors[index]);
+        }
+        self.predecessor = Some(predecessor);
     }
 
     fn fill(&mut self, successor: &NodeId) -> Result<(), VNextError> {

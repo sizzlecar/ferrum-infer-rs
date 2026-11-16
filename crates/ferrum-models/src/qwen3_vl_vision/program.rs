@@ -260,8 +260,10 @@ pub(super) fn build(
             SemanticValue::Integers(
                 c.grids()
                     .iter()
-                    .map(|g| Ok(g.rows()? as i64))
-                    .collect::<Result<Vec<_>, VNextError>>()?,
+                    .flat_map(|g| {
+                        std::iter::repeat_n((g.height() * g.width()) as i64, g.temporal() as usize)
+                    })
+                    .collect(),
             ),
         ),
     ])?;

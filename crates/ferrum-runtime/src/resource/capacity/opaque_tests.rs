@@ -177,3 +177,60 @@ fn fail_closed_accounts_reject_zero_and_nonzero_reservations() {
         ));
     }
 }
+
+#[test]
+fn capacity_observation_is_read_only_and_does_not_authorize_a_later_allocation() {
+    let device = descriptor(128);
+    let observer = DeviceCapacityOwner::open(&device, 128).unwrap();
+    let producer = DeviceCapacityOwner::open(&device, 128).unwrap();
+    let held = producer
+        .reserve(DeviceOpaqueMemoryKind::Bootstrap, 96)
+        .unwrap();
+    let before = observer.budget.availability_snapshot().unwrap();
+    observer.check_available_bytes(32).unwrap();
+    assert!(matches!(
+        observer.check_available_bytes(33),
+        Err(VNextError::DeviceCapacityUnavailable(_))
+    ));
+    assert_eq!(observer.budget.availability_snapshot().unwrap(), before);
+    assert_eq!(
+        observer.budget.account.state.lock().unwrap().claimed_bytes,
+        96
+    );
+
+    // Another owner may win after a positive observation. Original admission
+    // must still reject the stale prediction and preserve the existing claim.
+    let competing = producer.reserve(DeviceOpaqueMemoryKind::Stream, 1).unwrap();
+    assert!(matches!(
+        observer.reserve(DeviceOpaqueMemoryKind::Stream, 32),
+        Err(VNextError::DeviceCapacityUnavailable(_))
+    ));
+    drop(competing);
+    let exact = observer
+        .reserve(DeviceOpaqueMemoryKind::Stream, 32)
+        .unwrap();
+    observer.check_available_bytes(0).unwrap();
+    assert!(matches!(
+        observer.check_available_bytes(1),
+        Err(VNextError::DeviceCapacityUnavailable(_))
+    ));
+    drop((exact, held));
+    observer.check_available_bytes(128).unwrap();
+}
+
+#[test]
+fn capacity_observation_respects_other_live_ceilings_and_fail_closed_state() {
+    let device = descriptor(128);
+    let observer = DeviceCapacityOwner::open(&device, 128).unwrap();
+    let lower = DeviceCapacityOwner::open(&device, 96).unwrap();
+    observer.check_available_bytes(96).unwrap();
+    assert!(matches!(
+        observer.check_available_bytes(97),
+        Err(VNextError::DeviceCapacityUnavailable(_))
+    ));
+    drop(lower);
+    observer.check_available_bytes(128).unwrap();
+    observer.budget.account.state.lock().unwrap().poisoned = true;
+    assert!(observer.check_available_bytes(0).is_err());
+    assert!(observer.check_available_bytes(1).is_err());
+}

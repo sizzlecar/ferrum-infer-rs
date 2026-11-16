@@ -691,12 +691,53 @@ pub struct RunCliCommand {
     command: RunCommand,
     #[command(flatten)]
     image: super::image_product::ImageRunArgs,
+    #[command(flatten)]
+    video: super::video_product::VideoRunArgs,
 }
 
 pub async fn execute_cli(
     cmd: RunCliCommand,
     config: CliConfig,
 ) -> std::result::Result<(), super::image_product::CommandError> {
+    if let Some(path) = cmd.video.product.video_config {
+        use super::video_product::{VideoProductError, VideoReferencePath, VideoRunRequest};
+        use ferrum_engine::video_generation::{VideoFrameRate, VideoGenerationParameters};
+        let prompt = cmd.command.prompt.ok_or_else(|| {
+            VideoProductError::from(anyhow::anyhow!("video run requires --prompt"))
+        })?;
+        let destination = cmd.image.output.ok_or_else(|| {
+            VideoProductError::from(anyhow::anyhow!("video run requires --output"))
+        })?;
+        return super::video_product::execute_run(VideoRunRequest {
+            config: path,
+            parameters: VideoGenerationParameters {
+                prompt,
+                width: cmd.image.width.unwrap_or(832),
+                height: cmd.image.height.unwrap_or(480),
+                num_frames: cmd.video.num_frames.unwrap_or(124),
+                frame_rate: VideoFrameRate {
+                    numerator: cmd.video.fps.unwrap_or(24),
+                    denominator: 1,
+                },
+                seed: cmd.command.seed.unwrap_or(0),
+            },
+            references: if cmd.video.references.is_empty() {
+                cmd.image
+                    .image
+                    .into_iter()
+                    .map(|path| VideoReferencePath {
+                        kind: ferrum_engine::video_generation::VideoReferenceKind::Image,
+                        path,
+                    })
+                    .collect()
+            } else {
+                cmd.video.references
+            },
+            destination,
+        })
+        .await
+        .map_err(Into::into);
+    }
     let source = cmd
         .image
         .product
@@ -928,6 +969,9 @@ pub struct RunCommand {
     /// Paged-group4 uses free backing; paged-group4-grow-only may also grow pools without reclaiming.
     #[arg(long, value_enum)]
     pub sequence_backing_growth: Option<crate::commands::SequenceBackingGrowthArg>,
+    /// Physical pool preparation: on-demand (default) or within-budget.
+    #[arg(long, value_parser = ferrum_types::RuntimePoolPreparation::parse_runtime_value)]
+    pub runtime_pool_preparation: Option<ferrum_types::RuntimePoolPreparation>,
     /// Q4_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
     #[arg(long, value_enum)]
     pub q4_mmvq_weight_decode: Option<crate::commands::Q4MmvqWeightDecodeArg>,
@@ -2889,6 +2933,12 @@ fn run_startup_cli_runtime_entries(
     );
     crate::runtime_env::push_cli_runtime_entry(
         &mut entries,
+        ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY,
+        cmd.runtime_pool_preparation
+            .map(ferrum_types::RuntimePoolPreparation::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
         ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
         cmd.q4_mmvq_weight_decode
             .map(crate::commands::Q4MmvqWeightDecodeArg::as_runtime_value),
@@ -3469,6 +3519,7 @@ mod tests {
             causal_decode_attention_grouping: None,
             causal_decode_kv_reuse: None,
             sequence_backing_growth: None,
+            runtime_pool_preparation: None,
             q4_mmvq_weight_decode: None,
             q5_mmvq_weight_decode: None,
             q8_projection_weight_preparation: None,
@@ -6474,6 +6525,40 @@ mod tests {
                     .iter()
                     .find(|entry| entry.key == KEY)
                     .map(|entry| entry.source),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_pool_preparation_run_preserves_config_and_cli_precedence() {
+        use ferrum_types::{RuntimeConfigSource as Source, RuntimePoolPreparation as Mode};
+        for (cli, expected, source) in [
+            (None, Mode::WithinBudget, Source::ConfigFile),
+            (Some(Mode::OnDemand), Mode::OnDemand, Source::Cli),
+        ] {
+            let entries = crate::config::RuntimeCliConfig {
+                runtime_pool_preparation: Some(Mode::WithinBudget),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut command = test_run_cmd();
+            command.runtime_pool_preparation = cli;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                entries,
+                ferrum_types::RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.pool_preparation, expected);
+            assert_eq!(
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY)
+                    .unwrap()
+                    .source,
                 source
             );
         }

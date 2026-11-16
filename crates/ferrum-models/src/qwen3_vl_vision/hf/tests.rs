@@ -134,7 +134,10 @@ fn original_processor_policy_is_frozen_and_unsupported_resize_fails_closed() {
     }
     let p = processor(16, 1024);
     let a = fixture::qwen35_config(4, 6).architecture().clone();
-    assert!(Qwen3VLVisionGrid::new(2, 4, 6).is_err());
+    assert!(
+        Qwen3VLVisionHfConfig::new(a.clone(), Qwen3VLVisionGrid::new(2, 4, 6).unwrap(), &p)
+            .is_err()
+    );
     let wrong = fixture::config(4, 6).architecture().clone();
     assert!(
         Qwen3VLVisionHfConfig::new(wrong, Qwen3VLVisionGrid::new(1, 4, 6).unwrap(), &p).is_err()

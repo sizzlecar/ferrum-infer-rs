@@ -113,7 +113,7 @@ impl ModelFamilyProvider for ReuseFamily {
     }
 }
 
-fn execute(retain_a: bool) -> (Vec<u8>, u64) {
+fn execute(retain_intermediates: bool) -> (Vec<u8>, u64) {
     // All additions and these expected BF16 values are exact. Late input has
     // distinct values and is uploaded before A is produced, but consumed last.
     let x = [
@@ -144,8 +144,12 @@ fn execute(retain_a: bool) -> (Vec<u8>, u64) {
         (id(LATE), config.spec()),
     ]))
     .unwrap();
-    if retain_a {
-        options.retain_completion_value(id(A));
+    if retain_intermediates {
+        // Retain every intermediate for the longer-lifetime control. The
+        // uploaded x copy can still be reused after its last read at node/a.
+        for value in [A, B, C] {
+            options.retain_completion_value(id(value));
+        }
     }
     let compilation = ProgramPlanCompiler::compile(
         &family,
@@ -157,7 +161,7 @@ fn execute(retain_a: bool) -> (Vec<u8>, u64) {
     .unwrap();
     let plan = compilation.executable().execution_plan();
     let memory = plan.payload().memory();
-    let dedicated_bytes = memory
+    let unshared_bytes = memory
         .dynamic_descriptors()
         .iter()
         .map(|descriptor| descriptor.minimum_request_bytes().unwrap())
@@ -165,19 +169,14 @@ fn execute(retain_a: bool) -> (Vec<u8>, u64) {
     let planned = memory.minimum_step_bytes();
     assert_eq!(memory.static_bytes(), 0);
     assert_eq!(memory.dynamic_descriptors().len(), 6);
-    if retain_a {
-        assert_eq!(planned, dedicated_bytes);
-    } else {
-        assert!(planned < dedicated_bytes);
-        assert_eq!(
-            memory
-                .dynamic_pools()
-                .iter()
-                .flat_map(|pool| pool.step_resource_slots())
-                .filter(|slot| slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave)
-                .count(),
-            1
-        );
+    assert!(planned <= unshared_bytes);
+    if !retain_intermediates {
+        assert!(planned < unshared_bytes);
+        assert!(memory
+            .dynamic_pools()
+            .iter()
+            .flat_map(|pool| pool.step_resource_slots())
+            .any(|slot| slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave));
     }
     // Trusted reconstruction re-derives the same resource-origin and lifetime
     // proof; the public JSON does not grant an independent alias authority.
@@ -270,7 +269,7 @@ fn execute(retain_a: bool) -> (Vec<u8>, u64) {
 #[test]
 fn fixed_liveness_preserves_late_input_and_output_while_reducing_real_pool_residency() {
     let (reused_output, reused_bytes) = execute(false);
-    let (dedicated_output, dedicated_bytes) = execute(true);
-    assert_eq!(reused_output, dedicated_output);
-    assert!(reused_bytes < dedicated_bytes);
+    let (retained_output, retained_bytes) = execute(true);
+    assert_eq!(reused_output, retained_output);
+    assert!(reused_bytes < retained_bytes);
 }

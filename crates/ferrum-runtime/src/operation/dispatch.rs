@@ -2136,7 +2136,7 @@ impl OperationDispatch {
                     encoded_operations.push((
                         segment.start_node_index(),
                         segment_dynamic_bindings,
-                        compute,
+                        Some(compute),
                         segment_result_bindings,
                     ));
                     node_index = segment.end_node_index() as usize;
@@ -2199,6 +2199,18 @@ impl OperationDispatch {
                     timing_sink,
                     SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                 );
+                operation
+                    .validate_compute_bindings(
+                        resolved.execution_plan().payload().nodes()
+                            [completion.wave().nodes()[node_index].plan_node_index()]
+                        .values(),
+                        resolved
+                            .execution_plan()
+                            .payload()
+                            .work_limits()
+                            .is_tensor(),
+                    )
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
                 let program_binding_count = operation.program_binding_count();
                 retained_dependencies
                     .append(
@@ -2219,7 +2231,7 @@ impl OperationDispatch {
                 drop(validation_stage);
                 let operation_command_count = operation
                     .dynamic_binding_count()
-                    .checked_add(1)
+                    .checked_add(operation.compute_command_count())
                     .and_then(|count| count.checked_add(operation.result_binding_count()))
                     .ok_or_else(|| {
                         SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -2381,6 +2393,18 @@ impl OperationDispatch {
                     timing_sink,
                     SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                 );
+                operation
+                    .validate_compute_bindings(
+                        resolved.execution_plan().payload().nodes()
+                            [completion.wave().nodes()[node_index].plan_node_index()]
+                        .values(),
+                        resolved
+                            .execution_plan()
+                            .payload()
+                            .work_limits()
+                            .is_tensor(),
+                    )
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
                 let program_binding_count = operation.program_binding_count();
                 let retained_dependency_count = operation.retained_plan_dependency_count();
                 retained_dependencies
@@ -2402,7 +2426,7 @@ impl OperationDispatch {
                 drop(validation_stage);
                 let operation_command_count = operation
                     .dynamic_binding_count()
-                    .checked_add(1)
+                    .checked_add(operation.compute_command_count())
                     .and_then(|count| count.checked_add(operation.result_binding_count()))
                     .ok_or_else(|| {
                         SubmissionWaveDispatchError::Contract(invalid_operation(

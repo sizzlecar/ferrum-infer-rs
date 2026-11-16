@@ -180,6 +180,44 @@ fn f32_to_bf16_cast_executes_ties_subnormals_overflow_and_nan_classes() {
 }
 
 #[test]
+#[ignore = "requires configured CUDA host; managed exact BF16 to F32 promotion"]
+fn bf16_to_f32_cast_preserves_every_source_encoding_and_retires_owners() {
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let runtime = runtime();
+    let registry = OperationRuntimeRegistry::new(
+        vec![Box::new(cast_bf16_to_f32_contract().unwrap())],
+        cuda_vnext_tensor_providers(&runtime, &[CudaTensorOperation::CastBf16ToF32]).unwrap(),
+    )
+    .unwrap();
+    let materializers = WeightMaterializerRegistry::identity_only().unwrap();
+    let catalog = catalog(&runtime, &registry, &materializers);
+    let component =
+        cast_bf16_to_f32_config().compile(runtime.as_ref(), &registry, &catalog, &materializers);
+    let host = host();
+    let mut session = component
+        .initialize(
+            runtime.clone(),
+            host.clone(),
+            ComponentWeightSource::None,
+            initialization(),
+        )
+        .unwrap();
+    for trial in 0..2 {
+        drop(execute_cast_bf16_to_f32(&mut session, &host, trial));
+    }
+    assert!(matches!(
+        session.close().unwrap_or_else(|failure| panic!(
+            "CUDA promotion close failed: {:?}",
+            failure.failure()
+        )),
+        PlanRuntimeCloseOutcome::Closed(_)
+    ));
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
 #[ignore = "requires an explicitly configured CUDA host; exercises real managed INT8 GEMM"]
 fn canonical_w4_a8_integer_gemm_executes_through_managed_component() {
     let _gpu = GPU

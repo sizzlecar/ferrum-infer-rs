@@ -4,10 +4,12 @@ use super::{
     directory::{DirectoryOptions, ImageBackendKind},
 };
 use anyhow::Result;
+#[cfg(feature = "cuda")]
+use ferrum_engine::image_generation::ImageGenerationOutput;
 use ferrum_engine::image_generation::{
     service::{ImageGenerator, ImageService, ImageServiceConfig},
-    ImageEditRequest, ImageGenerationOutput, ImageGenerationRequest, ImagePipelineLimits,
-    ImageStageReceipt, QwenImage21Assets, QwenImage21Pipeline,
+    ImageEditRequest, ImageGenerationRequest, ImagePipelineLimits, ImageStageReceipt,
+    QwenImage21Assets, QwenImage21Pipeline,
 };
 
 pub(super) enum PreparedAssets {
@@ -308,41 +310,32 @@ impl PreparedPipeline {
             Self::Metal(pipeline) => ImageGenerator::maximum_reference_images(&**pipeline),
         }
     }
-    pub(super) fn generate(
-        &mut self,
+    pub(super) fn run_generation(
+        self,
         request: ImageGenerationRequest,
-    ) -> Result<ImageGenerationOutput, GenerationFailure> {
+    ) -> ferrum_engine::image_generation::service::ImageServiceRun {
         match self {
             #[cfg(feature = "cuda")]
-            Self::Cuda(pipeline) => pipeline
-                .generate(request)
-                .map_err(|e| Box::new(e) as GenerationFailure),
+            Self::Cuda(pipeline) => ImageService::run_generation(*pipeline, request, 1024 * 1024),
             #[cfg(feature = "cuda")]
-            Self::PH3Cuda(pipeline) => pipeline
-                .generate(request)
-                .map_err(|e| Box::new(e) as GenerationFailure),
+            Self::PH3Cuda(pipeline) => {
+                ImageService::run_generation(*pipeline, request, 1024 * 1024)
+            }
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            Self::Metal(pipeline) => pipeline
-                .generate(request)
-                .map_err(|e| Box::new(e) as GenerationFailure),
+            Self::Metal(pipeline) => ImageService::run_generation(*pipeline, request, 1024 * 1024),
         }
     }
-    pub(super) fn edit(
-        &mut self,
+    pub(super) fn run_edit(
+        self,
         request: ImageEditRequest,
-    ) -> Result<ImageGenerationOutput, GenerationFailure> {
+    ) -> ferrum_engine::image_generation::service::ImageServiceRun {
         match self {
             #[cfg(feature = "cuda")]
-            Self::Cuda(pipeline) => pipeline
-                .edit(request)
-                .map_err(|e| Box::new(e) as GenerationFailure),
+            Self::Cuda(pipeline) => ImageService::run_edit(*pipeline, request, 1024 * 1024),
             #[cfg(feature = "cuda")]
-            Self::PH3Cuda(pipeline) => ImageGenerator::edit(&mut **pipeline, request)
-                .map_err(|e| Box::new(e) as GenerationFailure),
+            Self::PH3Cuda(pipeline) => ImageService::run_edit(*pipeline, request, 1024 * 1024),
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            Self::Metal(pipeline) => pipeline
-                .edit(request)
-                .map_err(|e| Box::new(e) as GenerationFailure),
+            Self::Metal(pipeline) => ImageService::run_edit(*pipeline, request, 1024 * 1024),
         }
     }
     pub(super) fn shutdown(&mut self) -> Result<Vec<ImageStageReceipt>, GenerationFailure> {

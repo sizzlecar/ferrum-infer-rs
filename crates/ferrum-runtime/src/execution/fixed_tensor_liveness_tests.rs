@@ -164,13 +164,20 @@ fn token_scaled_late_uploaded_inputs_are_dedicated_while_internal_values_still_r
     .unwrap();
     assert_eq!(pools.len(), 1);
     let pool = &pools[0];
-    assert_eq!(pool.minimum_step_bytes(), 5 * 16);
+    assert_eq!(pool.minimum_step_bytes(), 4 * 16);
     let shared = pool
         .step_resource_slots()
         .iter()
         .filter(|slot| slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave)
         .collect::<Vec<_>>();
-    assert_eq!(shared.len(), 1);
+    assert_eq!(shared.len(), 2);
+    // The completion output begins at node/out. It may take b's dead
+    // backing, while its own lifetime still extends through terminal readback.
+    assert!(shared.iter().any(|slot| slot.resource_ids()
+        == &[
+            ResourceId::new("resource/b").unwrap(),
+            ResourceId::new("resource/out").unwrap(),
+        ]));
     assert_eq!(
         shared[0].resource_ids(),
         &[
@@ -180,7 +187,7 @@ fn token_scaled_late_uploaded_inputs_are_dedicated_while_internal_values_still_r
     );
     // Every input is already uploaded when node/a starts. In particular late
     // must not occupy b's slot before node/out reads its original bytes.
-    for name in ["resource/x", "resource/late", "resource/out"] {
+    for name in ["resource/x", "resource/late"] {
         let resource = ResourceId::new(name).unwrap();
         let slot = pool
             .step_resource_slots()
@@ -191,8 +198,8 @@ fn token_scaled_late_uploaded_inputs_are_dedicated_while_internal_values_still_r
         assert_eq!(slot.resource_ids(), &[resource]);
     }
     let exact = MemoryPlan::from_core_with_completion_retention(
-        80,
-        80,
+        64,
+        64,
         0,
         1,
         vec![],
@@ -202,11 +209,11 @@ fn token_scaled_late_uploaded_inputs_are_dedicated_while_internal_values_still_r
         &retained,
     )
     .unwrap();
-    assert_eq!(exact.minimum_runnable_request_bytes(), 80);
+    assert_eq!(exact.minimum_runnable_request_bytes(), 64);
     assert!(matches!(
         MemoryPlan::from_core_with_completion_retention(
-            79,
-            79,
+            63,
+            63,
             0,
             1,
             vec![],
@@ -216,8 +223,8 @@ fn token_scaled_late_uploaded_inputs_are_dedicated_while_internal_values_still_r
             &retained,
         ),
         Err(VNextError::PlanCapacityExceeded {
-            required_bytes: 80,
-            usable_capacity_bytes: 79
+            required_bytes: 64,
+            usable_capacity_bytes: 63
         })
     ));
 }
@@ -245,7 +252,7 @@ fn token_scaled_external_alias_cannot_use_an_internal_producer_lifetime() {
         &BTreeSet::from([ResourceId::new("resource/out").unwrap()]),
     )
     .unwrap();
-    assert_eq!(pools[0].minimum_step_bytes(), 6 * 16);
+    assert_eq!(pools[0].minimum_step_bytes(), 5 * 16);
     for resource in ["resource/a", "resource/late"] {
         let resource = ResourceId::new(resource).unwrap();
         let slot = pools[0]
@@ -259,16 +266,23 @@ fn token_scaled_external_alias_cannot_use_an_internal_producer_lifetime() {
 }
 
 #[test]
-fn fixed_internal_liveness_reuses_slots_but_late_uploaded_inputs_stay_dedicated() {
+fn fixed_uploaded_input_reuses_storage_only_after_its_last_read() {
     let pools = pools(&chain(), &["resource/out"]);
     assert_eq!(pools.len(), 1);
-    assert_eq!(pools[0].minimum_step_bytes(), 5 * 64);
+    assert_eq!(pools[0].minimum_step_bytes(), 3 * 64);
     let shared = pools[0]
         .step_resource_slots()
         .iter()
         .filter(|slot| slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave)
         .collect::<Vec<_>>();
-    assert_eq!(shared.len(), 1);
+    assert_eq!(shared.len(), 2);
+    // x is uploaded before node/a and dies there; b and then the retained
+    // output can overwrite its Step copy after the proven completion edges.
+    assert!(shared.iter().any(|slot| {
+        ["resource/x", "resource/b", "resource/out"]
+            .into_iter()
+            .all(|id| slot.resource_ids().contains(&ResourceId::new(id).unwrap()))
+    }));
     assert_eq!(
         shared[0].resource_ids(),
         &[
@@ -276,7 +290,7 @@ fn fixed_internal_liveness_reuses_slots_but_late_uploaded_inputs_stay_dedicated(
             ResourceId::new("resource/c").unwrap()
         ]
     );
-    for name in ["resource/x", "resource/late", "resource/out"] {
+    for name in ["resource/late"] {
         let resource = ResourceId::new(name).unwrap();
         let slot = pools[0]
             .step_resource_slots()
@@ -290,12 +304,19 @@ fn fixed_internal_liveness_reuses_slots_but_late_uploaded_inputs_stay_dedicated(
 #[test]
 fn fixed_retention_overlap_and_missing_completion_order_prevent_reuse() {
     let retained = pools(&chain(), &["resource/a", "resource/out"]);
-    assert_eq!(retained[0].minimum_step_bytes(), 6 * 64);
+    assert_eq!(retained[0].minimum_step_bytes(), 4 * 64);
+    // An input which is also a terminal result cannot be overwritten.
+    let retained_input = pools(&chain(), &["resource/x", "resource/out"]);
+    assert_eq!(retained_input[0].minimum_step_bytes(), 4 * 64);
+    assert!(retained_input[0]
+        .step_resource_slots()
+        .iter()
+        .any(|slot| { slot.resource_ids() == &[ResourceId::new("resource/x").unwrap()] }));
 
     let mut unordered = chain();
     unordered[2].dependencies.clear();
     let unordered = pools(&unordered, &["resource/out"]);
-    assert_eq!(unordered[0].minimum_step_bytes(), 6 * 64);
+    assert_eq!(unordered[0].minimum_step_bytes(), 5 * 64);
 
     let mut overlap = chain();
     overlap[2].values.push(token_binding(
@@ -309,7 +330,118 @@ fn fixed_retention_overlap_and_missing_completion_order_prevent_reuse() {
         .push(ResourceId::new("resource/a").unwrap());
     overlap[2].resources.sort();
     let overlap = pools(&overlap, &["resource/out"]);
-    assert_eq!(overlap[0].minimum_step_bytes(), 6 * 64);
+    assert_eq!(overlap[0].minimum_step_bytes(), 4 * 64);
+}
+
+#[test]
+fn serial_execution_orders_independent_branches_before_reusing_their_storage() {
+    let mut nodes = vec![
+        node(
+            "node/a",
+            &[],
+            &[("value/x", "resource/x")],
+            ("value/a", "resource/a"),
+        ),
+        node(
+            "node/b",
+            &["node/a"],
+            &[("value/a", "resource/a")],
+            ("value/b", "resource/b"),
+        ),
+        node(
+            "node/c",
+            &[],
+            &[("value/x", "resource/x")],
+            ("value/c", "resource/c"),
+        ),
+        node(
+            "node/out",
+            &["node/b", "node/c"],
+            &[
+                ("value/b", "resource/b"),
+                ("value/c", "resource/c"),
+                ("value/late", "resource/late"),
+            ],
+            ("value/out", "resource/out"),
+        ),
+    ];
+    let original = nodes.clone();
+    ExecutionPlan::apply_execution_order(&mut nodes, PlanExecutionOrder::DataDependencies);
+    assert_eq!(nodes, original);
+    assert_eq!(
+        pools(&nodes, &["resource/out"])[0].minimum_step_bytes(),
+        5 * 64
+    );
+    let shares = |pool: &DynamicBackingPoolSpec, left: &str, right: &str| {
+        pool.step_resource_slots().iter().any(|slot| {
+            slot.resource_ids()
+                .contains(&ResourceId::new(left).unwrap())
+                && slot
+                    .resource_ids()
+                    .contains(&ResourceId::new(right).unwrap())
+        })
+    };
+    assert!(!shares(
+        &pools(&nodes, &["resource/out"])[0],
+        "resource/a",
+        "resource/c"
+    ));
+
+    ExecutionPlan::apply_execution_order(&mut nodes, PlanExecutionOrder::Serial);
+    assert_eq!(nodes[2].dependencies, vec![NodeId::new("node/b").unwrap()]);
+    assert_eq!(nodes[3].dependencies, original[3].dependencies);
+    let serial = pools(&nodes, &["resource/out"]);
+    assert_eq!(serial[0].minimum_step_bytes(), 4 * 64);
+    assert!(shares(&serial[0], "resource/a", "resource/c"));
+    // The serial proof also allows the output to reuse x after node/c reads
+    // it. Without that proof all uploaded inputs retain dedicated backing.
+    let descriptors = ["x", "late", "a", "b", "c", "out"]
+        .map(|name| descriptor(&format!("resource/{name}")))
+        .to_vec();
+    let retained = BTreeSet::from([ResourceId::new("resource/out").unwrap()]);
+    for capacity in [4 * 64, 4 * 64 - 1] {
+        let plan = MemoryPlan::from_core_with_completion_retention(
+            capacity,
+            capacity,
+            0,
+            1,
+            vec![],
+            descriptors.clone(),
+            &nodes,
+            None,
+            &retained,
+        );
+        if capacity == 4 * 64 {
+            assert_eq!(plan.unwrap().minimum_runnable_request_bytes(), capacity);
+        } else {
+            assert!(matches!(
+                plan,
+                Err(VNextError::PlanCapacityExceeded {
+                    required_bytes: 256,
+                    usable_capacity_bytes: 255
+                })
+            ));
+        }
+    }
+    // Serial execution does not shorten a real reader/retention lifetime.
+    assert_eq!(
+        pools(&nodes, &["resource/a", "resource/out"])[0].minimum_step_bytes(),
+        5 * 64
+    );
+    nodes[3].values.push(token_binding(
+        "value/a",
+        ResolvedValueRole::Input,
+        TensorAccess::Read,
+        "resource/a",
+    ));
+    nodes[3]
+        .resources
+        .push(ResourceId::new("resource/a").unwrap());
+    nodes[3].resources.sort();
+    assert_eq!(
+        pools(&nodes, &["resource/out"])[0].minimum_step_bytes(),
+        5 * 64
+    );
 }
 
 #[test]
@@ -324,7 +456,7 @@ fn fixed_external_alias_cannot_borrow_an_internal_producer_proof() {
         "resource/a",
     ));
     let pools = pools(&nodes, &["resource/out"]);
-    assert_eq!(pools[0].minimum_step_bytes(), 6 * 64);
+    assert_eq!(pools[0].minimum_step_bytes(), 4 * 64);
 }
 
 #[test]

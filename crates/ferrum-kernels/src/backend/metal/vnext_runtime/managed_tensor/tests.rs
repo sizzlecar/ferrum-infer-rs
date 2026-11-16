@@ -19,10 +19,10 @@ fn account(aligned: bool) -> HostMemoryAccount {
     let limits = HostMemoryLimits::new(
         1 << 20,
         HostMemoryClassLimits {
-            input_preprocess_bytes: 1 << 19,
-            output_bytes: 1 << 19,
+            input_preprocess_bytes: 1 << 18,
+            output_bytes: 1 << 18,
             transfer_staging_bytes: 0,
-            weight_backing_bytes: 0,
+            weight_backing_bytes: 1 << 18,
         },
     )
     .unwrap();
@@ -91,12 +91,25 @@ fn fixed_tensor_attribution_survives_a_real_metal_submission_without_fake_tokens
 
 #[test]
 fn no_copy_upload_retains_aligned_host_charge_and_readback_writes_only_its_piece() {
+    for class in [HostMemoryClass::InputPreprocess, HostMemoryClass::Output] {
+        check_no_copy_upload(class);
+    }
+}
+
+fn check_no_copy_upload(class: HostMemoryClass) {
+    struct CapacityChanged(std::sync::mpsc::SyncSender<()>);
+    impl std::task::Wake for CapacityChanged {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.try_send(());
+        }
+    }
     let host = account(true);
-    let output = metal::objc::rc::autoreleasepool(|| {
+    let (changed, refunds) = std::sync::mpsc::sync_channel(1);
+    let _subscription =
+        host.subscribe_capacity(std::task::Waker::from(Arc::new(CapacityChanged(changed))));
+    let (output, output_charge) = metal::objc::rc::autoreleasepool(|| {
         let runtime = runtime();
-        let mut source = host
-            .allocate_zeroed(HostMemoryClass::InputPreprocess, 8)
-            .unwrap();
+        let mut source = host.allocate_zeroed(class, 8).unwrap();
         source
             .as_mut()
             .copy_from_slice(&[0, 63, 128, 63, 0, 64, 64, 64]);
@@ -138,6 +151,7 @@ fn no_copy_upload_retains_aligned_host_charge_and_readback_writes_only_its_piece
             .terminal()
             .is_succeeded());
         let mut output = host.allocate_zeroed(HostMemoryClass::Output, 16).unwrap();
+        let output_charge = host.usage().unwrap().allocated_bytes() - input_charge;
         output.as_mut().fill(91);
         assert!(runtime
             .readback_managed_into(
@@ -152,24 +166,30 @@ fn no_copy_upload_retains_aligned_host_charge_and_readback_writes_only_its_piece
         assert_eq!(&output.as_ref()[2..10], &[0, 63, 128, 63, 0, 64, 64, 64]);
         assert_eq!(&output.as_ref()[10..], &[91; 6]);
         assert_eq!(
-            host.usage()
-                .unwrap()
-                .class_committed_bytes(HostMemoryClass::InputPreprocess),
+            host.usage().unwrap().class_committed_bytes(class),
             input_charge
+                + if class == HostMemoryClass::Output {
+                    output_charge
+                } else {
+                    0
+                }
         );
         drop(fence);
-        output
+        (output, output_charge)
     });
     // Metal's command buffer also has an autoreleased retain. Completion and
     // dropping our fence do not require that native retain to be gone yet.
-    // Check final release after draining the pool, while the independent output
-    // allocation still proves that only the input charge was released.
-    assert_eq!(
-        host.usage()
-            .unwrap()
-            .class_committed_bytes(HostMemoryClass::InputPreprocess),
-        0
-    );
+    // Native resource disposal can also finish on a Metal driver thread. Wait
+    // for the actual Host refund notification after draining our pool, while
+    // the independent output proves that only the input charge was released.
+    // A retained/leaked owner still fails at this finite deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while host.usage().unwrap().allocated_bytes() > output_charge {
+        refunds
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("Metal did not refund the input backing after native owner release");
+    }
+    assert_eq!(host.usage().unwrap().allocated_bytes(), output_charge);
     drop(output);
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }
@@ -195,7 +215,7 @@ fn managed_tensor_io_rejects_foreign_misaligned_or_wrong_class_transfers_before_
             .encode_managed_upload(source.clone(), layout, &destination, 0)
             .is_err());
         let wrong_class = host
-            .allocate_zeroed(HostMemoryClass::Output, 8)
+            .allocate_zeroed(HostMemoryClass::WeightBacking, 8)
             .unwrap()
             .freeze();
         assert!(runtime

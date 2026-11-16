@@ -147,6 +147,12 @@ fn cuda_operator_distribution(path: &str) -> bool {
         "native-operators/cuda/README.md"
             | "native-operators/cuda/cutlass-fp8/README.md"
             | "native-operators/cuda/cutlass-fp8/CUTLASS-BSD-3-Clause.txt"
+            | "native-operators/cuda/cutlass-nvfp4/README.md"
+            | "native-operators/cuda/sage-vsa-fp4/README.md"
+            | "native-operators/cuda/sage-vsa-fp4/Apache-2.0.txt"
+            | "native-operators/cuda/sage-vsa-fp4/CUTLASS-BSD-3-Clause.txt"
+            | "native-operators/cuda/sage-vsa-fp4/NOTICE.txt"
+            | "native-operators/cuda/sage-vsa-fp4/upstream-headers.sha256"
     ) || matches!(
         cuda_operator_member(path),
         Some("README.md" | "llama-MIT.txt")
@@ -582,6 +588,12 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
         return classify_bench_core(relative);
     }
     if component == "ferrum-diffusion" {
+        if relative == "examples/bench_latent_layout.rs" {
+            return Some((
+                vec![Validation],
+                "standalone CPU latent-layout copy benchmark; no inference callers",
+            ));
+        }
         return (relative.starts_with("src/") && relative.ends_with(".rs")).then(|| {
             (vec![Kernel, Architecture],
                 "shared diffusion schedules, numerical integration and latent layouts: retain numerical boundaries and model execution across declared backends")
@@ -708,6 +720,10 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "src/decode_isolation.rs"
             | "src/env.rs"
             | "src/report.rs"
+            | "src/resource_usage.rs"
+            | "src/resource_usage/gpu.rs"
+            | "src/resource_usage/procfs.rs"
+            | "src/resource_usage/timing.rs"
             | "src/stats.rs"
             | "src/images.rs"
             | "src/images/continuous_trace.rs"
@@ -733,6 +749,17 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "examples/image_run_comparison/fieller.rs"
             | "examples/image_run_comparison/input.rs"
             | "examples/image_run_comparison/tests.rs"
+            | "examples/video_job_bench.rs"
+            | "examples/video_job_bench/client.rs"
+            | "examples/video_job_bench/client_tests.rs"
+            | "examples/video_job_bench/input.rs"
+            | "examples/video_job_bench/lifecycle.rs"
+            | "examples/video_job_bench/lifecycle_tests.rs"
+            | "examples/video_job_bench/report.rs"
+            | "examples/video_job_bench/resource_tests.rs"
+            | "examples/video_job_bench/resources.rs"
+            | "examples/video_job_bench/validation.rs"
+            | "examples/video_job_compare.rs"
             | "examples/checkpoint_diff.rs"
             | "examples/checkpoint_diff/directory.rs"
             | "examples/checkpoint_diff/tests.rs"
@@ -890,6 +917,12 @@ mod tests {
             "native-operators/cuda/marlin-instance-policy/README.md",
             "native-operators/cuda/cutlass-fp8/README.md",
             "native-operators/cuda/cutlass-fp8/CUTLASS-BSD-3-Clause.txt",
+            "native-operators/cuda/cutlass-nvfp4/README.md",
+            "native-operators/cuda/sage-vsa-fp4/README.md",
+            "native-operators/cuda/sage-vsa-fp4/Apache-2.0.txt",
+            "native-operators/cuda/sage-vsa-fp4/CUTLASS-BSD-3-Clause.txt",
+            "native-operators/cuda/sage-vsa-fp4/NOTICE.txt",
+            "native-operators/cuda/sage-vsa-fp4/upstream-headers.sha256",
         ] {
             assert_eq!(analyze_paths([path]).areas, [ChangeArea::Build]);
             assert_eq!(path_backend(path), Some(Backend::Cuda));
@@ -902,6 +935,8 @@ mod tests {
             "native-operators/cuda/upstream-linear/.cu",
             "native-operators/cuda/upstream-linear/../mmq.cu",
             "native-operators/cuda/cutlass-fp8/unreviewed.cu",
+            "native-operators/cuda/cutlass-nvfp4/unreviewed.cu",
+            "native-operators/cuda/sage-vsa-fp4/unreviewed.cu",
         ] {
             let impact = analyze_paths([sources[0], unknown]);
             assert_eq!(impact.areas, ALL_AREAS, "{unknown}");
@@ -1429,6 +1464,15 @@ mod tests {
             "crates/ferrum-bench-core/src/dataset/records/tests.rs",
             "crates/ferrum-bench-core/src/sse_text_event_gap.rs",
             "crates/ferrum-bench-core/src/sse_text_event_gap/tests.rs",
+            "crates/ferrum-bench-core/examples/video_job_bench.rs",
+            "crates/ferrum-bench-core/examples/video_job_bench/client.rs",
+            "crates/ferrum-bench-core/examples/video_job_bench/lifecycle.rs",
+            "crates/ferrum-bench-core/examples/video_job_compare.rs",
+            "crates/ferrum-bench-core/src/resource_usage.rs",
+            "crates/ferrum-bench-core/src/resource_usage/gpu.rs",
+            "crates/ferrum-bench-core/src/resource_usage/procfs.rs",
+            "crates/ferrum-bench-core/src/resource_usage/timing.rs",
+            "crates/ferrum-diffusion/examples/bench_latent_layout.rs",
             "crates/ferrum-bench-core/tests/release_staging_workflows/cuda_delivery.rs",
         ];
         for path in measurement {
@@ -1439,6 +1483,9 @@ mod tests {
         for unknown in [
             "crates/ferrum-bench-core/src/dataset/runtime.rs",
             "crates/ferrum-bench-core/src/client_slo/new_policy.rs",
+            "crates/ferrum-bench-core/src/resource_usage/new_policy.rs",
+            "crates/ferrum-bench-core/examples/video_job_bench/new_policy.rs",
+            "crates/ferrum-diffusion/examples/unknown.rs",
             "crates/ferrum-bench-core/tests/release_staging_workflows/unknown.rs",
         ] {
             let impact = analyze_paths(measurement.into_iter().chain([unknown]));

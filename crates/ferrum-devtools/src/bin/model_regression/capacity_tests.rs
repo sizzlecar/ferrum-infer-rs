@@ -24,6 +24,29 @@ fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
 }
 
 #[test]
+fn runtime_pool_preparation_is_forwarded_and_verified_for_both_entrypoints() {
+    assert!(parse(&["--runtime-pool-preparation", "automatic"]).is_err());
+    for mode in ["on-demand", "within-budget"] {
+        let args = parse(&["--runtime-pool-preparation", mode]).unwrap();
+        for entrypoint in ["run", "serve"] {
+            assert!(args
+                .common_args(entrypoint)
+                .windows(2)
+                .any(|pair| pair == ["--runtime-pool-preparation", mode]));
+        }
+        let entry = json!({"key": ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY, "effective_value": mode});
+        assert!(capacity::validate_effective_policy(&args, &json!({"entries": [entry]})).is_ok());
+        assert!(capacity::validate_effective_policy(&args, &json!({"entries": []})).is_err());
+        assert!(capacity::validate_effective_policy(&args, &json!({"entries": [{"key": ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY, "effective_value": "ignored"}]})).is_err());
+    }
+    assert!(!parse(&[])
+        .unwrap()
+        .common_args("serve")
+        .iter()
+        .any(|arg| arg == "--runtime-pool-preparation"));
+}
+
+#[test]
 fn memory_budget_cli_requires_positive_bytes_and_explicit_capacity() {
     for extra in [
         vec!["--runtime-memory-budget-bytes", "4294967296"],

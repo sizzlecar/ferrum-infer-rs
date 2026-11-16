@@ -29,6 +29,7 @@ pub mod loader;
 pub mod lora;
 pub mod mxfp4_safetensors_source;
 pub mod native_safetensors;
+pub mod nvfp4;
 pub mod process_mapped_dense;
 pub mod quant_linear;
 pub mod safetensors_archive;

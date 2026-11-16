@@ -57,8 +57,11 @@ pub struct NumericalExecutionProfile {
     pub id: NumericalProfileId,
     pub version: ContractVersion,
     pub family_id: ModelFamilyId,
-    /// The main activation is explicit so product metadata need not guess a
-    /// dtype from weights, a container, or a profile's human-readable name.
+    /// The primary output boundary is explicit so product metadata need not
+    /// guess its storage dtype from weights or a profile's name. Tensor-only
+    /// producers may return packed/integer storage; causal language families
+    /// additionally require a floating-point activation during preparation.
+    /// Encoded storage is described by its operation contract, not this dtype.
     pub primary_activation: ProgramValueId,
     /// Every operation output has a declared storage/rounding boundary. This
     /// includes residuals, intermediate activations, logits and token outputs.
@@ -95,14 +98,10 @@ impl NumericalExecutionProfile {
                 "profile version and operation contracts must be explicit",
             ));
         }
-        if !self
-            .boundaries
-            .get(&self.primary_activation)
-            .is_some_and(|dtype| floating(*dtype))
-        {
+        if !self.boundaries.contains_key(&self.primary_activation) {
             return Err(invalid(
                 &self.family_id,
-                "primary activation must name a floating-point boundary",
+                "primary activation must name a declared output boundary",
             ));
         }
         let mut operation_ids = BTreeSet::new();
@@ -173,9 +172,26 @@ impl NumericalExecutionProfile {
             .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
     }
 
-    pub fn activation_type(&self) -> Result<ElementType, VNextError> {
+    /// Physical storage type of the declared primary boundary. A packed U8
+    /// buffer does not imply U8 multiplication or accumulation: those remain
+    /// specified by the operation's numerical/encoding contract.
+    pub fn primary_storage_type(&self) -> Result<ElementType, VNextError> {
         self.validate()?;
         Ok(self.boundaries[&self.primary_activation])
+    }
+
+    /// Floating-point activation accessor retained for model/product callers.
+    /// Generic tensor producers must use `primary_storage_type`; encoded or
+    /// integer outputs cannot silently become a product's activation precision.
+    pub fn activation_type(&self) -> Result<ElementType, VNextError> {
+        let dtype = self.primary_storage_type()?;
+        if !floating(dtype) {
+            return Err(invalid(
+                &self.family_id,
+                "primary boundary is encoded/integer storage, not a floating-point activation",
+            ));
+        }
+        Ok(dtype)
     }
 
     pub fn kv_storage_format(&self) -> Result<Option<KvStorageFormat>, VNextError> {

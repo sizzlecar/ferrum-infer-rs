@@ -102,12 +102,7 @@ pub(super) fn validate_semantic_binding(
     execution_weight_schema: Option<&WeightSchema>,
     binding: &ResolvedValueBinding,
 ) -> Result<(), VNextError> {
-    if let Some(weight) = family
-        .program()
-        .weights()
-        .iter()
-        .find(|weight| &weight.value_id == binding.value_id())
-    {
+    if let Some(weight) = family.program().weight_for_value(binding.value_id()) {
         if binding.usage() != BufferUsage::Weights || binding.access() != TensorAccess::Read {
             return Err(invalid_plan(format!(
                 "weight value `{}` is not backed by immutable weight memory",
@@ -137,12 +132,7 @@ pub(super) fn validate_semantic_binding(
             "non-weight semantic value carries a physical weight binding",
         ));
     }
-    if let Some(state) = family
-        .program()
-        .states()
-        .iter()
-        .find(|state| &state.value_id == binding.value_id())
-    {
+    if let Some(state) = family.program().state_for_value(binding.value_id()) {
         if binding.usage() != BufferUsage::State {
             return Err(invalid_plan(format!(
                 "state value `{}` is not backed by state memory",

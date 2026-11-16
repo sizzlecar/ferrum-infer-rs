@@ -8,24 +8,25 @@ use ferrum_runtime::{AddcmulBf16Geometry, RowBroadcast, RowRmsNormSingleRoundBf1
 pub(crate) enum ReferenceRowRmsAddcmulGeometry {
     RowRms(RowRmsNormSingleRoundBf16Geometry),
     Addcmul(AddcmulBf16Geometry),
+    AddcmulFma(AddcmulBf16Geometry),
 }
 impl ReferenceRowRmsAddcmulGeometry {
     pub(crate) fn rows(self) -> u64 {
         match self {
             Self::RowRms(g) => g.rows(),
-            Self::Addcmul(g) => g.rows(),
+            Self::Addcmul(g) | Self::AddcmulFma(g) => g.rows(),
         }
     }
     pub(crate) fn width(self) -> u64 {
         match self {
             Self::RowRms(g) => g.width(),
-            Self::Addcmul(g) => g.width(),
+            Self::Addcmul(g) | Self::AddcmulFma(g) => g.width(),
         }
     }
     pub(crate) fn parameter_elements(self) -> u64 {
         match self {
             Self::RowRms(g) => g.width(),
-            Self::Addcmul(g) => {
+            Self::Addcmul(g) | Self::AddcmulFma(g) => {
                 if g.mode() == RowBroadcast::Row {
                     g.width()
                 } else {
@@ -37,7 +38,7 @@ impl ReferenceRowRmsAddcmulGeometry {
     pub(crate) fn logical_operations(self) -> Result<u64, ReferenceDeviceRuntimeError> {
         match self {
             Self::RowRms(g) => g.logical_arithmetic_operations(),
-            Self::Addcmul(g) => g.logical_arithmetic_operations(),
+            Self::Addcmul(g) | Self::AddcmulFma(g) => g.logical_arithmetic_operations(),
         }
         .map_err(invalid)
     }
@@ -54,6 +55,7 @@ impl ReferenceRowRmsAddcmulLaunch {
         match self.geometry {
             ReferenceRowRmsAddcmulGeometry::RowRms(_) => "vnext_row_rms_single_round_bf16",
             ReferenceRowRmsAddcmulGeometry::Addcmul(_) => "vnext_addcmul_bf16",
+            ReferenceRowRmsAddcmulGeometry::AddcmulFma(_) => "vnext_addcmul_fma_bf16",
         }
     }
     pub(crate) fn logical_work(
@@ -84,7 +86,11 @@ impl ReferenceRowRmsAddcmulLaunch {
         check(&self.parameter, self.geometry.parameter_elements() * 2)?;
         match (self.geometry, &self.update) {
             (ReferenceRowRmsAddcmulGeometry::RowRms(_), None) => {}
-            (ReferenceRowRmsAddcmulGeometry::Addcmul(_), Some(update)) => check(update, bytes)?,
+            (
+                ReferenceRowRmsAddcmulGeometry::Addcmul(_)
+                | ReferenceRowRmsAddcmulGeometry::AddcmulFma(_),
+                Some(update),
+            ) => check(update, bytes)?,
             _ => return Err(invalid("update presence differs from operation")),
         }
         if self.output.overlaps(&self.input)
@@ -142,7 +148,8 @@ pub(super) fn execute(launch: &ReferenceRowRmsAddcmulLaunch) {
                 }
             }
         }
-        ReferenceRowRmsAddcmulGeometry::Addcmul(g) => {
+        ReferenceRowRmsAddcmulGeometry::Addcmul(g)
+        | ReferenceRowRmsAddcmulGeometry::AddcmulFma(g) => {
             let mut storage = AllocationLocks::new([
                 &launch.input,
                 &launch.parameter,
@@ -158,8 +165,16 @@ pub(super) fn execute(launch: &ReferenceRowRmsAddcmulLaunch) {
                 let x = bf16::from_bits(storage.read_bits(0, index)).to_f32();
                 let gate = bf16::from_bits(storage.read_bits(1, p)).to_f32();
                 let update = bf16::from_bits(storage.read_bits(2, index)).to_f32();
-                let product = gate * update;
-                storage.write_bits(3, index, bf16::from_f32(x + product).to_bits());
+                let value = if matches!(
+                    launch.geometry,
+                    ReferenceRowRmsAddcmulGeometry::AddcmulFma(_)
+                ) {
+                    gate.mul_add(update, x)
+                } else {
+                    let product = gate * update;
+                    x + product
+                };
+                storage.write_bits(3, index, bf16::from_f32(value).to_bits());
             }
         }
     }

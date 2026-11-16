@@ -190,7 +190,8 @@ fn execute_pipeline(
         residency = ?pipeline.residency_policy(),
         "experimental image run; no throughput qualification"
     );
-    let result = if editing {
+    let host = pipeline.host_account().clone();
+    let run = if editing {
         if !pipeline.supports_edits() {
             return Err(anyhow::anyhow!(
                 "this image package does not declare complete editing assets"
@@ -210,33 +211,46 @@ fn execute_pipeline(
                 return Err(error.into());
             }
         };
-        pipeline.edit(ImageEditRequest {
+        pipeline.run_edit(ImageEditRequest {
             references: encoded.drain(1..).collect(),
             generation: request,
             image: encoded.remove(0),
         })
     } else {
-        pipeline.generate(request)
+        pipeline.run_generation(request)
     };
+    let ferrum_engine::image_generation::service::ImageServiceRun { result, shutdown } = run;
+    if shutdown.has_failure() {
+        return Err(ImageProductError::Run {
+            source: result
+                .err()
+                .map(anyhow::Error::from)
+                .unwrap_or_else(|| anyhow::anyhow!("image worker retirement failed")),
+            shutdown,
+        });
+    }
     let output = match result {
         Ok(output) => output,
-        Err(source) => return Err(ImageProductError::generation_pipeline(source, pipeline)),
+        Err(source) => {
+            return Err(ImageProductError::Run {
+                source: source.into(),
+                shutdown,
+            })
+        }
     };
-    // Close native sessions before fallible output encoding. The returned
-    // image keeps its independent managed Host backing after device close.
-    let shutdown = match pipeline.shutdown() {
-        Ok(receipts) => receipts,
-        Err(source) => return Err(ImageProductError::generation_pipeline(source, pipeline)),
-    };
+    // The shared worker has completed native close before fallible encoding.
+    // Keep its actual receipts and the output's original Host parent.
+    let receipts = shutdown
+        .stage_receipts()
+        .ok_or_else(|| anyhow::anyhow!("image worker did not return its shutdown receipts"))?;
     // The model adapter checks every pixel is finite before touching a sink.
-    let rgba = output.rgba.view(pipeline.host_account())?;
+    let rgba = output.rgba.view(&host)?;
     if rgba.rgba_dimensions() != [1, 4, height as usize, width as usize] {
         return Err(
             anyhow::anyhow!("image pipeline output dimensions differ from the request").into(),
         );
     }
-    let mut scratch = pipeline
-        .host_account()
+    let mut scratch = host
         .allocate_zeroed(HostMemoryClass::Output, 16 * 1024)
         .map_err(anyhow::Error::from)?;
     let mut file = OpenOptions::new()
@@ -261,7 +275,7 @@ fn execute_pipeline(
             "png": {"width": png.dimensions().width(), "height": png.dimensions().height(),
                 "encoded_bytes": png.encoded_bytes(), "color_type": "rgba8"},
             "generation": output.receipt,
-            "shutdown": shutdown,
+            "shutdown": receipts,
         }))
         .map_err(anyhow::Error::from)?
     );

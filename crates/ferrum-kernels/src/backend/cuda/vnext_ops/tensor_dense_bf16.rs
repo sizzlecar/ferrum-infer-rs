@@ -41,6 +41,9 @@ use super::super::vnext_runtime::{
 use super::tensor_silu::RetainedF32RowBias;
 use super::{binding, contract_error, implementation_fingerprint, provider_failure};
 
+mod rounded;
+pub(super) use rounded::{descriptor as rounded_descriptor, provider as rounded_provider};
+
 pub const NUMERICAL_PROFILE_ID: &str = "cuda.cublas.gemmex.bf16_f32.no_workspace.v1";
 pub const NUMERICAL_PROFILE_IDENTITY: &str = concat!(
     "gemm-ex;A=B=C=CUDA_R_16BF;compute=CUBLAS_COMPUTE_32F;",
@@ -823,6 +826,28 @@ fn launch_for(
     shape: Shape,
     scalar: Scalar,
 ) -> Result<(), CudaDeviceRuntimeError> {
+    launch_pointers(
+        stream,
+        blas,
+        input.device_ptr(),
+        weight,
+        output.device_ptr(),
+        shape,
+        scalar,
+    )
+}
+
+// Private arithmetic helper. Its callers retain and bounds-check every range
+// before encoding; raw addresses do not acquire storage or extend its lifetime.
+fn launch_pointers(
+    stream: &CudaStream,
+    blas: &CudaBlas,
+    input: u64,
+    weight: u64,
+    output: u64,
+    shape: Shape,
+    scalar: Scalar,
+) -> Result<(), CudaDeviceRuntimeError> {
     // Lane handles are not shared between streams. Each launch sets every
     // numerical/resource policy explicitly. SetStream resets workspace, so
     // the zero-workspace selection MUST follow it, even on the same stream.
@@ -867,10 +892,10 @@ fn launch_for(
                 &ALPHA,
                 weight as *const f32,
                 shape.inputs,
-                input.device_ptr() as *const f32,
+                input as *const f32,
                 shape.inputs,
                 &BETA,
-                output.device_ptr() as *mut f32,
+                output as *mut f32,
                 shape.outputs,
             )
         } else {
@@ -885,11 +910,11 @@ fn launch_for(
                 weight as *const c_void,
                 sys::cudaDataType_t::CUDA_R_16BF,
                 shape.inputs,
-                input.device_ptr() as *const c_void,
+                input as *const c_void,
                 sys::cudaDataType_t::CUDA_R_16BF,
                 shape.inputs,
                 &BETA as *const f32 as *const c_void,
-                output.device_ptr() as *mut c_void,
+                output as *mut c_void,
                 sys::cudaDataType_t::CUDA_R_16BF,
                 shape.outputs,
                 sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,

@@ -66,7 +66,7 @@ fn launch(
         )
         .region(0..32)
         .unwrap(),
-        update: if kind == RowSelectedBf16Kind::Addcmul {
+        update: if kind.input_count() == 3 {
             Some(
                 buffer(runtime, "resource.compact.u", &input, 16, ElementType::Bf16)
                     .region(0..8)
@@ -93,6 +93,7 @@ fn row_selected_bf16_rejects_wrong_physical_ports_aliases_and_update_presence() 
     for kind in [
         RowSelectedBf16Kind::Modulation,
         RowSelectedBf16Kind::Addcmul,
+        RowSelectedBf16Kind::AddcmulFma,
     ] {
         for case in 0..5 {
             let mut l = launch(&runtime, kind);

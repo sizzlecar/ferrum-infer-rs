@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 mod checkpoint;
+mod program_index;
 pub use checkpoint::{
     CheckpointInputDependency, ProgramCheckpointInputs, StateCheckpointCapability,
     StateCheckpointContents, StateCheckpointContract, PROGRAM_CHECKPOINT_INPUTS_VERSION,
@@ -71,8 +72,9 @@ pub struct PhysicalWeightComponentRef {
 pub struct WeightTensorSpec {
     pub id: WeightId,
     pub dimensions: Vec<u64>,
-    /// Dtype observed by the semantic program after decoding any physical
-    /// packing, indexing, or quantization components.
+    /// Dtype observed by the program after decoding a numerical weight. For an
+    /// explicit `PhysicalComponent` leaf this is its unchanged physical dtype;
+    /// that operand carries no decoded logical-weight element count.
     pub logical_element_type: ElementType,
     pub physical_layout: PhysicalWeightLayout,
     pub required: bool,
@@ -80,6 +82,17 @@ pub struct WeightTensorSpec {
 
 impl WeightTensorSpec {
     pub fn logical_elements(&self) -> Result<u64, VNextError> {
+        if matches!(
+            self.physical_layout,
+            PhysicalWeightLayout::PhysicalComponent(_)
+        ) {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: format!(
+                    "physical component operand `{}` has no decoded logical weight count; use the consuming operation's checked geometry",
+                    self.id
+                ),
+            });
+        }
         checked_elements(&self.dimensions).ok_or_else(|| VNextError::InvalidExecutionPlan {
             reason: format!("logical weight `{}` element count overflows u64", self.id),
         })
@@ -220,7 +233,13 @@ impl WeightSchema {
         for component in &self.components {
             if !component_ids.insert(component.id.clone())
                 || component.external_names.is_empty()
-                || component.dimensions.is_empty()
+                || (component.dimensions.is_empty()
+                    && !(matches!(component.encoding, WeightEncoding::Dense { .. })
+                        && self.tensors.iter().any(|tensor| {
+                            matches!(&tensor.physical_layout,
+                                PhysicalWeightLayout::PhysicalComponent(view)
+                                    if view.component_id() == &component.id)
+                        })))
                 || component
                     .external_names
                     .iter()
@@ -956,6 +975,29 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
             return Err(self.invalid("logical layout shape is empty, zero, or overflowing"));
         }
         match layout {
+            PhysicalWeightLayout::PhysicalComponent(view) => {
+                if depth != 1 {
+                    return Err(self.invalid("physical component views must be root leaves"));
+                }
+                let component = self.component(view.component_id())?;
+                if matches!(component.encoding, WeightEncoding::DenseAffine { .. })
+                    || component.physical_element_type() != logical_element_type
+                    || checked_elements(semantic_dimensions)
+                        .and_then(|count| count.checked_mul(logical_element_type.size_bytes()))
+                        != Some(component.physical_bytes()?)
+                {
+                    return Err(self.invalid(format!(
+                        "physical view of `{}` must preserve its exact byte range, physical dtype, and encoding",
+                        component.id
+                    )));
+                }
+                if !self.referenced.insert(component.id.clone()) {
+                    return Err(self.invalid(format!(
+                        "component `{}` is referenced more than once in the physical layout tree",
+                        component.id
+                    )));
+                }
+            }
             PhysicalWeightLayout::Dense { component_id } => {
                 let binding =
                     PhysicalWeightComponentBinding::exact_contiguous(component_id.clone());
@@ -1810,6 +1852,10 @@ pub struct ModelProgram {
     outputs: Vec<ProgramValueId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     checkpoint_inputs: Option<ProgramCheckpointInputs>,
+    /// Derived from the validated immutable program; never part of its wire
+    /// representation or fingerprint. Clones share the lookup metadata.
+    #[serde(skip)]
+    index: Arc<program_index::ProgramIndex>,
 }
 
 #[derive(Deserialize)]
@@ -2008,6 +2054,7 @@ impl ModelProgram {
         }
         states.sort_by(|left, right| left.id.cmp(&right.id));
         weights.sort_by(|left, right| left.weight_id.cmp(&right.weight_id));
+        let index = Arc::new(program_index::ProgramIndex::new(&blocks, &states, &weights));
         Ok(Self {
             family_id,
             inputs,
@@ -2017,6 +2064,7 @@ impl ModelProgram {
             weights,
             outputs,
             checkpoint_inputs: None,
+            index,
         })
     }
 
@@ -2320,6 +2368,24 @@ impl<'de> Deserialize<'de> for ModelSemanticMetadata {
 }
 
 impl ModelSemanticMetadata {
+    /// The tensor profile owns storage and arithmetic contracts; this semantic
+    /// layer adds language-only requirements. Definition and preparation both
+    /// apply it, so neither profile selection nor wire replay can bypass it.
+    fn validate_numerical_profile(
+        &self,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<(), VNextError> {
+        profile.validate()?;
+        if matches!(self, Self::CausalLanguage(_)) && profile.activation_type().is_err() {
+            return Err(VNextError::InvalidModelConfig {
+                family_id: profile.family_id.to_string(),
+                field: "numerical_profile".into(),
+                reason: "causal language primary activation must be floating-point".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// A language-only adapter must explicitly reject tensor components before
     /// opening tokenizer, sampling, or token execution resources.
     pub fn causal_language(&self) -> Result<&CausalLanguageMetadata, VNextError> {
@@ -2664,6 +2730,7 @@ impl PreparedModelFamily {
         weights.validate_program_references(&family_id, &program)?;
         numerical_profile.normalize();
         numerical_profile.validate_program(&program)?;
+        metadata.validate_numerical_profile(&numerical_profile)?;
         Self::validate_metadata(&family_id, &metadata)?;
         Ok(Self {
             wire_version: PREPARED_MODEL_FAMILY_WIRE_VERSION,
@@ -2956,6 +3023,9 @@ impl<P: ModelFamilyProvider> ModelFamilyRegistration for TypedFamilyRegistration
                 field: "numerical_profiles".to_owned(),
                 reason: "profile catalog belongs to another model family".to_owned(),
             });
+        }
+        for profile in numerical_profiles.profiles() {
+            metadata.validate_numerical_profile(profile)?;
         }
         Ok(ModelFamilyDefinition {
             parts: ModelFamilyDefinitionParts {

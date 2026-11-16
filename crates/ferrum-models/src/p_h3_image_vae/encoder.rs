@@ -11,7 +11,7 @@ mod config;
 mod program;
 mod weights;
 pub(crate) use checkpoint::PH3ImageVaeEncoderCheckpoint;
-pub(crate) use config::PH3ImageVaeEncoderConfig;
+pub(crate) use config::{CausalVaeEncoderSourceLayout, PH3ImageVaeEncoderConfig};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PH3ImageVaeEncoderLimits {
     pub max_metadata_bytes: usize,
@@ -116,7 +116,7 @@ impl ModelFamilyProvider for PH3ImageVaeEncoderFamily {
             .flat_map(|n| &n.outputs)
             .map(|v| (v.clone(), ElementType::F32))
             .collect();
-        let operations = F32CnnOp::ALL
+        let operations = F32CnnOp::NCHW
             .into_iter()
             .map(|kind| {
                 Ok(NumericalOperationContract {

@@ -14,10 +14,11 @@ use sha2::{Digest, Sha256};
 
 pub const NUMERICAL_PROFILE_ID: &str = "cuda.cudnn920.segmented_attention.bf16.v1";
 const NUMERICAL_IDENTITY: &str = concat!(
-    "BF16-QKVY-contiguous-rows;D72-or-D128;independent-positive-noncausal-segments;",
+    "BF16-QKVY-contiguous-rows;D64-or-D72-or-D128;independent-positive-noncausal-segments;",
     "F32-byvalue-scale;cuDNN9.20-forward-inference;deterministic-engine-filter;",
     "vendor-intermediate-rounding;finite-visible-domain;no-sequential-or-Torch-bitwise-claim;",
-    "each-segment-B1-QKVO-slice;all-valid-direct-KV;no-cross-segment-read;",
+    "consecutive-equal-length-segments-as-independent-native-batches-up-to-declared-limit;",
+    "all-valid-direct-QKVO-slices;no-cross-segment-read;no-padding;",
     "lengths-only-launch-no-payload-copy-or-payload-scratch;",
     "one-admitted-scratch-reused-in-stream-order;exact-queried-workspace;",
     "shared-cuDNN-handle-cache-opaque-and-binding-limits;prepared-native-plan-digest;",
@@ -102,8 +103,8 @@ impl Schedule {
             attrs,
         )
         .map_err(|e| e.to_string())?;
-        if !matches!(geometry.head_dim, 72 | 128) {
-            return Err("cuDNN segmented attention supports D72 or D128".into());
+        if !matches!(geometry.head_dim, 64 | 72 | 128) {
+            return Err("cuDNN segmented attention supports D64, D72 or D128".into());
         }
         if geometry.output_bytes > isize::MAX as u64
             || bindings.iter().any(|b| {
@@ -115,7 +116,7 @@ impl Schedule {
             return Err("cuDNN segmented attention requires addressable dense BF16 storage".into());
         }
         let heads = geometry.columns / geometry.head_dim;
-        let mut segments = Vec::with_capacity(geometry.lengths.len());
+        let mut segments: Vec<Segment> = Vec::with_capacity(geometry.lengths.len());
         let mut operations = 0u64;
         for (&start, &length) in geometry.starts.iter().zip(&geometry.lengths) {
             let rows = u32::try_from(length)
@@ -141,6 +142,8 @@ impl Schedule {
             let signature = CudnnSdpaSignature {
                 batch: 1,
                 heads: i64::try_from(heads).map_err(|_| "segment heads exceed i64")?,
+                key_value_heads: i64::try_from(heads).map_err(|_| "segment heads exceed i64")?,
+                causal: false,
                 query_length: i64::from(rows),
                 key_value_length: i64::from(rows),
                 head_dim: geometry.head_dim as i64,
@@ -153,6 +156,22 @@ impl Schedule {
             operations = operations
                 .checked_add(logical_work(length, heads, geometry.head_dim)?)
                 .ok_or("segmented attention work overflows")?;
+            if let Some(previous) = segments.last_mut() {
+                if previous.rows == rows
+                    && previous.signature.batch < CudnnSdpaSignature::MAX_BATCH
+                    && previous.offset_bytes.checked_add(previous.bytes) == Some(offset_bytes)
+                {
+                    // The sequence remains the isolation boundary. A native
+                    // batch adds no Q/K/V rows to any member's attention.
+                    previous.bytes = previous
+                        .bytes
+                        .checked_add(bytes)
+                        .ok_or("segmented native batch extent overflows")?;
+                    previous.signature.batch += 1;
+                    previous.signature.validate()?;
+                    continue;
+                }
+            }
             segments.push(Segment {
                 offset_bytes,
                 bytes,
@@ -189,7 +208,7 @@ struct PreparedSegment {
 }
 fn prepared_fingerprint(stages: &[PreparedSegment]) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"ferrum.cuda.segmented-attention.prepared.v1\0");
+    digest.update(b"ferrum.cuda.segmented-attention.prepared.v2\0");
     digest.update((stages.len() as u64).to_le_bytes());
     for s in stages {
         digest.update(s.segment.offset_bytes.to_le_bytes());
@@ -219,7 +238,10 @@ impl Provider {
                 self.cache.lookup(&segment.signature)
             }
             .map_err(|e| e.to_string())?;
-            let scratch = ScratchLayout::without_payload(1, plan.workspace_bytes())?;
+            let scratch = ScratchLayout::without_payload(
+                u32::try_from(segment.signature.batch).map_err(|_| "invalid native batch")?,
+                plan.workspace_bytes(),
+            )?;
             peak = peak.max(scratch.bytes);
             result.push(PreparedSegment {
                 segment,
@@ -404,7 +426,10 @@ impl Provider {
             bound.push(BoundSegment {
                 segment: p.segment,
                 scratch: s,
-                mask: attention::NativeMask::isolated_sequence(p.segment.rows)?,
+                mask: attention::NativeMask::isolated_sequences(
+                    p.segment.rows,
+                    p.segment.signature.batch as usize,
+                )?,
                 execution,
             });
         }
@@ -425,7 +450,7 @@ impl Provider {
                     let k_lengths = scratch + b.scratch.key_lengths_offset;
                     let rows = b.segment.rows;
                     let zero = 0u32;
-                    let one = 1u32;
+                    let batches = b.segment.signature.batch as u32;
                     let mut launch = stream.launch_builder(kernels.fused_attention_function(1));
                     launch
                         .arg(&k)
@@ -437,13 +462,13 @@ impl Provider {
                         .arg(&columns)
                         .arg(&rows)
                         .arg(&zero)
-                        .arg(&one)
+                        .arg(&batches)
                         .arg(&rows)
                         .arg(&rows)
                         .arg(&rows)
-                        // Each isolated segment is already contiguous and all
-                        // valid. The command retains its source regions through
-                        // the fence; the native plan keeps the same strides.
+                        // Consecutive equal-size segments retain their own
+                        // native batch strides and independent length entries.
+                        // Source regions survive through the same fence.
                         .arg(&zero) // copy_payload: initialize lengths only
                         .arg(&b.mask);
                     unsafe {

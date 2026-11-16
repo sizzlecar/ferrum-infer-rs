@@ -4,7 +4,7 @@
 
 use super::super::vnext_runtime::{
     CudaBufferRegion, CudaDeviceBuffer, CudaDeviceCommand, CudaDeviceRuntime,
-    CudaDeviceRuntimeError, CudaTensorCutlassRetention,
+    CudaDeviceRuntimeError, CudaTensorNativeModuleRetention, StaticNativeModule,
 };
 use super::{binding, contract_error, implementation_fingerprint, provider_failure};
 use crate::native_ops::cutlass_fp8::{
@@ -101,7 +101,8 @@ pub(super) fn source_fingerprint() -> Result<String, String> {
         include_bytes!("tensor_dense_fp8_bf16/grouped.rs"),
         include_bytes!("../../../native_ops/cutlass_fp8.rs"),
         include_bytes!("../../../native_ops/cutlass_fp8/cache.rs"),
-        include_bytes!("../vnext_runtime/tensor_eager/cutlass_owner.rs"),
+        include_bytes!("../vnext_runtime/tensor_eager/native_module_owner.rs"),
+        include_bytes!("../vnext_runtime/tensor_eager/native_module_capacity.rs"),
     ]))
 }
 
@@ -112,7 +113,7 @@ pub(super) struct Provider {
     plans: Arc<Mutex<PreparedPlanCache>>,
     probe: Option<Arc<CudaCutlassFp8Probe>>,
     // Retained after all plan records. Commands also keep this owner alive.
-    owner: Arc<CudaTensorCutlassRetention>,
+    owner: Arc<CudaTensorNativeModuleRetention>,
 }
 
 impl Provider {
@@ -145,8 +146,11 @@ impl Provider {
         ]);
         // Claim before any CUDART/native planning call. Querying driver device
         // attributes below neither loads this module nor creates another context.
-        let owner =
-            runtime.reserve_tensor_cutlass_module(&implementation, config.opaque_memory_bytes)?;
+        let owner = runtime.reserve_tensor_native_module(
+            StaticNativeModule::CutlassFp8,
+            &implementation,
+            config.opaque_memory_bytes,
+        )?;
         let implementation = if probe.is_some() {
             implementation_fingerprint(&[
                 implementation.as_bytes(),

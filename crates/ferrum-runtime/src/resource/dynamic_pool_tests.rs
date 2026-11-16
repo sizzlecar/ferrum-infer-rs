@@ -118,6 +118,7 @@ struct TestRuntime {
     descriptor_mismatch_buffer: std::sync::atomic::AtomicUsize,
     allocate_calls: AtomicU64,
     fail_on_call: AtomicU64,
+    allocation_capacity_failure: AtomicBool,
     panic_on_call: AtomicU64,
     mismatch_on_call: AtomicU64,
     backend_alive: Arc<AtomicBool>,
@@ -186,6 +187,7 @@ impl TestRuntime {
             descriptor_mismatch_buffer: std::sync::atomic::AtomicUsize::new(0),
             allocate_calls: AtomicU64::new(0),
             fail_on_call: AtomicU64::new(0),
+            allocation_capacity_failure: AtomicBool::new(false),
             panic_on_call: AtomicU64::new(0),
             mismatch_on_call: AtomicU64::new(0),
             backend_alive: Arc::new(AtomicBool::new(true)),
@@ -358,6 +360,14 @@ impl DeviceRuntime for TestRuntime {
             backend_alive: Arc::downgrade(&self.backend_alive),
             dropped_after_backend: Arc::clone(&self.dropped_after_backend),
         })
+    }
+
+    fn allocation_failure_kind(&self, _error: &Self::Error) -> crate::DeviceAllocationFailureKind {
+        if self.allocation_capacity_failure.load(Ordering::Acquire) {
+            crate::DeviceAllocationFailureKind::Capacity
+        } else {
+            crate::DeviceAllocationFailureKind::Unrecoverable
+        }
     }
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {
@@ -2917,7 +2927,11 @@ fn plan_budget_pressure_rebalances_idle_chunks_across_pools() {
     let harness = harness(Arc::clone(&runtime), catalog, 192, false);
     let maintenance = &harness.root.maintenance_controller;
     maintenance.initialize_pool(&donor_pool_id).unwrap();
-    let donor_growth = maintenance.grow_pool(&donor_pool_id, 64).unwrap();
+    let prepared = harness
+        .root
+        .ensure_pool_residency(BTreeMap::from([(donor_pool_id.clone(), 128)]))
+        .unwrap();
+    let donor_growth = &prepared.growths()[0];
     maintenance.initialize_pool(&target_pool_id).unwrap();
     let target_pool = Arc::clone(&harness.root.dynamic_pools.pools[&target_pool_id]);
     let held_target = claim_size(&harness.root.dynamic_pools, &target_pool, 64);
@@ -4721,6 +4735,114 @@ fn sequence_session_live_witness_rejects_terminal_and_dropped_sessions() {
 }
 
 #[test]
+fn resident_target_is_absolute_idempotent_and_does_not_claim_or_pin_capacity() {
+    for profile in [linear_profile(), paged_profile()] {
+        let catalog = pool_catalog(
+            profile,
+            AllocationLifetime::Request,
+            'a',
+            1,
+            256,
+            TestDemand::Fixed,
+        );
+        let runtime = new_runtime(&catalog, 256);
+        let h = harness(runtime, catalog, 256, false);
+        let maintenance = &h.root.maintenance_controller;
+        maintenance.initialize_pool(&h.pool_ids[0]).unwrap();
+        let before = maintenance.status().unwrap();
+        let targets = BTreeMap::from([(h.pool_ids[0].clone(), 128)]);
+        let growth = h.root.ensure_pool_residency(targets.clone()).unwrap();
+        assert_eq!(growth.growths()[0].chunk_bytes(), 64);
+        let after = maintenance.status().unwrap();
+        assert_eq!(after.pools()[0].resident_bytes(), 128);
+        assert_eq!(after.pools()[0].contract(), before.pools()[0].contract());
+        assert_eq!(
+            after.pools()[0].live_occupancy(),
+            before.pools()[0].live_occupancy()
+        );
+        assert_eq!(
+            after.maximum_active_sequences(),
+            before.maximum_active_sequences()
+        );
+        let calls = h.runtime.allocate_calls();
+        assert!(h
+            .root
+            .ensure_pool_residency(targets)
+            .unwrap()
+            .growths()
+            .is_empty());
+        assert!(h
+            .root
+            .ensure_pool_residency(BTreeMap::from([(h.pool_ids[0].clone(), 64)]))
+            .unwrap()
+            .growths()
+            .is_empty());
+        assert_eq!(h.runtime.allocate_calls(), calls);
+        assert_eq!(maintenance.status().unwrap(), after);
+        close_dynamic_test_root(h.root);
+    }
+}
+
+#[test]
+fn resident_target_batch_denials_do_not_partially_allocate_or_publish() {
+    let combined = combine_catalogs(&[
+        pool_catalog(
+            linear_profile(),
+            AllocationLifetime::Request,
+            'a',
+            1,
+            256,
+            TestDemand::Fixed,
+        ),
+        pool_catalog(
+            linear_profile(),
+            AllocationLifetime::Request,
+            'b',
+            1,
+            256,
+            TestDemand::Fixed,
+        ),
+    ]);
+    for budget in [192, 1024] {
+        let runtime = new_runtime(&combined, budget);
+        let h = harness(runtime, combined.clone(), budget, false);
+        let before = h.root.maintenance_controller.status().unwrap();
+        let targets = |bytes| h.pool_ids.iter().cloned().map(|id| (id, bytes)).collect();
+        if budget == 192 {
+            assert!(matches!(
+                h.root.ensure_pool_residency(targets(128)),
+                Err(VNextError::DeviceCapacityUnavailable(_))
+            ));
+        } else {
+            // Enough aggregate budget isolates the pool's resident ceiling.
+            assert!(matches!(
+                h.root.ensure_pool_residency(targets(320)),
+                Err(VNextError::DynamicPoolResidentUnavailable(_))
+            ));
+        }
+        assert_eq!(h.runtime.allocate_calls(), 0);
+        let denied = h.root.maintenance_controller.status().unwrap();
+        assert_eq!(denied.budget_claimed_bytes(), before.budget_claimed_bytes());
+        assert_eq!(denied.pools(), before.pools());
+        h.runtime.fail_on_call(2);
+        assert!(h.root.ensure_pool_residency(targets(64)).is_err());
+        let failed = h.root.maintenance_controller.status().unwrap();
+        assert_eq!(failed.budget_claimed_bytes(), 0);
+        assert!(failed.pools().iter().all(|pool| pool.resident_bytes() == 0));
+        h.runtime.fail_on_call(0);
+        assert_eq!(
+            h.root
+                .ensure_pool_residency(targets(64))
+                .unwrap()
+                .growths()
+                .len(),
+            2
+        );
+        close_dynamic_test_root(h.root);
+    }
+}
+
+#[test]
 fn multi_pool_batch_publishes_one_capacity_epoch() {
     let combined = combine_catalogs(&[
         pool_catalog(
@@ -4782,83 +4904,98 @@ fn multi_pool_batch_publishes_one_capacity_epoch() {
 
 #[test]
 fn multi_pool_nth_allocation_failure_has_zero_partial_publication() {
-    let combined = combine_catalogs(&[
-        pool_catalog(
-            linear_profile(),
-            AllocationLifetime::Request,
-            'a',
-            1,
-            256,
-            TestDemand::Fixed,
-        ),
-        pool_catalog(
-            linear_profile(),
-            AllocationLifetime::Request,
-            'b',
-            1,
-            256,
-            TestDemand::Fixed,
-        ),
-    ]);
-    let runtime = new_runtime(&combined, 512);
-    runtime.fail_on_call(2);
-    let harness = harness(Arc::clone(&runtime), combined, 512, false);
-    let requests = harness
-        .pool_ids
-        .iter()
-        .cloned()
-        .map(|pool_id| DynamicPoolGrowthRequest::new(pool_id, 64).unwrap())
-        .collect::<Vec<_>>();
-    let before = harness
-        .root
-        .dynamic_pools
-        .logical_admission
-        .snapshot()
-        .unwrap();
-    assert!(harness
-        .root
-        .maintenance_controller
-        .grow_pools(requests.clone())
-        .is_err());
-    let after = harness
-        .root
-        .dynamic_pools
-        .logical_admission
-        .snapshot()
-        .unwrap();
-    assert_eq!(after.capacity_epoch(), before.capacity_epoch());
-    assert!(after
-        .domains()
-        .iter()
-        .all(|domain| domain.total() == CapacityUnits::ZERO));
-    for pool in harness.root.dynamic_pools.pools.values() {
-        let state = pool.state.lock().unwrap();
-        assert_eq!(state.pending_growth_bytes, 0);
-        assert!(state.chunks.is_empty());
-    }
-    assert_eq!(
-        harness
+    for capacity in [false, true] {
+        let combined = combine_catalogs(&[
+            pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Request,
+                'a',
+                1,
+                256,
+                TestDemand::Fixed,
+            ),
+            pool_catalog(
+                linear_profile(),
+                AllocationLifetime::Request,
+                'b',
+                1,
+                256,
+                TestDemand::Fixed,
+            ),
+        ]);
+        let runtime = new_runtime(&combined, 512);
+        runtime.fail_on_call(2);
+        runtime
+            .allocation_capacity_failure
+            .store(capacity, Ordering::Release);
+        let harness = harness(Arc::clone(&runtime), combined, 512, false);
+        let requests = harness
+            .pool_ids
+            .iter()
+            .cloned()
+            .map(|pool_id| DynamicPoolGrowthRequest::new(pool_id, 64).unwrap())
+            .collect::<Vec<_>>();
+        let before = harness
             .root
             .dynamic_pools
-            .budget
-            .account
-            .state
-            .lock()
-            .unwrap()
-            .claimed_bytes,
-        0
-    );
-    runtime.fail_on_call(0);
-    assert_eq!(
-        harness
+            .logical_admission
+            .snapshot()
+            .unwrap();
+        let error = harness
             .root
             .maintenance_controller
-            .grow_pools(requests)
-            .unwrap()
-            .growths()
-            .len(),
-        2
-    );
+            .grow_pools(requests.clone())
+            .unwrap_err();
+        match error {
+            VNextError::DeviceAllocationUnavailable(pressure) if capacity => {
+                assert_eq!(pressure.requested_bytes(), 64);
+                assert_eq!(pressure.report().code(), "dynamic_pool_test");
+                assert_eq!(pressure.report().message(), "injected failure");
+                assert!(!pressure.resource_id().as_str().is_empty());
+            }
+            VNextError::InvalidExecutionPlan { .. } if !capacity => (),
+            other => panic!("allocation failure classification changed: {other:?}"),
+        }
+        let after = harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .snapshot()
+            .unwrap();
+        assert_eq!(after.capacity_epoch(), before.capacity_epoch());
+        assert!(after
+            .domains()
+            .iter()
+            .all(|domain| domain.total() == CapacityUnits::ZERO));
+        for pool in harness.root.dynamic_pools.pools.values() {
+            let state = pool.state.lock().unwrap();
+            assert_eq!(state.pending_growth_bytes, 0);
+            assert!(state.chunks.is_empty());
+        }
+        assert_eq!(
+            harness
+                .root
+                .dynamic_pools
+                .budget
+                .account
+                .state
+                .lock()
+                .unwrap()
+                .claimed_bytes,
+            0
+        );
+        runtime.fail_on_call(0);
+        assert_eq!(
+            harness
+                .root
+                .maintenance_controller
+                .grow_pools(requests)
+                .unwrap()
+                .growths()
+                .len(),
+            2
+        );
+    }
 }
 
 #[test]
@@ -5967,6 +6104,100 @@ fn contiguous_profile_rejects_fragmented_cross_chunk_claim() {
 }
 
 #[test]
+fn contiguous_pool_headroom_is_shared_and_capacity_denial_precedes_allocation() {
+    for (device_bytes, pool_bytes, expected_resident) in
+        [(2048, 2048, 512), (320, 2048, 320), (2048, 330, 320)]
+    {
+        let catalog = pool_catalog(
+            linear_profile(),
+            AllocationLifetime::Step,
+            'e',
+            1,
+            pool_bytes,
+            TestDemand::Tokens,
+        );
+        let h = harness(
+            new_runtime(&catalog, device_bytes),
+            catalog,
+            device_bytes,
+            false,
+        );
+        let maintenance = &h.root.maintenance_controller;
+        maintenance.grow_pool(&h.pool_ids[0], 256).unwrap();
+        let pool = Arc::clone(&h.root.dynamic_pools.pools[&h.pool_ids[0]]);
+        let first = claim_size(&h.root.dynamic_pools, &pool, 256);
+        let request = evaluated_request(&pool, 64);
+        let BackingPrepareDecision::Deferred(deferred) = h
+            .root
+            .dynamic_pools
+            .prepare_claim(std::slice::from_ref(&request))
+            .unwrap()
+        else {
+            panic!("occupied backing must require growth")
+        };
+        let before = h.runtime.allocate_calls();
+        assert!(matches!(
+            maintenance.maintain_for_live_deferred(&deferred).unwrap(),
+            DynamicDeferredMaintenanceOutcome::Maintained(_)
+        ));
+        assert_eq!(h.runtime.allocate_calls(), before + 1);
+        let second = claim_size(&h.root.dynamic_pools, &pool, 64);
+        assert_eq!(second.evidence().size_bytes(), 64);
+        let status = maintenance.status().unwrap();
+        assert_eq!(status.pools()[0].resident_bytes(), expected_resident);
+        assert_eq!(status.pools()[0].free_bytes(), expected_resident - 320);
+        assert_eq!(status.pools()[0].pending_growth_bytes(), 0);
+        // Releasing a peer's live claim makes its contiguous extent reusable;
+        // the larger physical pool never enlarges another claim's authority.
+        drop(first);
+        let third = claim_size(&h.root.dynamic_pools, &pool, 256);
+        assert_eq!(h.runtime.allocate_calls(), before + 1);
+        drop((second, third));
+        drop(request);
+        drop(pool);
+        close_dynamic_test_root(h.root);
+    }
+}
+
+#[test]
+fn pool_headroom_does_not_retry_native_allocation_failure() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'e',
+        1,
+        2048,
+        TestDemand::Tokens,
+    );
+    let h = harness(new_runtime(&catalog, 2048), catalog, 2048, false);
+    let maintenance = &h.root.maintenance_controller;
+    maintenance.grow_pool(&h.pool_ids[0], 256).unwrap();
+    let pool = Arc::clone(&h.root.dynamic_pools.pools[&h.pool_ids[0]]);
+    let first = claim_size(&h.root.dynamic_pools, &pool, 256);
+    let request = evaluated_request(&pool, 64);
+    let BackingPrepareDecision::Deferred(deferred) = h
+        .root
+        .dynamic_pools
+        .prepare_claim(std::slice::from_ref(&request))
+        .unwrap()
+    else {
+        panic!("occupied backing must require growth")
+    };
+    let before = h.runtime.allocate_calls();
+    h.runtime.fail_on_call(before + 1);
+    assert!(maintenance.maintain_for_live_deferred(&deferred).is_err());
+    assert_eq!(h.runtime.allocate_calls(), before + 1);
+    let status = maintenance.status().unwrap();
+    assert_eq!(status.pools()[0].resident_bytes(), 256);
+    assert_eq!(status.pools()[0].pending_growth_bytes(), 0);
+    assert_eq!(status.budget_claimed_bytes(), 256);
+    drop(first);
+    drop(request);
+    drop(pool);
+    close_dynamic_test_root(h.root);
+}
+
+#[test]
 fn contiguous_batch_deferral_retains_whole_packing_demand_and_grows_to_progress() {
     let catalog = pool_catalog(
         linear_profile(),
@@ -6014,7 +6245,7 @@ fn contiguous_batch_deferral_retains_whole_packing_demand_and_grows_to_progress(
         panic!("whole-transaction fragmentation must grow or wait, never retry unchanged")
     };
     assert_eq!(growth.growths().len(), 1);
-    assert_eq!(growth.growths()[0].chunk_bytes(), 448);
+    assert_eq!(growth.growths()[0].chunk_bytes(), 896);
 
     let BackingPrepareDecision::Prepared(prepared) =
         harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
@@ -6025,8 +6256,8 @@ fn contiguous_batch_deferral_retains_whole_packing_demand_and_grows_to_progress(
     assert_eq!(authorities.len(), 2);
     drop(authorities);
     let status = maintenance.status().unwrap();
-    assert_eq!(status.pools()[0].resident_bytes(), 1_344);
-    assert_eq!(status.pools()[0].free_bytes(), 1_344);
+    assert_eq!(status.pools()[0].resident_bytes(), 1_792);
+    assert_eq!(status.pools()[0].free_bytes(), 1_792);
 }
 
 #[test]

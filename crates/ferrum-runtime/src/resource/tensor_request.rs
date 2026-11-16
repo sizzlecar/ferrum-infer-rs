@@ -10,6 +10,67 @@ use crate::{
 pub struct TensorRequestStateMapping {
     pub source_output: ProgramValueId,
     pub destination_state: ProgramValueId,
+    pub selection: TensorOutputSelection,
+}
+
+/// A semantic selection from a contiguous completion output. It cannot name
+/// native storage or extend the admitted producer's logical extent.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum TensorOutputSelection {
+    #[default]
+    Whole,
+    LeadingAxis {
+        start: u64,
+        length: u64,
+    },
+}
+
+impl TensorOutputSelection {
+    fn resolve(
+        self,
+        tensor: &ResolvedTensorSpec,
+        source: &ResolvedStorageComponent,
+    ) -> Result<(ResolvedTensorSpec, ResolvedStorageComponent), VNextError> {
+        if tensor.layout() != &ResolvedTensorLayout::Contiguous
+            || source.length_bytes() != tensor.minimum_storage_bytes()?
+            || source.element_type() != tensor.element_type()
+        {
+            return Err(invalid_resource(
+                "state source is not an exact contiguous tensor",
+            ));
+        }
+        let Self::LeadingAxis { start, length } = self else {
+            return Ok((tensor.clone(), source.clone()));
+        };
+        let mut dimensions = tensor.dimensions().to_vec();
+        let first = dimensions
+            .first_mut()
+            .ok_or_else(|| invalid_resource("state source has no leading axis"))?;
+        if length == 0 || start.checked_add(length).is_none_or(|end| end > *first) {
+            return Err(invalid_resource(
+                "state source selection exceeds its leading axis",
+            ));
+        }
+        let stride = source.length_bytes() / *first;
+        *first = length;
+        let offset = start
+            .checked_mul(stride)
+            .and_then(|offset| source.offset_bytes().checked_add(offset))
+            .ok_or_else(|| invalid_resource("state source selection offset overflows"))?;
+        let selected = ResolvedTensorSpec::new(
+            dimensions,
+            tensor.element_type(),
+            ResolvedTensorLayout::Contiguous,
+        )?;
+        let storage = ResolvedStorageComponent::new(
+            source.component_id().cloned(),
+            source.resource_id().clone(),
+            offset,
+            selected.minimum_storage_bytes()?,
+            source.element_type(),
+        )?;
+        Ok((selected, storage))
+    }
 }
 
 #[derive(Clone)]
@@ -130,7 +191,7 @@ struct StateCopy {
     destination: StatePort,
 }
 
-pub(super) struct PreparedTensorRequestStateInitialization<R: DeviceRuntime> {
+struct PreparedTargetInitialization<R: DeviceRuntime> {
     copies: Vec<StateCopy>,
     // Physical segment retentions defend against a backend forgetting to retain
     // its borrowed views; the wave itself holds this through fence retirement.
@@ -140,12 +201,16 @@ pub(super) struct PreparedTensorRequestStateInitialization<R: DeviceRuntime> {
     settled: AtomicBool,
 }
 
-impl<R: DeviceRuntime> Drop for PreparedTensorRequestStateInitialization<R> {
+impl<R: DeviceRuntime> Drop for PreparedTargetInitialization<R> {
     fn drop(&mut self) {
         if !self.settled.load(Ordering::Acquire) {
             self.target.status.store(FAILED, Ordering::Release);
         }
     }
+}
+
+pub(super) struct PreparedTensorRequestStateInitialization<R: DeviceRuntime> {
+    targets: Vec<PreparedTargetInitialization<R>>,
 }
 
 impl<R: DeviceRuntime> PreparedStepSubmissionWave<R> {
@@ -155,6 +220,49 @@ impl<R: DeviceRuntime> PreparedStepSubmissionWave<R> {
         destination: &TensorRequestStateTarget<R>,
         mappings: &[TensorRequestStateMapping],
     ) -> Result<(), VNextError> {
+        self.initialize_tensor_request_states(source_plan, &[(destination, mappings)])
+    }
+
+    /// One producer fence publishes every destination, including independent
+    /// request slices of a joint result. Each destination retains its original
+    /// request capacity and transfer hazard; no allocation authority is shared.
+    pub fn initialize_tensor_request_states(
+        &mut self,
+        source_plan: &ExecutionPlan,
+        destinations: &[(&TensorRequestStateTarget<R>, &[TensorRequestStateMapping])],
+    ) -> Result<(), VNextError> {
+        if self.tensor_state_initialization.is_some() || destinations.is_empty() {
+            return Err(invalid_resource(
+                "state initialization is empty or already prepared",
+            ));
+        }
+        for (index, (destination, _)) in destinations.iter().enumerate() {
+            if destinations[..index]
+                .iter()
+                .any(|(prior, _)| Arc::ptr_eq(&prior.inner, &destination.inner))
+            {
+                return Err(invalid_resource(
+                    "state initialization repeats a destination",
+                ));
+            }
+        }
+        let targets = destinations
+            .iter()
+            .map(|(destination, mappings)| {
+                self.prepare_tensor_request_state(source_plan, destination, mappings)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.tensor_state_initialization =
+            Some(PreparedTensorRequestStateInitialization { targets });
+        Ok(())
+    }
+
+    fn prepare_tensor_request_state(
+        &self,
+        source_plan: &ExecutionPlan,
+        destination: &TensorRequestStateTarget<R>,
+        mappings: &[TensorRequestStateMapping],
+    ) -> Result<PreparedTargetInitialization<R>, VNextError> {
         let target = &destination.inner;
         let destination_runtime = &target
             .session
@@ -178,13 +286,10 @@ impl<R: DeviceRuntime> PreparedStepSubmissionWave<R> {
             .payload()
             .tensor_ports()
             .ok_or_else(|| invalid_resource("producer has no tensor ports"))?;
-        let mut source_ids = BTreeSet::new();
         let mut destination_ids = BTreeSet::new();
         let mut copies = Vec::with_capacity(mappings.len());
         for mapping in mappings {
-            if !source_ids.insert(&mapping.source_output)
-                || !destination_ids.insert(&mapping.destination_state)
-            {
+            if !destination_ids.insert(&mapping.destination_state) {
                 return Err(invalid_resource(
                     "request state copy mappings are duplicated",
                 ));
@@ -227,7 +332,8 @@ impl<R: DeviceRuntime> PreparedStepSubmissionWave<R> {
                     "state source requires one dense physical component",
                 ));
             };
-            if output.tensor() != &destination.tensor
+            let (selected, source) = mapping.selection.resolve(output.tensor(), source)?;
+            if selected != destination.tensor
                 || source.length_bytes() != destination.component.length_bytes()
                 || !source_plan
                     .payload()
@@ -240,7 +346,7 @@ impl<R: DeviceRuntime> PreparedStepSubmissionWave<R> {
             }
             copies.push(StateCopy {
                 node_index,
-                source: source.clone(),
+                source,
                 destination: destination.clone(),
             });
         }
@@ -266,14 +372,13 @@ impl<R: DeviceRuntime> PreparedStepSubmissionWave<R> {
                 ));
             }
         };
-        self.tensor_state_initialization = Some(PreparedTensorRequestStateInitialization {
+        Ok(PreparedTargetInitialization {
             copies,
             retentions: Mutex::new(Vec::new()),
             reservation: Some(reservation),
             target: target.clone(),
             settled: AtomicBool::new(false),
-        });
-        Ok(())
+        })
     }
 
     pub(crate) fn encode_tensor_state_initialization(
@@ -284,6 +389,18 @@ impl<R: DeviceRuntime> PreparedStepSubmissionWave<R> {
         let Some(init) = &self.tensor_state_initialization else {
             return Ok(());
         };
+        for target in &init.targets {
+            self.encode_tensor_state_target(runtime, commands, target)?;
+        }
+        Ok(())
+    }
+
+    fn encode_tensor_state_target(
+        &self,
+        runtime: &R,
+        commands: &mut DeviceCommandBatch<R::Command>,
+        init: &PreparedTargetInitialization<R>,
+    ) -> Result<(), VNextError> {
         let mut retained = init
             .retentions
             .lock()
@@ -362,6 +479,16 @@ impl<R: DeviceRuntime> PreparedStepSubmissionWave<R> {
         let Some(init) = &mut self.tensor_state_initialization else {
             return Ok(());
         };
+        for target in &mut init.targets {
+            Self::finish_tensor_state_target(target, success)?;
+        }
+        Ok(())
+    }
+
+    fn finish_tensor_state_target(
+        init: &mut PreparedTargetInitialization<R>,
+        success: bool,
+    ) -> Result<(), VNextError> {
         let guard = init
             .reservation
             .take()

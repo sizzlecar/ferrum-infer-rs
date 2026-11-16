@@ -328,7 +328,7 @@ r40 已修复连续拒绝候选与取消/补位导致存活请求迟迟不能前
 
 最近主线已合入 managed Qwen 生图/编辑（`c05fb98c8`）、并发编辑（`a248683fc`）、计划准备与执行重叠（`14993d727`）及 DiT 共享 FP8 激活量化（`89bf95192`）。这些能力应作为实现基础。
 
-目标启动时，[生图服务说明](image-generation.md)明确在完整批次之间调度。[服务调度器](../crates/ferrum-engine/src/image_generation/service/scheduler.rs)当时一次调用 `worker.execute(prepared, requests)`；[Qwen pipeline](../crates/ferrum-engine/src/image_generation.rs)内部运行完整去噪循环后交还控制权。主线已存在真实批前向与准备流水线，但尚无去噪中途加入；本工作树的步骤调度演进与验证见后续进展记录。
+目标启动时，[生图服务说明](image-generation.md)明确在完整批次之间调度。[服务调度器（现已移至共享迭代服务）](../crates/ferrum-engine/src/iterative_service/scheduler.rs)当时一次调用 `worker.execute(prepared, requests)`；[Qwen pipeline](../crates/ferrum-engine/src/image_generation.rs)内部运行完整去噪循环后交还控制权。主线已存在真实批前向与准备流水线，但尚无去噪中途加入；本工作树的步骤调度演进与验证见后续进展记录。
 
 [批准备对象](../crates/ferrum-engine/src/image_generation/prepare.rs)把 prompts、布局、latent 和执行阶段绑定成完整批次。连续批处理需要把请求状态与某次物理批组成分开；实际批宽、mask 和成员变化时，重新校验计划、资源授权与输出归属。
 

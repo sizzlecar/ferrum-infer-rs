@@ -165,7 +165,7 @@ fn grids_are_identity_and_invalid_shapes_fail_before_preparation() {
     assert_ne!(a.fingerprint().unwrap(), b.fingerprint().unwrap());
     assert_eq!(a.weights(), b.weights());
     let mut wire = serde_json::to_value(&c).unwrap();
-    wire["grids"][0]["temporal"] = json!(2);
+    wire["grids"][0]["temporal"] = json!(0);
     assert!(serde_json::from_value::<Qwen3VLVisionConfig>(wire).is_err());
     assert!(Qwen3VLVisionConfig::new(
         c.architecture().clone(),
@@ -245,5 +245,76 @@ fn governed_position_tables_use_merge_block_order_and_release_all_bytes() {
     let mut invalid = table;
     invalid[0..2].copy_from_slice(&0x7fc1_u16.to_le_bytes());
     assert!(c.position_inputs_bytes(&host, &invalid).is_err());
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn video_grid_expands_frame_local_attention_and_repeats_spatial_positions() {
+    let c = config(false);
+    let video = Qwen3VLVisionConfig::new(
+        c.architecture().clone(),
+        vec![
+            Qwen3VLVisionGrid::new(3, 2, 4).unwrap(),
+            Qwen3VLVisionGrid::new(2, 4, 4).unwrap(),
+        ],
+    )
+    .unwrap();
+    let family = Qwen3VLVisionFamily::new().unwrap();
+    let profiles = family.numerical_profiles(&video).unwrap();
+    let graph = family
+        .semantic_program(&video, &profiles.profiles()[0])
+        .unwrap();
+    for node in graph
+        .blocks()
+        .iter()
+        .flat_map(|b| &b.nodes)
+        .filter(|n| n.operation_id.as_str() == program::ATTENTION)
+    {
+        assert_eq!(
+            node.attributes[&AttributeId::new("segment_lengths").unwrap()],
+            SemanticValue::Integers(vec![8, 8, 8, 16, 16])
+        );
+    }
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            1 << 20,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: 1 << 20,
+                output_bytes: 0,
+                transfer_staging_bytes: 0,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    let table = (0..16 * 8)
+        .flat_map(|i| {
+            half::bf16::from_f32(i as f32 / 128.)
+                .to_bits()
+                .to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    let frames = video.position_inputs_bytes(&host, &table).unwrap();
+    let images = c.position_inputs_bytes(&host, &table).unwrap();
+    for (all, singles) in frames.iter().zip(&images) {
+        let row_bytes = all.bytes().len() / 56;
+        let first = &singles.bytes().bytes()[..8 * row_bytes];
+        let second = &singles.bytes().bytes()[8 * row_bytes..];
+        assert_eq!(
+            all.bytes().bytes(),
+            [first, first, first, second, second].concat()
+        );
+    }
+    assert!(Qwen3VLVisionConfig::new(
+        c.architecture().clone(),
+        vec![Qwen3VLVisionGrid::new(33, 2, 2).unwrap()]
+    )
+    .is_err());
+    assert!(comfy::Qwen3VLVisionComfyConfig::new(
+        c.architecture().clone(),
+        Qwen3VLVisionGrid::new(2, 2, 2).unwrap()
+    )
+    .is_err());
+    drop((frames, images));
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

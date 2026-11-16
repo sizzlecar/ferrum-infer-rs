@@ -554,19 +554,14 @@
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "095bf2ba33d8874090f28f53fb5ff79f41865d2a490b64d72976d7066193f67b",
-      "after_sha256": "899c941f46f9f1c7b46f5e6dbd427b208cbc2821987ada58cd36018756f2bdcd",
+      "before_sha256": "899c941f46f9f1c7b46f5e6dbd427b208cbc2821987ada58cd36018756f2bdcd",
+      "after_sha256": "5a9384146df0387b4097031cd20dd2375e6a7cc7f7c397a80927ef41e1a1b9ee",
       "areas": [
         "build",
         "backend_submission",
-        "template",
-        "termination",
-        "structured",
-        "tools",
-        "scheduler",
-        "kv"
+        "scheduler"
       ],
-      "rationale": "Reviewed the full README change since v0.19.0: optional bearer API keys for text and image serving, authentication off without a configured key, public health/static assets, CLI/environment/config precedence, and ordered Qwen image editing with up to ten references from v0.19.1. Reviewed the Qwen3.5-4B Q4_K_M RTX5090 ShareGPT comparison: same-session llama.cpp, fixed capacity, two repetitions, TTFT/TPOT/visible SSE ITL thresholds, zero errors, and an explicit development-candidate label rather than a final-archive or RTX4070Ti claim. Preserve distribution, protocol, backend submission, scheduler, KV, capacity and model obligations; changed native kernels retain their separately mapped source obligations. Final archive authentication, text inference and image generation/editing still require runtime validation. This content review does not certify execution, image quality or performance."
+      "rationale": "Reviewed the full README change since v0.19.1: one documentation link to the FastH3 video guide. Existing installation commands, text API defaults and performance tables are unchanged. The linked guide declares the CUDA FastH3 feature, native operators, reference media, capacity settings and shared iterative run/serve behavior; retain distribution, backend submission and scheduler obligations. Runtime implementation changes keep their independently mapped model, numerical and capacity obligations. This documentation review does not certify final-archive execution or performance."
     },
     {
       "path": "README_zh.md",

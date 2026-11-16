@@ -1689,7 +1689,7 @@ impl CausalAttentionReplayTopology {
 }
 
 /// The native launch geometry captured by the ordinary encoder. A fixed
-/// multi-row launch already contains both native paths at full capacity;
+/// packed launch already contains both native paths at full capacity;
 /// ordinary per-row launches retain their selected path and partition count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResidentCausalReplayTopology {
@@ -1760,7 +1760,6 @@ fn reusable_attention_topology(
         CausalDecodeAttentionGrouping::FixedCapacity
             | CausalDecodeAttentionGrouping::FixedExecutionCapacity
     ) && cfg!(feature = "cuda-indexed-causal-attention")
-        && ranges.len() > 1
         && !shape.int8_kv
         && request
             .binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)
@@ -1822,7 +1821,7 @@ fn reusable_fixed_attention_topology_from_rows(
     shape: CausalAttentionShape,
     rows: &[CausalAttentionTopologyRow],
 ) -> Result<Option<ReusableExecutionTopology>, String> {
-    if rows.len() <= 1 || shape.int8_kv {
+    if rows.is_empty() || shape.int8_kv {
         return Ok(None);
     }
     for row in rows {
@@ -3073,32 +3072,45 @@ fn encode_attention(
         }
     }
 
-    let packed = if input_packed && output_packed && invocation.participants().len() > 1 {
-        let input_region = compute_regions.len();
-        compute_regions.push(super::shared_token_region(
-            &invocation,
-            ResolvedValueRole::Input,
-            0,
-            precision.hidden(),
-            total_tokens,
-        )?);
-        let output_region = compute_regions.len();
-        compute_regions.push(super::shared_token_region(
-            &invocation,
-            ResolvedValueRole::Output,
-            0,
-            precision.hidden(),
-            total_tokens,
-        )?);
-        Some(PackedCausalAttentionLaunch {
-            input_region,
-            output_region,
-            tokens: total_tokens,
-            tokens_i32: checked_i32(total_tokens, "packed causal attention token count")?,
-        })
-    } else {
-        None
-    };
+    // Fixed-capacity replay also applies to a single decode row. Its current
+    // length must select V1/V2 through device bindings, just as it does for a
+    // larger batch, without replacing the program at a partition boundary.
+    let fixed_decode = matches!(
+        decode_attention_grouping,
+        CausalDecodeAttentionGrouping::FixedCapacity
+            | CausalDecodeAttentionGrouping::FixedExecutionCapacity
+    ) && semantics != CausalAttentionSemantics::ExplicitRope
+        && !shape.int8_kv
+        && token_ranges
+            .iter()
+            .all(|range| range.immediate_tokens() == 1);
+    let packed =
+        if input_packed && output_packed && (invocation.participants().len() > 1 || fixed_decode) {
+            let input_region = compute_regions.len();
+            compute_regions.push(super::shared_token_region(
+                &invocation,
+                ResolvedValueRole::Input,
+                0,
+                precision.hidden(),
+                total_tokens,
+            )?);
+            let output_region = compute_regions.len();
+            compute_regions.push(super::shared_token_region(
+                &invocation,
+                ResolvedValueRole::Output,
+                0,
+                precision.hidden(),
+                total_tokens,
+            )?);
+            Some(PackedCausalAttentionLaunch {
+                input_region,
+                output_region,
+                tokens: total_tokens,
+                tokens_i32: checked_i32(total_tokens, "packed causal attention token count")?,
+            })
+        } else {
+            None
+        };
 
     let mut binding_regions = vec![compute_regions[shared.binding].clone()];
     let mut compute_fence_dependencies = Vec::new();
@@ -6290,7 +6302,12 @@ mod tests {
         assert_eq!(make(&[129, 512, 257]), make(&[513, 1_025, 2_048]));
         assert_eq!(make(&[513, 512, 1_025]), make(&[1_025, 513, 512]));
         assert_ne!(make(&[129, 512, 257]), make(&[129, 512, 257, 513]));
-        assert!(make(&[512]).is_none());
+        let singleton = make(&[1]);
+        assert!(singleton.is_some());
+        for length in [511, 512, 513, 1_024, 1_025, 2_048] {
+            assert_eq!(singleton, make(&[length]));
+        }
+        assert!(make(&[]).is_none());
         let prefill = [CausalAttentionTopologyRow {
             active_tokens: 2,
             sequence_tokens: 64,

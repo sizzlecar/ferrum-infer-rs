@@ -193,7 +193,8 @@ fn prepared_convolution_binds_owner_shape_policy_and_actual_selection() {
     let fingerprint = convolution_fingerprint(owner.fingerprint(), shape, 128, selected);
     let prepared = PreparedConv {
         owner: Arc::clone(&owner),
-        shape,
+        shape: shape.into(),
+        direction: ConvolutionDirection::Forward,
         selected,
         fingerprint: fingerprint.clone(),
     };
@@ -263,6 +264,153 @@ fn prepared_convolution_binds_owner_shape_policy_and_actual_selection() {
         convolution_fingerprint("another-owner", shape, 128, selected),
         fingerprint
     );
+}
+
+#[test]
+fn backward_data_filters_its_own_algorithm_domain_and_actual_fma_workspace() {
+    let direction = ConvolutionDirection::BackwardData;
+    let candidate = ForwardPerformance {
+        algo: 5,
+        status: ffi::SUCCESS,
+        time: 0.,
+        memory: 64,
+        determinism: ffi::DETERMINISTIC,
+        math_type: 3,
+        reserved: [0; 3],
+    };
+    let candidates = [
+        ForwardPerformance {
+            algo: 6,
+            ..candidate
+        },
+        ForwardPerformance {
+            determinism: 0,
+            ..candidate
+        },
+        ForwardPerformance {
+            math_type: 0,
+            ..candidate
+        },
+        ForwardPerformance {
+            memory: 65,
+            ..candidate
+        },
+        candidate,
+    ];
+    assert_eq!(
+        choose_algorithm_direction(&candidates, 64, CudnnConvScalar::F32Fma, direction)
+            .unwrap()
+            .algo,
+        5
+    );
+    assert!(
+        choose_algorithm_direction(&candidates, 63, CudnnConvScalar::F32Fma, direction).is_none()
+    );
+    let selected = ConvolutionAlgorithm {
+        algo: 5,
+        math_type: 3,
+        required_bytes: 64,
+    };
+    assert!(selected
+        .validate_direction(64, CudnnConvScalar::F32Fma, direction)
+        .is_ok());
+    assert!(ConvolutionAlgorithm {
+        algo: 6,
+        ..selected
+    }
+    .validate_direction(64, CudnnConvScalar::F32Fma, direction)
+    .is_err());
+    assert!(selected.validate_workspace(256, 64).is_ok());
+    assert!(selected.validate_workspace(256, 128).is_err());
+
+    let mut failed = false;
+    assert!(prepare_convolution_selection_direction(
+        &mut failed,
+        63,
+        CudnnConvScalar::F32Fma,
+        direction,
+        || Ok(Some(selected))
+    )
+    .is_err());
+    assert!(!failed);
+    assert!(prepare_convolution_selection_direction(
+        &mut failed,
+        64,
+        CudnnConvScalar::F32Fma,
+        direction,
+        || Err("backward query failed".into())
+    )
+    .is_err());
+    assert!(failed);
+}
+
+#[test]
+fn transposed_prepared_identity_cannot_be_used_as_forward_or_with_another_owner() {
+    let owner = Arc::new(CudaCudnnOwner {
+        inner: Mutex::new(None),
+        fingerprint: "test-backward-owner".into(),
+        workspace_limit_bytes: 128,
+    });
+    // Dual grouped geometry: transposed dy [2,6,8,9] -> dx [2,4,8,9],
+    // with IOHW [6,2,3,3], matching the ordinary forward descriptors.
+    let shape = CudnnConv2dDescriptor {
+        scalar: CudnnConvScalar::F32Fma,
+        ..convolution_shape()
+    };
+    let selected = ConvolutionAlgorithm {
+        math_type: 3,
+        ..selected_algorithm()
+    };
+    let direction = ConvolutionDirection::BackwardData;
+    let fingerprint =
+        convolution_direction_fingerprint(owner.fingerprint(), shape, 128, selected, direction);
+    let forward_fingerprint = convolution_fingerprint(owner.fingerprint(), shape, 128, selected);
+    assert_ne!(fingerprint, forward_fingerprint);
+    let prepared = PreparedConv {
+        owner: owner.clone(),
+        shape: shape.into(),
+        direction,
+        selected,
+        fingerprint: fingerprint.clone(),
+    };
+    assert!(prepared
+        .validate_transposed_invocation(&owner, shape, Some(&fingerprint))
+        .is_ok());
+    assert!(prepared
+        .validate_invocation(&owner, shape, Some(&fingerprint))
+        .is_err());
+    assert!(prepared
+        .validate_transposed_invocation(&owner, shape, Some(&forward_fingerprint))
+        .is_err());
+    let another = Arc::new(CudaCudnnOwner {
+        inner: Mutex::new(None),
+        fingerprint: owner.fingerprint.clone(),
+        workspace_limit_bytes: 128,
+    });
+    assert!(prepared
+        .validate_transposed_invocation(&another, shape, Some(&fingerprint))
+        .is_err());
+    let swapped = CudnnConv2dDescriptor {
+        input: shape.output,
+        output: shape.input,
+        ..shape
+    };
+    assert!(prepared
+        .validate_transposed_invocation(&owner, swapped, Some(&fingerprint))
+        .is_err());
+    let forward = PreparedConv {
+        owner: owner.clone(),
+        shape: shape.into(),
+        direction: ConvolutionDirection::Forward,
+        selected,
+        fingerprint: forward_fingerprint.clone(),
+    };
+    assert!(forward
+        .validate_invocation(&owner, shape, Some(&forward_fingerprint))
+        .is_ok());
+    assert!(forward
+        .validate_transposed_invocation(&owner, shape, Some(&forward_fingerprint))
+        .is_err());
 }
 
 #[test]

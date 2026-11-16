@@ -100,6 +100,7 @@ cuda = [
     "ferrum-kernels/cuda",
     "ferrum-quantization/cuda",
 ]
+cuda-fast-h3 = ["cuda", "ferrum-models/cuda-cutlass-nvfp4", "ferrum-models/cuda-sage-vsa-fp4", "ferrum-kernels/cuda-cutlass-nvfp4", "ferrum-kernels/cuda-sage-vsa-fp4"]
 candle-cuda-compat = [
     "cuda",
     "candle-core/cuda",

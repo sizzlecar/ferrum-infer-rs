@@ -2,24 +2,31 @@
 //! a separate explicitly configured cuDNN owner in conv2d_f32.
 use super::*;
 use ferrum_runtime::{F32CnnGeometry, F32CnnOp, PhysicalWeightLayout, WeightFormatId};
-pub(super) const FUNCTIONS: [&str; 4] = [
+pub(super) const FUNCTIONS: [&str; 6] = [
     "ferrum_vnext_nchw_pad_f32",
     "ferrum_vnext_nchw_bias_f32",
     "ferrum_vnext_group_norm_silu_nchw_f32",
     "ferrum_vnext_plain_residual_add_nchw_f32",
+    "ferrum_vnext_ncdhw_pad_f32",
+    "ferrum_vnext_frame_group_norm_silu_ncthw_f32",
 ];
 pub fn numerical_profile(kind: F32CnnOp) -> &'static str {
     match kind {
         F32CnnOp::GroupNormSilu => "cuda.group_norm_silu.nchw.f32.tree256.two_pass.libdevice.rn.v1",
+        F32CnnOp::FrameGroupNormSilu => {
+            "cuda.frame_group_norm_silu.ncthw.f32.tree256.two_pass.libdevice.rn.v1"
+        }
         F32CnnOp::ResidualAdd => "cuda.plain_residual_add.nchw.f32.rn.no_ftz.v1",
+        F32CnnOp::VolumeResidualAdd => "cuda.plain_residual_add.ncthw.f32.rn.no_ftz.v1",
         F32CnnOp::Conv2d => super::conv2d_f32::NUMERICAL_PROFILE_ID,
+        F32CnnOp::Conv3d => super::conv2d_f32::NUMERICAL_PROFILE_3D_ID,
     }
 }
 pub(super) fn descriptor(
     device: &DeviceDescriptor,
     kind: F32CnnOp,
 ) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
-    if kind == F32CnnOp::Conv2d {
+    if matches!(kind, F32CnnOp::Conv2d | F32CnnOp::Conv3d) {
         return Err(CudaDeviceRuntimeError::contract(
             "F32 convolution requires explicit cuDNN composition",
         ));
@@ -184,7 +191,7 @@ impl Provider {
             let parameter = regions[1].device_ptr();
             let out = regions.last().unwrap().device_ptr();
             match g {
-                F32CnnGeometry::ResidualAdd(_) => {
+                F32CnnGeometry::ResidualAdd(_) | F32CnnGeometry::VolumeResidualAdd(_) => {
                     let mut launch = stream.launch_builder(kernels.cnn_f32_function(3));
                     launch.arg(&input).arg(&parameter).arg(&out).arg(&elements);
                     unsafe {
@@ -221,7 +228,36 @@ impl Provider {
                         })
                     }
                 }
-                F32CnnGeometry::Conv2d(_) => unreachable!("external cuDNN provider required"),
+                F32CnnGeometry::FrameGroupNormSilu(g) => {
+                    let beta = regions[2].device_ptr();
+                    let [batch, channels, frames, height, width] = g.shape();
+                    let groups = batch * frames * g.groups();
+                    let group_elements = g.group_elements();
+                    let spatial = height * width;
+                    let epsilon = g.effective_epsilon();
+                    let mut launch = stream.launch_builder(kernels.cnn_f32_function(5));
+                    launch
+                        .arg(&input)
+                        .arg(&parameter)
+                        .arg(&beta)
+                        .arg(&out)
+                        .arg(&groups)
+                        .arg(&group_elements)
+                        .arg(&channels)
+                        .arg(&spatial)
+                        .arg(&frames)
+                        .arg(&epsilon);
+                    unsafe {
+                        launch.launch(LaunchConfig {
+                            grid_dim: (groups.min(65535) as u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                    }
+                }
+                F32CnnGeometry::Conv2d(_) | F32CnnGeometry::Conv3d(_) => {
+                    unreachable!("external cuDNN provider required")
+                }
             }
             .map(|_| ())
             .map_err(|e| CudaDeviceRuntimeError::driver("F32 NCHW CNN launch", e))

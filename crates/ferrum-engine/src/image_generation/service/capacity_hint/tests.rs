@@ -204,13 +204,17 @@ fn shared() -> Shared<u64> {
             maximum_prompt_bytes: 1024,
             max_num_seqs: 64,
             request_batch_max_wait_ms: 0,
-        },
+        }
+        .into(),
         host: None,
         adapter: None,
     }
 }
 
-fn queued(seed: u64, adapter: Option<Arc<ImageAdapterBatchIdentity>>) -> Queued<u64> {
+fn queued(
+    seed: u64,
+    adapter: Option<Arc<crate::iterative_service::AdapterDomainKey>>,
+) -> Queued<u64> {
     Queued {
         trace: trace::RequestTrace::unobserved(),
         request: QueuedRequest::Generate(ImageGenerationRequest {
@@ -241,15 +245,16 @@ fn prepare(
     prepare_with_search(worker, hint, count, adapter, false)
 }
 
-fn prepare_with_search(
-    worker: &mut dyn BatchWorker<Output = u64>,
+fn prepare_with_search<W: BatchWorker<Output = u64>>(
+    worker: &mut W,
     hint: &mut CapacitySearchHint,
     count: usize,
     adapter: Option<ImageAdapterBatchIdentity>,
     progressive: bool,
 ) -> (Vec<u64>, Vec<u64>) {
     let shared = shared();
-    let adapter = adapter.map(Arc::new);
+    let adapter = adapter
+        .map(|identity| Arc::new(crate::iterative_service::AdapterDomainKey::from(&identity)));
     let mut batch = (0..count)
         .map(|seed| queued(seed as u64, adapter.clone()))
         .collect::<Vec<_>>();

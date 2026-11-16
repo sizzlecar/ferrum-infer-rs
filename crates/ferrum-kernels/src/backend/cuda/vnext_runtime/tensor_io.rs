@@ -69,6 +69,7 @@ impl Drop for SubmissionGuard<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UploadPurpose {
     Input,
+    RetainedOutput,
     StaticWeight,
     StaticWeightBacking,
 }
@@ -80,6 +81,7 @@ impl UploadPurpose {
     ) -> Result<Self, CudaDeviceRuntimeError> {
         match (class, usage) {
             (HostMemoryClass::InputPreprocess, BufferUsage::Activations) => Ok(Self::Input),
+            (HostMemoryClass::Output, BufferUsage::Activations) => Ok(Self::RetainedOutput),
             (HostMemoryClass::TransferStaging, BufferUsage::Weights) => Ok(Self::StaticWeight),
             (HostMemoryClass::WeightBacking, BufferUsage::Weights) => Ok(Self::StaticWeightBacking),
             _ => Err(CudaDeviceRuntimeError::contract(
@@ -90,7 +92,7 @@ impl UploadPurpose {
 
     fn phase(self) -> DeviceCommandPhase {
         match self {
-            Self::Input => DeviceCommandPhase::DynamicBinding,
+            Self::Input | Self::RetainedOutput => DeviceCommandPhase::DynamicBinding,
             Self::StaticWeight | Self::StaticWeightBacking => DeviceCommandPhase::Initialization,
         }
     }
@@ -98,6 +100,7 @@ impl UploadPurpose {
     fn host_class(self) -> HostMemoryClass {
         match self {
             Self::Input => HostMemoryClass::InputPreprocess,
+            Self::RetainedOutput => HostMemoryClass::Output,
             Self::StaticWeight => HostMemoryClass::TransferStaging,
             Self::StaticWeightBacking => HostMemoryClass::WeightBacking,
         }
@@ -350,6 +353,9 @@ mod tests {
         let input =
             UploadPurpose::new(HostMemoryClass::InputPreprocess, BufferUsage::Activations).unwrap();
         assert_eq!(input.phase(), DeviceCommandPhase::DynamicBinding);
+        let output = UploadPurpose::new(HostMemoryClass::Output, BufferUsage::Activations).unwrap();
+        assert_eq!(output.phase(), DeviceCommandPhase::DynamicBinding);
+        assert_eq!(output.host_class(), HostMemoryClass::Output);
         let weights =
             UploadPurpose::new(HostMemoryClass::TransferStaging, BufferUsage::Weights).unwrap();
         assert_eq!(weights.phase(), DeviceCommandPhase::Initialization);
@@ -361,6 +367,7 @@ mod tests {
             (HostMemoryClass::InputPreprocess, BufferUsage::Weights),
             (HostMemoryClass::TransferStaging, BufferUsage::Activations),
             (HostMemoryClass::Output, BufferUsage::Weights),
+            (HostMemoryClass::Output, BufferUsage::Persistent),
             (HostMemoryClass::WeightBacking, BufferUsage::Activations),
             (HostMemoryClass::WeightBacking, BufferUsage::Persistent),
             (HostMemoryClass::TransferStaging, BufferUsage::Persistent),

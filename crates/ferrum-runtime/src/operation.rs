@@ -143,7 +143,7 @@ pub use storage_profile::{
 };
 pub use tensor_contract::{
     AliasPolicy, BlockedTensorPadding, DimensionConstraint, LayoutConstraint, ResolvedTensorLayout,
-    ResolvedTensorSpec, StrideConstraint, TensorAccess, TensorContract,
+    ResolvedTensorSpec, StoredWeightInterpretation, StrideConstraint, TensorAccess, TensorContract,
 };
 pub(crate) use weight_contract::{
     checked_elements, physical_component_ids, same_shared_transform_sign_component,
@@ -152,11 +152,12 @@ pub(crate) use weight_contract::{
 pub use weight_contract::{
     AxisWeightComponent, BlockQuantizationSpec, CompositeWeightPart, GroupedFeatureTranspose,
     HadamardApplication, HadamardSigns, HadamardTransformSpec, PhysicalStorageLayout,
-    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
-    QuantizationGrouping, QuantizationPacking, QuantizationSpec, ResolvedWeightBinding,
-    ResolvedWeightComponentLayout, RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1,
-    WeightComponentRole, WeightEncoding, FP8_E4M3FN_WHOLE_TENSOR_F32_FORMAT_ID,
-    MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH, MAX_PHYSICAL_WEIGHT_LAYOUT_NODES, RN_F16_FRAGMENT_ABI_V1,
+    PhysicalWeightComponentBinding, PhysicalWeightComponentView, PhysicalWeightLayout,
+    PhysicalWeightPadding, QuantizationGrouping, QuantizationPacking, QuantizationSpec,
+    ResolvedWeightBinding, ResolvedWeightComponentLayout, RnF16FragmentPlanV1,
+    RnF16FragmentSourceFormatV1, WeightComponentRole, WeightEncoding,
+    FP8_E4M3FN_WHOLE_TENSOR_F32_FORMAT_ID, MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH,
+    MAX_PHYSICAL_WEIGHT_LAYOUT_NODES, RN_F16_FRAGMENT_ABI_V1,
 };
 
 mod candidate_state;

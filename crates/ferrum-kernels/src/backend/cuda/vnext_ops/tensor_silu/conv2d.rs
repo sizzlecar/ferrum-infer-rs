@@ -36,7 +36,7 @@ pub(crate) fn providers(
     config: &CudaCudnnConfig,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, None, false)
+    providers_impl(runtime, config, selected, None, false, false)
 }
 
 pub(crate) fn providers_with_sdpa(
@@ -45,7 +45,7 @@ pub(crate) fn providers_with_sdpa(
     policy: CudnnSdpaPlanPolicy,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, Some(policy), false)
+    providers_impl(runtime, config, selected, Some(policy), false, false)
 }
 
 pub(crate) fn providers_with_cross_attention(
@@ -54,7 +54,16 @@ pub(crate) fn providers_with_cross_attention(
     policy: CudnnSdpaPlanPolicy,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, Some(policy), true)
+    providers_impl(runtime, config, selected, Some(policy), true, false)
+}
+
+pub(crate) fn providers_with_causal_gqa(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCudnnConfig,
+    policy: CudnnSdpaPlanPolicy,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    providers_impl(runtime, config, selected, Some(policy), false, true)
 }
 
 fn providers_impl(
@@ -63,6 +72,7 @@ fn providers_impl(
     selected: &[CudaTensorOperation],
     sdpa_policy: Option<CudnnSdpaPlanPolicy>,
     cross_attention: bool,
+    causal_gqa: bool,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     if cross_attention
         && !runtime.descriptor().capabilities.contains(
@@ -121,6 +131,53 @@ fn providers_impl(
             )
         });
     }
+    let kernels = RetainedFunctions::load(runtime)?;
+    let mut providers = selection::providers_from_descriptors(descriptors, &kernels);
+    if spatial_matmul {
+        providers.push(spatial_matmul::provider(runtime, &kernels)?);
+    }
+    if let Some(cache) = sdpa {
+        if causal_gqa {
+            providers.push(cudnn_gqa::provider(
+                runtime.descriptor(),
+                Arc::clone(&cache),
+            )?);
+        }
+        if cross_attention {
+            providers.push(cudnn_cross_attention::provider(
+                runtime.descriptor(),
+                &kernels,
+                Arc::clone(&cache),
+            )?);
+        }
+        if segmented_sdpa {
+            providers.push(cudnn_segmented::provider(
+                runtime.descriptor(),
+                &kernels,
+                Arc::clone(&cache),
+            )?);
+        }
+        providers.push(cudnn_attention::provider(
+            runtime.descriptor(),
+            &kernels,
+            cache,
+        )?);
+    }
+    providers.push(provider(runtime, kernels, owner)?);
+    Ok(providers)
+}
+
+pub(super) fn provider(
+    runtime: &CudaDeviceRuntime,
+    kernels: Arc<RetainedFunctions>,
+    owner: Arc<CudaCudnnOwner>,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    let capability = CapabilityId::new(CONV2D_BF16_CAPABILITY_ID).map_err(contract_error)?;
+    if !runtime.descriptor().capabilities.contains(&capability) {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA runtime lacks BF16 convolution capability",
+        ));
+    }
     let contract = conv2d_bf16_contract().map_err(contract_error)?;
     let implementation = implementation_fingerprint(&[
         numerical_fingerprint().as_bytes(),
@@ -153,38 +210,11 @@ fn providers_impl(
     )
     .map_err(contract_error)?
     .with_fixed_tensor_work(true);
-    let kernels = RetainedFunctions::load(runtime)?;
-    let mut providers = selection::providers_from_descriptors(descriptors, &kernels);
-    if spatial_matmul {
-        providers.push(spatial_matmul::provider(runtime, &kernels)?);
-    }
-    if let Some(cache) = sdpa {
-        if cross_attention {
-            providers.push(cudnn_cross_attention::provider(
-                runtime.descriptor(),
-                &kernels,
-                Arc::clone(&cache),
-            )?);
-        }
-        if segmented_sdpa {
-            providers.push(cudnn_segmented::provider(
-                runtime.descriptor(),
-                &kernels,
-                Arc::clone(&cache),
-            )?);
-        }
-        providers.push(cudnn_attention::provider(
-            runtime.descriptor(),
-            &kernels,
-            cache,
-        )?);
-    }
-    providers.push(Box::new(ConvProvider {
+    Ok(Box::new(ConvProvider {
         descriptor,
         kernels,
         owner,
-    }));
-    Ok(providers)
+    }))
 }
 
 struct ConvProvider {

@@ -12,34 +12,40 @@ pub const REFERENCE_ROW_RMS_NORM_SINGLE_ROUND_BF16_NUMERICAL_PROFILE_ID: &str =
     "reference.row_rms_norm_single_round.bf16.warp32_precise.v1";
 pub const REFERENCE_ADDCMUL_BF16_NUMERICAL_PROFILE_ID: &str =
     "reference.addcmul.bf16.separate_f32_single_round.v1";
+pub const REFERENCE_ADDCMUL_FMA_BF16_NUMERICAL_PROFILE_ID: &str =
+    "reference.addcmul.bf16.fma_f32_single_round.v1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
     RowRms,
     Addcmul,
+    AddcmulFma,
 }
 impl Kind {
     fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::RowRms => row_rms_norm_single_round_bf16_contract(),
             Self::Addcmul => addcmul_bf16_contract(),
+            Self::AddcmulFma => addcmul_fma_bf16_contract(),
         }
     }
     fn capability(self) -> &'static str {
         match self {
             Self::RowRms => ROW_RMS_NORM_SINGLE_ROUND_BF16_CAPABILITY_ID,
             Self::Addcmul => ADDCMUL_BF16_CAPABILITY_ID,
+            Self::AddcmulFma => ADDCMUL_FMA_BF16_CAPABILITY_ID,
         }
     }
     fn profile(self) -> &'static str {
         match self {
             Self::RowRms => REFERENCE_ROW_RMS_NORM_SINGLE_ROUND_BF16_NUMERICAL_PROFILE_ID,
             Self::Addcmul => REFERENCE_ADDCMUL_BF16_NUMERICAL_PROFILE_ID,
+            Self::AddcmulFma => REFERENCE_ADDCMUL_FMA_BF16_NUMERICAL_PROFILE_ID,
         }
     }
     fn inputs(self) -> u32 {
         match self {
             Self::RowRms => 2,
-            Self::Addcmul => 3,
+            Self::Addcmul | Self::AddcmulFma => 3,
         }
     }
 }
@@ -57,10 +63,10 @@ impl ReferenceRowRmsAddcmulProvider {
         if !runtime.descriptor().capabilities.contains(&capability) {
             return Err(error("runtime lacks requested RowRMS/addcmul capability"));
         }
-        let name = if kind == Kind::RowRms {
-            "row_rms_norm_single_round"
-        } else {
-            "addcmul"
+        let name = match kind {
+            Kind::RowRms => "row_rms_norm_single_round",
+            Kind::Addcmul => "addcmul",
+            Kind::AddcmulFma => "addcmul_fma",
         };
         let provider = format!("provider.reference.{name}.bf16");
         let estimator = format!("resource-estimator.reference.{name}.bf16");
@@ -171,7 +177,7 @@ impl ReferenceRowRmsAddcmulProvider {
         ReferenceDeviceCommand::row_rms_addcmul_tensor(ReferenceRowRmsAddcmulLaunch {
             input: input(0)?,
             parameter: input(1)?,
-            update: if self.kind == Kind::Addcmul {
+            update: if self.kind != Kind::RowRms {
                 Some(input(2)?)
             } else {
                 None
@@ -223,20 +229,23 @@ fn geometry(
                     .map_err(|e| e.to_string())?,
             ))
         }
-        Kind::Addcmul => {
+        Kind::Addcmul | Kind::AddcmulFma => {
             let Some(SemanticValue::Text(mode)) = get("broadcast") else {
                 return Err("requires explicit broadcast".into());
             };
-            Ok(ReferenceRowRmsAddcmulGeometry::Addcmul(
-                AddcmulBf16Geometry::new(
-                    input(0)?,
-                    input(1)?,
-                    input(2)?,
-                    output,
-                    RowBroadcast::parse(mode).ok_or("invalid broadcast")?,
-                )
-                .map_err(|e| e.to_string())?,
-            ))
+            let g = AddcmulBf16Geometry::new(
+                input(0)?,
+                input(1)?,
+                input(2)?,
+                output,
+                RowBroadcast::parse(mode).ok_or("invalid broadcast")?,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(if kind == Kind::AddcmulFma {
+                ReferenceRowRmsAddcmulGeometry::AddcmulFma(g)
+            } else {
+                ReferenceRowRmsAddcmulGeometry::Addcmul(g)
+            })
         }
     }
 }

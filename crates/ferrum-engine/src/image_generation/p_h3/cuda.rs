@@ -425,6 +425,7 @@ impl PH3ImageCudaConfig {
             native_allocation_reuse: self.native_allocation_reuse,
             pinned_weight_upload: self.pinned_weight_upload.map(|policy| {
                 ferrum_kernels::backend::cuda::vnext_runtime::CudaPinnedWeightUploadConfig {
+                    minimum_allocation_bytes: 0,
                     maximum_allocation_bytes: policy.maximum_allocation_bytes,
                     maximum_registered_bytes: policy.maximum_registered_bytes,
                 }

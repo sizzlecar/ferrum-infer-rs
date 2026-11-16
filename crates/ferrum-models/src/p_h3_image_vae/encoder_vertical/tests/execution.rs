@@ -301,7 +301,7 @@ fn actual_stored_cuda_encoder_vertical_uses_f32_fma_cudnn_and_isolates_requests(
         opaque_memory_profile: "unqualified-encoder-cudnn9-fma-v1".into(),
     };
     let registry = OperationRuntimeRegistry::new(
-        F32CnnOp::ALL
+        F32CnnOp::NCHW
             .into_iter()
             .map(|k| Box::new(k.contract().unwrap()) as Box<dyn OperationContract>)
             .collect(),

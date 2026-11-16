@@ -31,6 +31,8 @@ fn physical_claim_identity_clone_shares_only_immutable_resource_ids() {
     ));
     assert_eq!(original, cloned);
     assert_eq!(original, independent);
+    assert_eq!(original.fingerprint, cloned.fingerprint);
+    assert_eq!(original.fingerprint, independent.fingerprint);
     assert_eq!(original.cmp(&independent), std::cmp::Ordering::Equal);
     assert_eq!(original.pool_id(), &pool('a'));
     assert_eq!(original.resource_ids()[0].as_str(), "resource-a");
@@ -49,13 +51,17 @@ fn physical_claim_identity_order_and_equality_preserve_pool_and_resources() {
     for (left_index, left) in cases.iter().enumerate() {
         for (right_index, right) in cases.iter().enumerate() {
             assert_eq!(left == right, left_index == right_index);
+            assert_eq!(
+                left.fingerprint == right.fingerprint,
+                left_index == right_index
+            );
             assert_eq!(left.partial_cmp(right), Some(left_index.cmp(&right_index)));
             assert_eq!(left.cmp(right), left_index.cmp(&right_index));
         }
     }
     // Sharing the resource list never hides a different pool owner.
-    let mut foreign_pool = cases[1].clone();
-    foreign_pool.pool_id = pool('b');
+    let mut foreign_pool = claim('b', &["resource-a", "resource-b"]);
+    foreign_pool.resource_ids = Arc::clone(&cases[1].resource_ids);
     assert!(Arc::ptr_eq(
         &cases[1].resource_ids,
         &foreign_pool.resource_ids
@@ -87,4 +93,57 @@ fn physical_claim_identity_serialization_matches_original_two_field_layout() {
     assert!(
         PhysicalBackingClaimIdentity::new(pool('a'), vec![duplicate.clone(), duplicate]).is_err()
     );
+}
+
+#[test]
+fn allocation_fingerprint_binds_live_generation_and_projection_to_shared_membership() {
+    let allocation = || LogicalBackingSliceAllocationEvidence {
+        domain_id: CapacityDomainId::new(1).unwrap(),
+        pool_id: pool('a'),
+        resource_id: ResourceId::new("resource-a").unwrap(),
+        pool_instance_id: 1,
+        physical_claim_identity: claim('a', &["resource-a", "resource-b"]),
+        reusable_execution_bucket_id: None,
+        segment_generation: 1,
+        segments: vec![BackingSegment::from_chunk(&pool('a'), 1, 1, 0, 64).unwrap()],
+        physical_offset_bytes: 0,
+        capacity_size_bytes: 64,
+        physical_size_bytes: 128,
+        alignment_bytes: 16,
+        usage: BufferUsage::Scratch,
+        element_type: ElementType::U8,
+        storage_profile: DynamicStorageProfile::new(
+            DynamicStorageAllocator::LinearArena,
+            crate::DynamicStorageView::Contiguous,
+        )
+        .unwrap(),
+        initialization: StateInitialization::None,
+        fingerprint: String::new(),
+    };
+    let original = allocation().compute_fingerprint().unwrap();
+    assert_eq!(original, allocation().compute_fingerprint().unwrap());
+    let changes: &[fn(&mut LogicalBackingSliceAllocationEvidence)] = &[
+        |a| a.pool_instance_id += 1,
+        |a| a.segment_generation += 1,
+        |a| a.domain_id = CapacityDomainId::new(2).unwrap(),
+        |a| a.resource_id = ResourceId::new("resource-b").unwrap(),
+        |a| a.physical_claim_identity = claim('a', &["resource-a", "resource-c"]),
+        |a| {
+            a.physical_claim_identity = claim('b', &["resource-a", "resource-b"]);
+            a.pool_id = pool('b');
+        },
+        |a| a.physical_offset_bytes = 64,
+        |a| a.capacity_size_bytes = 32,
+        |a| a.physical_size_bytes = 256,
+        |a| a.segments = vec![BackingSegment::from_chunk(&pool('a'), 1, 2, 0, 64).unwrap()],
+        |a| a.segments = vec![BackingSegment::from_chunk(&pool('a'), 1, 1, 64, 64).unwrap()],
+        |a| a.initialization = StateInitialization::Zero,
+        |a| a.usage = BufferUsage::State,
+        |a| a.element_type = ElementType::Bf16,
+    ];
+    for change in changes {
+        let mut changed = allocation();
+        change(&mut changed);
+        assert_ne!(original, changed.compute_fingerprint().unwrap());
+    }
 }

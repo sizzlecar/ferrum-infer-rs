@@ -83,6 +83,17 @@ pub use dense_f16_causal::{
 };
 mod tensor_dense_bf16;
 mod tensor_dense_fp8_bf16;
+mod tensor_nvfp4_bf16;
+pub use tensor_nvfp4_bf16::CutlassNvfp4Config;
+mod tensor_sparse_fp4_attention;
+mod tensor_sparse_fp4_quantize;
+pub use crate::native_ops::sage_vsa_fp4::{
+    CheckedHostVsaPattern, CheckedVsaRegions, SageVsaFp4Config,
+};
+#[cfg(feature = "cuda-nvfp4-diagnostics")]
+mod nvfp4_reference;
+#[cfg(feature = "cuda-nvfp4-diagnostics")]
+pub use crate::native_ops::nvfp4_reference::CudaNvfp4ReferenceConfig;
 mod tensor_storage;
 pub use tensor_dense_fp8_bf16::{
     CudaCutlassFp8Config, CudaCutlassFp8Probe, CudaCutlassFp8ProbeReceipt,
@@ -121,16 +132,21 @@ pub use tensor_dense_bf16::{
 pub use tensor_silu::{
     channelwise_f32_numerical_profile, cnn_f32_numerical_profile, cuda_vnext_cnn_f32_providers,
     cuda_vnext_cnn_f32_providers_with_fused_f32, cuda_vnext_cnn_f32_providers_with_native_options,
-    cuda_vnext_cnn_f32_providers_with_segmented_sdpa,
+    cuda_vnext_cnn_f32_providers_with_segmented_sdpa, cuda_vnext_cnn_f32_with_transpose_providers,
     tensor_primitive_profile as cuda_tensor_primitive_bf16_profile, CudaConvRotFusedOutputConfig,
     CudaCutlassFusedF32Config, CudaPhiloxDeviceGeometry, CudaPhiloxLaunchGeometry,
-    CudaTensorOperation, ADDCMUL_NUMERICAL_PROFILE_ID as CUDA_ADDCMUL_BF16_NUMERICAL_PROFILE_ID,
+    CudaTensorOperation,
+    ADDCMUL_FMA_NUMERICAL_PROFILE_ID as CUDA_ADDCMUL_FMA_BF16_NUMERICAL_PROFILE_ID,
+    ADDCMUL_NUMERICAL_PROFILE_ID as CUDA_ADDCMUL_BF16_NUMERICAL_PROFILE_ID,
     ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
     ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
+    BATCHED_F32_NUMERICAL_PROFILE_ID as CUDA_BATCHED_F32_NUMERICAL_PROFILE_ID,
     BATCHED_ROW_CONCAT_PROFILE_ID as CUDA_BATCHED_ROW_CONCAT_BF16_NUMERICAL_PROFILE_ID,
     BATCHED_SUFFIX_APPEND_F32_PROFILE_ID as CUDA_BATCHED_SUFFIX_APPEND_F32_NUMERICAL_PROFILE_ID,
     BUNDLE_NUMERICAL_IDENTITY as CUDA_POINTWISE_BF16_NUMERICAL_PROFILE_IDENTITY,
+    CAST_BF16_TO_F32_NUMERICAL_PROFILE_ID as CUDA_CAST_BF16_TO_F32_NUMERICAL_PROFILE_ID,
     CAST_F32_TO_BF16_NUMERICAL_PROFILE_ID as CUDA_CAST_F32_TO_BF16_NUMERICAL_PROFILE_ID,
+    CHANNEL_BIAS_ADD_BF16_NUMERICAL_PROFILE_ID as CUDA_CHANNEL_BIAS_ADD_BF16_NUMERICAL_PROFILE_ID,
     CHANNEL_L2_IMAGE_PROFILE_ID as CUDA_CHANNEL_L2_NORM_IMAGE_BF16_NUMERICAL_PROFILE_ID,
     CHANNEL_L2_PROFILE_ID as CUDA_CHANNEL_L2_NORM_BF16_NUMERICAL_PROFILE_ID,
     COMFY_CONVROT_INT8_EMBEDDING_F32_NUMERICAL_PROFILE_ID as CUDA_COMFY_CONVROT_INT8_EMBEDDING_F32_NUMERICAL_PROFILE_ID,
@@ -141,6 +157,7 @@ pub use tensor_silu::{
     COMFY_CONVROT_W8A8_F32_PROFILE_ID as CUDA_COMFY_CONVROT_W8A8_F32_NUMERICAL_PROFILE_ID,
     COMFY_CONVROT_W8A8_PROFILE_ID as CUDA_COMFY_CONVROT_W8A8_NUMERICAL_PROFILE_ID,
     CONV2D_PROFILE_ID as CUDA_CONV2D_BF16_NUMERICAL_PROFILE_ID,
+    CONV_TRANSPOSE2D_F32_NUMERICAL_PROFILE_ID,
     CROSS_ATTENTION_FUSED_PROFILE_ID as CUDA_CROSS_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_ID,
     CUDNN_SEGMENTED_ATTENTION_PROFILE_ID as CUDA_CUDNN_SEGMENTED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
     FUSED_ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_IDENTITY,
@@ -155,10 +172,15 @@ pub use tensor_silu::{
     HALF_SPLIT_ROPE_F32_PROFILE_ID as CUDA_HALF_SPLIT_ROPE_F32_NUMERICAL_PROFILE_ID,
     HALF_SPLIT_ROPE_NUMERICAL_IDENTITY as CUDA_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_IDENTITY,
     HALF_SPLIT_ROPE_NUMERICAL_PROFILE_ID as CUDA_HALF_SPLIT_ROPE_BF16_NUMERICAL_PROFILE_ID,
+    HEAD_AXIS_PACK_BF16_PROFILE_ID as CUDA_HEAD_AXIS_PACK_BF16_PROFILE_ID,
+    HEAD_AXIS_PACK_F32_TO_BF16_PROFILE_ID as CUDA_HEAD_AXIS_PACK_F32_TO_BF16_PROFILE_ID,
+    HEAD_FP8_ROUNDTRIP_BF16_NUMERICAL_PROFILE_ID as CUDA_HEAD_FP8_ROUNDTRIP_BF16_NUMERICAL_PROFILE_ID,
     HEAD_RMS_NORM_F32_PROFILE_ID as CUDA_HEAD_RMS_NORM_F32_NUMERICAL_PROFILE_ID,
     HEAD_RMS_NORM_PROFILE_ID as CUDA_HEAD_RMS_NORM_BF16_NUMERICAL_PROFILE_ID,
+    HEAD_RMS_NUMERICAL_IDENTITY as CUDA_HEAD_RMS_NORM_BF16_NUMERICAL_PROFILE_IDENTITY,
     LAYER_NORM_F32_PROFILE_ID as CUDA_LAYER_NORM_F32_NUMERICAL_PROFILE_ID,
     LAYER_NORM_PROFILE_ID as CUDA_LAYER_NORM_BF16_NUMERICAL_PROFILE_ID,
+    MASKED_TILE_MEAN_NUMERICAL_PROFILE_ID as CUDA_MASKED_TILE_MEAN_NUMERICAL_PROFILE_ID,
     MODULATION_NUMERICAL_PROFILE_ID as CUDA_MODULATION_SCALE_BF16_NUMERICAL_PROFILE_ID,
     NORM_NUMERICAL_IDENTITY as CUDA_NORMALIZATION_BF16_NUMERICAL_PROFILE_IDENTITY,
     NUMERICAL_PROFILE_ID as CUDA_SILU_BF16_NUMERICAL_PROFILE_ID,
@@ -175,13 +197,17 @@ pub use tensor_silu::{
     RESIDUAL_ADD_NCHW_PROFILE_ID as CUDA_PLAIN_RESIDUAL_ADD_NCHW_BF16_NUMERICAL_PROFILE_ID,
     ROPE_NUMERICAL_IDENTITY as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_IDENTITY,
     ROPE_NUMERICAL_PROFILE_ID as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_ID,
+    ROW_CENTER_BF16_NUMERICAL_PROFILE_ID as CUDA_ROW_CENTER_BF16_NUMERICAL_PROFILE_ID,
     ROW_GATHER_PROFILE_ID as CUDA_ROW_GATHER_BF16_NUMERICAL_PROFILE_ID,
     ROW_RMS_SINGLE_ROUND_NUMERICAL_PROFILE_ID as CUDA_ROW_RMS_NORM_SINGLE_ROUND_BF16_NUMERICAL_PROFILE_ID,
     ROW_SCATTER_ADD_F32_PROFILE_ID as CUDA_ROW_SCATTER_ADD_F32_NUMERICAL_PROFILE_ID,
     ROW_SCATTER_REPLACE_F32_PROFILE_ID as CUDA_ROW_SCATTER_REPLACE_F32_NUMERICAL_PROFILE_ID,
     ROW_SELECTED_ADDCMUL_BF16_PROFILE_ID as CUDA_ROW_SELECTED_ADDCMUL_BF16_NUMERICAL_PROFILE_ID,
+    ROW_SELECTED_ADDCMUL_FMA_BF16_PROFILE_ID as CUDA_ROW_SELECTED_ADDCMUL_FMA_BF16_NUMERICAL_PROFILE_ID,
     ROW_SELECTED_MODULATION_BF16_F32_PROFILE_ID as CUDA_ROW_SELECTED_MODULATION_BF16_F32_NUMERICAL_PROFILE_ID,
     ROW_SELECTED_MODULATION_BF16_PROFILE_ID as CUDA_ROW_SELECTED_MODULATION_BF16_NUMERICAL_PROFILE_ID,
+    SIGNAL_F32_NUMERICAL_PROFILE_ID as CUDA_SIGNAL_F32_NUMERICAL_PROFILE_ID,
+    SILU_F32_PROFILE_ID as CUDA_SILU_F32_NUMERICAL_PROFILE_ID,
     SILU_MUL_F32_PROFILE_ID as CUDA_SILU_MUL_F32_NUMERICAL_PROFILE_ID,
     SILU_MUL_NUMERICAL_PROFILE_ID as CUDA_SILU_MUL_BF16_NUMERICAL_PROFILE_ID,
     SILU_NCHW_PROFILE_ID as CUDA_SILU_NCHW_BF16_NUMERICAL_PROFILE_ID,
@@ -445,15 +471,37 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::PHILOX_NORMAL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::PHILOX_NORMAL_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::SILU_MUL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PACKED_SWIGLU_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::HEAD_RMS_PARTIAL_ROPE_SINGLE_ROUND_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SELECTED_RMS_MODULATION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SELECTED_RESIDUAL_RMS_MODULATION_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::TANH_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::MODULATION_SCALE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::GATED_RESIDUAL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::DENSE_LINEAR_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::AFFINE_LINEAR_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::AFFINE_LINEAR_F32_TO_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::CAST_F32_TO_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CAST_BF16_TO_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::BATCHED_MATMUL_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SCALE_RANK4_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SOFTMAX_RANK4_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PACK_HEAD_AXIS_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PACK_HEAD_AXIS_F32_TO_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::HEAD_FP8_ROUNDTRIP_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::INDEXED_HEAD_FP8_ROUNDTRIP_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::MASKED_TILE_MEAN_BF16_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::FIR_RESAMPLE1D_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SNAKE_BETA_LOG_NCHW_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SNAKE_ALPHA_NCHW_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CLAMP_RANK4_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_CENTER_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CHANNEL_BIAS_ADD_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::SILU_MUL_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SILU_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::MULTIPLY_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::GELU_TANH_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::GELU_ERF_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::PATCH_PROJECTION_F32_CAPABILITY_ID)?,
@@ -469,17 +517,25 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::HALF_SPLIT_ROPE_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::UNIT_HEAD_RMS_PARTIAL_ROPE_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::GROUPED_COLUMN_SLICE_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GROUPED_COLUMN_MEAN_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ADAPTIVE_AVG_POOL_ROWS_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::CHANNEL_BIAS_ADD_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::CHANNEL_SCALED_RESIDUAL_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CHANNEL_SCALED_RESIDUAL_SEPARATE_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::NAN_TO_NUM_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ROW_SELECTED_MODULATION_BF16_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ROW_SELECTED_MODULATION_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ROW_SELECTED_ADDCMUL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_SELECTED_ADDCMUL_FMA_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::BATCHED_SUFFIX_APPEND_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::LAYER_NORM_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::CONV2D_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CONV3D_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::CONV_TRANSPOSE2D_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::GROUP_NORM_SILU_NCHW_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::FRAME_GROUP_NORM_SILU_NCTHW_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_NCHW_F32_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_NCTHW_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::COMFY_CONVROT_SWIGLU_F32_W4A8_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::COMFY_CONVROT_SWIGLU_F32_W8A8_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::DENSE_LINEAR_BLOCK_BF16_CAPABILITY_ID)?,
@@ -492,6 +548,12 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::GELU_TANH_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ROW_GATHER_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_WRITE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ROW_INDEX_GATHER_OR_ZERO_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::MERGE_LEADING_BATCH_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SPLIT_LEADING_BATCH_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::LeadingBatchBf16Kind::Merge.view_capability_id())?,
+        CapabilityId::new(ferrum_runtime::LeadingBatchBf16Kind::Split.view_capability_id())?,
         CapabilityId::new(ferrum_runtime::BATCHED_ROW_CONCAT_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::PLAIN_RESIDUAL_ADD_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::HALF_SPLIT_ROPE_BF16_CAPABILITY_ID)?,
@@ -499,7 +561,9 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::FUSED_HEAD_RMS_PARTIAL_ROPE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ROW_RMS_NORM_SINGLE_ROUND_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ADDCMUL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::ADDCMUL_FMA_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::STRUCTURED_GQA_ATTENTION_FUSED_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::STRUCTURED_GQA_ATTENTION_F32_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::CONV2D_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::CHANNEL_L2_NORM_BF16_CAPABILITY_ID)?,
@@ -587,6 +651,162 @@ pub fn cuda_vnext_dense_linear_fp8_bf16_provider(
     Ok(Box::new(tensor_dense_fp8_bf16::Provider::new(
         runtime, config,
     )?))
+}
+
+/// Add packed NVFP4 capability to an explicit tensor composition. No provider
+/// is selected by default, and the native artifact must already be locked.
+pub fn cuda_tensor_runtime_enable_cutlass_nvfp4(
+    config: &mut CudaDeviceRuntimeConfig,
+) -> Result<(), VNextError> {
+    let native = tensor_nvfp4_bf16::source_fingerprint()
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+    config.capabilities.insert(CapabilityId::new(
+        ferrum_runtime::NVFP4_MATMUL_BF16_CAPABILITY_ID,
+    )?);
+    config.capabilities.insert(CapabilityId::new(
+        crate::native_ops::cutlass_nvfp4::CAPABILITY_ID,
+    )?);
+    config.capabilities.insert(CapabilityId::new(
+        ferrum_runtime::NVFP4_QUANTIZE_BF16_CAPABILITY_ID,
+    )?);
+    config.capabilities.insert(CapabilityId::new(
+        crate::native_ops::cutlass_nvfp4::QUANTIZE_CAPABILITY_ID,
+    )?);
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        native.as_bytes(),
+    ]);
+    Ok(())
+}
+
+pub fn cuda_vnext_nvfp4_matmul_bf16_provider(
+    runtime: &CudaDeviceRuntime,
+    config: &CutlassNvfp4Config,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(tensor_nvfp4_bf16::Provider::new(runtime, config)?))
+}
+
+/// Explicit immutable checked Host sparse attention profile. Dynamic GPU mask
+/// production and QKV quantization are separate operations, not implied here.
+pub fn cuda_tensor_runtime_enable_sage_vsa_fp4(
+    config: &mut CudaDeviceRuntimeConfig,
+) -> Result<(), VNextError> {
+    let native = tensor_sparse_fp4_attention::source_fingerprint()
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+    for capability in [
+        ferrum_runtime::SPARSE_FP4_ATTENTION_CHECKED_HOST_CAPABILITY_ID,
+        crate::native_ops::sage_vsa_fp4::CAPABILITY_ID,
+    ] {
+        config.capabilities.insert(CapabilityId::new(capability)?);
+    }
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        native.as_bytes(),
+    ]);
+    Ok(())
+}
+
+/// The provider, Core prepared receipt and encoded command retain this same
+/// charged immutable owner. A serialized digest cannot supply or forge it.
+pub fn cuda_vnext_sparse_fp4_attention_checked_host_provider(
+    runtime: &CudaDeviceRuntime,
+    config: &SageVsaFp4Config,
+    pattern: Arc<CheckedHostVsaPattern>,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(tensor_sparse_fp4_attention::Provider::new(
+        runtime, config, pattern,
+    )?))
+}
+
+/// Dynamic region selection consumes F32 pooled scores and writes private
+/// lists immediately before attention. Pooling/quantization are explicit
+/// upstream operations; this capability does not imply their implementation.
+pub fn cuda_tensor_runtime_enable_sage_vsa_fp4_regions(
+    config: &mut CudaDeviceRuntimeConfig,
+) -> Result<(), VNextError> {
+    if !crate::native_ops::sage_vsa_fp4::regions::compiled() {
+        return Err(VNextError::InvalidExecutionPlan {
+            reason: "VSA GPU region producer artifact unavailable".into(),
+        });
+    }
+    let native = tensor_sparse_fp4_attention::source_fingerprint()
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+    for capability in [
+        ferrum_runtime::SPARSE_FP4_ATTENTION_REGION_TOPK_CAPABILITY_ID,
+        crate::native_ops::sage_vsa_fp4::REGION_CAPABILITY_ID,
+    ] {
+        config.capabilities.insert(CapabilityId::new(capability)?);
+    }
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        native.as_bytes(),
+        crate::native_ops::sage_vsa_fp4::regions::REGION_SELECTION_NUMERICAL_IDENTITY.as_bytes(),
+    ]);
+    Ok(())
+}
+
+pub fn cuda_vnext_sparse_fp4_attention_region_topk_provider(
+    runtime: &CudaDeviceRuntime,
+    config: &SageVsaFp4Config,
+    regions: Arc<CheckedVsaRegions>,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(tensor_sparse_fp4_attention::Provider::regions(
+        runtime, config, regions,
+    )?))
+}
+
+/// Three Sage Q/K/V quantization launches, with explicit BF16 input geometry.
+/// This grants neither centering nor prefix slicing nor attention selection.
+pub fn cuda_tensor_runtime_enable_sage_vsa_fp4_quantize(
+    config: &mut CudaDeviceRuntimeConfig,
+) -> Result<(), VNextError> {
+    if !crate::native_ops::sage_vsa_fp4::quantize::compiled() {
+        return Err(VNextError::InvalidExecutionPlan {
+            reason: "Sage QKV quantization locked artifact unavailable".into(),
+        });
+    }
+    let native = tensor_sparse_fp4_attention::source_fingerprint()
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+    for capability in [
+        ferrum_runtime::SPARSE_FP4_QKV_QUANTIZE_BF16_CAPABILITY_ID,
+        crate::native_ops::sage_vsa_fp4::QUANTIZE_CAPABILITY_ID,
+    ] {
+        config.capabilities.insert(CapabilityId::new(capability)?);
+    }
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        native.as_bytes(),
+        crate::native_ops::sage_vsa_fp4::quantize::NUMERICAL_IDENTITY.as_bytes(),
+    ]);
+    Ok(())
+}
+
+pub fn cuda_vnext_sparse_fp4_qkv_quantize_bf16_provider(
+    runtime: &CudaDeviceRuntime,
+    config: &SageVsaFp4Config,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(tensor_sparse_fp4_quantize::Provider::new(
+        runtime, config,
+    )?))
+}
+
+/// Pure activation quantization and packed GEMM share one admitted static
+/// module allowance. Their explicit graph edges own the reusable packed data.
+pub fn cuda_vnext_nvfp4_bf16_providers(
+    runtime: &CudaDeviceRuntime,
+    config: &CutlassNvfp4Config,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_nvfp4_bf16::providers(runtime, config)
+}
+
+/// Independent, explicitly pinned qualification artifact. Never selected by a
+/// product factory. Uses this runtime's capacity, stream and completion owner.
+#[cfg(feature = "cuda-nvfp4-diagnostics")]
+pub fn cuda_vnext_nvfp4_reference_provider(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaNvfp4ReferenceConfig,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(nvfp4_reference::Provider::new(runtime, config)?))
 }
 
 /// Same native module, with typed pair/triple projections sharing activation
@@ -695,6 +915,22 @@ pub fn cuda_vnext_tensor_providers_with_cudnn(
     tensor_silu::providers_with_cudnn(runtime, config, selected)
 }
 
+pub use tensor_silu::CudaCudnnOperation;
+/// Select original convolution and attention providers for multiple phases
+/// sharing one tensor module, cuDNN owner and optional bounded SDPA cache.
+/// Register only the explicitly selected contracts. Vendor segmented attention
+/// and native `SegmentedAttention` are mutually exclusive implementations of
+/// one operation. External Sage/NVFP4 modules retain their separate factories.
+pub fn cuda_vnext_tensor_providers_with_cudnn_selection(
+    runtime: &CudaDeviceRuntime,
+    config: &super::vnext_runtime::CudaCudnnConfig,
+    policy: Option<super::vnext_runtime::CudnnSdpaPlanPolicy>,
+    vendor: &[CudaCudnnOperation],
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::providers_with_cudnn_selection(runtime, config, policy, vendor, selected)
+}
+
 /// Opt-in segmented cuDNN SDPA alongside the selected native operations and
 /// Conv2D, sharing one module permit and one separately charged cuDNN owner.
 /// The explicit finite cache quota is additional to the cuDNN owner's opaque
@@ -707,6 +943,22 @@ pub fn cuda_vnext_tensor_providers_with_cudnn_sdpa(
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     tensor_silu::providers_with_cudnn_sdpa(runtime, config, policy, selected)
+}
+
+pub use tensor_silu::{
+    CUDNN_GQA_NUMERICAL_IDENTITY as CUDA_CUDNN_GQA_NUMERICAL_IDENTITY,
+    CUDNN_GQA_NUMERICAL_PROFILE_ID as CUDA_CUDNN_GQA_NUMERICAL_PROFILE_ID,
+};
+/// Explicit all-valid causal compact GQA, sharing the existing cuDNN owner,
+/// bounded SDPA cache and tensor module. Register the fused GQA contract and
+/// the existing companion convolution/structured-fused contracts.
+pub fn cuda_vnext_tensor_providers_with_cudnn_causal_gqa(
+    runtime: &CudaDeviceRuntime,
+    config: &super::vnext_runtime::CudaCudnnConfig,
+    policy: super::vnext_runtime::CudnnSdpaPlanPolicy,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::providers_with_cudnn_causal_gqa(runtime, config, policy, selected)
 }
 
 /// Adds rectangular noncausal cross-attention to the existing cuDNN SDPA bundle.

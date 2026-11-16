@@ -185,6 +185,7 @@ impl Provider {
         match g {
             Geometry::Patch(g) => {
                 ReferenceDeviceCommand::patch_projection_f32_tensor(ReferenceAffineF32Launch {
+                    rounded_bf16: false,
                     dense: ReferenceDenseLinearLaunch {
                         input: region(ResolvedValueRole::Input, 0)?,
                         weight: region(ResolvedValueRole::Input, 1)?,

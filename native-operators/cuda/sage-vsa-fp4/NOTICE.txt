@@ -1,0 +1,30 @@
+The attention implementation is derived from the FastVideo source snapshot
+866a3cdb91a85aef8561847365fc8564add9e4c8, fastvideo-kernel/attn_qat_infer.
+
+SageAttention headers and the adapted launch/parameter structures:
+Copyright (c) 2025 by SageAttention team.
+Licensed under Apache License 2.0; see Apache-2.0.txt.
+
+tile_scheduler.h also states that it is based on FlashAttention3:
+Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar,
+Pradeep Ramani, Tri Dao. Licensed under Apache License 2.0.
+
+blockscaled_layout.h:
+Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause.
+The BSD-3-Clause terms in CUTLASS-BSD-3-Clause.txt also apply to this file.
+
+The deployed CUTLASS 4.3.0 header closure retains each original copyright
+and license notice. Its license terms are in CUTLASS-BSD-3-Clause.txt.
+
+Ferrum adaptations remove the unused Torch generator state, replace the
+Torch allocation/dispatch wrapper with explicit checked spans and stream,
+and use the caller-declared and verified SM count instead of fixed 170.
+The original numerical kernel headers remain unchanged.
+
+quantize_core.cuh preserves the original numerical kernel bodies from
+attn_qat_infer/quantization/fp4_quantization_4d.cu (same snapshot above;
+full source SHA256 f04880acf1e73c48b817c355f0290528c0cd9cad18a7e7d09e18ed8300e41a4e).
+Copyright (c) 2025 by SageAttention team, Apache License 2.0.
+Ferrum removes the Torch wrappers and unused includes, adds a private
+namespace and explicit CUDA includes, and retains the source license notice.

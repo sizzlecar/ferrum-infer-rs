@@ -71,8 +71,75 @@ pub(super) fn execute(l: &ReferenceCnnF32Launch) {
 fn execute_regions<const N: usize>(regions: [&ReferenceBufferRegion; N], geometry: F32CnnGeometry) {
     let mut s = AllocationLocks::new(regions);
     match geometry {
-        F32CnnGeometry::ResidualAdd(g) => {
-            for i in 0..g.elements() as usize {
+        F32CnnGeometry::Conv3d(g) => {
+            let [batches, channels, depth, height, width] = g.input();
+            let [outputs, group_channels, kd, kh, kw] = g.weight();
+            let [_, _, od, oh, ow] = g.output();
+            let pad = g.padding();
+            let stride = g.stride();
+            let dilation = g.dilation();
+            let outputs_per_group = outputs / g.groups();
+            for n in 0..batches {
+                for o in 0..outputs {
+                    for z in 0..od {
+                        for y in 0..oh {
+                            for x in 0..ow {
+                                let mut sum = 0.0f32;
+                                for c in 0..group_channels {
+                                    for kz in 0..kd {
+                                        for ky in 0..kh {
+                                            for kx in 0..kw {
+                                                let coordinates = std::array::from_fn(|a| {
+                                                    i128::from([z, y, x][a]) * i128::from(stride[a])
+                                                        + i128::from([kz, ky, kx][a])
+                                                            * i128::from(dilation[a])
+                                                        - i128::from(pad[2 * a])
+                                                });
+                                                let v = if let Some([iz, iy, ix]) =
+                                                    g.source_spatial(coordinates)
+                                                {
+                                                    let channel =
+                                                        o / outputs_per_group * group_channels + c;
+                                                    s.read_f32(
+                                                        0,
+                                                        ((((n * channels + channel) * depth + iz)
+                                                            * height
+                                                            + iy)
+                                                            * width
+                                                            + ix)
+                                                            as usize,
+                                                    )
+                                                } else {
+                                                    0.0
+                                                };
+                                                let w = s.read_f32(
+                                                    1,
+                                                    ((((o * group_channels + c) * kd + kz) * kh
+                                                        + ky)
+                                                        * kw
+                                                        + kx)
+                                                        as usize,
+                                                );
+                                                let product = v * w;
+                                                sum += product;
+                                            }
+                                        }
+                                    }
+                                }
+                                let value = sum + s.read_f32(2, o as usize);
+                                s.write_f32(
+                                    N - 1,
+                                    ((((n * outputs + o) * od + z) * oh + y) * ow + x) as usize,
+                                    value,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        F32CnnGeometry::ResidualAdd(_) | F32CnnGeometry::VolumeResidualAdd(_) => {
+            for i in 0..geometry.elements() as usize {
                 let v = s.read_f32(0, i) + s.read_f32(1, i);
                 s.write_f32(N - 1, i, v);
             }
@@ -134,38 +201,54 @@ fn execute_regions<const N: usize>(regions: [&ReferenceBufferRegion; N], geometr
                 }
             }
         }
-        F32CnnGeometry::GroupNormSilu(g) => {
-            let [batch, channels, height, width] = g.shape();
+        F32CnnGeometry::GroupNormSilu(_) | F32CnnGeometry::FrameGroupNormSilu(_) => {
+            let (batch, channels, frames, height, width, groups, epsilon) = match geometry {
+                F32CnnGeometry::GroupNormSilu(g) => {
+                    let [n, c, h, w] = g.shape();
+                    (n, c, 1, h, w, g.groups(), g.effective_epsilon())
+                }
+                F32CnnGeometry::FrameGroupNormSilu(g) => {
+                    let [n, c, t, h, w] = g.shape();
+                    (n, c, t, h, w, g.groups(), g.effective_epsilon())
+                }
+                _ => unreachable!(),
+            };
             let spatial = height * width;
-            let group = g.group_elements() as usize;
-            for ng in 0..batch * g.groups() {
-                let start = ng as usize * group;
+            let group = (channels / groups * spatial) as usize;
+            for ng in 0..batch * frames * groups {
+                let offset = |i: usize| {
+                    let n = ng / (frames * groups);
+                    let t = (ng / groups) % frames;
+                    let c = (ng % groups) * (channels / groups) + (i as u64) / spatial;
+                    (((n * channels + c) * frames + t) * spatial + (i as u64) % spatial) as usize
+                };
                 let mut sums = [0.0f32; 256];
                 for (lane, sum) in sums.iter_mut().enumerate() {
                     for i in (lane..group).step_by(256) {
-                        *sum += s.read_f32(0, start + i);
+                        *sum += s.read_f32(0, offset(i));
                     }
                 }
                 let mean = tree(&mut sums) / group as f32;
                 sums.fill(0.);
                 for (lane, sum) in sums.iter_mut().enumerate() {
                     for i in (lane..group).step_by(256) {
-                        let centered = s.read_f32(0, start + i) - mean;
+                        let centered = s.read_f32(0, offset(i)) - mean;
                         let square = centered * centered;
                         *sum += square;
                     }
                 }
                 let variance = tree(&mut sums) / group as f32;
-                let inverse = 1. / (variance + g.effective_epsilon()).sqrt();
+                let inverse = 1. / (variance + epsilon).sqrt();
                 for i in 0..group {
-                    let channel = ((start + i) as u64 / spatial % channels) as usize;
-                    let centered = s.read_f32(0, start + i) - mean;
+                    let position = offset(i);
+                    let channel = (position as u64 / (spatial * frames) % channels) as usize;
+                    let centered = s.read_f32(0, position) - mean;
                     let normalized = centered * inverse;
                     let scaled = normalized * s.read_f32(1, channel);
                     let affine = scaled + s.read_f32(2, channel);
                     let denominator = 1. + libm::expf(-affine);
                     let value = affine / denominator;
-                    s.write_f32(N - 1, start + i, value);
+                    s.write_f32(N - 1, position, value);
                 }
             }
         }

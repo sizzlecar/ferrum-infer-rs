@@ -125,6 +125,72 @@ fn release_retirement(mut retired: Retirement<u64>) {
 }
 
 #[tokio::test]
+async fn finite_queue_drains_and_retires_inside_tokio_without_cancelling_accepted_jobs() {
+    let f = fixture();
+    let calls = f.calls.clone();
+    let shutdown_calls = f.shutdown_calls.clone();
+    // The sealed queue must not wait for another arrival to fill this batch.
+    let service = ServiceCore::unstarted(&f, config(3, 30_000, 3), None);
+    let first = service.try_submit(request(11)).unwrap();
+    let second = service.try_submit(request(29)).unwrap();
+    let retired = service.run_to_completion(Box::new(f));
+    assert_eq!(first.completed().unwrap(), 11);
+    assert_eq!(second.completed().unwrap(), 29);
+    assert_eq!(*calls.lock().unwrap(), [vec![11, 29]]);
+    assert_eq!(shutdown_calls.load(Ordering::SeqCst), 1);
+    assert!(!service.snapshot().accepting);
+    assert_eq!(service.snapshot().pending_requests, 0);
+    assert!(service.try_submit(request(37)).is_err());
+    assert!(retired.failure.is_none());
+}
+
+#[test]
+fn finite_fatal_and_panic_keep_original_owner_and_skip_normal_close() {
+    for panic in [false, true] {
+        let mut f = fixture();
+        let error_dropped = Arc::new(AtomicUsize::new(0));
+        let worker_dropped = f.dropped.clone();
+        let shutdown_calls = f.shutdown_calls.clone();
+        if panic {
+            f.panic = Some(error_dropped.clone());
+        } else {
+            f.fail = Some(error_dropped.clone());
+        }
+        let service = ServiceCore::unstarted(&f, config(1, 0, 1), None);
+        let job = service.try_submit(request(11)).unwrap();
+        let retired = service.run_to_completion(Box::new(f));
+        assert!(job.completed().is_err());
+        assert!(retired.failure.is_some());
+        assert_eq!(shutdown_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(error_dropped.load(Ordering::SeqCst), 0);
+        assert_eq!(worker_dropped.load(Ordering::SeqCst), 0);
+        release_retirement(retired);
+        assert_eq!(error_dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(worker_dropped.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn finite_shutdown_failure_retains_the_delivered_output_and_original_close_error() {
+    let mut f = fixture();
+    let error_dropped = Arc::new(AtomicUsize::new(0));
+    f.shutdown_failure = Some(error_dropped.clone());
+    let calls = f.shutdown_calls.clone();
+    let service = ServiceCore::unstarted(&f, config(1, 0, 1), None);
+    let job = service.try_submit(request(11)).unwrap();
+    let retired = service.run_to_completion(Box::new(f));
+    assert_eq!(job.completed().unwrap(), 11);
+    assert!(
+        matches!(&retired.failure, Some(ImageWorkerFailure::Generation(error))
+        if error.downcast_ref::<OriginalFailure>().is_some())
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(error_dropped.load(Ordering::SeqCst), 0);
+    release_retirement(retired);
+    assert_eq!(error_dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn shutdown_failure_preserves_original_error_and_worker_owner() {
     let mut f = fixture();
     let error_dropped = Arc::new(AtomicUsize::new(0));

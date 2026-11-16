@@ -1,11 +1,40 @@
 use super::*;
 use serde::Deserializer;
+
+/// Declared checkpoint dialect; compute and logical parameter identities are shared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CausalVaeEncoderSourceLayout {
+    #[default]
+    Comfy,
+    Diffusers,
+}
+impl CausalVaeEncoderSourceLayout {
+    fn is_default(&self) -> bool {
+        *self == Self::Comfy
+    }
+    pub(super) fn external_name(self, logical: &str) -> String {
+        match self {
+            Self::Comfy => logical.to_owned(),
+            Self::Diffusers => logical
+                .replace("encoder.down.", "encoder.down_blocks.")
+                .replace(".block.", ".resnets.")
+                .replace(".nin_shortcut.", ".conv_shortcut.")
+                .replace(".downsample.", ".downsamplers.0."),
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct PH3ImageVaeEncoderConfig {
     architecture: PH3ImageVaeEncoderArchitecture,
     batch: u64,
     height: u64,
     width: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "CausalVaeEncoderSourceLayout::is_default"
+    )]
+    source_layout: CausalVaeEncoderSourceLayout,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,11 +43,15 @@ struct Wire {
     batch: u64,
     height: u64,
     width: u64,
+    #[serde(default)]
+    source_layout: CausalVaeEncoderSourceLayout,
 }
 impl<'de> Deserialize<'de> for PH3ImageVaeEncoderConfig {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let w = Wire::deserialize(d)?;
-        Self::new(w.architecture, w.batch, w.height, w.width).map_err(serde::de::Error::custom)
+        Self::new(w.architecture, w.batch, w.height, w.width)
+            .map(|c| c.with_source_layout(w.source_layout))
+            .map_err(serde::de::Error::custom)
     }
 }
 impl PH3ImageVaeEncoderConfig {
@@ -33,9 +66,17 @@ impl PH3ImageVaeEncoderConfig {
             batch,
             height,
             width,
+            source_layout: CausalVaeEncoderSourceLayout::Comfy,
         };
         c.validate()?;
         Ok(c)
+    }
+    pub(crate) fn with_source_layout(mut self, layout: CausalVaeEncoderSourceLayout) -> Self {
+        self.source_layout = layout;
+        self
+    }
+    pub(super) fn external_name(&self, logical: &str) -> String {
+        self.source_layout.external_name(logical)
     }
     pub fn architecture(&self) -> &PH3ImageVaeEncoderArchitecture {
         &self.architecture

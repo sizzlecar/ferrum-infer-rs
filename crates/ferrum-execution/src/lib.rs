@@ -20,10 +20,11 @@ pub mod prepared_model;
 pub mod tensor;
 pub mod token_execution;
 pub use tensor::{
-    PreparedTensorExecutor, TensorAdmissionFailure, TensorAdmissionStage, TensorExecutionError,
-    TensorExecutionOutput, TensorExecutionRetirement, TensorExecutorConfig,
-    TensorRequestCloseFailure, TensorRequestSession, TensorRequestStateMapping, TensorSerialActor,
-    TensorSerialActorStreamRequirements,
+    PreparedTensorExecutor, TensorAdmissionFailure, TensorAdmissionStage,
+    TensorDynamicPreparationOutcome, TensorExecutionError, TensorExecutionOutput,
+    TensorExecutionRetirement, TensorExecutorConfig, TensorRequestCloseFailure,
+    TensorRequestInitialization, TensorRequestSession, TensorRequestStateMapping,
+    TensorSerialActor, TensorSerialActorStreamRequirements,
 };
 
 #[cfg(any(test, feature = "test-support"))]

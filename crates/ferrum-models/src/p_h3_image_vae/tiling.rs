@@ -12,7 +12,7 @@ mod groups;
 mod moments;
 pub(crate) use canvas::{PH3ImageVaeCanvas, PH3ImageVaeCanvasDomain};
 pub use groups::{PH3ImageVaeTileBatch, PH3ImageVaeTileGroup};
-pub(crate) use moments::PH3ImageVaeMomentCanvas;
+pub(crate) use moments::{MomentBlendArithmetic, PH3ImageVaeMomentCanvas};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

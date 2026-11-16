@@ -267,6 +267,7 @@ fn check_prefix_phases(fixture: Fixture) {
         .map(|port| TensorRequestStateMapping {
             source_output: port.value_id().clone(),
             destination_state: port.value_id().clone(),
+            selection: TensorOutputSelection::Whole,
         })
         .collect::<Vec<_>>();
     let before = c.runtime().snapshot().readback_bytes;

@@ -1,14 +1,12 @@
 //! Optional local observation. Sampling never signals the server or changes GPU state.
 use super::*;
-use ferrum_bench_core::images::resource_usage::{
-    nvidia_memory_csv, GpuIdentity, ProcessIdentity, SampledMemory,
-};
+use ferrum_bench_core::images::resource_usage::{GpuIdentity, ProcessIdentity, SampledMemory};
+use ferrum_bench_core::resource_usage::GpuMemorySampler;
 use std::{
-    process::Stdio,
     sync::{Arc, Mutex},
     time::Instant,
 };
-use tokio::{io::AsyncReadExt, sync::oneshot, task::JoinHandle};
+use tokio::{sync::oneshot, task::JoinHandle};
 mod procfs;
 mod timing;
 pub use timing::ImageResourceQueryTiming;
@@ -166,6 +164,7 @@ pub(super) struct EndpointSampler {
     server_pid: Option<u32>,
     process: Option<Mutex<procfs::ProcessSampler>>,
     gpu_identity: Mutex<Option<Vec<GpuIdentity>>>,
+    gpu: GpuMemorySampler,
     #[cfg(test)]
     process_query_delay_ms: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -181,6 +180,7 @@ impl EndpointSampler {
                 .get(endpoint)
                 .map(|&pid| Mutex::new(procfs::ProcessSampler::new(PathBuf::from("/proc"), pid))),
             gpu_identity: Mutex::new(None),
+            gpu: GpuMemorySampler::default(),
             #[cfg(test)]
             process_query_delay_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -236,7 +236,13 @@ impl EndpointSampler {
                 None
             } else {
                 let query_started = Instant::now();
-                let result = query_gpu(&self.config).await;
+                let result = self
+                    .gpu
+                    .query(
+                        &self.config.gpu_indices,
+                        Duration::from_millis(self.config.gpu_query_timeout_ms),
+                    )
+                    .await;
                 Some((result, query_started, Instant::now()))
             }
         };
@@ -310,67 +316,6 @@ fn record_query(
         milliseconds(started.saturating_duration_since(epoch)),
     );
     timing.record(epoch, started, finished, new_peak, periodic_interval);
-}
-
-async fn query_gpu(
-    config: &ImageResourceSamplingConfig,
-) -> Result<(Vec<GpuIdentity>, u64), String> {
-    let indices = config
-        .gpu_indices
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut child = tokio::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=index,uuid,memory.used",
-            "--format=csv,noheader,nounits",
-            "--id",
-            &indices,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| format!("nvidia-smi launch: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "nvidia-smi stdout unavailable".to_string())?;
-    let operation = async {
-        let mut bytes = Vec::new();
-        stdout
-            .take(64 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|error| error.to_string())?;
-        if bytes.len() > 64 * 1024 {
-            return Err("nvidia-smi output exceeds 64 KiB".to_string());
-        }
-        let status = child.wait().await.map_err(|error| error.to_string())?;
-        if !status.success() {
-            return Err(format!("nvidia-smi exited with {status}"));
-        }
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|_| "nvidia-smi output is not UTF-8".to_string())?;
-        nvidia_memory_csv(text, &config.gpu_indices).map_err(|error| error.to_string())
-    };
-    match tokio::time::timeout(
-        Duration::from_millis(config.gpu_query_timeout_ms),
-        operation,
-    )
-    .await
-    {
-        Ok(Ok(value)) => Ok(value),
-        other => {
-            let _ = child.kill().await;
-            match other {
-                Ok(Err(error)) => Err(error),
-                _ => Err("nvidia-smi query timed out".into()),
-            }
-        }
-    }
 }
 
 pub(super) struct RunningResourceWindow {
@@ -499,6 +444,7 @@ mod tests {
             },
             server_pid: Some(42),
             process: Some(Mutex::new(procfs::ProcessSampler::new(path.into(), 42))),
+            gpu: GpuMemorySampler::default(),
             gpu_identity: Mutex::new(None),
             process_query_delay_ms: std::sync::atomic::AtomicU64::new(0),
             process_query_started: tokio::sync::Notify::new(),

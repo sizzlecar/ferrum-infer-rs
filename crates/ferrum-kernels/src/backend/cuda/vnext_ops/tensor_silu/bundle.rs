@@ -12,14 +12,14 @@ pub(super) struct RetainedFunctions {
     // Every CudaFunction retains the same native module/context. Field order
     // releases these owners before returning the one module capacity permit.
     functions: [CudaFunction; 7],
-    norm_functions: [CudaFunction; 3],
+    norm_functions: [CudaFunction; 4],
     rope_function: CudaFunction,
     attention_function: CudaFunction,
     fused_attention_functions: [CudaFunction; 3],
-    transport_functions: [CudaFunction; 2],
+    transport_functions: [CudaFunction; 5],
     half_split_rope_function: CudaFunction,
     fused_head_rms_partial_rope_function: CudaFunction,
-    row_rms_addcmul_functions: [CudaFunction; 2],
+    row_rms_addcmul_functions: [CudaFunction; 3],
     gqa_attention_function: CudaFunction,
     gqa_attention_f32_function: CudaFunction,
     spatial_functions: [CudaFunction; 3],
@@ -30,17 +30,27 @@ pub(super) struct RetainedFunctions {
     primitive_function: CudaFunction,
     block_decode_function: CudaFunction,
     comfy_convrot_functions: [CudaFunction; 9],
-    cast_f32_to_bf16_function: CudaFunction,
+    head_axis_pack_function: CudaFunction,
+    head_fp8_roundtrip_bf16_function: CudaFunction,
+    float_cast_function: CudaFunction,
+    batched_f32_functions: [CudaFunction; 2],
+    channel_bias_add_bf16_function: CudaFunction,
+    row_center_bf16_functions: [CudaFunction; 2],
+    masked_tile_mean_function: CudaFunction,
+    signal_f32_functions: [CudaFunction; 4],
     pointwise_f32_function: CudaFunction,
+    head_rms_partial_rope_single_round_function: CudaFunction,
+    packed_swiglu_bf16_function: CudaFunction,
+    row_selected_rms_modulation_bf16_function: CudaFunction,
     gelu_f32_function: CudaFunction,
     reshape_copy_f32_function: CudaFunction,
     row_scatter_f32_function: CudaFunction,
     channelwise_f32_function: CudaFunction,
     row_selected_modulation_function: CudaFunction,
-    row_selected_bf16_functions: [CudaFunction; 2],
+    row_selected_bf16_functions: [CudaFunction; 3],
     batched_suffix_append_f32_function: CudaFunction,
     layer_norm_f32_function: CudaFunction,
-    cnn_f32_functions: [CudaFunction; 4],
+    cnn_f32_functions: [CudaFunction; 6],
     norm_rope_f32_functions: [CudaFunction; 3],
     runtime_instance: u64,
     _provider: CudaTensorProviderRetention,
@@ -79,6 +89,11 @@ impl RetainedFunctions {
                 load_norm(norm::Kind::Layer)?,
                 load_norm(norm::Kind::HeadRms)?,
                 load_norm(norm::Kind::ZeroCenteredRms)?,
+                module
+                    .load_function(norm::HEAD_RMS_CARRY_FUNCTION)
+                    .map_err(|error| {
+                        CudaDeviceRuntimeError::driver("BF16 HeadRMS carry function load", error)
+                    })?,
             ];
             let rope_function = module.load_function(rope::FUNCTION).map_err(|error| {
                 CudaDeviceRuntimeError::driver("BF16 adjacent RoPE function load", error)
@@ -112,6 +127,9 @@ impl RetainedFunctions {
             let transport = [
                 load_transport(transport::Kind::RowGather)?,
                 load_transport(transport::Kind::BatchedRowConcat)?,
+                load_transport(transport::Kind::RowIndexGather)?,
+                load_transport(transport::Kind::MergeLeadingBatch)?,
+                load_transport(transport::Kind::RowWrite)?,
             ];
             let half_split_rope_function = module
                 .load_function(half_split_rope::FUNCTION)
@@ -120,7 +138,7 @@ impl RetainedFunctions {
                 })?;
             let row_rms_addcmul_functions =
                 row_rms_addcmul::FUNCTIONS.map(|name| module.load_function(name));
-            let [row_rms, addcmul] = row_rms_addcmul_functions;
+            let [row_rms, addcmul, addcmul_fma] = row_rms_addcmul_functions;
             let row_rms_addcmul_functions = [
                 row_rms.map_err(|e| {
                     CudaDeviceRuntimeError::driver("single-round RowRMS function load", e)
@@ -128,6 +146,8 @@ impl RetainedFunctions {
                 addcmul.map_err(|e| {
                     CudaDeviceRuntimeError::driver("single-round addcmul function load", e)
                 })?,
+                addcmul_fma
+                    .map_err(|e| CudaDeviceRuntimeError::driver("FMA addcmul function load", e))?,
             ];
             let gqa_attention_function = module.load_function(gqa::FUNCTION).map_err(|error| {
                 CudaDeviceRuntimeError::driver("BF16 structured GQA attention function load", error)
@@ -254,11 +274,53 @@ impl RetainedFunctions {
                         "ConvRot function list differs from its module ABI",
                     )
                 })?;
-            let cast_f32_to_bf16_function = module
-                .load_function("ferrum_vnext_cast_f32_to_bf16")
+            let float_cast_function = module
+                .load_function("ferrum_vnext_float_cast")
+                .map_err(|e| CudaDeviceRuntimeError::driver("F32 to BF16 cast function load", e))?;
+            let batched_f32_functions = [
+                module
+                    .load_function("ferrum_vnext_scale_rank4_f32")
+                    .map_err(|e| CudaDeviceRuntimeError::driver("F32 scale function load", e))?,
+                module
+                    .load_function("ferrum_vnext_row_softmax_rank4_f32")
+                    .map_err(|e| CudaDeviceRuntimeError::driver("F32 softmax function load", e))?,
+            ];
+            let head_axis_pack_function = module
+                .load_function("ferrum_vnext_head_axis_pack")
+                .map_err(|e| CudaDeviceRuntimeError::driver("head-axis pack function load", e))?;
+            let head_fp8_roundtrip_bf16_function = module
+                .load_function("ferrum_vnext_head_fp8_roundtrip_bf16")
                 .map_err(|e| {
-                CudaDeviceRuntimeError::driver("F32 to BF16 cast function load", e)
-            })?;
+                    CudaDeviceRuntimeError::driver("head FP8 roundtrip function load", e)
+                })?;
+            let channel_bias_add_bf16_function = module
+                .load_function("ferrum_vnext_channel_bias_add_bf16")
+                .map_err(|e| CudaDeviceRuntimeError::driver("BF16 channel bias load", e))?;
+            let row_center_bf16_functions = [
+                module
+                    .load_function("ferrum_vnext_row_center_mean_bf16")
+                    .map_err(|e| CudaDeviceRuntimeError::driver("row center mean load", e))?,
+                module
+                    .load_function("ferrum_vnext_row_center_subtract_bf16")
+                    .map_err(|e| CudaDeviceRuntimeError::driver("row center subtract load", e))?,
+            ];
+            let masked_tile_mean_function = module
+                .load_function("ferrum_vnext_masked_tile_mean_bf16_f32")
+                .map_err(|e| CudaDeviceRuntimeError::driver("masked tile mean function load", e))?;
+            let signal_f32_functions = [
+                module
+                    .load_function(signal_f32::FUNCTIONS[0])
+                    .map_err(|e| CudaDeviceRuntimeError::driver("FIR function load", e))?,
+                module
+                    .load_function(signal_f32::FUNCTIONS[1])
+                    .map_err(|e| CudaDeviceRuntimeError::driver("SnakeBeta function load", e))?,
+                module
+                    .load_function(signal_f32::FUNCTIONS[2])
+                    .map_err(|e| CudaDeviceRuntimeError::driver("clamp function load", e))?,
+                module
+                    .load_function(signal_f32::FUNCTIONS[3])
+                    .map_err(|e| CudaDeviceRuntimeError::driver("SnakeAlpha function load", e))?,
+            ];
             let [head, rope, unit_partial] =
                 norm_rope_f32::FUNCTIONS.map(|name| module.load_function(name));
             let channelwise_f32_function = module
@@ -269,10 +331,21 @@ impl RetainedFunctions {
                 .map_err(|e| {
                     CudaDeviceRuntimeError::driver("row-selected modulation function load", e)
                 })?;
+            let row_selected_rms_modulation_bf16_function = module
+                .load_function("ferrum_vnext_row_selected_rms_modulation_bf16")
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("fused RMS modulation function load", error)
+                })?;
+            let head_rms_partial_rope_single_round_function = module
+                .load_function("ferrum_vnext_head_rms_partial_rope_single_round_bf16")
+                .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?;
+            let packed_swiglu_bf16_function = module
+                .load_function("ferrum_vnext_packed_swiglu_bf16")
+                .map_err(|e| CudaDeviceRuntimeError::driver("packed SwiGLU function load", e))?;
             let pointwise_f32_function = module
                 .load_function("ferrum_vnext_pointwise_f32")
                 .map_err(|e| CudaDeviceRuntimeError::driver("F32 pointwise function load", e))?;
-            let [modulation, addcmul] =
+            let [modulation, addcmul, addcmul_fma] =
                 row_selected_bf16::FUNCTIONS.map(|name| module.load_function(name));
             let row_selected_bf16_functions = [
                 modulation.map_err(|e| {
@@ -280,6 +353,9 @@ impl RetainedFunctions {
                 })?,
                 addcmul.map_err(|e| {
                     CudaDeviceRuntimeError::driver("compact BF16 addcmul function load", e)
+                })?,
+                addcmul_fma.map_err(|e| {
+                    CudaDeviceRuntimeError::driver("compact BF16 FMA function load", e)
                 })?,
             ];
             let gelu_f32_function = module
@@ -300,12 +376,11 @@ impl RetainedFunctions {
                 .load_function(layer_norm_f32::FUNCTION)
                 .map_err(|e| CudaDeviceRuntimeError::driver("F32 layer norm function load", e))?;
             let cnn_f32_functions = cnn_f32::FUNCTIONS.map(|name| module.load_function(name));
-            let [pad, bias, norm, residual] = cnn_f32_functions;
-            let cnn_f32_functions = [pad, bias, norm, residual]
+            let cnn_f32_functions = cnn_f32_functions
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| CudaDeviceRuntimeError::driver("F32 CNN function load", e))?;
-            let cnn_f32_functions: [CudaFunction; 4] = cnn_f32_functions
+            let cnn_f32_functions: [CudaFunction; 6] = cnn_f32_functions
                 .try_into()
                 .unwrap_or_else(|_| unreachable!());
             let norm_rope_f32_functions = [
@@ -340,8 +415,18 @@ impl RetainedFunctions {
                 primitive_function,
                 block_decode_function,
                 comfy_convrot_functions,
-                cast_f32_to_bf16_function,
+                head_axis_pack_function,
+                head_fp8_roundtrip_bf16_function,
+                float_cast_function,
+                batched_f32_functions,
+                channel_bias_add_bf16_function,
+                row_center_bf16_functions,
+                masked_tile_mean_function,
+                signal_f32_functions,
                 pointwise_f32_function,
+                head_rms_partial_rope_single_round_function,
+                packed_swiglu_bf16_function,
+                row_selected_rms_modulation_bf16_function,
                 gelu_f32_function,
                 reshape_copy_f32_function,
                 row_scatter_f32_function,
@@ -374,8 +459,18 @@ impl RetainedFunctions {
             primitive_function,
             block_decode_function,
             comfy_convrot_functions,
-            cast_f32_to_bf16_function,
+            head_axis_pack_function,
+            head_fp8_roundtrip_bf16_function,
+            float_cast_function,
+            batched_f32_functions,
+            channel_bias_add_bf16_function,
+            row_center_bf16_functions,
+            masked_tile_mean_function,
+            signal_f32_functions,
             pointwise_f32_function,
+            head_rms_partial_rope_single_round_function,
+            packed_swiglu_bf16_function,
+            row_selected_rms_modulation_bf16_function,
             gelu_f32_function,
             reshape_copy_f32_function,
             row_scatter_f32_function,
@@ -418,8 +513,18 @@ impl RetainedFunctions {
             primitive_function,
             block_decode_function,
             comfy_convrot_functions,
-            cast_f32_to_bf16_function,
+            head_axis_pack_function,
+            head_fp8_roundtrip_bf16_function,
+            float_cast_function,
+            batched_f32_functions,
+            channel_bias_add_bf16_function,
+            row_center_bf16_functions,
+            masked_tile_mean_function,
+            signal_f32_functions,
             pointwise_f32_function,
+            head_rms_partial_rope_single_round_function,
+            packed_swiglu_bf16_function,
+            row_selected_rms_modulation_bf16_function,
             gelu_f32_function,
             reshape_copy_f32_function,
             row_scatter_f32_function,
@@ -453,8 +558,38 @@ impl RetainedFunctions {
     pub(super) fn comfy_convrot_function(&self, index: usize) -> &CudaFunction {
         &self.comfy_convrot_functions[index]
     }
-    pub(super) fn cast_f32_to_bf16_function(&self) -> &CudaFunction {
-        &self.cast_f32_to_bf16_function
+    pub(super) fn float_cast_function(&self) -> &CudaFunction {
+        &self.float_cast_function
+    }
+    pub(super) fn batched_f32_function(&self, index: usize) -> &CudaFunction {
+        &self.batched_f32_functions[index]
+    }
+    pub(super) fn head_axis_pack_function(&self) -> &CudaFunction {
+        &self.head_axis_pack_function
+    }
+    pub(super) fn head_fp8_roundtrip_bf16_function(&self) -> &CudaFunction {
+        &self.head_fp8_roundtrip_bf16_function
+    }
+    pub(super) fn channel_bias_add_bf16_function(&self) -> &CudaFunction {
+        &self.channel_bias_add_bf16_function
+    }
+    pub(super) fn row_center_bf16_function(&self, index: usize) -> &CudaFunction {
+        &self.row_center_bf16_functions[index]
+    }
+    pub(super) fn masked_tile_mean_function(&self) -> &CudaFunction {
+        &self.masked_tile_mean_function
+    }
+    pub(super) fn signal_f32_function(&self, index: usize) -> &CudaFunction {
+        &self.signal_f32_functions[index]
+    }
+    pub(super) fn head_rms_partial_rope_single_round_function(&self) -> &CudaFunction {
+        &self.head_rms_partial_rope_single_round_function
+    }
+    pub(super) fn packed_swiglu_bf16_function(&self) -> &CudaFunction {
+        &self.packed_swiglu_bf16_function
+    }
+    pub(super) fn row_selected_rms_modulation_bf16_function(&self) -> &CudaFunction {
+        &self.row_selected_rms_modulation_bf16_function
     }
     pub(super) fn pointwise_f32_function(&self) -> &CudaFunction {
         &self.pointwise_f32_function
@@ -512,8 +647,15 @@ impl RetainedFunctions {
         &self.spatial_matmul_functions[index]
     }
 
-    pub(super) fn norm_function(&self, kind: norm::Kind) -> &CudaFunction {
-        &self.norm_functions[kind.index()]
+    pub(super) fn norm_function(
+        &self,
+        kind: norm::Kind,
+        reduction: norm::ReductionPlan,
+    ) -> &CudaFunction {
+        &self.norm_functions[match reduction {
+            norm::ReductionPlan::AdjacentPowerOfTwo => kind.index(),
+            norm::ReductionPlan::AdjacentCarry => 3,
+        }]
     }
 
     pub(super) fn rope_function(&self) -> &CudaFunction {

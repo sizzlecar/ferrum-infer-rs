@@ -1,28 +1,12 @@
 //! Opaque image request correlation. These identifiers carry no request content
 //! and do not authorize execution, select a model, or establish timing evidence.
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const IMAGE_ATTEMPT_ID_HEADER: &str = "x-ferrum-image-attempt-id";
 pub const IMAGE_REQUEST_ID_HEADER: &str = "x-ferrum-image-request-id";
 pub const IMAGE_TRACE_SESSION_HEADER: &str = "x-ferrum-image-trace-session";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImageRequestCorrelation {
-    /// Minted by the service, never taken from a caller's request-id header.
-    pub request_id: Uuid,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_attempt_id: Option<Uuid>,
-}
-impl ImageRequestCorrelation {
-    pub fn new(client_attempt_id: Option<Uuid>) -> Self {
-        Self {
-            request_id: Uuid::new_v4(),
-            client_attempt_id,
-        }
-    }
-}
+pub use crate::iterative::RequestCorrelation as ImageRequestCorrelation;
 
 /// The only caller-supplied identity accepted by the image observation path.
 /// Require the fixed hyphenated UUID wire spelling; arbitrary strings, URNs,

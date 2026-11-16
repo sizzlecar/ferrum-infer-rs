@@ -50,6 +50,7 @@ fn execute(
     bias: &[f32],
 ) -> Vec<f32> {
     let patch = matches!(config.kind, Kind::F32Patch);
+    let rounded = matches!(config.kind, Kind::F32AffineToBf16);
     let config = if matches!(route, Route::DotOnly) {
         Config {
             kind: Kind::F32Dense,
@@ -60,6 +61,8 @@ fn execute(
     };
     let contract: Box<dyn OperationContract> = if matches!(route, Route::DotOnly) {
         Box::new(dense_linear_f32_contract().unwrap())
+    } else if rounded {
+        Box::new(affine_linear_f32_to_bf16_contract().unwrap())
     } else if patch {
         Box::new(patch_projection_f32_contract().unwrap())
     } else {
@@ -68,7 +71,9 @@ fn execute(
     let providers = match route {
         Route::Broadcast => cuda_vnext_tensor_providers(
             runtime,
-            &[if patch {
+            &[if rounded {
+                CudaTensorOperation::AffineLinearF32ToBf16
+            } else if patch {
                 CudaTensorOperation::PatchProjectionF32
             } else {
                 CudaTensorOperation::AffineLinearF32
@@ -107,7 +112,7 @@ fn execute(
             HostMemoryClassLimits {
                 input_preprocess_bytes: 128 << 20,
                 transfer_staging_bytes: 64 << 20,
-                output_bytes: 32 << 20,
+                output_bytes: 64 << 20,
                 weight_backing_bytes: 32 << 20,
             },
         )
@@ -151,8 +156,14 @@ fn execute(
     let values = output[0]
         .bytes()
         .bytes()
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .chunks_exact(if rounded { 2 } else { 4 })
+        .map(|b| {
+            if rounded {
+                half::bf16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f32()
+            } else {
+                f32::from_le_bytes(b.try_into().unwrap())
+            }
+        })
         .collect();
     assert!(matches!(
         session
@@ -163,6 +174,28 @@ fn execute(
     drop((output, component, catalog, registry));
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     values
+}
+
+#[test]
+#[ignore = "requires exclusive CUDA; bounded F32 scratch, native bias and cast"]
+fn rounded_f32_affine_streams_multiple_chunks_and_tail_with_exact_bias_boundary() {
+    let runtime = runtime();
+    for (rows, outputs) in [(1, 7), (8195, 7), (4099, 5376)] {
+        let config = Config {
+            kind: Kind::F32AffineToBf16,
+            rows,
+            inputs: 3,
+            outputs,
+        };
+        for trial in 0..2 {
+            let (x, w, b, expected) = fixture::rounded_affine_data(config, trial);
+            let actual = execute(&runtime, config, Route::Broadcast, &x, &w, &b);
+            assert_eq!(actual.len(), expected.len());
+            for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(a, e, "output {index}");
+            }
+        }
+    }
 }
 
 fn equal_float(actual: f32, expected: f32) {

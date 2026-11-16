@@ -13,7 +13,7 @@ use super::{
     BackingPrepareDecision, BackingSegment, BufferRequest, CapacityAvailabilityEpoch,
     CapacityDomainId, CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector,
     DeviceAllocationPermit, DeviceBufferRetention, DeviceCapacityAvailabilitySnapshot,
-    DeviceCapacityBudget, DeviceCapacityReservation, DeviceRuntime, Digest, DynamicBackingBlocker,
+    DeviceCapacityBudget, DeviceCapacityReservation, DeviceRuntime, DynamicBackingBlocker,
     DynamicBackingClaimOccupancy, DynamicBackingClaimResidency, DynamicBackingClaimScope,
     DynamicBackingDeferralReason, DynamicBackingDeferred, DynamicBackingPackingEnvelope,
     DynamicBackingPool, DynamicBackingPoolId, DynamicBackingPoolState,
@@ -32,7 +32,7 @@ use super::{
     PreparedLaneBackingClaim, ProgramBindingLayout, QuarantinedDynamicChunk,
     RequestStateHazardCoordinator, ResidentChunkBacking, ResidentChunkState, ResourceId,
     ResourceReservation, ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Serialize,
-    Sha256, StateInitialization, StaticProvisioningBinding, StepResourceSlotKind,
+    StateInitialization, StaticProvisioningBinding, StepResourceSlotKind,
     SubmissionWaveDomainCapacityLayout, SubmissionWaveDomainLayout, TransactionId, VNextError,
     DYNAMIC_POOL_MAINTENANCE_BOUNDARY_SCHEMA_VERSION, NEXT_DYNAMIC_POOL_INSTANCE_ID,
 };
@@ -40,6 +40,12 @@ use crate::{
     DeviceCapacityPressure, DynamicPoolResidentPressure, ReusableExecutionBucketId,
     ReusableExecutionMemoryPlan,
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PoolGrowthSizing {
+    Required,
+    Amortized,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicPoolGrowthBatchReceipt {
@@ -778,8 +784,53 @@ where
 
     pub(in crate::resource) fn maintain_pools_observed(
         &self,
+        intents: Vec<DynamicPoolGrowthIntent>,
+        capacity_blocked: &mut Option<DynamicDeviceCapacityBlocked>,
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        // Optional physical headroom belongs to the pool, independently of a
+        // request's logical claims or its Sequence/Step/Invocation lifetime.
+        // Explicit growth and runnable-minimum requests retain exact sizing.
+        if intents.iter().any(|intent| {
+            matches!(
+                intent,
+                DynamicPoolGrowthIntent::RevalidatedDeferral(_)
+                    | DynamicPoolGrowthIntent::RevalidatedAdmissionPressure { .. }
+            )
+        }) {
+            match self.maintain_pools_sized(
+                intents.clone(),
+                capacity_blocked,
+                PoolGrowthSizing::Amortized,
+            ) {
+                Ok(receipt) => return Ok(receipt),
+                // Both denials precede native allocation. Pending reservations
+                // have rolled back before the required-only retry; optional
+                // headroom must never trigger eviction, waiting or rejection.
+                Err(VNextError::DeviceCapacityUnavailable(_))
+                | Err(VNextError::DynamicPoolResidentUnavailable(_)) => {
+                    *capacity_blocked = None;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.maintain_required_pools_observed(intents, capacity_blocked)
+    }
+
+    /// A capacity-reclaim retry must not refill the reclaimed space with
+    /// optional headroom. Revalidate and reserve only the current demand.
+    pub(in crate::resource) fn maintain_required_pools_observed(
+        &self,
+        intents: Vec<DynamicPoolGrowthIntent>,
+        capacity_blocked: &mut Option<DynamicDeviceCapacityBlocked>,
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        self.maintain_pools_sized(intents, capacity_blocked, PoolGrowthSizing::Required)
+    }
+
+    fn maintain_pools_sized(
+        &self,
         mut intents: Vec<DynamicPoolGrowthIntent>,
         capacity_blocked: &mut Option<DynamicDeviceCapacityBlocked>,
+        sizing: PoolGrowthSizing,
     ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
         intents.sort_by(|left, right| left.pool_id().cmp(right.pool_id()));
         if intents
@@ -820,6 +871,18 @@ where
                 }
                 match intent {
                     DynamicPoolGrowthIntent::Additional(request) => request.requested_bytes(),
+                    DynamicPoolGrowthIntent::ResidentTarget { target_bytes, .. } => {
+                        let current = state
+                            .resident_bytes
+                            .checked_add(state.pending_growth_bytes)
+                            .ok_or_else(|| {
+                                invalid_resource("dynamic pool residency overflows u64")
+                            })?;
+                        if current >= *target_bytes {
+                            continue;
+                        }
+                        target_bytes - current
+                    }
                     DynamicPoolGrowthIntent::Minimum(_) => {
                         let current = state
                             .resident_bytes
@@ -896,7 +959,34 @@ where
                     }
                 }
             };
-            let chunk_bytes = align_up_resource(requested_bytes, pool.allocation_quantum())?;
+            let mut chunk_bytes = align_up_resource(requested_bytes, pool.allocation_quantum())?;
+            if sizing == PoolGrowthSizing::Amortized
+                && matches!(
+                    intent,
+                    DynamicPoolGrowthIntent::RevalidatedDeferral(_)
+                        | DynamicPoolGrowthIntent::RevalidatedAdmissionPressure { .. }
+                )
+            {
+                let state = pool
+                    .state
+                    .lock()
+                    .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))?;
+                let resident = state
+                    .resident_bytes
+                    .checked_add(state.pending_growth_bytes)
+                    .ok_or_else(|| invalid_resource("dynamic pool residency overflows u64"))?;
+                let room = pool
+                    .domain
+                    .pool
+                    .provisioning()
+                    .maximum_resident_bytes()
+                    .saturating_sub(resident);
+                let aligned_room = room / pool.allocation_quantum() * pool.allocation_quantum();
+                // Amortize native allocations across shapes and requests.
+                // Extra backing is unclaimed shared capacity, not extra
+                // sequence ownership or permission to exceed the device budget.
+                chunk_bytes = chunk_bytes.max(resident.min(aligned_room));
+            }
             let chunk = {
                 let mut state = pool
                     .state
@@ -1064,6 +1154,20 @@ where
                     seal: AllocationSeal,
                 })
                 .map_err(|error| {
+                    if self.runtime.allocation_failure_kind(&error)
+                        == crate::DeviceAllocationFailureKind::Capacity
+                    {
+                        return match self.runtime.describe_error(&error) {
+                            Ok(report) => VNextError::DeviceAllocationUnavailable(
+                                crate::DeviceAllocationPressure::new(
+                                    growth.expected_resource_id.clone(),
+                                    growth.chunk_bytes,
+                                    report,
+                                ),
+                            ),
+                            Err(description_error) => description_error,
+                        };
+                    }
                     invalid_resource(format!("dynamic pool device allocation failed: {error}"))
                 })?;
             let actual_descriptor = self.runtime.buffer_descriptor(&buffer);
@@ -1690,7 +1794,7 @@ where
         &self,
         requests: &[EvaluatedBackingRequest<'_>],
     ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
-        self.maintain_checkpoint_capacity_observed(requests, &mut None)
+        self.maintain_checkpoint_capacity_observed(requests, &mut None, PoolGrowthSizing::Amortized)
     }
 
     pub(in crate::resource) fn maintain_checkpoint_capacity_with_idle_reclaim(
@@ -1698,7 +1802,11 @@ where
         requests: &[EvaluatedBackingRequest<'_>],
     ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
         let mut capacity_blocked = None;
-        match self.maintain_checkpoint_capacity_observed(requests, &mut capacity_blocked) {
+        match self.maintain_checkpoint_capacity_observed(
+            requests,
+            &mut capacity_blocked,
+            PoolGrowthSizing::Amortized,
+        ) {
             Err(VNextError::DeviceCapacityUnavailable(pressure)) => {
                 let blocked = capacity_blocked.as_ref().ok_or_else(|| {
                     invalid_resource("checkpoint growth lost its device capacity observation")
@@ -1767,7 +1875,11 @@ where
                 // Recompute every target's packing from current state and
                 // reserve anew. A competitor or allocation failure can still
                 // reject this single retry; reclamation grants no capacity.
-                let mut receipt = self.maintain_checkpoint_capacity(requests)?;
+                let mut receipt = self.maintain_checkpoint_capacity_observed(
+                    requests,
+                    &mut None,
+                    PoolGrowthSizing::Required,
+                )?;
                 tracing::debug!(
                     coordinator_id = ?receipt.coordinator_id(),
                     reclaimed_bytes = rebalance.reclaimed_bytes(),
@@ -1786,6 +1898,7 @@ where
         &self,
         requests: &[EvaluatedBackingRequest<'_>],
         capacity_blocked: &mut Option<DynamicDeviceCapacityBlocked>,
+        sizing: PoolGrowthSizing,
     ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
         self.validate_checkpoint_requests(requests)?;
         let mut by_pool = BTreeMap::<DynamicBackingPoolId, Vec<u64>>::new();
@@ -1845,7 +1958,12 @@ where
         }
         // RevalidatedDeferral recomputes demand after acquiring the existing
         // canonical maintenance locks. No stale free-space snapshot grants bytes.
-        self.maintain_pools_observed(intents, capacity_blocked)
+        match sizing {
+            PoolGrowthSizing::Amortized => self.maintain_pools_observed(intents, capacity_blocked),
+            PoolGrowthSizing::Required => {
+                self.maintain_required_pools_observed(intents, capacity_blocked)
+            }
+        }
     }
 
     pub(in crate::resource) fn prepare_checkpoint_claim(
@@ -2356,12 +2474,7 @@ where
                                 initialization: projection.descriptor.initialization(),
                                 fingerprint: String::new(),
                             };
-                            let bytes = serde_json::to_vec(&allocation).map_err(|error| {
-                                invalid_resource(format!(
-                                    "logical backing allocation evidence encode failed: {error}"
-                                ))
-                            })?;
-                            allocation.fingerprint = format!("sha256/{:x}", Sha256::digest(bytes));
+                            allocation.fingerprint = allocation.compute_fingerprint()?;
                             Ok(LogicalBackingSliceEvidence {
                                 allocation: Arc::new(allocation),
                                 logical_size_bytes: projection.logical_size_bytes,

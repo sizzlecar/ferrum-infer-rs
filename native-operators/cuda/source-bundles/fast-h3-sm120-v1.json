@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "distribution": {
+    "repository": "sizzlecar/ferrum-infer-rs",
+    "tag": "fast-h3-sm120-sources-v1",
+    "asset_name": "fast-h3-sm120-sources-v1.tar.gz"
+  },
+  "archive": {
+    "sha256": "42d515bbe689ed3dd05a5b6caae9fa02a0784f488b8d88e04d147d32e89e9370",
+    "size_bytes": 2801634
+  },
+  "sources": {
+    "cutlass-nvfp4": {
+      "root": "cutlass-nvfp4",
+      "plan": "cutlass-nvfp4/source.plan.json",
+      "plan_sha256": "65f124250d774b71818ec5e18915d116bb29f3e3e67859bfead11b54146c8cde",
+      "source_package_sha256": "3506ba5981c910bf0d2b4962afb0b3551790e1fe3345559a7e5bef68340a30da",
+      "members": 506
+    },
+    "sage-vsa-fp4": {
+      "root": "sage-vsa-fp4",
+      "plan": "sage-vsa-fp4/source.plan.json",
+      "plan_sha256": "28b4836b1db9e5e407c357b0163901960f72c4cb8a016f66804e8d544b89282d",
+      "source_package_sha256": "c74e52e5c8d43a75b3c1428e5b6b9df015be8fdae77aa12e1c711c2cb059f38a",
+      "members": 295
+    }
+  },
+  "scope": "Compiler-observed source closures from the qualified RTX 5090 video native set; source distribution, not a new runtime qualification."
+}

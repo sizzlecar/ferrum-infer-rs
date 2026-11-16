@@ -77,7 +77,7 @@ hf-hub = { workspace = true }
 indicatif = "0.17"
 pathdiff = "0.2"
 futures-util = "0.3"
-tempfile = { version = "3.8", optional = true }
+tempfile = "3.8"
 
 # AArch64 acceleration is opt-in in sha2 0.10 and detects CPU support at runtime.
 # Limit assembly integration to macOS/Linux; other targets retain portable hashing.
@@ -102,6 +102,8 @@ accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 metal = ["ferrum-kernels/metal"]
 cuda = ["ferrum-kernels/cuda", "dep:cudarc"]
 cuda-cutlass-fp8 = ["cuda", "ferrum-kernels/cuda-cutlass-fp8"]
+cuda-cutlass-nvfp4 = ["cuda", "ferrum-kernels/cuda-cutlass-nvfp4"]
+cuda-sage-vsa-fp4 = ["cuda", "ferrum-kernels/cuda-sage-vsa-fp4"]
 cuda-indexed-causal-attention = ["cuda", "ferrum-kernels/cuda-indexed-causal-attention"]
 cuda-causal-gqa2 = ["cuda-indexed-causal-attention", "ferrum-kernels/cuda-causal-gqa2"]
 cuda-q4-shared-weight-decode = ["cuda", "ferrum-kernels/cuda-q4-shared-weight-decode"]
@@ -124,4 +126,4 @@ integration-tests = []
 registry = []
 # Deterministic tiny-model construction for downstream full-stack tests.
 # Never enabled in release; turned on by ferrum-engine dev-dependencies.
-test-support = ["dep:tempfile"]
+test-support = []

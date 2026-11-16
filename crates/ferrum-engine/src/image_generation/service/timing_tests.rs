@@ -157,7 +157,8 @@ fn run(fail_preparation: bool) -> (Capture, Arc<Shared<u64>>, Retirement<u64>) {
             maximum_prompt_bytes: 64,
             max_num_seqs: 2,
             request_batch_max_wait_ms: 0,
-        },
+        }
+        .into(),
         host: None,
     });
     // tracing-core's single-dispatcher fast path registers a new callsite

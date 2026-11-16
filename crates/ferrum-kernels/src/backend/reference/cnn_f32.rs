@@ -10,8 +10,13 @@ use std::collections::{BTreeMap, BTreeSet};
 pub fn reference_cnn_f32_numerical_profile(kind: F32CnnOp) -> &'static str {
     match kind {
         F32CnnOp::Conv2d => "reference.conv2d.f32.sequential_mul_add.separate_bias.v1",
+        F32CnnOp::Conv3d => "reference.conv3d.f32.sequential_mul_add.separate_bias.v1",
         F32CnnOp::GroupNormSilu => "reference.group_norm_silu.nchw.f32.tree256.two_pass.libm.v1",
+        F32CnnOp::FrameGroupNormSilu => {
+            "reference.frame_group_norm_silu.ncthw.f32.tree256.two_pass.libm.v1"
+        }
         F32CnnOp::ResidualAdd => "reference.plain_residual_add.nchw.f32.separate_rn.v1",
+        F32CnnOp::VolumeResidualAdd => "reference.plain_residual_add.ncthw.f32.separate_rn.v1",
     }
 }
 pub fn reference_vnext_cnn_f32_provider(

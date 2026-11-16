@@ -7,6 +7,84 @@ use ferrum_runtime::{
 use std::collections::BTreeSet;
 
 #[test]
+#[ignore = "requires CUDA; checks admitted cache preparation, live data and capacity fallback"]
+fn allocation_cache_preparation_preserves_live_storage_and_releases_its_claim() {
+    use crate::backend::cuda::vnext_runtime::{
+        CudaDeviceRuntime, CudaTensorCachePreparation, CudaTensorRuntimeConfig,
+    };
+    use ferrum_runtime::{DeviceId, DeviceRuntime, VNextError};
+    use std::num::NonZeroU64;
+    const MIB: u64 = 1 << 20;
+    const CEILING: u64 = 1024 * MIB;
+    const BOOTSTRAP: u64 = 256 * MIB;
+    let runtime = CudaDeviceRuntime::new_tensor_eager(CudaTensorRuntimeConfig {
+        device: crate::backend::cuda::vnext_ops::cuda_tensor_runtime_config(
+            0,
+            DeviceId::new("device.cuda.0").unwrap(),
+        )
+        .unwrap(),
+        usable_memory_bytes: CEILING,
+        bootstrap_memory_bytes: BOOTSTRAP,
+        stream_memory_bytes: 16 * MIB,
+        maximum_streams: 1,
+        maximum_in_flight_per_stream: 1,
+        maximum_commands_per_submission: 8,
+        opaque_memory_profile: "test.cuda.cache-preparation.v1".into(),
+    })
+    .unwrap();
+    let capacity = DeviceCapacityOwner::open(runtime.descriptor(), CEILING).unwrap();
+    let live_claim = capacity
+        .reserve(DeviceOpaqueMemoryKind::Bootstrap, MIB)
+        .unwrap();
+    let pool = runtime.tensor_allocation_pool().unwrap();
+    let stream = &runtime.allocation_stream;
+    let mut live = pool.allocate(MIB as usize).unwrap();
+    stream.memset_zeros(&mut live).unwrap();
+    stream
+        .memcpy_htod(&[17_u8, 39, 82, 255], &mut live.slice_mut(..4))
+        .unwrap();
+    stream.synchronize().unwrap();
+    let before = pool.snapshot().unwrap();
+    assert_eq!(
+        runtime
+            .prepare_tensor_allocation_cache(NonZeroU64::new(64 * MIB).unwrap())
+            .unwrap(),
+        CudaTensorCachePreparation::Prepared
+    );
+    let prepared = pool.snapshot().unwrap();
+    assert_eq!(prepared.pool_identity, before.pool_identity);
+    assert_eq!(prepared.used_bytes, before.used_bytes);
+    assert!(prepared.reserved_bytes.saturating_sub(prepared.used_bytes) >= 64 * MIB);
+    assert_eq!(
+        stream.clone_dtoh(&live.slice(..4)).unwrap(),
+        [17, 39, 82, 255]
+    );
+    // The original shared account can reacquire every byte of the temporary
+    // claim immediately. Logical capacity exhaustion must not touch the pool.
+    let remaining = capacity
+        .reserve(DeviceOpaqueMemoryKind::Bootstrap, CEILING - BOOTSTRAP - MIB)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .prepare_tensor_allocation_cache(NonZeroU64::new(1).unwrap())
+            .unwrap(),
+        CudaTensorCachePreparation::CapacityUnavailable
+    );
+    let skipped = pool.snapshot().unwrap();
+    assert_eq!(skipped.reserved_bytes, prepared.reserved_bytes);
+    assert_eq!(skipped.used_bytes, prepared.used_bytes);
+    assert!(matches!(
+        capacity.reserve(DeviceOpaqueMemoryKind::Bootstrap, 1),
+        Err(VNextError::DeviceCapacityUnavailable(_))
+    ));
+    drop(remaining);
+    drop(live);
+    stream.synchronize().unwrap();
+    drop(live_claim);
+    assert_eq!(pool.snapshot().unwrap().used_bytes, 0);
+}
+
+#[test]
 #[ignore = "requires a CUDA device with stream-ordered allocation support"]
 fn private_tensor_pool_retains_reuses_and_trims_without_changing_current_pool() {
     const MIB: usize = 1024 * 1024;

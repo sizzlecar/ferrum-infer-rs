@@ -279,6 +279,11 @@ impl<'de> Deserialize<'de> for PoolCompatibilityKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DynamicPoolProvisioningMode {
+    /// Automatic maintenance amortizes native allocations with shared,
+    /// geometric headroom. Budget or resident-ceiling pressure falls back to
+    /// exact required growth before allocation, including retries after reclaim.
+    /// Explicit growth and minimum provisioning retain their requested size;
+    /// logical claims never expand.
     DemandDrivenElastic,
 }
 

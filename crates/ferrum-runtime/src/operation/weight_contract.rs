@@ -309,6 +309,10 @@ pub const MAX_PHYSICAL_WEIGHT_LAYOUT_NODES: usize = 4096;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhysicalWeightLayout {
+    /// Read-only access to one complete physical component, without decoding,
+    /// slicing, storage remapping, or changing its source encoding. This is a
+    /// root-only operand view, not a logical numerical weight representation.
+    PhysicalComponent(PhysicalWeightComponentView),
     /// Exact, contiguous dense values. This common leaf deliberately remains
     /// compact; use `Stored` for explicit stride, tile, or padding geometry.
     Dense {
@@ -441,6 +445,7 @@ impl PhysicalWeightLayout {
                 }
             }
             Self::Dense { .. }
+            | Self::PhysicalComponent(_)
             | Self::Stored { .. }
             | Self::Quantized { .. }
             | Self::QuantizedBlockGrid { .. }
@@ -448,6 +453,24 @@ impl PhysicalWeightLayout {
             | Self::BlockQuantized { .. }
             | Self::RnF16DenseAndFragmentV1 { .. } => {}
         }
+    }
+}
+
+/// Metadata identifying a complete source component. Live resource authority
+/// still comes exclusively from the compiled Stored weight owner and its lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalWeightComponentView {
+    component_id: WeightId,
+}
+
+impl PhysicalWeightComponentView {
+    pub fn new(component_id: WeightId) -> Self {
+        Self { component_id }
+    }
+
+    pub fn component_id(&self) -> &WeightId {
+        &self.component_id
     }
 }
 
@@ -614,7 +637,11 @@ impl ResolvedWeightBinding {
             || component_ids.len() != self.components.len()
             || component_ids != referenced
             || self.components.iter().any(|component| {
-                component.physical_dimensions.is_empty()
+                (component.physical_dimensions.is_empty()
+                    && !matches!(&self.physical_layout,
+                        PhysicalWeightLayout::PhysicalComponent(view)
+                            if view.component_id() == component.component_id()
+                                && matches!(component.encoding(), WeightEncoding::Dense { .. })))
                     || component
                         .physical_dimensions
                         .iter()
@@ -653,6 +680,18 @@ impl ResolvedWeightBinding {
 
     pub fn physical_layout(&self) -> &PhysicalWeightLayout {
         &self.physical_layout
+    }
+
+    /// Returns the original component metadata only for an explicit raw view.
+    /// It does not grant access to bytes or prove a device operation completed.
+    pub fn physical_component_view(&self) -> Option<&ResolvedWeightComponentLayout> {
+        match &self.physical_layout {
+            PhysicalWeightLayout::PhysicalComponent(view) => self
+                .components
+                .iter()
+                .find(|component| component.component_id() == view.component_id()),
+            _ => None,
+        }
     }
 
     pub fn components(&self) -> &[ResolvedWeightComponentLayout] {
@@ -699,7 +738,12 @@ pub(crate) fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> 
             ));
         }
         let direct_bindings = match node {
-            PhysicalWeightLayout::Dense { .. } | PhysicalWeightLayout::Stored { .. } => 1,
+            PhysicalWeightLayout::PhysicalComponent(_) if depth != 1 => {
+                return Err("physical component views must be root leaves".to_owned());
+            }
+            PhysicalWeightLayout::PhysicalComponent(_)
+            | PhysicalWeightLayout::Dense { .. }
+            | PhysicalWeightLayout::Stored { .. } => 1,
             PhysicalWeightLayout::Quantized {
                 zero_points,
                 axis_indices,
@@ -751,6 +795,7 @@ pub(crate) fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> 
                 }
             }
             PhysicalWeightLayout::Dense { .. }
+            | PhysicalWeightLayout::PhysicalComponent(_)
             | PhysicalWeightLayout::Stored { .. }
             | PhysicalWeightLayout::Quantized { .. }
             | PhysicalWeightLayout::QuantizedBlockGrid { .. }
@@ -773,6 +818,9 @@ pub(crate) fn physical_component_ids(
             ids.insert(binding.component_id.clone());
         };
         match node {
+            PhysicalWeightLayout::PhysicalComponent(view) => {
+                ids.insert(view.component_id().clone());
+            }
             PhysicalWeightLayout::Dense { component_id } => {
                 ids.insert(component_id.clone());
             }

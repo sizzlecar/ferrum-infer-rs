@@ -65,9 +65,11 @@ mod listener;
 mod output;
 mod profile_delivery;
 mod responses;
+mod videos;
 
 pub use images::{ImageHttpConfig, ImageHttpService};
 pub use listener::BoundHttpListener;
+pub use videos::{VideoHttpConfig, VideoHttpService, VideoOutputPlanResolver, VideoPlanError};
 
 use profile_delivery::HttpProfileDelivery;
 pub use profile_delivery::{
@@ -310,6 +312,7 @@ impl AxumServer {
             if matches!(*state, LoadedEngineShutdown::Idle) {
                 let engine = self.state.llm.clone();
                 let images = self.state.images.clone();
+                let videos = self.state.videos.clone();
                 *state = LoadedEngineShutdown::Running(tokio::spawn(async move {
                     let text = match engine {
                         Some(engine) => engine.shutdown().await,
@@ -319,7 +322,11 @@ impl AxumServer {
                         Some(images) => images.shutdown().await,
                         None => Ok(()),
                     };
-                    text.and(image)
+                    let video = match videos {
+                        Some(videos) => videos.shutdown().await,
+                        None => Ok(()),
+                    };
+                    text.and(image).and(video)
                 }));
             }
             if let LoadedEngineShutdown::Running(task) = &mut *state {
@@ -465,6 +472,9 @@ impl AxumServer {
             .route("/v1/responses", post(responses::responses_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/images/generations", post(images::generations_handler))
+            .route("/v1/videos", post(videos::create))
+            .route("/v1/videos/:id", get(videos::get).delete(videos::delete))
+            .route("/v1/videos/:id/content", get(videos::content::get))
             .route(
                 "/v1/images/edits",
                 post(images::edits_handler)
@@ -494,6 +504,7 @@ impl AxumServer {
 pub struct AppState {
     pub llm: Option<Arc<dyn LlmInferenceEngine + Send + Sync>>,
     pub images: Option<ImageHttpService>,
+    pub videos: Option<VideoHttpService>,
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
     pub default_enable_thinking: Option<bool>,
@@ -513,6 +524,14 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Installs a concrete video service; no model worker is constructed by HTTP.
+    pub fn with_videos(mut self, videos: VideoHttpService) -> Self {
+        if self.served_model_registry.is_empty() {
+            self.served_model_registry = Arc::new(videos.registry());
+        }
+        self.videos = Some(videos);
+        self
+    }
     /// Installs the image registry only when no registry was provided. Existing
     /// aliases are never silently rewritten; startup checks their image binding.
     pub fn with_images(mut self, images: ImageHttpService) -> Self {
@@ -524,6 +543,30 @@ impl AppState {
     }
 
     fn validate_image_configuration(&self) -> ferrum_types::Result<()> {
+        if let Some(videos) = &self.videos {
+            let entry = self
+                .served_model_registry
+                .resolve(videos.model_name(), ServedModelKind::VideoGeneration)
+                .ok_or_else(|| {
+                    Error::config(
+                        "video service requires its explicit VideoGeneration registry entry",
+                    )
+                })?;
+            if entry.adapter().is_some() {
+                return Err(Error::config("video service does not support LoRA routing"));
+            }
+        }
+        if self.served_model_registry.entries().iter().any(|entry| {
+            entry.kind() == ServedModelKind::VideoGeneration
+                && !self
+                    .videos
+                    .as_ref()
+                    .is_some_and(|v| entry.public_name().as_str() == v.model_name())
+        }) {
+            return Err(Error::config(
+                "video registry entry has no matching video service",
+            ));
+        }
         if let Some(images) = &self.images {
             let entry = self
                 .served_model_registry
@@ -1202,6 +1245,11 @@ impl HttpServer for AxumServer {
             .images
             .as_ref()
             .is_some_and(|images| !images.service().is_accepting())
+            || self
+                .state
+                .videos
+                .as_ref()
+                .is_some_and(|videos| !videos.is_accepting())
         {
             return HealthStatus::Unhealthy;
         }
@@ -4814,7 +4862,8 @@ async fn health_handler(
         .is_some_and(HttpProfileDeliveryReport::is_degraded);
     let mut health = serde_json::json!({
         "status": if runtime_admission_error.is_some() || profile_failed
-            || state.images.as_ref().is_some_and(|images| !images.service().is_accepting()) { "unhealthy" }
+            || state.images.as_ref().is_some_and(|images| !images.service().is_accepting())
+            || state.videos.as_ref().is_some_and(|videos| !videos.is_accepting()) { "unhealthy" }
             else if profile_degraded { "degraded" } else { "healthy" },
         "profile_delivery": profile_report.as_ref().map(HttpProfileDeliveryReport::health_json),
         "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -4826,6 +4875,7 @@ async fn health_handler(
             "queued_requests": engine_status.queued_requests,
         },
         "images":state.images.as_ref().map(ImageHttpService::health),
+        "videos":state.videos.as_ref().map(VideoHttpService::health),
     });
 
     // These snapshots describe the text engine. Without one, their fallback

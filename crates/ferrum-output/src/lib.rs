@@ -19,6 +19,7 @@ use std::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
+pub mod mp4;
 pub mod png;
 
 mod semantic;

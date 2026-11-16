@@ -1042,10 +1042,10 @@ pub fn assert_idle_fragmented_growth_waits(fixture: &mut ObservedSession, rows: 
         .unwrap();
     let fixed_state_bytes = 3 * CONV_BYTES as u64;
     let hidden_bytes_per_row = 2 * H as u64 * ElementType::F16.size_bytes();
-    assert_eq!(
-        pool.resident_bytes(),
-        fixed_state_bytes + 2 * hidden_bytes_per_row
-    );
+    // The two-row logical demand is a lower bound. Contiguous growth chunks
+    // can leave additional idle backing; they must still fit the plan ceiling.
+    assert!(pool.resident_bytes() >= fixed_state_bytes + 2 * hidden_bytes_per_row);
+    assert!(pool.resident_bytes() <= pressure.maximum_resident_bytes());
     assert_eq!(
         pool.contract().provisioning().maximum_resident_bytes(),
         fixed_state_bytes + rows * hidden_bytes_per_row

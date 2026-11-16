@@ -34,6 +34,30 @@ impl MemoryPlan {
         active_sequences: u32,
         step_tokens: u64,
     ) -> Result<u64, VNextError> {
+        self.startup_workload_pool_bytes(
+            request_ceiling_tokens,
+            sequence_frontier_tokens,
+            active_sequences,
+            step_tokens,
+        )?
+        .values()
+        .try_fold(self.static_bytes, |total, bytes| {
+            total
+                .checked_add(*bytes)
+                .ok_or_else(|| invalid_plan("startup plan memory overflows u64"))
+        })
+    }
+
+    /// Per-pool physical targets for the same workload used by startup sizing.
+    /// These are planning estimates, not grants, claims or resident floors.
+    /// Maintenance must revalidate current residency and reserve device capacity.
+    pub fn startup_workload_pool_bytes(
+        &self,
+        request_ceiling_tokens: u64,
+        sequence_frontier_tokens: u64,
+        active_sequences: u32,
+        step_tokens: u64,
+    ) -> Result<BTreeMap<DynamicBackingPoolId, u64>, VNextError> {
         if request_ceiling_tokens == 0
             || sequence_frontier_tokens == 0
             || sequence_frontier_tokens > request_ceiling_tokens
@@ -66,7 +90,7 @@ impl MemoryPlan {
 
         self.dynamic_pools
             .iter()
-            .try_fold(self.static_bytes, |total, pool| {
+            .map(|pool| {
                 let sequence_bytes = pool.resource_ids.iter().try_fold(0_u64, |bytes, id| {
                     let descriptor = descriptors.get(id).ok_or_else(|| {
                         invalid_plan("startup pool references a missing descriptor")
@@ -127,9 +151,8 @@ impl MemoryPlan {
                     .checked_add(wave_bytes)
                     .ok_or_else(|| invalid_plan("startup pool memory overflows u64"))?
                     .max(pool.provisioning.minimum_resident_bytes());
-                total
-                    .checked_add(required)
-                    .ok_or_else(|| invalid_plan("startup plan memory overflows u64"))
+                Ok((pool.pool_id().clone(), required))
             })
+            .collect()
     }
 }

@@ -151,8 +151,8 @@ impl Fixture {
                 .initialize_pool(&pool)
                 .unwrap();
         }
-        // Ordinary pool initialization only. Foreground admission and optional
-        // checkpoint retention must request their own subsequent maintenance.
+        // Ordinary pool initialization only. Foreground admission can leave
+        // shared backing headroom that checkpoint retention is allowed to use.
         let mut source = family::Weights::new(family.stored_weight_schema().unwrap());
         if let Some(token) = nonfinite_token {
             source.set_nonfinite_embedding(token);
@@ -720,60 +720,66 @@ impl Fixture {
                 self.checkpoint_timing_mode,
             )
             .unwrap();
-        let NativeCheckpointStart::CapacityMaintenance {
+        let (start, capacity_before_copy) = if let NativeCheckpointStart::CapacityMaintenance {
             reason,
             maintenance,
         } = start
-        else {
-            panic!("foreground-only initialized pools must expose first-capture maintenance");
+        {
+            let receipt = match maintenance.try_maintain().unwrap() {
+                CheckpointCapacityMaintenanceOutcome::Ready(receipt) => receipt,
+                other => {
+                    panic!("checkpoint maintenance could not use available capacity: {other:?}")
+                }
+            };
+            let maintained = CapacitySnapshot::observe(&self.resources);
+            let growth_bytes = receipt
+                .growths()
+                .iter()
+                .map(|growth| growth.chunk_bytes())
+                .sum::<u64>();
+            assert!(
+                growth_bytes > 0,
+                "first capture must exercise real backing growth"
+            );
+            assert_eq!(
+                maintained.resident_bytes - before.resident_bytes,
+                growth_bytes
+            );
+            assert_eq!(maintained.free_bytes - before.free_bytes, growth_bytes);
+            assert_eq!(
+                maintained.budget_claimed_bytes - before.budget_claimed_bytes,
+                growth_bytes
+            );
+            assert_eq!(maintained.pending_growth_bytes, 0);
+            assert_eq!(
+                maintained.checkpoint_claims, 0,
+                "maintenance cannot reserve a copy"
+            );
+            assert_eq!(maintained.checkpoint_bytes, 0);
+            assert_eq!(maintained.non_checkpoint_bytes, before.non_checkpoint_bytes);
+            assert_eq!(
+                maintained.non_checkpoint_claims,
+                before.non_checkpoint_claims
+            );
+            eprintln!("first checkpoint maintenance: {reason:?}; before={before:?}; maintained={maintained:?}; growth_bytes={growth_bytes}");
+            // The maintenance receipt grants no copy permission and holds no
+            // source reservation. Re-enter the complete authenticated capture path.
+            let start = self
+                .reaper
+                .try_capture_sequence_checkpoint_with_timing(
+                    self.compilation.executable().execution_plan(),
+                    &binding,
+                    Arc::clone(source),
+                    Arc::clone(&self.lane),
+                    self.checkpoint_timing_mode,
+                )
+                .unwrap();
+            (start, maintained)
+        } else {
+            // Foreground growth may have left enough shared physical backing.
+            // Capture must consume that free space without growing the pool.
+            (start, before)
         };
-        let receipt = match maintenance.try_maintain().unwrap() {
-            CheckpointCapacityMaintenanceOutcome::Ready(receipt) => receipt,
-            other => panic!("checkpoint maintenance could not use available capacity: {other:?}"),
-        };
-        let maintained = CapacitySnapshot::observe(&self.resources);
-        let growth_bytes = receipt
-            .growths()
-            .iter()
-            .map(|growth| growth.chunk_bytes())
-            .sum::<u64>();
-        assert!(
-            growth_bytes > 0,
-            "first capture must exercise real backing growth"
-        );
-        assert_eq!(
-            maintained.resident_bytes - before.resident_bytes,
-            growth_bytes
-        );
-        assert_eq!(maintained.free_bytes - before.free_bytes, growth_bytes);
-        assert_eq!(
-            maintained.budget_claimed_bytes - before.budget_claimed_bytes,
-            growth_bytes
-        );
-        assert_eq!(maintained.pending_growth_bytes, 0);
-        assert_eq!(
-            maintained.checkpoint_claims, 0,
-            "maintenance cannot reserve a copy"
-        );
-        assert_eq!(maintained.checkpoint_bytes, 0);
-        assert_eq!(maintained.non_checkpoint_bytes, before.non_checkpoint_bytes);
-        assert_eq!(
-            maintained.non_checkpoint_claims,
-            before.non_checkpoint_claims
-        );
-        eprintln!("first checkpoint maintenance: {reason:?}; before={before:?}; maintained={maintained:?}; growth_bytes={growth_bytes}");
-        // The maintenance receipt grants no copy permission and holds no
-        // source reservation. Re-enter the complete authenticated capture path.
-        let start = self
-            .reaper
-            .try_capture_sequence_checkpoint_with_timing(
-                self.compilation.executable().execution_plan(),
-                &binding,
-                Arc::clone(source),
-                Arc::clone(&self.lane),
-                self.checkpoint_timing_mode,
-            )
-            .unwrap();
         match finish(start) {
             NativeCheckpointResult::Captured(value) => {
                 self.assert_checkpoint_timing(
@@ -783,8 +789,24 @@ impl Fixture {
                 let captured = CapacitySnapshot::observe(&self.resources);
                 assert!(captured.checkpoint_claims > 0);
                 assert!(captured.checkpoint_bytes > 0);
-                assert_eq!(captured.non_checkpoint_bytes, before.non_checkpoint_bytes);
-                assert_eq!(captured.non_checkpoint_claims, before.non_checkpoint_claims);
+                assert_eq!(captured.resident_bytes, capacity_before_copy.resident_bytes);
+                assert_eq!(
+                    captured.budget_claimed_bytes,
+                    capacity_before_copy.budget_claimed_bytes
+                );
+                assert_eq!(captured.pending_growth_bytes, 0);
+                assert_eq!(
+                    captured.free_bytes + captured.checkpoint_bytes,
+                    capacity_before_copy.free_bytes
+                );
+                assert_eq!(
+                    captured.non_checkpoint_bytes,
+                    capacity_before_copy.non_checkpoint_bytes
+                );
+                assert_eq!(
+                    captured.non_checkpoint_claims,
+                    capacity_before_copy.non_checkpoint_claims
+                );
                 eprintln!("first checkpoint captured: {captured:?}");
                 value
             }

@@ -10,7 +10,7 @@ pub(crate) struct ReferenceRowSelectedBf16Launch {
 impl ReferenceRowSelectedBf16Launch {
     pub(crate) fn validate(&self) -> Result<(), ReferenceDeviceRuntimeError> {
         let g = &self.geometry;
-        if self.update.is_some() != (g.kind() == RowSelectedBf16Kind::Addcmul) {
+        if self.update.is_some() != (g.kind().input_count() == 3) {
             return Err(invalid("update presence differs from selected operation"));
         }
         let table = g
@@ -105,6 +105,13 @@ pub(super) fn execute(launch: &ReferenceRowSelectedBf16Launch) {
                     let update = bf16::from_bits(storage.read_bits(2, i)).to_f32();
                     let product = gate * update;
                     x + product
+                }
+                RowSelectedBf16Kind::AddcmulFma => {
+                    let gate =
+                        bf16::from_bits(storage.read_bits(1, p * w + g.gate_column() as usize + c))
+                            .to_f32();
+                    let update = bf16::from_bits(storage.read_bits(2, i)).to_f32();
+                    gate.mul_add(update, x)
                 }
             };
             storage.write_bits(3, i, bf16::from_f32(value).to_bits());

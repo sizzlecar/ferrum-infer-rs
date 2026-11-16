@@ -4,6 +4,84 @@ use ferrum_types::{
     NativeOperatorProviderCatalogRow, NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
 };
 
+// Historical image/text catalog fixtures retain the SM89 provider closure.
+fn validate_catalog_extension(
+    original: &NativeOperatorProviderCatalog,
+    combined: &NativeOperatorProviderCatalog,
+    gpt_source: Option<&NativeOperatorProviderCatalog>,
+) -> Result<()> {
+    super::validate_catalog_extension(original, combined, gpt_source, Architecture::Sm89)
+}
+
+#[test]
+fn video_release_requires_both_native_operators_only_on_sm120() {
+    let set = ResolvedNativeOperatorArtifactSet {
+        lock_path: PathBuf::from("fixture.lock.json"),
+        g03_catalog_sha256: "a".repeat(64),
+        artifacts: Vec::new(),
+    };
+    for &(unit, _) in fast_h3::OPERATORS {
+        for (architecture, final_set, needed) in [
+            (Architecture::Sm120, true, true),
+            (Architecture::Sm120, false, false),
+            (Architecture::Sm89, true, false),
+        ] {
+            let required = required_units_for_set(architecture, final_set)
+                .filter(|candidate| *candidate == unit);
+            let result = ResolvedCudaNativeBuildCoverage::resolve(&set, required);
+            if needed {
+                assert!(
+                    matches!(result, Err(ferrum_native_ops::CudaNativeBuildCoverageError::MissingArtifact { operator, .. }) if operator == unit.artifact_operator())
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn sm120_catalog_cannot_drop_video_operations_or_replace_existing_contracts() {
+    let original = NativeOperatorProviderCatalog {
+        schema_version: NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
+        backend: NativeOperatorBackend::Cuda,
+        providers: vec![row("operation.text", "provider.cuda.text")],
+    };
+    let mut combined = original.clone();
+    for suffix in ["", "_pair", "_triple"] {
+        combined.providers.push(row(
+            &format!("operation.dense_linear_fp8{suffix}.bf16"),
+            &format!("provider.cuda.dense_linear_fp8{suffix}.bf16.cutlass"),
+        ));
+    }
+    combined.providers.extend(image_provider_rows());
+    combined.providers.extend(
+        fast_h3::PROVIDERS
+            .iter()
+            .map(|(op, provider)| row(op, provider)),
+    );
+    combined
+        .providers
+        .sort_by(|a, b| (&a.operation_id, &a.provider_id).cmp(&(&b.operation_id, &b.provider_id)));
+    super::validate_catalog_extension(&original, &combined, None, Architecture::Sm120).unwrap();
+    for (_, provider) in fast_h3::PROVIDERS {
+        let mut incomplete = combined.clone();
+        incomplete
+            .providers
+            .retain(|row| row.provider_id != *provider);
+        assert!(super::validate_catalog_extension(
+            &original,
+            &incomplete,
+            None,
+            Architecture::Sm120
+        )
+        .is_err());
+    }
+    assert!(
+        super::validate_catalog_extension(&original, &combined, None, Architecture::Sm89).is_err()
+    );
+}
+
 #[test]
 fn production_moe_closure_rejects_missing_dense_repacking_artifact() {
     // Exercise the resolver's actual missing-artifact boundary for the MoE
@@ -88,6 +166,30 @@ fn f32_only_q6_package_cannot_satisfy_the_production_f16_boundary() {
             .to_string()
             .contains(missing));
     }
+}
+
+#[test]
+fn q6_prefill_extension_preserves_the_packaged_descriptor_and_prior_kernels() {
+    let descriptor = "ferrum_native_q6_descriptor_v2";
+    let decode = "ferrum_upstream_q6_f16_plan_v1".to_owned();
+    let prefill =
+        ferrum_native_ops::upstream_q6_f16_linear::UPSTREAM_Q6_F16_PREFILL_PLAN_EXPORT.to_owned();
+    let previous = vec![descriptor.to_owned(), decode.clone()];
+    let declared = vec![decode.clone(), prefill.clone()];
+    assert_eq!(
+        q6_prefill_export_contract(&previous, descriptor, &declared).unwrap(),
+        vec![descriptor.to_owned(), decode.clone(), prefill.clone()]
+    );
+    let removed_decode = q6_prefill_export_contract(&previous, descriptor, &[prefill])
+        .unwrap_err()
+        .to_string();
+    assert!(removed_decode.contains(&decode));
+    assert!(
+        q6_prefill_export_contract(&previous, "different_descriptor", &declared)
+            .unwrap_err()
+            .to_string()
+            .contains(descriptor)
+    );
 }
 
 #[test]

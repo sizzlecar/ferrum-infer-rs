@@ -15,6 +15,20 @@ extern "C" __global__ void ferrum_vnext_channelwise_f32(
             output[i]=__fadd_rn(input[i],parameter1[column]);
         }else if(kind==2){
             output[i]=__fmaf_rn(parameter1[i],parameter2[column],input[i]);
+        }else if(kind==4){
+            output[i]=__fadd_rn(input[i],__fmul_rn(parameter1[i],parameter2[column]));
+        }else if(kind==5){
+            const uint64_t base=(i/columns)*source_columns, groups=source_columns/group_width;
+            float sum=0.0f;
+            for(uint64_t g=0;g<groups;g++) sum=__fadd_rn(sum,input[base+g*group_width+column]);
+            output[i]=__fdiv_rn(sum,float(groups));
+        }else if(kind==6){
+            const uint64_t base=(i/columns)*source_columns;
+            const uint64_t start=column*source_columns/columns, numerator=(column+1)*source_columns;
+            const uint64_t end=numerator/columns+(numerator%columns!=0);
+            float sum=0.0f;
+            for(uint64_t j=start;j<end;j++) sum=__fadd_rn(sum,input[base+j]);
+            output[i]=__fdiv_rn(sum,float(end-start));
         }else{
             const uint32_t bits=reinterpret_cast<const uint32_t*>(input)[i];
             const uint32_t magnitude=bits&0x7fffffffU;
