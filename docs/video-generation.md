@@ -1,6 +1,6 @@
 # FastH3 video generation
 
-This development branch runs `FastVideo/FastH3-Omni-NVFP4-QAD` through both
+Ferrum runs `FastVideo/FastH3-Omni-NVFP4-QAD` through both
 `ferrum run` and `ferrum serve`. Runtime qualification currently covers Linux
 CUDA on an RTX 5090 under WSL2. The pipeline uses the checkpoint's eight
 evaluations, NVFP4 weights, 36-layer quality video decoder and generated audio.

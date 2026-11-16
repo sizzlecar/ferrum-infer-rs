@@ -185,7 +185,7 @@ Whole-sweep peak device VRAM / window process RSS: Ferrum #1 **15.978 / 1.177 Gi
 
 - [API compatibility](docs/openai-api-compatibility.md) · [Agent serving](docs/agent-serving.md)
 - [Numerical profiles](docs/numerical-execution.zh.md) · [Caching](docs/cache-product.md)
-- [FastH3 video generation (development)](docs/video-generation.md)
+- [FastH3 video generation](docs/video-generation.md)
 
 ## Project
 
