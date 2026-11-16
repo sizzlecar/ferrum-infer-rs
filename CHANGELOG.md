@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Native FastH3 NVFP4 video generation with image, video and audio references through `run` and asynchronous `/v1/videos` jobs. Compatible requests share an iterative worker; capacity pressure can defer admission or reduce the active batch while preserving generation settings. Linux CUDA on RTX 5090 is the qualified video platform; see [setup, examples and measured limits](docs/video-generation.md).
+- Explicit `--runtime-pool-preparation within-budget` startup preparation for text `run` and `serve`. It prepares compiled workload pools before readiness when the existing memory budget permits; otherwise it retains on-demand allocation without reducing configured capacity. On-demand remains the default.
+
+### Fixed
+
+- Keep eligible single-request CUDA attention replay stable across context boundaries.
+- Grow shared runtime pools with bounded physical headroom, retaining required-only retries after reclamation and typed native allocation failures.
+
+### Validation scope and remaining work
+
+- The qualified 480p five-second video workload on RTX 5090 reduced C1 completion latency by 32.3% and increased C2 throughput by 43.7% against FastVideo across three paired repetitions. These measurements apply to the recorded development binaries, not yet to the final release archive. Long-reference requests completed but missed their latency target; 768p has only a single functional qualification.
+- Explicit text pool preparation passed three paired ShareGPT sweeps on RTX 5090: 1,152 timed requests completed, with C16 TTFT P99 of 245–297 ms versus 610–2,017 ms in the same binary's on-demand mode. Observed device memory increased by about 1.6 GiB, and median TTFT did not improve consistently. See the [evidence and limitations](docs/goal-windows-v0191-retest.zh.md).
+- The external RTX 4070 Ti Windows report is not closed: the short-prompt C1 throughput and C8/C16 median TTFT gaps still need matched reproduction. Cross-batch byte-identical text is not guaranteed. Windows signing identity is not configured; current Windows artifacts remain unsigned.
+
 ## [0.19.1] - 2026-11-12
 
 ### Added

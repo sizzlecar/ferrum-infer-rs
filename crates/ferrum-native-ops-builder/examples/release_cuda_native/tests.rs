@@ -4,6 +4,84 @@ use ferrum_types::{
     NativeOperatorProviderCatalogRow, NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
 };
 
+// Historical image/text catalog fixtures retain the SM89 provider closure.
+fn validate_catalog_extension(
+    original: &NativeOperatorProviderCatalog,
+    combined: &NativeOperatorProviderCatalog,
+    gpt_source: Option<&NativeOperatorProviderCatalog>,
+) -> Result<()> {
+    super::validate_catalog_extension(original, combined, gpt_source, Architecture::Sm89)
+}
+
+#[test]
+fn video_release_requires_both_native_operators_only_on_sm120() {
+    let set = ResolvedNativeOperatorArtifactSet {
+        lock_path: PathBuf::from("fixture.lock.json"),
+        g03_catalog_sha256: "a".repeat(64),
+        artifacts: Vec::new(),
+    };
+    for &(unit, _) in fast_h3::OPERATORS {
+        for (architecture, final_set, needed) in [
+            (Architecture::Sm120, true, true),
+            (Architecture::Sm120, false, false),
+            (Architecture::Sm89, true, false),
+        ] {
+            let required = required_units_for_set(architecture, final_set)
+                .filter(|candidate| *candidate == unit);
+            let result = ResolvedCudaNativeBuildCoverage::resolve(&set, required);
+            if needed {
+                assert!(
+                    matches!(result, Err(ferrum_native_ops::CudaNativeBuildCoverageError::MissingArtifact { operator, .. }) if operator == unit.artifact_operator())
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn sm120_catalog_cannot_drop_video_operations_or_replace_existing_contracts() {
+    let original = NativeOperatorProviderCatalog {
+        schema_version: NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
+        backend: NativeOperatorBackend::Cuda,
+        providers: vec![row("operation.text", "provider.cuda.text")],
+    };
+    let mut combined = original.clone();
+    for suffix in ["", "_pair", "_triple"] {
+        combined.providers.push(row(
+            &format!("operation.dense_linear_fp8{suffix}.bf16"),
+            &format!("provider.cuda.dense_linear_fp8{suffix}.bf16.cutlass"),
+        ));
+    }
+    combined.providers.extend(image_provider_rows());
+    combined.providers.extend(
+        fast_h3::PROVIDERS
+            .iter()
+            .map(|(op, provider)| row(op, provider)),
+    );
+    combined
+        .providers
+        .sort_by(|a, b| (&a.operation_id, &a.provider_id).cmp(&(&b.operation_id, &b.provider_id)));
+    super::validate_catalog_extension(&original, &combined, None, Architecture::Sm120).unwrap();
+    for (_, provider) in fast_h3::PROVIDERS {
+        let mut incomplete = combined.clone();
+        incomplete
+            .providers
+            .retain(|row| row.provider_id != *provider);
+        assert!(super::validate_catalog_extension(
+            &original,
+            &incomplete,
+            None,
+            Architecture::Sm120
+        )
+        .is_err());
+    }
+    assert!(
+        super::validate_catalog_extension(&original, &combined, None, Architecture::Sm89).is_err()
+    );
+}
+
 #[test]
 fn production_moe_closure_rejects_missing_dense_repacking_artifact() {
     // Exercise the resolver's actual missing-artifact boundary for the MoE

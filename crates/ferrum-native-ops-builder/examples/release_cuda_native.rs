@@ -30,6 +30,9 @@ use sha2::{Digest, Sha256};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
+#[path = "release_cuda_native/fast_h3.rs"]
+mod fast_h3;
+
 #[derive(Parser)]
 struct Arguments {
     #[command(subcommand)]
@@ -95,6 +98,9 @@ struct Build {
     fused_int8_source: PathBuf,
     #[arg(long)]
     fused_int8_plan: PathBuf,
+    /// Qualified source closures for the two SM120 FastH3 operators.
+    #[arg(long)]
+    fast_h3_source: Option<PathBuf>,
     #[arg(long)]
     work: PathBuf,
     #[arg(long)]
@@ -233,6 +239,12 @@ fn required_units_for_set(
             (final_set && matches!(architecture, Architecture::Sm120))
                 .then_some(CudaNativeBuildUnit::FlashinferXqa),
         )
+        .chain(
+            fast_h3::OPERATORS
+                .iter()
+                .filter(move |_| final_set && matches!(architecture, Architecture::Sm120))
+                .map(|(unit, _)| *unit),
+        )
 }
 
 fn reference_catalog(
@@ -256,6 +268,7 @@ fn validate_catalog_extension(
     original: &NativeOperatorProviderCatalog,
     combined: &NativeOperatorProviderCatalog,
     gpt_source: Option<&NativeOperatorProviderCatalog>,
+    architecture: Architecture,
 ) -> Result<()> {
     original.validate()?;
     combined.validate()?;
@@ -300,7 +313,7 @@ fn validate_catalog_extension(
             );
         }
     }
-    let additions = [
+    let mut additions = vec![
         (
             "operation.dense_linear_fp8.bf16",
             "provider.cuda.dense_linear_fp8.bf16.cutlass",
@@ -334,6 +347,9 @@ fn validate_catalog_extension(
             "provider.cuda.comfy_convrot_w8a8.swiglu_f32.bf16.cutlass_int8_fused_output",
         ),
     ];
+    if matches!(architecture, Architecture::Sm120) {
+        additions.extend_from_slice(fast_h3::PROVIDERS);
+    }
     if original.providers.iter().any(|row| {
         additions
             .iter()
@@ -352,12 +368,13 @@ fn validate_catalog_extension(
                 != 1
         })
     {
-        return Err("combined catalog must preserve production rows (or the exact GPT-OSS source declaration) and add FP8, fused F32 attention and fused INT8 output providers".into());
+        return Err("combined catalog must preserve production rows (or the exact GPT-OSS source declaration) and contain every declared image/video provider for the target architecture".into());
     }
     Ok(())
 }
 
 fn build(args: &Build) -> Result<()> {
+    let video = fast_h3::prepare(args)?;
     let reference = resolve(
         &args.reference_lock,
         args.reference_architecture.unwrap_or(args.architecture),
@@ -378,7 +395,12 @@ fn build(args: &Build) -> Result<()> {
             None
         }
     };
-    validate_catalog_extension(&base_catalog, &combined, gpt_source.as_ref())?;
+    validate_catalog_extension(
+        &base_catalog,
+        &combined,
+        gpt_source.as_ref(),
+        args.architecture,
+    )?;
     let catalog_sha = combined.canonical_sha256()?;
     if digest_file(&args.catalog)? != catalog_sha {
         return Err("combined catalog must use canonical bytes".into());
@@ -528,6 +550,24 @@ fn build(args: &Build) -> Result<()> {
         receipts.push(build_package(
             args,
             "flashinfer-xqa",
+            &source,
+            &plan,
+            &spec,
+            &args.workspace,
+        )?);
+    }
+    for (name, source, plan) in video {
+        let spec = args.work.join(format!("{name}.package.json"));
+        materialize_native_operator_package_spec(&NativeOperatorPackageSpecRequest {
+            definition_path: args.workspace.join(format!(
+                "native-operators/cuda/package-definitions/{name}.json"
+            )),
+            g03_catalog_path: args.catalog.clone(),
+            output_path: spec.clone(),
+        })?;
+        receipts.push(build_package(
+            args,
+            name,
             &source,
             &plan,
             &spec,

@@ -274,6 +274,16 @@ C16 吞吐配对变化 +11.62%、+7.35%、+19.44%；C1 为 +0.48%、+0.22%、+0.
 
 ## Windows 签名接入方案（身份未配置，尚未执行）
 
+2026-11-16 发布准备补充：用户确认目前没有代码签名证书或云签名身份，随后明确本次不做签名。该项按用户决定延期，不再作为本次发布前置条件，不能标为已解决；Windows 包继续明确未签名。此前仅写方案、未完成流水线接入。视频与文本分支已在独立 `release/fast-h3-v0200-20261116` 工作树无冲突合并；联合验证和正式发布尚未完成。
+
+已核查 [SignPath Foundation 条件](https://signpath.org/terms) 和 [GitHub 接入要求](https://docs.signpath.io/trusted-build-systems/github)：免费开源项目签名需要项目审核、每次签名人工批准，签名前工作流要求使用 GitHub 托管 runner。Ferrum 是公开 MIT 项目且已有 Windows 发布，但当前 CUDA Windows 构建和部分前置验证使用自托管 runner，因此尚不能宣称符合免费服务要求。CUDA/VC 运行库的分发资格也须按服务的 System Libraries 例外确认。不能仅把自托管构建产物转存到 GitHub 托管 runner 来绕过来源校验。
+
+可供提交的申请说明如下；尚未发送、未注册账户或接受服务条款：
+
+> Project: Ferrum — a Rust-native local inference engine with CLI and HTTP serving. Repository: https://github.com/sizzlecar/ferrum-infer-rs (MIT). Project website: https://ferrum.pandaailabs.com/. Existing Windows releases include CPU and CUDA SM89 portable ZIPs and Inno Setup installers. We seek signing coverage for our own engine executable, stable launcher, installer and uninstaller; bundled Microsoft/NVIDIA runtime DLLs retain their original vendor signatures. Our Windows CUDA builds currently use a self-hosted GitHub Actions runner. Before applying, please confirm the required hosted-build arrangement and eligibility of the bundled runtime libraries. We can provide the immutable source, build logs and artifact provenance. Maintainer contact, signing approver and final project privacy/code-signing policy will be supplied by the repository owner.
+
+后续接入沿现有产物链完成：签署核心 EXE → 生成 portable manifest/hash → 验证并共享唯一已签 launcher → 编译时签署 Inno Setup/卸载程序 → 验签、生成最终收据 → 最终解包与安装验证。身份、来源要求和证书发行者未确认前，不填造组织 ID、凭据或 signed 状态；发布说明须继续明确未签名。
+
 接入点是 `.github/workflows/release-windows.yml` 的原有产物链，避免新增第二套打包器。正式发布身份由公开可信代码签名证书或受管签名服务提供；目前未获得该身份，不建立自签证书冒充正式签名，也不采购或开通服务。
 
 1. 编译得到唯一的 core EXE 后，在 portable spec 和最终 SHA-256 生成前完成签名及 RFC 3161 时间戳。记录编译前后不同阶段的字节身份；现有 `build-profile.json` 的原始编译哈希不能继续假称为最终签名产物哈希。

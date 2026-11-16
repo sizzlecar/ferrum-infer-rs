@@ -540,7 +540,7 @@ jobs:
           work="$RUNNER_TEMP/sm120-native"
           mkdir "$work"
           cargo build --locked --profile release-tools -p ferrum-native-ops-builder --example release_cuda_native --bin ferrum-native-ops-builder
-          cargo build --locked --profile release-tools -p ferrum-kernels --example cutlass_fp8_catalog_declaration --example cutlass_fused_f32_catalog_declaration --example cutlass_int8_fused_output_catalog_declaration --example flashinfer_xqa_catalog_declaration
+          cargo build --locked --profile release-tools -p ferrum-kernels --example cutlass_fp8_catalog_declaration --example cutlass_fused_f32_catalog_declaration --example cutlass_int8_fused_output_catalog_declaration --example flashinfer_xqa_catalog_declaration --example cutlass_nvfp4_catalog_declaration --example sage_vsa_fp4_catalog_declaration
           ./target/release-tools/examples/release_cuda_native reference \
             --lock "$SM120_REFERENCE_LOCK" --catalog-output "$work/base-catalog.json"
           ./target/release-tools/examples/flashinfer_xqa_catalog_declaration \
@@ -553,7 +553,23 @@ jobs:
           ./target/release-tools/examples/cutlass_fused_f32_catalog_declaration \
             "$work/fused-f32-catalog.json" "$work/fp8-catalog.json"
           ./target/release-tools/examples/cutlass_int8_fused_output_catalog_declaration \
-            "$work/combined-catalog.json" "$work/fused-f32-catalog.json"
+            "$work/image-catalog.json" "$work/fused-f32-catalog.json"
+          ./target/release-tools/examples/cutlass_nvfp4_catalog_declaration \
+            134217728 experimental-release-source-declaration-v1 \
+            "$work/nvfp4-catalog.json" "$work/image-catalog.json"
+          ./target/release-tools/examples/sage_vsa_fp4_catalog_declaration \
+            134217728 experimental-release-source-declaration-v1 \
+            "$work/combined-catalog.json" "$work/nvfp4-catalog.json"
+          video_manifest=native-operators/cuda/source-bundles/fast-h3-sm120-v1.json
+          video_url=$(jq -er '"https://github.com/" + .distribution.repository + "/releases/download/" + .distribution.tag + "/" + .distribution.asset_name' "$video_manifest")
+          video_sha=$(jq -er '.archive.sha256' "$video_manifest")
+          curl --fail --location --retry 5 --retry-all-errors --output "$work/fast-h3-sources.tar.gz" "$video_url"
+          printf '%s  %s\n' "$video_sha" "$work/fast-h3-sources.tar.gz" | sha256sum --check --strict
+          mkdir "$work/fast-h3-source"
+          tar -xzf "$work/fast-h3-sources.tar.gz" -C "$work/fast-h3-source"
+          while IFS=$'\t' read -r plan expected; do
+            printf '%s  %s\n' "$expected" "$work/fast-h3-source/$plan" | sha256sum --check --strict
+          done < <(jq -er '.sources[] | [.plan, .plan_sha256] | @tsv' "$video_manifest")
           mkdir "$work/reference-workspace" "$work/source-bundle" "$work/fp8-source"
           git archive "$NATIVE_REFERENCE_REVISION" | tar -xf - -C "$work/reference-workspace"
           manifest=native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json
@@ -633,6 +649,7 @@ jobs:
             --fp8-source "$work/fp8-source" --fp8-plan "$work/fp8-plan.json" \
             --fused-f32-source "$work/cutlass-fused-f32-attention-source" --fused-f32-plan "$work/fused-f32-attention-plan.json" \
             --fused-int8-source "$work/cutlass-int8-fused-output-source" --fused-int8-plan "$work/int8-fused-output-plan.json" \
+            --fast-h3-source "$work/fast-h3-source" \
             --work "$work/builds" --output "$work/operator-set" \
             --object-cache "$RUNNER_TEMP/sm120-native-object-cache" --builder-sha "$RC_SHA" \
             --cuda-toolkit-root /usr/local/cuda --nvcc /usr/local/cuda/bin/nvcc \
@@ -674,7 +691,7 @@ jobs:
           export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
           test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
           cargo build --release --locked -p ferrum-cli --bin ferrum \
-            --features cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output
+            --features cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output,cuda-fast-h3
 
       - name: Strip and audit CUDA binary
         run: |
@@ -705,15 +722,17 @@ jobs:
           Ferrum v${VERSION} CUDA release binary
           CUDA toolkit image: nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
           CUDA_COMPUTE_CAP: 120
-          Cargo features: cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output
+          Cargo features: cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output,cuda-fast-h3
           Native production source baseline: ${NATIVE_OPERATOR_SET_ARCHIVE_URL}
           Native production source baseline SHA256: ${NATIVE_OPERATOR_SET_ARCHIVE_SHA256}
           Native operator set: rebuilt from locked production source plans plus pinned CUTLASS FP8
           Native operator archive SHA256: $(cut -d ' ' -f 1 "$RUNNER_TEMP/sm120-native/native-operator-set-sm120-production-fp8.tar.zst.sha256")
+          FastH3 source archive SHA256: $(jq -r '.archive.sha256' native-operators/cuda/source-bundles/fast-h3-sm120-v1.json)
           CUTLASS revision: ${CUTLASS_REVISION}
           CUTLASS source archive SHA256: ${CUTLASS_ARCHIVE_SHA256}
           Native operator lock SHA256: $(sha256sum "$FERRUM_NATIVE_OPERATOR_SET_LOCK" | cut -d ' ' -f 1)
           CUDA runtime libraries are not bundled. Install the NVIDIA driver and CUDA 12.8 or a compatible newer CUDA 12 runtime, and satisfy the shared-library list below.
+          FastH3 additionally requires its configured cuDNN libraries and FFmpeg/ffprobe; see docs/video-generation.md in the release source.
           Direct dynamic dependencies (the driver provides libcuda.so.1):
           ${runtime_dependencies}
           Use ldd ./ferrum to check for missing libraries before starting the server.
@@ -728,7 +747,7 @@ jobs:
             --backend cuda --target-triple x86_64-unknown-linux-gnu \
             --asset "$asset" --binary target/release/ferrum \
             --dependencies ferrum-linux-x86_64-cuda-sm120.dependencies.txt \
-            --cargo-features cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output \
+            --cargo-features cuda,cuda-production,cuda-cutlass-fp8,cuda-cutlass-fused-f32-attention,cuda-cutlass-int8-fused-output,cuda-fast-h3 \
             --cuda-compute-capability "$CUDA_COMPUTE_CAP" \
             --cuda-toolkit-image nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
 
