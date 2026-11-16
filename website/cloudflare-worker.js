@@ -3,10 +3,11 @@ import powerShellInstaller from "../scripts/install.ps1";
 
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
-const RELEASE_VERSION = "0.19.1";
+const RELEASE_VERSION = "0.20.0";
 const RELEASE_URL = `${REPOSITORY}/releases/tag/v${RELEASE_VERSION}`;
 const VALIDATION_URL = `${REPOSITORY}/releases/download/v0.19.0/release-validation.json`;
 const IMAGE_GUIDE_URL = `${REPOSITORY}/blob/v${RELEASE_VERSION}/docs/image-generation.md`;
+const VIDEO_GUIDE_URL = `${REPOSITORY}/blob/v${RELEASE_VERSION}/docs/video-generation.md`;
 const IMAGE_PERFORMANCE_URL = `${REPOSITORY}/releases/tag/v0.15.0#qwen-image-performance`;
 
 const css = String.raw`
@@ -160,12 +161,12 @@ const pages = {
     path: "/",
     alternatePath: "/zh/",
     alternateLabel: "中文",
-    title: "Ferrum — Text and image inference in Rust",
-    description: "Local text inference, P-H3 and Qwen-Image generation and editing, and OpenAI-compatible APIs in one Rust binary.",
+    title: "Ferrum — Text, image and video inference in Rust",
+    description: "Local text inference, image generation and editing, and FastH3 video generation through CLI and HTTP APIs in one Rust binary.",
     nav: [["Quick start", "#quick-start"], ["Images", "#images"], ["Supported scope", "#support"], ["Throughput", "#performance"], ["Project", "#project"]],
     eyebrow: `v${RELEASE_VERSION} · Released`,
-    h1: "Text and images.<br>One Rust binary.",
-    lead: "Run LLMs, P-H3 and Qwen-Image locally, with CLI and OpenAI-compatible APIs.",
+    h1: "Text, images and video.<br>One Rust binary.",
+    lead: "Run LLMs, P-H3, Qwen-Image and FastH3 locally, with CLI and HTTP APIs. Text and image serving support OpenAI-compatible endpoints.",
     goal: "Goal: maximize output throughput while meeting TTFT, TPOT and ITL SLOs.",
     goalContext: "Fix hardware, model and output policy; choose execution policy π from eligible policies Π under predeclared SLOs.",
     goalMathLabel: "Maximize valid output tokens from requests completed within fixed window T, divided by T, over eligible execution policies pi; require each latency percentile limit and completion fraction at least rho.",
@@ -200,6 +201,12 @@ const pages = {
     imageServeLabel: "CUDA: image API server",
     imageApi: 'HTTP: <code>POST /v1/images/generations</code> (JSON), <code>POST /v1/images/edits</code> (multipart). Qwen accepts up to ten ordered static 8-bit RGB/RGBA PNG references; P-H3 accepts up to eight ordered references through repeated <code>image[]</code> fields. For example, use a character as Picture 1 and a pose as Picture 2. PNG output is returned as <code>b64_json</code>; masks are unsupported.',
     imageConfigNote: 'P-H3 requires <code>--image-config</code> and supports landscape output such as 2720×1536. Qwen’s directory preset supports up to 2048×2048, subject to capacity checks. P-H3 Metal is not supported.',
+    videoTitle: "Generate video with sound",
+    videoLead: 'FastH3-Omni-NVFP4-QAD runs on Linux CUDA SM120 (RTX 5090), with image, video and audio references. At least one image or video reference is required. Compatible requests share continuous denoising batches; capacity pressure can defer admission or reduce the active batch.',
+    videoSetup: `Copy the <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/fast-h3-video-cuda.json">5090 configuration</a> and set the model, CUDA/cuDNN, FFmpeg and output paths. The tested preset uses 29 GiB of managed GPU capacity. <a href="${VIDEO_GUIDE_URL}">Setup, reference formats and asynchronous HTTP jobs</a>.`,
+    videoRunLabel: "Image reference to video",
+    videoServeLabel: "Video job API",
+    videoLimits: 'The qualified workload is 480p at 24 FPS with generated audio. 768p has limited functional evidence; long-reference workloads have not met their latency target. HTTP uses <code>POST /v1/videos</code>, status polling and a separate content download.',
     releasePerformanceTitle: "v0.19.0 · RTX 5090 measurements",
     releasePerformanceLead: "Qwen3.5-4B Q4_K_M · fixed server capacity 32, context/batch 2048 · pinned ShareGPT, 128–256 output tokens, ignore EOS · 64 requests × 2 repeats at each concurrency, plus 10 warmups per repeat. All 256 requests completed with zero errors; all repeats met P99 limits: TTFT 2000 ms, TPOT 50 ms, visible SSE text-event ITL 100 ms.",
     releaseTextCaption: "Qwen3.5-4B · output tok/s; latency in ms",
@@ -244,12 +251,12 @@ const pages = {
     path: "/zh/",
     alternatePath: "/",
     alternateLabel: "English",
-    title: "Ferrum — Rust 文本与图像推理",
-    description: "一个 Rust 二进制提供本地大模型推理、P-H3 与 Qwen-Image 图像生成和编辑，以及 OpenAI 兼容 API。",
+    title: "Ferrum — Rust 文本、图像与视频推理",
+    description: "一个 Rust 二进制提供本地大模型推理、图像生成和编辑、FastH3 视频生成，以及 CLI 和 HTTP API。",
     nav: [["快速开始", "#quick-start"], ["图像", "#images"], ["支持范围", "#support"], ["吞吐结果", "#performance"], ["项目说明", "#project"]],
     eyebrow: `v${RELEASE_VERSION} · 已发布`,
-    h1: "对话与生图，<br>一个 Rust 二进制。",
-    lead: "本地运行大模型、P-H3 与 Qwen-Image 图像生成和编辑，提供 CLI 和 OpenAI 兼容 API。",
+    h1: "对话、生图与视频，<br>一个 Rust 二进制。",
+    lead: "本地运行大模型、P-H3、Qwen-Image 与 FastH3，提供 CLI 和 HTTP API；文本与图像服务支持 OpenAI 兼容接口。",
     goal: "目标：在满足 TTFT、TPOT、ITL SLO 的前提下，最大化输出吞吐。",
     goalContext: "固定硬件、模型与输出策略，在预设 SLO 下从可用策略集合 Π 中选择执行策略 π。",
     goalMathLabel: "在可用执行策略π中，最大化固定窗口T内成功完成请求的有效输出token数除以T，并满足各延迟分位上限及最低完成比例ρ。",
@@ -284,6 +291,12 @@ const pages = {
     imageServeLabel: "CUDA 图像 API 服务",
     imageApi: 'HTTP：<code>POST /v1/images/generations</code> 接收 JSON，<code>POST /v1/images/edits</code> 接收 multipart。Qwen 接受最多十张有序的静态 8 位 RGB/RGBA PNG 参考图；P-H3 通过重复 <code>image[]</code> 字段接受最多八张有序参考图，例如 Picture 1 为人物、Picture 2 为姿势。返回 PNG 的 <code>b64_json</code>；不支持 mask。',
     imageConfigNote: 'P-H3 必须使用 <code>--image-config</code>，支持 2720×1536 等横向尺寸。Qwen 本地目录预设最高支持 2048×2048，仍须满足容量检查。P-H3 不支持 Metal。',
+    videoTitle: "生成带声音的视频",
+    videoLead: 'FastH3-Omni-NVFP4-QAD 在 Linux CUDA SM120（RTX 5090）上运行，支持图片、视频与音频参考，至少需要一个图片或视频参考。兼容请求共享连续去噪批次；容量不足时可以等待准入或缩小活动批次。',
+    videoSetup: `复制 <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/fast-h3-video-cuda.json">5090 配置</a>，设置模型、CUDA/cuDNN、FFmpeg 与输出路径。实测预设使用 29 GiB 托管显存容量。<a href="${VIDEO_GUIDE_URL}">配置、参考格式与异步 HTTP 任务</a>。`,
+    videoRunLabel: "图片参考生成视频",
+    videoServeLabel: "视频任务 API",
+    videoLimits: '已验证的主要负载为 480p、24 FPS，包含生成音频。768p 仅有有限功能证据，长参考视频尚未达到延迟目标。HTTP 使用 <code>POST /v1/videos</code> 提交，轮询状态后单独下载视频。',
     releasePerformanceTitle: "v0.19.0 · RTX 5090 实测",
     releasePerformanceLead: "Qwen3.5-4B Q4_K_M · 固定服务容量 32、上下文/批处理 2048 · 固定 ShareGPT，输出 128–256 token、忽略 EOS · 每档并发 64 请求 × 2 轮，每轮另预热 10 次。共 256 请求全部完成、零错误；各轮均满足 P99 上限：TTFT 2000 ms、TPOT 50 ms、可见 SSE 文本事件 ITL 100 ms。",
     releaseTextCaption: "Qwen3.5-4B · 输出 token/s；延迟单位 ms",
@@ -373,6 +386,10 @@ function render(page) {
     [page.ph3EditLabel, 'ferrum run --image-config p-h3-image-cuda.json --image person.png --image pose.png --prompt "Keep the person from Picture 1 and adopt the pose from Picture 2." --width 2720 --height 1536 --output edited.png'],
   ].map(([label, command], index) => codeBlock(label, command, `ph3-command-${index}`)).join("");
   const releaseTable = `<div class="table-wrap"><table><caption>${page.releaseTextCaption}<span>P50 / P99</span></caption><thead><tr><th scope="col">C</th><th scope="col">token/s</th><th scope="col">TTFT</th><th scope="col">TPOT</th><th scope="col">ITL</th></tr></thead><tbody>${releaseTextThroughput.map(([c, rate, ttft, tpot, itl]) => `<tr><th scope="row">${c}</th><td>${rate}</td><td>${ttft}</td><td>${tpot}</td><td>${itl}</td></tr>`).join("")}</tbody></table></div>`;
+  const videoCommands = [
+    [page.videoRunLabel, 'ferrum run --video-config fast-h3-video-cuda.json --reference image=reference.png --prompt "The person in <Picture 1> turns toward the lake." --width 832 --height 480 --num-frames 124 --fps 24 --seed 1101 --output clip.mp4'],
+    [page.videoServeLabel, "ferrum serve --video-config fast-h3-video-cuda.json --host 127.0.0.1 --port 8000"],
+  ].map(([label, command], index) => codeBlock(label, command, `video-command-${index}`)).join("");
   const releaseImageResults = page.releaseImageRows.map(([title, body]) => `<div><dt>${title}</dt><dd>${body}</dd></div>`).join("");
   const imageTable = `<div class="table-wrap"><table><caption>Qwen-Image-2.1-Turbo<span>images/s</span></caption><thead><tr><th scope="col">${page.workloadLabel}</th><th scope="col">C</th><th scope="col">Ferrum</th><th scope="col">vLLM-Omni</th><th scope="col">${page.ratio}</th></tr></thead><tbody>${imageThroughput.map(([task, size, c, ferrum, omni, ratio]) => `<tr><th scope="row">${size} ${page.imageTasks[task]}</th><td>${c}</td><td>${ferrum}</td><td>${omni}</td><td>${ratio}</td></tr>`).join("")}</tbody></table></div>`;
   return `<!doctype html>
@@ -446,6 +463,12 @@ function render(page) {
       <p class="copy-status" role="status" aria-live="polite"></p>
       <p>${page.imageApi}</p>
       <p class="note">${page.imageConfigNote}</p>
+    </div></section>
+    <section id="video"><div class="wrap">
+      <div class="section-head"><h2>${page.videoTitle}</h2><p>${page.videoLead}</p></div>
+      <p>${page.videoSetup}</p>
+      <div class="install-commands">${videoCommands}</div>
+      <p class="note">${page.videoLimits}</p>
     </div></section>
     <section id="support"><div class="wrap">
       <div class="section-head"><h2>${page.supportTitle}</h2></div>
