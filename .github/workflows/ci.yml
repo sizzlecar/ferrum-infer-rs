@@ -1,27 +1,30 @@
 name: CI runner network recovery
-run-name: Restore Windows and WSL GitHub checkout connectivity
+run-name: Restore WSL GitHub checkout connectivity
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  recover-network:
-    runs-on: [self-hosted, Windows, X64, ferrum-windows-native]
-    timeout-minutes: 5
-    env:
-      HTTP_PROXY: ''
-      HTTPS_PROXY: ''
-      ALL_PROXY: ''
-      NO_PROXY: '*'
+  recover-wsl-network:
+    runs-on: [self-hosted, Linux, X64, ferrum-cuda, cuda-sm89]
+    timeout-minutes: 3
     concurrency:
       group: ferrum-panda-hardware
       cancel-in-progress: false
       queue: max
     defaults:
       run:
-        shell: cmd
-        working-directory: C:\FerrumActions\runner
+        shell: bash
+        working-directory: /home/ferrum
     steps:
-      - name: Restore verified direct Git routes with the runner Node runtime
+      - name: Verify direct GitHub transport and restore the Git route
         run: |
-          "C:\FerrumActions\runner\externals\node24\bin\node.exe" -e "eval(Buffer.from('CmNvbnN0IGZzPXJlcXVpcmUoJ2ZzJyksY3A9cmVxdWlyZSgnY2hpbGRfcHJvY2VzcycpOwpjb25zdCBub3RpY2U9KHRpdGxlLHZhbHVlKT0+Y29uc29sZS5sb2coJzo6bm90aWNlIHRpdGxlPScrdGl0bGUrJzo6JytTdHJpbmcodmFsdWUpLnJlcGxhY2UoLyUvZywnJTI1JykucmVwbGFjZSgvXHIvZywnJTBEJykucmVwbGFjZSgvXG4vZywnJTBBJykpOwpjb25zdCBnaXQ9J0M6XFxGZXJydW1BY3Rpb25zXFx0b29sc1xcZ2l0LTIuNTUuMC41XFxiaW5cXGdpdC5leGUnOwpjb25zdCBlbnY9ey4uLnByb2Nlc3MuZW52fTsgZm9yKGNvbnN0IGsgb2YgT2JqZWN0LmtleXMoZW52KSl7aWYoL14oaHR0cHxodHRwc3xhbGwpX3Byb3h5JC9pLnRlc3QoaykpZGVsZXRlIGVudltrXTt9IGVudi5OT19QUk9YWT0nKic7CmZ1bmN0aW9uIHJ1bihjbWQsYXJncyx0aW1lb3V0PTMwMDAwKXtyZXR1cm4gY3Auc3Bhd25TeW5jKGNtZCxhcmdzLHtlbnYsZW5jb2Rpbmc6J3V0ZjgnLHRpbWVvdXQsd2luZG93c0hpZGU6dHJ1ZX0pO30Kbm90aWNlKCdOb2RlIHJlY292ZXJ5Jyxwcm9jZXNzLnZlcnNpb24pOwpsZXQgcj1ydW4oZ2l0LFsnLWMnLCdodHRwLnByb3h5PScsJy1jJywnaHR0cC5odHRwczovL2dpdGh1Yi5jb20vLnByb3h5PScsJy1jJywnaHR0cC5sb3dTcGVlZFRpbWU9MTAnLCctYycsJ2h0dHAubG93U3BlZWRMaW1pdD0xJywnbHMtcmVtb3RlJywnaHR0cHM6Ly9naXRodWIuY29tL3NpenpsZWNhci9mZXJydW0taW5mZXItcnMuZ2l0JywncmVmcy9oZWFkcy9tYWluJ10pOwpub3RpY2UoJ1dpbmRvd3MgZGlyZWN0IEdpdCcsSlNPTi5zdHJpbmdpZnkoe3N0YXR1czpyLnN0YXR1cyxlcnJvcjpyLmVycm9yPy5tZXNzYWdlLG91dDpyLnN0ZG91dCxlcnI6ci5zdGRlcnJ9KSk7CmlmKHIuc3RhdHVzIT09MCkgcHJvY2Vzcy5leGl0KDEpOwpjb25zdCBwPXByb2Nlc3MuZW52LlVTRVJQUk9GSUxFKydcXC5naXRjb25maWcnLHN0YW1wPW5ldyBEYXRlKCkudG9JU09TdHJpbmcoKS5yZXBsYWNlKC9bLTouXS9nLCcnKTsKaWYoZnMuZXhpc3RzU3luYyhwKSlmcy5jb3B5RmlsZVN5bmMocCxwKycuYmVmb3JlLXJlbGVhc2Utcm91dGUtJytzdGFtcCk7CmZzLmFwcGVuZEZpbGVTeW5jKHAsJ1xuW2h0dHAgImh0dHBzOi8vZ2l0aHViLmNvbS8iXVxuXHRwcm94eSA9XG4nKTsKbm90aWNlKCdXaW5kb3dzIEdpdCBjb25maWd1cmF0aW9uJywnRGlyZWN0IEdpdEh1YiByb3V0ZSB2ZXJpZmllZCBhbmQgc2F2ZWQ7IHByaW9yIGNvbmZpZ3VyYXRpb24gYmFja2VkIHVwJyk7CmNvbnN0IHNjcmlwdD0nc2V0IC1ldVxuZW52IC11IEhUVFBfUFJPWFkgLXUgSFRUUFNfUFJPWFkgLXUgQUxMX1BST1hZIC11IGh0dHBfcHJveHkgLXUgaHR0cHNfcHJveHkgLXUgYWxsX3Byb3h5IGdpdCAtYyBodHRwLnByb3h5PSAtYyBodHRwLmh0dHBzOi8vZ2l0aHViLmNvbS8ucHJveHk9IC1jIGh0dHAubG93U3BlZWRUaW1lPTEwIC1jIGh0dHAubG93U3BlZWRMaW1pdD0xIGxzLXJlbW90ZSBodHRwczovL2dpdGh1Yi5jb20vc2l6emxlY2FyL2ZlcnJ1bS1pbmZlci1ycy5naXQgcmVmcy9oZWFkcy9tYWluXG5jb25maWc9L2hvbWUvZmVycnVtLy5naXRjb25maWdcbmlmIFsgLWYgIiRjb25maWciIF07IHRoZW4gY3AgIiRjb25maWciICIkY29uZmlnLmJlZm9yZS1yZWxlYXNlLXJvdXRlLSQoZGF0ZSAtdSArJVklbSVkVCVIJU0lU1opIjsgZmlcbmdpdCBjb25maWcgLS1nbG9iYWwgLS1yZXBsYWNlLWFsbCBodHRwLmh0dHBzOi8vZ2l0aHViLmNvbS8ucHJveHkgIiJcbic7CnI9cnVuKCdDOlxcV2luZG93c1xcU3lzdGVtMzJcXHdzbC5leGUnLFsnLXUnLCdmZXJydW0nLCctLScsJ2Jhc2gnLCctbGMnLCdlY2hvICcrQnVmZmVyLmZyb20oc2NyaXB0KS50b1N0cmluZygnYmFzZTY0JykrJyB8IGJhc2U2NCAtZCB8IGJhc2ggLWUnXSw0NTAwMCk7Cm5vdGljZSgnV1NMIGRpcmVjdCBHaXQnLEpTT04uc3RyaW5naWZ5KHtzdGF0dXM6ci5zdGF0dXMsZXJyb3I6ci5lcnJvcj8ubWVzc2FnZSxvdXQ6ci5zdGRvdXQsZXJyOnIuc3RkZXJyfSkpOwpwcm9jZXNzLmV4aXQoci5zdGF0dXM9PT0wPzA6MSk7Cg==','base64').toString())"
+          set -euo pipefail
+          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+          export NO_PROXY='*'
+          result=$(timeout 30s git -c http.proxy= -c http.https://github.com/.proxy= -c http.lowSpeedTime=10 -c http.lowSpeedLimit=1 ls-remote https://github.com/sizzlecar/ferrum-infer-rs.git refs/heads/main 2>&1) || { printf '::error::Direct GitHub transport failed: %s\n' "$result"; exit 1; }
+          printf '::notice title=Direct WSL Git::%s\n' "$result"
+          config=/home/ferrum/.gitconfig
+          if [ -f "$config" ]; then cp "$config" "$config.before-release-route-$(date -u +%Y%m%dT%H%M%SZ)"; fi
+          git config --global --replace-all http.https://github.com/.proxy ''
+          printf '::notice::Restored the verified direct GitHub route; original Git configuration backed up\n'
