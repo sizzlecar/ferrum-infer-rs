@@ -19,15 +19,14 @@ jobs:
       queue: max
     defaults:
       run:
-        shell: powershell
+        shell: 'C:\FerrumActions\tools\powershell-7.6.6\pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}'
     steps:
       - name: Report the available shell and SSH listener
+        shell: cmd
         run: |
-          Write-Output ('::notice title=Recovery shell::PowerShell ' + $PSVersionTable.PSVersion)
-          $ssh = Get-Service sshd -ErrorAction SilentlyContinue
-          Write-Output ('::notice title=SSH service::' + $ssh.Status)
-          $git = Get-Item 'C:\FerrumActions\tools\git-2.55.0.5\bin\git.exe' -ErrorAction SilentlyContinue
-          Write-Output ('::notice title=Git executable::exists=' + [bool]$git)
+          echo ::notice title=Recovery shell::Windows cmd is running
+          "C:\FerrumActions\tools\git-2.55.0.5\bin\git.exe" --version
+          "C:\FerrumActions\tools\powershell-7.6.6\pwsh.exe" -NoProfile -Command "Write-Output ('::notice title=PowerShell version::' + $PSVersionTable.PSVersion)"
       - name: Check direct transport and restore repository Git routes
         run: |
           $ErrorActionPreference = 'Stop'
