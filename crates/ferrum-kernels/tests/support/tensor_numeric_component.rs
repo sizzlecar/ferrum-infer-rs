@@ -843,6 +843,7 @@ pub fn execute_affine_f32<R: DeviceRuntime>(
 
 /// Exact dyadic domain, independent F64 dot oracle with explicit F32 bias and
 /// BF16 boundaries. Rows vary across multiple CUDA chunks and their tail.
+#[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 pub fn rounded_affine_data(c: Config, trial: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     assert!(matches!(c.kind, Kind::F32AffineToBf16));
     assert_eq!(c.inputs, 3);
