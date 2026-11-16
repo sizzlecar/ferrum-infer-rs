@@ -7,7 +7,7 @@ permissions:
 jobs:
   recover-network:
     runs-on: [self-hosted, Windows, X64, ferrum-windows-native]
-    timeout-minutes: 10
+    timeout-minutes: 5
     env:
       HTTP_PROXY: ''
       HTTPS_PROXY: ''
@@ -19,45 +19,9 @@ jobs:
       queue: max
     defaults:
       run:
-        shell: 'C:\FerrumActions\tools\powershell-7.6.6\pwsh.exe -NoLogo -NoProfile -NonInteractive -File {0}'
+        shell: cmd
         working-directory: C:\FerrumActions\runner
     steps:
-      - name: Report the available shell and SSH listener
-        shell: cmd
+      - name: Restore verified direct Git routes with the runner Node runtime
         run: |
-          echo ::notice title=Recovery shell::Windows cmd is running
-          "C:\FerrumActions\tools\git-2.55.0.5\bin\git.exe" --version
-          "C:\FerrumActions\tools\powershell-7.6.6\pwsh.exe" -NoProfile -Command "Write-Output ('::notice title=PowerShell version::' + $PSVersionTable.PSVersion)"
-      - name: Check direct transport and restore repository Git routes
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $ProgressPreference = 'SilentlyContinue'
-          $git = 'C:\FerrumActions\tools\git-2.55.0.5\bin\git.exe'
-          $env:HTTP_PROXY = ''
-          $env:HTTPS_PROXY = ''
-          $env:ALL_PROXY = ''
-          $env:NO_PROXY = 'localhost,127.0.0.1,::1,github.com,api.github.com'
-          $ErrorActionPreference = 'Continue'
-          $diagnostic = (& $git -c http.proxy= -c http.https://github.com/.proxy= -c http.lowSpeedTime=10 -c http.lowSpeedLimit=1 ls-remote https://github.com/sizzlecar/ferrum-infer-rs.git refs/heads/main 2>&1 | Out-String).Trim()
-          $directCode = $LASTEXITCODE
-          Write-Output ('::notice title=Direct Git result::exit=' + $directCode + '; ' + $diagnostic.Replace("`r", '').Replace("`n", '%0A'))
-          $ErrorActionPreference = 'Stop'
-          if ($directCode -ne 0) { throw 'Direct Windows GitHub transport failed; no configuration changed' }
-          $config = Join-Path $env:USERPROFILE '.gitconfig'
-          $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-          if (Test-Path $config) { Copy-Item -LiteralPath $config -Destination ($config + '.before-release-route-' + $stamp) }
-          [IO.File]::AppendAllText($config, "`n[http `"https://github.com/`"]`n`tproxy =`n", (New-Object Text.UTF8Encoding($false)))
-          Write-Output 'Windows GitHub repository route restored; prior configuration backed up'
-          Get-Service sshd -ErrorAction SilentlyContinue | Select-Object Name,Status
-          Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort
-          $script = @'
-          set -eu
-          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy git -c http.proxy= -c http.https://github.com/.proxy= -c http.lowSpeedTime=10 -c http.lowSpeedLimit=1 ls-remote https://github.com/sizzlecar/ferrum-infer-rs.git refs/heads/main
-          config=/home/ferrum/.gitconfig
-          if [ -f "$config" ]; then cp "$config" "$config.before-release-route-$(date -u +%Y%m%dT%H%M%SZ)"; fi
-          git config --global --replace-all http.https://github.com/.proxy ''
-          printf 'WSL GitHub repository route restored; prior configuration backed up\n'
-          '@
-          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script.Replace("`r", "")))
-          & wsl.exe -u ferrum -- bash -lc "echo $encoded | base64 -d | bash -e"
-          if ($LASTEXITCODE -ne 0) { throw 'WSL route restoration failed' }
+          "C:\FerrumActions\runner\externals\node24\bin\node.exe" -e "eval(Buffer.from('CmNvbnN0IGZzPXJlcXVpcmUoJ2ZzJyksY3A9cmVxdWlyZSgnY2hpbGRfcHJvY2VzcycpOwpjb25zdCBub3RpY2U9KHRpdGxlLHZhbHVlKT0+Y29uc29sZS5sb2coJzo6bm90aWNlIHRpdGxlPScrdGl0bGUrJzo6JytTdHJpbmcodmFsdWUpLnJlcGxhY2UoLyUvZywnJTI1JykucmVwbGFjZSgvXHIvZywnJTBEJykucmVwbGFjZSgvXG4vZywnJTBBJykpOwpjb25zdCBnaXQ9J0M6XFxGZXJydW1BY3Rpb25zXFx0b29sc1xcZ2l0LTIuNTUuMC41XFxiaW5cXGdpdC5leGUnOwpjb25zdCBlbnY9ey4uLnByb2Nlc3MuZW52fTsgZm9yKGNvbnN0IGsgb2YgT2JqZWN0LmtleXMoZW52KSl7aWYoL14oaHR0cHxodHRwc3xhbGwpX3Byb3h5JC9pLnRlc3QoaykpZGVsZXRlIGVudltrXTt9IGVudi5OT19QUk9YWT0nKic7CmZ1bmN0aW9uIHJ1bihjbWQsYXJncyx0aW1lb3V0PTMwMDAwKXtyZXR1cm4gY3Auc3Bhd25TeW5jKGNtZCxhcmdzLHtlbnYsZW5jb2Rpbmc6J3V0ZjgnLHRpbWVvdXQsd2luZG93c0hpZGU6dHJ1ZX0pO30Kbm90aWNlKCdOb2RlIHJlY292ZXJ5Jyxwcm9jZXNzLnZlcnNpb24pOwpsZXQgcj1ydW4oZ2l0LFsnLWMnLCdodHRwLnByb3h5PScsJy1jJywnaHR0cC5odHRwczovL2dpdGh1Yi5jb20vLnByb3h5PScsJy1jJywnaHR0cC5sb3dTcGVlZFRpbWU9MTAnLCctYycsJ2h0dHAubG93U3BlZWRMaW1pdD0xJywnbHMtcmVtb3RlJywnaHR0cHM6Ly9naXRodWIuY29tL3NpenpsZWNhci9mZXJydW0taW5mZXItcnMuZ2l0JywncmVmcy9oZWFkcy9tYWluJ10pOwpub3RpY2UoJ1dpbmRvd3MgZGlyZWN0IEdpdCcsSlNPTi5zdHJpbmdpZnkoe3N0YXR1czpyLnN0YXR1cyxlcnJvcjpyLmVycm9yPy5tZXNzYWdlLG91dDpyLnN0ZG91dCxlcnI6ci5zdGRlcnJ9KSk7CmlmKHIuc3RhdHVzIT09MCkgcHJvY2Vzcy5leGl0KDEpOwpjb25zdCBwPXByb2Nlc3MuZW52LlVTRVJQUk9GSUxFKydcXC5naXRjb25maWcnLHN0YW1wPW5ldyBEYXRlKCkudG9JU09TdHJpbmcoKS5yZXBsYWNlKC9bLTouXS9nLCcnKTsKaWYoZnMuZXhpc3RzU3luYyhwKSlmcy5jb3B5RmlsZVN5bmMocCxwKycuYmVmb3JlLXJlbGVhc2Utcm91dGUtJytzdGFtcCk7CmZzLmFwcGVuZEZpbGVTeW5jKHAsJ1xuW2h0dHAgImh0dHBzOi8vZ2l0aHViLmNvbS8iXVxuXHRwcm94eSA9XG4nKTsKbm90aWNlKCdXaW5kb3dzIEdpdCBjb25maWd1cmF0aW9uJywnRGlyZWN0IEdpdEh1YiByb3V0ZSB2ZXJpZmllZCBhbmQgc2F2ZWQ7IHByaW9yIGNvbmZpZ3VyYXRpb24gYmFja2VkIHVwJyk7CmNvbnN0IHNjcmlwdD0nc2V0IC1ldVxuZW52IC11IEhUVFBfUFJPWFkgLXUgSFRUUFNfUFJPWFkgLXUgQUxMX1BST1hZIC11IGh0dHBfcHJveHkgLXUgaHR0cHNfcHJveHkgLXUgYWxsX3Byb3h5IGdpdCAtYyBodHRwLnByb3h5PSAtYyBodHRwLmh0dHBzOi8vZ2l0aHViLmNvbS8ucHJveHk9IC1jIGh0dHAubG93U3BlZWRUaW1lPTEwIC1jIGh0dHAubG93U3BlZWRMaW1pdD0xIGxzLXJlbW90ZSBodHRwczovL2dpdGh1Yi5jb20vc2l6emxlY2FyL2ZlcnJ1bS1pbmZlci1ycy5naXQgcmVmcy9oZWFkcy9tYWluXG5jb25maWc9L2hvbWUvZmVycnVtLy5naXRjb25maWdcbmlmIFsgLWYgIiRjb25maWciIF07IHRoZW4gY3AgIiRjb25maWciICIkY29uZmlnLmJlZm9yZS1yZWxlYXNlLXJvdXRlLSQoZGF0ZSAtdSArJVklbSVkVCVIJU0lU1opIjsgZmlcbmdpdCBjb25maWcgLS1nbG9iYWwgLS1yZXBsYWNlLWFsbCBodHRwLmh0dHBzOi8vZ2l0aHViLmNvbS8ucHJveHkgIiJcbic7CnI9cnVuKCdDOlxcV2luZG93c1xcU3lzdGVtMzJcXHdzbC5leGUnLFsnLXUnLCdmZXJydW0nLCctLScsJ2Jhc2gnLCctbGMnLCdlY2hvICcrQnVmZmVyLmZyb20oc2NyaXB0KS50b1N0cmluZygnYmFzZTY0JykrJyB8IGJhc2U2NCAtZCB8IGJhc2ggLWUnXSw0NTAwMCk7Cm5vdGljZSgnV1NMIGRpcmVjdCBHaXQnLEpTT04uc3RyaW5naWZ5KHtzdGF0dXM6ci5zdGF0dXMsZXJyb3I6ci5lcnJvcj8ubWVzc2FnZSxvdXQ6ci5zdGRvdXQsZXJyOnIuc3RkZXJyfSkpOwpwcm9jZXNzLmV4aXQoci5zdGF0dXM9PT0wPzA6MSk7Cg==','base64').toString())"
