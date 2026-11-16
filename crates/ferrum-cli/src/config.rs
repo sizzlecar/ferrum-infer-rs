@@ -290,6 +290,9 @@ pub struct RuntimeCliConfig {
     /// Opportunistic Sequence page reservation (default: exact).
     #[serde(default)]
     pub sequence_backing_growth: Option<ferrum_types::SequenceBackingGrowth>,
+    /// Physical pool preparation before readiness, without raising admission limits.
+    #[serde(default)]
+    pub runtime_pool_preparation: Option<ferrum_types::RuntimePoolPreparation>,
     /// Weight decode implementation for eligible Q4_K MarkerV2 MMVQ M8 leaves.
     #[serde(default)]
     pub q4_mmvq_weight_decode: Option<ferrum_types::Q4MmvqWeightDecode>,
@@ -518,6 +521,12 @@ impl RuntimeCliConfig {
             ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY,
             self.sequence_backing_growth
                 .map(ferrum_types::SequenceBackingGrowth::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY,
+            self.runtime_pool_preparation
+                .map(ferrum_types::RuntimePoolPreparation::as_runtime_value),
         );
         push_string_entry(
             &mut entries,
@@ -1939,6 +1948,32 @@ mod tests {
             toml::from_str::<CliConfig>("[runtime]\ncausal_decode_kv_reuse = \"automatic\"\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn runtime_pool_preparation_config_file_has_typed_values() {
+        for mode in [
+            ferrum_types::RuntimePoolPreparation::OnDemand,
+            ferrum_types::RuntimePoolPreparation::WithinBudget,
+        ] {
+            let value = mode.as_runtime_value();
+            let parsed: CliConfig = toml::from_str(&format!(
+                "[runtime]\nruntime_pool_preparation = \"{value}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(parsed.runtime.runtime_pool_preparation, Some(mode));
+            let entries = parsed.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, ferrum_types::RuntimeConfigSource::ConfigFile);
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\nruntime_pool_preparation = \"automatic\"\n"
+        )
+        .is_err());
     }
 
     #[test]

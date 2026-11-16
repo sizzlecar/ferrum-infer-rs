@@ -38,6 +38,140 @@ fn grow_only_request(tokens: usize) -> SequenceResourceExtensionRequest {
 }
 
 #[test]
+fn paged_growth_headroom_is_shared_without_expanding_sequence_claims() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        2048,
+        TestDemand::Tokens,
+    );
+    let h = harness(new_runtime(&catalog, 2048), catalog, 2048, false);
+    h.root
+        .maintenance_controller
+        .grow_pool(&h.pool_ids[0], 256)
+        .unwrap();
+    let sequences = ["headroom-a", "headroom-b", "headroom-c"]
+        .map(|id| admitted_sequence_with_ceiling(&h.root, id, 4));
+    let sessions = sequences
+        .each_ref()
+        .map(|sequence| sequence.open_session().unwrap());
+    for session in &sessions[..2] {
+        let next = match session
+            .try_ensure_backing_covers(grow_only_request(2))
+            .unwrap()
+        {
+            SequenceResourceExtensionDecision::Extended(next) => next,
+            _ => panic!("group growth must fit"),
+        };
+        assert_eq!(next.committed_tokens().unwrap(), 2);
+        assert_eq!(owned(&next), 256);
+    }
+    let status = h.root.dynamic_pool_status().unwrap();
+    assert_eq!(status.pools()[0].resident_bytes(), 1024);
+    assert_eq!(status.pools()[0].free_bytes(), 448);
+    let allocations = h.runtime.allocate_calls();
+    let next = match sessions[2]
+        .try_ensure_backing_covers(grow_only_request(2))
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Extended(next) => next,
+        _ => panic!("another sequence must consume shared headroom"),
+    };
+    assert_eq!(owned(&next), 256);
+    assert_eq!(h.runtime.allocate_calls(), allocations);
+    assert_eq!(
+        h.root.dynamic_pool_status().unwrap().pools()[0].free_bytes(),
+        256
+    );
+    drop(next);
+    for session in &sessions {
+        session.request_cancel().unwrap();
+        session.try_abort().unwrap();
+    }
+    drop((sessions, sequences));
+    close_dynamic_test_root(h.root);
+}
+
+#[test]
+fn paged_growth_headroom_respects_budget_and_pool_ceiling_before_native_allocation() {
+    // A device limit rejects optional doubling before allocation; a non-page-
+    // aligned pool limit clamps it. Both retain the exact group/required path.
+    for (device_bytes, pool_bytes) in [(640, 2048), (2048, 650)] {
+        let catalog = pool_catalog(
+            paged_profile(),
+            AllocationLifetime::Sequence,
+            'a',
+            1,
+            pool_bytes,
+            TestDemand::Tokens,
+        );
+        let h = harness(
+            new_runtime(&catalog, device_bytes),
+            catalog,
+            device_bytes,
+            false,
+        );
+        h.root
+            .maintenance_controller
+            .grow_pool(&h.pool_ids[0], 256)
+            .unwrap();
+        let sequences = ["bounded-a", "bounded-b", "bounded-c"]
+            .map(|id| admitted_sequence_with_ceiling(&h.root, id, 4));
+        let sessions = sequences
+            .each_ref()
+            .map(|sequence| sequence.open_session().unwrap());
+        for (index, session) in sessions.iter().enumerate() {
+            let next = match session
+                .try_ensure_backing_covers(grow_only_request(2))
+                .unwrap()
+            {
+                SequenceResourceExtensionDecision::Extended(next) => Some(next),
+                SequenceResourceExtensionDecision::Deferred(deferred) => {
+                    assert!(matches!(
+                        h.root.maintain_for_admission_deferred(&deferred).unwrap(),
+                        DynamicDeferredMaintenanceOutcome::Maintained(_)
+                            | DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
+                    ));
+                    None
+                }
+                SequenceResourceExtensionDecision::BackingDeferred(deferred) => {
+                    assert!(matches!(
+                        deferred.maintain().unwrap(),
+                        DynamicDeferredMaintenanceOutcome::Maintained(_)
+                            | DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
+                    ));
+                    None
+                }
+                _ => panic!("optional headroom must not reject required work"),
+            };
+            let next = next.unwrap_or_else(|| {
+                match session
+                    .try_ensure_backing_covers(grow_only_request(2))
+                    .unwrap()
+                {
+                    SequenceResourceExtensionDecision::Extended(next) => next,
+                    _ => panic!("required capacity maintenance must allow progress"),
+                }
+            });
+            assert_eq!(next.committed_tokens().unwrap(), 2);
+            assert_eq!(owned(&next), if index < 2 { 256 } else { 128 });
+        }
+        let status = h.root.dynamic_pool_status().unwrap();
+        assert_eq!(status.budget_claimed_bytes(), 640);
+        assert_eq!(status.pools()[0].resident_bytes(), 640);
+        assert_eq!(status.pools()[0].pending_growth_bytes(), 0);
+        for session in &sessions {
+            session.request_cancel().unwrap();
+            session.try_abort().unwrap();
+        }
+        drop((sessions, sequences));
+        close_dynamic_test_root(h.root);
+    }
+}
+
+#[test]
 fn paged_growth_grow_only_reserves_a_cold_pool_without_advancing_actual_work() {
     let catalog = pool_catalog(
         paged_profile(),

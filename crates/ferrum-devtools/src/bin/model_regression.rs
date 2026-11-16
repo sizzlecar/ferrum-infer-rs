@@ -95,6 +95,9 @@ struct Args {
     /// Public runtime memory budget for both entrypoints; requires explicit capacity.
     #[arg(long, requires_all = ["context_tokens", "max_num_seqs"], value_parser = clap::value_parser!(u64).range(1..))]
     runtime_memory_budget_bytes: Option<u64>,
+    /// Exercise the same typed physical pool preparation policy in run and serve.
+    #[arg(long, conflicts_with = "expected_task", value_parser = ferrum_types::RuntimePoolPreparation::parse_runtime_value)]
+    runtime_pool_preparation: Option<ferrum_types::RuntimePoolPreparation>,
     /// Forward the typed product admission fit gate; prepared tasks keep their declared policy.
     #[arg(long, value_enum, conflicts_with = "expected_task")]
     sequence_fit_policy: Option<capacity::SequenceFitPolicy>,
@@ -166,6 +169,12 @@ impl Args {
         }
         if let Some(tokens) = self.max_num_batched_tokens {
             args.extend(["--max-num-batched-tokens".into(), tokens.to_string()]);
+        }
+        if let Some(mode) = self.runtime_pool_preparation {
+            args.extend([
+                "--runtime-pool-preparation".into(),
+                mode.as_runtime_value().into(),
+            ]);
         }
         if let Some(capacity) = self.runtime_capacity() {
             if entrypoint == "run" {

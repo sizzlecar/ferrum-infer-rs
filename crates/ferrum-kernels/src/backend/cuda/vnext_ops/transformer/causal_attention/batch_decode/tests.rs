@@ -640,7 +640,7 @@ fn paired_query_heads_selects_only_supported_fixed_execution_shapes() {
     unsupported = supported;
     unsupported.int8_kv = true;
     assert!(!eligible(PairedQueryHeads, grouping, unsupported));
-    // Product M1 deliberately retains the existing per-participant attention.
+    // Single-row replay covers both native paths but retains unpaired math.
     let binding = BindingLayout::new(supported, 1).unwrap();
     let layout = ScratchLayout::for_participants(
         supported,
@@ -651,7 +651,7 @@ fn paired_query_heads_selects_only_supported_fixed_execution_shapes() {
     )
     .unwrap();
     let launches = build_launches(supported, binding, layout, &[1024]);
-    assert!(PreparedBatchDecode::for_launches(
+    let batch = PreparedBatchDecode::for_launches(
         &launches,
         true,
         binding,
@@ -660,10 +660,15 @@ fn paired_query_heads_selects_only_supported_fixed_execution_shapes() {
         true,
         true,
         grouping,
-        PairedQueryHeads
+        PairedQueryHeads,
     )
     .unwrap()
-    .is_none());
+    .unwrap();
+    let PreparedBatchDecode::Fixed(batch) = batch else {
+        panic!("single-row fixed execution must keep a capacity-stable program");
+    };
+    assert!(!batch.uses_paired_query_heads());
+    assert!(!batch.uses_unified_v2());
 }
 
 #[test]
@@ -743,20 +748,22 @@ fn unified_v2_effective_topology_counts_identity_and_fallbacks() {
     )
     .unwrap();
     let launches = build_launches(s, binding, layout, &[1024]);
-    assert!(
-        PreparedBatchDecode::for_launches(
-            &launches,
-            true,
-            binding,
-            s,
-            layout,
-            true,
-            true,
-            grouping,
-            PairedQueryHeadsUnifiedV2
-        )
-        .unwrap()
-        .is_none(),
-        "M1 retains the original per-participant route"
-    );
+    let batch = PreparedBatchDecode::for_launches(
+        &launches,
+        true,
+        binding,
+        s,
+        layout,
+        true,
+        true,
+        grouping,
+        PairedQueryHeadsUnifiedV2,
+    )
+    .unwrap()
+    .unwrap();
+    let PreparedBatchDecode::Fixed(batch) = batch else {
+        panic!("single-row fixed execution must keep a capacity-stable program");
+    };
+    assert!(!batch.uses_paired_query_heads());
+    assert!(!batch.uses_unified_v2());
 }

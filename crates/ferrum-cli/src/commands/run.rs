@@ -969,6 +969,9 @@ pub struct RunCommand {
     /// Paged-group4 uses free backing; paged-group4-grow-only may also grow pools without reclaiming.
     #[arg(long, value_enum)]
     pub sequence_backing_growth: Option<crate::commands::SequenceBackingGrowthArg>,
+    /// Physical pool preparation: on-demand (default) or within-budget.
+    #[arg(long, value_parser = ferrum_types::RuntimePoolPreparation::parse_runtime_value)]
+    pub runtime_pool_preparation: Option<ferrum_types::RuntimePoolPreparation>,
     /// Q4_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
     #[arg(long, value_enum)]
     pub q4_mmvq_weight_decode: Option<crate::commands::Q4MmvqWeightDecodeArg>,
@@ -2930,6 +2933,12 @@ fn run_startup_cli_runtime_entries(
     );
     crate::runtime_env::push_cli_runtime_entry(
         &mut entries,
+        ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY,
+        cmd.runtime_pool_preparation
+            .map(ferrum_types::RuntimePoolPreparation::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
         ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
         cmd.q4_mmvq_weight_decode
             .map(crate::commands::Q4MmvqWeightDecodeArg::as_runtime_value),
@@ -3510,6 +3519,7 @@ mod tests {
             causal_decode_attention_grouping: None,
             causal_decode_kv_reuse: None,
             sequence_backing_growth: None,
+            runtime_pool_preparation: None,
             q4_mmvq_weight_decode: None,
             q5_mmvq_weight_decode: None,
             q8_projection_weight_preparation: None,
@@ -6515,6 +6525,40 @@ mod tests {
                     .iter()
                     .find(|entry| entry.key == KEY)
                     .map(|entry| entry.source),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_pool_preparation_run_preserves_config_and_cli_precedence() {
+        use ferrum_types::{RuntimeConfigSource as Source, RuntimePoolPreparation as Mode};
+        for (cli, expected, source) in [
+            (None, Mode::WithinBudget, Source::ConfigFile),
+            (Some(Mode::OnDemand), Mode::OnDemand, Source::Cli),
+        ] {
+            let entries = crate::config::RuntimeCliConfig {
+                runtime_pool_preparation: Some(Mode::WithinBudget),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut command = test_run_cmd();
+            command.runtime_pool_preparation = cli;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                entries,
+                ferrum_types::RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.pool_preparation, expected);
+            assert_eq!(
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY)
+                    .unwrap()
+                    .source,
                 source
             );
         }

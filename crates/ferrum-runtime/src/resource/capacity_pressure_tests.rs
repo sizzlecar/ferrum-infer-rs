@@ -132,20 +132,20 @@ fn foreground_pressure_grows_beside_a_retained_checkpoint_without_evicting() {
         .try_maintain_for_capacity_pressure(&deferred)
         .unwrap()
         .unwrap();
-    assert_eq!(
-        receipt
-            .growths()
-            .iter()
-            .map(|g| g.chunk_bytes())
-            .sum::<u64>(),
-        CHECKPOINT_PAGE_BYTES
-    );
+    let growth_bytes = receipt
+        .growths()
+        .iter()
+        .map(|g| g.chunk_bytes())
+        .sum::<u64>();
+    // Shared physical headroom may exceed the missing page. It must neither
+    // evict the retained checkpoint nor change the sequence's logical lease.
+    assert!(growth_bytes >= CHECKPOINT_PAGE_BYTES);
     assert!(receipt.rebalance().is_none());
     assert!(receipt.maintenance_boundary().is_none());
     let after = h.root.dynamic_pool_status().unwrap();
     assert_eq!(
         after.budget_claimed_bytes(),
-        before.budget_claimed_bytes() + CHECKPOINT_PAGE_BYTES
+        before.budget_claimed_bytes() + growth_bytes
     );
     assert_eq!(
         binding
@@ -262,13 +262,15 @@ fn foreground_pressure_checks_logical_leases_before_physical_prepare() {
         .try_maintain_for_capacity_pressure(&deferred)
         .unwrap()
         .unwrap();
+    let growth_bytes = receipt
+        .growths()
+        .iter()
+        .map(|g| g.chunk_bytes())
+        .sum::<u64>();
+    assert!(growth_bytes >= CHECKPOINT_PAGE_BYTES);
     assert_eq!(
-        receipt
-            .growths()
-            .iter()
-            .map(|g| g.chunk_bytes())
-            .sum::<u64>(),
-        CHECKPOINT_PAGE_BYTES
+        h.root.dynamic_pool_status().unwrap().budget_claimed_bytes(),
+        before.budget_claimed_bytes() + growth_bytes
     );
     assert_eq!(
         binding

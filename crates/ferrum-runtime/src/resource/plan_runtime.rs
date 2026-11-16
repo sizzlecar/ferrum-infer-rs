@@ -7,7 +7,7 @@ use super::{
     CapacityUnits, CapacityVector, CapacityWaitCondition, CapacityWaitRecheck,
     DeferredDeviceCleanupDomainId, DeferredDeviceCleanupMaintenanceReceipt,
     DeferredDeviceCleanupStatus, DeviceCapacityClaim, DeviceCapacitySignal, DeviceId,
-    DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
+    DeviceRuntime, DynamicBackingDeferred, DynamicBackingPoolId, DynamicDeferredMaintenanceOutcome,
     DynamicPoolGrowthBatchReceipt, DynamicPoolMaintenanceController, DynamicPoolMaintenanceStatus,
     DynamicPoolSet, DynamicResourceShape, EvaluatedBackingProjection, EvaluatedBackingRequest,
     ExecutionLane, ExecutionLaneCreationError, FailureEnvelope, LaneBackingPrepareDecision,
@@ -971,6 +971,16 @@ where
         let _lifecycle = self.read_lifecycle("maintain deferred logical backing growth")?;
         self.maintenance_controller
             .maintain_for_admission_deferred(deferred)
+    }
+
+    /// Prepare optional physical capacity through the existing maintenance
+    /// authority. This grants no logical leases and changes no reclaim floor.
+    pub fn ensure_pool_residency(
+        self: &Arc<Self>,
+        targets: std::collections::BTreeMap<DynamicBackingPoolId, u64>,
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        let _lifecycle = self.read_lifecycle("prepare dynamic pool residency")?;
+        self.maintenance_controller.ensure_pool_residency(targets)
     }
 
     /// Attempts currently needed foreground pool growth without reclaiming
