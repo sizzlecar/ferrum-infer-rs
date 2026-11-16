@@ -19,7 +19,8 @@ jobs:
       queue: max
     defaults:
       run:
-        shell: 'C:\FerrumActions\tools\powershell-7.6.6\pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}'
+        shell: 'C:\FerrumActions\tools\powershell-7.6.6\pwsh.exe -NoLogo -NoProfile -NonInteractive -File {0}'
+        working-directory: C:\FerrumActions\runner
     steps:
       - name: Report the available shell and SSH listener
         shell: cmd
