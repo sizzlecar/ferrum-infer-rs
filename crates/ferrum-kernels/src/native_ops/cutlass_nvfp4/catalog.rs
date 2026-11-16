@@ -53,10 +53,10 @@ pub fn source_declaration_fingerprint() -> String {
         include_bytes!("../../../native/cutlass-nvfp4/boundary_checks.cuh"),
         include_bytes!("../../../native/cutlass-nvfp4/quantize.cu"),
         include_bytes!("../../../native/cutlass-nvfp4/source.seed.json"),
-        include_bytes!("../../../../ferrum-native-ops/src/cutlass_nvfp4.rs"),
-        include_bytes!("../../../../ferrum-native-ops/src/cutlass_nvfp4/quantize.rs"),
-        include_bytes!("../../../../ferrum-runtime/src/standard_operations/nvfp4_matmul_bf16.rs"),
-        include_bytes!("../../../../ferrum-runtime/src/standard_operations/nvfp4_quantize_bf16.rs"),
+        ferrum_native_ops::source_material::CUTLASS_NVFP4,
+        ferrum_native_ops::source_material::CUTLASS_NVFP4_QUANTIZE,
+        ferrum_runtime::source_material::NVFP4_MATMUL_BF16,
+        ferrum_runtime::source_material::NVFP4_QUANTIZE_BF16,
     ])
 }
 pub fn provider_catalog_declaration(
