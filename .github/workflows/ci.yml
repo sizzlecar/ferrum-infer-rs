@@ -8,6 +8,11 @@ jobs:
   recover-network:
     runs-on: [self-hosted, Windows, X64, ferrum-windows-native]
     timeout-minutes: 10
+    env:
+      HTTP_PROXY: ''
+      HTTPS_PROXY: ''
+      ALL_PROXY: ''
+      NO_PROXY: '*'
     concurrency:
       group: ferrum-panda-hardware
       cancel-in-progress: false
@@ -16,6 +21,13 @@ jobs:
       run:
         shell: powershell
     steps:
+      - name: Report the available shell and SSH listener
+        run: |
+          Write-Output ('::notice title=Recovery shell::PowerShell ' + $PSVersionTable.PSVersion)
+          $ssh = Get-Service sshd -ErrorAction SilentlyContinue
+          Write-Output ('::notice title=SSH service::' + $ssh.Status)
+          $git = Get-Item 'C:\FerrumActions\tools\git-2.55.0.5\bin\git.exe' -ErrorAction SilentlyContinue
+          Write-Output ('::notice title=Git executable::exists=' + [bool]$git)
       - name: Check direct transport and restore repository Git routes
         run: |
           $ErrorActionPreference = 'Stop'
@@ -25,8 +37,12 @@ jobs:
           $env:HTTPS_PROXY = ''
           $env:ALL_PROXY = ''
           $env:NO_PROXY = 'localhost,127.0.0.1,::1,github.com,api.github.com'
-          & $git -c http.proxy= -c http.https://github.com/.proxy= -c http.lowSpeedTime=10 -c http.lowSpeedLimit=1 ls-remote https://github.com/sizzlecar/ferrum-infer-rs.git refs/heads/main
-          if ($LASTEXITCODE -ne 0) { throw 'Direct Windows GitHub transport failed; no configuration changed' }
+          $ErrorActionPreference = 'Continue'
+          $diagnostic = (& $git -c http.proxy= -c http.https://github.com/.proxy= -c http.lowSpeedTime=10 -c http.lowSpeedLimit=1 ls-remote https://github.com/sizzlecar/ferrum-infer-rs.git refs/heads/main 2>&1 | Out-String).Trim()
+          $directCode = $LASTEXITCODE
+          Write-Output ('::notice title=Direct Git result::exit=' + $directCode + '; ' + $diagnostic.Replace("`r", '').Replace("`n", '%0A'))
+          $ErrorActionPreference = 'Stop'
+          if ($directCode -ne 0) { throw 'Direct Windows GitHub transport failed; no configuration changed' }
           $config = Join-Path $env:USERPROFILE '.gitconfig'
           $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
           if (Test-Path $config) { Copy-Item -LiteralPath $config -Destination ($config + '.before-release-route-' + $stamp) }
