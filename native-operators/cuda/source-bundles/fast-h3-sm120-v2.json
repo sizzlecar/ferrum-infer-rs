@@ -2,12 +2,12 @@
   "schema_version": 1,
   "distribution": {
     "repository": "sizzlecar/ferrum-infer-rs",
-    "tag": "fast-h3-sm120-sources-v1",
-    "asset_name": "fast-h3-sm120-sources-v1.tar.gz"
+    "tag": "fast-h3-sm120-sources-v2",
+    "asset_name": "fast-h3-sm120-sources-v2.tar.gz"
   },
   "archive": {
-    "sha256": "42d515bbe689ed3dd05a5b6caae9fa02a0784f488b8d88e04d147d32e89e9370",
-    "size_bytes": 2801634
+    "sha256": "cc2dfa0a7cc58ee3fc0c4a5435b2cbf0e7ec23aff8c7204c3f570821a418eaf3",
+    "size_bytes": 2801731
   },
   "sources": {
     "cutlass-nvfp4": {
@@ -25,5 +25,5 @@
       "members": 295
     }
   },
-  "scope": "Compiler-observed source closures from the qualified RTX 5090 video native set; source distribution, not a new runtime qualification."
+  "scope": "Compiler-observed source closures from the qualified RTX 5090 video native set, preserving declared include directories. All regular-file bytes and source plans are unchanged from v1; source distribution, not a new runtime qualification."
 }

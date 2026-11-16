@@ -560,16 +560,25 @@ jobs:
           ./target/release-tools/examples/sage_vsa_fp4_catalog_declaration \
             134217728 experimental-release-source-declaration-v1 \
             "$work/combined-catalog.json" "$work/nvfp4-catalog.json"
-          video_manifest=native-operators/cuda/source-bundles/fast-h3-sm120-v1.json
+          video_manifest=native-operators/cuda/source-bundles/fast-h3-sm120-v2.json
           video_url=$(jq -er '"https://github.com/" + .distribution.repository + "/releases/download/" + .distribution.tag + "/" + .distribution.asset_name' "$video_manifest")
           video_sha=$(jq -er '.archive.sha256' "$video_manifest")
           curl --fail --location --retry 5 --retry-all-errors --output "$work/fast-h3-sources.tar.gz" "$video_url"
           printf '%s  %s\n' "$video_sha" "$work/fast-h3-sources.tar.gz" | sha256sum --check --strict
           mkdir "$work/fast-h3-source"
           tar -xzf "$work/fast-h3-sources.tar.gz" -C "$work/fast-h3-source"
-          while IFS=$'\t' read -r plan expected; do
+          while IFS=$'\t' read -r source plan expected; do
             printf '%s  %s\n' "$expected" "$work/fast-h3-source/$plan" | sha256sum --check --strict
-          done < <(jq -er '.sources[] | [.plan, .plan_sha256] | @tsv' "$video_manifest")
+            # Check the complete locked closure, including empty include paths,
+            # before spending time compiling the production operator set.
+            ./target/release-tools/ferrum-native-ops-builder source-build \
+              --plan "$work/fast-h3-source/$plan" --source-root "$work/fast-h3-source/$source" \
+              --compute-capability sm_120 --builder-sha "$RC_SHA" \
+              --nvcc /usr/local/cuda/bin/nvcc --cuda-toolkit-root /usr/local/cuda \
+              --ccbin /usr/bin/g++-13 --ar /usr/bin/ar --nvcc-threads 1 \
+              --object-cache "$RUNNER_TEMP/sm120-native-object-cache" --plan-only \
+              --out "$work/fast-h3-preflight/$source"
+          done < <(jq -er '.sources[] | [.root, .plan, .plan_sha256] | @tsv' "$video_manifest")
           mkdir "$work/reference-workspace" "$work/source-bundle" "$work/fp8-source"
           git archive "$NATIVE_REFERENCE_REVISION" | tar -xf - -C "$work/reference-workspace"
           manifest=native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json
@@ -727,7 +736,7 @@ jobs:
           Native production source baseline SHA256: ${NATIVE_OPERATOR_SET_ARCHIVE_SHA256}
           Native operator set: rebuilt from locked production source plans plus pinned CUTLASS FP8
           Native operator archive SHA256: $(cut -d ' ' -f 1 "$RUNNER_TEMP/sm120-native/native-operator-set-sm120-production-fp8.tar.zst.sha256")
-          FastH3 source archive SHA256: $(jq -r '.archive.sha256' native-operators/cuda/source-bundles/fast-h3-sm120-v1.json)
+          FastH3 source archive SHA256: $(jq -r '.archive.sha256' native-operators/cuda/source-bundles/fast-h3-sm120-v2.json)
           CUTLASS revision: ${CUTLASS_REVISION}
           CUTLASS source archive SHA256: ${CUTLASS_ARCHIVE_SHA256}
           Native operator lock SHA256: $(sha256sum "$FERRUM_NATIVE_OPERATOR_SET_LOCK" | cut -d ' ' -f 1)
