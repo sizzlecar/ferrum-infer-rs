@@ -114,7 +114,11 @@ pub enum ImageStageRetirement {
 /// The caller can inspect its reaper, retire the execution error, then close.
 pub struct ActiveImageStage<R: DeviceRuntime> {
     pub receipt: ImageStageExecutionReceipt,
-    pub session: TensorComponentSession<R>,
+    // A session owns the executor and its recovery state. Keep that owner at a
+    // stable heap address while stages move between execution, residency and
+    // failure custody; copying its full inline storage through those paths can
+    // exhaust ordinary worker/test stacks even for tiny model inputs.
+    pub session: Box<TensorComponentSession<R>>,
     pub(super) declaration: ImageStageDeclaration,
 }
 
@@ -771,7 +775,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                         execution_wall_durations_us: Vec::new(),
                         device_profiles: Vec::new(),
                     },
-                    session,
+                    session: Box::new(session),
                     declaration,
                 },
                 weights,
