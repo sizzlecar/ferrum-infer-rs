@@ -42,7 +42,7 @@ impl Mp4Spool {
                 "spool needs positive byte capacity and at least three staging files",
             ));
         }
-        let mut builder = fs::DirBuilder::new();
+        let builder = &mut fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
