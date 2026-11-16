@@ -229,6 +229,8 @@ impl CudaVariant {
                     &["cuda", "cuda-production"],
                     &["cuda", "cuda-production", "cuda-cutlass-fp8"],
                     &["cuda", "cuda-production", "cuda-cutlass-fp8", "cuda-cutlass-fused-f32-attention", "cuda-cutlass-int8-fused-output"],
+                    // FastH3's NVFP4 providers are qualified only for SM120.
+                    &["cuda", "cuda-production", "cuda-cutlass-fp8", "cuda-cutlass-fused-f32-attention", "cuda-cutlass-int8-fused-output", "cuda-fast-h3"],
                 ],
             ),
         };
@@ -363,6 +365,77 @@ mod tests {
                     .contains("cuda-production feature bundle"));
             }
         }
+    }
+
+    fn sm120_video_abi() -> AbiInput {
+        AbiInput {
+            backend: Backend::Cuda,
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            cargo_features: [
+                "cuda",
+                "cuda-production",
+                "cuda-cutlass-fp8",
+                "cuda-cutlass-fused-f32-attention",
+                "cuda-cutlass-int8-fused-output",
+                "cuda-fast-h3",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            cuda_compute_capability: Some("120".into()),
+            cuda_toolkit_image: Some("nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66".into()),
+        }
+    }
+
+    #[test]
+    fn sm120_video_profile_preserves_feature_and_abi_boundaries() {
+        let name = "ferrum-linux-x86_64-cuda-sm120.tar.gz";
+        let capability = CudaDeliveryCapability::default();
+        let mut abi = sm120_video_abi();
+        assert_eq!(
+            capability.validate_asset(name, &abi).unwrap(),
+            Some(CudaVariant::Sm120)
+        );
+        abi.cargo_features.reverse();
+        assert_eq!(
+            capability.validate_asset(name, &abi).unwrap(),
+            Some(CudaVariant::Sm120)
+        );
+
+        for feature in ["cuda-fast-h3", "undeclared-cuda-feature"] {
+            let mut invalid = abi.clone();
+            invalid.cargo_features.push(feature.into());
+            assert!(capability.validate_asset(name, &invalid).is_err());
+        }
+        for feature in ["cuda", "cuda-production", "cuda-cutlass-fp8"] {
+            let mut invalid = abi.clone();
+            invalid.cargo_features.retain(|value| value != feature);
+            assert!(capability.validate_asset(name, &invalid).is_err());
+        }
+        let mut invalid = abi.clone();
+        invalid.target_triple = "x86_64-pc-windows-msvc".into();
+        assert!(capability.validate_asset(name, &invalid).is_err());
+        invalid = abi.clone();
+        invalid.cuda_compute_capability = Some("89".into());
+        assert!(capability.validate_asset(name, &invalid).is_err());
+        invalid = abi;
+        invalid.cuda_toolkit_image = Some("nvidia/cuda:12.4.0-devel-ubuntu22.04".into());
+        assert!(capability.validate_asset(name, &invalid).is_err());
+    }
+
+    #[test]
+    fn sm120_video_feature_is_not_an_sm89_package_capability() {
+        let name = "ferrum-linux-x86_64-cuda-sm89.tar.gz";
+        let mut abi = sm120_video_abi();
+        abi.cuda_compute_capability = Some("89".into());
+        abi.cuda_toolkit_image = Some("nvidia/cuda:12.4.0-devel-ubuntu22.04".into());
+        assert!(CudaVariant::from_abi(name, &abi).is_err());
+        abi.cargo_features
+            .retain(|feature| feature != "cuda-fast-h3");
+        assert_eq!(
+            CudaVariant::from_abi(name, &abi).unwrap(),
+            Some(CudaVariant::Sm89)
+        );
     }
 
     #[test]
