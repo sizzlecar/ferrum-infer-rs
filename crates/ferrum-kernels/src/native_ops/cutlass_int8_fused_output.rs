@@ -50,13 +50,9 @@ pub fn source_declaration_fingerprint() -> String {
         include_bytes!("../../native/cutlass-int8-fused-output/source.seed.json"),
         include_bytes!("../../native/cutlass-int8-fused-output/source.build.seed.json"),
         include_bytes!("../../build.rs"),
-        include_bytes!("../../../ferrum-native-ops/src/cutlass_int8_fused_output.rs"),
-        include_bytes!(
-            "../../../ferrum-runtime/src/standard_operations/comfy_convrot_w4a8_bf16.rs"
-        ),
-        include_bytes!(
-            "../../../ferrum-runtime/src/standard_operations/comfy_convrot_w8a8_bf16.rs"
-        ),
+        ferrum_native_ops::source_material::CUTLASS_INT8_FUSED_OUTPUT,
+        ferrum_runtime::source_material::COMFY_CONVROT_W4A8_BF16,
+        ferrum_runtime::source_material::COMFY_CONVROT_W8A8_BF16,
     ])
 }
 

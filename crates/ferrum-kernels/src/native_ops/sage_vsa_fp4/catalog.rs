@@ -75,17 +75,13 @@ pub fn source_declaration_fingerprint() -> String {
         include_bytes!("../../../native/sage-vsa-fp4/launch.cuh"),
         include_bytes!("../../../native/sage-vsa-fp4/params.h"),
         include_bytes!("../../../native/sage-vsa-fp4/source.seed.json"),
-        include_bytes!("../../../../ferrum-native-ops/src/sage_vsa_fp4.rs"),
-        include_bytes!("../../../../ferrum-native-ops/src/sage_vsa_fp4/lists.rs"),
-        include_bytes!("../../../../ferrum-native-ops/src/sage_vsa_fp4/selection.rs"),
-        include_bytes!("../../../../ferrum-native-ops/src/sage_vsa_fp4/selection/kernel_upload.rs"),
-        include_bytes!("../../../../ferrum-native-ops/src/sage_vsa_fp4/quantize.rs"),
-        include_bytes!(
-            "../../../../ferrum-runtime/src/standard_operations/sparse_fp4_attention.rs"
-        ),
-        include_bytes!(
-            "../../../../ferrum-runtime/src/standard_operations/sparse_fp4_qkv_quantize.rs"
-        ),
+        ferrum_native_ops::source_material::SAGE_VSA_FP4,
+        ferrum_native_ops::source_material::SAGE_VSA_FP4_LISTS,
+        ferrum_native_ops::source_material::SAGE_VSA_FP4_SELECTION,
+        ferrum_native_ops::source_material::SAGE_VSA_FP4_KERNEL_UPLOAD,
+        ferrum_native_ops::source_material::SAGE_VSA_FP4_QUANTIZE,
+        ferrum_runtime::source_material::SPARSE_FP4_ATTENTION,
+        ferrum_runtime::source_material::SPARSE_FP4_QKV_QUANTIZE,
     ])
 }
 pub fn provider_catalog_declaration(

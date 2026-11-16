@@ -25,6 +25,7 @@ mod operation;
 mod oracle;
 mod resolved;
 mod resource;
+pub mod source_material;
 mod standard_operations;
 mod static_initialization;
 mod weight_source;

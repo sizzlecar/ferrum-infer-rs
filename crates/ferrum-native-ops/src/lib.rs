@@ -18,6 +18,7 @@ pub mod manifest;
 pub mod registry;
 pub mod resolver;
 pub mod sage_vsa_fp4;
+pub mod source_material;
 pub mod upstream_extra_linear;
 pub mod upstream_linear;
 pub mod upstream_q6_f16_linear;
