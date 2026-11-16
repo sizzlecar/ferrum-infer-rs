@@ -291,6 +291,27 @@ where
             .ok_or_else(|| invalid_resource("single-pool growth produced no receipt"))
     }
 
+    /// Best-effort preparation callers may request physical residency without
+    /// acquiring logical claims or raising the reclaim floor. Revalidate every
+    /// target under canonical maintenance locks and reserve the entire batch
+    /// before native allocation. A repeated target never grows the pool twice.
+    pub fn ensure_pool_residency(
+        &self,
+        targets: BTreeMap<DynamicBackingPoolId, u64>,
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        self.pools.maintain_pools(
+            targets
+                .into_iter()
+                .map(
+                    |(pool_id, target_bytes)| DynamicPoolGrowthIntent::ResidentTarget {
+                        pool_id,
+                        target_bytes,
+                    },
+                )
+                .collect(),
+        )
+    }
+
     /// Grows distinct pools under one global reservation and one capacity
     /// epoch publication. Input order is ignored; duplicate pools are rejected.
     pub fn grow_pools(
@@ -428,9 +449,10 @@ where
                 // ordinary budget reservation and fresh packing checks. A
                 // competing reservation can now cause real device pressure;
                 // that bounded wait has no device-reclaim boundary to report.
+                // Do not refill reclaimed space with optional growth headroom.
                 let mut receipt = self
                     .pools
-                    .maintain_pools_observed(retry_intents, capacity_blocked)?;
+                    .maintain_required_pools_observed(retry_intents, capacity_blocked)?;
                 receipt.rebalance = Some(rebalance);
                 receipt.maintenance_boundary = Some(boundary);
                 Ok(receipt)
@@ -458,7 +480,7 @@ where
                 *capacity_blocked = None;
                 let mut receipt = self
                     .pools
-                    .maintain_pools_observed(retry_intents, capacity_blocked)?;
+                    .maintain_required_pools_observed(retry_intents, capacity_blocked)?;
                 receipt.rebalance = Some(rebalance);
                 receipt.maintenance_boundary = maintenance_boundary.clone();
                 Ok(receipt)

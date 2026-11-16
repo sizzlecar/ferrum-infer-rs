@@ -382,6 +382,13 @@ mod tests {
             }
         }
 
+        fn runtime_pool_preparation(self) -> Option<ferrum_types::RuntimePoolPreparation> {
+            match self.command {
+                TestCommand::Run(command) => command.runtime_pool_preparation,
+                TestCommand::Serve(command) => command.runtime_pool_preparation,
+            }
+        }
+
         fn completion_readback_policy(self) -> Option<CompletionReadbackPolicyArg> {
             match self.command {
                 TestCommand::Run(command) => command.completion_readback_policy,
@@ -913,6 +920,40 @@ mod tests {
                 "test-model",
                 "--causal-decode-kv-reuse",
                 "automatic",
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn runtime_pool_preparation_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .runtime_pool_preparation(),
+                None
+            );
+            for mode in [
+                ferrum_types::RuntimePoolPreparation::OnDemand,
+                ferrum_types::RuntimePoolPreparation::WithinBudget,
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--runtime-pool-preparation",
+                    mode.as_runtime_value(),
+                ])
+                .unwrap();
+                assert_eq!(parsed.runtime_pool_preparation(), Some(mode));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--runtime-pool-preparation",
+                "automatic"
             ])
             .is_err());
         }

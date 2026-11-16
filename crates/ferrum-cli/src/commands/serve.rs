@@ -181,6 +181,10 @@ pub struct ServeCommand {
     /// Paged-group4 uses free backing; paged-group4-grow-only may also grow pools without reclaiming.
     #[arg(long, value_enum)]
     pub sequence_backing_growth: Option<crate::commands::SequenceBackingGrowthArg>,
+    /// Prepare physical pools before readiness if the compiled workload fits:
+    /// on-demand (default) or within-budget. Admission limits remain unchanged.
+    #[arg(long, value_parser = ferrum_types::RuntimePoolPreparation::parse_runtime_value)]
+    pub runtime_pool_preparation: Option<ferrum_types::RuntimePoolPreparation>,
     /// Q4_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
     #[arg(long, value_enum)]
     pub q4_mmvq_weight_decode: Option<crate::commands::Q4MmvqWeightDecodeArg>,
@@ -559,6 +563,7 @@ async fn run_serve_lifecycle(
         causal_decode_attention_grouping,
         causal_decode_kv_reuse,
         sequence_backing_growth,
+        runtime_pool_preparation,
         q4_mmvq_weight_decode,
         q5_mmvq_weight_decode,
         q8_projection_weight_preparation,
@@ -976,6 +981,11 @@ async fn run_serve_lifecycle(
     push_sequence_backing_growth_cli_entry(
         &mut startup_cli_runtime_entries,
         sequence_backing_growth,
+    );
+    push_cli_runtime_entry(
+        &mut startup_cli_runtime_entries,
+        ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY,
+        runtime_pool_preparation.map(ferrum_types::RuntimePoolPreparation::as_runtime_value),
     );
     push_q4_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q4_mmvq_weight_decode);
     push_q5_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q5_mmvq_weight_decode);

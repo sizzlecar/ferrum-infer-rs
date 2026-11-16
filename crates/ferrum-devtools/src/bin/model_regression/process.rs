@@ -210,6 +210,7 @@ pub(super) async fn run(
             || args.kv_dtype.is_some()
             || args.sequence_fit_policy.is_some()
             || args.max_num_batched_tokens.is_some()
+            || args.runtime_pool_preparation.is_some()
             || identity::requires_source_evidence(args)?)
     {
         let path = args

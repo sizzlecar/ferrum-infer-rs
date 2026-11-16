@@ -107,6 +107,7 @@ pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<S
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY
             || entry.key == ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY
+            || entry.key == ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY
             || entry.key == ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY
             || entry.key == ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY
             || entry.key == ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY
@@ -130,6 +131,7 @@ pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Ve
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY
             || entry.key == ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY
+            || entry.key == ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY
             || entry.key == ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY
             || entry.key == ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY
             || entry.key == ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY
@@ -421,6 +423,24 @@ mod tests {
         assert!(ferrum_types::EngineConfig::default()
             .apply_runtime_config_snapshot(&environment)
             .is_err());
+    }
+
+    #[test]
+    fn runtime_pool_preparation_provenance_is_never_environment() {
+        let key = ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY;
+        let original = std::env::var_os(key);
+        for value in ["on-demand", "within-budget"] {
+            for source in [
+                RuntimeConfigSource::Default,
+                RuntimeConfigSource::ConfigFile,
+                RuntimeConfigSource::Cli,
+            ] {
+                let current = snapshot(&[(key, value, source)]);
+                assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+                assert!(materialize_runtime_env_effective(&current).is_empty());
+                assert_eq!(std::env::var_os(key), original);
+            }
+        }
     }
 
     #[test]

@@ -1222,6 +1222,7 @@ impl FerrumConfigBuilder {
             )?,
             execution.causal_decode_kv_reuse_decision()?,
             execution.sequence_backing_growth_decision()?,
+            execution.runtime_pool_preparation_decision()?,
             execution.q4_mmvq_weight_decode_decision()?,
             execution.q5_mmvq_weight_decode_decision()?,
             execution.q8_projection_weight_preparation_decision()?,
@@ -2742,6 +2743,45 @@ impl FerrumConfigBuilder {
             ],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn runtime_pool_preparation_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::RUNTIME_POOL_PREPARATION_CONFIG_KEY;
+        let invalid = |reason| AutoConfigError::InvalidOverride {
+            key: key.to_owned(),
+            reason,
+        };
+        let (mode, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::RuntimePoolPreparation::parse_config_entry(entry).map_err(invalid)?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::RuntimePoolPreparation::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if mode != crate::RuntimePoolPreparation::OnDemand
+            && self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
+        {
+            return Err(invalid(
+                "runtime pool preparation requires a compiled-plan runtime".into(),
+            ));
+        }
+        Ok(self.decision(
+            "runtime_pool_preparation",
+            mode.as_runtime_value(),
+            source,
+            source_key,
+            ["on-demand", "within-budget"],
+            Vec::new(),
+            vec![
+                RuntimeConfigEffect::Performance,
+                RuntimeConfigEffect::Memory,
+            ],
         ))
     }
 
@@ -7751,6 +7791,46 @@ mod tests {
                 engine.runtime.q5_mmvq_weight_decode,
                 crate::Q5MmvqWeightDecode::Baseline
             );
+        }
+    }
+
+    #[test]
+    fn runtime_pool_preparation_requires_compiled_plan_and_keeps_provenance() {
+        let key = crate::RUNTIME_POOL_PREPARATION_CONFIG_KEY;
+        for authority in [
+            ExecutionPlanningModel::CompiledPlan,
+            ExecutionPlanningModel::ExecutorManaged,
+        ] {
+            for mode in [
+                crate::RuntimePoolPreparation::OnDemand,
+                crate::RuntimePoolPreparation::WithinBudget,
+            ] {
+                let builder = FerrumConfigBuilder::new(snapshot_with_sources(&[(
+                    key,
+                    mode.as_runtime_value(),
+                    RuntimeConfigSource::Cli,
+                )]))
+                .with_execution_planning_model(authority);
+                let result = builder.resolve();
+                let supported = mode == crate::RuntimePoolPreparation::OnDemand
+                    || authority == ExecutionPlanningModel::CompiledPlan;
+                assert_eq!(result.is_ok(), supported, "{result:?}");
+                if let Ok(resolved) = result {
+                    let entry = resolved
+                        .runtime_config
+                        .entries
+                        .iter()
+                        .find(|entry| entry.key == key)
+                        .unwrap();
+                    assert_eq!(entry.effective_value, mode.as_runtime_value());
+                    assert_eq!(entry.source, RuntimeConfigSource::Cli);
+                    let mut engine = crate::EngineConfig::default();
+                    engine
+                        .apply_runtime_config_snapshot(&resolved.runtime_config)
+                        .unwrap();
+                    assert_eq!(engine.runtime.pool_preparation, mode);
+                }
+            }
         }
     }
 

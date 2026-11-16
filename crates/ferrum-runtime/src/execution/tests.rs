@@ -830,6 +830,14 @@ fn startup_memory_accounts_for_hybrid_state_and_each_sequences_physical_padding(
     assert_eq!(plan.startup_peak_bytes(1, 1, 1).unwrap(), 8192);
     assert_eq!(plan.startup_peak_bytes(5, 1, 1).unwrap(), 12288);
     assert_eq!(plan.startup_peak_bytes(5, 2, 2).unwrap(), 24576);
+    let targets = plan.startup_workload_pool_bytes(5, 5, 2, 2).unwrap();
+    assert_eq!(targets.len(), 1, "compatible hybrid state shares a pool");
+    assert_eq!(targets[plan.dynamic_pools()[0].pool_id()], 24576);
+    assert_eq!(
+        plan.startup_workload_pool_bytes(5, 1, 2, 2).unwrap()[plan.dynamic_pools()[0].pool_id()],
+        16384,
+        "sequence state follows its actual frontier, not its request ceiling"
+    );
     assert!(plan.startup_peak_bytes(4097, 1, 1).is_err());
     assert!(plan.startup_peak_bytes(1, 17, 1).is_err());
 }

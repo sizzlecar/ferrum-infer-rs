@@ -39,6 +39,11 @@ pub(super) fn validate_effective_policy(args: &Args, config: &Value) -> Result<(
             "FERRUM_MAX_BATCHED_TOKENS",
             args.max_num_batched_tokens.map(|tokens| tokens.to_string()),
         ),
+        (
+            ferrum_types::RUNTIME_POOL_PREPARATION_CONFIG_KEY,
+            args.runtime_pool_preparation
+                .map(|mode| mode.as_runtime_value().to_owned()),
+        ),
     ] {
         let Some(expected) = expected else { continue };
         let entries = config["entries"]
@@ -54,7 +59,10 @@ pub(super) fn validate_effective_policy(args: &Args, config: &Value) -> Result<(
 }
 
 pub(super) fn validate_runtime_policy(args: &Args, health: &Value) -> Result<()> {
-    if args.sequence_fit_policy.is_none() && args.max_num_batched_tokens.is_none() {
+    if args.sequence_fit_policy.is_none()
+        && args.max_num_batched_tokens.is_none()
+        && args.runtime_pool_preparation.is_none()
+    {
         // Existing release tasks can exercise other execution authorities. The
         // explicitly selected fit-policy probe requires vNext runtime evidence.
         return Ok(());

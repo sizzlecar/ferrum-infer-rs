@@ -41,7 +41,7 @@
 
 ## 当前状态
 
-2026-11-16：视频目标已完成，本目标进行中。单请求注意力拓扑修复已单独保存为提交 `930c46b66`；后续 C16 性能资格仍未通过，没有发布或合并。正式 v0.19.1 Linux SM120 二进制重新计算的 SHA-256 为 `377e6ce053cc2f55ccdd147d941603b66bebac27d262fff42021cf2fc7339387`；模型与数据集的实际字节均已核对。原主工作树未修改。证据和完整执行参数保存在 `/Users/chejinxuan/ferrum-handoffs/20261116-windows-v0191-followup` 及 5090 的同名目录。
+2026-11-16：视频目标已完成，本目标进行中。单请求注意力拓扑修复已单独保存为提交 `930c46b66`。最新 r5b 在显式 `within-budget` 选项下，通过 5090 固定 ShareGPT 负载的三轮配对 SLO 资格，1152 次计时请求零错误；默认仍为按需分配，4070 Ti Windows、外部短提示词差距及新样本 llama.cpp 主表未完成，没有发布或合并。正式 v0.19.1 Linux SM120 二进制重新计算的 SHA-256 为 `377e6ce053cc2f55ccdd147d941603b66bebac27d262fff42021cf2fc7339387`；模型与数据集的实际字节均已核对。原主工作树未修改。证据和完整执行参数保存在 `/Users/chejinxuan/ferrum-handoffs/20261116-windows-v0191-followup` 及 5090 的同名目录。
 
 ### 首轮同机诊断
 
@@ -132,11 +132,141 @@ C1 候选吞吐为 215.57–216.71 tokens/s，配对比值为 1.068×、1.604×�
 
 选样和实际输入/输出 usage 数组逐格一致，原始逐请求记录、严格单 token 资格及资源记录在库外 `prefill-policy-paired-r1.summary.json` 和对应服务目录。每次 GPU 采样只有 15–72 个成功样本、3–4 次查询失败，最大间隔 2003–2184ms；峰值只是观测下界，不能作显存下降结论。原始完整扫描的失败仍保留，不以这次独立 C16 实验替换。
 
-分块的三次配对吞吐变化约为 −6.97%、+0.75%、−2.77%，没有稳定收益且仍一次超限，暂不作为推荐配置。接下来使用本机已有 Nsight Systems 对 CUDA API 和 kernel 时序作诊断，区分内存分配、同步及逐算子提交；该跟踪有额外开销，不计为性能资格。停止继续盲调分块参数，也不更改预声明 SLO。
+分块的三次配对吞吐变化约为 −6.97%、+0.75%、−2.77%，没有稳定收益且仍一次超限，暂不作为推荐配置。停止继续盲调分块参数，也不更改预声明 SLO。
+
+### CUDA 分配停顿与分页池候选（进行中）
+
+已有 Nsight Systems 2024.6.2 对当前 CUDA 13.3 驱动提示不支持；本次采到了主机端 CUDA API，但没有 GPU kernel activity。对齐 HTTP 计时窗口后，发现 cuMemAllocAsync 单次耗时 147.48ms、484.92ms、1500.57ms。首批慢请求的首字窗口包含前一种慢分配。跟踪结果只用于诊断；嵌套 API 耗时不能相加当作 GPU 执行时间。
+
+随后取消 Nsight，只启用分配器目标的 DEBUG 计时，64/64 请求完成、零错误，TTFT P99 536.64ms、TPOT P99 28.21ms、可见 SSE ITL P99 87.05ms、吞吐 996.15 tokens/s。这轮计时窗口内有 54 次物理分配，最慢的两次为约 2MiB / 1842.50ms、6MiB / 437.47ms；同步部分各约 11μs，主要时间在原生分配调用。两次均属于 F16 分页序列状态池，驱动 reserved/used 同时增长。带 DEBUG 的数值仍不作为无诊断性能资格。
+
+第一个分页池候选 r3b 沿用公开的 PagedGroup4GrowOnly 策略：每序列仍只领取四页组，物理池在预算允许时按既有驻留量成倍增长，额外页保持共享空闲容量。池上限按页对齐裁剪；完整设备预算预留被拒绝时，在原生分配前回到精确组增长，之后仍保留原有按实际需求维护的路径。不改全局 CUDA 池阈值、采样、模型算术或服务容量。更少的扩容可能换来更多驻留显存，必须随延迟和吞吐一起实测。
+
+库外 candidate-r3b.source.json 固定该候选的源码身份，amortized-pool-r1.contract.json 固定相同 SLO 和三组配对规则。9 项分页增长定向用例通过，受影响 runtime crate 的 976 项通过、5 项忽略，覆盖共享页所有权、设备预算及池上限、所需容量的正常维护重试。首次新增边界用例遗漏了原有维护重试流程而失败，补齐测试调用后通过；未修改生产实现来绕过此容量边界。CUDA CLI 构建、格式检查及 run/serve 的 11 项产品阶段通过；二进制 SHA-256 为 82158dc19903a37b30f244eb71c10a1faf25c3e80e6ed451441bbf00f827bcaf。原始 Nsight、分配日志与摘要保留在 c16-nsys-r1 和 c16-alloc-debug-r1。
+
+首个孤立 C16 pilot 的 64 个请求全部完成、零错误，TTFT P50/P99 为 74.60/279.11ms、TPOT 为 11.04/13.19ms、可见 SSE ITL 为 6.67/75.60ms，吞吐 1308.36 tokens/s。结束时该分页状态池为 22 块 / 256MiB；此前未修改的独立运行是 110 块 / 181.5MiB。整卡采样峰值 6.022GiB、RSS 1.199GiB；GPU 95 个样本、4 次查询错误、最大间隔 2002ms，仍不是精确进程峰值。单轮通过没有替代重复验收。
+
+三组配对按预声明的失败即停规则，在第 2 组候选失败后停止，实际完成 3/6 个 arm、576/576 请求、零请求错误。第 1 组 C16 控制/候选吞吐 1354.12/1372.09 tokens/s、TTFT P99 303.67/268.66ms；第 2 组候选为 1329.28 tokens/s，TTFT P99 **505.97ms，失败**，TPOT/可见 SSE ITL P99 为 12.73/76.65ms。最慢请求是 27-token 输入、首个可见文本 525.20ms，同批多数请求约 494.5ms；不能把超过门槛的数值四舍五入为通过。C1/C8 均通过，剩余 3 个 arm 未执行；完整逐请求、分位数、资源和输入一致性证据在 amortized-pool-paired-r1.summary.json 及对应目录。未发布或将该候选记为性能资格通过。
+
+合同 amortized-bounded-c16-r1.contract.json 保留所有原门槛和固定服务容量，在同一候选上加已有公开的 256-token prefill step chunk / active-decode prefill token budget。三次独立 C16 启动验证全部通过：TTFT P99 为 303.56/301.66/422.30ms，TPOT P99 为 12.71/12.65/12.58ms，可见 SSE ITL P99 为 75.90/75.19/76.75ms，吞吐 1328.28/1346.04/1317.70 tokens/s，192/192 请求完成、零错误。复用 Rust replay 工具检查 1093-token 检索请求，C1 与 C8 共 9 个响应都为 violet-583，HTTP 200、自然 stop、usage 和流传输完整；相同请求的重放不作为不同状态隔离的证据。
+
+但随后完整 C1→C8→C16 配对仍失败：第 1 组候选 C16 的 TTFT P99 为 **615.20ms**、TPOT P99 为 12.76ms、可见 SSE ITL P99 为 72.91ms，吞吐 1300.34 tokens/s；对应控制为 262.02ms、14.91ms、76.35ms、1318.96 tokens/s。按冻结规则停止在 2/6 个 arm，384/384 请求无错误，剩余 4 个未执行。孤立 C16 的三轮通过没有覆盖进程内先前执行历史，组合方案仍未获得资格，不能作为推荐配置发布。
+
+完整历史的 basic 诊断中，最慢首字窗口内的物理分配最大约 2.1ms；该次 C16 吞吐降至 383.80 tokens/s，诊断本身影响明显。冷路径 ledger 的前 4096 条已被较早阶段占满，后续 12984 个 wave 溢出，不把缺失记录解释为没有图准备。
+
+随后使用 latency profile 和现有 ferrum.cuda.replay_preparation 目标日志：较大的图实例化耗时（最大 787.24ms）全部在启动期；C16 计时阶段只有一次约 5.23ms 的捕获/拓扑检查/实例化/上传组合，未落在两个最慢请求的首字窗口中。不能用启动期的慢调用解释计时阶段 TTFT。该诊断 C16 吞吐 346.51 tokens/s、TTFT P99 752.59ms，输出约 1GB 的 profile/scheduler 日志；去掉 scheduler trace 后仍为 338.72 tokens/s、745.48ms，说明并非仅重复写文件造成。详细诊断记录了 C16 decode 的 catalog_empty 回退，原无跟踪失败轮次没有同类已记录行；这些诊断不替代无跟踪性能资格，也不据此修改捕获策略。
+
+继续用已有基础计数器和原生调用目标日志缩小范围，关闭执行事件文件；同时检查原无跟踪失败轮次已经保存的阶段计数，避免重复采集。未扩大固定 ledger，也未改变 SLO。此候选的 Metal 全 targets 编译已通过，Linux 整仓测试及 Clippy 仍未重启。新证据位于库外 amortized-bounded-history-latency-r1、amortized-bounded-history-latency-lite-r1 及 aligned-preparation.json。
+
+### 统一物理池维护候选 r4（验证中）
+
+原无跟踪的组合失败轮次已保存的粗粒度计数显示，prefill 的 resource_prepare_attempt 最大 318.34ms。改用 Basic 纯计数器、不写执行事件文件后，完整 C1/C8/C16 扫描恢复正常吞吐：212.52/967.13/1278.83 tokens/s，TTFT P99 157.26/171.25/434.06ms，192/192 请求、零错误、该轮 SLO 均通过。但这仍是带目标 DEBUG 的诊断，不能替代无跟踪配对验收。运行期原生分配日志中，激活池、分页状态池、工作区分别出现 390.34ms、337.04ms、162.78ms 的分配调用；同步各仅数微秒。最大调用的精确计时/预热窗口尚未由请求级记录逐个对齐，不将它们全部称为计时请求的停顿。
+
+r3b 只覆盖分页序列扩容，未覆盖临时激活和 Invocation 工作区，因此 r4 将物理池余量从每序列预留策略中移出。统一的 DemandDrivenElastic 维护对重新验证后的自动增长尝试共享几何余量，适用于分页和连续存储；显式 grow_pool 和最低可运行容量仍按请求大小。全部池的预算预留与驻留上限检查先于任何原生分配；可选余量不被预算接受时先回滚，再重新验证精确需求。只有原生分配前的容量拒绝允许此重试，后端分配错误继续保留原有错误路径。Sequence/Request/Step/Invocation 的逻辑领取量、请求容量、模型计算和调度配置不变。余量可能增加驻留显存，必须继续检验受限预算下的正常维护和回收，以及完整历史的延迟与吞吐。
+
+候选源码基于 7bbea0287 加 C1 修复及此次池维护改动，逐版源码和构建记录冻结在库外。r4 首次新增测试因夹具使用了非十六进制指纹及不支持的 lifetime，在进入生产行为前失败；r4b 仅修正夹具后，两项连续池余量用例和 9 项分页增长用例通过。受影响 runtime crate 为 973 通过、5 失败、5 忽略，未跳过失败继续构建。
+
+其中 3 项回收用例暴露了实际设计问题：容量回收后的重试又加上几何余量，会重新填满刚释放的空间。r4c 将前台和 checkpoint 回收后的重试都保持为精确需求，继续重新验证打包和预算；这 3 项原测试的期望保持不变。另两项逻辑容量测试不应要求物理增长恰好一页，改为验证足够的增长、预算增量、checkpoint 保留和逻辑租约不变。candidate-r4c.source.json / changes.tar.gz 已冻结（归档 SHA-256 8caa64f9733a5702414351a2b699cef4a6eed25cfa60a93be9e6176bf08547da）。两项连续池、9 项分页增长检查通过；runtime 单元测试 978 通过、0 失败、5 忽略，CUDA CLI 构建通过，二进制 SHA-256 120fcfe21136aff7b34c5766e8edec4bd9827d8f73dfa23e75d338ef6f561d54。格式和 diff 检查通过；新版 Metal 编译和整仓检查尚未执行。
+
+run/serve 的 11 项 Rust 产品检查全部通过。随后直接冻结 unified-pool-paired-r1 的三组全历史 C1→C8→C16 配对，不增加孤立 pilot。两侧均保留 C1 修复、默认 prefill 配置及原固定容量，候选只改变物理池维护；顺序 candidate→control、control→candidate、candidate→control，每格 64 计时样本、10 预热。保持原 SLO 和失败即停规则，逐格及跨并发核对样本和 usage，保留所有请求/协议质量计数。
+
+**该轮仍未获得资格：第二组候选 C16 TTFT P99 为 824.34ms，停止于 4/6 个 arm。** 实际 768/768 计时请求完成，零请求/协议错误；每格 12138 output usage tokens，选样及输入/输出长度数组跨全部已执行格一致。以下 TPOT 为最后可见文本口径，ITL 为可见 SSE 文本事件口径；每行 n=64。
+
+| 配对 / 实现 | 并发 | TTFT P50 / P99 ms | TPOT P50 / P99 ms | 可见 SSE ITL P50 / P99 ms | 输出 tokens/s | SLO |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 / candidate | 1 | 45.53 / 100.59 | 4.33 / 4.83 | 4.21 / 4.81 | 216.00 | pass |
+| 1 / candidate | 8 | 52.97 / 187.40 | 7.65 / 8.92 | 5.55 / 67.57 | 968.07 | pass |
+| 1 / candidate | 16 | 75.08 / 271.43 | 11.10 / 13.76 | 6.65 / 78.84 | 1324.33 | pass |
+| 1 / control | 1 | 45.43 / 101.34 | 4.33 / 4.74 | 4.21 / 16.53 | 216.79 | pass |
+| 1 / control | 8 | 63.45 / 285.32 | 7.82 / 12.57 | 5.55 / 70.17 | 889.32 | pass |
+| 1 / control | 16 | 77.06 / 788.24 | 11.71 / 21.29 | 6.70 / 82.19 | 1120.54 | fail |
+| 2 / control | 1 | 45.80 / 101.01 | 4.38 / 4.86 | 4.23 / 6.27 | 214.47 | pass |
+| 2 / control | 8 | 52.58 / 405.67 | 8.06 / 13.11 | 5.54 / 53.25 | 854.56 | pass |
+| 2 / control | 16 | 75.17 / 417.49 | 10.36 / 17.90 | 6.68 / 76.51 | 1218.30 | pass |
+| 2 / candidate | 1 | 46.10 / 103.89 | 4.35 / 4.76 | 4.23 / 5.92 | 214.60 | pass |
+| 2 / candidate | 8 | 70.39 / 176.26 | 7.94 / 8.96 | 5.59 / 60.53 | 939.48 | pass |
+| 2 / candidate | 16 | 76.09 / 824.34 | 11.07 / 13.45 | 6.71 / 76.90 | 1266.47 | fail |
+
+两组 C8 吞吐分别提高 8.86% / 9.94%，但第二组 TTFT 中位数变差，不能声称首字全面改善。C16 吞吐分别提高 18.19% / 3.95%，仍不能抵消第二组尾延迟失败。C1 吞吐变化 −0.37% / +0.06%。第 3 组未执行，不报告完整三组资格或统计置信结论。
+
+| 配对 / 实现 | 设备采样峰值 GiB | RSS 采样峰值 / 生命周期 HWM GiB | GPU 样本 / 错误 / 最大间隔 ms | Host 样本 / 错误 |
+| --- | --- | --- | --- | --- |
+| 1 / candidate | 6.054 | 1.227 / 3.583 | 286 / 9 / 2204 | 375 / 0 |
+| 1 / control | 5.991 | 1.226 / 3.582 | 286 / 8 / 2005 | 387 / 0 |
+| 2 / control | 6.304 | 1.255 / 3.589 | 284 / 9 / 2204 | 387 / 0 |
+| 2 / candidate | 6.054 | 1.225 / 3.585 | 275 / 9 / 2201 | 375 / 0 |
+
+WSL 仍无目标进程显存归属，设备采样有缺失，峰值只是观测下界；RSS HWM 包含启动。严格单 token ITL 资格不足不抹去可见 SSE 间隔；逐请求事件数与 usage token 数的差异保留在原始 text_timing 中。
+
+失败候选已有的计数显示 prefill resource_prepare_attempt 最大 588.88ms。后续 unified-pool-alloc-http-r1 / r2 只开 Basic 计数器、原生分配目标和现成 tower_http::trace 请求开始日志，不写逐算子事件；每轮 222 个 HTTP 请求与每格 10 次预热 / 64 次计时完整对应，日志各约 180KB。两轮诊断 C16 分别为 1352.10 / 1359.44 tokens/s、TTFT P99 264.84 / 293.26ms，不能代替无跟踪失败。对齐显示约 199 / 510ms 的激活分配发生在 C16 预热；计时阶段均仅剩第一批请求中的一次约 128MiB 分页状态分配，分别耗时 0.85 / 9.36ms。第二轮 C1 计时阶段还出现一次约 84MiB / 155.57ms 激活分配。它们证明仍存在运行期冷扩容，尚未证明失败轮次的 588.88ms 就来自某一次具体调用，不把预热停顿计入正式 TTFT。
+
+第二轮客户端、服务停止及资源监控均正常结束；整理工具读取资源摘要时碰到文件尚未写完，报 JSONDecodeError。随后只读取同一次已完成的原始记录补齐摘要，没有重新运行或修改计时。该恢复说明保存在 orchestration-result.json。
+
+停止继续碰运气重跑。下一步复用 MemoryPlan::startup_workload_peak_bytes 和现有维护事务，为声明的服务容量准备物理 backing：逻辑上限、实际领取量、设备预算和可回收下限必须分开；可选准备不能变成新的不可回收最低驻留量，也不能因预算不足拒绝原本可按需运行的服务。准备量须来自编译后的容量公式及公开配置，不能写死 C16、128MiB 或测试样本。必须同时披露就绪时间和驻留显存代价，重新做 run/serve 及同配置配对验证。r4c 诊断结束时该设计尚未实现，后续进展见下节。
+
+本轮源码、测试、产品检查日志、四个配对 arm 和两个轻量诊断的 192 份小文件已归档为库外 unified-pool-r4c.evidence-r1.tar.gz（3998699 bytes，SHA-256 53664f92e1aa310b8074023f6b29fa7c0cc15f38dd78f273c5965b4eef225969），已回传本机并逐文件校验。产品 verifier 的完整 report.json 约 53MB，保留远端，哈希记入同包 manifest；没有复制模型或二进制进仓库。工作树源码与实际测试的 r4c 冻结清单再次逐文件核对一致，候选仍未提交为已验收的性能修复。
+
+### 启动容量准备 r5b：限定负载三轮资格通过，默认行为未改
+
+新增公开选项 `--runtime-pool-preparation on-demand|within-budget`，`run` / `serve` 共用；配置文件对应 `[runtime] runtime_pool_preparation = "within-budget"`。默认仍为 `on-demand`，不通过隐藏环境变量启用。编译后的 MemoryPlan 给出每个物理池的目标，现有维护事务只补足当前驻留量与目标之间的差额，不修改请求逻辑上限、领取量或可回收下限。
+
+可选准备在原执行器的 startup 生命周期内、Ready 之前执行。总目标超过预算，或完整批次在原生分配前遇到类型化容量拒绝时，继续原有按需分配；不为准备目标驱逐现有 owner。原生分配或发布错误进入原有启动失败与资源清理流程，不伪造准备成功。
+
+r5 初轮夹具把同时违反总预算和池上限的请求误写为只应返回池上限错误；实际优先返回类型化总预算不足且无原生分配，生产逻辑未改。修正夹具以充足总预算单独验证池上限，冻结 r5a 的 28 份 Rust 源文件，库外 archive SHA-256 `9c7eb60d8eb57fcae6b4b469298ab1fcd87e84a5854f2777ef6b0cca589c6ea3`。
+
+r5a 已通过 2 项绝对目标/批次拒绝/失败回滚测试、5 项启动容量公式测试、1 项准备空间回收测试和 2 项类型化配置测试。首次 CLI 检查命令遗漏启用 native-op-artifact 的产品特性，构建脚本在测试前拒绝；改用产品特性后，编译发现共享启动异步块需要显式 `Result` 类型。r5b 仅补这一类型标注，增量源码 archive SHA-256 `ad24e9a5fb217e0927f744234c412a0af816bdfda2a3e7c01d04eaa2fcf920ab`，完整清单仍验证 28 份 Rust 文件。两次失败日志均保留。
+
+r5b CUDA 产品构建通过，二进制 SHA-256 `668035c8c2e28b7b85cfd4aec6c5614b178a84a7dae7492887d17e34515ab964`。CLI 首次选中 bin 目标，实际运行 0 项测试，只计编译；随后正确选择 lib，4 项选项解析/配置优先级/来源测试通过。Rust model_regression 新增的参数传递与生效核验测试 1 项通过。连同源码未变的 10 项 Core/types 检查，共 15 项受影响检查；格式检查通过，未执行新全仓或 Metal 检查，不宣称 PR 已完成全部验证。
+
+prepared-pool-product-r1 的 11 项真实 CUDA 功能验证全部通过，包括 run/serve、历史/重置、C2 隔离、长上下文检索和关闭；验证器 SHA-256 `fb5e293604f44d49f38902d37573e72ca76faba5dd29699f555cd8cb198c675c`。四个产品进程均记录实际 `prepared`，serve 的计划总占用 7326820016 bytes（约 6.82GiB），低于 10066329600 bytes 预算。实际 GPU 物理峰值仍须另测，不能用计划字节代替。
+
+prepared-pool-paired-r1 在发出请求之前，因采集工具过早核验 systemd MainPID 对应的可执行文件而停止，0 个计时请求，不属于推理或 SLO 失败。保留原记录；工具改为有界等待该 PID 实际执行冻结二进制后再启动内存监控，产品代码未改。
+
+prepared-pool-paired-r2 已冻结合同并开始配对比较同一个 r5b 二进制的 `within-budget` 与 `on-demand`，只改变公开准备策略，维持原有 32 序列、2048 context/batch、10066329600 bytes 预算、ShareGPT 样本和三项 SLO。除推理吞吐/延迟外记录 HTTP health 暴露执行器 startup Ready 的时间及从启动开始的内存观测；功能验证通过后才启动性能验收，部分重复或旧诊断通过都不算新候选完成。
+
+六个 arm 全部完成：1152/1152 次计时请求成功、180 次非计时预热，样本身份、实际输入 usage 和输出长度数组跨实现及并发格一致，每格 n=64、输出 12138 usage tokens。candidate 的九个单元均满足 TTFT/TPOT/可见 SSE ITL 的 P99 SLO；control 的三次 C16 均为 TTFT 超限，客户端退出 1 属于 SLO 失败，非请求错误。三次配对不报告统计置信区间，也不据此承诺任意负载或 Windows 4070 Ti 的时延。
+
+| 配对 | 策略 | C | TTFT P50 / P99 ms | TPOT P50 / P99 ms | 可见 SSE ITL P50 / P99 ms | tokens/s | SLO |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | candidate | 1 | 47.91 / 100.52 | 4.33 / 4.76 | 4.21 / 5.51 | 215.81 | pass |
+| 1 | candidate | 8 | 51.02 / 171.16 | 7.69 / 8.70 | 5.53 / 50.32 | 966.46 | pass |
+| 1 | candidate | 16 | 64.10 / 296.63 | 10.67 / 13.25 | 6.71 / 76.55 | 1347.38 | pass |
+| 1 | control | 1 | 46.96 / 100.66 | 4.35 / 4.80 | 4.22 / 4.89 | 214.79 | pass |
+| 1 | control | 8 | 48.74 / 194.71 | 7.56 / 9.01 | 5.57 / 48.43 | 972.65 | pass |
+| 1 | control | 16 | 76.09 / 1329.48 | 10.63 / 12.55 | 6.69 / 78.13 | 1207.07 | fail |
+| 2 | control | 1 | 46.48 / 109.85 | 4.36 / 4.76 | 4.23 / 4.93 | 215.07 | pass |
+| 2 | control | 8 | 51.84 / 172.83 | 7.65 / 8.56 | 5.54 / 50.58 | 979.33 | pass |
+| 2 | control | 16 | 52.58 / 610.20 | 11.29 / 13.12 | 6.72 / 71.98 | 1243.46 | fail |
+| 2 | candidate | 1 | 48.24 / 100.55 | 4.35 / 4.79 | 4.21 / 5.08 | 215.55 | pass |
+| 2 | candidate | 8 | 48.30 / 205.48 | 7.63 / 8.91 | 5.53 / 49.77 | 969.10 | pass |
+| 2 | candidate | 16 | 76.74 / 244.50 | 10.87 / 13.06 | 6.75 / 80.93 | 1334.89 | pass |
+| 3 | candidate | 1 | 45.44 / 100.77 | 4.36 / 4.78 | 4.21 / 5.92 | 215.97 | pass |
+| 3 | candidate | 8 | 51.23 / 172.75 | 7.73 / 8.65 | 5.55 / 52.18 | 959.18 | pass |
+| 3 | candidate | 16 | 77.73 / 272.68 | 10.69 / 13.34 | 6.66 / 78.82 | 1339.54 | pass |
+| 3 | control | 1 | 46.60 / 100.56 | 4.35 / 4.87 | 4.22 / 4.84 | 214.48 | pass |
+| 3 | control | 8 | 58.79 / 177.23 | 7.63 / 9.27 | 5.55 / 61.25 | 958.01 | pass |
+| 3 | control | 16 | 78.65 / 2016.85 | 11.55 / 20.94 | 6.68 / 76.78 | 1121.49 | fail |
+
+C16 吞吐配对变化 +11.62%、+7.35%、+19.44%；C1 为 +0.48%、+0.22%、+0.70%，C8 为 −0.64%、−1.04%、+0.12%。收益集中在 C16 长尾及其吞吐，不能概括为全部 TTFT 改善：第二组 C16 中位数反而从 52.58 增至 76.74ms。C8 中位数和尾延迟也有双向波动，外部短提示词的中位数差距尚未关闭。
+
+| 配对 / 策略 | health Ready 秒 | 设备总显存峰值 GiB | RSS 峰值 / HWM GiB | GPU 样本 / 错误 / 最大间隔 ms | Host 样本 / 错误 |
+| --- | --- | --- | --- | --- | --- |
+| 1 / candidate | 13.526 | 7.647 | 3.584 / 3.599 | 310 / 10 / 2190 | 429 / 0 |
+| 1 / control | 15.157 | 6.054 | 3.592 / 3.594 | 311 / 11 / 2177 | 436 / 0 |
+| 2 / control | 14.766 | 6.054 | 3.579 / 3.593 | 306 / 10 / 2005 | 434 / 0 |
+| 2 / candidate | 13.179 | 7.647 | 3.586 / 3.606 | 293 / 12 / 2166 | 428 / 0 |
+| 3 / candidate | 14.354 | 7.647 | 3.578 / 3.583 | 288 / 14 / 2204 | 432 / 0 |
+| 3 / control | 14.911 | 6.054 | 3.578 / 3.593 | 308 / 12 / 2227 | 447 / 0 |
+
+显存观测增加约 1.59GiB。监控含启动，WSL 无目标进程显存归属且 GPU 有漏采，峰值为设备总量的观测下界。health 每 2 秒轮询，表中为观测到 Ready 的时间，不据此宣称精确的启动提速。candidate 三轮运行前后的九个池驻留量均相同，总预算领取量保持 7326820016 bytes；control 从 4989733328 增至 5608769360 bytes。这是首尾状态证据，不冒充逐次分配跟踪。每格有 2–5 个请求的可见事件数与 usage 不同，严格单 token ITL 仍不可用；没有缺失成功请求的 SSE 证据或被丢弃的可见文本停顿，客户端未标记传输合并。
+
+另以 prepared-pool-fallback-r1 把预算降至 6442450944 bytes（6GiB），低于完整准备目标，保持上下文和并发上限。四个进程均记录超预算后 `on_demand` 回退，run/serve 的 11 项功能验证仍全部成功。容量准备不足未导致拒绝启动；不吞掉真正原生执行错误。候选稳定后只补跑受影响 runtime crate：980 passed、0 failed、5 ignored，执行 0.21 秒；未跑全仓检查。
+
+源码、失败及通过的检查日志、两次功能验证的小文件和完整配对证据已在 5090 归档为 `prepared-pool-r5b.evidence-r1.tar.gz`，5147688 bytes，SHA-256 `f966cfa79c53fa94df08fb2245b8cf2425b29999d8cc9d096b9cf86d5c04ca58`，含 manifest 共 290 项。归档已回传本机，289 份内容逐文件哈希及当前 28 份源码均已核对。两个约 53MB 的产品完整 report.json 保留远端并在 manifest 记录哈希；模型、二进制和原始结果不进仓库。测量服务已停止，GPU 回到约 84MiB 空闲占用。
 
 ### 仍需完成
 
-1. 解决上述 C16 TTFT 长尾及候选资格失败，再冻结新合同验证；C1 回退改善不等同于关闭外部短提示词 C1 差距。
+1. 完成新样本、足量重复的同机 llama.cpp 主对照和外部短提示词差距分解。r5b 仅在显式准备选项及当前 ShareGPT 负载通过资格；默认仍为 on-demand，是否推广为默认策略、最终集成和发布验证未完成。C1 回退改善不等同于关闭外部短提示词 C1 差距。
 2. C8/C16 的外部短提示词 TTFT 分解。5090 跨批次文字差异和状态隔离已做局部实测，仍不承诺跨批次字节一致或代替外部原始请求复测。
 3. Windows 4070 Ti 实机复测和原始请求数据。5090 WSL2 诊断不能代替这一步。
 4. Windows 正式签名身份和验签闭环。仓库级 secrets 未发现签名凭据，仓库 variables 和 environments 列表为空；现有流程仅验第三方安装器签名。尚未配置或使用任何正式 Ferrum 签名身份。
@@ -169,9 +299,9 @@ Thank you for the report and the complete appendix. The reported completion tota
 
 1. **The SM89 median:** the difference does not yet establish a GPU-architecture cause. Your test compares two releases on short prompts, while our main 5090 table compared numerical profiles in one binary on ShareGPT. The warm-up and percentile aggregation also differ. Our separate short-prompt 5090 diagnostic did show a C16 median improvement, from 112.37 to 86.77 ms. Prefill taking a larger share on the 4070 Ti is a plausible hypothesis, but we have not measured that decomposition on your card.
 
-2. **The remaining first-token gap:** yes, it is on the optimization list. We are separating queueing, prefill, first-token sampling and delivery costs. We are not treating the 25–31% median gap as an unavoidable price for throughput. Candidates must retain the workload's latency limits and report throughput, tail latency and errors together.
+2. **The remaining first-token gap:** yes, it is on the optimization list. A 5090 candidate that prepares physical pools before readiness has now completed three paired ShareGPT sweeps: all 1,152 timed requests completed, and its C16 TTFT P99 was 245–297 ms versus 610–2,017 ms with on-demand allocation in the same binary. The tradeoff was about 1.6 GiB more observed device memory; C8 throughput moved between −1.0% and +0.1%, and median TTFT did not improve consistently. This is an explicit option in an unpublished candidate, not a reproduction or resolution of your Windows short-prompt median gap. We are not treating that 25–31% gap as unavoidable.
 
-3. **Single-request throughput:** yes. Your C1 first-token result is already close to llama.cpp, so the remaining throughput gap calls for decode investigation. Our 5090 diagnostics have identified a separate context-boundary replay issue and a candidate is being validated. This is not yet a fix or reproduction of your short-prompt 4070 Ti result; we will keep those claims separate.
+3. **Single-request throughput:** yes. Your C1 first-token result is already close to llama.cpp, so the remaining throughput gap calls for decode investigation. Our 5090 diagnostics identified and corrected a separate context-boundary replay issue; the latest ShareGPT candidate sustained about 216 output tokens/s at C1. We still need the full matched llama.cpp comparison for these samples, and this does not establish a fix for your short-prompt 4070 Ti result.
 
 4. **Signing:** we plan to sign Ferrum's Windows executable and installer, including the launcher and uninstaller chain. v0.19.1 remains unsigned. We have identified the build and verification steps that need to change, but a production signing identity is not configured, so we cannot promise a signed release date yet.
 

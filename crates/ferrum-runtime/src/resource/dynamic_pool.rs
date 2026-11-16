@@ -1573,6 +1573,11 @@ impl DynamicBackingDeferred {
 pub(super) enum DynamicPoolGrowthIntent {
     Additional(DynamicPoolGrowthRequest),
     Minimum(DynamicBackingPoolId),
+    /// A physical preparation target, independent of the pool's reclaim floor.
+    ResidentTarget {
+        pool_id: DynamicBackingPoolId,
+        target_bytes: u64,
+    },
     RevalidatedDeferral(DynamicBackingBlocker),
     /// Logical admission has not acquired this demand. Recheck both ledgers
     /// under the pool maintenance authority before deciding any growth.
@@ -1587,6 +1592,7 @@ impl DynamicPoolGrowthIntent {
         match self {
             Self::Additional(request) => request.pool_id(),
             Self::Minimum(pool_id) => pool_id,
+            Self::ResidentTarget { pool_id, .. } => pool_id,
             Self::RevalidatedDeferral(blocker) => blocker.pool_id(),
             Self::RevalidatedAdmissionPressure { pool_id, .. } => pool_id,
         }
