@@ -1,30 +1,18 @@
 name: CI runner network recovery
-run-name: Restore WSL GitHub checkout connectivity
+run-name: Read Windows workspace failure diagnostics
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  recover-wsl-network:
-    runs-on: [self-hosted, Linux, X64, ferrum-cuda, cuda-sm89]
+  inspect-windows:
+    runs-on: [self-hosted, Windows, X64, ferrum-windows-native]
     timeout-minutes: 3
-    concurrency:
-      group: ferrum-panda-hardware
-      cancel-in-progress: false
-      queue: max
     defaults:
       run:
-        shell: bash
-        working-directory: /home/ferrum
+        shell: cmd
+        working-directory: C:\FerrumActions\runner
     steps:
-      - name: Verify direct GitHub transport and restore the Git route
+      - name: Read bounded compiler errors from local runner logs
         run: |
-          set -euo pipefail
-          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
-          export NO_PROXY='*'
-          result=$(timeout 30s git -c http.proxy= -c http.https://github.com/.proxy= -c http.lowSpeedTime=10 -c http.lowSpeedLimit=1 ls-remote https://github.com/sizzlecar/ferrum-infer-rs.git refs/heads/main 2>&1) || { printf '::error::Direct GitHub transport failed: %s\n' "$result"; exit 1; }
-          printf '::notice title=Direct WSL Git::%s\n' "$result"
-          config=/home/ferrum/.gitconfig
-          if [ -f "$config" ]; then cp "$config" "$config.before-release-route-$(date -u +%Y%m%dT%H%M%SZ)"; fi
-          git config --global --replace-all http.https://github.com/.proxy ''
-          printf '::notice::Restored the verified direct GitHub route; original Git configuration backed up\n'
+          "C:\FerrumActions\runner\externals\node24\bin\node.exe" -e "eval(Buffer.from('CmNvbnN0IGZzPXJlcXVpcmUoJ2ZzJykscGF0aD1yZXF1aXJlKCdwYXRoJyk7CmZ1bmN0aW9uIG5vdGUodCx2KXtjb25zb2xlLmxvZygnOjpub3RpY2UgdGl0bGU9Jyt0Kyc6OicrU3RyaW5nKHYpLnJlcGxhY2UoLyUvZywnJTI1JykucmVwbGFjZSgvXHIvZywnJTBEJykucmVwbGFjZSgvXG4vZywnJTBBJykpO30KY29uc3Qgcm9vdD0nQzpcXEZlcnJ1bUFjdGlvbnNcXHJ1bm5lclxcX2RpYWcnOwpjb25zdCBjdXRvZmY9RGF0ZS5ub3coKS0zMCo2MCoxMDAwO2xldCBmaWxlcz1bXTsKZnVuY3Rpb24gd2FsayhkLGRlcHRoKXtmb3IoY29uc3QgZSBvZiBmcy5yZWFkZGlyU3luYyhkLHt3aXRoRmlsZVR5cGVzOnRydWV9KSl7Y29uc3QgcD1wYXRoLmpvaW4oZCxlLm5hbWUpO2lmKGUuaXNEaXJlY3RvcnkoKSl7aWYoZGVwdGg+MCl3YWxrKHAsZGVwdGgtMSk7fWVsc2V7Y29uc3Qgcz1mcy5zdGF0U3luYyhwKTtpZihzLm10aW1lTXM+PWN1dG9mZiYmcy5zaXplPDIwKjEwMjQqMTAyNClmaWxlcy5wdXNoKHtwLG10aW1lOnMubXRpbWVNcyxzaXplOnMuc2l6ZX0pO319fQp3YWxrKHJvb3QsMik7ZmlsZXMuc29ydCgoYSxiKT0+Yi5tdGltZS1hLm10aW1lKTsKbm90ZSgnUmVjZW50IGRpYWdub3N0aWMgZmlsZXMnLEpTT04uc3RyaW5naWZ5KGZpbGVzLnNsaWNlKDAsMjIpLm1hcChmPT4oe2ZpbGU6Zi5wLHNpemU6Zi5zaXplfSkpKSk7CmZvcihjb25zdCBmIG9mIGZpbGVzLnNsaWNlKDAsMzApKXtjb25zdCBsaW5lcz1mcy5yZWFkRmlsZVN5bmMoZi5wLCd1dGY4JykucmVwbGFjZSgvXHgxYlxbWzAtOTtdKm0vZywnJykuc3BsaXQoJ1xuJykuZmlsdGVyKGw9Pi9lcnJvcihcW1tBLVpdXGQrXF0pPzp8ZXJyb3I6fGZhdGFsIGVycm9yfFByb2Nlc3MgY29tcGxldGVkIHdpdGggZXhpdCBjb2RlfEVSUi4qKEh0dHB8dXBsb2FkfFVwbG9hZHxQcm94eXxwcm94eSkvLnRlc3QobCkpO2lmKGxpbmVzLmxlbmd0aClub3RlKCdGYWlsdXJlICcrcGF0aC5iYXNlbmFtZShmLnApLGxpbmVzLnNsaWNlKC0xNSkubWFwKGw9PmwucmVwbGFjZSgvaHR0cHM/OlwvXC9cUysvZywnW1VSTF0nKS5zbGljZSgwLDMwMCkpLmpvaW4oJ1xuJykpO30K','base64').toString())"
