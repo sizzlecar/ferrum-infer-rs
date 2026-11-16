@@ -5,6 +5,7 @@ mod config;
 #[cfg(all(feature = "cuda-cutlass-nvfp4", feature = "cuda-sage-vsa-fp4"))]
 #[path = "execute_fast_h3_dit/execution.rs"]
 mod execution;
+#[cfg(all(feature = "cuda-cutlass-nvfp4", feature = "cuda-sage-vsa-fp4"))]
 #[path = "execute_fast_h3_dit/limits.rs"]
 mod limits;
 #[path = "support/fast_h3_package.rs"]

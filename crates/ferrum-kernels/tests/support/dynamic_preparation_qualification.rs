@@ -1,4 +1,4 @@
-use super::fixture::{self, *};
+use super::fixture::*;
 use ferrum_execution::{
     component::{ComponentInitializationConfig, ComponentWeightSource, TensorComponentSession},
     TensorDynamicPreparationOutcome, TensorExecutorConfig, TensorSerialActor,

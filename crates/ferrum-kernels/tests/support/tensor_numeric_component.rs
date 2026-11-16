@@ -702,6 +702,7 @@ impl ModelFamilyProvider for Family {
     }
 }
 
+#[allow(dead_code)] // Shared fixture; each integration test exercises a subset.
 pub fn host() -> HostMemoryAccount {
     HostMemoryAccount::new(
         HostMemoryLimits::new(

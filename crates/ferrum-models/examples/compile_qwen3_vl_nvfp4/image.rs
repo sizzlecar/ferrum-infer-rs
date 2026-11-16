@@ -1,14 +1,22 @@
+#[cfg(feature = "cuda-cutlass-nvfp4")]
 use super::{bounded_read, Config};
-use anyhow::{ensure, Context, Result};
+#[cfg(feature = "cuda-cutlass-nvfp4")]
+use anyhow::Context;
+use anyhow::{ensure, Result};
+#[cfg(feature = "cuda-cutlass-nvfp4")]
 use ferrum_models::{
     fast_h3::{FastH3ImagePresentation, FastH3PresentationLimits, FastH3VisionFeatureView},
     qwen3_vl_text::Qwen3VLTextNvfp4Checkpoint,
     qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionGrid},
 };
+#[cfg(feature = "cuda-cutlass-nvfp4")]
 use ferrum_runtime::*;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "cuda-cutlass-nvfp4")]
 use sha2::{Digest, Sha256};
-use std::{io::Read, path::PathBuf};
+#[cfg(feature = "cuda-cutlass-nvfp4")]
+use std::io::Read;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +53,7 @@ impl ImageForward {
     }
 }
 #[derive(Clone, Debug, Deserialize)]
+#[cfg(feature = "cuda-cutlass-nvfp4")]
 struct Feature {
     value_id: String,
     file: PathBuf,
@@ -53,16 +62,19 @@ struct Feature {
     sha256: String,
 }
 #[derive(Clone, Debug, Deserialize)]
+#[cfg(feature = "cuda-cutlass-nvfp4")]
 struct Manifest {
     schema: String,
     grid: [u64; 3],
     merge_size: u64,
     outputs: [Feature; 4],
 }
+#[cfg(feature = "cuda-cutlass-nvfp4")]
 pub struct Prepared {
     pub presentation: FastH3ImagePresentation,
     manifest: Manifest,
 }
+#[cfg(feature = "cuda-cutlass-nvfp4")]
 pub fn prepare(c: &Config, metadata: &[u8]) -> Result<Option<Prepared>> {
     let Some(request) = &c.image_forward else {
         return Ok(None);
@@ -120,6 +132,7 @@ pub fn prepare(c: &Config, metadata: &[u8]) -> Result<Option<Prepared>> {
         manifest,
     }))
 }
+#[cfg(feature = "cuda-cutlass-nvfp4")]
 impl Prepared {
     pub fn inputs(
         &self,
@@ -188,6 +201,7 @@ fn hash(hash: &str) -> Result<()> {
     );
     Ok(())
 }
+#[cfg(feature = "cuda-cutlass-nvfp4")]
 fn checked(source: &SourceFile, limit: usize) -> Result<Vec<u8>> {
     let bytes = bounded_read(&source.path, limit)
         .with_context(|| format!("source {}", source.path.display()))?;

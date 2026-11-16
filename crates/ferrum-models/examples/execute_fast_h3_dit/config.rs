@@ -47,6 +47,7 @@ pub enum Workload {
     },
 }
 impl Workload {
+    #[cfg(all(feature = "cuda-cutlass-nvfp4", feature = "cuda-sage-vsa-fp4"))]
     pub fn rotary(&self) -> Rotary {
         match self {
             Self::Backbone { rotary, .. }

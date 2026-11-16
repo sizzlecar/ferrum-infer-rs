@@ -3,6 +3,7 @@
 //! Outputs are neutral safetensors plus provenance, not a video or a speed claim.
 #[path = "precompute_fast_h3_time/arguments.rs"]
 mod arguments;
+#[cfg(feature = "cuda")]
 #[path = "precompute_fast_h3_time/artifacts.rs"]
 mod artifacts;
 #[cfg(feature = "cuda")]

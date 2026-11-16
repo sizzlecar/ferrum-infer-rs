@@ -8,7 +8,7 @@ use retained_failure::Failure;
 
 #[path = "verify_fast_h3_ffn/arguments.rs"]
 mod arguments;
-#[cfg(any(feature = "test-support", test))]
+#[cfg(any(test, all(feature = "test-support", feature = "cuda-cutlass-nvfp4")))]
 #[path = "verify_fast_h3_ffn/dyadic.rs"]
 mod dyadic;
 #[cfg(feature = "cuda-cutlass-nvfp4")]

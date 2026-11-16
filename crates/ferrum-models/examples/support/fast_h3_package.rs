@@ -28,6 +28,7 @@ pub fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
 }
 
 /// Bound headers, shard names and aggregate payload before mapping archives.
+#[allow(dead_code)] // Configuration-only builds use bounded_read without loading weights.
 pub fn load(
     model_dir: &Path,
     profile: FastH3Nvfp4Profile,

@@ -129,6 +129,7 @@ pub fn mathematical_error(actual: &[u16], expected: &[u16]) -> u16 {
     assert!(maximum<=MATHEMATICAL_MAX_BF16_ULP,"F64 mathematical oracle exceeded predeclared {MATHEMATICAL_MAX_BF16_ULP} BF16 ULP budget: {maximum}");
     maximum
 }
+#[allow(dead_code)] // GPU fixtures serialize values; pure oracle tests use bits directly.
 pub fn bytes(values: &[u16]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }

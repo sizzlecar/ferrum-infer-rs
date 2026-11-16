@@ -2,8 +2,9 @@
 //! and save its pre-final-norm BF16 features through the same managed session.
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "cuda-cutlass-nvfp4")]
+use std::collections::BTreeSet;
 use std::{
-    collections::BTreeSet,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -140,7 +141,7 @@ fn bounded_read(path: &Path, limit: usize) -> Result<Vec<u8>> {
     );
     Ok(out)
 }
-#[cfg(any(feature = "cuda-cutlass-nvfp4", test))]
+#[cfg(feature = "cuda-cutlass-nvfp4")]
 fn load(
     c: &Config,
 ) -> Result<(
