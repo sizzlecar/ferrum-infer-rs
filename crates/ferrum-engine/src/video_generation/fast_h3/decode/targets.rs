@@ -1,5 +1,7 @@
 use anyhow::{ensure, Context, Result};
-use ferrum_models::fast_h3::{FastH3DenoisingFamily, FastH3DenoisingRequest, FastH3PackedLayout};
+use ferrum_models::fast_h3::FastH3DenoisingFamily;
+#[cfg(feature = "cuda-fast-h3")]
+use ferrum_models::fast_h3::{FastH3DenoisingRequest, FastH3PackedLayout};
 use ferrum_runtime::*;
 use std::ops::Range;
 
@@ -9,6 +11,7 @@ pub(crate) const AUDIO_TARGET_ID: &str = "value.fast_h3.decode.target.audio";
 /// Only a completed request may cross the solver/decoder boundary. This makes
 /// new InputPreprocess copies; neither frozen references nor Output aliases
 /// are supplied to the decoder.
+#[cfg(feature = "cuda-fast-h3")]
 pub(crate) fn managed_decoder_targets(
     request: &FastH3DenoisingRequest,
     layout: &FastH3PackedLayout,

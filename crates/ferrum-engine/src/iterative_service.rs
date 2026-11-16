@@ -580,6 +580,7 @@ impl<R: ServiceRequest, O: Send + 'static> ServiceCore<R, O> {
     ) -> Result<Self, ServiceError> {
         Self::start_with_host(worker, config, None)
     }
+    #[cfg(any(test, feature = "cuda-fast-h3"))]
     pub(crate) fn start_with_host(
         worker: Box<dyn BatchWorker<Request = R, Output = O>>,
         config: impl Into<ServiceConfig>,

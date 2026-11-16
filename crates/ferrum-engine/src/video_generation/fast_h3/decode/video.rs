@@ -169,6 +169,7 @@ impl<R: DeviceRuntime> FastH3VideoDecodePlan<R> {
     }
     /// Full target repacking coexists with one tile group and its two RoPE
     /// tables. The caller separately owns the original packed target copy.
+    #[cfg(feature = "cuda-fast-h3")]
     pub(crate) fn additional_input_host_bytes(
         &self,
         host: &HostMemoryAccount,

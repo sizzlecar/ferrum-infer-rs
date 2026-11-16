@@ -1,7 +1,7 @@
 use super::*;
 use crate::iterative_service::{
     observations::{LifecycleEvent, RequestOutcome},
-    BatchError, BatchPreparation, LifecycleObserver, LifecycleObserverHandle,
+    BatchError, BatchPreparation, BatchWorker, LifecycleObserver, LifecycleObserverHandle,
 };
 use crate::video_generation::{
     VideoFrameRate, VideoGenerationParameters, VideoReference, VideoReferenceLimits,

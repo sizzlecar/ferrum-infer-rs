@@ -2,14 +2,15 @@
 //! reserving request credit. Occupancy remains the scheduler's admission work.
 use crate::video_generation::fast_h3::conditioning::FastH3ConditioningReuse;
 use ferrum_models::spatial_tiles::{SpatialTileBatch, SpatialTileGroups};
-use ferrum_runtime::{
-    HostMemoryAccount, HostMemoryClass, HostMemoryError, HostMemoryScope, ModelProgram,
-};
+#[cfg(feature = "cuda-fast-h3")]
+use ferrum_runtime::ModelProgram;
+use ferrum_runtime::{HostMemoryAccount, HostMemoryClass, HostMemoryError, HostMemoryScope};
 
 type Claims = Vec<(HostMemoryClass, usize)>;
 
 /// Each external fixed tensor is a separate physical Host allocation. This is
 /// an upper bound for inputs that can instead borrow an existing immutable view.
+#[cfg(feature = "cuda-fast-h3")]
 pub(crate) fn input_backing_bytes(
     program: &ModelProgram,
     host: &HostMemoryAccount,

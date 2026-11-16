@@ -19,6 +19,7 @@ pub(crate) enum StaticNativeModule {
     CutlassNvfp4,
     CutlassFusedF32Attention,
     CutlassInt8FusedOutput,
+    #[cfg(feature = "cuda-nvfp4-diagnostics")]
     Nvfp4QualificationReference,
     SageVsaFp4,
 }
@@ -30,6 +31,7 @@ impl StaticNativeModule {
             Self::CutlassNvfp4 => 1,
             Self::CutlassFusedF32Attention => 2,
             Self::CutlassInt8FusedOutput => 3,
+            #[cfg(feature = "cuda-nvfp4-diagnostics")]
             Self::Nvfp4QualificationReference => 4,
             Self::SageVsaFp4 => 5,
         }
@@ -75,6 +77,7 @@ impl From<&'static str> for StaticNativeModuleCapacityError {
     }
 }
 impl StaticNativeModuleCapacity {
+    #[cfg(any(test, feature = "cuda-nvfp4-diagnostics"))]
     pub(crate) fn claim(
         &self,
         capacity: &DeviceCapacityOwner,

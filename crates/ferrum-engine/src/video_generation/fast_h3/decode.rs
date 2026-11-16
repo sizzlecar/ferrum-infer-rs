@@ -14,14 +14,18 @@ use ferrum_execution::{
 };
 use ferrum_runtime::*;
 
+#[cfg(any(test, feature = "cuda-fast-h3"))]
 mod admission;
 mod audio;
+#[cfg(any(test, feature = "cuda-fast-h3"))]
 mod targets;
 mod video;
+#[cfg(feature = "cuda-fast-h3")]
 pub(crate) use admission::{
     input_backing_bytes, release_conditioning_input_credit, select_host_tile_group,
 };
 pub use audio::{FastH3AudioDecodePlan, FastH3AudioDecodeSession};
+#[cfg(feature = "cuda-fast-h3")]
 pub(crate) use targets::managed_decoder_targets;
 pub use video::{
     FastH3DecodedVideo, FastH3VideoDecodeGeometry, FastH3VideoDecodePhase, FastH3VideoDecodePlan,

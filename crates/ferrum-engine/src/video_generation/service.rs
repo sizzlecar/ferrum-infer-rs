@@ -3,8 +3,8 @@ use super::{
     VideoOutputPlan, VideoRequestLimits,
 };
 use crate::iterative_service::{
-    self as core, BatchWorker, JobCancellationHandle, OutputLease, ServiceConfig, ServiceError,
-    ServiceSnapshot, WorkerFailure,
+    self as core, JobCancellationHandle, OutputLease, ServiceConfig, ServiceError, ServiceSnapshot,
+    WorkerFailure,
 };
 use ferrum_output::mp4::{Mp4CancellationHandle, Mp4EncodingPermit, Mp4Error, VideoAudioSpec};
 use ferrum_runtime::HostMemoryAccount;
@@ -17,7 +17,7 @@ use std::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-type Worker = dyn BatchWorker<Request = VideoGenerationRequest, Output = RawVideoOutput>;
+type Worker = dyn core::BatchWorker<Request = VideoGenerationRequest, Output = RawVideoOutput>;
 type Core = core::ServiceCore<VideoGenerationRequest, RawVideoOutput>;
 type CoreJob = core::Job<VideoGenerationRequest, RawVideoOutput>;
 
@@ -65,6 +65,7 @@ pub struct VideoService {
 }
 impl VideoService {
     /// Only an actual engine adapter supplies the existing worker protocol.
+    #[cfg(any(test, feature = "cuda-fast-h3"))]
     pub(crate) fn start_worker(
         worker: Box<Worker>,
         config: VideoServiceConfig,
@@ -136,6 +137,7 @@ impl VideoService {
     }
     /// A finite run seals and drains the same core, then waits for the same
     /// encoded result. Even rejected requests retire the supplied real worker.
+    #[cfg(any(test, feature = "cuda-fast-h3"))]
     pub(crate) async fn run_with_worker(
         worker: Box<Worker>,
         config: VideoServiceConfig,

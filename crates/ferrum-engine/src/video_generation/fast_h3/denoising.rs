@@ -154,6 +154,7 @@ impl<R: DeviceRuntime> DenoisingStage<R> {
     pub fn shared_weights_evidence(&self) -> Option<&SharedComponentWeightsEvidence> {
         self.weights.as_ref().map(SharedComponentWeights::evidence)
     }
+    #[cfg(feature = "cuda-fast-h3")]
     pub(super) fn resident_weights(&self) -> Option<&SharedComponentWeights<R>> {
         self.weights.as_ref().filter(|_| self.is_resident())
     }

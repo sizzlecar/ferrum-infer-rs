@@ -10,6 +10,7 @@ pub mod conditioning;
 pub mod cuda;
 pub mod decode;
 pub mod denoising;
+#[cfg(feature = "cuda-fast-h3")]
 mod worker;
 
 /// Supported product reference kinds and the released Ref2VA cardinalities.

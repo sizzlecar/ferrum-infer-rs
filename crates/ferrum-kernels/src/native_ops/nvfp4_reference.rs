@@ -2,11 +2,15 @@
 //! implementation or loads a library during manifest validation.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs::File, io::Read, path::PathBuf};
+use std::path::PathBuf;
+#[cfg(any(test, feature = "cuda-nvfp4-diagnostics"))]
+use std::{fs::File, io::Read};
 
 pub const NVFP4_REFERENCE_PROVIDER_ID: &str = "provider.cuda.diagnostic.flashinfer_nvfp4.bf16.v1";
 pub const NVFP4_REFERENCE_PROFILE: &str = "cuda_rcp_approx_ftz_v1";
+#[cfg(any(test, feature = "cuda-nvfp4-diagnostics"))]
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+#[cfg(any(test, feature = "cuda-nvfp4-diagnostics"))]
 const MAX_LIBRARY_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +52,7 @@ pub struct CudaNvfp4ReferenceConfig {
 }
 
 #[derive(Debug)]
+#[cfg(any(test, feature = "cuda-nvfp4-diagnostics"))]
 pub(crate) struct VerifiedNvfp4Reference {
     pub library: PathBuf,
     pub identity: String,
@@ -62,6 +67,7 @@ pub fn nvfp4_reference_wrapper_sha256() -> String {
     )
 }
 
+#[cfg(any(test, feature = "cuda-nvfp4-diagnostics"))]
 impl CudaNvfp4ReferenceConfig {
     pub(crate) fn verify(&self) -> Result<VerifiedNvfp4Reference, String> {
         if self.opaque_memory_bytes == 0
@@ -151,12 +157,14 @@ impl CudaNvfp4ReferenceConfig {
     }
 }
 
+#[cfg(any(test, feature = "cuda-nvfp4-diagnostics"))]
 fn sha(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+#[cfg(any(test, feature = "cuda-nvfp4-diagnostics"))]
 fn text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 4096 && !value.contains('\0')
 }
@@ -199,7 +207,14 @@ mod tests {
             manifest_sha256: format!("{:x}", Sha256::digest(&bytes)),
             opaque_memory_bytes: 4096,
         };
-        assert!(config.verify().is_ok());
+        let verified = config.verify().unwrap();
+        assert_eq!(verified.library, library.canonicalize().unwrap());
+        let mut changed_allowance = config.clone();
+        changed_allowance.opaque_memory_bytes += 1;
+        assert_ne!(
+            verified.identity,
+            changed_allowance.verify().unwrap().identity
+        );
         std::fs::write(&library, b"changed").unwrap();
         assert!(config.verify().unwrap_err().contains("library differs"));
         config.opaque_memory_bytes = 0;

@@ -11,6 +11,8 @@ pub const CHECKED_HOST_PATTERN_SOURCE: &str = "sparse-fp4.checked-immutable-host
 /// CUDA page registration is a separate, bounded runtime preparation step.
 pub struct CheckedHostVsaPattern {
     shape: SageVsaFp4ListShape,
+    // Retain the caller's charged immutable owners even in builds without CUDA.
+    #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
     payloads: [ManagedHostBytes; 3],
     digest: String,
     selected_tiles: u64,

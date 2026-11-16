@@ -18,6 +18,7 @@ mod video;
 mod vision;
 pub use dit::{precompute_tables, refine_text, ConditioningCompilation, ConditioningTables};
 pub use keyframe::{encode_keyframe, prepare_reference_image};
+#[cfg(feature = "cuda-fast-h3")]
 pub(crate) use reuse::ConditioningKey;
 pub use reuse::FastH3ConditioningReuse;
 pub use text::{encode_text, prepare_text, PreparedTextConditioning};

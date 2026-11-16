@@ -1,5 +1,7 @@
 //! Immutable charged geometry for GPU-produced sparse lists.
-use super::{host_pattern::integers, DeviceSpan, Error, ListShape, Request};
+#[cfg(any(feature = "cuda", test))]
+use super::DeviceSpan;
+use super::{host_pattern::integers, Error, ListShape, Request};
 pub use ferrum_native_ops::sage_vsa_fp4::selection::{
     CheckedRegionSelection, RegionBindingsV1, RegionHostV1, RegionKernelPlanV1, RegionPlanV1,
     RegionRequestV1, REGION_KERNEL_EXPORTS, REGION_SELECTION_EXPORTS,

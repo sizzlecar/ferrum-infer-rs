@@ -1,7 +1,9 @@
 //! Reuse is local to one immutable checkpoint/processor composition. Only
 //! completed Host results may be retained; this grants no device residency.
+#[cfg(any(test, feature = "cuda-fast-h3"))]
 use crate::video_generation::VideoGenerationRequest;
 use serde::{Deserialize, Serialize};
+#[cfg(any(test, feature = "cuda-fast-h3"))]
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -34,12 +36,14 @@ impl FastH3ConditioningReuse {
         }
         Ok(())
     }
+    #[cfg(any(test, feature = "cuda-fast-h3"))]
     pub(crate) fn retains(self, bytes: usize) -> bool {
         matches!(self, Self::LastResult { maximum_retained_bytes } if bytes <= maximum_retained_bytes)
     }
     /// A newly cached result keeps its original request-scoped Output credit
     /// through decoding. Its complete backing can coexist with every decoder
     /// buffer; the conditioning floor alone does not cover that overlap.
+    #[cfg(any(test, feature = "cuda-fast-h3"))]
     pub(crate) fn output_claim(self, decoder_bytes: usize, floor: usize) -> anyhow::Result<usize> {
         let retained = match self {
             Self::Disabled {} => 0,
@@ -59,7 +63,9 @@ impl FastH3ConditioningReuse {
 /// identity. Image-only conditioning remains independent of output geometry.
 /// Model/tokenizer/profile identity is the enclosing conditioner's lifetime.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "cuda-fast-h3"))]
 pub(crate) struct ConditioningKey([u8; 32]);
+#[cfg(any(test, feature = "cuda-fast-h3"))]
 impl ConditioningKey {
     pub(crate) fn new(request: &VideoGenerationRequest) -> Self {
         let mut hash = Sha256::new();
