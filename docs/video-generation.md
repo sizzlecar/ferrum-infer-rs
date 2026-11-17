@@ -98,8 +98,39 @@ Poll `GET /v1/videos/{id}` until `completed`, `failed` or `cancelled`.
 `in_progress` includes queuing, generation and encoding. Download a completed
 artifact from `GET /v1/videos/{id}/content`. `DELETE /v1/videos/{id}` requests
 cancellation and cleanup; cancellation is observed at safe execution boundaries.
-Delete terminal jobs after downloading them to release registry and spool
-capacity. The example retains at most 16 jobs and 2 GiB of encoded output.
+`output.maximum_jobs` (default 16) limits uploads and running jobs. A completed
+job releases both its active slot and its encoder output session. Results use
+separate durable storage under `output.directory/jobs-v1`: by default at most
+128 terminal jobs (`output.maximum_retained_jobs`) and 8 GiB of MP4s
+(`output.maximum_retained_bytes`). The encoder's temporary spool independently
+allows 2 GiB (`output.maximum_spool_bytes`); these two byte limits are additive,
+with bounded job metadata in addition.
+
+`output.retention_seconds` defaults to 86400 (24 hours), measured from the
+returned `finished_at` timestamp, including failed/cancelled records. Expiry is
+reclaimed on the next job admission, lookup, completion or server startup.
+Capacity pressure may evict the oldest safe terminal records sooner. DELETE
+also reclaims results; downloads already holding a result can finish, and their
+files remain charged until the reader closes. If those readers occupy all
+retained storage, new results can fail persistence instead of exceeding the
+configured disk bound. Unreaped encoder or panic owners are never evicted by
+TTL: the service preserves their active admission and reports incomplete
+shutdown. Unknown files are preserved and cause startup to reject that store.
+
+Completed records and MP4s survive an orderly restart with the same directory.
+An unfinished job recovered after a restart reports `failed` with an interruption
+error; GPU computation is not resumed. The store rejects concurrent processes,
+corrupt committed records, and limits smaller than its existing stored data.
+Keep the directory on persistent local storage. Existing anonymous temporary
+spools from older processes are not adopted or treated as disposable user data.
+`ferrum run --output` continues to publish its requested destination directly;
+HTTP retention settings apply to `ferrum serve`.
+
+Uploads have a 30-second idle deadline
+(`serving.upload_idle_timeout_seconds`) and a 300-second total deadline
+(`serving.upload_timeout_seconds`). Exceeding either returns HTTP 408 and
+releases ingress/Host allocations. These deadlines cover receiving the body,
+not generation or encoding time.
 Authentication uses the ordinary `serve --api-key` configuration.
 
 ## Batching and qualified limits
@@ -108,7 +139,7 @@ Compatible requests can join and leave the shared denoising loop at step
 boundaries. `serving.max_num_seqs` is an upper bound, not a guaranteed batch
 size. Memory and predicted work determine whether a second request joins;
 requests can wait and complete serially. `/health` exposes active, pending and
-preparing counts. A full ingress queue or output registry still requires the
+preparing counts. A full ingress queue or active-job limit still requires the
 client to wait before submitting more work.
 
 The current candidate has completed a 15-second video reference to a 362-frame

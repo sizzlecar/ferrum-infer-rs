@@ -145,6 +145,14 @@ impl Configuration {
             value.output.maximum_jobs > 0 && value.output.maximum_jobs <= u32::MAX as usize / 3,
             "video maximum_jobs exceeds the output file count bound"
         );
+        ensure!(
+            value.output.maximum_retained_jobs > 0
+                && value.output.maximum_retained_jobs <= u32::MAX as usize
+                && value.output.maximum_retained_bytes >= value.output.maximum_encoded_bytes
+                && value.output.retention_seconds > 0
+                && value.output.retention_seconds <= i64::MAX as u64,
+            "video retention requires positive job/TTL limits and enough bytes for one maximum encoded output"
+        );
         Ok(value)
     }
 }
@@ -173,6 +181,8 @@ pub(super) struct Serving {
     pub max_num_seqs: usize,
     pub request_batch_max_wait_ms: u64,
     pub maximum_prompt_bytes: usize,
+    pub upload_idle_timeout_seconds: u64,
+    pub upload_timeout_seconds: u64,
 }
 impl Default for Serving {
     fn default() -> Self {
@@ -183,11 +193,17 @@ impl Default for Serving {
             max_num_seqs: 2,
             request_batch_max_wait_ms: 0,
             maximum_prompt_bytes: 64 << 10,
+            upload_idle_timeout_seconds: 30,
+            upload_timeout_seconds: 300,
         }
     }
 }
 impl Serving {
     pub fn service_config(&self) -> Result<VideoServiceConfig> {
+        ensure!(
+            self.upload_idle_timeout_seconds > 0 && self.upload_timeout_seconds > 0,
+            "video upload deadlines must be positive"
+        );
         ensure!(
             (1..=2).contains(&self.max_num_seqs),
             "this FastH3 preset supports one or two active denoising requests"
@@ -226,10 +242,16 @@ enum Speed {
 #[serde(deny_unknown_fields)]
 pub(super) struct Output {
     pub ffmpeg: PathBuf,
-    /// Parent for a new process-owned spool; existing files are never adopted.
+    /// Parent for temporary encoder spools and the durable jobs-v1 directory.
     pub directory: PathBuf,
     #[serde(default = "default_jobs")]
     pub maximum_jobs: usize,
+    #[serde(default = "default_retained_jobs")]
+    pub maximum_retained_jobs: usize,
+    #[serde(default = "default_retained_bytes")]
+    pub maximum_retained_bytes: u64,
+    #[serde(default = "default_retention_seconds")]
+    pub retention_seconds: u64,
     #[serde(default = "default_spool_bytes")]
     maximum_spool_bytes: u64,
     #[serde(default = "default_encoded_bytes")]
@@ -245,6 +267,15 @@ pub(super) struct Output {
 }
 fn default_jobs() -> usize {
     16
+}
+fn default_retained_jobs() -> usize {
+    ferrum_server::VideoJobRetention::default().maximum_jobs
+}
+fn default_retained_bytes() -> u64 {
+    ferrum_server::VideoJobRetention::default().maximum_bytes
+}
+fn default_retention_seconds() -> u64 {
+    ferrum_server::VideoJobRetention::default().ttl.as_secs()
 }
 fn default_spool_bytes() -> u64 {
     2 << 30

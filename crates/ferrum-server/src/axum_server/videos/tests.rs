@@ -20,7 +20,12 @@ pub(super) fn host() -> HostMemoryAccount {
 pub(super) fn config() -> VideoHttpConfig {
     VideoHttpConfig {
         maximum_jobs: 2,
+        job_directory: std::env::temp_dir()
+            .join(format!("ferrum-video-jobs-{}", uuid::Uuid::new_v4())),
+        retention: VideoJobRetention::default(),
         maximum_body_bytes: 16 * 1024,
+        upload_idle_timeout: std::time::Duration::from_secs(30),
+        upload_timeout: std::time::Duration::from_secs(300),
         maximum_prompt_bytes: 1024,
         references: VideoReferenceLimits {
             minimum_visual: 1,
@@ -87,7 +92,16 @@ fn video_registry_requires_an_actual_service_and_declares_both_outputs() {
     assert!(super::super::AxumServer::from_state(state)
         .build_router()
         .is_err());
-    let mut config = config();
-    config.maximum_jobs = 0;
-    assert!(config.validate().is_err());
+    let mut invalid = config();
+    invalid.maximum_jobs = 0;
+    assert!(invalid.validate().is_err());
+    let mut invalid = config();
+    invalid.upload_idle_timeout = std::time::Duration::ZERO;
+    assert!(invalid.validate().is_err());
+    let mut invalid = config();
+    invalid.upload_timeout = std::time::Duration::ZERO;
+    assert!(invalid.validate().is_err());
+    let mut invalid = config();
+    invalid.retention.ttl = std::time::Duration::ZERO;
+    assert!(invalid.validate().is_err());
 }

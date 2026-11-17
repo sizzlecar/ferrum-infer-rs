@@ -2,6 +2,25 @@
 
 Ferrum supports Qwen-Image-2.1-Turbo on Linux CUDA and Apple Silicon Metal, and P-H3-Image on Linux CUDA SM89/SM120. Since v0.19.1, Qwen editing accepts up to ten ordered references; P-H3 accepts up to eight. v0.19.0 accepts only one Qwen reference. Each reference must be a static 8-bit RGB/RGBA PNG. Masks are unsupported. Editing can redraw background and details.
 
+## Browser Playground
+
+After starting an image server, open `/playground` on the same server (for
+example, `http://127.0.0.1:8000/playground`). If the server requires an API key,
+enter it in the password field and click **应用并连接**. The same button applies
+an updated key or retries the connection. **清除密钥** removes the key and
+reconnects without credentials. An HTTP 401 prompts for a key separately from
+an unavailable image service.
+
+The Playground sends the key in `Authorization: Bearer` for its configuration,
+generation and editing requests. The key stays in the current page's memory;
+it is not saved to browser storage or placed in a URL. Enter it again after
+refreshing. With no configured server key, the page connects automatically.
+
+`/health` remains public and reports image scheduling and resource limits.
+An `unhealthy` response uses HTTP 503, so an HTTP health probe can detect a
+stopped image service. `healthy` and `degraded` responses use HTTP 200; the JSON
+body retains the status and diagnostic details.
+
 ## P-H3 setup
 
 Copy the [P-H3 CUDA configuration](../crates/ferrum-cli/examples/config/p-h3-image-cuda.json)

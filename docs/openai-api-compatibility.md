@@ -27,6 +27,15 @@ or malformed credentials receive HTTP 401 with an OpenAI-shaped error and
 Requests are authenticated before parsing an inference body or reading an upload.
 `/health`, static Playground files and CORS preflight remain public.
 
+The image Playground has an API-key password field and a connection/update
+button. It sends the key on configuration, generation and editing requests,
+keeps it only for the current page, and requires re-entry after a refresh.
+Missing or rejected credentials show an authentication prompt; service
+unavailability is reported separately.
+
+`/health` returns HTTP 503 when its JSON status is `unhealthy`, and HTTP 200 for
+`healthy` or `degraded`. The response retains diagnostic details in either case.
+
 Configuration exports redact the secret. Use a server environment variable to
 avoid putting a key in shell history or process arguments. With no configured
 key, existing open-server behavior is preserved. `ferrum run` performs no HTTP

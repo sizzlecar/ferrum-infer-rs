@@ -52,7 +52,9 @@ pub use axum_server::{
     default_chat_sampling_params, init_prometheus_recorder, AxumServer, BoundHttpListener,
 };
 pub use axum_server::{ImageHttpConfig, ImageHttpService};
-pub use axum_server::{VideoHttpConfig, VideoHttpService, VideoOutputPlanResolver, VideoPlanError};
+pub use axum_server::{
+    VideoHttpConfig, VideoHttpService, VideoJobRetention, VideoOutputPlanResolver, VideoPlanError,
+};
 pub use model_registry::{
     LoraAdapterModel, ServedModelEntry, ServedModelKind, ServedModelName, ServedModelRegistry,
     ServedModelRegistryError,

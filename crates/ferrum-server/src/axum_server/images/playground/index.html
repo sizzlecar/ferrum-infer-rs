@@ -16,6 +16,13 @@
   <main class="workspace">
     <aside class="controls">
       <div class="intro"><span class="eyebrow">IMAGE STUDIO</span><h1>让想法成为画面。</h1><p>描述想象，或添加参考图继续创作。</p></div>
+      <form id="connection-form" class="connection" autocomplete="off">
+        <label class="field-label" for="api-key">API 密钥</label>
+        <input id="api-key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="服务未配置密钥时可留空" aria-describedby="key-hint connection-status">
+        <p id="key-hint" class="hint">仅用于当前页面的请求，刷新后需重新输入。</p>
+        <div class="connection-actions"><button id="connect" class="small-button" type="submit">应用并连接</button><button id="clear-key" class="small-button" type="button">清除密钥</button></div>
+        <p id="connection-status" class="notice" role="status" aria-live="polite">正在连接图像服务…</p>
+      </form>
       <form id="form" novalidate>
         <div class="mode-switch" aria-label="创作方式">
           <button id="mode-generate" class="mode active" type="button" aria-pressed="true">文生图</button>

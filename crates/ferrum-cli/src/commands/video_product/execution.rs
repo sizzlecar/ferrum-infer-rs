@@ -290,7 +290,17 @@ pub(super) async fn serve(
         service.clone(),
         VideoHttpConfig {
             maximum_jobs: config.output.maximum_jobs,
+            job_directory: config.output.directory.join("jobs-v1"),
+            retention: ferrum_server::VideoJobRetention {
+                maximum_jobs: config.output.maximum_retained_jobs,
+                maximum_bytes: config.output.maximum_retained_bytes,
+                ttl: std::time::Duration::from_secs(config.output.retention_seconds),
+            },
             maximum_body_bytes,
+            upload_idle_timeout: std::time::Duration::from_secs(
+                config.serving.upload_idle_timeout_seconds,
+            ),
+            upload_timeout: std::time::Duration::from_secs(config.serving.upload_timeout_seconds),
             maximum_prompt_bytes: config.serving.maximum_prompt_bytes,
             references: ferrum_engine::video_generation::fast_h3::REFERENCE_LIMITS,
             image_limits: ImageInputLimits::default(),

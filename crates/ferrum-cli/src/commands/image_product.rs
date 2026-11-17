@@ -258,6 +258,7 @@ pub fn validate_cli_matches(
         ][..],
         "serve" => &[
             "image_config",
+            "api_key",
             "host",
             "port",
             "served_model_name",

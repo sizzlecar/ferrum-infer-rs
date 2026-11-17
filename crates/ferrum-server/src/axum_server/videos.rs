@@ -12,8 +12,9 @@
 //! Content is available only after real completion at `/v1/videos/{id}/content`.
 //! DELETE requests cancellation and cleanup. A live record remains visible
 //! until its waiter finishes; completed deletion does not invalidate readers
-//! already holding its artifact. Terminal records consume finite registry and
-//! output capacity until explicitly deleted or shutdown drains them.
+//! already holding its artifact. Completed outputs have independent durable
+//! retention; TTL and capacity reclaim old terminal jobs without holding active
+//! output sessions. Restart recovers records, not unfinished GPU computations.
 use super::{AppState, ServerError};
 use crate::model_registry::{ServedModelKind, ServedModelRegistry};
 use axum::{
@@ -45,15 +46,40 @@ mod tests;
 /// independently bounded here, not represented as total process RSS.
 #[derive(Debug, Clone)]
 pub struct VideoHttpConfig {
-    /// Counts uploading, running and retained terminal jobs together.
+    /// Counts uploading/running jobs and retained unsafe failure owners.
     pub maximum_jobs: usize,
+    /// Exclusively owned, stable directory for restartable records and MP4s.
+    pub job_directory: std::path::PathBuf,
+    pub retention: VideoJobRetention,
     pub maximum_body_bytes: usize,
+    /// Maximum time without receiving nonempty request body data.
+    pub upload_idle_timeout: std::time::Duration,
+    /// Maximum total time spent receiving the request body, not generating video.
+    pub upload_timeout: std::time::Duration,
     pub maximum_prompt_bytes: usize,
     pub references: VideoReferenceLimits,
     pub image_limits: ImageInputLimits,
     pub audio_limits: AudioInputLimits,
     pub maximum_readers: u32,
     pub read_buffer_bytes: usize,
+}
+
+/// Terminal job storage is separate from upload/running admission and the
+/// encoder's temporary spool. Capacity pressure may shorten the retention TTL.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoJobRetention {
+    pub maximum_jobs: usize,
+    pub maximum_bytes: u64,
+    pub ttl: std::time::Duration,
+}
+impl Default for VideoJobRetention {
+    fn default() -> Self {
+        Self {
+            maximum_jobs: 128,
+            maximum_bytes: 8 << 30,
+            ttl: std::time::Duration::from_secs(24 * 60 * 60),
+        }
+    }
 }
 impl VideoHttpConfig {
     fn validate(&self) -> anyhow::Result<()> {
@@ -62,8 +88,28 @@ impl VideoHttpConfig {
             "invalid video registry capacity"
         );
         anyhow::ensure!(
+            self.job_directory.is_absolute()
+                && self.retention.maximum_jobs > 0
+                && self.retention.maximum_jobs <= tokio::sync::Semaphore::MAX_PERMITS
+                && self.retention.maximum_bytes >= 12
+                && self.retention.ttl.as_secs() > 0
+                && self.retention.ttl.as_secs() <= i64::MAX as u64,
+            "video job storage requires an absolute directory and positive retention bounds"
+        );
+        anyhow::ensure!(
             self.maximum_body_bytes > 0 && self.maximum_body_bytes <= isize::MAX as usize,
             "invalid video request body capacity"
+        );
+        anyhow::ensure!(
+            !self.upload_idle_timeout.is_zero()
+                && !self.upload_timeout.is_zero()
+                && tokio::time::Instant::now()
+                    .checked_add(self.upload_idle_timeout)
+                    .is_some()
+                && tokio::time::Instant::now()
+                    .checked_add(self.upload_timeout)
+                    .is_some(),
+            "video upload deadlines must be positive and representable"
         );
         anyhow::ensure!(
             self.maximum_prompt_bytes > 0 && self.maximum_prompt_bytes <= self.maximum_body_bytes,
@@ -150,7 +196,12 @@ impl VideoHttpService {
             service: service.into(),
             output_plan,
             registry,
-            jobs: Arc::new(registry::Registry::new(config.maximum_jobs)),
+            jobs: Arc::new(registry::Registry::new(
+                config.maximum_jobs,
+                &config.job_directory,
+                config.retention,
+                config.maximum_readers as usize,
+            )?),
             readers: Arc::new(tokio::sync::Semaphore::new(config.maximum_readers as usize)),
             shutdown_signal,
             shutdown: Default::default(),
@@ -170,7 +221,20 @@ impl VideoHttpService {
         self.registry.clone()
     }
     pub(super) fn health(&self) -> serde_json::Value {
-        serde_json::json!({"model":self.model_name(), "ready":self.is_accepting(), "protocol":"ferrum-video-jobs-v1", "jobs":self.jobs.len(), "maximum_jobs":self.config.maximum_jobs, "scheduler":self.service.snapshot()})
+        serde_json::json!({
+            "model": self.model_name(),
+            "ready": self.is_accepting(),
+            "protocol": "ferrum-video-jobs-v1",
+            "jobs": self.jobs.len(),
+            "active_jobs": self.config.maximum_jobs.saturating_sub(self.jobs.available_slots()),
+            "maximum_jobs": self.config.maximum_jobs,
+            "retained_jobs": self.jobs.retained_jobs(),
+            "retained_bytes": self.jobs.retained_bytes(),
+            "maximum_retained_jobs": self.config.retention.maximum_jobs,
+            "maximum_retained_bytes": self.config.retention.maximum_bytes,
+            "retention_seconds": self.config.retention.ttl.as_secs(),
+            "scheduler": self.service.snapshot(),
+        })
     }
     /// Cancellation of an observer leaves this sole shutdown task installed.
     /// It drains original job waiters (including kill/reap), reader operations
@@ -243,7 +307,10 @@ pub(super) async fn create(
     request: axum::extract::Request,
 ) -> Result<Response, ServerError> {
     let videos = available(&state)?;
-    let reservation = videos.jobs.reserve()?;
+    let jobs = videos.jobs.clone();
+    let reservation = tokio::task::spawn_blocking(move || jobs.reserve())
+        .await
+        .map_err(internal)??;
     let (input, reservation) = request::read(request, videos, reservation).await?;
     let seed = input.parameters.seed;
     let output = (videos.output_plan)(&input.parameters).map_err(|e| match e {
@@ -251,18 +318,27 @@ pub(super) async fn create(
         VideoPlanError::Service(error) => service_error(error),
     })?;
     // Registry lock covers the synchronous submit/installation boundary so a
-    // concurrent shutdown cannot miss an accepted job. No HTTP await follows
-    // ownership transfer until its independent waiter is installed.
-    let response = videos.jobs.submit(reservation, seed, || {
-        videos.service.try_submit(input, output)
-    })?;
+    // concurrent shutdown cannot miss an accepted job. The blocking operation
+    // installs its independent waiter even if its HTTP observer disconnects.
+    let videos = videos.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        videos.jobs.submit(reservation, seed, || {
+            videos.service.try_submit(input, output)
+        })
+    })
+    .await
+    .map_err(internal)??;
     Ok((StatusCode::ACCEPTED, Json(response)).into_response())
 }
 pub(super) async fn get(
     State(state): State<AppState>,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Response, ServerError> {
-    Ok(match available(&state)?.jobs.get(id) {
+    let jobs = available(&state)?.jobs.clone();
+    let snapshot = tokio::task::spawn_blocking(move || jobs.get(id))
+        .await
+        .map_err(internal)?;
+    Ok(match snapshot {
         Some(value) => Json(value).into_response(),
         None => missing(),
     })
@@ -271,7 +347,11 @@ pub(super) async fn delete(
     State(state): State<AppState>,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Response, ServerError> {
-    Ok(match available(&state)?.jobs.delete(id) {
+    let jobs = available(&state)?.jobs.clone();
+    let snapshot = tokio::task::spawn_blocking(move || jobs.delete(id))
+        .await
+        .map_err(internal)??;
+    Ok(match snapshot {
         Some(value) => Json(value).into_response(),
         None => missing(),
     })

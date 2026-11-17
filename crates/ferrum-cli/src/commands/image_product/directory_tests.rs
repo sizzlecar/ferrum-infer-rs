@@ -54,6 +54,40 @@ pub(super) fn metadata_fixture(root: &std::path::Path) {
     .unwrap();
     fs::write(root.join("processor/chat_template.jinja"), "{{ messages }}").unwrap();
 }
+
+#[test]
+fn image_serve_cli_accepts_api_key_for_discovered_directory() {
+    use clap::FromArgMatches;
+
+    let root = tempfile::tempdir().unwrap();
+    metadata_fixture(root.path());
+    let model = root.path().to_str().unwrap();
+    for source in [vec![model], vec!["--model", model]] {
+        let mut arguments = vec!["ferrum", "serve"];
+        arguments.extend(source);
+        arguments.extend(["--api-key", "explicit-key"]);
+        let definition = TestCli::command();
+        let matches = definition.clone().try_get_matches_from(&arguments).unwrap();
+        validate_cli_matches(&definition, &matches).unwrap();
+        assert_eq!(
+            matches
+                .subcommand_matches("serve")
+                .unwrap()
+                .get_one::<String>("api_key")
+                .map(String::as_str),
+            Some("explicit-key")
+        );
+        let TestCommand::Serve(_) = TestCli::from_arg_matches(&matches).unwrap().command else {
+            panic!("expected serve command");
+        };
+
+        arguments.extend(["--max-model-len", "16"]);
+        let error = validate(&arguments).unwrap_err().to_string();
+        assert!(error.contains("max_model_len"), "{error}");
+        assert!(!error.contains("explicit-key"));
+    }
+}
+
 #[test]
 fn explicit_image_precision_routes_both_entrypoints_and_rejects_text_or_config_mixing() {
     use ferrum_engine::image_generation::ImageCudaPrecisionPolicy;

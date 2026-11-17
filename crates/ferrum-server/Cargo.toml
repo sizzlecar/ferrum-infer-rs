@@ -69,6 +69,7 @@ uuid = { workspace = true }
 config = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 ferrum-kernels = { workspace = true }
 png = "=0.18.1"
 ferrum-execution = { workspace = true }
@@ -78,6 +79,7 @@ tokenizers = { workspace = true }
 tokio-test = "0.4"
 hyper = "1.0"
 reqwest = { workspace = true }
+tokio-tungstenite = { version = "=0.24.0", default-features = false, features = ["connect"] }
 
 [features]
 default = []
