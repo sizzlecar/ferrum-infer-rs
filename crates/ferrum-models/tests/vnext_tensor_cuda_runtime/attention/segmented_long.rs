@@ -26,9 +26,12 @@ const REL: f64 = 1.0 / 128.0;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SegmentedConfig {}
+pub(super) struct SegmentedConfig {}
 
-struct SegmentedFamily;
+pub(super) struct SegmentedFamily {
+    pub(super) head_dim: usize,
+    pub(super) lengths: Vec<usize>,
+}
 impl ModelFamilyProvider for SegmentedFamily {
     type Config = SegmentedConfig;
     fn family_id(&self) -> &ModelFamilyId {
@@ -48,7 +51,7 @@ impl ModelFamilyProvider for SegmentedFamily {
             return Err(VNextError::InvalidModelConfig {
                 family_id: self.family_id().to_string(),
                 field: "config".into(),
-                reason: "fixed long-shape fixture accepts only an empty object".into(),
+                reason: "segmented fixture accepts only an empty object".into(),
             });
         }
         Ok(())
@@ -98,7 +101,7 @@ impl ModelFamilyProvider for SegmentedFamily {
         _: &NumericalExecutionProfile,
     ) -> Result<ModelProgram, VNextError> {
         // Exact rational representation of the effective FP32 1/sqrt(D).
-        let scale = (1.0_f64 / (DIM as f64).sqrt()) as f32;
+        let scale = (1.0_f64 / (self.head_dim as f64).sqrt()) as f32;
         let scale = CanonicalRational::new(
             (f64::from(scale) * (1_u64 << 30) as f64) as i64,
             1_u64 << 30,
@@ -116,11 +119,16 @@ impl ModelFamilyProvider for SegmentedFamily {
                     inputs: INPUTS.into_iter().map(id).collect(),
                     outputs: vec![id(OUTPUT_ID)],
                     attributes: BTreeMap::from([
-                        (id("head_dim"), SemanticValue::Unsigned(DIM as u64)),
+                        (
+                            id("head_dim"),
+                            SemanticValue::Unsigned(self.head_dim as u64),
+                        ),
                         (id("scale"), SemanticValue::Rational(scale)),
                         (
                             id("segment_lengths"),
-                            SemanticValue::Integers(LENGTHS.map(|n| n as i64).to_vec()),
+                            SemanticValue::Integers(
+                                self.lengths.iter().map(|&n| n as i64).collect(),
+                            ),
                         ),
                     ]),
                 }],
@@ -375,12 +383,15 @@ fn managed_cuda_segmented_attention_8mp_length_matches_sampled_f64() {
     let catalog = registry
         .capability_catalog(runtime.descriptor().clone(), vec![engine])
         .unwrap();
-    let family = TypedFamilyRegistration::new(SegmentedFamily)
-        .prepare_with_profile(
-            &serde_json::json!({}),
-            &NumericalProfileId::new(PROFILE).unwrap(),
-        )
-        .unwrap();
+    let family = TypedFamilyRegistration::new(SegmentedFamily {
+        head_dim: DIM,
+        lengths: LENGTHS.to_vec(),
+    })
+    .prepare_with_profile(
+        &serde_json::json!({}),
+        &NumericalProfileId::new(PROFILE).unwrap(),
+    )
+    .unwrap();
     let spec = ProgramTensorSpec {
         dimensions: vec![ROWS as u64, COLUMNS as u64],
         element_type: ElementType::Bf16,

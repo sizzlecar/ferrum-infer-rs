@@ -12,6 +12,8 @@ mod family;
 mod newfused;
 #[path = "attention/segmented_long.rs"]
 mod segmented_long;
+#[path = "attention/segmented_range.rs"]
+mod segmented_range;
 use family::{AttentionConfig, AttentionFamily};
 const INPUTS: [&str; 3] = [
     "value.attention.query",
