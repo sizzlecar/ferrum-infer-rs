@@ -531,9 +531,9 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn sync_directory(path: &Path) -> Result<()> {
+fn sync_directory(_path: &Path) -> Result<()> {
     #[cfg(unix)]
-    File::open(path)?.sync_all()?;
+    File::open(_path)?.sync_all()?;
     Ok(())
 }
 
