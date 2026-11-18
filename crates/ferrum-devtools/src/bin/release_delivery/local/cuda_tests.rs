@@ -140,6 +140,152 @@ fn report(expected: &ExpectedModelRun) -> Value {
 }
 
 #[test]
+fn public_sm120_binds_fresh_automatic_installation_and_both_entrypoints_to_public_bytes() {
+    use clap::Parser;
+    use sha2::{Digest, Sha256};
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path();
+    let mut expected = cuda_task("public");
+    expected.use_default_backend = true;
+    let hash = &expected.binary_sha256;
+    let version = &expected.version;
+    let source = "1".repeat(40);
+    let archive_hash = "b".repeat(64);
+    let archive = "ferrum-linux-x86_64-cuda-sm120.tar.gz";
+    let binary = format!(
+        "/home/operator/.local/share/ferrum/installer/releases/{version}-cuda-{hash}/ferrum"
+    );
+    let script = b"#!/bin/sh\n";
+    let script_hash = format!("{:x}", Sha256::digest(script));
+    fs::write(dir.join("install.sh"), script).unwrap();
+    fs::write(dir.join("binary.sha256"), format!("{hash}  ferrum\n")).unwrap();
+    let public = json!({"id":15,"target_commitish":source,"tag_name":format!("v{version}"),"draft":false,"prerelease":false,
+        "published_at":"2026-01-01T12:00:00Z","assets":[{"id":19,"name":archive,"size":2048,"state":"uploaded","digest":format!("sha256:{archive_hash}")}]});
+    let evidence_asset = json!({"created_at":"2026-01-01T12:06:00Z"});
+    write_json(&dir.join("release.json"), &public).unwrap();
+    write_json(&dir.join("evidence-asset.json"), &evidence_asset).unwrap();
+    let mut model = report(&expected);
+    model["options"]["ferrum_bin"] = json!(binary);
+    model["started_at"] = json!("2026-01-01T12:04:00Z");
+    model["finished_at"] = json!("2026-01-01T12:05:00Z");
+    model["cases"][1]["evidence"]["ready"]["reasoning_protocol"] = json!("none");
+    model["cases"][2]["evidence"]["reasoning_protocol"] = json!("none");
+    model["cases"][2]["evidence"]["auto_config"]["hardware_capabilities"]["compute_capability"] =
+        json!("12.0");
+    let probes: Vec<_> = [vec!["--version"], vec!["--help"], vec!["run","--help"], vec!["serve","--help"]].into_iter()
+        .map(|args| json!({"arguments":args,"exit_code":0,"stdout":if args == ["--version"] {format!("ferrum {version}")} else {"usage".into()},"stderr":""})).collect();
+    let url = "https://ferrum.pandaailabs.com/install.sh";
+    let proof = json!({"schema_version":1,"release_id":15,"source_sha":source,"version":version,"archive_asset_id":19,
+        "install_home_before":{"home":"/home/operator","installer_root_exists":false,"launcher_exists":false},
+        "archive_transfer":{"requested_url":format!("https://ferrum.pandaailabs.com/downloads/v{version}/{archive}"),"download_bytes":2048,"exit_code":0,"http_status":200},
+        "install_started_at":"2026-01-01T12:01:00Z","install_finished_at":"2026-01-01T12:03:00Z","installer_args":[],
+        "installer_exit_code":0,"installer_output":"transfer complete","managed_archive_checksum":format!("{archive_hash}  {archive}\n"),
+        "entry":{"schema_version":1,"status":"passed","requested_url":url,"effective_url":url,"expected_sha256":script_hash,
+            "actual_sha256":script_hash,"http_status":200,"response_bytes":script.len(),"error":null},
+        "installed":{"schema_version":1,"status":"passed","channel":"bootstrap","version":version,"requested_binary":"/home/operator/.local/bin/ferrum",
+            "binary":binary,"binary_sha256":hash,"binary_sha256_after":hash,"observations":probes,"error":null},"model":model});
+    let verify = || {
+        let crate::Action::VerifyPublicSm120(args) = crate::Args::parse_from([
+            "release_delivery",
+            "verify-public-sm120",
+            "--directory",
+            dir.to_str().unwrap(),
+            "--version",
+            version,
+            "--source-sha",
+            &source,
+        ])
+        .action
+        else {
+            unreachable!()
+        };
+        crate::public_sm120::verify(args)
+    };
+    let check = |proof: &Value| {
+        write_json(&dir.join("evidence.json"), proof).unwrap();
+        let mut asset: Value =
+            serde_json::from_slice(&fs::read(dir.join("evidence-asset.json")).unwrap()).unwrap();
+        let bytes = fs::read(dir.join("evidence.json")).unwrap();
+        asset["digest"] = json!(format!("sha256:{:x}", Sha256::digest(&bytes)));
+        write_json(&dir.join("evidence-asset.json"), &asset).unwrap();
+        verify()
+    };
+    check(&proof).unwrap();
+    let mut pinned = proof.clone();
+    pinned["installer_args"] = json!([
+        "--version",
+        version,
+        "--backend",
+        "auto",
+        "--no-modify-path"
+    ]);
+    check(&pinned).unwrap();
+    let mut fallback = proof.clone();
+    fallback["archive_transfer"]["requested_url"] = json!(format!(
+        "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v{version}/{archive}"
+    ));
+    check(&fallback).unwrap();
+    write_json(&dir.join("evidence.json"), &proof).unwrap();
+    assert!(verify().unwrap_err().contains("digest"));
+    for (field, wrong) in [
+        ("/release_id", json!(99)),
+        ("/install_home_before/home", json!("/somewhere-else")),
+        ("/install_home_before/installer_root_exists", json!(true)),
+        ("/install_home_before/launcher_exists", json!(true)),
+        ("/archive_transfer", Value::Null),
+        (
+            "/archive_transfer/requested_url",
+            json!(format!(
+                "https://ferrum.pandaailabs.com/downloads/v{version}/{archive}.sha256"
+            )),
+        ),
+        ("/archive_transfer/download_bytes", json!(100)),
+        ("/archive_transfer/exit_code", json!(28)),
+        ("/archive_transfer/http_status", json!(206)),
+        ("/source_sha", json!("2".repeat(40))),
+        ("/archive_asset_id", json!(88)),
+        (
+            "/managed_archive_checksum",
+            json!(format!("{}  {archive}", "a".repeat(64))),
+        ),
+        ("/installer_args", json!(["--backend", "cuda"])),
+        (
+            "/installer_args",
+            json!(["--release-base-url", "https://local.invalid"]),
+        ),
+        ("/install_started_at", json!("2026-01-01T11:55:00Z")),
+        ("/entry/actual_sha256", json!("0".repeat(64))),
+        (
+            "/installed/requested_binary",
+            json!("/tmp/candidate/ferrum"),
+        ),
+        ("/installed/observations/2/exit_code", json!(1)),
+        ("/model/started_at", json!("2026-01-01T11:56:00Z")),
+        ("/model/binary_sha256", json!("0".repeat(64))),
+        ("/model/options/ferrum_bin", json!("/tmp/candidate/ferrum")),
+        ("/model/cases/1/evidence/ready/backend", json!("CPU")),
+        (
+            "/model/cases/2/evidence/auto_config/hardware_capabilities/compute_capability",
+            json!("8.9"),
+        ),
+        (
+            "/model/cases/3/evidence/observations/recall/message/content",
+            json!("incorrect"),
+        ),
+    ] {
+        let mut invalid = proof.clone();
+        *invalid.pointer_mut(field).unwrap() = wrong;
+        assert!(check(&invalid).is_err(), "accepted invalid {field}");
+    }
+    write_json(
+        &dir.join("evidence-asset.json"),
+        &json!({"created_at":"2026-01-01T11:59:00Z"}),
+    )
+    .unwrap();
+    assert!(check(&proof).is_err());
+}
+
+#[test]
 fn cuda_report_requires_observed_cuda_in_both_entrypoints_and_preserves_raw_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("report.json");

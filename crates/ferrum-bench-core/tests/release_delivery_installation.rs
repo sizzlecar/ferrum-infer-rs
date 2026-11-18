@@ -38,6 +38,8 @@ struct State {
     ancestors_succeeded: bool,
     active: &'static str,
     verify_only: &'static str,
+    git_ref: &'static str,
+    public_sm120_evidence: &'static str,
     sm120_required: &'static str,
     sm120_runtime_required: &'static str,
     sm120_runtime_policy: &'static str,
@@ -52,12 +54,15 @@ impl State {
             ancestors_succeeded: false, // optional cloud ancestor was skipped
             active,
             verify_only,
+            git_ref: "refs/heads/main",
+            public_sm120_evidence: "",
             sm120_required: "true",
             sm120_runtime_required: "false",
             sm120_runtime_policy: "not_run_hardware_unavailable",
             sm120_runtime_reason: "No approved SM120 runtime hardware is available.",
             results: BTreeMap::from([
                 ("prepare".into(), ResultState::Success),
+                ("public-sm120".into(), ResultState::Skipped),
                 (
                     "publish".into(),
                     if verify_only == "true" {
@@ -72,6 +77,8 @@ impl State {
 
     fn operand(&self, name: &str) -> Result<String, String> {
         let value = match name {
+            "github.r#ref" => self.git_ref,
+            "inputs.public_sm120_install_evidence" => self.public_sm120_evidence,
             "needs.prepare.outputs.active" => self.active,
             "needs.prepare.outputs.verify_only" => self.verify_only,
             "needs.prepare.outputs.sm120_required" => self.sm120_required,
@@ -123,7 +130,9 @@ fn expression(source: &str) -> Result<Expr, String> {
         .strip_prefix("${{")
         .and_then(|s| s.strip_suffix("}}"))
         .unwrap_or(source);
-    let mut normalized = source.replace('\'', "\"");
+    let mut normalized = source
+        .replace('\'', "\"")
+        .replace("github.ref", "github.r#ref");
     for (job, _) in workflow()["jobs"].as_mapping().unwrap() {
         let job = job.as_str().unwrap();
         normalized = normalized.replace(
@@ -369,6 +378,45 @@ fn verification_only_cannot_schedule_staging_models_cloud_or_publication() {
             )
             .unwrap());
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn postpublication_sm120_evidence_is_scheduled_and_required_only_in_its_verification_mode() {
+    let workflow = workflow();
+    let gate = expression(workflow["jobs"]["public-sm120"]["if"].as_str().unwrap()).unwrap();
+    let evidence_asset = "17:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut verify = State::new("false", "true");
+    verify.ancestors_succeeded = true;
+    verify.sm120_runtime_required = "true";
+    verify.sm120_runtime_policy = "required";
+    verify.sm120_runtime_reason = "";
+    verify.public_sm120_evidence = evidence_asset;
+    for installer in INSTALLERS {
+        verify
+            .results
+            .insert((*installer).into(), ResultState::Success);
+    }
+    assert!(scheduled(&gate, &verify).unwrap());
+    for result in ResultState::ALL {
+        verify.results.insert("public-sm120".into(), result);
+        assert_eq!(
+            complete_accepts(&workflow, &verify),
+            result == ResultState::Success
+        );
+    }
+    for (version_check, required, evidence, git_ref) in [
+        ("false", "true", evidence_asset, "refs/heads/main"),
+        ("true", "false", evidence_asset, "refs/heads/main"),
+        ("true", "true", "", "refs/heads/main"),
+        ("true", "true", evidence_asset, "refs/heads/other"),
+    ] {
+        verify.verify_only = version_check;
+        verify.sm120_runtime_required = required;
+        verify.public_sm120_evidence = evidence;
+        verify.git_ref = git_ref;
+        assert!(!scheduled(&gate, &verify).unwrap());
     }
 }
 

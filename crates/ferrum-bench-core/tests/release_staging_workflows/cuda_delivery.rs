@@ -579,7 +579,12 @@ fn required_sm120_cannot_complete_without_runtime_or_public_installation_evidenc
     let command = script(&delivery["jobs"]["complete"], "test \"$PREPARE\"");
     let dir = tempfile::tempdir().unwrap();
     let summary = dir.path().join("summary.md");
-    for verify_only in [false, true] {
+    for (verify_only, public_sm120) in [
+        (false, "success"),
+        (true, "skipped"),
+        (true, "failure"),
+        (true, "success"),
+    ] {
         fs::write(&summary, "").unwrap();
         let output = Command::new("bash")
             .args([
@@ -606,12 +611,18 @@ fn required_sm120_cannot_complete_without_runtime_or_public_installation_evidenc
             .env("BREW_INSTALL", "success")
             .env("UNIX_BOOTSTRAP", "success")
             .env("WINDOWS_BOOTSTRAP", "success")
+            .env("PUBLIC_SM120", public_sm120)
             .env("GITHUB_STEP_SUMMARY", &summary)
             .output()
             .unwrap();
-        assert!(!output.status.success());
+        assert_eq!(
+            output.status.success(),
+            verify_only && public_sm120 == "success"
+        );
         let summary = fs::read_to_string(&summary).unwrap();
-        if verify_only {
+        if verify_only && public_sm120 == "success" {
+            assert!(summary.contains("Verified the public SM120 bootstrap"));
+        } else if verify_only {
             assert!(summary.contains("Public SM120 installation/startup still requires"));
         } else {
             assert!(
