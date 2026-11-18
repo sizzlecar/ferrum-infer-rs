@@ -554,30 +554,23 @@
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "899c941f46f9f1c7b46f5e6dbd427b208cbc2821987ada58cd36018756f2bdcd",
-      "after_sha256": "5a9384146df0387b4097031cd20dd2375e6a7cc7f7c397a80927ef41e1a1b9ee",
+      "before_sha256": "5a9384146df0387b4097031cd20dd2375e6a7cc7f7c397a80927ef41e1a1b9ee",
+      "after_sha256": "b1eaac1048b69fe5dea6c72fef04a036e9860f16389fdbae961d84dd87de27d2",
       "areas": [
         "build",
-        "backend_submission",
-        "scheduler"
+        "backend_submission"
       ],
-      "rationale": "Reviewed the full README change since v0.19.1: one documentation link to the FastH3 video guide. Existing installation commands, text API defaults and performance tables are unchanged. The linked guide declares the CUDA FastH3 feature, native operators, reference media, capacity settings and shared iterative run/serve behavior; retain distribution, backend submission and scheduler obligations. Runtime implementation changes keep their independently mapped model, numerical and capacity obligations. This documentation review does not certify final-archive execution or performance."
+      "rationale": "The change since v0.20.0 links the P-H3 runtime installation instructions and asks users to configure model paths. The image backend now discovers its cuDNN library during startup. Distribution and GPU submission require regression coverage, including an actual P-H3 generation and edit on the final SM120 executable."
     },
     {
       "path": "README_zh.md",
-      "before_sha256": "1c1ec4799a80fea9e6a92f8eb9925bdd8acced46322739766eddf9f9cd55f206",
-      "after_sha256": "83980d5b16aca2905f13da766eea162135bf01deafb690d351318e022fcff789",
+      "before_sha256": "83980d5b16aca2905f13da766eea162135bf01deafb690d351318e022fcff789",
+      "after_sha256": "f7d054e2339b2fa270816bc1058b92754c13b99730be0dc097377f82f5363424",
       "areas": [
         "build",
-        "backend_submission",
-        "template",
-        "termination",
-        "structured",
-        "tools",
-        "scheduler",
-        "kv"
+        "backend_submission"
       ],
-      "rationale": "Reviewed the full README change since v0.18.5: add Linux CUDA P-H3 generation and ordered multi-reference editing, typed configuration setup, continuous batching, and explicitly candidate-scoped RTX5090 C1/C8 measurements. Preserve Qwen Image2.1 Turbo and all previous text/backend contracts. Image data discloses WSL48GB, precision,8steps,distinct references,n8/two repetitions,latency thresholds and unmeasured VRAM; it does not claim a final-release or current ComfyUI comparison. Retain build, backend, protocol, scheduler, KV, capacity and model obligations. P-H3 and Qwen image generation/editing receive separate real-model release checks in addition to the existing selected text models. This content review is not execution or performance evidence."
+      "rationale": "The change since v0.20.0 links the P-H3 runtime installation instructions and asks users to configure model paths. The image backend now discovers its cuDNN library during startup. Distribution and GPU submission require regression coverage, including an actual P-H3 generation and edit on the final SM120 executable."
     }
   ],
   "release_profile_ids": [
