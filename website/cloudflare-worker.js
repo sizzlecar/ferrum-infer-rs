@@ -3,7 +3,7 @@ import powerShellInstaller from "../scripts/install.ps1";
 
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
-const RELEASE_VERSION = "0.20.0";
+const RELEASE_VERSION = "0.20.1";
 const RELEASE_URL = `${REPOSITORY}/releases/tag/v${RELEASE_VERSION}`;
 const VALIDATION_URL = `${REPOSITORY}/releases/download/v0.19.0/release-validation.json`;
 const IMAGE_GUIDE_URL = `${REPOSITORY}/blob/v${RELEASE_VERSION}/docs/image-generation.md`;
@@ -191,7 +191,7 @@ const pages = {
     defaultsNote: 'Defaults adapt execution and capacity to capabilities, hardware and memory; explicit settings prevail. v0.19.1 automatically enables faster Q6 prefill for compatible Qwen3.5 GGUF CUDA paths. <a href="https://github.com/sizzlecar/ferrum-infer-rs/pull/514">RTX 5090 paired latency comparison and limits</a>. Qualified SM120 GGUF paths can use 8-bit activation quantization and integer dot products. <code>--numerical-profile qwen3_5.f32-master</code> retains the original mixed-precision reference. Batch layouts can change output. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/numerical-execution.zh.md">Numerical profiles</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/cache-product.md">Caching</a>.',
     imageTitle: "Generate and edit images",
     imageLead: 'P-H3-Image supports generation and ordered multi-reference editing on Linux CUDA SM89/SM120. <a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> supports generation and editing with up to ten ordered references. Compatible requests batch automatically within the configured capacity. The v0.19.1 Qwen pose-transfer sample did not follow the second reference; <a href="https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.19.1">validation scope and image-quality limits</a>.',
-    ph3Setup: `P-H3: copy the <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/p-h3-image-cuda.json">CUDA configuration</a>, set the model and CUDA/cuDNN library paths, then start the server below. It uses W4A8 text encoder/DiT, INT8 VAE and native prompt expansion. <a href="${IMAGE_GUIDE_URL}">Setup and capacity requirements</a>.`,
+    ph3Setup: `Copy the <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/p-h3-image-cuda.json">P-H3 CUDA configuration</a> and set the model paths. On RTX 5090, install CUDA 12.8 runtime libraries and cuDNN 9.20 for CUDA 12. Ferrum finds cuDNN automatically. PNG generation and editing need no media tools. <a href="${IMAGE_GUIDE_URL}">Setup and capacity requirements</a>.`,
     ph3ServeLabel: "P-H3: image API server",
     ph3EditLabel: "P-H3: character and pose references",
     imageMetalNote: 'Metal supports Qwen-Image generation and editing with a Q4_K_M GGUF DiT, FP8 text encoder and BF16 vision/VAE. Validated at 1024×1024 on an M4 Mac mini with 16 GiB unified memory. Use <code>--image-config</code> to select the backend, assets and memory budget.',
@@ -203,7 +203,7 @@ const pages = {
     imageConfigNote: 'P-H3 requires <code>--image-config</code> and supports landscape output such as 2720×1536. Qwen’s directory preset supports up to 2048×2048, subject to capacity checks. P-H3 Metal is not supported.',
     videoTitle: "Generate video with sound",
     videoLead: 'FastH3-Omni-NVFP4-QAD runs on Linux CUDA SM120 (RTX 5090), with image, video and audio references. At least one image or video reference is required. Compatible requests share continuous denoising batches; capacity pressure can defer admission or reduce the active batch.',
-    videoSetup: `Copy the <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/fast-h3-video-cuda.json">5090 configuration</a> and set the model, CUDA/cuDNN, FFmpeg and output paths. The tested preset uses 29 GiB of managed GPU capacity. <a href="${VIDEO_GUIDE_URL}">Setup, reference formats and asynchronous HTTP jobs</a>.`,
+    videoSetup: `Set the model and output directories in the <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/fast-h3-rtx5090-ref2va.json">RTX 5090 preset</a>. It uses 29 GiB of managed GPU memory and shares the P-H3 CUDA and cuDNN libraries. MP4 output uses FFmpeg with libx264 and AAC on PATH. Only video references need ffprobe. Starting either H3 server from its model directory alone is tracked in <a href="${REPOSITORY}/issues/528">#528</a>. <a href="${VIDEO_GUIDE_URL}">Setup, reference formats and HTTP jobs</a>.`,
     videoRunLabel: "Image reference to video",
     videoServeLabel: "Video job API",
     videoLimits: 'The qualified workload is 480p at 24 FPS with generated audio. 768p has limited functional evidence; long-reference workloads have not met their latency target. HTTP uses <code>POST /v1/videos</code>, status polling and a separate content download.',
@@ -281,7 +281,7 @@ const pages = {
     defaultsNote: '默认执行与容量按声明能力、硬件和内存选择，显式设置优先。v0.19.1 为兼容的 Qwen3.5 GGUF CUDA 路径自动启用 Q6 prefill 加速。<a href="https://github.com/sizzlecar/ferrum-infer-rs/pull/514">RTX 5090 同次对照延迟实测与限制</a>。合资格的 SM120 GGUF 路径可采用 8 位激活量化及整数点积。<code>--numerical-profile qwen3_5.f32-master</code> 保留原混合精度参考路径；批布局可能改变输出。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/numerical-execution.zh.md">数值策略</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/cache-product.md">缓存说明</a>。',
     imageTitle: "图像生成与编辑",
     imageLead: 'P-H3-Image 在 Linux CUDA SM89/SM120 上支持生图和有序多参考图编辑。<a href="https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo">Qwen-Image-2.1-Turbo</a> 支持生图和最多十张有序参考图编辑。兼容请求在配置容量内自动合批。v0.19.1 的 Qwen 姿势迁移样例未遵循第二张参考图；<a href="https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.19.1">查看验收范围与画质限制</a>。',
-    ph3Setup: `P-H3：复制 <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/p-h3-image-cuda.json">CUDA 配置</a>，设置模型与 CUDA/cuDNN 库路径，再用下方命令启动。采用 W4A8 文本编码器/DiT、INT8 VAE 与原生提示词扩写。<a href="${IMAGE_GUIDE_URL}">配置及容量要求</a>。`,
+    ph3Setup: `复制 <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/p-h3-image-cuda.json">P-H3 CUDA 配置</a>，填入模型路径。RTX 5090 使用 CUDA 12.8 运行库和 CUDA 12 版 cuDNN 9.20。Ferrum 会自动找到 cuDNN，生成和编辑 PNG 均无需安装媒体工具。<a href="${IMAGE_GUIDE_URL}">安装步骤和容量要求</a>。`,
     ph3ServeLabel: "P-H3 图像 API 服务",
     ph3EditLabel: "P-H3 人物与姿势双参考图",
     imageMetalNote: 'Metal 支持 Qwen-Image 生图与编辑，使用 Q4_K_M GGUF DiT、FP8 文本编码器和 BF16 视觉编码器/VAE。已在 M4 Mac mini、16 GiB 统一内存上验证 1024×1024。通过 <code>--image-config</code> 配置后端、资产和内存预算。',
@@ -293,7 +293,7 @@ const pages = {
     imageConfigNote: 'P-H3 必须使用 <code>--image-config</code>，支持 2720×1536 等横向尺寸。Qwen 本地目录预设最高支持 2048×2048，仍须满足容量检查。P-H3 不支持 Metal。',
     videoTitle: "生成带声音的视频",
     videoLead: 'FastH3-Omni-NVFP4-QAD 在 Linux CUDA SM120（RTX 5090）上运行，支持图片、视频与音频参考，至少需要一个图片或视频参考。兼容请求共享连续去噪批次；容量不足时可以等待准入或缩小活动批次。',
-    videoSetup: `复制 <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/fast-h3-video-cuda.json">5090 配置</a>，设置模型、CUDA/cuDNN、FFmpeg 与输出路径。实测预设使用 29 GiB 托管显存容量。<a href="${VIDEO_GUIDE_URL}">配置、参考格式与异步 HTTP 任务</a>。`,
+    videoSetup: `在 <a href="${REPOSITORY}/blob/v${RELEASE_VERSION}/crates/ferrum-cli/examples/config/fast-h3-rtx5090-ref2va.json">RTX 5090 预设</a>中填入模型目录和输出目录。预设使用 29 GiB 托管显存，与 P-H3 共用 CUDA 和 cuDNN。输出 MP4 使用系统 PATH 中支持 libx264 和 AAC 的 FFmpeg；只有输入参考视频才需要 ffprobe。从模型目录直接启动 P-H3 或 FastH3 的进展见 <a href="${REPOSITORY}/issues/528">#528</a>。<a href="${VIDEO_GUIDE_URL}">安装步骤、参考格式与 HTTP 任务</a>。`,
     videoRunLabel: "图片参考生成视频",
     videoServeLabel: "视频任务 API",
     videoLimits: '已验证的主要负载为 480p、24 FPS，包含生成音频。768p 仅有有限功能证据，长参考视频尚未达到延迟目标。HTTP 使用 <code>POST /v1/videos</code> 提交，轮询状态后单独下载视频。',
@@ -387,8 +387,8 @@ function render(page) {
   ].map(([label, command], index) => codeBlock(label, command, `ph3-command-${index}`)).join("");
   const releaseTable = `<div class="table-wrap"><table><caption>${page.releaseTextCaption}<span>P50 / P99</span></caption><thead><tr><th scope="col">C</th><th scope="col">token/s</th><th scope="col">TTFT</th><th scope="col">TPOT</th><th scope="col">ITL</th></tr></thead><tbody>${releaseTextThroughput.map(([c, rate, ttft, tpot, itl]) => `<tr><th scope="row">${c}</th><td>${rate}</td><td>${ttft}</td><td>${tpot}</td><td>${itl}</td></tr>`).join("")}</tbody></table></div>`;
   const videoCommands = [
-    [page.videoRunLabel, 'ferrum run --video-config fast-h3-video-cuda.json --reference image=reference.png --prompt "The person in <Picture 1> turns toward the lake." --width 832 --height 480 --num-frames 124 --fps 24 --seed 1101 --output clip.mp4'],
-    [page.videoServeLabel, "ferrum serve --video-config fast-h3-video-cuda.json --host 127.0.0.1 --port 8000"],
+    [page.videoRunLabel, 'ferrum run --video-config fast-h3-rtx5090-ref2va.json --reference image=reference.png --prompt "The person in <Picture 1> turns toward the lake." --width 832 --height 480 --num-frames 124 --fps 24 --seed 1101 --output clip.mp4'],
+    [page.videoServeLabel, "ferrum serve --video-config fast-h3-rtx5090-ref2va.json --host 127.0.0.1 --port 8000"],
   ].map(([label, command], index) => codeBlock(label, command, `video-command-${index}`)).join("");
   const releaseImageResults = page.releaseImageRows.map(([title, body]) => `<div><dt>${title}</dt><dd>${body}</dd></div>`).join("");
   const imageTable = `<div class="table-wrap"><table><caption>Qwen-Image-2.1-Turbo<span>images/s</span></caption><thead><tr><th scope="col">${page.workloadLabel}</th><th scope="col">C</th><th scope="col">Ferrum</th><th scope="col">vLLM-Omni</th><th scope="col">${page.ratio}</th></tr></thead><tbody>${imageThroughput.map(([task, size, c, ferrum, omni, ratio]) => `<tr><th scope="row">${size} ${page.imageTasks[task]}</th><td>${c}</td><td>${ferrum}</td><td>${omni}</td><td>${ratio}</td></tr>`).join("")}</tbody></table></div>`;
