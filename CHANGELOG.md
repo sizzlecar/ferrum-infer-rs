@@ -7,12 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-11-18
+
 ### Fixed
 
 - Image serving accepts an API key from the CLI or a partial server config. The Playground uses that key for generation and edits, keeps it in page memory, and clears it on refresh. Unhealthy image services return HTTP 503.
 - Image serving releases the worker's output slot before notifying the client. With a single slot, the next request can start as soon as the previous response and its data are released. An unread response still holds its slot.
 - Video uploads time out when stalled. Finished jobs free an active slot, survive normal server restarts, and expire under the configured age, byte and count limits. A download in progress can finish after the job is deleted.
 - On RTX 5090, P-H3 and FastH3 can share CUDA 12.8 and the CUDA 12 build of cuDNN 9.20. FastH3 finds FFmpeg on the system PATH for MP4 output. Only video references need ffprobe. Reference probes apply the decoder pixel limit before reading frames.
+
+### Installation and validation
+
+- The Linux SM120 download is 90,312,338 bytes, up 109,693 bytes (0.12%) from v0.20.0. The RTX 5090 text checks passed without cuDNN, FFmpeg or a CUDA SDK. Image and video users install their model checkpoints and system dependencies separately.
+- P-H3 needs a JSON configuration for its model paths and resource limits. FastH3's RTX 5090 preset needs its checkpoint and output directories. Direct startup from a model directory is tracked in [#528](https://github.com/sizzlecar/ferrum-infer-rs/issues/528).
 
 ## [0.20.0] - 2026-11-17
 

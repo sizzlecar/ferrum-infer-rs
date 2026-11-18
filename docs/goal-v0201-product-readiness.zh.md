@@ -1,9 +1,22 @@
-# 下一版本：产品修复、验收与发布
+# Ferrum v0.20.1 产品修复、验收与发布
 
-2026-11-18，状态：进行中。用户授权整理待办、开启目标模式、完成修复与验收后发布新版本。
-暂定版本 `0.20.1`，正式准备版本前核对远端最新发布。
-2026-11-18 已核对远端：最新正式发布为 `v0.20.0`，`main` 为 `91e637d77`，
-尚无 `v0.20.1` 标签；实际发布前仍需重新核对。
+2026-11-18 16:30（北京时间），Ferrum v0.20.1 已从 `cc098c3a0` 正式发布。公开安装渠道的实机验收仍在进行。[GitHub Release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.20.1)
+[产品修复](https://github.com/sizzlecar/ferrum-infer-rs/pull/523) · [版本准备](https://github.com/sizzlecar/ferrum-infer-rs/pull/524) · [发行任务](https://github.com/sizzlecar/ferrum-infer-rs/actions/runs/44232521500)
+
+## 冻结发行包验收
+
+- Linux SM120 包在 RTX 5090 完成 4 项安装与启动检查，3 个文本模型通过全部 35 个用例。另在无 cuDNN、FFmpeg 和 CUDA SDK 的文本环境中，使用安装器装入同一二进制，Qwen3.5-0.8B 的 6 项 CLI 和 HTTP 用例均通过。
+- 同一 SM120 二进制的 P-H3 鉴权服务连续完成生成、编辑、再生成，两次生成的像素相同。生成和编辑遇到缺失或错误的密钥均返回 401。FastH3 使用三字段预设、系统 FFmpeg 与 PNG 参考图，生成 832×480、24 fps、124 帧的 H.264 视频及 32 kHz 双声道 AAC。进程重启后，下载的 MP4 与重启前逐字节一致。
+- SM120 归档为 90,312,338 字节，v0.20.0 为 90,202,645 字节，本次增加 109,693 字节（约 0.12%）。两者均不含模型权重。选择图像或视频所需的系统库与媒体工具另计。[系统 GPU 依赖与安装成本](image-generation.md#p-h3-setup) · [视频编码与安装成本](video-generation.md#setup)
+- Apple Silicon 使用冻结的 Metal 二进制完成 4 项安装与启动检查。Llama 3.1 8B GGUF 通过 14 项，Qwen3.5-0.8B safetensors 通过 6 项，Qwen3.5-4B GGUF 通过 18 项，合计 38 项全部通过。[Metal 原包模型验收](https://github.com/sizzlecar/ferrum-infer-rs/actions/runs/44232521500/job/134583871861)
+- RTX 4050（SM89）使用冻结 Linux CUDA 包完成 Llama 3.2 1B、Qwen3.5 0.8B、Qwen3.5 4B 三个文本配置的运行与服务验收，FP8 独立数值对照通过。Linux CPU 包通过 Qwen3.5 0.8B 的 GGUF 和 safetensors 两种配置验收；两个包各通过 4 项启动检查。原 SM89 任务下载超时，其后排队的 CPU 任务被跳过。两项手工复验均使用冻结候选的相应二进制，归档 SHA-256 为 `bc78888b76d37f45cc4da3cf2d51f2e6c6daf6b3460658e12c7912e8c2bfd2ca`。
+- Windows x86_64 CPU 和 CUDA SM89 两种发行包都通过了打包与程序启动验证。CPU 包来自原发行任务，CUDA 包来自同一候选标签的[独立 Windows 构建](https://github.com/sizzlecar/ferrum-infer-rs/actions/runs/44244618049)。
+- 正式发布包含 47 个文件。公开 Mac Metal 与 Linux SM120 归档的 SHA-256 均与实机验收使用的归档一致。Homebrew 的 macOS 配方已更新到同一公开 Metal 归档。[发布记录](https://github.com/sizzlecar/ferrum-infer-rs/actions/runs/44264837074) · [Homebrew 更新](https://github.com/sizzlecar/homebrew-ferrum/commit/5dc6dafe113304bece13d3ddbf6b5b915b5aa2e0)
+- Apple Silicon 在全新用户目录中从官网零参数安装，自动选择 Metal。官网返回 HTTP 200 并传输完整的 20,899,079 字节；安装后的二进制与冻结 Metal 包一致，`--version`、`--help`、`run --help`、`serve --help` 均成功退出。
+- RTX 5090 在全新用户目录使用官网安装器自动选择 SM120，完成 4 项安装与启动检查。随后使用已安装程序运行 Qwen3.5-0.8B 的 6 项 CLI 和 HTTP 检查，服务报告 CUDA 计算能力 12.0。公开验收归档 SHA-256 为 `79b24081a763c95c5170856c41f62964e4feae506b7c23b00d4d5461ce80a509`。
+- crates.io 上的 22 个可发布 crate 均提供 0.20.1，均可下载，其校验值与正式发行记录一致。各平台包管理器公开安装的正式工作流仍在运行。
+
+首次在 RTX 5090 部署 P-H3 仍需填写 `--image-config` 模型路径与资源配置。FastH3 需要 `--video-config`、检查点和输出目录。仅传模型目录即可启动两种服务的工作由 [#528](https://github.com/sizzlecar/ferrum-infer-rs/issues/528) 跟踪。
 
 ## 交付目标
 
@@ -11,11 +24,7 @@
 有界保留结果并跨重启查询；FastH3 的正常安装不再要求用户查找 cuDNN、
 FFmpeg 和 ffprobe 的绝对路径。通过仓库正式发布流程交付实际验收的产物。
 
-依赖交付方案正在重新审查；用户要求综合考虑体积、维护和运行成本，不能把
-FFmpeg 命令行程序及整套 GPU 运行库默认装入发行包当作完成产品化。
-逐项审查实际功能、依赖闭包、启动成本、平台支持、取消/资源所有权及离线部署。
-文本入口不能因视频功能新增 cuDNN 或媒体前置条件。更换算子、编解码实现或
-运行库版本需要额外正确性和性能证据。
+RTX 5090 的 P-H3 和 FastH3 复用系统 CUDA 12.8 与 CUDA 12 版 cuDNN 9.20。视频输出使用系统 FFmpeg，视频参考输入还需要 ffprobe。纯文本入口沿用对应后端的依赖。模型及编码器变更的正确性与性能分别验收。
 
 用户明确的产品边界：
 
@@ -90,7 +99,7 @@ Qwen3 0.6B CPU 的多轮语义测试也单独跟踪：当前修复与已发布 0
 重复上一轮的 OK。相同权重、官方模板和消息在 PyTorch/Transformers 参考实现下也产生
 相同回答，因此该用例不能单独证明 Ferrum 引擎缺陷；保留失败记录，不把参考失败改记为语义通过。
 
-## 进度和证据
+## 开发阶段的验证记录
 
 - 正式 0.20.0 已复现图像 `--api-key` 拒绝和最小 `[server]` 配置失败。
 - 配置、鉴权、健康、上传和视频生命周期修复已进入工作分支，
@@ -166,7 +175,6 @@ Qwen3 0.6B CPU 的多轮语义测试也单独跟踪：当前修复与已发布 0
 - 视频启动增加单帧和立体声音频试编码，沿用产品输出的编码参数和进程回收流程，
   在加载模型前诊断缺少 libx264、AAC 或 MP4 输出支持。已在本机用真实 FFmpeg
   和可执行但无法编码 MP4 的程序分别验证成功与失败；最终候选包须重验。
-- 正式版本安装包、完整发布模型计划及公开安装验收仍在进行。
 - 托管 macOS 测试发现图像单输出名额的顺序请求偶发 429。通过控制线程交付时序，
   已在真实 HTTP 路径复现：第一张图的响应和数据均已释放，工作线程仍短暂持有
   名额，第二次请求因此返回“output session limit reached”。回归测试用客户端
