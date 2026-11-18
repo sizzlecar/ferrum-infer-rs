@@ -109,15 +109,22 @@ pub fn cuda_vnext_cnn_f32_providers_with_fused_f32(
 }
 /// Compose native choices while retaining one shared PTX/cuDNN owner. Each
 /// optional static native module has its own admitted opaque allowance.
-pub fn cuda_vnext_cnn_f32_providers_with_native_options(
+pub fn cuda_vnext_cnn_f32_providers_with_native_options<'a>(
     runtime: &CudaDeviceRuntime,
-    config: &crate::backend::cuda::vnext_runtime::CudaCudnnConfig,
+    config: impl Into<crate::backend::cuda::vnext_runtime::CudnnLibrarySelection<'a>>,
     policy: Option<crate::backend::cuda::vnext_runtime::CudnnSdpaPlanPolicy>,
     fused: Option<&CudaCutlassFusedF32Config>,
     convrot: Option<&CudaConvRotFusedOutputConfig>,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    conv2d_f32::providers_with_native_options(runtime, config, policy, fused, convrot, selected)
+    conv2d_f32::providers_with_native_options(
+        runtime,
+        config.into(),
+        policy,
+        fused,
+        convrot,
+        selected,
+    )
 }
 mod row_routing;
 mod row_selected_bf16;

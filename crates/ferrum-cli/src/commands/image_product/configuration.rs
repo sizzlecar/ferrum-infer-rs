@@ -202,7 +202,7 @@ pub struct CudaConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CudnnConfig {
-    pub library_path: PathBuf,
+    pub library_path: Option<PathBuf>,
     /// Ordered explicit dependencies, loaded under the same admitted owner.
     #[serde(default)]
     pub dependency_libraries: Vec<PathBuf>,
@@ -420,6 +420,10 @@ impl ImageProductConfig {
         match &config.backend {
             ImageBackendConfig::Cuda(cuda) => {
                 ensure!(
+                    cuda.cudnn.library_path.is_some(),
+                    "CUDA image configuration requires cudnn.library_path"
+                );
+                ensure!(
                     cuda.cudnn.dependency_libraries.len() <= 16,
                     "cuDNN dependency list exceeds 16 libraries"
                 );
@@ -533,8 +537,10 @@ impl ImageProductConfig {
             }
         }
         if let ImageBackendConfig::Cuda(cuda) = &mut self.backend {
-            if cuda.cudnn.library_path.is_relative() {
-                cuda.cudnn.library_path = base.join(&cuda.cudnn.library_path);
+            if let Some(path) = &mut cuda.cudnn.library_path {
+                if path.is_relative() && !path.as_os_str().is_empty() {
+                    *path = base.join(&*path);
+                }
             }
             for path in &mut cuda.cudnn.dependency_libraries {
                 if path.is_relative() {
@@ -566,7 +572,11 @@ impl CudaConfig {
                 fp8_host_cache: self.fp8_host_cache,
                 convolution_workspace: self.cudnn.convolution_workspace,
                 cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
-                    library_path: self.cudnn.library_path.clone(),
+                    library_path: self
+                        .cudnn
+                        .library_path
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("missing image cudnn.library_path"))?,
                     dependency_libraries: self.cudnn.dependency_libraries.clone(),
                     opaque_memory_bytes: self.cudnn.opaque_memory_bytes,
                     workspace_limit_bytes: self.cudnn.workspace_limit_bytes,

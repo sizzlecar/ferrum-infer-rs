@@ -38,7 +38,13 @@ pub struct FastH3CudaConfig {
     #[serde(default)]
     pub initial_allocation_cache_bytes: Option<NonZeroU64>,
     pub native_bytes: u64,
-    pub cudnn_library: PathBuf,
+    /// Omission selects the system cuDNN runtime for the compiled CUDA major.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cudnn_library: Option<PathBuf>,
+    /// Local process state; wire config records omission to preserve automatic selection.
+    #[serde(skip)]
+    discovered_cudnn: Option<PathBuf>,
+    #[serde(default)]
     pub cudnn_dependencies: Vec<PathBuf>,
     pub cudnn_opaque_bytes: u64,
     pub workspace_bytes: u64,
@@ -64,7 +70,8 @@ impl FastH3CudaConfig {
             minimum_pinned_weight_upload_bytes: 0,
             initial_allocation_cache_bytes: None,
             native_bytes: 64 << 20,
-            cudnn_library,
+            cudnn_library: Some(cudnn_library),
+            discovered_cudnn: None,
             cudnn_dependencies,
             cudnn_opaque_bytes: 512 << 20,
             workspace_bytes: 256 << 20,
@@ -72,6 +79,20 @@ impl FastH3CudaConfig {
             maximum_native_plans: 128,
             maximum_native_bindings: 1024,
         }
+    }
+    /// Resolve system discovery once, before opening model assets. Explicit
+    /// deployments retain their absolute paths and original preload behaviour.
+    pub fn resolve_cudnn(&mut self, discover: impl FnOnce() -> Result<PathBuf>) -> Result<()> {
+        if self.cudnn_library.is_none() {
+            self.discovered_cudnn = Some(discover()?);
+        }
+        Ok(())
+    }
+    fn library(&self) -> Result<&std::path::Path> {
+        self.cudnn_library
+            .as_deref()
+            .or(self.discovered_cudnn.as_deref())
+            .context("FastH3 requires a resolved cuDNN runtime")
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -106,7 +127,7 @@ impl FastH3CudaConfig {
             "invalid FastH3 device/native capacity"
         );
         ensure!(
-            self.cudnn_library.is_absolute()
+            self.library()?.is_absolute()
                 && self.cudnn_dependencies.iter().all(|p| p.is_absolute()),
             "cuDNN libraries require explicit absolute paths"
         );
@@ -188,14 +209,19 @@ impl FastH3CudaComposition {
             CudaCudnnOperation::CrossAttentionBf16,
             CudaCudnnOperation::CausalGqaBf16,
         ];
+        let cudnn = CudaCudnnConfig {
+            library_path: c.library()?.to_owned(),
+            dependency_libraries: c.cudnn_dependencies.clone(),
+            opaque_memory_bytes: c.cudnn_opaque_bytes,
+            workspace_limit_bytes: c.workspace_bytes,
+            opaque_memory_profile: "fast_h3.product.cudnn.v1".into(),
+        };
         let mut providers = cuda_vnext_tensor_providers_with_cudnn_selection(
             &runtime,
-            &CudaCudnnConfig {
-                library_path: c.cudnn_library.clone(),
-                dependency_libraries: c.cudnn_dependencies.clone(),
-                opaque_memory_bytes: c.cudnn_opaque_bytes,
-                workspace_limit_bytes: c.workspace_bytes,
-                opaque_memory_profile: "fast_h3.product.cudnn.v1".into(),
+            if c.cudnn_library.is_none() {
+                CudnnLibrarySelection::Discovered(&cudnn)
+            } else {
+                (&cudnn).into()
             },
             Some(CudnnSdpaPlanPolicy {
                 maximum_plans: c.maximum_native_plans,
@@ -307,6 +333,36 @@ mod tests {
         config.initial_allocation_cache_bytes = NonZeroU64::new(config.device_bytes);
         assert!(config.validate().is_err());
     }
+    #[test]
+    fn system_cudnn_resolution_preserves_declared_overrides_and_chooses_only_when_omitted() {
+        let explicit = std::path::PathBuf::from("/deployment/libcudnn.so.9");
+        let config = FastH3CudaConfig::rtx5090(explicit.clone(), vec![]);
+        let mut wire = serde_json::to_value(config).unwrap();
+        let mut configured: FastH3CudaConfig = serde_json::from_value(wire.clone()).unwrap();
+        configured
+            .resolve_cudnn(|| panic!("must preserve explicit path"))
+            .unwrap();
+        assert_eq!(configured.library().unwrap(), explicit);
+
+        wire.as_object_mut().unwrap().remove("cudnn_library");
+        wire.as_object_mut().unwrap().remove("cudnn_dependencies");
+        let discovered = std::path::PathBuf::from("/usr/lib/libcudnn.so.9");
+        let mut config: FastH3CudaConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert!(config.validate().is_err());
+        config.resolve_cudnn(|| Ok(discovered.clone())).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.library().unwrap(), discovered);
+        assert!(config.cudnn_library.is_none());
+        assert!(config.cudnn_dependencies.is_empty());
+
+        wire["cudnn_library"] = serde_json::json!("");
+        let mut invalid: FastH3CudaConfig = serde_json::from_value(wire).unwrap();
+        invalid
+            .resolve_cudnn(|| panic!("invalid explicit path must not trigger discovery"))
+            .unwrap();
+        assert!(invalid.validate().is_err());
+    }
+
     #[test]
     #[ignore = "requires CUDA SM120, pinned native operator lock and explicit cuDNN libraries; validates shared provider installation, not inference"]
     fn shared_cuda_composition_initializes_all_stage_provider_owners() {

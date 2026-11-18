@@ -2,7 +2,7 @@
 //! optional bounded SDPA cache. This creates no second execution context.
 use super::*;
 use crate::backend::cuda::vnext_runtime::{
-    CudaCudnnConfig, CudaCudnnOwner, CudaCudnnSdpaCache, CudnnSdpaPlanPolicy,
+    CudaCudnnOwner, CudaCudnnSdpaCache, CudnnLibrarySelection, CudnnSdpaPlanPolicy,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,7 +96,7 @@ fn validate(
 
 pub(crate) fn providers(
     runtime: &CudaDeviceRuntime,
-    config: &CudaCudnnConfig,
+    config: CudnnLibrarySelection<'_>,
     policy: Option<CudnnSdpaPlanPolicy>,
     vendor: &[CudaCudnnOperation],
     selected: &[CudaTensorOperation],

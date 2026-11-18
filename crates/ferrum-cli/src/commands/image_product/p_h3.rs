@@ -289,7 +289,11 @@ impl PH3ImageProductConfig {
         }
         let PH3ImageBackendConfig::Cuda(backend) = &self.backend;
         ensure!(
-            !backend.cudnn.library_path.as_os_str().is_empty()
+            backend
+                .cudnn
+                .library_path
+                .as_ref()
+                .is_none_or(|path| !path.as_os_str().is_empty())
                 && backend
                     .cudnn
                     .dependency_libraries
@@ -346,7 +350,9 @@ impl PH3ImageProductConfig {
             trace.resolve_path(base);
         }
         let PH3ImageBackendConfig::Cuda(backend) = &mut self.backend;
-        resolve(&mut backend.cudnn.library_path);
+        if let Some(path) = &mut backend.cudnn.library_path {
+            resolve(path);
+        }
         for path in &mut backend.cudnn.dependency_libraries {
             resolve(path);
         }
@@ -416,7 +422,10 @@ impl PH3ImageCudaBackendConfig {
                 >=limits.static_initialization.maximum_staging_bytes(),
             "H3 requires explicit source backing, preprocessing, output and static staging Host allowances");
         ensure!(
-            self.cudnn.library_path.is_absolute()
+            self.cudnn
+                .library_path
+                .as_ref()
+                .is_none_or(|path| path.is_absolute())
                 && self.cudnn.dependency_libraries.len() <= 16
                 && self
                     .cudnn
@@ -536,8 +545,11 @@ impl PH3ImageCudaBackendConfig {
                 .as_ref()
                 .map(PH3ImageCausalModuleConfig::resolved)
                 .transpose()?,
+            cudnn_discovered: self.cudnn.library_path.is_none(),
             cudnn: CudaCudnnConfig {
-                library_path: super::library::resolve(Some(&self.cudnn.library_path))?,
+                library_path: crate::commands::cudnn_library::resolve(
+                    self.cudnn.library_path.as_deref(),
+                )?,
                 dependency_libraries: self.cudnn.dependency_libraries.clone(),
                 opaque_memory_bytes: self.cudnn.opaque_memory_bytes,
                 workspace_limit_bytes: self.cudnn.workspace_limit_bytes,

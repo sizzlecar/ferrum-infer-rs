@@ -127,11 +127,14 @@ impl Configuration {
             data.len() <= 1024 * 1024,
             "video configuration exceeds 1 MiB"
         );
-        let value: Self = serde_json::from_slice(&data).context("video product JSON")?;
+        let mut value: Self = serde_json::from_slice(&data).context("video product JSON")?;
         ensure!(
             !value.model.trim().is_empty(),
             "video model name must be nonempty"
         );
+        value
+            .cuda
+            .resolve_cudnn(|| crate::commands::cudnn_library::resolve(None))?;
         value.cuda.validate()?;
         value.conditioning_reuse.validate()?;
         value.serving.service_config()?;

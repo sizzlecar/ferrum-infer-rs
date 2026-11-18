@@ -328,7 +328,10 @@ fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
         cuda.resolved_pipeline().unwrap().decoder_batch_policy,
         ferrum_engine::image_generation::ImageDecoderBatchPolicy::SingleImage
     );
-    assert_eq!(cuda.cudnn.library_path, base.join("lib/libcudnn.so.9"));
+    assert_eq!(
+        cuda.cudnn.library_path,
+        Some(base.join("lib/libcudnn.so.9"))
+    );
     assert!(cuda.cudnn.dependency_libraries.is_empty());
     assert!(
         matches!(config.weights.vae, WeightSource::Single{directory,file,..}

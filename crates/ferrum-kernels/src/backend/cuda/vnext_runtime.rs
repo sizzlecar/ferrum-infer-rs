@@ -77,12 +77,12 @@ mod tensor_eager;
 pub use idle_lanes::CudaNativeLaneReuse;
 mod tensor_io;
 mod terminal_readback;
-pub use cudnn::CudaCudnnConfig;
 pub use cudnn::CudnnSdpaPlanPolicy;
 pub(crate) use cudnn::{
     ConvolutionDimensions, CudaCudnnOwner, CudnnConv2dDescriptor, CudnnConv3dDescriptor,
     CudnnConvScalar, PreparedConv,
 };
+pub use cudnn::{CudaCudnnConfig, CudnnLibrarySelection};
 pub(crate) use cudnn::{
     CudaCudnnSdpaCache, CudnnSdpaBindings, CudnnSdpaExecution, CudnnSdpaPlan, CudnnSdpaSignature,
 };

@@ -370,7 +370,9 @@ impl DirectoryOptions {
             convolution_workspace:
                 ferrum_engine::image_generation::ImageCudaConvolutionWorkspacePolicy::Auto,
             cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
-                library_path: super::library::resolve(self.cudnn_library.as_deref())?,
+                library_path: crate::commands::cudnn_library::resolve(
+                    self.cudnn_library.as_deref(),
+                )?,
                 dependency_libraries: Vec::new(),
                 opaque_memory_bytes: 64 * MIB,
                 workspace_limit_bytes: 16 * MIB,

@@ -3,8 +3,8 @@
 use super::*;
 use crate::backend::cuda::vnext_runtime::{
     ConvolutionDimensions, CudaCudnnConfig, CudaCudnnOwner, CudaCudnnSdpaCache,
-    CudnnConv2dDescriptor, CudnnConv3dDescriptor, CudnnConvScalar, CudnnSdpaBindings,
-    CudnnSdpaPlanPolicy, CudnnSdpaSignature, PreparedConv,
+    CudnnConv2dDescriptor, CudnnConv3dDescriptor, CudnnConvScalar, CudnnLibrarySelection,
+    CudnnSdpaBindings, CudnnSdpaPlanPolicy, CudnnSdpaSignature, PreparedConv,
 };
 use ferrum_runtime::{
     Conv2dF32Geometry, Conv2dF32PaddingMode, Conv3dF32Geometry, DynamicStorageRequirement,
@@ -21,7 +21,7 @@ pub(crate) fn providers(
     config: &CudaCudnnConfig,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, None, None, None, false)
+    providers_impl(runtime, config.into(), selected, None, None, None, false)
 }
 
 pub(crate) fn providers_with_transpose(
@@ -30,7 +30,7 @@ pub(crate) fn providers_with_transpose(
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     super::conv_transpose2d_f32::require_capability(runtime.descriptor())?;
-    providers_impl(runtime, config, selected, None, None, None, true)
+    providers_impl(runtime, config.into(), selected, None, None, None, true)
 }
 
 pub(crate) fn providers_with_segmented_sdpa(
@@ -39,7 +39,15 @@ pub(crate) fn providers_with_segmented_sdpa(
     policy: CudnnSdpaPlanPolicy,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, Some(policy), None, None, false)
+    providers_impl(
+        runtime,
+        config.into(),
+        selected,
+        Some(policy),
+        None,
+        None,
+        false,
+    )
 }
 
 pub(crate) fn providers_with_fused_f32(
@@ -49,12 +57,20 @@ pub(crate) fn providers_with_fused_f32(
     fused: &CudaCutlassFusedF32Config,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    providers_impl(runtime, config, selected, policy, Some(fused), None, false)
+    providers_impl(
+        runtime,
+        config.into(),
+        selected,
+        policy,
+        Some(fused),
+        None,
+        false,
+    )
 }
 
 pub(crate) fn providers_with_native_options(
     runtime: &CudaDeviceRuntime,
-    config: &CudaCudnnConfig,
+    config: CudnnLibrarySelection<'_>,
     policy: Option<CudnnSdpaPlanPolicy>,
     fused: Option<&CudaCutlassFusedF32Config>,
     convrot: Option<&CudaConvRotFusedOutputConfig>,
@@ -65,7 +81,7 @@ pub(crate) fn providers_with_native_options(
 
 fn providers_impl(
     runtime: &CudaDeviceRuntime,
-    config: &CudaCudnnConfig,
+    config: CudnnLibrarySelection<'_>,
     selected: &[CudaTensorOperation],
     policy: Option<CudnnSdpaPlanPolicy>,
     fused: Option<&CudaCutlassFusedF32Config>,

@@ -18,8 +18,6 @@ mod gpu_tests;
 #[cfg(any(feature = "cuda", test))]
 mod host_cache;
 #[cfg(any(feature = "cuda", test))]
-mod library;
-#[cfg(any(feature = "cuda", test))]
 mod main_text_capture;
 #[cfg(any(feature = "cuda", test))]
 mod main_vision_capture;
