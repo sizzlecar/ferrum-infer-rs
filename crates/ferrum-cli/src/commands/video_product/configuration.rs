@@ -127,7 +127,7 @@ impl Configuration {
             data.len() <= 1024 * 1024,
             "video configuration exceeds 1 MiB"
         );
-        let mut value: Self = serde_json::from_slice(&data).context("video product JSON")?;
+        let mut value = Self::from_document(&data)?;
         ensure!(
             !value.model.trim().is_empty(),
             "video model name must be nonempty"
@@ -155,6 +155,23 @@ impl Configuration {
             "video retention requires positive job/TTL limits and enough bytes for one maximum encoded output"
         );
         Ok(value)
+    }
+
+    fn from_document(data: &[u8]) -> Result<Self> {
+        let doc = super::preset::PresetConfig::from_document(data)
+            .map_err(|error| anyhow::anyhow!("video product JSON: {error}"))?;
+        if let Some(short) = doc {
+            let mut config: Self = serde_json::from_slice(short.template())
+                .map_err(|error| anyhow::anyhow!("embedded video preset: {error}"))?;
+            config.source = Source::ModelDirectory {
+                path: short.model_directory,
+            };
+            config.output.directory = short.output_directory;
+            Ok(config)
+        } else {
+            serde_json::from_slice(data)
+                .map_err(|error| anyhow::anyhow!("video product JSON: {error}"))
+        }
     }
 }
 
@@ -349,5 +366,46 @@ impl Output {
             spool,
             encoder,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_form_uses_the_expanded_compute_and_output_policies_with_local_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("job store");
+        let model = Path::new("local models").join("reference generator");
+        let short = serde_json::json!({
+            "preset": "rtx5090_ref2va_v1",
+            "model_directory": model,
+            "output_directory": output,
+        });
+        let compact = Configuration::from_document(&serde_json::to_vec(&short).unwrap()).unwrap();
+        let expanded = Configuration::from_document(include_bytes!(
+            "../../../examples/config/fast-h3-video-cuda.json"
+        ))
+        .unwrap();
+
+        assert!(matches!(&compact.source, Source::ModelDirectory { path } if path == &model));
+        assert_eq!(compact.output.directory, output);
+        assert_eq!(compact.model, expanded.model);
+        assert_eq!(
+            serde_json::to_value(&compact.cuda).unwrap(),
+            serde_json::to_value(&expanded.cuda).unwrap()
+        );
+        assert_eq!(compact.maximum_plan_nodes, expanded.maximum_plan_nodes);
+        assert_eq!(
+            compact.video_decoder_tile_batch.maximum_tiles(),
+            expanded.video_decoder_tile_batch.maximum_tiles()
+        );
+        assert_eq!(compact.serving.max_num_seqs, expanded.serving.max_num_seqs);
+        assert_eq!(compact.output.crf, expanded.output.crf);
+        assert_eq!(
+            compact.output.maximum_encoded_bytes,
+            expanded.output.maximum_encoded_bytes
+        );
     }
 }

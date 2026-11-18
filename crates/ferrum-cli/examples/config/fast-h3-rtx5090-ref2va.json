@@ -1,0 +1,5 @@
+{
+  "preset": "rtx5090_ref2va_v1",
+  "model_directory": "/opt/ferrum/models/FastH3-Omni-NVFP4-QAD",
+  "output_directory": "/var/tmp/ferrum-video"
+}

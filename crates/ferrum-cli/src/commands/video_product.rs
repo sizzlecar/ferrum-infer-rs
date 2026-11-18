@@ -8,6 +8,8 @@ mod configuration;
 mod execution;
 #[cfg(any(feature = "cuda-fast-h3", test))]
 mod media;
+#[cfg(any(feature = "cuda-fast-h3", test))]
+mod preset;
 #[cfg(test)]
 mod tests;
 

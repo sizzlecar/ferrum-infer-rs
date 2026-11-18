@@ -19,12 +19,17 @@ Keep the complete model directory, including the reference transformer,
 packed NVFP4 weights, text/vision encoder, video/audio VAEs, schedulers,
 processor files and tokenizer.
 
-Copy the [5090 configuration](../crates/ferrum-cli/examples/config/fast-h3-video-cuda.json)
-and set its model, cuDNN main library and output paths for your
-installation. Relative model paths resolve from the process working directory.
-Leave `cuda.cudnn_dependencies` empty when the system loader can find the
-CUDA 12.8 libraries. This configuration reproduced the 124-frame release
-sample byte for byte on the 5090.
+Copy the [RTX 5090 Ref2VA preset](../crates/ferrum-cli/examples/config/fast-h3-rtx5090-ref2va.json)
+and set `model_directory` to the installed checkpoint and `output_directory`
+to an absolute spool and results directory. Relative model paths resolve from
+the process working directory. Both commands accept this file through
+`--video-config`.
+
+The [expanded configuration](../crates/ferrum-cli/examples/config/fast-h3-video-cuda.json)
+is the source of this preset's compute, memory, serving and encoding settings.
+Use the expanded form for custom paths, capacity limits or encoding options.
+The CUDA 12.8 configuration reproduced the 124-frame release sample byte for
+byte on the 5090.
 
 Both commands find FFmpeg on the system PATH. An absolute `output.ffmpeg`
 selects a different encoder. Reference video decoding uses the same FFmpeg by
@@ -39,8 +44,8 @@ limits: the Host buffer allowance is not a process RAM limit. The long-reference
 qualification observed about 39.3 GiB server RSS. Device capacity and private
 allocator reservations are not measurements of whole-device peak VRAM.
 
-The example includes the tested capacity settings. Omitting
-`maximum_plan_nodes` currently selects 16384, which is insufficient for the
+In the expanded form, omitting
+`maximum_plan_nodes` selects 16384, which is insufficient for the
 qualified 15-second long-reference graph. Keep the explicit node and command
 limits when using that workload. A larger metadata limit does not increase the
 GPU byte budget.
@@ -48,19 +53,19 @@ GPU byte budget.
 ## CLI
 
 ```sh
-ferrum run --video-config fast-h3-video-cuda.json \
+ferrum run --video-config fast-h3-rtx5090-ref2va.json \
   --reference image=reference.png \
   --prompt 'The person in <Picture 1> turns toward the lake. The camera moves slowly closer.' \
   --width 832 --height 480 --num-frames 124 --fps 24 --seed 1101 \
   --output clip.mp4
 
-ferrum run --video-config fast-h3-video-cuda.json \
+ferrum run --video-config fast-h3-rtx5090-ref2va.json \
   --reference video=reference.mp4 \
   --prompt 'Use <Video 1> for the scene and camera movement. Continue the movement smoothly.' \
   --width 832 --height 480 --num-frames 362 --fps 24 --seed 1301 \
   --output continuation.mp4
 
-ferrum serve --video-config fast-h3-video-cuda.json --host 127.0.0.1 --port 8000
+ferrum serve --video-config fast-h3-rtx5090-ref2va.json --host 127.0.0.1 --port 8000
 ```
 
 Repeat `--reference image=...`, `video=...` or `audio=...` in the intended order.
