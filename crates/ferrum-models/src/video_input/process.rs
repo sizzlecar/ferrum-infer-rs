@@ -42,6 +42,31 @@ impl Drop for Abort<'_> {
     }
 }
 
+fn decoder_pixel_limit(image: ImageInputLimits) -> Result<u64> {
+    let width = u64::from(image.maximum_width());
+    let height = u64::from(image.maximum_height());
+    let pixels = u64::try_from(image.maximum_pixels())?.min(
+        width
+            .checked_mul(height)
+            .context("video decoder dimension capacity overflow")?,
+    );
+    // FFmpeg 8.1 libavcodec checks FFALIGN(width, STRIDE_ALIGN) * height
+    // before allocating a frame; STRIDE_ALIGN is at most 64. Keep room for
+    // that row padding without rejecting an admitted, unaligned visible
+    // frame. Rotation can exchange the source axes. inspect() still enforces
+    // the exact visible dimensions/pixels; this is not an external RSS limit.
+    let padding = width
+        .max(height)
+        .min(pixels)
+        .checked_mul(63)
+        .context("video decoder row padding overflow")?;
+    let padded = pixels
+        .checked_add(padding)
+        .context("video decoder pixel capacity overflow")?;
+    // This AVOption accepts at most INT_MAX, also its existing default.
+    Ok(padded.min(i32::MAX as u64))
+}
+
 pub(super) fn run<T>(
     codec: &VideoInputCodec,
     program: &Path,
@@ -56,6 +81,7 @@ pub(super) fn run<T>(
         !encoded.is_empty() && encoded.len() <= config.maximum_encoded_bytes,
         "encoded video exceeds declared input capacity"
     );
+    let maximum_decoder_pixels = decoder_pixel_limit(config.image)?;
     let started = Instant::now();
     let check = || -> Result<()> {
         if cancelled.load(Ordering::Acquire) {
@@ -90,10 +116,17 @@ pub(super) fn run<T>(
         "-format_whitelist",
         "mov,matroska,webm",
     ]);
+    // Both tools can decode while finding stream information, before the
+    // caller sees metadata. Apply decoder options before opening the input,
+    // including ffprobe's later frame-counting pass.
+    command
+        .arg("-threads")
+        .arg(config.threads.to_string())
+        .arg("-max_pixels")
+        .arg(maximum_decoder_pixels.to_string());
     if decode {
         command
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-threads"])
-            .arg(config.threads.to_string())
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
             .arg("-i")
             .arg(staged.path())
             .args(arguments);
