@@ -11,6 +11,9 @@ It requires at least one image or video reference.
 Use a build with `cuda-fast-h3` and its pinned native operator set. On the
 RTX 5090, use CUDA 12.8 and cuDNN 9.20.0.48 **for CUDA 12**. MP4 output uses
 FFmpeg with libx264 and AAC encoding. Video references also need ffprobe.
+Follow the [shared GPU runtime setup](image-generation.md#p-h3-setup).
+On Ubuntu, `sudo apt-get install --no-install-recommends ffmpeg` supplies
+the encoder and probe tool. An existing compatible installation can be reused.
 The tested model revision is `f01e6a23ac6066aa9eb622cf94b6259442e70ec2`.
 Keep the complete model directory, including the reference transformer,
 packed NVFP4 weights, text/vision encoder, video/audio VAEs, schedulers,

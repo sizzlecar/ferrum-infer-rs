@@ -32,6 +32,20 @@ the installed `libcudnn.so.9`. Leave `dependency_libraries` empty when
 the system loader can find the CUDA 12.8 libraries. This configuration produced
 the same pixels as the reference for the 1024×1024 sample.
 
+On Ubuntu 24.04 x86_64 with a working NVIDIA driver and the NVIDIA APT
+repository enabled, install the runtime packages for the 5090:
+
+```sh
+sudo apt-get install --no-install-recommends \
+  cuda-cudart-12-8 libcublas-12-8 cuda-nvrtc-12-8 libnvjitlink-12-8 \
+  libcudnn9-cuda-12=9.20.0.48-1
+```
+
+P-H3 and FastH3 share this installation. For an estimate on your machine,
+use `apt-get --assume-no install` with the same package arguments. NVIDIA
+documents how to enable the repository for your distribution in the
+[cuDNN Linux installation guide](https://docs.nvidia.com/cudnn/installation/backend/linux/).
+
 The example targets a 32 GB GPU with a 29 GiB managed device ceiling and 48 GB
 system-memory limit. Its opaque module allowances are explicit reservations,
 not certified measurements for every driver/library version. Smaller GPUs need
