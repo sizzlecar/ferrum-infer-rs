@@ -8,18 +8,20 @@ It requires at least one image or video reference.
 
 ## Setup
 
-Use a build with `cuda-fast-h3` and its pinned native operator set. CUDA and
-cuDNN libraries, FFmpeg with H.264/AAC support, and ffprobe must be installed.
+Use a build with `cuda-fast-h3` and its pinned native operator set. On the
+RTX 5090, use CUDA 12.8 and cuDNN 9.20.0.48 **for CUDA 12**. MP4 output uses
+FFmpeg with libx264 and AAC encoding. Video references also need ffprobe.
 The tested model revision is `f01e6a23ac6066aa9eb622cf94b6259442e70ec2`.
 Keep the complete model directory, including the reference transformer,
 packed NVFP4 weights, text/vision encoder, video/audio VAEs, schedulers,
 processor files and tokenizer.
 
 Copy the [5090 configuration](../crates/ferrum-cli/examples/config/fast-h3-video-cuda.json)
-and set its absolute model, CUDA/cuDNN, FFmpeg and output paths. Relative
-model paths resolve from the process working directory. The example uses the
-tested CUDA 13 cuDNN dependency family alongside the CUDA build; match every
-listed library to your installation.
+and set its model, cuDNN main library, FFmpeg and output paths for your
+installation. Relative model paths resolve from the process working directory.
+Leave `cuda.cudnn_dependencies` empty when the system loader can find the
+CUDA 12.8 libraries. This configuration reproduced the 124-frame release
+sample byte for byte on the 5090.
 
 This preset explicitly declares 29 GiB of managed device capacity, 4 GiB of
 managed Host buffers, 32768 graph nodes/command records, automatic FFN row

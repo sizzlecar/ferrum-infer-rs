@@ -14,14 +14,7 @@
     "staging_bytes": 8388608,
     "native_bytes": 67108864,
     "cudnn_library": "/opt/cudnn/lib/libcudnn.so.9",
-    "cudnn_dependencies": [
-      "/opt/cuda-13/lib64/libcudart.so.13",
-      "/opt/cuda-13/lib64/libnvrtc-builtins.so.13.0",
-      "/opt/cuda-13/lib64/libnvrtc.so.13",
-      "/opt/cuda-13/lib64/libnvJitLink.so.13",
-      "/opt/cuda-13/lib64/libcublasLt.so.13",
-      "/opt/cuda-13/lib64/libcublas.so.13"
-    ],
+    "cudnn_dependencies": [],
     "cudnn_opaque_bytes": 536870912,
     "workspace_bytes": 268435456,
     "plan_cache_bytes": 536870912,

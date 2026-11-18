@@ -41,18 +41,11 @@
     "opaque_memory_profile": "p-h3-sm120-29g-example-v1",
     "cudnn": {
       "library_path": "/opt/cudnn/lib/libcudnn.so.9",
-      "dependency_libraries": [
-        "/opt/cuda-13/lib64/libcudart.so.13",
-        "/opt/cuda-13/lib64/libnvrtc-builtins.so.13.0",
-        "/opt/cuda-13/lib64/libnvrtc.so.13",
-        "/opt/cuda-13/lib64/libnvJitLink.so.13",
-        "/opt/cuda-13/lib64/libcublasLt.so.13",
-        "/opt/cuda-13/lib64/libcublas.so.13"
-      ],
+      "dependency_libraries": [],
       "opaque_memory_bytes": 1073741824,
       "workspace_limit_bytes": 268435456,
       "convolution_workspace": "configured_limit",
-      "opaque_memory_profile": "p-h3-cudnn9-cu13-f32-fma-example-v1"
+      "opaque_memory_profile": "p-h3-cudnn9-cu12-f32-fma-example-v1"
     },
     "host": {
       "total_bytes": 12884901888,

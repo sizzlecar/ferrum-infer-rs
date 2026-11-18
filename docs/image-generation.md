@@ -26,9 +26,11 @@ body retains the status and diagnostic details.
 Copy the [P-H3 CUDA configuration](../crates/ferrum-cli/examples/config/p-h3-image-cuda.json)
 beside your `models/` directory. It expects P-H3 metadata and prompt-upsample
 sources in `models/P-H3-Image/`, and the Comfy W4A8 text encoder/DiT and INT8 VAE
-archives in `models/P-H3-Image-Comfy/`. Set the CUDA/cuDNN absolute library paths
-to the installed libraries. The example uses the tested CUDA 13 cuDNN dependency
-family alongside the CUDA release binary; these libraries are not bundled.
+archives in `models/P-H3-Image-Comfy/`. On RTX 5090, use the CUDA 12.8 runtime
+and cuDNN 9.20.0.48 **for CUDA 12**. Set `backend.cudnn.library_path` to
+the installed `libcudnn.so.9`. Leave `dependency_libraries` empty when
+the system loader can find the CUDA 12.8 libraries. This configuration produced
+the same pixels as the reference for the 1024×1024 sample.
 
 The example targets a 32 GB GPU with a 29 GiB managed device ceiling and 48 GB
 system-memory limit. Its opaque module allowances are explicit reservations,
