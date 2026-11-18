@@ -297,9 +297,39 @@ fn accept_staged(
         "2.3.4",
         &"a".repeat(40),
         17,
+        None,
         "v2.3.3",
         "owner/repo",
     )
+}
+
+#[test]
+fn recovery_windows_receipt_keeps_its_own_run_and_original_release_label() {
+    let fixture = staged_fixture();
+    let path = fixture.root.path().join("windows-staging.json");
+    let mut receipt: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let accept = |standalone, original| {
+        super::super::gate::windows_assets::verify_one(
+            fixture.root.path(),
+            Backend::Cuda,
+            "2.3.4",
+            &"a".repeat(40),
+            standalone,
+            original,
+            "v2.3.3",
+            "owner/repo",
+        )
+    };
+    assert!(accept(31, Some(17)).is_err());
+    receipt["staging_label"] = serde_json::json!("recovery-17");
+    receipt["workflow_run_id"] = serde_json::json!(31);
+    fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    let verified = accept(31, Some(17)).unwrap();
+    assert_eq!(verified.attempt, 2);
+    assert_eq!(verified.candidate_tag, "v2.3.4-rc.7");
+    assert!(accept(31, Some(22)).is_err());
+    assert!(accept(17, Some(17)).is_err());
+    assert!(accept(31, None).is_err());
 }
 
 #[test]
@@ -341,6 +371,7 @@ fn windows_release_requires_cpu_startup_and_the_shared_stable_launcher() {
             "2.3.4",
             &"a".repeat(40),
             17,
+            None,
             "v2.3.3",
             "owner/repo",
         )

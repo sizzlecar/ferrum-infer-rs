@@ -695,6 +695,18 @@ fn resume_manual_inputs_are_paired_and_only_publication_checkpoint_is_optional()
     );
     assert!(existing.status.success());
     assert_eq!(String::from_utf8(existing.stdout).unwrap().trim(), "17");
+    assert!(downloads(job, "outputs.windows_cpu"));
+    assert!(downloads(job, "outputs.windows_cuda"));
+    let recovery = steps(job)
+        .iter()
+        .find(|step| {
+            step["env"]["WINDOWS_RUN"].as_str() == Some("${{ inputs.windows_cuda_staging_run_id }}")
+        })
+        .unwrap();
+    assert_eq!(
+        recovery["if"].as_str(),
+        Some("inputs.windows_cuda_staging_run_id != ''")
+    );
     for step in steps(job) {
         if let Some(ids) = step["with"]["artifact-ids"].as_str() {
             if ids.contains("outputs.publication_state") {
@@ -702,13 +714,81 @@ fn resume_manual_inputs_are_paired_and_only_publication_checkpoint_is_optional()
                     step["if"].as_str(),
                     Some("steps.source.outputs.publication_state != ''")
                 );
+            } else if ids.contains("outputs.windows_cuda") {
+                assert_eq!(
+                    step["if"].as_str(),
+                    Some("inputs.windows_cuda_staging_run_id == ''")
+                );
+                assert_eq!(
+                    step["with"]["run-id"].as_str(),
+                    Some("${{ inputs.source_run_id }}")
+                );
             } else {
                 assert!(
                     step["if"].is_null(),
                     "required evidence cannot depend on a publication checkpoint"
                 );
+                if ids.contains("outputs.windows_cpu") {
+                    assert_eq!(
+                        step["with"]["run-id"].as_str(),
+                        Some("${{ inputs.source_run_id }}")
+                    );
+                }
             }
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_keeps_the_original_windows_cpu_and_only_recovers_a_missing_cuda_package() {
+    use std::process::Command;
+    let resume = workflow("release-resume.yml");
+    let source = script(&resume["jobs"]["publish"], "artifact_id() {");
+    let start = source.find("for backend in cpu cuda; do").unwrap();
+    let end = start + source[start..].find("\nevidence_ids=").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("outputs");
+    let select = |backends: &[&str], recovery: &str| {
+        let records: Vec<_> = backends.iter().enumerate().map(|(index, backend)| {
+            serde_json::json!({"id":index+1,"name":format!("ferrum-windows-x86_64-{backend}-run-17-1-commit")})
+        }).collect();
+        fs::write(
+            dir.path().join("staged-artifacts.json"),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+        fs::write(&output, "").unwrap();
+        let result = Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                &source[start..end],
+            ])
+            .env("RUNNER_TEMP", dir.path())
+            .env("GITHUB_OUTPUT", &output)
+            .env("WINDOWS_CUDA_RUN", recovery)
+            .output()
+            .unwrap();
+        result
+            .status
+            .success()
+            .then(|| fs::read_to_string(&output).unwrap())
+    };
+    assert_eq!(
+        select(&["cpu", "cuda"], "").as_deref(),
+        Some("windows_cpu=1\nwindows_cuda=2\n")
+    );
+    assert_eq!(select(&["cpu"], "73").as_deref(), Some("windows_cpu=1\n"));
+    assert!(select(&["cpu"], "").is_none());
+    assert!(select(&["cpu", "cuda"], "73").is_none());
+    for recovery in ["", "73"] {
+        assert!(select(&["cuda"], recovery).is_none());
+        assert!(select(&["cpu", "cpu"], recovery).is_none());
     }
 }
 

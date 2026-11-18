@@ -1180,21 +1180,21 @@ async fn ci_fixture_with_runtime_source(
         .build()
         .unwrap();
     let result = match (windows_attempt, cuda_policy) {
-        (attempt, policy) if attempt.is_some() || policy.is_some() => {
-            ci_at_with_windows(
-                &client,
-                &url,
-                "owner/repo",
-                17,
-                &"a".repeat(40),
-                None,
-                attempt,
-                policy,
-                sm120_required,
-                source,
-            )
-            .await
-        }
+        (attempt, policy) if attempt.is_some() || policy.is_some() => ci_at_with_windows(
+            &client,
+            &url,
+            "owner/repo",
+            17,
+            &"a".repeat(40),
+            None,
+            attempt,
+            policy,
+            sm120_required,
+            source,
+            recovery::CiInputs::default(),
+        )
+        .await
+        .map(|(sm120, _)| sm120),
         _ => ci_at(&client, &url, "owner/repo", 17, &"a".repeat(40), None)
             .await
             .map(|_| None),

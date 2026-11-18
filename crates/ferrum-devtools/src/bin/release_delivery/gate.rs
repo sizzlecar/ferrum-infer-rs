@@ -13,7 +13,7 @@ use ferrum_bench_core::{
         distribution::distribution_check_descriptors,
         model_schedule::{model_check_descriptors, model_task_schedule, ModelTaskSchedule},
         model_tasks::{
-            verify_model_reports, ExpectedModelRun, ModelCheck, DEFAULT_CUDA_FUNCTIONAL_CAPACITY,
+            verify_model_report, ExpectedModelRun, ModelCheck, DEFAULT_CUDA_FUNCTIONAL_CAPACITY,
             DEFAULT_FUNCTIONAL_CAPACITY, DEFAULT_METAL_FUNCTIONAL_CAPACITY,
         },
         Backend, Behavior, CheckDescriptor, CudaModelLane, EvidenceLayer, Gap, MetalModelLane,
@@ -34,6 +34,9 @@ use tokio::process::Command;
 
 #[path = "ci_evidence.rs"]
 mod ci_evidence;
+
+#[path = "recovery.rs"]
+mod recovery;
 
 #[path = "cuda_gate.rs"]
 mod cuda_gate;
@@ -85,6 +88,12 @@ pub struct GateArgs {
     /// Manual uses the same required model/device/archive evidence; it does not claim CI success.
     #[arg(long, value_enum, default_value = "ci")]
     pub sm120_runtime_source: Sm120RuntimeSource,
+    /// Verified original SM89 and CPU evidence recovered after a transport failure.
+    #[arg(long)]
+    pub manual_local_evidence: Option<PathBuf>,
+    /// Successful standalone Windows CUDA staging dispatch on the frozen RC tag.
+    #[arg(long)]
+    pub windows_cuda_staging_run_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -185,6 +194,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         &args.version,
         &candidate,
         args.ci_run_id,
+        args.windows_cuda_staging_run_id,
         &text(&document["provenance"], "release_base_tag")?,
         &args.repo,
     )?;
@@ -245,18 +255,32 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         &args.version,
         sm120_runtime,
     )?;
-    let reports = args
+    let mut reports = args
         .report
         .iter()
         .map(|path| read::<Value>(path))
         .collect::<Result<Vec<_>, _>>()?;
-    let models = VerifiedModels::new(&tasks.expectations, &reports)?;
-    verify_sm120_model_device(&distributions, &models, sm120_runtime)?;
-    let installations = args
+    let mut installations = args
         .installation
         .iter()
         .map(|path| read::<installation::InstallationReport>(path))
         .collect::<Result<Vec<_>, _>>()?;
+    let manual = args
+        .manual_local_evidence
+        .as_deref()
+        .map(|directory| {
+            recovery::read_local(
+                directory,
+                args.ci_run_id,
+                &candidate,
+                &distributions,
+                &mut reports,
+                &mut installations,
+            )
+        })
+        .transpose()?;
+    let models = VerifiedModels::new(&tasks.expectations, &reports)?;
+    verify_sm120_model_device(&distributions, &models, sm120_runtime)?;
     verify_installations(
         &distributions,
         &installations,
@@ -272,6 +296,13 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         .release_cuda
         .as_ref()
         .ok_or("missing frozen CUDA policy")?;
+    let recovery = recovery::CiInputs {
+        manual_local: manual.is_some(),
+        standalone_windows: args
+            .windows_cuda_staging_run_id
+            .map(|run| (run, windows.cuda_candidate_tag.as_str())),
+        version: &args.version,
+    };
     verify_ci(
         &args.repo,
         args.ci_run_id,
@@ -280,6 +311,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         cuda_policy,
         sm120_runtime_required,
         args.sm120_runtime_source,
+        recovery,
     )
     .await?;
     let ci_evidence = ci_evidence::load(
@@ -296,7 +328,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     .await?;
     verify_obligations_with(&plan, &ci_evidence)?;
     // A rerun that began while artifacts were inspected must not reuse old Quality.
-    let sm120_ci = verify_ci(
+    let (sm120_ci, producers) = verify_ci(
         &args.repo,
         args.ci_run_id,
         &candidate,
@@ -304,6 +336,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         cuda_policy,
         sm120_runtime_required,
         args.sm120_runtime_source,
+        recovery,
     )
     .await?;
     let mut notes = fs::read_to_string(&args.notes).map_err(|e| format!("release notes: {e}"))?;
@@ -317,6 +350,21 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         sm120_ci,
         &mut notes,
     )?;
+    let recovered_delivery = if manual.is_some() || !producers.is_empty() {
+        notes.push_str(&format!("\n\nThe [original delivery](https://github.com/{}/actions/runs/{}) is retained in the publication record.", args.repo, args.ci_run_id));
+        if manual.is_some() {
+            notes.push_str(" The SM89 artifact transfer failed before model execution. The frozen CPU and SM89 packages, model suites, and SM89 FP8 runtime checker were verified manually.");
+        }
+        if let Some(id) = args.windows_cuda_staging_run_id {
+            notes.push_str(&format!(" Windows CUDA was packaged by the [standalone staging run](https://github.com/{}/actions/runs/{id}) for the same RC.", args.repo));
+        }
+        notes.push('\n');
+        Some(
+            serde_json::json!({"source_run_id": args.ci_run_id, "candidate_sha": candidate, "manual_local": manual, "producers": producers}),
+        )
+    } else {
+        None
+    };
     let mut assets: Vec<_> = distributions
         .into_values()
         .flat_map(|distribution| distribution.assets)
@@ -334,6 +382,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         notes,
         assets,
         sm120_runtime,
+        recovered_delivery,
     })
 }
 
@@ -769,30 +818,37 @@ struct VerifiedModels<'a> {
 }
 impl<'a> VerifiedModels<'a> {
     fn new(tasks: &'a [ExpectedModelRun], reports: &'a [Value]) -> Result<Self, String> {
-        let mut groups = BTreeMap::<&str, Vec<ExpectedModelRun>>::new();
-        for task in tasks {
-            groups
-                .entry(task.binary_sha256.as_str())
-                .or_default()
-                .push(task.clone());
-        }
-        if groups.is_empty() {
+        if tasks.is_empty() {
             return Err("model evidence requires prepared tasks".into());
         }
-        let mut report_groups = BTreeMap::<&str, Vec<Value>>::new();
+        // Reports can contain hundreds of MiB of original device observations.
+        // Bind by prepared binary and profile without duplicating their JSON.
+        let mut remaining = BTreeMap::new();
+        for task in tasks {
+            let key = (task.binary_sha256.as_str(), task.profile.id.as_str());
+            if remaining.insert(key, task).is_some() {
+                return Err(format!("duplicate prepared model task for {key:?}"));
+            }
+        }
         for report in reports {
             let hash = report["binary_sha256"]
                 .as_str()
-                .filter(|hash| groups.contains_key(hash))
-                .ok_or("model report has no matching prepared binary identity")?;
-            report_groups.entry(hash).or_default().push(report.clone());
+                .ok_or("model report omits binary identity")?;
+            let profile = report["profile_id"]
+                .as_str()
+                .ok_or("model report omits profile identity")?;
+            let task = remaining.remove(&(hash, profile)).ok_or_else(|| {
+                format!("unexpected or duplicated model report for {profile} / {hash}")
+            })?;
+            verify_model_report(task, report).map_err(|issues| {
+                format!(
+                    "model evidence for {profile} / {hash}: {}",
+                    issues.join("; ")
+                )
+            })?;
         }
-        for (hash, group) in groups {
-            verify_model_reports(
-                &group,
-                report_groups.get(hash).map(Vec::as_slice).unwrap_or(&[]),
-            )
-            .map_err(|issues| format!("model evidence for {hash}: {}", issues.join("; ")))?;
+        if let Some((key, _)) = remaining.first_key_value() {
+            return Err(format!("missing required model report for {key:?}"));
         }
         Ok(Self { tasks, reports })
     }
@@ -1150,6 +1206,33 @@ async fn public_version_at(
     Ok(())
 }
 
+async fn ci_get(
+    client: &reqwest::Client,
+    url: String,
+    token: Option<&str>,
+) -> Result<Value, String> {
+    let mut request = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "CI query failed; status unknown")?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "CI query returned HTTP {}; status unknown",
+            response.status()
+        ));
+    }
+    response
+        .json()
+        .await
+        .map_err(|_| "CI response was not valid JSON".into())
+}
 async fn verify_ci(
     repo: &str,
     run_id: u64,
@@ -1158,7 +1241,8 @@ async fn verify_ci(
     cuda_policy: &ReleaseCudaPolicy,
     sm120_runtime_required: bool,
     sm120_runtime_source: Sm120RuntimeSource,
-) -> Result<Option<Sm120CiObservation>, String> {
+    recovery: recovery::CiInputs<'_>,
+) -> Result<(Option<Sm120CiObservation>, Vec<Value>), String> {
     let client = reqwest::Client::builder()
         .user_agent("ferrum-release-delivery")
         .timeout(Duration::from_secs(30))
@@ -1176,6 +1260,7 @@ async fn verify_ci(
         Some(cuda_policy),
         sm120_runtime_required,
         sm120_runtime_source,
+        recovery,
     )
     .await
 }
@@ -1199,6 +1284,7 @@ async fn ci_at(
         None,
         false,
         Sm120RuntimeSource::Ci,
+        recovery::CiInputs::default(),
     )
     .await
     .map(|_| ())
@@ -1214,39 +1300,13 @@ async fn ci_at_with_windows(
     cuda_policy: Option<&ReleaseCudaPolicy>,
     sm120_runtime_required: bool,
     sm120_runtime_source: Sm120RuntimeSource,
-) -> Result<Option<Sm120CiObservation>, String> {
+    recovery: recovery::CiInputs<'_>,
+) -> Result<(Option<Sm120CiObservation>, Vec<Value>), String> {
     validate_sm120_runtime_source(sm120_runtime_required, sm120_runtime_source)?;
     if run_id == 0 {
         return Err("CI run id must be explicit and nonzero".into());
     }
-    async fn get(
-        client: &reqwest::Client,
-        url: String,
-        token: Option<&str>,
-    ) -> Result<Value, String> {
-        let mut request = client
-            .get(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| "CI query failed; status unknown")?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "CI query returned HTTP {}; status unknown",
-                response.status()
-            ));
-        }
-        response
-            .json()
-            .await
-            .map_err(|_| "CI response was not valid JSON".into())
-    }
-    let run = get(
+    let run = ci_get(
         client,
         format!("{base}/repos/{repo}/actions/runs/{run_id}"),
         token,
@@ -1263,6 +1323,14 @@ async fn ci_at_with_windows(
     {
         return Err("CI run does not belong to this candidate/repository/release workflow".into());
     }
+    if (recovery.manual_local || recovery.standalone_windows.is_some())
+        && (run["status"] != "completed"
+            || run["head_branch"] != "main"
+            || run["head_repository"]["id"].as_u64().is_none()
+            || run["head_repository"]["id"] != run["repository"]["id"])
+    {
+        return Err("recovery requires a completed original delivery from the same repository's main branch".into());
+    }
     let attempt = run["run_attempt"]
         .as_u64()
         .filter(|attempt| *attempt > 0)
@@ -1278,10 +1346,12 @@ async fn ci_at_with_windows(
     let mut local_cuda_occurrences = BTreeMap::new();
     let mut sm120_cuda_occurrences = BTreeMap::new();
     let mut cloud_cuda_occurrences = BTreeMap::new();
+    let mut cpu_model_occurrences = BTreeMap::new();
+    let mut recovered = Vec::new();
     let mut ids = BTreeSet::new();
     let mut total = None;
     loop {
-        let value = get(client, format!("{base}/repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page={page}"), token).await?;
+        let value = ci_get(client, format!("{base}/repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page={page}"), token).await?;
         let jobs = value["jobs"].as_array().ok_or("CI response omits jobs")?;
         let count = value["total_count"]
             .as_u64()
@@ -1298,12 +1368,15 @@ async fn ci_at_with_windows(
             if !ids.insert(id) {
                 return Err("CI response repeats a job across pages".into());
             }
-            let windows_job = job["name"] == "stage-cuda / Stage Windows x86_64 CUDA sm89";
+            let windows_job = job["name"] == "stage-cuda / Stage Windows x86_64 CUDA sm89"
+                || (recovery.standalone_windows.is_some() && job["name"] == "stage-cuda");
             let windows_cpu_job = job["name"] == "stage-cpu-windows / Stage Windows x86_64 CPU";
+            let cpu_models = recovery.manual_local && job["name"] == "CPU release models";
             let local_cuda_job = job["name"] == "cuda-models";
             let sm120_cuda_job = job["name"] == "cuda-models-sm120";
             let cloud_cuda_job = job["name"] == "cuda-models-cloud";
-            if job["name"] != "Quality / CI required"
+            if !cpu_models
+                && job["name"] != "Quality / CI required"
                 && !(windows_attempt.is_some() && (windows_job || windows_cpu_job))
                 && !(cuda_policy.is_some()
                     && (local_cuda_job
@@ -1320,7 +1393,9 @@ async fn ci_at_with_windows(
             {
                 return Err("Quality job belongs to another run or candidate".into());
             }
-            let selected = if sm120_cuda_job {
+            let selected = if cpu_models {
+                &mut cpu_model_occurrences
+            } else if sm120_cuda_job {
                 &mut sm120_cuda_occurrences
             } else if local_cuda_job {
                 &mut local_cuda_occurrences
@@ -1349,20 +1424,52 @@ async fn ci_at_with_windows(
         if sm120_runtime_required && sm120_runtime_source == Sm120RuntimeSource::Ci {
             cuda_gate::verify_sm120_job(&sm120_cuda_occurrences)?;
         }
-        cuda_gate::verify_jobs(
-            policy,
-            &run["event"],
-            &local_cuda_occurrences,
-            &cloud_cuda_occurrences,
-        )?;
+        if recovery.manual_local {
+            recovered.push(recovery::verify_transport(
+                &local_cuda_occurrences,
+                &cpu_model_occurrences,
+            )?);
+            cuda_gate::verify_cloud_job(policy, &run["event"], &cloud_cuda_occurrences)?;
+        } else {
+            cuda_gate::verify_jobs(
+                policy,
+                &run["event"],
+                &local_cuda_occurrences,
+                &cloud_cuda_occurrences,
+            )?;
+        }
     }
     if let Some(expected) = windows_attempt {
-        ci_evidence::verify_staging_job(
-            &run,
-            expected.cuda,
-            "stage-cuda / Stage Windows x86_64 CUDA sm89",
-            &windows_occurrences,
-        )?;
+        if let Some((id, tag)) = recovery.standalone_windows {
+            if windows_occurrences.is_empty()
+                || windows_occurrences
+                    .values()
+                    .any(|job| job["status"] != "completed" || job["conclusion"] != "skipped")
+            {
+                return Err("standalone Windows staging requires the original staging job to have been skipped".into());
+            }
+            recovered.push(
+                recovery::verify_windows(
+                    client,
+                    base,
+                    repo,
+                    &run,
+                    id,
+                    tag,
+                    recovery.version,
+                    expected.cuda,
+                    token,
+                )
+                .await?,
+            );
+        } else {
+            ci_evidence::verify_staging_job(
+                &run,
+                expected.cuda,
+                "stage-cuda / Stage Windows x86_64 CUDA sm89",
+                &windows_occurrences,
+            )?;
+        }
         ci_evidence::verify_staging_job(
             &run,
             expected.cpu,
@@ -1404,16 +1511,19 @@ async fn ci_at_with_windows(
             ),
             None => (None, None, "not_observed".into(), None, Vec::new()),
         };
-        Ok(Some(Sm120CiObservation {
-            workflow_run_id: run_id,
-            job_id,
-            run_attempt,
-            status,
-            conclusion,
-            failed_steps,
-        }))
+        Ok((
+            Some(Sm120CiObservation {
+                workflow_run_id: run_id,
+                job_id,
+                run_attempt,
+                status,
+                conclusion,
+                failed_steps,
+            }),
+            recovered,
+        ))
     } else {
-        Ok(None)
+        Ok((None, recovered))
     }
 }
 
