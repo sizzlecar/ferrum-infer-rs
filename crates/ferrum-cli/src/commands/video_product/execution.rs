@@ -102,7 +102,7 @@ fn read_reference(
 pub(super) async fn run(request: VideoRunRequest) -> Result<(), VideoProductError> {
     let config = Configuration::load(&request.config)?;
     let service_config = config.serving.service_config()?;
-    let output = config.output.prepare()?;
+    let output = config.output.prepare().await?;
     let files = reference_files(&request.references)?;
     ensure_destination(&request.destination)?;
     let input = config
@@ -263,7 +263,7 @@ pub(super) async fn serve(
     )
     .map_err(anyhow::Error::from)?;
     let service_config = config.serving.service_config()?;
-    let output = config.output.prepare()?;
+    let output = config.output.prepare().await?;
     let maximum_body_bytes = ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES
         .checked_mul(4)
         .and_then(|n| n.checked_div(3))

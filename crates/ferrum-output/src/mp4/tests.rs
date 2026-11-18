@@ -153,6 +153,36 @@ fn assert_refunded(store: &Mp4Spool, budget: &OutputBudget) {
     assert_eq!(budget.usage().sessions, 0);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn output_profile_rejects_a_working_program_that_does_not_encode_mp4() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = spool(&directory, 1 << 20);
+    let budget = budget();
+    let encoder = Mp4Encoder::new(config("/bin/echo".into()), store.clone()).unwrap();
+    let error = encoder
+        .check_output_profile(budget.try_open_session().unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, Mp4ErrorKind::Codec);
+    drop(error);
+    assert_refunded(&store, &budget);
+}
+
+#[tokio::test]
+#[ignore = "requires ffmpeg/libx264/AAC"]
+async fn output_profile_checks_the_selected_encoder_and_retires_its_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = spool(&directory, 1 << 20);
+    let budget = budget();
+    let encoder = Mp4Encoder::new(config(tool("ffmpeg")), store.clone()).unwrap();
+    encoder
+        .check_output_profile(budget.try_open_session().unwrap())
+        .await
+        .unwrap();
+    assert_refunded(&store, &budget);
+}
+
 #[tokio::test]
 #[ignore = "requires ffmpeg/libx264/AAC and ffprobe"]
 async fn real_ffmpeg_mp4_decodes_and_last_reader_retains_artifact_capacity() {

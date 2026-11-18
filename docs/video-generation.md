@@ -35,7 +35,9 @@ Use the expanded form for custom paths, capacity limits or encoding options.
 The CUDA 12.8 configuration reproduced the 124-frame release sample byte for
 byte on the 5090.
 
-Both commands find FFmpeg on the system PATH. An absolute `output.ffmpeg`
+Both commands find FFmpeg on the system PATH and encode a single test frame
+with stereo audio before loading the model. This checks the installed build's
+H.264/AAC encoders and fragmented MP4 output. An absolute `output.ffmpeg`
 selects a different encoder. Reference video decoding uses the same FFmpeg by
 default; set `input.ffmpeg` to select a separate build. Ferrum looks for
 ffprobe beside the input FFmpeg first, then on PATH. Set `input.ffprobe` to

@@ -317,7 +317,7 @@ pub(super) struct PreparedOutput {
     pub encoder: Mp4EncoderConfig,
 }
 impl Output {
-    pub fn prepare(&self) -> Result<PreparedOutput> {
+    pub async fn prepare(&self) -> Result<PreparedOutput> {
         let ffmpeg = super::media::output_ffmpeg(
             self.ffmpeg.as_deref(),
             std::env::var_os("PATH").as_deref(),
@@ -357,10 +357,15 @@ impl Output {
                 audio_bitrate: 192_000,
             },
         };
-        // Validate codec bounds before opening model/runtime resources.
-        // These constructors have not submitted work or started a codec child.
-        ferrum_output::mp4::Mp4Encoder::new(encoder.clone(), spool.clone())
+        let codec = ferrum_output::mp4::Mp4Encoder::new(encoder.clone(), spool.clone())
             .map_err(|e| anyhow::anyhow!("video codec configuration: {e}"))?;
+        codec.check_output_profile(budget.try_open_session()?).await.map_err(|error| {
+            anyhow::anyhow!(
+                "MP4 output check with {} failed: {error}. The video encoder requires FFmpeg with libx264 and AAC. {}",
+                encoder.ffmpeg.display(),
+                String::from_utf8_lossy(error.stderr()).trim()
+            )
+        })?;
         Ok(PreparedOutput {
             budget,
             spool,
