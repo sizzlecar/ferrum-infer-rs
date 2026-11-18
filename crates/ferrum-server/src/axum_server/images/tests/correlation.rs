@@ -94,7 +94,17 @@ async fn image_correlation_real_reference_success_returns_service_id_and_legacy_
             .oneshot(request(client_attempt))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
+        if status != StatusCode::OK {
+            let body = axum::body::to_bytes(response.into_body(), 32 * 1024)
+                .await
+                .unwrap();
+            panic!(
+                "request {} returned {status}: {}",
+                ids.len() + 1,
+                String::from_utf8_lossy(&body)
+            );
+        }
         let server_id = Uuid::parse_str(
             response.headers()[IMAGE_REQUEST_ID_HEADER]
                 .to_str()

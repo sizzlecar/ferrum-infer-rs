@@ -109,6 +109,87 @@ fn submit(
 }
 
 #[tokio::test]
+async fn delivered_output_releases_the_workers_http_session_before_waking_the_client() {
+    use ferrum_output::{OutputBudget, OutputSession};
+    use std::{
+        future::Future,
+        task::{Context, Wake},
+    };
+
+    struct SessionGate(OutputSession);
+    impl ImageOutputGate for SessionGate {
+        fn try_acquire(&self) -> Result<Option<ImageOutputLease>, ImageOutputGateError> {
+            Ok(Some(ImageOutputLease::new(self.0.clone())))
+        }
+        fn subscribe_capacity(&self, waker: Waker) -> ImageOutputLease {
+            ImageOutputLease::new(self.0.subscribe_capacity(waker))
+        }
+    }
+
+    // Run at the instant the worker signals result readiness. The next
+    // admission must depend only on the client's actual remaining owners.
+    struct ClientWake {
+        budget: OutputBudget,
+        lease: std::sync::Mutex<oneshot::Receiver<ImageOutputLease>>,
+        result: mpsc::Sender<(bool, bool)>,
+    }
+    impl Wake for ClientWake {
+        fn wake(self: Arc<Self>) {
+            let lease = self.lease.lock().unwrap().try_recv().unwrap();
+            let held = self.budget.try_open_session().is_err();
+            drop(lease);
+            let released = self.budget.try_open_session().is_ok();
+            self.result.send((held, released)).unwrap();
+        }
+    }
+
+    let (entered, execution) = mpsc::channel();
+    let (release, permit) = mpsc::channel();
+    let service = ServiceCore::start(
+        Box::new(Worker {
+            entered,
+            release: permit,
+        }),
+        config(),
+    )
+    .unwrap();
+    let budget = OutputBudget::new(ferrum_types::OutputConfig {
+        max_sessions: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let (job, lease) = submit(
+        &service,
+        1,
+        Arc::new(SessionGate(budget.try_open_session().unwrap())),
+    );
+    assert_eq!(receive(&execution), [1]);
+    let (result, events) = mpsc::channel();
+    let waker = Waker::from(Arc::new(ClientWake {
+        budget,
+        lease: std::sync::Mutex::new(lease),
+        result,
+    }));
+    let mut response = Box::pin(job.wait());
+    assert!(response
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    release.send(()).unwrap();
+    let (held, released) = receive(&events);
+    assert_eq!(response.await.unwrap(), 1);
+    assert!(service.shutdown().await.unwrap().failure.is_none());
+    assert!(
+        held,
+        "a retained response must still occupy its output slot"
+    );
+    assert!(
+        released,
+        "worker kept the slot after the client released its response"
+    );
+}
+
+#[tokio::test]
 async fn output_credit_dispatches_fifo_prefix_and_slow_owner_release_resumes_without_rejection() {
     let (entered, execution) = mpsc::channel();
     let (release, permit) = mpsc::channel();

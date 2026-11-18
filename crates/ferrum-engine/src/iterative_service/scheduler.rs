@@ -1104,20 +1104,19 @@ fn deliver_outputs<R: ServiceRequest, O>(
     responses: &mut Vec<Response<O>>,
     outputs: Vec<O>,
 ) {
-    for ((cancelled, response, _, gate, trace), output) in responses.drain(..).zip(outputs) {
+    for ((cancelled, response, prompt_reservation, gate, trace), output) in
+        responses.drain(..).zip(outputs)
+    {
+        drop(prompt_reservation);
         let result = if cancelled.load(Ordering::Acquire) {
+            drop((gate, output));
             Err(trace.error(
                 ServiceErrorKind::Cancelled,
                 "image response cancelled; active execution completed",
             ))
         } else {
-            if let Some(QueuedOutput {
-                lease: Some(lease),
-                response,
-                ..
-            }) = gate
-            {
-                let _ = response.send(lease);
+            if let Some(gate) = gate {
+                gate.deliver();
             }
             Ok(output)
         };
