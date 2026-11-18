@@ -539,8 +539,8 @@ jobs:
           test "sha256:$actual_sha" = "$(jq -er .digest windows-cuda-artifact.json)"
           mkdir staged-windows
           unzip -q windows-cuda.zip -d staged-windows
-          jq -e --arg sha "$CANDIDATE" --arg tag "$tag" --arg label "recovery-$SOURCE_RUN" --argjson run "$WINDOWS_RUN" --argjson attempt "$attempt" '
-            .candidate_sha == $sha and .candidate_tag == $tag and .staging_label == $label and
+          jq -e --arg sha "$CANDIDATE" --arg tag "$tag" --arg staging_label "recovery-$SOURCE_RUN" --argjson run "$WINDOWS_RUN" --argjson attempt "$attempt" '
+            .candidate_sha == $sha and .candidate_tag == $tag and .staging_label == $staging_label and
             .workflow_run_id == $run and .workflow_run_attempt == $attempt' staged-windows/windows-staging.json
       - uses: actions/download-artifact@v4
         with:
