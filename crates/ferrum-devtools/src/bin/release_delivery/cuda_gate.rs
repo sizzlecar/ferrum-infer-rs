@@ -164,14 +164,22 @@ pub(super) fn verify_jobs(
     local: &BTreeMap<u64, Value>,
     cloud: &BTreeMap<u64, Value>,
 ) -> Result<(), String> {
-    if policy.cloud == CloudCudaMode::Required && event != "workflow_dispatch" {
-        return Err("cloud CUDA rental requires an explicit manual release".into());
-    }
     let (_, local) = local
         .last_key_value()
         .ok_or("missing required local CUDA job")?;
     if local["status"] != "completed" || local["conclusion"] != "success" {
         return Err("latest required local CUDA job did not succeed".into());
+    }
+    verify_cloud_job(policy, event, cloud)
+}
+
+pub(super) fn verify_cloud_job(
+    policy: &ReleaseCudaPolicy,
+    event: &Value,
+    cloud: &BTreeMap<u64, Value>,
+) -> Result<(), String> {
+    if policy.cloud == CloudCudaMode::Required && event != "workflow_dispatch" {
+        return Err("cloud CUDA rental requires an explicit manual release".into());
     }
     let (_, cloud) = cloud
         .last_key_value()

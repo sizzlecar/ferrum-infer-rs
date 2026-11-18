@@ -246,6 +246,38 @@ evidence artifacts;
 missing or failed evidence blocks publication. Do not restart the whole workflow
 solely to retry an upload.
 
+### Recover a local model run after an artifact download fails
+
+When the SM89 job fails during the artifact download and its CPU successor is
+skipped, the release operator can transfer the frozen inputs over another
+connection. Verify the GitHub artifact ID, source run, candidate SHA and ZIP
+SHA-256 for each input. Use the original release plan, controller, model runner
+and staged packages. Run the SM89 model tasks and FP8 numerical and retirement
+test on the required GPU, and the CPU compatibility tasks on Linux x86_64.
+Use the install inspection and model commands from the [delivery workflow](../.github/workflows/release-delivery.yml).
+
+Keep both installation receipts, the full `model-cuda/` and `model-cpu/`
+directories, and `sm89-fp8-runtime.log` at the root of a tar.gz. Alongside them,
+write `manifest.json` with `schema_version` set to 1, the original
+`source_run_id` and `candidate_sha`. Its `fp8` object records the executed
+`test_name`, staged `checker_sha256`, original `log_sha256` and actual
+`exit_code`. Upload the archive as a release asset in the same repository.
+
+If the Windows CUDA build was skipped, dispatch the [Windows staging workflow](../.github/workflows/release-windows.yml)
+on the original annotated RC tag. Supply the frozen candidate SHA, version and
+stable launcher inputs, select `backend=cuda`, and use
+`staging_label=recovery-<source_run_id>` and `publish_release=false`.
+Record the resulting staging run ID.
+
+Dispatch [release resume](../.github/workflows/release-resume.yml) against
+`main` with the original `source_run_id`, the manual archive's
+`manual_local_evidence=<asset-id>:<sha256>`, and the
+`windows_cuda_staging_run_id` when applicable. Supply the original SM120
+evidence inputs separately if the candidate requires them. The controller
+checks the original jobs, staged bytes, hardware observation, frozen task
+results, and the actual Windows producer before publication. Public installer
+verification follows publication.
+
 Release delivery always runs the local CUDA lane on the existing RTX 4050
 (`ferrum-cuda`, `cuda-sm89`). Windows native staging, device CI and WSL model
 execution share a queued physical-host concurrency group so they do not compete

@@ -58,12 +58,14 @@ pub(in super::super) struct WindowsAttempts {
 pub(in super::super) struct VerifiedWindows {
     pub assets: Vec<AcceptedAsset>,
     pub attempts: WindowsAttempts,
+    pub cuda_candidate_tag: String,
 }
 
 #[derive(Debug)]
 pub(in super::super) struct VerifiedWindowsArtifact {
     pub assets: Vec<AcceptedAsset>,
     pub attempt: u64,
+    pub candidate_tag: String,
 }
 
 pub(in super::super) fn verify(
@@ -71,6 +73,7 @@ pub(in super::super) fn verify(
     version: &str,
     candidate: &str,
     run: u64,
+    standalone_cuda_run: Option<u64>,
     baseline_tag: &str,
     repo: &str,
 ) -> Result<VerifiedWindows, String> {
@@ -79,7 +82,8 @@ pub(in super::super) fn verify(
         Backend::Cuda,
         version,
         candidate,
-        run,
+        standalone_cuda_run.unwrap_or(run),
+        standalone_cuda_run.map(|_| run),
         baseline_tag,
         repo,
     )?;
@@ -89,6 +93,7 @@ pub(in super::super) fn verify(
         version,
         candidate,
         run,
+        None,
         baseline_tag,
         repo,
     )?;
@@ -114,6 +119,7 @@ pub(in super::super) fn verify(
     Ok(VerifiedWindows {
         assets: cuda.assets,
         attempts,
+        cuda_candidate_tag: cuda.candidate_tag,
     })
 }
 
@@ -123,6 +129,7 @@ pub(in super::super) fn verify_one(
     version: &str,
     candidate: &str,
     run: u64,
+    recovery_for: Option<u64>,
     baseline_tag: &str,
     repo: &str,
 ) -> Result<VerifiedWindowsArtifact, String> {
@@ -135,13 +142,20 @@ pub(in super::super) fn verify_one(
     let stage: Staging = super::read(&directory.join("windows-staging.json"))?;
     let setup = format!("ferrum-{version}-windows-x86_64-{suffix}-setup.exe");
     let candidate_prefix = format!("v{version}-rc.");
+    let expected_label = match recovery_for {
+        Some(source) if backend == Backend::Cuda && source != run && source != 0 => {
+            format!("recovery-{source}")
+        }
+        Some(_) => return Err("invalid standalone Windows CUDA staging source".into()),
+        None => format!("run-{run}-{}", stage.workflow_run_attempt),
+    };
     if stage.schema_version != 1
         || stage.version != version
         || stage.candidate_sha != candidate
         || stage.workflow_run_id != run
         || run == 0
         || stage.workflow_run_attempt == 0
-        || stage.staging_label != format!("run-{run}-{}", stage.workflow_run_attempt)
+        || stage.staging_label != expected_label
         || stage
             .candidate_tag
             .strip_prefix(&candidate_prefix)
@@ -271,5 +285,6 @@ pub(in super::super) fn verify_one(
     Ok(VerifiedWindowsArtifact {
         assets,
         attempt: stage.workflow_run_attempt,
+        candidate_tag: stage.candidate_tag,
     })
 }
