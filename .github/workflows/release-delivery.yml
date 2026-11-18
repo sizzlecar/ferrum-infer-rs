@@ -1213,7 +1213,7 @@ jobs:
         include:
           - runner: ubuntu-22.04
             platform: linux
-          - runner: macos-14
+          - runner: macos-latest
             platform: macos
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
