@@ -1,6 +1,6 @@
 # Ferrum v0.20.1 产品修复、验收与发布
 
-2026-11-18 16:30（北京时间），Ferrum v0.20.1 已从 `cc098c3a0` 正式发布。公开安装渠道的实机验收仍在进行。[GitHub Release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.20.1)
+2026-11-18 16:30（北京时间），Ferrum v0.20.1 已从 `cc098c3a0` 正式发布。[GitHub Release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.20.1)
 [产品修复](https://github.com/sizzlecar/ferrum-infer-rs/pull/523) · [版本准备](https://github.com/sizzlecar/ferrum-infer-rs/pull/524) · [发行任务](https://github.com/sizzlecar/ferrum-infer-rs/actions/runs/44232521500)
 
 ## 冻结发行包验收
@@ -13,8 +13,9 @@
 - Windows x86_64 CPU 和 CUDA SM89 两种发行包都通过了打包与程序启动验证。CPU 包来自原发行任务，CUDA 包来自同一候选标签的[独立 Windows 构建](https://github.com/sizzlecar/ferrum-infer-rs/actions/runs/44244618049)。
 - 正式发布包含 47 个文件。公开 Mac Metal 与 Linux SM120 归档的 SHA-256 均与实机验收使用的归档一致。Homebrew 的 macOS 配方已更新到同一公开 Metal 归档。[发布记录](https://github.com/sizzlecar/ferrum-infer-rs/actions/runs/44264837074) · [Homebrew 更新](https://github.com/sizzlecar/homebrew-ferrum/commit/5dc6dafe113304bece13d3ddbf6b5b915b5aa2e0)
 - Apple Silicon 在全新用户目录中从官网零参数安装，自动选择 Metal。官网返回 HTTP 200 并传输完整的 20,899,079 字节；安装后的二进制与冻结 Metal 包一致，`--version`、`--help`、`run --help`、`serve --help` 均成功退出。
-- RTX 5090 在全新用户目录使用官网安装器自动选择 SM120，完成 4 项安装与启动检查。随后使用已安装程序运行 Qwen3.5-0.8B 的 6 项 CLI 和 HTTP 检查，服务报告 CUDA 计算能力 12.0。公开验收归档 SHA-256 为 `79b24081a763c95c5170856c41f62964e4feae506b7c23b00d4d5461ce80a509`。
-- crates.io 上的 22 个可发布 crate 均提供 0.20.1，均可下载，其校验值与正式发行记录一致。各平台包管理器公开安装的正式工作流仍在运行。
+- RTX 5090 在全新用户目录使用官网安装器自动选择 SM120，完成 4 项安装与启动检查。随后使用已安装程序运行 Qwen3.5-0.8B 的 6 项 CLI 和 HTTP 检查，服务报告 CUDA 计算能力 12.0。公开验收归档 SHA-256 为 `79b24081a763c95c5170856c41f62964e4feae506b7c23b00d4d5461ce80a509`。[发布后 SM120 实机验收](https://github.com/sizzlecar/ferrum-infer-rs/actions/runs/44269332887/job/134682019352)
+- crates.io 的 22 个可发布 crate 均已发布 0.20.1，均未撤回，注册表的校验值与正式发行记录全部一致。
+- 官网全新安装与 Homebrew 升级分别验收。首轮公开工作流中，Mac Homebrew 在更新上游索引时下载失败，未执行 Ferrum 升级。托管 macOS 安装未执行，另有 Windows 和 Linux Homebrew 任务失败。后续重试及各渠道的状态以[公开安装工作流](https://github.com/sizzlecar/ferrum-infer-rs/actions/runs/44269332887)为准。
 
 首次在 RTX 5090 部署 P-H3 仍需填写 `--image-config` 模型路径与资源配置。FastH3 需要 `--video-config`、检查点和输出目录。仅传模型目录即可启动两种服务的工作由 [#528](https://github.com/sizzlecar/ferrum-infer-rs/issues/528) 跟踪。
 
