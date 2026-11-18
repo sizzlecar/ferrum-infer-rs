@@ -68,7 +68,7 @@ fn formal_version(version: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn verify_startup(version: &str, observations: &[Observation]) -> Result<(), String> {
+pub(super) fn verify_startup(version: &str, observations: &[Observation]) -> Result<(), String> {
     formal_version(version)?;
     if observations.len() != COMMANDS.len() {
         return Err("public installation startup probes are incomplete".into());

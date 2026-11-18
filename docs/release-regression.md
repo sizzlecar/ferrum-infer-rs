@@ -709,6 +709,26 @@ compile as needed. Cloud execution and cloud evidence reuse are rejected in this
 mode. A newer public default installer or tap can make verification of an older
 version fail; this mode does not silently accept a different installed version.
 
+For a release that requires SM120 hardware, run the public Unix installer in a clean
+account on that GPU after the formal release is public. Use its automatic backend
+selection. Record the public `release_delivery entry` receipt, the
+`release_delivery installed --channel bootstrap` receipt for `~/.local/bin/ferrum`,
+and the subsequent `model_regression --backend cuda --use-default-backend --checks basic`
+report from the same executable. Store the three original JSON objects as `entry`,
+`installed` and `model` in a single evidence JSON file with `schema_version: 1`.
+Include `version`, `source_sha`, the GitHub `release_id` and SM120 `archive_asset_id`,
+UTC RFC 3339 `install_started_at` and `install_finished_at`, the actual
+`installer_args` array, `installer_exit_code`, `installer_output`, and
+`managed_archive_checksum` copied from the active release directory's `.asset.sha256`.
+Record `install_home_before` with the absolute `home` and the pre-install presence
+of the launcher's path (`launcher_exists`) and managed root (`installer_root_exists`),
+counting dangling symlinks as present. Use curl write-out during this invocation to
+capture the complete archive transfer as `archive_transfer` with its original
+`requested_url`, `http_status`, `exit_code` and `download_bytes`.
+Upload the JSON as a separate evidence release asset in this repository and supply
+`-f public_sm120_install_evidence=ASSET_ID:SHA256` with `verify_published_version` on
+`main`. The verification job retains the original JSON and the public identities.
+
 Both normal delivery and verification-only delivery explicitly handle skipped
 ancestors in their installation job conditions. An optional cloud job being
 skipped must not suppress public installation checks after successful publication.

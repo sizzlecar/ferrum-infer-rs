@@ -201,7 +201,8 @@ pub(super) fn backend_name(backend: Backend) -> &'static str {
     }
 }
 
-pub(super) fn run_backend(value: &Value) -> Option<Backend> {
+/// Parse the actual backend in a Ferrum run ready event.
+pub fn run_backend(value: &Value) -> Option<Backend> {
     match value.as_str()? {
         "CPU" => Some(Backend::Cpu),
         "Metal" => Some(Backend::Metal),

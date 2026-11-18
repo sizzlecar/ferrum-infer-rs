@@ -22,6 +22,8 @@ mod progress;
 mod public_entry;
 #[path = "release_delivery/public_install.rs"]
 mod public_install;
+#[path = "release_delivery/public_sm120.rs"]
+mod public_sm120;
 #[path = "release_delivery/publish.rs"]
 mod publish;
 #[path = "release_delivery/submission.rs"]
@@ -90,6 +92,8 @@ enum Action {
     Inspect(installation::InspectArgs),
     Installed(public_install::InstalledArgs),
     Entry(public_entry::EntryArgs),
+    /// Verify original public bootstrap and model observations for the published SM120 package.
+    VerifyPublicSm120(public_sm120::Args),
     Gate {
         #[command(flatten)]
         inputs: gate::GateArgs,
@@ -115,6 +119,7 @@ async fn run(action: Action) -> Result<(), String> {
         Action::Portable(args) => portable::execute(args).await,
         Action::Installed(args) => public_install::verify(args).await,
         Action::Entry(args) => public_entry::verify(args).await,
+        Action::VerifyPublicSm120(args) => public_sm120::verify(args),
         Action::Gate { inputs, output } => {
             let accepted = gate::verify(inputs).await?;
             let mut file = std::fs::OpenOptions::new()

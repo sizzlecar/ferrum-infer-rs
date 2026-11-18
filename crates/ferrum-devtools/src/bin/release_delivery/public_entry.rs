@@ -3,7 +3,7 @@
 //! release workflow; matching script bytes alone never proves an installation.
 use super::public_install::Status;
 use clap::Args;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Write, path::PathBuf, time::Duration};
 
@@ -21,8 +21,8 @@ pub struct EntryArgs {
     pub output: PathBuf,
 }
 
-#[derive(Serialize)]
-struct EntryReport {
+#[derive(Deserialize, Serialize)]
+pub(super) struct EntryReport {
     schema_version: u32,
     status: Status,
     requested_url: String,
@@ -32,6 +32,22 @@ struct EntryReport {
     response_bytes: Option<usize>,
     http_status: Option<u16>,
     error: Option<String>,
+}
+
+impl EntryReport {
+    pub(super) fn matches_public_script(&self, url: &str, source: &[u8]) -> bool {
+        let hash = format!("{:x}", Sha256::digest(source));
+        self.schema_version == 1
+            && self.status == Status::Passed
+            && self.requested_url == url
+            && self.effective_url.as_deref() == Some(url)
+            && self.http_status == Some(200)
+            && self.response_bytes == Some(source.len())
+            && !source.is_empty()
+            && self.expected_sha256.as_ref() == Some(&hash)
+            && self.actual_sha256.as_ref() == Some(&hash)
+            && self.error.is_none()
+    }
 }
 
 async fn observe(args: &EntryArgs, report: &mut EntryReport) -> Result<(), String> {

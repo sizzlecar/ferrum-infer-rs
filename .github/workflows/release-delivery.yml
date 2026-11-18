@@ -11,6 +11,11 @@ on:
         required: false
         default: ''
         type: string
+      public_sm120_install_evidence:
+        description: "Verify-only: same-repository release asset ID:SHA256 for the postpublication SM120 bootstrap, startup and model report"
+        required: false
+        default: ''
+        type: string
       run_cloud_cuda:
         description: "Opt in to rented CUDA hardware for extended large-model regression (local CUDA remains required)"
         required: false
@@ -140,9 +145,17 @@ jobs:
           REUSE_CUDA_RUN_ID: ${{ inputs.reuse_cuda_run_id }}
           VERIFY_PUBLISHED_VERSION: ${{ inputs.verify_published_version }}
           SM120_RUNTIME_POLICY: ${{ steps.cuda-capability.outputs.sm120_runtime_policy }}
+          PUBLIC_SM120_INPUT: ${{ inputs.public_sm120_install_evidence }}
+          SM120_RUNTIME_REQUIRED: ${{ steps.cuda-capability.outputs.sm120_runtime_required }}
           SM120_RUNTIME_REASON: ${{ steps.cuda-capability.outputs.sm120_runtime_reason }}
           GH_TOKEN: ${{ inputs.verify_published_version != '' && github.token || secrets.RELEASE_GITHUB_TOKEN }}
         run: |
+          if [ -n "$PUBLIC_SM120_INPUT" ]; then
+            test -n "$VERIFY_PUBLISHED_VERSION"
+            test "${GITHUB_REF}" = refs/heads/main
+            test "$SM120_RUNTIME_REQUIRED" = true
+            [[ "$PUBLIC_SM120_INPUT" =~ ^[1-9][0-9]*:[0-9a-f]{64}$ ]] || exit 1
+          fi
           if [ -n "$VERIFY_PUBLISHED_VERSION" ]; then
             test "$EVENT" = workflow_dispatch
             [[ "$VERIFY_PUBLISHED_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
@@ -1332,8 +1345,66 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  public-sm120:
+    needs: prepare
+    if: >-
+      github.ref == 'refs/heads/main' && needs.prepare.outputs.verify_only == 'true' &&
+      needs.prepare.outputs.sm120_runtime_required == 'true' && inputs.public_sm120_install_evidence != ''
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Read the public release and the operator-supplied evidence
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          EVIDENCE: ${{ inputs.public_sm120_install_evidence }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_ref }}
+        run: |
+          mkdir "$RUNNER_TEMP/public-sm120"
+          cd "$RUNNER_TEMP/public-sm120"
+          repo="repos/$GITHUB_REPOSITORY"
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse "refs/tags/v$VERSION^{commit}")" = "$SOURCE_SHA"
+          git -C "$GITHUB_WORKSPACE" show "$SOURCE_SHA:scripts/install.sh" > install.sh
+          gh api "$repo/releases/tags/v$VERSION" > release-metadata.json
+          release_id=$(jq -er '.id | select(type == "number" and . > 0)' release-metadata.json)
+          gh api --paginate --slurp "$repo/releases/$release_id/assets?per_page=100" |
+            jq -e --slurpfile release release-metadata.json '
+              add | if length > 0 and (map(.id) | unique | length) == length
+              then . as $assets | $release[0] | .assets = $assets
+              else error("missing release assets or duplicate IDs across pages") end' > release.json
+          id=${EVIDENCE%%:*}
+          sha=${EVIDENCE#*:}
+          gh api "$repo/releases/assets/$id" > evidence-asset.json
+          jq -e --argjson id "$id" --arg repo "$GITHUB_REPOSITORY" --arg sha "$sha" '
+            .id == $id and .url == ("https://api.github.com/repos/" + $repo + "/releases/assets/" + ($id|tostring)) and
+            .state == "uploaded" and .size > 0 and .digest == ("sha256:" + $sha)' evidence-asset.json
+          gh api -H 'Accept: application/octet-stream' "$repo/releases/assets/$id" > evidence.json
+          checksum_id=$(jq -er '[.assets[] | select(.name == "ferrum-linux-x86_64-cuda-sm120.tar.gz.binary.sha256" and .state == "uploaded")] |
+            if length == 1 then .[0].id else error("missing or ambiguous public binary checksum") end' release.json)
+          gh api -H 'Accept: application/octet-stream' "$repo/releases/assets/$checksum_id" > binary.sha256
+          checksum_sha=$(jq -er --argjson id "$checksum_id" '.assets[] | select(.id == $id) | .digest | capture("^sha256:(?<sha>[0-9a-f]{64})$").sha' release.json)
+          echo "$checksum_sha  binary.sha256" | sha256sum --check --status
+      - name: Check the public installer, installed executable and SM120 model execution
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_ref }}
+        run: cargo run --locked -p ferrum-devtools --bin release_delivery -- verify-public-sm120 --directory "$RUNNER_TEMP/public-sm120" --version "$VERSION" --source-sha "$SOURCE_SHA"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-bootstrap-cuda-sm120
+          path: ${{ runner.temp }}/public-sm120/
+          if-no-files-found: warn
+          retention-days: 30
+
   complete:
-    needs: [prepare, publish, install-cargo, install-homebrew, install-bootstrap-unix, install-bootstrap-windows]
+    needs: [prepare, publish, install-cargo, install-homebrew, install-bootstrap-unix, install-bootstrap-windows, public-sm120]
     if: always() && !cancelled() && (needs.prepare.outputs.active == 'true' || needs.prepare.outputs.verify_only == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1353,6 +1424,7 @@ jobs:
           SM120_RUNTIME_POLICY: ${{ needs.prepare.outputs.sm120_runtime_policy }}
           SM120_RUNTIME_REASON: ${{ needs.prepare.outputs.sm120_runtime_reason }}
           WINDOWS_BOOTSTRAP: ${{ needs.install-bootstrap-windows.result }}
+          PUBLIC_SM120: ${{ needs.public-sm120.result }}
         run: |
           test "$PREPARE" = success
           if [ "$ACTIVE" = true ] && [ "$SM120_RUNTIME_REQUIRED" = true ]; then
@@ -1376,8 +1448,11 @@ jobs:
             true:required)
               test "$SM120_RUNTIME_REQUIRED" = true
               test "$VERIFY_ONLY" = true
-              printf 'Public Cargo, Homebrew and approved-fleet installation/startup checks passed. Public SM120 installation/startup still requires separate actual validation; prior manual candidate-archive evidence does not establish public installation success.\n' >> "$GITHUB_STEP_SUMMARY"
-              exit 1
+              if [ "$PUBLIC_SM120" != success ]; then
+                printf 'Public SM120 installation/startup still requires verified postpublication bootstrap and CUDA model observations.\n' >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+              printf 'Verified the public SM120 bootstrap, installed executable, and CUDA SM120 run/serve.\n' >> "$GITHUB_STEP_SUMMARY"
               ;;
             true:not_run_hardware_unavailable)
               test "$SM120_RUNTIME_REQUIRED" = false
