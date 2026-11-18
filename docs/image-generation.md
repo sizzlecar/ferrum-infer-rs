@@ -42,10 +42,14 @@ sudo apt-get install --no-install-recommends \
   libcudnn9-cuda-12=9.20.0.48-1
 ```
 
-P-H3 and FastH3 share this installation. For an estimate on your machine,
-use `apt-get --assume-no install` with the same package arguments. NVIDIA
-documents how to enable the repository for your distribution in the
-[cuDNN Linux installation guide](https://docs.nvidia.com/cudnn/installation/backend/linux/).
+P-H3 and FastH3 share these libraries. For the Qwen3.5 text workload on the
+same 5090, the observed NVIDIA user-space libraries came from `cuda-cudart-12-8`
+and `libcublas-12-8`. On a minimal Ubuntu 24.04.5 x86_64 image, APT estimated
+that adding NVRTC, nvJitLink and cuDNN for image generation would download an
+additional 541 MB and use about 1.31 GB more disk space. For a local estimate,
+use `apt-get --assume-no install` with the same package arguments. These figures
+exclude Ferrum, model weights, GPU drivers and repository metadata.
+See the [cuDNN Linux installation guide](https://docs.nvidia.com/cudnn/installation/backend/linux/) for repository setup.
 
 The example targets a 32 GB GPU with a 29 GiB managed device ceiling and 48 GB
 system-memory limit. Its opaque module allowances are explicit reservations,

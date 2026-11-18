@@ -14,6 +14,10 @@ FFmpeg with libx264 and AAC encoding. Video references also need ffprobe.
 Follow the [shared GPU runtime setup](image-generation.md#p-h3-setup).
 On Ubuntu, `sudo apt-get install --no-install-recommends ffmpeg` supplies
 the encoder and probe tool. An existing compatible installation can be reused.
+On a minimal Ubuntu 24.04.5 x86_64 image, installing FFmpeg and its distribution
+dependencies downloaded 133 MB; APT estimated an additional 457 MB on disk.
+This cost is in addition to the shared GPU runtime and depends on what is
+already installed. Ferrum's archive and the model weights are separate.
 The tested model revision is `f01e6a23ac6066aa9eb622cf94b6259442e70ec2`.
 Keep the complete model directory, including the reference transformer,
 packed NVFP4 weights, text/vision encoder, video/audio VAEs, schedulers,
