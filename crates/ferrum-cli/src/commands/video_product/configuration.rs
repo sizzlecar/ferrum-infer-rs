@@ -58,8 +58,7 @@ pub(super) struct Configuration {
     pub input: Input,
 }
 
-/// Input tools default beside the configured output ffmpeg; all capacities are
-/// explicit typed defaults and can be overridden in the product JSON.
+/// Input decoding inherits the output FFmpeg unless a separate build is selected.
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct Input {
@@ -84,15 +83,14 @@ impl Input {
     pub(super) fn prepare(
         &self,
         output: &Output,
+        output_ffmpeg: &Path,
     ) -> Result<ferrum_models::video_input::VideoInputCodec> {
-        let ffmpeg = self.ffmpeg.clone().unwrap_or_else(|| output.ffmpeg.clone());
-        let ffprobe = self.ffprobe.clone().unwrap_or_else(|| {
-            ffmpeg.with_file_name(if cfg!(windows) {
-                "ffprobe.exe"
-            } else {
-                "ffprobe"
-            })
-        });
+        let (ffmpeg, ffprobe) = super::media::reference_tools(
+            output_ffmpeg,
+            self.ffmpeg.as_deref(),
+            self.ffprobe.as_deref(),
+            std::env::var_os("PATH").as_deref(),
+        )?;
         ferrum_models::video_input::VideoInputCodec::new(
             ferrum_models::video_input::VideoInputCodecConfig {
                 ffmpeg,
@@ -138,8 +136,8 @@ impl Configuration {
         value.conditioning_reuse.validate()?;
         value.serving.service_config()?;
         ensure!(
-            value.output.ffmpeg.is_absolute() && value.output.directory.is_absolute(),
-            "video ffmpeg and output directory must be absolute paths"
+            value.output.directory.is_absolute(),
+            "video output directory must be an absolute path"
         );
         ensure!(
             value.output.maximum_jobs > 0 && value.output.maximum_jobs <= u32::MAX as usize / 3,
@@ -241,7 +239,7 @@ enum Speed {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Output {
-    pub ffmpeg: PathBuf,
+    ffmpeg: Option<PathBuf>,
     /// Parent for temporary encoder spools and the durable jobs-v1 directory.
     pub directory: PathBuf,
     #[serde(default = "default_jobs")]
@@ -300,6 +298,10 @@ pub(super) struct PreparedOutput {
 }
 impl Output {
     pub fn prepare(&self) -> Result<PreparedOutput> {
+        let ffmpeg = super::media::output_ffmpeg(
+            self.ffmpeg.as_deref(),
+            std::env::var_os("PATH").as_deref(),
+        )?;
         let budget = OutputBudget::new(OutputConfig {
             max_sessions: self.maximum_jobs,
             engine_queue_items: self.maximum_jobs,
@@ -318,7 +320,7 @@ impl Output {
         )
         .map_err(|e| anyhow::anyhow!("create video spool: {e}"))?;
         let encoder = Mp4EncoderConfig {
-            ffmpeg: self.ffmpeg.clone(),
+            ffmpeg,
             threads: self.threads,
             timeout: Duration::from_secs(self.timeout_seconds),
             maximum_encoded_bytes: self.maximum_encoded_bytes,

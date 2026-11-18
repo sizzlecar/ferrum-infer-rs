@@ -35,7 +35,6 @@
     "upload_timeout_seconds": 300
   },
   "output": {
-    "ffmpeg": "/usr/local/bin/ffmpeg",
     "directory": "/var/tmp/ferrum-video",
     "maximum_jobs": 16,
     "maximum_retained_jobs": 128,
@@ -59,8 +58,6 @@
   "feed_forward_partition": "if_capacity_needed",
   "video_postprocessing": "overlap_if_capacity_allows",
   "input": {
-    "ffmpeg": "/usr/local/bin/ffmpeg",
-    "ffprobe": "/usr/local/bin/ffprobe",
     "threads": 2,
     "timeout_seconds": 120
   },

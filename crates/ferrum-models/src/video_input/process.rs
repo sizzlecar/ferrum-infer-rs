@@ -139,7 +139,13 @@ pub(super) fn run<T>(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("start configured video codec")?,
+            .with_context(|| {
+                if decode {
+                    format!("video reference requires an executable FFmpeg; check input.ffmpeg ({})", program.display())
+                } else {
+                    format!("video reference requires ffprobe; install it beside input FFmpeg or on PATH, or set input.ffprobe ({})", program.display())
+                }
+            })?,
     ));
     let mut stdout = child
         .0

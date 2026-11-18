@@ -17,11 +17,17 @@ packed NVFP4 weights, text/vision encoder, video/audio VAEs, schedulers,
 processor files and tokenizer.
 
 Copy the [5090 configuration](../crates/ferrum-cli/examples/config/fast-h3-video-cuda.json)
-and set its model, cuDNN main library, FFmpeg and output paths for your
+and set its model, cuDNN main library and output paths for your
 installation. Relative model paths resolve from the process working directory.
 Leave `cuda.cudnn_dependencies` empty when the system loader can find the
 CUDA 12.8 libraries. This configuration reproduced the 124-frame release
 sample byte for byte on the 5090.
+
+Both commands find FFmpeg on the system PATH. An absolute `output.ffmpeg`
+selects a different encoder. Reference video decoding uses the same FFmpeg by
+default; set `input.ffmpeg` to select a separate build. Ferrum looks for
+ffprobe beside the input FFmpeg first, then on PATH. Set `input.ffprobe` to
+override that choice. PNG and WAVE references work without ffprobe.
 
 This preset explicitly declares 29 GiB of managed device capacity, 4 GiB of
 managed Host buffers, 32768 graph nodes/command records, automatic FFN row

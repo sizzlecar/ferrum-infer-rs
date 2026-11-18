@@ -6,6 +6,8 @@ use std::{any::Any, fmt, path::PathBuf};
 mod configuration;
 #[cfg(feature = "cuda-fast-h3")]
 mod execution;
+#[cfg(any(feature = "cuda-fast-h3", test))]
+mod media;
 #[cfg(test)]
 mod tests;
 
