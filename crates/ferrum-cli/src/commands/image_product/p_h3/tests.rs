@@ -1052,6 +1052,9 @@ fn omitted_cudnn_path_selects_discovery_but_an_explicit_empty_path_is_invalid() 
     let config = load(root.path(), &wire).unwrap();
     let PH3ImageBackendConfig::Cuda(backend) = config.backend;
     assert!(backend.cudnn.library_path.is_none());
+    wire["backend"]["cudnn"]["dependency_libraries"] = json!(["/old/libcudart.so.13"]);
+    assert!(load(root.path(), &wire).is_err());
+    wire["backend"]["cudnn"]["dependency_libraries"] = json!([]);
     wire["backend"]["cudnn"]["library_path"] = json!("");
     assert!(load(root.path(), &wire).is_err());
 }

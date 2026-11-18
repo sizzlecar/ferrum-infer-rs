@@ -289,6 +289,10 @@ impl PH3ImageProductConfig {
         }
         let PH3ImageBackendConfig::Cuda(backend) = &self.backend;
         ensure!(
+            backend.cudnn.library_path.is_some() || backend.cudnn.dependency_libraries.is_empty(),
+            "explicit cuDNN dependencies also require an explicit library_path"
+        );
+        ensure!(
             backend
                 .cudnn
                 .library_path

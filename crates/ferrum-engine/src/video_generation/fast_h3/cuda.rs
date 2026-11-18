@@ -84,6 +84,10 @@ impl FastH3CudaConfig {
     /// deployments retain their absolute paths and original preload behaviour.
     pub fn resolve_cudnn(&mut self, discover: impl FnOnce() -> Result<PathBuf>) -> Result<()> {
         if self.cudnn_library.is_none() {
+            ensure!(
+                self.cudnn_dependencies.is_empty(),
+                "explicit cuDNN dependencies also require an explicit cudnn_library"
+            );
             self.discovered_cudnn = Some(discover()?);
         }
         Ok(())
@@ -354,6 +358,12 @@ mod tests {
         assert_eq!(config.library().unwrap(), discovered);
         assert!(config.cudnn_library.is_none());
         assert!(config.cudnn_dependencies.is_empty());
+
+        wire["cudnn_dependencies"] = serde_json::json!(["/old/libcudart.so.13"]);
+        let mut mixed: FastH3CudaConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert!(mixed
+            .resolve_cudnn(|| panic!("reject mixed sources before lookup"))
+            .is_err());
 
         wire["cudnn_library"] = serde_json::json!("");
         let mut invalid: FastH3CudaConfig = serde_json::from_value(wire).unwrap();
