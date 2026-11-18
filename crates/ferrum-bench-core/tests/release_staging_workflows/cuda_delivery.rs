@@ -741,6 +741,44 @@ fn resume_manual_inputs_are_paired_and_only_publication_checkpoint_is_optional()
 
 #[cfg(unix)]
 #[test]
+fn resume_checks_the_downloaded_windows_receipt_against_its_producer() {
+    let workflow = workflow("release-resume.yml");
+    let download = script(&workflow["jobs"]["publish"], "unzip -q windows-cuda.zip");
+    let check_start = download
+        .rfind("\njq ")
+        .expect("download ends by checking the extracted staging receipt");
+    let check = &download[check_start..];
+    let dir = tempfile::tempdir().unwrap();
+    let staged = dir.path().join("staged-windows");
+    fs::create_dir(&staged).unwrap();
+    let receipt = serde_json::json!({
+        "candidate_sha": "a".repeat(40), "candidate_tag": "v1.2.3-rc.4",
+        "staging_label": "recovery-71", "workflow_run_id": 82, "workflow_run_attempt": 2
+    });
+    fs::write(staged.join("windows-staging.json"), receipt.to_string()).unwrap();
+    let verify = |attempt: &str| {
+        std::process::Command::new("bash")
+            .args(["-eu", "-c", check])
+            .current_dir(dir.path())
+            .env("CANDIDATE", receipt["candidate_sha"].as_str().unwrap())
+            .env("tag", receipt["candidate_tag"].as_str().unwrap())
+            .env("SOURCE_RUN", "71")
+            .env("WINDOWS_RUN", "82")
+            .env("attempt", attempt)
+            .output()
+            .unwrap()
+    };
+    let matched = verify("2");
+    assert!(
+        matched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&matched.stderr)
+    );
+    assert!(!verify("3").status.success());
+}
+
+#[cfg(unix)]
+#[test]
 fn resume_keeps_the_original_windows_cpu_and_only_recovers_a_missing_cuda_package() {
     use std::process::Command;
     let resume = workflow("release-resume.yml");
