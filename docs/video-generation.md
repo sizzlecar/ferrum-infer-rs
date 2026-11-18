@@ -8,18 +8,40 @@ It requires at least one image or video reference.
 
 ## Setup
 
-Use a build with `cuda-fast-h3` and its pinned native operator set. CUDA and
-cuDNN libraries, FFmpeg with H.264/AAC support, and ffprobe must be installed.
+Use a build with `cuda-fast-h3` and its pinned native operator set. On the
+RTX 5090, use CUDA 12.8 and cuDNN 9.20.0.48 **for CUDA 12**. MP4 output uses
+FFmpeg with libx264 and AAC encoding. Video references also need ffprobe.
+Follow the [shared GPU runtime setup](image-generation.md#p-h3-setup).
+On Ubuntu, `sudo apt-get install --no-install-recommends ffmpeg` supplies
+the encoder and probe tool. An existing compatible installation can be reused.
+On a minimal Ubuntu 24.04.5 x86_64 image, installing FFmpeg and its distribution
+dependencies downloaded 133 MB; APT estimated an additional 457 MB on disk.
+This cost is in addition to the shared GPU runtime and depends on what is
+already installed. Ferrum's archive and the model weights are separate.
 The tested model revision is `f01e6a23ac6066aa9eb622cf94b6259442e70ec2`.
 Keep the complete model directory, including the reference transformer,
 packed NVFP4 weights, text/vision encoder, video/audio VAEs, schedulers,
 processor files and tokenizer.
 
-Copy the [5090 configuration](../crates/ferrum-cli/examples/config/fast-h3-video-cuda.json)
-and set its absolute model, CUDA/cuDNN, FFmpeg and output paths. Relative
-model paths resolve from the process working directory. The example uses the
-tested CUDA 13 cuDNN dependency family alongside the CUDA build; match every
-listed library to your installation.
+Copy the [RTX 5090 Ref2VA preset](../crates/ferrum-cli/examples/config/fast-h3-rtx5090-ref2va.json)
+and set `model_directory` to the installed checkpoint and `output_directory`
+to an absolute spool and results directory. Relative model paths resolve from
+the process working directory. Both commands accept this file through
+`--video-config`.
+
+The [expanded configuration](../crates/ferrum-cli/examples/config/fast-h3-video-cuda.json)
+is the source of this preset's compute, memory, serving and encoding settings.
+Use the expanded form for custom paths, capacity limits or encoding options.
+The CUDA 12.8 configuration reproduced the 124-frame release sample byte for
+byte on the 5090.
+
+Both commands find FFmpeg on the system PATH and encode a single test frame
+with stereo audio before loading the model. This checks the installed build's
+H.264/AAC encoders and fragmented MP4 output. An absolute `output.ffmpeg`
+selects a different encoder. Reference video decoding uses the same FFmpeg by
+default; set `input.ffmpeg` to select a separate build. Ferrum looks for
+ffprobe beside the input FFmpeg first, then on PATH. Set `input.ffprobe` to
+override that choice. PNG and WAVE references work without ffprobe.
 
 This preset explicitly declares 29 GiB of managed device capacity, 4 GiB of
 managed Host buffers, 32768 graph nodes/command records, automatic FFN row
@@ -28,8 +50,8 @@ limits: the Host buffer allowance is not a process RAM limit. The long-reference
 qualification observed about 39.3 GiB server RSS. Device capacity and private
 allocator reservations are not measurements of whole-device peak VRAM.
 
-The example includes the tested capacity settings. Omitting
-`maximum_plan_nodes` currently selects 16384, which is insufficient for the
+In the expanded form, omitting
+`maximum_plan_nodes` selects 16384, which is insufficient for the
 qualified 15-second long-reference graph. Keep the explicit node and command
 limits when using that workload. A larger metadata limit does not increase the
 GPU byte budget.
@@ -37,19 +59,19 @@ GPU byte budget.
 ## CLI
 
 ```sh
-ferrum run --video-config fast-h3-video-cuda.json \
+ferrum run --video-config fast-h3-rtx5090-ref2va.json \
   --reference image=reference.png \
   --prompt 'The person in <Picture 1> turns toward the lake. The camera moves slowly closer.' \
   --width 832 --height 480 --num-frames 124 --fps 24 --seed 1101 \
   --output clip.mp4
 
-ferrum run --video-config fast-h3-video-cuda.json \
+ferrum run --video-config fast-h3-rtx5090-ref2va.json \
   --reference video=reference.mp4 \
   --prompt 'Use <Video 1> for the scene and camera movement. Continue the movement smoothly.' \
   --width 832 --height 480 --num-frames 362 --fps 24 --seed 1301 \
   --output continuation.mp4
 
-ferrum serve --video-config fast-h3-video-cuda.json --host 127.0.0.1 --port 8000
+ferrum serve --video-config fast-h3-rtx5090-ref2va.json --host 127.0.0.1 --port 8000
 ```
 
 Repeat `--reference image=...`, `video=...` or `audio=...` in the intended order.
@@ -98,8 +120,39 @@ Poll `GET /v1/videos/{id}` until `completed`, `failed` or `cancelled`.
 `in_progress` includes queuing, generation and encoding. Download a completed
 artifact from `GET /v1/videos/{id}/content`. `DELETE /v1/videos/{id}` requests
 cancellation and cleanup; cancellation is observed at safe execution boundaries.
-Delete terminal jobs after downloading them to release registry and spool
-capacity. The example retains at most 16 jobs and 2 GiB of encoded output.
+`output.maximum_jobs` (default 16) limits uploads and running jobs. A completed
+job releases both its active slot and its encoder output session. Results use
+separate durable storage under `output.directory/jobs-v1`: by default at most
+128 terminal jobs (`output.maximum_retained_jobs`) and 8 GiB of MP4s
+(`output.maximum_retained_bytes`). The encoder's temporary spool independently
+allows 2 GiB (`output.maximum_spool_bytes`); these two byte limits are additive,
+with bounded job metadata in addition.
+
+`output.retention_seconds` defaults to 86400 (24 hours), measured from the
+returned `finished_at` timestamp, including failed/cancelled records. Expiry is
+reclaimed on the next job admission, lookup, completion or server startup.
+Capacity pressure may evict the oldest safe terminal records sooner. DELETE
+also reclaims results; downloads already holding a result can finish, and their
+files remain charged until the reader closes. If those readers occupy all
+retained storage, new results can fail persistence instead of exceeding the
+configured disk bound. Unreaped encoder or panic owners are never evicted by
+TTL: the service preserves their active admission and reports incomplete
+shutdown. Unknown files are preserved and cause startup to reject that store.
+
+Completed records and MP4s survive an orderly restart with the same directory.
+An unfinished job recovered after a restart reports `failed` with an interruption
+error; GPU computation is not resumed. The store rejects concurrent processes,
+corrupt committed records, and limits smaller than its existing stored data.
+Keep the directory on persistent local storage. Existing anonymous temporary
+spools from older processes are not adopted or treated as disposable user data.
+`ferrum run --output` continues to publish its requested destination directly;
+HTTP retention settings apply to `ferrum serve`.
+
+Uploads have a 30-second idle deadline
+(`serving.upload_idle_timeout_seconds`) and a 300-second total deadline
+(`serving.upload_timeout_seconds`). Exceeding either returns HTTP 408 and
+releases ingress/Host allocations. These deadlines cover receiving the body,
+not generation or encoding time.
 Authentication uses the ordinary `serve --api-key` configuration.
 
 ## Batching and qualified limits
@@ -108,7 +161,7 @@ Compatible requests can join and leave the shared denoising loop at step
 boundaries. `serving.max_num_seqs` is an upper bound, not a guaranteed batch
 size. Memory and predicted work determine whether a second request joins;
 requests can wait and complete serially. `/health` exposes active, pending and
-preparing counts. A full ingress queue or output registry still requires the
+preparing counts. A full ingress queue or active-job limit still requires the
 client to wait before submitting more work.
 
 The current candidate has completed a 15-second video reference to a 362-frame

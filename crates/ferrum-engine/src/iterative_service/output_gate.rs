@@ -47,6 +47,17 @@ pub(crate) struct QueuedOutput {
     pub response: oneshot::Sender<OutputLease>,
 }
 
+impl QueuedOutput {
+    pub(super) fn deliver(self) {
+        // The admission gate can own the same session as the client's lease.
+        // Release the worker's reference before waking either receiver.
+        drop(self.gate);
+        if let Some(lease) = self.lease {
+            let _ = self.response.send(lease);
+        }
+    }
+}
+
 /// Separate from the queue mutex: resource owners are routinely dropped while
 /// updating queue state, and their refund callbacks must never lock that state.
 #[derive(Default)]

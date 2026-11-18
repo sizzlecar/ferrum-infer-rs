@@ -135,8 +135,9 @@ fn cpu_initial_noise_default_and_explicit_policies_keep_reference_policy_and_cap
     #[cfg(feature = "cuda")]
     for config in [&default, &parsed, &native] {
         let PH3ImageBackendConfig::Cuda(backend) = &config.backend;
-        std::fs::create_dir_all(backend.cudnn.library_path.parent().unwrap()).unwrap();
-        std::fs::write(&backend.cudnn.library_path, b"configuration-only fixture").unwrap();
+        let library = backend.cudnn.library_path.as_ref().unwrap();
+        std::fs::create_dir_all(library.parent().unwrap()).unwrap();
+        std::fs::write(library, b"configuration-only fixture").unwrap();
         let resolved = super::super::factory::PreparedBackend::from_p_h3_config(config).unwrap();
         let super::super::factory::PreparedBackend::PH3Cuda(resolved) = resolved else {
             panic!("declared H3 backend")
@@ -189,8 +190,9 @@ fn native_allocation_reuse_is_explicit_and_charged_inside_the_original_ceiling()
     assert!(!directory.path().join("comfy").exists());
     #[cfg(feature = "cuda")]
     {
-        std::fs::create_dir_all(backend.cudnn.library_path.parent().unwrap()).unwrap();
-        std::fs::write(&backend.cudnn.library_path, b"configuration-only fixture").unwrap();
+        let library = backend.cudnn.library_path.as_ref().unwrap();
+        std::fs::create_dir_all(library.parent().unwrap()).unwrap();
+        std::fs::write(library, b"configuration-only fixture").unwrap();
         let resolved = backend
             .resolved(parsed.vae_spatial_policy, parsed.vae_decoder_tile_batch)
             .unwrap();
@@ -253,8 +255,9 @@ fn native_lane_reuse_is_opt_in_and_bounded_by_resolved_streams() {
         );
         #[cfg(feature = "cuda")]
         {
-            std::fs::create_dir_all(backend.cudnn.library_path.parent().unwrap()).unwrap();
-            std::fs::write(&backend.cudnn.library_path, b"configuration-only fixture").unwrap();
+            let library = backend.cudnn.library_path.as_ref().unwrap();
+            std::fs::create_dir_all(library.parent().unwrap()).unwrap();
+            std::fs::write(library, b"configuration-only fixture").unwrap();
             let resolved = backend
                 .resolved(config.vae_spatial_policy, config.vae_decoder_tile_batch)
                 .unwrap();
@@ -359,8 +362,9 @@ fn spatial_decoder_batch_is_explicit_and_independent_of_request_capacity() {
     {
         // Configuration resolution only discovers a regular path. It must
         // carry the policy without loading a native library or a CUDA driver.
-        std::fs::create_dir_all(backend.cudnn.library_path.parent().unwrap()).unwrap();
-        std::fs::write(&backend.cudnn.library_path, b"configuration-only fixture").unwrap();
+        let library = backend.cudnn.library_path.as_ref().unwrap();
+        std::fs::create_dir_all(library.parent().unwrap()).unwrap();
+        std::fs::write(library, b"configuration-only fixture").unwrap();
         let resolved = backend
             .resolved(config.vae_spatial_policy, config.vae_decoder_tile_batch)
             .unwrap();
@@ -489,7 +493,7 @@ fn explicit_architecture_and_precision_are_independent_of_the_public_alias() {
     let PH3ImageBackendConfig::Cuda(backend) = config.backend;
     assert_eq!(
         backend.cudnn.library_path,
-        base.join("native/libcudnn.so.9")
+        Some(base.join("native/libcudnn.so.9"))
     );
     // Parsing/resolution never opens a driver/library or source payload.
     assert!(!root.path().join("native").exists());
@@ -1035,4 +1039,22 @@ fn h3_weight_arena_target_reaches_shared_pipeline_limits_for_run_and_serve() {
         wire["backend"]["pipeline"]["weight_arena_target_bytes"] = json!(0);
         assert!(load(root.path(), &wire).is_err());
     }
+}
+
+#[test]
+fn omitted_cudnn_path_selects_discovery_but_an_explicit_empty_path_is_invalid() {
+    let root = tempfile::tempdir().unwrap();
+    let mut wire = document();
+    wire["backend"]["cudnn"]
+        .as_object_mut()
+        .unwrap()
+        .remove("library_path");
+    let config = load(root.path(), &wire).unwrap();
+    let PH3ImageBackendConfig::Cuda(backend) = config.backend;
+    assert!(backend.cudnn.library_path.is_none());
+    wire["backend"]["cudnn"]["dependency_libraries"] = json!(["/old/libcudart.so.13"]);
+    assert!(load(root.path(), &wire).is_err());
+    wire["backend"]["cudnn"]["dependency_libraries"] = json!([]);
+    wire["backend"]["cudnn"]["library_path"] = json!("");
+    assert!(load(root.path(), &wire).is_err());
 }

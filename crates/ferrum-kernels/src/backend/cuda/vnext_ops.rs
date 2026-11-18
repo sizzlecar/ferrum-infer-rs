@@ -921,14 +921,14 @@ pub use tensor_silu::CudaCudnnOperation;
 /// Register only the explicitly selected contracts. Vendor segmented attention
 /// and native `SegmentedAttention` are mutually exclusive implementations of
 /// one operation. External Sage/NVFP4 modules retain their separate factories.
-pub fn cuda_vnext_tensor_providers_with_cudnn_selection(
+pub fn cuda_vnext_tensor_providers_with_cudnn_selection<'a>(
     runtime: &CudaDeviceRuntime,
-    config: &super::vnext_runtime::CudaCudnnConfig,
+    config: impl Into<super::vnext_runtime::CudnnLibrarySelection<'a>>,
     policy: Option<super::vnext_runtime::CudnnSdpaPlanPolicy>,
     vendor: &[CudaCudnnOperation],
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    tensor_silu::providers_with_cudnn_selection(runtime, config, policy, vendor, selected)
+    tensor_silu::providers_with_cudnn_selection(runtime, config.into(), policy, vendor, selected)
 }
 
 /// Opt-in segmented cuDNN SDPA alongside the selected native operations and

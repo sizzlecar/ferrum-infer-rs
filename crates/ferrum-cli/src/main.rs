@@ -13,6 +13,10 @@ use colored::*;
 use ferrum_cli::{commands::*, config::CliConfig, utils::setup_logging};
 use std::{future::Future, pin::Pin, process};
 
+#[cfg(test)]
+#[path = "main_tests.rs"]
+mod tests;
+
 #[derive(Parser)]
 #[command(name = "ferrum")]
 #[command(about = "Ferrum - Fast LLM Inference Engine")]

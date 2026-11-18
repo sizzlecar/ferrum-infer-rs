@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 fn png() -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -183,7 +184,16 @@ async fn chunked_body_enforces_limit_and_shutdown_releases_partial_ingress() {
         .header("content-type", "application/json")
         .body(Body::from_stream(chunks))
         .unwrap();
-    assert!(read_body(request, &host, 8, closing).await.is_err());
+    assert!(read_body(
+        request,
+        &host,
+        8,
+        Duration::from_secs(30),
+        Duration::from_secs(300),
+        closing
+    )
+    .await
+    .is_err());
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     tx.send(Ok(Bytes::from_static(b"{\"prompt\":")))
@@ -195,11 +205,224 @@ async fn chunked_body_enforces_limit_and_shutdown_releases_partial_ingress() {
             tokio_stream::wrappers::ReceiverStream::new(rx),
         ))
         .unwrap();
-    let read = read_body(request, &host, 1024, signal.subscribe());
+    let read = read_body(
+        request,
+        &host,
+        1024,
+        Duration::from_secs(30),
+        Duration::from_secs(300),
+        signal.subscribe(),
+    );
     tokio::pin!(read);
     assert!(futures::poll!(&mut read).is_pending());
     assert!(host.usage().unwrap().committed_bytes() > 0);
     signal.send_replace(true);
     assert!(read.await.is_err());
     assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+fn admitted_upload(
+    host: &HostMemoryAccount,
+    slots: &Arc<tokio::sync::Semaphore>,
+    closing: tokio::sync::watch::Receiver<bool>,
+    config: VideoHttpConfig,
+) -> Ingress {
+    Ingress {
+        host: host.clone(),
+        config,
+        model: Arc::from("video"),
+        slot: Arc::new(slots.clone().try_acquire_owned().unwrap()),
+        closing,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_upload_returns_408_and_releases_admission_and_host_memory() {
+    use axum::body::{Body, Bytes};
+    let host = super::super::tests::host();
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let (_signal, closing) = tokio::sync::watch::channel(false);
+    let config = super::super::tests::config();
+    let idle = config.upload_idle_timeout;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+    tx.send(Ok(Bytes::from_static(b"{\"prompt\":")))
+        .await
+        .unwrap();
+    let request = Request::builder()
+        .header("content-type", "application/json")
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap();
+    let ingress = admitted_upload(&host, &slots, closing, config);
+    let mut read = Box::pin(ingress.read(request));
+    assert!(futures::poll!(&mut read).is_pending());
+    assert_eq!(slots.available_permits(), 0);
+    assert!(host.usage().unwrap().committed_bytes() > 0);
+    tokio::time::advance(idle).await;
+    let error = read.await.err().expect("stalled upload must time out");
+    assert_eq!(error.into_response().status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(slots.available_permits(), 1);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    assert!(tx.is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn progressing_upload_still_obeys_total_deadline() {
+    use axum::body::{Body, Bytes};
+    let host = super::super::tests::host();
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let (_signal, closing) = tokio::sync::watch::channel(false);
+    let mut config = super::super::tests::config();
+    config.upload_idle_timeout = Duration::from_secs(3);
+    config.upload_timeout = Duration::from_secs(5);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+    let request = Request::builder()
+        .header("content-type", "application/json")
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap();
+    let mut read = Box::pin(admitted_upload(&host, &slots, closing, config).read(request));
+    assert!(futures::poll!(&mut read).is_pending());
+    for _ in 0..2 {
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tx.send(Ok(Bytes::from_static(b" "))).await.unwrap();
+        assert!(futures::poll!(&mut read).is_pending());
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let error = read
+        .await
+        .err()
+        .expect("active upload must obey total deadline");
+    assert_eq!(error.into_response().status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(slots.available_permits(), 1);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_partial_upload_releases_its_original_reservations() {
+    use axum::body::{Body, Bytes};
+    let host = super::super::tests::host();
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let (_signal, closing) = tokio::sync::watch::channel(false);
+    let chunks = futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(b"{")) })
+        .chain(futures::stream::pending());
+    let request = Request::builder()
+        .header("content-type", "application/json")
+        .body(Body::from_stream(chunks))
+        .unwrap();
+    let mut read = Box::pin(
+        admitted_upload(&host, &slots, closing, super::super::tests::config()).read(request),
+    );
+    assert!(futures::poll!(&mut read).is_pending());
+    assert_eq!(slots.available_permits(), 0);
+    assert!(host.usage().unwrap().committed_bytes() > 0);
+    drop(read);
+    assert_eq!(slots.available_permits(), 1);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_nonempty_data_extends_the_upload_idle_deadline() {
+    use axum::body::{Body, Bytes};
+    let host = super::super::tests::host();
+    let (_signal, closing) = tokio::sync::watch::channel(false);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+    let request = Request::builder()
+        .header("content-type", "application/json")
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap();
+    let mut read = Box::pin(read_body(
+        request,
+        &host,
+        1024,
+        Duration::from_secs(3),
+        Duration::from_secs(30),
+        closing,
+    ));
+    assert!(futures::poll!(&mut read).is_pending());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tx.send(Ok(Bytes::from_static(b"{"))).await.unwrap();
+    assert!(futures::poll!(&mut read).is_pending());
+    // Past the original deadline, real progress has kept the upload alive.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tx.send(Ok(Bytes::new())).await.unwrap();
+    assert!(futures::poll!(&mut read).is_pending());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let error = read
+        .await
+        .err()
+        .expect("empty chunks must not extend the idle deadline");
+    assert_eq!(error.into_response().status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn complete_upload_preserves_original_slot_until_job_submission() {
+    use axum::body::Body;
+    let host = super::super::tests::host();
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let (_signal, closing) = tokio::sync::watch::channel(false);
+    let request = Request::builder()
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&wire(&png())).unwrap()))
+        .unwrap();
+    let (input, slot) = admitted_upload(&host, &slots, closing, super::super::tests::config())
+        .read(request)
+        .await
+        .unwrap();
+    assert_eq!(slots.available_permits(), 0);
+    assert_eq!(input.parameters.seed, 42);
+    assert!(host.usage().unwrap().committed_bytes() > 0);
+    drop((input, slot));
+    assert_eq!(slots.available_permits(), 1);
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+}
+
+#[test]
+fn completed_upload_keeps_blocking_validation_owned_after_timeout_and_cancellation() {
+    use axum::body::Body;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = blocked.recv();
+        });
+        waiting.await.unwrap();
+        let host = super::super::tests::host();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (_signal, closing) = tokio::sync::watch::channel(false);
+        let config = super::super::tests::config();
+        let timeout = config.upload_timeout;
+        let request = Request::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&wire(&png())).unwrap()))
+            .unwrap();
+        let mut read = Box::pin(admitted_upload(&host, &slots, closing, config).read(request));
+        assert!(futures::poll!(&mut read).is_pending());
+        assert_eq!(slots.available_permits(), 0);
+        assert!(host.usage().unwrap().committed_bytes() > 0);
+        tokio::time::advance(timeout + Duration::from_secs(1)).await;
+        // The body is complete: its deadline cannot cancel queued validation.
+        assert!(futures::poll!(&mut read).is_pending());
+        drop(read);
+        assert_eq!(slots.available_permits(), 0);
+        assert!(host.usage().unwrap().committed_bytes() > 0);
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        // With one blocking thread, this barrier runs after the queued parser.
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    });
 }

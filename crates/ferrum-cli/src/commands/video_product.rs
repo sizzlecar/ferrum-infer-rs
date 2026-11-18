@@ -6,12 +6,16 @@ use std::{any::Any, fmt, path::PathBuf};
 mod configuration;
 #[cfg(feature = "cuda-fast-h3")]
 mod execution;
+#[cfg(any(feature = "cuda-fast-h3", test))]
+mod media;
+#[cfg(any(feature = "cuda-fast-h3", test))]
+mod preset;
 #[cfg(test)]
 mod tests;
 
 #[derive(Debug, Default, Args)]
 pub struct VideoProductArgs {
-    /// FastH3 video JSON: explicit assets, CUDA libraries, queue and output limits.
+    /// FastH3 video configuration: an RTX 5090 preset or a full configuration.
     #[arg(long, value_name = "JSON")]
     pub video_config: Option<PathBuf>,
 }

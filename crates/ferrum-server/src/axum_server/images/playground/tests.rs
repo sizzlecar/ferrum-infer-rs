@@ -14,6 +14,8 @@ use std::sync::{
 };
 use tower::ServiceExt;
 
+mod browser;
+
 struct MetadataGenerator {
     host: HostMemoryAccount,
     edits: bool,
@@ -50,6 +52,15 @@ impl ImageGenerator for MetadataGenerator {
             "metadata-only fixture cannot generate".into(),
         ))
     }
+    fn edit(
+        &mut self,
+        _: ferrum_engine::image_generation::ImageEditRequest,
+    ) -> Result<ferrum_engine::image_generation::ImageGenerationOutput, ImageBatchError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ImageBatchError::Rejected(
+            "metadata-only fixture cannot edit".into(),
+        ))
+    }
 }
 
 fn router(state: AppState) -> Router {
@@ -64,6 +75,54 @@ async fn get(router: &Router, path: &str) -> Response {
         .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
         .await
         .unwrap()
+}
+
+fn image_service(
+    maximum_reference_images: usize,
+) -> (ImageHttpService, HostMemoryAccount, Arc<AtomicUsize>) {
+    image_service_with_capacity(maximum_reference_images, 4096)
+}
+
+fn image_service_with_capacity(
+    maximum_reference_images: usize,
+    host_bytes: usize,
+) -> (ImageHttpService, HostMemoryAccount, Arc<AtomicUsize>) {
+    let host = HostMemoryAccount::new(
+        HostMemoryLimits::new(
+            host_bytes,
+            HostMemoryClassLimits {
+                input_preprocess_bytes: 4096,
+                output_bytes: host_bytes,
+                transfer_staging_bytes: 0,
+                weight_backing_bytes: 0,
+            },
+        )
+        .unwrap(),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let service = ImageService::new(
+        MetadataGenerator {
+            host: host.clone(),
+            edits: maximum_reference_images != 0,
+            maximum_reference_images,
+            calls: calls.clone(),
+        },
+        ImageServiceConfig {
+            batching: ferrum_types::ImageBatchPolicy::Configured,
+            maximum_pending: 2,
+            maximum_pending_bytes: 4096,
+            maximum_prompt_bytes: 64,
+            max_num_seqs: 1,
+            request_batch_max_wait_ms: 0,
+        },
+    )
+    .unwrap();
+    let mut config = super::super::tests::config();
+    config.default_width = 640;
+    config.default_height = 512;
+    config.default_seed = u64::MAX;
+    let images = ImageHttpService::new("declared-image-alias", service, config).unwrap();
+    (images, host, calls)
 }
 
 #[tokio::test]
@@ -89,41 +148,7 @@ async fn playground_routes_require_a_real_configured_image_service() {
 async fn playground_config_uses_declared_capabilities_without_queueing_inference() {
     for maximum_reference_images in [0, 1, 3, 8, 10] {
         let edits = maximum_reference_images != 0;
-        let host = HostMemoryAccount::new(
-            HostMemoryLimits::new(
-                4096,
-                HostMemoryClassLimits {
-                    input_preprocess_bytes: 4096,
-                    output_bytes: 4096,
-                    transfer_staging_bytes: 0,
-                    weight_backing_bytes: 0,
-                },
-            )
-            .unwrap(),
-        );
-        let calls = Arc::new(AtomicUsize::new(0));
-        let service = ImageService::new(
-            MetadataGenerator {
-                host: host.clone(),
-                edits,
-                maximum_reference_images,
-                calls: calls.clone(),
-            },
-            ImageServiceConfig {
-                batching: ferrum_types::ImageBatchPolicy::Configured,
-                maximum_pending: 2,
-                maximum_pending_bytes: 4096,
-                maximum_prompt_bytes: 64,
-                max_num_seqs: 1,
-                request_batch_max_wait_ms: 0,
-            },
-        )
-        .unwrap();
-        let mut config = super::super::tests::config();
-        config.default_width = 640;
-        config.default_height = 512;
-        config.default_seed = u64::MAX;
-        let images = ImageHttpService::new("declared-image-alias", service, config).unwrap();
+        let (images, host, calls) = image_service(maximum_reference_images);
         let router = router(AppState::default().with_images(images.clone()));
         let response = get(&router, "/playground/config").await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -192,4 +217,91 @@ async fn playground_config_uses_declared_capabilities_without_queueing_inference
         drop((router, images));
         assert_eq!(host.usage().unwrap().committed_bytes(), 0);
     }
+}
+
+#[tokio::test]
+async fn playground_credentials_unlock_configuration_and_image_routes() {
+    let (images, host, calls) = image_service(1);
+    let key = crate::ApiKey::new("private-playground-key").unwrap();
+    let router = crate::api_key::protect(
+        router(AppState::default().with_images(images.clone())),
+        Some(&key),
+    )
+    .unwrap();
+    for path in ["/playground", "/playground/app.js", "/playground/style.css"] {
+        let response = get(&router, path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        // Public assets must never embed a configured server credential.
+        assert!(!String::from_utf8_lossy(&bytes).contains("private-playground-key"));
+    }
+    for credential in [
+        None,
+        Some("Bearer wrong-key"),
+        Some("Bearer private-playground-key"),
+    ] {
+        for (method, path, content_type, body) in [
+            ("GET", "/playground/config", "application/json", ""),
+            (
+                "POST",
+                "/v1/images/generations",
+                "application/json",
+                r#"{"model":"other","prompt":"cloud"}"#,
+            ),
+            (
+                "POST",
+                "/v1/images/edits",
+                "multipart/form-data; boundary=bound",
+                "--bound--\r\n",
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, content_type);
+            if let Some(credential) = credential {
+                request = request.header(header::AUTHORIZATION, credential);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let authenticated = credential == Some("Bearer private-playground-key");
+            let expected = if !authenticated {
+                StatusCode::UNAUTHORIZED
+            } else if method == "GET" {
+                StatusCode::OK
+            } else {
+                // Authentication succeeds; the actual image handlers reject
+                // the deliberately invalid request before queueing inference.
+                StatusCode::BAD_REQUEST
+            };
+            assert_eq!(response.status(), expected, "{path}");
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if !authenticated {
+                assert_eq!(value["error"]["code"], "invalid_api_key");
+            } else if method == "GET" {
+                assert_eq!(value["model"], "declared-image-alias");
+            }
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    images.shutdown().await.unwrap();
+    assert!(!images.take_shutdown().await.unwrap().has_failure());
+    let response = get(&router, "/health").await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let health: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(health["status"], "unhealthy");
+    assert_eq!(health["images"]["ready"], false);
+    drop((router, images));
+    assert_eq!(host.usage().unwrap().committed_bytes(), 0);
 }

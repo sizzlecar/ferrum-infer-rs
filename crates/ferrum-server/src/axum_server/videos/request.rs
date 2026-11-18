@@ -49,32 +49,69 @@ pub(super) async fn read(
     videos: &VideoHttpService,
     slot: Arc<OwnedSemaphorePermit>,
 ) -> Result<(VideoGenerationRequest, Arc<OwnedSemaphorePermit>), ServerError> {
-    let host = videos.service.host_account().clone();
-    let body = read_body(
-        request,
-        &host,
-        videos.config.maximum_body_bytes,
-        videos.shutdown_signal.subscribe(),
-    )
-    .await?;
-    let config = videos.config.clone();
-    let model = videos.model_name.clone();
-    // Actual PNG validation is CPU work. The original ingress slot and Host
-    // backing remain in this task even if the HTTP caller disconnects.
-    tokio::task::spawn_blocking(move || {
-        let input = parse(body, &host, &config, &model)?;
-        Ok((input, slot))
-    })
+    Ingress {
+        host: videos.service.host_account().clone(),
+        config: videos.config.clone(),
+        model: videos.model_name.clone(),
+        slot,
+        closing: videos.shutdown_signal.subscribe(),
+    }
+    .read(request)
     .await
-    .map_err(internal)?
+}
+
+/// Owns admission through upload and blocking media validation. Cancelling or
+/// timing out an upload drops both its original slot and partial Host backing.
+struct Ingress {
+    host: HostMemoryAccount,
+    config: VideoHttpConfig,
+    model: Arc<str>,
+    slot: Arc<OwnedSemaphorePermit>,
+    closing: tokio::sync::watch::Receiver<bool>,
+}
+impl Ingress {
+    async fn read(
+        self,
+        request: Request,
+    ) -> Result<(VideoGenerationRequest, Arc<OwnedSemaphorePermit>), ServerError> {
+        let Self {
+            host,
+            config,
+            model,
+            slot,
+            closing,
+        } = self;
+        let body = read_body(
+            request,
+            &host,
+            config.maximum_body_bytes,
+            config.upload_idle_timeout,
+            config.upload_timeout,
+            closing,
+        )
+        .await?;
+        // Actual PNG validation is CPU work. The original ingress slot and Host
+        // backing remain in this task even if the HTTP caller disconnects.
+        tokio::task::spawn_blocking(move || {
+            let input = parse(body, &host, &config, &model)?;
+            Ok((input, slot))
+        })
+        .await
+        .map_err(internal)?
+    }
 }
 
 async fn read_body(
     request: Request,
     host: &HostMemoryAccount,
     maximum: usize,
+    idle_timeout: std::time::Duration,
+    timeout: std::time::Duration,
     mut closing: tokio::sync::watch::Receiver<bool>,
 ) -> Result<ManagedHostBytes, ServerError> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
+    let mut idle_deadline = started + idle_timeout;
     if request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -104,7 +141,22 @@ async fn read_body(
                 "video service is shutting down".into(),
             ));
         }
-        let next = tokio::select! { changed=closing.changed()=> { let _=changed; return Err(ServerError::ServiceUnavailable("video service is shutting down".into())); }, next=stream.next()=>next };
+        let next = tokio::select! {
+            // A continuously ready body must not starve shutdown or the total
+            // deadline. Empty chunks do not extend the idle deadline.
+            biased;
+            changed = closing.changed() => {
+                let _ = changed;
+                return Err(ServerError::ServiceUnavailable("video service is shutting down".into()));
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(ServerError::RequestTimeout("video upload exceeded its total time limit".into()));
+            },
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                return Err(ServerError::RequestTimeout("video upload stopped receiving data".into()));
+            },
+            next = stream.next() => next,
+        };
         let Some(chunk) = next else {
             break;
         };
@@ -112,6 +164,7 @@ async fn read_body(
         if chunk.is_empty() {
             continue;
         }
+        idle_deadline = tokio::time::Instant::now() + idle_timeout;
         let end = used
             .checked_add(chunk.len())
             .filter(|n| *n <= maximum)

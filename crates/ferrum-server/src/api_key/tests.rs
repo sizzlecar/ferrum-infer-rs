@@ -141,6 +141,17 @@ async fn actual_http_routes_require_bearer_and_keep_health_and_assets_public() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let response = client
+        .get(format!("{base}/playground/config"))
+        .bearer_auth("test-server-key")
+        .send()
+        .await
+        .unwrap();
+    // A valid key reaches the image-service readiness check. The empty state
+    // is unavailable, which is distinct from a missing/incorrect credential.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "service_unavailable_error");
     for path in [
         "/health",
         "/playground",

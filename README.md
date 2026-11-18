@@ -94,7 +94,7 @@ ferrum serve /path/to/Qwen-Image-2.1-Turbo --backend cuda \
 
 Both return PNG in `b64_json`. CUDA batches compatible requests automatically within capacity limits. Validated on L20 (SM89) and RTX 5090 (SM120); cuDNN 9 is required. Qwen also supports Metal generation and editing with a GGUF DiT, validated at 1024×1024 on an M4 Mac mini with 16 GiB memory.
 
-For P-H3, copy the [CUDA configuration](crates/ferrum-cli/examples/config/p-h3-image-cuda.json), set the model and CUDA/cuDNN paths, then start:
+For P-H3, install the [image runtime](docs/image-generation.md#p-h3-setup), copy the [CUDA configuration](crates/ferrum-cli/examples/config/p-h3-image-cuda.json), set the model paths, then start:
 
 ```sh
 ferrum serve --image-config p-h3-image-cuda.json --served-model-name P-H3-Image --port 8000

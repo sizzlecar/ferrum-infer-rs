@@ -4,6 +4,9 @@
   const active = new Map();
   const cards = [];
   let config = null;
+  let apiKey = '';
+  let connectionVersion = 0;
+  let connectionController = null;
   let mode = 'generate';
   let references = [];
   let referenceVersion = 0;
@@ -19,6 +22,30 @@
   function notice(message, success = false) {
     $('notice').textContent = message;
     $('notice').classList.toggle('success', success);
+  }
+  function connectionNotice(message, success = false) {
+    $('connection-status').textContent = message;
+    $('connection-status').classList.toggle('success', success);
+  }
+  function authorization(key) {
+    return key ? { Authorization: `Bearer ${key}` } : {};
+  }
+  async function responsePayload(response, key, version) {
+    if (response.status === 401) {
+      const error = new Error(key ? 'API 密钥无效或已失效，请更新密钥后重新连接。' : '此服务需要 API 密钥，请输入后点击“应用并连接”。');
+      error.name = 'AuthenticationError';
+      if (version === connectionVersion) {
+        config = null;
+        $('model').textContent = '需要 API 密钥'; $('model').title = '';
+        $('size').disabled = true; $('mode-edit').disabled = true;
+        connectionNotice(error.message); $('api-key').focus(); update();
+      }
+      throw error;
+    }
+    let payload;
+    try { payload = await response.json(); } catch (_) { throw new Error(`服务返回了无法解析的响应（HTTP ${response.status}）。`); }
+    if (!response.ok) throw new Error(payload?.error?.message || `请求失败（HTTP ${response.status}）。`);
+    return payload;
   }
   function update() {
     const limit = config ? Math.max(1, Math.min(2, config.maximum_concurrency || 2)) : 2;
@@ -202,6 +229,8 @@
     let seed;
     try { seed = seedValue(); } catch (error) { notice(error.message); return; }
     const request = { model: config.model, prompt, seed, size: $('size').value, n: 1, response_format: 'b64_json' };
+    const requestKey = apiKey;
+    const requestVersion = connectionVersion;
     const editing = mode === 'edit';
     const originals = references.map(reference => reference.blob);
     const controller = new AbortController();
@@ -235,11 +264,9 @@
         const data = new FormData();
         for (const [key, value] of Object.entries(request)) data.append(key, String(value));
         originals.forEach((blob, index) => data.append('image[]', blob, `reference-${index + 1}.png`));
-        response = await fetch('/v1/images/edits', { method: 'POST', body: data, signal: controller.signal });
-      } else response = await fetch('/v1/images/generations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request), signal: controller.signal });
-      let payload;
-      try { payload = await response.json(); } catch (_) { throw new Error(`服务返回了无法解析的响应（HTTP ${response.status}）。`); }
-      if (!response.ok) throw new Error(payload?.error?.message || `请求失败（HTTP ${response.status}）。`);
+        response = await fetch('/v1/images/edits', { method: 'POST', headers: authorization(requestKey), body: data, signal: controller.signal });
+      } else response = await fetch('/v1/images/generations', { method: 'POST', headers: { ...authorization(requestKey), 'Content-Type': 'application/json' }, body: JSON.stringify(request), signal: controller.signal });
+      const payload = await responsePayload(response, requestKey, requestVersion);
       if (!Array.isArray(payload.data) || payload.data.length !== 1 || typeof payload.data[0].b64_json !== 'string') throw new Error('服务没有返回约定的单张 PNG 图片。');
       if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
       const binary = atob(payload.data[0].b64_json);
@@ -254,7 +281,8 @@
       preview.replaceChildren(image); badge.textContent = '已完成'; badge.classList.add('done');
       const download = element('a', 'small-button', '下载 PNG');
       download.href = card.url; download.download = `ferrum-${seed}-${request.size}.png`; actions.prepend(download);
-      if (config.supports_edits) action(actions, '继续编辑', () => {
+      if (config?.supports_edits) action(actions, '继续编辑', () => {
+        if (!config?.supports_edits) { notice('请先连接支持图片编辑的服务。'); return; }
         try { setReference(blob, `生成结果 · Seed ${seed}`); } catch (error) { notice(error.message); return; }
         setMode('edit');
         $('prompt').value = ''; $('prompt').focus(); notice('已将这张结果设为参考图。', true);
@@ -286,27 +314,64 @@
   for (const name of ['dragenter', 'dragover']) $('drop-zone').addEventListener(name, event => { event.preventDefault(); $('drop-zone').classList.add('dragover'); });
   $('drop-zone').addEventListener('dragleave', () => $('drop-zone').classList.remove('dragover'));
   $('drop-zone').addEventListener('drop', event => { event.preventDefault(); $('drop-zone').classList.remove('dragover'); selectFiles(event.dataTransfer.files); });
+  $('connection-form').addEventListener('submit', event => {
+    event.preventDefault();
+    const value = $('api-key').value.trim();
+    if (value && !/^[A-Za-z0-9._~+/-]+=*$/.test(value)) {
+      connectionNotice('密钥格式无效，请只粘贴密钥本身，不包含 Bearer 前缀或空白。');
+      $('api-key').focus(); return;
+    }
+    apiKey = value;
+    $('api-key').value = value;
+    connect();
+  });
+  $('clear-key').addEventListener('click', () => {
+    apiKey = ''; $('api-key').value = ''; connect();
+  });
   window.addEventListener('beforeunload', () => {
+    connectionController?.abort();
     clearReferences();
     for (const controller of active.values()) controller.abort();
     for (const card of cards) if (card.url) URL.revokeObjectURL(card.url);
   });
-  fetch('/playground/config', { cache: 'no-store' }).then(async response => {
-    const value = await response.json();
-    if (!response.ok) throw new Error(value?.error?.message || '图像服务暂不可用。');
-    if (typeof value.model !== 'string' || !Array.isArray(value.sizes) || !value.sizes.length) throw new Error('服务配置缺少可用模型或尺寸。');
-    if (!Number.isSafeInteger(value.maximum_reference_images) || value.maximum_reference_images < 0 || (value.supports_edits && value.maximum_reference_images === 0) || !Number.isSafeInteger(value.maximum_reference_image_bytes) || value.maximum_reference_image_bytes <= 0) throw new Error('服务配置缺少有效的参考图限制。');
-    config = value; $('model').textContent = config.model; $('model').title = config.model;
-    $('size').replaceChildren();
-    for (const size of config.sizes) {
-      const option = element('option', '', size.label || `${size.width} × ${size.height}`);
-      option.value = `${size.width}x${size.height}`; $('size').append(option);
+  async function connect() {
+    const version = ++connectionVersion;
+    const key = apiKey;
+    connectionController?.abort();
+    const controller = new AbortController();
+    connectionController = controller;
+    config = null;
+    $('model').textContent = '正在连接模型…'; $('model').title = '';
+    $('size').disabled = true; $('mode-edit').disabled = true;
+    connectionNotice('正在连接图像服务…'); update();
+    try {
+      const response = await fetch('/playground/config', { cache: 'no-store', headers: authorization(key), signal: controller.signal });
+      const value = await responsePayload(response, key, version);
+      if (version !== connectionVersion) return;
+      if (typeof value.model !== 'string' || !Array.isArray(value.sizes) || !value.sizes.length) throw new Error('服务配置缺少可用模型或尺寸。');
+      if (!Number.isSafeInteger(value.maximum_reference_images) || value.maximum_reference_images < 0 || (value.supports_edits && value.maximum_reference_images === 0) || !Number.isSafeInteger(value.maximum_reference_image_bytes) || value.maximum_reference_image_bytes <= 0) throw new Error('服务配置缺少有效的参考图限制。');
+      config = value; $('model').textContent = config.model; $('model').title = config.model;
+      $('size').replaceChildren();
+      for (const size of config.sizes) {
+        const option = element('option', '', size.label || `${size.width} × ${size.height}`);
+        option.value = `${size.width}x${size.height}`; $('size').append(option);
+      }
+      const preferred = `${config.default_width}x${config.default_height}`;
+      if ([...$('size').options].some(option => option.value === preferred)) $('size').value = preferred;
+      $('size').disabled = false; $('mode-edit').disabled = !config.supports_edits;
+      if (!config.supports_edits) setMode('generate');
+      if (Number.isSafeInteger(config.default_seed) && config.default_seed >= 0) $('seed').value = String(config.default_seed);
+      else notice('服务默认 Seed 超出浏览器安全范围，请使用随机 Seed 或输入安全范围内的整数。');
+      renderReferences();
+      connectionNotice(key ? '已连接，API 密钥已应用。' : '已连接，无需 API 密钥。', true);
+    } catch (error) {
+      if (controller.signal.aborted || version !== connectionVersion) return;
+      config = null;
+      $('model').textContent = error.name === 'AuthenticationError' ? '需要 API 密钥' : '服务未就绪';
+      connectionNotice(error.message || '无法连接图像服务，请点击“应用并连接”重试。'); update();
+    } finally {
+      if (version === connectionVersion) connectionController = null;
     }
-    const preferred = `${config.default_width}x${config.default_height}`;
-    if ([...$('size').options].some(option => option.value === preferred)) $('size').value = preferred;
-    $('size').disabled = false; $('mode-edit').disabled = !config.supports_edits;
-    if (Number.isSafeInteger(config.default_seed) && config.default_seed >= 0) $('seed').value = String(config.default_seed);
-    else notice('服务默认 Seed 超出浏览器安全范围，请使用随机 Seed 或输入安全范围内的整数。');
-    renderReferences();
-  }).catch(error => { config = null; $('model').textContent = '服务未就绪'; notice(error.message || '无法连接图像服务，请刷新页面重试。'); update(); });
+  }
+  connect();
 })();

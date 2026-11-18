@@ -64,6 +64,7 @@ pub struct SchedulerCliConfig {
 
 /// Server CLI configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerCliConfig {
     /// Optional bearer API key. Exported configurations redact this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -960,6 +961,57 @@ impl Default for DevConfig {
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser, Subcommand};
+
+    #[tokio::test]
+    async fn partial_server_config_inherits_defaults_and_redacts_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ferrum.toml");
+        let defaults = ServerCliConfig::default();
+        for document in ["[server]\n", "[server]\napi_key = \"configured-key\"\n"] {
+            fs::write(&path, document).await.unwrap();
+            let config = CliConfig::load(&path).await.unwrap();
+            assert_eq!(config.server.host, defaults.host);
+            assert_eq!(config.server.port, defaults.port);
+            assert_eq!(config.server.config_path, defaults.config_path);
+            assert_eq!(config.server.log_level, defaults.log_level);
+            assert_eq!(config.server.hot_reload, defaults.hot_reload);
+            let expected_key = document
+                .contains("api_key")
+                .then(|| ferrum_server::ApiKey::new("configured-key").unwrap());
+            assert_eq!(config.server.api_key, expected_key);
+            assert!(!format!("{config:?}").contains("configured-key"));
+            config.save(&path).await.unwrap();
+            assert!(!fs::read_to_string(&path)
+                .await
+                .unwrap()
+                .contains("configured-key"));
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_server_config_preserves_overrides_and_rejects_invalid_types() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ferrum.toml");
+        fs::write(
+            &path,
+            "[server]\nhost = \"0.0.0.0\"\nport = 8090\ninterleaved_system_coalescing = false\n",
+        )
+        .await
+        .unwrap();
+        let config = CliConfig::load(&path).await.unwrap();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 8090);
+        assert_eq!(
+            config.server.log_level,
+            ServerCliConfig::default().log_level
+        );
+        assert!(!load_interleaved_system_coalescing(&path).await.unwrap());
+
+        fs::write(&path, "[server]\nport = \"invalid\"\n")
+            .await
+            .unwrap();
+        assert!(CliConfig::load(&path).await.is_err());
+    }
 
     #[tokio::test]
     async fn output_and_tokenizer_cache_config_reaches_shared_engine_settings() {

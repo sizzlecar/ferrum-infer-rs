@@ -13,15 +13,6 @@
     "maximum_commands_per_submission": 32768,
     "staging_bytes": 8388608,
     "native_bytes": 67108864,
-    "cudnn_library": "/opt/cudnn/lib/libcudnn.so.9",
-    "cudnn_dependencies": [
-      "/opt/cuda-13/lib64/libcudart.so.13",
-      "/opt/cuda-13/lib64/libnvrtc-builtins.so.13.0",
-      "/opt/cuda-13/lib64/libnvrtc.so.13",
-      "/opt/cuda-13/lib64/libnvJitLink.so.13",
-      "/opt/cuda-13/lib64/libcublasLt.so.13",
-      "/opt/cuda-13/lib64/libcublas.so.13"
-    ],
     "cudnn_opaque_bytes": 536870912,
     "workspace_bytes": 268435456,
     "plan_cache_bytes": 536870912,
@@ -37,12 +28,16 @@
     "maximum_pending_bytes": 268435456,
     "max_num_seqs": 2,
     "request_batch_max_wait_ms": 0,
-    "maximum_prompt_bytes": 65536
+    "maximum_prompt_bytes": 65536,
+    "upload_idle_timeout_seconds": 30,
+    "upload_timeout_seconds": 300
   },
   "output": {
-    "ffmpeg": "/usr/local/bin/ffmpeg",
     "directory": "/var/tmp/ferrum-video",
     "maximum_jobs": 16,
+    "maximum_retained_jobs": 128,
+    "maximum_retained_bytes": 8589934592,
+    "retention_seconds": 86400,
     "maximum_spool_bytes": 2147483648,
     "maximum_encoded_bytes": 134217728,
     "threads": 15,
@@ -61,8 +56,6 @@
   "feed_forward_partition": "if_capacity_needed",
   "video_postprocessing": "overlap_if_capacity_allows",
   "input": {
-    "ffmpeg": "/usr/local/bin/ffmpeg",
-    "ffprobe": "/usr/local/bin/ffprobe",
     "threads": 2,
     "timeout_seconds": 120
   },

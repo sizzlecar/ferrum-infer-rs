@@ -50,6 +50,20 @@ pub struct CudaCudnnConfig {
     pub opaque_memory_profile: String,
 }
 
+/// An automatically discovered library must target the same CUDA major as the
+/// linked backend. Explicit deployments may already provide a separate runtime.
+#[derive(Clone, Copy)]
+pub enum CudnnLibrarySelection<'a> {
+    Explicit(&'a CudaCudnnConfig),
+    Discovered(&'a CudaCudnnConfig),
+}
+
+impl<'a> From<&'a CudaCudnnConfig> for CudnnLibrarySelection<'a> {
+    fn from(config: &'a CudaCudnnConfig) -> Self {
+        Self::Explicit(config)
+    }
+}
+
 impl CudaCudnnConfig {
     pub(crate) fn validate(&self) -> Result<(), CudaDeviceRuntimeError> {
         if !self.library_path.is_absolute()
@@ -393,11 +407,26 @@ struct NativeOwner {
 // CUDA context to the calling thread. No raw handle escapes this module.
 unsafe impl Send for NativeOwner {}
 
+fn validate_discovered_cuda_major(
+    cudart: usize,
+    backend: u32,
+) -> Result<(), CudaDeviceRuntimeError> {
+    if cudart / 1000 != (backend / 1000) as usize {
+        return Err(CudaDeviceRuntimeError::contract(format!(
+            "discovered cuDNN was built for CUDA {cudart}; Ferrum was built for CUDA {backend}. Install cuDNN for CUDA {} or explicitly configure your compatible libraries", backend / 1000
+        )));
+    }
+    Ok(())
+}
+
 impl CudaCudnnOwner {
-    pub(crate) fn new(
+    pub(crate) fn new<'a>(
         runtime: &CudaDeviceRuntime,
-        config: &CudaCudnnConfig,
+        selection: impl Into<CudnnLibrarySelection<'a>>,
     ) -> Result<Arc<Self>, CudaDeviceRuntimeError> {
+        let selection = selection.into();
+        let (CudnnLibrarySelection::Explicit(config) | CudnnLibrarySelection::Discovered(config)) =
+            selection;
         config.validate()?;
         // Hash streams bounded stack chunks, never a library-sized payload Vec.
         // The complete sibling bundle is pinned as deployment provenance;
@@ -435,6 +464,15 @@ impl CudaCudnnOwner {
             return Err(CudaDeviceRuntimeError::contract(format!(
                 "cuDNN 9 is required, got {version}"
             )));
+        }
+        if matches!(selection, CudnnLibrarySelection::Discovered(_)) {
+            let built_for = unsafe { (api.cudart_version)() };
+            if let Err(error) =
+                validate_discovered_cuda_major(built_for, cudarc::driver::sys::CUDA_VERSION)
+            {
+                std::mem::forget((api, opaque, bootstrap, context));
+                return Err(error);
+            }
         }
         let mut native = NativeOwner {
             handle: std::ptr::null_mut(),

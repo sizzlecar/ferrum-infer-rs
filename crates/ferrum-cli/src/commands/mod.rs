@@ -297,6 +297,8 @@ impl VNextDiagnosticFaultArg {
 pub mod bench;
 pub mod bench_images;
 pub mod bench_serve;
+#[cfg(any(feature = "cuda", test))]
+mod cudnn_library;
 pub mod diagnostic_output_capture;
 pub mod doctor;
 pub mod image_product;

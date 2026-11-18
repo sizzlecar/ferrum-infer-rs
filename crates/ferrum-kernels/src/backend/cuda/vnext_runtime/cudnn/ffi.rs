@@ -38,6 +38,7 @@ pub(super) type BackwardDataPerformance = ForwardPerformance;
 pub(super) struct Api {
     pub graph: GraphApi,
     pub version: unsafe extern "C" fn() -> usize,
+    pub cudart_version: unsafe extern "C" fn() -> usize,
     pub create: unsafe extern "C" fn(*mut Handle) -> c_int,
     pub destroy: unsafe extern "C" fn(Handle) -> c_int,
     pub set_stream: unsafe extern "C" fn(Handle, *mut c_void) -> c_int,
@@ -184,6 +185,7 @@ impl Api {
                 execute: symbol!("cudnnBackendExecute"),
             },
             version: symbol!("cudnnGetVersion"),
+            cudart_version: symbol!("cudnnGetCudartVersion"),
             create: symbol!("cudnnCreate"),
             destroy: symbol!("cudnnDestroy"),
             set_stream: symbol!("cudnnSetStream"),

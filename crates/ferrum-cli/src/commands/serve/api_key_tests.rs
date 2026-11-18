@@ -10,16 +10,12 @@ struct TestCli {
 #[test]
 fn explicit_key_overrides_server_configuration_and_exports_redact() {
     let command = TestCli::try_parse_from(["ferrum", "--api-key", "explicit-key"]).unwrap();
-    let key = resolve_api_key(
-        command.serve.api_key,
-        Some(ferrum_server::ApiKey::new("configured-key").unwrap()),
-    )
-    .unwrap();
+    let mut config: CliConfig = toml::from_str("[server]\napi_key = \"configured-key\"\n").unwrap();
+    let key = resolve_api_key(command.serve.api_key, config.server.api_key.clone()).unwrap();
     assert_eq!(
         key,
         Some(ferrum_server::ApiKey::new("explicit-key").unwrap())
     );
-    let mut config = CliConfig::default();
     config.server.api_key = key;
     assert!(!serde_json::to_string(&config)
         .unwrap()

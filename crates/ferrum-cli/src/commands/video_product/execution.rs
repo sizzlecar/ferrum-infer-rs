@@ -16,7 +16,10 @@ use std::{
     sync::Arc,
 };
 
-fn pipeline(config: &Configuration) -> Result<FastH3Pipeline, VideoProductError> {
+fn pipeline(
+    config: &Configuration,
+    input: ferrum_models::video_input::VideoInputCodec,
+) -> Result<FastH3Pipeline, VideoProductError> {
     let mut limits = FastH3PipelineLimits::rtx5090();
     limits.conditioning.reuse = config.conditioning_reuse;
     limits.video_decoder_tile_batch = config.video_decoder_tile_batch;
@@ -30,13 +33,8 @@ fn pipeline(config: &Configuration) -> Result<FastH3Pipeline, VideoProductError>
         &config.source.paths(),
         limits.asset_limits(),
     )?);
-    FastH3Pipeline::new(
-        assets,
-        config.cuda.clone(),
-        limits,
-        config.input.prepare(&config.output)?,
-    )
-    .map_err(|error| VideoProductError::retain_error("FastH3 startup", error))
+    FastH3Pipeline::new(assets, config.cuda.clone(), limits, input)
+        .map_err(|error| VideoProductError::retain_error("FastH3 startup", error))
 }
 
 fn reference_files(paths: &[VideoReferencePath]) -> Result<Vec<(VideoReferenceKind, File, usize)>> {
@@ -104,10 +102,18 @@ fn read_reference(
 pub(super) async fn run(request: VideoRunRequest) -> Result<(), VideoProductError> {
     let config = Configuration::load(&request.config)?;
     let service_config = config.serving.service_config()?;
-    let output = config.output.prepare()?;
+    let output = config.output.prepare().await?;
     let files = reference_files(&request.references)?;
     ensure_destination(&request.destination)?;
-    let pipeline = pipeline(&config)?;
+    let input = config
+        .input
+        .prepare(&config.output, &output.encoder.ffmpeg)?;
+    super::media::check_run_input(
+        files.iter().map(|(kind, _, _)| *kind),
+        &input.config().ffmpeg,
+        &input.config().ffprobe,
+    )?;
+    let pipeline = pipeline(&config, input)?;
     let spec = pipeline.output_spec(&request.parameters)?;
     let plan = VideoOutputPlan::new(spec, output.encoder, output.spool, &output.budget)
         .map_err(anyhow::Error::from)?;
@@ -257,7 +263,7 @@ pub(super) async fn serve(
     )
     .map_err(anyhow::Error::from)?;
     let service_config = config.serving.service_config()?;
-    let output = config.output.prepare()?;
+    let output = config.output.prepare().await?;
     let maximum_body_bytes = ImageInputLimits::DEFAULT_MAXIMUM_ENCODED_BYTES
         .checked_mul(4)
         .and_then(|n| n.checked_div(3))
@@ -267,7 +273,10 @@ pub(super) async fn serve(
     let listener = BoundHttpListener::bind(&host, port)
         .await
         .map_err(anyhow::Error::from)?;
-    let pipeline = pipeline(&config)?;
+    let input = config
+        .input
+        .prepare(&config.output, &output.encoder.ffmpeg)?;
+    let pipeline = pipeline(&config, input)?;
     let geometry = pipeline.output_spec_resolver();
     let resolve: VideoOutputPlanResolver = Arc::new(move |parameters| {
         let spec = geometry
@@ -290,7 +299,17 @@ pub(super) async fn serve(
         service.clone(),
         VideoHttpConfig {
             maximum_jobs: config.output.maximum_jobs,
+            job_directory: config.output.directory.join("jobs-v1"),
+            retention: ferrum_server::VideoJobRetention {
+                maximum_jobs: config.output.maximum_retained_jobs,
+                maximum_bytes: config.output.maximum_retained_bytes,
+                ttl: std::time::Duration::from_secs(config.output.retention_seconds),
+            },
             maximum_body_bytes,
+            upload_idle_timeout: std::time::Duration::from_secs(
+                config.serving.upload_idle_timeout_seconds,
+            ),
+            upload_timeout: std::time::Duration::from_secs(config.serving.upload_timeout_seconds),
             maximum_prompt_bytes: config.serving.maximum_prompt_bytes,
             references: ferrum_engine::video_generation::fast_h3::REFERENCE_LIMITS,
             image_limits: ImageInputLimits::default(),

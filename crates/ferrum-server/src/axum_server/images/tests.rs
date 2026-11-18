@@ -534,6 +534,7 @@ async fn image_only_health_models_and_validation_do_not_claim_a_ready_text_engin
         .build_router()
         .unwrap();
     let health = json_get(router.clone(), "/health").await;
+    assert_eq!(health["status"], "healthy");
     assert_eq!(health["engine"]["text_loaded"], false);
     assert_eq!(health["engine"]["text_ready"], false);
     assert_eq!(health["images"]["ready"], true);
@@ -610,7 +611,24 @@ async fn image_only_health_models_and_validation_do_not_claim_a_ready_text_engin
     assert_eq!(images.output_usage().sessions, 0);
     images.shutdown().await.unwrap();
     assert!(images.take_shutdown().await.is_some());
-    let health = json_get(router, "/health").await;
+    let response = router
+        .oneshot(
+            axum::http::Request::get("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let health: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(health["images"]["ready"], false);
     assert_eq!(health["status"], "unhealthy");
 }

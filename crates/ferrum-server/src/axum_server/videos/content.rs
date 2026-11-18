@@ -3,14 +3,13 @@ use axum::{
     body::{Body, Bytes},
     http::header,
 };
-use ferrum_output::mp4::{Mp4Artifact, Mp4ArtifactReader};
 use ferrum_runtime::{HostMemoryAccount, HostMemoryClass, ManagedHostBuffer};
 use futures::StreamExt;
 use std::io::{self, Read};
 use tokio::sync::OwnedSemaphorePermit;
 
 struct Reader {
-    reader: Mp4ArtifactReader,
+    reader: Box<dyn Read + Send>,
     // In-flight blocking reads keep this permit after Body cancellation.
     _permit: OwnedSemaphorePermit,
 }
@@ -18,25 +17,31 @@ pub(in crate::axum_server) async fn get(
     State(state): State<AppState>,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Response, ServerError> {
-    let videos = available(&state)?;
-    let artifact = match videos.jobs.artifact(id) {
-        None => return Ok(missing()),
-        Some(Err(status)) => return Ok((StatusCode::CONFLICT, Json(status)).into_response()),
-        Some(Ok(artifact)) => artifact,
-    };
-    let permit = videos.jobs.admit_reader(&videos.readers)?;
-    let host = videos.service.host_account().clone();
-    let chunk_bytes = videos.config.read_buffer_bytes;
-    response(
-        artifact,
-        permit,
-        host,
-        chunk_bytes,
-        videos.shutdown_signal.subscribe(),
-    )
+    let videos = available(&state)?.clone();
+    // Lookup can reclaim expired records and sync deletion tombstones. Keep
+    // disk work off the async executor, and bound artifact owners before lookup.
+    tokio::task::spawn_blocking(move || {
+        let permit = videos.jobs.admit_reader(&videos.readers)?;
+        let artifact = match videos.jobs.artifact(id) {
+            None => return Ok(missing()),
+            Some(Err(status)) => return Ok((StatusCode::CONFLICT, Json(status)).into_response()),
+            Some(Ok(artifact)) => artifact,
+        };
+        response(
+            Box::new(artifact.open().map_err(internal)?),
+            artifact.encoded_bytes(),
+            permit,
+            videos.service.host_account().clone(),
+            videos.config.read_buffer_bytes,
+            videos.shutdown_signal.subscribe(),
+        )
+    })
+    .await
+    .map_err(internal)?
 }
 fn response(
-    artifact: Mp4Artifact,
+    source: Box<dyn Read + Send>,
+    size: u64,
     permit: OwnedSemaphorePermit,
     host: HostMemoryAccount,
     chunk_bytes: usize,
@@ -46,10 +51,9 @@ fn response(
         .allocate_zeroed(HostMemoryClass::Output, chunk_bytes)
         .map_err(capacity)?;
     let reader = Reader {
-        reader: artifact.open().map_err(internal)?,
+        reader: source,
         _permit: permit,
     };
-    let size = artifact.receipt().encoded_bytes;
     let stream = async_stream::try_stream! {
         let mut reader=reader;
         let mut buffer=Some(initial);
@@ -171,8 +175,12 @@ mod tests {
         let (_signal, closing) = tokio::sync::watch::channel(false);
         // Moves the only artifact into the HTTP reader, just as deleting a
         // completed registry record while its download is already active.
+        let source = artifact.open().unwrap();
+        let size = artifact.receipt().encoded_bytes;
+        drop(artifact);
         let response = response(
-            artifact,
+            Box::new(source),
+            size,
             readers.clone().acquire_owned().await.unwrap(),
             host.clone(),
             17,

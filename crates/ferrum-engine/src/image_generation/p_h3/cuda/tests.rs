@@ -138,6 +138,7 @@ fn config() -> PH3ImageCudaConfig {
         maximum_commands_per_submission: 4096,
         opaque_memory_profile: "declared-h3-runtime-v1".into(),
         prompt_expansion_causal: None,
+        cudnn_discovered: false,
         cudnn: CudaCudnnConfig {
             library_path: "/declared-native/libcudnn.so.9".into(),
             dependency_libraries: vec![],

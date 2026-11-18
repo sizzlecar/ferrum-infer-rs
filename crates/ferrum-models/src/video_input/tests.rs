@@ -1,6 +1,8 @@
 use super::*;
 use std::{io::Write, process::Command, sync::atomic::Ordering, time::Instant};
 
+mod decoder_capacity;
+
 fn tool(name: &str) -> PathBuf {
     // Tool discovery selects the test host's installed codec, never a machine
     // identity or a hidden product path. Production always requires paths.
@@ -42,13 +44,23 @@ fn fixture(
     directory: &std::path::Path,
     host: &HostMemoryAccount,
 ) -> ManagedHostBytes {
+    fixture_sized(config, directory, host, 32, 32)
+}
+fn fixture_sized(
+    config: &VideoInputCodecConfig,
+    directory: &std::path::Path,
+    host: &HostMemoryAccount,
+    width: u8,
+    height: u8,
+) -> ManagedHostBytes {
     let raw = directory.join("frames.rgba");
     let video = directory.join("source.mkv");
     let mut file = std::fs::File::create(&raw).unwrap();
     for frame in 0..6u8 {
-        for y in 0..32u8 {
-            for x in 0..32u8 {
-                file.write_all(&[frame * 20, x * 7, y * 7, 255]).unwrap();
+        for y in 0..height {
+            for x in 0..width {
+                file.write_all(&[frame * 20, x.wrapping_mul(7), y.wrapping_mul(7), 255])
+                    .unwrap();
             }
         }
     }
@@ -64,7 +76,7 @@ fn fixture(
             "-pixel_format",
             "rgba",
             "-video_size",
-            "32x32",
+            &format!("{width}x{height}"),
             "-framerate",
             "12",
             "-i",

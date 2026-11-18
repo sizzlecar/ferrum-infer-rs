@@ -81,6 +81,8 @@ pub struct PH3ImageCudaConfig {
     /// validated assets' declared prompt-expansion capability.
     pub prompt_expansion_causal: Option<CudaDenseF16CausalProfile>,
     pub cudnn: CudaCudnnConfig,
+    /// Automatically selected deployment libraries must match the compiled CUDA major.
+    pub cudnn_discovered: bool,
     pub attention_policy: ImageCudaAttentionPolicy,
     pub f32_attention_policy: PH3ImageF32AttentionPolicy,
     pub convrot_output_policy: PH3ImageConvRotOutputPolicy,
@@ -521,7 +523,13 @@ impl PH3ImageCudaConfig {
         });
         let mut providers = cuda_vnext_cnn_f32_providers_with_native_options(
             &runtime,
-            &convolution,
+            if self.cudnn_discovered {
+                ferrum_kernels::backend::cuda::vnext_runtime::CudnnLibrarySelection::Discovered(
+                    &convolution,
+                )
+            } else {
+                (&convolution).into()
+            },
             (self.attention_policy == ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1).then_some(
                 CudnnSdpaPlanPolicy {
                     maximum_plans: 64,

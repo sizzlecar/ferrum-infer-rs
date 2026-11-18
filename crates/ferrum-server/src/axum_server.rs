@@ -69,7 +69,9 @@ mod videos;
 
 pub use images::{ImageHttpConfig, ImageHttpService};
 pub use listener::BoundHttpListener;
-pub use videos::{VideoHttpConfig, VideoHttpService, VideoOutputPlanResolver, VideoPlanError};
+pub use videos::{
+    VideoHttpConfig, VideoHttpService, VideoJobRetention, VideoOutputPlanResolver, VideoPlanError,
+};
 
 use profile_delivery::HttpProfileDelivery;
 pub use profile_delivery::{
@@ -4436,7 +4438,8 @@ fn stream_validation_error_message(error: ServerError) -> String {
         | ServerError::ContextLengthExceeded(message)
         | ServerError::InvalidRequest { message, .. }
         | ServerError::UnsupportedFeature { message, .. }
-        | ServerError::CapacityExceeded(message) => message,
+        | ServerError::CapacityExceeded(message)
+        | ServerError::RequestTimeout(message) => message,
     }
 }
 
@@ -4860,10 +4863,18 @@ async fn health_handler(
     let profile_degraded = profile_report
         .as_ref()
         .is_some_and(HttpProfileDeliveryReport::is_degraded);
+    let unhealthy = runtime_admission_error.is_some()
+        || profile_failed
+        || state
+            .images
+            .as_ref()
+            .is_some_and(|images| !images.service().is_accepting())
+        || state
+            .videos
+            .as_ref()
+            .is_some_and(|videos| !videos.is_accepting());
     let mut health = serde_json::json!({
-        "status": if runtime_admission_error.is_some() || profile_failed
-            || state.images.as_ref().is_some_and(|images| !images.service().is_accepting())
-            || state.videos.as_ref().is_some_and(|videos| !videos.is_accepting()) { "unhealthy" }
+        "status": if unhealthy { "unhealthy" }
             else if profile_degraded { "degraded" } else { "healthy" },
         "profile_delivery": profile_report.as_ref().map(HttpProfileDeliveryReport::health_json),
         "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -4933,7 +4944,12 @@ async fn health_handler(
         }
     }
 
-    Ok(Json(health).into_response())
+    let status = if unhealthy {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        axum::http::StatusCode::OK
+    };
+    Ok((status, Json(health)).into_response())
 }
 
 /// Prometheus metrics endpoint — returns metrics in Prometheus text format.
@@ -5008,6 +5024,7 @@ enum ServerError {
     ContextLengthExceeded(String),
     ServiceUnavailable(String),
     CapacityExceeded(String),
+    RequestTimeout(String),
 }
 
 impl ServerError {
@@ -5065,6 +5082,12 @@ impl IntoResponse for ServerError {
                 AxumStatusCode::TOO_MANY_REQUESTS,
                 msg,
                 "rate_limit_error",
+                None,
+            ),
+            ServerError::RequestTimeout(msg) => (
+                AxumStatusCode::REQUEST_TIMEOUT,
+                msg,
+                "request_timeout_error",
                 None,
             ),
         };

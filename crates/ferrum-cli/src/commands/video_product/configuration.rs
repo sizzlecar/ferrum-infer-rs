@@ -58,8 +58,7 @@ pub(super) struct Configuration {
     pub input: Input,
 }
 
-/// Input tools default beside the configured output ffmpeg; all capacities are
-/// explicit typed defaults and can be overridden in the product JSON.
+/// Input decoding inherits the output FFmpeg unless a separate build is selected.
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct Input {
@@ -84,15 +83,14 @@ impl Input {
     pub(super) fn prepare(
         &self,
         output: &Output,
+        output_ffmpeg: &Path,
     ) -> Result<ferrum_models::video_input::VideoInputCodec> {
-        let ffmpeg = self.ffmpeg.clone().unwrap_or_else(|| output.ffmpeg.clone());
-        let ffprobe = self.ffprobe.clone().unwrap_or_else(|| {
-            ffmpeg.with_file_name(if cfg!(windows) {
-                "ffprobe.exe"
-            } else {
-                "ffprobe"
-            })
-        });
+        let (ffmpeg, ffprobe) = super::media::reference_tools(
+            output_ffmpeg,
+            self.ffmpeg.as_deref(),
+            self.ffprobe.as_deref(),
+            std::env::var_os("PATH").as_deref(),
+        )?;
         ferrum_models::video_input::VideoInputCodec::new(
             ferrum_models::video_input::VideoInputCodecConfig {
                 ffmpeg,
@@ -129,23 +127,51 @@ impl Configuration {
             data.len() <= 1024 * 1024,
             "video configuration exceeds 1 MiB"
         );
-        let value: Self = serde_json::from_slice(&data).context("video product JSON")?;
+        let mut value = Self::from_document(&data)?;
         ensure!(
             !value.model.trim().is_empty(),
             "video model name must be nonempty"
         );
+        value
+            .cuda
+            .resolve_cudnn(|| crate::commands::cudnn_library::resolve(None))?;
         value.cuda.validate()?;
         value.conditioning_reuse.validate()?;
         value.serving.service_config()?;
         ensure!(
-            value.output.ffmpeg.is_absolute() && value.output.directory.is_absolute(),
-            "video ffmpeg and output directory must be absolute paths"
+            value.output.directory.is_absolute(),
+            "video output directory must be an absolute path"
         );
         ensure!(
             value.output.maximum_jobs > 0 && value.output.maximum_jobs <= u32::MAX as usize / 3,
             "video maximum_jobs exceeds the output file count bound"
         );
+        ensure!(
+            value.output.maximum_retained_jobs > 0
+                && value.output.maximum_retained_jobs <= u32::MAX as usize
+                && value.output.maximum_retained_bytes >= value.output.maximum_encoded_bytes
+                && value.output.retention_seconds > 0
+                && value.output.retention_seconds <= i64::MAX as u64,
+            "video retention requires positive job/TTL limits and enough bytes for one maximum encoded output"
+        );
         Ok(value)
+    }
+
+    fn from_document(data: &[u8]) -> Result<Self> {
+        let doc = super::preset::PresetConfig::from_document(data)
+            .map_err(|error| anyhow::anyhow!("video product JSON: {error}"))?;
+        if let Some(short) = doc {
+            let mut config: Self = serde_json::from_slice(short.template())
+                .map_err(|error| anyhow::anyhow!("embedded video preset: {error}"))?;
+            config.source = Source::ModelDirectory {
+                path: short.model_directory,
+            };
+            config.output.directory = short.output_directory;
+            Ok(config)
+        } else {
+            serde_json::from_slice(data)
+                .map_err(|error| anyhow::anyhow!("video product JSON: {error}"))
+        }
     }
 }
 
@@ -173,6 +199,8 @@ pub(super) struct Serving {
     pub max_num_seqs: usize,
     pub request_batch_max_wait_ms: u64,
     pub maximum_prompt_bytes: usize,
+    pub upload_idle_timeout_seconds: u64,
+    pub upload_timeout_seconds: u64,
 }
 impl Default for Serving {
     fn default() -> Self {
@@ -183,11 +211,17 @@ impl Default for Serving {
             max_num_seqs: 2,
             request_batch_max_wait_ms: 0,
             maximum_prompt_bytes: 64 << 10,
+            upload_idle_timeout_seconds: 30,
+            upload_timeout_seconds: 300,
         }
     }
 }
 impl Serving {
     pub fn service_config(&self) -> Result<VideoServiceConfig> {
+        ensure!(
+            self.upload_idle_timeout_seconds > 0 && self.upload_timeout_seconds > 0,
+            "video upload deadlines must be positive"
+        );
         ensure!(
             (1..=2).contains(&self.max_num_seqs),
             "this FastH3 preset supports one or two active denoising requests"
@@ -225,11 +259,17 @@ enum Speed {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Output {
-    pub ffmpeg: PathBuf,
-    /// Parent for a new process-owned spool; existing files are never adopted.
+    ffmpeg: Option<PathBuf>,
+    /// Parent for temporary encoder spools and the durable jobs-v1 directory.
     pub directory: PathBuf,
     #[serde(default = "default_jobs")]
     pub maximum_jobs: usize,
+    #[serde(default = "default_retained_jobs")]
+    pub maximum_retained_jobs: usize,
+    #[serde(default = "default_retained_bytes")]
+    pub maximum_retained_bytes: u64,
+    #[serde(default = "default_retention_seconds")]
+    pub retention_seconds: u64,
     #[serde(default = "default_spool_bytes")]
     maximum_spool_bytes: u64,
     #[serde(default = "default_encoded_bytes")]
@@ -245,6 +285,15 @@ pub(super) struct Output {
 }
 fn default_jobs() -> usize {
     16
+}
+fn default_retained_jobs() -> usize {
+    ferrum_server::VideoJobRetention::default().maximum_jobs
+}
+fn default_retained_bytes() -> u64 {
+    ferrum_server::VideoJobRetention::default().maximum_bytes
+}
+fn default_retention_seconds() -> u64 {
+    ferrum_server::VideoJobRetention::default().ttl.as_secs()
 }
 fn default_spool_bytes() -> u64 {
     2 << 30
@@ -268,7 +317,11 @@ pub(super) struct PreparedOutput {
     pub encoder: Mp4EncoderConfig,
 }
 impl Output {
-    pub fn prepare(&self) -> Result<PreparedOutput> {
+    pub async fn prepare(&self) -> Result<PreparedOutput> {
+        let ffmpeg = super::media::output_ffmpeg(
+            self.ffmpeg.as_deref(),
+            std::env::var_os("PATH").as_deref(),
+        )?;
         let budget = OutputBudget::new(OutputConfig {
             max_sessions: self.maximum_jobs,
             engine_queue_items: self.maximum_jobs,
@@ -287,7 +340,7 @@ impl Output {
         )
         .map_err(|e| anyhow::anyhow!("create video spool: {e}"))?;
         let encoder = Mp4EncoderConfig {
-            ffmpeg: self.ffmpeg.clone(),
+            ffmpeg,
             threads: self.threads,
             timeout: Duration::from_secs(self.timeout_seconds),
             maximum_encoded_bytes: self.maximum_encoded_bytes,
@@ -304,14 +357,60 @@ impl Output {
                 audio_bitrate: 192_000,
             },
         };
-        // Validate codec bounds before opening model/runtime resources.
-        // These constructors have not submitted work or started a codec child.
-        ferrum_output::mp4::Mp4Encoder::new(encoder.clone(), spool.clone())
+        let codec = ferrum_output::mp4::Mp4Encoder::new(encoder.clone(), spool.clone())
             .map_err(|e| anyhow::anyhow!("video codec configuration: {e}"))?;
+        codec.check_output_profile(budget.try_open_session()?).await.map_err(|error| {
+            anyhow::anyhow!(
+                "MP4 output check with {} failed: {error}. The video encoder requires FFmpeg with libx264 and AAC. {}",
+                encoder.ffmpeg.display(),
+                String::from_utf8_lossy(error.stderr()).trim()
+            )
+        })?;
         Ok(PreparedOutput {
             budget,
             spool,
             encoder,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_form_uses_the_expanded_compute_and_output_policies_with_local_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("job store");
+        let model = Path::new("local models").join("reference generator");
+        let short = serde_json::json!({
+            "preset": "rtx5090_ref2va_v1",
+            "model_directory": model,
+            "output_directory": output,
+        });
+        let compact = Configuration::from_document(&serde_json::to_vec(&short).unwrap()).unwrap();
+        let expanded = Configuration::from_document(include_bytes!(
+            "../../../examples/config/fast-h3-video-cuda.json"
+        ))
+        .unwrap();
+
+        assert!(matches!(&compact.source, Source::ModelDirectory { path } if path == &model));
+        assert_eq!(compact.output.directory, output);
+        assert_eq!(compact.model, expanded.model);
+        assert_eq!(
+            serde_json::to_value(&compact.cuda).unwrap(),
+            serde_json::to_value(&expanded.cuda).unwrap()
+        );
+        assert_eq!(compact.maximum_plan_nodes, expanded.maximum_plan_nodes);
+        assert_eq!(
+            compact.video_decoder_tile_batch.maximum_tiles(),
+            expanded.video_decoder_tile_batch.maximum_tiles()
+        );
+        assert_eq!(compact.serving.max_num_seqs, expanded.serving.max_num_seqs);
+        assert_eq!(compact.output.crf, expanded.output.crf);
+        assert_eq!(
+            compact.output.maximum_encoded_bytes,
+            expanded.output.maximum_encoded_bytes
+        );
     }
 }

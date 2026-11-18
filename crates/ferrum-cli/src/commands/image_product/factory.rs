@@ -94,7 +94,7 @@ impl PreparedBackend {
             ImageBackendConfig::Cuda(cuda) => {
                 let mut config = cuda.resolved()?;
                 config.cudnn.library_path =
-                    super::library::resolve(Some(&config.cudnn.library_path))?;
+                    crate::commands::cudnn_library::resolve(Some(&config.cudnn.library_path))?;
                 config.validate()?;
                 Ok(Self::Cuda(config, None))
             }

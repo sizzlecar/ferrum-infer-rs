@@ -463,3 +463,10 @@ fn native_convolution_errors_and_unwinds_quarantine_without_retry() {
     assert!(result.is_err());
     assert!(failed);
 }
+
+#[test]
+fn automatic_cudnn_requires_the_backend_major_and_accepts_compatible_minor() {
+    assert!(super::validate_discovered_cuda_major(12090, 12080).is_ok());
+    assert!(super::validate_discovered_cuda_major(13000, 12080).is_err());
+    assert!(super::validate_discovered_cuda_major(0, 12080).is_err());
+}

@@ -452,13 +452,8 @@ fn deliver<R: ServiceRequest, O>(shared: &Shared<R, O>, job: Queued<R, O>, outpu
         )));
         return;
     }
-    if let Some(QueuedOutput {
-        lease: Some(lease),
-        response,
-        ..
-    }) = gate
-    {
-        let _ = response.send(lease);
+    if let Some(gate) = gate {
+        gate.deliver();
     }
     drop(_prompt_reservation);
     shared.lock().active -= 1;

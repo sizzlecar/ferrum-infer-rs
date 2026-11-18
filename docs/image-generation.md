@@ -2,14 +2,54 @@
 
 Ferrum supports Qwen-Image-2.1-Turbo on Linux CUDA and Apple Silicon Metal, and P-H3-Image on Linux CUDA SM89/SM120. Since v0.19.1, Qwen editing accepts up to ten ordered references; P-H3 accepts up to eight. v0.19.0 accepts only one Qwen reference. Each reference must be a static 8-bit RGB/RGBA PNG. Masks are unsupported. Editing can redraw background and details.
 
+## Browser Playground
+
+After starting an image server, open `/playground` on the same server (for
+example, `http://127.0.0.1:8000/playground`). If the server requires an API key,
+enter it in the password field and click **应用并连接**. The same button applies
+an updated key or retries the connection. **清除密钥** removes the key and
+reconnects without credentials. An HTTP 401 prompts for a key separately from
+an unavailable image service.
+
+The Playground sends the key in `Authorization: Bearer` for its configuration,
+generation and editing requests. The key stays in the current page's memory;
+it is not saved to browser storage or placed in a URL. Enter it again after
+refreshing. With no configured server key, the page connects automatically.
+
+`/health` remains public and reports image scheduling and resource limits.
+An `unhealthy` response uses HTTP 503, so an HTTP health probe can detect a
+stopped image service. `healthy` and `degraded` responses use HTTP 200; the JSON
+body retains the status and diagnostic details.
+
 ## P-H3 setup
 
 Copy the [P-H3 CUDA configuration](../crates/ferrum-cli/examples/config/p-h3-image-cuda.json)
 beside your `models/` directory. It expects P-H3 metadata and prompt-upsample
 sources in `models/P-H3-Image/`, and the Comfy W4A8 text encoder/DiT and INT8 VAE
-archives in `models/P-H3-Image-Comfy/`. Set the CUDA/cuDNN absolute library paths
-to the installed libraries. The example uses the tested CUDA 13 cuDNN dependency
-family alongside the CUDA release binary; these libraries are not bundled.
+archives in `models/P-H3-Image-Comfy/`. On RTX 5090, use the CUDA 12.8 runtime
+and cuDNN 9.20.0.48 **for CUDA 12**. Ferrum finds the installed cuDNN through
+the system library search path and checks that its CUDA major version matches
+the build. For a custom installation, set `backend.cudnn.library_path` to the
+absolute `libcudnn.so.9` path. Explicit dependency paths retain their declared
+load order.
+
+On Ubuntu 24.04 x86_64 with a working NVIDIA driver and the NVIDIA APT
+repository enabled, install the runtime packages for the 5090:
+
+```sh
+sudo apt-get install --no-install-recommends \
+  cuda-cudart-12-8 libcublas-12-8 cuda-nvrtc-12-8 libnvjitlink-12-8 \
+  libcudnn9-cuda-12=9.20.0.48-1
+```
+
+P-H3 and FastH3 share these libraries. For the Qwen3.5 text workload on the
+same 5090, the observed NVIDIA user-space libraries came from `cuda-cudart-12-8`
+and `libcublas-12-8`. On a minimal Ubuntu 24.04.5 x86_64 image, APT estimated
+that adding NVRTC, nvJitLink and cuDNN for image generation would download an
+additional 541 MB and use about 1.31 GB more disk space. For a local estimate,
+use `apt-get --assume-no install` with the same package arguments. These figures
+exclude Ferrum, model weights, GPU drivers and repository metadata.
+See the [cuDNN Linux installation guide](https://docs.nvidia.com/cudnn/installation/backend/linux/) for repository setup.
 
 The example targets a 32 GB GPU with a 29 GiB managed device ceiling and 48 GB
 system-memory limit. Its opaque module allowances are explicit reservations,

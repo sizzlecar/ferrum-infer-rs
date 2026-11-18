@@ -31,7 +31,7 @@ pub(super) fn resolve(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = first_library(&standard.map(PathBuf::from))? {
         return Ok(path);
     }
-    anyhow::bail!("cuDNN 9 was not found in LD_LIBRARY_PATH, the system loader cache, or standard library directories; install cuDNN 9 or pass --image-cudnn-library /absolute/path/libcudnn.so.9")
+    anyhow::bail!("cuDNN 9 was not found in LD_LIBRARY_PATH, the system loader cache, or standard library directories; install the cuDNN 9 runtime for this Ferrum CUDA build or set an explicit cuDNN library path")
 }
 fn canonical_library(path: &Path) -> Result<PathBuf> {
     let path = std::fs::canonicalize(path)
@@ -44,7 +44,7 @@ fn canonical_library(path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 fn first_library(directories: &[PathBuf]) -> Result<Option<PathBuf>> {
-    for directory in directories {
+    for directory in directories.iter().filter(|dir| dir.is_absolute()) {
         let path = directory.join("libcudnn.so.9");
         if path.try_exists()? {
             return canonical_library(&path).map(Some);

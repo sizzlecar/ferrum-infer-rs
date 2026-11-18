@@ -235,7 +235,16 @@ async fn saturated_http_fanout(detail: ObservabilityProfileDetail, streaming: bo
     assert!(read_profile_events(&healthy_path)
         .iter()
         .any(|event| event["phase"] == "actual_serve_first_request_done"));
-    let health = response_json(get(router, "/health").await).await;
+    let health_response = get(router, "/health").await;
+    assert_eq!(
+        health_response.status(),
+        if detail.requires_complete_evidence() {
+            AxumStatusCode::SERVICE_UNAVAILABLE
+        } else {
+            AxumStatusCode::OK
+        }
+    );
+    let health = response_json(health_response).await;
     assert_eq!(
         health["profile_delivery"]["required_failure"],
         detail.requires_complete_evidence()

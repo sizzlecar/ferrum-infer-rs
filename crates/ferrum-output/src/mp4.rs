@@ -262,6 +262,46 @@ impl Mp4Encoder {
             spool,
         })
     }
+
+    /// Encode one black frame and a short stereo silence through the configured
+    /// H.264/AAC muxer. The worker owns and retires its process and temporary
+    /// files exactly as for a full encode. No input decoder is involved.
+    pub async fn check_output_profile(&self, session: OutputSession) -> Result<(), Mp4Error> {
+        use std::io::Read;
+
+        let mut config = (*self.config).clone();
+        config.timeout = config.timeout.min(Duration::from_secs(10));
+        config.maximum_encoded_bytes = config.maximum_encoded_bytes.min(64 << 10);
+        let encoder = Self::new(config, self.spool.clone())?;
+        let spec = VideoAudioSpec {
+            width: 16,
+            height: 16,
+            frames: 1,
+            fps_numerator: 25,
+            fps_denominator: 1,
+            audio_sample_rate: 32000,
+            audio_sample_frames: 1280,
+        };
+        let permit = encoder.try_admit(session, spec)?.ok_or_else(|| {
+            Mp4Error::new(
+                Mp4ErrorKind::Capacity,
+                "no output capacity for the MP4 encoder check",
+            )
+        })?;
+        let artifact = permit
+            .start(vec![0; spec.rgb_bytes()?], vec![0; spec.pcm_bytes()?])?
+            .wait()
+            .await?;
+        let mut header = [0; 8];
+        artifact.open()?.read_exact(&mut header)?;
+        if &header[4..] != b"ftyp" {
+            return Err(Mp4Error::new(
+                Mp4ErrorKind::Codec,
+                "encoder returned an invalid MP4 header",
+            ));
+        }
+        Ok(())
+    }
     /// Metadata-only admission reserves worst-case raw staging + encoded file
     /// bytes and three files. `None` means a current output owner holds capacity.
     pub fn try_admit(

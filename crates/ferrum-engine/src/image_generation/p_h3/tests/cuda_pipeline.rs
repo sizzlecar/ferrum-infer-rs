@@ -67,6 +67,7 @@ pub(in crate::image_generation::p_h3) fn config() -> Result<PH3ImageCudaConfig> 
         opaque_memory_profile: "unqualified-tiny-h3-complete-cuda-v1".into(),
         // Explicit Disabled route: no source, causal provider or second runtime.
         prompt_expansion_causal: None,
+        cudnn_discovered: false,
         cudnn: CudaCudnnConfig {
             library_path: PathBuf::from(
                 std::env::var_os("FERRUM_TEST_CUDNN_LIBRARY_PATH")
