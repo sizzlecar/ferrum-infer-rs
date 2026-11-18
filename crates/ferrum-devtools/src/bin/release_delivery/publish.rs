@@ -44,6 +44,8 @@ struct ChannelState {
     crates: bool,
     github_release_and_tap: bool,
     installations: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovered_delivery: Option<serde_json::Value>,
 }
 
 pub async fn publish(args: PublishArgs, accepted: AcceptedRelease) -> Result<(), String> {
@@ -53,6 +55,7 @@ pub async fn publish(args: PublishArgs, accepted: AcceptedRelease) -> Result<(),
     let mut state = ChannelState {
         version: accepted.version.clone(), candidate_sha: accepted.candidate_sha.clone(),
         crates: false, github_release_and_tap: false,
+        recovered_delivery: accepted.recovered_delivery.clone(),
         installations: "pending: registry and Homebrew installation/startup verification must follow public publication".into(),
     };
     let state_path = args.state_dir.join("channels.json");
