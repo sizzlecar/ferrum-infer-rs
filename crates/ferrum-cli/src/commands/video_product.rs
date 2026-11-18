@@ -15,7 +15,7 @@ mod tests;
 
 #[derive(Debug, Default, Args)]
 pub struct VideoProductArgs {
-    /// FastH3 video JSON: explicit assets, CUDA libraries, queue and output limits.
+    /// FastH3 video configuration: an RTX 5090 preset or a full configuration.
     #[arg(long, value_name = "JSON")]
     pub video_config: Option<PathBuf>,
 }

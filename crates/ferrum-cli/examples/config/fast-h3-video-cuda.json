@@ -13,8 +13,6 @@
     "maximum_commands_per_submission": 32768,
     "staging_bytes": 8388608,
     "native_bytes": 67108864,
-    "cudnn_library": "/opt/cudnn/lib/libcudnn.so.9",
-    "cudnn_dependencies": [],
     "cudnn_opaque_bytes": 536870912,
     "workspace_bytes": 268435456,
     "plan_cache_bytes": 536870912,

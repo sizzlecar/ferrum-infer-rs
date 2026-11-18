@@ -40,8 +40,6 @@
     "maximum_commands_per_submission": 4096,
     "opaque_memory_profile": "p-h3-sm120-29g-example-v1",
     "cudnn": {
-      "library_path": "/opt/cudnn/lib/libcudnn.so.9",
-      "dependency_libraries": [],
       "opaque_memory_bytes": 1073741824,
       "workspace_limit_bytes": 268435456,
       "convolution_workspace": "configured_limit",

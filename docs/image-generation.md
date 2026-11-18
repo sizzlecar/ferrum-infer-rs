@@ -27,10 +27,11 @@ Copy the [P-H3 CUDA configuration](../crates/ferrum-cli/examples/config/p-h3-ima
 beside your `models/` directory. It expects P-H3 metadata and prompt-upsample
 sources in `models/P-H3-Image/`, and the Comfy W4A8 text encoder/DiT and INT8 VAE
 archives in `models/P-H3-Image-Comfy/`. On RTX 5090, use the CUDA 12.8 runtime
-and cuDNN 9.20.0.48 **for CUDA 12**. Set `backend.cudnn.library_path` to
-the installed `libcudnn.so.9`. Leave `dependency_libraries` empty when
-the system loader can find the CUDA 12.8 libraries. This configuration produced
-the same pixels as the reference for the 1024×1024 sample.
+and cuDNN 9.20.0.48 **for CUDA 12**. Ferrum finds the installed cuDNN through
+the system library search path and checks that its CUDA major version matches
+the build. For a custom installation, set `backend.cudnn.library_path` to the
+absolute `libcudnn.so.9` path. Explicit dependency paths retain their declared
+load order.
 
 On Ubuntu 24.04 x86_64 with a working NVIDIA driver and the NVIDIA APT
 repository enabled, install the runtime packages for the 5090:
