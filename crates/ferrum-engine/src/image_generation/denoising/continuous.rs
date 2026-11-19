@@ -282,6 +282,13 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         job: u64,
         persistent: HostMemoryScope,
     ) -> Result<ContinuousRequest<R>, ImageGenerationFailure<R>> {
+        let schedule = self
+            .execution
+            .sources
+            .assets
+            .schedule
+            .for_image_latents(p.latent_shape.packed_dimensions()[0])
+            .map_err(process)?;
         let mut stages = Vec::new();
         let inputs = p
             .prompts
@@ -343,13 +350,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let host = persistent.account();
         let sample = copy(&host, &sample).map_err(process)?;
         let text = copy(&host, &features).map_err(process)?;
-        let solver = ManagedBf16Euler::new(
-            self.execution.sources.assets.schedule.solver().clone(),
-            host,
-            sample.tensor().clone(),
-            self.profiles.euler,
-        )
-        .map_err(|e| process(e.into()))?;
+        let solver =
+            ManagedBf16Euler::new(schedule, host, sample.tensor().clone(), self.profiles.euler)
+                .map_err(|e| process(e.into()))?;
         Ok(ContinuousRequest {
             pipeline: self.execution.service_preparation_identity.clone(),
             state: RequestState {

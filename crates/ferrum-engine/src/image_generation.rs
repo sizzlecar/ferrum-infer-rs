@@ -113,7 +113,7 @@ use ferrum_models::qwen_image21::pipeline_adapters::{
     QwenImage21LatentDomain, QwenImage21LatentLayout, QwenImage21LatentShape,
     QwenImage21LatentStatistics, QwenImage21ManagedLatents, QwenImage21RgbaOutput,
 };
-use ferrum_models::qwen_image21::sampling_schedule::QwenImage21SamplingSchedule;
+use ferrum_models::qwen_image21::sampling_schedule::QwenImage21SamplingPlan;
 use ferrum_models::qwen_image21::t2i_prompt::{QwenImage21T2iPromptBatch, QwenImage21T2iTokenizer};
 use ferrum_models::qwen_image21::{
     QwenImage21Config, QwenImage21T2iLayout, QwenImage21TransformerConfig,
@@ -696,6 +696,13 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         // into one admitted NCHW backing. Heavy model stages execute batch B.
         let [_, _, height, width] = latent_shape.nchw_dimensions();
         let item_shape = QwenImage21LatentShape::new(1, height, width).map_err(process)?;
+        let schedule = self
+            .execution
+            .sources
+            .assets
+            .schedule
+            .for_image_latents(item_shape.packed_dimensions()[0])
+            .map_err(process)?;
         let mut batch_noise = self
             .execution_host()
             .allocate_zeroed(HostMemoryClass::InputPreprocess, latent_shape.byte_len())
@@ -771,7 +778,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 job,
                 request_order.caller_indices(),
                 transformer,
-                self.execution.sources.assets.schedule.solver(),
+                &schedule,
                 self.profiles.euler,
                 sample,
                 text_input.clone(),
@@ -786,7 +793,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             sample = denoising.finish(self.execution_host()).map_err(process)?;
         } else {
             let mut solver = ManagedBf16Euler::new(
-                self.execution.sources.assets.schedule.solver().clone(),
+                schedule,
                 self.execution_host().clone(),
                 sample.tensor().clone(),
                 self.profiles.euler,

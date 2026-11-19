@@ -20,9 +20,17 @@ pub struct QwenImage21ImageProcessor {
 }
 
 #[derive(Deserialize)]
-struct Metadata {
-    image_processor: Processor,
-    processor_class: String,
+#[serde(untagged)]
+enum Metadata {
+    ProcessorConfig {
+        processor_class: String,
+        image_processor: Processor,
+    },
+    PreprocessorConfig {
+        processor_class: String,
+        #[serde(flatten)]
+        image_processor: Processor,
+    },
 }
 
 #[derive(Deserialize)]
@@ -72,8 +80,17 @@ impl QwenImage21ImageProcessor {
         // metadata remains outside this single-image adapter's input domain.
         let metadata: Metadata = serde_json::from_slice(bytes)
             .map_err(|e| ImageInputError::Configuration(e.to_string()))?;
-        let p = metadata.image_processor;
-        if metadata.processor_class != "Qwen3VLProcessor"
+        let (processor_class, p) = match metadata {
+            Metadata::ProcessorConfig {
+                processor_class,
+                image_processor,
+            }
+            | Metadata::PreprocessorConfig {
+                processor_class,
+                image_processor,
+            } => (processor_class, image_processor),
+        };
+        if processor_class != "Qwen3VLProcessor"
             || !matches!(
                 p.image_processor_type.as_str(),
                 "Qwen2VLImageProcessorFast" | "Qwen2VLImageProcessor"

@@ -199,7 +199,13 @@ fn execute(
         .managed_rotary_frequencies(&pipeline.execution.host)
         .unwrap();
     let mut solver = ManagedBf16Euler::new(
-        pipeline.execution.sources.assets.schedule.solver().clone(),
+        pipeline
+            .execution
+            .sources
+            .assets
+            .schedule
+            .for_image_latents(1)
+            .unwrap(),
         pipeline.execution.host.clone(),
         sample.tensor().clone(),
         pipeline.profiles.euler,

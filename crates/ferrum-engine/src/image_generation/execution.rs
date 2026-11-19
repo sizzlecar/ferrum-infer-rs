@@ -273,9 +273,9 @@ impl ImagePipelineSourceAdapter for QwenImage21SourceAdapter {
             ImageStage::TextEncoder | ImageStage::VisionEncoder => {
                 QwenImage21StageSource::Archive(sources.text_encoder.as_ref())
             }
-            ImageStage::VaeEncoder | ImageStage::Decoder => {
-                QwenImage21StageSource::Archive(sources.vae.as_ref())
-            }
+            ImageStage::VaeEncoder | ImageStage::Decoder => QwenImage21StageSource::Managed(
+                ManagedDenseArchiveSource::new(sources.vae.as_ref(), host),
+            ),
             ImageStage::Denoiser
                 if QwenImage21TransformerFamily::is_fp8_profile(profile.as_str()) =>
             {
@@ -324,12 +324,18 @@ impl ImagePipelineSourceAdapter for QwenImage21SourceAdapter {
                 anyhow::bail!("Qwen image source does not declare this stage")
             }
         };
+        let vae = matches!(
+            declaration.stage,
+            ImageStage::VaeEncoder | ImageStage::Decoder
+        );
         let exact = ExactBf16TensorSource::new(source);
-        let backing = plan.prepare_host_backing(family, Some(&exact))?;
+        let managed = ManagedDenseArchiveSource::new(source, host);
+        let backing_source: &dyn WeightComponentSource = if vae { &managed } else { &exact };
+        let backing = plan.prepare_host_backing(family, Some(backing_source))?;
         let converted = backing.additional_bytes();
-        if declaration.stage != ImageStage::Denoiser
-            || QwenImage21TransformerFamily::is_fp8_profile(profile.as_str())
-        {
+        let dense_denoiser = declaration.stage == ImageStage::Denoiser
+            && !QwenImage21TransformerFamily::is_fp8_profile(profile.as_str());
+        if !vae && !dense_denoiser {
             return Ok((converted, backing));
         }
         // This legacy Qwen dense source materializes one identity component at

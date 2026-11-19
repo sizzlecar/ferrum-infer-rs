@@ -51,7 +51,7 @@ impl QwenImage21Assets {
                 vision_schema.stored_schema()?,
                 self.sources.text_encoder.as_ref(),
             )?,
-            validate_archive(encoder_schema.stored_schema()?, self.sources.vae.as_ref())?,
+            validate_vae_archive(encoder_schema.stored_schema()?, self.sources.vae.as_ref())?,
         ];
         let positions = self
             .sources

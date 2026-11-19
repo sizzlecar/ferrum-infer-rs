@@ -19,6 +19,35 @@ fn parse(index: &Value, scheduler: &Value) -> Result<QwenImage21SamplingSchedule
 }
 
 #[test]
+fn dynamic_checkpoint_uses_the_target_latent_extent_and_stretches_to_terminal() {
+    let index_bytes = br#"{"scheduler":["diffusers","FlowMatchEulerDiscreteScheduler"]}"#;
+    let mut config = scheduler();
+    config["use_dynamic_shifting"] = json!(true);
+    config["shift_terminal"] = json!(0.02);
+    let plan =
+        QwenImage21SamplingPlan::parse(index_bytes, &serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(plan.for_image_latents(0).is_err());
+
+    // Reference values from the Diffusers exponential shift and stretch for
+    // 512x512 and 1024x1024, with a spatial VAE scale of eight.
+    for (tokens, expected) in [(4096, 0.67918277), (16384, 0.78986752)] {
+        let schedule = plan.for_image_latents(tokens).unwrap();
+        let steps = schedule.steps();
+        assert_eq!(steps.len(), 40);
+        assert_eq!(plan.evaluation_count(), steps.len());
+        assert_eq!(steps[0].sigma(), 1.0);
+        assert!((steps[19].sigma() - expected).abs() < 1e-6);
+        assert!((steps[39].sigma() - 0.02).abs() < 1e-6);
+        assert_eq!(steps[39].next_sigma(), 0.0);
+    }
+
+    let ambiguous = serde_json::to_vec(&index(json!([1.0, 0.5]))).unwrap();
+    assert!(
+        QwenImage21SamplingPlan::parse(&ambiguous, &serde_json::to_vec(&config).unwrap()).is_err()
+    );
+}
+
+#[test]
 fn evaluation_count_is_metadata_driven_including_public_capacity_boundary() {
     for count in [1, 2, 8, QWEN_IMAGE21_MAX_SAMPLING_EVALUATIONS] {
         // Binary fractions remain exact through JSON -> F32 and times 1000.

@@ -213,8 +213,7 @@ impl ImageDenoisingGenerator for Cohorted {
             .sources
             .assets
             .schedule
-            .steps()
-            .len()
+            .evaluation_count()
             .checked_sub(completed)
     }
     fn initialization_cohort_generator(
@@ -609,7 +608,7 @@ fn start_cohort(
     start_cohort_with_wait(mode, 0)
 }
 fn extended_schedule(pipeline: &mut QwenImage21Pipeline<Runtime>) {
-    use ferrum_models::qwen_image21::sampling_schedule::QwenImage21SamplingSchedule;
+    use ferrum_models::qwen_image21::sampling_schedule::QwenImage21SamplingPlan;
     let index = serde_json::json!({"scheduler":["diffusers","FlowMatchEulerDiscreteScheduler"],
         "sample_sigmas":[1.0,0.875,0.75,0.625,0.5,0.375,0.25,0.125]});
     let scheduler = serde_json::json!({"_class_name":"FlowMatchEulerDiscreteScheduler","_diffusers_version":"fixture",
@@ -619,7 +618,7 @@ fn extended_schedule(pipeline: &mut QwenImage21Pipeline<Runtime>) {
         "use_dynamic_shifting":false,"use_exponential_sigmas":false,"use_karras_sigmas":false});
     Arc::get_mut(&mut pipeline.execution.sources.assets)
         .expect("fresh fixture owns its assets")
-        .schedule = QwenImage21SamplingSchedule::parse(
+        .schedule = QwenImage21SamplingPlan::parse(
         &serde_json::to_vec(&index).unwrap(),
         &serde_json::to_vec(&scheduler).unwrap(),
     )
