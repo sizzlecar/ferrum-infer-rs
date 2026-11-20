@@ -78,7 +78,18 @@ impl PipelineSourceBundle {
         let declaration = PipelineDeclaration::from_json(model_index.bytes())?;
         let mut components = BTreeMap::new();
         for component in declaration.components() {
-            let config = reader.read(component.config_path(), false)?;
+            let config = if component.architecture() == ComponentArchitecture::Qwen3VlProcessor {
+                match reader.read_optional(component.config_path())? {
+                    Some(config) => config,
+                    None => reader
+                        .read_optional("processor/preprocessor_config.json")?
+                        .ok_or_else(|| FerrumError::model(
+                            "required pipeline metadata processor/processor_config.json or processor/preprocessor_config.json",
+                        ))?,
+                }
+            } else {
+                reader.read(component.config_path(), false)?
+            };
             validate_component_config(component, &config)?;
             let mut auxiliary = BTreeMap::new();
             match component.architecture() {

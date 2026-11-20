@@ -69,6 +69,12 @@ describe the measured configuration and its limits.
 
 ## CUDA
 
+The [Qwen-Image-2.1 base checkpoint](https://huggingface.co/Qwen/Qwen-Image-2.1)
+uses 40 resolution-dependent denoising steps. It reads the scheduler in the
+checkpoint and converts its FP32 VAE weights to BF16 on load. Use the original
+checkpoint files with a BF16 `--image-config` for `ferrum run` and `ferrum serve`.
+The Turbo checkpoint uses its own explicit schedule.
+
 Use a complete local [model directory](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo), a Ferrum CUDA release matching your GPU, and cuDNN 9. The FP8 profile quantizes the text encoder and DiT; vision and VAE stay BF16.
 
 ```sh

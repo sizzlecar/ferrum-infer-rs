@@ -78,7 +78,12 @@ pub(super) fn request(
     let text = copy(&host, &original_text).unwrap();
     drop((original_sample, original_text));
     let solver = ManagedBf16Euler::new(
-        p.execution.sources.assets.schedule.solver().clone(),
+        p.execution
+            .sources
+            .assets
+            .schedule
+            .for_image_latents(1)
+            .unwrap(),
         host,
         sample.tensor().clone(),
         p.profiles.euler,

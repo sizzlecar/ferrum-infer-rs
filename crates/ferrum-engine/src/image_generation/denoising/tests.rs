@@ -213,7 +213,13 @@ fn state(
         41,
         indices,
         config,
-        pipeline.execution.sources.assets.schedule.solver(),
+        &pipeline
+            .execution
+            .sources
+            .assets
+            .schedule
+            .for_image_latents(1)
+            .unwrap(),
         pipeline.profiles.euler,
         sample,
         text,

@@ -58,7 +58,7 @@ pub struct QwenImage21Assets {
     pub(super) vae: QwenImage21VaeDecoderConfig,
     pub(super) tokenizer: QwenImage21T2iTokenizer,
     pub(super) statistics: QwenImage21LatentStatistics,
-    pub(super) schedule: QwenImage21SamplingSchedule,
+    pub(super) schedule: QwenImage21SamplingPlan,
     pub(super) editing: Option<EditAssets>,
     pub(super) lora: Option<Arc<ferrum_quantization::linear_adapter::PreparedLinearAdapter>>,
     pub(super) lora_materializer:
@@ -102,8 +102,7 @@ impl QwenImage21Assets {
         let vae = QwenImage21VaeDecoderConfig::from_hf_json(metadata.vae, 1, 1, 1)?;
         let statistics =
             QwenImage21LatentStatistics::from_vae_config(&serde_json::from_slice(metadata.vae)?)?;
-        let schedule =
-            QwenImage21SamplingSchedule::parse(metadata.model_index, metadata.scheduler)?;
+        let schedule = QwenImage21SamplingPlan::parse(metadata.model_index, metadata.scheduler)?;
         ensure!(
             text.hidden_size() == transformer.context_dim(),
             "text hidden width differs from transformer context width"
@@ -139,7 +138,7 @@ impl QwenImage21Assets {
         let required_weight_bytes = [
             validate_archive(text_schema.stored_schema()?, sources.text_encoder.as_ref())?,
             dit_bytes,
-            validate_archive(vae_schema.stored_schema()?, sources.vae.as_ref())?,
+            validate_vae_archive(vae_schema.stored_schema()?, sources.vae.as_ref())?,
         ];
         let embedding = sources
             .text_encoder
@@ -270,6 +269,18 @@ pub(super) fn validate_archive(
     schema: &WeightSchema,
     source: &dyn TensorArchive,
 ) -> anyhow::Result<u64> {
+    validate_dense_bf16_archive(schema, source, &[ElementType::Bf16])
+}
+
+fn validate_vae_archive(schema: &WeightSchema, source: &dyn TensorArchive) -> anyhow::Result<u64> {
+    validate_dense_bf16_archive(schema, source, &[ElementType::Bf16, ElementType::F32])
+}
+
+fn validate_dense_bf16_archive(
+    schema: &WeightSchema,
+    source: &dyn TensorArchive,
+    source_types: &[ElementType],
+) -> anyhow::Result<u64> {
     let mut total = 0_u64;
     for component in &schema.components {
         let [name] = component.external_names.as_slice() else {
@@ -282,17 +293,24 @@ pub(super) fn validate_archive(
                     element_type: ElementType::Bf16
                 }
             ),
-            "only untransformed BF16 source weights are supported"
+            "expected a dense BF16 weight component"
         );
         let actual = source.tensor(name)?;
+        let target_bytes = component.physical_bytes()?;
+        let stored_type = actual
+            .element_type()
+            .filter(|ty| source_types.contains(ty))
+            .with_context(|| format!("unsupported source weight precision: {name}"))?;
+        let source_bytes = (target_bytes / ElementType::Bf16.size_bytes())
+            .checked_mul(stored_type.size_bytes())
+            .context("stored source weight bytes overflow")?;
         ensure!(
-            actual.element_type() == Some(ElementType::Bf16)
-                && actual.shape() == component.dimensions
-                && u64::try_from(actual.bytes().len())? == component.physical_bytes()?,
+            actual.shape() == component.dimensions
+                && u64::try_from(actual.bytes().len())? == source_bytes,
             "physical weight metadata mismatch: {name}"
         );
         total = total
-            .checked_add(component.physical_bytes()?)
+            .checked_add(target_bytes)
             .context("required weight bytes overflow")?;
     }
     Ok(total)

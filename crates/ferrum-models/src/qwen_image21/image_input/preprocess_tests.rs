@@ -12,6 +12,18 @@ fn config() -> serde_json::Value {
     }})
 }
 
+#[test]
+fn accepts_flat_diffusers_preprocessor_metadata() {
+    let wrapped = config();
+    let mut flat = wrapped["image_processor"].clone();
+    flat["processor_class"] = wrapped["processor_class"].clone();
+    flat["patch_size"] = json!(16);
+    let processor =
+        QwenImage21ImageProcessor::from_json(&serde_json::to_vec(&flat).unwrap()).unwrap();
+    assert_eq!(processor.patch_size(), 16);
+    assert_eq!(processor.merge_size(), 2);
+}
+
 fn processor() -> QwenImage21ImageProcessor {
     QwenImage21ImageProcessor::from_json(&serde_json::to_vec(&config()).unwrap()).unwrap()
 }

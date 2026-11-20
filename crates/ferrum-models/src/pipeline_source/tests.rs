@@ -200,6 +200,23 @@ fn rejects_unsupported_or_incomplete_declarations_before_component_reads() {
 }
 
 #[test]
+fn accepts_checkpoint_processor_metadata_under_preprocessor_config() {
+    let fixture = MetadataFixture::new();
+    let processor = fixture.root().join("processor");
+    fs::rename(
+        processor.join("processor_config.json"),
+        processor.join("preprocessor_config.json"),
+    )
+    .unwrap();
+
+    let bundle = fixture.open().unwrap();
+    assert_eq!(
+        bundle.component("processor").unwrap().config().path(),
+        "processor/preprocessor_config.json"
+    );
+}
+
+#[test]
 fn missing_and_empty_required_files_are_explicit_preflight_errors() {
     for path in [
         "model_index.json",
