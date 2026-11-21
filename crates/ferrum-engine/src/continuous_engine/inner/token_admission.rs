@@ -486,7 +486,10 @@ impl EngineInner {
             waiting != 0 && self.config.scheduler.max_running_requests > width && planning.is_none()
         }) {
             let active = self.scheduler.active_count();
-            if window > width && active < window {
+            // Prepare up to a whole wave inside the verified window. Capping
+            // cold admission by the first prefill step's token count can grow
+            // the same backing repeatedly during a burst.
+            if active < window {
                 limit = limit.min(window - active);
                 false
             } else {
