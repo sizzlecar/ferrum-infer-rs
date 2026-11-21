@@ -129,6 +129,24 @@ impl DynamicPoolDomainSpec {
         self.pool.pool_id()
     }
 
+    pub(super) fn fixed_prefill_bytes(&self) -> Option<u64> {
+        if self.pool.reusable_workspace_ceiling_bytes() != 0
+            || self.pool.checkpoint_growth_ceiling_bytes() != 0
+            || !self.descriptors.iter().all(|resource| {
+                matches!(
+                    resource.lifetime(),
+                    AllocationLifetime::Request | AllocationLifetime::Sequence
+                ) && matches!(resource.demand(), DynamicResourceDemand::Fixed { .. })
+            })
+        {
+            return None;
+        }
+        self.pool
+            .minimum_request_bytes()
+            .checked_add(self.pool.minimum_sequence_bytes())
+            .filter(|bytes| *bytes > 0)
+    }
+
     pub(super) fn optional_growth_ceiling(&self, wave: std::num::NonZeroU32) -> u64 {
         let provisioning = self.pool.provisioning();
         let hard_limit = provisioning.maximum_resident_bytes();
@@ -509,8 +527,14 @@ where
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) maintenance: Mutex<()>,
     pub(super) optional_growth_ceiling_bytes: AtomicU64,
+    pub(super) fixed_prefill: std::sync::OnceLock<FixedPrefillBacking>,
     pub(super) next_extent_generation: AtomicU64,
     pub(super) state: Mutex<DynamicBackingPoolState<R::Buffer>>,
+}
+
+pub(super) struct FixedPrefillBacking {
+    pub(super) bytes_per_request: u64,
+    pub(super) wave_bytes: u64,
 }
 
 pub(super) struct PendingGrowthGuard<R>

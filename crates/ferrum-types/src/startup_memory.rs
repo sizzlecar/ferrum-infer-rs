@@ -139,6 +139,25 @@ pub struct PrefillPreparationWindow {
     pub request_context_limit: Option<usize>,
 }
 
+pub const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 512;
+
+impl PrefillPreparationWindow {
+    /// Extra multi-chunk prompts that fit the next token budget and the proven context.
+    pub fn funded_lookahead(self, wave: usize, step_tokens: usize, chunk_tokens: usize) -> usize {
+        let chunk_tokens = chunk_tokens.max(1);
+        if step_tokens == 0
+            || self
+                .request_context_limit
+                .is_some_and(|limit| limit <= chunk_tokens)
+        {
+            return 0;
+        }
+        self.max_sequences
+            .saturating_sub(wave)
+            .min((step_tokens / chunk_tokens).max(1))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupMemoryPlan {
     pub request: StartupMemoryRequest,

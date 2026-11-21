@@ -213,6 +213,7 @@ where
                 optional_growth_ceiling_bytes: AtomicU64::new(
                     domain.pool.provisioning().maximum_resident_bytes(),
                 ),
+                fixed_prefill: std::sync::OnceLock::new(),
                 next_extent_generation: AtomicU64::new(1),
                 state: Mutex::new(DynamicBackingPoolState {
                     resident_bytes: 0,
@@ -987,6 +988,14 @@ where
                 // Extra backing is unclaimed shared capacity, not extra
                 // sequence ownership or permission to exceed the device budget.
                 chunk_bytes = chunk_bytes.max(resident.min(aligned_room));
+                // When genuinely filling the executing wave, include the small
+                // funded lookahead in this same native allocation. Otherwise a
+                // speculative waiter can synchronously stall all live decodes.
+                if pool.fixed_prefill.get().is_some_and(|fixed| {
+                    resident < fixed.wave_bytes && chunk_bytes >= fixed.wave_bytes - resident
+                }) {
+                    chunk_bytes = chunk_bytes.max(aligned_room);
+                }
             }
             let chunk = {
                 let mut state = pool

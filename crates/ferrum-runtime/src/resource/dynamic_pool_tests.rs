@@ -6520,7 +6520,7 @@ fn executing_wave_bounds_optional_state_growth_but_admits_the_next_real_request(
     let harness = harness(new_runtime(&catalog, 1536), catalog, 1536, false);
     let root = &harness.root;
     let wave = std::num::NonZeroU32::new(2).unwrap();
-    root.limit_optional_pool_growth_to_wave(wave);
+    root.configure_prefill_pool_growth(wave, 0);
     let status = root.dynamic_pool_status().unwrap();
     let ceiling = |id| {
         status
@@ -6562,6 +6562,60 @@ fn executing_wave_bounds_optional_state_growth_but_admits_the_next_real_request(
     let third = admitted_request(root, "wave/third");
     drop((third, second, first, binding));
     close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn funded_fixed_prefills_share_the_last_wave_allocation_and_skip_cold_state() {
+    for (budget, expected_resident, expected_lookahead) in [(512, 192, 1), (128, 128, 0)] {
+        let fixed = pool_catalog(
+            linear_profile(),
+            AllocationLifetime::Request,
+            'a',
+            1,
+            512,
+            TestDemand::Fixed,
+        );
+        let pool = fixed.pool_id.clone();
+        let harness = harness(new_runtime(&fixed, budget), fixed, budget, false);
+        let root = &harness.root;
+        root.configure_prefill_pool_growth(std::num::NonZeroU32::new(2).unwrap(), 1);
+        assert_eq!(root.immediately_backed_fixed_prefills(3), 0);
+        root.maintenance_controller.initialize_pool(&pool).unwrap();
+        let first = admitted_request(root, "lookahead/first");
+        assert_eq!(root.immediately_backed_fixed_prefills(3), 0);
+        let binding = root.trusted_runtime_binding().unwrap();
+        let second = binding
+            .try_admit_request(
+                request_admission(),
+                RunId::new("run/lookahead/second").unwrap(),
+                RequestIdentity::new("request/lookahead/second").unwrap(),
+            )
+            .unwrap();
+        let growth = match second {
+            RequestResourceAdmissionDecision::BackingDeferred(d) => d.maintain().unwrap(),
+            RequestResourceAdmissionDecision::Deferred(d) => {
+                root.maintain_for_admission_deferred(&d).unwrap()
+            }
+            _ => panic!("the final member of the executing wave requires backing"),
+        };
+        let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = growth else {
+            panic!("the wave must install its physical state");
+        };
+        assert_eq!(
+            receipt.growths()[0].published_capacity_bytes(),
+            expected_resident
+        );
+        let second = admitted_request(root, "lookahead/second");
+        assert_eq!(
+            root.immediately_backed_fixed_prefills(3),
+            expected_lookahead
+        );
+        let third = (expected_lookahead > 0).then(|| admitted_request(root, "lookahead/third"));
+        assert_eq!(root.immediately_backed_fixed_prefills(3), 0);
+        assert_eq!(harness.runtime.allocate_calls(), 2);
+        drop((third, second, first, binding));
+        close_dynamic_test_root(harness.root);
+    }
 }
 
 #[test]

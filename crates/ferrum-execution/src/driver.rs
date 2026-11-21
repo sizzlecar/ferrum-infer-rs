@@ -653,6 +653,7 @@ fn budget_reusable_decode_seed_prefill(
 pub struct ProgramExecutorConfig {
     pub maximum_model_tokens: usize,
     maximum_decode_wave_sequences: u32,
+    prefill_step_chunk_tokens: usize,
     pub weight_arena_packing: ferrum_runtime::WeightArenaPacking,
     pub startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
     pub pool_preparation: ferrum_types::RuntimePoolPreparation,
@@ -999,6 +1000,10 @@ impl ProgramExecutorConfig {
         Ok(Self {
             maximum_model_tokens,
             maximum_decode_wave_sequences,
+            prefill_step_chunk_tokens: engine
+                .scheduler
+                .prefill_step_chunk
+                .unwrap_or(ferrum_types::DEFAULT_PREFILL_CHUNK_TOKENS),
             weight_arena_packing: engine.memory.weight_arena_target_bytes.map_or(
                 ferrum_runtime::WeightArenaPacking::ByElementType,
                 |target_bytes| ferrum_runtime::WeightArenaPacking::Bounded { target_bytes },
@@ -5306,7 +5311,16 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             phase_native_started,
         )?;
         if let Some(wave) = std::num::NonZeroU32::new(config.maximum_decode_wave_sequences) {
-            plan_resources.limit_optional_pool_growth_to_wave(wave);
+            let prepared = config.startup_memory_plan.as_ref().map_or(0, |plan| {
+                plan.auto_prefill_preparation_window().map_or(0, |window| {
+                    window.funded_lookahead(
+                        wave.get() as usize,
+                        plan.selected.max_batch_tokens,
+                        config.prefill_step_chunk_tokens,
+                    )
+                })
+            });
+            plan_resources.configure_prefill_pool_growth(wave, prepared);
         }
         executor_startup.finish();
         metrics
@@ -9478,6 +9492,11 @@ impl<R: DeviceRuntime> ModelExecutor for ProgramExecutor<R> {
                 "resolved vNext admission limits violated their typed contract: {reason}"
             ))
         })
+    }
+
+    fn immediately_backed_prefills(&self, maximum: usize) -> usize {
+        self.plan_resources
+            .immediately_backed_fixed_prefills(maximum)
     }
 
     fn resolved_model_plan(&self) -> Option<&ResolvedModelPlan> {

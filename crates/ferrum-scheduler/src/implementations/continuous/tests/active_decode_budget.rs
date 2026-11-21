@@ -47,33 +47,57 @@ fn saturated_wave_prepares_ahead_only_for_multi_chunk_work_that_fits() {
     activate_decode_requests(&scheduler, 2);
     waiting_prompt(&scheduler, chunk);
     assert_eq!(
-        scheduler.prefill_limit_before_selection(&batch, window(4, Some(chunk)), |_| panic!(
-            "a single-chunk backlog needs no context scan"
-        )),
+        scheduler.prefill_limit_before_selection(
+            &batch,
+            window(4, Some(chunk)),
+            |_| panic!("a single-chunk backlog needs no context scan"),
+            |_| panic!("no speculative fixed state is needed")
+        ),
         None
     );
     waiting_prompt(&scheduler, chunk + 1);
     assert_eq!(
-        scheduler.prefill_limit_before_selection(&batch, window(2, None), |_| true),
+        scheduler.prefill_limit_before_selection(
+            &batch,
+            window(4, Some(chunk)),
+            |_| panic!("the proved context cannot contain a multi-chunk prompt"),
+            |_| panic!("this plan needs no fixed-state lookahead")
+        ),
         None
     );
     assert_eq!(
-        scheduler.prefill_limit_before_selection(&batch, window(4, None), |_| panic!(
-            "full model context fits"
-        )),
-        Some(1)
-    );
-    assert_eq!(
-        scheduler.prefill_limit_before_selection(&batch, window(4, Some(chunk)), |_| false),
+        scheduler.prefill_limit_before_selection(&batch, window(2, None), |_| true, |n| n),
         None
     );
     assert_eq!(
-        scheduler.prefill_limit_before_selection(&batch, window(4, Some(chunk * 2)), |limit| limit
-            == chunk * 2),
+        scheduler.prefill_limit_before_selection(
+            &batch,
+            window(4, None),
+            |_| panic!("full model context fits"),
+            |n| n
+        ),
         Some(1)
     );
     assert_eq!(
-        scheduler.prefill_limit_before_selection(&batch, None, |_| true),
+        scheduler.prefill_limit_before_selection(&batch, window(4, Some(chunk)), |_| false, |n| n),
+        None
+    );
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(
+            &batch,
+            window(4, Some(chunk * 2)),
+            |limit| limit == chunk * 2,
+            |n| n
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(
+            &batch,
+            None,
+            |_| true,
+            |_| panic!("explicit capacity uses its own admission policy")
+        ),
         Some(2)
     );
 }
@@ -90,8 +114,17 @@ fn saturated_wave_charges_one_chunk_per_speculative_slot() {
         max_sequences: 8,
         request_context_limit: None,
     });
-    let early =
-        |tokens| scheduler.prefill_limit_before_selection(&hint(4, tokens), window, |_| true);
+    let early = |tokens| {
+        scheduler.prefill_limit_before_selection(&hint(4, tokens), window, |_| true, |n| n)
+    };
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(&hint(4, 2 * chunk), window, |_| true, |_| 0),
+        None
+    );
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(&hint(4, 2 * chunk), window, |_| true, |_| 1),
+        Some(1)
+    );
     assert_eq!(early(0), None);
     assert_eq!(early(chunk - 1), Some(1));
     assert_eq!(early(2 * chunk), Some(2));

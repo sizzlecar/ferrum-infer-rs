@@ -915,7 +915,7 @@ impl Default for ContinuousBatchConfig {
             max_prefill_batch: 8,
             max_decode_batch: 256,
             enable_chunked_prefill: true,
-            prefill_chunk_size: 512,
+            prefill_chunk_size: ferrum_types::DEFAULT_PREFILL_CHUNK_TOKENS,
             max_kv_blocks_per_request: 1024,
             enable_swapping: true,
             swap_priority_threshold: Priority::Low,
@@ -2142,6 +2142,7 @@ impl ContinuousBatchScheduler {
         hint: &BatchHint,
         automatic_window: Option<PrefillPreparationWindow>,
         all_fit_context: impl FnOnce(usize) -> bool,
+        immediately_backed: impl FnOnce(usize) -> usize,
     ) -> Option<usize> {
         let width = hint.max_batch_size;
         let waiting = self.waiting_count();
@@ -2158,7 +2159,7 @@ impl ContinuousBatchScheduler {
         }
         let prepared_limit = if window.max_sequences > width && active < window.max_sequences {
             width
-                .saturating_add(self.queued_prefill_lookahead(hint))
+                .saturating_add(self.queued_prefill_lookahead(hint, window))
                 .min(window.max_sequences)
         } else {
             width
@@ -2167,7 +2168,8 @@ impl ContinuousBatchScheduler {
             && active < prepared_limit
             && window.request_context_limit.is_none_or(all_fit_context)
         {
-            prepared_limit
+            let wanted = prepared_limit - active;
+            width.max(active.saturating_add(immediately_backed(wanted).min(wanted)))
         } else {
             width
         };
@@ -2177,16 +2179,20 @@ impl ContinuousBatchScheduler {
     /// Each speculative slot needs a queued multi-chunk prompt and enough
     /// tokens for one normal chunk in the next wave. A single long prompt
     /// cannot justify opening state for the entire backlog.
-    fn queued_prefill_lookahead(&self, hint: &BatchHint) -> usize {
-        if hint.max_tokens == 0 {
-            return 0;
-        }
+    fn queued_prefill_lookahead(
+        &self,
+        hint: &BatchHint,
+        window: PrefillPreparationWindow,
+    ) -> usize {
         let chunk = self
             .runtime_config
             .prefill_step_chunk
             .unwrap_or(self.cb_config.prefill_chunk_size)
             .max(1);
-        let chunks_per_step = (hint.max_tokens / chunk).max(1);
+        let chunks_per_step = window.funded_lookahead(hint.max_batch_size, hint.max_tokens, chunk);
+        if chunks_per_step == 0 {
+            return 0;
+        }
         self.waiting_queue
             .read()
             .iter()

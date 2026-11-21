@@ -475,11 +475,12 @@ impl EngineInner {
             .startup_memory_plan
             .as_ref()
             .and_then(|plan| plan.auto_prefill_preparation_window());
-        let early_limit = self
-            .scheduler
-            .prefill_limit_before_selection(&hint, window, |tokens| {
-                self.sequences.all_fit_context(tokens)
-            });
+        let early_limit = self.scheduler.prefill_limit_before_selection(
+            &hint,
+            window,
+            |tokens| self.sequences.all_fit_context(tokens),
+            |maximum| self.model_executor.immediately_backed_prefills(maximum),
+        );
         let intent = self.scheduler.prepare_token_batch_selection(hint);
         let (selection, limit) = if let Some(limit) = early_limit {
             (Selection::Ready(intent), limit)
