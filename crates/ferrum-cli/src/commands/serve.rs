@@ -169,8 +169,8 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub causal_decode_preparation_mode: Option<crate::commands::CausalDecodePreparationModeArg>,
 
-    /// Causal decode grouping (default: contiguous). Other modes require packed native CUDA attention.
-    /// Fixed-execution-capacity also uses the declared --max-model-len bound.
+    /// Group causal decode rows. Auto uses fixed launches on eligible native CUDA plans.
+    /// Bucketed-execution-capacity sizes each launch for the longest live row within --max-model-len.
     #[arg(long, value_enum)]
     pub causal_decode_attention_grouping: Option<crate::commands::CausalDecodeAttentionGroupingArg>,
     /// Causal decode K/V load reuse (default: none). Paired modes require native CUDA GQA2 support.

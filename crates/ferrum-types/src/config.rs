@@ -542,15 +542,32 @@ pub enum CausalDecodeAttentionGrouping {
     FixedCapacity,
     /// Bound fixed native scratch by the declared execution context limit.
     FixedExecutionCapacity,
+    /// Keep the declared context and scratch, and reuse a fixed launch across a range of live lengths.
+    BucketedExecutionCapacity,
 }
 
 impl CausalDecodeAttentionGrouping {
+    /// Short native V1 and V2 requests share one replayable launch through this length.
+    pub const FIRST_EXECUTION_BUCKET_TOKENS: usize = 2_048;
+
+    pub const fn uses_execution_context_limit(self) -> bool {
+        matches!(
+            self,
+            Self::FixedExecutionCapacity | Self::BucketedExecutionCapacity
+        )
+    }
+
+    pub const fn uses_fixed_launch(self) -> bool {
+        matches!(self, Self::FixedCapacity) || self.uses_execution_context_limit()
+    }
+
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
             Self::Contiguous => "contiguous",
             Self::Indexed => "indexed",
             Self::FixedCapacity => "fixed-capacity",
             Self::FixedExecutionCapacity => "fixed-execution-capacity",
+            Self::BucketedExecutionCapacity => "bucketed-execution-capacity",
         }
     }
 
@@ -560,8 +577,9 @@ impl CausalDecodeAttentionGrouping {
             "indexed" => Ok(Self::Indexed),
             "fixed-capacity" => Ok(Self::FixedCapacity),
             "fixed-execution-capacity" => Ok(Self::FixedExecutionCapacity),
+            "bucketed-execution-capacity" => Ok(Self::BucketedExecutionCapacity),
             _ => Err(format!(
-                "expected contiguous, indexed, fixed-capacity or fixed-execution-capacity; got {raw:?}"
+                "expected contiguous, indexed, fixed-capacity, fixed-execution-capacity or bucketed-execution-capacity; got {raw:?}"
             )),
         }
     }
@@ -2503,6 +2521,7 @@ mod tests {
                 CausalDecodeAttentionGrouping::Indexed,
                 CausalDecodeAttentionGrouping::FixedCapacity,
                 CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+                CausalDecodeAttentionGrouping::BucketedExecutionCapacity,
                 CausalDecodeAttentionGrouping::Contiguous,
             ] {
                 let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
@@ -2589,6 +2608,7 @@ mod tests {
             CausalDecodeAttentionGrouping::Indexed,
             CausalDecodeAttentionGrouping::FixedCapacity,
             CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+            CausalDecodeAttentionGrouping::BucketedExecutionCapacity,
         ] {
             let mut config = EngineConfig::default();
             assert!(config

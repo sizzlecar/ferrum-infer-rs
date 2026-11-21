@@ -320,14 +320,23 @@ fn complete_case(initial_lengths: &[u64], measure: bool) {
     .unwrap();
     let capacity_lengths = vec![2048; participants];
     let launches = build_launches(shape, binding, layout, &capacity_lengths);
-    let batch = FixedBatchDecode::for_launches(&launches, true, binding, shape, layout, true, true)
-        .unwrap()
-        .unwrap()
-        .with_kv_reuse(
-            ferrum_types::CausalDecodeKvReuse::PairedQueryHeads,
-            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
-            shape,
-        );
+    let batch = FixedBatchDecode::for_launches(
+        &launches,
+        true,
+        binding,
+        shape,
+        layout,
+        true,
+        true,
+        CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+    )
+    .unwrap()
+    .unwrap()
+    .with_kv_reuse(
+        ferrum_types::CausalDecodeKvReuse::PairedQueryHeads,
+        CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+        shape,
+    );
     assert!(
         batch.uses_paired_query_heads(),
         "A must use current production paired-query V2"

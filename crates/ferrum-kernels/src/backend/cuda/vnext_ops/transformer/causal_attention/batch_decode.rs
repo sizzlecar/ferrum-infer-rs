@@ -719,11 +719,7 @@ impl PreparedBatchDecode {
         grouping: CausalDecodeAttentionGrouping,
         kv_reuse: ferrum_types::CausalDecodeKvReuse,
     ) -> Result<Option<Self>, String> {
-        if matches!(
-            grouping,
-            CausalDecodeAttentionGrouping::FixedCapacity
-                | CausalDecodeAttentionGrouping::FixedExecutionCapacity
-        ) {
+        if grouping.uses_fixed_launch() {
             #[cfg(feature = "cuda-indexed-causal-attention")]
             return fixed::FixedBatchDecode::for_launches(
                 launches,
@@ -733,6 +729,7 @@ impl PreparedBatchDecode {
                 layout,
                 packed_prepare_gate,
                 independent_sequence_kv,
+                grouping,
             )
             .map(|batch| {
                 batch.map(|batch| Self::Fixed(batch.with_kv_reuse(kv_reuse, grouping, shape)))
@@ -754,10 +751,14 @@ impl PreparedBatchDecode {
     }
 
     pub(super) fn is_fixed(&self) -> bool {
+        self.fixed_launch_capacity().is_some()
+    }
+
+    pub(super) fn fixed_launch_capacity(&self) -> Option<u64> {
         match self {
-            Self::Grouped(_) => false,
+            Self::Grouped(_) => None,
             #[cfg(feature = "cuda-indexed-causal-attention")]
-            Self::Fixed(_) => true,
+            Self::Fixed(batch) => Some(batch.launch_capacity_tokens()),
         }
     }
 

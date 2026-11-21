@@ -34,6 +34,34 @@ fn engine(resolved: &ResolvedFerrumConfig) -> crate::EngineConfig {
 }
 
 #[test]
+fn long_native_context_buckets_decode_but_respects_configured_grouping_and_limit() {
+    let mut model = ModelCapabilities::unknown();
+    model.max_context_len = Some(262_144);
+    let grouping = |entries: &[(&str, &str)]| {
+        let resolved = builder(cuda(), entries)
+            .with_model_capabilities(model.clone())
+            .resolve()
+            .unwrap();
+        engine(&resolved).runtime.causal_decode_attention_grouping
+    };
+    assert_eq!(
+        grouping(&[]),
+        CausalDecodeAttentionGrouping::BucketedExecutionCapacity
+    );
+    assert_eq!(
+        grouping(&[("FERRUM_MAX_MODEL_LEN", "2048")]),
+        CausalDecodeAttentionGrouping::FixedExecutionCapacity
+    );
+    assert_eq!(
+        grouping(&[(
+            crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY,
+            "fixed-execution-capacity"
+        )]),
+        CausalDecodeAttentionGrouping::FixedExecutionCapacity
+    );
+}
+
+#[test]
 fn cuda_execution_defaults_materialize_the_validated_bundle() {
     let hardware = cuda();
     // Match ordinary serve startup: supplying hardware alone leaves the

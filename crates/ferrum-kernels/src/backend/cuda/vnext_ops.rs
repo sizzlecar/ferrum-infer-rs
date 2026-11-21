@@ -2171,8 +2171,7 @@ impl CudaVNextComposition {
             }
             explicit => explicit,
         };
-        if causal_decode_attention_grouping
-            == ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+        if causal_decode_attention_grouping.uses_execution_context_limit()
             && execution_context_limit == Some(0)
         {
             return Err(CudaDeviceRuntimeError::contract(
@@ -2228,6 +2227,7 @@ impl CudaVNextComposition {
             ferrum_types::CausalDecodeAttentionGrouping::Indexed
                 | ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity
                 | ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                | ferrum_types::CausalDecodeAttentionGrouping::BucketedExecutionCapacity
         ) && !cfg!(feature = "cuda-indexed-causal-attention")
         {
             return Err(CudaDeviceRuntimeError::contract(
@@ -2239,12 +2239,11 @@ impl CudaVNextComposition {
             ferrum_types::CausalDecodeKvReuse::PairedQueryHeads
                 | ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2
         ) {
-            if causal_decode_attention_grouping
-                != ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+            if !causal_decode_attention_grouping.uses_execution_context_limit()
                 || causal_decode_preparation != ferrum_types::CausalDecodePreparationMode::Packed
             {
                 return Err(CudaDeviceRuntimeError::contract(
-                    "paired query heads require packed fixed-execution-capacity attention",
+                    "paired query heads require packed attention with a fixed execution context",
                 ));
             }
             if !cfg!(feature = "cuda-causal-gqa2")
@@ -2263,6 +2262,7 @@ impl CudaVNextComposition {
             ferrum_types::CausalDecodeAttentionGrouping::Indexed
                 | ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity
                 | ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                | ferrum_types::CausalDecodeAttentionGrouping::BucketedExecutionCapacity
         ) && causal_decode_preparation != ferrum_types::CausalDecodePreparationMode::Packed
         {
             return Err(CudaDeviceRuntimeError::contract(

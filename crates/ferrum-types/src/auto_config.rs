@@ -1076,6 +1076,7 @@ impl FerrumConfigBuilder {
         let execution = self.resolve_execution_defaults(
             reusable_execution.value,
             plan_attention.as_ref().map(|(_, compiled)| compiled.value),
+            max_model_len.as_ref().map(|setting| setting.value),
         )?;
         let mut runtime_config = execution.runtime_config.clone();
         // Native resource selection is one typed decision. A diagnostic-only
@@ -2704,6 +2705,7 @@ impl FerrumConfigBuilder {
             crate::CausalDecodeAttentionGrouping::Indexed
                 | crate::CausalDecodeAttentionGrouping::FixedCapacity
                 | crate::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                | crate::CausalDecodeAttentionGrouping::BucketedExecutionCapacity
         ) {
             let preparation = self
                 .entry(crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY)
@@ -2740,6 +2742,7 @@ impl FerrumConfigBuilder {
                 "indexed",
                 "fixed-capacity",
                 "fixed-execution-capacity",
+                "bucketed-execution-capacity",
             ],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
@@ -2866,9 +2869,9 @@ impl FerrumConfigBuilder {
             // The grouping decision above checks packed preparation, native
             // attention, F16 KV and the CUDA plan-runtime authority.
             if !self.hardware.compiled_features.cuda_causal_gqa2
-                || grouping != crate::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                || !grouping.uses_execution_context_limit()
             {
-                return Err(invalid("paired-query-heads KV reuse requires the cuda-causal-gqa2 build feature and fixed-execution-capacity causal decode grouping".into()));
+                return Err(invalid("paired-query-heads KV reuse requires the cuda-causal-gqa2 build feature and fixed-execution-capacity or bucketed-execution-capacity causal decode grouping".into()));
             }
         }
         Ok(self.decision(

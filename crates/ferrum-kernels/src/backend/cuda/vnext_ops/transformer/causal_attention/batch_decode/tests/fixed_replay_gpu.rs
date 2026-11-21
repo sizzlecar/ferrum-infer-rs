@@ -3,6 +3,7 @@
 use super::*;
 use crate::backend::cuda::vnext_ops::transformer::causal_attention::batch_decode::fixed::FixedBatchDecode;
 use cudarc::driver::{sys::CUevent_flags, CudaGraph};
+use CausalDecodeAttentionGrouping::{BucketedExecutionCapacity, FixedExecutionCapacity, Indexed};
 
 #[cfg(feature = "cuda-causal-gqa2-tests")]
 #[path = "fixed_replay_gpu/gqa2.rs"]
@@ -57,17 +58,19 @@ impl ReplayBatch {
     }
 
     fn new(
-        fixed: bool,
+        grouping: CausalDecodeAttentionGrouping,
         launches: &[CausalAttentionLaunch],
         binding: BindingLayout,
         shape: CausalAttentionShape,
         layout: ScratchLayout,
     ) -> Self {
-        if fixed {
+        if grouping.uses_fixed_launch() {
             Self::Fixed(
-                FixedBatchDecode::for_launches(launches, true, binding, shape, layout, true, true)
-                    .unwrap()
-                    .expect("fixture has packed independent decode rows"),
+                FixedBatchDecode::for_launches(
+                    launches, true, binding, shape, layout, true, true, grouping,
+                )
+                .unwrap()
+                .expect("fixture has packed independent decode rows"),
             )
         } else {
             Self::Indexed(
@@ -433,6 +436,17 @@ fn fixed_execution_capacity_captured_replay_matches_indexed_bits_and_guards_on_c
     ]);
 }
 
+#[test]
+#[ignore = "requires CUDA and pinned indexed addressed-vLLM operators"]
+fn bucketed_execution_capacity_replay_matches_indexed_across_live_length_buckets_on_cuda() {
+    captured_capacity_replay_candidate(
+        &[(128, 8, true, 32_768, Some(8_192))],
+        false,
+        false,
+        BucketedExecutionCapacity,
+    );
+}
+
 fn captured_capacity_replay(cases: &[(u64, usize, bool, u64, Option<usize>)]) {
     captured_capacity_replay_with_gqa2(cases, false);
 }
@@ -441,13 +455,14 @@ fn captured_capacity_replay_with_gqa2(
     cases: &[(u64, usize, bool, u64, Option<usize>)],
     gqa2: bool,
 ) {
-    captured_capacity_replay_candidate(cases, gqa2, false);
+    captured_capacity_replay_candidate(cases, gqa2, false, FixedExecutionCapacity);
 }
 
 fn captured_capacity_replay_candidate(
     cases: &[(u64, usize, bool, u64, Option<usize>)],
     gqa2: bool,
     production: bool,
+    grouping: CausalDecodeAttentionGrouping,
 ) {
     let runtime = CudaDeviceRuntime::new(
         cuda_vnext_runtime_config(
@@ -491,7 +506,7 @@ fn captured_capacity_replay_candidate(
         .unwrap();
         let initial = vec![129; participants];
         let launches = build_launches(shape, binding, layout, &initial);
-        let fixed = ReplayBatch::new(true, &launches, binding, shape, layout)
+        let fixed = ReplayBatch::new(grouping, &launches, binding, shape, layout)
             .test_candidate(gqa2, production, shape);
         let replay_key = |batch: &ReplayBatch| match batch {
             ReplayBatch::Fixed(batch) => batch
@@ -505,9 +520,12 @@ fn captured_capacity_replay_candidate(
                 .finish()
                 .bind_runtime_payload("causal", std::iter::empty(), &[]),
         };
-        let initial_key = replay_key(&fixed);
+        let mut current_key = replay_key(&fixed);
+        let mut graph_capacity =
+            fixed_decode_launch_capacity(grouping, shape.maximum_context_tokens, initial[0]);
+        let mut captures = 1;
         let mut layers = vec![layer(&stream, shape, binding, layout, &initial, 0)];
-        let fixed_graph = capture(
+        let mut fixed_graph = capture(
             &stream,
             &provider.functions,
             &layers,
@@ -562,13 +580,32 @@ fn captured_capacity_replay_candidate(
                 .map(|length| length.min(shape.maximum_context_tokens))
                 .collect::<Vec<_>>();
             let current = build_launches(shape, binding, layout, &lengths);
-            let fresh_fixed = ReplayBatch::new(true, &current, binding, shape, layout)
+            let fresh_fixed = ReplayBatch::new(grouping, &current, binding, shape, layout)
                 .test_candidate(gqa2, production, shape);
-            assert_eq!(
-                initial_key,
-                replay_key(&fresh_fixed),
-                "fixed identity included current paths, frontier or row permutation"
+            let next_key = replay_key(&fresh_fixed);
+            let next_capacity = fixed_decode_launch_capacity(
+                grouping,
+                shape.maximum_context_tokens,
+                *lengths.iter().max().unwrap(),
             );
+            assert_eq!(next_key != current_key, next_capacity != graph_capacity);
+            if next_capacity != graph_capacity {
+                assert_eq!(grouping, BucketedExecutionCapacity);
+                fixed_graph = capture(
+                    &stream,
+                    &provider.functions,
+                    &layers,
+                    &fresh_fixed,
+                    &current,
+                    1,
+                    binding,
+                    shape,
+                    layout,
+                );
+                current_key = next_key;
+                graph_capacity = next_capacity;
+                captures += 1;
+            }
             let input = poisoned_input(shape, layout, &requests, wave + 1);
             let mut expected = Vec::new();
             for arm in &mut layers[0].arms {
@@ -580,9 +617,19 @@ fn captured_capacity_replay_candidate(
                 stream.memcpy_htod(&input, &mut arm.scratch).unwrap();
                 expected.push(words);
             }
-            // Reference recaptures its current host-selected groups. The fixed
-            // graph is captured exactly once and sees only fresh device data.
-            let reference = ReplayBatch::new(gqa2, &current, binding, shape, layout);
+            // The reference follows current host-selected groups. Within each
+            // fixed launch capacity, replay sees only fresh device bindings.
+            let reference = ReplayBatch::new(
+                if gqa2 {
+                    FixedExecutionCapacity
+                } else {
+                    Indexed
+                },
+                &current,
+                binding,
+                shape,
+                layout,
+            );
             let reference_graph = capture(
                 &stream,
                 &provider.functions,
@@ -624,7 +671,7 @@ fn captured_capacity_replay_candidate(
             drop(reference_graph);
         }
         drop(fixed_graph);
-        println!("fixed_capacity_complete_replay head_dim={head_dim} M={participants} model_maximum_context={maximum_context} effective_maximum_context={} execution_limit={execution_limit:?} fixed_captures=1 v1_only_capacity={} current_requests_pages_and_maximum_context=true full_query_context_kv_bits=true masks_complete=true", shape.maximum_context_tokens, shape.maximum_context_tokens <= 512);
+        println!("fixed_capacity_complete_replay head_dim={head_dim} M={participants} model_maximum_context={maximum_context} effective_maximum_context={} execution_limit={execution_limit:?} fixed_captures={captures} v1_only_capacity={} current_requests_pages_and_maximum_context=true full_query_context_kv_bits=true masks_complete=true", shape.maximum_context_tokens, shape.maximum_context_tokens <= 512);
     }
 }
 
@@ -674,8 +721,14 @@ fn sixteen_layer_inclusive_candidate(gqa2: bool, production: bool) {
         .unwrap();
         let capacity_lengths = vec![shape.maximum_context_tokens; participants];
         let capacity_launches = build_launches(shape, binding, layout, &capacity_lengths);
-        let fixed = ReplayBatch::new(true, &capacity_launches, binding, shape, layout)
-            .test_candidate(gqa2, production, shape);
+        let fixed = ReplayBatch::new(
+            FixedExecutionCapacity,
+            &capacity_launches,
+            binding,
+            shape,
+            layout,
+        )
+        .test_candidate(gqa2, production, shape);
         // Distinct allocations and seed data for sixteen actual causal layers.
         // Max-context pages are allocated once, outside every timing window.
         let mut layers = (0..16)
@@ -710,7 +763,17 @@ fn sixteen_layer_inclusive_candidate(gqa2: bool, production: bool) {
             let launches = build_launches(shape, binding, layout, &lengths);
             // The GQA2 arm compares against the current fixed implementation,
             // not the older indexed CPU regrouping used by the original test.
-            let reference = ReplayBatch::new(gqa2, &launches, binding, shape, layout);
+            let reference = ReplayBatch::new(
+                if gqa2 {
+                    FixedExecutionCapacity
+                } else {
+                    Indexed
+                },
+                &launches,
+                binding,
+                shape,
+                layout,
+            );
             let wave = match case {
                 "all_v1" => 11,
                 "mixed" => 23,
@@ -814,6 +877,7 @@ fn production_gqa2_preserves_fixed_bits_state_fallback_and_fresh_replay_on_cuda(
         ],
         true,
         true,
+        FixedExecutionCapacity,
     );
 }
 
