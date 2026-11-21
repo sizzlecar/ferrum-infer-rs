@@ -847,6 +847,49 @@ fn startup_memory_accounts_for_hybrid_state_and_each_sequences_physical_padding(
         16384,
         "sequence state follows its actual frontier, not its request ceiling"
     );
+    // A sealed width-3 / width-1 capture cohort ends with two four-token
+    // sequences and one seven-token sequence. Only the latter crosses a KV page.
+    let capture_peak = plan
+        .startup_grouped_workload_peak_bytes(
+            7,
+            &[(4, 2), (7, 1)],
+            1,
+            1,
+            crate::SequenceBackingGrowthPolicy::Exact,
+        )
+        .unwrap();
+    assert_eq!(capture_peak, 2 * 8192 + 12288);
+    let budget = capture_peak - 1;
+    assert!(plan.startup_peak_bytes(7, 1, 7).unwrap() <= budget);
+    assert!(plan.startup_workload_peak_bytes(7, 1, 3, 3).unwrap() <= budget);
+    assert!(capture_peak > budget);
+    assert!(plan
+        .startup_grouped_workload_peak_bytes(
+            7,
+            &[(8, 1)],
+            1,
+            1,
+            crate::SequenceBackingGrowthPolicy::Exact
+        )
+        .is_err());
+    let four_pages = std::num::NonZeroU32::new(4).unwrap();
+    let capture = |ceiling, growth| {
+        plan.startup_grouped_workload_peak_bytes(ceiling, &[(1, 1), (5, 2)], 2, 2, growth)
+            .unwrap()
+    };
+    // One unextended request keeps one KV page. The two extended requests
+    // can own four pages apiece, clipped to the physical parent ceiling.
+    assert_eq!(
+        capture(32, crate::SequenceBackingGrowthPolicy::Exact),
+        8 * 4096
+    );
+    for growth in [
+        crate::SequenceBackingGrowthPolicy::PagedGroup(four_pages),
+        crate::SequenceBackingGrowthPolicy::PagedGroupGrowOnly(four_pages),
+    ] {
+        assert_eq!(capture(32, growth), 12 * 4096);
+        assert_eq!(capture(9, growth), 10 * 4096);
+    }
     assert!(plan.startup_peak_bytes(4097, 1, 1).is_err());
     assert!(plan.startup_peak_bytes(1, 17, 1).is_err());
 }
@@ -891,6 +934,12 @@ fn startup_memory_reuses_only_proven_step_slots_and_ordered_invocations() {
     )
     .unwrap();
     assert_eq!(plan.startup_peak_bytes(100, 1, 4).unwrap(), 4 * 128 + 128);
+    assert_eq!(
+        plan.startup_resident_workload_peak_bytes(100, 1, 8, 2, 2)
+            .unwrap(),
+        2 * 128 + 128,
+        "step and invocation storage follows the wave despite other resident requests"
+    );
     let unordered = vec![
         plan_node("node/a", &[], &["activation/a", "scratch/a"]),
         plan_node("node/b", &[], &["activation/b", "scratch/b"]),
@@ -1052,6 +1101,30 @@ fn startup_memory_decode_preserves_request_ceiling_without_reserving_full_kv_con
     assert_eq!(full_request_shallow_sequence, 4 * (4 * 4096 + 64));
     assert!(full_request_shallow_sequence > plan.startup_peak_bytes(1, 4, 4).unwrap());
     assert!(full_request_shallow_sequence < plan.startup_peak_bytes(4096, 4, 4).unwrap());
+    assert_eq!(
+        plan.startup_resident_workload_peak_bytes(4096, 1, 4, 2, 2)
+            .unwrap(),
+        full_request_shallow_sequence,
+        "sequences outside the current wave retain their request and sequence storage"
+    );
+    // A contiguous descriptor never grants surplus pages on extension.
+    assert_eq!(
+        plan.startup_grouped_workload_peak_bytes(
+            4096,
+            &[(5, 4)],
+            2,
+            2,
+            crate::SequenceBackingGrowthPolicy::PagedGroupGrowOnly(
+                std::num::NonZeroU32::new(4).unwrap()
+            ),
+        )
+        .unwrap(),
+        plan.startup_resident_workload_peak_bytes(4096, 5, 4, 2, 2)
+            .unwrap()
+    );
+    assert!(plan
+        .startup_resident_workload_peak_bytes(4096, 1, 2, 4, 4)
+        .is_err());
 }
 
 #[test]

@@ -1631,30 +1631,11 @@ where
                         "sequence extension descriptor coverage regressed",
                     ));
                 }
-                let desired_bytes = match (growth_policy, descriptor.storage().profile().view()) {
-                    (
-                        super::SequenceBackingGrowthPolicy::PagedGroup(pages)
-                        | super::SequenceBackingGrowthPolicy::PagedGroupGrowOnly(pages),
-                        super::DynamicStorageView::PagedRegions { block_bytes },
-                    ) => {
-                        let ceiling =
-                            descriptor.evaluate_request_bytes_for_shape(parent_ceiling)?;
-                        if target_bytes > ceiling {
-                            return Err(invalid_resource(
-                                "sequence extension exceeds its parent physical ceiling",
-                            ));
-                        }
-                        let group = block_bytes
-                            .checked_mul(u64::from(pages.get()))
-                            .ok_or_else(|| invalid_resource("sequence page group overflows u64"))?;
-                        target_bytes
-                            .div_ceil(group)
-                            .checked_mul(group)
-                            .unwrap_or(ceiling)
-                            .min(ceiling)
-                    }
-                    _ => target_bytes,
-                };
+                let desired_bytes = growth_policy.extension_allocation_bytes(
+                    descriptor,
+                    target_bytes,
+                    parent_ceiling,
+                )?;
                 let delta_bytes = desired_bytes.saturating_sub(owned_bytes);
                 if delta_bytes == 0 {
                     continue;

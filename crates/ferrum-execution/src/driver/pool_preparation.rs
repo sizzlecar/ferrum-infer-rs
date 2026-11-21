@@ -9,19 +9,31 @@ pub(super) fn prepare<R: DeviceRuntime>(
     mode: ferrum_types::RuntimePoolPreparation,
     context_tokens: usize,
     step_tokens: u64,
+    startup: Option<&ferrum_types::StartupMemoryPlan>,
 ) -> Result<()> {
     if mode == ferrum_types::RuntimePoolPreparation::OnDemand {
         return Ok(());
     }
     let context = u64::try_from(context_tokens)
         .map_err(|_| FerrumError::config("pool preparation context exceeds u64"))?;
+    let resident = memory.maximum_active_sequences();
+    // Discovered concurrency was proved for two separate shapes. Prewarm the
+    // larger verified shape, leaving subsequent growth with ordinary admission.
+    let (frontier, residents, wave, tokens) = match startup.and_then(|plan| {
+        plan.serving_concurrency_search
+            .as_ref()
+            .map(|search| (plan, search))
+    }) {
+        Some((plan, search)) if plan.decode_peak_bytes >= plan.context_peak_bytes => {
+            let wave = u32::try_from(search.decode_wave_sequences)
+                .map_err(|_| FerrumError::config("startup decode wave exceeds u32"))?;
+            (1, resident, wave, u64::from(wave))
+        }
+        Some(_) => (context, 1, 1, step_tokens.min(context)),
+        None => (context, resident, resident, step_tokens),
+    };
     let targets = memory
-        .startup_workload_pool_bytes(
-            context,
-            context,
-            memory.maximum_active_sequences(),
-            step_tokens,
-        )
+        .startup_resident_workload_pool_bytes(context, frontier, residents, wave, tokens)
         .map_err(|error| FerrumError::config(format!("compiled pool preparation: {error}")))?;
     let requested_total = targets
         .values()

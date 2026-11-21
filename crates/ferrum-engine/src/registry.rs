@@ -2816,6 +2816,7 @@ pub(crate) mod tests {
             context_is_explicit: false,
             sequences_is_explicit: false,
             batch_is_explicit: false,
+            search_serving_concurrency: false,
         });
         let (runtime, executor) = create(&config);
         let executor = executor.unwrap();
@@ -2881,6 +2882,62 @@ pub(crate) mod tests {
             report.selected.max_batch_tokens
         );
         engine.shutdown().await.unwrap();
+
+        // More requests may retain their state than participate in a single
+        // decode wave. Keep the single-request context and per-wave token
+        // budget on the expanded plan that is actually loaded.
+        let mut serving = config.clone();
+        serving.runtime.max_model_len = Some(128);
+        serving.batching.max_batch_size = 2;
+        serving.output.max_sessions = 6;
+        let request = serving.runtime.startup_memory_request.as_mut().unwrap();
+        request.usable_capacity_bytes = capacity;
+        request.search_serving_concurrency = true;
+        let (_, expanded) = create(&serving);
+        let expanded = expanded.unwrap();
+        let report = expanded.startup_memory_plan().unwrap();
+        assert_eq!(report.selected.context_tokens, 128);
+        assert_eq!(report.selected.max_batch_tokens, 8);
+        assert_eq!(report.selected.max_sequences, serving.output.max_sessions);
+        let search = report.serving_concurrency_search.as_ref().unwrap();
+        assert_eq!(search.decode_wave_sequences, 2);
+        assert_eq!(search.capture_warmup_peak_bytes, None);
+        let expanded_memory = expanded
+            .resolved_model_plan()
+            .unwrap()
+            .execution_plan()
+            .payload()
+            .memory();
+        assert_eq!(expanded_memory.maximum_active_sequences(), 6);
+        assert_eq!(
+            report.decode_peak_bytes,
+            expanded_memory
+                .startup_resident_workload_peak_bytes(128, 1, 6, 2, 2)
+                .unwrap()
+        );
+        drop(expanded);
+        serving
+            .runtime
+            .startup_memory_request
+            .as_mut()
+            .unwrap()
+            .sequences_is_explicit = true;
+        let (_, explicit) = create(&serving);
+        let explicit = explicit.unwrap();
+        assert_eq!(
+            explicit
+                .startup_memory_plan()
+                .unwrap()
+                .selected
+                .max_sequences,
+            4
+        );
+        assert!(explicit
+            .startup_memory_plan()
+            .unwrap()
+            .serving_concurrency_search
+            .is_none());
+        drop(explicit);
 
         config.runtime.max_model_len = Some(declared_context as usize);
         let request = config.runtime.startup_memory_request.as_mut().unwrap();

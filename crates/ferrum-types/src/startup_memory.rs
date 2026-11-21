@@ -20,6 +20,10 @@ pub struct StartupMemoryRequest {
     pub context_is_explicit: bool,
     pub sequences_is_explicit: bool,
     pub batch_is_explicit: bool,
+    /// Permit the compiled text service to discover resident request capacity.
+    /// Single-request, explicit and preset configurations keep their own bounds.
+    #[serde(default)]
+    pub search_serving_concurrency: bool,
 }
 
 impl StartupMemoryRequest {
@@ -72,6 +76,7 @@ impl StartupMemoryRequest {
             context_is_explicit: explicit("FERRUM_MAX_MODEL_LEN") || explicit("FERRUM_KV_CAPACITY"),
             sequences_is_explicit: explicit("FERRUM_PAGED_MAX_SEQS"),
             batch_is_explicit: explicit("FERRUM_MAX_BATCHED_TOKENS"),
+            search_serving_concurrency: false,
         })
     }
 }
@@ -101,12 +106,27 @@ pub enum StartupWorkload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartupConcurrencySearch {
+    /// Largest candidate within output, scheduler admission and token limits.
+    pub upper_bound: usize,
+    /// Decode participants in one wave at the selected resident request limit.
+    pub decode_wave_sequences: usize,
+    /// Additional candidate plans compiled after the original startup fit.
+    pub candidate_compilations: usize,
+    /// Managed peak of the synthetic decode cohort prepared before readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_warmup_peak_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupMemoryPlan {
     pub request: StartupMemoryRequest,
     pub requested: StartupResourceLimits,
     pub selected: StartupResourceLimits,
     pub context_peak_bytes: u64,
     pub decode_peak_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_concurrency_search: Option<StartupConcurrencySearch>,
     pub reasons: Vec<String>,
 }
 
@@ -232,6 +252,7 @@ pub fn fit_startup_resources(
         selected,
         context_peak_bytes: peak_bytes(prefill(context, batch))?,
         decode_peak_bytes: peak_bytes(decode(sequences))?,
+        serving_concurrency_search: None,
         reasons,
     })
 }

@@ -289,6 +289,22 @@ fn reusable_execution_maximum_decode_sequence_tokens(decode_width_count: usize) 
         .ok_or_else(|| FerrumError::config("vNext reusable startup token ceiling overflowed"))
 }
 
+/// Automatic startup capture may fall back to its canonical anchors. Every
+/// anchor requires warmup, capture and validation in the same synthetic
+/// sequence. Return the largest trial that this fixed context can prepare.
+fn context_bounded_capture_width(mut width: usize, context_tokens: usize) -> Result<usize> {
+    while width > 0 {
+        let anchors = reusable_execution_anchor_decode_widths(width);
+        if reusable_execution_maximum_decode_sequence_tokens(anchors.len())? <= context_tokens {
+            break;
+        }
+        // All intermediate widths need at least as many anchors as this
+        // width. The preceding power of two is the next shorter inventory.
+        width = anchors.iter().rev().nth(1).copied().unwrap_or(0);
+    }
+    Ok(width)
+}
+
 fn resolve_reusable_capture_admission(
     requested: ReusableExecutionPreparationMode,
     resolved: ReusableExecutionPreparationMode,
@@ -636,6 +652,7 @@ fn budget_reusable_decode_seed_prefill(
 #[derive(Debug, Clone)]
 pub struct ProgramExecutorConfig {
     pub maximum_model_tokens: usize,
+    maximum_decode_wave_sequences: u32,
     pub weight_arena_packing: ferrum_runtime::WeightArenaPacking,
     pub startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
     pub pool_preparation: ferrum_types::RuntimePoolPreparation,
@@ -654,6 +671,44 @@ pub struct ProgramExecutorConfig {
 }
 
 impl ProgramExecutorConfig {
+    fn reusable_startup_plan(
+        &self,
+        memory: &MemoryPlan,
+        device_supported: bool,
+    ) -> Result<Option<VNextReusableExecutionStartupPlan>> {
+        if !self.device_reusable_execution_enabled || !device_supported {
+            return Ok(None);
+        }
+        let reusable = memory.reusable_execution().ok_or_else(|| {
+            FerrumError::internal(
+                "vNext reusable execution is enabled without a resolved memory plan",
+            )
+        })?;
+        let policy = reusable.program_policy().ok_or_else(|| {
+            FerrumError::internal(
+                "vNext reusable execution is enabled without a resolved program policy",
+            )
+        })?;
+        let resolution = self
+            .reusable_execution_capture_resolution
+            .clone()
+            .ok_or_else(|| {
+                FerrumError::internal(
+                    "vNext reusable execution is enabled without capture resolution evidence",
+                )
+            })?;
+        VNextReusableExecutionStartupPlan::resolve(
+            policy,
+            resolution,
+            self.maximum_model_tokens,
+            &self.reusable_execution_prefill_chunks,
+            reusable
+                .capped_device_executables_per_lane()
+                .unwrap_or_else(|| reusable.maximum_device_executables()),
+        )
+        .map(Some)
+    }
+
     /// Extra causal inputs remain current-wave managed uploads. Only decode
     /// segments may be captured, after real input-bearing work has arrived.
     fn supports_causal_input_replay(&self) -> bool {
@@ -849,8 +904,20 @@ impl ProgramExecutorConfig {
         // Workspace buckets remain backend-independent capacity policy. The
         // exact device-program matrix is attached only when this runtime will
         // prepare it, and becomes part of the resolved policy fingerprint.
+        let maximum_decode_wave_sequences = if engine
+            .runtime
+            .startup_memory_request
+            .as_ref()
+            .is_some_and(|request| {
+                request.search_serving_concurrency && !request.sequences_is_explicit
+            }) {
+            maximum_active_sequences
+                .min(u32::try_from(engine.batching.max_batch_size).unwrap_or(u32::MAX))
+        } else {
+            maximum_active_sequences
+        };
         let reusable_execution_resolution = resolve_reusable_execution_policy(
-            maximum_active_sequences,
+            maximum_decode_wave_sequences,
             maximum_scheduled_tokens,
             maximum_model_tokens,
             &reusable_execution_prefill_chunks,
@@ -931,6 +998,7 @@ impl ProgramExecutorConfig {
 
         Ok(Self {
             maximum_model_tokens,
+            maximum_decode_wave_sequences,
             weight_arena_packing: engine.memory.weight_arena_target_bytes.map_or(
                 ferrum_runtime::WeightArenaPacking::ByElementType,
                 |target_bytes| ferrum_runtime::WeightArenaPacking::Bounded { target_bytes },
@@ -1224,6 +1292,60 @@ impl VNextReusableExecutionStartupPlan {
                 VNextReusableExecutionDescriptor::Prefill { .. } => None,
             })
             .collect()
+    }
+
+    /// Compute the managed peak of the synthetic decode cohort. For each
+    /// width only its last pass matters: earlier passes have the same workspace
+    /// and shorter frontiers. Hybrid replay starts with fresh requests.
+    fn capture_warmup_peak(
+        &self,
+        mut peak_bytes: impl FnMut(u64, &[(u64, u32)], u32) -> Result<u64>,
+    ) -> Result<Option<u64>> {
+        if !self.program_policy.prepares_before_readiness() {
+            return Ok(None);
+        }
+        let widths = self.decode_widths(); // Same widest-first inventory as preparation.
+                                           // The executor issues one decode token per participant. Other uniform
+                                           // query shapes in a lower-level catalog cannot be prepared by this loop.
+        if widths
+            .iter()
+            .rev()
+            .ne(&self.capture_resolution.effective_decode_widths)
+        {
+            return Err(FerrumError::config(
+                "capture warmup requires exactly the resolved single-token decode widths",
+            ));
+        }
+        let before_replay = self.warmup_passes + self.capture_passes;
+        let passes = if self.replay_uses_fresh_sequences() {
+            before_replay.max(self.replay_validation_passes)
+        } else {
+            before_replay + self.replay_validation_passes
+        };
+        // resolve() already checked the sum and product against the context.
+        let request_ceiling = self.maximum_decode_sequence_tokens as u64;
+        // Slots between adjacent widths participate in exactly the first i+1
+        // widths. Each slot was prefilled with one token before any decode.
+        let mut groups = widths
+            .iter()
+            .enumerate()
+            .map(|(i, &width)| {
+                let count = width - widths.get(i + 1).copied().unwrap_or(0);
+                (1 + ((passes - 1) * (i + 1)) as u64, count as u32)
+            })
+            .collect::<Vec<_>>();
+        let mut peak = 0;
+        for (i, &width) in widths.iter().enumerate() {
+            for (frontier, _) in &mut groups[i..] {
+                *frontier += 1;
+            }
+            peak = peak.max(peak_bytes(request_ceiling, &groups, width as u32)?);
+        }
+        Ok(Some(peak))
+    }
+
+    fn replay_uses_fresh_sequences(&self) -> bool {
+        self.device_plan.catalog_lifetime() == ReusableExecutionCatalogLifetime::OnDemandBounded
     }
 
     fn prefill_chunks(&self) -> Vec<PrefillChunk> {
@@ -5145,43 +5267,10 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             .capabilities
             .iter()
             .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
-        let reusable_execution_startup_plan =
-            if config.device_reusable_execution_enabled && reusable_execution_supported {
-                let reusable_memory = resolved_plan
-                    .execution_plan()
-                    .payload()
-                    .memory()
-                    .reusable_execution()
-                    .ok_or_else(|| {
-                        FerrumError::internal(
-                            "vNext reusable execution is enabled without a resolved memory plan",
-                        )
-                    })?;
-                let program_policy = reusable_memory.program_policy().ok_or_else(|| {
-                    FerrumError::internal(
-                        "vNext reusable execution is enabled without a resolved program policy",
-                    )
-                })?;
-                let capture_resolution = config
-                    .reusable_execution_capture_resolution
-                    .clone()
-                    .ok_or_else(|| {
-                        FerrumError::internal(
-                        "vNext reusable execution is enabled without capture resolution evidence",
-                    )
-                    })?;
-                Some(VNextReusableExecutionStartupPlan::resolve(
-                    program_policy,
-                    capture_resolution,
-                    config.maximum_model_tokens,
-                    &config.reusable_execution_prefill_chunks,
-                    reusable_memory
-                        .capped_device_executables_per_lane()
-                        .unwrap_or_else(|| reusable_memory.maximum_device_executables()),
-                )?)
-            } else {
-                None
-            };
+        let reusable_execution_startup_plan = config.reusable_startup_plan(
+            resolved_plan.execution_plan().payload().memory(),
+            reusable_execution_supported,
+        )?;
         let checkpoint_capture = checkpoint_selection
             .map(|selection| {
                 selection.bind(
@@ -5584,8 +5673,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         let requested_decode_widths = plan.decode_widths();
         let requested_prefill_chunks = plan.prefill_chunks();
         let requested_prefill_token_counts = plan.prefill_token_counts();
-        let bounded = plan.device_plan.catalog_lifetime()
-            == ReusableExecutionCatalogLifetime::OnDemandBounded;
+        let bounded = plan.replay_uses_fresh_sequences();
         if bounded {
             let initial = self.prepare_on_demand_reusable_execution(&plan, started)?;
             if !plan.program_policy.prepares_before_readiness() {
@@ -9348,6 +9436,7 @@ impl<R: DeviceRuntime> ModelExecutor for ProgramExecutor<R> {
                 self.policy.maximum_scheduled_tokens().map_err(|error| {
                     FerrumError::config(format!("runtime pool preparation token bound: {error}"))
                 })?,
+                self.startup_memory_plan.as_ref(),
             )?;
             let report = self.prepare_reusable_execution_startup().await?;
             self.reset_request_metrics_after_startup()?;
@@ -10150,6 +10239,107 @@ mod tests {
 
         metrics.reset();
         assert_eq!(metrics.snapshot()["wave_authorities"], 0);
+    }
+
+    #[test]
+    fn serving_capture_warmup_tracks_each_slots_frontier_and_hybrid_replay_reset() {
+        use ferrum_types::ReusableExecutionPreparationMode::*;
+        for (mode, widest, narrowest) in [
+            (Startup, vec![(4, 2), (6, 1)], vec![(4, 2), (7, 1)]),
+            (
+                StartupAndOnDemand,
+                vec![(3, 2), (4, 1)],
+                vec![(3, 2), (5, 1)],
+            ),
+        ] {
+            let config = ReusableExecutionCaptureConfig {
+                exact_decode_widths: Some(vec![1, 3]),
+                preparation: mode,
+                ..Default::default()
+            };
+            let plan = resolve_test_reusable_startup_plan(8, 16, 7, &[], 1, &config).unwrap();
+            let mut seen = Vec::new();
+            let peak = plan
+                .capture_warmup_peak(|request_ceiling, groups, width| {
+                    assert_eq!(request_ceiling, 7);
+                    seen.push((width, groups.to_vec()));
+                    let sequence_bytes = groups
+                        .iter()
+                        .map(|&(frontier, count)| frontier * u64::from(count))
+                        .sum::<u64>();
+                    Ok(sequence_bytes + u64::from(width))
+                })
+                .unwrap();
+            let expected_peak = widest
+                .iter()
+                .map(|&(tokens, count)| tokens * u64::from(count))
+                .sum::<u64>()
+                + 3;
+            assert_eq!(seen, vec![(3, widest), (1, narrowest)]);
+            assert_eq!(peak, Some(expected_peak));
+        }
+        let config = ReusableExecutionCaptureConfig {
+            preparation: OnDemand,
+            ..Default::default()
+        };
+        let on_demand = resolve_test_reusable_startup_plan(3, 16, 7, &[], 1, &config).unwrap();
+        assert_eq!(
+            on_demand
+                .capture_warmup_peak(|_, _, _| panic!("no startup cohort"))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn serving_capture_warmup_rejects_heterogeneous_query_inventory_before_sizing() {
+        use ferrum_runtime::{
+            ReusableExecutionProgramPolicy, ReusableExecutionProgramShape,
+            ReusableExecutionProgramSpec,
+        };
+        let config = ReusableExecutionCaptureConfig {
+            exact_decode_widths: Some(vec![1, 3]),
+            preparation: ferrum_types::ReusableExecutionPreparationMode::Startup,
+            ..Default::default()
+        };
+        let plan = resolve_test_reusable_startup_plan(3, 16, 32, &[], 1, &config).unwrap();
+        for width in [1, 3] {
+            let mut programs = plan.program_policy.programs().to_vec();
+            programs.push(
+                ReusableExecutionProgramSpec::new(
+                    programs[0].class_id().clone(),
+                    ReusableExecutionProgramShape::uniform_decode(width, 2).unwrap(),
+                )
+                .unwrap(),
+            );
+            let count = programs.len() as u64;
+            let policy =
+                ReusableExecutionProgramPolicy::exact_startup_sealed(1, 1, 1, programs).unwrap();
+            let mixed = VNextReusableExecutionStartupPlan::resolve(
+                &policy,
+                plan.capture_resolution.clone(),
+                32,
+                &[],
+                count,
+            )
+            .unwrap();
+            assert!(matches!(
+                mixed.capture_warmup_peak(|_, _, _| panic!("cannot execute this startup shape")),
+                Err(FerrumError::Config { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn serving_capture_expansion_preserves_a_working_sixteen_token_context() {
+        let config = ReusableExecutionCaptureConfig::default();
+        let plan = |width| resolve_test_reusable_startup_plan(width, 2048, 16, &[], 1, &config);
+        assert!(plan(4).is_ok());
+        assert!(plan(32).is_err());
+        let limit = super::context_bounded_capture_width(32, 16).unwrap();
+        assert_eq!(limit, 16);
+        assert!(plan(limit as u32).is_ok());
+        assert!(plan(limit as u32 + 1).is_err());
     }
 
     #[test]

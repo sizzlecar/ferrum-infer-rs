@@ -123,6 +123,9 @@ pub enum ProgramCompilationError {
         required_bytes: u64,
         usable_capacity_bytes: u64,
     },
+    /// The immutable provider catalog has no implementation for this plan.
+    #[error("vNext plan compile: {0}")]
+    UnavailableProvider(VNextError),
     #[error(transparent)]
     Invalid(#[from] FerrumError),
 }
@@ -131,6 +134,9 @@ impl From<ProgramCompilationError> for FerrumError {
     fn from(error: ProgramCompilationError) -> Self {
         match error {
             ProgramCompilationError::Invalid(error) => error,
+            unsupported @ ProgramCompilationError::UnavailableProvider(_) => {
+                FerrumError::model(unsupported.to_string())
+            }
             capacity => FerrumError::config(capacity.to_string()),
         }
     }
@@ -152,6 +158,9 @@ impl ProgramCompilationError {
                 required_bytes,
                 usable_capacity_bytes,
             },
+            unsupported @ VNextError::UnsupportedOperation { .. } => {
+                Self::UnavailableProvider(unsupported)
+            }
             error => Self::Invalid(FerrumError::model(format!("vNext plan compile: {error}"))),
         }
     }
@@ -183,6 +192,15 @@ mod tests {
             "allocator out of memory",
         )));
         assert!(matches!(error, FerrumError::Device { .. }));
+        assert!(matches!(
+            ProgramCompilationError::from_plan(VNextError::UnsupportedOperation {
+                node_id: None,
+                operation_id: "attention".into(),
+                device_id: "test-device".into(),
+                reason: "provider does not cover the selected shape".into(),
+            }),
+            ProgramCompilationError::UnavailableProvider(_)
+        ));
     }
 }
 
@@ -448,17 +466,99 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
         self.config.static_initialization
     }
 
+    /// The baseline is already verified at this context. Preserve its startup
+    /// capture contract when exploring a wider compile at the same context.
+    pub fn serving_concurrency_capture_limit(
+        &self,
+        engine: &EngineConfig,
+        upper: usize,
+    ) -> Result<usize> {
+        let automatic_startup = self
+            .config
+            .reusable_execution_capture_resolution
+            .as_ref()
+            .is_some_and(|capture| {
+                capture.source == VNextReusableExecutionDecodeWidthSource::Automatic
+            })
+            && self
+                .config
+                .runtime_policy
+                .reusable_execution_policy()
+                .and_then(|policy| policy.program_policy())
+                .is_some_and(|program| program.prepares_before_readiness());
+        if !automatic_startup {
+            return Ok(upper);
+        }
+        let trial_width = upper
+            .min(engine.batching.max_batch_size)
+            .min(engine.batching.max_num_batched_tokens)
+            .min(
+                engine
+                    .backend
+                    .reusable_execution_capture
+                    .maximum_automatic_exact_decode_width,
+            );
+        let supported =
+            super::context_bounded_capture_width(trial_width, self.config.maximum_model_tokens)?;
+        Ok(if supported < trial_width {
+            supported
+        } else {
+            upper
+        })
+    }
+
+    /// Managed peak of the actual before-readiness synthetic decode workload.
+    /// Disabled, unsupported and pure on-demand graphs have no such cohort.
+    pub fn startup_capture_warmup_peak_bytes(&self) -> Result<Option<u64>> {
+        let memory = self
+            .compilation
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory();
+        let supported = self
+            .composition
+            .runtime()
+            .descriptor()
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
+        let Some(plan) = self.config.reusable_startup_plan(memory, supported)? else {
+            return Ok(None);
+        };
+        plan.capture_warmup_peak(|ceiling, groups, width| {
+            memory
+                .startup_grouped_workload_peak_bytes(
+                    ceiling,
+                    groups,
+                    width,
+                    u64::from(width),
+                    self.config
+                        .runtime_policy
+                        .admission()
+                        .sequence_backing_growth,
+                )
+                .map_err(|error| {
+                    FerrumError::config(format!("compiled capture warmup memory: {error}"))
+                })
+        })
+    }
+
     /// Evaluate the retained compiled plan without allocating device memory.
     pub fn startup_peak_bytes(&self, workload: ferrum_types::StartupWorkload) -> Result<u64> {
-        let (context, frontier, sequences, tokens) = match workload {
+        let (context, frontier, sequences, wave_sequences, tokens) = match workload {
             ferrum_types::StartupWorkload::Prefill {
                 context_tokens,
                 chunk_tokens,
-            } => (context_tokens, context_tokens, 1, chunk_tokens),
+            } => (context_tokens, context_tokens, 1, 1, chunk_tokens),
             ferrum_types::StartupWorkload::Decode {
                 context_tokens,
                 active_sequences,
-            } => (context_tokens, 1, active_sequences, active_sequences),
+            } => {
+                let width =
+                    active_sequences.min(self.config.maximum_decode_wave_sequences as usize);
+                (context_tokens, 1, active_sequences, width, width)
+            }
         };
         let context = u64::try_from(context)
             .map_err(|_| FerrumError::config("startup context exceeds u64"))?;
@@ -473,7 +573,13 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
             .execution_plan()
             .payload()
             .memory()
-            .startup_workload_peak_bytes(context, frontier, sequences, tokens)
+            .startup_resident_workload_peak_bytes(
+                context,
+                frontier,
+                sequences,
+                wave_sequences as u32,
+                tokens,
+            )
             .map_err(|error| FerrumError::config(format!("compiled startup memory: {error}")))
     }
 
@@ -497,6 +603,11 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
             || plan.request.usable_capacity_bytes != memory.usable_capacity_bytes()
             || plan.context_peak_bytes > memory.usable_capacity_bytes()
             || plan.decode_peak_bytes > memory.usable_capacity_bytes()
+            || plan
+                .serving_concurrency_search
+                .as_ref()
+                .and_then(|search| search.capture_warmup_peak_bytes)
+                .is_some_and(|bytes| bytes > memory.usable_capacity_bytes())
         {
             return Err(FerrumError::config(
                 "startup memory report differs from the retained compiled plan",
