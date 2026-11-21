@@ -477,44 +477,48 @@ impl EngineInner {
             .startup_memory_plan
             .as_ref()
             .and_then(|plan| plan.auto_prefill_preparation_window());
-        let (selection, limit) =
-            if let Some(limit) = self.scheduler.prefill_limit_before_selection(width, window) {
-                (Selection::Ready(intent), limit)
-            } else {
-                self.refresh_selection_prefixes(None).await?;
-                let progress = self.with_selection_capacity(|wake, observe| {
-                    let draft = self.scheduler.select_resident_token_work(
-                        intent,
-                        wake,
-                        observe,
-                        planning.as_deref_mut(),
-                    )?;
-                    let limit = self.scheduler.new_prefills_for_draft(&draft);
-                    if limit == 0 {
-                        // Nothing will enter or restore a prefix between the two
-                        // selections. Use the same capacity snapshot for both.
-                        return self
-                            .scheduler
-                            .finish_token_batch(draft, wake, observe, planning.as_deref_mut())
-                            .map(std::ops::ControlFlow::Break);
-                    }
-                    Ok(std::ops::ControlFlow::Continue((draft, limit)))
-                })?;
-                match progress {
-                    std::ops::ControlFlow::Break(batch) => {
-                        return Ok((
-                            batch,
-                            PendingPrefillMaintenance::new(
-                                self.model_executor.as_ref().as_ref(),
-                                Vec::new(),
-                            ),
-                        ))
-                    }
-                    std::ops::ControlFlow::Continue((draft, limit)) => {
-                        (Selection::Started(draft), limit)
-                    }
+        let early_limit = self
+            .scheduler
+            .prefill_limit_before_selection(width, window, |tokens| {
+                self.sequences.all_fit_context(tokens)
+            });
+        let (selection, limit) = if let Some(limit) = early_limit {
+            (Selection::Ready(intent), limit)
+        } else {
+            self.refresh_selection_prefixes(None).await?;
+            let progress = self.with_selection_capacity(|wake, observe| {
+                let draft = self.scheduler.select_resident_token_work(
+                    intent,
+                    wake,
+                    observe,
+                    planning.as_deref_mut(),
+                )?;
+                let limit = self.scheduler.new_prefills_for_draft(&draft);
+                if limit == 0 {
+                    // Nothing will enter or restore a prefix between the two
+                    // selections. Use the same capacity snapshot for both.
+                    return self
+                        .scheduler
+                        .finish_token_batch(draft, wake, observe, planning.as_deref_mut())
+                        .map(std::ops::ControlFlow::Break);
                 }
-            };
+                Ok(std::ops::ControlFlow::Continue((draft, limit)))
+            })?;
+            match progress {
+                std::ops::ControlFlow::Break(batch) => {
+                    return Ok((
+                        batch,
+                        PendingPrefillMaintenance::new(
+                            self.model_executor.as_ref().as_ref(),
+                            Vec::new(),
+                        ),
+                    ))
+                }
+                std::ops::ControlFlow::Continue((draft, limit)) => {
+                    (Selection::Started(draft), limit)
+                }
+            }
+        };
         let (admitted, pending) = if limit != 0 {
             self.prepare_dynamic_admission_round(limit, planning.as_deref_mut())
                 .await?

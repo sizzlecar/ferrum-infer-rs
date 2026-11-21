@@ -120,6 +120,23 @@ pub struct StartupConcurrencySearch {
     /// full context, with the full mixed-step budget and prepared workspaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub two_wave_full_context_peak_bytes: Option<u64>,
+    /// A smaller per-request context at which both complete waves fit when
+    /// the model's full context does not. Includes its physical byte charge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_wave_bounded_context: Option<StartupPrefillContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartupPrefillContext {
+    pub max_request_tokens: usize,
+    pub peak_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillPreparationWindow {
+    pub max_sequences: usize,
+    /// When present, all live requests must fit this context to use the second wave.
+    pub request_context_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,19 +154,26 @@ pub struct StartupMemoryPlan {
 impl StartupMemoryPlan {
     /// Eager preparation may get one wave ahead only when that complete
     /// working set fits. Parked work can still yield its execution slot.
-    pub fn auto_prefill_preparation_window(&self) -> Option<usize> {
+    pub fn auto_prefill_preparation_window(&self) -> Option<PrefillPreparationWindow> {
         let search = self.serving_concurrency_search.as_ref()?;
         let width = search.decode_wave_sequences;
-        Some(
-            if search
-                .two_wave_full_context_peak_bytes
-                .is_some_and(|peak| peak <= self.request.usable_capacity_bytes)
-            {
+        let budget = self.request.usable_capacity_bytes;
+        let full_context_fits = search
+            .two_wave_full_context_peak_bytes
+            .is_some_and(|peak| peak <= budget);
+        let bounded = search
+            .two_wave_bounded_context
+            .filter(|proof| proof.peak_bytes <= budget && proof.max_request_tokens > 0);
+        Some(PrefillPreparationWindow {
+            max_sequences: if full_context_fits || bounded.is_some() {
                 width.saturating_mul(2).min(self.selected.max_sequences)
             } else {
                 width
             },
-        )
+            request_context_limit: bounded
+                .filter(|_| !full_context_fits)
+                .map(|proof| proof.max_request_tokens),
+        })
     }
 
     pub fn apply_to_engine_config(&self, engine: &mut crate::EngineConfig) -> Result<(), String> {

@@ -2912,16 +2912,22 @@ pub(crate) mod tests {
         let lookahead_peak = search.two_wave_full_context_peak_bytes.unwrap();
         assert!(lookahead_peak > report.context_peak_bytes);
         let mut window = report.clone();
+        let expected_window = |max_sequences| {
+            Some(ferrum_types::PrefillPreparationWindow {
+                max_sequences,
+                request_context_limit: None,
+            })
+        };
         window.request.usable_capacity_bytes = lookahead_peak;
-        assert_eq!(window.auto_prefill_preparation_window(), Some(4));
+        assert_eq!(window.auto_prefill_preparation_window(), expected_window(4));
         window.request.usable_capacity_bytes = lookahead_peak - 1;
-        assert_eq!(window.auto_prefill_preparation_window(), Some(2));
+        assert_eq!(window.auto_prefill_preparation_window(), expected_window(2));
         window
             .serving_concurrency_search
             .as_mut()
             .unwrap()
             .two_wave_full_context_peak_bytes = None;
-        assert_eq!(window.auto_prefill_preparation_window(), Some(2));
+        assert_eq!(window.auto_prefill_preparation_window(), expected_window(2));
         assert_eq!(
             report.decode_peak_bytes,
             expanded_memory
@@ -2932,6 +2938,48 @@ pub(crate) mod tests {
         // authorizes a fresh search when the output session limit has changed.
         let receipt = report.clone();
         drop(expanded);
+        let mut long_context = serving.clone();
+        long_context.runtime.max_model_len = Some(declared_context as usize);
+        let (_, long) = create(&long_context);
+        let long = long.unwrap();
+        let report = long.startup_memory_plan().unwrap();
+        let search = report.serving_concurrency_search.as_ref().unwrap();
+        let proof = search
+            .two_wave_bounded_context
+            .expect("shorter requests fit two waves");
+        assert!(proof.max_request_tokens < report.selected.context_tokens);
+        assert_eq!(
+            report
+                .auto_prefill_preparation_window()
+                .unwrap()
+                .request_context_limit,
+            Some(proof.max_request_tokens)
+        );
+        let memory = long
+            .resolved_model_plan()
+            .unwrap()
+            .execution_plan()
+            .payload()
+            .memory();
+        let wave = search.decode_wave_sequences as u32;
+        let price = |context: usize| {
+            memory
+                .startup_resident_workload_peak_bytes(
+                    context as u64,
+                    context as u64,
+                    2 * wave,
+                    wave,
+                    report
+                        .selected
+                        .max_batch_tokens
+                        .min(context * wave as usize) as u64,
+                )
+                .unwrap()
+        };
+        assert_eq!(price(proof.max_request_tokens), proof.peak_bytes);
+        assert!(proof.peak_bytes <= report.request.usable_capacity_bytes);
+        assert!(price(proof.max_request_tokens + 1) > report.request.usable_capacity_bytes);
+        drop(long);
         let mut restored = serving.clone();
         receipt.apply_to_engine_config(&mut restored).unwrap();
         restored.runtime.startup_memory_request = None;

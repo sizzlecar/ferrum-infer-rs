@@ -544,13 +544,14 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
         })
     }
 
-    /// Cost of retaining two complete waves at full context while one mixed
-    /// step executes. Include the actual page-growth and prepared arena policy.
-    pub fn two_wave_full_context_peak_bytes(
+    /// Price two complete waves while one mixed step executes. If full context
+    /// does not fit, find the largest verified context on this compilation.
+    pub fn two_wave_prefill_capacity(
         &self,
         wave: u32,
         batch_tokens: usize,
-    ) -> Result<Option<u64>> {
+        budget: u64,
+    ) -> Result<(Option<u64>, Option<ferrum_types::StartupPrefillContext>)> {
         let memory = self
             .compilation
             .executable()
@@ -561,28 +562,50 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
             .checked_mul(2)
             .filter(|&n| n <= memory.maximum_active_sequences())
         else {
-            return Ok(None);
+            return Ok((None, None));
         };
-        let context = u64::try_from(self.config.maximum_model_tokens)
-            .map_err(|_| FerrumError::config("compiled context exceeds u64"))?;
         let tokens = u64::try_from(batch_tokens)
-            .map_err(|_| FerrumError::config("compiled batch token budget exceeds u64"))?
-            .min(context.saturating_mul(u64::from(wave)));
-        memory
-            .startup_grouped_workload_peak_bytes(
-                context,
-                &[(context, resident)],
-                wave,
-                tokens,
-                self.config
-                    .runtime_policy
-                    .admission()
-                    .sequence_backing_growth,
-            )
-            .map(Some)
-            .map_err(|error| {
-                FerrumError::config(format!("compiled prefill lookahead memory: {error}"))
-            })
+            .map_err(|_| FerrumError::config("compiled batch token budget exceeds u64"))?;
+        let peak = |context: usize| {
+            let context = u64::try_from(context)
+                .map_err(|_| FerrumError::config("compiled context exceeds u64"))?;
+            memory
+                .startup_grouped_workload_peak_bytes(
+                    context,
+                    &[(context, resident)],
+                    wave,
+                    tokens.min(context.saturating_mul(u64::from(wave))),
+                    self.config
+                        .runtime_policy
+                        .admission()
+                        .sequence_backing_growth,
+                )
+                .map_err(|error| {
+                    FerrumError::config(format!("compiled prefill lookahead memory: {error}"))
+                })
+        };
+        let context = self.config.maximum_model_tokens;
+        let full_peak = peak(context)?;
+        if full_peak <= budget {
+            return Ok((Some(full_peak), None));
+        }
+        let mut low = 0;
+        let mut high = context - 1;
+        let mut bounded = None;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            let bytes = peak(middle)?;
+            if bytes <= budget {
+                low = middle;
+                bounded = Some(ferrum_types::StartupPrefillContext {
+                    max_request_tokens: middle,
+                    peak_bytes: bytes,
+                });
+            } else {
+                high = middle - 1;
+            }
+        }
+        Ok((Some(full_peak), bounded))
     }
 
     /// Evaluate the retained compiled plan without allocating device memory.

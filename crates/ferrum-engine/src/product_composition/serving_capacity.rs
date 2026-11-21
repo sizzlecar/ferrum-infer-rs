@@ -156,17 +156,20 @@ pub(super) fn expand<'a, R: DeviceRuntime>(
         ));
     }
     let wave = resident.min(engine.batching.max_batch_size);
-    let two_wave_full_context_peak_bytes = selected.two_wave_full_context_peak_bytes(
-        u32::try_from(wave)
-            .map_err(|_| ferrum_types::FerrumError::config("decode wave exceeds u32"))?,
-        fitted.selected.max_batch_tokens,
-    )?;
+    let (two_wave_full_context_peak_bytes, two_wave_bounded_context) = selected
+        .two_wave_prefill_capacity(
+            u32::try_from(wave)
+                .map_err(|_| ferrum_types::FerrumError::config("decode wave exceeds u32"))?,
+            fitted.selected.max_batch_tokens,
+            budget,
+        )?;
     fitted.serving_concurrency_search = Some(StartupConcurrencySearch {
         upper_bound,
         decode_wave_sequences: wave,
         candidate_compilations: compilations,
         capture_warmup_peak_bytes: warmup_peak,
         two_wave_full_context_peak_bytes,
+        two_wave_bounded_context,
     });
     Ok(selected)
 }

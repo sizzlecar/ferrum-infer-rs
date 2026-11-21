@@ -3,6 +3,8 @@ use super::*;
 
 pub(super) struct SequenceHandle {
     request_id: RequestId,
+    /// Maximum physical context needed by this generation, fixed at publication.
+    maximum_sequence_tokens: usize,
     state: Mutex<Option<SequenceState>>,
 }
 
@@ -14,6 +16,7 @@ impl SequenceHandle {
             }
             Self {
                 request_id,
+                maximum_sequence_tokens: state.model_maximum_sequence_tokens(),
                 state: Mutex::new(Some(state)),
             }
         })
@@ -50,6 +53,15 @@ impl SequenceRegistry {
 
     pub(super) fn is_empty(&self) -> bool {
         self.index.read().is_empty()
+    }
+
+    /// Publication and admission share the iteration gate. Include parked and
+    /// queued requests so an asynchronous grant cannot introduce a longer one.
+    pub(super) fn all_fit_context(&self, tokens: usize) -> bool {
+        self.index
+            .read()
+            .values()
+            .all(|handle| handle.maximum_sequence_tokens <= tokens)
     }
 
     pub(super) fn is_current(&self, handle: &Arc<SequenceHandle>) -> bool {

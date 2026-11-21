@@ -56,9 +56,9 @@ use ferrum_execution::model_executor::{
 use ferrum_interfaces::scheduler::{PreparedPrefixRestore, SchedulerMetrics};
 use ferrum_runtime::{AdmissionRejected, CapacityAvailabilityEpoch};
 use ferrum_types::{
-    AllocatorCapacityDomain, BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority,
-    RequestId, RequestIngressBoundary, RequestState, Result, SchedulerConfig,
-    PROMPT_TOKENS_METADATA_KEY,
+    AllocatorCapacityDomain, BatchId, FerrumError, InferenceRequest, InferenceResponse,
+    PrefillPreparationWindow, Priority, RequestId, RequestIngressBoundary, RequestState, Result,
+    SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
 };
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
@@ -2140,7 +2140,8 @@ impl ContinuousBatchScheduler {
     pub fn prefill_limit_before_selection(
         &self,
         width: usize,
-        automatic_window: Option<usize>,
+        automatic_window: Option<PrefillPreparationWindow>,
+        all_fit_context: impl FnOnce(usize) -> bool,
     ) -> Option<usize> {
         let waiting = self.waiting_count();
         let limit = width.min(waiting);
@@ -2154,9 +2155,12 @@ impl ContinuousBatchScheduler {
         if waiting <= width.saturating_sub(active) {
             return Some(limit);
         }
-        let can_prepare_ahead = window > width && active < window;
-        let window = if can_prepare_ahead && self.waiting_has_multi_chunk_prefill(width) {
-            window
+        let can_prepare_ahead = window.max_sequences > width && active < window.max_sequences;
+        let window = if can_prepare_ahead
+            && self.waiting_has_multi_chunk_prefill(width)
+            && window.request_context_limit.is_none_or(all_fit_context)
+        {
+            window.max_sequences
         } else {
             width
         };
