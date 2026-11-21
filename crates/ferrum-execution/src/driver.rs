@@ -2235,24 +2235,24 @@ fn product_repetition_input(
     }
 }
 
-fn padded_repetition_token_id_bytes(token_ids: &[u32], capacity: usize) -> Result<Vec<u8>> {
+/// The device row keeps its compiled capacity. The separately uploaded offsets
+/// authorize reads of this participant's live prefix, including after a row is reused.
+fn repetition_token_id_prefix(
+    token_ids: &[u32],
+    capacity: usize,
+) -> Result<(HostTransferLayout, Vec<u8>)> {
     if token_ids.len() > capacity {
         return Err(FerrumError::backend(format!(
             "vNext sparse repetition input contains {} ids, capacity is {capacity}",
             token_ids.len()
         )));
     }
-    let byte_capacity = capacity
-        .checked_mul(std::mem::size_of::<u32>())
-        .ok_or_else(|| FerrumError::backend("vNext repetition token-id bytes overflow usize"))?;
-    let mut bytes = vec![0_u8; byte_capacity];
-    for (destination, token_id) in bytes
-        .chunks_exact_mut(std::mem::size_of::<u32>())
-        .zip(token_ids)
-    {
-        destination.copy_from_slice(&token_id.to_le_bytes());
-    }
-    Ok(bytes)
+    let count = u64::try_from(token_ids.len())
+        .map_err(|_| FerrumError::backend("vNext repetition token count exceeds u64"))?;
+    let layout = HostTransferLayout::new(ElementType::U32, count)
+        .map_err(|error| FerrumError::backend(error.to_string()))?;
+    let bytes = token_ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+    Ok((layout, bytes))
 }
 
 fn decode_selected_token(bytes: &[u8], vocabulary_size: usize) -> Result<TokenId> {
@@ -9909,7 +9909,7 @@ mod tests {
         decode_selected_token, is_language_masked_argmax_operation,
         is_language_token_embedding_operation, journal_clock_anchor_required,
         nonterminal_completion_message, normalized_product_token_mask,
-        padded_repetition_token_id_bytes, product_output_mode_for_roles, product_repetition_input,
+        product_output_mode_for_roles, product_repetition_input, repetition_token_id_prefix,
         reported_allocated_bytes, resolve_reusable_execution_policy,
         resolve_runtime_attention_authority, resolved_sequence_fit_policy,
         reusable_catalog_lookup_allowed, reusable_executable_inventory_matches,
@@ -11340,19 +11340,15 @@ mod tests {
     }
 
     #[test]
-    fn repetition_token_ids_are_zero_padded_to_the_typed_participant_capacity() {
-        let bytes = padded_repetition_token_id_bytes(&[3, 9], 4).unwrap();
-        assert_eq!(
-            bytes,
-            [
-                3_u32.to_le_bytes(),
-                9_u32.to_le_bytes(),
-                0_u32.to_le_bytes(),
-                0_u32.to_le_bytes(),
-            ]
-            .concat()
-        );
-        assert!(padded_repetition_token_id_bytes(&[3, 9], 1).is_err());
+    fn repetition_upload_covers_only_the_live_ids_within_the_participant_capacity() {
+        let ids = [3_u32, 0x01020304];
+        let expected = [ids[0].to_le_bytes(), ids[1].to_le_bytes()].concat();
+        for capacity in [ids.len(), 262_144] {
+            let (layout, bytes) = repetition_token_id_prefix(&ids, capacity).unwrap();
+            assert_eq!(layout.byte_len().unwrap(), 8);
+            assert_eq!(bytes, expected);
+        }
+        assert!(repetition_token_id_prefix(&ids, 1).is_err());
     }
 
     #[test]

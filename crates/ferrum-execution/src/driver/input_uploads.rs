@@ -134,11 +134,6 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             .collect::<Result<Vec<_>>>();
         uploads.extend(token_mask_uploads?.into_iter().flatten());
         let repetition_uploads = (|| -> Result<_> {
-            let repetition_capacity = u64::try_from(self.io.repetition_capacity)
-                .map_err(|_| FerrumError::backend("vNext repetition capacity exceeds u64"))?;
-            let repetition_token_id_layout =
-                HostTransferLayout::new(ElementType::U32, repetition_capacity)
-                    .map_err(|error| FerrumError::backend(error.to_string()))?;
             let repetition_offset_layout = HostTransferLayout::new(ElementType::U32, 2)
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
             let repetition_penalty_layout = HostTransferLayout::new(ElementType::F32, 1)
@@ -156,13 +151,6 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         "vNext sparse repetition penalty must be finite and positive",
                     ));
                 }
-                if repetition.token_ids.len() > self.io.repetition_capacity {
-                    return Err(FerrumError::backend(format!(
-                        "vNext sparse repetition input contains {} ids, capacity is {}",
-                        repetition.token_ids.len(),
-                        self.io.repetition_capacity
-                    )));
-                }
                 if repetition.token_ids.iter().any(|token| {
                     usize::try_from(*token).map_or(true, |token| token >= self.io.output_elements)
                 }) {
@@ -177,17 +165,18 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     FerrumError::backend("vNext repetition token count exceeds u32")
                 })?;
                 if repetition_count != 0 {
+                    let (layout, bytes) = repetition_token_id_prefix(
+                        repetition.token_ids,
+                        self.io.repetition_capacity,
+                    )?;
                     token_id_uploads.push(
                         SubmissionWaveInputUpload::new(
                             self.io.repetition_token_ids_input_node_id.clone(),
                             participant_index,
                             self.io.repetition_token_ids_input_ordinal,
                             0,
-                            repetition_token_id_layout,
-                            padded_repetition_token_id_bytes(
-                                repetition.token_ids,
-                                self.io.repetition_capacity,
-                            )?,
+                            layout,
+                            bytes,
                         )
                         .map_err(|error| FerrumError::backend(error.to_string()))?,
                     );
