@@ -34,6 +34,93 @@ fn scheduled_tokens(batch: &BatchPlan, request_id: &RequestId) -> Option<usize> 
 }
 
 #[test]
+fn saturated_wave_defers_new_state_until_a_participant_parks() {
+    let scheduler = budgeted_scheduler(16);
+    let decodes = activate_decode_requests(&scheduler, 2);
+    let newcomer = waiting_prompt(&scheduler, 5);
+    let select = || {
+        scheduler
+            .select_resident_token_work(
+                scheduler.prepare_token_batch_selection(hint(2, 16)),
+                None,
+                &mut |_| {},
+                None,
+            )
+            .unwrap()
+    };
+    let full = select();
+    assert_eq!(scheduler.new_prefills_for_draft(&full), 0);
+    assert_eq!(scheduler.waiting_count(), 1);
+    assert_eq!(
+        scheduler
+            .finish_token_batch(full, None, &mut |_| {}, None)
+            .unwrap()
+            .batch
+            .unwrap()
+            .requests
+            .len(),
+        2
+    );
+
+    let wake = scheduler.pause_for_output(&decodes[0]).unwrap();
+    let partial = select();
+    let slots = scheduler.new_prefills_for_draft(&partial);
+    assert_eq!(slots, 1);
+    scheduler
+        .prepare_token_admission_observed(
+            slots,
+            None,
+            &mut |request| {
+                assert_eq!(request.id, newcomer);
+                AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                    request_id: request.id.clone(),
+                })
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    let batch = scheduler
+        .finish_token_batch(partial, None, &mut |_| {}, None)
+        .unwrap()
+        .batch
+        .unwrap();
+    assert_eq!(scheduled_tokens(&batch, &newcomer), Some(5));
+    assert_eq!(scheduled_tokens(&batch, &decodes[1]), Some(1));
+    assert_eq!(scheduled_tokens(&batch, &decodes[0]), None);
+    assert_eq!(scheduler.active_count(), 3);
+    wake.resume();
+    let resumed = select();
+    assert!(resumed.contains(&decodes[0]));
+    assert!(resumed.contains(&decodes[1]));
+}
+
+#[test]
+fn saturated_wave_accounts_for_prefill_tokens_before_probing_waiters() {
+    let scheduler = budgeted_scheduler(3);
+    activate_decode_requests(&scheduler, 1);
+    let incumbent = waiting_prompt(&scheduler, 8);
+    scheduler.promote_to_prefill_with_empty_retry(&incumbent, None);
+    let waiting = waiting_prompt(&scheduler, 8);
+    let draft = scheduler
+        .select_resident_token_work(
+            scheduler.prepare_token_batch_selection(hint(4, 32)),
+            None,
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+    assert_eq!(scheduler.new_prefills_for_draft(&draft), 0);
+    let batch = scheduler
+        .finish_token_batch(draft, None, &mut |_| {}, None)
+        .unwrap()
+        .batch
+        .unwrap();
+    assert_eq!(scheduled_tokens(&batch, &incumbent), Some(3));
+    assert_eq!(scheduled_tokens(&batch, &waiting), None);
+    assert_eq!(scheduler.waiting_count(), 1);
+}
+
+#[test]
 fn active_decode_prefill_token_budget_caps_the_whole_iteration_with_request_caps() {
     let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
         max_running_requests: 8,

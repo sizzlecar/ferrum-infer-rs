@@ -69,7 +69,10 @@ impl EngineInner {
 
     /// Planning owns the iteration gate. Each preparation additionally retains
     /// its original request handle across the device await and publication.
-    pub(super) async fn restore_admitted_prefixes(&self) -> Result<()> {
+    pub(super) async fn restore_admitted_prefixes(
+        &self,
+        draft: Option<&ferrum_scheduler::implementations::continuous::TokenBatchDraft>,
+    ) -> Result<()> {
         let candidates = self
             .sequences
             .snapshot()
@@ -109,6 +112,9 @@ impl EngineInner {
         }
 
         for (handle, prompt_tokens) in candidates {
+            if draft.is_some_and(|draft| draft.contains(handle.request_id())) {
+                continue;
+            }
             let request_id = handle.request_id().clone();
             let Some((tokens, maximum_sequence_tokens, incarnation)) = (|| {
                 let state = handle.lock();
