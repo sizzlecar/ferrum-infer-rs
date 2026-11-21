@@ -6,6 +6,8 @@
 
 27B GGUF 原始 C96 回退版本吞吐为 231.00。当前候选与主干交换启动顺序后，各完成 768/768 条，四轮合并吞吐为主干 617.00、候选 614.13 输出 tok/s。候选的首 token 和每输出 token P99 分别慢 147.96 和 2.51 ms，可见间隔快 2.98 ms。同版显式上限 32 另测两轮为 614.98 tok/s。README 冻结请求的逐模型配对与原始延迟门限仍在核对。[本轮实机证据](performance-auto-serving-admission-rtx5090.zh.md) · [首次热门模型验收](performance-auto-serving-capacity-rtx5090.zh.md) · [布局与过载诊断](performance-auto-serving-layout-rtx5090.zh.md) · [问题线索 #504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504)
 
+调度器实验 `a27e1a6bf` 修复了队列扫描前新到请求可能错过空执行位的问题。9B C16 与同窗前版相比，吞吐从 1,186.13 提到 1,199.88 tok/s，首 token P99 从 402.94 降到 320.83 ms。4B C16 的首 token 也更快，吞吐却从 1,436.05 降到 1,405.58 tok/s。该实验保持独立，采用决定还需要核对反序、普通 C48 和 27B C96。[调度器实验的同卡对照](performance-auto-serving-admission-rtx5090.zh.md#调度器实验的无跟踪对照)
+
 ## 产品目标
 
 用户在同一台卡上换用更小的模型时，普通 `ferrum serve MODEL` 能利用多出来的容量。服务应说明采用的单请求上下文上限、可同时保留状态的请求数、单轮可执行的批宽和 token 预算。高并发的价值用成功完成请求的输出吞吐和用户可见延迟衡量。
@@ -39,6 +41,7 @@
 - [#386](https://github.com/sizzlecar/ferrum-infer-rs/pull/386) 已把原生 `run` 和 `serve` 接入设备探针和编译计划。问题出在产品默认值同时充当了搜索上限，两层各自给出的约束缺少区分。
 - [#503](https://github.com/sizzlecar/ferrum-infer-rs/pull/503) 修复 Windows SM89 原生算子的选择。后续 [#504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504) 单独记录了 4050 6 GiB 上 Auto 4 与显式 32 的差距。这次用 5090 检验相同的架构问题，4050 上的修复效果仍需在该卡复验。
 - [#514](https://github.com/sizzlecar/ferrum-infer-rs/pull/514) 发布的 5090 Qwen3.5-4B C8/C16 数据固定了服务端容量 32。客户端发出的并发、服务端允许驻留的请求数和调度器单步执行的批宽需要分别记录。
+- 4B 同卡实测中，显式 `--max-num-seqs 48` 还将优先预填充阈值从 Auto 的 32 提至 48，自动预捕获的最大解码宽度仍是 32。Auto 的预算可行性、实际驻留数、调度优先级和捕获覆盖范围分别影响响应时间。健康接口的“处于解码阶段”是采样时的请求数，每轮 GPU 实际提交宽度须从执行证据读取。[配置对照](performance-auto-serving-admission-rtx5090.zh.md)
 - [#517](https://github.com/sizzlecar/ferrum-infer-rs/pull/517) 已提供 `--runtime-pool-preparation within-budget`。容量搜索决定可接纳的形状，预备策略决定何时为这些形状分配物理池，运行时按实际存活请求和缓存占用执行准入。三者共用编译后的物理成本口径。
 - [#523](https://github.com/sizzlecar/ferrum-infer-rs/pull/523) 和 [#532](https://github.com/sizzlecar/ferrum-infer-rs/pull/532) 分别改了视频运行时／任务恢复和 Qwen-Image 2.1。它们也有批处理和资源准备，但请求存活时间与文本 KV 的增长方式不同。这里的驻留与单轮宽度契约限定在文本生成。
 
@@ -174,13 +177,19 @@ cargo build --locked --offline --profile release-tools -p ferrum-cli --bin ferru
 
 5090 上的原始 Rust 报告、逐轮数据、`/health`、SSE 和跟踪位于 `/mnt/d/ferrum-capacity-eval-20261121-0701/r4-full-evidence.tgz`（SHA-256 `78a7a7053d20594a349ee6b31c14d547ca7493042b1eb6f453ad1b590e2663b2`）。长输入和前缀缓存另存于同目录的 `r4-prefix-full.tgz`（SHA-256 `95c2203498c436fdf2eb04503a8564bcf01ab0c45ef09118e1cf70ddc5d77a47`）。同目录 `build-evidence/` 保留与上文哈希对应的两个服务二进制及验证日志。大文件保存在仓库外。
 
-## 工程验证
+## 11 月 21 日首轮的工程验证与服务恢复
 
 - macOS 上 `cargo fmt --all -- --check`、Git 差异检查与 `cargo check --locked --workspace --all-targets --features metal` 通过。Metal 本次只验证编译。
 - Linux 上 `cargo check --locked --workspace --all-targets`、`cargo clippy --locked --workspace --all-targets -- -A warnings` 通过。CUDA 12.8.1 搭配上述 SM120 算子锁，`cargo check --locked -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2` 通过。
 - Linux 普通用户执行 `cargo test --locked --offline --workspace --all-targets --no-fail-fast`，最终退出码 0。348 份测试结果合计 8610 项通过、102 项标记忽略。首次容器以 root 运行时可写入只读文件，触发安装器权限回归测试的前置断言；切换为普通用户后也为 `trybuild` 配置了独立可写缓存，再运行全套。
 - Rust 定向测试覆盖 CLI 的自动／显式／预设／单请求入口，真实模型计划到引擎的传递、算子不可用与容量不足的区分、上下文不足时的捕获宽度、捕获重放、Q8 可选布局、逐序列页对齐和按执行波计费。5090 上另用实际服务验证协议、请求驻留和受管分配。
 - 实验结束后已停止测试服务并释放 5090 的临时构建盘。原有 `fastvideo-h3-5090.service` 已恢复到 `active/running`，其主进程出现在 GPU 计算进程表，端口 18196 的 `/health` 和 `/v1/models` 均返回 HTTP 200。热门模型及 4B 反序复测收尾后于 17:48 再次核对。服务与 path 保持原先的 disabled 设置，path 为 inactive，唯一 GPU 进程号与服务主进程一致，模型列表返回 `FastH3-Omni-5090`。
+
+## 11 月 22 日当前候选的工程验证
+
+当前性能候选为 `4d4d9f409`。macOS 的执行、引擎、运行时、调度器和共享类型库分别通过 277、947、1,040、208 和 276 项测试，引擎和运行时各有 1 和 7 项标记为忽略。另在真实 Metal GPU 上完成 FP32 精度／残差别名、FP16 对 CPU、两种精度的掩码与重复惩罚选词，以及参与者工作区隔离四项对照。工作区尺寸测试也通过，专用 Metal 计时微基准按其标记跳过。5090 已运行本候选的四项 CUDA 算子对照，涵盖重复惩罚有效前缀、批处理与捕获以及分页解码。两个独立的 4B CUDA `ferrum run` 进程在固定 2048 和模型默认上下文均返回算术答案 `5`。服务端实测、冻结请求的三项 P99 和仍在验证的退化单列于[性能报告](performance-auto-serving-admission-rtx5090.zh.md)。
+
+本轮原业务服务已按要求停止。Linux 全工作区检查与最终服务恢复仍待完成。调度器实验 `a27e1a6bf` 的独立验证只记在其自身提交下。
 
 ## 默认 Auto 的性能回归
 
