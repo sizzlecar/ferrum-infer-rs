@@ -2,7 +2,9 @@
 
 **默认 Auto 仍在验收，5090 上当前实测提交为 `4d4d9f409`。** Qwen3.5-4B Q4_K_M 普通启动、混合 ShareGPT C48 的 288 条请求全部成功。相对于前一候选 `f1e3f4c0f`，吞吐从 550.15 升至 1,165.80 输出 tok/s，首 token P99 从 5.80 降至 2.74 秒，每输出 token P99 从 120.74 降至 39.57 ms，可见间隔 P99 从 190.73 降至 180.90 ms，按时完成从 141 增至 248 条。固定 C48 的引擎输入上传从 20.06 降至 0.27 GB。混合 C48 仍超过首 token 和可见间隔门限。[逐项测量](performance-auto-serving-admission-rtx5090.zh.md)
 
-27B GGUF 原始 C96 回退版本吞吐为 231.00，当前候选为 615.10，两次独立启动的同卡主干为 611.96、620.14 输出 tok/s，各组均完成 384/384 条。与后一次主干比较，当前候选的首 token 和每输出 token P99 分别慢 192.49 和 2.25 ms，可见间隔快 12.55 ms。九种权重的冻结 ShareGPT、反向启动顺序和同一版的显式容量对照仍决定是否发布。此前 4B 普通启动的两组主干 / `f1e3f4c0f` 虽在混合 C48 有收益，C8 的可见间隔 P99 却从 51.39 增至 55.95 ms。该冻结客户端显式关闭重复惩罚，还要单独复测。当前版的准入收益另用只含输入上传修复的主干核对。[本轮实机证据](performance-auto-serving-admission-rtx5090.zh.md) · [首次热门模型验收](performance-auto-serving-capacity-rtx5090.zh.md) · [布局与过载诊断](performance-auto-serving-layout-rtx5090.zh.md) · [问题线索 #504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504)
+在同一 4B 普通启动、混合 C48 上，主干、主干仅修上传、同版显式 32、Auto 和同版显式 48 的吞吐分别为 337.28、532.10、872.13、1,165.80 和 1,213.19 tok/s。Auto 实际最多驻留 36 条，按时完成 248/288，每输出 token P99 为 39.57 ms。显式 48 的对应结果为 275/288 和 48.99 ms。固定短输入则是 Auto 的吞吐更高，1,787.17 对 1,690.76 tok/s。每个设置都用了同样的外部请求与采样口径。[各手动设置及输入修复对照](performance-auto-serving-admission-rtx5090.zh.md)
+
+27B GGUF 原始 C96 回退版本吞吐为 231.00。当前候选与主干交换启动顺序后，各完成 768/768 条，四轮合并吞吐为主干 617.00、候选 614.13 输出 tok/s。候选的首 token 和每输出 token P99 分别慢 147.96 和 2.51 ms，可见间隔快 2.98 ms。同版显式上限 32 另测两轮为 614.98 tok/s。README 冻结请求的逐模型配对与原始延迟门限仍在核对。[本轮实机证据](performance-auto-serving-admission-rtx5090.zh.md) · [首次热门模型验收](performance-auto-serving-capacity-rtx5090.zh.md) · [布局与过载诊断](performance-auto-serving-layout-rtx5090.zh.md) · [问题线索 #504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504)
 
 ## 产品目标
 
