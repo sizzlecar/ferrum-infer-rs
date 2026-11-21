@@ -2915,7 +2915,29 @@ pub(crate) mod tests {
                 .startup_resident_workload_peak_bytes(128, 1, 6, 2, 2)
                 .unwrap()
         );
+        // A restored receipt records earlier decisions. Only a current request
+        // authorizes a fresh search when the output session limit has changed.
+        let receipt = report.clone();
         drop(expanded);
+        let mut restored = serving.clone();
+        receipt.apply_to_engine_config(&mut restored).unwrap();
+        restored.runtime.startup_memory_request = None;
+        restored.output.max_sessions = receipt.selected.max_sequences + 1;
+        let (_, restored) = create(&restored);
+        let restored = restored.unwrap();
+        assert_eq!(restored.startup_memory_plan(), Some(&receipt));
+        assert_eq!(
+            restored
+                .resolved_model_plan()
+                .unwrap()
+                .execution_plan()
+                .payload()
+                .memory()
+                .maximum_active_sequences() as usize,
+            receipt.selected.max_sequences
+        );
+        drop(restored);
+
         serving
             .runtime
             .startup_memory_request

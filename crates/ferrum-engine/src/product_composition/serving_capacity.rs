@@ -4,6 +4,10 @@ use ferrum_types::{
     EngineConfig, Result, StartupConcurrencySearch, StartupMemoryPlan, StartupWorkload,
 };
 
+pub(super) fn requested(plan: &StartupMemoryPlan) -> bool {
+    plan.request.search_serving_concurrency && !plan.request.sequences_is_explicit
+}
+
 pub(super) fn upper_bound(engine: &EngineConfig) -> usize {
     // The product validates max_num_seqs <= max_num_batched_tokens. Retain
     // that same public contract so users can replay Auto's effective limits.
