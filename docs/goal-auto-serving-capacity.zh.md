@@ -1,10 +1,12 @@
 # 文本服务按编译计划选择并发容量
 
-**状态**　容量机制及 0.8B 的 5090 实测已完成，README 热门文本模型的性能验收进行中。2026-11-21 从 `main` 的 `0603698cf` 开始，实现提交为 `5d72c31c5`，问题线索见 [#504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504)。
+**状态**　容量机制、0.8B 边界实测和 README 九种热门文本权重的 5090 性能复测已完成。主干与候选各完成 3264/3264 个计时请求，各有 29/36 轮达到原模型的延迟门限。2026-11-21 从 `main` 的 `0603698cf` 开始，实现提交为 `5d72c31c5`，问题线索见 [#504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504)。
 
 ## 产品目标
 
 用户在同一台卡上换用更小的模型时，普通 `ferrum serve MODEL` 能利用多出来的容量。服务应说明采用的单请求上下文上限、可同时保留状态的请求数、单轮可执行的批宽和 token 预算。高并发的价值用成功完成请求的输出吞吐和用户可见延迟衡量。
+
+初版目标对实机验收只写到“建立可复现的同机基线、核验估算与实际资源边界并对比输出有效性及吞吐/延迟”。这使一个 0.8B 模型就能满足文字上的完成条件，遗漏了 README 已发布的用户负载。修订后的完成条件列在下文第 5 项，覆盖九种权重各自的历史并发、请求集和延迟门限。
 
 旧版本先按总显存给出目标并发，再在编译计划允许的范围内向下拟合。这使相同显存档位的大小模型共享并发上限。本次让显存档位提供搜索起点，由候选计划决定能否再多保留几个请求。继续保留显式容量、命名预设及 `run` 的单请求默认语义。[显存估计](../crates/ferrum-types/src/auto_config.rs) · [初始容量拟合](../crates/ferrum-types/src/startup_memory.rs) · [服务并发搜索](../crates/ferrum-engine/src/product_composition/serving_capacity.rs)
 
@@ -31,7 +33,7 @@
 | GPT-OSS-20B MXFP4 | C8、C16；每次启动每格 32 请求，两个独立服务进程。保留 Harmony 默认 medium 和自然 EOS，另列历史 vLLM 吞吐门限。 |
 | Qwen3.8-27B UD-Q4_K_M、Qwen3.8-27B compressed-tensors INT4 | C8、C16；每格 200 请求 × 2，复用 35B 选样 tokenizer 和 27B 模型模板，P99 门限 442.08／29.5956／88.7867 ms。 |
 
-各组门限、历史同卡参照与负载来源见 [README 性能表](../README.md#performance)、[4B 至 35B 对照](performance-rtx5090-popular-models-20261101.md)、[GPT-OSS](performance-rtx5090-gpt-oss-20261102.md) 和 [27B](performance-popular-models-p0.zh.md)。
+逐行结果记录在[本次热门模型实测](performance-auto-serving-capacity-rtx5090.zh.md)。各组门限、历史同卡参照与负载来源见 [README 性能表](../README.md#performance)、[4B 至 35B 对照](performance-rtx5090-popular-models-20261101.md)、[GPT-OSS](performance-rtx5090-gpt-oss-20261102.md) 和 [27B](performance-popular-models-p0.zh.md)。
 
 ## 证据判读
 
@@ -150,8 +152,8 @@ cargo build --locked --offline --profile release-tools -p ferrum-cli --bin ferru
 - Linux 上 `cargo check --locked --workspace --all-targets`、`cargo clippy --locked --workspace --all-targets -- -A warnings` 通过。CUDA 12.8.1 搭配上述 SM120 算子锁，`cargo check --locked -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2` 通过。
 - Linux 普通用户执行 `cargo test --locked --offline --workspace --all-targets --no-fail-fast`，最终退出码 0。348 份测试结果合计 8610 项通过、102 项标记忽略。首次容器以 root 运行时可写入只读文件，触发安装器权限回归测试的前置断言；切换为普通用户后也为 `trybuild` 配置了独立可写缓存，再运行全套。
 - Rust 定向测试覆盖 CLI 的自动／显式／预设／单请求入口，真实模型计划到引擎的传递、算子不可用与容量不足的区分、上下文不足时的捕获宽度、捕获重放、Q8 可选布局、逐序列页对齐和按执行波计费。5090 上另用实际服务验证协议、请求驻留和受管分配。
-- 实验结束后已停止测试服务并释放 5090 的临时构建盘。原有 `fastvideo-h3-5090.service` 已恢复到 `active/running`，其主进程出现在 GPU 计算进程表，端口 18196 的 `/health` 和 `/v1/models` 均返回 HTTP 200。服务与 path 保持原先的 disabled 设置，path 仍为 inactive。
+- 实验结束后已停止测试服务并释放 5090 的临时构建盘。原有 `fastvideo-h3-5090.service` 已恢复到 `active/running`，其主进程出现在 GPU 计算进程表，端口 18196 的 `/health` 和 `/v1/models` 均返回 HTTP 200。热门模型及 4B 反序复测收尾后于 17:48 再次核对。服务与 path 保持原先的 disabled 设置，path 为 inactive，唯一 GPU 进程号与服务主进程一致，模型列表返回 `FastH3-Omni-5090`。
 
 ## 下一个产品方向
 
-这次解决了用户第一次启动文本服务时“这台机器允许保留多少个请求”的问题。下一步建议做“我的业务在延迟目标内适合多少并发”。可以在现有 Rust `bench-serve` 里让用户选自己的提示词和 TTFT／可见 ITL 目标，以已验证的驻留上限限定扫描范围，输出每档的吞吐、排队、失败数和多次测量范围。5090 上的 256 个席位已经实测可用，但 C48 短请求仍有一轮 ITL 超标。这个结果给出了把物理容量和服务负载建议做成两个产品输出的依据。
+这次解决了用户第一次启动文本服务时“这台机器允许保留多少个请求”的问题。下一步建议做“我的业务在延迟目标内适合多少并发”。可以在现有 Rust `bench-serve` 里让用户选自己的提示词和 TTFT／可见 ITL 目标，以已验证的驻留上限限定扫描范围，输出每档的吞吐、排队、失败数和多次测量范围。5090 上的 256 个席位已经实测可用，但 C48 短请求仍有一轮 ITL 超标。热门模型的复测也显示，4B Q4_K_M 能在 C48 同时驻留 48 个请求，两种长度分布各三轮都超过可见 ITL 目标。给用户建议并发时，应以所选权重、真实输入分布和延迟门限做测量。
