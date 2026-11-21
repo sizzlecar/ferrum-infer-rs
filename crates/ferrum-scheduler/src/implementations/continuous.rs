@@ -2139,10 +2139,11 @@ impl ContinuousBatchScheduler {
     /// free slot. Use the optional second wave for multi-chunk prefill work.
     pub fn prefill_limit_before_selection(
         &self,
-        width: usize,
+        hint: &BatchHint,
         automatic_window: Option<PrefillPreparationWindow>,
         all_fit_context: impl FnOnce(usize) -> bool,
     ) -> Option<usize> {
+        let width = hint.max_batch_size;
         let waiting = self.waiting_count();
         let limit = width.min(waiting);
         let Some(window) = automatic_window else {
@@ -2155,32 +2156,48 @@ impl ContinuousBatchScheduler {
         if waiting <= width.saturating_sub(active) {
             return Some(limit);
         }
-        let can_prepare_ahead = window.max_sequences > width && active < window.max_sequences;
-        let window = if can_prepare_ahead
-            && self.waiting_has_multi_chunk_prefill(width)
-            && window.request_context_limit.is_none_or(all_fit_context)
-        {
-            window.max_sequences
+        let prepared_limit = if window.max_sequences > width && active < window.max_sequences {
+            width
+                .saturating_add(self.queued_prefill_lookahead(hint))
+                .min(window.max_sequences)
         } else {
             width
         };
-        (active < window).then(|| limit.min(window - active))
+        let target = if prepared_limit > width
+            && active < prepared_limit
+            && window.request_context_limit.is_none_or(all_fit_context)
+        {
+            prepared_limit
+        } else {
+            width
+        };
+        (active < target).then(|| limit.min(target - active))
     }
 
-    fn waiting_has_multi_chunk_prefill(&self, width: usize) -> bool {
+    /// Each speculative slot needs a queued multi-chunk prompt and enough
+    /// tokens for one normal chunk in the next wave. A single long prompt
+    /// cannot justify opening state for the entire backlog.
+    fn queued_prefill_lookahead(&self, hint: &BatchHint) -> usize {
+        if hint.max_tokens == 0 {
+            return 0;
+        }
         let chunk = self
             .runtime_config
             .prefill_step_chunk
-            .unwrap_or(self.cb_config.prefill_chunk_size);
+            .unwrap_or(self.cb_config.prefill_chunk_size)
+            .max(1);
+        let chunks_per_step = (hint.max_tokens / chunk).max(1);
         self.waiting_queue
             .read()
             .iter()
             .filter(|request| !request.prefix_rendezvous.held())
-            .take(width)
-            .any(|request| {
+            .take(hint.max_batch_size)
+            .filter(|request| {
                 self.known_remaining_prefill_tokens(request)
                     .is_some_and(|tokens| tokens > chunk)
             })
+            .take(chunks_per_step)
+            .count()
     }
 
     fn waiting_prefills_that_fit(

@@ -469,8 +469,6 @@ impl EngineInner {
             Started(TokenBatchDraft),
         }
 
-        let width = hint.max_batch_size;
-        let intent = self.scheduler.prepare_token_batch_selection(hint);
         let window = self
             .config
             .runtime
@@ -479,9 +477,10 @@ impl EngineInner {
             .and_then(|plan| plan.auto_prefill_preparation_window());
         let early_limit = self
             .scheduler
-            .prefill_limit_before_selection(width, window, |tokens| {
+            .prefill_limit_before_selection(&hint, window, |tokens| {
                 self.sequences.all_fit_context(tokens)
             });
+        let intent = self.scheduler.prepare_token_batch_selection(hint);
         let (selection, limit) = if let Some(limit) = early_limit {
             (Selection::Ready(intent), limit)
         } else {

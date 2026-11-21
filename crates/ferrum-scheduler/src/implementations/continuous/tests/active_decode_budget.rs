@@ -37,6 +37,7 @@ fn scheduled_tokens(batch: &BatchPlan, request_id: &RequestId) -> Option<usize> 
 fn saturated_wave_prepares_ahead_only_for_multi_chunk_work_that_fits() {
     let scheduler = budgeted_scheduler(16);
     let chunk = scheduler.cb_config.prefill_chunk_size;
+    let batch = hint(2, 2 * chunk);
     let window = |max_sequences, request_context_limit| {
         Some(PrefillPreparationWindow {
             max_sequences,
@@ -46,35 +47,69 @@ fn saturated_wave_prepares_ahead_only_for_multi_chunk_work_that_fits() {
     activate_decode_requests(&scheduler, 2);
     waiting_prompt(&scheduler, chunk);
     assert_eq!(
-        scheduler.prefill_limit_before_selection(2, window(4, Some(chunk)), |_| panic!(
+        scheduler.prefill_limit_before_selection(&batch, window(4, Some(chunk)), |_| panic!(
             "a single-chunk backlog needs no context scan"
         )),
         None
     );
     waiting_prompt(&scheduler, chunk + 1);
     assert_eq!(
-        scheduler.prefill_limit_before_selection(2, window(2, None), |_| true),
+        scheduler.prefill_limit_before_selection(&batch, window(2, None), |_| true),
         None
     );
     assert_eq!(
-        scheduler.prefill_limit_before_selection(2, window(4, None), |_| panic!(
+        scheduler.prefill_limit_before_selection(&batch, window(4, None), |_| panic!(
             "full model context fits"
         )),
-        Some(2)
+        Some(1)
     );
     assert_eq!(
-        scheduler.prefill_limit_before_selection(2, window(4, Some(chunk)), |_| false),
+        scheduler.prefill_limit_before_selection(&batch, window(4, Some(chunk)), |_| false),
         None
     );
     assert_eq!(
-        scheduler.prefill_limit_before_selection(2, window(4, Some(chunk * 2)), |limit| limit
+        scheduler.prefill_limit_before_selection(&batch, window(4, Some(chunk * 2)), |limit| limit
             == chunk * 2),
-        Some(2)
+        Some(1)
     );
     assert_eq!(
-        scheduler.prefill_limit_before_selection(2, None, |_| true),
+        scheduler.prefill_limit_before_selection(&batch, None, |_| true),
         Some(2)
     );
+}
+
+#[test]
+fn saturated_wave_charges_one_chunk_per_speculative_slot() {
+    let scheduler = budgeted_scheduler(16);
+    let chunk = scheduler.cb_config.prefill_chunk_size;
+    activate_decode_requests(&scheduler, 4);
+    for _ in 0..4 {
+        waiting_prompt(&scheduler, chunk + 1);
+    }
+    let window = Some(PrefillPreparationWindow {
+        max_sequences: 8,
+        request_context_limit: None,
+    });
+    let early =
+        |tokens| scheduler.prefill_limit_before_selection(&hint(4, tokens), window, |_| true);
+    assert_eq!(early(0), None);
+    assert_eq!(early(chunk - 1), Some(1));
+    assert_eq!(early(2 * chunk), Some(2));
+    assert_eq!(early(8 * chunk), Some(4));
+    scheduler
+        .prepare_token_admission_observed(
+            1,
+            None,
+            &mut |request| {
+                AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                    request_id: request.id.clone(),
+                })
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_eq!(scheduler.active_count(), 5);
+    assert_eq!(early(2 * chunk), Some(1));
 }
 
 #[test]
