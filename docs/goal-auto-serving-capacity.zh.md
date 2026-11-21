@@ -1,6 +1,6 @@
 # 文本服务按编译计划选择并发容量
 
-**验收结论：未通过，建议保留主干默认行为。** 5090 上原有 Auto 将 4B Q4_K_M 的驻留数限制在 32。候选在 C48 下实际同时驻留了 48 个请求，容量修复已验证。性能条件未满足，同卡 27B GGUF 在 C8、C16 的吞吐分别下降 4.28%、3.21%，两档合并各自两轮后的首 token P99 也都升高。基线为 2026-11-21 的主干 `0603698cf`，候选为 `5d72c31c5`。[实测报告](performance-auto-serving-capacity-rtx5090.zh.md) · [问题线索 #504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504)
+**默认 Auto 的性能验收未通过，保留主干行为。** 5090 上的 4B Q4_K_M 已能在 C48 下驻留 48 条请求。第一版候选 `5d72c31c5` 在 27B GGUF 上因 Q8 预解码回退，C8/C16 吞吐分别低于主干 4.28% 和 3.21%。布局修复版 `4c2b58108` 恢复了这两档的吞吐，但 C16 首 token P99 仍比同窗口主干高 90.74 ms。在另一次 96 并发的短请求对照中，主干用 19.38 秒完成 192 条，布局修复版用了 60.29 秒。主干为 `0603698cf`。[第一次热门模型验收](performance-auto-serving-capacity-rtx5090.zh.md) · [修复与过载实测](performance-auto-serving-layout-rtx5090.zh.md) · [问题线索 #504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504)
 
 ## 产品目标
 
@@ -158,4 +158,4 @@ cargo build --locked --offline --profile release-tools -p ferrum-cli --bin ferru
 
 ## 默认 Auto 的性能回归
 
-Ferrum 团队负责用 README 已冻结的 ShareGPT 样本验收默认 Auto。当前优先处理 27B GGUF 的退化。可在同一张 5090 上用相同的 C8/C16 请求，对照主干 Auto、候选 Auto 以及候选显式 32，检查吞吐和三项 P99，以区分扩大驻留上限的影响与候选代码的其他影响。修复后由团队重跑九种权重的 ShareGPT 对照，按上文的合入标准决定是否启用新版默认值。
+Ferrum 团队使用 README 冻结的 ShareGPT 样本验收默认 Auto，并把高于旧驻留上限的压力测试与主干同卡配对。每档比较吞吐、首 token P99、每输出 token P99 和可见输出间隔 P99。请求成功数与容量命中均独立核对。27B 的 C96 短请求已重现默认扩容触发的执行缓存回收，应作为这一改动的回归场景。保留轮次、样本、显存压力、队列和执行目录信息。[27B 复测及机制](performance-auto-serving-layout-rtx5090.zh.md)
