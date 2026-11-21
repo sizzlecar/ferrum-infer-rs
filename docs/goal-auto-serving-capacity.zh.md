@@ -2,7 +2,7 @@
 
 **默认 Auto 仍在验收，当前实测提交为 `f1e3f4c0f`。** 5090 普通启动 4B，两种启动顺序下的混合 ShareGPT 并发 48 已在主干和候选各完成 576/576 条。实际最多驻留从 32 增至 36，合并吞吐从 326 提至 557 输出 tok/s，首 token P99 从 10.25 降至 5.99 秒，按时请求从 67 增至 289 条。C8 的可见间隔 P99 在两个顺序下都升高，合并为 51.39 → 55.95 ms。27B CT INT4 的冻结 ShareGPT 在 C16 两端仍均超过原门限。同一 4B 候选在混合 C48 中，手动容量 16、32、48 分别达到 425、356、493 输出 tok/s，三者每输出 token 的 P99 分别为 61.85、103.72、186.85 ms。Auto 的吞吐高于这三个手动设置，手动 16 有最短的逐 token 延迟。九种权重的逐项配对、显式容量和到达率继续决定能否发布。[本轮实机数据](performance-auto-serving-admission-rtx5090.zh.md)
 
-此前的 `387aa5566` 把 27B GGUF 的严重 C96 回退从 231 恢复至 610 输出 tok/s，同窗主干为 618。它在 4B 的 2048 上下文有收益，普通 262,144 上下文却出现回归。当前候选按活跃请求长度选择可复用的 CUDA 解码范围，支持原模型的完整上下文。真实 `run` 已在两种上下文通过，5090 原生解码的数值和内存边界对照也已通过。[本轮实机证据](performance-auto-serving-admission-rtx5090.zh.md) · [第一次热门模型验收](performance-auto-serving-capacity-rtx5090.zh.md) · [布局与过载诊断](performance-auto-serving-layout-rtx5090.zh.md) · [问题线索 #504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504)
+27B GGUF 在 C96 的原始回退为 231.00 输出 tok/s，`f1e3f4c0f` 与同窗主干分别为 612.92 和 611.96，两端各完成 384/384 条。候选三项 P99 比主干分别慢 149.08、2.62、10.56 ms。4B 的 CPU 采样还发现，一次固定 C48 测试的有效重复惩罚 ID 仅占 2.35 MB，服务却按容量补零后上传了 19.84 GB。`4d4d9f409` 已改为传送活跃 ID，仍须在两种上下文、真实并发和各权重下重新计时。[本轮实机证据](performance-auto-serving-admission-rtx5090.zh.md) · [第一次热门模型验收](performance-auto-serving-capacity-rtx5090.zh.md) · [布局与过载诊断](performance-auto-serving-layout-rtx5090.zh.md) · [问题线索 #504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504)
 
 ## 产品目标
 
