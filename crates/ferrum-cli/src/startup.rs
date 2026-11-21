@@ -348,7 +348,7 @@ mod tests {
                 );
                 assert_eq!(
                     engine.runtime.causal_decode_attention_grouping,
-                    CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                    CausalDecodeAttentionGrouping::BucketedExecutionCapacity
                 );
                 assert_eq!(
                     engine.runtime.causal_decode_kv_reuse,

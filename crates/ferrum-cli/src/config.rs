@@ -1502,6 +1502,7 @@ mod tests {
             "indexed",
             "fixed-capacity",
             "fixed-execution-capacity",
+            "bucketed-execution-capacity",
         ] {
             let config: CliConfig = toml::from_str(&format!(
                 "[runtime]\ncausal_decode_attention_grouping = \"{value}\"\n"

@@ -969,40 +969,30 @@ fn validate_causal_decode_preparation_mode(
     validate_q4_mmvq_weight_decode(config, plan_runtime)?;
     validate_q5_mmvq_weight_decode(config, plan_runtime)?;
     validate_q8_projection_weight_preparation(config, plan_runtime)?;
+    let grouping = config
+        .engine_config
+        .runtime
+        .causal_decode_attention_grouping;
     if config.engine_config.runtime.causal_decode_kv_reuse
         != ferrum_types::CausalDecodeKvReuse::None
-        && (!cfg!(feature = "cuda-causal-gqa2")
-            || config
-                .engine_config
-                .runtime
-                .causal_decode_attention_grouping
-                != ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity)
+        && (!cfg!(feature = "cuda-causal-gqa2") || !grouping.uses_execution_context_limit())
     {
         return Err(FerrumError::unsupported(
-            "paired-query-heads KV reuse requires the cuda-causal-gqa2 build feature and fixed-execution-capacity causal decode grouping",
+            "paired-query-heads KV reuse requires the cuda-causal-gqa2 build feature and a fixed or bucketed execution context",
         ));
     }
     causal_decode_execution_context_limit(config)?;
-    use ferrum_types::{
-        AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
-    };
-    if matches!(
-        config
-            .engine_config
-            .runtime
-            .causal_decode_attention_grouping,
-        CausalDecodeAttentionGrouping::Indexed
-            | CausalDecodeAttentionGrouping::FixedCapacity
-            | CausalDecodeAttentionGrouping::FixedExecutionCapacity
-    ) && (config.engine_config.runtime.causal_decode_preparation_mode
-        != CausalDecodePreparationMode::Packed
-        || !matches!(config.device, Device::CUDA(_))
-        || !plan_runtime
-        || !cfg!(feature = "cuda-indexed-causal-attention"))
+    use ferrum_types::{AttentionExecutionPolicy, CausalDecodePreparationMode};
+    if grouping.requires_packed_preparation()
+        && (config.engine_config.runtime.causal_decode_preparation_mode
+            != CausalDecodePreparationMode::Packed
+            || !matches!(config.device, Device::CUDA(_))
+            || !plan_runtime
+            || !cfg!(feature = "cuda-indexed-causal-attention"))
     {
         return Err(FerrumError::unsupported(format!(
             "{} causal decode attention grouping requires packed preparation on a CUDA plan runtime with compiled indexed native attention",
-            config.engine_config.runtime.causal_decode_attention_grouping.as_runtime_value()
+            grouping.as_runtime_value()
         )));
     }
     if config.engine_config.runtime.causal_decode_preparation_mode
@@ -1043,19 +1033,18 @@ fn validate_causal_decode_preparation_mode(
 
 // Composition precedes automatic startup fitting. Forward the declared hard
 // upper bound; a later fit may shrink it further. The backend also clamps it
-// to the model shape and uses it only for FixedExecutionCapacity.
+// to the model shape for grouping modes that use the execution context.
 fn causal_decode_execution_context_limit(config: &ComponentConfig) -> Result<Option<usize>> {
     let limit = config.engine_config.runtime.max_model_len;
-    if config
+    let grouping = config
         .engine_config
         .runtime
-        .causal_decode_attention_grouping
-        == ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
-        && limit == Some(0)
-    {
-        return Err(FerrumError::config(
-            "fixed-execution-capacity requires a positive maximum model length when configured",
-        ));
+        .causal_decode_attention_grouping;
+    if grouping.uses_execution_context_limit() && limit == Some(0) {
+        return Err(FerrumError::config(format!(
+            "{} requires a positive maximum model length when configured",
+            grouping.as_runtime_value()
+        )));
     }
     Ok(limit)
 }
@@ -2084,26 +2073,28 @@ pub(crate) mod tests {
     fn causal_decode_attention_grouping_execution_context_limit_preserves_bound_and_rejects_zero() {
         use ferrum_types::CausalDecodeAttentionGrouping;
         let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
-        config
-            .engine_config
-            .runtime
-            .causal_decode_attention_grouping =
-            CausalDecodeAttentionGrouping::FixedExecutionCapacity;
-        for limit in [None, Some(1), Some(512), Some(2048), Some(usize::MAX)] {
-            config.engine_config.runtime.max_model_len = limit;
-            assert_eq!(
-                causal_decode_execution_context_limit(&config).unwrap(),
-                limit
-            );
+        for grouping in [
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+            CausalDecodeAttentionGrouping::BucketedExecutionCapacity,
+        ] {
+            config
+                .engine_config
+                .runtime
+                .causal_decode_attention_grouping = grouping;
+            for limit in [None, Some(1), Some(512), Some(2048), Some(usize::MAX)] {
+                config.engine_config.runtime.max_model_len = limit;
+                assert_eq!(
+                    causal_decode_execution_context_limit(&config).unwrap(),
+                    limit
+                );
+            }
+            config.engine_config.runtime.max_model_len = Some(0);
+            assert!(causal_decode_execution_context_limit(&config).is_err());
+            assert!(validate_causal_decode_preparation_mode(&config, true)
+                .unwrap_err()
+                .to_string()
+                .contains("positive maximum model length"));
         }
-        config.engine_config.runtime.max_model_len = Some(0);
-        assert!(causal_decode_execution_context_limit(&config).is_err());
-        assert!(validate_causal_decode_preparation_mode(&config, true)
-            .unwrap_err()
-            .to_string()
-            .contains("positive maximum model length"));
-        // The original grouping keeps its previous interpretation; only the
-        // new mode authorizes a context-bound native scratch plan.
         config
             .engine_config
             .runtime
@@ -2121,6 +2112,7 @@ pub(crate) mod tests {
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
             ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::BucketedExecutionCapacity,
         ] {
             let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
             assert_eq!(
@@ -2179,6 +2171,7 @@ pub(crate) mod tests {
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
             ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::BucketedExecutionCapacity,
         ] {
             let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
             config.device = Device::CUDA(0);
@@ -2210,6 +2203,10 @@ pub(crate) mod tests {
                 && cfg!(feature = "cuda-indexed-causal-attention");
             #[cfg(not(feature = "cuda"))]
             let supported = false;
+            if grouping.uses_execution_context_limit() && cfg!(feature = "cuda-causal-gqa2") {
+                config.engine_config.runtime.causal_decode_kv_reuse =
+                    ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2;
+            }
             for policy in [
                 AttentionExecutionPolicy::Auto,
                 AttentionExecutionPolicy::NativeAdaptive,
@@ -2245,6 +2242,7 @@ pub(crate) mod tests {
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
             ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::BucketedExecutionCapacity,
         ] {
             let mut engine = EngineConfig::default();
             engine.runtime.causal_decode_attention_grouping = grouping;

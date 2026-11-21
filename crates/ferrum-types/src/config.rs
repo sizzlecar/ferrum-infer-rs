@@ -561,6 +561,10 @@ impl CausalDecodeAttentionGrouping {
         matches!(self, Self::FixedCapacity) || self.uses_execution_context_limit()
     }
 
+    pub const fn requires_packed_preparation(self) -> bool {
+        matches!(self, Self::Indexed) || self.uses_fixed_launch()
+    }
+
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
             Self::Contiguous => "contiguous",
