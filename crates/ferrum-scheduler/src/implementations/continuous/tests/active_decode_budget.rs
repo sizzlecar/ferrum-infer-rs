@@ -34,6 +34,22 @@ fn scheduled_tokens(batch: &BatchPlan, request_id: &RequestId) -> Option<usize> 
 }
 
 #[test]
+fn saturated_wave_prepares_ahead_only_for_multi_chunk_work_that_fits() {
+    let scheduler = budgeted_scheduler(16);
+    let chunk = scheduler.cb_config.prefill_chunk_size;
+    activate_decode_requests(&scheduler, 2);
+    waiting_prompt(&scheduler, chunk);
+    assert_eq!(scheduler.prefill_limit_before_selection(2, Some(4)), None);
+    waiting_prompt(&scheduler, chunk + 1);
+    assert_eq!(scheduler.prefill_limit_before_selection(2, Some(2)), None);
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(2, Some(4)),
+        Some(2)
+    );
+    assert_eq!(scheduler.prefill_limit_before_selection(2, None), Some(2));
+}
+
+#[test]
 fn saturated_wave_defers_new_state_until_a_participant_parks() {
     let scheduler = budgeted_scheduler(16);
     let decodes = activate_decode_requests(&scheduler, 2);

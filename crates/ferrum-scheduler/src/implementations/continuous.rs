@@ -2134,6 +2134,51 @@ impl ContinuousBatchScheduler {
         )
     }
 
+    /// Return the number of requests that can be prepared before selection.
+    /// A saturated working set needs an actual resident selection to find a
+    /// free slot. Use the optional second wave for multi-chunk prefill work.
+    pub fn prefill_limit_before_selection(
+        &self,
+        width: usize,
+        automatic_window: Option<usize>,
+    ) -> Option<usize> {
+        let waiting = self.waiting_count();
+        let limit = width.min(waiting);
+        let Some(window) = automatic_window else {
+            return Some(limit);
+        };
+        if waiting == 0 || self.config.max_running_requests <= width || self.config.slo.is_some() {
+            return Some(limit);
+        }
+        let active = self.active_count();
+        if waiting <= width.saturating_sub(active) {
+            return Some(limit);
+        }
+        let can_prepare_ahead = window > width && active < window;
+        let window = if can_prepare_ahead && self.waiting_has_multi_chunk_prefill(width) {
+            window
+        } else {
+            width
+        };
+        (active < window).then(|| limit.min(window - active))
+    }
+
+    fn waiting_has_multi_chunk_prefill(&self, width: usize) -> bool {
+        let chunk = self
+            .runtime_config
+            .prefill_step_chunk
+            .unwrap_or(self.cb_config.prefill_chunk_size);
+        self.waiting_queue
+            .read()
+            .iter()
+            .filter(|request| !request.prefix_rendezvous.held())
+            .take(width)
+            .any(|request| {
+                self.known_remaining_prefill_tokens(request)
+                    .is_some_and(|tokens| tokens > chunk)
+            })
+    }
+
     fn waiting_prefills_that_fit(
         &self,
         limit: usize,
@@ -3611,13 +3656,18 @@ impl ContinuousBatchScheduler {
         }
     }
 
-    fn chunked_prefill_budget_tokens(&self, req: &ContinuousBatchRequest, chunk: usize) -> usize {
-        let remaining = if req.prefill_tokens == 0 {
+    fn known_remaining_prefill_tokens(&self, req: &ContinuousBatchRequest) -> Option<usize> {
+        if req.prefill_tokens == 0 {
             self.prompt_token_estimate(req)
-                .unwrap_or(self.cb_config.prefill_chunk_size)
         } else {
-            req.prefill_tokens.saturating_sub(req.prefill_chunk_offset)
-        };
+            Some(req.prefill_tokens.saturating_sub(req.prefill_chunk_offset))
+        }
+    }
+
+    fn chunked_prefill_budget_tokens(&self, req: &ContinuousBatchRequest, chunk: usize) -> usize {
+        let remaining = self
+            .known_remaining_prefill_tokens(req)
+            .unwrap_or(self.cb_config.prefill_chunk_size);
         chunk.min(remaining).max(1)
     }
 

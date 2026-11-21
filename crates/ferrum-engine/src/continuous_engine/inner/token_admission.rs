@@ -470,71 +470,51 @@ impl EngineInner {
         }
 
         let width = hint.max_batch_size;
-        let waiting = self.scheduler.waiting_count();
         let intent = self.scheduler.prepare_token_batch_selection(hint);
-        let mut limit = width.min(waiting);
-        // Explicit residency and cost-based ingress keep their own admission
-        // contract. Ordinary Auto may prepare one additional wave when the
-        // retained plan priced both at full context.
         let window = self
             .config
             .runtime
             .startup_memory_plan
             .as_ref()
             .and_then(|plan| plan.auto_prefill_preparation_window());
-        let select_residents_first = if let Some(window) = window.filter(|_| {
-            waiting != 0 && self.config.scheduler.max_running_requests > width && planning.is_none()
-        }) {
-            let active = self.scheduler.active_count();
-            // Prepare up to a whole wave inside the verified window. Capping
-            // cold admission by the first prefill step's token count can grow
-            // the same backing repeatedly during a burst.
-            if active < window {
-                limit = limit.min(window - active);
-                false
+        let (selection, limit) =
+            if let Some(limit) = self.scheduler.prefill_limit_before_selection(width, window) {
+                (Selection::Ready(intent), limit)
             } else {
-                waiting > width.saturating_sub(active)
-            }
-        } else {
-            false
-        };
-        let (selection, limit) = if select_residents_first {
-            self.refresh_selection_prefixes(None).await?;
-            let progress = self.with_selection_capacity(|wake, observe| {
-                let draft = self.scheduler.select_resident_token_work(
-                    intent,
-                    wake,
-                    observe,
-                    planning.as_deref_mut(),
-                )?;
-                let limit = self.scheduler.new_prefills_for_draft(&draft);
-                if limit == 0 {
-                    // Nothing will enter or restore a prefix between the two
-                    // selections. Use the same capacity snapshot for both.
-                    return self
-                        .scheduler
-                        .finish_token_batch(draft, wake, observe, planning.as_deref_mut())
-                        .map(std::ops::ControlFlow::Break);
+                self.refresh_selection_prefixes(None).await?;
+                let progress = self.with_selection_capacity(|wake, observe| {
+                    let draft = self.scheduler.select_resident_token_work(
+                        intent,
+                        wake,
+                        observe,
+                        planning.as_deref_mut(),
+                    )?;
+                    let limit = self.scheduler.new_prefills_for_draft(&draft);
+                    if limit == 0 {
+                        // Nothing will enter or restore a prefix between the two
+                        // selections. Use the same capacity snapshot for both.
+                        return self
+                            .scheduler
+                            .finish_token_batch(draft, wake, observe, planning.as_deref_mut())
+                            .map(std::ops::ControlFlow::Break);
+                    }
+                    Ok(std::ops::ControlFlow::Continue((draft, limit)))
+                })?;
+                match progress {
+                    std::ops::ControlFlow::Break(batch) => {
+                        return Ok((
+                            batch,
+                            PendingPrefillMaintenance::new(
+                                self.model_executor.as_ref().as_ref(),
+                                Vec::new(),
+                            ),
+                        ))
+                    }
+                    std::ops::ControlFlow::Continue((draft, limit)) => {
+                        (Selection::Started(draft), limit)
+                    }
                 }
-                Ok(std::ops::ControlFlow::Continue((draft, limit)))
-            })?;
-            match progress {
-                std::ops::ControlFlow::Break(batch) => {
-                    return Ok((
-                        batch,
-                        PendingPrefillMaintenance::new(
-                            self.model_executor.as_ref().as_ref(),
-                            Vec::new(),
-                        ),
-                    ))
-                }
-                std::ops::ControlFlow::Continue((draft, limit)) => {
-                    (Selection::Started(draft), limit)
-                }
-            }
-        } else {
-            (Selection::Ready(intent), limit)
-        };
+            };
         let (admitted, pending) = if limit != 0 {
             self.prepare_dynamic_admission_round(limit, planning.as_deref_mut())
                 .await?
