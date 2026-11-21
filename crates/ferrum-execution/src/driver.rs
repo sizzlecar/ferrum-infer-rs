@@ -5305,6 +5305,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             &run_id,
             phase_native_started,
         )?;
+        if let Some(wave) = std::num::NonZeroU32::new(config.maximum_decode_wave_sequences) {
+            plan_resources.limit_optional_pool_growth_to_wave(wave);
+        }
         executor_startup.finish();
         metrics
             .program_binding_upload

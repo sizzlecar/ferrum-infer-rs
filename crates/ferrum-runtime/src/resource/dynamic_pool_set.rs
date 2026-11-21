@@ -210,6 +210,9 @@ where
                 domain: domain.clone(),
                 logical_admission: logical_admission.clone(),
                 maintenance: Mutex::new(()),
+                optional_growth_ceiling_bytes: AtomicU64::new(
+                    domain.pool.provisioning().maximum_resident_bytes(),
+                ),
                 next_extent_generation: AtomicU64::new(1),
                 state: Mutex::new(DynamicBackingPoolState {
                     resident_bytes: 0,
@@ -976,10 +979,8 @@ where
                     .checked_add(state.pending_growth_bytes)
                     .ok_or_else(|| invalid_resource("dynamic pool residency overflows u64"))?;
                 let room = pool
-                    .domain
-                    .pool
-                    .provisioning()
-                    .maximum_resident_bytes()
+                    .optional_growth_ceiling_bytes
+                    .load(Ordering::Relaxed)
                     .saturating_sub(resident);
                 let aligned_room = room / pool.allocation_quantum() * pool.allocation_quantum();
                 // Amortize native allocations across shapes and requests.

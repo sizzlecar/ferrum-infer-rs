@@ -998,6 +998,19 @@ where
             .try_maintain_for_capacity_pressure(deferred)
     }
 
+    /// Limit speculative native allocation to the executing wave's fixed state
+    /// and workspaces. This only tightens optional headroom. Existing backing,
+    /// logical capacity, and allocation of actual demand remain available.
+    pub fn limit_optional_pool_growth_to_wave(&self, wave: std::num::NonZeroU32) {
+        if wave.get() >= self.dynamic_pools.maximum_active_sequences() {
+            return;
+        }
+        for pool in self.dynamic_pools.pools.values() {
+            pool.optional_growth_ceiling_bytes
+                .fetch_min(pool.domain.optional_growth_ceiling(wave), Ordering::Relaxed);
+        }
+    }
+
     /// Returns a point-in-time view of the exact dynamic pools owned by this
     /// plan. Product telemetry consumes this instead of maintaining a second
     /// allocator ledger that can drift from admission decisions.

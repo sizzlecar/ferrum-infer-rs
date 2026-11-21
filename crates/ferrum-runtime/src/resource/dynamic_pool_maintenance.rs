@@ -12,6 +12,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -193,6 +194,9 @@ where
                 contract: super::DynamicPoolContractStatus::from_domain(&pool.domain),
                 storage_profile: pool.domain.pool.compatibility().profile(),
                 resident_bytes: state.resident_bytes,
+                optional_growth_ceiling_bytes: pool
+                    .optional_growth_ceiling_bytes
+                    .load(Ordering::Relaxed),
                 pending_growth_bytes: state.pending_growth_bytes,
                 free_bytes: state.allocator.free_bytes,
                 largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
