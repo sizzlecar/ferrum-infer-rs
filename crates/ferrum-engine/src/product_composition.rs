@@ -1703,6 +1703,7 @@ mod tests {
                         },
                     )?;
                     verified.serving_concurrency_search = Some(StartupConcurrencySearch {
+                        two_wave_full_context_peak_bytes: None,
                         upper_bound: 8,
                         decode_wave_sequences: 4,
                         candidate_compilations: 2,
@@ -1831,6 +1832,7 @@ mod tests {
         let mut baseline = q8_compressed_capacity();
         let budget = baseline.request.usable_capacity_bytes;
         baseline.serving_concurrency_search = Some(ferrum_types::StartupConcurrencySearch {
+            two_wave_full_context_peak_bytes: None,
             upper_bound: 4,
             decode_wave_sequences: 4,
             candidate_compilations: 0,

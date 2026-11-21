@@ -472,10 +472,30 @@ impl EngineInner {
         let width = hint.max_batch_size;
         let waiting = self.scheduler.waiting_count();
         let intent = self.scheduler.prepare_token_batch_selection(hint);
-        let exceeds_wave = self.config.scheduler.max_running_requests > width
-            && waiting != 0
-            && waiting > width.saturating_sub(self.scheduler.active_count());
-        let (selection, limit) = if exceeds_wave {
+        let mut limit = width.min(waiting);
+        // Explicit residency and cost-based ingress keep their own admission
+        // contract. Ordinary Auto may prepare one additional wave when the
+        // retained plan priced both at full context.
+        let window = self
+            .config
+            .runtime
+            .startup_memory_plan
+            .as_ref()
+            .and_then(|plan| plan.auto_prefill_preparation_window());
+        let select_residents_first = if let Some(window) = window.filter(|_| {
+            waiting != 0 && self.config.scheduler.max_running_requests > width && planning.is_none()
+        }) {
+            let active = self.scheduler.active_count();
+            if window > width && active < window {
+                limit = limit.min(window - active);
+                false
+            } else {
+                waiting > width.saturating_sub(active)
+            }
+        } else {
+            false
+        };
+        let (selection, limit) = if select_residents_first {
             self.refresh_selection_prefixes(None).await?;
             let progress = self.with_selection_capacity(|wake, observe| {
                 let draft = self.scheduler.select_resident_token_work(
@@ -510,7 +530,7 @@ impl EngineInner {
                 }
             }
         } else {
-            (Selection::Ready(intent), width.min(waiting))
+            (Selection::Ready(intent), limit)
         };
         let (admitted, pending) = if limit != 0 {
             self.prepare_dynamic_admission_round(limit, planning.as_deref_mut())

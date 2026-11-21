@@ -116,6 +116,10 @@ pub struct StartupConcurrencySearch {
     /// Managed peak of the synthetic decode cohort prepared before readiness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_warmup_peak_bytes: Option<u64>,
+    /// Managed peak for one executing wave and one prepared wave, both at
+    /// full context, with the full mixed-step budget and prepared workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_wave_full_context_peak_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +135,23 @@ pub struct StartupMemoryPlan {
 }
 
 impl StartupMemoryPlan {
+    /// Eager preparation may get one wave ahead only when that complete
+    /// working set fits. Parked work can still yield its execution slot.
+    pub fn auto_prefill_preparation_window(&self) -> Option<usize> {
+        let search = self.serving_concurrency_search.as_ref()?;
+        let width = search.decode_wave_sequences;
+        Some(
+            if search
+                .two_wave_full_context_peak_bytes
+                .is_some_and(|peak| peak <= self.request.usable_capacity_bytes)
+            {
+                width.saturating_mul(2).min(self.selected.max_sequences)
+            } else {
+                width
+            },
+        )
+    }
+
     pub fn apply_to_engine_config(&self, engine: &mut crate::EngineConfig) -> Result<(), String> {
         engine.runtime.max_model_len = Some(self.selected.context_tokens);
         engine.scheduler.max_running_requests = self.selected.max_sequences;

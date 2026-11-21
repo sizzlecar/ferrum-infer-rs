@@ -544,6 +544,47 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
         })
     }
 
+    /// Cost of retaining two complete waves at full context while one mixed
+    /// step executes. Include the actual page-growth and prepared arena policy.
+    pub fn two_wave_full_context_peak_bytes(
+        &self,
+        wave: u32,
+        batch_tokens: usize,
+    ) -> Result<Option<u64>> {
+        let memory = self
+            .compilation
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory();
+        let Some(resident) = wave
+            .checked_mul(2)
+            .filter(|&n| n <= memory.maximum_active_sequences())
+        else {
+            return Ok(None);
+        };
+        let context = u64::try_from(self.config.maximum_model_tokens)
+            .map_err(|_| FerrumError::config("compiled context exceeds u64"))?;
+        let tokens = u64::try_from(batch_tokens)
+            .map_err(|_| FerrumError::config("compiled batch token budget exceeds u64"))?
+            .min(context.saturating_mul(u64::from(wave)));
+        memory
+            .startup_grouped_workload_peak_bytes(
+                context,
+                &[(context, resident)],
+                wave,
+                tokens,
+                self.config
+                    .runtime_policy
+                    .admission()
+                    .sequence_backing_growth,
+            )
+            .map(Some)
+            .map_err(|error| {
+                FerrumError::config(format!("compiled prefill lookahead memory: {error}"))
+            })
+    }
+
     /// Evaluate the retained compiled plan without allocating device memory.
     pub fn startup_peak_bytes(&self, workload: ferrum_types::StartupWorkload) -> Result<u64> {
         let (context, frontier, sequences, wave_sequences, tokens) = match workload {

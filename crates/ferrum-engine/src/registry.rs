@@ -2909,6 +2909,19 @@ pub(crate) mod tests {
             .payload()
             .memory();
         assert_eq!(expanded_memory.maximum_active_sequences(), 6);
+        let lookahead_peak = search.two_wave_full_context_peak_bytes.unwrap();
+        assert!(lookahead_peak > report.context_peak_bytes);
+        let mut window = report.clone();
+        window.request.usable_capacity_bytes = lookahead_peak;
+        assert_eq!(window.auto_prefill_preparation_window(), Some(4));
+        window.request.usable_capacity_bytes = lookahead_peak - 1;
+        assert_eq!(window.auto_prefill_preparation_window(), Some(2));
+        window
+            .serving_concurrency_search
+            .as_mut()
+            .unwrap()
+            .two_wave_full_context_peak_bytes = None;
+        assert_eq!(window.auto_prefill_preparation_window(), Some(2));
         assert_eq!(
             report.decode_peak_bytes,
             expanded_memory

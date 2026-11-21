@@ -155,11 +155,18 @@ pub(super) fn expand<'a, R: DeviceRuntime>(
             "concurrent sequences: {original} -> {resident}, verified against the compiled serving plan"
         ));
     }
+    let wave = resident.min(engine.batching.max_batch_size);
+    let two_wave_full_context_peak_bytes = selected.two_wave_full_context_peak_bytes(
+        u32::try_from(wave)
+            .map_err(|_| ferrum_types::FerrumError::config("decode wave exceeds u32"))?,
+        fitted.selected.max_batch_tokens,
+    )?;
     fitted.serving_concurrency_search = Some(StartupConcurrencySearch {
         upper_bound,
-        decode_wave_sequences: resident.min(engine.batching.max_batch_size),
+        decode_wave_sequences: wave,
         candidate_compilations: compilations,
         capture_warmup_peak_bytes: warmup_peak,
+        two_wave_full_context_peak_bytes,
     });
     Ok(selected)
 }
