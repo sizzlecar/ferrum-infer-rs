@@ -957,8 +957,8 @@ pub struct RunCommand {
     #[arg(long, value_enum)]
     pub causal_decode_preparation_mode: Option<crate::commands::CausalDecodePreparationModeArg>,
 
-    /// Causal decode grouping (default: contiguous). Other modes require packed native CUDA attention.
-    /// Fixed-execution-capacity also uses the declared --max-model-len bound.
+    /// Group causal decode rows. Auto uses fixed launches on eligible native CUDA plans.
+    /// Bucketed-execution-capacity sizes each launch for the longest live row within --max-model-len.
     #[arg(long, value_enum)]
     pub causal_decode_attention_grouping: Option<crate::commands::CausalDecodeAttentionGroupingArg>,
     /// Causal decode K/V load reuse (default: none). Paired modes require native CUDA GQA2 support.
@@ -1369,7 +1369,12 @@ pub async fn execute(
     engine_config
         .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
-    engine_config.runtime.startup_memory_request = startup_memory_request;
+    crate::startup::apply_memory_request(
+        &mut engine_config,
+        startup_memory_request,
+        &startup_auto_config.workload_profile,
+        crate::startup::StartupUsage::SingleRequest,
+    );
     let vnext_checkpoint_capture = cmd.vnext_checkpoint.to_config()?;
     validate_teacher_forced_checkpoint_run(&cmd, vnext_checkpoint_capture.as_ref())?;
     let teacher_forcing = vnext_checkpoint_capture
@@ -5491,6 +5496,7 @@ mod tests {
             },
             context_peak_bytes: 500 * 1024 * 1024,
             decode_peak_bytes: 480 * 1024 * 1024,
+            serving_concurrency_search: None,
             reasons: vec!["context and batch reduced to fit compiled workspace".into()],
         };
         let mut engine = ferrum_types::EngineConfig::default();

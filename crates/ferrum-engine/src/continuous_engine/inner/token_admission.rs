@@ -409,6 +409,146 @@ impl EngineInner {
         matches!(result.outcome, AdmissionProbeOutcome::Admitted(_)) && pending.publish().is_ok()
     }
 
+    fn with_selection_capacity<T>(
+        &self,
+        select: impl FnOnce(
+            Option<AdmissionWakeSnapshot<'_>>,
+            &mut dyn FnMut(ExecutorAdmissionQueueObservation),
+        ) -> Result<T>,
+    ) -> Result<T> {
+        let mut observations = Vec::new();
+        let selected = {
+            let mut availability = self.dynamic_admission_availability.lock();
+            let epochs = self
+                .model_executor
+                .write_execution_capacity_snapshot(&mut availability)?;
+            let wake = epochs.map(|epochs| {
+                AdmissionWakeSnapshot::new(
+                    AdmissionWakeEpochs::new(
+                        epochs.coordinator_id,
+                        epochs.release_epoch,
+                        epochs.capacity_epoch,
+                        0,
+                    ),
+                    &availability,
+                )
+            });
+            select(wake, &mut |event| observations.push(event))
+        };
+        for observation in observations {
+            self.trace_executor_admission_queue_observation(observation);
+        }
+        selected
+    }
+
+    async fn refresh_selection_prefixes(
+        &self,
+        draft: Option<&ferrum_scheduler::implementations::continuous::TokenBatchDraft>,
+    ) -> Result<()> {
+        self.refresh_prefix_rendezvous()?;
+        if self.model_executor.supports_plan_runtime_prefix_restore() {
+            self.restore_admitted_prefixes(draft).await?;
+            self.refresh_prefix_rendezvous()?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn select_token_batch(
+        &self,
+        hint: ferrum_interfaces::BatchHint,
+        mut planning: Option<&mut TimePlanningRound>,
+    ) -> Result<(
+        ferrum_scheduler::BatchSelection,
+        PendingPrefillMaintenance<'_>,
+    )> {
+        use ferrum_scheduler::implementations::continuous::{
+            TokenBatchDraft, TokenBatchSelectionIntent,
+        };
+        enum Selection {
+            Ready(TokenBatchSelectionIntent),
+            Started(TokenBatchDraft),
+        }
+
+        let window = self
+            .config
+            .runtime
+            .startup_memory_plan
+            .as_ref()
+            .and_then(|plan| plan.auto_prefill_preparation_window());
+        let early_limit = self.scheduler.prefill_limit_before_selection(
+            &hint,
+            window,
+            |tokens| self.sequences.all_fit_context(tokens),
+            |maximum| self.model_executor.immediately_backed_prefills(maximum),
+        );
+        let intent = self.scheduler.prepare_token_batch_selection(hint);
+        let (selection, limit) = if let Some(limit) = early_limit {
+            (Selection::Ready(intent), limit)
+        } else {
+            self.refresh_selection_prefixes(None).await?;
+            let progress = self.with_selection_capacity(|wake, observe| {
+                let draft = self.scheduler.select_resident_token_work(
+                    intent,
+                    wake,
+                    observe,
+                    planning.as_deref_mut(),
+                )?;
+                let limit = self.scheduler.new_prefills_for_draft(&draft);
+                if limit == 0 {
+                    // Nothing will enter or restore a prefix between the two
+                    // selections. Use the same capacity snapshot for both.
+                    return self
+                        .scheduler
+                        .finish_token_batch(draft, wake, observe, planning.as_deref_mut())
+                        .map(std::ops::ControlFlow::Break);
+                }
+                Ok(std::ops::ControlFlow::Continue((draft, limit)))
+            })?;
+            match progress {
+                std::ops::ControlFlow::Break(batch) => {
+                    return Ok((
+                        batch,
+                        PendingPrefillMaintenance::new(
+                            self.model_executor.as_ref().as_ref(),
+                            Vec::new(),
+                        ),
+                    ))
+                }
+                std::ops::ControlFlow::Continue((draft, limit)) => {
+                    (Selection::Started(draft), limit)
+                }
+            }
+        };
+        let (admitted, pending) = if limit != 0 {
+            self.prepare_dynamic_admission_round(limit, planning.as_deref_mut())
+                .await?
+        } else {
+            (0, Vec::new())
+        };
+        let maintenance =
+            PendingPrefillMaintenance::new(self.model_executor.as_ref().as_ref(), pending);
+        self.complete_typed_admission_failures().await?;
+        let batch = match selection {
+            Selection::Ready(intent) => {
+                self.refresh_selection_prefixes(None).await?;
+                self.with_selection_capacity(|wake, observe| {
+                    self.scheduler
+                        .next_batch_with_token_admissions(intent, wake, observe, planning)
+                })?
+            }
+            Selection::Started(draft) => {
+                if admitted != 0 {
+                    self.refresh_selection_prefixes(Some(&draft)).await?;
+                }
+                self.with_selection_capacity(|wake, observe| {
+                    self.scheduler
+                        .finish_token_batch(draft, wake, observe, planning)
+                })?
+            }
+        };
+        Ok((batch, maintenance))
+    }
+
     pub(super) async fn prepare_dynamic_admission_round(
         &self,
         maximum_admissions: usize,

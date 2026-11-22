@@ -14,6 +14,7 @@ impl FerrumConfigBuilder {
         &self,
         reusable_execution: bool,
         attention: Option<AttentionExecutionPolicy>,
+        execution_context_tokens: Option<usize>,
     ) -> Result<Self, AutoConfigError> {
         // Only absent entries are automatic. An explicit conservative choice
         // remains an opt-out, including entries from config files and presets.
@@ -91,7 +92,13 @@ impl FerrumConfigBuilder {
                     .cuda_indexed_causal_attention
                 && causal_preparation == CausalDecodePreparationMode::Packed
             {
-                CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                if execution_context_tokens.is_some_and(|limit| {
+                    limit > CausalDecodeAttentionGrouping::FIRST_EXECUTION_BUCKET_TOKENS
+                }) {
+                    CausalDecodeAttentionGrouping::BucketedExecutionCapacity
+                } else {
+                    CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                }
             } else {
                 CausalDecodeAttentionGrouping::Contiguous
             }
@@ -106,7 +113,7 @@ impl FerrumConfigBuilder {
                     .cuda_indexed_causal_attention
                 && self.hardware.compiled_features.cuda_causal_gqa2
                 && causal_preparation == CausalDecodePreparationMode::Packed
-                && grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                && grouping.uses_execution_context_limit()
             {
                 CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2
             } else {

@@ -689,10 +689,18 @@ fn unified_v2_effective_topology_counts_identity_and_fallbacks() {
         )
         .unwrap();
         let launches = build_launches(s, binding, layout, &[capacity; 4]);
-        let base =
-            fixed::FixedBatchDecode::for_launches(&launches, true, binding, s, layout, true, true)
-                .unwrap()
-                .unwrap();
+        let base = fixed::FixedBatchDecode::for_launches(
+            &launches,
+            true,
+            binding,
+            s,
+            layout,
+            true,
+            true,
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+        )
+        .unwrap()
+        .unwrap();
         let a = base.clone().with_kv_reuse(PairedQueryHeads, grouping, s);
         let b = base.with_kv_reuse(PairedQueryHeadsUnifiedV2, grouping, s);
         let enabled = cfg!(feature = "cuda-causal-gqa2") && head_dim == 256 && capacity == 2048;

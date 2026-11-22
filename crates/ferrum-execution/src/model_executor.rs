@@ -2126,6 +2126,12 @@ pub trait ModelExecutor: Send + Sync + 'static {
         None
     }
 
+    /// An upper bound for speculative new requests whose fixed state is
+    /// already backed. Ordinary admission rechecks all actual resources.
+    fn immediately_backed_prefills(&self, _maximum: usize) -> usize {
+        0
+    }
+
     /// Reports the immutable sources bound to this executor. The default
     /// borrows the sources from the exact resolved plan, when one is exposed.
     /// This is a trusted implementation's consistency report, not runtime

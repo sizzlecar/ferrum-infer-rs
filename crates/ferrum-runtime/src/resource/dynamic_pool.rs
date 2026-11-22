@@ -128,6 +128,56 @@ impl DynamicPoolDomainSpec {
     pub(super) fn pool_id(&self) -> &DynamicBackingPoolId {
         self.pool.pool_id()
     }
+
+    pub(super) fn fixed_prefill_bytes(&self) -> Option<u64> {
+        if self.pool.reusable_workspace_ceiling_bytes() != 0
+            || self.pool.checkpoint_growth_ceiling_bytes() != 0
+            || !self.descriptors.iter().all(|resource| {
+                matches!(
+                    resource.lifetime(),
+                    AllocationLifetime::Request | AllocationLifetime::Sequence
+                ) && matches!(resource.demand(), DynamicResourceDemand::Fixed { .. })
+            })
+        {
+            return None;
+        }
+        self.pool
+            .minimum_request_bytes()
+            .checked_add(self.pool.minimum_sequence_bytes())
+            .filter(|bytes| *bytes > 0)
+    }
+
+    pub(super) fn optional_growth_ceiling(&self, wave: std::num::NonZeroU32) -> u64 {
+        let provisioning = self.pool.provisioning();
+        let hard_limit = provisioning.maximum_resident_bytes();
+        let Some(first) = self.descriptors.first() else {
+            return hard_limit;
+        };
+        let instances = first.theoretical_maximum_instances();
+        if wave.get() >= instances
+            || self.descriptors.iter().any(|resource| {
+                resource.theoretical_maximum_instances() != instances
+                    || (matches!(
+                        resource.lifetime(),
+                        AllocationLifetime::Request | AllocationLifetime::Sequence
+                    ) && !matches!(resource.demand(), DynamicResourceDemand::Fixed { .. }))
+            })
+        {
+            // KV and other growing request state need room for token/page growth
+            // throughout the sequence, independently of the decode wave.
+            return hard_limit;
+        }
+        // Each descriptor's theoretical residency includes this same checked
+        // instance count. Retained programs and checkpoints are pool-wide.
+        let per_instance = self.pool.theoretical_ceiling_bytes() / u128::from(instances);
+        let wave_bytes = per_instance * u128::from(wave.get())
+            + u128::from(self.pool.reusable_workspace_ceiling_bytes())
+            + u128::from(self.pool.checkpoint_growth_ceiling_bytes());
+        wave_bytes.clamp(
+            u128::from(provisioning.minimum_resident_bytes()),
+            u128::from(hard_limit),
+        ) as u64
+    }
 }
 
 #[derive(Debug)]
@@ -476,8 +526,15 @@ where
     pub(super) domain: DynamicPoolDomainSpec,
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) maintenance: Mutex<()>,
+    pub(super) optional_growth_ceiling_bytes: AtomicU64,
+    pub(super) fixed_prefill: std::sync::OnceLock<FixedPrefillBacking>,
     pub(super) next_extent_generation: AtomicU64,
     pub(super) state: Mutex<DynamicBackingPoolState<R::Buffer>>,
+}
+
+pub(super) struct FixedPrefillBacking {
+    pub(super) bytes_per_request: u64,
+    pub(super) wave_bytes: u64,
 }
 
 pub(super) struct PendingGrowthGuard<R>
@@ -956,6 +1013,7 @@ pub struct DynamicPoolStatus {
     pub(super) contract: DynamicPoolContractStatus,
     pub(super) storage_profile: DynamicStorageProfile,
     pub(super) resident_bytes: u64,
+    pub(super) optional_growth_ceiling_bytes: u64,
     pub(super) pending_growth_bytes: u64,
     pub(super) free_bytes: u64,
     pub(super) largest_contiguous_bytes: u64,
@@ -988,6 +1046,12 @@ impl DynamicPoolStatus {
 
     pub const fn resident_bytes(&self) -> u64 {
         self.resident_bytes
+    }
+
+    /// Upper bound for unrequested headroom. A required allocation may
+    /// still grow the pool up to its physical provisioning limit.
+    pub const fn optional_growth_ceiling_bytes(&self) -> u64 {
+        self.optional_growth_ceiling_bytes
     }
 
     pub const fn pending_growth_bytes(&self) -> u64 {

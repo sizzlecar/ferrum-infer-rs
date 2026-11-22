@@ -15,6 +15,10 @@ pub(in super::super) struct FixedBatchDecode {
 }
 
 impl FixedBatchDecode {
+    pub(super) fn launch_capacity_tokens(&self) -> u64 {
+        self.v2.unwrap_or(self.v1).maximum_sequence
+    }
+
     pub(super) fn packed_work(&self) -> Option<PackedDecodeWork> {
         self.packed_work
     }
@@ -64,6 +68,7 @@ impl FixedBatchDecode {
         layout: ScratchLayout,
         packed_prepare_gate: bool,
         independent_sequence_kv: bool,
+        grouping: CausalDecodeAttentionGrouping,
     ) -> Result<Option<Self>, String> {
         if shape.int8_kv {
             return Ok(None);
@@ -110,14 +115,21 @@ impl FixedBatchDecode {
                 shape.head_dim,
             )
         };
+        let longest_row = launches
+            .iter()
+            .map(|launch| launch.sequence_tokens)
+            .max()
+            .unwrap_or(0);
+        let launch_capacity =
+            fixed_decode_launch_capacity(grouping, shape.maximum_context_tokens, longest_row);
         Ok(Some(Self {
             paired_query_heads: false,
             unified_v2: false,
             participants: validated.participants,
             packed_work: validated.packed_work,
             v1: dimensions(VLLM_PARTITION_TOKENS.min(shape.maximum_context_tokens))?,
-            v2: (shape.maximum_context_tokens > VLLM_PARTITION_TOKENS)
-                .then(|| dimensions(shape.maximum_context_tokens))
+            v2: (launch_capacity > VLLM_PARTITION_TOKENS)
+                .then(|| dimensions(launch_capacity))
                 .transpose()?,
         }))
     }
@@ -456,7 +468,7 @@ pub(super) fn paired_query_heads_eligible(
             ferrum_types::CausalDecodeKvReuse::PairedQueryHeads
                 | ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2
         )
-        && grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity
+        && grouping.uses_execution_context_limit()
         && !shape.int8_kv
         && shape.head_dim == 256
         && shape.key_value_heads > 0

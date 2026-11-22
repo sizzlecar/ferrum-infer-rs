@@ -34,6 +34,205 @@ fn scheduled_tokens(batch: &BatchPlan, request_id: &RequestId) -> Option<usize> 
 }
 
 #[test]
+fn saturated_wave_prepares_ahead_only_for_multi_chunk_work_that_fits() {
+    let scheduler = budgeted_scheduler(16);
+    let chunk = scheduler.cb_config.prefill_chunk_size;
+    let batch = hint(2, 2 * chunk);
+    let window = |max_sequences, request_context_limit| {
+        Some(PrefillPreparationWindow {
+            max_sequences,
+            request_context_limit,
+        })
+    };
+    activate_decode_requests(&scheduler, 2);
+    waiting_prompt(&scheduler, chunk);
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(
+            &batch,
+            window(4, Some(chunk)),
+            |_| panic!("a single-chunk backlog needs no context scan"),
+            |_| panic!("no speculative fixed state is needed")
+        ),
+        None
+    );
+    waiting_prompt(&scheduler, chunk + 1);
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(
+            &batch,
+            window(4, Some(chunk)),
+            |_| panic!("the proved context cannot contain a multi-chunk prompt"),
+            |_| panic!("this plan needs no fixed-state lookahead")
+        ),
+        None
+    );
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(&batch, window(2, None), |_| true, |n| n),
+        None
+    );
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(
+            &batch,
+            window(4, None),
+            |_| panic!("full model context fits"),
+            |n| n
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(&batch, window(4, Some(chunk)), |_| false, |n| n),
+        None
+    );
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(
+            &batch,
+            window(4, Some(chunk * 2)),
+            |limit| limit == chunk * 2,
+            |n| n
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(
+            &batch,
+            None,
+            |_| true,
+            |_| panic!("explicit capacity uses its own admission policy")
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn saturated_wave_charges_one_chunk_per_speculative_slot() {
+    let scheduler = budgeted_scheduler(16);
+    let chunk = scheduler.cb_config.prefill_chunk_size;
+    activate_decode_requests(&scheduler, 4);
+    for _ in 0..4 {
+        waiting_prompt(&scheduler, chunk + 1);
+    }
+    let window = Some(PrefillPreparationWindow {
+        max_sequences: 8,
+        request_context_limit: None,
+    });
+    let early = |tokens| {
+        scheduler.prefill_limit_before_selection(&hint(4, tokens), window, |_| true, |n| n)
+    };
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(&hint(4, 2 * chunk), window, |_| true, |_| 0),
+        None
+    );
+    assert_eq!(
+        scheduler.prefill_limit_before_selection(&hint(4, 2 * chunk), window, |_| true, |_| 1),
+        Some(1)
+    );
+    assert_eq!(early(0), None);
+    assert_eq!(early(chunk - 1), Some(1));
+    assert_eq!(early(2 * chunk), Some(2));
+    assert_eq!(early(8 * chunk), Some(4));
+    scheduler
+        .prepare_token_admission_observed(
+            1,
+            None,
+            &mut |request| {
+                AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                    request_id: request.id.clone(),
+                })
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_eq!(scheduler.active_count(), 5);
+    assert_eq!(early(2 * chunk), Some(1));
+}
+
+#[test]
+fn saturated_wave_defers_new_state_until_a_participant_parks() {
+    let scheduler = budgeted_scheduler(16);
+    let decodes = activate_decode_requests(&scheduler, 2);
+    let newcomer = waiting_prompt(&scheduler, 5);
+    let select = || {
+        scheduler
+            .select_resident_token_work(
+                scheduler.prepare_token_batch_selection(hint(2, 16)),
+                None,
+                &mut |_| {},
+                None,
+            )
+            .unwrap()
+    };
+    let full = select();
+    assert_eq!(scheduler.new_prefills_for_draft(&full), 0);
+    assert_eq!(scheduler.waiting_count(), 1);
+    assert_eq!(
+        scheduler
+            .finish_token_batch(full, None, &mut |_| {}, None)
+            .unwrap()
+            .batch
+            .unwrap()
+            .requests
+            .len(),
+        2
+    );
+
+    let wake = scheduler.pause_for_output(&decodes[0]).unwrap();
+    let partial = select();
+    let slots = scheduler.new_prefills_for_draft(&partial);
+    assert_eq!(slots, 1);
+    scheduler
+        .prepare_token_admission_observed(
+            slots,
+            None,
+            &mut |request| {
+                assert_eq!(request.id, newcomer);
+                AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                    request_id: request.id.clone(),
+                })
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    let batch = scheduler
+        .finish_token_batch(partial, None, &mut |_| {}, None)
+        .unwrap()
+        .batch
+        .unwrap();
+    assert_eq!(scheduled_tokens(&batch, &newcomer), Some(5));
+    assert_eq!(scheduled_tokens(&batch, &decodes[1]), Some(1));
+    assert_eq!(scheduled_tokens(&batch, &decodes[0]), None);
+    assert_eq!(scheduler.active_count(), 3);
+    wake.resume();
+    let resumed = select();
+    assert!(resumed.contains(&decodes[0]));
+    assert!(resumed.contains(&decodes[1]));
+}
+
+#[test]
+fn saturated_wave_accounts_for_prefill_tokens_before_probing_waiters() {
+    let scheduler = budgeted_scheduler(3);
+    activate_decode_requests(&scheduler, 1);
+    let incumbent = waiting_prompt(&scheduler, 8);
+    scheduler.promote_to_prefill_with_empty_retry(&incumbent, None);
+    let waiting = waiting_prompt(&scheduler, 8);
+    let draft = scheduler
+        .select_resident_token_work(
+            scheduler.prepare_token_batch_selection(hint(4, 32)),
+            None,
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+    assert_eq!(scheduler.new_prefills_for_draft(&draft), 0);
+    let batch = scheduler
+        .finish_token_batch(draft, None, &mut |_| {}, None)
+        .unwrap()
+        .batch
+        .unwrap();
+    assert_eq!(scheduled_tokens(&batch, &incumbent), Some(3));
+    assert_eq!(scheduled_tokens(&batch, &waiting), None);
+    assert_eq!(scheduler.waiting_count(), 1);
+}
+
+#[test]
 fn active_decode_prefill_token_budget_caps_the_whole_iteration_with_request_caps() {
     let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
         max_running_requests: 8,

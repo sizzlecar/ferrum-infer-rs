@@ -119,6 +119,23 @@ pub(crate) fn memory_request(
     Ok(None)
 }
 
+/// Keep workload/preset selection separate from the pre-upload device sample.
+/// Only ordinary accelerator serving may grow beyond its initial concurrency.
+pub(crate) fn apply_memory_request(
+    engine: &mut EngineConfig,
+    mut request: Option<StartupMemoryRequest>,
+    workload: &WorkloadProfile,
+    usage: StartupUsage,
+) {
+    if let Some(request) = &mut request {
+        request.search_serving_concurrency = usage == StartupUsage::PersistentServing
+            && engine.backend.device.is_gpu()
+            && workload.preset.is_none()
+            && !request.sequences_is_explicit;
+    }
+    engine.runtime.startup_memory_request = request;
+}
+
 pub(crate) fn hardware_for_request(
     device: &ferrum_types::Device,
     request: Option<&StartupMemoryRequest>,
@@ -165,12 +182,18 @@ pub(crate) fn apply_engine_plan(resolved: &mut ResolvedFerrumConfig, engine_conf
     if let Some(plan) = engine_config.runtime.startup_memory_plan.as_ref() {
         resolved.apply_startup_memory_plan(plan);
         eprintln!(
-            "Memory plan: context={} tokens, concurrent requests={}, batch={} tokens, budget={:.2} GiB",
+            "Memory plan: context={} tokens, resident request limit={}, batch={} tokens, budget={:.2} GiB",
             plan.selected.context_tokens,
             plan.selected.max_sequences,
             plan.selected.max_batch_tokens,
             plan.request.usable_capacity_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         );
+        if let Some(search) = &plan.serving_concurrency_search {
+            eprintln!(
+                "  Up to {} requests per decode step (resident concurrency search ceiling {})",
+                search.decode_wave_sequences, search.upper_bound,
+            );
+        }
         for reason in &plan.reasons {
             eprintln!("  {reason}");
         }
@@ -325,7 +348,7 @@ mod tests {
                 );
                 assert_eq!(
                     engine.runtime.causal_decode_attention_grouping,
-                    CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                    CausalDecodeAttentionGrouping::BucketedExecutionCapacity
                 );
                 assert_eq!(
                     engine.runtime.causal_decode_kv_reuse,
@@ -522,6 +545,38 @@ mod tests {
     }
 
     #[test]
+    fn compiled_concurrency_search_is_limited_to_automatic_accelerator_serving() {
+        use ferrum_types::Device::{CPU, CUDA};
+        use StartupUsage::{PersistentServing, SingleRequest};
+
+        let requested = RuntimeConfigSnapshot::default();
+        let memory = StartupMemoryRequest::from_snapshot(
+            DeviceMemorySnapshot {
+                capacity_bytes: 6 << 30,
+                available_bytes: 5 << 30,
+                source: "fixture".into(),
+            },
+            0.9,
+            &requested,
+        )
+        .unwrap();
+        let serving = WorkloadProfile::serving_default_for_hardware(&hardware());
+        let preset = WorkloadProfile::m3_qwen3_30b_a3b_int4();
+        for (usage, device, workload, expected) in [
+            (PersistentServing, CUDA(1), &serving, true),
+            (SingleRequest, CUDA(1), &serving, false),
+            (PersistentServing, CPU, &serving, false),
+            (PersistentServing, CUDA(1), &preset, false),
+        ] {
+            let mut engine = EngineConfig::default();
+            engine.backend.device = device;
+            apply_memory_request(&mut engine, Some(memory.clone()), workload, usage);
+            let request = engine.runtime.startup_memory_request.unwrap();
+            assert_eq!(request.search_serving_concurrency, expected);
+        }
+    }
+
+    #[test]
     fn explicit_batch_limits_automatic_concurrency_before_memory_fitting() {
         let requested = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
             "FERRUM_MAX_BATCHED_TOKENS",
@@ -602,6 +657,16 @@ mod tests {
                 StartupUsage::PersistentServing,
             )
             .unwrap();
+            let mut engine = EngineConfig::default();
+            engine.backend.device = ferrum_types::Device::CUDA(0);
+            apply_memory_request(
+                &mut engine,
+                Some(memory),
+                &resolved.workload_profile,
+                StartupUsage::PersistentServing,
+            );
+            let request = engine.runtime.startup_memory_request.unwrap();
+            assert!(!request.search_serving_concurrency);
             for entry in requested.entries {
                 assert!(resolved.runtime_config.entries.contains(&entry));
             }

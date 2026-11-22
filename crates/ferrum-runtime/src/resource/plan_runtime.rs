@@ -998,6 +998,61 @@ where
             .try_maintain_for_capacity_pressure(deferred)
     }
 
+    /// Configure the expanded plan before serving. Workspaces follow the
+    /// executing wave. Its fixed request pools may prepare the funded next
+    /// prefills while growing for that wave. Required demand can still grow.
+    pub fn configure_prefill_pool_growth(&self, wave: std::num::NonZeroU32, lookahead: usize) {
+        let maximum = self.dynamic_pools.maximum_active_sequences();
+        if wave.get() >= maximum {
+            return;
+        }
+        let extra = u32::try_from(lookahead)
+            .unwrap_or(u32::MAX)
+            .min(maximum - wave.get());
+        for pool in self.dynamic_pools.pools.values() {
+            let mut ceiling = pool.domain.optional_growth_ceiling(wave);
+            if extra > 0 {
+                if let Some(bytes) = pool.domain.fixed_prefill_bytes() {
+                    let wave_bytes = bytes.saturating_mul(u64::from(wave.get()));
+                    let funded_bytes =
+                        wave_bytes.saturating_add(bytes.saturating_mul(u64::from(extra)));
+                    ceiling =
+                        funded_bytes.min(pool.domain.pool.provisioning().maximum_resident_bytes());
+                    pool.fixed_prefill
+                        .get_or_init(|| super::dynamic_pool::FixedPrefillBacking {
+                            bytes_per_request: bytes,
+                            wave_bytes,
+                        });
+                }
+            }
+            pool.optional_growth_ceiling_bytes
+                .fetch_min(ceiling, Ordering::Relaxed);
+        }
+    }
+
+    /// Conservative free fixed-state capacity for optional prefills only.
+    /// A single free extent suffices for all same-alignment claims per request.
+    /// The physical admission transaction remains authoritative.
+    pub fn immediately_backed_fixed_prefills(&self, mut maximum: usize) -> usize {
+        for pool in self.dynamic_pools.pools.values() {
+            let Some(fixed) = pool.fixed_prefill.get() else {
+                continue;
+            };
+            let Ok(state) = pool.state.lock() else {
+                return 0;
+            };
+            if state.poisoned {
+                return 0;
+            }
+            let ready = state.allocator.largest_contiguous_bytes() / fixed.bytes_per_request;
+            maximum = maximum.min(usize::try_from(ready).unwrap_or(usize::MAX));
+            if maximum == 0 {
+                break;
+            }
+        }
+        maximum
+    }
+
     /// Returns a point-in-time view of the exact dynamic pools owned by this
     /// plan. Product telemetry consumes this instead of maintaining a second
     /// allocator ledger that can drift from admission decisions.
@@ -1631,30 +1686,11 @@ where
                         "sequence extension descriptor coverage regressed",
                     ));
                 }
-                let desired_bytes = match (growth_policy, descriptor.storage().profile().view()) {
-                    (
-                        super::SequenceBackingGrowthPolicy::PagedGroup(pages)
-                        | super::SequenceBackingGrowthPolicy::PagedGroupGrowOnly(pages),
-                        super::DynamicStorageView::PagedRegions { block_bytes },
-                    ) => {
-                        let ceiling =
-                            descriptor.evaluate_request_bytes_for_shape(parent_ceiling)?;
-                        if target_bytes > ceiling {
-                            return Err(invalid_resource(
-                                "sequence extension exceeds its parent physical ceiling",
-                            ));
-                        }
-                        let group = block_bytes
-                            .checked_mul(u64::from(pages.get()))
-                            .ok_or_else(|| invalid_resource("sequence page group overflows u64"))?;
-                        target_bytes
-                            .div_ceil(group)
-                            .checked_mul(group)
-                            .unwrap_or(ceiling)
-                            .min(ceiling)
-                    }
-                    _ => target_bytes,
-                };
+                let desired_bytes = growth_policy.extension_allocation_bytes(
+                    descriptor,
+                    target_bytes,
+                    parent_ceiling,
+                )?;
                 let delta_bytes = desired_bytes.saturating_sub(owned_bytes);
                 if delta_bytes == 0 {
                     continue;

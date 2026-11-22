@@ -1894,6 +1894,38 @@ impl SequenceBackingGrowthPolicy {
     pub const fn is_exact(&self) -> bool {
         matches!(self, Self::Exact)
     }
+
+    /// Physical grant requested by one extension, including optional grouped pages.
+    /// The planner uses this same ceiling when the grant may already be held.
+    pub(crate) fn extension_allocation_bytes(
+        self,
+        descriptor: &crate::DynamicResourceDescriptor,
+        target_bytes: u64,
+        parent_ceiling: DynamicResourceShape,
+    ) -> Result<u64, VNextError> {
+        match (self, descriptor.storage().profile().view()) {
+            (
+                Self::PagedGroup(pages) | Self::PagedGroupGrowOnly(pages),
+                crate::DynamicStorageView::PagedRegions { block_bytes },
+            ) => {
+                let ceiling = descriptor.evaluate_request_bytes_for_shape(parent_ceiling)?;
+                if target_bytes > ceiling {
+                    return Err(invalid_resource(
+                        "sequence extension exceeds its parent physical ceiling",
+                    ));
+                }
+                let group = block_bytes
+                    .checked_mul(u64::from(pages.get()))
+                    .ok_or_else(|| invalid_resource("sequence page group overflows u64"))?;
+                Ok(target_bytes
+                    .div_ceil(group)
+                    .checked_mul(group)
+                    .unwrap_or(ceiling)
+                    .min(ceiling))
+            }
+            _ => Ok(target_bytes),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1681,6 +1681,20 @@ async fn install_execution_readiness_wake(
     (request_id, receipt.into_wake())
 }
 
+#[test]
+fn preparation_context_includes_queued_output_until_the_request_retires() {
+    let sequences = SequenceRegistry::default();
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 9;
+    let id = request.id.clone();
+    let state = SequenceState::new(request, vec![TokenId(1); 4]);
+    sequences.publish(id.clone(), || Ok(state)).unwrap();
+    assert!(sequences.all_fit_context(12));
+    assert!(!sequences.all_fit_context(11));
+    assert!(sequences.take(&id).is_some());
+    assert!(sequences.all_fit_context(11));
+}
+
 fn readiness_wait_target(
     request_id: &RequestId,
 ) -> (Arc<SequenceHandle>, ExecutionReadinessWaitTarget) {

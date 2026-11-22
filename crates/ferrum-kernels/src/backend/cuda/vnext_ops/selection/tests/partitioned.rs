@@ -38,10 +38,21 @@ pub(super) fn large_cases(n: usize) -> Vec<Case> {
     negative[1] = f32::from_bits(0x80000001);
     let mut zero_partitions = signed_zero_case(n, 255, 256, false);
     zero_partitions.logits[512] = 0.0;
+    let mut reused_row = vec![0.0; n];
+    reused_row[7] = 7.0;
+    reused_row[8] = 6.0;
     // Keep the partitioned path active for every tested penalty value.
     zero_partitions.offsets = [0, 0];
     vec![
         zero_partitions,
+        // The stale suffix names the winning token. Reading it after a shorter
+        // history reuses this row would change the selection under a penalty.
+        Case {
+            logits: reused_row,
+            valid: vec![1; n],
+            repetition: vec![9, 7],
+            offsets: [0, 1],
+        },
         Case {
             logits: vec![f32::NAN; n],
             valid: vec![1; n],

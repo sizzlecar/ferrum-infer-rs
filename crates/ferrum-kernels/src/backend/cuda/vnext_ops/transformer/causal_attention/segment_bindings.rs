@@ -160,7 +160,7 @@ pub(super) fn declare(
     precision: CausalPrecision,
     attention_policy: AttentionExecutionPolicy,
     launches: &[CausalAttentionLaunch],
-    fixed_capacity: bool,
+    fixed_launch_capacity: Option<u64>,
     upload_strategy: ProgramBindingUploadStrategy,
     validations: Vec<ValidationRecipe>,
 ) -> Result<Option<SegmentBindingDeclaration>, String> {
@@ -215,8 +215,8 @@ pub(super) fn declare(
             replay_topologies: launches
                 .iter()
                 .map(|launch| {
-                    if fixed_capacity {
-                        ResidentCausalReplayTopology::FixedCapacity
+                    if let Some(maximum_sequence) = fixed_launch_capacity {
+                        ResidentCausalReplayTopology::FixedCapacity { maximum_sequence }
                     } else {
                         ResidentCausalReplayTopology::CapturedRow {
                             path: launch.path,

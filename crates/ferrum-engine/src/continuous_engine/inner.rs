@@ -1306,49 +1306,8 @@ impl EngineInner {
         {
             return Ok(EngineIterationOutcome::Progressed);
         }
-        let selection_intent = self.scheduler.prepare_token_batch_selection(hint);
-        let (_, prefill_maintenance) = self
-            .prepare_dynamic_admission_round(hint_max_batch_size, planning.as_mut())
-            .await?;
-        let prefill_maintenance = PendingPrefillMaintenance::new(
-            self.model_executor.as_ref().as_ref(),
-            prefill_maintenance,
-        );
-        self.complete_typed_admission_failures().await?;
-        self.refresh_prefix_rendezvous()?;
-        if self.model_executor.supports_plan_runtime_prefix_restore() {
-            self.restore_admitted_prefixes().await?;
-            self.refresh_prefix_rendezvous()?;
-        }
-        let (scheduled, observations) = {
-            let mut availability = self.dynamic_admission_availability.lock();
-            let epochs = self
-                .model_executor
-                .write_execution_capacity_snapshot(&mut availability)?;
-            let wake = epochs.map(|epochs| {
-                AdmissionWakeSnapshot::new(
-                    AdmissionWakeEpochs::new(
-                        epochs.coordinator_id,
-                        epochs.release_epoch,
-                        epochs.capacity_epoch,
-                        0,
-                    ),
-                    &availability,
-                )
-            });
-            let mut observations = Vec::new();
-            let scheduled = self.scheduler.next_batch_with_token_admissions(
-                selection_intent,
-                wake,
-                &mut |observation| observations.push(observation),
-                planning.as_mut(),
-            );
-            (scheduled, observations)
-        };
-        for observation in observations {
-            self.trace_executor_admission_queue_observation(observation);
-        }
-        let nb_result = scheduled?;
+        let (nb_result, prefill_maintenance) =
+            self.select_token_batch(hint, planning.as_mut()).await?;
         self.complete_typed_admission_failures().await?;
         let sched_elapsed = sched_t0.elapsed();
         self.record_scheduling_time(sched_elapsed);

@@ -2171,8 +2171,7 @@ impl CudaVNextComposition {
             }
             explicit => explicit,
         };
-        if causal_decode_attention_grouping
-            == ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+        if causal_decode_attention_grouping.uses_execution_context_limit()
             && execution_context_limit == Some(0)
         {
             return Err(CudaDeviceRuntimeError::contract(
@@ -2223,12 +2222,8 @@ impl CudaVNextComposition {
                 q5_mmvq_weight_decode.as_runtime_value()
             )));
         }
-        if matches!(
-            causal_decode_attention_grouping,
-            ferrum_types::CausalDecodeAttentionGrouping::Indexed
-                | ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity
-                | ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
-        ) && !cfg!(feature = "cuda-indexed-causal-attention")
+        if causal_decode_attention_grouping.requires_packed_preparation()
+            && !cfg!(feature = "cuda-indexed-causal-attention")
         {
             return Err(CudaDeviceRuntimeError::contract(
                 "indexed causal decode attention grouping requires compiled indexed native attention",
@@ -2239,12 +2234,11 @@ impl CudaVNextComposition {
             ferrum_types::CausalDecodeKvReuse::PairedQueryHeads
                 | ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2
         ) {
-            if causal_decode_attention_grouping
-                != ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+            if !causal_decode_attention_grouping.uses_execution_context_limit()
                 || causal_decode_preparation != ferrum_types::CausalDecodePreparationMode::Packed
             {
                 return Err(CudaDeviceRuntimeError::contract(
-                    "paired query heads require packed fixed-execution-capacity attention",
+                    "paired query heads require packed attention with a fixed execution context",
                 ));
             }
             if !cfg!(feature = "cuda-causal-gqa2")
@@ -2258,12 +2252,8 @@ impl CudaVNextComposition {
         }
         let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
             .map_err(contract_error)?;
-        if matches!(
-            causal_decode_attention_grouping,
-            ferrum_types::CausalDecodeAttentionGrouping::Indexed
-                | ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity
-                | ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
-        ) && causal_decode_preparation != ferrum_types::CausalDecodePreparationMode::Packed
+        if causal_decode_attention_grouping.requires_packed_preparation()
+            && causal_decode_preparation != ferrum_types::CausalDecodePreparationMode::Packed
         {
             return Err(CudaDeviceRuntimeError::contract(
                 "indexed causal decode attention grouping requires packed causal decode preparation",

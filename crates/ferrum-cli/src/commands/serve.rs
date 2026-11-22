@@ -169,8 +169,8 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub causal_decode_preparation_mode: Option<crate::commands::CausalDecodePreparationModeArg>,
 
-    /// Causal decode grouping (default: contiguous). Other modes require packed native CUDA attention.
-    /// Fixed-execution-capacity also uses the declared --max-model-len bound.
+    /// Group causal decode rows. Auto uses fixed launches on eligible native CUDA plans.
+    /// Bucketed-execution-capacity sizes each launch for the longest live row within --max-model-len.
     #[arg(long, value_enum)]
     pub causal_decode_attention_grouping: Option<crate::commands::CausalDecodeAttentionGroupingArg>,
     /// Causal decode K/V load reuse (default: none). Paired modes require native CUDA GQA2 support.
@@ -1187,7 +1187,12 @@ async fn run_serve_lifecycle(
             .map_err(ferrum_types::FerrumError::config)?;
         engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
         engine_config.runtime.diagnostic_output_capture = diagnostic_output_capture;
-        engine_config.runtime.startup_memory_request = startup_memory_request;
+        crate::startup::apply_memory_request(
+            &mut engine_config,
+            startup_memory_request,
+            &startup_auto_config.workload_profile,
+            crate::startup::StartupUsage::PersistentServing,
+        );
         engine_config.backend.backend_options.insert(
             "model_path".to_string(),
             serde_json::Value::String(engine_model_path.clone()),

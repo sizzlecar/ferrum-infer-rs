@@ -56,9 +56,9 @@ use ferrum_execution::model_executor::{
 use ferrum_interfaces::scheduler::{PreparedPrefixRestore, SchedulerMetrics};
 use ferrum_runtime::{AdmissionRejected, CapacityAvailabilityEpoch};
 use ferrum_types::{
-    AllocatorCapacityDomain, BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority,
-    RequestId, RequestIngressBoundary, RequestState, Result, SchedulerConfig,
-    PROMPT_TOKENS_METADATA_KEY,
+    AllocatorCapacityDomain, BatchId, FerrumError, InferenceRequest, InferenceResponse,
+    PrefillPreparationWindow, Priority, RequestId, RequestIngressBoundary, RequestState, Result,
+    SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
 };
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
@@ -612,6 +612,46 @@ pub struct TokenBatchSelectionIntent {
     skip_initial_decode: bool,
 }
 
+/// Resident work chosen for one iteration, with the physical wave budgets left
+/// for new prefills. No queue guard or executor authority crosses admission.
+#[must_use]
+pub struct TokenBatchDraft {
+    hint: BatchHint,
+    now: Instant,
+    iteration: u64,
+    batch_requests: Vec<ScheduledRequest>,
+    scheduled_request_ids: HashSet<RequestId>,
+    total_tokens: usize,
+    scheduled_decode_count: usize,
+    skip_initial_decode: bool,
+    fill_first_armed: bool,
+    active_decode_prefill_chunk: Option<usize>,
+    prefill_step_chunk: Option<usize>,
+    prefill_tokens_left: Option<usize>,
+    prefill_chunks_left: Option<usize>,
+    recompute_slots_left: Option<usize>,
+    mixed_recompute_epoch: u64,
+}
+
+impl TokenBatchDraft {
+    /// A prefix restored after this selection must not advance a participant
+    /// already scheduled at its current token offset.
+    pub fn contains(&self, request: &RequestId) -> bool {
+        self.scheduled_request_ids.contains(request)
+    }
+
+    /// Each new prefill needs at least one token, one participant slot and,
+    /// when a mixed-wave chunk quota is active, one of those chunks.
+    fn remaining_prefill_slots(&self) -> usize {
+        self.hint
+            .max_batch_size
+            .saturating_sub(self.batch_requests.len())
+            .min(self.hint.max_tokens.saturating_sub(self.total_tokens))
+            .min(self.prefill_tokens_left.unwrap_or(usize::MAX))
+            .min(self.prefill_chunks_left.unwrap_or(usize::MAX))
+    }
+}
+
 enum WaitingAdmissionMode<'a> {
     Legacy,
     Prepared {
@@ -875,7 +915,7 @@ impl Default for ContinuousBatchConfig {
             max_prefill_batch: 8,
             max_decode_batch: 256,
             enable_chunked_prefill: true,
-            prefill_chunk_size: 512,
+            prefill_chunk_size: ferrum_types::DEFAULT_PREFILL_CHUNK_TOKENS,
             max_kv_blocks_per_request: 1024,
             enable_swapping: true,
             swap_priority_threshold: Priority::Low,
@@ -1948,24 +1988,42 @@ impl ContinuousBatchScheduler {
         }
     }
 
-    /// Select only work already admitted by the common token executor protocol.
-    /// Native snapshots remain optional evidence, never manufactured for an executor.
-    pub fn next_batch_with_token_admissions(
+    /// Choose existing runnable work before opening heavyweight sequence state
+    /// for queued requests. The returned draft resumes the same iteration.
+    pub fn select_resident_token_work(
         &self,
         intent: TokenBatchSelectionIntent,
         wake: Option<AdmissionWakeSnapshot<'_>>,
         observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
         mut planning: Option<&mut TimePlanningRound>,
-    ) -> Result<BatchSelection> {
-        let batch = self.create_iteration_batch_with_time(
+    ) -> Result<TokenBatchDraft> {
+        self.select_resident_work(
             intent.hint,
-            WaitingAdmissionMode::Prepared {
+            &mut WaitingAdmissionMode::Prepared {
                 wake,
                 observer,
                 initial_priority: Some(intent.skip_initial_decode),
             },
             Instant::now(),
-            planning.as_deref_mut(),
+            &mut planning,
+        )
+    }
+
+    pub fn finish_token_batch(
+        &self,
+        draft: TokenBatchDraft,
+        wake: Option<AdmissionWakeSnapshot<'_>>,
+        observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
+        mut planning: Option<&mut TimePlanningRound>,
+    ) -> Result<BatchSelection> {
+        let batch = self.finish_selected_work(
+            draft,
+            &mut WaitingAdmissionMode::Prepared {
+                wake,
+                observer,
+                initial_priority: None,
+            },
+            &mut planning,
         )?;
         if let Some(round) = planning.as_ref() {
             self.slo_diagnostics.lock().record(round);
@@ -1975,6 +2033,20 @@ impl ContinuousBatchScheduler {
             retry_at: planning.as_ref().and_then(|round| round.retry_at()),
             time_blocked: planning.as_ref().is_some_and(|round| round.time_blocked()),
         })
+    }
+
+    /// Select only work already admitted by the common token executor protocol.
+    /// Native snapshots remain optional evidence, never manufactured for an executor.
+    pub fn next_batch_with_token_admissions(
+        &self,
+        intent: TokenBatchSelectionIntent,
+        wake: Option<AdmissionWakeSnapshot<'_>>,
+        observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
+        mut planning: Option<&mut TimePlanningRound>,
+    ) -> Result<BatchSelection> {
+        let draft =
+            self.select_resident_token_work(intent, wake, observer, planning.as_deref_mut())?;
+        self.finish_token_batch(draft, wake, observer, planning)
     }
 
     pub fn waiting_for_confirmed_capacity_release(&self) -> bool {
@@ -2040,9 +2112,107 @@ impl ContinuousBatchScheduler {
         }
         drop(prefill_queue);
 
-        let mut limit = target
+        let limit = target
             .saturating_sub(self.active_count())
             .min(hint.max_batch_size);
+        self.waiting_prefills_that_fit(limit, remaining_tokens, None, prefill_step_chunk)
+    }
+
+    /// Use the same input cost as selection, after all runnable resident work
+    /// has spent its share of this wave. Held rendezvous requests own no slot.
+    pub fn new_prefills_for_draft(&self, draft: &TokenBatchDraft) -> usize {
+        let tokens = draft
+            .hint
+            .max_tokens
+            .saturating_sub(draft.total_tokens)
+            .min(draft.prefill_tokens_left.unwrap_or(usize::MAX));
+        self.waiting_prefills_that_fit(
+            draft.remaining_prefill_slots(),
+            tokens,
+            draft.active_decode_prefill_chunk,
+            draft.prefill_step_chunk,
+        )
+    }
+
+    /// Return the number of requests that can be prepared before selection.
+    /// A saturated working set needs an actual resident selection to find a
+    /// free slot. Use the optional second wave for multi-chunk prefill work.
+    pub fn prefill_limit_before_selection(
+        &self,
+        hint: &BatchHint,
+        automatic_window: Option<PrefillPreparationWindow>,
+        all_fit_context: impl FnOnce(usize) -> bool,
+        immediately_backed: impl FnOnce(usize) -> usize,
+    ) -> Option<usize> {
+        let width = hint.max_batch_size;
+        let waiting = self.waiting_count();
+        let limit = width.min(waiting);
+        let Some(window) = automatic_window else {
+            return Some(limit);
+        };
+        if waiting == 0 || self.config.max_running_requests <= width || self.config.slo.is_some() {
+            return Some(limit);
+        }
+        let active = self.active_count();
+        if waiting <= width.saturating_sub(active) {
+            return Some(limit);
+        }
+        let prepared_limit = if window.max_sequences > width && active < window.max_sequences {
+            width
+                .saturating_add(self.queued_prefill_lookahead(hint, window))
+                .min(window.max_sequences)
+        } else {
+            width
+        };
+        let target = if prepared_limit > width
+            && active < prepared_limit
+            && window.request_context_limit.is_none_or(all_fit_context)
+        {
+            let wanted = prepared_limit - active;
+            width.max(active.saturating_add(immediately_backed(wanted).min(wanted)))
+        } else {
+            width
+        };
+        (active < target).then(|| limit.min(target - active))
+    }
+
+    /// Each speculative slot needs a queued multi-chunk prompt and enough
+    /// tokens for one normal chunk in the next wave. A single long prompt
+    /// cannot justify opening state for the entire backlog.
+    fn queued_prefill_lookahead(
+        &self,
+        hint: &BatchHint,
+        window: PrefillPreparationWindow,
+    ) -> usize {
+        let chunk = self
+            .runtime_config
+            .prefill_step_chunk
+            .unwrap_or(self.cb_config.prefill_chunk_size)
+            .max(1);
+        let chunks_per_step = window.funded_lookahead(hint.max_batch_size, hint.max_tokens, chunk);
+        if chunks_per_step == 0 {
+            return 0;
+        }
+        self.waiting_queue
+            .read()
+            .iter()
+            .filter(|request| !request.prefix_rendezvous.held())
+            .take(hint.max_batch_size)
+            .filter(|request| {
+                self.known_remaining_prefill_tokens(request)
+                    .is_some_and(|tokens| tokens > chunk)
+            })
+            .take(chunks_per_step)
+            .count()
+    }
+
+    fn waiting_prefills_that_fit(
+        &self,
+        limit: usize,
+        remaining_tokens: usize,
+        active_decode_prefill_chunk: Option<usize>,
+        prefill_step_chunk: Option<usize>,
+    ) -> usize {
         if limit == 0 || remaining_tokens == 0 {
             return 0;
         }
@@ -2057,15 +2227,19 @@ impl ContinuousBatchScheduler {
                 break;
             }
             let available = remaining_tokens.saturating_sub(admitted_tokens);
-            let tokens = self.prefill_budget_tokens(request, None, prefill_step_chunk, available);
+            let tokens = self.prefill_budget_tokens(
+                request,
+                active_decode_prefill_chunk,
+                prefill_step_chunk,
+                available,
+            );
             if tokens == 0 || tokens > available {
                 break;
             }
             admitted_tokens += tokens;
             admitted += 1;
         }
-        limit = limit.min(admitted);
-        limit
+        admitted
     }
 
     fn capacity_backpressure_admit_limit(&self) -> Option<usize> {
@@ -3509,13 +3683,18 @@ impl ContinuousBatchScheduler {
         }
     }
 
-    fn chunked_prefill_budget_tokens(&self, req: &ContinuousBatchRequest, chunk: usize) -> usize {
-        let remaining = if req.prefill_tokens == 0 {
+    fn known_remaining_prefill_tokens(&self, req: &ContinuousBatchRequest) -> Option<usize> {
+        if req.prefill_tokens == 0 {
             self.prompt_token_estimate(req)
-                .unwrap_or(self.cb_config.prefill_chunk_size)
         } else {
-            req.prefill_tokens.saturating_sub(req.prefill_chunk_offset)
-        };
+            Some(req.prefill_tokens.saturating_sub(req.prefill_chunk_offset))
+        }
+    }
+
+    fn chunked_prefill_budget_tokens(&self, req: &ContinuousBatchRequest, chunk: usize) -> usize {
+        let remaining = self
+            .known_remaining_prefill_tokens(req)
+            .unwrap_or(self.cb_config.prefill_chunk_size);
         chunk.min(remaining).max(1)
     }
 
@@ -3676,34 +3855,24 @@ impl ContinuousBatchScheduler {
 
     fn add_prefill_requests_to_batch(
         &self,
-        iteration: u64,
-        now: Instant,
-        hint: &BatchHint,
-        batch_requests: &mut Vec<ScheduledRequest>,
-        total_tokens: &mut usize,
-        scheduled_request_ids: &mut HashSet<RequestId>,
-        active_decode_prefill_tokens_remaining: &mut Option<usize>,
+        draft: &mut TokenBatchDraft,
         planning: &mut Option<&mut TimePlanningRound>,
-        active_decode_prefill_chunks_remaining: &mut Option<usize>,
-        capacity_deferred_mixed_recompute_slots_remaining: &mut Option<usize>,
-        active_decode_prefill_chunk: Option<usize>,
-        prefill_step_chunk: Option<usize>,
         waiting_admission: &mut WaitingAdmissionMode<'_>,
-        _capacity_release_epoch: u64,
-        capacity_mixed_recompute_epoch: u64,
     ) -> Result<()> {
-        if batch_requests.len() >= hint.max_batch_size || *total_tokens >= hint.max_tokens {
+        if draft.batch_requests.len() >= draft.hint.max_batch_size
+            || draft.total_tokens >= draft.hint.max_tokens
+        {
             return Ok(());
         }
 
         let mut prefill_queue = self.prefill_queue.write();
-        self.prioritize_ttft(&mut prefill_queue, now, planning.as_deref_mut());
+        self.prioritize_ttft(&mut prefill_queue, draft.now, planning.as_deref_mut());
         let mut rejected = Vec::new();
         for req in prefill_queue.iter_mut() {
-            if batch_requests.len() >= hint.max_batch_size {
+            if draft.batch_requests.len() >= draft.hint.max_batch_size {
                 break;
             }
-            if scheduled_request_ids.contains(&req.inner.request.id) {
+            if draft.scheduled_request_ids.contains(&req.inner.request.id) {
                 continue;
             }
             prefix_restore::release_orphaned_capacity_hold(req);
@@ -3713,7 +3882,7 @@ impl ContinuousBatchScheduler {
             if Self::execution_readiness_is_blocked(req) {
                 continue;
             }
-            if Self::execution_maintenance_retry_is_blocked(req, iteration)? {
+            if Self::execution_maintenance_retry_is_blocked(req, draft.iteration)? {
                 continue;
             }
             if self.execution_capacity_is_blocked(
@@ -3725,37 +3894,35 @@ impl ContinuousBatchScheduler {
             }
             let budgeted_capacity_deferred = Self::should_budget_capacity_deferred_mixed_recompute(
                 req,
-                active_decode_prefill_chunk,
+                draft.active_decode_prefill_chunk,
             );
             if budgeted_capacity_deferred
-                && req.capacity_deferred_mixed_attempt_epoch == Some(capacity_mixed_recompute_epoch)
+                && req.capacity_deferred_mixed_attempt_epoch == Some(draft.mixed_recompute_epoch)
             {
                 continue;
             }
             if budgeted_capacity_deferred
-                && capacity_deferred_mixed_recompute_slots_remaining
-                    .as_ref()
-                    .copied()
-                    .unwrap_or(0)
-                    == 0
+                && draft.recompute_slots_left.as_ref().copied().unwrap_or(0) == 0
             {
                 continue;
             }
-            if active_decode_prefill_chunks_remaining
+            if draft
+                .prefill_chunks_left
                 .as_ref()
                 .is_some_and(|remaining| *remaining == 0)
             {
                 break;
             }
 
-            let mut step_tokens_remaining = hint.max_tokens.saturating_sub(*total_tokens);
-            if let Some(remaining) = active_decode_prefill_tokens_remaining.as_ref() {
+            let mut step_tokens_remaining =
+                draft.hint.max_tokens.saturating_sub(draft.total_tokens);
+            if let Some(remaining) = draft.prefill_tokens_left.as_ref() {
                 step_tokens_remaining = step_tokens_remaining.min(*remaining);
             }
             let mut prefill_chunk_tokens = self.prefill_budget_tokens(
                 req,
-                active_decode_prefill_chunk,
-                prefill_step_chunk,
+                draft.active_decode_prefill_chunk,
+                draft.prefill_step_chunk,
                 step_tokens_remaining,
             );
             // Skip fully-prefilled requests that are still in the queue
@@ -3764,14 +3931,14 @@ impl ContinuousBatchScheduler {
             if prefill_chunk_tokens == 0 {
                 continue;
             }
-            if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
+            if let Some(remaining) = draft.prefill_tokens_left.as_mut() {
                 if *remaining == 0 {
                     break;
                 }
             }
 
             if let Some(round) = planning.as_deref_mut() {
-                match self.prefill_time_decision(req, prefill_chunk_tokens, round, now) {
+                match self.prefill_time_decision(req, prefill_chunk_tokens, round, draft.now) {
                     TimeDecision::Allow(tokens) => prefill_chunk_tokens = tokens,
                     TimeDecision::Hold => continue,
                     TimeDecision::Reject(error) => {
@@ -3781,7 +3948,7 @@ impl ContinuousBatchScheduler {
                 }
             }
 
-            if *total_tokens + prefill_chunk_tokens <= hint.max_tokens {
+            if draft.total_tokens + prefill_chunk_tokens <= draft.hint.max_tokens {
                 if let Some(round) = planning.as_deref_mut() {
                     round.selected_work(self.cost_work(
                         req,
@@ -3795,21 +3962,20 @@ impl ContinuousBatchScheduler {
                 scheduled.tokens_to_process = Some(prefill_chunk_tokens);
                 req.logical_work_frontier
                     .mark_scheduled(prefill_chunk_tokens);
-                scheduled_request_ids.insert(scheduled.request.id.clone());
-                batch_requests.push(scheduled);
-                *total_tokens += prefill_chunk_tokens;
-                if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
+                draft
+                    .scheduled_request_ids
+                    .insert(scheduled.request.id.clone());
+                draft.batch_requests.push(scheduled);
+                draft.total_tokens += prefill_chunk_tokens;
+                if let Some(remaining) = draft.prefill_tokens_left.as_mut() {
                     *remaining = remaining.saturating_sub(prefill_chunk_tokens);
                 }
-                if let Some(remaining) = active_decode_prefill_chunks_remaining.as_mut() {
+                if let Some(remaining) = draft.prefill_chunks_left.as_mut() {
                     *remaining = remaining.saturating_sub(1);
                 }
                 if budgeted_capacity_deferred {
-                    req.capacity_deferred_mixed_attempt_epoch =
-                        Some(capacity_mixed_recompute_epoch);
-                    if let Some(remaining) =
-                        capacity_deferred_mixed_recompute_slots_remaining.as_mut()
-                    {
+                    req.capacity_deferred_mixed_attempt_epoch = Some(draft.mixed_recompute_epoch);
+                    if let Some(remaining) = draft.recompute_slots_left.as_mut() {
                         *remaining = remaining.saturating_sub(1);
                     }
                 }
@@ -4185,6 +4351,18 @@ impl ContinuousBatchScheduler {
         now: Instant,
         mut planning: Option<&mut TimePlanningRound>,
     ) -> Result<Option<BatchPlan>> {
+        let draft = self.select_resident_work(hint, &mut waiting_admission, now, &mut planning)?;
+        self.admit_synchronous_waiters(&draft, &mut waiting_admission)?;
+        self.finish_selected_work(draft, &mut waiting_admission, &mut planning)
+    }
+
+    fn select_resident_work(
+        &self,
+        hint: BatchHint,
+        waiting_admission: &mut WaitingAdmissionMode<'_>,
+        now: Instant,
+        planning: &mut Option<&mut TimePlanningRound>,
+    ) -> Result<TokenBatchDraft> {
         self.validate_slo()?;
         if let Some(round) = planning.as_deref_mut() {
             round.reset_selection();
@@ -4195,8 +4373,7 @@ impl ContinuousBatchScheduler {
         let mut batch_requests = Vec::new();
         let mut scheduled_request_ids = HashSet::new();
         let mut total_tokens = 0;
-        let fill_first_initial_cohort_armed =
-            self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
+        let fill_first_armed = self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
         let skip_decode_for_prefill_first = waiting_admission
             .initial_priority()
             .unwrap_or_else(|| self.skip_decode_for_prefill_first(&hint));
@@ -4211,26 +4388,25 @@ impl ContinuousBatchScheduler {
                 &mut batch_requests,
                 &mut total_tokens,
                 &mut scheduled_request_ids,
-                &mut waiting_admission,
-                &mut planning,
+                waiting_admission,
+                planning,
             )?;
         }
-        let mut scheduled_decode_count = batch_requests.len();
+        let scheduled_decode_count = batch_requests.len();
         let active_decode_prefill_chunk =
             self.active_decode_prefill_chunk_for_iteration(&hint, scheduled_decode_count);
         let prefill_step_chunk = self.runtime_config.prefill_step_chunk;
-        let mut active_decode_prefill_tokens_remaining = self.active_decode_prefill_budget_tokens(
+        let active_decode_prefill_tokens_remaining = self.active_decode_prefill_budget_tokens(
             &hint,
             scheduled_decode_count,
             active_decode_prefill_chunk,
             prefill_step_chunk,
         );
-        let mut active_decode_prefill_chunks_remaining = self.active_decode_prefill_budget_chunks(
+        let active_decode_prefill_chunks_remaining = self.active_decode_prefill_budget_chunks(
             &hint,
             scheduled_decode_count,
             active_decode_prefill_chunk,
         );
-        let capacity_release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
         let capacity_mixed_recompute_epoch =
             self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed);
         let mixed_recompute_release_ready = self
@@ -4253,7 +4429,7 @@ impl ContinuousBatchScheduler {
             && active_decode_prefill_tokens_remaining.unwrap_or(0) > 0
             && mixed_recompute_release_ready
             && mixed_recompute_kv_capacity_ready;
-        let mut capacity_deferred_mixed_recompute_slots_remaining =
+        let capacity_deferred_mixed_recompute_slots_remaining =
             allow_capacity_deferred_mixed_recompute.then(|| {
                 self.capacity_deferred_mixed_recompute_slot_budget(
                     active_decode_prefill_chunk,
@@ -4264,33 +4440,36 @@ impl ContinuousBatchScheduler {
                 )
             });
 
-        // Then, add prefill requests up to the per-iter token budget.
-        // Phase 3: `max_prefill_batch=8` no longer caps the count —
-        // the only budget is `hint.max_tokens` (= EngineConfig's
-        // `max_num_batched_tokens`, default 4096). Decodes contribute
-        // 1 token each; prefill chunks contribute their chunk size.
-        // This is what lets the Qwen3MoE `unified_forward` path
-        // activate for cohort prefills (m_total must stay ≤ scratch
-        // max_tokens, which is pre-allocated to the same budget).
-        self.add_prefill_requests_to_batch(
-            iteration,
+        let mut draft = TokenBatchDraft {
+            hint,
             now,
-            &hint,
-            &mut batch_requests,
-            &mut total_tokens,
-            &mut scheduled_request_ids,
-            &mut active_decode_prefill_tokens_remaining,
-            &mut planning,
-            &mut active_decode_prefill_chunks_remaining,
-            &mut capacity_deferred_mixed_recompute_slots_remaining,
+            iteration,
+            batch_requests,
+            scheduled_request_ids,
+            total_tokens,
+            scheduled_decode_count,
+            skip_initial_decode: skip_decode_for_prefill_first,
+            fill_first_armed,
             active_decode_prefill_chunk,
             prefill_step_chunk,
-            &mut waiting_admission,
-            capacity_release_epoch,
-            capacity_mixed_recompute_epoch,
-        )?;
+            prefill_tokens_left: active_decode_prefill_tokens_remaining,
+            prefill_chunks_left: active_decode_prefill_chunks_remaining,
+            recompute_slots_left: capacity_deferred_mixed_recompute_slots_remaining,
+            mixed_recompute_epoch: capacity_mixed_recompute_epoch,
+        };
+        self.add_prefill_requests_to_batch(&mut draft, planning, waiting_admission)?;
+        Ok(draft)
+    }
 
+    fn admit_synchronous_waiters(
+        &self,
+        draft: &TokenBatchDraft,
+        waiting_admission: &mut WaitingAdmissionMode<'_>,
+    ) -> Result<()> {
         // Check if we should admit new requests from waiting queue.
+        if matches!(waiting_admission, WaitingAdmissionMode::Prepared { .. }) {
+            return Ok(());
+        }
         let active_capacity = self
             .config
             .max_running_requests
@@ -4304,7 +4483,8 @@ impl ContinuousBatchScheduler {
             .capacity_backpressure_admit_limit()
             .map(|limit| available_slots.min(limit))
             .unwrap_or(available_slots);
-        if matches!(&waiting_admission, WaitingAdmissionMode::Legacy) {
+        if matches!(waiting_admission, WaitingAdmissionMode::Legacy) {
+            let capacity_release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
             self.legacy_waiting_admission_ticks
                 .fetch_add(1, Ordering::Relaxed);
             let active_count_for_capacity_wait = self.active_count();
@@ -4328,7 +4508,7 @@ impl ContinuousBatchScheduler {
                 let budgeted_capacity_deferred =
                     Self::should_budget_capacity_deferred_mixed_recompute(
                         req,
-                        active_decode_prefill_chunk,
+                        draft.active_decode_prefill_chunk,
                     );
                 let release_ready =
                     req.capacity_deferred_until_release_epoch <= capacity_release_epoch;
@@ -4341,12 +4521,12 @@ impl ContinuousBatchScheduler {
                     requests_to_admit
                         .push((req.inner.request.id.clone(), Some(capacity_release_epoch)));
                 } else if req.capacity_deferred_mixed_attempt_epoch
-                    == Some(capacity_mixed_recompute_epoch)
+                    == Some(draft.mixed_recompute_epoch)
                 {
                     continue;
-                } else if allow_capacity_deferred_mixed_recompute
+                } else if draft.recompute_slots_left.is_some()
                     && release_blocked_capacity_deferred_admissions
-                        < capacity_deferred_mixed_recompute_slots_remaining.unwrap_or(0)
+                        < draft.recompute_slots_left.unwrap_or(0)
                 {
                     requests_to_admit.push((req.inner.request.id.clone(), None));
                     release_blocked_capacity_deferred_admissions += 1;
@@ -4356,64 +4536,54 @@ impl ContinuousBatchScheduler {
             for (req_id, empty_retry_epoch) in requests_to_admit {
                 self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
             }
-        } else if matches!(&waiting_admission, WaitingAdmissionMode::Dynamic { .. }) {
-            self.admit_waiting_dynamically(usize::MAX, available_slots, &mut waiting_admission)?;
+        } else if matches!(waiting_admission, WaitingAdmissionMode::Dynamic { .. }) {
+            self.admit_waiting_dynamically(usize::MAX, available_slots, waiting_admission)?;
         }
 
-        // vLLM's scheduler spends the remaining per-step token budget on
-        // waiting requests after running requests. Mirror that behavior so
-        // newly admitted prefills do not wait an extra iteration just because
-        // the current batch already contains decode work.
-        self.add_prefill_requests_to_batch(
-            iteration,
-            now,
-            &hint,
-            &mut batch_requests,
-            &mut total_tokens,
-            &mut scheduled_request_ids,
-            &mut active_decode_prefill_tokens_remaining,
-            &mut planning,
-            &mut active_decode_prefill_chunks_remaining,
-            &mut capacity_deferred_mixed_recompute_slots_remaining,
-            active_decode_prefill_chunk,
-            prefill_step_chunk,
-            &mut waiting_admission,
-            capacity_release_epoch,
-            capacity_mixed_recompute_epoch,
-        )?;
+        Ok(())
+    }
 
+    fn finish_selected_work(
+        &self,
+        mut draft: TokenBatchDraft,
+        waiting_admission: &mut WaitingAdmissionMode<'_>,
+        planning: &mut Option<&mut TimePlanningRound>,
+    ) -> Result<Option<BatchPlan>> {
+        self.add_prefill_requests_to_batch(&mut draft, planning, waiting_admission)?;
         // Fill-first is a throughput policy, not permission to deadlock. A
         // typed WaitForRelease request may need active decodes to retire before
         // its epoch can advance. If admission produced no runnable prefill,
         // restore decode work so the release condition can become true.
-        if skip_decode_for_prefill_first && batch_requests.is_empty() {
-            let batch_len_before_decode_fallback = batch_requests.len();
+        if draft.skip_initial_decode && draft.batch_requests.is_empty() {
+            let batch_len_before_decode_fallback = draft.batch_requests.len();
             self.add_decode_requests_to_batch(
-                iteration,
-                &hint,
-                &mut batch_requests,
-                &mut total_tokens,
-                &mut scheduled_request_ids,
-                &mut waiting_admission,
-                &mut planning,
+                draft.iteration,
+                &draft.hint,
+                &mut draft.batch_requests,
+                &mut draft.total_tokens,
+                &mut draft.scheduled_request_ids,
+                waiting_admission,
+                planning,
             )?;
-            scheduled_decode_count += batch_requests.len() - batch_len_before_decode_fallback;
+            draft.scheduled_decode_count +=
+                draft.batch_requests.len() - batch_len_before_decode_fallback;
         }
 
         // Whichever path scheduled the first decode (the normal decode-first
         // path or the WaitForRelease deadlock fallback) ends cold-cohort
         // fill-first for this busy period.
-        if fill_first_initial_cohort_armed && scheduled_decode_count > 0 {
+        if draft.fill_first_armed && draft.scheduled_decode_count > 0 {
             self.fill_first_initial_cohort_armed
                 .store(false, Ordering::Release);
         }
 
-        if batch_requests.is_empty() {
+        if draft.batch_requests.is_empty() {
             return Ok(None);
         }
 
         let batch_id = BatchId::new();
-        let max_seq_len = batch_requests
+        let max_seq_len = draft
+            .batch_requests
             .iter()
             .map(|r| r.request.sampling_params.max_tokens)
             .max()
@@ -4421,20 +4591,20 @@ impl ContinuousBatchScheduler {
 
         debug!(
             "Created iteration {} batch: {} requests, {} tokens",
-            iteration,
-            batch_requests.len(),
-            total_tokens
+            draft.iteration,
+            draft.batch_requests.len(),
+            draft.total_tokens
         );
 
         Ok(Some(BatchPlan {
             batch_id,
-            requests: batch_requests,
+            requests: draft.batch_requests,
             max_sequence_length: max_seq_len,
             estimated_time_ms: Some(self.cb_config.target_iteration_time_ms),
             resource_requirements: BatchResourceRequirements {
-                gpu_memory: (total_tokens * 16) as u64,
-                cpu_memory: (total_tokens * 4) as u64,
-                kv_cache_blocks: total_tokens / 16,
+                gpu_memory: (draft.total_tokens * 16) as u64,
+                cpu_memory: (draft.total_tokens * 4) as u64,
+                kv_cache_blocks: draft.total_tokens / 16,
                 recurrent_state_bytes: 0,
                 recurrent_state_slots: 0,
                 compute_units: 1,

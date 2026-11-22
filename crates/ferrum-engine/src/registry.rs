@@ -969,40 +969,30 @@ fn validate_causal_decode_preparation_mode(
     validate_q4_mmvq_weight_decode(config, plan_runtime)?;
     validate_q5_mmvq_weight_decode(config, plan_runtime)?;
     validate_q8_projection_weight_preparation(config, plan_runtime)?;
+    let grouping = config
+        .engine_config
+        .runtime
+        .causal_decode_attention_grouping;
     if config.engine_config.runtime.causal_decode_kv_reuse
         != ferrum_types::CausalDecodeKvReuse::None
-        && (!cfg!(feature = "cuda-causal-gqa2")
-            || config
-                .engine_config
-                .runtime
-                .causal_decode_attention_grouping
-                != ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity)
+        && (!cfg!(feature = "cuda-causal-gqa2") || !grouping.uses_execution_context_limit())
     {
         return Err(FerrumError::unsupported(
-            "paired-query-heads KV reuse requires the cuda-causal-gqa2 build feature and fixed-execution-capacity causal decode grouping",
+            "paired-query-heads KV reuse requires the cuda-causal-gqa2 build feature and a fixed or bucketed execution context",
         ));
     }
     causal_decode_execution_context_limit(config)?;
-    use ferrum_types::{
-        AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
-    };
-    if matches!(
-        config
-            .engine_config
-            .runtime
-            .causal_decode_attention_grouping,
-        CausalDecodeAttentionGrouping::Indexed
-            | CausalDecodeAttentionGrouping::FixedCapacity
-            | CausalDecodeAttentionGrouping::FixedExecutionCapacity
-    ) && (config.engine_config.runtime.causal_decode_preparation_mode
-        != CausalDecodePreparationMode::Packed
-        || !matches!(config.device, Device::CUDA(_))
-        || !plan_runtime
-        || !cfg!(feature = "cuda-indexed-causal-attention"))
+    use ferrum_types::{AttentionExecutionPolicy, CausalDecodePreparationMode};
+    if grouping.requires_packed_preparation()
+        && (config.engine_config.runtime.causal_decode_preparation_mode
+            != CausalDecodePreparationMode::Packed
+            || !matches!(config.device, Device::CUDA(_))
+            || !plan_runtime
+            || !cfg!(feature = "cuda-indexed-causal-attention"))
     {
         return Err(FerrumError::unsupported(format!(
             "{} causal decode attention grouping requires packed preparation on a CUDA plan runtime with compiled indexed native attention",
-            config.engine_config.runtime.causal_decode_attention_grouping.as_runtime_value()
+            grouping.as_runtime_value()
         )));
     }
     if config.engine_config.runtime.causal_decode_preparation_mode
@@ -1043,19 +1033,18 @@ fn validate_causal_decode_preparation_mode(
 
 // Composition precedes automatic startup fitting. Forward the declared hard
 // upper bound; a later fit may shrink it further. The backend also clamps it
-// to the model shape and uses it only for FixedExecutionCapacity.
+// to the model shape for grouping modes that use the execution context.
 fn causal_decode_execution_context_limit(config: &ComponentConfig) -> Result<Option<usize>> {
     let limit = config.engine_config.runtime.max_model_len;
-    if config
+    let grouping = config
         .engine_config
         .runtime
-        .causal_decode_attention_grouping
-        == ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
-        && limit == Some(0)
-    {
-        return Err(FerrumError::config(
-            "fixed-execution-capacity requires a positive maximum model length when configured",
-        ));
+        .causal_decode_attention_grouping;
+    if grouping.uses_execution_context_limit() && limit == Some(0) {
+        return Err(FerrumError::config(format!(
+            "{} requires a positive maximum model length when configured",
+            grouping.as_runtime_value()
+        )));
     }
     Ok(limit)
 }
@@ -2084,26 +2073,28 @@ pub(crate) mod tests {
     fn causal_decode_attention_grouping_execution_context_limit_preserves_bound_and_rejects_zero() {
         use ferrum_types::CausalDecodeAttentionGrouping;
         let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
-        config
-            .engine_config
-            .runtime
-            .causal_decode_attention_grouping =
-            CausalDecodeAttentionGrouping::FixedExecutionCapacity;
-        for limit in [None, Some(1), Some(512), Some(2048), Some(usize::MAX)] {
-            config.engine_config.runtime.max_model_len = limit;
-            assert_eq!(
-                causal_decode_execution_context_limit(&config).unwrap(),
-                limit
-            );
+        for grouping in [
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+            CausalDecodeAttentionGrouping::BucketedExecutionCapacity,
+        ] {
+            config
+                .engine_config
+                .runtime
+                .causal_decode_attention_grouping = grouping;
+            for limit in [None, Some(1), Some(512), Some(2048), Some(usize::MAX)] {
+                config.engine_config.runtime.max_model_len = limit;
+                assert_eq!(
+                    causal_decode_execution_context_limit(&config).unwrap(),
+                    limit
+                );
+            }
+            config.engine_config.runtime.max_model_len = Some(0);
+            assert!(causal_decode_execution_context_limit(&config).is_err());
+            assert!(validate_causal_decode_preparation_mode(&config, true)
+                .unwrap_err()
+                .to_string()
+                .contains("positive maximum model length"));
         }
-        config.engine_config.runtime.max_model_len = Some(0);
-        assert!(causal_decode_execution_context_limit(&config).is_err());
-        assert!(validate_causal_decode_preparation_mode(&config, true)
-            .unwrap_err()
-            .to_string()
-            .contains("positive maximum model length"));
-        // The original grouping keeps its previous interpretation; only the
-        // new mode authorizes a context-bound native scratch plan.
         config
             .engine_config
             .runtime
@@ -2121,6 +2112,7 @@ pub(crate) mod tests {
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
             ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::BucketedExecutionCapacity,
         ] {
             let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
             assert_eq!(
@@ -2179,6 +2171,7 @@ pub(crate) mod tests {
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
             ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::BucketedExecutionCapacity,
         ] {
             let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
             config.device = Device::CUDA(0);
@@ -2210,6 +2203,10 @@ pub(crate) mod tests {
                 && cfg!(feature = "cuda-indexed-causal-attention");
             #[cfg(not(feature = "cuda"))]
             let supported = false;
+            if grouping.uses_execution_context_limit() && cfg!(feature = "cuda-causal-gqa2") {
+                config.engine_config.runtime.causal_decode_kv_reuse =
+                    ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2;
+            }
             for policy in [
                 AttentionExecutionPolicy::Auto,
                 AttentionExecutionPolicy::NativeAdaptive,
@@ -2245,6 +2242,7 @@ pub(crate) mod tests {
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
             ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::BucketedExecutionCapacity,
         ] {
             let mut engine = EngineConfig::default();
             engine.runtime.causal_decode_attention_grouping = grouping;
@@ -2816,6 +2814,7 @@ pub(crate) mod tests {
             context_is_explicit: false,
             sequences_is_explicit: false,
             batch_is_explicit: false,
+            search_serving_concurrency: false,
         });
         let (runtime, executor) = create(&config);
         let executor = executor.unwrap();
@@ -2881,6 +2880,145 @@ pub(crate) mod tests {
             report.selected.max_batch_tokens
         );
         engine.shutdown().await.unwrap();
+
+        // More requests may retain their state than participate in a single
+        // decode wave. Keep the single-request context and per-wave token
+        // budget on the expanded plan that is actually loaded.
+        let mut serving = config.clone();
+        serving.runtime.max_model_len = Some(128);
+        serving.batching.max_batch_size = 2;
+        serving.output.max_sessions = 6;
+        let request = serving.runtime.startup_memory_request.as_mut().unwrap();
+        request.usable_capacity_bytes = capacity;
+        request.search_serving_concurrency = true;
+        let (_, expanded) = create(&serving);
+        let expanded = expanded.unwrap();
+        let report = expanded.startup_memory_plan().unwrap();
+        assert_eq!(report.selected.context_tokens, 128);
+        assert_eq!(report.selected.max_batch_tokens, 8);
+        assert_eq!(report.selected.max_sequences, serving.output.max_sessions);
+        let search = report.serving_concurrency_search.as_ref().unwrap();
+        assert_eq!(search.decode_wave_sequences, 2);
+        assert_eq!(search.capture_warmup_peak_bytes, None);
+        let expanded_memory = expanded
+            .resolved_model_plan()
+            .unwrap()
+            .execution_plan()
+            .payload()
+            .memory();
+        assert_eq!(expanded_memory.maximum_active_sequences(), 6);
+        let lookahead_peak = search.two_wave_full_context_peak_bytes.unwrap();
+        assert!(lookahead_peak > report.context_peak_bytes);
+        let mut window = report.clone();
+        let expected_window = |max_sequences| {
+            Some(ferrum_types::PrefillPreparationWindow {
+                max_sequences,
+                request_context_limit: None,
+            })
+        };
+        window.request.usable_capacity_bytes = lookahead_peak;
+        assert_eq!(window.auto_prefill_preparation_window(), expected_window(4));
+        window.request.usable_capacity_bytes = lookahead_peak - 1;
+        assert_eq!(window.auto_prefill_preparation_window(), expected_window(2));
+        window
+            .serving_concurrency_search
+            .as_mut()
+            .unwrap()
+            .two_wave_full_context_peak_bytes = None;
+        assert_eq!(window.auto_prefill_preparation_window(), expected_window(2));
+        assert_eq!(
+            report.decode_peak_bytes,
+            expanded_memory
+                .startup_resident_workload_peak_bytes(128, 1, 6, 2, 2)
+                .unwrap()
+        );
+        // A restored receipt records earlier decisions. Only a current request
+        // authorizes a fresh search when the output session limit has changed.
+        let receipt = report.clone();
+        drop(expanded);
+        let mut long_context = serving.clone();
+        long_context.runtime.max_model_len = Some(declared_context as usize);
+        let (_, long) = create(&long_context);
+        let long = long.unwrap();
+        let report = long.startup_memory_plan().unwrap();
+        let search = report.serving_concurrency_search.as_ref().unwrap();
+        let proof = search
+            .two_wave_bounded_context
+            .expect("shorter requests fit two waves");
+        assert!(proof.max_request_tokens < report.selected.context_tokens);
+        assert_eq!(
+            report
+                .auto_prefill_preparation_window()
+                .unwrap()
+                .request_context_limit,
+            Some(proof.max_request_tokens)
+        );
+        let memory = long
+            .resolved_model_plan()
+            .unwrap()
+            .execution_plan()
+            .payload()
+            .memory();
+        let wave = search.decode_wave_sequences as u32;
+        let price = |context: usize| {
+            memory
+                .startup_resident_workload_peak_bytes(
+                    context as u64,
+                    context as u64,
+                    2 * wave,
+                    wave,
+                    report
+                        .selected
+                        .max_batch_tokens
+                        .min(context * wave as usize) as u64,
+                )
+                .unwrap()
+        };
+        assert_eq!(price(proof.max_request_tokens), proof.peak_bytes);
+        assert!(proof.peak_bytes <= report.request.usable_capacity_bytes);
+        assert!(price(proof.max_request_tokens + 1) > report.request.usable_capacity_bytes);
+        drop(long);
+        let mut restored = serving.clone();
+        receipt.apply_to_engine_config(&mut restored).unwrap();
+        restored.runtime.startup_memory_request = None;
+        restored.output.max_sessions = receipt.selected.max_sequences + 1;
+        let (_, restored) = create(&restored);
+        let restored = restored.unwrap();
+        assert_eq!(restored.startup_memory_plan(), Some(&receipt));
+        assert_eq!(
+            restored
+                .resolved_model_plan()
+                .unwrap()
+                .execution_plan()
+                .payload()
+                .memory()
+                .maximum_active_sequences() as usize,
+            receipt.selected.max_sequences
+        );
+        drop(restored);
+
+        serving
+            .runtime
+            .startup_memory_request
+            .as_mut()
+            .unwrap()
+            .sequences_is_explicit = true;
+        let (_, explicit) = create(&serving);
+        let explicit = explicit.unwrap();
+        assert_eq!(
+            explicit
+                .startup_memory_plan()
+                .unwrap()
+                .selected
+                .max_sequences,
+            4
+        );
+        assert!(explicit
+            .startup_memory_plan()
+            .unwrap()
+            .serving_concurrency_search
+            .is_none());
+        drop(explicit);
 
         config.runtime.max_model_len = Some(declared_context as usize);
         let request = config.runtime.startup_memory_request.as_mut().unwrap();

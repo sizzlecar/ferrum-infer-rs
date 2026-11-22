@@ -139,6 +139,7 @@ pub enum CausalDecodeAttentionGroupingArg {
     Indexed,
     FixedCapacity,
     FixedExecutionCapacity,
+    BucketedExecutionCapacity,
 }
 
 impl CausalDecodeAttentionGroupingArg {
@@ -155,6 +156,10 @@ impl CausalDecodeAttentionGroupingArg {
             }
             Self::FixedExecutionCapacity => {
                 ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                    .as_runtime_value()
+            }
+            Self::BucketedExecutionCapacity => {
+                ferrum_types::CausalDecodeAttentionGrouping::BucketedExecutionCapacity
                     .as_runtime_value()
             }
         }
@@ -518,6 +523,10 @@ mod tests {
                 (
                     "fixed-execution-capacity",
                     CausalDecodeAttentionGroupingArg::FixedExecutionCapacity,
+                ),
+                (
+                    "bucketed-execution-capacity",
+                    CausalDecodeAttentionGroupingArg::BucketedExecutionCapacity,
                 ),
             ] {
                 let parsed = TestCli::try_parse_from([

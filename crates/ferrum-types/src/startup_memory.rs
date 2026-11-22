@@ -20,6 +20,10 @@ pub struct StartupMemoryRequest {
     pub context_is_explicit: bool,
     pub sequences_is_explicit: bool,
     pub batch_is_explicit: bool,
+    /// Permit the compiled text service to discover resident request capacity.
+    /// Single-request, explicit and preset configurations keep their own bounds.
+    #[serde(default)]
+    pub search_serving_concurrency: bool,
 }
 
 impl StartupMemoryRequest {
@@ -72,6 +76,7 @@ impl StartupMemoryRequest {
             context_is_explicit: explicit("FERRUM_MAX_MODEL_LEN") || explicit("FERRUM_KV_CAPACITY"),
             sequences_is_explicit: explicit("FERRUM_PAGED_MAX_SEQS"),
             batch_is_explicit: explicit("FERRUM_MAX_BATCHED_TOKENS"),
+            search_serving_concurrency: false,
         })
     }
 }
@@ -101,16 +106,95 @@ pub enum StartupWorkload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartupConcurrencySearch {
+    /// Largest candidate within output, scheduler admission and token limits.
+    pub upper_bound: usize,
+    /// Decode participants in one wave at the selected resident request limit.
+    pub decode_wave_sequences: usize,
+    /// Additional candidate plans compiled after the original startup fit.
+    pub candidate_compilations: usize,
+    /// Managed peak of the synthetic decode cohort prepared before readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_warmup_peak_bytes: Option<u64>,
+    /// Managed peak for one executing wave and one prepared wave, both at
+    /// full context, with the full mixed-step budget and prepared workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_wave_full_context_peak_bytes: Option<u64>,
+    /// A smaller per-request context at which both complete waves fit when
+    /// the model's full context does not. Includes its physical byte charge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_wave_bounded_context: Option<StartupPrefillContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartupPrefillContext {
+    pub max_request_tokens: usize,
+    pub peak_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillPreparationWindow {
+    pub max_sequences: usize,
+    /// When present, all live requests must fit this context to use the second wave.
+    pub request_context_limit: Option<usize>,
+}
+
+pub const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 512;
+
+impl PrefillPreparationWindow {
+    /// Extra multi-chunk prompts that fit the next token budget and the proven context.
+    pub fn funded_lookahead(self, wave: usize, step_tokens: usize, chunk_tokens: usize) -> usize {
+        let chunk_tokens = chunk_tokens.max(1);
+        if step_tokens == 0
+            || self
+                .request_context_limit
+                .is_some_and(|limit| limit <= chunk_tokens)
+        {
+            return 0;
+        }
+        self.max_sequences
+            .saturating_sub(wave)
+            .min((step_tokens / chunk_tokens).max(1))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupMemoryPlan {
     pub request: StartupMemoryRequest,
     pub requested: StartupResourceLimits,
     pub selected: StartupResourceLimits,
     pub context_peak_bytes: u64,
     pub decode_peak_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_concurrency_search: Option<StartupConcurrencySearch>,
     pub reasons: Vec<String>,
 }
 
 impl StartupMemoryPlan {
+    /// Eager preparation may get one wave ahead only when that complete
+    /// working set fits. Parked work can still yield its execution slot.
+    pub fn auto_prefill_preparation_window(&self) -> Option<PrefillPreparationWindow> {
+        let search = self.serving_concurrency_search.as_ref()?;
+        let width = search.decode_wave_sequences;
+        let budget = self.request.usable_capacity_bytes;
+        let full_context_fits = search
+            .two_wave_full_context_peak_bytes
+            .is_some_and(|peak| peak <= budget);
+        let bounded = search
+            .two_wave_bounded_context
+            .filter(|proof| proof.peak_bytes <= budget && proof.max_request_tokens > 0);
+        Some(PrefillPreparationWindow {
+            max_sequences: if full_context_fits || bounded.is_some() {
+                width.saturating_mul(2).min(self.selected.max_sequences)
+            } else {
+                width
+            },
+            request_context_limit: bounded
+                .filter(|_| !full_context_fits)
+                .map(|proof| proof.max_request_tokens),
+        })
+    }
+
     pub fn apply_to_engine_config(&self, engine: &mut crate::EngineConfig) -> Result<(), String> {
         engine.runtime.max_model_len = Some(self.selected.context_tokens);
         engine.scheduler.max_running_requests = self.selected.max_sequences;
@@ -232,6 +316,7 @@ pub fn fit_startup_resources(
         selected,
         context_peak_bytes: peak_bytes(prefill(context, batch))?,
         decode_peak_bytes: peak_bytes(decode(sequences))?,
+        serving_concurrency_search: None,
         reasons,
     })
 }

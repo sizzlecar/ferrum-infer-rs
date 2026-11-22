@@ -210,6 +210,10 @@ where
                 domain: domain.clone(),
                 logical_admission: logical_admission.clone(),
                 maintenance: Mutex::new(()),
+                optional_growth_ceiling_bytes: AtomicU64::new(
+                    domain.pool.provisioning().maximum_resident_bytes(),
+                ),
+                fixed_prefill: std::sync::OnceLock::new(),
                 next_extent_generation: AtomicU64::new(1),
                 state: Mutex::new(DynamicBackingPoolState {
                     resident_bytes: 0,
@@ -976,16 +980,22 @@ where
                     .checked_add(state.pending_growth_bytes)
                     .ok_or_else(|| invalid_resource("dynamic pool residency overflows u64"))?;
                 let room = pool
-                    .domain
-                    .pool
-                    .provisioning()
-                    .maximum_resident_bytes()
+                    .optional_growth_ceiling_bytes
+                    .load(Ordering::Relaxed)
                     .saturating_sub(resident);
                 let aligned_room = room / pool.allocation_quantum() * pool.allocation_quantum();
                 // Amortize native allocations across shapes and requests.
                 // Extra backing is unclaimed shared capacity, not extra
                 // sequence ownership or permission to exceed the device budget.
                 chunk_bytes = chunk_bytes.max(resident.min(aligned_room));
+                // When genuinely filling the executing wave, include the small
+                // funded lookahead in this same native allocation. Otherwise a
+                // speculative waiter can synchronously stall all live decodes.
+                if pool.fixed_prefill.get().is_some_and(|fixed| {
+                    resident < fixed.wave_bytes && chunk_bytes >= fixed.wave_bytes - resident
+                }) {
+                    chunk_bytes = chunk_bytes.max(aligned_room);
+                }
             }
             let chunk = {
                 let mut state = pool

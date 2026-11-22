@@ -575,12 +575,11 @@ impl CudaCausalPagedAttentionProvider {
         let decode_attention_grouping = runtime.causal_decode_attention_grouping();
         let causal_decode_kv_reuse = runtime.causal_decode_kv_reuse();
         let grouping_identity = decode_attention_grouping.as_runtime_value().as_bytes();
-        let execution_context_limit =
-            if decode_attention_grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity {
-                runtime.execution_context_limit()
-            } else {
-                None
-            };
+        let execution_context_limit = if decode_attention_grouping.uses_execution_context_limit() {
+            runtime.execution_context_limit()
+        } else {
+            None
+        };
         if execution_context_limit == Some(0) {
             return Err(CudaDeviceRuntimeError::contract(
                 "fixed execution capacity requires a positive execution context limit",
@@ -639,7 +638,7 @@ impl CudaCausalPagedAttentionProvider {
         provider_sources.push(include_bytes!("causal_attention/batch_decode/fixed.rs"));
         provider_sources.push(semantics.fingerprint_tag());
         provider_sources.push(include_bytes!("../../../program_binding_rows.rs"));
-        if decode_attention_grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity {
+        if decode_attention_grouping.uses_execution_context_limit() {
             provider_sources.push(&execution_context_identity);
         }
 
@@ -689,7 +688,7 @@ impl CudaCausalPagedAttentionProvider {
             include_bytes!("causal_attention/explicit_decode.rs"),
             semantics.fingerprint_tag(),
         ];
-        if decode_attention_grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity {
+        if decode_attention_grouping.uses_execution_context_limit() {
             estimator_sources.push(&execution_context_identity);
         }
         let estimator_fingerprint = implementation_fingerprint(&estimator_sources);
@@ -1689,11 +1688,13 @@ impl CausalAttentionReplayTopology {
 }
 
 /// The native launch geometry captured by the ordinary encoder. A fixed
-/// packed launch already contains both native paths at full capacity;
+/// packed launch contains the native paths up to its captured capacity;
 /// ordinary per-row launches retain their selected path and partition count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResidentCausalReplayTopology {
-    FixedCapacity,
+    FixedCapacity {
+        maximum_sequence: u64,
+    },
     CapturedRow {
         path: CausalAttentionKernelPath,
         topology: CausalAttentionReplayTopology,
@@ -1715,11 +1716,14 @@ impl ResidentCausalReplayTopology {
             CausalAttentionKernelPath::select(policy, shape, active_tokens, sequence_tokens)?;
         let topology = CausalAttentionReplayTopology::new(shape, path, sequence_tokens)?;
         Ok(match self {
-            Self::FixedCapacity => matches!(
-                path,
-                CausalAttentionKernelPath::VllmAddressedDecodeV1
-                    | CausalAttentionKernelPath::VllmAddressedDecodeV2
-            ),
+            Self::FixedCapacity { maximum_sequence } => {
+                sequence_tokens <= maximum_sequence
+                    && matches!(
+                        path,
+                        CausalAttentionKernelPath::VllmAddressedDecodeV1
+                            | CausalAttentionKernelPath::VllmAddressedDecodeV2
+                    )
+            }
             Self::CapturedRow {
                 path: captured_path,
                 topology: captured_topology,
@@ -1755,11 +1759,8 @@ fn reusable_attention_topology(
         return Err("CUDA causal topology has no participant token ranges".to_owned());
     }
 
-    if matches!(
-        grouping,
-        CausalDecodeAttentionGrouping::FixedCapacity
-            | CausalDecodeAttentionGrouping::FixedExecutionCapacity
-    ) && cfg!(feature = "cuda-indexed-causal-attention")
+    if grouping.uses_fixed_launch()
+        && cfg!(feature = "cuda-indexed-causal-attention")
         && !shape.int8_kv
         && request
             .binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)
@@ -1786,7 +1787,7 @@ fn reusable_attention_topology(
             })
             .collect::<Result<Vec<_>, String>>()?;
         if let Some(topology) =
-            reusable_fixed_attention_topology_from_rows(attention_policy, shape, &rows)?
+            reusable_fixed_attention_topology_from_rows(grouping, attention_policy, shape, &rows)?
         {
             return Ok(topology);
         }
@@ -1816,7 +1817,26 @@ struct CausalAttentionTopologyRow {
     sequence_tokens: u64,
 }
 
+/// A captured V2 grid must cover every row whose fresh bindings it accepts.
+/// Geometric growth keeps short requests on a common graph and bounds the
+/// number of larger graphs as a sequence grows towards its declared limit.
+fn fixed_decode_launch_capacity(
+    grouping: CausalDecodeAttentionGrouping,
+    execution_limit: u64,
+    longest_row: u64,
+) -> u64 {
+    if grouping != CausalDecodeAttentionGrouping::BucketedExecutionCapacity {
+        return execution_limit;
+    }
+    longest_row
+        .max(CausalDecodeAttentionGrouping::FIRST_EXECUTION_BUCKET_TOKENS as u64)
+        .checked_next_power_of_two()
+        .unwrap_or(execution_limit)
+        .min(execution_limit)
+}
+
 fn reusable_fixed_attention_topology_from_rows(
+    grouping: CausalDecodeAttentionGrouping,
     attention_policy: AttentionExecutionPolicy,
     shape: CausalAttentionShape,
     rows: &[CausalAttentionTopologyRow],
@@ -1844,6 +1864,13 @@ fn reusable_fixed_attention_topology_from_rows(
         CausalAttentionReplayTopology::new(shape, path, row.sequence_tokens)?;
     }
     let binding = BindingLayout::new(shape, rows.len())?;
+    let longest_row = rows
+        .iter()
+        .map(|row| row.sequence_tokens)
+        .max()
+        .unwrap_or(0);
+    let launch_capacity =
+        fixed_decode_launch_capacity(grouping, shape.maximum_context_tokens, longest_row);
     let v1_capacity = VLLM_PARTITION_TOKENS.min(shape.maximum_context_tokens);
     batch_decode::BatchDecode::dimensions(
         rows.len(),
@@ -1852,11 +1879,11 @@ fn reusable_fixed_attention_topology_from_rows(
         shape.query_heads,
         shape.head_dim,
     )?;
-    if shape.maximum_context_tokens > VLLM_PARTITION_TOKENS {
+    if launch_capacity > VLLM_PARTITION_TOKENS {
         batch_decode::BatchDecode::dimensions(
             rows.len(),
             binding,
-            shape.maximum_context_tokens,
+            launch_capacity,
             shape.query_heads,
             shape.head_dim,
         )?;
@@ -1866,6 +1893,7 @@ fn reusable_fixed_attention_topology_from_rows(
     digest.update((rows.len() as u64).to_le_bytes());
     digest.update(v1_capacity.to_le_bytes());
     digest.update(shape.maximum_context_tokens.to_le_bytes());
+    digest.update(launch_capacity.to_le_bytes());
     digest.update(binding.slot_bytes.to_le_bytes());
     Ok(Some(ReusableExecutionTopology::Dynamic(
         DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
@@ -1946,7 +1974,7 @@ impl CausalAttentionShape {
         grouping: CausalDecodeAttentionGrouping,
         execution_context_limit: Option<usize>,
     ) -> Result<Self, String> {
-        if grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity {
+        if grouping.uses_execution_context_limit() {
             if let Some(limit) = execution_context_limit {
                 if limit == 0 {
                     return Err("execution context limit must be positive".to_owned());
@@ -3075,11 +3103,8 @@ fn encode_attention(
     // Fixed-capacity replay also applies to a single decode row. Its current
     // length must select V1/V2 through device bindings, just as it does for a
     // larger batch, without replacing the program at a partition boundary.
-    let fixed_decode = matches!(
-        decode_attention_grouping,
-        CausalDecodeAttentionGrouping::FixedCapacity
-            | CausalDecodeAttentionGrouping::FixedExecutionCapacity
-    ) && semantics != CausalAttentionSemantics::ExplicitRope
+    let fixed_decode = decode_attention_grouping.uses_fixed_launch()
+        && semantics != CausalAttentionSemantics::ExplicitRope
         && !shape.int8_kv
         && token_ranges
             .iter()
@@ -3525,7 +3550,9 @@ fn encode_attention(
             precision,
             attention_policy,
             &launches,
-            batch_decode.as_ref().is_some_and(|batch| batch.is_fixed()),
+            batch_decode
+                .as_ref()
+                .and_then(|batch| batch.fixed_launch_capacity()),
             program_binding_upload_strategy,
             segment_validations.unwrap_or_default(),
         )?;
@@ -6293,6 +6320,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             reusable_fixed_attention_topology_from_rows(
+                CausalDecodeAttentionGrouping::FixedExecutionCapacity,
                 AttentionExecutionPolicy::NativeAdaptive,
                 shape,
                 &rows,
@@ -6313,6 +6341,7 @@ mod tests {
             sequence_tokens: 64,
         }; 2];
         assert!(reusable_fixed_attention_topology_from_rows(
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
             AttentionExecutionPolicy::NativeAdaptive,
             shape,
             &prefill
@@ -6324,12 +6353,43 @@ mod tests {
             sequence_tokens: 64,
         }; 2];
         assert!(reusable_fixed_attention_topology_from_rows(
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
             AttentionExecutionPolicy::Portable,
             shape,
             &decode
         )
         .unwrap()
         .is_none());
+    }
+
+    #[cfg(feature = "cuda-indexed-causal-attention")]
+    #[test]
+    fn bucketed_fixed_decode_graph_and_resident_replay_respect_the_longest_live_row() {
+        let shape = goal_shape(24, 4, 256, 10_000);
+        let policy = AttentionExecutionPolicy::NativeAdaptive;
+        let grouping = CausalDecodeAttentionGrouping::BucketedExecutionCapacity;
+        let graph = |lengths: [u64; 2]| {
+            let rows = lengths.map(|sequence_tokens| CausalAttentionTopologyRow {
+                active_tokens: 1,
+                sequence_tokens,
+            });
+            reusable_fixed_attention_topology_from_rows(grouping, policy, shape, &rows)
+        };
+        let short = graph([1, 511]).unwrap().unwrap();
+        assert_eq!(Some(short), graph([2_048, 513]).unwrap());
+        let longer = graph([11, 2_049]).unwrap().unwrap();
+        assert_ne!(short, longer);
+        assert_eq!(Some(longer), graph([4_096, 512]).unwrap());
+        assert_eq!(
+            fixed_decode_launch_capacity(grouping, 10_000, 8_193),
+            10_000
+        );
+        assert!(graph([10_001, 100]).is_err());
+        let resident = ResidentCausalReplayTopology::FixedCapacity {
+            maximum_sequence: 2_048,
+        };
+        assert!(resident.accepts(policy, shape, 1, 2_048).unwrap());
+        assert!(!resident.accepts(policy, shape, 1, 2_049).unwrap());
     }
 
     #[cfg(feature = "cuda-indexed-causal-attention")]
@@ -6341,6 +6401,7 @@ mod tests {
         }; 2];
         let make = |context| {
             reusable_fixed_attention_topology_from_rows(
+                CausalDecodeAttentionGrouping::FixedExecutionCapacity,
                 AttentionExecutionPolicy::NativeAdaptive,
                 goal_shape(24, 4, 256, context),
                 &rows,
@@ -6354,6 +6415,7 @@ mod tests {
             sequence_tokens: 0,
         }; 2];
         assert!(reusable_fixed_attention_topology_from_rows(
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
             AttentionExecutionPolicy::NativeAdaptive,
             goal_shape(24, 4, 256, 2_048),
             &invalid
@@ -6364,6 +6426,7 @@ mod tests {
             sequence_tokens: 2_049,
         }; 2];
         assert!(reusable_fixed_attention_topology_from_rows(
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
             AttentionExecutionPolicy::NativeAdaptive,
             goal_shape(24, 4, 256, 2_048),
             &invalid
@@ -6928,6 +6991,7 @@ mod tests {
         {
             let topology = |shape, sequence| {
                 reusable_fixed_attention_topology_from_rows(
+                    CausalDecodeAttentionGrouping::FixedExecutionCapacity,
                     AttentionExecutionPolicy::NativeAdaptive,
                     shape,
                     &[CausalAttentionTopologyRow {
@@ -6944,6 +7008,7 @@ mod tests {
             }
             assert_ne!(first, topology(long, 513));
             assert!(reusable_fixed_attention_topology_from_rows(
+                CausalDecodeAttentionGrouping::FixedExecutionCapacity,
                 AttentionExecutionPolicy::NativeAdaptive,
                 bounded,
                 &[CausalAttentionTopologyRow {
@@ -7344,7 +7409,9 @@ mod tests {
         let shape = goal_shape(24, 4, 256, 2_048);
         // Issued only from an actual PreparedBatchDecode::Fixed. A configured
         // fixed grouping with one row does not obtain this authorization.
-        let captured = ResidentCausalReplayTopology::FixedCapacity;
+        let captured = ResidentCausalReplayTopology::FixedCapacity {
+            maximum_sequence: shape.maximum_context_tokens,
+        };
         for sequence_tokens in [1, 511, 512, 513, 1_024, 1_025, 2_048] {
             assert!(captured
                 .accepts(
