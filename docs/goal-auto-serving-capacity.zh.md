@@ -6,9 +6,9 @@ Qwen3.5-4B Q4_K_M 普通启动、混合 ShareGPT C48 的 288 条请求全部成�
 
 在同一 4B 普通启动、混合 C48 上，主干、主干仅修上传、同版显式 32、Auto 和同版显式 48 的吞吐分别为 337.28、532.10、872.13、1,165.80 和 1,213.19 tok/s。Auto 实际最多驻留 36 条，按时完成 248/288，每输出 token P99 为 39.57 ms。显式 48 的对应结果为 275/288 和 48.99 ms。固定短输入则是 Auto 的吞吐更高，1,787.17 对 1,690.76 tok/s。每个设置都用了同样的外部请求与采样口径。[各手动设置及输入修复对照](performance-auto-serving-admission-rtx5090.zh.md)
 
-27B GGUF 原始 C96 回退版本吞吐为 231.00。当前候选与主干交换启动顺序后，各完成 768/768 条，四轮合并吞吐为主干 617.00、候选 614.13 输出 tok/s。候选的首 token 和每输出 token P99 分别慢 147.96 和 2.51 ms，可见间隔快 2.98 ms。同版显式上限 32 另测两轮为 614.98 tok/s。README 冻结请求的逐模型配对与原始延迟门限仍在核对。[本轮实机证据](performance-auto-serving-admission-rtx5090.zh.md) · [首次热门模型验收](performance-auto-serving-capacity-rtx5090.zh.md) · [布局与过载诊断](performance-auto-serving-layout-rtx5090.zh.md) · [问题线索 #504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504)
+27B GGUF 原始 C96 回退版本吞吐为 231.00。当前候选与主干交换启动顺序后，各完成 768/768 条，四轮合并吞吐为主干 617.00、候选 614.13 输出 tok/s。候选的首 token 和每输出 token P99 分别慢 147.96 和 2.51 ms，可见间隔快 2.98 ms。同版显式上限 32 另测两轮为 614.98 tok/s。README 九种权重的首轮配对已完成，两版各通过 36 轮中的 29 轮，27B 两种格式合计各有 7 轮超出既有门限。[本轮实机证据](performance-auto-serving-admission-rtx5090.zh.md) · [首次热门模型验收](performance-auto-serving-capacity-rtx5090.zh.md) · [布局与过载诊断](performance-auto-serving-layout-rtx5090.zh.md) · [问题线索 #504](https://github.com/sizzlecar/ferrum-infer-rs/issues/504)
 
-调度器实验 `a27e1a6bf` 修复了队列扫描前新到请求可能错过空执行位的问题。9B C16 与同窗前版相比，吞吐从 1,186.13 提到 1,199.88 tok/s，首 token P99 从 402.94 降到 320.83 ms。4B C16 的首 token 也更快，吞吐却从 1,436.05 降到 1,405.58 tok/s。该实验保持独立，采用决定还需要核对反序、普通 C48 和 27B C96。[调度器实验的同卡对照](performance-auto-serving-admission-rtx5090.zh.md#调度器实验的无跟踪对照)
+调度器实验 `a27e1a6bf` 修复了队列扫描前新到请求可能错过空执行位的问题。4B C16 的两种进程顺序下，首 token P99 分别快 27 和 126 ms，吞吐分别下降 2.12% 和 2.77%。9B C16 首轮的首 token 快 82 ms，反序后慢 87 ms。该实验已从本次默认方案中排除。4B 的另一组记录把一次 175.5 ms 的预填充准备定位到 C16 首批计时请求。相同负载的物理分配记录显示，预填充激活池在首批执行时增长约 23 MB。正在单独验证把这类空间提前到就绪前准备的成本和效果。[调度器与预填充的同卡对照](performance-auto-serving-admission-rtx5090.zh.md#调度器实验的无跟踪对照)
 
 ## 产品目标
 
