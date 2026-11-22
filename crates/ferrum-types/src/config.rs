@@ -413,8 +413,9 @@ pub const RUNTIME_POOL_PREPARATION_CONFIG_KEY: &str = "FERRUM_RUNTIME_POOL_PREPA
 pub enum RuntimePoolPreparation {
     #[default]
     OnDemand,
-    /// Prepare the compiled maximum workload if the whole target fits. Capacity
-    /// pressure before native allocation keeps ordinary on-demand operation.
+    /// Prepare the compiled workload if it fits. Automatic serving also checks
+    /// the combined pool residency of its verified prefill and decode shapes.
+    /// Capacity pressure before native allocation keeps ordinary on-demand operation.
     WithinBudget,
 }
 
